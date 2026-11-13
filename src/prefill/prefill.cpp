@@ -93,18 +93,15 @@ inline bool force_pageable() {
     static const bool v = [] { const char* e = strata::env_get("TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
     return v;
 }
-// STRATA_PLE_COMPACT=1 (opt-in, upstream 17b08c963): the prompt chunk's PLE rows go up raw and are dequantized on the
-// device (IQ4_NL tables held in memory); the same floats as the host dequant, 7x fewer bytes over the host link
-inline bool ple_compact_on() {
-    static const bool on = [] { const char* v = strata::env_get("PLE_COMPACT"); return v != nullptr && v[0] == '1'; }();
-    return on;
-}
-// STRATA_PLE_COPY_STREAM=1 (opt-in with PLE_COMPACT, upstream d6428bf29): the raw rows go up on a stream of their own
-// instead of the compute stream, which otherwise idles for the copy; the same bytes and kernels
-inline bool ple_copy_stream_on() {
-    static const bool on = [] { const char* v = strata::env_get("PLE_COPY_STREAM"); return v != nullptr && v[0] == '1'; }();
-    return on;
-}
+// STRATA_PLE_COMPACT (upstream 17b08c963): the prompt chunk's PLE rows go up raw and are dequantized on the device
+// (IQ4_NL tables held in memory); the same floats as the host dequant, 7x fewer bytes over the host link.
+// STRATA_PLE_COPY_STREAM (upstream d6428bf29): the raw rows go up on a stream of their own instead of the compute
+// stream, which otherwise idles for the copy; the same bytes and kernels.
+// 0/1 forces each; unset/auto times the first chunk's landing both ways at the first init (ple_landing_probe).
+int ple_compact_pick = -1;       // -1: not decided, 0/1: off/on
+int ple_copy_stream_pick = -1;
+inline bool ple_compact_on() { return ple_compact_pick == 1; }
+inline bool ple_copy_stream_on() { return ple_compact_pick == 1 && ple_copy_stream_pick == 1; }
 // A host table the GPU reads or writes every layer (the routing ids, the row maps, the group bounds): USM host
 // memory that a kernel reads and writes in place (to_device / from_device: copy_i32_from_mapped), so these small copies
 // never queue behind the streamed experts on the copy engine (upstream 1b3bb8f8).  A copy from or to pageable memory
@@ -179,6 +176,9 @@ inline double cpu_share_env() {   // -1: measured
     return v;
 }
 inline bool cpu_share_on() { return cpu_share_env() != 0.0; }
+// XESTRATA_PREFILL_CPU_SHARE_BATCH: a batch slot is decoding beside this read (Prefill::set_share_blocked): the pool
+// is its windows'
+std::atomic<bool> g_share_blocked{false};
 double g_pinned_share = 1.0;
 int g_ring_override = 0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
@@ -1186,6 +1186,66 @@ uint64_t expert_group_bytes(size_t T) {
 }
 }
 
+// XESTRATA_PLE_COMPACT=auto: one 512-token chunk's PLE landing, the host gather included, timed in turn at the first
+// init - the host dequant and 10,240 floats a token over the link against the raw IQ4_NL rows (1,440 bytes a token)
+// and the device's dequant.  The compact form is taken when it is 3% faster: upstream's reporters had +1.0..1.7% of a
+// prompt on a PCIe Gen2 x4 link, and a Gen4 x16 link is where it saves nothing.  The copy stream goes with it: the same
+// bytes and kernels, the upload moved off the compute stream.
+void ple_landing_probe(void* stream, strata::kernels::PleTable& table, int64_t chunk) {
+    constexpr int64_t kTokens = 512, kRounds = 2;
+    const int64_t T = std::min<int64_t>(chunk, kTokens);
+    const uint64_t nrows = table.rows();
+    std::vector<uint32_t> rows((size_t) T * strata::kernels::PLE_N_HEADS);
+    for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t) ((i * 2654435761u) % (nrows != 0 ? nrows : 1));
+    std::vector<float> floats((size_t) T * N);
+    std::vector<uint8_t> raw((size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES);
+    void* fdev = nullptr;
+    void* rdev = nullptr;
+    const bool alloc = strata::gpu::alloc_device(&fdev, floats.size() * 4) && strata::gpu::alloc_device(&rdev, raw.size());
+    if (!alloc) {
+        if (fdev != nullptr) strata::gpu::free(fdev);
+        if (rdev != nullptr) strata::gpu::free(rdev);
+        std::fprintf(stderr, "prefill: the PLE landing's timing: no device memory for 512 tokens: the host dequant\n");
+        ple_compact_pick = 0;
+        ple_copy_stream_pick = 0;
+        return;
+    }
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    std::string e;
+    auto time_of = [&](bool compact) {
+        const auto t0 = now();
+        if (compact) {
+            if (!table.gather_raw_iq4nl(rows.data(), (size_t) T, raw.data())) return -1.0;
+            if (!strata::gpu::copy_async(rdev, raw.data(), raw.size(), stream)) return -1.0;
+            strata::kernels::ple_iq4nl_dequant((const uint8_t*) rdev, T * strata::kernels::PLE_N_HEADS, (float*) fdev, stream);
+        } else {
+            if (!table.gather_batch(rows.data(), (size_t) T, floats.data(), e)) return -1.0;
+            if (!strata::gpu::copy_async(fdev, floats.data(), floats.size() * 4, stream)) return -1.0;
+        }
+        if (!strata::gpu::stream_sync(stream)) return -1.0;
+        return std::chrono::duration<double, std::milli>(now() - t0).count();
+    };
+    double host = 1e30, compact = 1e30;
+    for (int r = 0; r < kRounds; ++r) {
+        if (const double t = time_of(false); t >= 0.0) host = std::min(host, t);
+        if (const double t = time_of(true); t >= 0.0) compact = std::min(compact, t);
+    }
+    strata::gpu::free(fdev);
+    strata::gpu::free(rdev);
+    const bool on = compact >= 0.0 && host < 1e29 && compact <= 0.97 * host;
+    ple_compact_pick = on ? 1 : 0;
+    ple_copy_stream_pick = on ? 1 : 0;
+    auto text = [](double ms) {
+        if (ms >= 1e29) return std::string("did not run");
+        char b[48];
+        std::snprintf(b, sizeof b, "%.2f ms", ms);
+        return std::string(b);
+    };
+    std::fprintf(stderr, "prefill: the PLE landing of %lld tokens: the host dequant %s, the raw rows and the device's "
+                         "dequant %s: the %s (XESTRATA_PLE_COMPACT=0/1 picks one)\n", (long long) T,
+                 text(host).c_str(), text(compact).c_str(), on ? "raw rows" : "host dequant");
+}
+
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes) {
@@ -1302,6 +1362,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!m.ple_copied[b] && !strata::gpu::event_create(&m.ple_copied[b]))
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
+    }
+    // STRATA_PLE_COMPACT/PLE_COPY_STREAM: the environment, else the first chunk's landing timed once
+    if (ple_compact_pick < 0) {
+        const int c = strata::env_auto("PLE_COMPACT");
+        const int s = strata::env_auto("PLE_COPY_STREAM");
+        if (c >= 0) {
+            ple_compact_pick = c;
+            ple_copy_stream_pick = s >= 0 ? s : 0;
+        } else if (ss.ple.table != nullptr && ss.ple.table->is_open()) {
+            ple_landing_probe(m.cs, *ss.ple.table, chunk);
+            if (s >= 0) ple_copy_stream_pick = s;
+        }
     }
     // STRATA_PLE_COMPACT: without the buffer (no VRAM for it) the rows take the host dequant as before
     if (ple_compact_on() && m.ple_raw_dev == nullptr &&
@@ -1427,6 +1499,26 @@ bool Prefill::carve(size_t T, void* alloc) {
         // GU, H and Hq: one group's rows where every layer takes the int8 products (mmq_group_rows_cap); the chunk's
         // where some layer's FP16 products write GU by the chunk's rows
         const size_t GR = mp.any && !mp.fallback ? (size_t) mmq_group_rows_cap(T) : T * K;
+        // XESTRATA_MMQ_GROUP_CAP: once per chunk layout, say that the int8 group scratch took effect (the rows it
+        // holds), and once why it is ignored where the layout cannot use it
+        if (!o.count_only) {
+            static int64_t said_chunk = -1;
+            static bool said_ignored = false;
+            const bool mmq_only = mp.any && !mp.fallback;
+            const char* v = strata::env_get("MMQ_GROUP_CAP");
+            const bool forced = v != nullptr && std::strtol(v, nullptr, 10) != 0;
+            if (mmq_only && (int64_t) GR < (int64_t) T * K && (int64_t) T != said_chunk) {
+                said_chunk = (int64_t) T;
+                std::fprintf(stderr, "xestrata prefill: chunk %zu tokens: the int8 group scratch holds one group's rows "
+                                     "(%zu of %zu; XESTRATA_MMQ_GROUP_CAP)\n", T, GR, T * K);
+            }
+            if (forced && !mmq_only && !said_ignored) {
+                said_ignored = true;
+                std::fprintf(stderr, "xestrata prefill: XESTRATA_MMQ_GROUP_CAP=1 is ignored: %s\n",
+                             !mp.any ? "the prompt path runs the FP16 path here, not the int8 products"
+                                     : "a layer takes the FP16 fallback");
+            }
+        }
         m.GU = c.take<float>(GR * 1280, ok);
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
@@ -1681,6 +1773,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
 void Prefill::set_ring_override(int slots) { g_ring_override = std::clamp(slots,0,RING_MAX); }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_group_cap(bool on) { g_group_cap = on; }
+void Prefill::set_share_blocked(bool blocked) { g_share_blocked.store(blocked, std::memory_order_release); }
 bool Prefill::group_cap() { return g_group_cap; }
 void Prefill::set_expert_group(int g) { g_expert_group = std::clamp(g, 1, 64); }
 int Prefill::expert_group() { return g_expert_group; }
@@ -2703,6 +2796,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     m.ids_host.from_device(m.ids, m.cs);
                     const strata::kernels::cpu::ExpertLayout& lay_c = strata::kernels::cpu::expert_layout();
                     bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr && !m.cpu_dead &&
+                                     !g_share_blocked.load(std::memory_order_acquire) &&
                                      lay_c.native && !lay_c.fmt.empty();
                     // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
                     // nothing left (upstream 04dbe561, 0.1.41 report: tight RAM, chats failing).  A buffer that cannot be
@@ -3399,21 +3493,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const auto* tabs = reinterpret_cast<const uint8_t* const*>(m.tab_dev);
                             if (mtab) { gu.wtab = tabs + j0; gu.woff = 0; }
                             m.mmq_ctx->run(gu, m.cs);
-                            // STRATA_SWIGLU_QUANT=1: swiglu and the down product's int8 rows in one kernel, the same
-                            // bytes (upstream dd97421d3).  Opt-in: 32K prompt equal on the B70 and the RTX 4070, 5%
-                            // slower on the RX 9060 XT (2026-10-28)
-                            static const bool sq = [] {
-                                const char* e = strata::env_get("SWIGLU_QUANT");
-                                return e != nullptr && e[0] == '1';
-                            }();
-                            if (sq) {
-                                pt.mark(kPfGemmD, cs);
-                                mmq::swiglu_quantize(m.GU, m.Hq, mmq_dt, nr, 640, !lay.native, m.cs);
-                            } else {
-                                mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs);
-                                pt.mark(kPfGemmD, cs);
-                                mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
-                            }
+                            mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
                             grp_rows_last = nr;
                             mmq::Product dn;
                             dn.w = mmq_direct ? ring0 + f.down_off : m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640;

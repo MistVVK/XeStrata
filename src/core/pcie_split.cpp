@@ -11,6 +11,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -50,13 +51,14 @@ struct PcieFetchProbe {
     int32_t* d_n = nullptr;
     uint8_t* d_dst = nullptr;
     int64_t bytes = 0;
+    int ring = kRing;   // the experts the launches take from (the start's 32; a 2-expert probe, 2)
     int turn = 0;
     strata::gpu::Stream s = nullptr;
-    bool open(const strata::core::ExpertDispatch& d, int64_t layer, std::string& why) {
+    bool open(const strata::core::ExpertDispatch& d, int64_t layer, std::string& why, int want = kRing) {
         bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
         unsigned long long src[kRing] = {};
         int n = 0, aliased = 0;
-        for (int64_t e = 0; e < d.n_expert && n < kRing; ++e) {
+        for (int64_t e = 0; e < d.n_expert && n < want; ++e) {
             if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] >= 0 || !d.src->pinned(layer, e)) continue;
             const uint8_t* a = d.src->device_alias(layer, e);
             if (a == nullptr) {
@@ -73,7 +75,11 @@ struct PcieFetchProbe {
             }
             src[n++] = (unsigned long long) a;
         }
-        if (n < kRing || (aliased > 0 && aliased < n)) { why = "no layer part with 32 experts to time over PCIe"; return false; }
+        if (n < want || n == 0 || (aliased > 0 && aliased < n)) {
+            why = "no layer part with " + std::to_string(want) + " experts to time over PCIe";
+            return false;
+        }
+        ring = n;
         if (!strata::gpu::alloc_device(&buf, (size_t) (16 + 8 * kRing + 2 * bytes + 256))) { why = "no device memory for the timing"; return false; }
         d_n = reinterpret_cast<int32_t*>(buf);
         d_src = reinterpret_cast<unsigned long long*>(buf + 16);
@@ -85,7 +91,7 @@ struct PcieFetchProbe {
     bool launch(int count, int times) {
         if (!strata::gpu::copy(d_n, &count, sizeof count)) return false;
         for (int i = 0; i < times; ++i, ++turn)
-            strata::kernels::fetch_blobs(d_src + (size_t) ((2 * turn) % kRing), d_n, d_dst, bytes, 2, s);
+            strata::kernels::fetch_blobs(d_src + (size_t) ((2 * turn) % ring), d_n, d_dst, bytes, 2, s);
         return strata::gpu::stream_sync(s);
     }
     // `mean`: the mean of 6 rounds instead of the best of 3 - beside a load that comes and goes the best round is one
@@ -297,12 +303,50 @@ bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strat
     return true;
 }
 
+namespace {
+// STRATA_PCIE_MIN1's auto decision: -1 not probed yet, 0/1 the pick (one process: the machine's answer)
+std::atomic<int> g_pcie_min1{-1};
+}  // namespace
+
+bool pcie_min1_on() {
+    static const int fixed = strata::env_auto("PCIE_MIN1");
+    if (fixed >= 0) return fixed == 1;
+    return g_pcie_min1.load(std::memory_order_relaxed) > 0;
+}
+
+bool pcie_min1_worth(ExpertDispatch& d, int64_t n_layers, std::string& why) {
+    double c = 0.0, q = 0.0, q0 = 0.0, p = 0.0, p0 = 0.0;
+    int64_t layer = -1;
+    if (!measure_cpu_expert_one_ms(d, n_layers, c, layer, why)) return false;
+    if (!measure_gpu_expert_ms(d, layer, q0, q, why)) return false;
+    PcieFetchProbe probe;
+    if (!probe.open(d, layer, why, 2) || !probe.time(p0, p, why, /*mean=*/true)) return false;
+    PcieSplitTimes t;
+    t.c0 = 0.0; t.c = c; t.cb0 = 0.0; t.cb = c;   // alone, as the CPU's one miss of two
+    t.p0 = p0; t.p = p; t.pb0 = p0; t.pb = p;
+    t.q0 = q0; t.q = q;
+    const bool on = pcie_split_m(t, false, 2, 0) >= 1;
+    std::fprintf(stderr, "xestrata: the PCIe lane with two misses a layer: one expert %.3f ms on the CPU, %.3f ms over "
+                         "PCIe and %.3f ms on the GPU: %s (XESTRATA_PCIE_MIN1=0/1 picks one)\n",
+                 c, p, q, on ? "one goes over PCIe" : "the CPU takes both");
+    return on;
+}
+
 bool setup_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, bool overlap, const char* keep, double frac,
                       const char* who) {
     std::string why;
     if (keep == nullptr && !measure_pcie_split(d, n_layers, t, why)) keep = why.c_str();
     if (keep != nullptr) {
         std::fprintf(stderr, "%s: PCIe split: the share %.2f of the missed experts (%s)\n", who, frac, keep);
+        // a fixed share rounds to 0 at one or two misses a layer: decide once whether the lane's floor pays
+        if (frac > 0.0 && g_pcie_min1.load(std::memory_order_relaxed) < 0 && strata::env_auto("PCIE_MIN1") < 0) {
+            why.clear();
+            const bool on = pcie_min1_worth(d, n_layers, why);
+            if (!on && !why.empty())
+                std::fprintf(stderr, "xestrata: PCIE_MIN1: the timing did not run (%s): the CPU takes the misses\n",
+                             why.c_str());
+            g_pcie_min1.store(on ? 1 : 0, std::memory_order_relaxed);
+        }
         return false;
     }
     d.pcie_split = &t;

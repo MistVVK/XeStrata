@@ -30,6 +30,7 @@ List the GPUs in setup's `--gpus` (numbered as `--check` lists them; the first r
 
 setup writes the first GPU's PCI address in `"gpu_pci"` and the others' in `"split_pci"`, and the server passes
 `--layer-split` and `--split-device` to the engine.
+With two cards from `--gpus` and the model fitting one of them, setup and the start log say how many engines replicas or split serving would run ([replicas](#independent-engines-side-by-side-replicas), [split serving](#read-the-prompt-on-one-card-make-the-answer-on-another-split-serving)); the layer split stays unless the config's `"replicas"` or `"split_serve"` asks for them (a request alone is slower there).
 The engine's own options:
 
 | Option | Meaning |
@@ -92,7 +93,7 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
 - With `--pipeline-windows 2` a window is priced at its slowest stage, not the stages' sum: the first GPU runs the next window while the later ones verify this one, so a balanced split is the faster one.
 - Last, the first GPU alone is priced too: unless the second GPU's role (split or helper) is predicted 5% shorter, the first GPU runs alone (`XESTRATA_SPLIT_GAIN_PCT`). On a B70 + RTX 4070 the first GPU alone decoded IQ3_XXS fastest (32K: 104 tok/s, the helper 96, the split 79; predicted 12.0, 12.1 and 12.3 ms), and the helper won with IQ3_S and with both GPUs at 12 GiB (predicted 9% shorter or more).
 - `--split-roles helper` (the server's, when it makes images on the second GPU) gives the second GPU a helper cache's role or none: a helper can be closed and opened again between requests (`HELPER off` / `HELPER on`; [IMAGE](IMAGE.md)).
-- `--split-skip-if-fits` (`"split_skip_if_fits": true` in the config; opt-in, upstream 18ad40c0d) runs on the first GPU alone when its cache holds every profiled pair beside the session, the drafter and the reserve: a split would only add hand-offs.
+- `--split-skip-if-fits` (`"split_skip_if_fits"` in the config; upstream 18ad40c0d) runs on the first GPU alone when its cache holds every profiled pair beside the session, the drafter and the reserve: a split would only add hand-offs.  The default is `"auto"`: the server passes it with a layer split, and the engine decides at start whether every pair fits; `false` turns it off (with `--layer-split K`, a split point of your own, `"auto"` does not pass it either).
 - With two GPUs, the second is also priced, with the same model, as a helper cache (as `--expert-cache-device1`) instead of a stage, and the helper is taken only when its time is more than 5% shorter.
   The model prices decode only: the split reads a prompt on both GPUs, while with the helper the first GPU reads every layer. On two cards of one kind, a helper predicted slightly faster took 1.8 times the split's time to read a prompt.
   The first GPU then runs every layer, and the second holds the experts the first one's cache does not, as many as its free VRAM takes, and computes those of them that decode would have given the CPU (and, in a short prompt, those few tokens route to: [DETAILS](DETAILS.md#prefill-tokenss)).
@@ -151,7 +152,7 @@ On a B70 + RTX 4070 (IQ2_XS, K=45, a 32K prompt) prefill went from 2,350 to 2,42
 threads, so that both stages' CPU experts run at once.
 Where the RAM bandwidth is the limit it is slower (below); it is an experiment for PCs with faster RAM, off by default.
 
-## Independent engines side by side (replicas, opt-in)
+## Independent engines side by side (replicas)
 
 When the model fits fewer cards, independent engines on groups of cards, with the requests spread over them, give more total throughput than one split over every card (upstream 8d276c19).
 A split is one pipeline whose stages wait on each other; each replica runs a pipeline of its own.
@@ -165,17 +166,20 @@ A group's first card is its engine's GPU; a group of two or more cards splits it
 An entry may add `"env"` and `"args"`.
 `serve/server.py --replicas N` does the same.
 
+`"replicas"` is `"auto"` by default, which runs none.  With two or more cards, each card holding the whole model on its own (its weights, the K/V and the expert cache) and the RAM holding a copy of the experts for every card, setup and the start log say how many engines this machine could run (a request alone is faster on the layer split, so "auto" does not choose them).  `"replicas": N` runs them, `"replicas": 1` turns them off, and a split point of your own (`--layer-split K`) is not replaced.
+
 - A request goes to the replica with the lowest cost: the prompt tokens it would read again and the requests running there. A conversation's next turn goes back to its replica unless another is much less busy.
 - On Linux every replica gets physical cores of its own (`"replica_cpus": false` turns that off).
 - A replica that stopped is started again in the background; the others keep serving.
 - On Linux the replicas keep one copy of the model's experts in RAM and share it (upstream 3ccfd5aed, 378200894). The first replica fills it; the others start after it and skip the read. `"replica_shared_arena": false` gives each replica its own copy (the RAM for as many copies as replicas). On Windows each replica keeps its own.
 
-## Read the prompt on one card, make the answer on another (split serving, opt-in)
+## Read the prompt on one card, make the answer on another (split serving)
 
 When two GPUs can each hold the whole model, one can read the prompt (prefill) and the other make the answer (decode) (upstream 690172c46; the idea and the hand-made setup are @MarcoTool's, in upstream's issue #4000).
 The layers are not split: the server starts two engines, one card each, and the prefill engine hands the session it read to the decode engine through a file in RAM.
 The client still sees one endpoint.
-Nothing changes unless it is set.
+
+`"split_serve"` is `"auto"` by default, which runs none: with two cards that each hold the whole model on its own, setup and the start log say the prompts could be read on the second card (a request alone is made on one card there, so "auto" does not choose it).  The cards below, or `--split-serve`, run it; a split point of your own (`--layer-split K`) is not replaced.
 
 In the config (`xestrata-<model>.json`) the cards are PCI addresses, as in `"gpu_pci"`:
 

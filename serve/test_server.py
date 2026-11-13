@@ -3261,8 +3261,8 @@ class KeptReplies(unittest.TestCase):
         self.assertEqual(seen["X-Strata-Upload"], seen["X-XeStrata-Upload"])
         self.assertEqual(seen[None], 415)                # without the header the form is refused
         self.assertNotEqual(seen["X-Strata-Upload"], 415)
-        self.assertEqual(envvars.get("GDN_TC", env={"STRATA_GDN_TC": "1"}), "1")
-        self.assertEqual(envvars.get("GDN_TC", env={"STRATA_GDN_TC": "1", "XESTRATA_GDN_TC": "0"}), "0")
+        self.assertEqual(envvars.get("KVA", env={"STRATA_KVA": "1"}), "1")
+        self.assertEqual(envvars.get("KVA", env={"STRATA_KVA": "1", "XESTRATA_KVA": "0"}), "0")
 
 
 class PromptProgress(unittest.TestCase):

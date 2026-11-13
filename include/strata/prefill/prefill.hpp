@@ -142,8 +142,13 @@ public:
     /// to a share of the experts it would stream (`auto`: measured, where both sides end together); their rows go to
     /// the tail of the experts' outputs (upstream 978d3558).  Not bit-identical to the GPU's rows (the CPU's own
     /// activation format).  Unset (default) or null: every expert on the GPU.  Only for a pool no other thread runs
-    /// meanwhile (no batch slots).  Set before `init`.
+    /// meanwhile (no batch slots, or XESTRATA_PREFILL_CPU_SHARE_BATCH=1's gate: set_share_blocked).  Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+
+    /// XESTRATA_PREFILL_CPU_SHARE_BATCH=1 (batch slots beside the pool): set before each read - true while a slot
+    /// decodes (its windows use the pool), so no chunk of that read takes the share; false lets the read's chunks take
+    /// it.  One flag for the process (a layer split hands it on): the pool is one.
+    static void set_share_blocked(bool blocked);
 
     /// A helper GPU's expert cache (RemoteExperts: --expert-cache-device1, or --layer-split auto's helper).  A chunk
     /// below the streamed-walk size hands it the experts this GPU does not hold and it does, routed by at most

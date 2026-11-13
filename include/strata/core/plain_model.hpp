@@ -518,9 +518,10 @@ public:
     /// was filled from, marked dropped before the server unloads the engine.  False with `err` without an arena.
     bool arena_drop(const std::string& line, std::string& answer, std::string& err);
     /// --kv-grow: the K/V holds at least `cells` cells (whole steps), the tier giving VRAM up for them; and, when it
-    /// holds far more than `cells`, it gives the rest back to the tier.  Between requests; true without --kv-grow.
+    /// holds far more than `cells` (or `hold`, the cells a parked conversation may need: kv_grow_hold.hpp), it gives
+    /// the rest back to the tier.  Between requests; true without --kv-grow.
     bool kv_grow_to(int64_t cells, std::string& err);
-    bool kv_trim(int64_t cells, std::string& err);
+    bool kv_trim(int64_t cells, int64_t hold, std::string& err);
     bool kv_elastic() const { return kv_cells_ >= 0; }
     /// --control-vector: the loaded vector's tables (kernels/cvec.hpp, cvec_upload) on every stage's GPU too, before
     /// the first window; the blocks then apply it after their FFN (steer)

@@ -18,6 +18,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/kv_elastic.hpp"
+#include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/link_probe.hpp"
 #include "strata/core/split_predict.hpp"
@@ -1891,6 +1892,46 @@ int kernel_bench(const std::string& pack) {
     return 0;
 }
 
+// XESTRATA_PREFILL_HELPER_SOURCE=auto: a blob a helper holds, copied from the helper's VRAM and from the source the
+// prompt path would read anyway (RAM or the files) in turn; the helper is taken when it is 5% faster.  The B70 + RTX
+// 4070 pair read slower from the helper (the 4070's x4 link against RAM), which is what the timing keeps the switch
+// from being on where it is so.
+bool helper_copy_faster(strata::core::RemotePrefillSource& helper, strata::core::ExpertSource& fallback) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    int64_t layer = -1, expert = -1;
+    for (int64_t l = 0; l < lay.n_layers && layer < 0; ++l)
+        for (int64_t e = 0; e < lay.n_expert; ++e)
+            if (helper.from_helper(l, e)) { layer = l; expert = e; break; }
+    if (layer < 0) {
+        std::fprintf(stderr, "xestrata serve: no helper holds a prompt expert yet: the prompt path reads as before\n");
+        return false;
+    }
+    std::vector<uint8_t> dst((size_t) lay.blob_bytes(layer));
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    auto one = [&](bool from_helper) {
+        double best = 1e30;
+        for (int r = 0; r < 5; ++r) {
+            const auto t0 = now();
+            const bool ok = from_helper ? helper.copy_blob(layer, expert, dst.data())
+                                        : fallback.copy_blob(layer, expert, dst.data());
+            const double ms = std::chrono::duration<double, std::milli>(now() - t0).count();
+            if (!ok) return -1.0;
+            best = std::min(best, ms);
+        }
+        return best;
+    };
+    const double h = one(true), f = one(false);
+    if (h < 0.0 || f < 0.0) {
+        std::fprintf(stderr, "xestrata serve: the helper's blob could not be timed: the prompt path reads as before\n");
+        return false;
+    }
+    const bool on = h <= 0.95 * f;
+    std::fprintf(stderr, "xestrata serve: a helper's cached blob %.3f ms against the source's %.3f ms: the prompt path "
+                         "%s (XESTRATA_PREFILL_HELPER_SOURCE=0/1 picks one)\n", h, f,
+                 on ? "reads the helper's cache" : "reads as before");
+    return on;
+}
+
 // The PCIe split: core's setup_pcie_split, which the other models' engine calls the same way.
 void setup_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, const Options& o, bool pcie_given,
                       bool layer_split, bool overlap, strata::core::PcieSplitTimes& t) {
@@ -1958,6 +1999,18 @@ void seed_usage_from_prompt(std::vector<float>& usage, const strata::prefill::Pr
     strata::core::seed_usage(usage, ps.routed, ps.routed_k, seen, n_expert, period, decay);
 }
 }  // namespace
+
+// The prompt path gets the CPU pool beside --batch slots too (upstream 1b1a28e77's opt-in, on by default here: RX
+// 9060 XT, --batch 2, a 2050-token read --prefill 3072: 577.2 -> 780.4 tok/s, +35.2%; the decode of the same runs
+// 56.5 -> 55.4, -1.9%, within the run spread).  A batched read takes the share only while no slot decodes
+// (Prefill::set_share_blocked), since the slots' windows use the pool; XESTRATA_PREFILL_CPU_SHARE_BATCH=0 turns it off.
+static bool prefill_cpu_share_batch() {
+    static const bool on = [] {
+        const char* v = strata::env_get("PREFILL_CPU_SHARE_BATCH");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
 
 // Whether the prompt path gets the CPU pool for its share (STRATA_PREFILL_CPU_SHARE, auto by default).  An explicit
 // setting is the user's: the pool is given (0 turns the share off in the prompt path), with a warning when host memory
@@ -6306,11 +6359,13 @@ int main(int argc, char** argv) {
         if (const char* v = strata::env_get("KV_GROW_FLOOR"); v != nullptr && std::strtoll(v, nullptr, 10) > 0)
             kvg.floor = std::strtoll(v, nullptr, 10);
         std::fprintf(stderr, "xestrata generate: elastic K/V: %lld of %lld cells in VRAM (%.2f of %.2f GiB); the expert "
-                             "cache (%lld slots) gives the K/V room below slot %lld as the context grows\n",
+                             "cache (%lld slots) gives the K/V room below slot %lld as the context grows; a parked "
+                             "conversation's cells %s\n",
                      (long long) kvg.cells, (long long) o.max_context,
                      (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
                      (double) strata::core::qsa_kv_elastic_full_bytes() / 1073741824.0, (long long) xcache.slots(),
-                     (long long) top);
+                     (long long) top,
+                     strata::core::kv_grow_hold() ? "stay while it waits" : "go back after each request");
     };
     // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
@@ -6881,18 +6936,26 @@ int main(int argc, char** argv) {
                                  "--conversation-save are off (a parked conversation carries the draft layer's K/V)\n");
             o.conversation_save.clear();
         }
-        // STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path may take a blob a helper's VRAM cache already
-        // holds from that cache instead of reading the files again.  The helpers are idle while a prompt is read
-        // (the serve path is serial: no batch slots), so the copy needs no ordering against their kernel streams.
-        // Default off: the prompt path's source is srcp, exactly as before.
+        // STRATA_PREFILL_HELPER_SOURCE: the prompt path may take a blob a helper's VRAM cache already holds from that
+        // cache instead of reading the files again.  The helpers are idle while a prompt is read (the serve path is
+        // serial: no batch slots), so the copy needs no ordering against their kernel streams.  0/1 fixes it;
+        // unset/auto times a helper's blob against the source's once (helper_copy_faster).
         std::vector<strata::core::RemoteExperts*> prefill_helpers;
         prefill_helpers.reserve((size_t) drive.d.remote_count);
         for (int r = 0; r < drive.d.remote_count; ++r) prefill_helpers.push_back(drive.d.remote[r]);
         std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
         strata::core::ExpertSource* prefill_src = srcp;
         uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
-        if (const char* hv = strata::env_get("PREFILL_HELPER_SOURCE"); hv != nullptr && std::strtol(hv, nullptr, 10) != 0 &&
-            srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
+        bool take_helper = false;
+        if (srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
+            const int want = strata::env_auto("PREFILL_HELPER_SOURCE");
+            if (want >= 0) take_helper = want == 1;
+            else {
+                strata::core::RemotePrefillSource probe(*srcp, prefill_helpers);
+                take_helper = helper_copy_faster(probe, *srcp);
+            }
+        }
+        if (take_helper) {
             prefill_helper_src = std::make_unique<strata::core::RemotePrefillSource>(*srcp, prefill_helpers);
             prefill_src = prefill_helper_src.get();
             std::fprintf(stderr, "xestrata serve: the prompt path reads the experts a helper cache holds from that "
@@ -6984,7 +7047,14 @@ int main(int argc, char** argv) {
         }
         if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
         // the pool is idle while a prompt is read unless batch slots decode between its parts
-        if (!multi_gpu && o.batch <= 0 && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
+        // XESTRATA_PREFILL_CPU_SHARE_BATCH=1 (opt-in): the prompt path gets the pool beside batch slots too; a read
+        // takes the share only while no slot decodes (set_share_blocked before each chunk of a batched read), since
+        // the slots' windows use the pool
+        if (prefill_cpu_share_batch() && o.batch > 0 && !o.no_pool)
+            std::fprintf(stderr, "xestrata serve: XESTRATA_PREFILL_CPU_SHARE_BATCH=1: the prompt path may use the CPU "
+                                 "pool beside the %lld batch slots, for a read with no slot decoding\n", (long long) o.batch);
+        if (!multi_gpu && (o.batch <= 0 || prefill_cpu_share_batch()) && !o.no_pool &&
+            cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
             sp.set_cpu_pool(&pool);
         mem_mark("before the prompt path init");
         if (df2_loaded) sp.set_taps(df2.tap_layers(), 0, 2048);   // tap_first set per request (the prompt's length)
@@ -10885,13 +10955,9 @@ int main(int argc, char** argv) {
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
             if (kvg.on) {
                 kv_quiesce();
-                // STRATA_KV_GROW_HOLD=1 (opt-in, #1128): keep the K/V as long as the longest parked conversation;
-                // default: trim to this request alone
-                static const bool hold_on = [] {
-                    const char* v = strata::env_get("KV_GROW_HOLD");
-                    return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-                }();
-                if (!kvg_trim(n + 256, hold_on ? conversations.longest_tokens() + 256 : 0)) {
+                // XESTRATA_KV_GROW_HOLD (upstream 56ae98dd, #1128): keep the K/V as long as the longest parked
+                // conversation, where holding pays for itself (kv_grow_hold.hpp)
+                if (!kvg_trim(n + 256, strata::core::kv_grow_hold() ? conversations.longest_tokens() + 256 : 0)) {
                     std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
                     return 1;
@@ -11298,7 +11364,13 @@ int main(int argc, char** argv) {
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + C);
                     const auto tq = Clock::now();
-                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    // XESTRATA_PREFILL_CPU_SHARE_BATCH: this chunk takes the CPU share only with no slot decoding
+                    // (the slots' windows between the chunks use the pool)
+                    const bool gate = prefill_cpu_share_batch();
+                    if (gate) strata::prefill::Prefill::set_share_blocked(batch_on());
+                    const bool run_ok = sp.run(ids.data() + q, r - q, q, e);
+                    if (gate) strata::prefill::Prefill::set_share_blocked(false);
+                    if (!run_ok) return false;
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;

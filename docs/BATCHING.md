@@ -5,25 +5,28 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 -->
 # Several requests at once (batch slots)
 
-By default XeStrata serves **one request at a time**: the others wait in the server's queue.
-With `"parallel": N` (the engine's `--batch N`, also spelled `--slots N`) the engine keeps up to N conversations open and decodes them **together**.
+`"parallel"` (the engine's `--batch N`, also spelled `--slots N`) keeps up to N conversations open in the engine and decodes them **together** (upstream's #465; the engine part is PR #559).
 Every verify window then carries one token of each conversation, so the dense weights, the shared expert, the head and every routed expert two conversations share are read once per window for all of them.
 
-It is opt-in and changes nothing when the options are absent (upstream's #465; the engine part is PR #559).
+The default is `"auto"`, which is one at a time: a slot's session takes VRAM from the expert cache, so it would make the **decode of the one user a server mostly has** slower, and whether several requests will come is not known at the start.
 
 ## Turning it on
 
-Add `"parallel": 2` to the model's config (`xestrata-<model>.json`) and restart, or run setup with `--parallel 2`.
-Setup recommends it only where it does not cost speed (below); any number you ask for is kept as asked, with a note when it is more than setup would recommend.
+`"parallel"` in the model's config (`xestrata-<model>.json`) is one of three things.
 
 ```json
-"parallel": 2
+"parallel": "auto"     // the default: one at a time (the slots are not started)
+"parallel": 2          // start that many (setup --parallel 2 writes it too)
+"parallel": 1          // one at a time (off)
 ```
+
+Setup says how many slots this machine could hold (whether the expert cache has room, below); any number you ask for is kept as asked, with a note when it is more than setup would recommend.
 
 | Option | What it does |
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own session (GDN recurrence, QSA K/V and indexer, PLE history). |
-| `--batch-mtp` / `--no-batch-mtp` | on by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. On a layer split the slots' drafters sit on the last GPU ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)). `XESTRATA_BATCH_MTP=0` turns it off as well (`auto`, the default, keeps it where `--mtp` and the slots allow it; `0` and `1` fix it). |
+| `"batch_groups": G` / `--batch-groups G` | On a layer split, the N slots in G groups, a stage on another group at once ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)); `auto` with a layer split and 2 or more slots: the most groups that divide them. |
+| `--batch-mtp` / `--no-batch-mtp` | On by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. On a layer split the slots' drafters sit on the last GPU ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)). `XESTRATA_BATCH_MTP=0` turns it off as well (`auto`, the default, keeps it where `--mtp` and the slots allow it; `0` and `1` fix it). |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can.
 That is at most 8 slots (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit.
@@ -33,17 +36,19 @@ The server reads the count the engine reports (`INFO batch_slots=N`), and `GET /
 With `--batch-mtp`, four greedy requests of 200 tokens in 4 slots gave every slot the same tokens as decoding it alone (`tools/batch_test.py`, `--pcie-frac 0 --adapt-every 1000000`).
 The aggregate went from 87.4 / 86.8 to 90.6 / 90.6 tokens/s on the B70 and from 45.2 / 44.0 to 44.6 / 43.8 tokens/s on the RTX 4070 (the run-to-run spread).
 
-### What a slot costs, and what setup recommends
+### What a slot costs, and what setup says
 
 Every slot's session takes VRAM that the expert cache would otherwise hold: about 0.6 GB at a 32K context with 8-bit KV, more with a longer context.
 With KV streaming (`--kv-resident N`) only N cells of each QSA layer stay in VRAM, and each slot's whole KV cache takes pinned RAM.
 On a card whose experts mostly run on the CPU, a batch reads about as many distinct experts as the requests one by one (different conversations route to different experts).
 The gain there is in **waiting time**, and a request alone runs slower for the smaller expert cache (upstream measured 11-24 % on a 12 GB card).
 
-So setup recommends `"parallel"` **only where the experts mostly fit in VRAM**.
-The expert cache (the card's VRAM less about 5 GB) must still hold at least half of the model's experts beside the slots, and the slots may take at most a fifth of it, up to 4 slots.
-At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one at a time and setup says "parallel N reduces waiting for several users but costs about 10-25% speed per request on this card".
-`--parallel N` is honoured as asked either way.
+So setup says how many slots the machine could hold **where the experts mostly fit in VRAM** (the expert cache - the cards' VRAM less about 5 GB - must still hold at least half of the model's experts beside the slots, and the slots may take at most a fifth of it, up to 4).
+At a 32K context with 8-bit KV that is 4 slots for IQ3_XXS (50.3 GB of experts) on a 64 GB card, and one at a time for the same model on a 24 GB card (Q2_0's 34.0 GB makes 3 there).  One at a time, setup says "parallel N reduces waiting for several users but costs about 10-25% speed per request on this card".
+The model's sizes come from the config, which setup writes (`"model_gb"`, `"experts_gb"`); a config written by hand that does not say them runs one at a time.
+
+The start log says what was chosen and why, a line each ("auto" for `"parallel"`: one at a time, this machine holds N, `"parallel": N` starts them).
+The slot count is an engine start argument (`--batch N`), so changing it while the server runs would mean reading the model again.  That is why "auto" does not try the slots when concurrent requests arrive: it stays at one at a time.
 
 ## How the server uses the slots
 
@@ -147,7 +152,8 @@ Sampled requests (temperature, top_p, top_k, min_p, seed) are drawn row by row w
 
 ## The other models (the plain engine)
 
-Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B and Qwen3.5-9B take the slots with the same `"parallel": N` (GLM-5.3-Flash and `--vision` not yet).
+Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B and Qwen3.5-9B take the slots with the same `"parallel": N` (the default `"auto"` is one at a time; GLM-5.3-Flash and `--vision` not yet).
+How many this machine could hold is Qwen3.8-Flash-Next's rule: the models' weights and experts' sizes and the cards' VRAM, not the model's kind.
 How the server uses them (moving from the solo path into a slot, each slot's conversation cache, `prompt_cache_key`) is Qwen3.8-Flash-Next's.
 
 - At most `--max-t` slots (8 by default). Each slot's state is taken before the VRAM tier of experts, within half the VRAM free then, and the start log says how many were taken.
