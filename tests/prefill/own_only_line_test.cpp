@@ -117,6 +117,24 @@ int main() {
         if (!f.due()) { std::fprintf(stderr, "FAIL %s:%d: a plan made after the share was armed is not due\n", __FILE__, __LINE__); ++failed; }
         CHECK_LINE(f.take(floor_with_share(false, 0, 64)), line_64);
     }
+    // The "prompt pieces" line (default_stream_floor() caches the pack's own 64): the same wait, and the floor in force when it prints, not the 64 it was cached with.
+    {
+        using strata::prefill::floor_with_share;
+        using strata::prefill::OwnOnlyLineDeferred;
+        const char* tail = " tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.";
+        const std::string p1536 = std::string("prefill: prompt pieces of 1536") + tail;
+        const std::string p3072 = std::string("prefill: prompt pieces of 3072") + tail;
+        const std::string p64 = std::string("prefill: prompt pieces of 64") + tail;
+        OwnOnlyLineDeferred d;
+        d.want_pieces();
+        if (d.pieces_due() || d.due()) { std::fprintf(stderr, "FAIL %s:%d: pieces line due before the share is armed\n", __FILE__, __LINE__); ++failed; }
+        d.mark_ready();
+        if (!d.pieces_due() || d.due()) { std::fprintf(stderr, "FAIL %s:%d: pieces line not due (or the plan line due without counts)\n", __FILE__, __LINE__); ++failed; }
+        CHECK_LINE(d.take_pieces(floor_with_share(true, 3072, 64)), p1536.c_str());   // discrete card, plain pack, share armed
+        if (d.pieces_due()) { std::fprintf(stderr, "FAIL %s:%d: pieces line printed twice\n", __FILE__, __LINE__); ++failed; }
+        CHECK_LINE(strata::prefill::stream_floor_pieces_line(floor_with_share(false, 3072, 64)), p3072.c_str());   // rule off / integrated, share armed
+        CHECK_LINE(strata::prefill::stream_floor_pieces_line(floor_with_share(false, 0, 64)), p64.c_str());        // rule off / integrated, no share: as before
+    }
     if (failed) {
         std::fprintf(stderr, "own_only_line_test: %d check(s) failed\n", failed);
         return 1;

@@ -506,6 +506,15 @@ inline bool trellis_cuda_all_fused() {
     return false;
 #endif
 }
+#if defined(STRATA_PF_OWN_ONLY)
+// The two start-up lines of a build without MMQ that name the long-prompt floor ("prompt pieces of N tokens or more read on the fused kernels ..." when the pack's own floor is
+// cached, and "prompt kernels: chunks of N tokens or more ..." when the plan is made) are printed once arm_cpu_share has run (own_only_line.hpp OwnOnlyLineDeferred), with
+// the floor stream_all_min() returns then: both moments come before the CPU share is armed and before the card has answered, and printed there they named 64 while the engine
+// ran at the share's 3,072 or the plain pack's 1,536.  own_only_line_flush() is defined after stream_all_min().
+std::mutex g_own_line_mu;
+strata::prefill::OwnOnlyLineDeferred g_own_line;
+inline void own_only_line_flush();
+#endif
 // The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
 inline int64_t default_stream_floor() {
     static std::atomic<int64_t> cached{-1};
@@ -532,8 +541,18 @@ inline int64_t default_stream_floor() {
         return v;
     }
     cached.store(v, std::memory_order_release);
+#if defined(STRATA_PF_OWN_ONLY)
+    if (v != strata::prefill::kStreamFloorDefault) {   // printed with the floor in force once the share is armed (own_only_line_flush)
+        {
+            std::lock_guard<std::mutex> lk(g_own_line_mu);
+            g_own_line.want_pieces();
+        }
+        own_only_line_flush();
+    }
+#else
     if (v != strata::prefill::kStreamFloorDefault)
         std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
+#endif
     return v;
 }
 // The plain pack in a build without MMQ on a DISCRETE CUDA card takes strata::prefill::kPlainDiscreteFloor, with or without the CPU share (plain_floor_rule.hpp: the share's limit would replace the
@@ -560,17 +579,14 @@ inline int64_t stream_all_min() {
     return strata::prefill::floor_with_share(discrete, g_stream_min_share, discrete || g_stream_min_share <= 0 ? default_stream_floor() : 0);
 }
 #if defined(STRATA_PF_OWN_ONLY)
-// The start-up line of a build without MMQ ("prompt kernels: chunks of N tokens or more ..."): the plan (mmq_plan) makes the counts early in the start, before the CPU share
-// is armed and before the card has answered, so the floor is printed once arm_cpu_share has run (own_only_line.hpp OwnOnlyLineDeferred), as stream_all_min() returns it then.
-std::mutex g_own_line_mu;
-strata::prefill::OwnOnlyLineDeferred g_own_line;
 inline void own_only_line_flush() {
     {
         std::lock_guard<std::mutex> lk(g_own_line_mu);
-        if (!g_own_line.due()) return;
+        if (!g_own_line.due() && !g_own_line.pieces_due()) return;
     }
-    const int64_t floor_tokens = stream_all_min();   // outside the lock: it may print default_stream_floor()'s own line first
+    const int64_t floor_tokens = stream_all_min();   // outside the lock: a first call caches default_stream_floor(), which flushes itself (nothing is printed twice)
     std::lock_guard<std::mutex> lk(g_own_line_mu);
+    if (g_own_line.pieces_due()) std::fprintf(stderr, "%s\n", g_own_line.take_pieces(floor_tokens).c_str());
     if (g_own_line.due()) std::fprintf(stderr, "%s\n", g_own_line.take(floor_tokens).c_str());
 }
 #endif

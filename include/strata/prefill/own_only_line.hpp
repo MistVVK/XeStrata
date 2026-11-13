@@ -61,6 +61,12 @@ inline std::string own_only_line(int64_t layers, int64_t floor_tokens, const Own
     return s;
 }
 
+/// The other start-up line that names the floor (prefill.cpp default_stream_floor(), when the pack's own floor differs from the default 1,024: the plain pack, the trellis packs).
+inline std::string stream_floor_pieces_line(int64_t floor_tokens) {
+    return "prefill: prompt pieces of " + std::to_string(floor_tokens) +
+           " tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.";
+}
+
 /// When the line is printed.  The counts are known when the prompt plan is made (early in the start, before the expert cache), but the floor is not: the CPU share's limit
 /// and the card's class (plain_floor_rule.hpp) arrive later, so a line printed with the plan named the floor of a card that had not answered yet (64 tokens while the
 /// engine ran at 3,072 or 1,536).  The plan stores its counts here; the line is printed once the share has been armed (Prefill::arm_cpu_share, which runs after the card
@@ -80,11 +86,19 @@ public:
         printed_ = true;
         return own_only_line(layers_, floor_tokens, big_, small_, peer_off_);
     }
+    /// The pack's own floor was decided and differs from the default (stream_floor_pieces_line is wanted).  The same wait for the share.
+    void want_pieces() { pieces_wanted_ = true; }
+    bool pieces_due() const { return pieces_wanted_ && ready_ && !pieces_printed_; }
+    std::string take_pieces(int64_t floor_tokens) {
+        pieces_printed_ = true;
+        return stream_floor_pieces_line(floor_tokens);
+    }
 
 private:
     int64_t layers_ = 0;
     OwnOnlySplit big_, small_;
     bool peer_off_ = false, have_ = false, ready_ = false, printed_ = false;
+    bool pieces_wanted_ = false, pieces_printed_ = false;
 };
 
 }  // namespace strata::prefill
