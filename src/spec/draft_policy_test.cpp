@@ -644,6 +644,9 @@ int main() {
             bs.set_fixed_costs(tab, 5, 0);
             bs.start_calibration(false, cb.real, cb.cal, cb.real_cost, cb.reqs);
             check(bs.fixed() && !bs.table_held() && std::fabs(bs.cost_ms(4) - 18.57 * rr) < 1e-6, "budget: a start after the budget uses the table at once, same prices");
+            for (int i = 0; i < 16; ++i) bd.observe(true, 4, 2, 0, 19.90);   // a size the policy now chooses collects its own rounds while the table is in use
+            check(bd.calibrate(cb, rb) && bd.fixed() && (cb.real[0] & 8u) && std::fabs(bd.cost_ms(4) - 19.90) < 1e-9 && cb.reqs == DraftPolicy::kCalibReqs,
+                  "budget: in use, a size with its own kCalibN rounds becomes real");
         }
         // the file round trip: state, real, real cost, cal
         CostFile w;
