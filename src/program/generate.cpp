@@ -72,6 +72,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/dflash2.hpp"
+#include "strata/core/window_rows.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the engine's part (kva_engine)
@@ -86,11 +87,13 @@
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_probe.hpp"
+#include "strata/spec/df2_block_policy.hpp"
 #include "strata/spec/drafter_policy.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/guess_gate.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/static_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -2815,6 +2818,16 @@ int main(int argc, char** argv) {
         const int chain_base = o.spec;
         o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, spec_rows));
     }
+    // Reserve the wide DFlash2 probe's window before the verifier and tap buffers are allocated. Keep an explicitly
+    // numbered --spec as given unless --wide-window on asks for the wider form.
+    if ((o.draft == "auto" || o.draft == "dflash2") && !o.draft_model.empty() &&
+        o.batch == 0 && o.pipeline_windows < 2 &&
+        strata::core::window_rows_cap() == strata::kernels::kWindowMaxT &&
+        (strata::core::wide_window() == strata::core::WideWindow::On ||
+         (o.serve && o.spec_auto && strata::spec::probe_enabled()))) {
+        if (o.mtp_max_t == 0 && o.spec > 0) o.mtp_max_t = o.spec;
+        o.spec = strata::core::window_rows_cap();
+    }
     // the MTP's own windows stay at 8 rows (its draft layer's kernels are the narrow window's); a lookup or DFlash2
     // window goes on to --spec
     if (!o.mtp.empty() && o.spec > (int) strata::kernels::kVerifyNarrowT &&
@@ -4696,6 +4709,10 @@ int main(int argc, char** argv) {
     const strata::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "xestrata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
+    strata::spec::StaticDrafter static_drafter;
+    const int static_mode = static_drafter.configure((int32_t) n_vocab);
+    bool static_selected = static_mode == 1;
+    int block_selected = strata::core::wide_window() == strata::core::WideWindow::On ? 1 : 0;
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
@@ -7376,6 +7393,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "xestrata serve: %s\n", err.c_str());
                 return 1;
             }
+            df2.set_max_drafts(o.spec - 1);
             if (!df2.prepare(ver.tap_dev(), err)) {
                 std::fprintf(stderr, "xestrata serve: %s\n", err.c_str());
                 return 1;
@@ -9019,6 +9037,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "xestrata serve: %s (%.1f s)\n", v.line.c_str(),
                          std::chrono::duration<double>(Clock::now() - probe_t0).count());
             if (v.measured) {
+                if (static_mode < 0) static_selected = v.df2_static;
+                if (strata::core::wide_window() == strata::core::WideWindow::Auto) block_selected = v.df2_block;
                 strata::spec::Drafter keep = v.keep;
                 // DFlash2 alone or beside the MTP keeps the VRAM it took from the reserve: only where the reserve the
                 // engine started with is still free beside it (a long prompt's buffers come out of the reserve)
@@ -9048,8 +9068,9 @@ int main(int argc, char** argv) {
                         if (df2_loaded && df2.head_shared()) {   // DFlash2's head was the MTP's: its own first
                             std::string e;
                             df2.release();
-                            if (!df2.load(o.draft_model, 0, e) || !df2.bind(wt, g, &native_head, df2_vocab, e) ||
-                                !df2.prepare(ver.tap_dev(), e)) {
+                            const bool rebound = df2.load(o.draft_model, 0, e) && df2.bind(wt, g, &native_head, df2_vocab, e);
+                            if (rebound) df2.set_max_drafts(S - 1);
+                            if (!rebound || !df2.prepare(ver.tap_dev(), e)) {
                                 std::fprintf(stderr, "xestrata serve: DFlash2 could not take its own head (%s): the MTP "
                                                      "stays\n", e.c_str());
                                 df2_drop(nullptr);
@@ -9098,7 +9119,9 @@ int main(int argc, char** argv) {
             return true;
         };
         {
-            const bool want_arms = probe_ok && (o.draft == "auto" || o.spec_auto) && !o.native_head_gguf.empty();
+            const bool want_arms = probe_ok && !o.native_head_gguf.empty() &&
+                (o.draft == "auto" || o.spec_auto || (df2_loaded && static_mode < 0 && static_drafter.loaded()) ||
+                 (df2_loaded && S >= strata::kernels::kWindowMaxT && strata::core::wide_window() == strata::core::WideWindow::Auto));
             if (df2_deferred && want_arms) {
                 // DFlash2 beside everything else, where the VRAM it takes leaves kProbeFreeMib free; its pack must be
                 // this model's
@@ -9128,21 +9151,30 @@ int main(int argc, char** argv) {
                             if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
                         }
                         df2_loaded = true;
-                        if (!df2.bind(wt, g, &native_head, df2_vocab, e) || !df2.prepare(ver.tap_dev(), e)) {
+                        if (!df2.bind(wt, g, &native_head, df2_vocab, e)) {
                             std::fprintf(stderr, "xestrata serve: DFlash2: %s: the MTP drafts\n", e.c_str());
                             df2_drop(nullptr);
-                        } else if (free_mib() < (long long) kProbeFreeMib) {
-                            df2_drop("less VRAM is left free beside it than the measurement needs");
                         } else {
                             df2.set_max_drafts(S - 1);
+                            if (!df2.prepare(ver.tap_dev(), e)) {
+                                std::fprintf(stderr, "xestrata serve: DFlash2: %s: the MTP drafts\n", e.c_str());
+                                df2_drop(nullptr);
+                            } else if (free_mib() < (long long) kProbeFreeMib) {
+                                df2_drop("less VRAM is left free beside it than the measurement needs");
+                            }
                         }
                     }
                 }
             } else if (df2_deferred) {
                 df2_drop(nullptr);
             }
-            if (want_arms)
-                probe_arms = strata::spec::DraftProbe::arms(use_mtp, df2_loaded, o.draft == "auto", S_mtp, o.spec_auto, S);
+            if (want_arms) {
+                probe_arms = strata::spec::DraftProbe::arms(use_mtp, df2_loaded, o.draft == "auto", S_mtp, o.spec_auto, S,
+                                                             false, 8, static_mode < 0 && static_drafter.loaded(),
+                                                             S < strata::kernels::kWindowMaxT ? 0 : strata::core::wide_window() == strata::core::WideWindow::On ? 1
+                                                                 : strata::core::wide_window() == strata::core::WideWindow::Auto ? 2 : 0,
+                                                             false, static_mode == 1);
+            }
             std::vector<int32_t> prompt;
             if (probe_arms.size() >= 2) {
                 try {
@@ -10738,9 +10770,17 @@ int main(int argc, char** argv) {
                 if (req_off) req_df2 = false;
                 if (req_df2 != policy_is_df2) { std::swap(policy, policy_idle); policy_is_df2 = req_df2; }
             }
+            const int64_t df2_short0 = df2.rounds_short, df2_wide0 = df2.rounds_wide;
+            const bool req_static = req_df2 && (probe_running && req_probe >= -1
+                ? probe_arms[(size_t) std::max(req_probe, 0)].static_table : static_selected);
+            const int req_block = probe_running && req_probe >= -1
+                ? probe_arms[(size_t) std::max(req_probe, 0)].block : block_selected;
+            strata::spec::Df2BlockPolicy block_policy(req_block == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
+                                                      : req_block == 2 ? strata::spec::Df2BlockPolicy::Mode::Adaptive
+                                                                       : strata::spec::Df2BlockPolicy::Mode::Short);
             const bool req_mtp = use_mtp && mtp.loaded() && !req_df2 && !req_off;   // the MTP drafts this request
             // the windows this request checks: the measurement's arm, else the window the measurement kept
-            const int req_cap = req_spec_cap > 0 ? req_spec_cap : spec_cap;
+            const int req_cap = req_spec_cap > 0 ? req_spec_cap : req_df2 ? 0 : spec_cap;
             const int S_r = req_cap > 0 ? std::min(S, req_cap) : S, S_mtp_r = std::min(S_mtp, S_r);
             if (use_mtp && req_mtp)
                 mtp.set_max_drafts(req_cap > 0 ? S_mtp_r - 1 : mtp_drafts0);
@@ -11996,6 +12036,7 @@ int main(int argc, char** argv) {
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
             }
             bool first_window = true;
+            int df2_width = strata::kernels::kVerifyNarrowT;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             // XESTRATA_FOLLOW=<file> (token forcing, measurement only, off by default; tools/force_check.py): one line
             // per request in the order the engine decodes them, comma-separated token ids (an empty line: that request
@@ -12700,8 +12741,20 @@ int main(int argc, char** argv) {
             policy.set_scale_all(req_minp_rule);
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 policy.set_context(p);         // STRATA_SPEC_COST: the round costs of this context length
+                bool static_window = false;
+                if (req_static && !first_window) {
+                    const int32_t prev = consumed.empty() ? -1 : consumed.back();
+                    const int count = static_drafter.propose(prev, x, std::min(S_r, df2_width) - 1, sbuf.data());
+                    if (count > 0) {
+                        static_window = true;
+                        for (int i = 0; i < S_r - 1; ++i) {
+                            if (i < count) drafts[(size_t) i] = sbuf[(size_t) i];
+                            dprob[(size_t) i] = i < count ? 1.0f : 0.0f;
+                        }
+                    }
+                }
                 int T = (req_mtp || req_df2) ? S_mtp_r : 1;   // no drafter: one token a round unless a lookup fires
-                if (req_df2) T = strata::spec::df2_window(dprob.data(), S_r, df2_conf);   // DFlash2's confidence cut
+                if (req_df2) T = strata::spec::df2_window(dprob.data(), std::min(S_r, df2_width), df2_conf);   // DFlash2's confidence cut
                 else if (req_mtp && !req_minp_rule) T = policy.mtp_window(dprob.data(), S_mtp_r);
                 else if (req_mtp && req_spec_min_p > 0.0) {
                     T = 1;
@@ -12922,6 +12975,9 @@ int main(int argc, char** argv) {
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                if (req_df2 && !first_window && !static_window && !from_sfx && chain_n == 0 && T == df2_width &&
+                    produced_n + a + 1 < max_new)
+                    block_policy.observe(df2_width, a);
                 draft_offered += T - 1;
                 draft_accepted += a;
                 first_window = false;
@@ -12971,10 +13027,12 @@ int main(int argc, char** argv) {
                                           outv[(size_t) a]);
                 bool drafted = eos || produced_n >= max_new;
                 if (!drafted && req_df2) {
-                    int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                    float pp[strata::core::Dflash2Drafter::kDrafts];
+                    df2_width = block_policy.choose(S_r);
+                    df2.set_block_rows(df2_width);
+                    int32_t dd[strata::core::Dflash2Drafter::kMaxDrafts] = {};
+                    float pp[strata::core::Dflash2Drafter::kMaxDrafts] = {};
                     drafted = df2.draft(ver.tap_dev(), a + 1, p, outv[(size_t) a], dd, pp, err);
-                    for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                    for (size_t i = 0; i < drafts.size() && i < (size_t) df2_width - 1; ++i) {
                         drafts[(size_t) i] = dd[i];
                         dprob[(size_t) i] = pp[i];
                     }
@@ -13055,6 +13113,10 @@ int main(int argc, char** argv) {
                 }
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            if (req_df2 && strata::env_auto("DF2_BLOCK_LOG") == 1)
+                std::fprintf(stderr, "xestrata dflash2: block rounds 8=%lld 16=%lld static=%d\n",
+                             (long long) (df2.rounds_short - df2_short0), (long long) (df2.rounds_wide - df2_wide0),
+                             (int) req_static);
             if (req_probe >= 0)   // the start's measurement: this run's speed
                 probe_runs.push_back({req_probe, produced_n, decode_ms, draft_offered, draft_accepted});
             if (df2_loaded && req_kind != 0 && req_probe == -2)   // --draft auto learn: this request's measured decode speed
@@ -13836,7 +13898,12 @@ int main(int argc, char** argv) {
                 const auto sh = mtp.shared_head();
                 if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
             }
-            if (!df2.bind(wt, g, &native_head, df2_vocab, err) || !df2.prepare(ver.tap_dev(), err)) {
+            if (!df2.bind(wt, g, &native_head, df2_vocab, err)) {
+                std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
+                return 1;
+            }
+            df2.set_max_drafts(o.spec - 1);
+            if (!df2.prepare(ver.tap_dev(), err)) {
                 std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -13975,8 +14042,11 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         const bool use_df2 = df2_loaded;   // the CLI: DFlash2 is the drafter when loaded (--draft auto acts as dflash2)
+        strata::spec::Df2BlockPolicy block_policy(block_selected == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
+                                                                      : strata::spec::Df2BlockPolicy::Mode::Short);
+        int df2_width = strata::kernels::kVerifyNarrowT;
         const double df2_conf = o.draft_conf > 0.0 ? o.draft_conf : df2_default_conf(xcache.slots());
-        if (use_df2) df2.set_max_drafts(S_mtp - 1);
+        if (use_df2) df2.set_max_drafts(o.spec - 1);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         // the window rule, as the chain drafts: another draft after n when the rule would keep it (--spec-window)
         const bool minp_rule = o.spec_window == "min-p";
@@ -14060,8 +14130,19 @@ int main(int argc, char** argv) {
             const Clock::time_point t0 = Clock::now();
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
             policy.set_context(p);   // STRATA_SPEC_COST: the round costs of this context length
+            if (use_df2 && static_selected && !first_window) {
+                const int32_t prev = produced.size() > 1 ? (int32_t) produced[produced.size() - 2]
+                    : o.tokens.empty() ? -1 : (int32_t) o.tokens.back();
+                const int count = static_drafter.propose(prev, x, std::min(o.spec, df2_width) - 1, sbuf.data());
+                if (count > 0) {
+                    for (int i = 0; i < o.spec - 1; ++i) {
+                        if (i < count) drafts[(size_t) i] = sbuf[(size_t) i];
+                        dprob[(size_t) i] = i < count ? 1.0f : 0.0f;
+                    }
+                }
+            }
             int T = S_mtp;
-            if (use_df2) T = strata::spec::df2_window(dprob.data(), S_mtp, df2_conf);
+            if (use_df2) T = strata::spec::df2_window(dprob.data(), std::min(o.spec, df2_width), df2_conf);
             else if (use_mtp && !minp_rule) T = policy.mtp_window(dprob.data(), S_mtp);
             else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
@@ -14239,10 +14320,12 @@ int main(int argc, char** argv) {
             }
             bool drafted = (int64_t) produced.size() >= max_new;
             if (!drafted && use_df2) {
-                int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                float pp[strata::core::Dflash2Drafter::kDrafts];
+                df2_width = block_policy.choose(o.spec);
+                df2.set_block_rows(df2_width);
+                int32_t dd[strata::core::Dflash2Drafter::kMaxDrafts] = {};
+                float pp[strata::core::Dflash2Drafter::kMaxDrafts] = {};
                 drafted = df2.draft(ver.tap_dev(), a + 1, p, outv[(size_t) a], dd, pp, err);
-                for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                for (size_t i = 0; i < drafts.size() && i < (size_t) df2_width - 1; ++i) {
                     drafts[(size_t) i] = dd[i];
                     dprob[(size_t) i] = pp[i];
                 }

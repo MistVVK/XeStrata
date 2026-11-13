@@ -4,6 +4,7 @@
 #include "strata/spec/draft_probe.hpp"
 
 #include "strata/platform/env.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -24,15 +25,26 @@ const char* drafter_name(Drafter d) {
 }
 
 std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec,
-                                       bool bdraft2, int bdraft2_spec) {
+                                       bool bdraft2, int bdraft2_spec, bool static_available, int wide_mode, bool bdraft_shead, bool static_forced) {
     std::vector<ProbeArm> a;
     if (mtp) {
         a.push_back({Drafter::Mtp, spec});
         // the smallest window with a draft: on a machine where a verify row costs much it can beat the larger one
         if (spec_auto && spec > 2) a.push_back({Drafter::Mtp, 2});
     }
-    if (df2) a.push_back({Drafter::Df2, df2_spec});
-    if (bdraft2) a.push_back({Drafter::Bdraft2, bdraft2_spec});
+    if (df2) {
+        const int first = wide_mode == 1 && df2_spec >= kernels::kWindowMaxT ? 1 : 0;
+        const int last = wide_mode == 2 && df2_spec >= kernels::kWindowMaxT ? 2 : first;
+        for (int block = first; block <= last; ++block) {
+            const int cap = block == 0 ? std::min(df2_spec, kernels::kVerifyNarrowT) : df2_spec;
+            if (!static_forced) a.push_back({Drafter::Df2, cap, false, block});
+            if (static_available || static_forced) a.push_back({Drafter::Df2, cap, true, block});
+        }
+    }
+    if (bdraft2) {
+        a.push_back({Drafter::Bdraft2, bdraft2_spec});
+        if (bdraft_shead) a.push_back({Drafter::Bdraft2, bdraft2_spec, false, 0, true});
+    }
     if (none_ok && (mtp || df2 || bdraft2)) a.push_back({Drafter::None, 1});
     if (a.size() < 2) a.clear();
     return a;
@@ -75,6 +87,9 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
                       arms[i].drafter == Drafter::None ? " " : (" window " + std::to_string(arms[i].spec) + " ").c_str(),
                       v.tps[i]);
         v.line += buf;
+        if (arms[i].drafter == Drafter::Df2 && arms[i].block == 2) v.line += " adaptive block";
+        if (arms[i].static_table) v.line += " + static table";
+        if (arms[i].shead) v.line += " + SHEAD 512";
         if (drafted[i] > 0) {
             std::snprintf(buf, sizeof buf, " (drafts kept %.2f)", (double) accepted[i] / (double) drafted[i]);
             v.line += buf;
@@ -94,7 +109,7 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
     auto rank = [&](size_t i) {
         const ProbeArm& a = arms[i];
         const int d = a.drafter == Drafter::Mtp ? 0 : a.drafter == Drafter::Df2 || a.drafter == Drafter::Bdraft2 ? 1 : 2;
-        return d * 2 + (a.spec == spec_default || a.drafter != Drafter::Mtp ? 0 : 1);
+        return d * 16 + (a.spec == spec_default || a.drafter != Drafter::Mtp ? 0 : 8) + a.block * 2 + (a.static_table || a.shead ? 1 : 0);
     };
     std::vector<size_t> order(n);
     for (size_t i = 0; i < n; ++i) order[i] = i;
@@ -106,6 +121,20 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
     size_t pick = best;
     for (size_t i : order)
         if (i == best || !beats(best, i)) { pick = i; break; }
+    // When both drafters stay, choose each form by the same fastest-then-cheapest rule, independent of the other.
+    auto form = [&](Drafter d) {
+        size_t fast = n;
+        for (size_t i = 0; i < n; ++i)
+            if (arms[i].drafter == d && (fast == n || v.tps[i] > v.tps[fast])) fast = i;
+        if (fast == n) return n;
+        for (size_t i : order)
+            if (arms[i].drafter == d && (i == fast || !beats(fast, i))) return i;
+        return fast;
+    };
+    const size_t df2_pick = form(Drafter::Df2), bdraft_pick = form(Drafter::Bdraft2);
+    v.df2_static = df2_pick != n && arms[df2_pick].static_table;
+    v.df2_block = df2_pick != n ? arms[df2_pick].block : 0;
+    v.bdraft_shead = bdraft_pick != n && arms[bdraft_pick].shead;
     v.keep = arms[pick].drafter;
     v.spec = arms[pick].drafter == Drafter::None ? 1 : arms[pick].spec;
     // the MTP and DFlash2 both within the margin of the fastest: both stay and DrafterPolicy picks per request
@@ -117,6 +146,11 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
     v.line += v.keep_both ? " - both drafters stay (within the margin), picked per request"
                           : std::string(" - keeps ") + drafter_name(v.keep) +
                                 (v.keep == Drafter::None ? std::string() : " window " + std::to_string(v.spec));
+    if ((v.keep == Drafter::Df2 || v.keep_both) && df2_pick != n) {
+        v.line += std::string(" (DFlash2 block ") + (v.df2_block == 0 ? "8" : v.df2_block == 1 ? "16" : "adaptive") +
+                  (v.df2_static ? ", static table on)" : ", static table off)");
+    }
+    if (v.keep == Drafter::Bdraft2 && bdraft_pick != n) v.line += v.bdraft_shead ? " (SHEAD 512)" : " (full head)";
     return v;
 }
 
