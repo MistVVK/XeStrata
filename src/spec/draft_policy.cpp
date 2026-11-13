@@ -290,6 +290,7 @@ bool read_cost_file(const std::string& path, const std::string& key, CostFile& o
             out.state_effect = line == "state 1";
             continue;
         }
+        if (line == "fresh 1") { out.fresh = true; continue; }
         if (line.rfind("reqs ", 0) == 0) {
             int rq = -1;
             if (std::sscanf(line.c_str(), "reqs %d", &rq) != 1 || rq < 0 || rq > 1000000) { why = "a malformed request count"; return false; }
@@ -344,7 +345,7 @@ bool read_cost_file(const std::string& path, const std::string& key, CostFile& o
         out.tables[(size_t) b] = std::move(v);
         any = true;
     }
-    if (!ended || !any) { why = "the file is cut short"; return false; }
+    if (!ended || (!any && !out.fresh) || (any && out.fresh)) { why = "the file is cut short"; return false; }
     out.key = key;
     return true;
 }
@@ -373,6 +374,7 @@ bool write_cost_file(const std::string& path, const CostFile& c, std::string& wh
         }
         if (c.state_effect) f << "state 1\n";
         if (c.reqs > 0) f << "reqs " << c.reqs << "\n";
+        if (c.fresh) f << "fresh 1\n";
         for (int k = 0; k < CostLearner::kCtxBuckets; ++k) {
             if (c.real[(size_t) k] != 0u) f << "real " << k << " " << c.real[(size_t) k] << "\n";
             for (int t = 1; t <= CostLearner::kMaxT; ++t)
@@ -700,6 +702,47 @@ void DraftPolicy::start_calibration(bool state_effect, const std::array<unsigned
     if (calib_on_ && reqs_ < kCalibReqs && fixed_ && live_saved_) hold_table();
 }
 
+void DraftPolicy::start_passive(const CostFile& cf, int n) {
+    passive_ = true;
+    calib_fresh_only_ = true;   // see the header: only the first seconds of a busy run count, no detection of a load-time effect
+    real_ = {};
+    real_[0] = cf.real[0];
+    cal_ = {};
+    cal_[0] = cf.cal[0];
+    real_cost_ = {};
+    real_cost_[0] = cf.real_cost[0];
+    learned_ = {};
+    fixed_n_ = {};
+    fixed_n_[0] = std::clamp(n, 1, kMaxT);
+    for (int t = 1; t <= kMaxT; ++t)   // a mark without a cost (a damaged file) is no mark; a size past the table length is none
+        if ((real_[0] >> (t - 1) & 1u) && (!(real_cost_[0][(size_t) t] > 0.0) || t > fixed_n_[0])) real_[0] &= ~(1u << (t - 1));
+    reqs_ = std::max(cf.reqs, 0);
+    held_table_ = true;
+    fixed_ = false;
+    calib_on_ = true;
+    calib_dirty_ = false;
+}
+
+void DraftPolicy::take_over_passive() {
+    const int bk_was = bk_;
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        const int n = fixed_n_[(size_t) k];
+        for (int t = 1; t <= n; ++t) {
+            double v;
+            if (real_[(size_t) k] >> (t - 1) & 1u) v = real_cost_[(size_t) k][(size_t) t];   // a real size: its own cost
+            else if (cost_n_[k][t] > 0 && cost_[k][t] > 0.0) v = cost_[k][t];                  // a size never reached 16 rounds: what the live estimator has now
+            else {
+                bk_ = k;
+                v = cost_ms(t);   // never measured: the policy's own prior, as without a table
+                bk_ = bk_was;
+            }
+            if (!(v > 0.0)) v = t > 1 ? learned_[(size_t) k][(size_t) t - 1] : 1.0;
+            learned_[(size_t) k][(size_t) t] = v;
+        }
+    }
+    passive_ = false;
+}
+
 void DraftPolicy::hold_table() {
     for (int k = 0; k < kCtxBuckets; ++k) {
         if (fixed_n_[(size_t) k] <= 0) continue;
@@ -732,7 +775,8 @@ void DraftPolicy::calib_add(int bucket, int t, double ms, double age) {
     if (bucket < 0 || bucket >= kCtxBuckets || t < 1 || t > fixed_n_[(size_t) bucket]) return;
     if (real_[(size_t) bucket] >> (t - 1) & 1u) return;
     if (calib_fresh_only_ && age > CostLearner::kFreshS) return;   // the table is what rounds of the first seconds of a busy run cost
-    const double base = learned_[(size_t) bucket][(size_t) t];
+    double base = learned_[(size_t) bucket][(size_t) t];
+    if (!(base > 0.0) && passive_) base = cost_n_[bucket][t] > 0 ? cost_[bucket][t] : 0.0;   // no learned table: the live cost of the size is the reference
     if (!(base > 0.0)) return;
     CalAcc& a = cal_[(size_t) bucket][(size_t) t];
     if (a.n >= kCalibN) return;
@@ -754,7 +798,7 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
             CalAcc& a = cal_[(size_t) k][(size_t) t];
             if (a.n < kCalibN) continue;
             const double v = a.sum / a.n, base = learned_[(size_t) k][(size_t) t];
-            if (v >= kCalibOkLo * base && v <= kCalibOkHi * base) {
+            if (!(base > 0.0) || (v >= kCalibOkLo * base && v <= kCalibOkHi * base)) {   // no learned cost (passive): the clamped rounds are taken as they are
                 std::snprintf(b, sizeof b, "%s%d rows %.2f -> %.2f", report.empty() ? "" : ", ", t, base, v);
                 report += b;
                 real_cost_[(size_t) k][(size_t) t] = v;
@@ -777,7 +821,7 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
     for (int k = 0; k < kCtxBuckets; ++k) {
         const int n = fixed_n_[(size_t) k];
         if (n <= 0) continue;
-        cf.tables[(size_t) k].assign(learned_[(size_t) k].begin() + 1, learned_[(size_t) k].begin() + 1 + n);   // the file keeps the learned costs
+        if (!(passive_ && !fixed_)) cf.tables[(size_t) k].assign(learned_[(size_t) k].begin() + 1, learned_[(size_t) k].begin() + 1 + n);   // the file keeps the learned costs
         cf.real[(size_t) k] = real_[(size_t) k];
         for (int t = 0; t <= kMaxT; ++t) {
             cf.cal[(size_t) k][(size_t) t] = cal_[(size_t) k][(size_t) t];
@@ -786,6 +830,7 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
     }
     cf.state_effect = calib_fresh_only_;
     cf.reqs = reqs_;
+    cf.fresh = passive_;
     calib_dirty_ = false;
     calib_on_ = false;
     for (int k = 0; k < kCtxBuckets; ++k)
@@ -793,6 +838,15 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
             if (!(real_[(size_t) k] >> (t - 1) & 1u)) calib_on_ = true;
     // the last size is calibrated, or kCalibReqs requests have not reached the rest: the table decides from the next round on
     if (held_table_ && (!calib_on_ || reqs_ >= kCalibReqs)) {
+        if (passive_) {
+            take_over_passive();
+            for (int k = 0; k < kCtxBuckets; ++k) {
+                const int n = fixed_n_[(size_t) k];
+                if (n > 0) cf.tables[(size_t) k].assign(learned_[(size_t) k].begin() + 1, learned_[(size_t) k].begin() + 1 + n);
+            }
+            cf.fresh = false;
+            changed = true;
+        }
         use_table();
         if (calib_on_) report += std::string(report.empty() ? "" : ", ") + "table in use, sizes real requests did not reach keep a scaled learned cost";
     }

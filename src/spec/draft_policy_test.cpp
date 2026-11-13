@@ -648,6 +648,82 @@ int main() {
             check(bd.calibrate(cb, rb) && bd.fixed() && (cb.real[0] & 8u) && std::fabs(bd.cost_ms(4) - 19.90) < 1e-9 && cb.reqs == DraftPolicy::kCalibReqs,
                   "budget: in use, a size with its own kCalibN rounds becomes real");
         }
+        {   // a machine with no table: built from the real rounds, no learning stretch, live costs decide until the take-over
+            CostFile c0;
+            c0.key = "k";
+            c0.fresh = true;
+            DraftPolicy p(8), lv(8);
+            p.start_passive(c0, 5);
+            check(p.passive() && p.table_held() && !p.fixed() && p.calibrating() && !p.learning(), "passive: held from the first request, no learning");
+            bool same = true;
+            for (int i = 0; i < 40; ++i) {
+                const DraftPolicy::Pick pa = p.choose(i % 3 + 1, 5, 2), pb = lv.choose(i % 3 + 1, 5, 2);
+                same = same && pa.lookup == pb.lookup && pa.t == pb.t && pa.pad == 0 && std::fabs(p.cost_ms(3) - lv.cost_ms(3)) < 1e-12;
+                p.set_busy_age(2.0);
+                p.observe(i % 3 == 0, i % 3 + 1, 1, 0, 12.7 + 2.0 * (i % 3));
+                lv.observe(i % 3 == 0, i % 3 + 1, 1, 0, 12.7 + 2.0 * (i % 3));
+            }
+            check(same && p.forced_rounds() == 0, "passive: picks and costs equal a policy without a table, no forced window");
+            CostFile cp;
+            std::string rp;
+            check(p.calibrate(cp, rp) && cp.fresh && cp.tables[0].empty() && cp.reqs == 1, "passive: the file has no table yet, one request counted");
+            // only the first seconds of a busy run are counted
+            DraftPolicy q(8);
+            q.start_passive(c0, 5);
+            q.set_busy_age(2.0);
+            for (int i = 0; i < 10; ++i) q.observe(false, 2, 1, 0, 14.6);
+            q.set_busy_age(50.0);
+            for (int i = 0; i < 10; ++i) q.observe(false, 2, 1, 0, 14.6);
+            CostFile cq;
+            q.calibrate(cq, rp);
+            check(cq.cal[0][2].n == 9 && cq.fresh, "passive: rounds late in a busy run are not counted; the first round of a size has no live cost to clamp to");
+            // the sums survive a restart: 9 + 7 more = 16 own rounds make the size real
+            cq.key = "k";
+            std::string wpath = "dp_passive_test.costs", wwhy;
+            check(write_cost_file(wpath, cq, wwhy), "passive: file written");
+            CostFile cr;
+            check(read_cost_file(wpath, "k", cr, wwhy) && cr.fresh && cr.tables[0].empty() && cr.cal[0][2].n == 9, "passive: a file with no table reads back");
+            std::remove(wpath.c_str());
+            DraftPolicy r(8);
+            r.start_passive(cr, 5);
+            r.set_busy_age(1.0);
+            for (int i = 0; i < 8; ++i) r.observe(false, 2, 1, 0, 14.6);
+            CostFile cs;
+            check(r.calibrate(cs, rp) && (cs.real[0] & 2u) && std::fabs(cs.real_cost[0][2] - 14.6) < 1e-9 && r.passive(), "passive: the size is real after 16 own rounds across a restart");
+            // take-over by every size real: the real costs, a table in the file
+            DraftPolicy a(8);
+            a.start_passive(c0, 5);
+            a.set_busy_age(1.0);
+            const double rt[5] = {12.9, 14.6, 16.7, 19.9, 21.3};
+            for (int t = 1; t <= 5; ++t)
+                for (int i = 0; i < 17; ++i) a.observe(t >= 4, t, 1, 0, rt[t - 1]);
+            CostFile ca;
+            check(a.calibrate(ca, rp) && a.fixed() && !a.passive() && !a.table_held() && !a.calibrating() && !ca.fresh && ca.tables[0].size() == 5, "passive: every size real: the table takes over, the file has a table");
+            check(std::fabs(a.cost_ms(1) - 12.9) < 1e-9 && std::fabs(a.cost_ms(4) - 19.9) < 1e-9 && std::fabs(ca.tables[0][2] - 16.7) < 1e-9, "passive: the real costs decide, the file keeps them as the table");
+            // take-over after kCalibReqs requests: a size never reached takes the live cost, a never measured one the policy's prior
+            DraftPolicy b(8), lb(8);
+            b.start_passive(c0, 5);
+            b.set_busy_age(1.0);
+            for (int i = 0; i < 17; ++i) {
+                b.observe(false, 2, 1, 0, 14.6);
+                lb.observe(false, 2, 1, 0, 14.6);
+            }
+            for (int i = 0; i < 6; ++i) {
+                b.observe(true, 4, 2, 0, 19.9);
+                lb.observe(true, 4, 2, 0, 19.9);
+            }
+            CostFile cb2;
+            for (int rq = 0; rq < DraftPolicy::kCalibReqs; ++rq) {
+                b.observe(false, 2, 1, 0, 14.6);
+                b.calibrate(cb2, rp);
+            }
+            check(b.fixed() && !b.passive() && cb2.reqs == DraftPolicy::kCalibReqs && cb2.tables[0].size() == 5, "passive: after kCalibReqs requests the table takes over");
+            check(std::fabs(cb2.tables[0][1] - 14.6) < 1e-9 && std::fabs(cb2.tables[0][3] - 19.9) < 1e-9 && std::fabs(cb2.tables[0][2] - lb.cost_ms(3)) < 0.1 && std::fabs(b.cost_ms(4) - 19.9) < 1e-9,
+                  "passive: real size 2 at its real cost, size 4 at its live cost, size 3 (never measured) at the policy's prior");
+            for (int i = 0; i < 17; ++i) b.observe(true, 4, 2, 0, 20.1);   // the unreached size keeps collecting
+            CostFile cb3 = cb2;
+            check(b.calibrate(cb3, rp) && (cb3.real[0] & 8u) && std::fabs(b.cost_ms(4) - (5 * 19.9 + 11 * 20.1) / 16.0) < 1e-6, "passive: after the take-over a size still collects and becomes real at 16 own rounds");
+        }
         // the file round trip: state, real, real cost, cal
         CostFile w;
         w.key = "k2";

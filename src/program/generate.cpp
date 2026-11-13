@@ -14565,7 +14565,29 @@ int main(int argc, char** argv) {
             dc_key = draft_costs_key(argc, argv, o.draft_costs_key, spec_cost);
             strata::spec::CostFile cf;
             std::string why;
-            if (strata::spec::read_cost_file(o.draft_costs, dc_key, cf, why)) {
+            // a machine with no table (a new engine, driver, model or setting discards the file) builds one from the rounds of its normal requests, with live
+            // costs deciding meanwhile: no learning stretch.  The old one-start stretch (forced filler windows, a burst of requests) runs only for the test
+            // harnesses that set STRATA_DRAFT_COSTS_LEARN=1; the server and the launcher never do.
+            const char* dc_lv = std::getenv("STRATA_DRAFT_COSTS_LEARN");
+            const bool dc_force_learn = dc_lv != nullptr && dc_lv[0] == '1';
+            const bool dc_read_ok = strata::spec::read_cost_file(o.draft_costs, dc_key, cf, why);
+            if (dc_read_ok && cf.fresh) {   // a file of the passive stretch: the real rounds collected so far
+                dc_file = cf;
+                policy.start_passive(cf, policy.top_size());
+                dc_calib = true;
+                std::fprintf(stderr, "strata serve: draft costs: this machine's table is being built from real requests (%s; %d requests so far): live costs "
+                                     "decide until every window size has %d own rounds or %d requests have run\n",
+                             o.draft_costs.c_str(), cf.reqs, strata::spec::DraftPolicy::kCalibN, strata::spec::DraftPolicy::kCalibReqs);
+            } else if (!dc_read_ok && !dc_force_learn) {   // no table yet
+                cf.key = dc_key;
+                cf.fresh = true;
+                dc_file = cf;
+                policy.start_passive(cf, policy.top_size());
+                dc_calib = true;
+                std::fprintf(stderr, "strata serve: draft costs: no table for this machine yet (%s: %s): it is built from real requests, live costs decide "
+                                     "until every window size has %d own rounds or %d requests have run\n",
+                             o.draft_costs.c_str(), why.c_str(), strata::spec::DraftPolicy::kCalibN, strata::spec::DraftPolicy::kCalibReqs);
+            } else if (dc_read_ok) {
                 std::string sizes;
                 for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
                     if (!cf.tables[(size_t) k].empty()) {
@@ -20120,10 +20142,19 @@ int main(int argc, char** argv) {
             // --draft-costs, calibration: the real rounds of this request that the sizes still at their learned cost have collected; a size with
             // kCalibN of them takes their mean (the file is rewritten whole, the new cost applies from the next request on, no later change)
             if (dc_calib && (policy.calib_dirty() || policy.table_held())) {
-                const bool dc_was_held = policy.table_held();
+                const bool dc_was_held = policy.table_held(), dc_was_passive = policy.passive();
                 strata::spec::CostFile cc = dc_file;
                 std::string rep, why;
                 if (policy.calibrate(cc, rep)) {
+                    if (dc_was_passive && !policy.passive()) {   // the table is made: the shares go in with it, the CPU share only when a short prompt has measured it
+                        if (strata::prefill::Prefill::cpu_share_balancing() && sp.stats().cpu_share_readings > 0)
+                            cc.cpu_share = std::clamp(std::round(sp.stats().cpu_share_balanced * 20.0) / 20.0, 0.05, 0.9);
+                        if (dc_pcie_ok) {
+                            if (!pcie_auto.on) cc.pcie_frac = o.pcie_frac;
+                            else dc_pcie_pending = true;
+                        }
+                        dc_shares_due = true;
+                    }
                     const bool saved = strata::spec::write_cost_file(o.draft_costs, cc, why);
                     dc_file = cc;
                     if (!rep.empty())
