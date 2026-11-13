@@ -49,7 +49,10 @@ public:
                            std::string& why) {
             return epoch(ep, why) && replay(q, scales, pos, rows, why);
         };
-        history.begin(ids, n, resume, restore, cold, replay_error);
+        if (!history.begin_request(ids, n, resume, restore, cold, replay_error)) {
+            err = replay_error;
+            return false;
+        }
         return epoch(history.epoch(), err);
     }
     // Record exactly the activation rows used by the committed context update. Token history is a separate
