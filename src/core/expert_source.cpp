@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
+#include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/auto_pick.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -575,13 +576,28 @@ uint64_t gate_cache_room() {
             at = cut == 0 || cut == std::string::npos ? std::string("/") : at.substr(0, cut);
         }
     }
-    if (best > 0) return best;
-    std::ifstream info("/proc/meminfo");
-    std::string key, unit;
-    uint64_t value = 0;
-    while (info >> key >> value >> unit)
-        if (key == "MemAvailable:") return value * 1024;
-    return 0;
+    if (best == 0) {
+        std::ifstream info("/proc/meminfo");
+        std::string key, unit;
+        uint64_t value = 0;
+        while (info >> key >> value >> unit)
+            if (key == "MemAvailable:") { best = value * 1024; break; }
+    }
+    // upstream 0a0e4463e: a cgroup's whole `file` counter is not this engine's to have - the pages it holds itself are
+    // in it, and crediting them sent a RAM-budget config to the file cache when the group had a third less (prompts
+    // 2.5-3x slower).  The smaller of that figure and the conversation cache's sampler (only the clean inactive file
+    // cache, less dirty and writeback, never more than the group's current) decides.  XESTRATA_FILE_TIER_HONEST=0 keeps
+    // the old figure.
+    static const bool honest = [] {
+        const char* v = strata::env_get("FILE_TIER_HONEST");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (best > 0 && honest) {
+        strata::core::MemoryProbePaths paths;   // the real files; the operator's --memory-limit-mib is not the page cache's
+        if (auto sample = strata::core::sample_host_memory(paths, /*explicit_limit=*/0); sample && sample->available > 0)
+            best = std::min(best, sample->available);
+    }
+    return best;
 }
 }  // namespace
 #endif
