@@ -130,7 +130,7 @@ The fewer slots a group has, the fewer tokens share one read of the weights, so 
 On a layer split without `--batch-groups` the default is `auto` (upstream ca001df5; `--batch-groups 1` for one group).
 The default groups do not give way to `--batch-mtp` (on by default with `--mtp`): it is turned off then, and the log says so (upstream a0116b27).
 Grouped windows do not verify the MTP proposals, but four concurrent requests on 2x RTX A4000 ran 25-30% faster in groups than in the one group that verifies them.
-`--batch-groups 1` or `XESTRATA_BATCH_MTP_SERIAL=1` keeps `--batch-mtp` in one group, as before (with few concurrent requests, or prompts that come rarely, it can be the faster choice).
+`--batch-groups 1` or `XESTRATA_BATCH_MTP_SERIAL=1` keeps `--batch-mtp` in one group, as before (with few concurrent requests, or prompts that come rarely, it can be the faster choice). `XESTRATA_BATCH_MTP_SERIAL` is `auto` by default: the pipelined groups.
 `XESTRATA_PIPED_MTP=N` (opt-in) keeps the groups and has each slot verify its MTP proposals in them ([BATCHING](BATCHING.md#mtp-drafts-in-the-pipelined-groups-xestrata_piped_mtp-opt-in)).
 The engine logs the groups it chose and reports them as `INFO batch_groups`, and the server assigns the slots by them.
 A free slot before a busy one in its group is used first (upstream 2c7c02ab).

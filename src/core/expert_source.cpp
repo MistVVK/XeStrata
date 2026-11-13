@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/remote_experts.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -3233,8 +3234,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     static const bool device_plan = [] {
-        const char* v = strata::env_get("VERIFY_DEVICE_PLAN");
-        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        return strata::core::pick_from_env("VERIFY_DEVICE_PLAN") == strata::core::Pick::On;
     }();
     const bool gpu_zeroes_hits = d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan;
     const bool any_cpu = std::any_of(kind, kind + n, [](int32_t v) { return v == -1; });   // -2: skipped, no work

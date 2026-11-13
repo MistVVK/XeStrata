@@ -378,6 +378,9 @@ public:
     }
     /// --spec-window min-p's floor for this request (setup's calibration, spec_min_p=); < 0: the engine's own rule
     void set_spec_min_p(double p) { for (PlainModel* st : chain()) st->req_spec_min_p_ = p; }
+    /// --serve: a request's prompt reads the residency table again, so the windows are not where a switch that changes
+    /// when a swap is applied can be measured against the prompt's rounding (auto_pick.hpp).
+    void set_serve(bool on) { for (PlainModel* st : chain()) st->serve_ = on; }
     /// The PCIe share of the missed experts for this request (setup's calibration, pcie_frac=); < 0: the engine's own
     void set_pcie_frac(double f);
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
@@ -1096,6 +1099,7 @@ private:
     int64_t adapt_period_ = 0;
     bool adapt_auto_ = false;
     int64_t adapt_rows_ = 0;
+    bool serve_ = false;   ///< --serve: the window probes that change when a swap is applied stay off (set_serve)
     double pool_ms_ = 0, win_ms_ = 0;   ///< this stage's windows: the CPU pool's host time and the whole
     /// The root's period and the stages' phases from it: the rounds in turn, a share of the period apart.
     void set_adapt_period(int64_t period);

@@ -4664,7 +4664,19 @@ constexpr int kPlainAdaptLag = 3;
 
 bool PlainModel::settle_window(std::string& err) {
     if (pending_.empty()) return settle_swaps(false, err);   // a round of blocking fills: its exchanges commit
-    return ++pending_age_ < adapt_lag(kPlainAdaptLag) || settle_swaps(true, err);
+    const int lag = adapt_lag(kPlainAdaptLag);
+    if (++pending_age_ < lag) return true;
+    // XESTRATA_ADAPT_LAG=auto: what the round's lag cost, the wait the window took for the copies or the swapped
+    // experts' CPU work over the windows they waited (auto_pick.hpp)
+    const size_t n_swaps = pending_.size();
+    const auto lag0 = std::chrono::steady_clock::now();
+    const bool ok = settle_swaps(true, err);
+    const double wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lag0).count();
+    const double per = root_ != nullptr && root_->split_.c > 0.0
+                           ? std::max(0.0, root_->split_.c - root_->split_.q) : 0.04;
+    if ((root_ == nullptr || root_ == this) && !serve_)   // not under --serve: a prompt reads the table again
+        strata::core::adapt_lag_window(wait_ms + (lag > 1 ? (double) (lag - 1) * (double) n_swaps * per : 0.0));
+    return ok;
 }
 
 bool PlainModel::settle_swaps(bool wait, std::string& err) {

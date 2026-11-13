@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/constraint_upload.hpp"
 
 #include "strata/core/native_head.hpp"
@@ -721,12 +722,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             std::fprintf(stderr, "xestrata verify: the GPU's running kernels do not see the host's writes: each window "
                                  "runs as segments the host launches (slower)\n");
     }
-    // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
-    // exact, but neutral on RIBPC 1-2 GPUs: off by default)
+    // E-6: a layer whose routed experts are all resident is planned on the device (XESTRATA_VERIFY_DEVICE_PLAN=1: on;
+    // exact, but neutral on RIBPC 1-2 GPUs, and the window graph keeps the choice, so auto (the default) is off and the
+    // switch is the A/B's other side)
     {
-        const char* v = strata::env_get("VERIFY_DEVICE_PLAN");
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
-        device_plan_ = !always_publish_ && v != nullptr && (int) std::strtol(v, nullptr, 10) != 0;
+        device_plan_ = !always_publish_ && strata::core::pick_from_env("VERIFY_DEVICE_PLAN") == strata::core::Pick::On;
     }
     res_graph_ = !always_publish_ && hits.h_res != nullptr && hits.d_res != nullptr && MoeWindow::resident_graph_on();
     if (!win_.device_plans()) { device_plan_ = false; res_graph_ = false; }

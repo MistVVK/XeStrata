@@ -181,12 +181,13 @@ upstream の Strata 0.1.45 から 0.2.0-beta（`3d1fb480`）までの変更を X
 - setup: ダウンロードするモデルのファイルを大きさと SHA-256 で固定する。大きなファイルは複数の接続でダウンロードする。ビルドの道具（cmake・ninja）は実行時の requirements から分ける。SSD でも RAM に余裕があれば `--ple-io ram` を付ける。画像を読めるモデルでは画像を既定で入にする。
 - serve: 文脈に収まらない `max_tokens` は、400 にせず残りの余地まで縮める（`--no-fit-max-tokens` で以前のように断る）。
 - CPU のプールの既定のワーカーを、32 本とコンテナの CPU の割り当てまでにする。cgroup の RAM の判定では、きれいなページキャッシュを回収できるものに数える。
-- 適応の段で入れ替えたエキスパートは、既定で 2 つ目の窓から使う（`XESTRATA_ADAPT_LAG=2`、RTX 4070 で decode +8.6%）。
+- 適応の段で入れ替えたエキスパートは、既定で 2 つ目の窓から使う（`XESTRATA_ADAPT_LAG`、RTX 4070 で decode +8.6%）。
+  `auto`（既定）は、入れ替えのコピーを待つ窓がある最初の数窓で「次の窓が待つ」と「既定の窓数」を交互に回し、トークン当たりの時間が 3% 以上短い方を選ぶ（`0` は次の窓が待つ、`2` 以上はその窓数）。
 - 画像の読み手（xestrata-vision）は、文章のモデルの語彙とヘッダーだけを読む（Gyro の型のファイルでも開ける）。
 
 この取り込みの間に XeStrata の側で直したもの:
 
-- VRAM のエキスパートの入れ替えの位置で窓を切るのは、CPU と GPU で丸めが違う層があるモデルだけにする（`XESTRATA_ADAPT_CUT=0|1`）。Qwen3.8 の 4 つのファイルはすべての層が CPU と GPU で同じビットになるので、窓を切らない。同じ文で decode は RTX 4070 で 59.3 → 61.3、B70 で 80.5 → 86.9 tok/s。
+- VRAM のエキスパートの入れ替えの位置で窓を切るのは、CPU と GPU で丸めが違う層があるモデルだけにする（`XESTRATA_ADAPT_CUT`。`auto` が既定で形式の規則、`0` と `1` で固定）。Qwen3.8 の 4 つのファイルはすべての層が CPU と GPU で同じビットになるので、窓を切らない。同じ文で decode は RTX 4070 で 59.3 → 61.3、B70 で 80.5 → 86.9 tok/s。
 
 upstream v0.2.0-beta と 3 社の GPU で比べました（generate は 5 つのモデルファイル、serve、通常使用、画像の生成）。
 IQ3_XXS の generate では、B70 は upstream の `sycl/` 版より prefill が 1.7〜3.0 倍、decode が 18〜38% 速いです。
@@ -251,7 +252,7 @@ upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を X
   GPU のランタイムの立ち上げで止まったエンジンの起動し直し、落ちたエンジンの終わり方の表示、Responses API の `reasoning_effort`、会話のキャッシュの画像の照合（#2228）、stdin の読み手の終了の競合。
 - 量子化の品質の物差し（`tools/quant_quality.py`、`tools/quant_formats.py`）。
 - `XESTRATA_HC_Q8`（ハイパーコネクションの down/up を Q8_0 で読む、BF16 の pack では読み込み時に Q8_0 にする）: 読み込み時に両方の形を測って速い方を使い、Q8_0 なら GPU 1 枚のときは BF16 の写しを VRAM から外します。AMD では次の射影のための q8_1 も読みの中で書きます（B70 で decode +3.5%。答えが変わる近似）。
-- opt-in のまま移したもの: `XESTRATA_COPY_PRIO`、`XESTRATA_PCIE_MIN1`、arena の `--adapt-async 1`、`XESTRATA_DENSE_F32`。
+- opt-in のまま移したもの: `XESTRATA_COPY_PRIO`（自動は 0。1 で `--pcie-mode dma` のコピーの stream を高優先にする）、`XESTRATA_DENSE_F32`。
 - 起動時の短い測りで選ぶもの（`0`・`1` で固定できる）: CPU プールの待ち方（`XESTRATA_POOL_UMWAIT`。CPU の WAITPKG を確かめ、公開から起きるまでの時間をスピンと UMWAIT で測ります）と、PCIe の分担の下限（`XESTRATA_PCIE_MIN1`。分担を固定したときに 1〜2 個の外れが 0 に丸まらないよう、CPU・PCIe・GPU の 1 個あたりの時間を測って決めます）。
 
 この取り込みの間に XeStrata の側で直したもの:
@@ -286,7 +287,7 @@ upstream の Strata 0.1.43 から 0.1.43.1（`a0116b27`）までの変更を、W
 - serve: BGEN の枠を断られたら別の枠を試す（#1994）、before_load のフックの失敗に 503 と Retry-After を返し `/unload?wait=1` を受ける（#1997）、
   文中の `</tool_call>` を文として扱う（#2026）、`<tool_call>` の中の Markdown の囲みの呼び出しを読む（#2037）、
   画像の準備中に去ったクライアントの準備を止める（#1999）。
-- 層の分割と `--batch` では、既定の組を `--batch-mtp` に譲らない（#2038、`XESTRATA_BATCH_MTP_SERIAL=1` で前の形）。
+- 層の分割と `--batch` では、既定の組を `--batch-mtp` に譲らない（#2038、`XESTRATA_BATCH_MTP_SERIAL` の `auto`（既定）は流れ作業、`1` で前の形）。
 - setup の `--calibrate` は `--model`・`--family` のモデルを調整する（#2036）。ベンチマークはエンジンが使う GPU だけを報告し（#1985・#2062）、
   ベンチマークが起動するサーバーは `--expert-profile-save` なしで動く（#2088）。
 

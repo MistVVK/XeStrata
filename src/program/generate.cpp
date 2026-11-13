@@ -28,6 +28,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_tier.hpp"
+#include "strata/core/auto_pick.hpp"
 #include "strata/program/done_line.hpp"
 #include "strata/program/gen_keys.hpp"
 #include "strata/program/id_list.hpp"
@@ -190,15 +191,12 @@ const char* pipe_dbg_env(const char* name) {
     return on ? strata::env_get(name) : nullptr;
 }
 
-// Upstream #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tier leaves an expert a helper GPU holds out of the
-// primary's promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache
-// (RemoteExperts::holds), so an expert the helper's tier swaps in or out later is followed.
+// Upstream #731: the adaptive tier leaves an expert a helper GPU holds out of the primary's promotion candidates (it
+// would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds), so an expert the helper's
+// tier swaps in or out later is followed.  XESTRATA_DISJOINT_ADAPT: auto (the first windows of a run whose helpers
+// hold experts decide, auto_pick.hpp), 0 or 1.  Nothing to do without a helper.
 bool helper_holds(const strata::core::ExpertDispatch& d, int64_t layer, int32_t expert) {
-    static const bool on = [] {
-        const char* v = strata::env_get("DISJOINT_ADAPT");
-        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-    }();
-    if (!on) return false;
+    if (d.remote_count <= 0 || !strata::core::disjoint_adapt_on()) return false;
     for (int r = 0; r < d.remote_count; ++r)
         if (d.remote[r]->holds(layer, expert)) return true;
     return false;
@@ -1051,10 +1049,14 @@ int on_rotational_disk(const std::string& path, std::string& dev) {
 
 #endif
 
-/// #463's A/B: STRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed (0.1.37)
+/// #463's A/B: XESTRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed
+/// (0.1.37).  Auto (the default) is on where the lag probe found the copies land within the window (its choice of 1:
+/// the wait costs it nothing), off where they do not (the RTX 4070, lag 2): not waiting then took 95.55 against 94.92
+/// tok/s on the B70 and 45.23 against 42.52 on the RX 9060 XT (32K, Qwen3.8, 2026-11-13).  0 and 1 fix it.
 bool adapt_nowait() {
-    static const bool v = [] { const char* e = strata::env_get("ADAPT_NOWAIT"); return e && e[0] == '1'; }();
-    return v;
+    static const strata::core::Pick p = strata::core::pick_from_env("ADAPT_NOWAIT");
+    if (p != strata::core::Pick::Auto) return p == strata::core::Pick::On;
+    return strata::core::adapt_lag_chosen() == 1;
 }
 
 /// --adapt-async: one background job at a time (the asynchronous adaptive tier's copies and memcpys).  `post` hands
@@ -1129,7 +1131,7 @@ bool adapt_device_table_lags() { return adapt_nowait() || adapt_lag() > 1; }
 /// windows on one text at temperature 0.7 (97 against 89 rounds, 2026-10-20).  What it gives up: serve's prompts from
 /// the second turn on are not computed in the canonical rows, so there the swaps' timing changes the rounding and a
 /// greedy chat can differ from run to run (the fourth turn did on the RTX 4070, 1K, 2026-10-20; cut, two runs gave the
-/// same text).  STRATA_ADAPT_CUT=0|1 forces it.
+/// same text).  XESTRATA_ADAPT_CUT=0|1 forces it; auto (the default) is the pack's format's rule.
 /// Gyro's trellis layers (TQ2_T to TQP7, rotated) are not cut either, though their two sides round differently:
 /// cut, the windows that the draft policy and the lookups would make long were held to the next position, and Gyro-M
 /// lost decode to upstream, which does not cut (RX 9060 XT, 1K, upstream's text: 48.0 tok/s cut against 54.2 uncut
@@ -1137,14 +1139,10 @@ bool adapt_device_table_lags() { return adapt_nowait() || adapt_lag() > 1; }
 /// moves an expert between the CPU and the GPU inside a window.
 bool adapt_cuts_windows() {
     static const bool v = [] {
-        const char* e = strata::env_get("ADAPT_CUT");
-        if (e && *e) return e[0] != '0';
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        if (!lay.native || lay.fmt.empty()) return true;
-        for (const auto& f : lay.fmt)
-            if ((f.had_gu || !strata::kernels::cpu::canon_layer(f)) && !strata::kernels::cpu::tq_supported(f.gu_type))
-                return true;
-        return false;
+        const auto p = strata::core::pick_from_env("ADAPT_CUT");
+        if (p == strata::core::Pick::Off) return false;
+        if (p == strata::core::Pick::On) return true;
+        return !strata::core::adapt_layers_round_alike();
     }();
     return v;
 }
@@ -4473,10 +4471,10 @@ int main(int argc, char** argv) {
                      st.dev, last ? " and head" : "", (double) fb / 1073741824.0);
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
-    auto batch_mtp_serial = [] {   // STRATA_BATCH_MTP_SERIAL=1: --batch-mtp keeps its serial windows (batch_groups.hpp)
-        const char* v = strata::env_get("BATCH_MTP_SERIAL");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    };
+    // XESTRATA_BATCH_MTP_SERIAL: auto (the default) keeps the pipelined groups where a layer split runs them (measured
+    // faster: Qwen3.6-35B-A3B on a B70 + RTX 4070 split, 4 slots, 89.3 tok/s in 2 groups against 69.2 in one group with
+    // drafts, docs/BATCHING.md), 1 keeps --batch-mtp's serial windows, 0 the pipelined groups.
+    auto batch_mtp_serial = [] { return strata::core::pick_from_env("BATCH_MTP_SERIAL") == strata::core::Pick::On; };
 
     // --batch (upstream PR #559, #465): o.batch more sessions carved like the main one, one per slot of the batch
     // windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.  A count the engine
@@ -4487,7 +4485,14 @@ int main(int argc, char** argv) {
     // 45.2 / 44.0 -> 44.6 / 43.8 (the run-to-run spread); 49 MiB a slot.  --no-batch-mtp / STRATA_BATCH_MTP=0: off.
     // When it was asked for and cannot run it is said and left off (plain batching still starts).
     int want_batch_mtp = o.batch_mtp;
-    if (const char* v = strata::env_get("BATCH_MTP"); v != nullptr && v[0] != '\0') want_batch_mtp = v[0] != '0' ? 1 : 0;
+    // XESTRATA_BATCH_MTP: auto (the default) keeps the command line's choice, on where --mtp and the slots allow it;
+    // 0 and 1 turn it off and on.  Measured near neutral either way (4 slots, aggregate: B70 87.4 -> 90.6 tok/s, RTX
+    // 4070 45.2 -> 44.6, within the run-to-run spread), so auto keeps it where it runs.
+    switch (strata::core::pick_from_env("BATCH_MTP")) {
+        case strata::core::Pick::On: want_batch_mtp = 1; break;
+        case strata::core::Pick::Off: want_batch_mtp = 0; break;
+        case strata::core::Pick::Auto: break;
+    }
     bool batch_mtp = want_batch_mtp != 0;
     // STRATA_PIPED_MTP=N (opt-in, upstream 17878ac57): --batch-mtp's proposals in the pipelined groups of a layer split
     // (batch_groups.hpp mtp_piped); decided once the slots that fit and the groups are final (piped_mtp, below)
@@ -13508,6 +13513,9 @@ int main(int argc, char** argv) {
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
         strata::core::PcieSplitTimes pcie_split;   // the measured split
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
+        // what a swapped-in expert costs on the CPU against the GPU (the split probe's times): what a window the lag
+        // keeps it on the CPU costs (auto_pick.hpp's ADAPT_LAG); 0.04 ms when the probe could not run
+        const double per_expert_ms = pcie_split.c > 0.0 ? std::max(0.0, pcie_split.c - pcie_split.q) : 0.04;
         pcie_move_if_pays(drive.d, ver.fetch_branch(), prefill.stats(), host_res, o.spec);
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
@@ -13775,9 +13783,20 @@ int main(int argc, char** argv) {
             drive.d.failed = false;
             // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
             // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
-            // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
-            if (adapt_nowait()) apply_pending(false);
-            else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+            // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B).  XESTRATA_ADAPT_LAG=auto measures what a
+            // round's lag costs: the wait the window took for the copies, or the swapped experts' CPU work over the
+            // windows a swap waited.
+            if (adapt_nowait()) {
+                apply_pending(false);
+            } else if (!pending.empty() && ++pending_age >= adapt_lag()) {
+                const int lag_now = adapt_lag();
+                const size_t n_swaps = pending.size();
+                const auto lag0 = Clock::now();
+                apply_pending(true);
+                const double wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - lag0).count();
+                strata::core::adapt_lag_window(wait_ms + (lag_now > 1 ? (double) (lag_now - 1) * (double) n_swaps *
+                                                                           per_expert_ms : 0.0));
+            }
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
                 return 1;
@@ -13906,6 +13925,8 @@ int main(int argc, char** argv) {
             const bool timed = timed_round && !ver.captured_last();
             if (timed && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             else if (timed) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
+            if (timed)   // the switch the windows choose (auto_pick.hpp)
+                strata::core::disjoint_adapt_window(round_ms, T, drive.d.remote_count > 0);
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "xestrata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);

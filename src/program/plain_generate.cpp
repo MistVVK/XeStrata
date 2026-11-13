@@ -32,6 +32,7 @@
 #include "strata/core/script_guard.hpp"
 #include "strata/core/logit_bias.hpp"
 #include "strata/core/plain_model.hpp"
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/control_vector.hpp"
 #include "strata/core/stdin_lines.hpp"
@@ -621,8 +622,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         bin.batch = (int) bs.size();
         bin.later_stages = model.stages() - 1;
         bin.batch_mtp = slot_drafts;
-        const char* ms = strata::env_get("BATCH_MTP_SERIAL");
-        bin.mtp_serial = ms != nullptr && *ms != 0 && *ms != '0';
+        bin.mtp_serial = strata::core::pick_from_env("BATCH_MTP_SERIAL") == strata::core::Pick::On;
         const bg::Result r = bg::resolve(bin);
         groups = r.groups;
         if (r.from_auto && r.serial != bg::Serial::None)
@@ -2149,8 +2149,13 @@ int plain_main(int argc, char** argv) {
 
     strata::core::PlainOptions opt;
     opt.coupled_draft = strata::core::coupled_draft_env();   // STRATA_SPEC_COUPLED=1, as Qwen3.8-Flash-Next's
-    if (const char* e = strata::env_get("BATCH_MTP"); e != nullptr && *e != 0)   // (=0: --no-batch-mtp)
-        opt.batch_mtp = std::strtol(e, nullptr, 10) != 0;
+    // XESTRATA_BATCH_MTP: auto (the default) keeps the option (on by default where the slots allow it); 0 and 1 turn
+    // it off and on, as --no-batch-mtp / --batch-mtp do.
+    switch (strata::core::pick_from_env("BATCH_MTP")) {
+        case strata::core::Pick::On: opt.batch_mtp = true; break;
+        case strata::core::Pick::Off: opt.batch_mtp = false; break;
+        case strata::core::Pick::Auto: break;
+    }
     opt.gguf = gguf;
     std::vector<int32_t> prompt;
     int64_t n_new = 16;
@@ -2489,6 +2494,7 @@ int plain_main(int argc, char** argv) {
 
     strata::core::PlainModel model;
     model.set_sampler(sp);
+    model.set_serve(serve);
     std::string err;
     if (!opt.shared_arena.empty() && (opt.mmap_experts || opt.resident_gib != 0)) {
         std::fprintf(stderr, "xestrata (%s): --shared-expert-arena shares the experts' RAM copy: not with --mmap-experts or "

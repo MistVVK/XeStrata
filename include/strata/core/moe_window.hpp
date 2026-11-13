@@ -23,9 +23,11 @@
 // which MoE layer and token group each one belongs to, in that order.
 #pragma once
 
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -170,7 +172,9 @@ private:
     MoeWindowTier tier_;
     bool segmented_ = false;
     const std::vector<strata::gpu::Graph*>* segs_ = nullptr;
-    strata::gpu::Stream copy_ = nullptr;   ///< the copy engine's stream (the PCIe share by DMA)
+    // the PCIe share's copies (a DMA: --pcie-mode dma): XESTRATA_COPY_PRIO's stream (a high-priority one or not)
+    strata::gpu::Stream copies_[2] = {nullptr, nullptr};   ///< 0 the normal priority, 1 high
+    strata::gpu::Stream copy_ = nullptr;                   ///< copies_[the chosen one] (the stream in use)
     bool copy_used_ = false;               ///< copies queued on copy_ since it was last drained
     uint32_t cur_ring_ = 0;
 

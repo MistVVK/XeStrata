@@ -178,12 +178,13 @@ The main ones:
 - setup: the model files it downloads are pinned by size and SHA-256; large files are downloaded over several connections; the build tools (cmake, ninja) are apart from the run-time requirements; `--ple-io ram` also on an SSD when the RAM has room; pictures on by default for the models that read them.
 - serve: a `max_tokens` that does not fit in the context is shortened to the room left instead of answered with 400 (`--no-fit-max-tokens` refuses it as before).
 - The CPU pool's default workers are at most 32 and the container's CPU quota; the cgroup RAM check counts the clean page cache as reclaimable.
-- The adaptive tier's swapped-in experts are used from the second window by default (`XESTRATA_ADAPT_LAG=2`, decode +8.6% on the RTX 4070).
+- The adaptive tier's swapped-in experts are used from the second window by default (`XESTRATA_ADAPT_LAG`, decode +8.6% on the RTX 4070).
+  `auto` (the default) runs the next window waiting and the engine's window count in turn over the first windows where one of the tier's copies is waiting, and keeps the shorter time a token (3% or more; `0` waits at the next window, `2` and up is that many windows).
 - The picture reader (xestrata-vision) reads only the text model's vocabulary and header (so a file of Gyro's types opens).
 
 Fixed on XeStrata's side meanwhile:
 
-- The windows are cut at the positions of the VRAM experts' swaps only for a model with a layer that the CPU and the GPU round differently (`XESTRATA_ADAPT_CUT=0|1`). Every layer of Qwen3.8's four files gives the same bits on the CPU and the GPU, so their windows are not cut: on one text, decode 59.3 -> 61.3 tok/s on the RTX 4070 and 80.5 -> 86.9 on the B70.
+- The windows are cut at the positions of the VRAM experts' swaps only for a model with a layer that the CPU and the GPU round differently (`XESTRATA_ADAPT_CUT`; `auto` is the format's rule, `0` and `1` fix it). Every layer of Qwen3.8's four files gives the same bits on the CPU and the GPU, so their windows are not cut: on one text, decode 59.3 -> 61.3 tok/s on the RTX 4070 and 80.5 -> 86.9 on the B70.
 
 Compared with upstream v0.2.0-beta on the three makers' GPUs (generate on five model files, serve, everyday use, image generation).
 In IQ3_XXS's generate, the B70 is 1.7 to 3.0 times as fast in prefill as upstream's `sycl/` port and 18 to 38% faster in decode;
@@ -260,9 +261,12 @@ The main ones:
 - `XESTRATA_HC_Q8` (the hyper-connection down/up read in Q8_0; a BF16 pack's quantized at load): both forms are timed
   at load and the faster kept; with Q8_0 on one GPU the BF16 copies leave the VRAM, and on AMD the read also writes
   the next projections' q8_1 (B70 decode +3.5%; an approximation that changes the output).
-- Ported and kept opt-in: `XESTRATA_COPY_PRIO`, `XESTRATA_PCIE_MIN1`, `--adapt-async 1` in the arena
-- Chosen by a short measurement at start (0 or 1 fixes it): the CPU pool's park (`XESTRATA_POOL_UMWAIT`: the CPUID WAITPKG bit, then the time from a publish to the wake, spinning and with UMWAIT) and the PCIe lane's floor (`XESTRATA_PCIE_MIN1`: with a fixed share, the CPU's, PCIe's and the GPU's time for one expert, so that one or two misses a layer do not round to none).
-  mode, `XESTRATA_DENSE_F32`.
+- Ported and kept opt-in: `XESTRATA_COPY_PRIO` (`auto` is 0; 1 puts the `--pcie-mode dma` copy stream at high
+  priority), `XESTRATA_DENSE_F32`.
+- Chosen by a short measurement at start (0 or 1 fixes it): the CPU pool's park (`XESTRATA_POOL_UMWAIT`: the CPUID
+  WAITPKG bit, then the time from a publish to the wake, spinning and with UMWAIT) and the PCIe lane's floor
+  (`XESTRATA_PCIE_MIN1`: with a fixed share, the CPU's, PCIe's and the GPU's time for one expert, so that one or two
+  misses a layer do not round to none).
 
 Fixed on XeStrata's side during this integration:
 
@@ -300,7 +304,7 @@ The main ones:
 - serve: a refused BGEN slot tries another slot (#1994), a failing before_load hook answers 503 with Retry-After and `/unload?wait=1` is taken (#1997),
   a quoted `</tool_call>` in a message is text (#2026), a call in a Markdown fence inside `<tool_call>` is read (#2037),
   and a client that leaves while its pictures are prepared stops the preparation (#1999).
-- Layer split with `--batch`: the default groups no longer give way to `--batch-mtp` (#2038; `XESTRATA_BATCH_MTP_SERIAL=1` for the old form).
+- Layer split with `--batch`: the default groups no longer give way to `--batch-mtp` (#2038; `XESTRATA_BATCH_MTP_SERIAL` is `auto` by default, the pipelined groups, `1` for the old form).
 - setup's `--calibrate` tunes the model of `--model` and `--family` (#2036). The benchmark reports only the GPUs the engine uses (#1985, #2062),
   and the server it starts runs without `--expert-profile-save` (#2088).
 

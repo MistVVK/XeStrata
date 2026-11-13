@@ -52,9 +52,10 @@ int64_t plan_ptr_off(int64_t cap) { return ((4 + (cap + 1) + 2 * cap) + 1) & ~1l
 }  // namespace
 
 MoeWindow::~MoeWindow() {
-    if (copy_ != nullptr) {
-        strata::gpu::stream_sync(copy_);
-        strata::gpu::stream_destroy(copy_);
+    for (strata::gpu::Stream& c : copies_) {
+        if (c == nullptr) continue;
+        strata::gpu::stream_sync(c);
+        strata::gpu::stream_destroy(c);
     }
     for (void* p : {(void*) h_x_, (void*) h_ids_, (void*) h_w_, (void*) h_ymiss_, (void*) h_seq_, (void*) h_flag_,
                     (void*) h_flagA_, (void*) h_flagB_, (void*) h_plan_, arena_, (void*) skip_, (void*) slot_off_d_})
@@ -148,13 +149,17 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             slot_off_d_ = nullptr;
         }
     }
-    // STRATA_COPY_PRIO=1: the copy stream at high priority (upstream 728097fb6, opt-in)
-    static const bool copy_prio = [] {
-        const char* v = strata::env_get("COPY_PRIO");
-        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-    }();
-    copy_ = strata::gpu::stream_create(copy_prio);
-    if (!copy_) { err = "moe window: copy stream create failed"; return false; }
+    // XESTRATA_COPY_PRIO: the PCIe share's copies on a stream of high priority (upstream 728097fb6, opt-in there).
+    // Auto (the default) is off: the RX 9060 XT's forced A/B (`--pcie-mode dma`, Qwen3.8, 32K) read 37.4 against 38.9
+    // tok/s for it, inside the machine's 14% run-to-run spread (2026-11-13), so the window it was measured by does not
+    // carry the decision; 1 turns it on.  A window the copy kernel stages (--pcie-mode kernel) has no copies here.
+    {
+        const strata::core::Pick prio = strata::core::pick_from_env("COPY_PRIO");
+        const bool high = prio == strata::core::Pick::On;
+        copies_[high ? 1 : 0] = strata::gpu::stream_create(high);
+        if (copies_[high ? 1 : 0] == nullptr) { err = "moe window: copy stream create failed"; return false; }
+        copy_ = copies_[high ? 1 : 0];
+    }
     strata::gpu::Stream probe = strata::gpu::stream_create();
     if (!probe) { err = "moe window: stream create failed"; return false; }
     // segments also on the processor's own graphics, where the running kernels see the host's writes through the first
