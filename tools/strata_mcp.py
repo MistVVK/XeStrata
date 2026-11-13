@@ -784,9 +784,11 @@ class Strata:
                         if d.get("mem_total"):          # a plain model: none of Flash-Next's budget or low-RAM modes
                             pass
                         elif d.get("budget"):
+                            # one label for every model (upstream a16f3fe39): all of its experts in RAM is "fits";
+                            # with less RAM a budget of them is kept and the rest read from the SSD, which runs
+                            # ("may run slower") - never "does not fit", whatever a RAM floor alone said
                             verdict = (("experimental: " if d.get("experimental") else "")
-                                       + "part of its experts in RAM, the rest read from the SSD"
-                                       if ram >= d["ram_gb"] else "does not fit")
+                                       + ("fits" if ram >= d["ram_gb"] else "may run slower"))
                         elif S and S.low_ram_needed(m, ram) and S.low_ram_fits(m, ram, vram):
                             verdict = "fits in the low-RAM mode (slower: the GPU holds part of the experts)"
                     except Exception:                   # noqa: BLE001

@@ -579,6 +579,11 @@ class Helpers(unittest.TestCase):
         self.assertEqual((by["UD-Q4_K_XL"]["experimental"], by["UD-Q4_K_XL"]["images"]), (True, True))   # #967
         self.assertFalse(by["UD-IQ4_XS"]["on_this_pc"].startswith("experimental"))
         self.assertTrue(by["UD-Q4_K_XL"]["on_this_pc"].startswith("experimental"))
+        self.assertEqual(by["UD-IQ4_XS"]["on_this_pc"], "fits")             # 63.7 GB of RAM, all of its experts
+        # a 32 GB card with 31 GB of RAM: 51 GB of weights beside 63 GB of memory - it runs, slower (upstream a16f3fe39)
+        fam = next(f for f in s.model_table({"ram_gb": 31.0, "gpus": [{"vram_gb": 32.0, "usable": True}]})
+                   if f["family"] == "unsloth")
+        self.assertEqual({x["model"]: x["on_this_pc"] for x in fam["sizes"]}["UD-IQ4_XS"], "may run slower")
 
     def test_recommendation_follows_ram(self):
         s = M.Strata(HERE.parent)
