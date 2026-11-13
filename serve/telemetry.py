@@ -763,6 +763,11 @@ def total_vram_mib(gpu_pci=None):
     return int(total >> 20) if total is not None else None
 
 
+def ram_gb() -> float:
+    """The RAM the machine has, in GB (0.0 when it cannot be read): serve/autotune.py's choices and the panels."""
+    return hardware.ram_gb()
+
+
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
     if os.path.exists("/proc/cpuinfo"):

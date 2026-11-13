@@ -78,6 +78,7 @@ from typing import Any, NamedTuple, NoReturn
 
 from serve import download as download_core
 from serve import envvars, hardware, kernel_check, model_terms, places, release_check, settings
+from serve import autotune
 from serve import option_values as OV
 from serve.model_terms import _qimage
 from serve import translate as translate_mod
@@ -1737,12 +1738,8 @@ def _memory_status():
 
 
 def ram_gb():
-    if WIN:
-        return _memory_status().ullTotalPhys / 2**30
-    for line in hardware.proc_text("meminfo").splitlines():
-        if line.startswith("MemTotal"):
-            return int(line.split()[1]) * 1024 / 2**30
-    return 0.0
+    """The RAM this machine has, in GB (serve/hardware.py's reader, the server's too)."""
+    return hardware.ram_gb()
 
 
 def ram_reserve_args(a) -> list:
@@ -4281,6 +4278,18 @@ def expert_profile_for(layers: int, experts: int) -> str | None:
         if len(head) == 16 and head[:4] == b"STRP" and struct.unpack("<3I", head[4:]) == (1, layers, experts):
             return p.name
     return None
+
+
+def experts_gb(path) -> float:
+    """The bytes of a plain model's expert tensors, in GB, from its GGUF header: the part the engine's expert cache
+    holds (the tensors custom_info reads for a model of the user's own files); 0.0 when the header cannot be read."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+    try:
+        return round(sum(t.expected_bytes() or 0 for t in GGUFFile(path).tensors
+                         if re.match(r"blk\.\d+\.ffn_(gate|up|down)_exps\.", t.name)) / 1e9, 1)
+    except (OSError, ValueError, struct.error):
+        return 0.0
 
 
 def custom_info(shards: list, mid: str) -> dict:
@@ -7816,48 +7825,36 @@ def saved_prefill_share(cfg: dict) -> str | None:
 
 
 # upstream #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the
-PARALLEL_MAX = 8               # #465: the engine's batch window holds at most 8 requests
-PARALLEL_SHARE = 0.2           # #465: the slots' sessions may take this share of the VRAM the expert cache would hold
-PARALLEL_HELD = 0.5            # #465: ... and only where the cache still holds this share of the experts beside them
-PARALLEL_COST_NOTE = ("parallel N reduces waiting for several users but costs about 10-25% speed per request on this "
-                      "card")
+# #465: the batch slots - the rule and the slot's size are serve/autotune.py's, which the server chooses by
+PARALLEL_MAX = autotune.PARALLEL_MAX
+PARALLEL_COST_NOTE = autotune.PARALLEL_COST_NOTE
 
 
 def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
-    """#465: the VRAM one batch slot's session takes: its KV cache (12 QSA layers; with KV streaming only the 32K
-    positions the attention reads stay in VRAM) and the DeltaNet state (~0.17 GB).  Measured (upstream): 0.56 GiB at
-    32K int8."""
-    kv_tok = 12 * KV_CELL_BYTES.get(kv, 1056)
-    return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
+    """#465: the VRAM one batch slot's session takes (serve/autotune.py's rule: 0.56 GiB at 32K int8)."""
+    return autotune.parallel_slot_gb(ctx, kv, streaming)
 
 
 def parallel_recommend(vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool) -> int:
-    """#465: how many requests at once ("parallel") to recommend: 0 = none (one at a time).  Only where the experts
-    mostly fit in VRAM - the expert cache (the card's VRAM less ~5 GB) still holds PARALLEL_HELD of the model's experts
-    beside the slots' sessions, which take at most PARALLEL_SHARE of it, up to 4.  Where the experts mostly run on the
-    CPU a batch reads about as many experts as the requests one by one and every slot's VRAM is expert cache lost
-    (upstream measured a 12 GB card: a request alone 11-24% slower with 2-4 slots; docs/BATCHING.md)."""
-    cache_gb = max(0.0, vram_gb - 5)
-    slot = parallel_slot_gb(ctx, kv, streaming)
-    best = 0
-    for n in (2, 3, 4):
-        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb:
-            best = n
-    return best
+    """#465: how many requests at once ("parallel") this card offers: 0 = one at a time (serve/autotune.py's rule)."""
+    return autotune.parallel_recommend(vram_gb, arena_gb, ctx, kv, streaming)
 
 
 def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool,
                   batch_mtp: bool = False) -> list[str]:
-    """#465: what setup says about "parallel": the recommendation (or, where it would cost speed, why it is left at
-    one), or how the asked count compares with it (kept as asked: recommend, never force).  `batch_mtp`: the engine
-    runs with --batch-mtp (the server's default with --mtp), which takes every slot asked, past PARALLEL_MAX."""
+    """#465: what setup says about "parallel": what the server will choose by itself (it is "auto" unless the config
+    says otherwise, from the cards' VRAM and the experts' size), or how the asked count compares with it (kept as
+    asked: recommend, never force).  `batch_mtp`: the engine runs with --batch-mtp (the server's default with --mtp),
+    which takes every slot asked, past PARALLEL_MAX."""
     rec = parallel_recommend(vram_gb, arena_gb, ctx, kv, streaming)
     slot = parallel_slot_gb(ctx, kv, streaming)
     if asked is None or asked <= 1:
         if not rec:
-            return [f"Several requests at once: left at one at a time - {PARALLEL_COST_NOTE} (docs/BATCHING.md)."]
-        return [f"Several requests at once (opt-in): --parallel {rec} decodes up to {rec} together instead of one "
-                f"after the other (each takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md)."]
+            return [f"Several requests at once: one at a time on this machine - {PARALLEL_COST_NOTE} "
+                    "(docs/BATCHING.md)."]
+        return [f'Several requests at once: off in "auto" (the default) - a slot takes VRAM from the expert cache, '
+                f'which a request alone pays for. This machine holds {rec}: the config\'s "parallel": {rec} starts '
+                f"them (each slot takes ~{slot:.1f} GB; docs/BATCHING.md)"]
     lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
              f"{asked * slot:.1f} GB in all)"]
     used = asked if batch_mtp else min(asked, PARALLEL_MAX)
@@ -8146,8 +8143,17 @@ def cpu_ctx(fam: dict, ram: float) -> int:
 
 def replicas_config(a, cfg: dict) -> None:
     """--replicas N: data-parallel replicas (serve/replicas.py, upstream 8d276c19) over the chosen GPUs, in equal
-    groups"""
-    if a.replicas is None or a.replicas < 2:
+    groups.  Without it the config's "replicas" stays "auto": the server runs one engine per card when the model fits
+    one card and the RAM holds a copy of its experts for each (serve/autotune.py); setup says what that is here."""
+    if a.replicas is None:
+        if not cfg.get("replicas"):
+            n = autotune.replicas(autotune.read(cfg), cfg)
+            if n >= 2:
+                ok(f"replicas: this machine could run {n} engines, one on each card (the model fits one card, and the "
+                   f'RAM holds a copy of its experts for each); "replicas": {n} runs them - the server does not choose '
+                   "them by itself, since a request alone is faster on the layer split")
+        return
+    if a.replicas < 2:
         return
     cards = [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])] if cfg.get("gpu_pci") else []
     if not cards or len(cards) % a.replicas:
@@ -8391,6 +8397,11 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                            "tokenizer": str(tok_dir / "tokenizer"), "model_name": served_name(family, model),
                            "family": family,
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+    # for serve/autotune.py's choices (its "parallel": slots taken from the VRAM the experts leave, "replicas",
+    # "split_serve"): the model's files and, of them, the experts the cache holds - a dense model has none
+    cfg["model_gb"] = round(d["size"] / 1e9, 1)
+    if fam.get("profile"):
+        cfg["experts_gb"] = experts_gb(gguf)
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (XESTRATA_GPU_PCI)
     if len(sel) > 1:                                   # --gpus: the layer split's other cards, as Qwen3.8-Flash-Next's
@@ -8648,14 +8659,16 @@ OPTIONS = [
             kind="number", place="advanced", min=0, max=1e6, hint="(none) GiB of RAM to leave free for other programs",
             takes="a number of GiB, 0 or more", cli={"metavar": "N"}),
     _option("parallel", "Requests decoded together (each takes VRAM from the expert cache)",
-            "up to N requests decode together (batch slots, opt-in; default: one at a time, the others wait). Each "
-            "slot takes VRAM from the expert cache; setup says what it recommends",
+            "up to N requests decode together (batch slots; default: the server chooses by itself at every start from "
+            "the card's VRAM and the experts' size, and 1 to N fixes it). Each slot takes VRAM from the expert cache; "
+            "setup says what the automatic choice would be",
             kind="int", place="advanced", min=1, hint="1: one request at a time",
             takes="a number of requests, 1 or more", cli={"metavar": "N"}),
     _option("replicas", "With a layer split: independent engines, each on an equal group of the GPUs",
             "several GPUs (--gpus): run N independent engines, each on its own equal group of the chosen cards (2 "
-            "replicas on 4 cards = two 2-card engines), requests spread over them (opt-in; more total throughput for "
-            "a model that fits fewer cards; each replica holds its own copy of the model in RAM and VRAM)",
+            "replicas on 4 cards = two 2-card engines), requests spread over them (default: the server chooses by "
+            "itself when every card alone holds the model; more total throughput for a model that fits fewer cards; "
+            "each replica holds its own copy of the model in RAM and VRAM)",
             kind="int", place="advanced", min=1, hint="1", takes="a number of engines, 1 or more",
             cli={"metavar": "N"}),
     _option("source", "Where the model files come from",
@@ -10117,6 +10130,10 @@ def main() -> int:
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (XESTRATA_GPU_PCI)
+    # for serve/autotune.py's choices ("parallel", "replicas", "split_serve"): the model's files and, of them, the
+    # experts the cache holds
+    cfg["model_gb"] = MODELS[model]["download_gb"]
+    cfg["experts_gb"] = MODELS[model]["arena_gb"]
     if len(sel) > 1:                                   # --gpus: the layer split's other cards (docs/MULTIGPU.md)
         cfg["gpu_pci"] = gpu["pci"]
         cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]
@@ -10148,7 +10165,7 @@ def main() -> int:
         else:
             cfg["parallel"] = 1
             ok("parallel requests: one at a time (--parallel 1)")
-    else:                                              # the opt-in, said once (nothing changes)
+    else:                                              # "auto": the server chooses; setup says what that is here
         for line in parallel_note(None, gpu_expert_vram(gpu), MODELS[model]["arena_gb"], ctx, kv, streaming):
             say("  " + line)
     if vision != "none":

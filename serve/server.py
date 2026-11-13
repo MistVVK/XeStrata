@@ -80,6 +80,7 @@ from serve import downgrades  # noqa: E402
 from serve import model_terms  # noqa: E402
 from serve import notices  # noqa: E402
 from serve import envvars  # noqa: E402
+from serve import autotune  # noqa: E402
 from serve import search as search_api  # noqa: E402
 from serve import skills as skills_api  # noqa: E402
 from serve import tool_parallel  # noqa: E402
@@ -3858,35 +3859,57 @@ def engine_args(cfg: dict) -> list[str]:
         args.append("--session-save-reclaim")
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
-    return conversation_save_args(cfg, learned_profile_args(cfg, args))
+    return conversation_save_args(cfg, learned_profile_args(cfg, conversation_cache_args(cfg, args)))
+
+
+def conversation_cache_args(cfg: dict, args: list[str]) -> list[str]:
+    """"conversation_cache_mib" in the config: the RAM budget of the engine's parked conversations, in MiB (0 turns
+    them off).  Absent or "auto": the engine sizes it from the RAM free once the model is loaded - its own rule, the
+    same in both engines (core's auto_conversation_cache_mib), which knows what the load left.  An engine argument of
+    the config's own wins."""
+    v = cfg.get("conversation_cache_mib")
+    if v is None or v == autotune.AUTO or "--conversation-cache-mib" in args[:-1]:
+        return args
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        print(f'[xestrata] "conversation_cache_mib" must be a number of MiB (0 turns it off) or "auto", not {v!r}: the '
+              "engine sizes it", flush=True)
+        return args
+    return args + ["--conversation-cache-mib", str(v)]
 
 
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
 
 
 def parallel_args(cfg: dict, args: list[str]) -> list[str]:
-    """#465 (opt-in): "parallel": N in the config - up to N requests decode together in the engine's batch slots
-    (--batch N); more wait their turn.  1 or absent: one request at a time, as before.  A value the engine cannot use
-    is said and passed on: the engine warns and adjusts (recommend, never force)."""
-    if "--batch" in args or "--slots" in args:
-        return []
-    n = cfg.get("parallel")
-    if n is None or n is False:
-        return []
-    if isinstance(n, bool) or not isinstance(n, int):
-        print(f'[xestrata] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
-              flush=True)
-        return []
-    if n <= 1:
-        return []
-    # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / XESTRATA_BATCH_MTP=0 turn it off)
-    env = envvars.get("BATCH_MTP", "")
-    batch_mtp = "--batch-mtp" in args or env not in ("", "0") or (
-        "--mtp" in args and "--no-batch-mtp" not in args and env != "0")
-    if n > PARALLEL_MAX and not batch_mtp:
-        print(f'[xestrata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
-              f"{PARALLEL_MAX}", flush=True)
-    return ["--batch", str(n)]
+    """The engine's batch slots: "parallel": N in the config - up to N requests decode together (--batch N); more wait
+    their turn.  1, false or absent: one request at a time, as before.  The server fills "parallel" in from the
+    machine before the engine starts (serve/autotune.py: "auto" is the default), so an "auto" still here was not
+    resolved by its caller and runs one at a time.  "batch_groups": a number, or "auto" for the engine's own choice of
+    groups over a layer split's stages (the engine knows the slots that fit).  A value the engine cannot use is said
+    and passed on: the engine warns and adjusts (recommend, never force)."""
+    out: list[str] = []
+    if "--batch" not in args and "--slots" not in args:
+        n = cfg.get("parallel")
+        if isinstance(n, bool) or n == autotune.AUTO:
+            n = None
+        elif n is not None and not isinstance(n, int):
+            print(f'[xestrata] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
+                  flush=True)
+            n = None
+        if isinstance(n, int) and n >= 2:
+            # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / XESTRATA_BATCH_MTP=0 turn it off)
+            env = envvars.get("BATCH_MTP", "")
+            batch_mtp = "--batch-mtp" in args or env not in ("", "0") or (
+                "--mtp" in args and "--no-batch-mtp" not in args and env != "0")
+            if n > PARALLEL_MAX and not batch_mtp:
+                print(f'[xestrata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it '
+                      f"will use {PARALLEL_MAX}", flush=True)
+            out += ["--batch", str(n)]
+    g = cfg.get("batch_groups")
+    if "--batch-groups" not in args and (g == autotune.AUTO or (
+            isinstance(g, int) and not isinstance(g, bool) and g >= 1)):
+        out += ["--batch-groups", str(g)]
+    return out
 
 
 def conversation_save_args(cfg: dict, args: list[str]) -> list[str]:
@@ -11700,14 +11723,16 @@ def _main() -> int:
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
-                    help="data-parallel replicas (opt-in): cut the cards (\"gpu_pci\" and \"split_pci\") into N equal "
-                         "groups and run one engine on each, requests spread over them (also \"replicas\" in the "
-                         "config: a number, or [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}])")
+                    help="data-parallel replicas: cut the cards (\"gpu_pci\" and \"split_pci\") into N equal groups "
+                         "and run one engine on each, requests spread over them (also \"replicas\" in the config: a "
+                         "number, [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}]; \"auto\", the "
+                         "default, runs none and the start log says how many this machine could run)")
     ap.add_argument("--split-serve", default=None, metavar="PREFILL,DECODE",
-                    help="split serving (opt-in): one engine on the card PREFILL reads the prompt, a second on the "
-                         "card DECODE makes the answer, the session handed over in RAM; the cards by PCI address "
+                    help="split serving: one engine on the card PREFILL reads the prompt, a second on the card DECODE "
+                         "makes the answer, the session handed over in RAM; the cards by PCI address "
                          "(0000:03:00.0,0000:09:00.0; also \"split_serve\" in the config: {\"prefill_gpu\": "
-                         "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}; docs/MULTIGPU.md)")
+                         "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}; \"auto\", the default, runs none "
+                         "and the start log says when two cards could; docs/MULTIGPU.md)")
     a = ap.parse_args()
     if a.engine == "strata":                            # the name upstream's scripts and older launchers pass
         a.engine = "xestrata"
@@ -11728,6 +11753,17 @@ def _main() -> int:
     lift_reasoning_effort_arg(cfg)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    # the settings the machine decides (serve/autotune.py): "parallel", "batch_groups", "vram_elastic",
+    # "conversation_cache_mib", "replicas", "split_serve" and "split_skip_if_fits" are "auto" unless the config says
+    # otherwise.  The cards' VRAM, the RAM, their number and the model's size choose here, and the log says what each
+    # choice is.  An explicit value in the config is the user's own and is left as it is.
+    plan = None
+    if a.engine == "xestrata" and cfg:
+        plan = autotune.resolve(cfg, autotune.read(cfg))
+        cfg = plan.cfg
+        print("[xestrata] the machine's choices:", flush=True)
+        for line in plan.notes:
+            print(f"[xestrata]   {line}", flush=True)
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()

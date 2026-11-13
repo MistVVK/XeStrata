@@ -51,12 +51,16 @@ bool native_experts_available() noexcept { return true; }
 // compiled for AVX-512 and iq_avx2.cpp for AVX2, and native_gu_rows asks these on every CPU before it
 // has checked what the CPU can run.  A function in a wide-ISA file may use that ISA anywhere in its body, so an
 // answer that is only a comparison must not come from one (#795).
-// IQ4_XS's gate/up rows in 512-bit lanes (upstream 55dc17697): opt-in (XESTRATA_IQ512_IQ4XS=1), because its rows round
-// differently from the ggml-cpu dot an AVX-512 CPU takes them with today (the reason IQ4_XS had no 512-bit kernel).
+// IQ4_XS's gate/up rows in 512-bit lanes (upstream 55dc17697), on where the CPU has the AVX-512 the kernel needs
+// (XESTRATA_IQ512_IQ4XS=0 turns them off).  They round differently from the ggml-cpu single-token dot an AVX-512 CPU
+// takes IQ4_XS with today.  llvm-mca on the built loop (znver4, a 256-value block): 35.3 cycles at one token where
+// ggml's dot is 31.8 (-11%), 41.0 at two (two dots: 63.6, +35%) and 54.3 at four (127.2, +57%): the decode windows
+// (MTP or drafts: two tokens and up) win, one-token windows lose a little.  No AVX-512 machine here: the speed is an
+// estimate (unverified).
 static bool iq4xs_512_on() {
     static const bool on = [] {
         const char* v = strata::env_get("IQ512_IQ4XS");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return on;
 }

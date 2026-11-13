@@ -165,10 +165,8 @@ template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 13
     static constexpr float K = 1.0f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
         const __m512i tab = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl)));
-        // int, not ptrdiff_t: the wider products changed this decode's AVX-512 code
-        const int o0 = 16 * (2 * j), o1 = 16 * (2 * j + 1);
-        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + o0));
-        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + o1));
+        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * j)));
+        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * j + 1)));
         const __m128i m4 = _mm_set1_epi8(0x0f);
         const __m256i h0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q0, 4), m4), _mm_and_si128(q0, m4));
         const __m256i h1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q1, 4), m4), _mm_and_si128(q1, m4));
@@ -185,6 +183,63 @@ template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 13
     }
 };
 
+// XESTRATA_IQ_GATHER=auto (unset): the two decodes, gather and scalar lookups, on 256 blocks of each IQ3 format, in
+// turn after a warm-up; the gather is taken when it is 2% faster.  The margin keeps a start from moving the choice
+// where the two are close, and the difference the gather makes is 3-5%: one instruction on some cores, microcode on
+// others, which a CPU's name does not say.
+bool iq3_gather_probe() {
+    constexpr int kBlocks = 256, kReps = 64;
+    static uint8_t blocks18[kBlocks * Fmt<18>::bytes], blocks21[kBlocks * Fmt<21>::bytes];
+    static bool filled = false;
+    if (!filled) {
+        uint32_t x = 2463534242u;
+        for (uint8_t& c : blocks18) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; c = (uint8_t) x; }
+        for (uint8_t& c : blocks21) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; c = (uint8_t) x; }
+        filled = true;
+    }
+    static volatile int64_t sink = 0;
+    auto time = [](bool g) {
+        gather = g;
+        __m512i acc = _mm512_setzero_si512();
+        auto pass = [&acc]() {
+            for (int b = 0; b < kBlocks; ++b)
+                for (int j = 0; j < 4; ++j) {
+                    __m512i gg, sc;
+                    __mmask64 m;
+                    Fmt<18>::decode(blocks18 + (size_t) b * Fmt<18>::bytes, j, gg, m, sc);
+                    acc = _mm512_add_epi64(acc, gg);
+                    Fmt<21>::decode(blocks21 + (size_t) b * Fmt<21>::bytes, j, gg, m, sc);
+                    acc = _mm512_add_epi64(acc, gg);
+                }
+        };
+        for (int w = 0; w < 4; ++w) pass();   // the clocks up
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < kReps; ++r) pass();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        sink += _mm512_reduce_add_epi64(acc);
+        return us;
+    };
+    const double scalar = std::min(time(false), time(false));
+    const double gathered = std::min(time(true), time(true));
+    gather = false;
+    const bool on = gathered * 1.02 < scalar;
+    std::fprintf(stderr, "xestrata: the IQ3 decode: AVX-512 gather %.0f us, scalar lookups %.0f us (%d blocks x 4; "
+                         "XESTRATA_IQ_GATHER=0/1 picks one)\n", gathered, scalar, kBlocks);
+    return on;
+}
+
+void iq3_gather_decide() {
+    static const bool once = [] {
+        const int v = strata::env_auto("IQ_GATHER");
+        gather = v >= 0 ? v == 1 : iq3_gather_probe();
+        return true;
+    }();
+    (void) once;
+}
+
+// prefetch_ahead: E-2's software prefetch distance in bytes (iq_prefetch_bytes, STRATA_IQ_PREFETCH; 0 = off): -2-3%
+// gate/up time on IQ3_S decode (the rows are read at ~30 GB/s by 6 cores, near what DDR5 with 4 KB pages gives: the
+// pool is memory-bound)
 template <int TY, int NT>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res, int prefetch_ahead) {
     __m512 accf[NT];
@@ -299,6 +354,7 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         case 18: dot_rows_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 21: dot_rows_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 23: dot_rows_nt<23>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }

@@ -18,6 +18,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/kv_elastic.hpp"
+#include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/link_probe.hpp"
 #include "strata/core/split_predict.hpp"
@@ -6313,11 +6314,13 @@ int main(int argc, char** argv) {
         if (const char* v = strata::env_get("KV_GROW_FLOOR"); v != nullptr && std::strtoll(v, nullptr, 10) > 0)
             kvg.floor = std::strtoll(v, nullptr, 10);
         std::fprintf(stderr, "xestrata generate: elastic K/V: %lld of %lld cells in VRAM (%.2f of %.2f GiB); the expert "
-                             "cache (%lld slots) gives the K/V room below slot %lld as the context grows\n",
+                             "cache (%lld slots) gives the K/V room below slot %lld as the context grows; a parked "
+                             "conversation's cells %s\n",
                      (long long) kvg.cells, (long long) o.max_context,
                      (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
                      (double) strata::core::qsa_kv_elastic_full_bytes() / 1073741824.0, (long long) xcache.slots(),
-                     (long long) top);
+                     (long long) top,
+                     strata::core::kv_grow_hold() ? "stay while it waits" : "go back after each request");
     };
     // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
@@ -10899,13 +10902,9 @@ int main(int argc, char** argv) {
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
             if (kvg.on) {
                 kv_quiesce();
-                // STRATA_KV_GROW_HOLD=1 (opt-in, #1128): keep the K/V as long as the longest parked conversation;
-                // default: trim to this request alone
-                static const bool hold_on = [] {
-                    const char* v = strata::env_get("KV_GROW_HOLD");
-                    return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-                }();
-                if (!kvg_trim(n + 256, hold_on ? conversations.longest_tokens() + 256 : 0)) {
+                // XESTRATA_KV_GROW_HOLD (upstream 56ae98dd, #1128): keep the K/V as long as the longest parked
+                // conversation, where holding pays for itself (kv_grow_hold.hpp)
+                if (!kvg_trim(n + 256, strata::core::kv_grow_hold() ? conversations.longest_tokens() + 256 : 0)) {
                     std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
                     return 1;

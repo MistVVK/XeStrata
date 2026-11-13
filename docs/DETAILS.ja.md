@@ -171,7 +171,9 @@ RAM は文脈 1 トークンあたり約 13.7 KB 使い、128K で約 1.7 GB で
 残りはエキスパートのキャッシュが使い、文脈が伸びるとスロットを KV に渡し、短い要求のあとに取り戻します。
 KV とキャッシュは仮想メモリ（`sycl_ext_oneapi_virtual_mem`）の上にあり、どちらのアドレスも動かないので、捕まえたグラフはそのまま使えます。
 1 つの GPU で、仮想メモリに対応し、エキスパートのプロファイルがあり、KV のストリーミングをせず、すべてのエキスパートが RAM にあるときだけ有効になり、そうでなければ（`--batch` と `--vram-elastic` も）エンジンがそう言って無効のままです。
-`XESTRATA_KV_GROW_HOLD=1` は、置いておいた会話のうち最長のもののセルを、それが戻るまで KV に残します。
+`XESTRATA_KV_GROW_HOLD` は、置いておいた会話のうち最長のもののセルを、それが戻るまで KV に残します（`=1` で常に残し、`=0` で常に戻します）。
+指定しなければ、`--kv-grow` の既定と同じく、デバイスが報告する仮想メモリの粒度で決めます（2 MiB 以上なら残します）。
+B70 の 64 KiB のように小さいと、仮想メモリに置いたキャッシュがもともと遅いので、残すと遅くなります（RTX 4070 では残す方が速く、B70 では遅かった。2026-10-09）。
 128K の文脈、int8、IQ2_XS、4,945 トークンのプロンプトで測ると（各 1 回）、カードで結果が分かれました。
 
 | | prefill（トークン/秒） | その後の decode | 短い会話の decode | スロット |
@@ -534,7 +536,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--vram-reserve-later-mib N` | 層を分けたとき、2 枚目以降の GPU に空けておく VRAM（既定は `--vram-reserve-mib` と同じ） |
 | `--vision` | `--serve` で画像つきの要求を受ける（Qwen3.5-9B と qwen35moe のモデル。setup が画像を選んだとき書きます） |
 | `--device cpu`、`--cpu-threads N` | Qwen3.5 の密なモデル（qwen35）を CPU だけで動かす（[GPU のない PC](#gpu-のない-pc)。SYCL の使える GPU が 1 つもないときは、書かなくても CPU で動きます）。`--cpu-threads` は使うスレッドの数（既定は CPU の割り当てを考慮した物理コア数） |
-| `--batch N`（`"parallel": N`） | `--serve` で最大 N 個の会話をまとめて decode する（[BATCHING](BATCHING.ja.md#ほかのモデルplain-のエンジン)。GLM-5.3-Flash と `--vision` ではまだ使えません） |
+| `--batch N`（`"parallel": N`、既定は `"auto"`） | `--serve` で最大 N 個の会話をまとめて decode する（[BATCHING](BATCHING.ja.md#ほかのモデルplain-のエンジン)。GLM-5.3-Flash と `--vision` ではまだ使えません） |
 | `--prompt-cache N`、`--prompt-cache-every N`、`--prompt-cache-root N`、`--turn-token ID`、`--conversation-save-checkpoints N` | `--serve` で、再帰の状態を持つモデル（Ornith、Qwen3.6、Qwen3.5-9B）の会話のチェックポイント。再帰の状態は前の位置へ戻せないので、会話の途中から続く要求（描き方の違う返答の次のターン、書き換えた発言、同じシステムプロンプトの新しい会話）は、チェックポイントがなければ全部を読み直します。意味と既定は Qwen3.8-Flash-Next と同じで（[会話のキャッシュ](#会話のキャッシュ)）、要求の `pin` と `"strata_checkpoint": false` も効きます。チェックポイントは再帰の状態だけで（Qwen3.6 で約 60 MB）、その下の位置の K/V は会話のものを使います。`--turn-token` の既定は語彙の `<|im_start|>`、なければ `<|start|>` です。注意の層だけのモデル（llm-jp、GLM-5.3-Flash）は、どの位置までの K/V も使えるので要りません |
 | `--tail-role-token ID`、`--prompt-cache-tail`、`--prompt-cache-spread`、`--conversation-cache-min-tokens N`、`--conversation-cache-park-gain N`、`--short-read N`、`--session-save-reclaim` | `--serve` の会話のキャッシュとチェックポイントの方針（Qwen3.8-Flash-Next と同じ意味）。`--short-read` の既定は `--max-t` です |
 | `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N`、`--yarn-ext-factor F`、`--yarn-attn-factor F`、`--yarn-beta-fast F`、`--yarn-beta-slow F` | 文脈の延長（YaRN の値は llama.cpp と同じ意味） |
@@ -697,7 +699,7 @@ setup はそこでファイルを見つけ、設定を書き直します。
   GPU の負荷、VRAM、温度、電力、PCIe の通信量、CPU、RAM、ディスク、使っている文脈、最近の要求です。
   モデルを複数の GPU に分けたときや、画像に別の GPU を使うときは、GPU のカードの上にタブが並びます。すべての GPU の合計と GPU ごとの値を切り替えられ、どの GPU が何をしているか（文章、画像、補助、層の分担、prefill / decode）がタブの印に出ます。
   画像を別の GPU で作るときは、文章の状態と画像の状態が別々の行に出ます。
-  会話のキャッシュのカードには、prefill のトークンのうちキャッシュから戻せた数（最後の要求と起動から）と、`--conversation-cache-mib` を入れていれば、置いた会話の数とメモリ、置いた・戻した・追い出した回数が出ます（upstream #596。`/metrics` の `"conversation_cache"` にも同じもの）。
+  会話のキャッシュのカードには、prefill のトークンのうちキャッシュから戻せた数（最後の要求と起動から）と、会話のキャッシュが有効なら（`--conversation-cache-mib` か、それを省いたときのエンジンの自動）、置いた会話の数とメモリ、置いた・戻した・追い出した回数が出ます（upstream #596。`/metrics` の `"conversation_cache"` にも同じもの）。`--conversation-cache-mib` は設定の `"conversation_cache_mib"` でも書けます（MiB。0 で切る）。省くとエンジンが、モデルを読んだ後の空き RAM から決めます（両方のエンジンで同じ規則）。
 - **About**: モデルとエンジンの設定、ほかのアプリをつなぐアドレスです。
 
 `http://127.0.0.1:8095/?q=質問` を開くと、その質問をした新しい会話から始まります。
@@ -750,7 +752,7 @@ XeStrata は、GPU の空いている VRAM をエキスパートで埋め（エ�
 そのぶんエキスパートのキャッシュが小さくなるので、答えは少し遅くなることがあります。
 
 動かしたまま空ける量を変えることもできます（upstream #533）。
-画像を作るモデルがある設定と GPU のエンコーダーを使う設定では、エキスパートのキャッシュを 512 MiB ずつのかたまり（`"vram_segment_mib"` で変更）で持ちます（`--vram-elastic`）。ほかの設定では `"vram_elastic": true` で同じになり、`"vram_elastic": false` でいつも 1 つの割り当てです。B70・RTX 4070・RX 9060 XT で、かたまりで持っても prefill と decode は変わりませんでした。
+エキスパートのキャッシュを 512 MiB ずつのかたまり（`"vram_segment_mib"` で変更）で持つか（`--vram-elastic`）は、設定の `"vram_elastic"` が決めます。既定の `"auto"` では、画像を作るモデルがある設定と GPU のエンコーダーを使う設定でかたまりにし（何かが要求の間に VRAM を借りるため）、それ以外は 1 つの割り当てです。`true` でいつもかたまり、`false` でいつも 1 つの割り当てです。層の分割ではエンジンが 1 枚ずつキャッシュを持つので、かたまりにはなりません。B70・RTX 4070・RX 9060 XT で、かたまりで持っても prefill と decode は変わりませんでした。
 要求の合間に `POST /v1/vram` に `{"reserve_mib": 6000}` を送ると、その量が空くまでキャッシュの後ろのかたまりを GPU に返し、`{"reserve_mib": null}` で起動時の量に戻します。
 実行中の要求があれば、それが終わってから変えます。
 返したかたまりにあったエキスパートは CPU で計算するので、答えは同じで、遅くなります。
@@ -1451,7 +1453,7 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 
 ### いまの限界とサンプリング
 
-- 要求は 1 つずつ処理し（同時に処理するのは `"parallel"` で有効にしたときだけ、[BATCHING](BATCHING.ja.md)）、KV キャッシュに持てる会話の履歴は 1 つです。
+- 要求は 1 つずつ処理し（同時に処理するのは `"parallel": N` を指定したときだけ、[BATCHING](BATCHING.ja.md)）、KV キャッシュに持てる会話の履歴は 1 つです。
   2 つの会話を行き来すると、置いておく機能がオフなら、分かれたところから先を読み直します。
   システムプロンプトのような共通の先頭は使い回します。
 - 画像は、画像ありで setup したときだけ使えます（[下](#画像)）。

@@ -33,12 +33,13 @@ class Parallel(unittest.TestCase):
 
     def test_notes_recommend_never_force(self):
         q2 = S.MODELS["Q2_0"]["arena_gb"]
-        # 12 GB: left at one, with the reason
+        # 12 GB: one at a time, with the reason
         note = S.parallel_note(None, 12, q2, 32768, "int8", False)
         self.assertEqual(len(note), 1)
         self.assertIn("one at a time", note[0])
         self.assertIn("costs about 10-25% speed per request on this card", note[0])
-        self.assertIn("--parallel 3", S.parallel_note(None, 24, q2, 32768, "int8", False)[0])
+        # 24 GB: the number the machine's own choice holds, said as the value that fixes it
+        self.assertIn('"parallel": 3', S.parallel_note(None, 24, q2, 32768, "int8", False)[0])
         # asked on 12 GB: kept, with the cost said
         lines = S.parallel_note(4, 12, q2, 32768, "int8", False)
         self.assertIn("4 at once", lines[0])
