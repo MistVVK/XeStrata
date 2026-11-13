@@ -69,11 +69,22 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int ggml_type, const void* w, size_t 
                            int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst,
                            const uint8_t* const* wtab = nullptr, size_t woff = 0, int64_t rows = 0);
 
+/// iq_mmq_grouped's product on RDNA3's and RDNA4's WMMA in FP16 (iq_kernels.cpp): each weight block dequantized in
+/// local memory to the values iq_dequant_f16 writes, each activation value its int8 times its block's scale.  The
+/// same operands and outputs as iq_mmq_grouped's (other last bits: FP16 products, not the int8 sums).  For the i-quants
+/// and Q2_0, w_rows a multiple of 128 and w_cols of 64 (iq_mmq_f16_ok).
+bool iq_mmq_f16_ok(sycl::queue& q, int ggml_type, int64_t w_rows, int64_t w_cols);
+sycl::event iq_mmq_f16_grouped(sycl::queue& q, int ggml_type, const void* w, size_t expert_bytes, int64_t w_rows,
+                               int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
+                               int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst,
+                               const uint8_t* const* wtab, size_t woff);
+
 /// Times the two forms Intel's XMX take these products in for products of ggml_type, w_rows x w_cols (the weights'
 /// own columns, as iq_mmq_row_bytes takes them), n experts (1: a dense product) of 8 to 256 rows each, and keeps the
-/// faster for each class of rows (iq_mmq_grouped then takes it; a product not timed takes the work-group form).  For
-/// the engine's warming, before its first prompt: a few milliseconds a class, once a GPU and shape.  Nothing where
-/// the GPU takes one form (not Intel's XMX).
+/// faster for each class of rows (iq_mmq_grouped then takes it; a product not timed takes the work-group form); on
+/// RDNA3 and RDNA4 the int8 form against the FP16 one (iq_mmq_f16_grouped) for groups of experts of 512 and 1024 rows
+/// each (a product not timed takes the int8 form).  For the engine's warming, before its first prompt: a few
+/// milliseconds a class, once a GPU and shape.  Nothing where the GPU takes one form.
 void iq_mmq_choose_forms(sycl::queue& q, int ggml_type, int64_t w_rows, int64_t w_cols, int n = 16);
 
 /// One expert's product of few rows (a dense model's short prompt) takes K in parts, a work-group each, the parts'

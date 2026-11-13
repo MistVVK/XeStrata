@@ -53,8 +53,10 @@ inline uint64_t counted_free(uint64_t free, uint64_t free_at_start, int64_t vram
     const uint64_t vf = (uint64_t) vram_free_mib << 20;
     return free_at_start > vf ? free - std::min(free, free_at_start - vf) : free;
 }
-/// An integrated GPU's free memory: at most what Linux can give back, less STRATA_UMA_HEADROOM_GIB (default 6).
-void apply_uma_limit(uint64_t& free);
+/// An integrated GPU's free memory: at most what the OS can give back, less STRATA_UMA_HEADROOM_GIB (default 6).
+/// Not where the device's total is larger than the OS's own RAM (`total`): that is a BIOS carve-out, a pool of its
+/// own, and the system's RAM is not what it hands out (a Strix Halo: 64 GiB of carve-out, 62 GiB seen by the OS).
+void apply_uma_limit(uint64_t& free, uint64_t total);
 /// A discrete GPU's free memory on Windows: at most what the OS's budget for this process leaves it
 /// (platform::gpu_local_memory_budget), for the GPU at the PCI address `pci`.  Elsewhere `free` stays as it is.
 void apply_os_budget(const std::string& pci, uint64_t& free);

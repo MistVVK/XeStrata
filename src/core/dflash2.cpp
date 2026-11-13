@@ -350,8 +350,8 @@ bool Dflash2Drafter::alloc(std::string& err) {
     vram_ += slab_total;
     rt_ctx_ = reinterpret_cast<float*>(d_meta_ + kMetaInts);
     rt_blk_ = rt_ctx_ + B * 128;
-    cur_ = Lineage{(size_t) N_, {}, {}};
-    if (!strata::gpu::alloc_host(&h_meta_, kMetaBytes + (size_t) N_ * 4) || !strata::gpu::alloc_host(&h_out_, 64 * 4)) {
+    history_.init((size_t) N_, 32, kRing, window_);
+    if (!strata::gpu::alloc_host(&h_meta_, meta_bytes() + (size_t) N_ * 4) || !strata::gpu::alloc_host(&h_out_, 64 * sizeof(int32_t))) {
         err = "dflash2: host staging";
         return false;
     }

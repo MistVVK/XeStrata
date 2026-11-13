@@ -33,12 +33,15 @@
 //
 #include "strata/kernels/canon_math.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/timed_choice.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/gpu.hpp"
+#include "amd_wmma.hpp"
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
 #include "iq_bits.hpp"
@@ -2312,11 +2315,166 @@ sycl::event launch_iq_gemm(sycl::queue& q, const sycl::half* X, const IqGemmPtrs
     });
 }
 
+// ---------------------------------------------------------------- iq_mmq_f16_grouped: RDNA3's and RDNA4's WMMA
+// iq_mmq_grouped's expert products in FP16 on the matrix instructions amd_wmma.hpp takes (16 x 16 x 16 tiles on 32
+// lanes, mma_gemm's shape on those GPUs), from the int8 products' own operands: a work-group of 2 x 4 sub-groups, each
+// SGM x 2 tiles, takes WM = 32 SGM rows of one expert by 128 of its weight rows; for each KC values of K it stages the
+// rows' int8 activations times their block's scale (iq_mmq_quantize's) as FP16, zero past the expert's last row, and
+// dequantizes the 128 x KC weights (the dequantizers above: the values iq_dequant_f16 writes) into local memory, B
+// column-major (a weight row's K values contiguous, as the instructions' B operand reads them), and its sub-groups
+// multiply them; row r's outputs go to dst row ids[r].  SGM by the most rows an expert has: an expert of 16 rows does
+// not pay a 128-row tile's products.  RX 9060 XT (2026-11-13), 16 experts' 1280 x 2560 IQ2_S gate/up, us an expert at
+// 64, 256 and 1024 rows: 23, 63 and 247 against the int8 products' 17, 63 and 238 (the weights from FP16 rows instead
+// of the int8 activations: 26, 59, 227); IQ4_XS's 21, 57, 220 against 20, 56, 214.  Where it pays is in the engine,
+// at a 32K prompt's 1000 rows an expert (iq_mmq.cpp's f16_first).
+struct ToNK {
+    sycl::half* row;   // the weight row in the tile
+    int piece;         // the offset of the tile's first value in the 256-value piece
+    template<int N> void put(int off, const float* v) const { store<N>(row + (off - piece), v); }
+};
+
+template<int TYPE, int SGM>
+struct IqWmmaKernel {
+    static constexpr int NSGM = 2, NSGN = 4, SGN = 2, T16 = 16, SG = 32, NSG = NSGM * NSGN, WG = NSG * SG;
+    static constexpr int WM = NSGM * SGM * T16, WN = NSGN * SGN * T16, KC = 64;
+    static constexpr int LD = KC + 8;          // a row's stride in the tile (16-byte rows, other banks)
+    static constexpr int LOCAL = (WM + WN) * LD;
+    const int8_t* x8;                          // the int8 rows, then their scales xs
+    const float* xs;
+    const uint8_t* w8;                         // expert e's weights at w8 + e expert_bytes, or wtab[e] + woff
+    const uint8_t* const* wtab;
+    size_t woff, expert_bytes;
+    const int32_t* ids;                        // the output row of each row (null: the row itself)
+    float* Y;
+    const int32_t* bounds;
+    size_t row_bytes;
+    int64_t ldy, tiles_m, nN, K;
+    sycl::local_accessor<sycl::half, 1> lm;    // [WM][LD] of X, then [WN][LD] of the weights
+
+    void operator()(sycl::nd_item<1> it) const {
+#if STRATA_AMD_WMMA
+        const int64_t g = (int64_t) it.get_group(0);
+        const int64_t ex = g / (tiles_m * nN), r = g % (tiles_m * nN), tm = r / nN, tn = r % nN;
+        const int64_t row0 = bounds[ex], rows = bounds[ex + 1] - row0;
+        const int64_t m0 = tm * WM, wn0 = tn * WN;
+        if (m0 >= rows) return;   // the whole work-group: the expert has fewer rows than the launch allows for
+        const auto sg = it.get_sub_group();
+        const int sgid = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int lid = (int) it.get_local_linear_id();
+        const int ms = sgid / NSGN * SGM * T16, ns = sgid % NSGN * SGN * T16;
+        const uint8_t* w = wtab != nullptr ? wtab[ex] + woff : w8 + (size_t) ex * expert_bytes;
+        sycl::half* al = &lm[0];
+        sycl::half* bl = &lm[(size_t) WM * LD];
+        xe::wmma::C c[SGM][SGN];
+        for (int i = 0; i < SGM; ++i)
+            for (int j = 0; j < SGN; ++j) xe::wmma::fill(sg, c[i][j], 0.0f);
+        for (int64_t k0 = 0; k0 < K; k0 += KC) {
+            sycl::group_barrier(it.get_group());   // the last step's tiles are read
+            for (int v = lid; v < WM * (KC / 8); v += WG) {
+                const int rr = v / (KC / 8), cc = v % (KC / 8) * 8;
+                const int64_t row = m0 + rr;
+                sycl::vec<sycl::half, 8> h(sycl::half(0.0f));
+                if (row < rows) {
+                    const auto q = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(x8 + (row0 + row) * K + k0 + cc);
+                    const float d = xs[(row0 + row) * (K / 32) + (k0 + cc) / 32];
+                    for (int j = 0; j < 8; ++j) h[j] = sycl::half(d * (float) q[j]);
+                }
+                *reinterpret_cast<sycl::vec<sycl::half, 8>*>(al + rr * LD + cc) = h;
+            }
+            const int piece = (int) (k0 % 256);
+            for (int t = lid; t < WN * (KC / 8); t += WG) {   // neighbouring work-items: the same 8 values of neighbouring rows
+                const int rr = t % WN, tt = t / WN;
+                dq_one<TYPE>(w + (size_t) (wn0 + rr) * row_bytes, k0 / 256, ToNK{bl + rr * LD, piece}, piece / 8 + tt);
+            }
+            sycl::group_barrier(it.get_group());
+            for (int kk = 0; kk < KC; kk += T16) {
+                xe::wmma::A<sycl::half> a[SGM];
+                xe::wmma::Bc<sycl::half> b[SGN];
+                for (int i = 0; i < SGM; ++i) xe::wmma::load(sg, a[i], al + (ms + i * T16) * LD + kk, LD);
+                for (int j = 0; j < SGN; ++j) xe::wmma::load(sg, b[j], bl + (ns + j * T16) * LD + kk, LD);
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j) xe::wmma::mad(sg, c[i][j], a[i], b[j], c[i][j]);
+            }
+        }
+        const int lo = lane & 15, hi = lane >> 4;
+        for (int i = 0; i < SGM; ++i)
+            for (int j = 0; j < SGN; ++j) {
+                const int64_t n = wn0 + ns + (int64_t) j * T16 + lo;
+                for (int e = 0; e < 8; ++e) {
+                    const int64_t row = m0 + ms + (int64_t) i * T16 + xe::wmma::row_of(hi, e);
+                    if (row >= rows) continue;
+                    const int64_t out = ids != nullptr ? ids[row0 + row] : row0 + row;
+                    Y[out * ldy + n] = c[i][j].v[e];
+                }
+            }
+#else
+        (void) it;
+#endif
+    }
+    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
+};
+
+template<int TYPE, int SGM>
+sycl::event launch_iq_wmma(sycl::queue& q, IqWmmaKernel<TYPE, SGM> k, int G, int64_t max_rows, int64_t N) {
+    using Kn = IqWmmaKernel<TYPE, SGM>;
+    k.tiles_m = (max_rows + Kn::WM - 1) / Kn::WM;
+    k.nN = N / Kn::WN;
+    k.row_bytes = iq_row_bytes(TYPE, k.K);
+    return q.submit([&](sycl::handler& h) {
+        k.lm = sycl::local_accessor<sycl::half, 1>(sycl::range<1>((size_t) Kn::LOCAL), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (G * k.tiles_m * k.nN) * Kn::WG, Kn::WG), k);
+    });
+}
+
+// The launch's arguments; the tile's rows by the most rows an expert has: one 32-row tile up to 32 rows, 64 up to
+// 64, else 128 a work-group
+struct IqWmmaArgs {
+    const int8_t* x8 = nullptr;
+    const float* xs = nullptr;
+    const uint8_t* w8 = nullptr;
+    const uint8_t* const* wtab = nullptr;
+    size_t woff = 0, expert_bytes = 0;
+    const int32_t* ids = nullptr;
+    float* Y = nullptr;
+    const int32_t* bounds = nullptr;
+    int64_t ldy = 0, N = 0, K = 0;
+};
+template<int TYPE>
+sycl::event launch_iq_gemm_wmma(sycl::queue& q, const IqWmmaArgs& a, int G, int64_t max_rows) {
+    const auto kn = [&](auto sgm) {
+        constexpr int S = decltype(sgm)::value;
+        return IqWmmaKernel<TYPE, S>{a.x8, a.xs, a.w8, a.wtab, a.woff, a.expert_bytes, a.ids, a.Y, a.bounds, 0, a.ldy, 0, 0, a.K, {}};
+    };
+    if (max_rows <= 32) return launch_iq_wmma(q, kn(std::integral_constant<int, 1>{}), G, max_rows, a.N);
+    if (max_rows <= 64) return launch_iq_wmma(q, kn(std::integral_constant<int, 2>{}), G, max_rows, a.N);
+    return launch_iq_wmma(q, kn(std::integral_constant<int, 4>{}), G, max_rows, a.N);
+}
+
+sycl::event iq_wmma_by_type(int t, sycl::queue& q, const IqWmmaArgs& a, int G, int64_t max_rows) {
+    switch (t) {
+        case 16: return launch_iq_gemm_wmma<16>(q, a, G, max_rows);
+        case 17: return launch_iq_gemm_wmma<17>(q, a, G, max_rows);
+        case 18: return launch_iq_gemm_wmma<18>(q, a, G, max_rows);
+        case 19: return launch_iq_gemm_wmma<19>(q, a, G, max_rows);
+        case 20: return launch_iq_gemm_wmma<20>(q, a, G, max_rows);
+        case 21: return launch_iq_gemm_wmma<21>(q, a, G, max_rows);
+        case 22: return launch_iq_gemm_wmma<22>(q, a, G, max_rows);
+        case 23: return launch_iq_gemm_wmma<23>(q, a, G, max_rows);
+        case 29: return launch_iq_gemm_wmma<29>(q, a, G, max_rows);
+        default: return launch_iq_gemm_wmma<42>(q, a, G, max_rows);
+    }
+}
+
 // the formats iq_gemm_grouped_f16 dequantizes into its tile (dq_one); the K-quants and Q5_1 / Q8_0 take the fp16
 // dequant and xmx_gemm_grouped instead
 bool in_iq_gemm(int t) {
     return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 ||
            is_tq(t);
+}
+// the formats IqWmmaKernel takes: their dequantizers' values for tids piece / 8 .. piece / 8 + 7 lie in the 64 values
+// from piece (a 32-value sub-block a 4 tids, Q2_0's 64-value block 8)
+bool in_iq_wmma(int t) {
+    return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42;
 }
 bool is_iq(int t) {
     return in_iq_gemm(t) || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 6 || t == 7 || t == 8 || t == 2 ||
@@ -2615,6 +2773,29 @@ void iq_gemm_grouped_f16(int t, const uint16_t* X, const void* const* W, int64_t
         default: e = launch_iq_gemm<42>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
     }
     sync_if_needed(stream, e, "iq_gemm_grouped_f16");
+}
+
+bool iq_mmq_f16_ok(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols) {
+    if (!in_iq_wmma(t) || w_rows % 128 != 0 || w_cols % 64 != 0 || no_xmx()) return false;
+    static core::PerDevice<bool> per_device;
+    return per_device.get(q.get_device(), [&q] {
+        const sycl::device d = q.get_device();
+        return xe::amd_wmma(d) && d.get_info<sycl::info::device::local_mem_size>() >=
+                                      (size_t) IqWmmaKernel<16, 4>::LOCAL * sizeof(sycl::half);
+    });
+}
+
+sycl::event iq_mmq_f16_grouped(sycl::queue& q, int t, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols,
+                               int n, const void* xq, int64_t total_rows, const int32_t* bounds, int64_t max_rows,
+                               const int32_t* ids, float* dst, int64_t ld_dst, const uint8_t* const* wtab, size_t woff) {
+    if (n <= 0 || max_rows <= 0) return {};
+    require(iq_mmq_f16_ok(q, t, w_rows, w_cols), "iq_mmq_f16_grouped");
+    IqWmmaArgs a;
+    a.x8 = static_cast<const int8_t*>(xq);
+    a.xs = reinterpret_cast<const float*>(a.x8 + total_rows * w_cols);
+    a.w8 = static_cast<const uint8_t*>(w); a.wtab = wtab; a.woff = woff; a.expert_bytes = expert_bytes; a.ids = ids;
+    a.Y = dst; a.bounds = bounds; a.ldy = ld_dst; a.N = w_rows; a.K = w_cols;
+    return iq_wmma_by_type(t, q, a, n, max_rows);
 }
 
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type) noexcept {
