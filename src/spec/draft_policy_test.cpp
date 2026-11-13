@@ -556,22 +556,34 @@ int main() {
         const double tab[5] = {12.68, 14.30, 16.41, 18.57, 20.90};
         const Cal cal0{};
         const Rc rc0{};
-        DraftPolicy c(8);
+        DraftPolicy c(8), live(8);   // `live` has no table: a held table must decide exactly like it
         c.set_fixed_costs(tab, 5, 0);
         c.start_calibration(false, Real{}, cal0, rc0);
-        check(c.calibrating() && !c.calib_dirty(), "calib: on after a table is fixed, nothing collected");
-        for (int i = 0; i < 15; ++i) c.observe(false, 3, 2, 0, 16.70);
+        check(c.calibrating() && !c.calib_dirty() && c.table_held() && !c.fixed(), "calib: a table with uncalibrated sizes is held back: live costs, nothing collected yet");
+        bool same = true;
+        for (int i = 0; i < 15; ++i) {
+            const DraftPolicy::Pick pa = c.choose(i % 3 + 1, 5, 2), pb = live.choose(i % 3 + 1, 5, 2);
+            same = same && pa.lookup == pb.lookup && pa.t == pb.t && std::fabs(c.cost_ms(3) - live.cost_ms(3)) < 1e-12;
+            c.observe(false, 3, 2, 0, 16.70);
+            live.observe(false, 3, 2, 0, 16.70);
+        }
         CostFile cf;
         std::string rep;
+        check(same && std::fabs(c.cost_ms(3) - 16.70) < 1e-9 && std::fabs(c.cost_ms(4) - live.cost_ms(4)) < 1e-12,
+              "calib: while held back, picks and costs equal those of a policy without a table (the live cost follows the rounds)");
         check(c.calibrate(cf, rep) && rep.empty() && cf.cal[0][3].n == 15, "calib: 15 real rounds are kept, nothing replaced");
-        check(std::fabs(c.cost_ms(3) - 16.41) < 1e-9 && std::fabs(c.cost_ms(4) - 18.57) < 1e-9, "calib: under kCalibN rounds every cost stays the learned one");
         c.observe(false, 3, 2, 0, 16.70);
-        check(c.calibrate(cf, rep) && !rep.empty(), "calib: the 16th real round replaces the cost");
-        const double r3 = 16.70 / 16.41;
-        check(std::fabs(c.cost_ms(3) - 16.70) < 1e-9 && (cf.real[0] & 4u) && std::fabs(cf.real_cost[0][3] - 16.70) < 1e-9 && std::fabs(cf.tables[0][2] - 16.41) < 1e-9,
-              "calib: the size takes the mean, is marked real; the file keeps the learned cost beside it");
-        check(std::fabs(c.cost_ms(4) - 18.57 * r3) < 1e-6 && std::fabs(c.cost_ms(5) - 20.90 * r3) < 1e-6 && std::fabs(c.cost_ms(2) - 14.30 * r3) < 1e-6 && std::fabs(c.cost_ms(1) - 12.68) < 1e-9,
-              "calib: sizes not real yet (2 rows and more) are priced at learned x the real sizes' ratio, size 1 stays");
+        check(c.calibrate(cf, rep) && !rep.empty() && (cf.real[0] & 4u) && std::fabs(cf.real_cost[0][3] - 16.70) < 1e-9 && std::fabs(cf.tables[0][2] - 16.41) < 1e-9,
+              "calib: the 16th real round marks the size real; the file keeps the learned cost beside it");
+        check(c.table_held() && !c.fixed() && c.calibrating(), "calib: one real size is not enough: the table stays held back");
+        // the other four sizes get their 16 rounds: the table takes over at that request's end, at the real costs
+        const double rt[5] = {12.90, 14.60, 16.70, 19.90, 21.30};
+        for (int t = 1; t <= 5; ++t)
+            if (t != 3)
+                for (int i = 0; i < 16; ++i) c.observe(t == 4 || t == 5, t, 1, 0, rt[t - 1]);
+        check(c.calibrate(cf, rep) && c.fixed() && !c.table_held() && !c.calibrating(), "calib: with the last size calibrated the table is used");
+        check(std::fabs(c.cost_ms(1) - 12.90) < 1e-9 && std::fabs(c.cost_ms(3) - 16.70) < 1e-9 && std::fabs(c.cost_ms(4) - 19.90) < 1e-9 && std::fabs(c.cost_ms(5) - 21.30) < 1e-9,
+              "calib: the real costs decide");
         for (int i = 0; i < 40; ++i) c.observe(false, 3, 2, 0, 15.0);
         check(!c.calib_dirty() && std::fabs(c.cost_ms(3) - 16.70) < 1e-9, "calib: a real size never changes again");
         // a lookup size reached once per request: its rounds come across starts through the file
@@ -593,10 +605,21 @@ int main() {
         }
         check((cd.real[0] & 8u) != 0 && std::fabs(cd.real_cost[0][4] - 18.9) < 1e-9 && cd.cal[0][4].n == 0 && std::fabs(cd.tables[0][3] - 18.57) < 1e-9,
               "calib: 16 starts of one round each calibrate the size");
-        DraftPolicy again(8);   // a start from that file: size 4 real, the others provisional at 18.9 / 18.57
+        DraftPolicy again(8);   // a start from that file: size 4 real, the others not: the table is held back
         again.set_fixed_costs(tab, 5, 0);
         again.start_calibration(false, real1, cal1, rc1);
-        check(std::fabs(again.cost_ms(4) - 18.9) < 1e-9 && std::fabs(again.cost_ms(5) - 20.90 * 18.9 / 18.57) < 1e-6, "calib: a restart gives the same costs");
+        check(again.table_held() && !again.fixed() && again.calibrating(), "calib: a restart with sizes still uncalibrated keeps the table held back");
+        {   // a file with every size real: the table is used from the first round, at the real costs
+            Real all{};
+            all[0] = 31u;
+            Rc rcall = rc0;
+            for (int t = 1; t <= 5; ++t) rcall[0][(size_t) t] = tab[t - 1] * 1.03;
+            DraftPolicy u(8);
+            u.set_fixed_costs(tab, 5, 0);
+            u.start_calibration(false, all, cal0, rcall);
+            check(u.fixed() && !u.table_held() && !u.calibrating() && std::fabs(u.cost_ms(4) - 18.57 * 1.03) < 1e-9 && std::fabs(u.cost_ms(1) - 12.68 * 1.03) < 1e-9,
+                  "calib: a start from a fully calibrated file uses the table at the real costs");
+        }
         // the file round trip: state, real, real cost, cal
         CostFile w;
         w.key = "k2";
@@ -634,7 +657,7 @@ int main() {
         CostFile cg;
         std::string rg;
         g.calibrate(cg, rg);
-        check(rg.empty() && std::fabs(g.cost_ms(2) - 14.30) < 1e-9 && cg.cal[0][2].n == 0 && (cg.real[0] & 2u) == 0, "calib: rounds far above the learned cost are dropped");
+        check(rg.empty() && g.table_held() && cg.cal[0][2].n == 0 && (cg.real[0] & 2u) == 0, "calib: rounds far above the learned cost are dropped");
         // a size that real requests never reach, and a machine whose real sizes are all 1 row: nothing is scaled
         DraftPolicy h(8);
         h.set_fixed_costs(tab, 5, 0);
@@ -643,8 +666,7 @@ int main() {
         CostFile ch;
         std::string rh;
         h.calibrate(ch, rh);
-        check((ch.real[0] & 1u) != 0 && std::fabs(h.cost_ms(1) - 13.0) < 1e-9 && std::fabs(h.cost_ms(2) - 14.30) < 1e-9 && std::fabs(h.cost_ms(5) - 20.90) < 1e-9,
-              "calib: a real 1-row size scales nothing else");
+        check((ch.real[0] & 1u) != 0 && h.table_held() && !h.fixed(), "calib: one real size does not bring the table into use");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

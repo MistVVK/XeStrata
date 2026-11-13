@@ -228,11 +228,10 @@ public:
     /// the machine has a load-time effect), across starts through the table file (CostFile::cal).  At kCalibN rounds the size's cost becomes their mean
     /// (a result outside [kCalibOkLo, kCalibOkHi] x the learned cost means a disturbed stretch: the rounds are dropped and collected again) and the size
     /// is marked real (CostFile::real) for good: no later change, so the windows of a repeated start are the same.  A size that real requests never reach
-    /// keeps its learned cost, except for the provisional step below.  real, cal and real_cost come from the file (CostFile).
-    /// Provisional step: a size that is not real yet and has 2 or more rows is priced at its learned cost x the mean of (real cost / learned cost) over the
-    /// real sizes of 2 or more rows (when there are some), so a size that real requests reach rarely (the 4-row lookup: about one round per request) is not
-    /// left at a price that the sizes next to it have already left.  Scaling every size alike would change no choice (the policy compares costs with each
-    /// other); this changes the prices relative to each other, from the engine's own measurements, and only until the size has its own 16 rounds.
+    /// keeps its learned cost.  real, cal and real_cost come from the file (CostFile).
+    /// Until every size of the table is real the table is not used: the policy decides with live costs, exactly as without a table (a half-calibrated
+    /// table priced a JSON request 5 % slower than live costs), and only collects the real rounds; once the last size is calibrated the table
+    /// (the real costs) decides for good.
     static constexpr int kCalibN = 16;
     static constexpr double kCalibLo = 0.85, kCalibHi = 1.30, kCalibOkLo = 0.86, kCalibOkHi = 1.29;
     void start_calibration(bool state_effect, const std::array<unsigned, kCtxBuckets>& real,
@@ -240,6 +239,10 @@ public:
                            const std::array<std::array<double, kMaxT + 1>, kCtxBuckets>& real_cost);
     bool calibrating() const { return calib_on_; }
     bool calib_dirty() const { return calib_dirty_; }
+    /// While a loaded table still has sizes that are not calibrated (calibrating()), the table is held back: the policy decides with live costs
+    /// exactly as without a table (fixed() is false), and the real rounds are collected meanwhile.  Once the last size is calibrated (at a request's
+    /// end, calibrate()) the table takes over for good.  table_held() is true in that stretch.
+    bool table_held() const { return held_table_; }
     /// At a request's end: replaces the sizes that have kCalibN real rounds and puts the table, the real marks and the rounds collected so far into
     /// cf (its other fields stay); report says which sizes changed (empty when none).  True when cf should be written (something changed).
     bool calibrate(CostFile& cf, std::string& report);
@@ -296,8 +299,13 @@ private:
     std::array<unsigned, kCtxBuckets> real_{};
     std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets> cal_{};
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> learned_{}, real_cost_{};   // the table as fixed (learned); the cost of each real size
+    bool held_table_ = false;                              // a table is loaded but not used yet: live costs decide (see table_held())
+    bool live_saved_ = false;
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> live_cost_{}, live_n_{};   // the live costs as they were when the table was set
     void calib_add(int bucket, int t, double ms, double age);
-    void apply_provisional();
+    void apply_table();
+    void hold_table();       // back to the live costs (fixed_ off) for the buckets that have a table
+    void use_table();        // all sizes calibrated: the table (real costs) decides, fixed_ on
     int explore_size(int lookup_k, int pad_cap) const;                  // the size a learning stretch measures next, 0 = none (choose() counts it)
     int explore_next(int reach, int skip) const;                        // the smallest size 2..reach (not `skip`) that still needs rounds; counts it; 0 = none
     bool explore_ok() const;                                            // a forced round counts now (fresh phase, or no state effect)

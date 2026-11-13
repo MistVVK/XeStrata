@@ -407,7 +407,13 @@ DraftPolicy::DraftPolicy(int max_t, double margin)
 }
 
 void DraftPolicy::set_fixed_costs(const double* ms, int n, int bucket) {
+    if (!fixed_ && !live_saved_) {   // the live costs at this point: start_calibration() may hand them back
+        live_cost_ = cost_;
+        live_n_ = cost_n_;
+        live_saved_ = true;
+    }
     fixed_ = true;
+    held_table_ = false;
     held_.clear();
     if (ms == nullptr || n <= 0) return;
     bucket = std::clamp(bucket, 0, kCtxBuckets - 1);
@@ -639,22 +645,13 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
 
 // ---- calibration of a fixed table against real requests (see the header)
 
-void DraftPolicy::apply_provisional() {
+void DraftPolicy::apply_table() {
+    if (!fixed_) return;   // a held table: cost_ is the live cost, not touched
     for (int k = 0; k < kCtxBuckets; ++k) {
         const int n = fixed_n_[(size_t) k];
         if (n <= 0) continue;
-        double sum = 0.0;
-        int cnt = 0;
-        for (int t = 2; t <= n; ++t)
-            if ((real_[(size_t) k] >> (t - 1) & 1u) && learned_[(size_t) k][(size_t) t] > 0.0) {
-                sum += real_cost_[(size_t) k][(size_t) t] / learned_[(size_t) k][(size_t) t];
-                ++cnt;
-            }
-        const double r = cnt > 0 ? sum / cnt : 1.0;
-        for (int t = 1; t <= n; ++t) {
-            if (real_[(size_t) k] >> (t - 1) & 1u) cost_[(size_t) k][(size_t) t] = real_cost_[(size_t) k][(size_t) t];
-            else cost_[(size_t) k][(size_t) t] = learned_[(size_t) k][(size_t) t] * (t >= 2 ? r : 1.0);
-        }
+        for (int t = 1; t <= n; ++t)
+            cost_[(size_t) k][(size_t) t] = real_[(size_t) k] >> (t - 1) & 1u ? real_cost_[(size_t) k][(size_t) t] : learned_[(size_t) k][(size_t) t];
         for (int t = 2; t <= n; ++t)   // more rows never cost less
             if (cost_[(size_t) k][(size_t) t] < cost_[(size_t) k][(size_t) t - 1]) cost_[(size_t) k][(size_t) t] = cost_[(size_t) k][(size_t) t - 1];
     }
@@ -670,7 +667,7 @@ void DraftPolicy::start_calibration(bool state_effect, const std::array<unsigned
     for (int k = 0; k < kCtxBuckets; ++k)   // a mark without a cost (a damaged file) is no mark
         for (int t = 1; t <= kMaxT; ++t)
             if ((real_[(size_t) k] >> (t - 1) & 1u) && !(real_cost_[(size_t) k][(size_t) t] > 0.0)) real_[(size_t) k] &= ~(1u << (t - 1));
-    apply_provisional();
+    apply_table();
     calib_dirty_ = false;
     calib_on_ = false;
     for (int k = 0; k < kCtxBuckets; ++k) {
@@ -678,6 +675,35 @@ void DraftPolicy::start_calibration(bool state_effect, const std::array<unsigned
         for (int t = 1; t <= n; ++t)
             if (!(real_[(size_t) k] >> (t - 1) & 1u)) calib_on_ = true;
     }
+    if (calib_on_ && fixed_ && live_saved_) hold_table();   // not calibrated: live costs decide, as without a table
+}
+
+void DraftPolicy::hold_table() {
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        if (fixed_n_[(size_t) k] <= 0) continue;
+        cost_[(size_t) k] = live_cost_[(size_t) k];
+        cost_n_[(size_t) k] = live_n_[(size_t) k];
+    }
+    fixed_ = false;
+    held_table_ = true;
+    held_.clear();
+}
+
+void DraftPolicy::use_table() {
+    fixed_ = true;
+    apply_table();   // every size is real: its real cost
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        const int n = fixed_n_[(size_t) k];
+        if (n <= 0) continue;
+        for (int t = 1; t <= kMaxT; ++t) {
+            const bool in = t <= n && cost_[(size_t) k][(size_t) t] > 0.0;
+            if (!in) cost_[(size_t) k][(size_t) t] = 0.0;
+            cost_n_[(size_t) k][(size_t) t] = in ? 1e6 : 0.0;
+        }
+    }
+    fixed_ = true;
+    held_table_ = false;
+    held_.clear();
 }
 
 void DraftPolicy::calib_add(int bucket, int t, double ms, double age) {
@@ -715,16 +741,6 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
             a = CalAcc{};   // replaced, or disturbed (rounds dropped, collected again)
         }
     }
-    if (replaced) {
-        std::array<std::array<double, kMaxT + 1>, kCtxBuckets> before = cost_;
-        apply_provisional();
-        for (int k = 0; k < kCtxBuckets; ++k)
-            for (int t = 1; t <= fixed_n_[(size_t) k]; ++t)
-                if (!(real_[(size_t) k] >> (t - 1) & 1u) && std::fabs(cost_[(size_t) k][(size_t) t] - before[(size_t) k][(size_t) t]) > 0.005) {
-                    std::snprintf(b, sizeof b, "%s%d rows (not real yet) %.2f -> %.2f", report.empty() ? "" : ", ", t, before[(size_t) k][(size_t) t], cost_[(size_t) k][(size_t) t]);
-                    report += b;
-                }
-    }
     for (int k = 0; k < kCtxBuckets; ++k) {
         const int n = fixed_n_[(size_t) k];
         if (n <= 0) continue;
@@ -741,6 +757,7 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
     for (int k = 0; k < kCtxBuckets; ++k)
         for (int t = 1; t <= fixed_n_[(size_t) k]; ++t)
             if (!(real_[(size_t) k] >> (t - 1) & 1u)) calib_on_ = true;
+    if (held_table_ && !calib_on_) use_table();   // the last size is calibrated: the table decides from the next round on
     return changed || replaced;
 }
 

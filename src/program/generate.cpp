@@ -14579,8 +14579,13 @@ int main(int argc, char** argv) {
                     dc_pcie_pending = true;
                     extra += "; PCIe share: refined in this run, then stored";
                 }
-                std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s): the same request "
-                                     "gives the same tokens on every start\n", o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
+                if (dc_calib)
+                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is loaded (%s; window sizes %s%s), not used yet: the "
+                                         "windows follow live costs until every size is calibrated against real requests\n",
+                                 o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
+                else
+                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s): the same request "
+                                         "gives the same tokens on every start\n", o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
             } else {
                 policy.set_learning(true);
                 dc_learning = true;
@@ -20101,8 +20106,10 @@ int main(int argc, char** argv) {
                         std::snprintf(b, sizeof b, "; PCIe share %.2f", cf.pcie_frac);
                         t0 += b;
                     }
-                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is learned (%s); it is fixed from the next request "
-                                         "on%s%s\n", t0.c_str(), saved ? "" : " (not saved: ", saved ? "" : (why + "; the next start learns again)").c_str());
+                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is learned (%s); %s%s%s\n", t0.c_str(),
+                                 dc_calib ? "live costs decide until every size is calibrated against real requests, then it is fixed"
+                                          : "it is fixed from the next request on",
+                                 saved ? "" : " (not saved: ", saved ? "" : (why + "; the next start learns again)").c_str());
                 }
             }
             // --draft-costs, calibration: the real rounds of this request that the sizes still at their learned cost have collected; a size with
@@ -20118,6 +20125,9 @@ int main(int argc, char** argv) {
                                      saved ? "" : (" (not saved: " + why + ")").c_str());
                 }
                 dc_calib = policy.calibrating();
+                if (!dc_calib && policy.fixed())
+                    std::fprintf(stderr, "strata serve: draft costs: every size is calibrated; this machine's table decides the windows from the next "
+                                         "request on\n");
             }
             // --draft-costs with a table from before the stored PCIe share: once PcieAuto has settled (three readings, or it gave up), its
             // share goes into the file beside the table and is fixed from the next request; the next start loads it
