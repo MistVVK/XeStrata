@@ -110,6 +110,14 @@ constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_
               // CUDA opt-in (STRATA_PF_FUSED_TQ=1): the Gyro trellis types (agentionai's ids, cmake/strata_ggml_tq_overlay.cmake; the pinned
               // ggml.h has no enumerators for them): 128 weights a block, {fp16 d; qs}; Gyro-M TQ2_T, Gyro-S TQK6 gate/up + TQK7 down
               T_TQ2_T = 144, T_TQK6 = 145, T_TQK7 = 146;
+// Turing (sm_75, STRATA_PF_FUSED_SM75): the i-quant gate/up formats and the IQ4_NL down that have a set-up instance of native_kernel there, one bit each (DevInfo::t75_set; a down's bits are
+// 8 up).  The kernels are the same source as sm_80+'s (the Turing MMAs are m8n8k16, mma32 / mma16 below); the block gets 64 KB of shared memory there, so a format is set up only if its
+// instance fits (setup_ww), and its 64-row (WW 4) instance only if that fits too (t75_w4).  kT75Formats is the list of formats taken on Turing (a commit adds one format at a time).
+__host__ __device__ constexpr int t75_slot(int t) {
+    return t == T_IQ2_XXS ? 0 : t == T_IQ2_XS ? 1 : t == T_IQ2_S ? 2 : t == T_IQ3_XXS ? 3 : t == T_IQ3_S ? 4 : t == T_IQ4_XS ? 5 : t == T_IQ4_NL ? 6 : -1;
+}
+__host__ __device__ constexpr unsigned t75_bit(int t, bool gu) { return t75_slot(t) < 0 ? 0u : 1u << (t75_slot(t) + (gu ? 0 : 8)); }
+constexpr unsigned kT75Formats = t75_bit(T_IQ3_S, true) | t75_bit(T_IQ4_NL, false);
 // the trellis types: 128-value blocks (32 steps of 4 weights), two 32-value sub-blocks a 64-value stage
 __host__ __device__ constexpr bool is_tq(int t) { return t == T_TQ2_T || t == T_TQK6 || t == T_TQK7; }
 __host__ __device__ constexpr int tq_k(int t) { return t == T_TQK6 ? 6 : t == T_TQK7 ? 7 : 8; }
@@ -2154,6 +2162,7 @@ struct DevInfo {
     bool g1151 = false; // gfx1151 (Strix Halo): Q8_0 down layers on the F16 kernel by default (q8d_f16_default)
     bool w12 = false;   // gfx12 (RDNA4): the native kernels only - the Q2_0 pack's (moe_fused.cu) are not ported there
     bool t75 = false;   // Turing (STRATA_PF_FUSED_SM75): the Q2_0 / Q2_0 layers only (what was set up and checked there)
+    unsigned t75_set = 0, t75_w4 = 0;   // Turing: the i-quant gate/up and IQ4_NL down instances set up (t75_bit), and those whose 64-row (WW 4) instance fits 64 KB too
     bool q2n = false;   // sm_80+ with STRATA_PF_FUSED_Q2N=1: the native Q2_0 pack's Q2_0 gate/up is set up as well (opt-in)
     bool s120 = false;  // compute capability 12.0 (sm120_series.hpp): the default for the formats measured there
     bool s121 = false;  // GB10 (sm_121, DGX Spark): 128-row tiles win from 65,536 routed rows a launch up (pick_ww)
@@ -2230,6 +2239,11 @@ template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, native_kernel<T, GU, WW, NT, F16>) != cudaSuccess || fa.ptxVersion < 75) return false;
     const size_t sm = smem_bytes(T, WW, host_astages(), NT, F16, GU);
+    {   // the block's shared memory on the card as the code sees it (STRATA_EMULATE_CC=75 on a bigger card: 64 KB, so the Turing set-up does not accept what a real Turing card refuses)
+        int dev = 0, optin = 0;
+        cudaGetDevice(&dev);
+        if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) == cudaSuccess && sm > (size_t) strata::smem_optin_of(optin)) return false;
+    }
     if (cudaFuncSetAttribute(native_kernel<T, GU, WW, NT, F16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm) != cudaSuccess)
         return false;
     int o = 0;
@@ -2239,6 +2253,17 @@ template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup
     return true;
 }
 template <int T, bool GU> bool setup_one(int& occ) { return setup_ww<T, GU, 4>(occ) && setup_ww<T, GU, 2>(occ); }
+// Turing: one i-quant instance pair.  The 128-row (WW 2) instance must fit and be set up; the 64-row one (WW 4: 256 weight rows, about 6 KB more shared memory) only if it fits 64 KB too.
+// A format not in kT75Formats is left out.  A failed WW 2 set-up leaves occ as it was.
+template <int T, bool GU> void t75_setup(DevInfo& d, int& occ) {
+    if ((kT75Formats & t75_bit(T, GU)) == 0) return;
+    int o = occ;
+    if (!setup_ww<T, GU, 2>(o)) return;
+    int o4 = o;
+    if (setup_ww<T, GU, 4>(o4)) { d.t75_w4 |= t75_bit(T, GU); o = o4; }
+    occ = o;
+    d.t75_set |= t75_bit(T, GU);
+}
 // STRATA_PF_FUSED_NT=256 (sm_80+, opt-in): the 256-thread kernels (native_kernel's NT)
 // STRATA_PF_FUSED_F16=1 (sm_80+, opt-in, changes the output at rounding level): the NT = 256 kernels' F16 products
 bool f16c_requested() {
@@ -2356,6 +2381,13 @@ const DevInfo& dev_info() {
     if (major < 8) {   // Turing: the canonical Q2_0 pack's kernels (the codebook formats' do not fit 64 KB at 4 warps a row)
         d.t75 = true;
         d.ok = setup_one<T_Q2_0, true>(occ) && setup_one<T_Q2_0, false>(occ);
+        // the i-quant pairs (kT75Formats) on the same kernels, in a build that takes the Turing set (STRATA_PF_FUSED_SM75); STRATA_PF_FUSED_SM75_IQ=0 leaves them off (a diagnostic: the int8 dp4a kernels again)
+        static const bool iq_off = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM75_IQ"); return v != nullptr && v[0] == '0'; }();
+        if (d.ok && !iq_off) {
+            t75_setup<T_IQ2_XXS, true>(d, occ); t75_setup<T_IQ2_XS, true>(d, occ); t75_setup<T_IQ2_S, true>(d, occ);
+            t75_setup<T_IQ3_XXS, true>(d, occ); t75_setup<T_IQ3_S, true>(d, occ); t75_setup<T_IQ4_XS, true>(d, occ);
+            t75_setup<T_IQ4_NL, false>(d, occ);
+        }
         d.occ = d.ok ? occ : 1;
         cudaGetLastError();
         return d;
@@ -2586,6 +2618,21 @@ bool d_covered_on(int t, const DevInfo& d) {
     return d_covered(t);
 }
 
+#if !defined(__HIPCC__)
+// Turing: whether the pair has set-up kernels here - the canonical Q2_0 pair, or an i-quant gate/up of kT75Formats (t75_set) with an IQ4_NL (t75_set) or Q2_0 down
+bool t75_pair_ok(const DevInfo& d, int gu_type, int d_type) {
+    if (gu_type == T_Q2_0) return d_type == T_Q2_0;
+    if (t75_bit(gu_type, true) == 0 || (d.t75_set & t75_bit(gu_type, true)) == 0) return false;
+    return d_type == T_Q2_0 || (t75_bit(d_type, false) != 0 && (d.t75_set & t75_bit(d_type, false)) != 0);
+}
+// Turing: the instances a launch can run.  The 64-row (WW 4) instance of a format that did not fit 64 KB does not exist, so such a launch takes the 128-row one
+int t75_ww(const DevInfo& d, const NativeGeom& g, int ww) {
+    if (ww != 4) return ww;
+    const bool gu4 = g.gu_type == T_Q2_0 || (d.t75_w4 & t75_bit(g.gu_type, true)) != 0;
+    const bool d4 = g.d_type == T_Q2_0 || (d.t75_w4 & t75_bit(g.d_type, false)) != 0;
+    return gu4 && d4 ? 4 : 2;
+}
+#endif
 #if defined(__HIPCC__)
 int host_astages() { return ASTAGES; }   // (#2145 defines it for CUDA above; HIP keeps the one depth)
 #endif
@@ -2696,6 +2743,10 @@ int pick_ww(int64_t n, int n_expert, bool staged, bool wide, int kq) {
 // Every call site that launches `launch<...>` with a ww from pick_ww on a batch of blobs takes its ww from here.
 int launch_ww(const Batch& b, const NativeGeom& g, int64_t n, int n_expert, bool staged, bool wide, int kq = 0) {
 #if !defined(__HIPCC__)
+    {   // Turing has no staging kernels (no cp.async: ASTAGES_DEV 2), so the blob check does not apply; only the instances that fit 64 KB exist
+        const DevInfo& dv = dev_info();
+        if (dv.t75) return t75_ww(dv, g, pick_ww(n, n_expert, staged, wide, kq));
+    }
     if ((staged || sw_on(g.d_type, false)) && !staged_blobs_ok(b, g)) return strata::prefill::fused_tile::kUnstagedWw;
 #else
     (void) b;
@@ -2878,7 +2929,9 @@ bool native_supported(int gu_type, int d_type) {
     if (d.w12 && d_type == T_Q8_0 && !kq_on() && !q8d_hip_requested()) return false;
 #endif
     if (!d.ok || !d_covered_on(d_type, d)) return false;
-    if (d.t75 && (gu_type != T_Q2_0 || d_type != T_Q2_0)) return false;
+#if !defined(__HIPCC__)
+    if (d.t75 && !t75_pair_ok(d, gu_type, d_type)) return false;
+#endif
     if (env < 0) return d.w12;
     return requested() || d.w12;
 }
@@ -2912,7 +2965,12 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     g_dm16_used = false;
     if (b.e1 <= b.e0 || n <= 0) return;
     const DevInfo& d = dev_info();
-    if (!d.ok || !gu_covered(g.gu_type) || !d_covered_on(g.d_type, d)) {
+#if !defined(__HIPCC__)
+    const bool t75_missing = d.t75 && !t75_pair_ok(d, g.gu_type, g.d_type);   // (Turing: an instance that was not set up would fail to launch)
+#else
+    constexpr bool t75_missing = false;
+#endif
+    if (!d.ok || !gu_covered(g.gu_type) || !d_covered_on(g.d_type, d) || t75_missing) {
         std::fprintf(stderr, "prefill fused experts (native): types %d / %d are not covered here\n", g.gu_type, g.d_type);
         std::exit(1);
     }
