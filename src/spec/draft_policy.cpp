@@ -79,19 +79,45 @@ double median_of(std::vector<float> v) {
 
 static_assert(CostLearner::kMaxT == DraftPolicy::kMaxT && CostLearner::kCtxBuckets == DraftPolicy::kCtxBuckets, "one table shape");
 
-void CostLearner::add(int bucket, int t, double ms) {
+void CostLearner::add(int bucket, int t, double ms, double busy_age_s) {
     if (!(ms > 0.0) || !std::isfinite(ms)) return;
     bucket = std::clamp(bucket, 0, kCtxBuckets - 1);
     t = std::clamp(t, 1, kMaxT);
-    ++rounds_;
-    auto& v = s_[(size_t) bucket][(size_t) t];
+    const bool late = busy_age_s > kFreshS;   // a GPU that has been busy for long can run in another state than a request after a pause finds it
+    ++(late ? late_ : rounds_);
+    auto& v = (late ? late_s_ : s_)[(size_t) bucket][(size_t) t];
     if ((int) v.size() < kKeep) v.push_back((float) ms);
 }
 
 void CostLearner::reset() {
     for (auto& b : s_)
         for (auto& v : b) v.clear();
+    for (auto& b : late_s_)
+        for (auto& v : b) v.clear();
     rounds_ = 0;
+    late_ = 0;
+}
+
+bool CostLearner::state_effect(int bucket, int min_n) const {
+    if (bucket < 0 || bucket >= kCtxBuckets) return false;
+    const int need = std::max(1, min_n);
+    for (int t = 1; t <= kMaxT; ++t) {
+        const auto& f = s_[(size_t) bucket][(size_t) t];
+        const auto& l = late_s_[(size_t) bucket][(size_t) t];
+        if ((int) f.size() < need || (int) l.size() < need) continue;
+        const double tf = trimmed_mean(f), tl = trimmed_mean(l);
+        if (tf > 0.0 && std::fabs(tl - tf) / tf > kStateTol) return true;
+    }
+    return false;
+}
+
+std::array<std::vector<float>, CostLearner::kMaxT + 1> CostLearner::sets(int bucket, bool pooled) const {
+    std::array<std::vector<float>, kMaxT + 1> out;
+    for (int t = 1; t <= kMaxT; ++t) {
+        out[(size_t) t] = s_[(size_t) bucket][(size_t) t];
+        if (pooled) out[(size_t) t].insert(out[(size_t) t].end(), late_s_[(size_t) bucket][(size_t) t].begin(), late_s_[(size_t) bucket][(size_t) t].end());
+    }
+    return out;
 }
 
 int CostLearner::samples(int bucket, int t) const {
@@ -102,7 +128,7 @@ int CostLearner::samples(int bucket, int t) const {
 std::vector<double> CostLearner::table(int bucket, int min_n) const {
     std::vector<double> out;
     if (bucket < 0 || bucket >= kCtxBuckets) return out;
-    const auto& b = s_[(size_t) bucket];
+    const std::array<std::vector<float>, kMaxT + 1> b = sets(bucket, !state_effect(bucket, min_n));
     int top = 0;
     std::array<double, kMaxT + 1> got{};
     std::vector<int> seen;
@@ -125,24 +151,30 @@ std::vector<double> CostLearner::table(int bucket, int min_n) const {
             if (u > t && hi == 0) hi = u;
         }
         if (lo > 0 && hi > 0) out.push_back(got[(size_t) lo] + (got[(size_t) hi] - got[(size_t) lo]) * (t - lo) / (double) (hi - lo));
-        else {
-            const int u = hi > 0 ? hi : lo;
-            out.push_back(got[(size_t) u] * kShape[t] / kShape[u]);
-        }
+        else if (hi > 0) out.push_back(got[(size_t) hi] * kShape[t] / kShape[hi]);   // below every measured size: the prior shape
+        else if (seen.size() >= 2) {   // above them: the straight line through the two largest measured sizes (a size with a few samples is not trusted)
+            const int u2 = seen[seen.size() - 1], u1 = seen[seen.size() - 2];
+            const double slope = std::max(0.0, (got[(size_t) u2] - got[(size_t) u1]) / (double) (u2 - u1));
+            out.push_back(got[(size_t) u2] + slope * (t - u2));
+        } else out.push_back(got[(size_t) lo] * kShape[t] / kShape[lo]);
     }
+    for (size_t i = 1; i < out.size(); ++i) out[i] = std::max(out[i], out[i - 1]);   // more rows never cost less
     return out;
 }
 
 CostLearner::Verdict CostLearner::check(int64_t min_rounds, int min_n) const {
     Verdict v;
     char b[160];
-    bool any = false, every_bucket_ok = true;
+    bool any = false, every_bucket_ok = true, effect = false;
     for (int k = 0; k < kCtxBuckets; ++k) {
         bool has = false, measured = false;
         double prev_ms = 0.0;
         int prev_t = 0;
+        const bool eff = state_effect(k, min_n);
+        effect = effect || eff;
+        const std::array<std::vector<float>, kMaxT + 1> use = sets(k, !eff);
         for (int t = 1; t <= kMaxT; ++t) {
-            const auto& s = s_[(size_t) k][(size_t) t];
+            const auto& s = use[(size_t) t];
             has = has || !s.empty();
             if ((int) s.size() < std::max(1, min_n)) continue;
             measured = true;
@@ -175,14 +207,18 @@ CostLearner::Verdict CostLearner::check(int64_t min_rounds, int min_n) const {
         any = any || measured;
         if (has && !measured) every_bucket_ok = false;
     }
-    v.ready = rounds_ >= min_rounds && any && every_bucket_ok;
+    // no state effect: every round counts.  With one: the fresh rounds, or, for a stretch that never paused (one long burst keeps only its first kFreshS
+    // seconds), kFallbackFactor x the quota in rounds of any age when the fresh ones are at least 1 / kFallbackShare of the quota
+    const bool enough = effect ? (rounds_ >= min_rounds || (rounds_ + late_ >= kFallbackFactor * min_rounds && rounds_ * kFallbackShare >= min_rounds))
+                               : rounds_ + late_ >= min_rounds;
+    v.ready = enough && any && every_bucket_ok;
     return v;
 }
 
 // ---------------------------------------------------------------------------------------------------- the table file
 
 namespace {
-constexpr const char* kCostFileHead = "strata-draft-costs 1";
+constexpr const char* kCostFileHead = "strata-draft-costs 2";   // 2: learned from the rounds of the first seconds of a busy run; a version 1 file is learned again
 // the path as UTF-8 (the server passes it so); on Windows a plain std::string would be read in the ANSI code page
 std::filesystem::path utf8_path(const std::string& s) { return std::filesystem::path(std::u8string(s.begin(), s.end())); }
 std::string one_line(std::string s) {
@@ -439,7 +475,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
-    if (learning_ && round_ms > 0) learner_.add(bk_, t, round_ms);
+    if (learning_ && round_ms > 0) learner_.add(bk_, t, round_ms, busy_age_);
     if (round_ms > 0 && !fixed_) {
         round_ms = clamp_sample(t, round_ms);
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
@@ -476,7 +512,7 @@ void DraftPolicy::observe_committed(bool lookup, int t, int accepted, int match)
 }
 
 void DraftPolicy::defer_cost(int64_t end, int t, double round_ms) {
-    if (round_ms > 0 && (learning_ || !fixed_)) held_.push_back({end, bk_, std::clamp(t, 1, kMaxT), round_ms});
+    if (round_ms > 0 && (learning_ || !fixed_)) held_.push_back({end, bk_, std::clamp(t, 1, kMaxT), round_ms, busy_age_});
 }
 
 void DraftPolicy::apply_costs(int64_t committed) {
@@ -484,7 +520,7 @@ void DraftPolicy::apply_costs(int64_t committed) {
     const int bucket_now = bk_;
     for (; n < held_.size() && held_[n].end < committed; ++n) {
         const HeldCost& h = held_[n];
-        if (learning_) learner_.add(h.bucket, h.t, h.ms);
+        if (learning_) learner_.add(h.bucket, h.t, h.ms, h.age);
         if (fixed_) continue;
         bk_ = h.bucket;   // observe()'s update, in the bucket the round ran in
         const double ms = clamp_sample(h.t, h.ms);
@@ -584,7 +620,7 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
 
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
-    if (learning_ && round_ms > 0) learner_.add(bk_, t, round_ms);
+    if (learning_ && round_ms > 0) learner_.add(bk_, t, round_ms, busy_age_);
     if (round_ms > 0 && !fixed_) {
         round_ms = clamp_sample(t, round_ms);
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples

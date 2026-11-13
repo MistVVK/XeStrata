@@ -14549,6 +14549,10 @@ int main(int argc, char** argv) {
         constexpr int kDraftCostMinN = 20;           // a window size needs this many rounds to be measured (fewer: filled in)
         std::string dc_key;
         bool dc_learning = false;
+        // how long the engine has been busy: the learner keeps only the rounds of the first seconds of a busy run (CostLearner::kFreshS); a busy run
+        // starts at a request that begins CostLearner::kIdleS or more after the last one ended (the GPU runs slower and steeper after a long load)
+        Clock::time_point dc_busy_since = Clock::now(), dc_last_end = Clock::now();
+        bool dc_seen_request = false;
         bool dc_pcie_pending = false;    // a loaded table without a PCIe share: written into it once PcieAuto has settled
         strata::spec::CostFile dc_file;  // that table, as loaded
         if (!o.draft_costs.empty() && !policy.fixed()) {
@@ -16269,7 +16273,14 @@ int main(int argc, char** argv) {
                 continue;
             }
             const bool geni = line.rfind("GENI ", 0) == 0;
-            if (geni || line.rfind("GEN ", 0) == 0) refresh_file_tier();
+            if (geni || line.rfind("GEN ", 0) == 0) {
+                refresh_file_tier();
+                if (dc_learning) {   // the request's arrival, before its prompt is read: a pause since the last one ended starts a new busy run
+                    const Clock::time_point dc_now = Clock::now();
+                    if (!dc_seen_request || std::chrono::duration<double>(dc_now - dc_last_end).count() >= strata::spec::CostLearner::kIdleS) dc_busy_since = dc_now;
+                    dc_seen_request = true;
+                }
+            }
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
@@ -19975,6 +19986,7 @@ int main(int argc, char** argv) {
                     tr_k = 0;
                 }
                 if (spec_cost && use_mtp && timed_round && !from_sfx) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
+                if (dc_learning) policy.set_busy_age(std::chrono::duration<double>(Clock::now() - dc_busy_since).count());
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
@@ -19991,6 +20003,7 @@ int main(int argc, char** argv) {
             if (hold_on && std::strcmp(finish, "length") == 0 && produced_n >= req_hold_n && (produced_n < max_new || admit_slot >= 0)) finish = "hold";
             if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            dc_last_end = Clock::now();   // the busy run goes on when the next request starts within CostLearner::kIdleS of this
             if (use_df2 && o.draft_auto && bandit_key != 0 && produced_n >= 48 && decode_ms > 0.0) {
                 DraftBandit& b = bandit[bandit_key];
                 const int w = req_df2 ? 1 : 0;

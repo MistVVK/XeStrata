@@ -8,6 +8,7 @@
 //   5. the policy never proposes a window beyond its cap.
 #include "strata/spec/draft_policy.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -280,6 +281,89 @@ int main() {
               "learning on: observe, observe_chain and held times are collected");
     }
     {
+        // The fixture of the Mac lane's fresh learning run (M5 Max, Q2_0, 30 requests of 256 tokens): sample counts and mean round ms per window size.
+        // 4 rows had 2 samples: its value comes from its neighbours, not from the two samples.
+        using strata::spec::CostLearner;
+        const auto fill = [](CostLearner& L, int t, int n, double ms, double age) {   // n samples around ms (+-1 %, mean ms)
+            for (int i = 0; i < n; ++i) L.add(0, t, ms * (1.0 + 0.005 * ((i % 5) - 2)), age);
+        };
+        CostLearner M;
+        fill(M, 1, 1193, 13.50, 2.0); fill(M, 2, 894, 15.74, 2.0); fill(M, 3, 1834, 18.40, 2.0); fill(M, 4, 2, 22.62, 2.0); fill(M, 5, 83, 24.95, 2.0);
+        const std::vector<double> t = M.table(0, 20);
+        check(t.size() == 5 && std::fabs(t[0] - 13.50) < 0.05 && std::fabs(t[2] - 18.40) < 0.05 && std::fabs(t[4] - 24.95) < 0.05, "fit: the well-sampled sizes are their trimmed means");
+        check(t.size() == 5 && std::fabs(t[3] - (18.40 + 24.95) / 2.0) < 0.05, "fit: 4 rows (2 samples) lie between its neighbours, not at its own 22.62");
+        check(M.rounds() == 4006 && M.late_rounds() == 0, "fit: all 4,006 rounds of the fixture were fresh");
+        // a size above the measured ones (5 rows with 8 samples): the straight line through the two largest measured sizes
+        CostLearner E;
+        fill(E, 1, 600, 12.5, 2.0); fill(E, 2, 400, 14.2, 2.0); fill(E, 3, 700, 16.2, 2.0); fill(E, 5, 8, 99.0, 2.0);
+        const std::vector<double> e = E.table(0, 20);
+        check(e.size() == 5 && std::fabs(e[3] - (16.2 + 2.0)) < 0.05 && std::fabs(e[4] - (16.2 + 4.0)) < 0.05,
+              "fit: 4 and 5 rows above the measured sizes continue the line through 2 and 3 rows (8 samples of 5 rows are not trusted)");
+        bool mono = true;
+        for (size_t i = 1; i < e.size(); ++i) mono &= e[i] >= e[i - 1];
+        CostLearner Dn;                                                       // a size measured cheaper than the one before it (noise): the table does not fall
+        fill(Dn, 1, 100, 20.0, 2.0); fill(Dn, 2, 100, 19.0, 2.0); fill(Dn, 3, 100, 25.0, 2.0);
+        const std::vector<double> d = Dn.table(0, 20);
+        mono &= d.size() == 3 && d[1] >= d[0] && d[2] >= d[1];
+        check(mono, "fit: the table never falls from one size to the next");
+        // busy age: a fast state for the first seconds of a run, a slow and steeper one later; only the first is kept
+        CostLearner B;
+        for (int i = 0; i < 1400; ++i) {
+            B.add(0, 1, 12.5, 4.0); B.add(0, 2, 14.2, 4.0); B.add(0, 3, 16.2, 4.0);               // fresh (the first seconds of a run)
+            B.add(0, 1, 14.5, 60.0); B.add(0, 2, 17.1, 60.0); B.add(0, 3, 20.2, 60.0);            // the same machine after a minute of load
+            if (i % 25 == 0) { B.add(0, 5, 21.3, 4.0); B.add(0, 5, 27.7, 60.0); }
+        }
+        const std::vector<double> b = B.table(0, 20);
+        check(B.rounds() == 4200 + 56 && B.late_rounds() == 4200 + 56, "busy age: late rounds are counted and not kept");
+        check(b.size() == 5 && std::fabs(b[2] - 16.2) < 0.05 && std::fabs(b[4] / b[2] - 21.3 / 16.2) < 0.01,
+              "busy age: the table is the fast state (5 rows against 3 rows 1.31, not 1.37 of the late rounds)");
+        CostLearner U;                                                        // an age that is not known counts as fresh
+        U.add(0, 3, 16.0);
+        check(U.rounds() == 1 && U.late_rounds() == 0, "busy age: an unknown age (none given) is kept");
+        // readiness: a stretch that never paused ends with its first seconds after 3 x the quota; one that is mid-way is not ready
+        CostLearner Bur;
+        for (int i = 0; i < 300; ++i) { Bur.add(0, 1, 12.5, 2.0); Bur.add(0, 2, 14.2, 2.0); Bur.add(0, 3, 16.2, 2.0); }    // 900 fresh rounds
+        check(!Bur.check(1000, 20).ready, "ready: 900 fresh rounds and nothing else is not ready");
+        for (int i = 0; i < 700; ++i) Bur.add(0, 3, 20.2, 90.0);
+        check(!Bur.check(1000, 20).ready, "ready: late rounds below 3 x the quota do not end a short stretch");
+        CostLearner Bur2;                                                     // one long burst: 330 fresh rounds, then 2,700 late ones
+        for (int i = 0; i < 110; ++i) { Bur2.add(0, 1, 12.5, 2.0); Bur2.add(0, 2, 14.2, 2.0); Bur2.add(0, 3, 16.2, 2.0); }
+        for (int i = 0; i < 2000; ++i) Bur2.add(0, 3, 20.2, 90.0);
+        check(!Bur2.check(1000, 20).ready, "ready: 330 fresh + 2,000 late rounds (under 3 x the quota) is not ready");
+        for (int i = 0; i < 700; ++i) Bur2.add(0, 3, 20.2, 90.0);
+        const CostLearner::Verdict bv = Bur2.check(1000, 20);
+        const std::vector<double> bt = Bur2.table(0, 20);
+        check(bv.ready && !bv.disturbed && bt.size() == 3 && std::fabs(bt[2] - 16.2) < 0.05,
+              "ready: one burst that never paused ends after 3 x the quota, with the table of its first seconds");
+        CostLearner Few;                                                      // 150 fresh rounds only: not enough even after a very long burst
+        for (int i = 0; i < 50; ++i) { Few.add(0, 1, 12.5, 2.0); Few.add(0, 2, 14.2, 2.0); Few.add(0, 3, 16.2, 2.0); }
+        for (int i = 0; i < 5000; ++i) Few.add(0, 3, 20.2, 90.0);
+        check(!Few.check(1000, 20).ready, "ready: under a fifth of the quota kept is never ready");
+        // a machine without a state effect (the Radeon 780M: 75.5 ms for one row early, 76.0 late; windows of 1, 3 and 6 rows): every round counts, the rare sizes
+        // get all their samples (3 rows: 8 fresh + 100 late)
+        CostLearner R;
+        fill(R, 1, 80, 75.5, 2.0); fill(R, 3, 8, 111.0, 2.0); fill(R, 6, 3, 178.0, 2.0);
+        fill(R, 1, 1200, 76.0, 40.0); fill(R, 3, 100, 111.2, 40.0); fill(R, 6, 14, 178.1, 40.0);
+        const std::vector<double> rt = R.table(0, 20);
+        check(!R.state_effect(0, 20), "pooled: 0.7 % between early and late rounds is no state effect");
+        check(rt.size() == 6 && std::fabs(rt[2] - 111.1) < 0.2 && std::fabs(rt[0] - 76.0) < 0.2, "pooled: the table uses every round (3 rows from 108 samples)");
+        check(R.check(1000, 20).ready, "pooled: ready after the quota of rounds of any age");
+        check(B.state_effect(0, 20), "state effect: 16 % between early and late rounds is one");
+        // the policy hands the age to the learner, and a held (gated) time keeps the age it had
+        DraftPolicy pa(6);
+        pa.set_learning(true);
+        pa.set_busy_age(30.0);
+        pa.observe(false, 3, 1, 0, 20.0);
+        pa.set_busy_age(2.0);
+        pa.observe(false, 3, 1, 0, 16.0);
+        check(pa.learner().rounds() == 1 && pa.learner().late_rounds() == 1 && pa.learner().samples(0, 3) == 1, "policy: a round is kept by the busy age it ran at");
+        pa.set_busy_age(40.0);
+        pa.defer_cost(5, 3, 21.0);
+        pa.set_busy_age(1.0);
+        pa.apply_costs(100);
+        check(pa.learner().rounds() == 1 && pa.learner().late_rounds() == 2, "policy: a held time keeps the busy age of its round");
+    }
+    {
         // The table file: a round trip, another key, a cut-short file, a missing file, a folder that does not exist yet.
         namespace fs = std::filesystem;
         using strata::spec::CostFile;
@@ -298,9 +382,9 @@ int main() {
               "file: read back with its key, every bucket as written");
         check(!strata::spec::read_cost_file(path, "card B|engine 1|model m spec 6", r, why) && !why.empty(), "file: another key is not loaded");
         check(!strata::spec::read_cost_file((dir / "none.costs").string(), c.key, r, why), "file: a missing file is not loaded");
-        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18"; }
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 2\nkey x\nbucket 0 15.1,18"; }
         check(!strata::spec::read_cost_file(path, "x", r, why), "file: a cut-short file (no end line) is not loaded");
-        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,abc\nend\n"; }
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 2\nkey x\nbucket 0 15.1,abc\nend\n"; }
         check(!strata::spec::read_cost_file(path, "x", r, why), "file: a malformed table is not loaded");
         check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why), "file: a bad file is replaced whole");
         check(!fs::exists(fs::path(path + ".tmp"), ec), "file: no temporary file is left");
@@ -308,21 +392,31 @@ int main() {
         c.cpu_share = 0.45;
         check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why) && r.cpu_share == 0.45,
               "file: the CPU prompt share is stored and read back with the table");
-        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\nshare 1.7\nend\n"; }
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 2\nkey x\nbucket 0 15.1,18\nshare 1.7\nend\n"; }
         check(!strata::spec::read_cost_file(path, "x", r, why), "file: a share outside 0..1 is not loaded");
         // the decode PCIe share PcieAuto settled on (repeatable output): stored and read back; a file written before it has none, and
         // still loads (the engine then refines the share as before and writes it)
-        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\nshare 0.900\nend\n"; }
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 2\nkey x\nbucket 0 15.1,18\nshare 0.900\nend\n"; }
         check(strata::spec::read_cost_file(path, "x", r, why) && r.cpu_share == 0.9 && r.pcie_frac < 0.0,
               "file: a file from before the PCIe share loads, with no PCIe share");
         c.pcie_frac = 0.15;
         check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why) && r.pcie_frac == 0.15 &&
                   r.cpu_share == 0.45 && r.tables[0].size() == 4,
               "file: the PCIe share is stored and read back with the table and the prompt share");
-        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\npcie -0.2\nend\n"; }
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 2\nkey x\nbucket 0 15.1,18\npcie -0.2\nend\n"; }
         check(!strata::spec::read_cost_file(path, "x", r, why), "file: a PCIe share outside 0..1 is not loaded");
-        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\npcie 0.15x\nend\n"; }
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 2\nkey x\nbucket 0 15.1,18\npcie 0.15x\nend\n"; }
         check(!strata::spec::read_cost_file(path, "x", r, why), "file: a malformed PCIe share is not loaded");
+        // version 1 (learned from every round, so from the slow state of a long burst): not loaded, learned again
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\nend\n"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why) && why.find("format") != std::string::npos, "file: a version 1 table is not loaded (learned again)");
+        // a start closed in the middle of learning leaves no table: nothing is written before the stretch is ready, and a half-written temporary file
+        // (the process died while writing) is never read as the table
+        fs::remove(fs::path(path), ec);
+        { std::ofstream f(path + ".tmp", std::ios::binary | std::ios::trunc); f << "strata-draft-costs 2\nkey x\nbucket 0 15.1,18"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why), "file: a half-written temporary file beside a missing table is not a table");
+        check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why) && !fs::exists(fs::path(path + ".tmp"), ec),
+              "file: the next write replaces the leftover temporary file and the table loads");
         fs::remove_all(dir, ec);
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
