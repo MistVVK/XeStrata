@@ -815,8 +815,7 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 void qsa_attention(const float* q, const strata::kernels::QsaAttnPools& pools, const int32_t* ids,
                    const int32_t* steps, int64_t cap, const strata::kernels::QsaShapes& shapes,
                    float* scratch, float* out, int64_t n, int64_t batch, bool rotate, gpu::Stream stream) {
-    static const bool old_attn = strata::env_get("PROMPT_ATTN_OLD") != nullptr;
-    if (old_attn || !strata::kernels::flash_attn_select(q, pools, ids, steps, cap, shapes, out, n, stream))
+    if (!strata::kernels::flash_attn_select(q, pools, ids, steps, cap, shapes, out, n, stream))
         for (int64_t t = 0; t < n; t += batch) {
             const int64_t nb = std::min(batch, n - t);
             strata::kernels::qsa_decode_attn_batch(q + t * ZV, pools, ids + t * cap,
