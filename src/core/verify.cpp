@@ -422,6 +422,9 @@ Verifier::~Verifier() {
     if (dc_arena_) strata::gpu::free(dc_arena_);
     if (h_commitd_) strata::gpu::free(h_commitd_);
     if (logit_bias_device_) strata::gpu::free(logit_bias_device_);
+    for (float* b : slot_bias_dev_)
+        if (b != nullptr) strata::gpu::free(b);
+    if (slot_hist_d_) strata::gpu::free(slot_hist_d_);
     if (allowed_device_) strata::gpu::free(allowed_device_);
     if (rp_lambda_d_) strata::gpu::free(rp_lambda_d_);
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
@@ -466,6 +469,30 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     }
     logit_bias_host_ = bias;
     sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
+    return true;
+}
+
+bool Verifier::set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) {
+    if (next_ && !next_->set_slot_logit_bias(slot, bias, err)) return false;
+    if (le_ < g_->n_layers) return true;          // only the stage with the head draws the rows
+    if (slot < 0 || slot >= (int) slot_bias_dev_.size()) return true;
+    if (bias.empty()) {   // its array stays for the slot's next bias; only this row's pointer is cleared
+        slot_sp_[(size_t) slot].logit_bias = nullptr;
+        return true;
+    }
+    if (bias.size() != (size_t) n_vocab_) { err = "logit_bias vocabulary size mismatch"; return false; }
+    const OnDevice on_device(device_);
+    float*& dev = slot_bias_dev_[(size_t) slot];
+    const size_t bytes = bias.size() * sizeof(float);
+    if (dev == nullptr && !strata::gpu::alloc_device(&dev, bytes)) {
+        err = "cannot allocate the slot's logit_bias";
+        return false;
+    }
+    if (!strata::gpu::copy(dev, bias.data(), bytes)) {   // its own array: a request's bias is its row's alone
+        err = "cannot upload the slot's logit_bias";
+        return false;
+    }
+    slot_sp_[(size_t) slot].logit_bias = dev;
     return true;
 }
 
@@ -2007,6 +2034,8 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     tail_snap_b_ = reinterpret_cast<float*>(static_cast<uint8_t*>(arena_b_) + a);
     slots_ = slots;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
+    slot_bias_dev_.assign(slots.size(), nullptr);
+    slot_tail_.assign(slots.size(), {});
     std::fprintf(stderr, "xestrata verify: batch windows of up to %lld sequences\n", (long long) S);
     return true;
 }
@@ -2645,19 +2674,61 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     return 1;
 }
 
-// A batch window's rows sampled outside the graph: a sampled slot's, and with a grammar's masks set (set_allowed: a
-// slot with a grammar, the engine's batch_step) every row, each with its own row of the masks - the graph's argmax
-// knows no mask, and a slot without a grammar has a row that allows every token.
+// A batch window's rows sampled outside the graph: a sampled slot's, a penalised one's (its reply tail and the
+// tokens this window fed to it, `slot_penalty_rows`), one whose request has a logit bias of its own
+// (set_slot_logit_bias), and with a grammar's masks set (set_allowed: a slot with a grammar, the engine's
+// batch_step) every row, each with its own row of the masks - the graph's argmax knows no mask, and a slot without a
+// grammar has a row that allows every token.  A plain greedy slot with none of these keeps the window's argmax
+// token, untouched.  Every row is drawn as a solo window draws it: Philox(seed, position), its own parameters.
 bool Verifier::sample_rows(int S, std::string& err) {
+    const auto penalised = [](const strata::kernels::SamplerParams& sp) {
+        return sp.penalty_last_n > 0 &&
+               (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f);
+    };
     bool any = false;
     const size_t words = (size_t) ((n_vocab_ + 31) / 32);
+    // the penalty-history rows of this window, built once: the widest of its windows is every row's stride, and a
+    // row counts only its own penalty_last_n of it
+    int h = 0;
+    for (int t = 0; t < S; ++t) {
+        const strata::kernels::SamplerParams& sp = slot_sp_[(size_t) last_rows_[t]];
+        if (penalised(sp)) h = std::max(h, std::min(sp.penalty_last_n, strata::kernels::kPenaltyWindowCap));
+    }
+    if (h > 0) {
+        std::vector<const int32_t*> tails(slots_.size(), nullptr);
+        std::vector<int64_t> n_tails(slots_.size(), 0);
+        for (size_t b = 0; b < slots_.size() && b < slot_tail_.size(); ++b) {
+            tails[b] = slot_tail_[b].data();
+            n_tails[b] = (int64_t) slot_tail_[b].size();
+        }
+        std::vector<int32_t> hrows((size_t) S * (size_t) h, -1);
+        strata::kernels::slot_penalty_rows(last_rows_, last_tokens_, S, tails.data(), n_tails.data(), h, hrows.data());
+        const OnDevice on_hist(device_);
+        const size_t need = (size_t) S * (size_t) h;
+        if (slot_hist_cap_ < need) {
+            if (slot_hist_d_ != nullptr) strata::gpu::free(slot_hist_d_);
+            slot_hist_d_ = nullptr;
+            if (!strata::gpu::alloc_device(&slot_hist_d_, need * sizeof(int32_t))) {
+                err = "verify batch: the penalty history's allocation failed";
+                return false;
+            }
+            slot_hist_cap_ = need;
+        }
+        if (!strata::gpu::copy(slot_hist_d_, hrows.data(), need * sizeof(int32_t))) {
+            err = "verify batch: the penalty history's upload failed";
+            return false;
+        }
+    }
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (!allowed_on_ && (sp.greedy || sp.temperature <= 0.0f)) continue;
+        const bool pen = h > 0 && penalised(sp);
+        const bool bias = sp.logit_bias != nullptr;
+        if (!allowed_on_ && !bias && !pen && (sp.greedy || sp.temperature <= 0.0f)) continue;
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        sp.penalty_last_n = 0;
+        if (!pen) sp.penalty_last_n = 0;          // no history handed to this row: no window to count
         sp.allowed = allowed_on_ ? allowed_device_ + (size_t) t * words : nullptr;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
+        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
+                                       pen ? slot_hist_d_ + (size_t) t * (size_t) h : nullptr, pen ? h : 0, sp,
                                        m_out_ + t, cs_);
         any = true;
     }
@@ -3138,6 +3209,14 @@ bool InProcessStage::wait_commit(std::string& err) { return next_->wait_commit(e
 void InProcessStage::set_sampling(const strata::kernels::SamplerParams& sp) { next_->set_sampling(sp); }
 void InProcessStage::set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
     next_->set_slot_sampling(slot, sp);
+}
+
+void InProcessStage::set_slot_history(int slot, const int32_t* tail, int64_t n) {
+    next_->set_slot_history(slot, tail, n);
+}
+
+bool InProcessStage::set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) {
+    return next_->set_slot_logit_bias(slot, bias, err);
 }
 void InProcessStage::set_head_sampling(bool on) { next_->set_head_sampling(on); }
 bool InProcessStage::set_logit_bias(const std::vector<float>& bias, std::string& err) {

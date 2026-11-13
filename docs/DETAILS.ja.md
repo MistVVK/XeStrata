@@ -1092,7 +1092,7 @@ print(r.choices[0].message.content)
   setup は、対話で動かした最初の 1 回と `--setup` のときに、使うかを尋ねて `settings.json` に書きます（`--script-guard ja|en|ko|zh-cn|zh-tw|off` で尋ねずに決められます）。勧める答えは、システムの言語が日本語なら `ja`、韓国語なら `ko`、中国語なら `zh-cn`（台湾・香港は `zh-tw`）、ベトナム語なら `off`、それ以外は `en` です。
   XeStrata の計測（`xestrata --setup --bench`、`tools/` の計測の道具、リリースと upstream の追従の比べ）は、どの要求にも `"script_guard": "off"` を付けるので、この設定に左右されません。
   Web のチャット設定では、最初は表示言語が日本語なら「日本語」、韓国語なら「韓国語」、中国語なら「中国語（簡体）」、それ以外なら「英語など（CJKV 以外）」が選ばれています。止める字の言語で書かせるときはオフにします。
-  logit_bias を受け付けないエンジン（古いエンジン、`"parallel"` のバッチの枠）では効かず、server のウィンドウにそう 1 行出します。
+  logit_bias を受け付けないエンジン（古いエンジン）と、`"parallel"` のバッチの枠（この守りは 1 度に 1 つの要求の分しか持ちません）では効かず、server のウィンドウにそう 1 行出します。
   `GET /props` の `script_guard` が指定のない要求に効く値を、`/metrics` の `script_guard`（Prometheus では `strata:script_guard_*_total`）が効かせた要求、書き直した字、通した字の数を示します。
 - **1 つのトークンを繰り返す返答は打ち切ります**: 返答が同じトークンを 256 回続けたら、server はそこで `finish_reason` を `"length"` にして終え、ウィンドウにそう表示します。
   ループに入ったモデルや、1 つのトークンを出し続ける壊れた状態のためです（upstream の #606 では `!` が 36,689 個続きました）。

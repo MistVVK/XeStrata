@@ -597,6 +597,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::vector<int32_t> ids;      // the tokens its state holds
         std::vector<Checkpoint> checks;
         strata::kernels::SamplerParams sp;
+        int pen_n = 0;                 // its penalty window (0: none), so its rows get their own history
+        int64_t reply0 = 0;            // where its reply began in `ids` (the penalty window's start)
         Clock::time_point t0;
     };
     std::vector<BSlot> bs((size_t) model.batch_slot_count());
@@ -692,6 +694,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::fflush(stdout);
             return true;
         }
+        // each penalised slot's reply tail for its row's penalty window (set_slot_history): the tokens its session
+        // consumed since its reply began, the token this window feeds not in it yet
+        for (const size_t b : go) {
+            const BSlot& s = bs[b];
+            if (s.pen_n <= 0) continue;
+            const int64_t from = std::max<int64_t>(0, std::min<int64_t>(s.reply0, (int64_t) s.ids.size()));
+            model.set_slot_history((int) b, s.ids.data() + from, (int64_t) s.ids.size() - from);
+        }
         outs.resize(toks.size());
         if (!model.forward_slots(toks.data(), rows.data(), at.data(), sps.data(), (int) toks.size(), outs.data(), berr))
             return false;
@@ -772,6 +782,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 next_group = (g + 1) % groups;
             }
         }
+        if (enter != nullptr)   // the entering group's rows: their slots' reply tails (set_slot_history)
+            for (const int b : enter->slot) {
+                const BSlot& s = bs[(size_t) b];
+                if (s.pen_n <= 0) continue;
+                const int64_t from = std::max<int64_t>(0, std::min<int64_t>(s.reply0, (int64_t) s.ids.size()));
+                model.set_slot_history(b, s.ids.data() + from, (int64_t) s.ids.size() - from);
+            }
         if (enter != nullptr || !model.pipe_empty()) {
             strata::core::PlainModel::GroupWindow* done = nullptr;
             if (!model.pipe_tick(enter, done, berr)) return false;
@@ -1133,6 +1150,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         sp.greedy = true;
         sp.temperature = 0.0f;
         sp.top_p = 1.0f;
+        int64_t req_pen_from = -1;   // pen_from=N: the request continues one whose reply began at token N
         std::string emb_path;   // GENI: the embeddings file, the first word after the keys (the shared reader)
         {   // the sampling keys between max_new and the ids (strata/program/gen_keys.hpp, the two engines' one)
             strata::program::GenKeyFields kf;
@@ -1141,6 +1159,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             kf.penalty_repeat = &sp.penalty_repeat; kf.penalty_freq = &sp.penalty_freq;
             kf.penalty_present = &sp.penalty_present;
             kf.penalty_last_n = &sp.penalty_last_n; kf.penalty_last_n_clamp0 = true;
+            kf.pen_from = &req_pen_from;
             kf.ckpt_bool = &req_ckpt; kf.prefill = &req_prefill; kf.pin = &req_pin;
             kf.logprobs = &req_logprobs; kf.grammar = &req_grammar;
             kf.logit_bias = &req_bias_text; kf.logit_bias_present = &req_bias;
@@ -1254,7 +1273,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // in); XESTRATA_PENALTY_PROMPT=1 counts the prompt's last tokens too, unset is this build's default (see
         // sampler.hpp: the old window until the quality check passes)
         static const bool pen_prompt = strata::kernels::penalty_counts_prompt(strata::env_get("PENALTY_PROMPT"));
-        const size_t pen_from = strata::kernels::penalty_window_from(ids.empty() ? 0 : ids.size() - 1, pen_prompt);
+        size_t pen_from = strata::kernels::penalty_window_from(ids.empty() ? 0 : ids.size() - 1, pen_prompt);
+        // a request that continues an earlier leg (prompt + what it generated: solo -> batch slot, slot -> solo)
+        // names where its reply began, so the window keeps the earlier reply's tokens
+        if (req_pen_from >= 0 && !pen_prompt) pen_from = std::min<size_t>(pen_from, (size_t) req_pen_from);
         std::vector<float> lrow(req_logprobs >= 0 ? (size_t) V : 0);   // the logits the next pick comes from
         // before a pick after the window that reads `fed`
         auto constrain = [&](int32_t fed) -> bool {
@@ -1949,6 +1971,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
             // --batch-mtp: the MTP layer's cell at n too, where the request's first draft came from (spec_start)
             const bool first_draft = spec && model.batch_drafts() && !model.pending_drafts().empty();
+            // the slot's own logit bias before its session moves in: its batch rows read it, as this request's did
+            if (cont && !model.set_slot_logit_bias(admit_slot, bias, err)) {
+                std::fprintf(stderr, "xestrata (%s): batch slot %d: the logit_bias: %s\n", arch.c_str(), admit_slot,
+                             err.c_str());
+                err.clear();
+                cont = false;
+            }
             if (cont && !model.copy_session(-1, admit_slot, first_draft ? n + 1 : n, false, err)) {
                 std::fprintf(stderr, "xestrata (%s): batch admission failed: %s\n", arch.c_str(), err.c_str());
                 err.clear();
@@ -1967,6 +1996,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 sl.sp = sp;
                 sl.t0 = Clock::now();
                 sl.ids = live;
+                // its own penalties in the slot's windows (set_slot_history before each window): the reply tail from
+                // where the reply began, and pen_from when this leg continues an earlier one
+                sl.pen_n = penalties ? std::min(sp.penalty_last_n, strata::kernels::kPenaltyWindowCap) : 0;
+                sl.reply0 = (int64_t) strata::kernels::penalty_window_from(live.size() > 0 ? live.size() - 1 : 0,
+                                                                           pen_prompt);
+                if (req_pen_from >= 0 && !pen_prompt) sl.reply0 = std::min<int64_t>(sl.reply0, req_pen_from);
                 // the checkpoint at the prompt's turn (the next turn of the conversation goes on from it)
                 const Checkpoint* best = nullptr;
                 for (const Checkpoint& c : checks)

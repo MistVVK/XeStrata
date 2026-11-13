@@ -2643,6 +2643,45 @@ bool PlainModel::set_history(const int32_t* tokens, int n, std::string& err) {
     return true;
 }
 
+void PlainModel::set_slot_history(int slot, const int32_t* tail, int64_t n) {
+    PlainModel& t = tail();
+    if (slot < 0 || slot >= t.batch_slot_count()) return;
+    if ((int) t.slot_tail_.size() <= slot) t.slot_tail_.resize((size_t) slot + 1);
+    if (n > 0) t.slot_tail_[(size_t) slot].assign(tail, tail + n);
+    else t.slot_tail_[(size_t) slot].clear();
+}
+
+bool PlainModel::set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) {
+    PlainModel& t = tail();
+    if (slot < 0 || slot >= t.batch_slot_count()) return true;
+    if ((int) t.slot_bias_dev_.size() <= slot) {
+        t.slot_bias_dev_.resize((size_t) slot + 1, nullptr);
+        t.slot_bias_on_.resize((size_t) slot + 1, 0);
+    }
+    if (bias.empty()) {   // its array stays for the slot's next bias; only this request's rows stop reading it
+        t.slot_bias_on_[(size_t) slot] = 0;
+        return true;
+    }
+    if (cpu_ != nullptr) { err = "plain model: a slot's logit_bias needs a GPU"; return false; }
+    if (bias.size() != (size_t) t.n_vocab_) { err = "plain model: logit_bias vocabulary size mismatch"; return false; }
+    const OnDevice on(t.dev_);
+    float*& dev = t.slot_bias_dev_[(size_t) slot];
+    const size_t bytes = bias.size() * sizeof(float);
+    if (dev == nullptr) {
+        if (!strata::gpu::alloc_device(&dev, bytes)) {
+            err = "plain model: cannot allocate the slot's logit_bias";
+            return false;
+        }
+        t.allocs_.push_back(dev);
+    }
+    if (!strata::gpu::copy(dev, bias.data(), bytes)) {   // its own array: a request's bias is its row's alone
+        err = "plain model: cannot upload the slot's logit_bias";
+        return false;
+    }
+    t.slot_bias_on_[(size_t) slot] = 1;
+    return true;
+}
+
 void PlainModel::pick(const float* logits, int T, int64_t pos, int32_t* out, strata::gpu::Stream cs) const {
     k::SamplerParams sp = sampler_;
     sp.counter = (uint64_t) pos;   // row t's draw: position pos + t
@@ -3928,12 +3967,56 @@ bool PlainModel::stage_slots(const int32_t* tokens, const int* slot, const int64
     if (!(eager ? run_window(T, false, err)
                 : launch_serve(bexec_[set], bsegs_[set], moe_trunk_, moe_local_.data(), T, err)))
         return false;
-    if (last())
-        for (int t = 0; t < T; ++t) {   // each row with its request's sampling, its draw counted from its position
+    if (last()) {
+        // Each row with its request's sampling, its draw counted from its position; a penalised slot's row with its
+        // reply tail and this window's tokens of it (`slot_penalty_rows`: what a solo request's row holds), and a
+        // slot's own logit bias (set_slot_logit_bias).  A plain greedy row without them keeps the window's pick.
+        const auto penalised = [](const k::SamplerParams& p) {
+            return p.penalty_last_n > 0 &&
+                   (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f);
+        };
+        int h = 0;
+        for (int t = 0; t < T; ++t)
+            if (penalised(sp[t])) h = std::max(h, std::min(sp[t].penalty_last_n, k::kPenaltyWindowCap));
+        std::vector<int32_t> hrows;
+        if (h > 0) {
+            std::vector<const int32_t*> tails((size_t) batch_slot_count(), nullptr);
+            std::vector<int64_t> n_tails((size_t) batch_slot_count(), 0);
+            for (int b = 0; b < batch_slot_count() && b < (int) slot_tail_.size(); ++b) {
+                tails[(size_t) b] = slot_tail_[(size_t) b].data();
+                n_tails[(size_t) b] = (int64_t) slot_tail_[(size_t) b].size();
+            }
+            hrows.assign((size_t) T * (size_t) h, -1);
+            k::slot_penalty_rows(slot, tokens, T, tails.data(), n_tails.data(), h, hrows.data());
+            const size_t need = (size_t) T * (size_t) h;
+            if (slot_hist_cap_ < need) {   // its own buffer: the solo window's history keeps its own
+                int32_t* d = nullptr;
+                if (!strata::gpu::alloc_device(&d, need * 4)) {
+                    err = std::string("plain model: the slots' penalty history: ") + strata::gpu::last_error();
+                    return false;
+                }
+                allocs_.push_back(d);
+                slot_hist_dev_ = d;
+                slot_hist_cap_ = need;
+            }
+            if (!strata::gpu::copy(slot_hist_dev_, hrows.data(), need * 4)) {
+                err = std::string("plain model: the slots' penalty history: ") + strata::gpu::last_error();
+                return false;
+            }
+        }
+        for (int t = 0; t < T; ++t) {
             k::SamplerParams p = sp[t];
             p.counter = (uint64_t) pos[t];
-            k::sample_tokens(logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, p, m_out_ + t, cs_);
+            const int b = slot[t];
+            const bool pen = h > 0 && penalised(p);
+            const bool bias = b >= 0 && b < (int) slot_bias_on_.size() && slot_bias_on_[(size_t) b] != 0;
+            if (bias) p.logit_bias = slot_bias_dev_[(size_t) b];
+            if (!pen) p.penalty_last_n = 0;   // no history handed to this row: nothing for it to count
+            k::sample_tokens(logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
+                             pen ? slot_hist_dev_ + (size_t) t * (size_t) h : nullptr, pen ? h : 0, p, m_out_ + t,
+                             cs_);
         }
+    }
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("plain model: the batch window: ") + strata::gpu::last_error();
         return false;

@@ -368,6 +368,13 @@ public:
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
     bool set_allowed(const uint32_t* row, std::string& err);
     bool set_history(const int32_t* tokens, int n, std::string& err);
+    /// A BATCH slot's own reply tail for its penalty window and its own logit bias, as Qwen3.8-Flash-Next's verifier
+    /// has them (verify.hpp: set_slot_history, set_slot_logit_bias): the batch windows draw each row with its
+    /// request's penalties and bias, so a request reads the same tokens in a slot as alone.  The tail is the tokens
+    /// the slot's session consumed since its reply began (the sampler's penalty_last_n of them are counted), the
+    /// fed-back head not in it yet.  On the last stage, which picks.
+    void set_slot_history(int slot, const int32_t* tail, int64_t n);
+    bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err);
     /// A mask for each of a window's T rows, (n_vocab + 31) / 32 words each (null: any).
     bool set_allowed_rows(const uint32_t* rows, int T, std::string& err);
     /// What spec_step calls with each window (win[0] the pending token, then the drafts) before it reads it, to set
@@ -1213,6 +1220,12 @@ private:
     uint32_t* allowed_dev_ = nullptr;   ///< max_t rows of the same mask
     int32_t* hist_dev_ = nullptr;       ///< max_t rows of hist_len_ tokens
     int hist_len_ = 0, hist_cap_ = 0;
+    // the batch slots' own (set_slot_history, set_slot_logit_bias): per slot its reply tail and its bias array
+    std::vector<std::vector<int32_t>> slot_tail_;
+    std::vector<float*> slot_bias_dev_;   ///< per slot: its bias array on the device (kept for the slot's next one)
+    std::vector<char> slot_bias_on_;      ///< ... and whether the slot's current request has a bias
+    int32_t* slot_hist_dev_ = nullptr;    ///< the batch window's slots' penalty-history rows (device)
+    size_t slot_hist_cap_ = 0;            ///< ... how many int32 fit; grows to the widest window
     bool bias_on_ = false, allowed_on_ = false;
     std::function<bool(const int32_t*, int, std::string&)> window_masks_;   ///< set_window_masks
     double req_spec_min_p_ = -1.0;

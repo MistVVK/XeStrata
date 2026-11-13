@@ -31,6 +31,8 @@ struct GenKeyFields {
     float* penalty_present = nullptr;
     int* penalty_last_n = nullptr;
     bool penalty_last_n_clamp0 = false;   ///< plain: max(0, v); generate takes v as it is
+    int64_t* pen_from = nullptr;          ///< the request continues one whose reply began at token N (its penalty
+                                          ///< window starts there; a solo -> batch slot or slot -> solo leg)
     // the request
     int* ckpt_int = nullptr;              ///< generate's int
     bool* ckpt_bool = nullptr;            ///< plain's bool
@@ -82,6 +84,7 @@ inline void parse_gen_keys(char*& endp, const GenKeyFields& f, bool geni = false
             else if (key == "penalty_repeat" && f.penalty_repeat) *f.penalty_repeat = std::strtof(v, nullptr);
             else if (key == "penalty_freq" && f.penalty_freq) *f.penalty_freq = std::strtof(v, nullptr);
             else if (key == "penalty_present" && f.penalty_present) *f.penalty_present = std::strtof(v, nullptr);
+            else if (key == "pen_from" && f.pen_from) *f.pen_from = std::strtoll(v, nullptr, 10);
             else if (key == "penalty_last_n" && f.penalty_last_n)
                 *f.penalty_last_n = f.penalty_last_n_clamp0 ? std::max(0, (int) std::strtol(v, nullptr, 10))
                                                             : (int) std::strtol(v, nullptr, 10);

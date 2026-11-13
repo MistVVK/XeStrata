@@ -247,6 +247,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(penalty_window_test src/kernels/penalty_window_test.cpp)
   target_include_directories(penalty_window_test PRIVATE include)
   add_test(NAME penalty_window_test COMMAND penalty_window_test)
+  # --batch slots keep their request's penalties and logit bias: the per-row histories of a batch window (upstream
+  # 2678c9732); header-only, no GPU
+  add_executable(slot_history_test src/kernels/slot_history_test.cpp)
+  target_include_directories(slot_history_test PRIVATE include)
+  add_test(NAME slot_history_test COMMAND slot_history_test)
   # upstream b89bf5947: an engine started at Low disk priority goes back to Normal (Windows; else it skips)
   add_executable(io_priority_test tests/platform/io_priority_test.cpp)
   target_link_libraries(io_priority_test PRIVATE strata_platform)
