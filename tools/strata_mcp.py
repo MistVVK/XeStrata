@@ -301,7 +301,7 @@ def spawn_detached(cmd: list, cwd: Path, log_path: Path, env: dict | None = None
 def run_quiet(cmd, timeout=30) -> str:
     """A command's stdout ('' when it is missing or fails)."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
                               stdin=subprocess.DEVNULL).stdout or ""
     except (OSError, subprocess.SubprocessError, ValueError):
         return ""

@@ -1593,7 +1593,7 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
         return r
     r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
                        stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
-                       text=True)
+                       text=True, errors="replace")
     env = dict(os.environ if env is None else env)
     envvars.put_default(env, "EXIT_WITH_PARENT", "1")   # mtp_fetch.py ends with setup (upstream #3257)
     if check and r.returncode != 0:
@@ -1624,7 +1624,7 @@ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
 
 def out(cmd):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=60).stdout
     except (OSError, subprocess.TimeoutExpired):
         return ""
 
@@ -1853,7 +1853,8 @@ def nvidia_smi() -> dict:
         return {}
     try:
         r = subprocess.run([exe, "--query-gpu=pci.bus_id,name,memory.total,compute_cap",
-                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=60)
+                           "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                           errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return {}
     found = {}
@@ -1960,7 +1961,7 @@ def rocm_lib_dirs() -> list:
     libamdhip64 (a distribution's, or a ROCm that installs an ld.so.conf); ROCm 7.14's packages install none, and the
     SYCL runtime's HIP adapter then did not load (no GPU listed) until its lib/ was on LD_LIBRARY_PATH."""
     try:
-        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
+        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace").stdout
     except OSError:
         cached = ""
     if "libamdhip64.so" in cached:
@@ -2175,7 +2176,7 @@ def pkg_installed(name: str) -> bool:
            ["pacman", "-T", name] if family == "arch" else
            ["dpkg-query", "-W", "-f", "${db:Status-Abbrev}", name])
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     except OSError:
         return True                                    # no package manager to ask: nothing is said
     return r.returncode == 0 and (family in ("fedora", "arch") or r.stdout.startswith("ii"))
@@ -2199,7 +2200,7 @@ def amd_libs_loadable() -> bool:
     own packages (the Podman image's ROCm, container/install.sh) are not the distribution's that BUILD.json's runtime
     names."""
     try:
-        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
+        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace").stdout
     except OSError:
         return False
     return all(f"{lib}.so" in cached for lib in ("libamdhip64", "librocblas", "libhipblaslt"))
@@ -2248,7 +2249,7 @@ def igc_version() -> str | None:
     if WIN:
         return None
     try:
-        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace", timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     for line in out.splitlines():
@@ -2267,7 +2268,7 @@ def level_zero_build() -> int | None:
     if WIN:
         return None
     try:
-        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace", timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     for line in out.splitlines():
@@ -2618,8 +2619,8 @@ def cuda_major(root: str) -> int | None:
         pass
     nvcc = Path(root) / "bin" / "nvcc"
     try:
-        out = subprocess.run([str(nvcc) if nvcc.exists() else "nvcc", "--version"], capture_output=True, text=True,
-                             timeout=30).stdout
+        out = subprocess.run([str(nvcc) if nvcc.exists() else "nvcc", "--version"], capture_output=True,
+                             text=True, errors="replace", timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.search(r"release (\d+)\.", out)
@@ -2767,7 +2768,8 @@ def rocm_missing() -> list:
     clang_ok = False
     for cxx in [str(c) for r in roots for c in (r / "llvm/bin/clang++", r / "lib/llvm/bin/clang++") if c.exists()] + \
             glob.glob("/usr/lib64/rocm/llvm/bin/clang++") + glob.glob("/usr/lib/llvm-*/bin/clang++"):
-        r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True, text=True)
+        r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True,
+                           text=True, errors="replace")
         clang_ok = clang_ok or (r.returncode == 0 and Path(r.stdout.strip()).is_file())
     # in the order of PACKAGES' AMD part
     have = [any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
@@ -3051,7 +3053,7 @@ CMAKE_MIN = (3, 24)                    # CMakeLists.txt: cmake_minimum_required(
 def _tool_version(path, name):
     """(ok, version tuple) of `path --version`: ok False when it does not run (a pip launcher whose Python is gone)."""
     try:
-        done = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+        done = subprocess.run([path, "--version"], capture_output=True, text=True, errors="replace", timeout=30)
     except (OSError, subprocess.SubprocessError):
         return False, ()
     if done.returncode != 0:
@@ -4538,7 +4540,7 @@ def engine_tool(*args: str) -> str:
     """xestrata-device's output for `args` (--list-devices, --cpu): where setup has no sysfs or /proc to read (Windows),
     the engine reports the GPUs and the CPU itself."""
     exe = packaged_engine_dir() / ("xestrata-device.exe" if WIN else "xestrata-device")
-    r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=120)
+    r = subprocess.run([str(exe), *args], capture_output=True, text=True, errors="replace", timeout=120)
     if r.returncode != 0:
         raise subprocess.SubprocessError((r.stderr or r.stdout).strip() or f"{exe.name} {' '.join(args)} failed")
     return r.stdout
@@ -4583,7 +4585,7 @@ def mkl_root() -> str | None:
 
 
 def compiler_version(cxx, env) -> str:
-    r = subprocess.run([str(cxx), "--version"], capture_output=True, text=True, env=env)
+    r = subprocess.run([str(cxx), "--version"], capture_output=True, text=True, errors="replace", env=env)
     lines = [x.strip() for x in r.stdout.splitlines()] or ["?"]
     # dpclang's first line ends "build based on:", the clang version is on the next
     return f"{lines[0]} {lines[1]}" if lines[0].endswith(":") and len(lines) > 1 else lines[0]
@@ -4602,7 +4604,7 @@ def new_enough(comp: dict) -> bool:
     """Whether the compiler is intel/llvm 7 or later: its SYCL runtime is libsycl 9 (the distribution's dpclang++ 6.2
     has libsycl 8, and gives the Arc Pro B70 no XMX)."""
     r = subprocess.run([comp["cxx"], "-fsycl", "-dM", "-E", "-x", "c++", "-"], input="#include <sycl/sycl.hpp>\n",
-                       capture_output=True, text=True, env=comp["env"])
+                       capture_output=True, text=True, errors="replace", env=comp["env"])
     m = re.search(r"#define __LIBSYCL_MAJOR_VERSION (\d+)", r.stdout)
     return m is not None and int(m.group(1)) >= 9
 
@@ -4668,11 +4670,11 @@ def probe_gpu(comp: dict, pci: str | None) -> dict | None:
     with tempfile.TemporaryDirectory() as d:
         exe = Path(d) / "xmx_probe"
         r = subprocess.run([comp["cxx"], "-fsycl", str(ROOT / "tools" / "xmx_probe.cpp"), "-o", str(exe)],
-                           capture_output=True, text=True, env=comp["env"])
+                           capture_output=True, text=True, errors="replace", env=comp["env"])
         if r.returncode != 0:
             warn(f"{Path(comp['cxx']).name} could not build the XMX probe: {(r.stderr or r.stdout).strip()[-300:]}")
             return None
-        r = subprocess.run([str(exe)], capture_output=True, text=True, env=comp["env"], timeout=120)
+        r = subprocess.run([str(exe)], capture_output=True, text=True, errors="replace", env=comp["env"], timeout=120)
     seen = {}
     for line in r.stdout.splitlines():
         f = dict(x.split("=", 1) for x in line.split(" name=")[0].split() if "=" in x)
@@ -6985,7 +6987,7 @@ def mtp_corrupt(mtp: Path, env=None) -> bool:
     if not (mtp / "tensors").is_dir():
         return False
     r = subprocess.run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "verify", "--out", str(mtp)], env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     return r.returncode == 3
 
 
@@ -7148,7 +7150,7 @@ def dotnet_has(kind: str) -> bool:
         return False
     try:
         listed = subprocess.run([dotnet, "--list-runtimes" if kind == "runtime" else "--list-sdks"],
-                                capture_output=True, text=True, timeout=30).stdout
+                                capture_output=True, text=True, errors="replace", timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return False
     pattern = r"^Microsoft\.NETCore\.App (\d+)\." if kind == "runtime" else r"^(\d+)\."
