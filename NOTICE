@@ -85,6 +85,10 @@ Every copyright holder whose work is in this repository, its license and where t
   after YASAKANI's smp_hash.cuh (kh_mix, kh_gumbel) and q35_sample.cu (its version-3 pick)
   (https://github.com/yasakani-dev/yasakani, 0.1.0 at 0205f06); that code stays under Apache-2.0, the files as a
   whole are under the LGPL (LGPL-3.0-or-later AND MIT AND Apache-2.0) - LICENSES/Apache-2.0.txt
+  The SHEAD output head (include/strata/kernels/shead.hpp, src/kernels/xe/shead.cpp,
+  include/strata/core/shead.hpp, src/core/shead.cpp) is written after YASAKANI's q35_bdraft.cu and engine35.cpp.
+  It stays under Apache-2.0; these files as a whole are under the LGPL (LGPL-3.0-or-later AND Apache-2.0) -
+  LICENSES/Apache-2.0.txt.
 - Copyright (c) 2024 Sahand Ahmadian; Copyright (c) 2024 Jonseed
   MIT - the image engine's Detail Daemon (src/image/guidance.cpp, include/strata/image/guidance.hpp: its schedule, the
   sigma the model is asked at, their constants and the settings' defaults), written after
