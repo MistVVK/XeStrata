@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 the YASAKANI authors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT AND Apache-2.0
 // src/kernels/sampler_host.cpp - see include/strata/kernels/sampler_host.hpp.  The kernel's chain (src/kernels/xe/
 // sampler.cpp, sample_launch and pick_from_list) step for step, serially: the window is the history row's tail of
 // penalty_last_n ids, an id outside the vocabulary never counts; the top_k list is k argmaxes over the not-yet-taken
@@ -37,14 +38,19 @@ float philox_uniform(uint64_t seed, uint64_t counter) {
     return (float) (c0 >> 8) * (1.0f / 16777216.0f);   // 24 bits: uniform in [0,1), never 1.0
 }
 
-double gumbel_exp(uint64_t seed, uint64_t counter, uint32_t token) {
-    uint64_t z = seed ^ (counter * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) token * 0xD1B54A32D192ED03ull);
+// The Gumbel noise, the kernel's `gumbel_noise`: YASAKANI's smp_hash.cuh `kh_gumbel`, a Gumbel draw hashed from
+// (seed, position, token id).  The kernel makes it only for the top kGumbelK of a row's survivors.
+uint64_t kh_mix(uint64_t z) {
     z += 0x9E3779B97F4A7C15ull;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    z ^= z >> 31;
-    const double u = ((double) (z >> 11) + 0.5) * (1.0 / 9007199254740992.0);   // (0, 1), never 0 or 1
-    return -std::log(u);
+    return z ^ (z >> 31);
+}
+
+double gumbel_noise(uint64_t seed, uint64_t counter, uint32_t token) {
+    const uint64_t h = kh_mix(kh_mix(kh_mix(seed) ^ counter) ^ ((uint64_t) token * 0xD6E8FEB86659FD93ull));
+    const double u = ((double) (h >> 11) + 0.5) * (1.0 / 9007199254740992.0);   // (0, 1), never 0 or 1
+    return -std::log(-std::log(u));
 }
 
 float apply_penalties(float logit, int count, const SamplerParams& p) {
@@ -79,23 +85,26 @@ int pick_from_list(const int* sel_ids, const float* sel_logit, int k, const Samp
             if (sel_logit[i] < thresh) { n_keep = i; break; }
     }
     n_keep = std::max(n_keep, 1);   // the first entry is never cut (its own logit is the threshold's base)
+    // a Gumbel pick draws over the top kGumbelK of the survivors only, as the kernel's
+    const int nb = pp.gumbel && n_keep > kGumbelK ? kGumbelK : n_keep;
     auto scaled = [&](int i) { return sel_logit[i] * inv_t; };
     float smx = scaled(0);
-    for (int i = 1; i < n_keep; ++i) smx = std::fmax(smx, scaled(i));
+    for (int i = 1; i < nb; ++i) smx = std::fmax(smx, scaled(i));
     D sum = 0;
-    for (int i = 0; i < n_keep; ++i) sum += std::exp((D) scaled(i) - (D) smx);
-    int pick = sel_ids[n_keep - 1];
+    if (!pp.gumbel)
+        for (int i = 0; i < nb; ++i) sum += std::exp((D) scaled(i) - (D) smx);
+    int pick = sel_ids[nb - 1];
     if (pp.gumbel) {
-        D best = -1;
-        for (int i = 0; i < n_keep; ++i) {
-            const D r = std::exp((D) scaled(i) - (D) smx) / sum / gumbel_exp(pp.seed, pp.counter + (uint64_t) t,
-                                                                               (uint32_t) sel_ids[i]);
-            if (r > best) { best = r; pick = sel_ids[i]; }
+        D best = -std::numeric_limits<D>::infinity();
+        for (int i = 0; i < nb; ++i) {
+            const D g = (D) scaled(i) - (D) smx + gumbel_noise(pp.seed, pp.counter + (uint64_t) t,
+                                                               (uint32_t) sel_ids[i]);
+            if (g > best) { best = g; pick = sel_ids[i]; }
         }
     } else {
         const float u = philox_uniform(pp.seed, pp.counter + (uint64_t) t);
         D cum = 0;
-        for (int i = 0; i < n_keep; ++i) {
+        for (int i = 0; i < nb; ++i) {
             cum += std::exp((D) scaled(i) - (D) smx) / sum;
             if ((D) u < cum) { pick = sel_ids[i]; break; }
         }
