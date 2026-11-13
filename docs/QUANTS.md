@@ -162,9 +162,9 @@ budget mode (A4000, 1,500 GPU slots), for +4-10% decode in RAM and +26-67% in th
 `STRATA_ROUTE_TAIL_SKIP=0` in a config's `"env"` turns it off.
 
 **The hyper-connections on NVIDIA:** the pack's `--compat-bf16` copy of the Q8_0 HC projections rounds them to BF16
-(and doubles their bytes). `STRATA_HC_Q8=1` reads the file's own Q8_0 instead (on AMD gfx12 it is the default): on the
+(and doubles their bytes). On NVIDIA the engine reads the file's own Q8_0 by default for files that carry them as Q8_0 (the Unsloth UD files); `STRATA_HC_Q8=0` restores the BF16 read. On the
 A4000 UD-Q4_K_XL then comes closer to Q8_0 (yardstick KL 0.0562 -> 0.0526, p99 0.925 -> 0.716) and to the same file on
-AMD (KL 0.038 -> 0.033). Opt-in until decided.
+AMD (KL 0.038 -> 0.033).
 
 ## Images
 
