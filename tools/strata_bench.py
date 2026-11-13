@@ -37,6 +37,7 @@ it. `--compare <older results folder>` prints the two side by side.  Standard li
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import getpass
 import json
@@ -715,6 +716,39 @@ def without_profile_save(cfg: dict) -> tuple[dict, bool]:
     return ({**cfg, "args": out} if removed else cfg), removed
 
 
+@contextlib.contextmanager
+def term_is_interrupt():
+    """While a run owns a server it started, SIGTERM (and Ctrl+Break on Windows) end the run the way Ctrl+C does, so the
+    `finally` that stops the server runs.  Without this a plain `kill` (a service stop, a script's timeout) ended only
+    this tool and left the server and the engine holding the port and the GPU.  Main thread only; the earlier handlers
+    come back afterwards."""
+    import signal
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(signum, frame):
+        raise KeyboardInterrupt
+
+    saved = []
+    for name in ("SIGTERM", "SIGBREAK"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        try:
+            saved.append((number, signal.signal(number, handler)))
+        except (ValueError, OSError):
+            pass
+    try:
+        yield
+    finally:
+        for number, old in saved:
+            try:
+                signal.signal(number, old)
+            except (ValueError, OSError, TypeError):
+                pass
+
+
 def start_server(cfg_path: Path, port: int, gpu: str | None, log_path: Path):
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
@@ -1038,64 +1072,66 @@ def main(argv=None) -> int:
     red = redactor(key=key)
     started = False
     try:
-        if is_strata(base, key):
-            say(f"Using the XeStrata server already running at {base}.")
-        elif a.url:
-            print(f"No XeStrata server answers at {base}.", file=sys.stderr)
-            return 2
-        else:
-            if try_json(base, "/health", key, 3) is not None:
-                print(f"Port {port} is used by something that is not XeStrata: pass --port N.", file=sys.stderr)
+        with term_is_interrupt():
+            if is_strata(base, key):
+                say(f"Using the XeStrata server already running at {base}.")
+            elif a.url:
+                print(f"No XeStrata server answers at {base}.", file=sys.stderr)
                 return 2
-            assert cfg_path is not None
-            log_path = Path(tempfile.gettempdir()) / f"xestrata-bench-{os.getpid()}.log"
-            say(f"Starting {cfg_path.name} on port {port} (loading takes 1-3 minutes; the PC may be slow "
-                "meanwhile) ...")
-            proc = start_server(cfg_path, port, a.gpu, log_path)
-            started = True
-            if not wait_ready(base, key, proc, a.ready_timeout, say):
-                tail = (log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
-                        if log_path.exists() else [])
-                print("The server did not become ready. Last log lines:\n" + red("\n".join(tail)), file=sys.stderr)
-                return 1
-        t0 = time.time()
-        pre = collect_machine(base, key, cfg, a.gpu)
-        suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients,
-                      want_long=a.long)
-        slots = pre.get("parallel_slots") or 1
-        if a.clients and a.clients > slots:
-            say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly "
-                "wait their turn.")
-        say("Running the suite (about 3-10 minutes) ...")
-        out = suite.run()
-        machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
-        if not machine.get("gpu"):
-            machine["gpu"] = pre.get("gpu")
-        res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
-               "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long,
-                          "started_server": started,
-                          "command": "python tools/strata_bench.py" + "".join(
-                              f" {x}" for x in (f"--clients {a.clients}" if a.clients else "",
-                                                "--long" if a.long else "", "--think" if a.think else "",
-                                                f"--runs {a.runs}" if a.runs != 3 else "") if x)},
-               "elapsed_s": time.time() - t0, "machine": machine, "results": out}
-        parent = Path(a.out) if a.out else ROOT / "bench" / "XeStrataBenchResults"
-        d = write_results(res, parent, red, log_excerpt(log_path) if log_path else [])
-        say("\nResults (median, range over the runs):")
-        say(red(short_table(res)))
-        if out["failures"] or out["skipped"]:
-            say(f"  ({len(out['failures'])} failed request(s), {len(out['skipped'])} skipped test(s): see the report)")
-        if a.compare:
-            say("\nCompared with " + a.compare + ":")
-            say(red(compare_table(load_results(Path(a.compare)), redact_obj(res, lambda s: s))))
-        try:
-            shown = d.relative_to(ROOT)
-        except ValueError:
-            shown = d
-        say(f"\nReport: {shown / 'README.md'}\nIt is in upstream Strata's community report format "
-            f"(its docs/COMMUNITY_BENCHMARKS.md). Home folders, user and host names and IP addresses are already "
-            f"replaced; read it once before you share it.")
-        return 1 if out["failures"] and not any(out[k] for k in ("chat", "prompts", "agent")) else 0
+            else:
+                if try_json(base, "/health", key, 3) is not None:
+                    print(f"Port {port} is used by something that is not XeStrata: pass --port N.", file=sys.stderr)
+                    return 2
+                assert cfg_path is not None
+                log_path = Path(tempfile.gettempdir()) / f"xestrata-bench-{os.getpid()}.log"
+                say(f"Starting {cfg_path.name} on port {port} (loading takes 1-3 minutes; the PC may be slow "
+                    "meanwhile) ...")
+                proc = start_server(cfg_path, port, a.gpu, log_path)
+                started = True
+                if not wait_ready(base, key, proc, a.ready_timeout, say):
+                    tail = (log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
+                            if log_path.exists() else [])
+                    print("The server did not become ready. Last log lines:\n" + red("\n".join(tail)), file=sys.stderr)
+                    return 1
+            t0 = time.time()
+            pre = collect_machine(base, key, cfg, a.gpu)
+            suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients,
+                          want_long=a.long)
+            slots = pre.get("parallel_slots") or 1
+            if a.clients and a.clients > slots:
+                say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly "
+                    "wait their turn.")
+            say("Running the suite (about 3-10 minutes) ...")
+            out = suite.run()
+            machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
+            if not machine.get("gpu"):
+                machine["gpu"] = pre.get("gpu")
+            res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
+                   "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long,
+                              "started_server": started,
+                              "command": "python tools/strata_bench.py" + "".join(
+                                  f" {x}" for x in (f"--clients {a.clients}" if a.clients else "",
+                                                    "--long" if a.long else "", "--think" if a.think else "",
+                                                    f"--runs {a.runs}" if a.runs != 3 else "") if x)},
+                   "elapsed_s": time.time() - t0, "machine": machine, "results": out}
+            parent = Path(a.out) if a.out else ROOT / "bench" / "XeStrataBenchResults"
+            d = write_results(res, parent, red, log_excerpt(log_path) if log_path else [])
+            say("\nResults (median, range over the runs):")
+            say(red(short_table(res)))
+            if out["failures"] or out["skipped"]:
+                say(f"  ({len(out['failures'])} failed request(s), {len(out['skipped'])} skipped test(s): "
+                    "see the report)")
+            if a.compare:
+                say("\nCompared with " + a.compare + ":")
+                say(red(compare_table(load_results(Path(a.compare)), redact_obj(res, lambda s: s))))
+            try:
+                shown = d.relative_to(ROOT)
+            except ValueError:
+                shown = d
+            say(f"\nReport: {shown / 'README.md'}\nIt is in upstream Strata's community report format "
+                f"(its docs/COMMUNITY_BENCHMARKS.md). Home folders, user and host names and IP addresses are already "
+                f"replaced; read it once before you share it.")
+            return 1 if out["failures"] and not any(out[k] for k in ("chat", "prompts", "agent")) else 0
     finally:
         if started:
             stop_server(proc)

@@ -115,6 +115,35 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
 
 
+class TermTests(unittest.TestCase):
+    """upstream d73ce8608: SIGTERM ends a run like Ctrl+C, so the `finally` that stops the server this tool started
+    runs; without it a plain `kill` left the server and the engine holding the port and the GPU."""
+
+    def test_sigterm_becomes_an_interrupt_and_the_old_handler_comes_back(self):
+        import signal
+        before = signal.getsignal(signal.SIGTERM)
+        with self.assertRaises(KeyboardInterrupt):
+            with B.term_is_interrupt():
+                self.assertNotEqual(signal.getsignal(signal.SIGTERM), before)
+                os.kill(os.getpid(), signal.SIGTERM)
+                for _ in range(1000):
+                    pass                                        # the signal is delivered to the next bytecode
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    def test_another_thread_is_left_alone(self):
+        import signal
+        before = signal.getsignal(signal.SIGTERM)
+        seen = []
+
+        def run():
+            with B.term_is_interrupt():
+                seen.append(signal.getsignal(signal.SIGTERM))
+        t = threading.Thread(target=run)
+        t.start()
+        t.join()
+        self.assertEqual(seen, [before])
+
+
 class SuiteTests(unittest.TestCase):
     def setUp(self):
         self.srv = FakeStrata()
