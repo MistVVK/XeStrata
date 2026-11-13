@@ -528,6 +528,58 @@ inline void row_dot_canon_gen(const uint8_t* row, int nblocks, const int8_t* con
     }
 }
 
+// The fixed-point canonical rows (canon_math.hpp's fx_*; iq_kernels.cpp's seg_dot_canon and iq_mmq.cpp's FX bodies take
+// the same steps): IQ3_XXS.  A block's eight 32-value units' (2 ls + 1)-weighted integer sums added first, as above,
+// then that sum times the block's integer scale (the activation's and the block's d at the row's exponent) added in
+// int64; the row's value from its sum.  Every addition is exact, so no order is the GPU's to follow.
+template <int TY> constexpr bool canon_fx() { return TY == 18 || TY == 118; }
+template <int TY> constexpr int fx_k_log2() {
+    return Fmt32<TY>::K == 0.125f ? -3 : Fmt32<TY>::K == 0.25f ? -2 : Fmt32<TY>::K == 0.5f ? -1 : 0;
+}
+// the activations' blocks a row of these rows takes at most (canon_layer: n_embd's values within kNativeActBytes)
+constexpr int kFxBlocks = 32;
+
+STRATA_ROWS_FN inline int32_t hsum_i32(__m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+    return _mm_cvtsi128_si32(s);
+}
+
+// xp[t][i]: token t's block i's scale as fx parts, topa[t] its largest exponent
+template <int TY, int NT> STRATA_ROWS_FN
+inline void row_dot_canon_fx(const uint8_t* row, int nblocks, const int8_t* const* xq,
+                             const canon::FxPart (*xp)[kFxBlocks], const int* topa, float* res) {
+    const int pf = prefetch_distance();
+    int topw = canon::kFxNone;
+    for (int i = 0; i < nblocks; ++i) {
+        const int e = canon::fx_exp(h2f(u16(row + (size_t) i * Fmt32<TY>::bytes)));
+        topw = e > topw ? e : topw;
+    }
+    int64_t acc[NT];
+    for (int t = 0; t < NT; ++t) acc[t] = 0;
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * Fmt32<TY>::bytes;
+        rows_ahead(blk, pf);
+        __m256i acci[NT];
+        for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
+        for (int j = 0; j < 4; ++j)
+            for (int half = 0; half < 2; ++half) {
+                __m256i g, sgn, sc;
+                Fmt32<TY>::decode(blk, j, half, g, sgn, sc);
+                const int off = 256 * i + 64 * j + 32 * half;
+                for (int t = 0; t < NT; ++t) {
+                    const __m256i yv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq[t] + off));
+                    acci[t] = madd_add(acci[t], _mm256_maddubs_epi16(g, _mm256_sign_epi8(yv, sgn)), sc);
+                }
+            }
+        const canon::FxPart w = canon::fx_part(h2f(u16(blk)));
+        for (int t = 0; t < NT; ++t)
+            acc[t] += (int64_t) canon::fx_scale(xp[t][i], w, topa[t] + topw) * (int64_t) hsum_i32(acci[t]);
+    }
+    for (int t = 0; t < NT; ++t) res[t] = canon::fx_value(acc[t], topa[t] + topw, fx_k_log2<TY>());
+}
+
 template <int TY, int NT> STRATA_ROWS_FN
 inline void row_dot_canon(const uint8_t* row, int nblocks, const int8_t* const* xq, const float* const* xd,
                           float* res) {
@@ -539,6 +591,23 @@ template <int TY, int NT> STRATA_ROWS_FN
 void canon_rows(const uint8_t* w, size_t row_bytes, int n, const int8_t* const* xq, const float* const* xd,
                 float* const* out, int r0, int r1) {
     float res[NT];
+    if constexpr (canon_fx<TY>()) {   // the activations' parts once for every row
+        const int nb = n / QK_K;
+        canon::FxPart xp[NT][kFxBlocks];
+        int topa[NT];
+        for (int t = 0; t < NT; ++t) {
+            topa[t] = canon::kFxNone;
+            for (int i = 0; i < nb; ++i) {
+                xp[t][i] = canon::fx_part(xd[t][i]);
+                topa[t] = xp[t][i].e > topa[t] ? xp[t][i].e : topa[t];
+            }
+        }
+        for (int r = r0; r < r1; ++r) {
+            row_dot_canon_fx<TY, NT>(w + (size_t) r * row_bytes, nb, xq, xp, topa, res);
+            for (int t = 0; t < NT; ++t) out[t][r] = res[t];
+        }
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         row_dot_canon<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, xq, xd, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
