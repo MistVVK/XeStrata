@@ -1744,10 +1744,13 @@ class StrataEngine:
         return None
 
     def _apply_bdone(self, f: list[str]) -> None:
-        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
+        """BDONE counts the admission token too, but its clock starts after the admission's DONE: the slot time includes
+        the admission time and the token is not counted twice; a figure the engine never reported stays unknown."""
         if len(f) >= 5 and isinstance(self.last, dict):
-            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
-                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+            admission_ms = self.last.get("decode_ms")
+            self.last = {**self.last, "finish": f[3],
+                         "decode_ms": admission_ms + float(f[4]) if admission_ms is not None else None,
+                         "generated": int(f[2]) if f[2].isdigit() else None}
 
     def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine
@@ -1978,6 +1981,7 @@ class StrataEngine:
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         carry = {}
+        yielded_legs = []   # prompt reads that gave way before producing output (their figures are summed once)
         ok = yield from self._take_control(cancel, len(prompt), new=True)
         if not ok:
             return
@@ -1986,6 +1990,7 @@ class StrataEngine:
         slot, gen0, reserved = None, None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
+        admission_pending, admission_before = False, None   # the admission's DONE is partial until BADM 0 or BDONE
         yields, solo_again, refused = 0, 0, 0
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         try:
@@ -2040,6 +2045,7 @@ class StrataEngine:
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
                         raise EngineNonFinite("the engine's logits became non-finite (upstream Strata #879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
+                        yielded_legs.append(self.last)
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
                         with self.slot_cv:
@@ -2129,6 +2135,7 @@ class StrataEngine:
                         self.lp_lines = own_lp
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    admission_pending, admission_before = True, self.last
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
@@ -2169,6 +2176,7 @@ class StrataEngine:
                         slot = None
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
+                    admission_pending = cont
                     phase = "slot" if cont else "none"
                     while pending:
                         t = pending.pop(0)
@@ -2177,6 +2185,7 @@ class StrataEngine:
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (upstream Strata #879)")
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
+                        yielded_legs.append(self.last)
                         continue                            # gave way: again once the shorter request is in
                     break
                 self.ctl.release()
@@ -2216,6 +2225,7 @@ class StrataEngine:
                         phase = "none"
                         f = line.split()
                         self._apply_bdone(f)
+                        admission_pending = False
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
@@ -2254,6 +2264,8 @@ class StrataEngine:
                     self._drain_control("DONE", born=born)
                 elif phase == "admit":
                     line = self._drain_control("BADM", born=born)
+                    if line and line.startswith("BADM "):
+                        admission_pending = line.split()[2:3] == ["1"]
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
             except EngineDied:
@@ -2263,11 +2275,19 @@ class StrataEngine:
                 bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
                 if bd is not None:
                     self._apply_bdone(bd.split())
+                    admission_pending = False
                     bdone_in = True
+            ended_on_yield = bool(yielded_legs and self.last is yielded_legs[-1])
+            if admission_pending and isinstance(self.last, dict) and (self.last is not admission_before or carry):
+                # a background drain owns the rest: the admission's one token and time are not this request's totals
+                self.last = {**self.last, "generated": None, "decode_ms": None}
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
             if carry and isinstance(self.last, dict):
                 self.last = add_carry(carry, self.last)
+            earlier_reads = yielded_legs[:-1] if ended_on_yield else yielded_legs
+            if earlier_reads and isinstance(self.last, dict):
+                self.last = prefill_leg_stats(earlier_reads, self.last, len(ids))
             if holding:
                 self.ctl.release()
             if admit_wait:
@@ -6389,8 +6409,9 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
 def carry_leg(carry: dict, leg: dict) -> None:
     """#1869: a request that decoded in a batch slot and went back to the solo path ends with the solo path's DONE,
     which replaces the engine's figures: keep the slot leg's decode time, tokens and prompt figures to add to it."""
-    carry["decode_ms"] = carry.get("decode_ms", 0.0) + float(leg.get("decode_ms") or 0.0)
-    carry["generated"] = carry.get("generated", 0) + int(leg.get("generated") or 0)
+    for key in ("decode_ms", "generated"):
+        previous, value = carry.get(key, 0), leg.get(key)
+        carry[key] = previous + value if previous is not None and value is not None else None
     carry.setdefault("prompt_ms", float(leg.get("prompt_ms") or 0.0))
     if leg.get("prompt_read") is not None:
         carry.setdefault("prompt_read", int(leg["prompt_read"]))
@@ -6399,9 +6420,10 @@ def carry_leg(carry: dict, leg: dict) -> None:
 def add_carry(carry: dict, last: dict) -> dict:
     """The request's totals: the earlier legs' decode time and tokens plus the final one's; the prompt figures of the
     leg that read the prompt (the solo continuation reads next to nothing)."""
-    out = {**last, "decode_ms": float(last.get("decode_ms") or 0.0) + carry.get("decode_ms", 0.0),
-           "generated": int(last.get("generated") or 0) + carry.get("generated", 0),
-           "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
+    out = {**last, "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
+    for key in ("decode_ms", "generated"):
+        previous, value = carry.get(key, 0), last.get(key)
+        out[key] = previous + value if previous is not None and value is not None else None
     if "prompt_read" in carry:
         out["prompt_read"] = carry["prompt_read"]
     return out
@@ -6434,14 +6456,15 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
         # (not the conversation cache), so the rate is not made of tokens it never read
         cache_n = max(cache_n, max(0, prompt_tokens - int(last["prompt_read"])))
     prompt_n, prompt_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"])
-    decode_ms = float(last.get("decode_ms") or 0)
-    decoded = int(last.get("generated") or generated)          # the engine's count gives its rate, as /metrics does
+    decode_ms = last.get("decode_ms")
+    decoded = last.get("generated")   # explicit zero and missing native work are not the API's output count
     return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
             "prompt_per_token_ms": round(prompt_ms / prompt_n, 3) if prompt_n else None,
             "prompt_per_second": round(prompt_n / (prompt_ms / 1000), 1) if prompt_n and prompt_ms > 0 else None,
-            "predicted_n": generated, "predicted_ms": round(decode_ms, 1),
-            "predicted_per_token_ms": round(decode_ms / decoded, 3) if decoded else None,
-            "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
+            "predicted_n": generated, "predicted_ms": round(decode_ms, 1) if decode_ms is not None else None,
+            "predicted_per_token_ms": round(decode_ms / decoded, 3) if decoded and decode_ms is not None else None,
+            "predicted_per_second": (round(decoded / (decode_ms / 1000), 1)
+                                     if decoded and decode_ms and decode_ms > 0 else None),
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported
             # them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
@@ -6460,9 +6483,21 @@ def request_stats(segments: list[dict]) -> dict:
             result.pop(key, None)
     for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
                 "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb"):
-        if any(segment.get(key) is not None for segment in segments):
+        if key in ("decode_ms", "generated") and any(segment.get(key) is None for segment in segments):
+            result[key] = None        # a leg whose figure the engine never reported: the total is not known either
+        elif any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
     return result
+
+
+def prefill_leg_stats(earlier: list[dict], last: dict, prompt_tokens: int) -> dict:
+    """Total yielded prompt reads once, retaining only reuse from before this API request (upstream #5318)."""
+    legs = [*earlier, last]
+    total = request_stats(legs)
+    if all(leg.get("prompt_read") is not None for leg in legs):
+        fresh = max(0, prompt_tokens - int(total.get("reused") or 0))
+        total["prompt_read"] = min(fresh, sum(int(leg["prompt_read"]) for leg in legs))
+    return total
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):

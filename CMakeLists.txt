@@ -238,6 +238,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(aux_cpus_test tests/platform/aux_cpus_test.cpp)
   target_link_libraries(aux_cpus_test PRIVATE strata_platform)
   add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
+  # STRATA_PREFILL_TIMING: a mark in the phase already running is not recorded (upstream #4006); header-only, no GPU
+  add_executable(timer_marks_test tests/prefill/timer_marks_test.cpp)
+  target_include_directories(timer_marks_test PRIVATE include)
+  add_test(NAME timer_marks_test COMMAND timer_marks_test)
   # when the default CPU prefill share is armed (#1595, the host's memory): header-only rules, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
