@@ -490,9 +490,9 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
 // of one launch share the activations; each runs as its own kernel (the fused launch is a later speed idea).
 namespace {
 
-// The paired form's sub-group is 16 wide.  NVIDIA's device compile takes 32 only and warns of any other number, and
-// df2_gemm never picks the pair where the device does not report 16, so that compile names 32.
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+// The paired form's sub-group is 16 wide.  NVIDIA's and AMD's device compiles take 32 only and warn of any other
+// number, and df2_gemm never picks the pair where the device does not report 16, so those compiles name 32.
+#if defined(__SYCL_DEVICE_ONLY__) && (defined(__NVPTX__) || defined(__AMDGCN__))
 #define DF2_GEMM_SG(PAIR) [[sycl::reqd_sub_group_size(32)]]
 #else
 #define DF2_GEMM_SG(PAIR) [[sycl::reqd_sub_group_size((PAIR) ? 16 : 32)]]
