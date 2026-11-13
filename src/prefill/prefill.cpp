@@ -10,6 +10,7 @@
 #include "strata/prefill/staged_group_rule.hpp"
 #include "strata/prefill/staged_fo_rule.hpp"
 #include "strata/prefill/stream_floor_rule.hpp"
+#include "strata/prefill/switch_point_rule.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/fewrows.hpp"
 #include "strata/prefill/gp100_prompt_default.hpp"
@@ -389,6 +390,25 @@ inline bool staged_fo_on() {
     cached.store(v ? 1 : 0, std::memory_order_release);
     return v;
 }
+// STRATA_SWITCH_POINT=1 (research, default off; CUDA builds only): the floor of a card that streams part of the experts comes from switch_point_rule.hpp's cost estimate.
+// The card's counts arrive from Prefill::set_card_expert_share (the cache's slots and layers x experts, known before the first lend); until then the default answers.
+inline bool switch_point_on() {
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
+    return false;   // measured on CUDA only
+#else
+    static const bool on = [] { const char* e = std::getenv("STRATA_SWITCH_POINT"); return e != nullptr && e[0] == '1' && e[1] == '\0'; }();
+    return on;
+#endif
+}
+std::atomic<int64_t> g_sp_resident{-1}, g_sp_total{0};
+double g_sp_blob_mb = 0.0, g_sp_link_gbps = 0.0;   // the cache's mean blob (MB) and the start-up probe (GB/s), from Prefill::set_card_expert_share
+int g_sp_sm = 0;                                   // the card's multiprocessor count
+// the card as the rule scales it; a field not set gives card_known() == false and the default floor
+inline strata::prefill::switch_point::Card sp_card() {
+    strata::prefill::switch_point::Card c;
+    c.blob_mb = g_sp_blob_mb; c.link_gbps = g_sp_link_gbps; c.sm = g_sp_sm;
+    return c;
+}
 // The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
 inline int64_t default_stream_floor() {
     static std::atomic<int64_t> cached{-1};
@@ -397,7 +417,18 @@ inline int64_t default_stream_floor() {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return strata::prefill::kStreamFloorDefault;
     const bool cls = stream_floor_class_measured();
-    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on());
+    int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on());
+    if (v == strata::prefill::kStreamFloorDefault && switch_point_on()) {
+        const int64_t res = g_sp_resident.load(std::memory_order_acquire), tot = g_sp_total.load(std::memory_order_acquire);
+        if (res < 0) return v;   // the card's counts are not known yet: the default, not cached
+        const auto card = sp_card();
+        if (!strata::prefill::switch_point::card_known(card)) return v;   // the link or the card is not known: the default, not cached
+        v = strata::prefill::switch_point::floor_for_card(res, tot, card);
+        std::fprintf(stderr, "prefill: STRATA_SWITCH_POINT=1: prompt chunks of %lld tokens or more stream every expert the card does not hold (%lld of %lld experts resident; %.2f MB experts, %.1f GB/s link, %d SMs); a shorter chunk stages only the routed ones\n",
+                     (long long) v, (long long) res, (long long) tot, card.blob_mb, card.link_gbps, card.sm);
+        cached.store(v, std::memory_order_release);
+        return v;
+    }
     cached.store(v, std::memory_order_release);
     if (v != strata::prefill::kStreamFloorDefault)
         std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
@@ -3015,6 +3046,17 @@ int64_t Prefill::short_read_default(int64_t base) {
     const bool cls = stream_floor_class_measured();
     return strata::prefill::short_read_default(base, cls, cls && layers_all_fused_only(), staged_fo_on());
 }
+void Prefill::set_card_expert_share(int64_t resident_slots, int64_t total_pairs, double blob_mb, double link_gbps) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    int dev = 0;
+    cudaDeviceProp prop;
+    g_sp_sm = (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess) ? prop.multiProcessorCount : 0;
+#endif
+    g_sp_blob_mb = blob_mb;
+    g_sp_link_gbps = link_gbps;
+    g_sp_total.store(total_pairs, std::memory_order_release);
+    g_sp_resident.store(resident_slots, std::memory_order_release);
+}
 
 // --prefill-pipe (opt-in; STRATA_PREFILL_PIPE): a layer split reads a prompt as a pipeline - stage s reads chunk c while
 // stage s+1 reads chunk c-1. A stage-chunk costs its layers x (b + a C): a fixed part per chunk (b: the pass over the
@@ -3220,6 +3262,12 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
         g_share_default = true;
+        if (switch_point_on() && g_sp_resident.load(std::memory_order_acquire) >= 0 && strata::prefill::switch_point::card_known(sp_card())) {
+            // STRATA_SWITCH_POINT=1 (research): the share's limit scales with the card's own floor (floor x kShareRatio), not the fixed 3,072
+            const int64_t lim = strata::prefill::switch_point::share_limit_for(strata::prefill::switch_point::floor_for_card(
+                g_sp_resident.load(std::memory_order_acquire), g_sp_total.load(std::memory_order_acquire), sp_card()));
+            if (lim > 0) g_share_limit_arch = lim;
+        }
         std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks up to %lld tokens (the idle CPU "
                              "takes some of the experts the GPU would stream; answers can differ slightly from 0.1.40.3, "
                              "mean KL ~0.004 below 1024 tokens, ~0.011 at 1-3K). STRATA_PREFILL_CPU_SHARE=0 turns it off, "
