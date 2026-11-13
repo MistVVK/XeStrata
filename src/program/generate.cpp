@@ -176,12 +176,6 @@ std::string vram_free_note() {
     return buf;
 }
 
-// perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
-bool refill_blocking() {
-    static const bool v = strata::env_get("REFILL_BLOCKING") != nullptr;
-    return v;
-}
-
 using Clock = std::chrono::steady_clock;
 
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
@@ -11069,14 +11063,14 @@ int main(int argc, char** argv) {
                     strata::core::ExpertCache& c = st < 0 ? xcache : stages[(size_t) st]->cache;
                     const strata::core::OnDevice on(st < 0 ? -1 : stages[(size_t) st]->dev);
                     bool any = false;
-                    for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                    for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait
                         if (stage_at(i) != st) continue;
                         // a transient source's blob is copied into fill_tmp, so each fill must be over before the next
                         const bool tb = srcp->transient(i / g.n_expert, i % g.n_expert);
                         const uint8_t* b = blob_to_copy(srcp, i / g.n_expert, i % g.n_expert, fill_tmp);
                         const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                        if (b == nullptr || !(refill_blocking() || tb ? c.fill_slot_blocking(slot, b, e, nb)
-                                                                      : c.fill_slot_queued(slot, b, e, nb)))
+                        if (b == nullptr || !(tb ? c.fill_slot_blocking(slot, b, e, nb)
+                                                 : c.fill_slot_queued(slot, b, e, nb)))
                             return false;
                         host_res[(size_t) i] = slot;
                         any = true;
@@ -12946,12 +12940,12 @@ int main(int argc, char** argv) {
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
-            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait
                 const bool tb = srcp->transient(i / g.n_expert, i % g.n_expert);   // see the serve loop's refill
                 const uint8_t* b = blob_to_copy(srcp, i / g.n_expert, i % g.n_expert, fill_tmp);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                if (b == nullptr || !(refill_blocking() || tb ? xcache.fill_slot_blocking(slot, b, err, nb)
-                                                              : xcache.fill_slot_queued(slot, b, err, nb))) {
+                if (b == nullptr || !(tb ? xcache.fill_slot_blocking(slot, b, err, nb)
+                                         : xcache.fill_slot_queued(slot, b, err, nb))) {
                     std::fprintf(stderr, "xestrata generate: refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
