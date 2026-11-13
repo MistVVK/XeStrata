@@ -89,7 +89,7 @@ setup は `--drafting auto|dflash2` のとき、モデルごとに版を固定�
 
 `--serve` の `--draft auto` は、起動の最後（READY の前）に、読み込んだ drafter（MTP、DFlash2 の pack があれば
 DFlash2）と「drafter なし」を、固定の短い英文で交互に decode して比べ、速いものを残します。負けた drafter は
-VRAM と RAM から外します。`--spec auto`（setup が書きます）なら窓の上限も候補にします（Qwen3.8-Flash-Next は 4 と 2、
+VRAM と RAM から外します（MTP の層の K/V は、会話のキャッシュと保存した会話が持つので残します）。`--spec auto`（setup が書きます）なら窓の上限も候補にします（Qwen3.8-Flash-Next は 4 と 2、
 plain エンジンは 3 と 2）。最速が他より 3%（と自身の回の間のぶれ）以上速くなければ、安い形（MTP、DFlash2、なしの順、
 設定の窓）を残します。MTP と DFlash2 がその幅の中なら両方を残し、要求ごとに選びます（下）。測りに使う DFlash2 は
 起動の最後に読み込み、エキスパートのキャッシュは MTP だけのときと同じ大きさで取るので、MTP が勝てば pack が

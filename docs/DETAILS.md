@@ -90,7 +90,8 @@ this PC (`tools/dflash2_fetch.py --model`, checked against their SHA-256; Qwen3.
 
 With `--serve`, `--draft auto` decodes a short fixed English text at the end of the start (before READY) with each
 drafter loaded (the MTP and, with a DFlash2 pack, DFlash2) and with no drafter, in turn, and keeps the fastest; the
-drafters that lose are released from VRAM and RAM. With `--spec auto` (setup writes it) the largest window is a
+drafters that lose are released from VRAM and RAM (the MTP layer's K/V stays: the conversation cache and the saved
+conversations carry it). With `--spec auto` (setup writes it) the largest window is a
 candidate too (4 and 2 for Qwen3.8-Flash-Next, 3 and 2 in the plain engine). Unless the fastest is 3% (and its own
 runs' spread) ahead of the others, the cheaper form stays (the MTP, DFlash2, none in that order; the configured window).
 When the MTP and DFlash2 are within that margin both stay and each request picks one (below). The DFlash2 that is
