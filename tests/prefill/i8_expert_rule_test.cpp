@@ -2,6 +2,7 @@
 // Nothing set: the HIP cards gfx1030 / gfx1031 / gfx1032 take them (groups averaging 256 entries or more, the layout and the device allowing it); every
 // other card keeps MMQ.  STRATA_EXPERT_I8=1 asks for them on any card, =0 goes back to the old kernels on the class.  No GPU, no model.
 #include <cstdio>
+#include <initializer_list>
 
 #include "strata/kernels/i8_expert_rule.hpp"
 
