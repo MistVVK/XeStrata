@@ -397,6 +397,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(share_rules_test PRIVATE include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
 
+  # the chunk a prompt piece below the walk floor lends its buffers for (the staged layout, not the rounded chunk's streamed one): header-only rule, no GPU
+  add_executable(loan_rules_test tests/prefill/loan_rules_test.cpp)
+  target_include_directories(loan_rules_test PRIVATE include)
+  add_test(NAME loan_rules_test COMMAND loan_rules_test)
+
   # which work item (128 or 64 routed rows) the CUDA fused prompt kernels take, per card class (pick_ww): the pure rule, pinned at the two sides of every threshold for the
   # measured classes and compared with the previous rule for every class that must not change (header-only, no GPU)
   add_executable(fused_tile_rule_test tests/prefill/fused_tile_rule_test.cpp)
