@@ -398,7 +398,7 @@ BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `
 
 ### 応答
 
-- `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。アダプターを当てたときは `lora`（当てたものの `name` と `scale`）も。
+- `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`、`background`（その画像に使った値: `auto`・`transparent`・`opaque`。`opaque` はアルファを白の上に重ねた 8 ビットの RGB の PNG です）。アダプターを当てたときは `lora`（当てたものの `name` と `scale`）も。
 - `usage`: 画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16x16 ピクセルで 1 つのトークン）。HunyuanImage 3.0 では、プロンプトの ids と、作った画像の 16x16 画素ごとの 1 個で、参照画像は VAE のトークンと SigLIP2 の 1,024 スロットを数えます。
 - `xestrata-engine`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）、アダプターを当てたときはその本数（`lora_n`）、VRAM（`lora_mib`）、プロンプトのタグで飛ばした名前（`lora_unknown`）、当てたファイルにあって当てられない鍵（`lora_ignored`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。マスクの部分を切り出して描いたときは、描いた大きさ（`made_size`）と、切り出した範囲（`crop`: `box` が 1 枚目の画像の上の x・y・幅・高さ、`whole` が画像全体を描き直したか。何も塗っていないマスクでは `empty`）、切り出しと貼り戻しの秒数（`plan` の `crop_s`）も。2 段で描いたときは、2 段目の範囲・描いた大きさ・strength（`refine`）も。
 - 画像のモデルは `/v1/models` にも出ます。

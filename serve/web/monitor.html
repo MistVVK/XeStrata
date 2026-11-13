@@ -28,7 +28,7 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
 <div class="card"><div class="label">Model</div><div id="model-state" class="value"><span class="dot"></span><span id="loaded">Connecting…</span></div><div id="model" class="model">127.0.0.1:5001/v1</div></div>
 <div class="card"><div class="label">Requests retained</div><div id="count" class="value">—</div><div id="active" class="small">Waiting for server</div></div>
 <div class="card"><div class="label">Last wall-clock</div><div id="wall" class="value">—</div><div class="small">Includes queue and model loading</div></div>
-<div class="card"><div class="label">Last decode speed</div><div id="speed" class="value">—</div><div class="small">Engine timing · tokens / second</div></div>
+<div class="card"><div class="label">Average decode speed</div><div id="speed" class="value">—</div><div class="small">Run average · tokens / second</div></div>
 </div>
 <section class="panel"><div class="panel-bar"><h2>Requests</h2><div class="filters"><input id="search" aria-label="Filter requests" placeholder="Search ID or endpoint"><select id="filter" aria-label="Request status"><option value="all">All statuses</option><option value="active">Active</option><option value="completed">Completed</option><option value="error">Errors</option></select></div></div>
 <div class="workspace"><div id="requests" class="requests" aria-label="Request list"></div><div class="detail">

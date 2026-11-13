@@ -1103,6 +1103,7 @@ print(r.choices[0].message.content)
   テンプレートの形の隣の形（`<parameter=NAME>` で始まる呼び出し、`<tool_call>` の中の JSON、`<tool_call>` のない `<function=NAME>` の塊、1 つの `<tool_call>` の中の 2 つ目の呼び出し）も、宣言したツールの呼び出しなら読みます（upstream 0.2.8 から既定）。
   エージェントの 1,462 ターンでは、意図どおりに読めたのがこれで 98.3%、なしで 92.9% でした。
   `xestrata-<model>.json` に `"tool_call_recovery": false` を書くと、これを切ります。
+  宣言していない名前の呼び出しも、形が正しければ、`xestrata-<model>.json` の `"undeclared_tool_calls": "call"`（環境変数 `XESTRATA_UNDECLARED_TOOL_CALLS=call`。設定が勝ちます）で呼び出しとして返せます。未知の名前に自分の規則を持つクライアント（持っているツールの名前をモデルに伝えて聞き直す）のための物で、既定の `"text"` は今までどおり文のままで、その横に `strata_rejected_tool_calls` が付きます（upstream #4622）。
   それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
 - **呼び出しの読み手が直すもの、直さないもの**: 文字列の引数が呼び出しを丸ごと引用していても、自分の `</parameter><parameter=NAME>` を繰り返していても、値はそのままです（upstream #4078）。
   `</function>` の抜けた呼び出しは、回答の中でも思考の中でも呼び出しとして読みます（upstream #4427）。
@@ -1116,6 +1117,10 @@ print(r.choices[0].message.content)
   立て直したいクライアントは、持っているツールの名前をモデルに伝えて聞き直せます。要求が宣言していないツールの呼び出しを XeStrata が動かしたり渡したりすることはありません。
   server のウィンドウにも同じ名前が出て、`/metrics/prometheus` は塊の数を `strata:tool_calls_unread_total` で数えます。
   形の崩れた塊（宣言していない名前でないもの）もそこで数えますが、挙げる名前はありません。
+- **`/v1/messages` の Anthropic の tool search**（upstream #4663）: `"defer_loading": true` の tool は宣言されますが、プロンプトのツール一覧には出しません。
+  `tool_result` の中の `tool_reference` の塊（tool search の結果）は、その場所でその tool の定義をプロンプトに入れます（ツール一覧と同じ形なので、tool を読んでもプロンプトの先頭と、そのキャッシュは変わりません）。
+  それ以外の参照は今までどおり落とします（MCP の server が消えた古い参照で、会話が止まらないように）。
+  `defer_loading` の tool を持つ要求は、宣言したより多くの tool を抱えています（Claude Code は ToolSearch と `DeferredToolPlaceholder` を宣言し、MCP の tool は会話の中だけで名指しします）ので、その要求では宣言していない名前の呼び出しも `tool_use` で返します。Claude Code はそれを実行します（text では turn が終わっていました）。
 - **チャットのアプリ**: 「OpenAI 互換」の接続先を持つアプリなら使えます。
   ベース URL は `http://127.0.0.1:8095/v1`、API キーは何でも構いません。
 - **OpenCode**（upstream #543）: `opencode.jsonc`（プロジェクトの中か `~/.config/opencode/`）の出発点です。

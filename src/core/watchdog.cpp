@@ -5,6 +5,7 @@
 
 #include "strata/core/watchdog.hpp"
 
+#include "strata/core/gpu_pause_time.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/platform/env.hpp"
 #include "strata/platform/thread_name.hpp"
@@ -161,6 +162,18 @@ void disk_wait_threads(std::FILE* f) {
 // upstream's 512 MiB warning.
 std::atomic<int64_t> g_req_vram_free_mib{-1};
 
+// AMD on Linux: the driver's paused-GPU counter (ms) when the current request began; -1 before the first request,
+// when the counter is not available, and in every other build.  Read once per request, never per step.
+std::atomic<int64_t> g_req_gpu_pause_ms{-1};
+
+int64_t gpu_pause_now() {
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+    return gpu_pause_ms_self();
+#else
+    return -1;
+#endif
+}
+
 }  // namespace
 
 #if defined(_WIN32)
@@ -292,6 +305,8 @@ std::string stage_text() {
 
 void watchdog_note_request_vram(int64_t free_mib) { g_req_vram_free_mib.store(free_mib); }
 
+void watchdog_note_request_gpu_pause() { g_req_gpu_pause_ms.store(gpu_pause_now()); }
+
 void stall_report(std::FILE* f, uint64_t layers_during) {
 #if defined(_WIN32)
     const char* stacks = strata::env_get("STALL_STACKS");
@@ -308,8 +323,9 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
                         "a cause of a window that never finishes: a larger --vram-reserve-mib leaves room)\n",
                      (long long) vf);
 #if defined(_WIN32)
-    if (want_stacks) stall_stacks::print(f);
+    if (want_stacks) stall_stacks::print(f);   // as they were when the stall was noticed, not as they are now
 #endif
+    int64_t gpu_pause_before = -1;   // the GPU pause counter at the first pass, for the change over the 2 s
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -326,6 +342,12 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
                      m.commit_mib,
                      "in swap", m.avail_mib, m.faults, "major page faults so far"
         );
+        // AMD on Linux: how long the driver kept the GPU work paused (no line where the counter cannot be read)
+        if (const int64_t now = gpu_pause_now(); now >= 0) {
+            const std::string line = gpu_pause_stall_line(now, g_req_gpu_pause_ms.load(), gpu_pause_before);
+            if (!line.empty()) std::fprintf(f, "%s\n", line.c_str());
+            if (pass == 0) gpu_pause_before = now;
+        }
         std::fflush(f);
     }
 }
