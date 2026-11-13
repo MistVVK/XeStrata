@@ -244,7 +244,8 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
     const uint16_t *kf = pools.k_pool, *vf = pools.v_pool, *ksc = pools.k_scale, *vsc = pools.v_scale;
     const int8_t *ki = pools.k_q, *vi = pools.v_q;
     const uint8_t *k4 = pools.k_q4, *v4 = pools.v_q4, *ktc = pools.k_tc, *vtc = pools.v_tc;
-    const int tc_bits = pools.tc_bits;
+    const int tc_bits = pools.tc_bits, tc_kv = pools.tc_ring_kv;
+    const uint8_t* ring = pools.tc_ring;
     const int32_t* tbl = pools.page_table;
     const int64_t PS = page_size, CK = KH * HD;
     queue.parallel_for(sycl::range<1>((size_t) (Tk * CK / 8)), [=](sycl::id<1> id) {
@@ -252,7 +253,11 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
         const int dd = (int) (i - j * CK - g * HD);
         const int64_t row = ((int64_t) tbl[c / PS] * KH + g) * PS + c % PS;
         h8 kv, vv;
-        if (fmt == kFmtTcq) {
+        if (fmt == kFmtTcq && ring != nullptr && c >= tcq::ring_coded(ring, HD, tc_kv)) {   // not coded yet
+            const int kr = tcq::ring_row(0, (int) (c % kTcqRing), (int) g, tc_kv), vr = kr + kTcqRing * tc_kv;
+            kv = i8_row8<HD>(tcq::ring_codes(ring, 0, HD), tcq::ring_scales(ring, 0, HD, tc_kv), kr, dd);
+            vv = i8_row8<HD>(tcq::ring_codes(ring, 0, HD), tcq::ring_scales(ring, 0, HD, tc_kv), vr, dd);
+        } else if (fmt == kFmtTcq) {
             kv = tcq_row8<HD>(ktc, tc_bits, row, dd);
             vv = tcq_row8<HD>(vtc, tc_bits, row, dd);
         } else if (fmt == kFmtF16) {

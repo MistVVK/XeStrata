@@ -35,6 +35,8 @@ struct QsaAttnPools {
     const uint8_t* k_tc = nullptr;      ///< trellis-coded rows (kv_tcq.hpp), same layout, head_dim * bits / 8 + 4 B
     const uint8_t* v_tc = nullptr;
     int tc_bits = 0;                    ///< 4 or 5 with k_tc
+    const uint8_t* tc_ring = nullptr;   ///< deferred coding's INT8 ring (kv_tcq_ring_bytes), or null
+    int tc_ring_kv = 0;                 ///< its KV heads (the ring's rows a plane: kTcqRing x this)
     const int32_t* page_table = nullptr;
 };
 

@@ -51,6 +51,7 @@ struct KvAppend {
     uint8_t* k_tc = nullptr;
     uint8_t* v_tc = nullptr;
     int tc_bits = 0;
+    uint8_t* tc_ring = nullptr;   ///< deferred coding's ring (kv_tcq.hpp); null: each cell coded as it is written
     const int32_t* page_table = nullptr;
     const KvHostPools* host = nullptr;
     const KvHostPools* stage = nullptr;

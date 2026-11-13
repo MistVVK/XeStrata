@@ -76,4 +76,21 @@ inline void values(const uint8_t* r, int head_dim, int bits, int dd, float* out,
     }
 }
 
+// The ring of deferred coding (kv_tcq_ring_bytes): a plane's row (cell mod kTcqRing, KV head) is plane * kTcqRing *
+// n_kv + slot * n_kv + h
+inline int ring_row(int plane, int slot, int h, int n_kv) { return (plane * kTcqRing + slot) * n_kv + h; }
+inline const int8_t* ring_codes(const uint8_t* ring, int row, int head_dim) {
+    return reinterpret_cast<const int8_t*>(ring) + (int64_t) row * head_dim;
+}
+inline const uint16_t* ring_scales(const uint8_t* ring, int row, int head_dim, int n_kv) {
+    return reinterpret_cast<const uint16_t*>(ring + 2ll * kTcqRing * n_kv * head_dim) + (int64_t) row * (head_dim / 64);
+}
+// the cell below which every cell is coded (the rest are read from the ring)
+inline int* ring_coded(uint8_t* ring, int head_dim, int n_kv) {
+    return reinterpret_cast<int*>(ring + 2ll * kTcqRing * n_kv * (head_dim + head_dim / 64 * 2));
+}
+inline int ring_coded(const uint8_t* ring, int head_dim, int n_kv) {
+    return *reinterpret_cast<const int*>(ring + 2ll * kTcqRing * n_kv * (head_dim + head_dim / 64 * 2));
+}
+
 }  // namespace strata::kernels::tcq

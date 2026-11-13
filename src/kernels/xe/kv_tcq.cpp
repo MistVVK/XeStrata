@@ -12,6 +12,11 @@
 // group (xor shuffles), and each state takes its group's from the lane of that number.  The keys carry the
 // predecessor in their low 8 bits, so ties go to the lowest predecessor, and the last step's to the lowest state:
 // every row codes the same way whatever else is in the launch.
+//
+// Deferred coding (KvAppend::tc_ring, kv_tcq.hpp): the encoder takes the cells of the blocks of kTcqBlock an append
+// completes, each from the append's FP32 row rounded through INT8 as the ring keeps it, or from the ring for the
+// block's cells an earlier append wrote; then the coded bound moves to the last complete block, and ring_write keeps
+// the append's last kTcqRing cells, after the encoder has read the ring (the queue is in order).
 #include "strata/kernels/kv_tcq.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -94,6 +99,57 @@ void fwht256_signed(float* data, int64_t n_rows, bool inverse, void* stream) {
     if (!stream) core::Runtime::get().wait(e, "fwht256_signed");
 }
 
+namespace {
+
+// A cell's position: step-based (graph-capturable) or from pos0
+inline long long pos_of(const KvAppend& p, int64_t j) {
+    return p.step ? (long long) p.step[j * p.step_stride + kStepPos] : (long long) (p.pos0 + j);
+}
+
+// The ring's write (deferred coding): the last kTcqRing cells of the append as INT8 (kv_q8.cpp's rounding) at their
+// position's slot, and the coded bound lowered to the block of a cell this append did not code (a verify window
+// written again after a rejection).  One work-group of 256 a (cell, plane, KV head), two sub-groups a group of 64.
+sycl::event ring_write(sycl::queue& queue, const KvAppend& p, int kv_heads, int planes, int64_t cur_stride) {
+    const int64_t n = std::min<int64_t>(p.n_tok, kTcqRing), j0 = p.n_tok - n;
+    return queue.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> wmax(sycl::range<1>(HD / WARP), hd);
+        hd.parallel_for(sycl::nd_range<1>((size_t) n * planes * kv_heads * HD, HD),
+                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int64_t wg = (int64_t) it.get_group(0);
+            const int h = (int) (wg % kv_heads);
+            const int64_t jp = wg / kv_heads, j = j0 + jp / planes;
+            const int plane = (int) (jp % planes), d = (int) it.get_local_id(0);
+            const long long pos = pos_of(p, j);
+            const float x = (plane ? p.v : p.k)[j * cur_stride + (int64_t) h * HD + d];
+            const float am = sycl::reduce_over_group(sg, sycl::fabs(x), sycl::maximum<float>());
+            if (sg.get_local_linear_id() == 0) wmax[sg.get_group_linear_id()] = am;
+            sycl::group_barrier(it.get_group());
+            const int g = d / 64;
+            const float amax = sycl::fmax(wmax[2 * g], wmax[2 * g + 1]);
+            const uint16_t sbits = f16_gpu::f16_from_f32(amax / 127.0f);
+            const float sf = f16_gpu::f32_from_f16(sbits);
+            int q = 0;
+            if (sf > 0.0f) q = sycl::clamp((int) sycl::rint(x / sf), -127, 127);
+            const int row = tcq::ring_row(plane, (int) (pos % kTcqRing), h, kv_heads);
+            int8_t* codes = const_cast<int8_t*>(tcq::ring_codes(p.tc_ring, row, HD));
+            codes[d] = (int8_t) q;
+            if (d % 64 == 0) const_cast<uint16_t*>(tcq::ring_scales(p.tc_ring, row, HD, kv_heads))[g] = sbits;
+            if (d == 0 && plane == 0 && h == 0) {
+                const long long last = pos_of(p, p.n_tok - 1);
+                const int cend = (int) ((last + 1) / kTcqBlock * kTcqBlock);
+                if (pos >= cend) {   // not coded by this append: its block is read from the ring
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device> ce(
+                        *tcq::ring_coded(p.tc_ring, HD, kv_heads));
+                    ce.fetch_min((int) (pos / kTcqBlock * kTcqBlock));
+                }
+            }
+        });
+    });
+}
+
+}  // namespace
+
 void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream) {
     if (s.head_dim != HD)
         throw core::DeviceError("kv_append_tcq: the trellis-coded cache wants head_dim 256 (the rotation's size)");
@@ -108,6 +164,11 @@ void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream) {
     const int planes = a.k_tc == a.v_tc && a.k == a.v ? 1 : 2;
     const int64_t cur_stride = a.cur_stride > 0 ? a.cur_stride : (int64_t) kv_heads * HD;
     const int uu = 256 >> bits;   // a state's predecessors share one of uu groups
+    // deferred (a ring): the cells of the blocks this append completes, from the block of its first cell, which
+    // are at most n_tok + kTcqBlock - 1 (the append's cells are consecutive positions, as the prompt's chunks and the
+    // windows write them); else each cell of the append
+    const bool defer = a.tc_ring != nullptr;
+    const int64_t n_rows = defer ? a.n_tok + kTcqBlock - 1 : a.n_tok;
     auto& queue = queue_for(stream);
     const sycl::device dev = queue.get_device();
     // sub-groups a row: every job at once where the device takes the work-group and its local memory
@@ -117,30 +178,60 @@ void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream) {
     int sgs = std::min<int>(jobs, (int) (wg_max / WARP));
     while (sgs > 1 && fixed + (size_t) sgs * kTcqChain * uu > local) --sgs;
     const KvAppend p = a;
-    const auto e = queue.submit([&](sycl::handler& hd) {
+    sycl::event e = queue.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> xr(sycl::range<1>(HD), hd);                       // the row
         sycl::local_accessor<uint8_t, 1> bp(sycl::range<1>((size_t) sgs * kTcqChain * uu), hd);   // a job's choices
         sycl::local_accessor<uint8_t, 1> st(sycl::range<1>((size_t) mu.n * HD), hd);    // each multiplier's path
         sycl::local_accessor<float, 1> err(sycl::range<1>((size_t) jobs), hd);          // each job's error
         sycl::local_accessor<float, 1> ssq(sycl::range<1>(1), hd);
-        hd.parallel_for(sycl::nd_range<1>((size_t) p.n_tok * planes * kv_heads * sgs * WARP, (size_t) sgs * WARP),
+        hd.parallel_for(sycl::nd_range<1>((size_t) n_rows * planes * kv_heads * sgs * WARP, (size_t) sgs * WARP),
                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const auto grp = it.get_group();
             const sycl::sub_group sg = it.get_sub_group();
             const int64_t wg = (int64_t) it.get_group(0);
             const int h = (int) (wg % kv_heads);
-            const int64_t jp = wg / kv_heads, j = jp / planes;
-            const bool is_v = jp % planes == 1;
+            const int64_t ip = wg / kv_heads, ri = ip / planes;
+            const bool is_v = ip % planes == 1;
             const int tid = (int) it.get_local_id(0), nthr = sgs * WARP;
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
-            const long long pos = p.step ? (long long) p.step[j * p.step_stride + kStepPos] : (long long) (p.pos0 + j);
-            const float* src = (is_v ? p.v : p.k) + j * cur_stride + (int64_t) h * HD;
-            for (int i = tid; i < HD; i += nthr) xr[i] = src[i];
+            long long pos;
+            int64_t j = ri;           // the append's cell the row comes from, -1: the ring's
+            if (defer) {
+                const long long first = pos_of(p, 0), last = pos_of(p, p.n_tok - 1);
+                const long long c0 = first / kTcqBlock * kTcqBlock, cend = (last + 1) / kTcqBlock * kTcqBlock;
+                pos = c0 + ri;
+                if (pos >= cend) return;   // uniform: no block completed past this cell
+                j = pos >= first ? (int64_t) (pos - first) : -1;
+            } else {
+                pos = pos_of(p, ri);
+            }
+            if (j >= 0) {
+                const float* src = (is_v ? p.v : p.k) + j * cur_stride + (int64_t) h * HD;
+                for (int k = tid; k < HD; k += nthr) xr[k] = src[k];
+            } else {
+                const int row = tcq::ring_row(is_v ? 1 : 0, (int) (pos % kTcqRing), h, kv_heads);
+                const int8_t* codes = tcq::ring_codes(p.tc_ring, row, HD);
+                const uint16_t* scales = tcq::ring_scales(p.tc_ring, row, HD, kv_heads);
+                for (int k = tid; k < HD; k += nthr) xr[k] = (float) codes[k] * f16_gpu::f32_from_f16(scales[k / 64]);
+            }
+            sycl::group_barrier(grp);
+            if (defer && j >= 0 && sgi == 0) {   // the append's cells through INT8 as the ring keeps them (ring_write)
+                for (int g = 0; g < HD / 64; ++g) {
+                    const float a0 = xr[g * 64 + lane], a1 = xr[g * 64 + 32 + lane];
+                    const float am = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(a0), sycl::fabs(a1)),
+                                                             sycl::maximum<float>());
+                    const float sf = f16_gpu::f32_from_f16(f16_gpu::f16_from_f32(am / 127.0f));
+                    const int q0 = sf > 0.0f ? sycl::clamp((int) sycl::rint(a0 / sf), -127, 127) : 0;
+                    const int q1 = sf > 0.0f ? sycl::clamp((int) sycl::rint(a1 / sf), -127, 127) : 0;
+                    xr[g * 64 + lane] = (float) q0 * sf;
+                    xr[g * 64 + 32 + lane] = (float) q1 * sf;
+                }
+            }
             sycl::group_barrier(grp);
             if (sgi == 0) {   // the row's sum of squares, in one order
                 float q = 0.0f;
-                for (int i = 0; i < HD / WARP; ++i) {
-                    const float v = xr[i * WARP + lane];
+                for (int k = 0; k < HD / WARP; ++k) {
+                    const float v = xr[k * WARP + lane];
                     q = sycl::fma(v, v, q);
                 }
                 q = sycl::reduce_over_group(sg, q, sycl::plus<float>());
@@ -232,6 +323,16 @@ void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream) {
             }
         });
     });
+    if (defer) {
+        // the coded bound up to the blocks this append completed (one work-item), before the ring's write lowers it
+        // for the cells past them
+        queue.single_task([=] {
+            const long long first = pos_of(p, 0), last = pos_of(p, p.n_tok - 1);
+            const long long c0 = first / kTcqBlock * kTcqBlock, cend = (last + 1) / kTcqBlock * kTcqBlock;
+            if (cend > c0) *tcq::ring_coded(p.tc_ring, HD, kv_heads) = (int) cend;
+        });
+        e = ring_write(queue, p, kv_heads, planes, cur_stride);
+    }
     if (!stream) core::Runtime::get().wait(e, "kv_append_tcq");
 }
 
