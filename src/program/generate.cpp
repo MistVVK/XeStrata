@@ -14606,9 +14606,13 @@ int main(int argc, char** argv) {
                     dc_pcie_pending = true;
                     extra += "; PCIe share: refined in this run, then stored";
                 }
-                if (dc_calib)
+                if (dc_calib && policy.table_held())
                     std::fprintf(stderr, "strata serve: draft costs: this machine's table is loaded (%s; window sizes %s%s), not used yet: the "
                                          "windows follow live costs until every size is calibrated against real requests (or 100 requests have run)\n",
+                                 o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
+                else if (dc_calib)
+                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s); sizes real requests have not "
+                                         "reached yet keep collecting rounds and change the table once when they have their own\n",
                                  o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
                 else
                     std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s): the same request "
@@ -15922,6 +15926,41 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+        // ---- window warm-up (lane DRAFT-COSTS): the first run of a window width builds its graph / pipeline (srv118 CUDA: a capture; Metal: the first execution), so a
+        // width that the policy first picks inside a long request pays it there (M5 Max, IQ3_S: +60 ms on the first five-row lookup round, in the timed code request in 5 of 8 launches
+        // with a table, because the release and the live costs happen to pay it in request 1).  One dummy window per allowed width 1..S, once, before the first request is read; it
+        // changes nothing a request can see: the windows write K/V cells 0..T-1 and the recurrent state of the session, and session_zero() below zeroes the session exactly as a request
+        // that reuses nothing does (the engine's state after session_init); no checkpoint, conversation entry, RNG draw, policy sample or statistic is touched (the policy's observe_*
+        // calls live in the decode loop); the expert cache may page in what the dummy token routes to (speed only).  STRATA_WINDOW_WARM=0: off (research switch).
+        {
+            static const bool warm_off = [] { const char* v = std::getenv("STRATA_WINDOW_WARM"); return v != nullptr && v[0] == '0'; }();
+            if (!warm_off && S >= 2 && n_stages == 1 && !batch_on() && !piped) {
+                const Clock::time_point w0 = Clock::now();
+                std::vector<int32_t> wtok((size_t) S, 1), wout((size_t) S + 1, 0);
+                std::string werr, wlist;
+                bool wok = true;
+                for (int t = 1; t <= S && wok; ++t) {
+                    if (!policy.allowed(t)) continue;
+                    const Clock::time_point t0 = Clock::now();
+                    drive.d.layers = 0;
+                    drive.d.experts = 0;
+                    drive.d.failed = false;
+                    wok = ver.run(t, wtok.data(), 0, win_pool_fn, win_pool_user, wout.data(), werr) && !drive.d.failed;
+                    char wb[48];
+                    std::snprintf(wb, sizeof wb, "%s%d:%.0f", wlist.empty() ? "" : " ", t,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    wlist += wb;
+                }
+                strata::core::session_zero(ss, g, nullptr, main_cs);
+                cudaStreamSynchronize(main_stream);
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
+                std::fprintf(stderr, "strata serve: window warm-up: ms per width %s, total %.0f ms%s%s\n", wlist.c_str(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - w0).count(), wok ? "" : "; a window failed: ",
+                             wok ? "" : werr.c_str());
+            }
+        }
         for (;;) {
             line_drain_ms = 0.0;
             strata::core::manifest::instance().flush_if_dirty("request");   // STRATA_MANIFEST: what the last request added (a no-op when off)
