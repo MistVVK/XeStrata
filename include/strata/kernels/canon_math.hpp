@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 the YASAKANI authors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND Apache-2.0
 // include/strata/kernels/canon_math.hpp - the arithmetic an expert's rows take on the CPU and on every GPU alike.
 //
 // A verify window's expert runs on the GPU when it is in VRAM (or read over PCIe) and on the CPU when not, and which
@@ -9,6 +10,11 @@
 // differs).  So the expert path's SwiGLU and its activations' int8 scale are built from the first kind only, with
 // the fused multiply-adds written out (a compiler that contracted `a * b + c` on one side and not on the other would
 // round differently), and no value leaves the normal range (devices differ in how they flush subnormals).
+//
+// A row whose products are summed as integers (fx_*, below) takes no order of additions at all: what the CPU, a
+// GPU's decode and a GPU's prompt products (the matrix engines' tiles, any split of K) add is exact, so any order
+// gives the same bits.  The idea is YASAKANI's (github.com/yasakani-dev/yasakani, Apache-2.0: lnord.cu's XSUM rows,
+// each block's scale rounded to a fixed-point integer and the int8 sums times it added in int64).
 //
 // Usable in SYCL device code and in plain host code (the CPU kernels are not SYCL translation units).
 #pragma once
@@ -105,6 +111,66 @@ inline int8_t q8_value(float x, float id) {
     const float r = t + (t < 0.0f ? -0.5f : 0.5f);
     const float c = r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r;
     return (int8_t) (int32_t) c;
+}
+
+// ---- the fixed-point sums
+//
+// A row of an i-quant's blocks of 256 against an activation with one fp16 scale a 256 (the gate/up rows):
+//   y = K sum_b da_b dw_b I_b,  I_b = sum over the block's 32-value calls of (the call's integer scale) x (its dot)
+// with da_b, dw_b fp16 values (the activation's and the weights' d) and K a power of two (the format's).  Each fp16
+// value is m 2^e with an integer m below 2^11, so da_b dw_b = (ma mw) 2^(ea + ew) with ma mw below 2^22, exactly.  The
+// row's sum takes one exponent, top = (the largest ea of the activation) + (the largest ew of the row): block b's
+// product is the integer A_b = ma mw 2^(ea + ew - top + kFxHead), rounded half away from zero where the shift is to the
+// right (a block far below the row's largest), below 2^30; A_b I_b (I_b below 2^26 for the i-quants' grids and scales)
+// is added in int64, and the sum times 2^(top - kFxHead) K is the row's value, one conversion to FP32 (nearest).
+// Every step is an integer one but that last, so the same blocks give the same bits on the CPU and every GPU, in any
+// order.
+
+/// The head room of a block's integer scale over the row's largest product: A_b below 2^(22 + kFxHead).
+constexpr int kFxHead = 8;
+/// The exponent fx_exp gives 0: below every fp16 value's, so a zero never sets a row's top.
+constexpr int kFxNone = -1000;
+
+/// An fp16 value v held as a float, as |v| = m 2^e (2^10 <= m < 2^11; m 0 and e kFxNone for 0) and its sign.  An fp16
+/// value is a normal float whose 13 low mantissa bits are 0 (fp16's subnormals too).
+struct FxPart {
+    uint32_t m;
+    int e;
+    uint32_t neg;   // 1: negative
+};
+inline FxPart fx_part(float v) {
+    const uint32_t u = bits(v), ef = (u >> 23) & 0xFFu;
+    if (ef == 0) return {0u, kFxNone, 0u};
+    return {((u & 0x7FFFFFu) | 0x800000u) >> 13, (int) ef - 137, u >> 31};
+}
+/// e of an fp16 value (kFxNone for 0): a row's top is the largest of its activation's plus the largest of its weights'
+inline int fx_exp(float v) { return fx_part(v).e; }
+
+/// A block's integer scale A for the parts of a (the activation's d) and w (the weights' d) in a row of exponent `top`:
+/// (ma mw) 2^(ea + ew - top + kFxHead), rounded half away from zero where the shift is to the right.
+inline int32_t fx_scale(const FxPart& a, const FxPart& w, int top) {
+    if (a.m == 0u || w.m == 0u) return 0;
+    const uint32_t m = a.m * w.m;
+    const int s = a.e + w.e - top + kFxHead;   // at most kFxHead where top is the row's
+    uint32_t r;
+    if (s >= 0) r = m << s;
+    else if (s < -23) r = 0u;   // m below 2^22: rounds to 0
+    else r = (m + (1u << (-s - 1))) >> -s;
+    return (a.neg ^ w.neg) != 0u ? -(int32_t) r : (int32_t) r;
+}
+inline int32_t fx_scale(float a, float w, int top) { return fx_scale(fx_part(a), fx_part(w), top); }
+
+/// 2^k for k in [-126, 127]
+inline float pow2(int k) { return from_bits((uint32_t) (k + 127) << 23); }
+
+/// A row's value from its int64 sum (sum of A_b I_b), its `top` and log2 of its format's K: the sum to FP32 (nearest),
+/// then times 2^(top - kFxHead + k_log2) in two exact steps.  0 for a 0 sum (a row or an activation of zeros, whose
+/// top is not a number's).
+inline float fx_value(int64_t sum, int top, int k_log2) {
+    STRATA_CANON_NO_CONTRACT
+    if (sum == 0) return 0.0f;
+    const int k = top - kFxHead + k_log2, h = k / 2;
+    return (float) sum * pow2(h) * pow2(k - h);
 }
 
 }  // namespace strata::kernels::canon

@@ -41,6 +41,7 @@ PERMISSIVE_OTHER = {"contributors to the vLLM-Omni project": "Apache-2.0", "The 
                     "SageAttention team": "Apache-2.0", "(comfy-kitchen)": "Apache-2.0",
                     "the comfyui_controlnet_aux contributors": "Apache-2.0",
                     "the ComfyUI-SeedVR2_VideoUpscaler contributors": "Apache-2.0",
+                    "the YASAKANI authors": "Apache-2.0",
                     "Secret Labs AB": "MIT-CMU", "Fredrik Lundh and contributors": "MIT-CMU",
                     "Jeffrey A. Clark and contributors": "MIT-CMU"}
 OWN = "LGPL-3.0-or-later"
