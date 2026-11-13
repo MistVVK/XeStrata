@@ -54,6 +54,11 @@ void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int3
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
                    const int32_t* anchor_pos, int ring_slots, int window, float* part, void* xq, float* xd,
                    void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr, int rows = 8);
+/// The same attention, returning eight FP32 rows [8][4096] instead of quantizing them. The output can feed
+/// a weight format with its own activation quantizer. The rings, block keys and partials have the same layout.
+void df2_attention_f32(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
+                       const int32_t* anchor_pos, int ring_slots, int window, float* part, float* out, void* stream,
+                       const int64_t* tag = nullptr, const int32_t* epoch = nullptr);
 /// 0: XESTRATA_DF2_ATTN_256 (auto: timed on the first window), 1: the 8-query-group form, 2: the 256-work-item
 /// form (the tests run both; the engine leaves 0).
 void df2_attention_variant(int v);

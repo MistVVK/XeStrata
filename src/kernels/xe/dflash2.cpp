@@ -494,6 +494,29 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
     df2_attention_combine<8>(qu, part, xq, xd);
 }
 
+void df2_attention_f32(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
+                       const int32_t* anchor_pos, int ring_slots, int window, float* part, float* out, void* stream,
+                       const int64_t* tag, const int32_t* epoch) {
+    sycl::queue& qu = Q(stream);
+    // The 8-query form does not touch the quantized output buffers; combine its partials directly as FP32.
+    df2_attention_v1<8>(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, nullptr, nullptr, tag, epoch);
+    qu.parallel_for(sycl::nd_range<1>((size_t) kDf2Kv * 32 * HD, HD), [=](nd_item<1> it) {
+        const int a = (int) it.get_group(0), kvh = a >> 5, qi = a & 31, d = (int) it.get_local_id(0);
+        float maximum = -INFINITY;
+        for (int c = 0; c < kDf2PartChunks; ++c)
+            maximum = sycl::fmax(maximum, part[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130]);
+        float sum = 0.0f, value = 0.0f;
+        for (int c = 0; c < kDf2PartChunks; ++c) {
+            const float* p = part + (((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130;
+            const float weight = p[0] == -INFINITY ? 0.0f : sycl::exp(p[0] - maximum);
+            sum += p[1] * weight;
+            value = sycl::fma(p[2 + d], weight, value);
+        }
+        const int row = qi >> 2, head = kvh * kDf2Gqa + (qi & 3);
+        out[(size_t) row * 32 * HD + head * HD + d] = sum > 0.0f ? value / sum : 0.0f;
+    });
+}
+
 // ---- the drafter's GEMM: one sub-group per output row, lane = block * 2 + half (16 values a lane).  The matrices
 // of one launch share the activations; each runs as its own kernel (the fused launch is a later speed idea).
 namespace {

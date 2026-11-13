@@ -435,6 +435,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/sampler_host.cpp
                                     src/kernels/xe/native_gdn.cpp src/kernels/xe/native_moe.cpp
                                     src/kernels/xe/fused_gdn.cpp src/kernels/xe/native_gdn_preprocess.cpp
+                                    src/kernels/xe/yskn.cpp
                                     src/kernels/xe/native_ple_postops.cpp src/kernels/xe/native_qsa.cpp
                                     src/kernels/xe/native_qsa_score.cpp src/kernels/xe/native_qsa_indexer.cpp
                                     src/kernels/xe/native_flash_attn.cpp src/kernels/xe/qsa_select.cpp
@@ -567,8 +568,9 @@ if(STRATA_ENABLE_XE)
                                    src/core/native_dense.cpp src/core/dense_slab.cpp src/core/verify.cpp
                                    src/core/moe_window.cpp
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
+                                   src/artifact/yskn.cpp
                                    src/core/mtp.cpp src/core/dflash2.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
-                                   src/core/shead.cpp
+                                   src/core/shead.cpp src/core/bdraft2.cpp src/core/draft_ring_log.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/control_vector.cpp
                                    src/core/vmm.cpp src/core/draft_head.cpp
@@ -1564,6 +1566,11 @@ if(STRATA_ENABLE_XE)
     add_executable(sampler_parity src/kernels/sampler_parity.cpp)
     target_link_libraries(sampler_parity PRIVATE strata_kernels)
     add_test(NAME sampler_parity COMMAND sampler_parity --selftest)
+    # the .yskn products on the GPU (decode, the prompt's FP16 rows and rotations) against the CPU reference, on a
+    # synthetic container; the reader compiles in (picojson through strata_xgrammar's include)
+    add_executable(yskn_parity src/kernels/yskn_parity.cpp src/artifact/yskn.cpp)
+    target_link_libraries(yskn_parity PRIVATE strata_kernels strata_xgrammar)
+    add_test(NAME yskn_parity COMMAND yskn_parity --selftest)
     add_test(NAME device_selftest COMMAND strata-device --selftest)
     set_tests_properties(elementwise_parity device_selftest PROPERTIES TIMEOUT 60)
   endif()

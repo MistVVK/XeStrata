@@ -61,6 +61,13 @@
 namespace strata {
 class GgufModel;
 }
+namespace strata::yskn {
+class Container;
+struct TensorDesc;
+}
+namespace strata::kernels {
+struct YsknDev;
+}
 
 namespace strata::core {
 
@@ -657,7 +664,12 @@ private:
         const void* data = nullptr;
         int type = -1;
         int n_in = 0, n_out = 0;
+        /// a .yskn matrix (open_yskn): its codes in data, read by the yskn kernels from FP32 rows, never by the GGUF
+        /// types' kernels
+        const strata::kernels::YsknDev* yk = nullptr;
     };
+    /// Whether w's products read the q8_1 rows the norms and kernels write (not BF16, F32 or .yskn matrices)
+    static bool q8_in(const W& w);
     struct Block {
         bool recurrent = false;
         int64_t gdn = -1, attn = -1;    ///< index among the GDN / attention blocks
@@ -707,6 +719,21 @@ private:
     /// An F32 vector or matrix, or a BF16 one widened to F32 at load (exact: Qwen3.6's MTP layer keeps its two routers
     /// in BF16).
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
+    /// A .yskn model (YASAKANI's trellis-coded Qwen3.8-27B): the GGUF is a skeleton (tools/yskn_skeleton.py: the
+    /// metadata, the tokenizer, the norms and the GDN's small tensors) whose `xestrata.yskn.file` names the .yskn
+    /// beside it, and the matrices the skeleton lacks are read from that file (upload_yskn), the embedding's rows
+    /// decoded on the host (embed).  false with err on a .yskn that is not this model's.
+    bool open_yskn(std::string& err);
+    /// GGUF tensor `name`'s matrix from the .yskn: its codes in the device order, its tables, signs and the GDN's
+    /// V-head order (grouped in the file, tiled in the engine) as row or column maps; false: none there (err unset)
+    /// or a failure (err set)
+    bool upload_yskn(const std::string& name, W& w, std::string& err);
+    /// The scratch the decode's .yskn products share, sized for the largest matrix and max_t rows
+    bool yskn_scratch(std::string& err);
+    /// The prompt's product of a .yskn matrix: x16 [T] (row stride ldx) rotated, the matrix decoded to FP16 rows and
+    /// multiplied by prefill::Gemm, the rows rotated back into y (row stride ldy, 0: n_out), in parts of the scratch's
+    /// rows
+    void prompt_yskn(const W& w, const uint16_t* x16, int64_t ldx, float* y, int64_t T, int64_t ldy);
     /// The head's tensor: output.weight, or token_embd.weight where the file ties the two (as llama.cpp reads Qwen3.5's
     /// small models, which have no output.weight)
     const char* head_name() const;
@@ -1083,6 +1110,16 @@ private:
     bool load_embedding(std::string& err);
     int32_t* mrope_ = nullptr;       ///< --vision: the cells' (t, h, w), device [max_cells][3]
     size_t emb_row_ = 0;
+    std::unique_ptr<strata::yskn::Container> yskn_;          ///< open_yskn's file, mapped
+    std::vector<std::unique_ptr<strata::kernels::YsknDev>> yskn_devs_;   ///< the W::yk the matrices point at
+    const strata::yskn::TensorDesc* yskn_emb_ = nullptr;      ///< the coded embedding, with its residual tables
+    std::vector<const strata::yskn::TensorDesc*> yskn_emb_extra_;
+    std::vector<int8_t> yskn_emb_signs_;
+    void* yskn_scratch_ = nullptr;   ///< the decode's .yskn products' (yskn_scratch)
+    /// the prompt's: the FP16 matrix, the rotated input rows, the rotated output rows (prompt_yskn)
+    uint16_t* yskn_w16_ = nullptr;
+    uint16_t* yskn_x16_ = nullptr;
+    float* yskn_yrot_ = nullptr;
     W head_;
     const float* out_norm_ = nullptr;
     std::vector<Block> blocks_;
