@@ -30,6 +30,7 @@ List the GPUs in setup's `--gpus` (numbered as `--check` lists them; the first r
 
 setup writes the first GPU's PCI address in `"gpu_pci"` and the others' in `"split_pci"`, and the server passes
 `--layer-split` and `--split-device` to the engine.
+With two cards from `--gpus` and the model fitting one of them, the server chooses at every start whether replicas or split serving serve better ([replicas](#independent-engines-side-by-side-replicas), [split serving](#read-the-prompt-on-one-card-make-the-answer-on-another-split-serving)); `--layer-split K` keeps the layer split.
 The engine's own options:
 
 | Option | Meaning |

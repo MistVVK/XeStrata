@@ -30,6 +30,7 @@ setup で、使う GPU を `--gpus` に並べます（番号は `--check` の表
 
 setup は最初の GPU を `"gpu_pci"` に、後の GPU を `"split_pci"` に PCI アドレスで書き、サーバーがエンジンに
 `--layer-split` と `--split-device` を渡します。
+`--gpus` で 2 枚を選び、その 1 枚にモデルが収まるときは、サーバーが起動のたびに、レプリカか split serving の方が得かを自分で決めます（[レプリカ](#独立したエンジンを並べるレプリカ)・[split serving](#prompt-を-1-枚で読み答えを別の-1-枚で作るsplit-serving)）。層の分割のままにしたいときは、`--layer-split K` で分割点を決めます。
 エンジンを直接動かすときのオプションは次のとおりです。
 
 | オプション | 意味 |
