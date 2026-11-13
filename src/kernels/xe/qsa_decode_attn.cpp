@@ -179,7 +179,10 @@ inline float dotn(const float* k, const float* q) {
 
 // LOOP: a slot reads more than one chunk (n_slots below the chunks); without it every expression is the one this file
 // had before the slots.
-template <int HD, int G, int KV_MODE, bool LOOP, int NC, bool PERCELL>
+// ROWS: a batch window's rows, each with its own slot's pools.  A template argument, not a test of rows.n in the
+// kernel: the pools picked per work-item cost the B70 8 times the kernel's time (69 -> 532 us at 8192 cells) and the
+// RTX 4070 some, for every caller.
+template <int HD, int G, int KV_MODE, bool LOOP, int NC, bool PERCELL, bool ROWS>
 sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools pools, const int32_t* ids_all,
                          const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
                          float* part_m_all, float* part_l_all, int n_slots, size_t n_q, int cap,
@@ -205,8 +208,11 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
             const sycl::sub_group sg = it.get_sub_group();
             const size_t z = it.get_group(0);
             // batched form: query z, with its own q row, selection, step and scratch; a batch window's row reads
-            // its own slot's pools (rows.n > 0)
-            const QsaAttnPools p = rows.n > 0 ? rows.p[z] : pools;
+            // its own slot's pools (ROWS)
+            const QsaAttnPools& p = [&]() -> const QsaAttnPools& {
+                if constexpr (ROWS) return rows.p[z];
+                else return pools;
+            }();
             const float* q = q_all + z * (size_t) (n_kv_heads * G) * HD;
             const int32_t* ids = dense ? nullptr : ids_all + z * (size_t) cap;
             const int32_t* step = step_all + z * kStepCount;
@@ -693,23 +699,23 @@ int kv_mode_of(const QsaAttnPools& pools) {
     return pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3 : (pools.k_q != nullptr ? 1 : 0));
 }
 
-template <int HD, int G, bool LOOP, bool PERCELL>
+template <int HD, int G, bool LOOP, bool PERCELL, bool ROWS>
 void launch_kv_form(int kv_mode, int nc, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
                int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div,
                int min_chunk, const QsaAttnPoolsRows& rows) {
     if constexpr (PERCELL) {
-        if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-        else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-        else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-        else launch_chunk<HD, G, 0, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+        if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+        else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+        else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+        else launch_chunk<HD, G, 0, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     } else {
-    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-    else launch_chunk<HD, G, 0, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else launch_chunk<HD, G, 0, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     }
 }
 
@@ -718,12 +724,14 @@ void launch_kv(int kv_mode, int nc, sycl::queue& queue, const float* q, const Qs
                const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
                int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div, int min_chunk, bool percell,
                const QsaAttnPoolsRows& rows) {
-    if (percell)
-        launch_kv_form<HD, G, LOOP, true>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m,
-                                        part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-    else
-        launch_kv_form<HD, G, LOOP, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m,
-                                         part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    const auto go = [&]<bool CELL, bool ROWS>() {
+        launch_kv_form<HD, G, LOOP, CELL, ROWS>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc,
+                                                part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk,
+                                                rows);
+    };
+    if (rows.n > 0) { if (percell) go.template operator()<true, true>(); else go.template operator()<false, true>(); }
+    else if (percell) go.template operator()<true, false>();
+    else go.template operator()<false, false>();
 }
 
 // The decode attention's form on a GPU, for a shape (head_dim, query heads per KV head): the cells a step of the fp16
