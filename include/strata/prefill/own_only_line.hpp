@@ -61,4 +61,30 @@ inline std::string own_only_line(int64_t layers, int64_t floor_tokens, const Own
     return s;
 }
 
+/// When the line is printed.  The counts are known when the prompt plan is made (early in the start, before the expert cache), but the floor is not: the CPU share's limit
+/// and the card's class (plain_floor_rule.hpp) arrive later, so a line printed with the plan named the floor of a card that had not answered yet (64 tokens while the
+/// engine ran at 3,072 or 1,536).  The plan stores its counts here; the line is printed once the share has been armed (Prefill::arm_cpu_share, which runs after the card
+/// answered and before the first prompt), with the floor the rule returns at that point.  Not thread-safe by itself: prefill.cpp holds a mutex around it.
+class OwnOnlyLineDeferred {
+public:
+    /// The plan's counts.  Kept until printed.
+    void plan(int64_t layers, const OwnOnlySplit& big, const OwnOnlySplit& small, bool peer_off) {
+        layers_ = layers; big_ = big; small_ = small; peer_off_ = peer_off; have_ = true;
+    }
+    /// The floor is final from now on (the share is armed).
+    void mark_ready() { ready_ = true; }
+    /// True once: the counts are there, the floor is final, and the line has not been printed.
+    bool due() const { return have_ && ready_ && !printed_; }
+    /// The line with the floor the rule returns now; marks it printed.
+    std::string take(int64_t floor_tokens) {
+        printed_ = true;
+        return own_only_line(layers_, floor_tokens, big_, small_, peer_off_);
+    }
+
+private:
+    int64_t layers_ = 0;
+    OwnOnlySplit big_, small_;
+    bool peer_off_ = false, have_ = false, ready_ = false, printed_ = false;
+};
+
 }  // namespace strata::prefill

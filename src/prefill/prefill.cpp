@@ -559,6 +559,21 @@ inline int64_t stream_all_min() {
     // (default_stream_floor() prints its line once and caches: only asked when its answer can be the result, as before)
     return strata::prefill::floor_with_share(discrete, g_stream_min_share, discrete || g_stream_min_share <= 0 ? default_stream_floor() : 0);
 }
+#if defined(STRATA_PF_OWN_ONLY)
+// The start-up line of a build without MMQ ("prompt kernels: chunks of N tokens or more ..."): the plan (mmq_plan) makes the counts early in the start, before the CPU share
+// is armed and before the card has answered, so the floor is printed once arm_cpu_share has run (own_only_line.hpp OwnOnlyLineDeferred), as stream_all_min() returns it then.
+std::mutex g_own_line_mu;
+strata::prefill::OwnOnlyLineDeferred g_own_line;
+inline void own_only_line_flush() {
+    {
+        std::lock_guard<std::mutex> lk(g_own_line_mu);
+        if (!g_own_line.due()) return;
+    }
+    const int64_t floor_tokens = stream_all_min();   // outside the lock: it may print default_stream_floor()'s own line first
+    std::lock_guard<std::mutex> lk(g_own_line_mu);
+    if (g_own_line.due()) std::fprintf(stderr, "%s\n", g_own_line.take(floor_tokens).c_str());
+}
+#endif
 // STRATA_PREFILL_CPU_SHARE (opt-in; set_cpu_pool): a chunk below stream_all_min() hands the decode CPU pool - idle
 // while a prompt is read - the non-resident experts few of its tokens route to, instead of streaming them over PCIe.
 // `auto`: the share measured, each layer's CPU time per expert and the GPU's per streamed expert (CUDA events around
@@ -1976,7 +1991,11 @@ const MmqPlan& mmq_plan() {
                 }
                 strata::prefill::own_only_count_layer(big, small, fo, i8, i8_gated, entry_on, unfolded);
             }
-            std::fprintf(stderr, "%s\n", strata::prefill::own_only_line(layers, stream_all_min(), big, small, peer_off).c_str());
+            {   // printed once the share is armed, with the floor in force then (own_only_line_flush)
+                std::lock_guard<std::mutex> lk(g_own_line_mu);
+                g_own_line.plan(layers, big, small, peer_off);
+            }
+            own_only_line_flush();
             std::string sw;
             for (const std::string& k : own_only_switches()) sw += (sw.empty() ? "" : " ") + k;
             if (mf) strata::core::manifest::instance().path("prefill", "own-only-build", true,
@@ -3479,6 +3498,13 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
     (void) by_default;
 #endif
     if (applies && cpu_share_on()) g_stream_min_share = cpu_share_max();
+#if defined(STRATA_PF_OWN_ONLY)
+    {   // the floor is final now (the card answered before this call): the start-up line of a build without MMQ
+        std::lock_guard<std::mutex> lk(g_own_line_mu);
+        g_own_line.mark_ready();
+    }
+    own_only_line_flush();
+#endif
 }
 
 void Prefill::set_share_blocked(bool blocked) { g_share_blocked.store(blocked, std::memory_order_release); }

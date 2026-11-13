@@ -4,6 +4,7 @@
 #include <string>
 
 #include "strata/prefill/own_only_line.hpp"
+#include "strata/prefill/plain_floor_rule.hpp"
 
 using strata::prefill::OwnOnlySplit;
 using strata::prefill::own_only_line;
@@ -84,6 +85,37 @@ int main() {
         OwnOnlySplit b2, s2;
         strata::prefill::own_only_count_layer(b2, s2, false, true, true, true, true);   // an int8 layer on a gated class: FP16 in the long class, int8 below
         if (!(b2.fp16 == 1 && s2.i8 == 1 && b2.i8 == 0)) { std::fprintf(stderr, "FAIL %s:%d: gated int8 layer\n", __FILE__, __LINE__); ++failed; }
+    }
+    // The printed floor is the one the rule returns once the share is armed and the card has answered (plain_floor_rule.hpp floor_with_share), not the value at the
+    // time the plan is made.  Plain Q2_0 pack in a build without MMQ: 48 layers on the fused kernels at the floor and above, 48 on the FP16 path below it.
+    {
+        using strata::prefill::floor_with_share;
+        using strata::prefill::OwnOnlyLineDeferred;
+        OwnOnlySplit big; big.fused = 48;
+        OwnOnlySplit small; small.fp16 = 48;
+        const char* line_1536 = "strata: prompt kernels: chunks of 1536 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the FP16 path.";
+        const char* line_3072 = "strata: prompt kernels: chunks of 3072 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the FP16 path.";
+        const char* line_64 = "strata: prompt kernels: chunks of 64 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the FP16 path.";
+        // the plan is made first (the old line printed 64 here): nothing is due until the share is armed
+        OwnOnlyLineDeferred d;
+        d.plan(48, big, small, false);
+        if (d.due()) { std::fprintf(stderr, "FAIL %s:%d: due before the share is armed\n", __FILE__, __LINE__); ++failed; }
+        d.mark_ready();
+        if (!d.due()) { std::fprintf(stderr, "FAIL %s:%d: not due after the share is armed\n", __FILE__, __LINE__); ++failed; }
+        // a discrete CUDA card, share armed: the plain pack's floor 1,536
+        CHECK_LINE(d.take(floor_with_share(true, 3072, 64)), line_1536);
+        if (d.due()) { std::fprintf(stderr, "FAIL %s:%d: printed twice\n", __FILE__, __LINE__); ++failed; }
+        // the same plan with the rule switched off (STRATA_PF_PLAIN_FLOOR=0) or on an integrated card: the share's limit when armed, else the pack's 64
+        OwnOnlyLineDeferred e;
+        e.plan(48, big, small, false);
+        e.mark_ready();
+        CHECK_LINE(e.take(floor_with_share(false, 3072, 64)), line_3072);
+        OwnOnlyLineDeferred f;
+        f.mark_ready();   // armed before the plan was made: the plan prints at once
+        if (f.due()) { std::fprintf(stderr, "FAIL %s:%d: due without counts\n", __FILE__, __LINE__); ++failed; }
+        f.plan(48, big, small, false);
+        if (!f.due()) { std::fprintf(stderr, "FAIL %s:%d: a plan made after the share was armed is not due\n", __FILE__, __LINE__); ++failed; }
+        CHECK_LINE(f.take(floor_with_share(false, 0, 64)), line_64);
     }
     if (failed) {
         std::fprintf(stderr, "own_only_line_test: %d check(s) failed\n", failed);
