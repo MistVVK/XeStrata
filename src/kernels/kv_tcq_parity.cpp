@@ -7,7 +7,11 @@
 //    of the row's root mean square times the multipliers.
 // 2. The same bits whether the cells are written one at a time (step) or as one chunk (pos0): a row codes alone.
 // 3. The decode attention over the coded cells (KV_MODE 4) against the host's attention over the host's decoding.
+// Deferred coding (the ring, the default; 5 bits): 4. the same code, ring and coded bound whether the cells come one at
+// a time or as one chunk; 5. the decode attention against the host's reading of the code below the bound and of the
+// ring's INT8 above it.
 
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_tcq.hpp"
 #include "strata/kernels/kv_tcq_tables.hpp"
@@ -103,6 +107,34 @@ void decode_row_host(const uint8_t* row, int bits, float* out) {
         }
         out[d] = (float) code_of(bits, st) * (sc / 256.0f);
     }
+}
+
+// The largest difference of the GPU's attention `out` of query rows q from the host's over the decoded K and V
+double attention_diff(const std::vector<float>& q, const std::vector<float>& kdec, const std::vector<float>& vdec,
+                      const std::vector<float>& out, int T, int H, int NH) {
+    const int G = NH / H;
+    double worst = 0.0;
+    for (int qh = 0; qh < NH; ++qh) {
+        const int h = qh / G;
+        std::vector<double> sc(T);
+        double mx = -1e300, sum = 0.0;
+        for (int t = 0; t < T; ++t) {
+            double dot = 0.0;
+            for (int d = 0; d < D; ++d) dot += (double) q[(size_t) qh * D + d] * kdec[((size_t) t * H + h) * D + d];
+            sc[t] = dot / 16.0;
+            mx = std::max(mx, sc[t]);
+        }
+        for (int t = 0; t < T; ++t) {
+            sc[t] = std::exp(sc[t] - mx);
+            sum += sc[t];
+        }
+        for (int d = 0; d < D; ++d) {
+            double o = 0.0;
+            for (int t = 0; t < T; ++t) o += sc[t] / sum * vdec[((size_t) t * H + h) * D + d];
+            worst = std::max(worst, std::fabs(o - out[(size_t) qh * D + d]));
+        }
+    }
+    return worst;
 }
 
 void run(int bits) {
@@ -225,33 +257,128 @@ void run(int bits) {
     strata::parity::sync();
     std::vector<float> out(q.size());
     strata::parity::copy_bytes_out(out.data(), d_out, out.size() * 4);
-    const int G = NH / H;
-    double worst = 0.0;
-    for (int qh = 0; qh < NH; ++qh) {
-        const int h = qh / G;
-        std::vector<double> sc(T);
-        double mx = -1e300, sum = 0.0;
-        for (int t = 0; t < T; ++t) {
-            double dot = 0.0;
-            for (int d = 0; d < D; ++d) dot += (double) q[(size_t) qh * D + d] * kdec[((size_t) t * H + h) * D + d];
-            sc[t] = dot / 16.0;
-            mx = std::max(mx, sc[t]);
-        }
-        for (int t = 0; t < T; ++t) {
-            sc[t] = std::exp(sc[t] - mx);
-            sum += sc[t];
-        }
-        for (int d = 0; d < D; ++d) {
-            double o = 0.0;
-            for (int t = 0; t < T; ++t) o += sc[t] / sum * vdec[((size_t) t * H + h) * D + d];
-            worst = std::max(worst, std::fabs(o - out[(size_t) qh * D + d]));
-        }
-    }
+    const double worst = attention_diff(q, kdec, vdec, out, T, H, NH);
     if (worst > 1e-4) {
         std::fprintf(stderr, "FAIL: tcq%d: the decode attention differs from the host's by %e\n", bits, worst);
         ++g_fail;
     } else {
         std::printf("  -> tcq%d: code and scale as the host's, the same bits a step or a chunk, attention within %e\n",
+                    bits, worst);
+    }
+}
+
+// Deferred coding: 24 cells (one block coded, 8 in the ring), written a cell at a time and as one chunk
+void run_deferred(int bits) {
+    std::printf("[tcq%d deferred] the ring: one cell a step and one chunk, decode attention\n", bits);
+    std::mt19937 rng(7 + bits);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    k::QsaShapes s = k::qsa_real_shapes();
+    s.page_size = 64;
+    const int H = (int) s.n_head_kv, NH = (int) s.n_head, T = 24, P = (int) s.page_size, pages = 2;
+    const size_t row_b = k::kv_tcq_bytes_per_head(D, bits), pool_b = (size_t) pages * H * P * row_b;
+    const size_t ring_b = k::kv_tcq_ring_bytes(D, H);
+    std::vector<float> kh((size_t) T * H * D), vh((size_t) T * H * D);
+    for (auto& x : kh) x = 2.0f * nd(rng);
+    for (auto& x : vh) x = 2.0f * nd(rng);
+    std::vector<int32_t> table = {1, 0};
+    int32_t* d_table = dalloc<int32_t>(pages);
+    strata::parity::copy_bytes_in(d_table, table.data(), table.size() * 4);
+    float* d_k = dalloc<float>(kh.size());
+    float* d_v = dalloc<float>(vh.size());
+    strata::parity::copy_bytes_in(d_k, kh.data(), kh.size() * 4);
+    strata::parity::copy_bytes_in(d_v, vh.data(), vh.size() * 4);
+    std::vector<int32_t> steps((size_t) T * k::kStepCount);
+    for (int t = 0; t < T; ++t) k::qsa_step_fill(steps.data() + (size_t) t * k::kStepCount, t, s);
+    int32_t* d_steps = dalloc<int32_t>(steps.size());
+    strata::parity::copy_bytes_in(d_steps, steps.data(), steps.size() * 4);
+    uint8_t *d_k1 = dalloc<uint8_t>(pool_b), *d_v1 = dalloc<uint8_t>(pool_b), *d_r1 = dalloc<uint8_t>(ring_b);
+    uint8_t *d_k2 = dalloc<uint8_t>(pool_b), *d_v2 = dalloc<uint8_t>(pool_b), *d_r2 = dalloc<uint8_t>(ring_b);
+    for (int t = 0; t < T; ++t) {
+        k::KvAppend a;
+        a.step = d_steps + (size_t) t * k::kStepCount;
+        a.k = d_k + (size_t) t * H * D;
+        a.v = d_v + (size_t) t * H * D;
+        a.n_tok = 1;
+        a.k_tc = d_k1;
+        a.v_tc = d_v1;
+        a.tc_bits = bits;
+        a.tc_ring = d_r1;
+        a.page_table = d_table;
+        k::kv_append_cells(a, s, nullptr);
+    }
+    {
+        k::KvAppend a;
+        a.step = d_steps;
+        a.step_stride = k::kStepCount;
+        a.k = d_k;
+        a.v = d_v;
+        a.n_tok = T;
+        a.k_tc = d_k2;
+        a.v_tc = d_v2;
+        a.tc_bits = bits;
+        a.tc_ring = d_r2;
+        a.page_table = d_table;
+        k::kv_append_cells(a, s, nullptr);
+    }
+    strata::parity::sync();
+    std::vector<uint8_t> k1(pool_b), v1(pool_b), r1(ring_b), k2(pool_b), v2(pool_b), r2(ring_b);
+    strata::parity::copy_bytes_out(k1.data(), d_k1, pool_b);
+    strata::parity::copy_bytes_out(v1.data(), d_v1, pool_b);
+    strata::parity::copy_bytes_out(r1.data(), d_r1, ring_b);
+    strata::parity::copy_bytes_out(k2.data(), d_k2, pool_b);
+    strata::parity::copy_bytes_out(v2.data(), d_v2, pool_b);
+    strata::parity::copy_bytes_out(r2.data(), d_r2, ring_b);
+    int coded = 0;
+    std::memcpy(&coded, r1.data() + ring_b - 64, 4);
+    if (k1 != k2 || v1 != v2 || r1 != r2 || coded != T / k::kTcqBlock * k::kTcqBlock) {
+        std::fprintf(stderr, "FAIL: tcq%d deferred: one cell a step and one chunk differ (coded %d)\n", bits, coded);
+        ++g_fail;
+    }
+
+    // the host's reading: the code below the bound, the ring's INT8 (codes, FP16 scales per 64) above it
+    std::vector<float> kdec((size_t) T * H * D), vdec((size_t) T * H * D);
+    const size_t scales_at = 2ull * k::kTcqRing * H * D;
+    for (int t = 0; t < T; ++t)
+        for (int h = 0; h < H; ++h)
+            for (int is_v = 0; is_v < 2; ++is_v) {
+                float* out = (is_v ? vdec : kdec).data() + ((size_t) t * H + h) * D;
+                if (t < coded) {
+                    const long long row = ((long long) table[t / P] * H + h) * P + t % P;
+                    decode_row_host((is_v ? v1 : k1).data() + row * row_b, bits, out);
+                    continue;
+                }
+                const size_t rr = ((size_t) is_v * k::kTcqRing + (size_t) (t % k::kTcqRing)) * H + h;
+                for (int d = 0; d < D; ++d) {
+                    uint16_t sb;
+                    std::memcpy(&sb, r1.data() + scales_at + (rr * (D / 64) + d / 64) * 2, 2);
+                    out[d] = (float) (int8_t) r1[rr * D + d] * k::f32_from_f16(sb);
+                }
+            }
+    std::vector<float> q((size_t) NH * D);
+    for (auto& x : q) x = nd(rng);
+    float* d_q = dalloc<float>(q.size());
+    float* d_out = dalloc<float>(q.size());
+    strata::parity::copy_bytes_in(d_q, q.data(), q.size() * 4);
+    const int64_t cells = (int64_t) pages * P;
+    float* d_scratch = dalloc<float>(k::qsa_decode_attn_scratch_floats(cells, s));
+    k::QsaAttnPools pools;
+    pools.k_tc = d_k1;
+    pools.v_tc = d_v1;
+    pools.tc_bits = bits;
+    pools.tc_ring = d_r1;
+    pools.tc_ring_kv = H;
+    pools.page_table = d_table;
+    k::qsa_dense_attn_step(d_q, pools, d_steps + (size_t) (T - 1) * k::kStepCount, cells, s, d_scratch, d_out,
+                           nullptr);
+    strata::parity::sync();
+    std::vector<float> out(q.size());
+    strata::parity::copy_bytes_out(out.data(), d_out, out.size() * 4);
+    const double worst = attention_diff(q, kdec, vdec, out, T, H, NH);
+    if (worst > 1e-4) {
+        std::fprintf(stderr, "FAIL: tcq%d deferred: the decode attention differs from the host's by %e\n", bits, worst);
+        ++g_fail;
+    } else {
+        std::printf("  -> tcq%d deferred: the same code, ring and bound a step or a chunk, attention within %e\n",
                     bits, worst);
     }
 }
@@ -262,6 +389,7 @@ int main() {
     std::printf("=== Running kv_tcq_parity test ===\n");
     run(4);
     run(5);
+    run_deferred(5);
     if (g_fail == 0) {
         std::printf("=== kv_tcq_parity: ALL TESTS PASSED ===\n");
         return 0;
