@@ -597,5 +597,33 @@ class Helpers(unittest.TestCase):
         self.assertTrue(any("own graphics" in n for n in r["notes"]))
 
 
+class ProcIdentity(unittest.TestCase):
+    """upstream 7ea172159: an ended process is not "running", not even while nobody has reaped it yet (a zombie) - on
+    Windows, where the test must not be os.kill(pid, 0) (that ends the process), and on Linux (/proc's state)."""
+
+    def test_an_ended_child_is_not_running_before_it_is_reaped(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            end = time.time() + 10
+            while M.proc_identity(child.pid) is not None and time.time() < end:
+                time.sleep(0.05)                        # it has ended; wait() is what reaps it
+            self.assertIsNone(M.proc_identity(child.pid))
+            self.assertFalse(M.proc_alive(child.pid, "linux:0"))
+        finally:
+            child.wait()
+
+    def test_a_running_child_is_running_and_its_token_is_its_own(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            ident = M.proc_identity(child.pid)
+            self.assertIsNotNone(ident)
+            self.assertTrue(M.proc_alive(child.pid, ident))
+            self.assertFalse(M.proc_alive(child.pid, ident + "x"))
+        finally:
+            child.kill()
+            child.wait()
+        self.assertIsNone(M.proc_identity(child.pid))
+
+
 if __name__ == "__main__":
     unittest.main()
