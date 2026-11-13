@@ -79,12 +79,6 @@ Every copyright holder whose work is in this repository, its license and where t
   window's half over the overlap's middle third), after https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
   (src/core/generation_utils.py); that code stays under Apache-2.0, the file as a whole is under the LGPL
   (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
-- Copyright (c) 2026 the YASAKANI authors
-  Apache-2.0 - the fixed-point sums of the experts' products (include/strata/kernels/canon_math.hpp, fx_*: each
-  block's scale rounded to a fixed-point integer, the int8 sums times it added in int64, so the CPU's rows and every
-  GPU's products give the same bits in any order), after YASAKANI's XSUM rows (https://github.com/yasakani-dev/yasakani
-  at 0205f06, src/lnord.cu); that code stays under Apache-2.0, the file as a whole is under the LGPL
-  (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
 - Copyright (c) 2024 Sahand Ahmadian; Copyright (c) 2024 Jonseed
   MIT - the image engine's Detail Daemon (src/image/guidance.cpp, include/strata/image/guidance.hpp: its schedule, the
   sigma the model is asked at, their constants and the settings' defaults), written after
