@@ -843,7 +843,7 @@ if(STRATA_ENABLE_XE)
   # The experts' quantized products (moe_mmq.cpp) run on the int8 matrix engines where the GPU reports the shape
   # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
   # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
-  add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp
+  add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/gdn_chunk.cpp
                                     src/prefill/prefill.cpp src/prefill/moe_mmq.cpp src/prefill/plain_prompt.cpp
                                     src/prefill/plain_prompt_glm5.cpp)
   target_include_directories(strata_prefill PUBLIC include)
