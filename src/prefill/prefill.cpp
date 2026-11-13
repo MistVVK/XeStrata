@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/expert_tier.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
@@ -191,10 +192,25 @@ int g_ring_override = 0;
 // slots 1296 tok/s, 512 1364, 768 1376; IQ3_XXS's 2.3 MB blobs, 64K: 384 1043, 512 1034, the ring's slots taken from
 // the cache's resident experts).
 constexpr uint64_t kRingBigBytes = 800ull << 20;
+// XESTRATA_PREFILL_RING_DEPTH (upstream a1e6ef324): the pinned read's ring is 192 slots, not 384, below 8192-token
+// chunks - a short chunk's attention half is short and the deeper ring's staging only waits longer.  Measured on the
+// RTX 4070 at a 4K prompt: +1.2% and then +1.6% with 192, the B70 the same; a 32K prompt in one 16384-token chunk
+// loses 12.5% with it, so the chunk's size decides.  Upstream's boundary is 12K-token chunks; this path's big-ring
+// rule starts at 8192-token chunks and measured better there (384 slots 1296 tok/s, 512 1364 at 8192-token chunks),
+// so the shallow ring stops at it.  auto (unset): the chunk's size; 0: 384 everywhere; 1: 192 everywhere.
+// STRATA_PREFILL_RING's exact count still wins over all three (the A/B's switch).
+constexpr int64_t kRingShallowT = 8192;
+inline core::Pick ring_depth_pick() {
+    static const core::Pick v = core::pick_from_env("PREFILL_RING_DEPTH");
+    return v;
+}
 inline int ring_slots(size_t T) {
     const char* v = strata::env_get("PREFILL_RING");
     const uint64_t blob_b = (uint64_t) std::max<int64_t>(MAXBLOB(), 1);
-    const int pinned = (int64_t) T >= 8192 ? (int) std::clamp<uint64_t>(kRingBigBytes / blob_b, 384, 512) : 384;
+    const int big_ring = (int) std::clamp<uint64_t>(kRingBigBytes / blob_b, 384, 512);
+    const core::Pick depth = ring_depth_pick();
+    const bool shallow = depth == core::Pick::On || (depth == core::Pick::Auto && (int64_t) T < kRingShallowT);
+    const int pinned = shallow ? 192 : (int64_t) T >= 8192 ? big_ring : 384;
     int r = v ? (int) std::strtol(v, nullptr, 10)
               : (g_ring_override > 0 ? g_ring_override : g_pinned_share >= 0.9 ? pinned : 96);
     if (!v) {
