@@ -3959,6 +3959,19 @@ int strata::qwen35::run(int argc, char** argv) {
         if (std::getenv(v) == nullptr) _putenv_s(v, "1");
 #endif
     }
+#if !defined(__HIPCC__)
+    // A build without llama.cpp's MMQ (MMQ::built() false: strata_pf_own with mmq_absent.cpp) has no MMQ tile for any layer, so a layer takes the fused kernels or the
+    // whole prompt takes the grouped kernels.  `strata` already sets STRATA_PF_FUSED=1 before main in such a build (prefill.cpp, g_own_only_defaults), which makes every
+    // sm_80+ card whose kernels cover a layer's pair take them (fused_tile::q36_takes); this standalone engine does not link that code, so it does the same here: the same
+    // behaviour on both entry points.  A value you set is kept (=0 keeps every layer on the grouped kernels).  A build with MMQ is unchanged.
+    if (!MMQ::built()) {
+#if !defined(_WIN32)
+        setenv("STRATA_PF_FUSED", "1", 0);
+#else
+        if (std::getenv("STRATA_PF_FUSED") == nullptr) _putenv_s("STRATA_PF_FUSED", "1");
+#endif
+    }
+#endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
     Model m;
