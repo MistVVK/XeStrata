@@ -46,10 +46,10 @@ While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, 
 
 With a helper GPU (`--expert-cache-device1`, or the helper `--layer-split auto` chose), in the same short chunks the experts not in VRAM that the helper holds and few tokens route to are computed by the helper from its own VRAM. Their tokens' rows go to it through host memory registered on both GPUs, and the results come back the same way. How many tokens an expert may have is where moving its rows over the helper's link and back takes less time than streaming the expert to the first GPU, from both links as measured at the start (19 for a B70 and an RTX 4070 on x4). `XESTRATA_PREFILL_HELPER_ROWS=n` sets it, `0` turns it off. The helper computes with its int8 products, so the reply can differ slightly from the first GPU alone's (the first token's KL on a 1K prompt 0.011; the CPU share at 0.5: 0.020). On a B70 and an RTX 4070 a 1K prompt went from 693 to 735 tokens/s.
 
-The prefill has four opt-in switches, set in the engine's environment. None of them changes a bit of the answers.
+The prefill has four switches, set in the engine's environment. None of them changes a bit of the answers.
 
-- `XESTRATA_PLE_COMPACT=1`: the chunk's PLE rows go up to the GPU still quantized (IQ4_NL) and are dequantized there, about a seventh of the bytes over the host link. Without VRAM for that buffer the rows are dequantized on the host as before.
-- `XESTRATA_PLE_COPY_STREAM=1` (with `XESTRATA_PLE_COMPACT=1`): those rows go up on a stream of their own instead of the compute stream.
+- `XESTRATA_PLE_COMPACT` (0 or 1 fixes it): the chunk's PLE rows go up to the GPU still quantized (IQ4_NL) and are dequantized there, about a seventh of the bytes over the host link. Without VRAM for that buffer the rows are dequantized on the host as before. Unset (auto), the first start times the landing of a 512-token chunk both ways (the host's dequant, and the raw rows with the device's) and takes the form 3% or more faster.
+- `XESTRATA_PLE_COPY_STREAM` (0 or 1 fixes it; with `XESTRATA_PLE_COMPACT`): those rows go up on a stream of their own instead of the compute stream. Auto takes it only when `XESTRATA_PLE_COMPACT` was taken (the same bytes and kernels, the upload moved off the compute stream).
 - `XESTRATA_EMBED_VRAM=1`: the native embedding table in VRAM instead of mapped host memory. Without room for the table plus 512 MiB it stays in host memory, and the log says so.
 - `XESTRATA_DEQUANT_SIDE=1`: the dense weights' dequantization to FP16 runs on a side stream, overlapping the product before it. It takes a second scratch buffer.
 
