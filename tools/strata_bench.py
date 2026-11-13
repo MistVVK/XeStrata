@@ -73,18 +73,35 @@ BURST_MAX_TOKENS = 128
 
 
 # --------------------------------------------------------------------------------------------------------- redaction
+def usable_key(value) -> str:
+    """An API key as a client may send it: "" for nothing, blanks, or "none" in any case (the server's word for no
+    key, #4483)."""
+    if isinstance(value, (list, tuple)):                # a config may list several keys: the first one is the client's
+        value = value[0] if value else None
+    text = "" if value is None else str(value).strip()
+    return "" if text.lower() == "none" else text
+
+
 def redactor(extra: tuple[str, ...] = (), key: str = ""):
     """-> f(text) -> text with this machine's home folders, user and host names, the Strata folder, IP addresses and the
-    API key replaced.  Applied to everything that is written or printed from the server's or the machine's own text."""
+    API key replaced.  Applied to everything that is written or printed from the server's or the machine's own text.
+    The key is replaced only where it stands as a whole token and in its own case (#4483): a short key is also a
+    common word or a part of a hash.  A hyphen next to it does not make it part of a longer word (`pack-<key>`,
+    `<key>-1`: the key leaked there); letters, digits and the underscore do.  The names (user, host) are not touched
+    inside a label this function wrote: redacting a text twice gives the same text (a user called "user" gave
+    `<<user>>`)."""
     subs: list[tuple[re.Pattern, str, int]] = []   # pattern, label, the value's length
 
-    def add(value, label, word=False):
+    def add(value, label, word=False, exact=False):
         if value and len(str(value)) >= 4:
             v = str(value)
             for form in sorted({v, v.replace("\\", "/"), v.replace("/", "\\")}, key=len, reverse=True):
                 pat = re.escape(form)
-                subs.append((re.compile(r"(?<![\w-])" + pat + r"(?![\w-])" if word else pat, re.I), label,
-                             len(form)))
+                if word and exact:
+                    pat = r"(?<!\w)" + pat + r"(?!\w)"
+                elif word:
+                    pat = r"(?<![\w<-])" + pat + r"(?![\w>-])"
+                subs.append((re.compile(pat, 0 if exact else re.I), label, len(form)))
 
     add(ROOT, "<xestrata>")
     add(Path.home(), "<home>")
@@ -97,7 +114,7 @@ def redactor(extra: tuple[str, ...] = (), key: str = ""):
     add(platform.node(), "<host>", True)
     for x in extra:
         add(x, "<private>", True)
-    add(key, "<key>")
+    add(usable_key(key), "<key>", word=True, exact=True)
     # the longest VALUE first: the Strata folder before the home folder it is under, before the user's name both
     # hold (by the pattern's length the word-bounded user name came before a short Strata folder and broke it)
     subs.sort(key=lambda p: -p[2])
@@ -1028,7 +1045,7 @@ def main(argv=None) -> int:
                   "or give --url of a running server.", file=sys.stderr)
             return 2
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
-    key = a.api_key or ((cfg or {}).get("api_key") or "")
+    key = usable_key(a.api_key) or usable_key((cfg or {}).get("api_key"))
     if a.url:
         base = a.url.rstrip("/")
     else:
