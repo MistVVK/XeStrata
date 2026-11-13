@@ -20,6 +20,8 @@ namespace strata::prefill {
 inline constexpr int64_t kStreamFloorDefault = 1024;
 inline constexpr int64_t kFusedOnlyFloor = 64;   // the streamed walk is faster than the FP16 path at every size measured from 96 up (par/RESULTS-STRIX-SHORT.md); the server reads pieces of up to --short-read tokens through the verify windows and longer ones batched
 
+inline constexpr int64_t kTrellisCudaFloor = 64;   // sweep on an RTX A6000 (sm_86, Gyro-S, floors 64 / 128 / 256 / 512 / 1,024 at 128 to 1,000 tokens, two rounds, par/RESULTS-MMQ-TAIL.md): 64 is the fastest at every size (a prompt of N tokens streams from a floor of N - 1 down, so 128 / 256 / 512 token prompts need 64 / 128 / 256 or lower)
+
 /// `class_measured`: the device class this default was measured on (Windows gfx1151).  `all_layers_fused_only`: the layer set has no MMQ tile and the fused kernels take every layer.
 /// `staged_entry`: the staged walk takes such layers on its fused group entry (staged_fo_rule.hpp), so the old FP16 path below the floor is gone and the floor needs no lowering.
 ///
@@ -30,8 +32,16 @@ inline constexpr int64_t kFusedOnlyFloor = 64;   // the streamed walk is faster 
 /// `trellis_gfx12_fused`: a build without MMQ on a gfx12 card (Radeon AI PRO R9700 / RX 9070) loading a native pack whose every layer is a trellis pair (Gyro-S TQK6 / TQK7) on the fused kernels.  The staged
 /// fused entry reads such layers about twice as slowly as MMQ does below the floor, the streamed walk 1.5 to 1.7 times faster than MMQ from 128 tokens up (R9700, Gyro-S: 128 tokens 252 ms with MMQ, 542 ms on the staged
 /// entry, 167 ms on the streamed walk; par/RESULTS-MMQ-TAIL.md), so the floor is kFusedOnlyFloor there whatever the staged entry says.  A build with MMQ passes false.
-constexpr int64_t stream_floor_default(bool class_measured, bool all_layers_fused_only, bool staged_entry, bool plain_pack_fused = false, bool trellis_gfx12_fused = false) {
-    return (class_measured && all_layers_fused_only && !staged_entry) || plain_pack_fused || trellis_gfx12_fused ? kFusedOnlyFloor : kStreamFloorDefault;
+///
+/// `trellis_cuda_fused`: the same layer set (a native pack whose every layer is a trellis pair on the fused kernels) in a build without MMQ on a CUDA card on which those kernels run (prefill.cpp
+/// trellis_cuda_all_fused(): layers_all_fused_only() is true only where fused::native_supported takes every layer, which for the trellis pair on CUDA means the sm_86 class with 80 or more SMs by
+/// default, or any sm_80+ card with STRATA_PF_FUSED_TQ=1; every other CUDA card keeps the layers off the fused kernels and this flag is false).  Below the floor such a layer runs each routed expert on
+/// the dequantize + FP16 path (RTX A6000, Gyro-S: 128 / 512 / 1,000 tokens 550 / 1,026 / 1,322 ms against 204 / 456 / 674 ms with MMQ, par/RESULTS-MMQ-TAIL.md); the floor is kTrellisCudaFloor.
+constexpr int64_t stream_floor_default(bool class_measured, bool all_layers_fused_only, bool staged_entry, bool plain_pack_fused = false, bool trellis_gfx12_fused = false,
+                                       bool trellis_cuda_fused = false) {
+    return (class_measured && all_layers_fused_only && !staged_entry) || plain_pack_fused || trellis_gfx12_fused ? kFusedOnlyFloor
+           : trellis_cuda_fused                                                                              ? kTrellisCudaFloor
+                                                                                                              : kStreamFloorDefault;
 }
 
 }  // namespace strata::prefill

@@ -6,6 +6,7 @@
 
 using strata::prefill::kFusedOnlyFloor;
 using strata::prefill::kStreamFloorDefault;
+using strata::prefill::kTrellisCudaFloor;
 using strata::prefill::stream_floor_default;
 
 static int failed = 0;
@@ -35,6 +36,17 @@ int main() {
     CHECK(stream_floor_default(false, false, true, false, true) == kFusedOnlyFloor);
     CHECK(stream_floor_default(false, false, false, false, true) == kFusedOnlyFloor);
     CHECK(stream_floor_default(true, true, true, false, true) == kFusedOnlyFloor);
+    // a build without MMQ on a CUDA card on which the fused trellis kernels run (Gyro-S on an RTX A6000, sm_86 with 84 SMs): the floor is kTrellisCudaFloor whatever the class and the staged entry say
+    CHECK(stream_floor_default(false, false, false, false, false, true) == kTrellisCudaFloor);
+    CHECK(stream_floor_default(false, false, true, false, false, true) == kTrellisCudaFloor);
+    CHECK(stream_floor_default(true, true, true, false, false, true) == kTrellisCudaFloor);
+    CHECK(kTrellisCudaFloor >= 1 && kTrellisCudaFloor <= kStreamFloorDefault);
+    // the gfx12 rows stay as gated: the CUDA flag adds nothing to them (the two flags are never both true in one build)
+    CHECK(stream_floor_default(false, false, false, false, true, false) == kFusedOnlyFloor);
+    CHECK(stream_floor_default(false, false, false, false, true, true) == kFusedOnlyFloor);
+    // no CUDA flag (a build with MMQ, a card whose trellis kernels are off, another format set): every row above stands
+    CHECK(stream_floor_default(false, false, true, false, false, false) == kStreamFloorDefault);
+    CHECK(stream_floor_default(true, false, false, false, false, false) == kStreamFloorDefault);
     // without the flag (a build with MMQ, another card, another format set) the rows above stand
     CHECK(stream_floor_default(false, false, true, false, false) == kStreamFloorDefault);
     CHECK(stream_floor_default(false, true, true, false, false) == kStreamFloorDefault);
