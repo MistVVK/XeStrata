@@ -6351,7 +6351,7 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     const int bm = tm == 8 ? 128 : 16 * tm;
     i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
     I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
-             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0)};
+             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_env_int("STRATA_I8_N8", 0) != 0};   // STRATA_I8_N8=1: 8-entry slices (tile codes 2-4)
     switch (L.gu_type) {
         case 16: i8_launch<16, true>(tm, a, s); break;
         case 17: i8_launch<17, true>(tm, a, s); break;

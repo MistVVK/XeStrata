@@ -418,7 +418,36 @@ __global__ void __launch_bounds__(256) i8_tiles_kernel(const int32_t* __restrict
     if (tid == 255) tile_off[ng] = s[255];
 }
 
-template <int T, bool GU, int TM>
+// The per-(row, entry) dot of one 32-value sub-block pair, the arithmetic of the tile kernel's inner loop: t = integer scale x integer sum (exact), added to the
+// accumulator by one fmaf in the caller.  Used by the NR variant (8-entry slices); the original loop keeps its own copy of the same expressions.
+template <int T>
+__device__ __forceinline__ int i8_row_t(const uint4 (&w)[2], const uint4& rc, const uint4& a0, const uint4& a1) {
+    int s0 = i8_dot0((int) w[0].x, (int) a0.x);
+    s0 = ggml_cuda_dp4a((int) w[0].y, (int) a0.y, s0);
+    s0 = ggml_cuda_dp4a((int) w[0].z, (int) a0.z, s0);
+    s0 = ggml_cuda_dp4a((int) w[0].w, (int) a0.w, s0);
+    if constexpr (i8_two_scales(T)) {
+        int s1 = i8_dot0((int) w[1].x, (int) a1.x);
+        s1 = ggml_cuda_dp4a((int) w[1].y, (int) a1.y, s1);
+        s1 = ggml_cuda_dp4a((int) w[1].z, (int) a1.z, s1);
+        s1 = ggml_cuda_dp4a((int) w[1].w, (int) a1.w, s1);
+        return __mul24(s1, (int) rc.y) + __mul24(s0, (int) rc.x);
+    } else {
+        s0 = ggml_cuda_dp4a((int) w[1].x, (int) a1.x, s0);
+        s0 = ggml_cuda_dp4a((int) w[1].y, (int) a1.y, s0);
+        s0 = ggml_cuda_dp4a((int) w[1].z, (int) a1.z, s0);
+        s0 = ggml_cuda_dp4a((int) w[1].w, (int) a1.w, s0);
+        if constexpr (i8_unit_scale(T)) return s0;
+        else if constexpr (i8_wide_scale(T)) return s0 * (int) rc.x;
+        else return __mul24(s0, (int) rc.x);
+    }
+}
+
+// NR = research variant "N8" (STRATA_I8_N8=1): the entry slices are 8 entries wide instead of 16.  A thread owns 2 weight rows (the row pair `half` = ty / 8:
+// rows tx + 16 (2 half + i2)) and one entry of each 8-entry slice (entry ty % 8 + 8 js), so a block with 6 entries runs one slice with all 256 threads busy
+// where the 16-entry slice left 10 of 16 entry rows computing nothing.  Every (row, entry) accumulates the same terms in the same order: bit-identical output.
+// The gate/up epilogue needs the gate (row pair 0) and up (row pair 1) values of one entry together: the up half hands them over through shared memory.
+template <int T, bool GU, int TM, bool NR>
 __global__ void __launch_bounds__(I8_NT)
 i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
           const int32_t* __restrict__ tile_off, const int32_t* __restrict__ ent_idx, const block_q8_1* __restrict__ A,
@@ -530,11 +559,13 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         }
     };
 
-    float acc[TM][4];
+    constexpr int NJ = NR ? 2 * TM : TM, NI = NR ? 2 : 4;   // slices of this thread, rows of this thread
+    const int half = ty >> 3, ey = ty & 7;                  // NR: the row pair and the entry within a slice (a warp holds two ty of one half)
+    float acc[NJ][NI];
 #pragma unroll
-    for (int j = 0; j < TM; ++j)
+    for (int j = 0; j < NJ; ++j)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) acc[j][i] = 0.0f;
+        for (int i = 0; i < NI; ++i) acc[j][i] = 0.0f;
 
     uint32_t wraw[I8NR<T>], ar[9];
 #pragma unroll
@@ -555,6 +586,32 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         const uint32_t* const Ab = s_a + b * SM::SZ_A;
         const uint32_t* const Rb = s_r + b * SM::SZ_R;
         const float* const Db = s_ad + b * SM::SZ_D;
+        if constexpr (NR) {
+            I8_PRAGMA_UNROLL(I8_BLK_UNROLL)
+            for (int blk = 0; blk < 4; ++blk) {
+                uint4 rc[2], wv[2][2];
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const int row = tx + 16 * (2 * half + i);
+                    rc[i] = *(const uint4*) (Rb + row * I8_RS + blk * 4);
+                    wv[i][0] = *(const uint4*) (W + row * I8_LD + blk * 8);
+                    wv[i][1] = *(const uint4*) (W + row * I8_LD + blk * 8 + 4);
+                }
+#pragma unroll
+                for (int j = 0; j < NJ; ++j) {
+                    if (8 * j >= nv) break;   // uniform: the 8-entry slices at and beyond nv hold no entry of this tile
+                    const int arow = ey + 8 * j;
+                    const float ax = Db[arow * 4 + blk];
+                    const uint4 a0 = *(const uint4*) (Ab + arow * I8_LD + blk * 8);
+                    const uint4 a1 = *(const uint4*) (Ab + arow * I8_LD + blk * 8 + 4);
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const int t = i8_row_t<T>(wv[i], rc[i], a0, a1);
+                        acc[j][i] = fmaf((float) t, __uint_as_float(rc[i].z) * ax, acc[j][i]);
+                    }
+                }
+            }
+        } else {
         I8_PRAGMA_UNROLL(I8_BLK_UNROLL)
         for (int blk = 0; blk < 4; ++blk) {
             uint4 rc[4], wv[4][2];
@@ -598,11 +655,57 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
                 }
             }
         }
+        }
         if (st + 1 < ns) { store_w(b ^ 1, st + 1, wraw); store_a(b ^ 1, ar); }
         __syncthreads();
     }
 
     // epilogues
+    if constexpr (NR) {
+        if constexpr (GU) {
+            // the up half (row pair 1: up rows of features tx, tx + 16) hands its sums to the gate half (row pair 0) of the same entry: after the loop's last
+            // barrier the weight stage buffers are free
+            float* const ex = (float*) s_w;   // [slice][entry ey][tx][2]
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                if (8 * j >= nv) break;   // uniform
+                if (half == 1) *(float2*) (ex + ((j * 8 + ey) * 16 + tx) * 2) = make_float2(acc[j][0], acc[j][1]);
+            }
+            __syncthreads();
+            if (half == 0) {
+                const int nb = (int) (L.n_ff / 32);
+#pragma unroll
+                for (int j = 0; j < NJ; ++j) {
+                    if (8 * j >= nv) break;   // uniform
+                    const int e = e_lo + ey + 8 * j;
+                    const float2 u = *(const float2*) (ex + ((j * 8 + ey) * 16 + tx) * 2);
+                    const float g0 = acc[j][0], g1 = acc[j][1];
+                    const float h0 = (g0 / (1.0f + __expf(-g0))) * u.x;
+                    const float h1 = (g1 / (1.0f + __expf(-g1))) * u.y;
+                    float amax = fmaxf(fabsf(h0), fabsf(h1));
+#pragma unroll
+                    for (int o = 8; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                    if (e < e_hi) {
+                        const float d_inv = 127.0f / amax;
+                        block_q8_1* hb = hq + (size_t) e * nb + blockIdx.y;
+                        hb->qs[tx] = i8_code(h0, d_inv, amax);
+                        hb->qs[tx + 16] = i8_code(h1, d_inv, amax);
+                        if (tx == 0) i8_put_scale(hb, amax, d_inv);
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                const int e = e_lo + ey + 8 * j;
+                if (e < e_hi) {
+                    float* o = out + (size_t) ent_idx[e] * L.n_embd + (size_t) blockIdx.y * 64 + tx + 32 * half;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) o[16 * i] = acc[j][i];
+                }
+            }
+        }
+    } else
     if constexpr (GU) {
         // thread rows i = 0, 1: gate features tx, tx + 16 of the tile; i = 2, 3: the up rows of the same features
         const int nb = (int) (L.n_ff / 32);
@@ -900,6 +1003,7 @@ struct I8Args {
     NativeExpertLayout L;
     int64_t tiles_ub;
     int bisect;
+    bool n8 = false;     // research, tile codes 2-4: 8-entry slices with two weight rows per thread (see i8_kernel, NR)
 };
 
 // what the last native_expert_i8 call asked its two launches for (the tile code, the dynamic shared memory in bytes passed as the launch's third argument, and
@@ -920,13 +1024,23 @@ template <int T, bool GU, int TM>
 void i8_launch_tm(const I8Args& a, cudaStream_t s) {
     constexpr size_t smem = I8Smem<T, TM>::bytes;
 #if !defined(__HIPCC__)
-    if (smem > 48 * 1024) cudaFuncSetAttribute(i8_kernel<T, GU, TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    if (smem > 48 * 1024) {
+        cudaFuncSetAttribute(i8_kernel<T, GU, TM, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(i8_kernel<T, GU, TM, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    }
 #endif
     const dim3 grid((unsigned) a.tiles_ub, (unsigned) (GU ? a.L.n_ff / 32 : a.L.n_embd / 64));
-    if constexpr (GU)
-        i8_kernel<T, true, TM><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
-    else
-        i8_kernel<T, false, TM><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+    if (a.n8) {   // research: 8-entry slices (STRATA_I8_N8=1)
+        if constexpr (GU)
+            i8_kernel<T, true, TM, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+        else
+            i8_kernel<T, false, TM, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+    } else {
+        if constexpr (GU)
+            i8_kernel<T, true, TM, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+        else
+            i8_kernel<T, false, TM, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+    }
     i8_note_launch(GU, TM, smem);
 }
 template <int T, bool GU>
