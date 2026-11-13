@@ -5,6 +5,8 @@
 
 #include "strata/core/watchdog.hpp"
 
+#include "strata/core/gpu.hpp"
+#include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/platform/env.hpp"
 #include "strata/platform/thread_name.hpp"
@@ -184,6 +186,15 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             std::fprintf(f, "  2 s later:\n");
         }
+        // upstream 711a7e937 (#5718 follow-up): the streams a host may be blocked on (the prompt path's), asked without
+        // blocking - before the diags below, so "finished" here means the GPU was done and the waiting host was not woken
+        strata::core::stream_watch().report(f, [](void* s, int, std::string& why) {
+            switch (strata::gpu::stream_status((strata::gpu::Stream) s)) {
+                case strata::gpu::Status::Done: return strata::core::StreamState::finished;
+                case strata::gpu::Status::Pending: return strata::core::StreamState::working;
+                default: why = strata::gpu::last_error(); return strata::core::StreamState::failed;
+            }
+        });
         if (auto fn = diag_pool_fn().load()) fn(f);
         if (auto fn = diag_verify_fn().load()) fn(f);
 #if !defined(_WIN32)

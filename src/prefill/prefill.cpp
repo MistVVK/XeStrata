@@ -9,6 +9,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
@@ -1905,6 +1906,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // upstream 711a7e937: the stall report asks this stream (the one the waits below block on) whether its work is done
+    const core::WatchedStream watched("the prompt path's compute stream", (void*) m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
@@ -4116,6 +4119,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // upstream 711a7e937: as the default path
+    const core::WatchedStream watched("the prompt path's compute stream", (void*) m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
