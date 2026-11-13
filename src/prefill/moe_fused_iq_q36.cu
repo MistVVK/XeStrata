@@ -99,6 +99,17 @@ bool native_supported_ext(int gu_type, int d_type) {
     return native_supported(gu_type, d_type);
 }
 
+// Whether the engine takes the fused kernels for a layer of this pair on the current device: STRATA_PF_FUSED=1 on every card whose kernels cover the pair, unset on the cards
+// the Flash-Next engine's default rule takes (fused_tile::q36_takes, which is takes_by_default for the card, the staged gate/up and the staged down), =0 never.
+bool native_layer_ext(int gu_type, int d_type) {
+    static const int env = strata::prefill::fused_tile::pf_env(std::getenv("STRATA_PF_FUSED"));
+    static const int sm40_env = strata::prefill::fused_tile::sm40_env_of(std::getenv("STRATA_PF_FUSED_SM40"));
+    if (env == 0 || !native_supported_ext(gu_type, d_type)) return false;
+    const DevInfo& d = dev_info();
+    const bool down_ok = sw_on(d_type, false) || d_type == T_IQ4_NL || d_type == T_Q2_0;
+    return strata::prefill::fused_tile::q36_takes(env, {d.s120, d.s121, d.sms, d.s86}, sm40_env, sw_on(gu_type, true), down_ok, true);
+}
+
 void experts_native_ext(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa, const int32_t* src, void* ha,
                         float* dm, void* stream) {
     if (!is_kq_down_pair(g.gu_type, g.d_type)) {
@@ -116,9 +127,9 @@ void experts_native_ext(const Batch& b, const NativeGeom& g, int n_expert, int64
     const Tables tb = tables(const_cast<void*>(scratch), n_expert);
     // staged: the launch's gate/up or down kernel is a weight-staging instance (the K-quant downs are, K = 512); the staged instances are the 128-row tile's.  launch_ww (as in
     // experts_native) runs the staging check for such a launch: one whose expert blobs are not device memory at 2-byte aligned addresses takes the unstaged 64-row kernel of the
-    // same formats (same output bits), sticky for the process, one log line, no exit.  The wide argument (the Q6_K / Q8_0 gate/up class of the sm_86 tile line) is false for this path's gate/up.
+    // same formats (same output bits), sticky for the process, one log line, no exit.  The wide argument is fused_tile::wide_pair: true for this path's K-quant pairs, so sm_86 cards with 40+ SMs take the 128-row tile above 112 rows an expert (fused_tile_rule.hpp; the 80+ SM ones used to take 64 there).
     const bool staged = sw_on(g.gu_type, true) || sw_on(g.d_type, false);
-    const int ww = launch_ww(b, g, n, n_expert, staged, g.gu_type == T_Q6_K || g.gu_type == T_Q8_0);
+    const int ww = launch_ww(b, g, n, n_expert, staged, strata::prefill::fused_tile::wide_pair(g.gu_type, g.d_type));
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
     const unsigned k_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_kq);
     const unsigned k_d = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * (g.d_type == T_Q5_K ? kd.occ5 : kd.occ6));

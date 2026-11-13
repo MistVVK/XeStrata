@@ -141,7 +141,7 @@ export STRATA_PREFILL_STREAM_MIN=128   # prompt reads of 128-1,023 tokens on the
 
 `STRATA_PF_GEMM`, `STRATA_HC_UPMIX`, `STRATA_PA_FAST`, `STRATA_HIP_WMMA` and `STRATA_SELECT_WMMA` together are one opt-in on an
 integrated Radeon: `STRATA_IGPU_PROMPT_SET=1` ([AMD_HIP.md](AMD_HIP.md), "Integrated GPUs"), measured on a Radeon 780M only, where
-it is the default. `STRATA_PF_FUSED`, `STRATA_PF_SWITCH_MIN_T` and `STRATA_PREFILL_STREAM_MIN` stay opt-in as well.
+it is the default. `STRATA_PF_SWITCH_MIN_T` and `STRATA_PREFILL_STREAM_MIN` stay opt-in as well. `STRATA_PF_FUSED` is on by itself on an integrated Radeon under Linux (measured on the 780M only; the Strix Halo takes it by the same rule and was not run there); `STRATA_PF_FUSED=0` keeps MMQ.
 
 **On Windows the Strix Halo is the exception** (engine 0.1.52 and later): `gfx1151` takes the matrix-core set by itself -
 `STRATA_HIP_WMMA`, `STRATA_PF_GEMM`, `STRATA_PA_FAST`, `STRATA_HC_UPMIX` and `STRATA_PF_FUSED`, without `STRATA_SELECT_WMMA`
@@ -153,7 +153,7 @@ measured there.
 
 | Switch | What it does |
 | --- | --- |
-| `STRATA_PREFILL_STREAM_MIN=N` | `STRATA_PF_FUSED=1` reaches only chunks of N tokens or more (1,024 by default, the floor measured on a discrete card). With every expert in unified memory nothing streams and MMQ is the slow part, so a smaller N (128) speeds up an agent's turn (a tool result of about 1,000 tokens on a cached conversation: 3.1 to 6.0 s at 1,024 against 0.9 to 2.5 s at 128). |
+| `STRATA_PREFILL_STREAM_MIN=N` | `STRATA_PF_FUSED=1` reaches only chunks of N tokens or more (1,024 by default, the floor measured on a discrete card). On Windows a UD-Q4_K_XL set reads pieces below 1,024 tokens on the fused kernels' staged entry by itself (pieces of 96 to 1,000 tokens read 3.8 to 5.2 times sooner than on the old path; `STRATA_PF_STAGED_FO=0` gives the long-prompt path from 64 tokens instead, 3.6 to 4.5 times sooner); other sets keep 1,024, and a smaller N is opt-in. |
 | `STRATA_PF_FUSED_KQ=1` | A UD-Q4_K_XL or other K-quant pack takes the fused experts only with this as well. |
 | `STRATA_PF_F16=1` (gfx11 only) | Runs the covered prompt experts on the F16 matrix cores instead of the int8 ones. It rounds differently from the int8 kernels. |
 | `STRATA_REFILL_PARTS=1` (exact; HIP and CUDA, a GGUF read in place) | Refills the expert-cache slots a prompt borrowed straight from the GGUF mapping instead of through an assembled 4 MB copy per expert. Only gfx1151 has measured it. |

@@ -217,7 +217,8 @@
      "GGML_NO_BACKTRACE": "1"
     },
     "notes": [
-     "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)"
+     "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)",
+     "[strata] drafting: draft vocabulary: draft_vocab.bin (the default)"
     ]
    }
   },
@@ -354,7 +355,8 @@
      "GGML_NO_BACKTRACE": "1"
     },
     "notes": [
-     "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)"
+     "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)",
+     "[strata] drafting: draft vocabulary: draft_vocab.bin (the default)"
     ]
    }
   },
@@ -476,7 +478,8 @@
      "GGML_NO_BACKTRACE": "1"
     },
     "notes": [
-     "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)"
+     "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)",
+     "[strata] drafting: draft vocabulary: draft_vocab.bin (the default)"
     ]
    }
   }

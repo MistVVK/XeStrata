@@ -996,6 +996,7 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
+    bool short_read_set = false;       // --short-read given: the class default (Prefill::short_read_default) does not apply
     bool prefill_head_alias = false;   // lend the native output head's VRAM to prompt buffers between request phases
     /// --pipeline-windows N (--serve, a layer split on exactly two GPUs; opt-in): 1 = a prompt's short reads through
     /// the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1 reads window K);
@@ -1180,7 +1181,8 @@ void usage() {
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
-                 "                       of the batched prompt path (default 64, 0 = off)\n"
+                 "                       of the batched prompt path (default 64, or 24 on Windows Strix Halo with a\n"
+                 "                       UD-Q4_K_XL set, where the batched path is quicker from 26 tokens; 0 = off)\n"
                  "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
                  "                       then release prompt buffers and reload it before decode\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
@@ -3786,7 +3788,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
-        else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+        else if (a == "--short-read") { o.short_read = std::max(0LL, std::atoll(next("--short-read"))); o.short_read_set = true; }
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -4047,6 +4049,9 @@ int main(int argc, char** argv) {
                              "#1630); 7500 and below were stable. Kept as asked; a bare --prefill auto stops at %lld\n",
                      o.prefill_cap_warn.c_str(), (long long) strata::platform::host_limits::kWinHipAutoChunkCap);
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+    // the start-up line about K-quant experts: the default is set here (before any engine code reads its switches), the line is printed once the expert layout is
+    // loaded and only when the loaded set has K-quant experts (strata::core::nv_kq_line_wanted), so a model without them says nothing untrue
+    bool kq_line_pending = false, kq_line_fused = false;
     {   // CUDA sm_86 / sm_60: the switches that are exact AND faster there are on by default (strata/core/nv_defaults.hpp), when every
         // visible card has that one compute capability; before any engine code reads its switches, the user's own settings are kept
         int nd = 0;
@@ -4067,7 +4072,16 @@ int main(int argc, char** argv) {
                     if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
                         cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess && (m < lo_m || (m == lo_m && n < lo_n))) { lo_m = m; lo_n = n; }
                 }
-                strata::core::apply_nv_kq_default(lo_m, lo_n);
+                // does Strata's own fused kernel read the K-quant experts on a visible card (the line says so then; strata::core::nv_kq_fused_here)
+                bool kq_fused_here = false;
+                for (int d = 0; d < nd; ++d) {
+                    int m = 0, n = 0, sms = 0;
+                    if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess && cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, d) == cudaSuccess && strata::core::nv_kq_fused_here(m, n, sms))
+                        kq_fused_here = true;
+                }
+                kq_line_pending = !strata::core::apply_nv_kq_default(lo_m, lo_n, kq_fused_here, false).empty();
+                kq_line_fused = kq_fused_here;
             }
         }
         (void) cudaGetLastError();
@@ -4815,6 +4829,15 @@ int main(int argc, char** argv) {
             (void) strata::prefill::mmq::supported(f.d_type);
 #endif
         }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+        if (kq_line_pending && lay.native) {
+            std::vector<std::pair<int, int>> kq_types;
+            kq_types.reserve(lay.fmt.size());
+            for (const auto& f : lay.fmt) kq_types.emplace_back(f.gu_type, f.d_type);
+            if (strata::core::nv_kq_line_wanted(kq_types))
+                std::fprintf(stderr, "%s\n", strata::core::nv_kq_default_line(kq_line_fused).c_str());
+        }
+#endif
         // APR (prism.hadamard) packs: every expert path rotates its activations (CPU pool: native_quant_act / _h;
         // GPU verify, remote GPUs, prompt FP16 path: hadamard_rows).  Validated end to end on CUDA (sm_86, sm_89 with
         // a two-GPU layer split and peer decode, sm_120) and on HIP gfx1151.  Other HIP architectures run the same
@@ -10689,10 +10712,43 @@ int main(int argc, char** argv) {
             }
             src.set_extra_drop_files(std::move(drop));
         }
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+        // BATCH SLOTS ON THE STRIX HALO: every session (the main one and each slot) pins its streamed K/V for the whole context, and with the RAM copy of experts
+        // that is the page-locked memory of the start.  4 slots at 131,072 tokens with the usual 38 GiB budget (20.33 GiB of complement) stopped inside the prompt
+        // path, and with 18 GiB the OS ran out of page-locked memory; 15 GiB started and served.  So here the RAM copy is cut to what leaves complement + pinned K/V
+        // at the level of the largest start that worked (include/strata/core/uma_cache.hpp, with the job ids); the experts left out are read from the SSD.  Context,
+        // slot count and prompt chunk are untouched.  Only with --batch 2 or more, so a single request is as before.  STRATA_UMA_PIN_CAP=0: the RAM budget stays as set (the way back).
+        // The line below is printed after the pin, and only when the cap really left experts out (the RAM copy filled up to it): with 2 slots (12.47 GiB of complement) and
+        // 3 slots (16.40 GiB) the whole complement is under the cap, nothing is cut and the start is as before (strix-20261112-1952-001f printed the line there).
+        // The cap has no floor that turns into a refusal (owner, 11-12: "we should allow people to start, even if its read by ssd"): with so many slots that their K/V alone is over
+        // the level the cap is 0 and the RAM copy is empty (budget 1 byte: 0 would mean "no limit"); every expert the GPU cache does not hold is read from the SSD, and the start goes on.
+        bool uma_cap_applied = false;
+        uint64_t uma_cap = 0;
+        const char* const uma_pin_cap = std::getenv("STRATA_UMA_PIN_CAP");
+        if (o.batch >= 2 && o.prefill_own_keep_chunk && o.resident_budget > 0 && !(uma_pin_cap != nullptr && uma_pin_cap[0] == '0')) {
+            const uint64_t kv = strata::core::qsa_kv_host_bytes();
+            uma_cap = strata::core::uma_pinned_complement_cap_bytes(kv);
+            const uint64_t budget = strata::core::uma_pinned_complement_budget_bytes(kv);
+            if (o.resident_budget > budget) {
+                uma_cap_applied = true;
+                o.resident_budget = budget;
+            }
+        }
+#endif
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
         src.budget_is_automatic(ram_fallback_resident);   // its clamp line then names no flag
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+        // cut = the RAM copy reached the cap (within 16 MiB: the ranked experts are taken while they fit, the last gap is under one expert's blob, about 4 MiB)
+        if (uma_cap_applied && resident_ok && src.resident_bytes() + (16ull << 20) >= uma_cap) {
+            if (uma_cap == 0)
+                std::fprintf(stderr, "strata: %d requests at once: the experts are read from the SSD when needed so that everything fits in this PC's memory (STRATA_UMA_PIN_CAP=0 keeps the RAM budget as set)\n", o.batch);
+            else
+                std::fprintf(stderr, "strata: %d requests at once: %.1f GiB of experts are kept in RAM so that everything fits in this PC's memory; the rest are read from the SSD when needed (STRATA_UMA_PIN_CAP=0 keeps the RAM budget as set)\n",
+                             o.batch, (double) uma_cap / 1073741824.0);
+        }
+#endif
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403
@@ -11109,7 +11165,9 @@ int main(int argc, char** argv) {
                     fe != nullptr && fe[0] != '\0', le != nullptr && le[0] != '\0');
                 if (pp.any()) {
                     const int64_t chunk_default = chunk;
-                    if (pp.fused_off) strata::prefill::pf_fused_override().store(0);
+                    // MMQ's buffer layout (so the layer-major walk runs); the native fused kernels still run in the walk's groups and the streamed chunks
+                    // (pf_fused_override.hpp), unless STRATA_PF_SMALL_FUSED=0 keeps MMQ's kernels there as before
+                    if (pp.fused_off) strata::prefill::pf_fused_override().store(strata::prefill::small_card_kernels_on(std::getenv("STRATA_PF_SMALL_FUSED")) ? strata::prefill::kPfFusedKernelsOnly : 0);
                     if (pp.layer_major) {
 #if defined(_WIN32)
                         _putenv_s("STRATA_PREFILL_LAYER_MAJOR", "1");
@@ -11132,7 +11190,7 @@ int main(int argc, char** argv) {
                                      (long long) chunk);
                     } else
                     std::fprintf(stderr, "strata serve: small expert cache: the default prompt path would read in chunks of %lld tokens (under %lld), "
-                                         "so prompts read with the unfused experts%s (chunk %lld tokens); STRATA_PF_SMALL=0 keeps the default path, "
+                                         "so prompts are read the way that suits a card with little memory%s (chunk %lld tokens); STRATA_PF_SMALL=0 keeps the default path, "
                                          "STRATA_PF_FUSED / STRATA_PREFILL_LAYER_MAJOR set by hand win\n",
                                  (long long) chunk_default, (long long) strata::kSmallCardChunkBelow,
                                  pp.layer_major ? " and, from two chunks, the layer-major walk" : "", (long long) chunk);
@@ -11595,10 +11653,13 @@ int main(int argc, char** argv) {
                 continue;
             }
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-            if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
+            const bool batch_memory = o.batch >= 2 && o.prefill_own_keep_chunk && (err.find("fit") != std::string::npos || err.find("copy stream") != std::string::npos);
+            if (err.find("fit") != std::string::npos && !batch_memory)   // #85: say what frees VRAM
                 std::fprintf(stderr, "strata serve: the GPU has too little free VRAM for the prompt path: turn images "
                                      "off (setup: --vision no), close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
+            if (batch_memory)   // (the chunk list has been tried by now, and a failed attempt leaves the pool full: no retry can follow)
+                std::fprintf(stderr, "strata: %d requests at once do not fit in this PC's memory: start with --batch %d\n", o.batch, o.batch - 1);
             return 1;
         }
         uma_refuse_chunk_if_full(o.prefill_chunk, borrow != nullptr, xcache.gib());
@@ -12252,6 +12313,8 @@ int main(int argc, char** argv) {
         // the verify windows after the batched part).  The retry reads that tail batched (--short-read 0 for one request):
         // a reporter's prompts failed there every time and passed with --short-read 0.
         bool nf_prompt_windows = false, short_read_off_once = false;
+        // --short-read's default (64) is a class default where the staged fused entry takes the pieces the windows would otherwise read (Prefill::short_read_default); the user's own value wins
+        if (!o.short_read_set) o.short_read = strata::prefill::Prefill::short_read_default(o.short_read);
         std::vector<ConvCheckpoint> checks;
         // KVA: which prefixes of token ids a KVA read approximated, so the draft layer knows, for whatever state a request
         // continues from, the first cell built from a real row (kva_floor.hpp).  Empty without KVA.

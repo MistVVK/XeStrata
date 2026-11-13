@@ -150,6 +150,14 @@ macro(strata_hip_prompt_tests)
     add_test(NAME hip_prefill_expert_paths_bench COMMAND hip_prefill_expert_paths_bench --quick)
     set_tests_properties(hip_prefill_expert_paths_bench PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     list(APPEND _strata_hip_tests hip_prefill_expert_paths_bench)
+    # the hyper-connection read's fused up projection + mix (gr_upmix, STRATA_HC_UPMIX) on gfx11: BF16 images against the default pair, and the FP16 prompt
+    # path's FP16 images (STRATA_HIP_PROMPT_F16=1) against the FP64 reference; exit 77 off gfx11 / without a card
+    set_source_files_properties(src/prefill/gr_upmix_parity.cu PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
+    add_executable(hip_gr_upmix_parity src/prefill/gr_upmix_parity.cu)
+    target_link_libraries(hip_gr_upmix_parity PRIVATE strata_prefill strata_hip_runtime)
+    add_test(NAME hip_gr_upmix_parity COMMAND hip_gr_upmix_parity --max-t 8192)
+    set_tests_properties(hip_gr_upmix_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    list(APPEND _strata_hip_tests hip_gr_upmix_parity)
     # STRATA_PF_FUSED_Q8D=1 (gfx12, opt-in): the pinned UD-IQ4_XS's i-quant / Q8_0 pairs on the fused kernels without the K-quant switch (--no-kq);
     # off gfx12 the pairs are not covered without STRATA_PF_FUSED_KQ and the test skips (77, as without a card)
     add_test(NAME hip_prefill_fused_iq_q8d COMMAND hip_prefill_fused_iq "--only=S / Q8_0" --edge --no-timing --no-kq)

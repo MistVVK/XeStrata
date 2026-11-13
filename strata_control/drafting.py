@@ -27,6 +27,8 @@ import json
 import mmap
 import os
 import re
+import struct
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -465,6 +467,149 @@ def supported_model(model_name: str | None = None, family: str | None = None) ->
     return bool(model_name and _SUPPORTED_NAME.match(str(model_name)))
 
 
+# --------------------------------------------------------------------------------------------------- the model file itself
+#
+# A run config whose model_name does not match _SUPPORTED_NAME (a renamed file, a hand-written config, a feed model under its own name, no name at all) used to start the MTP with
+# no word said, also when the file is Qwen3.8-Flash-Next and DFlash2 was the default for it. What decides now is what the file is: the architecture, the layer count, the hidden
+# size and the vocabulary size in its GGUF header against what the drafter pack records (its ``cfg hidden / vocab / taps`` lines, tools/dflash2_pack.py).
+
+TARGET_ARCH = "qwen4exp"                                    # general.architecture of the Qwen3.8-Flash-Next GGUFs (tools/gguf_writer.py)
+#: What the drafter pack was made for, used when no pack is on this computer yet to read it from: ``cfg hidden 2560``, ``cfg vocab 248320``, ``cfg taps 5,15,25,35,45``
+#: (the layers of the target it reads; the model needs more layers than the last tap).
+PACK_TARGET = {"hidden": 2560, "vocab": 248320, "taps": (5, 15, 25, 35, 45)}
+#: The model name a file that fits is treated as (the plain family name: no quantization, so no per-quantization table entry applies).
+FILE_FITS_AS = "qwen3.8-flash-next"
+#: Names the DFlash2 exclusions above stand for (Coder, NVFP4, Swift): a file under such a name stays out whatever its header says.
+_EXCLUDED_NAME = re.compile(r"coder|nvfp4|swift", re.IGNORECASE)
+_GGUF_HEAD = 1 << 20                                        # bytes of a GGUF read for its header (the keys are in the first few KB; the vocabulary's words are never read)
+_PACK_HEAD = 1 << 16
+_GGUF_SCALAR = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+
+def gguf_facts(path: Any) -> dict[str, Any] | None:
+    """What a GGUF file says about itself, from its first megabyte: ``arch`` (general.architecture), ``layers`` (<arch>.block_count), ``hidden`` (<arch>.embedding_length) and
+    ``vocab`` (the number of tokenizer.ggml.tokens, read from the array's header: the words are not read). A part that is not there is None; None when the file is not a GGUF
+    or cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(_GGUF_HEAD)
+    except (OSError, TypeError, ValueError):
+        return None
+    if len(head) < 24 or head[:4] != b"GGUF":
+        return None
+    facts: dict[str, Any] = {"arch": None, "layers": None, "hidden": None, "vocab": None}
+    try:
+        pos = 16
+        (n_kv,) = struct.unpack_from("<Q", head, pos)
+        pos += 8
+        for _ in range(min(n_kv, 4096)):
+            (klen,) = struct.unpack_from("<Q", head, pos)
+            pos += 8
+            key = head[pos:pos + klen].decode("utf-8", "replace")
+            pos += klen
+            (vtype,) = struct.unpack_from("<I", head, pos)
+            pos += 4
+            if vtype == 8:                                  # a string
+                (slen,) = struct.unpack_from("<Q", head, pos)
+                pos += 8
+                if key == "general.architecture":
+                    facts["arch"] = head[pos:pos + slen].decode("utf-8", "replace")
+                pos += slen
+            elif vtype in (4, 5) and (key.endswith(".block_count") or key.endswith(".embedding_length")):
+                (value,) = struct.unpack_from("<I" if vtype == 4 else "<i", head, pos)
+                facts["layers" if key.endswith(".block_count") else "hidden"] = value
+                pos += 4
+            elif vtype in _GGUF_SCALAR:
+                pos += _GGUF_SCALAR[vtype]
+            elif vtype == 9:                                # an array: element type, count
+                etype, count = struct.unpack_from("<IQ", head, pos)
+                pos += 12
+                if key == "tokenizer.ggml.tokens":
+                    facts["vocab"] = count
+                    break                                   # the words follow: everything wanted comes before them
+                if etype in _GGUF_SCALAR:
+                    pos += count * _GGUF_SCALAR[etype]
+                else:
+                    break                                   # an array of words before the tokens: not looked into
+            else:
+                break
+            if pos > len(head):
+                break
+    except (struct.error, ValueError, OverflowError, MemoryError):        # a damaged header: no answer
+        return None
+    return facts if facts["arch"] else None
+
+
+#: The model_name setup writes for a set of each family (setup.py's family names): f"{name}-{model.lower()}". Coder, Swift and NVFP4 are left out on purpose (no DFlash2 numbers).
+_SET_NAME_PREFIX = {"qwen": "qwen3.8-flash-next", "unsloth": "qwen3.8-flash-next-unsloth", "gyro": "qwen3.8-flash-next-gyro"}
+_known_names: dict[tuple[str, int, int], str | None] = {}
+
+
+def known_name_of_file(args: list[Any]) -> str | None:
+    """The model_name setup would have written for the file in --native when its header is EXACTLY one set of data/gguf_fingerprints.json (strata_control/models.py known_set_by_header: tensor count,
+    payload bytes and expert formats over all shards; never the layout guess), so a renamed copy gets that set's table entry (tuned pack, confidence) as under its own name; None otherwise.
+    Read once per file, size and time (the tensor directory of every shard is read: about a second)."""
+    path = _flag_value(args, "--native")
+    if not path:
+        return None
+    try:
+        stat = Path(path).stat()
+        key = (str(path), stat.st_size, stat.st_mtime_ns)
+        if key not in _known_names:
+            from strata_control import models
+            found = models.known_set_by_header(path)
+            prefix = _SET_NAME_PREFIX.get(found.split("/", 1)[0]) if found else None
+            name = f"{prefix}-{found.split('/', 1)[1].lower()}" if prefix and found else None
+            _known_names[key] = name if name and supported_model(name) else None
+        return _known_names[key]
+    except Exception:                                  # noqa: BLE001 - not known is the general defaults
+        return None
+
+
+def pack_target(data_dir: str | Path | None = None) -> dict[str, Any]:
+    """What the drafter pack on this computer says it was made for (``hidden``, ``vocab``, ``taps`` from its ``cfg`` lines), else PACK_TARGET."""
+    want = dict(PACK_TARGET)
+    if data_dir:
+        base = Path(data_dir) / FOLDER
+        for name in (TUNED_NAME, TUNED_BF16_NAME, CONVERTED_NAME, PACK_NAME):
+            try:
+                with open(base / name, "rb") as f:
+                    head = f.read(_PACK_HEAD)
+            except OSError:
+                continue
+            if len(head) < 12 or head[:4] != b"DF2P":
+                continue
+            (n,) = struct.unpack_from("<I", head, 8)
+            for ln in head[12:12 + n].decode("utf-8", "replace").splitlines():
+                parts = ln.split()
+                if len(parts) >= 3 and parts[0] == "cfg":
+                    try:
+                        if parts[1] in ("hidden", "vocab"):
+                            want[parts[1]] = int(parts[2])
+                        elif parts[1] == "taps":
+                            want["taps"] = tuple(int(x) for x in parts[2].split(","))
+                    except ValueError:
+                        pass
+            break
+    return want
+
+
+def file_fit(args: list[Any], data_dir: str | Path | None = None) -> str:
+    """Is the model file in the engine arguments (``--native``) the one the drafter pack was made for? ``fits`` (Qwen3.8-Flash-Next's architecture, the pack's hidden size and
+    vocabulary, more layers than the last tap), ``family`` (the same architecture, other sizes: a different model of that family), ``other`` (another architecture) or
+    ``unknown`` (no file in the arguments, not a GGUF, or not readable)."""
+    path = _flag_value(args, "--native")
+    facts = gguf_facts(path) if path else None
+    if not facts:
+        return "unknown"
+    if facts["arch"] != TARGET_ARCH:
+        return "other"
+    want = pack_target(data_dir)
+    if facts["hidden"] == want["hidden"] and (facts["layers"] or 0) > max(want["taps"]) and facts["vocab"] in (None, want["vocab"]):
+        return "fits"
+    return "family"
+
+
 def _here(path: Path) -> bool:
     try:
         return path.is_file() and path.stat().st_size > (1 << 20)
@@ -667,6 +812,7 @@ class Decision:
     drafter: str                 # what the engine is started with: mtp | dflash2 | off
     note: str = ""               # plain words when the choice could not be applied; "" otherwise
     flags: tuple[str, ...] = ()  # engine flags added
+    vocab: str = ""              # log line (not shown to the person): which draft vocabulary file a DFlash2 start uses and why; "" for the other drafters
 
 
 def normalize(value: Any) -> str:
@@ -862,7 +1008,7 @@ VOCAB_NAME = "draft_vocab.bin"
 
 
 #: The subsets a person can choose in setup (``--draft-vocab``), by name: the files Strata ships in data/ (setup.DRAFT_VOCABS names the same ones).
-VOCAB_FILES = {"cjk": VOCAB_NAME, "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin", "fr": "draft_vocab_fr.bin"}
+VOCAB_FILES = {"cjk": VOCAB_NAME, "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin", "fr": "draft_vocab_fr.bin", "latin": "draft_vocab_latin.bin"}
 #: The sha256 of the 27-Han-token subset up to 0.1.26 (setup.OLD_DRAFT_VOCABS): a copy that is any shipped subset may be replaced by the person's later choice, a made-by-hand one never.
 OLD_VOCAB_SHA256 = {"369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced9597fb25"}
 
@@ -870,6 +1016,201 @@ OLD_VOCAB_SHA256 = {"369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced959
 def shipped_vocab(choice: str | None = None) -> Path:
     """The draft vocabulary Strata ships with (``data/draft_vocab.bin``, also in the packaged Control), or the shipped subset named ``choice`` (cjk, en, cyrillic, fr)."""
     return Path(__file__).resolve().parents[1] / "data" / VOCAB_FILES.get(choice or "cjk", VOCAB_NAME)
+
+
+# --------------------------------------------------------------------------------------------------- the vocabulary by the computer's language
+#
+# DFlash2 proposes tokens only from the draft vocabulary. The default one (cjk) holds English, code and every Chinese / Japanese / Korean token and misses 46% of the tokens of a Russian answer
+# and 20-26% of German, Spanish, French and Polish ones. Measured on l620 (RESULTS-DRAFT-VOCAB.md): `cyrillic` gives Russian +26%, `latin` (English + the tokens of de / es / fr / pl text) +8 to +12%
+# on those four, both within 0.3% of the default on English and code; either file costs 12-16% on Chinese and Japanese. So with no choice saved, the file follows the computer's languages, and
+# anything that could mean Chinese, Japanese or Korean keeps the default (the costs are lopsided: the wrong file on CJK text costs far more than the right one gains elsewhere).
+
+#: Language codes by the script their text is written in (the ones the vocabulary files cover: Cyrillic, and the Latin script beyond English). Anything else (English, Arabic, Hebrew, Hindi, Thai,
+#: Greek...) says nothing.
+_CJK_LANGS = frozenset("zh ja ko yue cmn wuu hak nan gan lzh".split())
+_CYRILLIC_LANGS = frozenset("ru uk be bg mk sr kk ky tg mn tt ba cv ce os sah ab av kv udm".split())
+_LATIN_LANGS = frozenset(("de fr es pt it nl pl cs sk sl hr bs ro hu sv da nb nn no fi et lv lt tr vi id ms ca gl eu af sq is ga cy mt fil tl sw "
+                          "lb fo gd br oc rm eo la uz az tk hsb dsb ast an co fy sc se smn nds wa ln zu xh st tn yo ig ha so mg haw mi sm to").split())
+_CJK_SCRIPTS = frozenset("hans hant hani jpan kore hang hira kana bopo".split())
+
+
+def script_of_language(tag: Any) -> str:
+    """The script group a language tag (``ru-RU``, ``sr-Latn-RS``, ``de_DE.UTF-8``, ``sr_RS@latin``, ``zh-Hans``) says: ``cjk``, ``cyrillic``, ``latin`` (a Latin-script language other than English) or ``""`` (English, another
+    script, ``C`` / ``POSIX``, nothing readable)."""
+    text = str(tag or "").strip()
+    if not text:
+        return ""
+    low = text.lower()
+    if low in ("c", "posix") or low.startswith(("c.", "posix.")):
+        return ""
+    modifier = ""
+    if "@" in low:
+        low, modifier = low.split("@", 1)
+    low = low.split(".", 1)[0]
+    parts = [p for p in low.replace("_", "-").split("-") if p]
+    if not parts:
+        return ""
+    lang, scripts = parts[0], parts[1:]
+    if any(p in _CJK_SCRIPTS for p in scripts) or lang in _CJK_LANGS:
+        return "cjk"
+    if "cyrl" in scripts or modifier == "cyrillic":
+        return "cyrillic"
+    if "latn" in scripts or modifier == "latin":
+        return "" if lang == "en" else "latin"
+    if lang in _CYRILLIC_LANGS:
+        return "cyrillic"
+    if lang in _LATIN_LANGS:
+        return "latin"
+    return ""
+
+
+def vocab_for_languages(ui: Any = (), region: Any = (), keyboards: Any = ()) -> tuple[str, str]:
+    """(choice, language): the draft vocabulary for the computer's language signals, ``cjk`` (the default file) or ``cyrillic`` or ``latin``, and the language that decided ("" for the default). Each argument is a list of
+    language tags: ``ui`` the display / interface languages, ``region`` the regional format (user locale), ``keyboards`` the installed keyboard-layout languages.
+      any Chinese, Japanese or Korean signal anywhere -> the default;
+      else a Cyrillic signal, or a Latin-script non-English signal, picks that file; when both kinds are present the first one in the UI languages wins, then the regional format, then the keyboards;
+      no signal at all, English only, ``C`` / ``POSIX``, other scripts -> the default."""
+    groups = [[(script_of_language(t), str(t)) for t in (g or ())] for g in (ui, region, keyboards)]
+    seen = {s for g in groups for s, _ in g if s}
+    if not seen or "cjk" in seen:
+        return "cjk", ""
+    for g in groups:
+        for script, tag in g:
+            if script:
+                return script, tag.replace("_", "-").split(".", 1)[0].split("@", 1)[0].split("-", 1)[0].lower()
+    return "cjk", ""
+
+
+def _windows_names(call) -> list[str]:
+    try:
+        return [x for x in call() if x]
+    except Exception:                        # noqa: BLE001 - a signal that cannot be read says nothing
+        return []
+
+
+def os_language_signals(env: Any = None, system: str | None = None) -> dict[str, list[str]]:
+    """Every language signal this computer gives cheaply and locally: ``ui``, ``region``, ``keyboards`` (lists of tags). Linux and anywhere an environment is set: LANGUAGE, LC_ALL, LC_MESSAGES, LANG (display) and
+    LC_CTYPE, LC_TIME, LC_NUMERIC, LC_MONETARY (regional); Windows: the preferred UI languages, the user locale and the installed keyboard layouts (kernel32 / user32 through ctypes); the Mac: the preferred
+    languages and the locale from the user's global preferences file. A read that fails gives nothing for that signal; there is no waiting and no network."""
+    from strata_control import sysinfo         # (the platform module's own call asks WMI with no timeout on Windows)
+    env = os.environ if env is None else env
+    system = system or sysinfo.system()
+    ui: list[str] = []
+    region: list[str] = []
+    keyboards: list[str] = []
+    try:
+        ui += [x for x in str(env.get("LANGUAGE", "")).split(":") if x]
+        ui += [str(env.get(k, "")) for k in ("LC_ALL", "LC_MESSAGES", "LANG") if env.get(k)]
+        region += [str(env.get(k, "")) for k in ("LC_CTYPE", "LC_TIME", "LC_NUMERIC", "LC_MONETARY") if env.get(k)]
+    except Exception:                        # noqa: BLE001
+        pass
+    if system == "Windows":
+        ui_w, region_w, kb_w = _windows_languages()
+        ui, region, keyboards = ui_w + ui, region_w + region, kb_w
+    elif system == "Darwin":
+        try:
+            import plistlib
+            with open(Path.home() / "Library" / "Preferences" / ".GlobalPreferences.plist", "rb") as fh:
+                prefs = plistlib.load(fh)
+            ui = [str(x) for x in prefs.get("AppleLanguages") or []] + ui
+            if prefs.get("AppleLocale"):
+                region = [str(prefs["AppleLocale"])] + region
+        except Exception:                    # noqa: BLE001
+            pass
+    return {"ui": ui, "region": region, "keyboards": keyboards}
+
+
+def computer_language_signals() -> dict[str, list[str]]:
+    """The signals of THIS computer (os_language_signals with its own environment); the one name the tests replace so that no result depends on the language of the box that runs them."""
+    return os_language_signals()
+
+
+def _windows_languages() -> tuple[list[str], list[str], list[str]]:
+    """(UI languages, user locale, keyboard-layout languages) as locale names on Windows, each read on its own so one failure leaves the others."""
+    ui: list[str] = []
+    region: list[str] = []
+    keyboards: list[str] = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+    except Exception:                        # noqa: BLE001
+        return ui, region, keyboards
+
+    def locale_name(langid: int) -> str:
+        buf = ctypes.create_unicode_buffer(85)
+        return buf.value if k32.LCIDToLocaleName(langid & 0xFFFF, buf, 85, 0) > 0 else ""
+
+    try:
+        count = wintypes.ULONG(0)
+        size = wintypes.ULONG(0)
+        if k32.GetUserPreferredUILanguages(0x8, ctypes.byref(count), None, ctypes.byref(size)) and size.value:
+            raw = ctypes.create_unicode_buffer(size.value)
+            if k32.GetUserPreferredUILanguages(0x8, ctypes.byref(count), raw, ctypes.byref(size)):
+                ui = [x for x in ctypes.wstring_at(ctypes.addressof(raw), size.value).split("\x00") if x]
+    except Exception:                        # noqa: BLE001
+        pass
+    if not ui:
+        try:
+            ui = [x for x in (locale_name(k32.GetUserDefaultUILanguage()),) if x]
+        except Exception:                    # noqa: BLE001
+            pass
+    try:
+        buf = ctypes.create_unicode_buffer(85)
+        if k32.GetUserDefaultLocaleName(buf, 85) > 0 and buf.value:
+            region = [buf.value]
+    except Exception:                        # noqa: BLE001
+        pass
+    try:
+        u32 = ctypes.windll.user32
+        u32.GetKeyboardLayoutList.restype = ctypes.c_int
+        n = u32.GetKeyboardLayoutList(0, None)
+        if 0 < n <= 64:
+            layouts = (ctypes.c_void_p * n)()
+            got = u32.GetKeyboardLayoutList(n, layouts)
+            keyboards = [x for x in (locale_name(int(layouts[i] or 0) & 0xFFFF) for i in range(max(0, got))) if x]
+    except Exception:                        # noqa: BLE001
+        pass
+    return ui, region, keyboards
+
+
+def vocab_ids_fit(path: Path, n_vocab: int | None = None) -> bool:
+    """Is this file a draft vocabulary of the model's tokenizer: whole int32 ids, none below zero or past the vocabulary (the drafter pack's own vocabulary size, 248,320 for Qwen3.8-Flash-Next)?"""
+    import array
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    if not data or len(data) % 4:
+        return False
+    ids = array.array("i")
+    ids.frombytes(data)
+    if sys.byteorder == "big":
+        ids.byteswap()
+    return min(ids) >= 0 and max(ids) < (n_vocab or PACK_TARGET["vocab"])
+
+
+def auto_vocab(cfg: dict, args: list[str], current: Path | None, form: str | None, data_dir: str | Path | None = None,
+               signals: dict[str, list[str]] | None = None) -> tuple[Path | None, str]:
+    """(file, line) for a DFlash2 start: the draft vocabulary file and one log line saying which and why. The person's own choice always wins and is kept as it was: ``draft_vocab`` saved in the run config (setup
+    ``--draft-vocab``, also when it is the default one) or ``--mtp-draft-vocab`` in the arguments. Otherwise the file follows the computer's languages (vocab_for_languages) when the engine takes the file by name
+    (FORM_FILE, or an engine nobody can tell: the usual form), the shipped file is here and fits this model's vocabulary; anything else is today's default, said nothing about. Nothing is written to the config: it is worked out at every start."""
+    name = lambda p: Path(p).name if p else "none"       # noqa: E731
+    saved = cfg.get("draft_vocab")
+    if saved or _flag_value(args, "--mtp-draft-vocab") or _flag_value(cfg.get("user_args") or [], "--mtp-draft-vocab"):
+        return current, f"draft vocabulary: {name(current)} (set by you)"
+    if form not in (None, FORM_FILE) or current is None:           # (None: the engine program is not known: the usual form, the file by name)
+        return current, f"draft vocabulary: {name(current)} (the default)"
+    try:
+        sig = signals if signals is not None else computer_language_signals()
+        choice, language = vocab_for_languages(sig.get("ui"), sig.get("region"), sig.get("keyboards"))
+    except Exception:                        # noqa: BLE001 - no answer means the default
+        choice, language = "cjk", ""
+    if choice != "cjk":
+        picked = shipped_vocab(choice)
+        if picked.is_file() and vocab_ids_fit(picked, pack_target(data_dir)["vocab"]):
+            return picked, f"draft vocabulary: {picked.name} (by this computer's language: {language})"
+    return current, f"draft vocabulary: {name(current)} (the default)"
 
 
 def _sha256(path: Path) -> str:
@@ -1116,13 +1457,23 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     args = [str(a) for a in cfg.get("args") or []]
     if cfg.get("split_engine_note") and _flag_value(args, "--draft") == "dflash2":   # the all-cards split engine started with DFlash2 as its drafter (split_engine.split_config): its flags are its own, nothing is added or taken out
         return Decision("dflash2", "dflash2")
-    if not supported_model(cfg.get("model_name"), family):    # another model: its drafting is not this choice's business (Swift, Coder, NVFP4, Qwen3.6...)
+    name = cfg.get("model_name")
+    fit = ""
+    if not supported_model(name, family):
+        # the name is not one setup writes: what the FILE is decides (a renamed Flash-Next file, a hand-written config, a feed model under its own name); Coder, NVFP4 and Swift stay out by name
+        fit = file_fit(args, data_dir) if family is None and not _EXCLUDED_NAME.search(str(name or "")) else ""
+        if fit == "fits":
+            name = known_name_of_file(args) or FILE_FITS_AS        # a file that is exactly a known set gets that set's table entry; any other the general defaults
+    if not supported_model(name, family):                     # another model: its drafting is not this choice's business (Swift, Coder, NVFP4, Qwen3.6...)
         asked = normalize(cfg.get("drafting"))
         if asked == "off" or cfg.get("mtp") is False:            # no drafter for this model (its draft layer is off, or a feed model whose entry says drafter: none): say so, start none
             # "mtp": false: the server's own draft-layer step takes the layer out (and says so); "drafting": "off" alone: taken out here
             cfg["args"] = strip_draft_flags(args) if cfg.get("mtp") is False else strip_mtp_flags(strip_draft_flags(args))
             return Decision(asked, "off")
         if asked == "dflash2":
+            cfg["args"] = strip_draft_flags(args)
+            return Decision(asked, "mtp", NOT_SUPPORTED)
+        if fit == "family":                                       # a Qwen3.8-Flash-Next-family file the drafter was not made for (other sizes): the MTP, and the person is told
             cfg["args"] = strip_draft_flags(args)
             return Decision(asked, "mtp", NOT_SUPPORTED)
         return Decision(asked, "mtp")
@@ -1134,15 +1485,15 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     mode = cfg.get("drafting")
     if cfg.get("mtp") is False and normalize(mode) == "auto":
         mode = "off"                                          # "Draft layer (MTP)" turned off by the person, and no drafter chosen since: no drafter
-    decision = decide(mode, model_name=cfg.get("model_name"), family=family, data_dir=data_dir, backend=backend, archs=archs,
+    decision = decide(mode, model_name=name, family=family, data_dir=data_dir, backend=backend, archs=archs,
                       mtp_here=mtp_here, blocked=blocked_by(strip_draft_flags(args), split=split, slots=slots, named=normalize(mode) == "dflash2", backend=backend) or form == FORM_NONE, vocab_here=vocab is not None,
                       args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
     mine = cfg.get("user_args") or []
     pack = None
     if decision.drafter == "dflash2":
-        qualifies = tuned_applies(backend, cfg.get("model_name"), archs, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
-        pack = pack_path(data_dir, engine, model_name=cfg.get("model_name"), backend=backend, tuned=qualifies)
-        if Path(pack) != tuned_path(data_dir, tuned_variant(backend, cfg.get("model_name"))) and not pack_ready(data_dir):         # (only the tuned pack is here and this engine cannot read it: no drafter file for it)
+        qualifies = tuned_applies(backend, name, archs, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
+        pack = pack_path(data_dir, engine, model_name=name, backend=backend, tuned=qualifies)
+        if Path(pack) != tuned_path(data_dir, tuned_variant(backend, name)) and not pack_ready(data_dir):         # (only the tuned pack is here and this engine cannot read it: no drafter file for it)
             decision = Decision(decision.asked, "mtp", NOT_DOWNLOADED) if mtp_here is not False else Decision(decision.asked, "off", NONE_HERE)
     if decision.drafter == "off":
         cfg["args"] = strip_mtp_flags(strip_draft_flags(args))
@@ -1153,12 +1504,14 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
             cfg["mtp"] = True                                 # an explicit drafter choice overrides an older "mtp": false
     else:
         base = strip_mtp_flags(strip_draft_flags(args))
+        vocab, vocab_line = auto_vocab(cfg, args, vocab, form, data_dir)         # the person's own choice, else the computer's language, else the default
+        decision.vocab = vocab_line
         flags = list(engine_flags(pack, vocab, form))
         kept_conf = _flag_value(mine, "--draft-conf")
-        tuned_conf = tuned_conf_for(backend, cfg.get("model_name")) if Path(pack) == tuned_path(data_dir, tuned_variant(backend, cfg.get("model_name"))) else None     # Metal: the conf the tuned pack was measured with; CUDA / HIP: None, the backend's own conf stays
+        tuned_conf = tuned_conf_for(backend, name) if Path(pack) == tuned_path(data_dir, tuned_variant(backend, name)) else None     # Metal: the conf the tuned pack was measured with; CUDA / HIP: None, the backend's own conf stays
         held = slots_of(base, vram_mib)
-        tuned_here = Path(pack) == tuned_path(data_dir, tuned_variant(backend, cfg.get("model_name")))
-        card_conf = big_blackwell_conf_for(backend, cfg.get("model_name"), archs, vram_mib, held) if tuned_here else None      # large-VRAM Blackwell, IQ3_S, tuned pack: the measured 0.55; Strix keeps 0.35 and only widens the window
+        tuned_here = Path(pack) == tuned_path(data_dir, tuned_variant(backend, name))
+        card_conf = big_blackwell_conf_for(backend, name, archs, vram_mib, held) if tuned_here else None      # large-VRAM Blackwell, IQ3_S, tuned pack: the measured 0.55; Strix keeps 0.35 and only widens the window
         flags[flags.index("--draft-conf") + 1] = kept_conf if kept_conf is not None else f"{tuned_conf if tuned_conf is not None else card_conf if card_conf is not None else conf_for(backend, held):g}"
         flags[flags.index("--spec") + 1] = str(window_for(backend, archs, vram_mib, held))
         if _flag_value(mine, "--spec") is None:

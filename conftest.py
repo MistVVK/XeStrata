@@ -21,6 +21,20 @@ def _fresh_host_memory():
     yield
     forget()
 
+@_pytest.fixture(autouse=True)
+def _no_language_of_the_box():
+    """The draft vocabulary follows the computer's languages (strata_control/drafting.py auto_vocab): a test that starts the drafter must not depend on the language, regional format or keyboards of the
+    box it runs on (a Windows PC with a Slovenian keyboard layout, a Russian runner). Every test starts on a computer that says no language; the tests about the rule give their own signals."""
+    try:
+        from unittest import mock
+        from strata_control import drafting
+    except ImportError:
+        yield
+        return
+    with mock.patch.object(drafting, "computer_language_signals", return_value={"ui": [], "region": [], "keyboards": []}):
+        yield
+
+
 _home = tempfile.mkdtemp(prefix="strata-pytest-config-")
 os.environ["APPDATA"] = _home
 os.environ["XDG_CONFIG_HOME"] = _home

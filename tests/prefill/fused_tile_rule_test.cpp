@@ -457,5 +457,222 @@ int main() {
         CHECK(pick(Card{false, false, 48, true}, 81910, E, false, false).ww == 4 && pick(Card{false, false, 48, true}, 81910, E, true, true).ww == 2);   // the staged 128-row choice the fallback overrides
         std::printf("fused_tile_rule_test: staging guard: %lld blob cases, 16 geometries, the check budget and the sticky fallback checked, %d failed so far\n", cases, failed);
     }
+    // ---- the Qwen3.6 engine (strata-q36): which layers take the fused prompt kernels, q36_takes(env, card, sm40_env, gate_staged, down_ok, covered).  The whole grid against an oracle written from the sentence of the
+    // decision: a layer whose pair the kernels do not cover, or STRATA_PF_FUSED=0 (or any value not starting with '1'): MMQ.  =1: the fused kernels on every card.  Unset: the cards of the Flash-Next default rule, an
+    // sm_86-class (8.0 / 8.6 / 8.9) or sm_120 card (not sm_121 alone, not a card with neither flag: sm_75, sm_87, sm_90, AMD) with 80+ SMs for every layer, 40-79 SMs for a staged gate/up with a staged down
+    // while STRATA_PF_FUSED_SM40 is not "0", under 40 SMs never.
+    {
+        using namespace strata::prefill::fused_tile;
+        CHECK(pf_env(nullptr) == -1 && pf_env("") == -1 && pf_env("1") == 1 && pf_env("1x") == 1 && pf_env("0") == 0 && pf_env("2") == 0 && pf_env("yes") == 0 && pf_env("off") == 0);
+        CHECK(sm40_env_of(nullptr) == -1 && sm40_env_of("0") == 0 && sm40_env_of("1") == 1 && sm40_env_of("") == 1 && sm40_env_of("on") == 1);
+        long long cmp = 0, bad = 0, yes_def = 0, yes_opt = 0, no_zero = 0, yes40 = 0, yes80 = 0;
+        for (int env = -1; env <= 1; ++env)
+            for (int sm40e = -1; sm40e <= 1; ++sm40e)
+                for (int s120 = 0; s120 < 2; ++s120)
+                    for (int s86 = 0; s86 < 2; ++s86)
+                        for (int s121 = 0; s121 < 2; ++s121)
+                            for (int sms = 0; sms <= 200; ++sms)
+                                for (int g = 0; g < 2; ++g)
+                                    for (int d = 0; d < 2; ++d)
+                                        for (int cov = 0; cov < 2; ++cov) {
+                                            ++cmp;
+                                            const Card c{s120 != 0, s121 != 0, sms, s86 != 0};
+                                            const bool in_class = s120 || s86;
+                                            bool want = false;
+                                            if (cov != 0 && env == 1) want = true;
+                                            if (cov != 0 && env == -1) want = in_class && (sms >= 80 || (sms >= 40 && sm40e != 0 && g != 0 && d != 0));
+                                            if (q36_takes(env, c, sm40e, g != 0, d != 0, cov != 0) != want) ++bad;
+                                            if (want && env == -1) ++yes_def;
+                                            if (want && env == 1) ++yes_opt;
+                                            if (want && env == -1 && sms < 80) ++yes40;
+                                            if (want && env == -1 && sms >= 80) ++yes80;
+                                            if (env == 0 && !want) ++no_zero;
+                                        }
+        CHECK(bad == 0 && yes_def > 0 && yes_opt > 0 && yes40 > 0 && yes80 > 0 && no_zero > 0);
+        std::printf("fused_tile_rule_test: Qwen3.6 engine: %lld switch / SM40 switch / card flag / SM count / format combinations (%lld wrong; %lld yes unset, %lld of them below 80 SMs, %lld at 80+; %lld yes under =1)\n", cmp, bad, yes_def, yes40, yes80, yes_opt);
+        // named cards, formats of UD-Q4_K_XL (a staged K-quant gate/up with a staged Q5_K / Q6_K down), STRATA_PF_FUSED unset
+        const Card a6000c{false, false, 84, true}, a4000c{false, false, 48, true}, a100{false, false, 108, true}, rtx4090{false, false, 128, true}, rtx3050{false, false, 20, true}, pro5000{true, false, 110, false},
+            rtx5090{true, false, 170, false}, rtx5070{true, false, 48, false}, gb10c{false, true, 48, false}, turing{false, false, 68, false}, orin{false, false, 16, false}, hopper{false, false, 132, false};
+        for (const Card& c : {a6000c, a100, rtx4090, pro5000, rtx5090}) CHECK(q36_takes(-1, c, -1, true, true, true) && q36_takes(-1, c, 0, true, true, true));      // 80+ SMs: the SM40 switch moves nothing
+        for (const Card& c : {a4000c, rtx5070}) CHECK(q36_takes(-1, c, -1, true, true, true) && q36_takes(-1, c, 1, true, true, true) && !q36_takes(-1, c, 0, true, true, true));   // 40-79 SMs: staged, SM40 not "0"
+        for (const Card& c : {rtx3050, gb10c, turing, orin, hopper}) CHECK(!q36_takes(-1, c, -1, true, true, true) && !q36_takes(-1, c, 1, true, true, true));          // under 40 SMs, sm_121, no class flag: MMQ
+        CHECK(!q36_takes(-1, a4000c, -1, false, true, true) && !q36_takes(-1, a4000c, -1, true, false, true));   // an unstaged gate/up or down on 48 SMs: MMQ
+        CHECK(q36_takes(-1, a6000c, -1, false, false, true) && !q36_takes(-1, a6000c, -1, true, true, false));   // 80+ SMs take any covered pair, never an uncovered one
+        // STRATA_PF_FUSED=0 is MMQ on every card; =1 is the fused kernels on every card that covers the pair (the way strata-q36 behaved with the opt-in)
+        for (const Card& c : {a6000c, a4000c, a100, rtx4090, pro5000, rtx5090, rtx5070, rtx3050, gb10c, turing, orin, hopper}) {
+            CHECK(!q36_takes(0, c, -1, true, true, true) && q36_takes(1, c, -1, false, false, true) && !q36_takes(1, c, -1, true, true, false));
+        }
+        // the class is takes_by_default's: the same answer as the Flash-Next rule for a covered pair with the staged flags, every card above
+        for (const Card& c : {a6000c, a4000c, a100, rtx4090, pro5000, rtx5090, rtx5070, rtx3050, gb10c, turing, orin, hopper})
+            for (int sm40e = -1; sm40e <= 1; ++sm40e)
+                for (int g = 0; g < 2; ++g)
+                    for (int d = 0; d < 2; ++d) CHECK(q36_takes(-1, c, sm40e, g != 0, d != 0, true) == takes_by_default(c, sm40_on(sm40e), g != 0, d != 0));
+        // compute capability: 8.0 / 8.6 / 8.9 are in the class (s86_class), 8.7 / 9.0 / 7.5 are not, STRATA_PF_FUSED_SM86=0 empties it
+        CHECK(q36_takes(-1, Card{false, false, 108, s86_class(8, 0)}, -1, true, true, true) && q36_takes(-1, Card{false, false, 128, s86_class(8, 9)}, -1, true, true, true));
+        CHECK(!q36_takes(-1, Card{false, false, 16, s86_class(8, 7)}, -1, true, true, true) && !q36_takes(-1, Card{false, false, 132, s86_class(9, 0)}, -1, true, true, true) &&
+              !q36_takes(-1, Card{false, false, 68, s86_class(7, 5)}, -1, true, true, true) && !q36_takes(-1, Card{false, false, 84, s86_class(8, 6, true)}, -1, true, true, true));
+    }
+    // ---- the K-quant pairs of Qwen3.6's UD-Q4_K_XL in the wide class (tile 128 above 112 rows an expert on sm_86 cards with 40+ SMs): wide_pair(gu_type, d_type) and the rule at the engine's launch sizes
+    {
+        using namespace strata::prefill::fused_tile;
+        // ggml type ids: Q8_0 8, Q4_K 12, Q5_K 13, Q6_K 14, IQ3_XXS 18, IQ3_S 21, IQ4_XS 23, IQ4_NL 20, Q5_1 7, Q2_0 (any), Q5_0 6
+        long long bad = 0, yes = 0;
+        for (int gu = 0; gu < 40; ++gu)
+            for (int d = 0; d < 40; ++d) {
+                const bool want = gu == 14 || gu == 8 || ((gu == 12 || gu == 13) && (d == 13 || d == 14));
+                if (wide_pair(gu, d) != want) ++bad;
+                yes += want ? 1 : 0;
+            }
+        CHECK(bad == 0 && yes == 84);   // gu 14 (40 downs) + gu 8 (40) + {12, 13} x {13, 14} (4);
+        CHECK(wide_pair(12, 13) && wide_pair(12, 14) && wide_pair(13, 13) && wide_pair(13, 14) && wide_pair(14, 8) && wide_pair(8, 8));
+        CHECK(!wide_pair(12, 7) && !wide_pair(12, 8) && !wide_pair(13, 7) && !wide_pair(12, 20) && !wide_pair(18, 20) && !wide_pair(21, 20) && !wide_pair(23, 20) && !wide_pair(22, 2));   // Flash-Next's K-quant gate/up (Q5_1 / Q8_0 down) and the i-quant pairs keep their rule
+        // Qwen3.6: 256 experts, top 8, a chunk of T tokens = T * 8 rows an expert-average of T / 32: 1,024 / 1,792 / 2,048 / 4,096 / 8,192 / 20,000 tokens
+        const Card a6000{false, false, 84, true}, a4000{false, false, 48, true}, a100{false, false, 108, true}, rtx4090{false, false, 128, true}, pro5000{true, false, 110, false}, rtx5090{true, false, 170, false};
+        const bool w = wide_pair(12, 13);
+        for (const Card& c : {a6000, a100, rtx4090}) {   // sm_86 class with 80+ SMs
+            CHECK(pick(c, 1024 * 8, 256, true, w).ww == 4 && pick(c, 1792 * 8, 256, true, w).ww == 4);                       // 32 and 56 rows an expert: the band's bottom, 64 as before
+            CHECK(pick(c, 2048 * 8, 256, true, w).ww == 2 && pick(c, 2048 * 8, 256, true, w).why == Why::kBand);              // 64: the band, 128 as before
+            for (int T : {4096, 8192, 20000}) CHECK(pick(c, (int64_t) T * 8, 256, true, w).ww == 2 && pick(c, (int64_t) T * 8, 256, true, w).why == Why::kS86Wide);   // 128 / 256 / 625: 128 rows now
+            for (int T : {4096, 8192, 20000}) CHECK(pick(c, (int64_t) T * 8, 256, true, false).ww == 4);                       // not the class: the old pick, 64 rows
+            CHECK(pick(c, 4096 * 8, 256, true, w).ww == 2 && pick(c, 3584 * 8, 256, true, w).ww == 2 && pick(c, 3584 * 8, 256, true, false).ww == 2);   // 112 rows an expert (3,584 tokens): band, 128 either way
+            CHECK(pick(c, 3585 * 8, 256, true, w).ww == 2 && pick(c, 3585 * 8, 256, true, false).ww == 4);                    // 112.03: the line
+        }
+        // under 80 SMs the staged rule already takes 128 (A4000), sm_120 never looks at wide
+        for (int T : {1024, 2048, 4096, 8192, 20000}) {
+            const int64_t n = (int64_t) T * 8;
+            CHECK(pick(a4000, n, 256, true, w).ww == 2 && pick(a4000, n, 256, true, w).why == Why::kStaged && pick(a4000, n, 256, true, false).ww == 2);
+            for (const Card& c : {pro5000, rtx5090, Card{true, false, 48, false}}) CHECK(pick(c, n, 256, true, w).ww == pick(c, n, 256, true, false).ww && pick(c, n, 256, true, w).why == pick(c, n, 256, true, false).why);
+        }
+        CHECK(pick(pro5000, 4096 * 8, 256, true, w).ww == 2 && pick(pro5000, 2048 * 8, 256, true, w).ww == 2 && pick(rtx5090, 4096 * 8, 256, true, w).ww == 4);   // the 110-SM card picks 128 from 56 rows an expert; the 170-SM one is as before
+        // the whole sm_86 grid at the Qwen3.6 shape against an oracle written from the sentence: staged and wide, an sm_86-class card: 1-79 SMs 128 rows; 80+ SMs 128 rows from above 56 rows an expert, else 64
+        long long bad2 = 0, cmp2 = 0;
+        for (int sms = 1; sms <= 200; ++sms)
+            for (int T = 256; T <= 24576; T += 64) {
+                const int64_t n = (int64_t) T * 8;
+                const double avg = (double) n / 256.0;
+                const int want = sms < 80 ? 2 : (avg > 56.0 ? 2 : 4);
+                ++cmp2;
+                if (pick(Card{false, false, sms, true}, n, 256, true, true).ww != want) ++bad2;
+            }
+        CHECK(bad2 == 0);
+        std::printf("fused_tile_rule_test: Qwen3.6 K-quant pairs in the wide class: %lld sm_86 SM count / chunk combinations (%lld wrong)\n", cmp2, bad2);
+    }
+    // ---- Flash-Next's K-quant pairs (UD-Q4_K_XL: gate/up Q4_K or Q5_K with a Q5_1 or Q8_0 down): kq_flash_kind(gu_type, d_type) and the tile rule's kq argument.  Flash-Next: 512 experts, top 10, a launch of T tokens = T * 10 rows.
+    {
+        using namespace strata::prefill::fused_tile;
+        // ggml type ids: Q5_1 7, Q8_0 8, Q4_K 12, Q5_K 13, Q6_K 14, IQ3_S 21, IQ4_NL 20
+        long long bad = 0;
+        for (int gu = 0; gu < 40; ++gu)
+            for (int d = 0; d < 40; ++d) {
+                const int want = (gu == 12 || gu == 13) ? (d == 7 ? 1 : d == 8 ? 2 : 0) : 0;
+                if (kq_flash_kind(gu, d) != want) ++bad;
+                if (kq_flash_kind(gu, d) != 0 && wide_pair(gu, d)) ++bad;   // disjoint from Qwen3.6's K-quant pairs (a Q5_K / Q6_K down)
+            }
+        CHECK(bad == 0);
+        CHECK(kq_flash_kind(12, 7) == 1 && kq_flash_kind(12, 8) == 2 && kq_flash_kind(13, 8) == 2 && kq_flash_kind(13, 7) == 1);   // the three UD-Q4_K_XL pairs (and Q5_K / Q5_1, not in the set)
+        CHECK(kq_flash_kind(12, 13) == 0 && kq_flash_kind(13, 14) == 0 && kq_flash_kind(14, 8) == 0 && kq_flash_kind(8, 8) == 0 && kq_flash_kind(21, 20) == 0 && kq_flash_kind(18, 20) == 0);   // Qwen3.6's pairs, Q6_K / Q8_0, Q8_0 / Q8_0, the i-quant pairs: none
+        // the whole grid against an oracle written from the sentence: kq == 0 is the rule as it was; kq 1 or 2 on an sm_86-class card with 80 to 99 SMs and at least 5.8 rows an expert: 128 rows (why kS86Kq); kq == 2 on an sm_120 card
+        // with 100 to 149 SMs and at least 5.8 rows an expert: 128 rows (why kS120Kq); everything else the rule as it was
+        long long cmp = 0, bad2 = 0, moved86 = 0, moved120 = 0;
+        for (int s120 = 0; s120 < 2; ++s120)
+            for (int s86 = 0; s86 < 2; ++s86)
+                for (int s121 = 0; s121 < 2; ++s121)
+                    for (int sms = 0; sms <= 200; ++sms)
+                        for (int T = 64; T <= 40000; T += 61)
+                            for (int st = 0; st < 2; ++st)
+                                for (int wd = 0; wd < 2; ++wd)
+                                    for (int kq = 0; kq <= 2; ++kq) {
+                                        const Card c{s120 != 0, s121 != 0, sms, s86 != 0};
+                                        const int64_t n = (int64_t) T * 10;
+                                        const double avg = (double) n / 512.0;
+                                        const Pick base = pick(c, n, 512, st != 0, wd != 0, 0);
+                                        const Pick got = pick(c, n, 512, st != 0, wd != 0, kq);
+                                        bool s86_line = false, s120_line = false;
+                                        if (!c.s121 && avg >= 5.8) {
+                                            // the lines before the new ones answer first: the staged rule (40-79 SMs) and the sm_120 rules
+                                            const bool before = (c.s121) || (st != 0 && (c.s86 || c.s120) && sms > 0 && sms < 80) ||
+                                                                (c.s120 && sms >= 80 && (avg >= 159.9 || (sms >= 100 && sms < 150 && avg > 112.0))) || (c.s120 && sms >= 40 && sms < 80) ||
+                                                                (wd != 0 && c.s86 && sms >= 40 && avg > 112.0);
+                                            s86_line = kq != 0 && c.s86 && sms >= 80 && sms < 100 && !before;
+                                            s120_line = kq == 2 && c.s120 && sms >= 100 && sms < 150 && !before && !s86_line;
+                                        }
+                                        ++cmp;
+                                        if (s86_line) {
+                                            if (got.ww != 2 || got.why != Why::kS86Kq) ++bad2;
+                                            if (base.ww != 2) ++moved86;
+                                        } else if (s120_line) {
+                                            if (got.ww != 2 || got.why != Why::kS120Kq) ++bad2;
+                                            if (base.ww != 2) ++moved120;
+                                        } else if (got.ww != base.ww || got.why != base.why) ++bad2;
+                                    }
+        CHECK(bad2 == 0 && moved86 > 0 && moved120 > 0);
+        std::printf("fused_tile_rule_test: Flash-Next K-quant pairs: %lld card flag / SM count / launch size / switch combinations (%lld wrong; %lld launches move to 128 rows on sm_86 with 80-99 SMs, %lld on sm_120 with 100-149 SMs)\n", cmp, bad2, moved86, moved120);
+        // named cards and sizes (tokens x 10 rows over 512 experts): 300 / 1,000 / 2,048 / 4,096 / 8,192 / 20,000 / 32,768 tokens
+        const Card a6000{false, false, 84, true}, a4000{false, false, 48, true}, a100{false, false, 108, true}, rtx4090{false, false, 128, true}, pro5000{true, false, 110, false},
+            rtx5090{true, false, 170, false}, rtx5070{true, false, 48, false}, gb10{false, true, 48, false};
+        for (int k : {1, 2})
+            for (int T : {300, 1000, 2048, 4096, 8192, 20000, 32768}) {
+                const int64_t n = (int64_t) T * 10;
+                CHECK(pick(a6000, n, 512, true, false, k).ww == 2 && pick(a6000, n, 512, true, false, k).why == Why::kS86Kq);   // A6000: 128 rows at every size measured, MMQ / fused 1.65 1.49 1.52 1.29 1.04 0.97 0.88 (Q4_K / Q5_1)
+                CHECK(pick(a4000, n, 512, true, false, k).ww == 2 && pick(a4000, n, 512, true, false, k).why == Why::kStaged);   // 48 SMs: the staged rule decides first, 128 rows from every size
+            }
+        for (int T : {300, 1000, 2048, 4096, 8192, 20000, 32768}) {   // the classes not measured keep today's pick
+            const int64_t n = (int64_t) T * 10;
+            for (int k : {1, 2})
+                for (const Card& c : {a100, rtx4090, rtx5090, rtx5070, gb10}) CHECK(pick(c, n, 512, true, false, k).ww == pick(c, n, 512, true, false, 0).ww && pick(c, n, 512, true, false, k).why == pick(c, n, 512, true, false, 0).why);
+            CHECK(pick(pro5000, n, 512, true, false, 1).ww == pick(pro5000, n, 512, true, false, 0).ww);   // the PRO 5000 and the Q5_1 down (43 layers): today's pick
+        }
+        // the card's edges and the size's edge: 80 and 99 SMs in, 79 (not staged) and 100 out; 5.8 rows an expert = 2,969.6 rows
+        CHECK(pick(Card{false, false, 80, true}, 2970, 512, true, false, 1).why == Why::kS86Kq && pick(Card{false, false, 99, true}, 2970, 512, true, false, 1).why == Why::kS86Kq);
+        CHECK(pick(Card{false, false, 100, true}, 2970, 512, true, false, 1).why == Why::kBand && pick(Card{false, false, 100, true}, 2970, 512, true, false, 1).ww == 4);
+        CHECK(pick(Card{false, false, 84, true}, 2969, 512, true, false, 1).why == Why::kBand && pick(Card{false, false, 84, true}, 2969, 512, true, false, 1).ww == 4);   // under 5.8 rows an expert: as before
+        CHECK(pick(Card{false, false, 84, true}, 2970, 512, true, false, 1).ww == 2 && pick(Card{false, false, 84, true}, 2970, 512, true, false, 0).ww == 4);
+        // sm_120, the two Q8_0-down pairs: 128 rows from 5.8 rows an expert on 100 to 149 SMs; the Q5_1 down and every other sm_120 class keep today's pick
+        CHECK(pick(pro5000, 3000, 512, true, false, 2).ww == 2 && pick(pro5000, 3000, 512, true, false, 2).why == Why::kS120Kq && pick(pro5000, 3000, 512, true, false, 0).ww == 4);   // 300 tokens: 64 before
+        CHECK(pick(pro5000, 20480, 512, true, false, 2).ww == 2 && pick(pro5000, 20480, 512, true, false, 2).why == Why::kS120Kq);                                                    // 2,048 tokens: 64 before
+        CHECK(pick(pro5000, 40960, 512, true, false, 2).ww == 2 && pick(pro5000, 40960, 512, true, false, 0).ww == 2 && pick(pro5000, 61440, 512, true, false, 2).why == Why::kS120Mid && pick(pro5000, 81920, 512, true, false, 2).why == Why::kS120Large);   // 80 rows: 128 either way; above 112 the rules above decide
+        CHECK(pick(Card{true, false, 99, false}, 3000, 512, true, false, 2).ww == 4 && pick(Card{true, false, 150, false}, 3000, 512, true, false, 2).ww == 4 && pick(Card{true, false, 100, false}, 3000, 512, true, false, 2).ww == 2);
+        CHECK(pick(pro5000, 3000, 512, true, false, 1).ww == 4 && pick(pro5000, 20480, 512, true, false, 1).ww == 4);   // Q5_1 down on the PRO 5000: 64 rows below 56 rows an expert, as measured
+        // Qwen3.6 (256 experts, top 8) is a different call: kq is never passed there, and wide_pair's answers above are unchanged
+        CHECK(pick(a6000, 2048 * 8, 256, true, true, 0).ww == pick(a6000, 2048 * 8, 256, true, true).ww);
+    }
+    // ---- Flash-Next's K-quant experts by default: kq_takes(kq_env, card, sm40_env), whether dev_info sets the K-quant kernels up.  The whole grid against an oracle written from the sentence of the decision:
+    // STRATA_PF_FUSED_KQ=0 (or any value not starting with '1'): never.  =1: every card.  Unset: the cards of the i-quant default rule (an sm_86-class or sm_120 card, not sm_121 alone, not a card with neither
+    // flag) with 80+ SMs, 40-79 SMs while STRATA_PF_FUSED_SM40 is not "0", under 40 SMs never.
+    {
+        using namespace strata::prefill::fused_tile;
+        long long cmp = 0, bad = 0, yes_def = 0, yes40 = 0, yes80 = 0;
+        for (int env = -1; env <= 1; ++env)
+            for (int sm40e = -1; sm40e <= 1; ++sm40e)
+                for (int s120 = 0; s120 < 2; ++s120)
+                    for (int s86 = 0; s86 < 2; ++s86)
+                        for (int s121 = 0; s121 < 2; ++s121)
+                            for (int sms = 0; sms <= 200; ++sms) {
+                                const Card c{s120 != 0, s121 != 0, sms, s86 != 0};
+                                bool want = false;
+                                if (env == 1) want = true;
+                                if (env == -1) want = (s120 || s86) && (sms >= 80 || (sms >= 40 && sm40e != 0));
+                                ++cmp;
+                                if (kq_takes(env, c, sm40e) != want) ++bad;
+                                if (want && env == -1) { ++yes_def; (sms >= 80 ? yes80 : yes40)++; }
+                            }
+        CHECK(bad == 0 && yes_def > 0 && yes40 > 0 && yes80 > 0);
+        std::printf("fused_tile_rule_test: Flash-Next K-quant default: %lld switch / SM40 switch / card flag / SM count combinations (%lld wrong; %lld yes unset: %lld at 80+ SMs, %lld at 40-79)\n", cmp, bad, yes_def, yes80, yes40);
+        // the switch as the engine reads it: the same reading as STRATA_PF_FUSED's (pf_env)
+        CHECK(pf_env(nullptr) == -1 && pf_env("") == -1 && pf_env("1") == 1 && pf_env("0") == 0 && pf_env("off") == 0);
+        // named cards, switch unset
+        const Card a6000{false, false, 84, true}, a40{false, false, 84, true}, a4000{false, false, 48, true}, a100{false, false, 108, true}, rtx4090{false, false, 128, true}, pro5000{true, false, 110, false},
+            rtx5090{true, false, 170, false}, rtx5070{true, false, 48, false}, gb10{false, true, 48, false}, rtx3050{false, false, 20, true}, turing{false, false, 68, false}, hopper{false, false, 132, false};
+        for (const Card& c : {a6000, a40, a100, rtx4090, pro5000, rtx5090}) CHECK(kq_takes(-1, c, -1) && kq_takes(-1, c, 0) && kq_takes(-1, c, 1) && !kq_takes(0, c, -1) && kq_takes(1, c, -1));   // 80+ SMs: the SM40 switch moves nothing
+        for (const Card& c : {a4000, rtx5070}) CHECK(kq_takes(-1, c, -1) && kq_takes(-1, c, 1) && !kq_takes(-1, c, 0) && !kq_takes(0, c, -1) && kq_takes(1, c, 0));                             // 40-79 SMs: on, STRATA_PF_FUSED_SM40=0 off
+        for (const Card& c : {gb10, rtx3050, turing, hopper}) CHECK(!kq_takes(-1, c, -1) && !kq_takes(-1, c, 1) && !kq_takes(0, c, -1) && kq_takes(1, c, -1));                                  // sm_121, under 40 SMs, no class flag: the opt-in only
+        // the same answer as the i-quant rule for a staged gate/up with a staged down, every card above
+        for (const Card& c : {a6000, a4000, a100, rtx4090, pro5000, rtx5090, rtx5070, gb10, rtx3050, turing, hopper})
+            for (int sm40e = -1; sm40e <= 1; ++sm40e) CHECK(kq_takes(-1, c, sm40e) == takes_by_default(c, sm40_on(sm40e), true, true));
+        // compute capability: 8.0 / 8.6 / 8.9 are in the class (s86_class), 8.7 / 9.0 / 7.5 are not, STRATA_PF_FUSED_SM86=0 empties it
+        CHECK(kq_takes(-1, Card{false, false, 108, s86_class(8, 0)}, -1) && kq_takes(-1, Card{false, false, 128, s86_class(8, 9)}, -1));
+        CHECK(!kq_takes(-1, Card{false, false, 16, s86_class(8, 7)}, -1) && !kq_takes(-1, Card{false, false, 132, s86_class(9, 0)}, -1) && !kq_takes(-1, Card{false, false, 68, s86_class(7, 5)}, -1) &&
+              !kq_takes(-1, Card{false, false, 84, s86_class(8, 6, true)}, -1));
+    }
     return failed == 0 ? 0 : 1;
 }

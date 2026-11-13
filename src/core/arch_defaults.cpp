@@ -162,6 +162,10 @@ bool igpu_cache_drop_default(const char* gcn_arch, bool integrated, bool windows
     return igpu_arena_no_thp_default(gcn_arch, integrated, windows);   // the same device class
 }
 
+bool igpu_fused_prompt_default(const char* gcn_arch, bool integrated, bool windows) {
+    return igpu_arena_no_thp_default(gcn_arch, integrated, windows);   // the same device class
+}
+
 std::vector<std::pair<std::string, std::string>> igpu_default_env(const char* gcn_arch, bool integrated) {
     std::vector<std::pair<std::string, std::string>> t;
     if (!integrated || !igpu_prompt_defaults_arch(gcn_arch)) return t;
@@ -366,6 +370,10 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrat
 #else
     const bool win_host = false;
 #endif
+    // Linux integrated gfx11 (gfx1103 / gfx1150 / gfx1151): the prompt experts on Strata's fused int8 kernels.  Silent: the prefill's own line
+    // ("prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1 ...") is printed when the kernels are taken.  A value the user set is kept (=0 = MMQ).
+    if (igpu_fused_prompt_default(gcn_arch, integrated, win_host) && std::getenv("STRATA_PF_FUSED") == nullptr)
+        set_default({"STRATA_PF_FUSED", "1"});
     for (const auto& kv : parallel_default_env(gcn_arch, win_host, batch_slots)) {
         if (std::getenv(kv.first.c_str()) != nullptr) continue;
         set_default(kv);

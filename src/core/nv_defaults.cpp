@@ -3,6 +3,8 @@
 
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/emulate.hpp"
+#include "strata/core/sm120_series.hpp"
+#include "strata/prefill/fused_tile_rule.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -64,6 +66,13 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // identical with it on and off (docs/DGX_SPARK_LINUX.md; HANDOVER §6.2).  It rounds differently from MMQ,
             // so it is a default with an off switch, like the sm_86 table.
             {"STRATA_PF_FUSED", "1"},
+            // the same fused prompt kernels for the K-quant experts of Unsloth's UD-Q4_K_XL files (Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down) instead of llama.cpp's MMQ.
+            // UD-Q4_K_XL (Flash-Next), expert cache budget 12000 (15,283 of 24,576 experts resident, so the box keeps over 16 GiB of its 121 GiB free), two starts a pair,
+            // against the FP16 prompt path's text, 48 real-text prompts (24 at 2,048 and 24 at 4,096 tokens, 256 forced tokens each, 12,288 positions): forced-token
+            // KL kq / MMQ 0.895 [0.808, 0.989] (0.864 [0.756, 0.976] at 2K, 0.928 [0.791, 1.088] at 4K), top-1 against the FP16 path's 96.31% / 95.74%, the same
+            // text twice byte for byte on both sides (repeat floor 0); prompt speed kq / MMQ, 10 interleaved pairs, median of the per-round ratios 1.10 / 1.26 / 1.18 / 1.53 at 2K / 4K / 8K / 20K (faster in 7 / 8 / 8 / 9 of 10; the rounds scatter 0.5 to 2.0)
+            // (phaseA-tests/par/RESULTS-SPARK-KQ.md).  STRATA_PF_FUSED_KQ=0 is the way back (a switch you set is kept); it is off with the rest of the table by STRATA_SM121_PERF=0.
+            {"STRATA_PF_FUSED_KQ", "1"},
             // NVFP4 prompt MMQ with FP4 activations (W4A4), the Blackwell path the engine keeps opt-in.  On this part, the
             // NVFP4 pack measured prompt 1.106x at 4K and 1.229x at 16K against the default W4A8 MMQ, decode unchanged
             // (1.015x), and 24 of 24 greedy answers byte-identical with it on and off.  Opt-in upstream because it is only
@@ -130,7 +139,33 @@ std::vector<std::pair<std::string, std::string>> nv_kq_default_env(int min_major
     return t;
 }
 
-std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor) {
+bool nv_kq_fused_here(int major, int minor, int sms) {
+    namespace ft = strata::prefill::fused_tile;
+    if (ft::pf_env(std::getenv("STRATA_PF_FUSED")) == 0) return false;
+    const ft::Card c{strata::sm120_default(major, minor), major == 12 && minor == 1, sms, ft::s86_class(major, minor, off("STRATA_PF_FUSED_SM86"))};
+    return ft::kq_takes(ft::pf_env(std::getenv("STRATA_PF_FUSED_KQ")), c, ft::sm40_env_of(std::getenv("STRATA_PF_FUSED_SM40")));
+}
+
+std::string nv_kq_default_line(bool fused_here) {
+    if (fused_here)
+        return "strata: a model with K-quant experts (Unsloth UD-Q4/Q5/Q6_K_XL) reads its prompt on Strata's own kernels where they cover the layer "
+               "(Q4_K and Q5_K gate/up with a Q5_1 or Q8_0 down) and on llama.cpp's MMQ kernels for the rest (STRATA_PF_FUSED_KQ=0 gives all of them back to MMQ)";
+    return "strata: a model with K-quant experts (Unsloth UD-Q4/Q5/Q6_K_XL) reads its prompt on llama.cpp's MMQ kernels "
+           "(STRATA_MMQ_KQ=0 or STRATA_NV_KQ_DEFAULT=0 turns it off)";
+}
+
+bool nv_kq_expert_type(int ggml_type) {
+    // ggml type ids: Q5_1 = 7, Q4_K = 12, Q5_K = 13, Q6_K = 14 (the cases of prefill::mmq::supported() behind kq_ok())
+    return ggml_type == 7 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14;
+}
+
+bool nv_kq_line_wanted(const std::vector<std::pair<int, int>>& layer_gate_up_down_types) {
+    for (const auto& l : layer_gate_up_down_types)
+        if (nv_kq_expert_type(l.first) || nv_kq_expert_type(l.second)) return true;
+    return false;
+}
+
+std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor, bool fused_here, bool say) {
     std::vector<std::string> set;
     for (const auto& kv : nv_kq_default_env(min_major, min_minor)) {
         if (std::getenv(kv.first.c_str()) != nullptr) continue;   // the user's setting wins, whatever it is
@@ -141,9 +176,8 @@ std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor) {
 #endif
         set.push_back(kv.first);
     }
-    if (!set.empty())   // the engine says nothing more on a pack without K-quant experts: the variable is never read there
-        std::fprintf(stderr, "strata: a model with K-quant experts (Unsloth UD-Q4/Q5/Q6_K_XL) reads its prompt on llama.cpp's MMQ kernels "
-                             "(STRATA_MMQ_KQ=0 or STRATA_NV_KQ_DEFAULT=0 turns it off)\n");
+    if (say && !set.empty())   // the engine passes say = false and prints the line after the expert layout is loaded, only for a set with K-quant experts (nv_kq_line_wanted)
+        std::fprintf(stderr, "%s\n", nv_kq_default_line(fused_here).c_str());
     return set;
 }
 

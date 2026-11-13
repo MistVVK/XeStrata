@@ -11,6 +11,8 @@
 // A switch the user set (to anything) is never overridden; STRATA_GFX1151_DEFAULTS=0 turns the whole table off.
 #pragma once
 
+#include "strata/kernels/gfx_arch.hpp"
+
 #include <string>
 #include <utility>
 #include <vector>
@@ -70,6 +72,17 @@ bool igpu_kfd_settle_default(const char* gcn_arch, bool integrated, bool windows
 /// the file-cache give-back during and after the expert load (strata/core/page_cache_drop.hpp) applies to the same class: an integrated
 /// gfx11 GPU under Linux (gfx1103, gfx1150, gfx1151).  Never Windows, never a discrete card.  STRATA_NO_ARENA_CACHE_DROP=1 turns it off.
 bool igpu_cache_drop_default(const char* gcn_arch, bool integrated, bool windows);
+/// the prompt experts on Strata's own fused int8 kernels (STRATA_PF_FUSED=1) instead of llama.cpp's MMQ, for the same class: an integrated gfx11 GPU
+/// under Linux (gfx1103, gfx1150, gfx1151).  Never Windows (gfx1151 there has it in igpu_default_env), never a discrete card.  apply_arch_defaults sets
+/// STRATA_PF_FUSED=1 where the user has not set the variable; STRATA_PF_FUSED=0 is the way back to MMQ.
+bool igpu_fused_prompt_default(const char* gcn_arch, bool integrated, bool windows);
+/// The 16-bit prompt GEMMs FP16 in and out (STRATA_HIP_PROMPT_F16, gemm.cu prompt_f16()): `env` is the variable's text (nullptr = unset).  "1" = on, any other set
+/// value = off (as before); unset = the device rule: on for a Radeon 780M (gfx1103, integrated, Linux), off everywhere else (every other gfx11, gfx12, gfx103x,
+/// Windows and discrete cards are unchanged).  Inline: src/prefill/gemm.cu uses it without linking arch_defaults.cpp.
+inline bool prompt_f16_resolve(const char* env, const char* gcn_arch, bool integrated, bool windows) {
+    if (env != nullptr) return env[0] == '1';
+    return integrated && !windows && strata::kernels::gfx_arch_is(gcn_arch, "gfx1103");
+}
 /// Whether the expert arena skips its MADV_HUGEPAGE request: `no_arena_thp` is STRATA_NO_ARENA_THP (nullptr when unset): "0" asks for the huge
 /// pages, any other value skips the request; unset leaves it to `igpu_rule` (igpu_arena_no_thp_default for this device).  `thp_always`: the
 /// kernel's THP mode is "always" (the request would add nothing, #771).  Inline: src/core/pinned.cu (strata_core) uses it without
