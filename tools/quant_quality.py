@@ -81,7 +81,8 @@ def cmd_ids(a) -> int:
         print(f"{name}: {len(ids)} tokens, kept {keep}")
     out = pathlib.Path(a.out or (sd / "set.ids.json"))
     # seg_tokens: the longest segment (the run's context and short-read size)
-    out.write_text(json.dumps({"version": sd.name, "seg_tokens": max(len(s["ids"]) for s in segs), "segments": segs}))
+    out.write_text(json.dumps({"version": sd.name, "seg_tokens": max(len(s["ids"]) for s in segs),
+                               "vocab_size": len(toks), "segments": segs}))
     print(f"wrote {out}")
     return 0
 
@@ -116,9 +117,30 @@ def engine_args(cfg: dict, gpu_experts, seg_tokens: int) -> list[str]:
             "--short-read", str(seg_tokens + 64), "--prefill", "512"]
 
 
+def check_ids_vocab(st: dict, cfg: dict, ids_path: str) -> None:
+    """A wrong ids file fails here, loudly: every id must be inside the model's vocabulary (the vocabulary of the
+    config's tokenizer folder when it names one, else the size the ids file recorded when `ids` made it), or the run
+    reads nonsense - an ids file made with another model's tokenizer has ids the engine cannot read."""
+    vocab = None
+    tdir = cfg.get("tokenizer")
+    if tdir and (pathlib.Path(tdir) / "vocab.json").is_file():
+        vocab = len(json.loads((pathlib.Path(tdir) / "vocab.json").read_text(encoding="utf-8")))
+    elif st.get("vocab_size"):
+        vocab = int(st["vocab_size"])
+    if not vocab:
+        return
+    for s in st["segments"]:
+        mx = max(s["ids"]) if s["ids"] else -1
+        if mx >= vocab:
+            raise SystemExit(f"{ids_path}: segment '{s['name']}' has token id {mx} >= the model's vocabulary "
+                             f"({vocab}): this ids file was made with another tokenizer; make one with "
+                             "`quant_quality.py ids --tokenizer <the model's tokenizer folder>`")
+
+
 def cmd_run(a) -> int:
     cfg = json.load(open(a.config, encoding="utf-8-sig"))
     st = json.load(open(a.ids))
+    check_ids_vocab(st, cfg, a.ids)
     out = pathlib.Path(a.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
