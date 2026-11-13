@@ -15,6 +15,7 @@
 #include "device_caps.hpp"
 #include "strata/kernels/q8_act.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/timed_choice.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_verify_kernels
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/platform/env.hpp"

@@ -81,6 +81,9 @@ public:
     virtual bool wait_commit(std::string& err) = 0;
     virtual void set_sampling(const strata::kernels::SamplerParams& sp) = 0;
     virtual void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) = 0;
+    /// A slot's reply tail for its penalty window and its own logit bias (same process: the pointer is copied).
+    virtual void set_slot_history(int slot, const int32_t* tail, int64_t n) = 0;
+    virtual bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) = 0;
     virtual void set_head_sampling(bool on) = 0;
     virtual bool set_logit_bias(const std::vector<float>& bias, std::string& err) = 0;
     /// The grammar's allowed tokens for the next window's T rows (host bitmask rows), uploaded on the last stage's
@@ -118,6 +121,8 @@ public:
     bool wait_commit(std::string& err) override;
     void set_sampling(const strata::kernels::SamplerParams& sp) override;
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) override;
+    void set_slot_history(int slot, const int32_t* tail, int64_t n) override;
+    bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) override;
     void set_head_sampling(bool on) override;
     bool set_logit_bias(const std::vector<float>& bias, std::string& err) override;
     bool set_allowed(const uint32_t* rows, int T, std::string& err) override;
@@ -218,6 +223,9 @@ public:
     /// gathered for every window row into tap_dev() ([T][ntap][n_embd]).  Only the layers this stage runs below the
     /// last are kept.  Set before init; empty (the default) allocates nothing and records nothing.
     void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
+    /// The taps off after init (the start's measurement released DFlash2): the window graphs, captured with the tap
+    /// kernels, are dropped and captured again without them on their next use.
+    void taps_off();
     const float* tap_dev() const { return tap_dev_; }
     int n_taps() const { return (int) tap_layers_.size(); }
 
@@ -353,13 +361,32 @@ public:
                            const int64_t* pos, std::string& err);
     bool batch_commit_rows_submit(const int* rows, int S, int hbase, std::string& err);
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
-    /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
-    /// its row is drawn again with Philox(seed, position), as a solo window draws it.  Greedy by default.  Set on
-    /// the first stage of a layer split, it reaches the last (which draws).
+    /// A slot's sampling (temperature / top_p / top_k / min_p / seed, and with set_slot_history and
+    /// set_slot_logit_bias its penalties and bias): its row is drawn again with Philox(seed, position), as a solo
+    /// window draws it.  Greedy by default.  Set on the first stage of a layer split, it reaches the last (which
+    /// draws).
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
-        if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
+        if (slot >= 0 && slot < (int) slot_sp_.size()) {
+            slot_sp_[(size_t) slot] = sp;
+            // a slot's own bias array stays its row's (set_slot_logit_bias; the request's sp carries no pointer)
+            slot_sp_[(size_t) slot].logit_bias =
+                slot < (int) slot_bias_dev_.size() ? slot_bias_dev_[(size_t) slot] : nullptr;
+        }
         if (next_) next_->set_slot_sampling(slot, sp);
     }
+    /// A slot's reply tail for its penalty window: the `n` tokens its session consumed since the reply began (the
+    /// last penalty_last_n of them are counted), the fed-back head not in it yet.  Set before every batch window
+    /// that holds the slot while it has a penalty; reaches the last stage, which draws the rows.
+    void set_slot_history(int slot, const int32_t* tail, int64_t n) {
+        if (slot >= 0 && slot < (int) slot_tail_.size()) {
+            if (n > 0) slot_tail_[(size_t) slot].assign(tail, tail + n);
+            else slot_tail_[(size_t) slot].clear();
+        }
+        if (next_) next_->set_slot_history(slot, tail, n);
+    }
+    /// A slot's logit bias (n_vocab floats, empty = none), added before its row's penalties and filters as a solo
+    /// request's is.  Reaches the last stage.
+    bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err);
 
     /// Row `t` of the last window's head logits (the distribution token t of the window came from: before sampling,
     /// temperature and penalties) into `host` (vocab() floats); false when there is none.  OpenAI's logprobs.
@@ -465,6 +492,10 @@ private:
     /// The host's half of a batch window: the checks, the graphs, the rows' staging (run_slot_rows, batch_launch).
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     std::vector<strata::kernels::SamplerParams> slot_sp_;
+    std::vector<float*> slot_bias_dev_;              ///< per slot: its logit bias on the device (null: none)
+    std::vector<std::vector<int32_t>> slot_tail_;    ///< per slot: its reply tail for the penalty window
+    int32_t* slot_hist_d_ = nullptr;                 ///< the current batch window's penalty-history rows (device)
+    size_t slot_hist_cap_ = 0;                       ///< ... and how many int32 fit (grows to the widest window)
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot

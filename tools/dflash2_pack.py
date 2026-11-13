@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""tools/dflash2_pack.py - the DFlash2 drafter (incoai/Qwen3.8-Flash-Next-DFlash2, Apache-2.0) as the engine's
-runtime file.
+"""tools/dflash2_pack.py - a DFlash2 drafter (Inco AI's, Apache-2.0: Qwen3.8-Flash-Next's, GLM-5.3-Flash's,
+Qwen3.6-35B-A3B's) as the engine's runtime file.
 
     python tools/dflash2_pack.py model.safetensors config.json out.pack [--q4_0] [--q4_0-selector]
     python tools/dflash2_pack.py --convert-selector in.pack out.pack
@@ -102,8 +102,10 @@ def quant_q4_0(w):
     return out.tobytes()
 
 
-def pack(st_path, cfg_path, out_path, say=print, q4=False, q4_selector=False):
-    """Write the engine's runtime file for the drafter in `st_path` (+ its config.json). Returns the bytes written."""
+def pack(st_path, cfg_path, out_path, say=print, q4=False, q4_selector=False,
+         source="incoai/Qwen3.8-Flash-Next-DFlash2 a22a1744"):
+    """Write the engine's runtime file for the drafter in `st_path` (+ its config.json). Returns the bytes written.
+    `source`: the repository and revision the index names (a cfg line, so a pack's bytes are those of its source)."""
     with open(cfg_path, encoding="utf-8") as fh:
         cfg = json.load(fh)
     dc = cfg["dflash_config"]
@@ -154,7 +156,7 @@ def pack(st_path, cfg_path, out_path, say=print, q4=False, q4_selector=False):
         "eps": cfg["rms_norm_eps"], "block": dc["block_size"], "conv_group": dc["conv_group_size"],
         "conv_kernel": dc["conv_kernel_size"], "mask_token": dc["mask_token_id"], "rank": dc["selector_rank"],
         "top_k": dc["selector_top_k"], "taps": dc["target_layer_ids"],
-        "vocab": cfg["vocab_size"], "source": "incoai/Qwen3.8-Flash-Next-DFlash2 a22a1744",
+        "vocab": cfg["vocab_size"], "source": source,
     }
     off = 0
     for t in tensors:

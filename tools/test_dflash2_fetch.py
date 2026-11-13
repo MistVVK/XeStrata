@@ -60,16 +60,18 @@ class FetchTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
+    def drafter(self, pinned=True):
+        """The synthetic drafter's pins (its repository and revision those of Qwen3.8's, so the pack's source line,
+        and with it its bytes, are what the class's packs hold)."""
+        q38 = F.DRAFTERS[F.DEFAULT]
+        files = (("config.json", len(self.cfg), sha(self.cfg)), ("model.safetensors", len(self.st), sha(self.st)))
+        return F.Drafter("test", q38.repo, q38.revision, files, "t.q4_0.pack",
+                         (len(self.q4), sha(self.q4)) if pinned else None, "t.q4_0-selq4.pack",
+                         (len(self.selq4), sha(self.selq4)) if pinned else None, 0.1, 0.1, "NOTICE.md")
+
     def setUp(self):
         self.out = self.dir / ("out-%s" % self._testMethodName)
-        self.pins = mock.patch.multiple(
-            F,
-            FILES=(("config.json", len(self.cfg), sha(self.cfg)), ("model.safetensors", len(self.st), sha(self.st))),
-            PACK_BYTES=len(self.q4), PACK_SHA256=sha(self.q4),
-            CONVERTED_BYTES=len(self.selq4), CONVERTED_SHA256=sha(self.selq4),
-        )
-        self.pins.start()
-        self.addCleanup(self.pins.stop)
+        self.d = self.drafter()
 
     def serve(self, request, timeout=None):
         url = request.full_url
@@ -83,37 +85,37 @@ class FetchTest(unittest.TestCase):
 
     def test_fetch_packs_converts_and_removes_the_download(self):
         with mock.patch("urllib.request.urlopen", side_effect=self.serve):
-            F.fetch(self.out)
-        got = F.ready(self.out)
+            F.fetch(self.d, self.out)
+        got = F.ready(self.d, self.out)
         self.assertIsNotNone(got)
-        self.assertEqual(got[1], F.CONVERTED_NAME)
-        self.assertEqual((self.out / F.CONVERTED_NAME).read_bytes(), self.selq4)
-        self.assertEqual((self.out / F.PACK_NAME).read_bytes(), self.q4)
+        self.assertEqual(got[1], self.d.converted_name)
+        self.assertEqual((self.out / self.d.converted_name).read_bytes(), self.selq4)
+        self.assertEqual((self.out / self.d.pack_name).read_bytes(), self.q4)
         self.assertFalse((self.out / "download").exists(), "the 1.2 GB download is removed")
         self.assertTrue((self.out / "LICENSE").is_file())
         self.assertTrue((self.out / "NOTICE.md").is_file())
-        self.assertEqual(F.verify(self.out), 0)
+        self.assertEqual(F.verify(self.d, self.out), 0)
 
     def test_a_ready_install_is_not_fetched_again(self):
         (self.out).mkdir(parents=True, exist_ok=True)
-        (self.out / F.CONVERTED_NAME).write_bytes(self.selq4)
+        (self.out / self.d.converted_name).write_bytes(self.selq4)
         with mock.patch("urllib.request.urlopen", side_effect=AssertionError("no network for a ready install")):
-            F.fetch(self.out)
-        self.assertEqual(F.verify(self.out), 0)
+            F.fetch(self.d, self.out)
+        self.assertEqual(F.verify(self.d, self.out), 0)
 
     def test_a_q4_pack_is_converted_without_a_download(self):
         self.out.mkdir(parents=True, exist_ok=True)
-        (self.out / F.PACK_NAME).write_bytes(self.q4)
+        (self.out / self.d.pack_name).write_bytes(self.q4)
         # ready() finds the Q4 pack; fetch still converts the selector (the Q4 pack alone is not the converted one)
         with mock.patch("urllib.request.urlopen", side_effect=AssertionError("no network: the Q4 pack is here")):
-            F.fetch(self.out)
-        self.assertEqual((self.out / F.CONVERTED_NAME).read_bytes(), self.selq4)
+            F.fetch(self.d, self.out)
+        self.assertEqual((self.out / self.d.converted_name).read_bytes(), self.selq4)
 
     def test_a_corrupt_pack_is_found_by_verify(self):
         self.out.mkdir(parents=True, exist_ok=True)
-        (self.out / F.CONVERTED_NAME).write_bytes(self.selq4[:-1] + b"\x00")
-        self.assertIsNone(F.ready(self.out))
-        self.assertEqual(F.verify(self.out), F.BAD)
+        (self.out / self.d.converted_name).write_bytes(self.selq4[:-1] + b"\x00")
+        self.assertIsNone(F.ready(self.d, self.out))
+        self.assertEqual(F.verify(self.d, self.out), F.BAD)
 
     def test_a_stopped_download_continues_where_it_stopped(self):
         self.out.mkdir(parents=True, exist_ok=True)
@@ -128,15 +130,24 @@ class FetchTest(unittest.TestCase):
             return self.serve(request, timeout)
 
         with mock.patch("urllib.request.urlopen", side_effect=serve):
-            F.fetch(self.out)
+            F.fetch(self.d, self.out)
         self.assertIn("bytes=%d-" % half, seen, "the .part is resumed with a Range")
-        self.assertEqual(F.verify(self.out), 0)
+        self.assertEqual(F.verify(self.d, self.out), 0)
 
     def test_offline_is_refused_in_plain_words(self):
         with mock.patch("urllib.request.urlopen", side_effect=OSError("no route to host")):
             with self.assertRaises(SystemExit) as e:
-                F.fetch(self.out)
+                F.fetch(self.d, self.out)
         self.assertIn("MTP", str(e.exception))
+
+    def test_an_unpinned_drafter_keeps_the_pack_it_made(self):
+        # a drafter whose packs have no pin yet: the download is still checked, the packs are kept as made
+        self.d = self.drafter(pinned=False)
+        with mock.patch("urllib.request.urlopen", side_effect=self.serve):
+            F.fetch(self.d, self.out)
+        self.assertEqual(F.ready(self.d, self.out)[1], self.d.converted_name)
+        self.assertEqual((self.out / self.d.converted_name).read_bytes(), self.selq4)
+        self.assertFalse(any(p.suffix == ".tmp" for p in self.out.iterdir()))
 
     def test_wrong_bytes_are_refused(self):
         def serve(request, timeout=None):
@@ -147,8 +158,8 @@ class FetchTest(unittest.TestCase):
 
         with mock.patch("urllib.request.urlopen", side_effect=serve):
             with self.assertRaises(SystemExit):
-                F.fetch(self.out)
-        self.assertIsNone(F.ready(self.out))
+                F.fetch(self.d, self.out)
+        self.assertIsNone(F.ready(self.d, self.out))
 
 
 if __name__ == "__main__":

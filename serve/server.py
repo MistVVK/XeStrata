@@ -2036,6 +2036,8 @@ class StrataEngine:
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
+        orig_len = len(prompt)   # a leg that continues an earlier one (prompt + what it generated) names where its
+        # reply began: pen_from, the penalty window's start (solo -> slot, slot -> solo)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         carry = {}
@@ -2061,7 +2063,9 @@ class StrataEngine:
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
-                    head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                    pf = f" pen_from={orig_len - 1}" if len(prompt) > orig_len else ""
+                    head = (f"GENI {left}{keys}{pf} {embeddings}" if embeddings
+                            else f"GEN {left}{keys}{pf}")
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     if own_lp is not None:
                         self.lp_lines = own_lp
@@ -2184,7 +2188,9 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    pf = f" pen_from={orig_len - 1}" if len(prompt) > orig_len else ""
+                    head = (f"BGENI {slot} {left}{keys}{pf} {embeddings}" if embeddings
+                            else f"BGEN {slot} {left}{keys}{pf}")
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
@@ -5882,8 +5888,8 @@ class Service:
         if info.get("logit_bias") != 1 or getattr(self.engine, "batch", 0):
             if not self.script_guard_unsupported:
                 self.script_guard_unsupported = True
-                print("[xestrata] script guard: not applied - this engine takes no logit_bias (an older engine, or "
-                      "\"parallel\" batch slots)", flush=True)
+                print("[xestrata] script guard: not applied - it holds one request at a time (an engine without "
+                      "logit_bias, or \"parallel\" batch slots)", flush=True)
             return None
         with self.status_lock:
             self.script_guard_counts["requests"] += 1

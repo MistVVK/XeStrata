@@ -214,6 +214,7 @@ bool PlainModel::load_glm5(std::string& err) {
     if (n_dsa == 0) { err = "plain model: the model has no DSA block"; return false; }
     if (has_mtp_) {   // a DSA block of its own caches, after the trunk's
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
+        mtp_allocs_[0] = allocs_.size();   // the layer's own weights (release_mtp)
         gmtp_.kda = false;
         gmtp_.idx = n_dsa++;
         if (!load_gblock(m, s.n_layer, gmtp_, err, true) || !upload(m, p + "eh_proj.weight", mtp_eh_, err) ||
@@ -226,6 +227,7 @@ bool PlainModel::load_glm5(std::string& err) {
             err = "plain model: the MTP layer's eh_proj has another shape or type";
             return false;
         }
+        mtp_allocs_[1] = allocs_.size();
     }
 
     if (!tune_uploaded(err)) return false;
@@ -478,6 +480,7 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
         ffn_out = moe_out_;
     }
     k::glm5_hc_post(ffn_out, g_hs_, g_post_, g_comb_, g_hs_, N, T, cs);
+    tap_rows(l, g_hs_, kHC, T, 0, true, cs);   // DFlash2's taps: the mean of the four streams (sglang's capture)
     return true;
 }
 
