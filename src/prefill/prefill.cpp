@@ -60,6 +60,7 @@
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/kernels/i8_expert_rule.hpp"
 #include "strata/prefill/i8_group.hpp"
 #include "strata/prefill/routed_stream.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -1570,7 +1571,7 @@ bool i8_count_on() {
     return on;
 }
 struct I8Count {
-    int64_t layers = 0, layers_i8 = 0, ent = 0, ent_i8 = 0, groups_i8 = 0, min_avg = INT64_MAX;
+    int64_t layers = 0, layers_i8 = 0, ent = 0, ent_i8 = 0, groups_i8 = 0, min_avg = INT64_MAX, layers_few = 0, ent_few = 0;
 };
 I8Count& i8_count() {
     static I8Count c;
@@ -5488,6 +5489,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }();
                         strata::kernels::NativeExpertLayout i8_L{};
                         bool i8_l = false;
+                        bool i8_few = false;   // the few-rows route: the layer's groups run on native_expert_grouped, the activations as quantize_q8_1_rows makes them
                         // (a build without MMQ has no use_mmq layer: the layers the fused kernels do not take come here too, as long as the buffers below exist)
                         if (lay.native && !fused_l && !fz_staged && !wmma_l && !had_gu && !had_d && rows_cpu == 0 && on_peer.empty() && !m.pp &&
                             m.group_cap == 0 && !m.fused_bufs && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
@@ -5500,8 +5502,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const auto& f = lay.fmt[(size_t) l];
                             i8_L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                             const int64_t i8_groups = ((int64_t) order.size() + MMQ_GROUP - 1) / MMQ_GROUP;
-                            i8_l = i8_L.up_off == f.up_off && i8_L.down_off == f.down_off && i8_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF &&
-                                   strata::kernels::native_expert_i8_prompt(i8_L, rows_local / i8_groups);
+                            const bool i8_same = i8_L.up_off == f.up_off && i8_L.down_off == f.down_off && i8_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF;
+                            // The few-rows route (i8_expert_rule.hpp): with it, the size floor of the int8 kernel (256 entries a group) gives way to the crossing; a layer
+                            // under it (average rows per expert, over the experts that have rows) runs on the grouped kernels in the same groups, from it up on the int8
+                            // kernel.  A pair the grouped kernels do not have, or a group whose scratch would not fit the layer's GU rows, keeps the floor.
+                            const int i8_fr = i8_same ? strata::kernels::native_expert_i8_few_rows_limit() : 0;
+                            i8_l = i8_same && strata::kernels::native_expert_i8_prompt(i8_L, i8_fr > 0 ? strata::kernels::kI8MinGroupEntries : rows_local / i8_groups);
+                            if (i8_l && i8_fr > 0 && strata::kernels::i8_fewrows_takes(i8_fr, rows_local, (int64_t) order.size())) {
+                                int64_t max_rows = 0;   // the most rows one group of the walk launches with
+                                for (size_t j = 0; j < order.size(); j += (size_t) MMQ_GROUP) {
+                                    const size_t je = std::min(order.size(), j + (size_t) MMQ_GROUP) - 1;
+                                    max_rows = std::max<int64_t>(max_rows, (int64_t) m.off[(size_t) order[je]] + m.cnt[(size_t) order[je]] - m.off[(size_t) order[j]]);
+                                }
+                                if (strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff) &&
+                                    strata::kernels::native_expert_scratch_bytes(max_rows, kFF) <= (size_t) rows_local * (size_t) kFF2 * sizeof(float))
+                                    i8_few = true;
+                                else
+                                    i8_l = strata::kernels::native_expert_i8_prompt(i8_L, rows_local / i8_groups);
+                            }
                             if (i8_count_on() && i8_groups > 0) {
                                 I8Count& c = i8_count();
                                 c.min_avg = std::min<int64_t>(c.min_avg, rows_local / i8_groups);
@@ -5513,6 +5531,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             ++c.layers;
                             c.ent += rows_local;
                             if (i8_l) { ++c.layers_i8; c.ent_i8 += rows_local; }
+                            if (i8_few) { ++c.layers_few; c.ent_few += rows_local; }   // (the few-rows route's layers are counted in the int8 ones too)
                         }
                         // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
                         // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
@@ -5545,7 +5564,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 err = "prefill: int8 experts: no memory for the group record";
                                 return false;
                             }
-                            strata::kernels::native_expert_i8_quantize(m.mixed, T, N, m.fr_xq, m.cs);   // the kernels' own image (FP32 scales), 36 bytes per block as q8_1
+                            if (i8_few)   // the few-rows route: the grouped kernels read q8_1 with FP16 scales (the same 36 bytes a block)
+                                strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.fr_xq, m.cs);
+                            else
+                                strata::kernels::native_expert_i8_quantize(m.mixed, T, N, m.fr_xq, m.cs);   // the kernels' own image (FP32 scales), 36 bytes per block as q8_1
                         }
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed` (APR:
@@ -6111,7 +6133,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 pt.mark(kPfGemmGU, cs);
                                 if (!strata::prefill::i8grp::run(i8_L, g8, order.data(), m.off.data(), m.cnt.data(),
                                                                  [&](const void* h, size_t bytes) { return m.up_ring.h2d(m.i8_rec, h, bytes, m.cs) == cudaSuccess; },
-                                                                 m.i8_rec, m.ids_identity, m.src_dev, m.fr_xq, m.GU, kFF2, m.Dm, N, m.cs, &i8_nr, &i8_ne)) {
+                                                                 m.i8_rec, m.ids_identity, m.src_dev, m.fr_xq, m.GU, kFF2, m.Dm, N, m.cs, &i8_nr, &i8_ne,
+                                                                 i8_few, (size_t) rows_local * (size_t) kFF2 * sizeof(float))) {
                                     std::fprintf(stderr, "prefill: int8 experts: the group's record could not be made (%lld rows, %d experts)\n", (long long) i8_nr, i8_ne);
                                     std::exit(1);   // (flush cannot return an error: as the gather's own failure path, the engine stops)
                                 }
@@ -6743,9 +6766,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (i8_count_on()) {   // STRATA_I8_COUNT=1: this chunk's entries by path (the counters restart for the next chunk)
             I8Count& c = i8_count();
             std::fprintf(stderr, "strata i8-count: chunk of %lld tokens: %lld layers reached the group walk, %lld on native_expert_i8; routed entries %lld, on native_expert_i8 %lld (%.2f %%), "
-                                 "elsewhere in the walk %lld; i8 groups %lld; smallest group average seen %lld entries\n",
+                                 "elsewhere in the walk %lld; i8 groups %lld; smallest group average seen %lld entries; few-rows route (grouped kernels, counted in the int8 ones): %lld layers, %lld entries\n",
                          (long long) T, (long long) c.layers, (long long) c.layers_i8, (long long) c.ent, (long long) c.ent_i8, c.ent > 0 ? 100.0 * (double) c.ent_i8 / (double) c.ent : 0.0,
-                         (long long) (c.ent - c.ent_i8), (long long) c.groups_i8, (long long) (c.min_avg == INT64_MAX ? -1 : c.min_avg));
+                         (long long) (c.ent - c.ent_i8), (long long) c.groups_i8, (long long) (c.min_avg == INT64_MAX ? -1 : c.min_avg), (long long) c.layers_few,
+                         (long long) c.ent_few);
             c = I8Count{};
         }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th

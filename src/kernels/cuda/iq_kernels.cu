@@ -6287,6 +6287,22 @@ bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries)
 
 bool native_expert_i8_by_default() noexcept { return i8_expert_class_default(i8_switch_state(), i8_device_gcn()); }
 
+// OWN-I8 few-rows route: STRATA_I8_FEWROWS read once (not set = the card's class default, 0 = off, N = a limit of N rows per expert); the class default asks the
+// current device's compute capability (a HIP card has none that matters: the CUDA rule's 10)
+int native_expert_i8_few_rows_limit() noexcept {
+    static const char* const text = std::getenv("STRATA_I8_FEWROWS");
+    if (i8_switch_state() == 0) return 0;
+    int major = 0, minor = 0;
+#if !defined(__HIPCC__)
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess) {
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+    }
+#endif
+    return i8_fewrows_limit(text, i8_fewrows_class_default(major, minor));
+}
+
 size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, int64_t n_ff) {
     const size_t hqb = ((size_t) cap_entries * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;   // as native_expert_i8 carves it
     return hqb + (size_t) (cap_groups + 1) * sizeof(int32_t);

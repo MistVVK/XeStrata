@@ -12721,6 +12721,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_I8_FEWROWS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6293,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "kernels",
+   "note": "Research: the few-rows route of STRATA_EXPERT_I8's prompt path: a layer whose experts average fewer routed rows than the limit runs on the grouped kernels instead of the int8 kernel. Not set: 8 on a Tesla P100, 10 elsewhere. 0: off (the int8 kernel keeps its 256-entry floor). N: a limit of N rows per expert.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_I8_FORCE",
    "backends": [
     "sycl"

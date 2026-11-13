@@ -103,6 +103,10 @@ bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries)
 /// OWN-I8: true when the answer above is "yes" because of the card class (STRATA_EXPERT_I8 not set), not because the variable names it; the engine's
 /// start line differs.  A Metal build answers false.
 bool native_expert_i8_by_default() noexcept;
+/// OWN-I8, the few-rows route (include/strata/kernels/i8_expert_rule.hpp): the average routed rows per expert under which a prompt layer that takes the int8 kernels
+/// runs on the grouped kernels instead; 0 = no route (STRATA_I8_FEWROWS=0, or the int8 kernels are off).  The class default: 8 on a Tesla P100, 10 elsewhere.
+/// Shared prompt code, no device work for a build that has none: a Metal build answers 0.
+int native_expert_i8_few_rows_limit() noexcept;
 /// OWN-I8 (tests, logs; CUDA / HIP builds only, no Metal definition: nothing shared calls these three): the dynamic shared memory per block the current device
 /// lets `native_expert_i8` use, in bytes (the device's opt-in attribute, 48 KB where it reports less; STRATA_I8_SMEM_LIMIT can lower it).
 size_t native_expert_i8_smem_limit() noexcept;

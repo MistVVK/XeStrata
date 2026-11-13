@@ -60,7 +60,7 @@ struct Group {
 template <class Upload>
 bool run(const strata::kernels::NativeExpertLayout& L, const Group& g, const int32_t* order, const int32_t* off, const int32_t* cnt, Upload&& upload,
          uint8_t* rec_dev, const int32_t* ids_identity, const int32_t* src_dev, const void* x_q8_1, float* gu_scratch, int64_t gu_row_floats,
-         float* dm, int64_t dm_row_floats, void* stream, int64_t* rows = nullptr, int* experts = nullptr) {
+         float* dm, int64_t dm_row_floats, void* stream, int64_t* rows = nullptr, int* experts = nullptr, bool few = false, size_t gu_total_bytes = 0) {
     const size_t a = g.j0 + (size_t) g.first, b = g.j0 + (size_t) g.n;
     const int ne = (int) (b - a);
     const int64_t r0 = off[(size_t) order[a]];
@@ -77,6 +77,15 @@ bool run(const strata::kernels::NativeExpertLayout& L, const Group& g, const int
     const int32_t s_end = (int32_t) nr;
     std::memcpy(rec_h + kRecStart + 4 * (size_t) ne, &s_end, 4);
     std::memcpy(rec_h + kRecN, &ne, 4);
+    if (few) {
+        // the few-rows route: the grouped kernels, whose scratch (gate, up, SwiGLU as FP32 and H as q8_1) is carved from the start of the layer's `gu_scratch`
+        // (`gu_total_bytes` of it; the group launches one after the other on one stream, so each one has it to itself); `x_q8_1` is the q8_1 image of
+        // quantize_q8_1_rows (FP16 scales), same record and same entry tables as the int8 call
+        if (nr <= 0 || strata::kernels::native_expert_scratch_bytes(nr, L.n_ff) > gu_total_bytes || !upload((const void*) rec_h, kRecBytes)) return false;
+        strata::kernels::native_expert_grouped(L, (const unsigned long long*) rec_dev, (const int32_t*) (rec_dev + kRecStart), (const int32_t*) (rec_dev + kRecN),
+                                               ids_identity, src_dev + r0, ne, nr, x_q8_1, (void*) gu_scratch, dm + r0 * dm_row_floats, stream);
+        return true;
+    }
     if (nr <= 0 || strata::kernels::native_expert_i8_scratch_bytes(nr, ne, L.n_ff) > (size_t) nr * (size_t) gu_row_floats * sizeof(float) ||
         !upload((const void*) rec_h, kRecBytes))
         return false;
