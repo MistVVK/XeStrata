@@ -12,7 +12,7 @@
 // shapes of 16, 32 and 64 rows).  The weights are random block bytes with a sane d: every bit pattern of the grid
 // indices and signs is a valid block.  Exit 77 (skipped) where the GPU runs neither form.
 //
-// The fixed-point forms (iq_mmq_fx: IQ2_XXS, IQ3_XXS, IQ3_S, and IQ4_NL's down) against the CPU's canonical rows
+// The fixed-point forms (iq_mmq_fx: the gate/up's i-quants and IQ4_NL's down) against the CPU's canonical rows
 // (canon_expert.hpp, iq256_canon_rows), every bit: the activations' int8 values and fp16 scales the two quantized, and
 // each output.  The rows' 256s at scales 2^-6 to 2^6, a row of zeros among them, so the rows' tops and the blocks'
 // shifts both ways are taken.
@@ -488,7 +488,8 @@ int main(int argc, char** argv) try {
         bad += check(GGML_TYPE_IQ2_XS, 128, 512, c);
         bad += check(GGML_TYPE_Q4_K, 128, 512, c);
         if (strata::kernels::cpu::cpu_avx2_ok()) {   // the CPU's rows are AVX2's
-            for (const ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S})
+            for (const ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                                      GGML_TYPE_IQ2_S})
                 bad += check_fx(t, 256, 2560, c);
             bad += check_fx_down(512, 640, c);
         }

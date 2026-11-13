@@ -28,8 +28,8 @@ const char* iq_mmq_path(sycl::queue& q);
 /// activations (iq_mmq_quantize's canon); the same bits as the CPU's canonical rows (canon_expert.hpp) and the decode's
 /// grouped experts, in any tile shape and on every GPU.
 inline constexpr int kIqMmqFx = 1000;
-/// The type iq_mmq_grouped takes for the fixed-point products of ggml_type (the gate/up's IQ2_XXS, IQ3_XXS, IQ3_S, the
-/// down's IQ4_NL), or 0 where it has none.
+/// The type iq_mmq_grouped takes for the fixed-point products of ggml_type (the gate/up's IQ2_XXS, IQ2_XS, IQ3_XXS,
+/// IQ3_S and IQ2_S, the down's IQ4_NL), or 0 where it has none.
 int iq_mmq_fx(int ggml_type);
 /// The ggml types whose weights these products decode (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K), and
 /// the fixed-point forms (iq_mmq_fx).
