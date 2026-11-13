@@ -9,6 +9,8 @@
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/staged_group_rule.hpp"
 #include "strata/prefill/staged_fo_rule.hpp"
+#include "strata/prefill/fp16_rows_rule.hpp"
+#include "strata/prefill/own_only_line.hpp"
 #include "strata/prefill/stream_floor_rule.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/fewrows.hpp"
@@ -63,10 +65,16 @@
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/kernels/i8_expert_rule.hpp"
+#include "strata/prefill/i8_group.hpp"
 #include "strata/prefill/routed_stream.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm120_series.hpp"
+
+namespace strata::kernels {   // the P100 class rule's entry point (iq_kernels.cu; Metal: stubs_i8.cpp); declared here so that no kernel object's header changes
+bool native_expert_i8_floor_gated() noexcept;   // true: the unset int8 default gives way to the FP16 path from stream_all_min() tokens up (Tesla P100, build without MMQ)
+}  // namespace strata::kernels
 
 namespace {
 // STRATA_PLE_BATCH for the prompt path: the user's variable wins; unset, it is on except for an engine built with CUDA 12.8 on a compute capability 12.0 card
@@ -193,6 +201,7 @@ std::vector<std::string>& own_only_switches() {
     return set;
 }
 const bool g_own_only_defaults = [] {
+    strata::kernels::native_expert_i8_set_mmq_free();   // the int8 expert kernels are the default prompt-expert kernels here (i8_expert_rule.hpp, i8_switch_effective)
 #if defined(STRATA_USE_HIP) || defined(__HIPCC__)
     static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_KQ"};
 #else
@@ -374,7 +383,7 @@ inline bool stream_floor_class_measured() {
 #endif
 }
 // The staged walk's group entry (fz_staged) also takes a layer with no MMQ tile that the fused kernels cover (mmq_plan().fo), routed experts only, so a prompt chunk below the long-prompt
-// floor does not run each routed expert on the dequantize + FP16 GEMM path (staged_fo_rule.hpp).  STRATA_PF_STAGED_FO=1 asks for it on any card (research), 0 turns it off; unset: on where it was
+// floor does not run each routed expert on the dequantize + FP16 GEMM path (staged_fo_rule.hpp).  STRATA_PF_STAGED_FO=1 asks for it on any card (research), 0 turns it off; unset: in a build without MMQ on every class for the layers the fused kernels cover; in a build with MMQ on where it was
 // measured (Windows gfx1151 with a layer set that is fused-only on every layer, and the entry's own prerequisites: the staged walk's resident-group gather and its group entry).  Decided once when
 // the expert layout is known (a call before that answers from the variable alone and is not cached).
 inline bool staged_fo_on() {
@@ -385,7 +394,12 @@ inline bool staged_fo_on() {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return strata::prefill::staged_fo_switch(env);
     const bool cls = stream_floor_class_measured();
-    const bool v = strata::prefill::staged_fo_decide(env, cls && layers_all_fused_only() && staged_group_gather() && staged_group_entry_on());
+#if defined(STRATA_PF_OWN_ONLY)
+    constexpr bool own_only = true;    // a build without MMQ: the fused staged entry on every class, for every layer the fused kernels cover (staged_fo_rule.hpp)
+#else
+    constexpr bool own_only = false;
+#endif
+    const bool v = strata::prefill::staged_fo_decide(env, strata::prefill::staged_fo_class_default(own_only, cls && layers_all_fused_only(), staged_group_gather() && staged_group_entry_on()));
     cached.store(v ? 1 : 0, std::memory_order_release);
     return v;
 }
@@ -1375,6 +1389,9 @@ struct Prefill::Impl {
     uint8_t* fr_rec = nullptr;
     void* fr_scr = nullptr;
     int64_t fr_xq_rows = 0;
+    // OWN-I8 (STRATA_EXPERT_I8=1, native_expert_i8): kI8RecBytes of device memory - the group tables of one launch (blob pointers, row bounds, the
+    // group count); the layer's tokens as q8_1 rows live in fr_xq (the same rows the few-row path quantizes), its scratch is the group's GU rows
+    uint8_t* i8_rec = nullptr;
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // THE PROMPT ROOM's resolved counts for this layout (carve): the rule's ring, the room's first slot (past the
@@ -1564,6 +1581,7 @@ void Prefill::release() {
     if (impl_->fr_xq) cudaFree(impl_->fr_xq);
     if (impl_->fr_rec) cudaFree(impl_->fr_rec);
     if (impl_->fr_scr) cudaFree(impl_->fr_scr);
+    if (impl_->i8_rec) cudaFree(impl_->i8_rec);
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->ple_copy) (void) cudaStreamDestroy(impl_->ple_copy);
     if (impl_->ple_raw_free) (void) cudaEventDestroy(impl_->ple_raw_free);
@@ -1624,6 +1642,24 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// OWN-I8: the int8 kernels' groups are collected by i8_group.hpp (its own group size, no MMQ); both sizes are the same number here
+static_assert(MMQ_GROUP == strata::prefill::i8grp::kGroupMax, "the int8 expert group and the MMQ group have the same size");
+#if defined(STRATA_PREFILL_MMQ)
+static_assert(strata::prefill::i8grp::kGroupMax == strata::prefill::mmq::kGatherGroupMax, "the int8 expert group and MMQ's gather group have the same size");
+#endif
+// STRATA_I8_COUNT=1 (diagnostic, off by default, no effect on any result): one stderr line per prompt chunk saying how many of the routed (token, expert)
+// entries of the layers that reached the MMQ group walk ran on native_expert_i8 and how many stayed on the walk's own kernels (MMQ, or the FP16 path).
+bool i8_count_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_I8_COUNT"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+struct I8Count {
+    int64_t layers = 0, layers_i8 = 0, ent = 0, ent_i8 = 0, groups_i8 = 0, min_avg = INT64_MAX, layers_few = 0, ent_few = 0;
+};
+I8Count& i8_count() {
+    static I8Count c;
+    return c;
+}
 // The MMQ row table (`ids_identity`, T*K rows) is read past its end by llama.cpp's stream-k fixup, which loads a whole
 // J-column tile of ids before it compares the tile with the expert's rows (see mmq_ids_margin.hpp: the margin follows the
 // backend's tile bound).  An expert takes at most one row per token, so max_rows <= T.  Without the slack the table is an
@@ -1785,15 +1821,28 @@ const MmqPlan& mmq_plan() {
             }
         }
 #if defined(STRATA_PF_OWN_ONLY)
-        {   // [DRAFT] wording: the owner's to word (P4-SPLIT); one line per process, the plan is made once
-            int64_t nf = 0;
-            for (char c : p.fo) nf += c != 0;
+        if (layers > 0) {   // [DRAFT] wording: the owner's to word.  One line per process (the plan is made once): the layer counts per path, from the rule functions that pick the path.
+            const bool peer_off = strata::core::peer_portable();            // the walk's own condition (no_peer): the fused kernels stay off with a peer device
+            const bool entry_on = staged_fo_on();                           // the staged group entry for a fused-only layer below the floor (staged_fo_rule.hpp)
+            strata::prefill::OwnOnlySplit big, small;                       // at or above the long-prompt floor, below it
+            const bool i8_gated = strata::kernels::native_expert_i8_floor_gated();   // P100 class: the int8 default is for chunks under stream_all_min() only, the FP16 path from it up
+            for (int64_t l = 0; l < layers; ++l) {
+                const bool fo = p.fo[(size_t) l] != 0 && !peer_off;
+                bool i8 = false;                                            // the int8 expert kernels take this layer's formats (the class rule or STRATA_EXPERT_I8, i8_wants_identity's test)
+                if (lay.native) {
+                    const auto& f = lay.fmt[(size_t) l];
+                    if (!f.tail_off && !f.had_gu && !f.had_d)
+                        i8 = strata::kernels::native_expert_i8_prompt(strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), (int64_t) 1 << 20);
+                }
+                if (fo) ++big.fused; else if (i8 && !i8_gated) ++big.i8; else ++big.fp16;   // (a gated class: no int8 in the long class)
+                if (fo && entry_on) ++small.staged; else if (i8) ++small.i8; else ++small.fp16;
+            }
+            std::fprintf(stderr, "%s\n", strata::prefill::own_only_line(layers, stream_all_min(), big, small, peer_off).c_str());
             std::string sw;
             for (const std::string& k : own_only_switches()) sw += (sw.empty() ? "" : " ") + k;
-            std::fprintf(stderr, "strata: [DRAFT] this engine was built without llama.cpp's MMQ prompt kernels. Prompt experts use Strata's own "
-                                 "kernels for %lld of %lld layers; the other layers, prompt pieces under %lld tokens and --peer-device use the "
-                                 "slower FP16 path. Switched on for this: %s (a switch you set is kept).\n",
-                         (long long) nf, (long long) layers, (long long) stream_all_min(), sw.empty() ? "none" : sw.c_str());
+            if (mf) strata::core::manifest::instance().path("prefill", "own-only-build", true,
+                "this engine was built without llama.cpp's MMQ prompt kernels",
+                "switches on by default here (a switch you set is kept): " + (sw.empty() ? std::string("none") : sw));
         }
 #endif
         // STRATA_MMQ_DIRECT=1: a native layer's resident experts are read in place when the pointer-table MMQ covers
@@ -1841,6 +1890,22 @@ const MmqPlan& mmq_plan() {
 }
 // the FP16 buffers (Xs, Hh): the FP16 path's, or pf_wmma's activations and down input
 bool fp16_bufs(const MmqPlan& mp) { return mp.fallback || pf_wmma(); }
+// OWN-I8: does a layer of this layout take the int8 expert groups on this device (the class rule or STRATA_EXPERT_I8=1, and the formats)?  A build without MMQ
+// has no MMQ buffers when no layer takes the fused kernels (mmq_plan().any is false); the int8 groups need one row table of theirs (the identity ids_identity),
+// which carve and bytes_needed then take on their own.
+bool i8_wants_identity() {
+    static const bool on = [] {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        if (!lay.native) return false;
+        for (const auto& f : lay.fmt) {
+            if (f.tail_off || f.had_gu || f.had_d) continue;
+            const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            if (strata::kernels::native_expert_i8_prompt(L, (int64_t) 1 << 20)) return true;
+        }
+        return false;
+    }();
+    return on;
+}
 // STRATA_PF_GROUP_SCRATCH=1 (opt-in): on a layout whose every layer takes MMQ (no fused experts, no FP16 fallback or pf_wmma), the
 // gate/up output, its SwiGLU and its q8_1 copy (GU, H, Hq) hold one expert group's rows instead of the whole chunk's:
 // a group's products read them and are done with them before the next group starts, so the products and the bits are
@@ -1924,9 +1989,11 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
-    if (fp16_bufs(mp)) a.take<uint16_t>(T * K * N, ok);
+    // the FP16 path's Xs / Hh: in a fused layout the tail below the stream floor only (fp16_rows_rule.hpp), like GU / H / Hq above
+    const size_t Tf = (size_t) strata::prefill::fp16_buf_tokens((int64_t) T, fused, stream_all_min());
+    if (fp16_bufs(mp)) a.take<uint16_t>(Tf * K * N, ok);
     a.take<float>(mb.gu, ok);
-    if (fp16_bufs(mp)) a.take<uint16_t>(T * K * kFF, ok);
+    if (fp16_bufs(mp)) a.take<uint16_t>(Tf * K * kFF, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * kFF, ok);
     a.take<float>(T * kFF, ok); a.take<uint16_t>(T * kFF, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
     if (mp.any) {
@@ -2310,9 +2377,10 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
-        m.Xs = fp16_bufs(mp) ? c.take<uint16_t>(T * K * N, ok) : nullptr;
+        const size_t Tf = (size_t) strata::prefill::fp16_buf_tokens((int64_t) T, fz, stream_all_min());   // (the tail below the floor in a fused layout: fp16_rows_rule.hpp)
+        m.Xs = fp16_bufs(mp) ? c.take<uint16_t>(Tf * K * N, ok) : nullptr;
         m.GU = c.take<float>(mb.gu, ok);
-        m.Hh = fp16_bufs(mp) ? c.take<uint16_t>(T * K * kFF, ok) : nullptr;
+        m.Hh = fp16_bufs(mp) ? c.take<uint16_t>(Tf * K * kFF, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * kFF, ok); m.sup = c.take<float>(T * kFF, ok); m.sh_h = c.take<uint16_t>(T * kFF, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
@@ -2351,6 +2419,10 @@ bool Prefill::carve(size_t T, void* alloc) {
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+    } else if (i8_wants_identity()) {
+        const size_t ids_rows = mmq_ids_rows(T);
+        if (ids_rows == 0) ok = false;
+        m.ids_identity = o.take<int32_t>(ids_rows, ok);   // OWN-I8: the identity row table of the int8 groups (no MMQ buffers in this layout)
     }
     m.ring = ring_slots(T);
     const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
@@ -3164,6 +3236,10 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
             o.take<int64_t>((size_t) g.n_expert, ok);
             o.take<int32_t>(4 * ws::max_chunks((int64_t) T * K, g.n_expert), ok);
         }
+    } else if (i8_wants_identity()) {
+        const size_t ids_rows = mmq_ids_rows(T);
+        if (ids_rows == 0) ok = false;
+        o.take<int32_t>(ids_rows, ok);   // ids_identity (OWN-I8, a build without MMQ buffers)
     }
     if (owned_pages) {
         if (stage_slots(T) > 0) o.take<uint8_t>((size_t) stage_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
@@ -5382,12 +5458,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // of layer l ({T, N, K} int64, T x N floats, T x K expert ids) for testing products on real rows
                         static const char* dump_moe = std::getenv("STRATA_DUMP_MOE_INPUT");
                         static bool dumped_moe = false;
-                        if (dump_moe && !dumped_moe && l == std::atoi(std::getenv("STRATA_DUMP_MOE_LAYER") ? std::getenv("STRATA_DUMP_MOE_LAYER") : "0")) {
+                        // STRATA_DUMP_MOE_LAYER=all (research): every layer of the process's first chunk, layer l into <path>.L<l> (the layers come in order; the second chunk and later
+                        // requests are not dumped)
+                        static const bool dump_all = [] { const char* e = std::getenv("STRATA_DUMP_MOE_LAYER"); return e != nullptr && std::strcmp(e, "all") == 0; }();
+                        static int dump_next = 0;
+                        const bool dump_this = dump_moe != nullptr && (dump_all ? l == dump_next
+                                                                               : (!dumped_moe && l == std::atoi(std::getenv("STRATA_DUMP_MOE_LAYER") ? std::getenv("STRATA_DUMP_MOE_LAYER") : "0")));
+                        if (dump_this) {
                             dumped_moe = true;
+                            if (dump_all) ++dump_next;
                             std::vector<float> x((size_t) (T * N));
                             cudaMemcpyAsync(x.data(), m.mixed, x.size() * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
                             cudaStreamSynchronize(m.cs);
-                            if (std::FILE* f = std::fopen(dump_moe, "wb")) {
+                            const std::string dump_path = dump_all ? std::string(dump_moe) + ".L" + std::to_string(l) : std::string(dump_moe);
+                            if (std::FILE* f = std::fopen(dump_path.c_str(), "wb")) {
                                 const int64_t hdr[3] = {(int64_t) T, (int64_t) N, (int64_t) K};
                                 std::fwrite(hdr, sizeof hdr, 1, f);
                                 std::fwrite(x.data(), sizeof(float), x.size(), f);
@@ -5497,20 +5581,112 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                !nib_l.on &&
 #endif
                                                fused::native_supported(mmq_gt, mmq_dt);
+                        // OWN-I8 (STRATA_EXPERT_I8=1 on any card; unset: the default of the HIP cards gfx1030 / 1031 / 1032, i8_expert_rule.hpp; =0 off): the MMQ groups of a native layer on our own
+                        // int8 dot-product kernels (native_expert_i8, src/kernels/cuda/i8_expert.cuh), where MMQ's gather, per-row quantize,
+                        // gate/up, SwiGLU, quantize and down run.  The group's experts are read where they are (the cache slot or the ring slot:
+                        // the gather's wait and slot release are kept, the copy is not made); the layer's tokens go to q8_1 ONCE per token (fr_xq,
+                        // the few-row path's rows) in place of MMQ's per-row copy; SwiGLU and the q8_1 of H are inside the gate/up launch, down
+                        // writes the rows of Dm the combine reads.  Not with a layer the fused kernels take (they are the faster path on the
+                        // cards that have them), the CPU share, a peer, STRATA_MMQ_DIRECT / _WS, the WMMA tiles, STRATA_PF_GROUP_SCRATCH, NVFP4
+                        // tails, Hadamard-folded or nibble layers; and only for groups of 256 entries or more (native_expert_i8_prompt).
+                        static const bool i8_group_env = [] {   // the group walk's own switch: the I8 launches ride on it
+                            const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
+                            return v == nullptr || std::atoi(v) != 0;
+                        }();
+                        strata::kernels::NativeExpertLayout i8_L{};
+                        bool i8_l = false;
+                        bool i8_few = false;   // the few-rows route: the layer's groups run on native_expert_grouped, the activations as quantize_q8_1_rows makes them
+                        // (a build without MMQ has no use_mmq layer: the layers the fused kernels do not take come here too, as long as the buffers below exist)
+                        if (lay.native && strata::kernels::i8_order_allows(fused_l, fz_staged) && !wmma_l && !had_gu && !had_d && rows_cpu == 0 && on_peer.empty() && !m.pp &&
+                            m.group_cap == 0 && (!m.fused_bufs || !stream_all) && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
+                            !(m.cache && mmq_plan().direct[(size_t) l]) && i8_group_env && !order.empty() &&
+                            (!strata::kernels::native_expert_i8_floor_gated() || strata::kernels::i8_chunk_default_allows(-1, true, true, (int64_t) T, stream_all_min())) &&   // the P100 class rule: from the stream floor up the unset default is the FP16 path (i8_expert_rule.hpp)
+                            m.GU != nullptr && m.Dm != nullptr && m.src_dev != nullptr && m.ids_identity != nullptr &&
+#if STRATA_EXPERT_NIBBLE_BUILT
+                            !nib_l.on &&
+#endif
+                            true) {
+                            const auto& f = lay.fmt[(size_t) l];
+                            i8_L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                            const int64_t i8_groups = ((int64_t) order.size() + MMQ_GROUP - 1) / MMQ_GROUP;
+                            const bool i8_same = i8_L.up_off == f.up_off && i8_L.down_off == f.down_off && i8_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF;
+                            // The few-rows route (i8_expert_rule.hpp): with it, the size floor of the int8 kernel (256 entries a group) gives way to the crossing; a layer
+                            // under it (average rows per expert, over the experts that have rows) runs on the grouped kernels in the same groups, from it up on the int8
+                            // kernel.  A pair the grouped kernels do not have, or a group whose scratch would not fit the layer's GU rows, keeps the floor.
+                            const int i8_fr = i8_same ? strata::kernels::native_expert_i8_few_rows_limit() : 0;
+                            i8_l = i8_same && strata::kernels::native_expert_i8_prompt(i8_L, i8_fr > 0 ? strata::kernels::kI8MinGroupEntries : rows_local / i8_groups);
+                            if (i8_l && i8_fr > 0 && strata::kernels::i8_fewrows_takes(i8_fr, rows_local, (int64_t) order.size())) {
+                                int64_t max_rows = 0;   // the most rows one group of the walk launches with
+                                for (size_t j = 0; j < order.size(); j += (size_t) MMQ_GROUP) {
+                                    const size_t je = std::min(order.size(), j + (size_t) MMQ_GROUP) - 1;
+                                    max_rows = std::max<int64_t>(max_rows, (int64_t) m.off[(size_t) order[je]] + m.cnt[(size_t) order[je]] - m.off[(size_t) order[j]]);
+                                }
+                                if (strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff) &&
+                                    strata::kernels::native_expert_scratch_bytes(max_rows, kFF) <= (size_t) rows_local * (size_t) kFF2 * sizeof(float))
+                                    i8_few = true;
+                                else
+                                    i8_l = strata::kernels::native_expert_i8_prompt(i8_L, rows_local / i8_groups);
+                            }
+                            if (i8_count_on() && i8_groups > 0) {
+                                I8Count& c = i8_count();
+                                c.min_avg = std::min<int64_t>(c.min_avg, rows_local / i8_groups);
+                                if (i8_l) c.groups_i8 += i8_groups;
+                            }
+                        }
+                        if (i8_count_on()) {   // every layer that reaches here: its routed entries and where they ran
+                            I8Count& c = i8_count();
+                            ++c.layers;
+                            c.ent += rows_local;
+                            if (i8_l) { ++c.layers_i8; c.ent_i8 += rows_local; }
+                            if (i8_few) { ++c.layers_few; c.ent_few += rows_local; }   // (the few-rows route's layers are counted in the int8 ones too)
+                        }
                         // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
                         // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
                         const float* xsrc = m.mixed;
                         if (fz_staged) {
                             fz_staged_l = true;
                             if (!use_mmq) {   // a fused-only layer (the class default, or STRATA_PF_STAGED_FO=1): said once
+#if !defined(STRATA_PF_OWN_ONLY)   // a build without MMQ says it in its start-up line (own_only_line.hpp)
                                 static bool said_fo = false;
                                 if (!said_fo) {
                                     said_fo = true;
                                     std::fprintf(stderr, "strata prefill: a layer with no MMQ tile reads prompt pieces below %lld tokens on the fused kernels' staged group "
                                                          "entry, routed experts only. STRATA_PF_STAGED_FO=0 keeps the old rule.\n", (long long) stream_all_min());
                                 }
+#endif
                             }
                             fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                        }
+                        if (i8_l) {   // the layer's T tokens as q8_1 rows, once (the grouped kernels' activations)
+                            if (static bool said = false; !said) {
+                                said = true;
+                                if (strata::kernels::native_expert_i8_by_default()) {
+#if !defined(STRATA_PF_OWN_ONLY)   // a build without MMQ says what runs in its start-up line (own_only_line.hpp), per chunk size: this one would be wrong above the P100's stream floor
+                                    std::fprintf(stderr, "strata: prompt experts on our own int8 kernels (the default of this build or graphics card; STRATA_EXPERT_I8=0 goes back to the old kernels)\n");
+#endif
+                                } else
+                                    std::fprintf(stderr, "strata: prompt experts on our own int8 dot-product kernels (STRATA_EXPERT_I8=1)\n");
+                            }
+                            if (m.fr_xq == nullptr || m.fr_xq_rows < T) {
+                                if (m.fr_xq) cudaFree(m.fr_xq);
+                                m.fr_xq = nullptr;
+                                m.fr_xq_rows = 0;
+                                if (cudaMalloc(&m.fr_xq, (size_t) T * (size_t) (N / 32) * 36) != cudaSuccess) {
+                                    m.fr_xq = nullptr;
+                                    err = "prefill: int8 experts: no memory for the activations";
+                                    return false;
+                                }
+                                m.fr_xq_rows = T;
+                            }
+                            if (m.i8_rec == nullptr && cudaMalloc((void**) &m.i8_rec, strata::prefill::i8grp::kRecBytes) != cudaSuccess) {
+                                m.i8_rec = nullptr;
+                                err = "prefill: int8 experts: no memory for the group record";
+                                return false;
+                            }
+                            if (i8_few)   // the few-rows route: the grouped kernels read q8_1 with FP16 scales (the same 36 bytes a block)
+                                strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.fr_xq, m.cs);
+                            else
+                                strata::kernels::native_expert_i8_quantize(m.mixed, T, N, m.fr_xq, m.cs);   // the kernels' own image (FP32 scales), 36 bytes per block as q8_1
                         }
                         if (use_mmq || fz_staged) {   // (fz_staged without use_mmq: a fused-only layer with the entry on (staged_fo_on(), staged_fo_rule.hpp); the block builds the group bounds)
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed` (APR:
@@ -5527,6 +5703,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 if (fz_staged) {
                                     // (P4-SMALL: Xq already holds the per-token int8 rows, above)
+                                } else if (i8_l) {
+                                    // (OWN-I8: the tokens' q8_1 rows are in fr_xq, above; MMQ's per-row copy is not made)
                                 } else if (mmq::fp4_activations(mmq_gt))
                                     mmq::quantize(xsrc, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
                                 else
@@ -5636,6 +5814,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     wl.rows = T * K; wl.n = (int) n; wl.xq = m.Xq; wl.gu = m.GU; wl.hq = m.Hq; wl.dm = m.Dm;
                                 }
                             }
+                        } else if (i8_l) {
+                            // (the int8 kernels read the tokens' q8_1 rows through src_dev: no per-row copy at all)
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                             // APR: Hadamard-folded gate/up take H (s * x); Xs is this layer's private gathered copy
@@ -5942,14 +6122,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
                             return v == nullptr || std::atoi(v) != 0;
                         }();
-                        const bool group_gather = group_env && stream_all && use_mmq && lay.native &&
-                                                  MMQ_GROUP <= mmq::kGatherGroupMax;
+                        const bool group_gather = group_env && stream_all && lay.native && ((use_mmq && MMQ_GROUP <= mmq::kGatherGroupMax) || i8_l);
                         // The staged walk (a short prompt) groups too, resident and staged experts alike: its ring is
                         // then STAGE_GRP slots, two groups, and it stages no further ahead than the open group allows,
                         // so a group's staged slots stay unread-over until its flush (one wait on the last copy, one
                         // event releasing them all, as in the streamed walk).
-                        const bool group_resident = group_env && !stream_all && (use_mmq || fz_staged) && lay.native &&
-                                                    MMQ_GROUP <= mmq::kGatherGroupMax;
+                        const bool group_resident = group_env && !stream_all && lay.native && (((use_mmq || fz_staged) && MMQ_GROUP <= mmq::kGatherGroupMax) || i8_l);
                         const bool gg_now = group_gather || group_resident;
                         const int stage_n = group_resident ? STAGE_GRP : STAGE;
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
@@ -6033,6 +6211,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         size_t gg_ents[MMQ_GROUP];   // the streamed walk: their entries (wait_copied)
                         int gg_nslots = 0;   // ring slots gathered by the next flush
                         size_t cur_entry = 0;   // the streamed walk: the entry compute() is given
+                        strata::prefill::i8grp::Group g8;   // OWN-I8: the open group of the int8 kernels (i8_group.hpp), for a layer with i8_l
                         // P4-SMALL (fz_staged): the open group's expert pointers and the layer's native geometry
                         // The layer's tables are built once (fused::group_bounds over every routed expert's rows, below); the experts then
                         // launch in batches: the open batch (fz_b, local experts [fz_j0, ..)) closes at kMaxBatch experts, at MMQ_GROUP experts
@@ -6055,12 +6234,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // `zero`: the MMQ tail zeroed after the gathered experts (the group's last flush); a direct
                         // group's tail is zeroed by prep_group
                         auto flush = [&](size_t zero) {
-                            if (gg.n <= gg.first) return;
+                            if (i8_l ? !g8.open() : gg.n <= gg.first) return;
                             const auto& f = lay.fmt[(size_t) l];
                             if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
                                 pt.mark(kPfWaitCopy, cs);
                                 wait_copied(gg_ents[gg_nslots - 1], (size_t) gg_slots[gg_nslots - 1]);
                                 pt.mark(kPfDequant, cs);
+                            }
+                            if (i8_l) {
+                                // OWN-I8 (i8_group.hpp): the open group's experts [g8.first, g8.n) run here as one launch pair on native_expert_i8, each read
+                                // where it is (a flush in the middle of a group, for a skipped ring entry, runs the experts it holds so far as a group of
+                                // their own).  Their rows are contiguous: bounds relative to the first row go up with the blob pointers; the rows' tokens are
+                                // src_dev from there, the rows' places in Dm are the identity from there; H as q8_1 lives in the group's own rows of GU
+                                // (the rows of an MMQ gate/up output, unused here: 5,120 bytes a row against the 720 + a few bytes of H that this needs)
+                                int64_t i8_nr = 0;
+                                int i8_ne = 0;
+                                pt.mark(kPfGemmGU, cs);
+                                if (!strata::prefill::i8grp::run(i8_L, g8, order.data(), m.off.data(), m.cnt.data(),
+                                                                 [&](const void* h, size_t bytes) { return m.up_ring.h2d(m.i8_rec, h, bytes, m.cs) == cudaSuccess; },
+                                                                 m.i8_rec, m.ids_identity, m.src_dev, m.fr_xq, m.GU, kFF2, m.Dm, N, m.cs, &i8_nr, &i8_ne,
+                                                                 i8_few, (size_t) rows_local * (size_t) kFF2 * sizeof(float))) {
+                                    std::fprintf(stderr, "prefill: int8 experts: the group's record could not be made (%lld rows, %d experts)\n", (long long) i8_nr, i8_ne);
+                                    std::exit(1);   // (flush cannot return an error: as the gather's own failure path, the engine stops)
+                                }
+                                if (gg_nslots > 0) {   // the group's staged blobs are read: one event releases their slots
+                                    const int rel = gg_slots[gg_nslots - 1];
+                                    cudaEventRecord(m.used[rel], m.cs);
+                                    for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                                }
+                                gg_nslots = 0;
+                                g8.launched();
+                                return;
                             }
 #if STRATA_EXPERT_NIBBLE_BUILT
                             if (nib_l.on) {   // the GGUF blocks rebuilt from the 4-bit slots: the bytes the copy gives
@@ -6130,6 +6334,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 gg_nslots = 0;
                                 fz_j0 = j + 1;
+                                return true;
+                            }
+                            if (i8_l) {   // OWN-I8: the expert joins the int8 kernels' open group; the group's products run in the flush
+                                g8.add(j, blob_dev);
+                                if (slot >= 0) { gg_ents[gg_nslots] = cur_entry; gg_slots[gg_nslots++] = slot; }
+                                if (!strata::prefill::i8grp::Group::last(j, order.size())) return true;
+                                flush(0);
+                                g8.reset();
                                 return true;
                             }
                             if (use_mmq) {
@@ -6669,6 +6881,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             });
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
+        }
+        if (i8_count_on()) {   // STRATA_I8_COUNT=1: this chunk's entries by path (the counters restart for the next chunk)
+            I8Count& c = i8_count();
+            std::fprintf(stderr, "strata i8-count: chunk of %lld tokens: %lld layers reached the group walk, %lld on native_expert_i8; routed entries %lld, on native_expert_i8 %lld (%.2f %%), "
+                                 "elsewhere in the walk %lld; i8 groups %lld; smallest group average seen %lld entries; few-rows route (grouped kernels, counted in the int8 ones): %lld layers, %lld entries\n",
+                         (long long) T, (long long) c.layers, (long long) c.layers_i8, (long long) c.ent, (long long) c.ent_i8, c.ent > 0 ? 100.0 * (double) c.ent_i8 / (double) c.ent : 0.0,
+                         (long long) (c.ent - c.ent_i8), (long long) c.groups_i8, (long long) (c.min_avg == INT64_MAX ? -1 : c.min_avg), (long long) c.layers_few,
+                         (long long) c.ent_few);
+            c = I8Count{};
         }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)

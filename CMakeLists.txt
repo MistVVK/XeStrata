@@ -414,6 +414,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(staged_group_rule_test PRIVATE include)
   add_test(NAME staged_group_rule_test COMMAND staged_group_rule_test)
 
+  # when a prompt layer's expert groups take our own int8 kernels (native_expert_i8): STRATA_EXPERT_I8 = 1 / 0 / unset, where unset means the HIP cards gfx1030 / 1031 / 1032 from
+  # 256 entries per group and every other card keeps MMQ (header-only, no GPU)
+  add_executable(i8_expert_rule_test tests/prefill/i8_expert_rule_test.cpp)
+  target_include_directories(i8_expert_rule_test PRIVATE include)
+  add_test(NAME i8_expert_rule_test COMMAND i8_expert_rule_test)
   # from which chunk size a prompt chunk takes the long-prompt path: 1,024, or the lower floor of a layer set that is fused-only on every layer on Windows gfx1151 (header-only, no GPU)
   add_executable(stream_floor_rule_test tests/prefill/stream_floor_rule_test.cpp)
   target_include_directories(stream_floor_rule_test PRIVATE include)
@@ -423,6 +428,16 @@ if(STRATA_BUILD_TESTS)
   add_executable(staged_fo_rule_test tests/prefill/staged_fo_rule_test.cpp)
   target_include_directories(staged_fo_rule_test PRIVATE include)
   add_test(NAME staged_fo_rule_test COMMAND staged_fo_rule_test)
+
+  # the start-up sentence of an engine built without llama.cpp's MMQ prompt kernels (layer counts per path; header-only, no GPU)
+  add_executable(own_only_line_test tests/prefill/own_only_line_test.cpp)
+  target_include_directories(own_only_line_test PRIVATE include)
+  add_test(NAME own_only_line_test COMMAND own_only_line_test)
+
+  # how many tokens the FP16 expert path's buffers (Xs, Hh) are sized for: the tail below the stream floor in a fused layout, the full chunk elsewhere (header-only, no GPU)
+  add_executable(fp16_rows_rule_test tests/prefill/fp16_rows_rule_test.cpp)
+  target_include_directories(fp16_rows_rule_test PRIVATE include)
+  add_test(NAME fp16_rows_rule_test COMMAND fp16_rows_rule_test)
 
   # whether the CUDA fused prompt kernels take the Gyro trellis experts by default (STRATA_PF_FUSED_TQ unset: the sm_86 cards with 80+ SMs; =1 any card; =0 off): the pure
   # rule, pinned for every card class (header-only, no GPU)

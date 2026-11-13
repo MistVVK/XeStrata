@@ -6298,7 +6298,7 @@
    "last_date": "2026-10-12",
    "status": "research",
    "owner": "prefill",
-   "note": "[auto] diagnostic / trace / measurement switch by name or by code, not documented for users",
+   "note": "Research: the layer whose first-chunk MoE input STRATA_DUMP_MOE_INPUT writes; \"all\" writes every layer of the first chunk to <path>.L<layer> (the rows for the bench's --real mode).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -6985,6 +6985,39 @@
    "status": "opt-in",
    "owner": "kernels/cuda",
    "note": "[auto] documented for users (docs/EXPERTDEC.md:27)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_EXPERT_I8",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6241,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "rollback",
+   "owner": "kernels",
+   "note": "CUDA / HIP, not a user setting. Unset: the HIP cards gfx1030 / gfx1031 / gfx1032 (RX 6000 series RDNA2, no matrix cores) run a prompt layer's expert groups on our own int8 dot-product kernels (native_expert_i8) for the gate/up formats IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S and IQ2_S with an IQ4_NL or Q2_0 down, in the prompt path's MMQ groups of 256 entries or more (include/strata/kernels/i8_expert_rule.hpp); every other card is unchanged in a build with MMQ. In a build without llama.cpp's MMQ (-DSTRATA_MMQ=OFF, or HIP without STRATA_PREFILL_MMQ) unset means on for every card and every layer the kernel covers that the fused kernels and the staged group entry do not take (otherwise the layer would run on the per-expert FP16 path); on a Tesla P100 (compute capability 6.0, no dp4a) that default applies only to prompt chunks under the stream floor (stream_all_min, 1,024 tokens), the FP16 path from it up, as the build with MMQ does there. =0 goes back to the old kernels on that class, or to the FP16 path in a build without MMQ (the way back). =1 asks for the int8 kernels on any card (a layer the fused kernels take stays on them; on a card with fused kernels set STRATA_PF_FUSED=0 as well) and, as the only way, in native_expert_grouped (the Qwen3.6 engine's prompt). Goes away with MMQ (release C) or stays as the only path.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -12595,6 +12628,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_I8_BISECT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6291,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "kernels",
+   "note": "Debug only: STRATA_EXPERT_I8's kernels return at point n, uniform over the block (a fault hunt on HIP). 0: off.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8_COUNT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 1566,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "kernels",
+   "note": "Debug only: prints one line per prompt chunk with the routed entries that ran on native_expert_i8 and the ones that stayed on the group walk's own kernels. 0: off.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_I8_DBG",
    "backends": [
     "sycl"
@@ -12626,6 +12725,39 @@
    "status": "opt-in",
    "owner": "sycl/prefill",
    "note": "[auto] documented for users (docs/INTEL_INT8_EXPERTS.md:27)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8_FEWROWS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6293,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "kernels",
+   "note": "Research: the few-rows route of STRATA_EXPERT_I8's prompt path: a layer whose experts average fewer routed rows than the limit runs on the grouped kernels instead of the int8 kernel. Not set: 6 on a Tesla P100, 7 elsewhere (8 and 10 with STRATA_I8_N8=0). 0: off (the int8 kernel keeps its 256-entry floor). N: a limit of N rows per expert.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -12731,6 +12863,113 @@
    "status": "opt-in",
    "owner": "sycl/prefill",
    "note": "[auto] documented for users (docs/INTEL_INT8_EXPERTS.md:26)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8_N8",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6354,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [
+    {
+     "file": "src/kernels/native_i8_parity.cpp",
+     "line": 246
+    },
+    {
+     "file": "src/kernels/native_i8_parity.cpp",
+     "line": 255
+    },
+    {
+     "file": "src/kernels/native_i8_parity.cpp",
+     "line": 257
+    }
+   ],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "kernels",
+   "note": "The 8-entry slices of the tile-2..4 int8 expert kernel (STRATA_EXPERT_I8's prompt path; two weight rows and one entry of each 8-entry slice per thread; output bit-identical). Not set: on for tile 2 (up to about 1,950 tokens at Flash-Next's shape), off for tiles 3 and above. 1: tiles 2 to 4. 0: off.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8_SMEM_LIMIT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/i8_expert.cuh",
+     "line": 833,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "kernels",
+   "note": "Test only: pretends the card has this many bytes of shared memory per block, so STRATA_EXPERT_I8's kernels fall to a smaller tile or answer 'not supported' (native_i8_parity uses it).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8_TM",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6281,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "kernels",
+   "note": "Research: the tile of STRATA_EXPERT_I8's kernels, 2, 3 or 4 rows of 16 entries per thread (32, 48 or 64 entries a block), 8 = the 128-entry tile. Unset: chosen by the entries per expert.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -25897,7 +26136,7 @@
    "last_date": "2026-11-12",
    "status": "rollback",
    "owner": "prefill",
-   "note": "[reviewed] The staged walk's fused group entry for a layer that has no MMQ tile but that the fused kernels cover (UD-Q4_K_XL on gfx1151 without STRATA_MMQ_KQ; every layer of a build without llama.cpp's MMQ): a prompt chunk below the long-prompt floor runs its routed experts on the fused kernels, streaming only the routed ones, instead of the dequantize + FP16 GEMM path. Unset: on for Windows gfx1151 with a layer set that has no MMQ tile and the fused kernels on every layer; off elsewhere. =1 asks for it on any card (research), =0 turns it off (the long-prompt path from 64 tokens on that class). src/prefill/prefill.cpp staged_fo_on, include/strata/prefill/staged_fo_rule.hpp.",
+   "note": "[reviewed] The staged walk's fused group entry for a layer that has no MMQ tile but that the fused kernels cover (UD-Q4_K_XL on gfx1151 without STRATA_MMQ_KQ; every layer of a build without llama.cpp's MMQ): a prompt chunk below the long-prompt floor runs its routed experts on the fused kernels, streaming only the routed ones, instead of the dequantize + FP16 GEMM path. Unset: in a build without llama.cpp's MMQ on for every layer the fused kernels cover, on every card class (the build without MMQ takes the path the build with MMQ takes wherever that path does not need MMQ; the layers the fused kernels do not cover take the int8 kernels, then the FP16 path); in a build with MMQ on for Windows gfx1151 with a layer set that has no MMQ tile and the fused kernels on every layer, off elsewhere. =1 asks for it on any card (research), =0 turns it off (the long-prompt path from 64 tokens on the Windows gfx1151 class). src/prefill/prefill.cpp staged_fo_on, include/strata/prefill/staged_fo_rule.hpp.",
    "retire_after": "",
    "retired_in": ""
   },
