@@ -289,7 +289,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WS_FAST` | number | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
 
-## Switches that go back to earlier behaviour (67)
+## Switches that go back to earlier behaviour (68)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
