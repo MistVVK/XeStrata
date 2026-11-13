@@ -17,6 +17,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_decode_attn
 #include "strata/kernels/device_arch_tag.hpp"
@@ -29,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace strata::kernels {
@@ -382,7 +384,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
 
 // steps_all (with `dense` and `window` as launch_chunk's): only the slots the query's cells reached are read (the others
 // hold no cells); null: every slot
-template <int HD, int G>
+template <int HD, int G, bool PREFETCH>
 sycl::event launch_merge(sycl::queue& queue, const float* part_acc_all, const float* part_m_all, const float* part_l_all,
                          int n_slots, float* attn_all, size_t n_head, size_t n_q, long long scratch_stride,
                          const int32_t* steps_all = nullptr, bool dense = true, int window = 0, int min_chunk = CHUNK) {
@@ -404,9 +406,41 @@ sycl::event launch_merge(sycl::queue& queue, const float* part_acc_all, const fl
         const int kvh = h / G, hl = h % G;
         const int d = (int) it.get_local_id(1);
         float M = -FLT_MAX;
-        for (int c = 0; c < n_chunks; ++c) M = sycl::fmax(M, part_m[(kvh * n_slots + c) * G + hl]);
+        int c = 0;
+        if constexpr (PREFETCH) {
+            for (; c + 8 <= n_chunks; c += 8) {
+                float maxima[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) maxima[j] = part_m[(kvh * n_slots + c + j) * G + hl];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) M = sycl::fmax(M, maxima[j]);
+            }
+        }
+        for (; c < n_chunks; ++c) M = sycl::fmax(M, part_m[(kvh * n_slots + c) * G + hl]);
         float L = 0.0f, acc = 0.0f;
-        for (int c = 0; c < n_chunks; ++c) {
+        c = 0;
+        if constexpr (PREFETCH) {
+            for (; c + 8 <= n_chunks; c += 8) {
+                float maxima[8], sums[8], values[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int slot = kvh * n_slots + c + j;
+                    maxima[j] = part_m[slot * G + hl];
+                    if (maxima[j] != -FLT_MAX) {
+                        sums[j] = part_l[slot * G + hl];
+                        values[j] = part_acc[((size_t) slot * G + hl) * HD + d];
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    if (maxima[j] == -FLT_MAX) continue;
+                    const float w = sycl::exp(maxima[j] - M);
+                    L = sycl::fma(sums[j], w, L);
+                    acc = sycl::fma(values[j], w, acc);
+                }
+            }
+        }
+        for (; c < n_chunks; ++c) {
             const int slot = kvh * n_slots + c;
             const float m = part_m[slot * G + hl];
             if (m == -FLT_MAX) continue;
@@ -500,8 +534,39 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     else
         launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
                                 n_slots, n_q, (int) cap, stride, window, split, min_chunk);
-    const auto e = launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q, stride,
-                                       steps, ids == nullptr, window, min_chunk);
+    // Measure both forms on this device and shape, outside graph capture.  The new form keeps the fold order but
+    // brings eight independent partials into registers before using them.  A 5% margin keeps the old form at a tie.
+    using MergeKey = std::tuple<int, int, int, int, int, int, int>;
+    static core::TimedCache<sycl::device, MergeKey, bool> choices;
+    const MergeKey key{n_slots, (int) n_q, (int) s.n_head, kv_mode, ids == nullptr, window, min_chunk};
+    auto merge = [&](bool prefetch) {
+        return prefetch
+            ? launch_merge<HD, G, true>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q,
+                                        stride, steps, ids == nullptr, window, min_chunk)
+            : launch_merge<HD, G, false>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q,
+                                         stride, steps, ids == nullptr, window, min_chunk);
+    };
+    bool prefetch = false;
+    const char* mode = strata::env_get("ATTN_MERGE_PREFETCH");
+    if (mode && mode[0] == '1' && mode[1] == '\0') prefetch = true;
+    else if (!mode || !*mode || std::string(mode) == "auto") {
+        const auto cached = choices.get(queue.get_device(), key);
+        if (cached) prefetch = *cached;
+        else if (n_slots >= 8 && core::timing_depth == 0 &&
+                 queue.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
+            const auto measured = core::timed_choice({
+                {[&] { for (int i = 0; i < 8; ++i) merge(false); return true; }},
+                {[&] { for (int i = 0; i < 8; ++i) merge(true); return true; }}
+            }, [&] { queue.wait_and_throw(); });
+            prefetch = choices.put(queue.get_device(), key, measured.pick == 1);
+            std::fprintf(stderr, "xestrata: attention merge %s (%d slots, %zu queries; %.1f / %.1f us)\n",
+                         prefetch ? "prefetch" : "plain", n_slots, n_q, measured.seconds[0] * 1e6 / 8,
+                         measured.seconds[1] * 1e6 / 8);
+        }
+    } else if (!(mode[0] == '0' && mode[1] == '\0')) {
+        throw core::DeviceError("XESTRATA_ATTN_MERGE_PREFETCH must be auto, 0 or 1");
+    }
+    const auto e = merge(prefetch);
     if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
 }
 
