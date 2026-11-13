@@ -2834,6 +2834,12 @@ def stray_words(strays) -> str:
     return " (it also printed on its output: " + " | ".join(x[:120] for x in list(strays)[-3:]) + ")"
 
 
+# The picture formats the server opens through Pillow (upstream #4220): JPEG 2000 and the other decoders Pillow may
+# carry are never handed a client's bytes (GHSA-78g4-xqwv-q3g8 is an OpenJPEG heap overflow reachable from
+# Image.open().load(); Pillow picks the decoder by the file's first bytes).
+PICTURE_FORMATS = ("JPEG", "PNG", "GIF", "BMP", "WEBP", "TIFF", "AVIF")
+
+
 class Vision:
     """The resident image encoder: `xestrata-vision` (the engine's vision encoder + the mmproj file, on the GPU or the
     CPU) reads `ENC <image> <out>` lines and writes each image's embeddings; results are cached by the image's hash,
@@ -3211,7 +3217,7 @@ class Vision:
         try:
             import io
             from PIL import Image
-            with Image.open(io.BytesIO(data)) as im:
+            with Image.open(io.BytesIO(data), formats=PICTURE_FORMATS) as im:
                 return im.getexif().get(0x0112, 1) not in (None, 0, 1)
         except Exception:  # noqa: BLE001 - any failure leaves the image as it was sent
             return False
@@ -3235,7 +3241,7 @@ class Vision:
             raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
                              "GIF work without it") from None
         try:
-            im = Image.open(io.BytesIO(data))
+            im = Image.open(io.BytesIO(data), formats=PICTURE_FORMATS)
             im.load()
             from PIL import ImageOps
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
@@ -6868,7 +6874,7 @@ def low_detail(source) -> str | bytes:
         return source
     data = source if isinstance(source, bytes) else Vision.load(source)
     try:
-        with Image.open(io.BytesIO(data)) as im:
+        with Image.open(io.BytesIO(data), formats=PICTURE_FORMATS) as im:
             if max(im.size) <= LOW_DETAIL_SIDE:
                 return data
             im.thumbnail((LOW_DETAIL_SIDE, LOW_DETAIL_SIDE))
