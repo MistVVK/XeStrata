@@ -1329,24 +1329,25 @@ SgChoice& sg_choice(sycl::queue& q) {
     static core::PerDevice<std::shared_ptr<SgChoice>> per_device;
     return *per_device.get(q.get_device(), [] { return std::make_shared<SgChoice>(); });
 }
-int rows_class(int64_t mean_rows) {
+// top: the last class (log2 of its rows), which takes every larger mean too
+int rows_class(int64_t mean_rows, int top = 8) {
     int r = 3;   // 8 rows and fewer
-    while (r < 8 && ((int64_t) 1 << r) < mean_rows) ++r;
+    while (r < top && ((int64_t) 1 << r) < mean_rows) ++r;
     return r;
 }
 thread_local bool t_choosing = false;   // inside iq_mmq_choose_forms: a class not chosen yet is timed
-bool intel_sub_group_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, int64_t K,
-                           const std::function<sycl::event()>& sg, const std::function<sycl::event()>& wg) {
-    static const char* const env = std::getenv("XESTRATA_IQ_MMQ_SUB_GROUP");
-    if (env != nullptr && (env[0] == '0' || env[0] == '1')) return env[0] == '1';
+// The choice between two forms of a product for its class (sg_choice's key), kept for the GPU: `first` timed against
+// `second` inside iq_mmq_choose_forms and taken where it is 5% faster or more; a class not timed takes `second`.
+bool timed_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, int64_t K, int top,
+                 const std::function<sycl::event()>& first, const std::function<sycl::event()>& second) {
     SgChoice& c = sg_choice(q);
-    const auto key = std::make_tuple(ty, rows_class(mean_rows), n == 1, N, K);
+    const auto key = std::make_tuple(ty, rows_class(mean_rows, top), n == 1, N, K);
     {
         std::lock_guard<std::mutex> lock(c.mu);
         if (const auto it = c.picks.find(key); it != c.picks.end()) return it->second;
     }
     if (!t_choosing) return false;
-    double sg_s = 0, wg_s = 0;
+    double a_s = 0, b_s = 0;
     const auto time = [&](const std::function<sycl::event()>& f) {
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < 3; ++i) f();
@@ -1355,18 +1356,54 @@ bool intel_sub_group_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int
     };
     try {
         q.wait_and_throw();
-        sg();   // each once first: its kernel's build
-        wg();
+        first();   // each once first: its kernel's build
+        second();
         q.wait_and_throw();
-        sg_s = time(sg);
-        wg_s = time(wg);
+        a_s = time(first);
+        b_s = time(second);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "xestrata: timing the int8 expert products' forms: %s\n", e.what());
-        sg_s = wg_s = 0;
+        a_s = b_s = 0;
     }
-    const bool pick = sg_s > 0 && wg_s > 0 && sg_s * 1.05 < wg_s;
+    const bool pick = a_s > 0 && b_s > 0 && a_s * 1.05 < b_s;
     std::lock_guard<std::mutex> lock(c.mu);
     c.picks[key] = pick;
+    return pick;
+}
+bool intel_sub_group_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, int64_t K,
+                           const std::function<sycl::event()>& sg, const std::function<sycl::event()>& wg) {
+    static const char* const env = std::getenv("XESTRATA_IQ_MMQ_SUB_GROUP");
+    if (env != nullptr && (env[0] == '0' || env[0] == '1')) return env[0] == '1';
+    return timed_first(q, ty, mean_rows, n, N, K, 8, sg, wg);
+}
+
+// Whether an expert group's product on RDNA3's or RDNA4's WMMA takes the FP16 form (iq_mmq_f16_grouped: the weights
+// dequantized to FP16 in local memory, the int8 activations times their scales) before the int8 one: timed for the
+// classes of 512 and 1024 rows an expert (the last takes every larger mean) as Intel's two forms are
+// (iq_mmq_choose_forms; the first takes 257 rows on), and taken where it is 5% faster; fewer rows keep the int8 form
+// untimed.  RX 9060 XT (2026-11-13, Qwen3.8-Flash-Next IQ3_XXS, generate, three starts each): a 32K prompt (about 1000
+// rows an expert) 1209-1211 tok/s with the int8 form, 1249-1259 with this choice, 1259 with the FP16 form at every
+// class; a 4K prompt (about 110) 949-952, 948-950 and 915-930.  The two give other last bits (FP16 products against
+// exact int8 sums), so a class may answer otherwise from GPU to GPU, not from start to start (kept for the GPU).
+// XESTRATA_IQ_MMQ_F16: unset, by the timing; 0, never; 1, at every class where it runs.
+constexpr int kF16TopClass = 10, kF16FirstClass = 9;
+int f16_env() {
+    static const int v = [] {
+        const char* e = std::getenv("XESTRATA_IQ_MMQ_F16");
+        return e == nullptr || e[0] == '\0' ? -1 : (int) std::strtol(e, nullptr, 10) != 0;
+    }();
+    return v;
+}
+bool f16_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, int64_t K,
+               const std::function<sycl::event()>& f16, const std::function<sycl::event()>& i8) {
+    if (f16_env() >= 0) return f16_env() == 1;
+    if (rows_class(mean_rows, kF16TopClass) < kF16FirstClass) return false;
+    const bool timing = t_choosing;
+    const bool pick = timed_first(q, ty, mean_rows, n, N, K, kF16TopClass, f16, i8);
+    if (timing && pick)
+        std::fprintf(stderr, "xestrata: the experts' int8 products of type %d (%lld x %lld) take the FP16 form at %lld rows "
+                             "an expert (timed faster; XESTRATA_IQ_MMQ_F16=0 keeps the int8 one)\n",
+                     ty, (long long) N, (long long) K, (long long) mean_rows);
     return pick;
 }
 
@@ -1457,6 +1494,18 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
 #undef STRATA_MMQ_ROWS_SG
 #undef STRATA_MMQ_LAUNCH_SG
 #undef STRATA_MMQ_ROWS_INTEL
+    // RDNA3 and RDNA4: an expert group's product in FP16 where it was timed faster for its class of rows (f16_first)
+    if (n > 1 && f16_env() != 0 && iq_mmq_f16_ok(q, TY, w_rows, w_cols)) {
+        const auto f16 = [&] {
+            return iq_mmq_f16_grouped(q, TY, w, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids,
+                                      dst, ld_dst, wtab, woff);
+        };
+        const auto i8 = [&]() -> sycl::event {
+            if (tail) STRATA_MMQ_ROWS(false, true, 0);
+            STRATA_MMQ_ROWS(false, false, 0);
+        };
+        return f16_first(q, TY, mean_rows, n, w_rows, w_cols, f16, i8) ? f16() : i8();
+    }
     if (tail) STRATA_MMQ_ROWS(false, true, 0);
     STRATA_MMQ_ROWS(false, false, 0);
 #undef STRATA_MMQ_ROWS
@@ -1669,16 +1718,25 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
 }
 
 void iq_mmq_choose_forms(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, int n) {
-    if (!iq_mmq_type_ok(t) || intel_shape_of(q) == 0) return;   // one form only
-    if (const char* env = std::getenv("XESTRATA_IQ_MMQ_SUB_GROUP"); env != nullptr && (env[0] == '0' || env[0] == '1'))
-        return;
-    constexpr int64_t kTop = 256;   // the most rows an expert timed (the last class)
+    if (!iq_mmq_type_ok(t)) return;
+    if (intel_shape_of(q) != 0) {   // Intel's two forms (intel_sub_group_first)
+        if (const char* env = std::getenv("XESTRATA_IQ_MMQ_SUB_GROUP"); env != nullptr && (env[0] == '0' || env[0] == '1'))
+            return;
+    } else if (f16_env() >= 0 || std::max(n, 1) == 1 || !iq_mmq_f16_ok(q, t, w_rows, w_cols)) {   // f16_first
+        return;   // one form only
+    }
+    // the classes timed: Intel's forms 8 to 256 rows an expert, the FP16 form 512 and 1024 (f16_first)
+    const bool intel = intel_shape_of(q) != 0;
+    const int top = intel ? 8 : kF16TopClass;
+    const int64_t kTop = (int64_t) 1 << top, kFirst = intel ? 8 : (int64_t) 1 << kF16FirstClass;
     n = std::max(n, 1);
-    const int64_t cols = iq_mmq_type_dup(t) ? 2 * w_cols : w_cols, R = n * kTop;
+    // the buffers hold n experts of 256 rows: a class of more rows takes fewer experts (at least 2), so that the
+    // timing takes no more memory than Intel's (taken with the engine's caches already in place)
+    const int64_t cols = iq_mmq_type_dup(t) ? 2 * w_cols : w_cols, R = n * std::min<int64_t>(kTop, 256);
     {
         SgChoice& c = sg_choice(q);
         std::lock_guard<std::mutex> lock(c.mu);
-        if (c.picks.count(std::make_tuple(t, rows_class(kTop), n == 1, w_rows, cols)) != 0) return;   // timed before
+        if (c.picks.count(std::make_tuple(t, rows_class(kTop, top), n == 1, w_rows, cols)) != 0) return;   // timed before
     }
     const size_t eb = (size_t) w_rows * iq_mmq_row_bytes(t, w_cols);
     // the products' buffers: n experts' weights (any bits are valid blocks; the values do not change the time), the
@@ -1695,10 +1753,13 @@ void iq_mmq_choose_forms(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, 
             q.memset(xq, 0, iq_mmq_act_bytes(R, cols));
             q.parallel_for(sycl::range<1>((size_t) R), [=](sycl::id<1> i) { ids[i] = (int32_t) i[0]; });
             std::vector<int32_t> hb((size_t) n + 1);
-            for (int64_t r = 8; r <= kTop; r *= 2) {
-                for (int e = 0; e <= n; ++e) hb[(size_t) e] = (int32_t) (e * r);
-                q.memcpy(bounds, hb.data(), hb.size() * sizeof(int32_t)).wait();
-                iq_mmq_grouped(q, t, w, eb, w_rows, cols, n, xq, n * r, bounds, r, ids, dst, w_rows, nullptr, 0, n * r);
+            for (int64_t r = kFirst; r <= kTop; r *= 2) {
+                const int nr = n == 1 ? 1 : (int) std::max<int64_t>(2, std::min<int64_t>(n, R / r));
+                for (int e = 0; e <= nr; ++e) hb[(size_t) e] = (int32_t) (e * r);
+                q.memcpy(bounds, hb.data(), (size_t) (nr + 1) * sizeof(int32_t)).wait();
+                if ((int64_t) nr * r <= R)
+                    iq_mmq_grouped(q, t, w, eb, w_rows, cols, nr, xq, nr * r, bounds, r, ids, dst, w_rows, nullptr, 0,
+                                   nr * r);
             }
             q.wait_and_throw();
         } catch (const std::exception& e) {
