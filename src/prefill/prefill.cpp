@@ -5636,12 +5636,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (fz_staged) {
                             fz_staged_l = true;
                             if (!use_mmq) {   // a fused-only layer (the class default, or STRATA_PF_STAGED_FO=1): said once
+#if !defined(STRATA_PF_OWN_ONLY)   // a build without MMQ says it in its start-up line (own_only_line.hpp)
                                 static bool said_fo = false;
                                 if (!said_fo) {
                                     said_fo = true;
                                     std::fprintf(stderr, "strata prefill: a layer with no MMQ tile reads prompt pieces below %lld tokens on the fused kernels' staged group "
                                                          "entry, routed experts only. STRATA_PF_STAGED_FO=0 keeps the old rule.\n", (long long) stream_all_min());
                                 }
+#endif
                             }
                             fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         }
