@@ -2475,11 +2475,15 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
-                if self.can_stop:
+                # the engine can be ended or restarted on another thread meanwhile: close() closes stdin (a
+                # write then raises ValueError) before it clears `proc` (None then) - the STOP has nobody to
+                # reach, and the request's own outcome must not be replaced by that error
+                proc = self.proc
+                if self.can_stop and proc is not None:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
-                    except OSError:
+                        proc.stdin.write("STOP\n")
+                        proc.stdin.flush()
+                    except (OSError, ValueError):
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
