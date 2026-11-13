@@ -20,5 +20,6 @@
  "df19": "El motor de reparto entre todas las tarjetas no pudo arrancar, así que se usa el reparto normal por capas.",
  "df20": "Predicción: desactivada (a las tarjetas les faltaba memoria)",
  "df21": "En su Mac, en nuestras pruebas DFlash2 fue más rápido que MTP con este modelo.",
- "df22": "DFlash2 está desactivado de forma predeterminada en esta tarjeta gráfica por ahora; elíjalo en Predicción para usarlo."
+ "df22": "DFlash2 está desactivado de forma predeterminada en esta tarjeta gráfica por ahora; elíjalo en Predicción para usarlo.",
+ "df23": "Predicción: ninguna en cupos paralelos (un token por solicitud y paso); una sola solicitud sigue prediciendo"
 }

@@ -1524,10 +1524,16 @@ class Runner:
                 name = self.catalog.model_name_of(self.s.family, self.s.model)
             except Exception:                                # noqa: BLE001 - an unreadable table is only the old, generic plan
                 name = None
+        split = bool(self.s.gpus and len(self.s.gpus) > 1)
+        slot_drafts = False
+        if str(backend or "").lower() == "cuda" and drafting.request_count(args, int(self.s.parallel or 0)) in drafting.SLOT_DRAFT_REQUESTS:     # (the card is only read for a start that could be in the class)
+            sig = self.drafting_signals(cfg, {"backend": backend, "archs": archs})
+            slot_drafts = drafting.slot_drafts_by_default(mode, backend=backend, archs=archs, vram_mib=sig["vram_mib"], args=sig["args"], slots=int(self.s.parallel or 0), split=split)   # the drafter is fetched before the start (ensure_drafter)
         return {"mode": mode, "klass": drafting.card_class(archs), "model_name": name, "family": self.s.family,
                 "data_dir": drafting.data_dir_of(args) or (Path(self.s.data_dir) if self.s.data_dir else None),
                 "backend": backend, "archs": archs, "mtp_here": drafting.mtp_ready(args) if cfg else None,
-                "blocked": drafting.blocked_by(args, split=bool(self.s.gpus and len(self.s.gpus) > 1), slots=int(self.s.parallel or 0), named=drafting.normalize(mode) == "dflash2", backend=backend)}
+                "blocked": drafting.blocked_by(args, split=split, slots=int(self.s.parallel or 0), named=drafting.normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts),
+                "slots_none": drafting.slots_draft_nothing(drafting.merged_args(cfg), int(self.s.parallel or 0))}
 
     def drafting_signals(self, cfg: dict, want: dict) -> dict:
         """The two signals drafting.tuned_applies reads besides the backend and the card: the arguments (--expert-cache and the others the confidence reads, with the person's own

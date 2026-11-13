@@ -20,5 +20,6 @@
  "df19": "O motor de divisão entre todas as placas não conseguiu iniciar, então a divisão normal por camadas está em uso.",
  "df20": "Previsão: desligada (faltou memória nas placas)",
  "df21": "No seu Mac, nos nossos testes o DFlash2 foi mais rápido que o MTP com este modelo.",
- "df22": "O DFlash2 está desligado por predefinição nesta placa de vídeo por agora; escolha-o em Previsão para o usar."
+ "df22": "O DFlash2 está desligado por predefinição nesta placa de vídeo por agora; escolha-o em Previsão para o usar.",
+ "df23": "Previsão: nenhuma em vagas paralelas (um token por pedido e por passo); um único pedido ainda faz previsão"
 }

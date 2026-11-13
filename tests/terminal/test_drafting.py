@@ -279,7 +279,7 @@ class EngineArguments(unittest.TestCase):
         for kw in ({"slots": 4},):
             c = self.cfg()                                   # Auto: unchanged, the MTP for several requests
             d = self.apply(c, **kw)
-            self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_HERE), kw)
+            self.assertEqual((d.drafter, d.note), ("mtp", drafting.NONE_IN_SLOTS), kw)
             self.assertEqual(c["args"], self.args, kw)
             c = self.cfg(drafting="mtp")                     # the MTP chosen: unchanged
             d = self.apply(c, **kw)
@@ -393,7 +393,7 @@ class EngineArguments(unittest.TestCase):
             args = engine_args(self.cfg(drafting="mtp"))
             self.assertEqual(args, self.args)
             self.assertEqual(engine_args(self.cfg(parallel=4))[:len(self.args)], self.args, "Auto with several requests: the MTP alone")
-            self.assertEqual(drafting.take_note(), drafting.NOT_HERE, "the engine that starts next is told why")
+            self.assertEqual(drafting.take_note(), drafting.NONE_IN_SLOTS, "the engine that starts next is told why")
             self.assertEqual(engine_args(self.cfg(drafting="mtp", parallel=4))[:len(self.args)], self.args, "the MTP chosen: unchanged")
             self.assertEqual(drafting.take_note(), "")
             # DFlash2 chosen by name with a number of requests the person chose: DFlash2 with that many, no note
@@ -741,9 +741,9 @@ class WordsMatchTheApp(unittest.TestCase):
         catalogs = {l: {**json.loads((folder / f"{l}.json").read_text(encoding="utf-8")), **json.loads((folder / f"df2-{l}.json").read_text(encoding="utf-8"))}
                     for l in ("en", "de", "es", "fr", "ja", "ko", "pt", "ru", "zh")}
         ids = {v: k for k, v in catalogs["en"].items()}
-        self.assertEqual(len(drafting.REASONS), 9)
+        self.assertEqual(len(drafting.REASONS), 10)
         lines = [drafting.mtp_line(r) for r in (drafting.DIDNT_FIT, drafting.NOT_HERE, drafting.NOT_SUPPORTED, drafting.NOT_DOWNLOADED, drafting.NOT_THIS_CARD, drafting.DIDNT_START)]
-        lines += [drafting.line("dflash2", drafting.NO_MTP), drafting.line("off", drafting.NONE_HERE), drafting.line("off", drafting.SHORT_OF_VRAM)]
+        lines += [drafting.line("dflash2", drafting.NO_MTP), drafting.line("off", drafting.NONE_HERE), drafting.line("off", drafting.SHORT_OF_VRAM), drafting.line("mtp", drafting.NONE_IN_SLOTS)]
         for line in lines:
             self.assertIn(line, ids, line)
             for lang, catalog in catalogs.items():

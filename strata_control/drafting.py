@@ -838,13 +838,48 @@ FETCH_HINT = "Run strata drafting fetch to get the DFlash2 drafter now."
 DIDNT_START = "DFlash2 didn't start"          # Auto picked DFlash2, the engine ended before it was ready, and the start was repeated once with the MTP (serve/server.py)
 NOT_SERVED = NOT_HERE
 SHORT_OF_VRAM = "the cards were short of memory"   # the engine ended before it was ready for lack of graphics memory: the start was repeated once with no drafter (serve/server.py), never with the MTP
-REASONS = (DIDNT_FIT, NOT_HERE, NOT_SUPPORTED, NOT_DOWNLOADED, NOT_THIS_CARD, NO_MTP, NONE_HERE, DIDNT_START, SHORT_OF_VRAM)
+#: Request slots (2 or more requests at once) with the MTP layer loaded but no ``--batch-mtp``: the slots draft nothing and only a single request drafts. This reason is the whole line after
+#: "Drafting: " (``line`` prints it as it is, not inside "MTP (...)"); ``slots_draft_nothing`` says when it is true.
+NONE_IN_SLOTS = "none in parallel slots (one token per request and step); a single request still drafts"
+REASONS = (DIDNT_FIT, NOT_HERE, NOT_SUPPORTED, NOT_DOWNLOADED, NOT_THIS_CARD, NO_MTP, NONE_HERE, DIDNT_START, SHORT_OF_VRAM, NONE_IN_SLOTS)
+#: The server's line for a DFlash2 start whose request slots draft too (a drafter per request slot, guesses only in the rows the slots leave spare); ``slot_drafts_run`` says when.
+SLOT_DRAFTS_LINE = "Drafting: DFlash2, one guess window per request slot (spare rows only)"
 
 
 def line(drafter: str, reason: str = "") -> str:
-    """``Drafting: DFlash2``, ``Drafting: MTP (DFlash2 isn't available in this mode)``, ``Drafting: off (no drafter is downloaded yet)``."""
+    """``Drafting: DFlash2``, ``Drafting: MTP (DFlash2 isn't available in this mode)``, ``Drafting: off (no drafter is downloaded yet)``, ``Drafting: none in parallel slots (...)``."""
+    if reason == NONE_IN_SLOTS:
+        return f"Drafting: {NONE_IN_SLOTS}"
     word = {"mtp": "MTP", "dflash2": "DFlash2", "off": "off"}.get(drafter, drafter)
     return f"Drafting: {word} ({reason})" if reason else f"Drafting: {word}"
+
+
+def merged_args(cfg: dict[str, Any]) -> list[str]:
+    """The config's engine arguments with the person's own ``user_args`` over them, as the server merges them at a start (what slots_draft_nothing reads)."""
+    args = [str(a) for a in cfg.get("args") or []]
+    if cfg.get("user_args"):
+        from strata_control import user_args
+        args = user_args.merge(args, cfg["user_args"])
+    return args
+
+
+def slots_draft_nothing(args: list[Any], slots: int | float | None = 0) -> bool:
+    """Do this start's request slots draft nothing? Yes for 2 or more requests at once with no ``--batch-mtp`` (and no ``STRATA_BATCH_MTP``, no ``--pipeline-windows``) in the arguments:
+    the engine runs the slots with one token per request and step, and only a single request drafts. (Called for a start that runs the MTP layer: the slots' own DFlash2 drafts are
+    ``slot_drafts_run``; with ``--batch-mtp`` the slots carry MTP drafts and the usual line stays.)"""
+    items = [str(a) for a in args or []]
+    if request_count(items, slots) < 2 or "--batch-mtp" in items or "--pipeline-windows" in items:
+        return False
+    return os.environ.get("STRATA_BATCH_MTP", "0") in ("", "0")
+
+
+def slot_drafts_run(args: list[Any], slots: int | float | None = 0, split: bool = False) -> bool:
+    """Does a DFlash2 start draft in its request slots too (``--draft dflash2 --batch N``, a drafter per slot)? Yes for 2 or more requests at once, unless ``STRATA_BATCH_DF2=0`` (the way back,
+    as the engine reads it), a layer split (``split`` or ``--layer-split``: its slots draft only where they run as one group, not decided here) or ``--pipeline-windows``."""
+    items = [str(a) for a in args or []]
+    if split or request_count(items, slots) < 2 or "--layer-split" in items or "--pipeline-windows" in items:
+        return False
+    return os.environ.get("STRATA_BATCH_DF2", "") != "0"
 
 
 def mtp_line(reason: str) -> str:
@@ -969,7 +1004,45 @@ def slots_of(args: list[Any], vram_mib: float | None = None) -> int | None:
     return None
 
 
-def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0, named: bool = False, backend: str | None = None) -> bool:
+#: How many requests at once get DFlash2 slot drafts by default (see slot_drafts_by_default). l620, RTX PRO 5000 72 GB, IQ3_S, every expert resident, 32 requests x 3 passes a start
+#: (phaseA-tests/par/RESULTS-PAR-DRAFT.md, blocks 4 and 5), requests per minute: 2 clients: queued on one stream 65.4, slots with no drafts 60.0, MTP slot drafts 68.4, DFlash2 slot drafts 69.1;
+#: 3 clients (two starts each): queued 64.3, slots with no drafts 74.1 / 73.3, DFlash2 slot drafts 73.5 / 74.5 (level, so 3 is not in the list);
+#: 4 clients: queued 64.5, slots with no drafts 82.9, MTP slot drafts 80.6, DFlash2 slot drafts 78.8. From 3 requests on, plain slots stay what a start gets.
+SLOT_DRAFT_REQUESTS = (2,)
+
+
+def request_count(args: list[Any], slots: int | float | None = 0) -> int:
+    """How many requests at once this start serves: ``slots`` (the config's ``parallel``) or the number after ``--batch`` / ``--slots`` / ``--parallel``, whichever is larger; 0 = one at a time."""
+    n = int(slots) if isinstance(slots, (int, float)) and not isinstance(slots, bool) else 0
+    for flag in ("--batch", "--slots", "--parallel"):
+        value = _flag_value(args, flag)
+        if value is not None and value.isdigit():
+            n = max(n, int(value))
+    return n
+
+
+def slot_drafts_by_default(mode: Any, *, backend: str | None, archs: Any = None, vram_mib: float | None = None, args: list[Any] | None = None, slots: int | float | None = 0,
+                           split: bool = False, drafter_here: bool = True) -> bool:
+    """Does Auto start the request slots with DFlash2 slot drafts (``--draft dflash2 --draft-model <pack> --batch N``, one drafter per slot, no MTP layer loaded) instead of the MTP
+    and slots with no drafts? Yes when ALL of these hold, the class that was measured and nothing else: the choice is Auto; the start serves 2 requests at once (SLOT_DRAFT_REQUESTS);
+    one CUDA card of the large-VRAM Blackwell class holding every expert (big_blackwell: sm_120, at least 48 GB, the first CONF_STEPS step; None for several cards and for the Spark's
+    shared memory); no layer split; the DFlash2 drafter is on this computer (``drafter_here``); and the person has not chosen otherwise: no ``--batch-mtp`` or ``--pipeline-windows`` in
+    the arguments, ``STRATA_BATCH_MTP`` not set, ``STRATA_BATCH_DF2=0`` not set (the way back, as the engine reads it). Every other class (AMD, the Spark, Strix, Metal, Arc, several
+    cards, a streaming card) and every other request count keep their rule as it was: the MTP loaded and slots with no drafts, or what the person named. A start that serves one request
+    at a time never comes here."""
+    if normalize(mode) != "auto" or split or not drafter_here:
+        return False
+    items = [str(a) for a in args or []]
+    if any(a in items for a in ("--layer-split", "--batch-mtp", "--pipeline-windows")):
+        return False
+    if os.environ.get("STRATA_BATCH_MTP", "0") not in ("", "0") or os.environ.get("STRATA_BATCH_DF2", "") == "0":
+        return False
+    if request_count(items, slots) not in SLOT_DRAFT_REQUESTS:
+        return False
+    return big_blackwell(backend, archs, vram_mib, slots_of(strip_mtp_flags(strip_draft_flags(items)), vram_mib))
+
+
+def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0, named: bool = False, backend: str | None = None, slot_drafts: bool = False) -> bool:
     """Does this start have something DFlash2 does not run beside: several requests at once (``--batch``, ``--slots``, ``--parallel``; per-slot DFlash2 drafts are on by
     default only for a layer split whose slots run as one group and are opt-in on one card, so the MTP's ``--batch-mtp`` is the measured choice there) or
     ``--pipeline-windows``. A layer split over several cards is NOT in the list any more (owner, 2026-11-02: the 0.1.56 engine runs ``--draft dflash2
@@ -980,9 +1053,11 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0, named: b
     too, and the engine serves them with a drafter per request (``--draft dflash2 --batch N``, the slot drafts); only ``--pipeline-windows`` (the MTP's speculative next window,
     which DFlash2 has no counterpart for) still blocks. Auto never passes ``named``: it keeps the MTP for several requests.
     The Metal engine has no per-request drafters (generate.cpp batch_df2_wanted), so DFlash2 beside request slots there would draft nothing and the person would not know: on
-    Metal (``backend``) the old rule stays and a DFlash2 chosen with several requests is the MTP with the usual reason."""
+    Metal (``backend``) the old rule stays and a DFlash2 chosen with several requests is the MTP with the usual reason.
+
+    ``slot_drafts``: Auto on the class whose slot drafts are the default (slot_drafts_by_default says so; the caller asks it): the same as ``named`` for the request slots."""
     items = [str(a) for a in args or []]
-    if named and str(backend or "").lower() != "metal":
+    if (named or slot_drafts) and str(backend or "").lower() != "metal":
         return "--pipeline-windows" in items
     return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel")))
 
@@ -1314,8 +1389,9 @@ def choice_of(mode: Any, *, model_name: str | None = None, family: str | None = 
 
 def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None,
            backend: str | None = None, archs: Any = None, mtp_here: bool | None = None, blocked: bool = False, vocab_here: bool = True,
-           args: list[Any] | None = None, vram_mib: float | None = None) -> Decision:
-    """The drafter a start uses. Never raises. One drafter, never two. A choice that cannot be applied becomes the other drafter when that one is on this computer,
+           args: list[Any] | None = None, vram_mib: float | None = None, slots_none: bool = False) -> Decision:
+    """The drafter a start uses. Never raises. ``slots_none`` (slots_draft_nothing of the start's arguments and request count; False when the caller cannot know it): the reason for a
+    DFlash2 that is not available here is NONE_IN_SLOTS instead of NOT_HERE, so the plan says what the server says. One drafter, never two. A choice that cannot be applied becomes the other drafter when that one is on this computer,
     else none, with a note in plain words. ``mtp_here`` says whether the MTP layer is on disk (None: not known, taken as there), ``blocked`` that this start is a layer
     split or has several requests at once (see blocked_by), ``vocab_here`` that the draft vocabulary DFlash2 needs is there. ``klass`` is not used any more (Auto
     does not depend on the kind of card) and stays only so the callers keep working."""
@@ -1329,6 +1405,8 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
 
     if want == "dflash2":
         reason = NOT_HERE if (blocked or not vocab_here) else NOT_DOWNLOADED if not drafter_ready(data_dir, model_name, backend) else ""
+        if reason == NOT_HERE and slots_none:
+            reason = NONE_IN_SLOTS
         if not reason:
             return Decision(asked, "dflash2", flags=engine_flags(pack_path(data_dir)))
         return Decision(asked, "mtp", reason) if have_mtp else Decision(asked, "off", NONE_HERE)
@@ -1450,7 +1528,8 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     in ``user_args`` stays. C is 0.35 where the card holds most experts and higher where fewer slots fit (conf_for_slots): from the person's own ``--expert-cache N``,
     else from ``vram_mib``, the memory of the one card (None: several cards, a shared-memory chip, unknown: 0.35). MTP: the arguments without any DFlash2 option.
     ``off``: neither (the draft layer's own switch, ``"mtp": false``). ``slots`` says that this start serves several requests at
-    once: with Auto that is the MTP, said in one line; with DFlash2 chosen by name it is DFlash2 with a drafter per request (blocked_by ``named``; ``split``, a layer
+    once: with Auto that is the MTP, said in one line (except the one class of slot_drafts_by_default: 2 requests on one large Blackwell card holding every expert, where it is
+    DFlash2 with a drafter per request); with DFlash2 chosen by name it is DFlash2 with a drafter per request (blocked_by ``named``; ``split``, a layer
     split over several cards, is ignored: DFlash2 runs on it). A config from before this rule that names both drafters starts with the one chosen.
     `engine` is the engine program that will start (None: not known, the usual flags): an engine that only takes `--mtp DIR` for the vocabulary gets that
     (still without the MTP layer), and an engine without `--draft-fallback` gets no DFlash2 flag at all (the MTP, said in one line)."""
@@ -1485,9 +1564,12 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     mode = cfg.get("drafting")
     if cfg.get("mtp") is False and normalize(mode) == "auto":
         mode = "off"                                          # "Draft layer (MTP)" turned off by the person, and no drafter chosen since: no drafter
+    slot_drafts = slot_drafts_by_default(mode, backend=backend, archs=archs, vram_mib=vram_mib, args=args, slots=slots, split=split,
+                                         drafter_here=vocab is not None and form != FORM_NONE and drafter_ready(data_dir, name, backend))
     decision = decide(mode, model_name=name, family=family, data_dir=data_dir, backend=backend, archs=archs,
-                      mtp_here=mtp_here, blocked=blocked_by(strip_draft_flags(args), split=split, slots=slots, named=normalize(mode) == "dflash2", backend=backend) or form == FORM_NONE, vocab_here=vocab is not None,
-                      args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
+                      mtp_here=mtp_here, blocked=blocked_by(strip_draft_flags(args), split=split, slots=slots, named=normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts) or form == FORM_NONE,
+                      vocab_here=vocab is not None, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib,
+                      slots_none=slots_draft_nothing(args, slots))     # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
     mine = cfg.get("user_args") or []
     pack = None
     if decision.drafter == "dflash2":

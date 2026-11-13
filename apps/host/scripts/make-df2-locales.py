@@ -220,6 +220,16 @@ add("DFlash2 is off by default on this graphics card for now; choose it in Draft
     "O DFlash2 está desligado por predefinição nesta placa de vídeo por agora; escolha-o em Previsão para o usar.",
     "현재 이 그래픽 카드에서는 DFlash2가 기본적으로 꺼져 있습니다. 사용하려면 ‘초안 예측’에서 선택하세요.",
     "DFlash2 est désactivé par défaut sur cette carte graphique pour le moment ; choisissez-le dans Anticipation pour l'utiliser.")
+# strata_control/drafting.py NONE_IN_SLOTS after "Drafting: ": request slots with no --batch-mtp draft nothing (the line is printed whole, not inside "MTP (...)")
+add("Drafting: none in parallel slots (one token per request and step); a single request still drafts",
+    "预测草稿：并行槽位中没有（每个请求每一步一个词元）；单个请求仍会预测草稿",
+    "先読み：並列の枠ではなし（リクエストごと、ステップごとに 1 トークン）；リクエストが 1 件だけのときは先読みします",
+    "Vorausraten: keines in parallelen Plätzen (ein Token pro Anfrage und Schritt); eine einzelne Anfrage rät weiterhin voraus",
+    "Predicción: ninguna en cupos paralelos (un token por solicitud y paso); una sola solicitud sigue prediciendo",
+    "Предсказание: нет в параллельных слотах (один токен на запрос за шаг); один запрос по-прежнему предсказывает",
+    "Previsão: nenhuma em vagas paralelas (um token por pedido e por passo); um único pedido ainda faz previsão",
+    "초안 예측: 병렬 슬롯에서는 없음(요청당 한 단계에 토큰 하나); 요청이 하나뿐이면 초안 예측을 합니다",
+    "Anticipation : aucune dans les emplacements parallèles (un token par requête et par étape) ; une requête unique anticipe toujours")
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
 NBSP = " "
 

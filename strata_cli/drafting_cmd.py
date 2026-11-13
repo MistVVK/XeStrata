@@ -123,9 +123,15 @@ def _inputs(a) -> dict:
     elif drafting.normalize(mode) in ("auto", "mtp") and not getattr(a, "no_split", False) and _split_expected({**cfg, "drafting": mode}, args, bool(getattr(a, "engines_unloading", False))):
         a._split = True                                      # the plan says so (the app's Models screen and its load read it); asked with the choice in hand, as the Terminal does
         mode = "mtp"                                         # the all-cards split engine runs the MTP draft layer: the app fetches that, not DFlash2's drafter
+    parallel = cfg.get("parallel") if isinstance(cfg.get("parallel"), int) else 0
+    slot_drafts = False
+    if str(backend or "").lower() == "cuda" and drafting.request_count(args, parallel) in drafting.SLOT_DRAFT_REQUESTS:     # (the card is only read for a start that could be in the class)
+        sig = _signals(a, {"backend": backend, "archs": archs})
+        slot_drafts = drafting.slot_drafts_by_default(mode, backend=backend, archs=archs, vram_mib=sig.get("vram_mib"), args=sig.get("args"), slots=parallel)   # the drafter is fetched before the start
     return {"mode": mode, "klass": drafting.card_class(archs), "model_name": model_name, "family": a.family, "data_dir": data,
             "backend": backend, "archs": archs, "mtp_here": drafting.mtp_ready(args) if cfg else None,
-            "blocked": drafting.blocked_by(args, slots=cfg.get("parallel") if isinstance(cfg.get("parallel"), int) else 0, named=drafting.normalize(mode) == "dflash2", backend=backend)}
+            "blocked": drafting.blocked_by(args, slots=parallel, named=drafting.normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts),
+            "slots_none": drafting.slots_draft_nothing(drafting.merged_args(cfg), parallel)}      # (False when the request count is not in the config: today's line)
 
 
 def _signals(a, want: dict) -> dict:

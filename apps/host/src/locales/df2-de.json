@@ -20,5 +20,6 @@
  "df19": "Die Alle-Karten-Split-Engine konnte nicht starten, deshalb läuft die normale Schichtaufteilung.",
  "df20": "Vorausraten: aus (den Karten fehlte Speicher)",
  "df21": "Auf Ihrem Mac war DFlash2 bei diesem Modell in unseren Tests schneller als MTP.",
- "df22": "DFlash2 ist auf dieser Grafikkarte vorerst standardmäßig aus; wählen Sie es unter „Vorausraten“ aus, um es zu nutzen."
+ "df22": "DFlash2 ist auf dieser Grafikkarte vorerst standardmäßig aus; wählen Sie es unter „Vorausraten“ aus, um es zu nutzen.",
+ "df23": "Vorausraten: keines in parallelen Plätzen (ein Token pro Anfrage und Schritt); eine einzelne Anfrage rät weiterhin voraus"
 }
