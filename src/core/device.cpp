@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+#include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
@@ -1088,9 +1089,28 @@ uint64_t unreported_vram_margin(const std::string& pci, uint64_t total) {
 }
 
 uint64_t max_alloc_bytes() {
-    const uint64_t dev = Runtime::get().device().get_info<sycl::info::device::max_mem_alloc_size>();
-    const uint64_t lim = max_alloc_limit_bytes();
-    return lim != 0 && lim < dev ? lim : dev;
+    static const uint64_t v = [] {
+        const uint64_t dev = Runtime::get().device().get_info<sycl::info::device::max_mem_alloc_size>();
+        const uint64_t lim = max_alloc_limit_bytes();
+        const uint64_t claim = lim != 0 && lim < dev ? lim : dev;
+        // HIP's adapter can report a largest allocation far below what the device gives: 32 MiB for a gfx1151 that
+        // hands out 24 GiB in one call (Strix Halo, 2026-11-13).  A claim that small splits the expert tier into
+        // pieces too small for the prompt path to borrow its chunk across (74 MiB for 16 tokens), so it is measured:
+        // allocations twice the claim up to 1 GiB, the largest that succeeds.  Where the claim is the device's
+        // limit the first try fails and the claim stands; the tier's own allocation is what reports a refusal, and
+        // its pieces fallback covers that.
+        const uint64_t total = Runtime::get().device().get_info<sycl::info::device::global_mem_size>();
+        if (claim >= (1ull << 30) || total < (8ull << 30)) return claim;
+        uint64_t good = claim;
+        for (uint64_t want = claim * 2; want <= (1ull << 30); want *= 2) {
+            void* p = strata::gpu::alloc_device((size_t) want);
+            if (p == nullptr) break;
+            strata::gpu::free(p);
+            good = want;
+        }
+        return good;
+    }();
+    return v;
 }
 
 DeviceInfo device_info(int ordinal) {
