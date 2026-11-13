@@ -203,7 +203,10 @@ std::vector<std::string>& own_only_switches() {
 const bool g_own_only_defaults = [] {
     strata::kernels::native_expert_i8_set_mmq_free();   // the int8 expert kernels are the default prompt-expert kernels here (i8_expert_rule.hpp, i8_switch_effective)
 #if defined(STRATA_USE_HIP) || defined(__HIPCC__)
-    static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_KQ"};
+    // (gfx12 only: every one of these is read behind the device's own gfx12 check, moe_fused_iq.cu q8d_hip_requested .. q6k_hip_requested, so a gfx11
+    // card keeps the rules it has: its layers of those formats take the FP16 path here as before)
+    static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_Q8D", "STRATA_PF_FUSED_Q8GU",
+                                      "STRATA_PF_FUSED_Q6K", "STRATA_PF_FUSED_KQ", "STRATA_PF_FUSED_TQ"};
 #else
     // (not STRATA_PF_FUSED_Q2N: the GGUF Q2_0 / Q2_0 pair on sm_80+ misses its worst-row bound against MMQ at 20K / 32K tokens on sm_86,
     // not explained yet; those layers take the FP16 path here unless the user sets it)
