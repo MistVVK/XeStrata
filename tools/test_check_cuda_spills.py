@@ -67,6 +67,19 @@ class Classification(unittest.TestCase):
         self.assertEqual(rc, 1)                            # one allowance lowered: the same object now fails
         self.assertIn("over its allowance STACK 16 LOCAL 0", out)
 
+    def test_sm_89_has_the_allowance_of_the_same_kernels_as_sm_86(self):
+        # Ada runs the same device code as Ampere: every kernel the table lists for sm_86 that sm_89 also builds has the same stack there
+        key = "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel"
+        self.assertEqual(CS.ALLOWED[key]["sm_89"], CS.ALLOWED[key]["sm_86"])
+        mangled = "_ZN6strata7kernels12_GLOBAL__N_113rope_table_kernelEPKiifPf"
+        demangled = "strata::kernels::(anonymous namespace)::rope_table_kernel(int const*, int, float, float*)"
+        rows = [("dflash2.cu.o", "sm_89", mangled, {"REG": 16, "STACK": 32, "LOCAL": 0})]
+        rc, out = quiet(CS.check, "x.a", rows, {mangled: demangled})
+        self.assertEqual(rc, 0, out)
+        rows = [("dflash2.cu.o", "sm_89", mangled, {"REG": 16, "STACK": 40, "LOCAL": 0})]
+        rc, out = quiet(CS.check, "x.a", rows, {mangled: demangled})
+        self.assertEqual(rc, 1)                            # growth on sm_89 still fails
+
     def test_a_vendored_ggml_kernel_is_skipped_and_counted(self):
         rows = [("mmq.cu.o", "sm_86", "_Z9mul_mat_qILi2ELi8EEvPKvS1_PfRiiiiii", {"REG": 128, "STACK": 64})]
         rc, out = quiet(CS.check, "x.a", rows, {rows[0][2]: "void mul_mat_q<2, 8>(void const*, void const*, float*, int&, int, int, int, int, int)"})

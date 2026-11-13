@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,14 @@ static std::string join(const std::vector<int>& v) {
 }
 
 int main() {
+    // On a machine with two NUMA nodes (a two-socket CPU, or a container on one) the pool splits itself over both nodes by
+    // default and takes cores from each, so its workers no longer follow the topology's order: this test is about that
+    // order, so the split is switched off here (pool_tasks_test covers the split).
+#if defined(_WIN32)
+    _putenv_s("STRATA_NUMA_POOL", "0");
+#else
+    setenv("STRATA_NUMA_POOL", "0", 1);
+#endif
     const std::vector<cpu::LogicalCpuInfo> layout = cpu::logical_cpu_layout();
     std::printf("pool_cores_test: %zu logical processors\n", layout.size());
     expect(!layout.empty(), "the system names its logical processors");

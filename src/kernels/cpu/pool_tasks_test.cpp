@@ -355,7 +355,11 @@ int main(int argc, char** argv) {
                 const std::vector<int> a_cores = a.worker_cores();
                 const int a_workers = a.workers();
                 unset_env("STRATA_TEST_SYSFS_ROOT");
+                // the real machine may have two NUMA nodes (a two-socket CPU, a container on one): then the automatic split
+                // runs and gives the pool the cores of both nodes, which is not what this comparison is about
+                put_env("STRATA_NUMA_POOL", "0");
                 cpu::ExpertPool b(0, true, true);
+                unset_env("STRATA_NUMA_POOL");
                 if (a_workers != b.workers() || a_cores != b.worker_cores()) {
                     std::fprintf(stderr, "a one-node fake machine changed the pool's workers or cores\n");
                     return 1;
