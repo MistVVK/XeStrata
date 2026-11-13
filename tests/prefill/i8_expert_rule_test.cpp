@@ -71,13 +71,13 @@ int main() {
     CHECK(i8_fewrows_limit("yes", 10) == 10);
     CHECK(i8_fewrows_limit("-3", 8) == 8);
     CHECK(i8_fewrows_limit("99999999999", 10) > 100000);   // a huge number does not wrap to a small one
-    // the class default: the P100 (6.0) 8, every other card 10 (6.1, 7.0, 7.5, 8.6, 12.0, a HIP card with no capability at all)
-    CHECK(i8_fewrows_class_default(6, 0) == 8);
-    CHECK(i8_fewrows_class_default(6, 1) == 10);
-    CHECK(i8_fewrows_class_default(7, 0) == 10);
-    CHECK(i8_fewrows_class_default(8, 6) == 10);
-    CHECK(i8_fewrows_class_default(12, 0) == 10);
-    CHECK(i8_fewrows_class_default(0, 0) == 10);
+    // the class default: the P100 (6.0) 6, every other card 7 (6.1, 7.0, 7.5, 8.6, 12.0, a HIP card with no capability at all)
+    CHECK(i8_fewrows_class_default(6, 0) == 6);
+    CHECK(i8_fewrows_class_default(6, 1) == 7);
+    CHECK(i8_fewrows_class_default(7, 0) == 7);
+    CHECK(i8_fewrows_class_default(8, 6) == 7);
+    CHECK(i8_fewrows_class_default(12, 0) == 7);
+    CHECK(i8_fewrows_class_default(0, 0) == 7);
     // the decision: rows strictly under limit x experts go to the grouped kernels (512 experts: 5,119 rows is under 10 per expert, 5,120 is 10)
     CHECK(i8_fewrows_takes(10, 5119, 512));
     CHECK(!i8_fewrows_takes(10, 5120, 512));
@@ -88,6 +88,21 @@ int main() {
     CHECK(!i8_fewrows_takes(0, 100, 512));       // the route is off
     CHECK(!i8_fewrows_takes(10, 100, 0));        // no experts: nothing to decide
     CHECK(!i8_fewrows_takes(-1, 100, 512));
+    // the 8-entry slices: not set (-1) = tile 2 only, 1 = tiles 2-4, 0 = none; tile 8 (the 128-entry kernel) never has them
+    CHECK(i8_n8_takes(-1, 2));
+    CHECK(!i8_n8_takes(-1, 3));
+    CHECK(!i8_n8_takes(-1, 4));
+    CHECK(!i8_n8_takes(-1, 8));
+    CHECK(i8_n8_takes(1, 2));
+    CHECK(i8_n8_takes(1, 3));
+    CHECK(i8_n8_takes(1, 4));
+    CHECK(!i8_n8_takes(1, 8));
+    CHECK(!i8_n8_takes(0, 2));
+    CHECK(!i8_n8_takes(0, 4));
+    CHECK(i8_n8_takes(i8_switch_parse(nullptr), 2));
+    CHECK(i8_n8_takes(i8_switch_parse(""), 2));
+    CHECK(!i8_n8_takes(i8_switch_parse("0"), 2));
+    CHECK(i8_n8_takes(i8_switch_parse("1"), 4));
     if (failed) {
         std::fprintf(stderr, "i8_expert_rule_test: %d check(s) failed\n", failed);
         return 1;

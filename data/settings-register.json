@@ -12749,7 +12749,7 @@
    "last_date": null,
    "status": "research",
    "owner": "kernels",
-   "note": "Research: the few-rows route of STRATA_EXPERT_I8's prompt path: a layer whose experts average fewer routed rows than the limit runs on the grouped kernels instead of the int8 kernel. Not set: 8 on a Tesla P100, 10 elsewhere. 0: off (the int8 kernel keeps its 256-entry floor). N: a limit of N rows per expert.",
+   "note": "Research: the few-rows route of STRATA_EXPERT_I8's prompt path: a layer whose experts average fewer routed rows than the limit runs on the grouped kernels instead of the int8 kernel. Not set: 6 on a Tesla P100, 7 elsewhere (8 and 10 with STRATA_I8_N8=0). 0: off (the int8 kernel keeps its 256-entry floor). N: a limit of N rows per expert.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -12855,6 +12855,47 @@
    "status": "opt-in",
    "owner": "sycl/prefill",
    "note": "[auto] documented for users (docs/INTEL_INT8_EXPERTS.md:26)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8_N8",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6354,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [
+    {
+     "file": "src/kernels/native_i8_parity.cpp",
+     "line": 246
+    },
+    {
+     "file": "src/kernels/native_i8_parity.cpp",
+     "line": 255
+    },
+    {
+     "file": "src/kernels/native_i8_parity.cpp",
+     "line": 257
+    }
+   ],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "kernels",
+   "note": "The 8-entry slices of the tile-2..4 int8 expert kernel (STRATA_EXPERT_I8's prompt path; two weight rows and one entry of each 8-entry slice per thread; output bit-identical). Not set: on for tile 2 (up to about 1,950 tokens at Flash-Next's shape), off for tiles 3 and above. 1: tiles 2 to 4. 0: off.",
    "retire_after": "",
    "retired_in": ""
   },

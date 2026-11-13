@@ -532,7 +532,7 @@ __device__ __forceinline__ int i8_row_t(const uint4 (&w)[2], const uint4& rc, co
     }
 }
 
-// NR = research variant "N8" (STRATA_I8_N8=1): the entry slices are 8 entries wide instead of 16.  A thread owns 2 weight rows (the row pair `half` = ty / 8:
+// NR = variant "N8" (tile 2 by default, STRATA_I8_N8=1 for tiles 2-4, 0 for none; i8_n8_takes): the entry slices are 8 entries wide instead of 16.  A thread owns 2 weight rows (the row pair `half` = ty / 8:
 // rows tx + 16 (2 half + i2)) and one entry of each 8-entry slice (entry ty % 8 + 8 js), so a block with 6 entries runs one slice with all 256 threads busy
 // where the 16-entry slice left 10 of 16 entry rows computing nothing.  Every (row, entry) accumulates the same terms in the same order: bit-identical output.
 // The gate/up epilogue needs the gate (row pair 0) and up (row pair 1) values of one entry together: the up half hands them over through shared memory.
@@ -1103,7 +1103,7 @@ struct I8Args {
     NativeExpertLayout L;
     int64_t tiles_ub;
     int bisect;
-    bool n8 = false;     // research, tile codes 2-4: 8-entry slices with two weight rows per thread (see i8_kernel, NR)
+    bool n8 = false;     // tile codes 2-4: 8-entry slices with two weight rows per thread (see i8_kernel, NR)
 };
 
 // what the last native_expert_i8 call asked its two launches for (the tile code, the dynamic shared memory in bytes passed as the launch's third argument, and
@@ -1130,7 +1130,7 @@ void i8_launch_tm(const I8Args& a, cudaStream_t s) {
     }
 #endif
     const dim3 grid((unsigned) a.tiles_ub, (unsigned) (GU ? a.L.n_ff / 32 : a.L.n_embd / 64));
-    if (a.n8) {   // research: 8-entry slices (STRATA_I8_N8=1)
+    if (a.n8) {   // 8-entry slices (i8_n8_takes)
         if constexpr (GU)
             i8_kernel<T, true, TM, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
         else

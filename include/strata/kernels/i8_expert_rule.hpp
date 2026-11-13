@@ -42,11 +42,11 @@ inline bool i8_expert_takes(int state, const char* gcn, int64_t group_entries, b
 
 // The few-rows route.  A layer whose experts average fewer routed rows than a crossing runs on the grouped kernels (native_expert_grouped, no shared-memory
 // staging: one launch pair per 16 experts like the int8 kernel's, the q8_1 image of the rows made by quantize_q8_1_rows); from the crossing up it runs on the
-// int8 kernel.  Measured on one MoE layer of Flash-Next's shape (average rows per expert where both take equal time): Tesla P100 (sm_60) 8.4, A4000 10.2 - 11.7,
-// RX 6700 XT 10.2 - 10.8, R9700 11.7 (par/RESULTS-I8-RESEARCH.md); the limits below are a little under them, so the int8 side never loses more than 5 %.
+// int8 kernel.  Measured on one MoE layer of Flash-Next's shape (average rows per expert where both take equal time), WITHOUT the 8-entry slices (N8): Tesla P100 (sm_60) 8.4, A4000 10.2 - 11.7,
+// RX 6700 XT 10.2 - 10.8, R9700 11.7 (par/RESULTS-I8-RESEARCH.md); WITH them (STRATA_I8_N8, on by default in this range, see i8_n8_takes) P100 5.7 - 5.8, A4000 6.9 - 7.4, R9700 6.9 - 7.4 (par/RESULTS-I8-MMQOFF.md).  The limits below are the crossings with N8; the int8 side never loses more than 5 %.
 // Without the route the int8 kernel keeps the size floor above (256 entries per group of 16 experts = 16 rows per expert) and the layers under it stay on today's path.
-inline constexpr int kI8FewRowsDefault = 10;   ///< every card but the Tesla P100
-inline constexpr int kI8FewRowsSm60 = 8;       ///< compute capability 6.0 (the P100): its crossing is lower
+inline constexpr int kI8FewRowsDefault = 7;    ///< every card but the Tesla P100 (10 with STRATA_I8_N8=0)
+inline constexpr int kI8FewRowsSm60 = 6;       ///< compute capability 6.0 (the P100): its crossing is lower (8 with STRATA_I8_N8=0)
 
 /// STRATA_I8_FEWROWS read as the limit: not set (or empty, or text that is no number) = the card class's own `class_default`, 0 = no route, N = a limit of N rows per expert.
 inline int i8_fewrows_limit(const char* text, int class_default) {
@@ -60,10 +60,20 @@ inline int i8_fewrows_limit(const char* text, int class_default) {
     return (int) v;
 }
 
-/// The class's default limit: the P100 (compute capability 6.0) 8, every other card 10.
+/// The class's default limit: the P100 (compute capability 6.0) 6, every other card 7.
 inline int i8_fewrows_class_default(int cc_major, int cc_minor) { return cc_major == 6 && cc_minor == 0 ? kI8FewRowsSm60 : kI8FewRowsDefault; }
 
 /// Does a layer with `rows` routed rows over `experts` experts (those with at least one row) take the grouped kernels?  limit 0 = the route is off.
 inline bool i8_fewrows_takes(int limit, int64_t rows, int64_t experts) { return limit > 0 && experts > 0 && rows < (int64_t) limit * experts; }
+
+// The 8-entry slices of the tile-2..4 int8 kernel (N8: two weight rows and one entry of each 8-entry slice per thread; bit-identical output).  Measured on the A4000, the P100 and
+// the R9700 (par/RESULTS-I8-MMQOFF.md, I8 column of the expert-paths bench, Flash-Next's shape, IQ2_XXS / Q2_0 and IQ3_S / IQ4_NL): tile 2 (up to 39 entries per expert on average, about
+// 1,950 tokens) 23 - 33 % faster at 100 - 300 tokens, 12 - 17 % at 1,000 and 6 - 13 % at 1,500 on all three; tile 3 (2,048 tokens) 3 - 6 % faster on the A4000 and the P100 but
+// 1.6 - 2.9 % SLOWER on the R9700.  So the default is tile 2 only; STRATA_I8_N8=1 asks for tiles 2 - 4, STRATA_I8_N8=0 for none.
+/// STRATA_I8_N8 read as a state (1 / 0 / -1 not set), the tile code the call settled on (2, 3, 4 = rows of 16 entries per thread; 8 = the 128-entry kernel, which has no 8-entry form).
+inline bool i8_n8_takes(int state, int tile) {
+    if (state == 0) return false;
+    return state == 1 ? tile >= 2 && tile <= 4 : tile == 2;
+}
 
 }  // namespace strata::kernels
