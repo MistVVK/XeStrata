@@ -48,6 +48,12 @@
 #endif
 #define QCH 64
 
+// Saturating fp16 store for the direct-half K/V cache (--kv fp16).  A value outside fp16's range becomes +/-inf in
+// the cell, and the attention below multiplies every cell's V by a weight that is exactly 0 for a cell far below the
+// row's max (p = exp(s - m) underflows to 0.0f), so the cache could form inf * 0 = NaN - the same poison #879 fixed
+// on the expert activations, one buffer over.  Saturating keeps a wrong-but-finite value, which cannot poison.
+static inline half hsat(float v) { return half(clamp(v, -65504.0f, 65504.0f)); }
+
 #ifndef STRATA_XH16_DECL
 #define STRATA_XH16_DECL
 // STRATA_METAL_F16 (function constant 25): the window's x also as half planes, after the float planes and S16:
@@ -280,7 +286,7 @@ kernel void qsa_prep_fp16(device const float* qfull [[buffer(0)]], device const 
         float x = (isv ? vcur : kcur)[(t * QKV + h) * QD + tid];
         if (!isv) x = norm_rope(x, 0.0f, kn, row, part, tid, sg, lane, QD, a.eps, cs, absp, true, mt);
         const uint rowi = cell * QKV + uint(h);
-        (isv ? vqr : kqr)[rowi * QD + tid] = half(x);   // no quantization: the raw half is the cache
+        (isv ? vqr : kqr)[rowi * QD + tid] = hsat(x);   // no quantization: the raw half is the cache (saturated, see hsat)
     } else {
         const int h = r - QH - 2 * QKV;
         const float x = tid < ID ? iqraw[(t * IH + h) * ID + tid] : 0.0f;
@@ -547,6 +553,10 @@ kernel void qsa_attn_fp16(device const float* qcur [[buffer(0)]], device const h
     for (int c = 0; c < nc; ++c) {
         const uint rowi = uint(cid[c]) * QKV + uint(g);
         const float v = float(vq[rowi * QD + tid]);   // thread = dim j: the row's half at [j]
+        // A cell the store above could not keep finite (a cache written by an older build, a corrupted byte) has
+        // nothing to add: dropping the term keeps the request alive with one cell's contribution missing instead of
+        // turning the whole row into a NaN through inf * 0.  Finite cells are unaffected, bit for bit.
+        if (!isfinite(v)) continue;
         for (int h = 0; h < HPG; ++h) acc[h] = fma(s[h][c], v, acc[h]);
     }
     for (int h = 0; h < HPG; ++h) {
