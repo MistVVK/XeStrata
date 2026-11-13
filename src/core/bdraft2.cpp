@@ -230,6 +230,12 @@ void Bdraft2Weights::block(const float* anchor_embedding, const float* mask_embe
     select(w.final, B - 1, anchor, w.hp, w.ids, w.scores, out, probabilities, stream);
 }
 
+bool Bdraft2Weights::release_shead(std::string& err) {
+    if (uses_shead()) { err = "bdraft2: cannot release the selected SHEAD"; return false; }
+    head_.release();
+    return true;
+}
+
 void Bdraft2Weights::top512(const float* h, int rows, int32_t* ids, float* values, void* stream) {
     head_.top512(h, rows, ids, values, stream);
 }
