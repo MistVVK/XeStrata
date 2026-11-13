@@ -39,7 +39,6 @@ PERMISSIVE = ("Niko1221 and the Strata contributors", "The ggml authors", "Debia
 # the same for the projects under another permissive license: a copyright holder's words -> its license
 PERMISSIVE_OTHER = {"contributors to the vLLM-Omni project": "Apache-2.0", "The HuggingFace Inc. team": "Apache-2.0",
                     "SageAttention team": "Apache-2.0", "(comfy-kitchen)": "Apache-2.0",
-                    "the YASAKANI authors": "Apache-2.0",
                     "the comfyui_controlnet_aux contributors": "Apache-2.0",
                     "the ComfyUI-SeedVR2_VideoUpscaler contributors": "Apache-2.0",
                     "Secret Labs AB": "MIT-CMU", "Fredrik Lundh and contributors": "MIT-CMU",
