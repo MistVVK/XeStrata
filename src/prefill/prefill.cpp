@@ -1430,6 +1430,26 @@ bool Prefill::carve(size_t T, void* alloc) {
         // GU, H and Hq: one group's rows where every layer takes the int8 products (mmq_group_rows_cap); the chunk's
         // where some layer's FP16 products write GU by the chunk's rows
         const size_t GR = mp.any && !mp.fallback ? (size_t) mmq_group_rows_cap(T) : T * K;
+        // XESTRATA_MMQ_GROUP_CAP: once per chunk layout, say that the int8 group scratch took effect (the rows it
+        // holds), and once why it is ignored where the layout cannot use it
+        if (!o.count_only) {
+            static int64_t said_chunk = -1;
+            static bool said_ignored = false;
+            const bool mmq_only = mp.any && !mp.fallback;
+            const char* v = strata::env_get("MMQ_GROUP_CAP");
+            const bool forced = v != nullptr && std::strtol(v, nullptr, 10) != 0;
+            if (mmq_only && (int64_t) GR < (int64_t) T * K && (int64_t) T != said_chunk) {
+                said_chunk = (int64_t) T;
+                std::fprintf(stderr, "xestrata prefill: chunk %zu tokens: the int8 group scratch holds one group's rows "
+                                     "(%zu of %zu; XESTRATA_MMQ_GROUP_CAP)\n", T, GR, T * K);
+            }
+            if (forced && !mmq_only && !said_ignored) {
+                said_ignored = true;
+                std::fprintf(stderr, "xestrata prefill: XESTRATA_MMQ_GROUP_CAP=1 is ignored: %s\n",
+                             !mp.any ? "the prompt path runs the FP16 path here, not the int8 products"
+                                     : "a layer takes the FP16 fallback");
+            }
+        }
         m.GU = c.take<float>(GR * 1280, ok);
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
