@@ -3972,15 +3972,21 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
     if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {
         const uint64_t need = want + (uint64_t) blob;
+        // upstream 4adc047d: under a HARD limit the arena also needs its headroom.  The arena is pinned and never given
+        // back, and the engine's own memory (buffers, the head, the PLE rows) comes on top of it, so a limit just above
+        // the arena was killed while loading (cgroup OOM; upstream found 49 GiB against a 46.84 GiB arena).  The headroom
+        // is the one the RAM copy keeps free beside it (4 GiB, raised to --ram-reserve-mib when that is larger).
+        const uint64_t headroom = detail::ram_headroom(4ull << 30);
+        const uint64_t limit_need = need > UINT64_MAX - headroom ? UINT64_MAX : need + headroom;
         const double gib = 1073741824.0;
         char buf[512];
-        if (hm.cgroup_limit < need) {
+        if (hm.cgroup_limit < limit_need) {
             std::snprintf(buf, sizeof buf,
-                          "ArenaExpertSource: the expert arena needs %.2f GiB of RAM but this process's memory limit "
-                          "(cgroup memory.max / memory.limit_in_bytes) is %.2f GiB: it would be killed while loading. "
-                          "Raise the container's limit, or run with less RAM: --mmap-experts with "
-                          "--resident-budget-gib N keeps only the hottest experts in RAM",
-                          (double) need / gib, (double) hm.cgroup_limit / gib);
+                          "ArenaExpertSource: the expert arena needs %.2f GiB of RAM and the engine's own memory about "
+                          "%.2f GiB more, but this process's memory limit (cgroup memory.max / memory.limit_in_bytes) is "
+                          "%.2f GiB: it would be killed while loading. Raise the container's limit, or run with less "
+                          "RAM: --mmap-experts with --resident-budget-gib N keeps only the hottest experts in RAM",
+                          (double) need / gib, (double) headroom / gib, (double) hm.cgroup_limit / gib);
             err = buf;
             return false;
         }
