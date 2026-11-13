@@ -150,26 +150,15 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         }
     }
     // XESTRATA_COPY_PRIO: the PCIe share's copies on a stream of high priority (upstream 728097fb6, opt-in there).
-    // Auto (the default) runs both forms over the first windows that have copies and keeps the faster window time
-    // (auto_pick.hpp); 0 and 1 fix it, and a window the copy kernel stages (--pcie-mode kernel) has no copies here.
+    // Auto (the default) is off: the RX 9060 XT's forced A/B (`--pcie-mode dma`, Qwen3.8, 32K) read 37.4 against 38.9
+    // tok/s for it, inside the machine's 14% run-to-run spread (2026-11-13), so the window it was measured by does not
+    // carry the decision; 1 turns it on.  A window the copy kernel stages (--pcie-mode kernel) has no copies here.
     {
         const strata::core::Pick prio = strata::core::pick_from_env("COPY_PRIO");
-        copies_[0] = strata::gpu::stream_create(false);
-        if (prio != strata::core::Pick::Off) copies_[1] = strata::gpu::stream_create(true);
-        if (copies_[0] == nullptr) { err = "moe window: copy stream create failed"; return false; }
-        if (prio == strata::core::Pick::On && copies_[1] == nullptr) {
-            err = "moe window: the copy stream at high priority could not be made";
-            return false;
-        }
-        if (prio == strata::core::Pick::Auto && copies_[1] == nullptr)
-            std::fprintf(stderr, "xestrata moe window: XESTRATA_COPY_PRIO: no stream at high priority on this device: "
-                                 "off\n");
-        else if (prio == strata::core::Pick::Auto) {
-            copy_auto_ = true;
-            copy_choice_ = strata::core::WindowChoice("xestrata moe window", "COPY_PRIO",
-                                                      "the PCIe share's copies on a stream of high priority");
-        }
-        copy_ = copies_[prio == strata::core::Pick::On ? 1 : 0];
+        const bool high = prio == strata::core::Pick::On;
+        copies_[high ? 1 : 0] = strata::gpu::stream_create(high);
+        if (copies_[high ? 1 : 0] == nullptr) { err = "moe window: copy stream create failed"; return false; }
+        copy_ = copies_[high ? 1 : 0];
     }
     strata::gpu::Stream probe = strata::gpu::stream_create();
     if (!probe) { err = "moe window: stream create failed"; return false; }
@@ -232,16 +221,8 @@ void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t by
     MoeWindow* w = (MoeWindow*) ctx;
     const uint32_t want = w->cur_ring_;
     if (n <= 0) { w->raise_flag_b_ordered(want); return; }   // an empty plan stays behind the copies already queued
-    if (w->copy_window_ && !w->copy_used_) {   // the window's form (auto): the previous window's copies have landed
-        w->copy_ = w->copies_[w->copy_choice_.on() ? 1 : 0];
-        w->copy_window_ = false;
-    }
     uint8_t* stage = (uint8_t*) w->sink_.staging;   // this group's half in a split window
     for (int i = 0; i < n; ++i) strata::gpu::copy_async(stage + (size_t) i * bytes, src[i], bytes, w->copy_);
-    if (!w->copy_used_ && !w->copy_timed_) {
-        w->copy_t0_ = Clock::now();
-        w->copy_timed_ = true;
-    }
     w->copy_used_ = true;
     FlagSet& fs = w->flag_sets_[want % (sizeof w->flag_sets_ / sizeof w->flag_sets_[0])];
     fs.flag = w->h_flagB_;
@@ -442,8 +423,6 @@ void MoeWindow::combine(int grp, int tb, int n, const float* w, const float* sha
 // ---------------------------------------------------------------- the host
 
 void MoeWindow::reset() {
-    copy_window_ = copy_auto_;   // the window's form, chosen where both streams are there
-    copy_timed_ = false;
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
@@ -510,7 +489,6 @@ bool MoeWindow::next_segment(uint32_t want, strata::gpu::Graph* next, strata::gp
                              int64_t layer, std::string& err) {
     const bool synced = strata::gpu::stream_sync(copy_);
     if (synced) copy_used_ = false;   // drained: everything queued on copy_ has landed
-    copy_timed_ = false;              // a segmented window's copies end here, not at sync_copies
     if (!synced || *(volatile uint32_t*) h_flagB_ < want) {
         err = std::string(who) + ": the PCIe share of layer " + std::to_string(layer) + " did not land";
         return false;
@@ -532,16 +510,11 @@ void MoeWindow::release(strata::gpu::Stream cs) {
     strata::gpu::stream_sync(cs);
     strata::gpu::stream_sync(copy_);
     copy_used_ = false;
-    copy_timed_ = false;
 }
 
 bool MoeWindow::sync_copies() {
     const bool ok = strata::gpu::stream_sync(copy_);
     if (ok) copy_used_ = false;
-    if (copy_timed_) {
-        if (ok) copy_choice_.took(std::chrono::duration<double, std::milli>(Clock::now() - copy_t0_).count(), 1);
-        copy_timed_ = false;
-    }
     return ok;
 }
 

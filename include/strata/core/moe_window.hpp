@@ -172,15 +172,9 @@ private:
     MoeWindowTier tier_;
     bool segmented_ = false;
     const std::vector<strata::gpu::Graph*>* segs_ = nullptr;
-    // the PCIe share's copies (a DMA: --pcie-mode dma): the stream of the priority XESTRATA_COPY_PRIO chose, and the
-    // window's choice between the two while it is auto (auto_pick.hpp)
+    // the PCIe share's copies (a DMA: --pcie-mode dma): XESTRATA_COPY_PRIO's stream (a high-priority one or not)
     strata::gpu::Stream copies_[2] = {nullptr, nullptr};   ///< 0 the normal priority, 1 high
     strata::gpu::Stream copy_ = nullptr;                   ///< copies_[the chosen one] (the stream in use)
-    WindowChoice copy_choice_;
-    bool copy_auto_ = false;               ///< both streams exist and the first windows choose between them
-    bool copy_window_ = false;             ///< this window's form is still to be taken
-    std::chrono::steady_clock::time_point copy_t0_;   ///< the window's first copy queued
-    bool copy_timed_ = false;
     bool copy_used_ = false;               ///< copies queued on copy_ since it was last drained
     uint32_t cur_ring_ = 0;
 
