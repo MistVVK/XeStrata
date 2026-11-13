@@ -5890,7 +5890,7 @@ def kv_streaming_ram_gb(ctx, kv) -> float:
 def kv_streaming_wanted(model, ctx, kv, ram) -> bool:
     """Does setup stream this model's KV cache on this PC (--kv-resident): from 64K up, when the RAM holds the cache
     beside the model's experts (+1 GB).  The merges' and the release's measurements ask it too (tools/bench_core.py)."""
-    return ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_streaming_ram_gb(ctx, kv) + 1
+    return ctx >= 65536 and ram >= MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB + kv_streaming_ram_gb(ctx, kv) + 1
 
 
 #: The draft layer (MTP) takes about 1 GB of graphics memory out of the expert cache (upstream 671f4573d): its files
