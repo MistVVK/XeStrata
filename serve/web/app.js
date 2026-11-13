@@ -728,6 +728,12 @@ function imageState(img) {
   return [label, detail, 100 * (img.progress || 0)];
 }
 
+// The run's average speed from the totals: tokens over milliseconds (token-weighted, so a short request does not
+// outweigh a long one).  Null when the totals do not hold both numbers yet.
+function avgSpeed(ms, tokens) {
+  return typeof ms === "number" && ms > 0 && typeof tokens === "number" && tokens > 0 ? tokens / (ms / 1000) : null;
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail) {
   for (const m of METRICS) $(`ml-${m.key}`).textContent = m.label();
   // model state. An image job on a card of its own (or the helper card) runs beside the chat: the row under it says
@@ -800,19 +806,26 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   }
 
   // the eight cards
+  // Idle: not the last request's speed (one request is noisy) but the run's average from the server's totals
+  // (token-weighted, the same figure the engine's DONE lines and Prometheus report).  Live stays live.
+  const avgDecode = avgSpeed(totals && totals.decode_ms, totals && totals.output_tokens);
+  const readTokens = totals ? Math.max(0, (totals.prompt_tokens || 0) - (totals.reused || 0)) : 0;
+  const avgPrefill = avgSpeed(totals && totals.prompt_ms, readTokens);
   if (image) {   // an image job in the text model's turn: its seconds a step, not a decode rate
     setMetric("speed", live.image.step_s == null ? null : fmt(live.image.step_s, 2), "s/step",
               tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
   } else {
-    const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
+    const speed = live.state === "generating" ? live.tok_s : avgDecode != null ? avgDecode : last ? last.decode_tok_s : null;
     setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-              live.state === "generating" ? tr("mon.decodeNow", "Decode now") : last ? tr("mon.decodeLast", "Decode last request") : tr("mon.decode", "Decode"));
+              live.state === "generating" ? tr("mon.decodeNow", "Decode now") : avgDecode != null ? tr("mon.decodeAvg", "Decode · run average")
+              : last ? tr("mon.decodeLast", "Decode last request") : tr("mon.decode", "Decode"));
   }
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
+                : avgPrefill != null ? avgPrefill : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
   if (image) setMetric("prefill", null, "t/s", tr("img.job", "Image job"));
   else setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
                  live.state === "reading" ? tr("mon.prefillNow", "Prefill now") : live.state === "generating" ? tr("mon.prefillThis", "Prefill this request")
+                 : avgPrefill != null ? tr("mon.prefillAvg", "Prefill · run average")
                  : last ? tr("mon.prefillLast", "Prefill last request") : tr("mon.prefill", "Prefill"));
   spark("sp-speed", h.tok_s, undefined, true);
   spark("sp-prefill", h.prefill_tok_s_mean);

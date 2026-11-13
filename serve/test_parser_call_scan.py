@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Wrapped-call precheck parity against the original structural walk."""
 import itertools
 import random
@@ -11,7 +12,7 @@ from serve import frontend
 
 class ReferenceParser(frontend.OutputParser):
     def _wrapped_call_end(self):
-        return frontend.call_end(self.buf)
+        return frontend.call_end(self.buf, self._final)
 
 
 def events_without_ids(events):
@@ -56,6 +57,7 @@ class CallScanTests(unittest.TestCase):
                 for char in "</parameter></function></tool_call>":
                     parser.feed(char)
                 self.assertEqual(walk.call_count, before + 1)
+                parser.finish()      # #4701: a closed call waits for what might follow it; the turn's end settles it
                 self.assertEqual(parser._call_end_checked, 0)
 
 

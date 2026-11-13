@@ -257,8 +257,50 @@ class ForcedCallOpening(unittest.TestCase):
         from serve.frontend import forced_call
         one, two = [{"name": "a"}], [{"name": "a"}, {"name": "b"}]
         self.assertTrue(forced_call("required", one).endswith("<function=a>\n"))
-        self.assertTrue(forced_call("required", two).endswith("<function="))
+        self.assertTrue(forced_call("required", two).endswith("<tool_call>\n"))   # the model writes "<function=NAME>"
         self.assertIsNone(forced_call("auto", one))
+
+
+class AnthropicToolResultOrder(unittest.TestCase):
+    """#4832: a client may send a parallel call's results in the order its tools finished (Claude Code does); the
+    template pairs them with the calls by position, so they are put back in call order by tool_use_id first."""
+
+    def setUp(self):
+        self.template = ChatTemplate(Path(__file__).with_name("test_chat_template.jinja"))
+
+    @staticmethod
+    def history(results_reversed=False):
+        results = [{"type": "tool_result", "tool_use_id": "toolu_slow", "content": "RESULT_FROM_SLOW"},
+                   {"type": "tool_result", "tool_use_id": "toolu_fast", "content": "RESULT_FROM_FAST"}]
+        if results_reversed:
+            results.reverse()
+        return [{"role": "user", "content": "Search for both."},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_slow", "name": "Grep", "input": {"pattern": "slow"}},
+                    {"type": "tool_use", "id": "toolu_fast", "name": "Grep", "input": {"pattern": "fast"}}]},
+                {"role": "user", "content": results}]
+
+    def test_results_in_finished_order_render_as_the_calls_order(self):
+        raw = self.history(results_reversed=True)
+        before = copy.deepcopy(raw)
+        messages, _, kwargs = anthropic_to_messages({"messages": raw})
+        self.assertEqual(raw, before)                         # the request is not changed
+        self.assertEqual([m["content"] for m in messages if m["role"] == "tool"],
+                         ["RESULT_FROM_SLOW", "RESULT_FROM_FAST"])
+        prompt = self.template.render(messages, **kwargs)
+        self.assertLess(prompt.index("RESULT_FROM_SLOW"), prompt.index("RESULT_FROM_FAST"))
+
+    def test_the_ids_never_reach_the_template(self):
+        messages, _, _ = anthropic_to_messages({"messages": self.history(results_reversed=True)})
+        self.assertTrue(all(set(m) == {"role", "content"} for m in messages[2:]))
+        self.assertTrue(all(set(c) == {"function"} for c in messages[1]["tool_calls"]))
+
+    def test_an_incomplete_run_keeps_the_order_received(self):
+        raw = self.history(results_reversed=True)
+        raw[2]["content"][0].pop("tool_use_id")               # one result without its id: no reordering
+        messages, _, _ = anthropic_to_messages({"messages": raw})
+        self.assertEqual([m["content"] for m in messages if m["role"] == "tool"],
+                         ["RESULT_FROM_FAST", "RESULT_FROM_SLOW"])
 
 
 class QuotedToolCallCloser(unittest.TestCase):

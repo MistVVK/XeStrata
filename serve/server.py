@@ -69,7 +69,8 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a 
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
                             OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
-                            custom_tool_names, forced_call, images_of, legacy_function_call, legacy_functions,
+                            anthropic_tools, custom_tool_names, forced_call, images_of, legacy_function_call,
+                            legacy_functions,
                             literal_tags, thinking_signature, mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
@@ -251,6 +252,25 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `xestrata-engine --serve` rejects prompt + max_new + 8 > context: the same margin here
+
+
+class ContextOverflow(ValueError):
+    """A request that does not fit the context (a 400 on every API).  It keeps the numbers, so /v1/messages can also
+    say it the way Anthropic's API does: a client that decides from the wording (Claude Code compacts on "prompt is
+    too long", and shortens max_tokens on "input length and `max_tokens` exceed context limit") then does what it does
+    for Anthropic's own error (#4838)."""
+
+    def __init__(self, text, *, prompt, context, max_new=None):
+        super().__init__(text)
+        self.prompt, self.context, self.max_new = prompt, context, max_new
+
+    def anthropic_text(self) -> str:
+        room = self.context - CTX_SLACK
+        if self.max_new is None or self.prompt > room - 1:   # the prompt alone leaves no room
+            return f"prompt is too long: {self.prompt} tokens > {room - 1} maximum; {self}"
+        return f"input length and `max_tokens` exceed context limit: {self.prompt} + {self.max_new} > {room}; {self}"
+
+
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -4443,6 +4463,8 @@ class Service:
         self.anthropic_think_unasked = False              # #278: "anthropic_thinking": "model" -> True
         # on unless the config's "tool_call_recovery" is false: tool calls in forms next to the template's
         self.tool_call_recovery = True
+        # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
+        self.undeclared_tool_calls = "text"
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
         self.translation: Any = None                      # Translation when the config has "translate"
         self.video_jobs: Any = None                       # serve/videos.py's VideoJobs, made at the first video request
@@ -5570,18 +5592,19 @@ class Service:
                 # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
                 # other refusals (engine starting, images) keep it: the same prompt comes back and its encode is reused.
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({ctx}); requests are never truncated")
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                                      f"({ctx}); requests are never truncated", prompt=len(ids), context=ctx)
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({ctx}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's xestrata-<model>.json to shorten it to the room left (#545)")
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                                      f"({ctx}); requests are never truncated. Send a smaller "
+                                      f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to "
+                                      "the model's xestrata-<model>.json to shorten it to the room left (#545)",
+                                      prompt=len(ids), context=ctx, max_new=max_new)
             print(f"[xestrata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) "
                   f"leaves that much of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default; upstream f31b6efd6)
@@ -5779,13 +5802,15 @@ class Service:
                loop_guard.STOP: "stopped"}[act.kind]] += 1
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-            declared_only=False) -> Iterator[tuple[str, object]]:
+            declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
-        `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        `force` (forced_call): the opening of the call the reply must make - see prepare().  `deferred` (Anthropic's
+        tool search): a call for an undeclared name is a call too - see anthropic_tools."""
         strict = (sampling or {}).get("strata_strict_tools")
         if strict:                     # the strict tools' calls, checked before they are sent (check_strict)
             rest = {k: v for k, v in sampling.items() if k != "strata_strict_tools"}
-            yield from checked_calls(self.run(ids, thinking, tools, max_new, rest, cancel, force, declared_only),
+            yield from checked_calls(self.run(ids, thinking, tools, max_new, rest, cancel, force, declared_only,
+                                              deferred),
                                      strict)
             return
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
@@ -5833,8 +5858,10 @@ class Service:
                 budget = max(1, max_new - reserve)
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
-                  reader(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-                         declared_only=declared_only))
+                  reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
+                         recover=self.tool_call_recovery, declared_only=declared_only,
+                         # #4622: a well-formed call of an undeclared name is a call too, opt-in as for a deferred tool
+                         deferred=deferred or self.undeclared_tool_calls == "call"))
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         # the loop guard (serve/loop_guard.py): every id goes through it before the parser; it holds back a short
@@ -6604,6 +6631,51 @@ class ToolHubs:
         text = f"error: there is no tool named {name!r}"
         return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
                 "tool": name}
+
+
+def _history_call_names(req) -> list:
+    """The tool names a request's own conversation called, in order, on any of the three routes: Chat Completions (an
+    assistant message's tool_calls), Anthropic (an assistant message's tool_use blocks) and Responses (function_call /
+    custom_tool_call input items, a namespace in front as `namespace.name`)."""
+    names = []
+    for message in req.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            names.append((call.get("function") or {}).get("name") if isinstance(call, dict) else None)
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                names.append(block.get("name"))
+    items = req.get("input")
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call"):
+            name = item.get("name")
+            if isinstance(name, str) and name and isinstance(item.get("namespace"), str) and item["namespace"]:
+                name = f"{item['namespace']}.{name}"
+            names.append(name)
+    return names
+
+
+def with_history_tools(tools, req) -> list:
+    """#4663: an agent's tool set changes between turns (deferred tools, MCP servers, a compacted history), and the
+    model calls a tool it used earlier in this conversation that this turn's `tools` no longer lists.  That call came
+    back as raw text with finish_reason "stop", and the client took it for prose and stopped.  A name the
+    conversation's own assistant turns called is a tool the client has, so it counts as declared (the call comes back
+    as a tool call; the client says what it does with it) - on Chat Completions, Anthropic and Responses.  Nothing is
+    added when the request declared no tools at all, or for a name that is already declared."""
+    if not tools or not isinstance(req, dict):
+        return tools
+    try:
+        have = {t.get("name") for t in tools if isinstance(t, dict)}
+        extra = []
+        for name in _history_call_names(req):
+            if isinstance(name, str) and name and name not in have:
+                have.add(name)
+                extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
+        return [*tools, *extra] if extra else tools
+    except Exception:  # noqa: BLE001 - a shape this reader does not know leaves the tools as they were
+        return tools
 
 
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
@@ -7503,7 +7575,8 @@ def anthropic_search_blocks(x: dict, calls: dict) -> list[dict]:
     return [{"type": "web_search_tool_result", "tool_use_id": sid, "content": content}]
 
 
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None,
+                     deferred=False):
     """`run`: the events to send instead of Service.run's (run_with_mcp with the web search tools): their activity
     becomes Anthropic's server tool blocks (anthropic_search_blocks) and usage.server_tool_use."""
     mid = "msg_" + uuid.uuid4().hex[:24]
@@ -7529,7 +7602,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
     server_calls: dict = {}                        # the web search calls run here: id -> web_search / web_fetch
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
-                                                       declared_only=True):
+                                                       declared_only=True, deferred=deferred):
         if kind == "ping":
             yield None
             continue
@@ -10549,14 +10622,16 @@ def make_handler(svc: Service):
                     "locale": search_api.locale(ws.get("user_location"), self.headers.get("Accept-Language"))})
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
+            callable_tools, deferred = anthropic_tools(req)     # #4663: the deferred tools are callable, unlisted
             if search_tools is not None:
                 want = {"web_search": any(t["type"].startswith("web_search_") for t in hosted),
                         "fetch_page": any(t["type"].startswith("web_fetch_") for t in hosted)}
                 offered = [t for t in search_tools.template_tools(exclude={t["name"] for t in tools or []})
                            if want.get(t["name"])]
                 tools = (tools or []) + offered or None
+                callable_tools = (callable_tools or []) + offered
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
-                tools = None
+                tools = callable_tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
                                 getattr(svc.template, "call_form", "qwen"))
             messages, validator = anthropic_prepare_format(req, messages, tools)
@@ -10566,7 +10641,12 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            try:
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req,
+                                                     cancel=cancel)
+            except ContextOverflow as overflow:
+                # #4838: Anthropic's own wording first, XeStrata's sentence after it
+                raise ValueError(overflow.anthropic_text()) from None
             strict, patterns = constrained_tools(req.get("tools"))
             # with tools only the calls have a grammar: the answer is checked after it is written (#60)
             svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking)
@@ -10582,7 +10662,8 @@ def make_handler(svc: Service):
                 run = run_with_mcp(svc, search_tools, messages, tools, kw, ids, thinking, max_new,
                                    int(req.get("max_tokens") or 0), req, cancel,
                                    {t["name"] for t in tools} & set(search_tools.routes()), force=force)
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, run=run)
+            events = anthropic_events(svc, req, ids, thinking, callable_tools, max_new, cancel, force=force, run=run,
+                                      deferred=deferred)
             if validator is not None:
                 events = anthropic_structured(events, validator)
             events = self._capture(events, "anthropic")
@@ -11517,6 +11598,19 @@ def model_card_sampling(arch, thinking) -> dict:
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
 
 
+def undeclared_tool_calls_setting(cfg: dict) -> str:
+    """#4622: the config's "undeclared_tool_calls": "text" (the default, when the config does not name it) keeps a
+    well-formed call of a tool the request did not declare as the text the model wrote, with
+    strata_rejected_tool_calls beside it; "call" returns it as a tool call, for a client that has its own policy for
+    unknown names (it answers the model with the tool names it has).  Anything else stops the start."""
+    mode = cfg.get("undeclared_tool_calls")
+    if mode is None:                 # the environment names it too (XESTRATA_UNDECLARED_TOOL_CALLS); the config wins
+        mode = envvars.get("UNDECLARED_TOOL_CALLS") or "text"
+    if mode not in ("text", "call"):
+        raise SystemExit(f"[xestrata] config \"undeclared_tool_calls\" must be \"text\" or \"call\", not {mode!r}")
+    return mode
+
+
 def tool_call_recovery_setting(cfg: dict) -> bool:
     """The config's "tool_call_recovery" (see OutputParser's recover): on when the config does not name it,
     "tool_call_recovery": false turns it off.  Anything but true or false stops the start."""
@@ -11896,6 +11990,7 @@ def _main() -> int:
         raise SystemExit(f"[xestrata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
+    svc.undeclared_tool_calls = undeclared_tool_calls_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[xestrata] config \"env_to_user\" must be true or false, not {etu!r}")
