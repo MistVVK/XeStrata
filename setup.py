@@ -935,7 +935,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
               "profile": "expert-profile-coder.bin"},
     # Unsloth's Dynamic v3.1 from 2 to 4 bits (UD-Q2_0 to the EXPERIMENTAL UD-Q4_K_XL) and the 5- to 8-bit files of
     # the original model; "shards", "experimental" and "vision" are per model (MODELS)
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's Dynamic v3.1 quantizations",
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's 1- to 8-bit quantizations",
                 "about": "1 to 4 bits (UD-IQ1_M to UD-Q4_K_XL, 68 to 111 GB downloads) and 5 to 8 bits; with too "
                          "little RAM part of the experts are read from the SSD",
                 "hf": hf("unsloth/Qwen3.8-Flash-Next-GGUF") + "{q}/",
