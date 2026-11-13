@@ -174,6 +174,7 @@ template<> struct FxOf<21> {
 template<int T> struct DecFx {
     using F = FxOf<T>;
     static constexpr int QK = 256, BSZ = (int) sizeof(typename F::B);
+    static constexpr int group32() { return 8; }   // the blocks of 32 a group (FXG)
     static constexpr int fx_log2() { return F::log2k(); }
     static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
         Sub r = Dec<T>::get(row, sb, row_bytes);
@@ -550,6 +551,7 @@ template<> struct Dec<kIqMmqFx + 21> : DecFx<21> {};
 // (K 1/8)
 template<int T, class B> struct DecFxHalf {
     static constexpr int QK = 256, BSZ = (int) sizeof(B);
+    static constexpr int group32() { return 8; }   // the blocks of 32 a group (FXG)
     static constexpr int fx_log2() { return -3; }
     static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
         Sub r = Dec<T>::get(row, sb, row_bytes);
@@ -566,6 +568,7 @@ template<> struct Dec<kIqMmqFx + 22> : DecFxHalf<22, block_iq2_s> {};
 // IQ4_NL (a down projection's, on activations with a scale for each 32): Dec<20>'s values, s0 1, s1 the block's d
 template<> struct Dec<kIqMmqFx + 20> {
     static constexpr int QK = 32, BSZ = (int) sizeof(block_iq4_nl);
+    static constexpr int group32() { return 1; }   // the blocks of 32 a group (FXG)
     static constexpr int fx_log2() { return 0; }
     static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
         Sub r = Dec<20>::get(row, sb, row_bytes);
@@ -575,6 +578,22 @@ template<> struct Dec<kIqMmqFx + 20> {
     }
     static float block_d(const uint8_t* row, int b) {
         return (float) (reinterpret_cast<const block_iq4_nl*>(row) + b)->d;
+    }
+};
+
+// Q2_0 (gate/up on a scale for each 256, down on one for each 32): Dec<42>'s values (code - 1), s0 1, s1 the 64's d; a
+// group of one block of 32, whichever its activation
+template<> struct Dec<kIqMmqFx + 42> {
+    static constexpr int QK = 64, BSZ = (int) sizeof(block_q2_0);
+    static constexpr int group32() { return 1; }   // the blocks of 32 a group (FXG)
+    static constexpr int fx_log2() { return 0; }
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        Sub r = Dec<42>::get(row, sb, row_bytes);
+        r.s0 = 1.0f;
+        return r;
+    }
+    static float block_d(const uint8_t* row, int b) {
+        return (float) (reinterpret_cast<const block_q2_0*>(row) + b)->d;
     }
 };
 
@@ -588,7 +607,7 @@ constexpr bool has_min() { return TY == 7 || TY == 12 || TY == 13; }
 template<int TY>
 constexpr bool fx_form() {
     return TY == kIqMmqFx + 16 || TY == kIqMmqFx + 17 || TY == kIqMmqFx + 18 || TY == kIqMmqFx + 20 ||
-           TY == kIqMmqFx + 21 || TY == kIqMmqFx + 22;
+           TY == kIqMmqFx + 21 || TY == kIqMmqFx + 22 || TY == kIqMmqFx + 42;
 }
 
 // ---------------------------------------------------------------- the products
@@ -629,8 +648,11 @@ struct Kernel {
     // (exact), then that sum times the group's fx_scale added in int64 (any order: the CPU's canonical rows give the
     // same bits); the activations canonical (iq_mmq_quantize's canon: one fp16 scale a group), K whole
     static constexpr bool FX = fx_form<TY>();
-    // FX: the blocks of 32 that share one activation scale and one d (8: a 256's, gate/up; 1: a down row's IQ4_NL)
-    static constexpr int FXG = FX ? Dec<TY>::QK / 32 : 1;
+    // FX: the blocks of 32 that share one activation scale and one d (8: a 256's, gate/up; 1: IQ4_NL's, Q2_0's)
+    static constexpr int FXG = [] {
+        if constexpr (FX) return Dec<TY>::group32();
+        else return 1;
+    }();
     static_assert(!FX || !MIN, "the fixed-point sums take no min");
     // FX with a scale for each 16 (HALF): the halves' integer scales in the weights' two scale slots, the group's d in
     // the min's (wml, Sub::m)
@@ -677,17 +699,17 @@ struct Kernel {
     // loop's first barrier publishes them.
     void fx_tops(int lid, int lanes, int64_t row0, int64_t rows, int64_t m0, int64_t n0, const uint8_t* wx, int* ta,
                  int* tw) const {
-        const int64_t kb = K / 32, ng = K / (32 * FXG);
+        const int64_t kb = K / 32, nw = K / Dec<TY>::QK;
         for (int rr = lid; rr < WM; rr += lanes) {
             int t = canon::kFxNone;
             if (m0 + rr < rows)
-                for (int64_t b = 0; b < ng; ++b) t = sycl::max(t, canon::fx_exp(xs[(row0 + m0 + rr) * kb + FXG * b]));
+                for (int64_t b = 0; b < kb; b += FXG) t = sycl::max(t, canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
             ta[rr] = t;
         }
         for (int nn = lid; nn < WN; nn += lanes) {
             int t = canon::kFxNone;
             const uint8_t* wr = wx + (size_t) (n0 + nn) * row_bytes;
-            for (int64_t b = 0; b < ng; ++b) t = sycl::max(t, canon::fx_exp(Dec<TY>::block_d(wr, (int) b)));
+            for (int64_t b = 0; b < nw; ++b) t = sycl::max(t, canon::fx_exp(Dec<TY>::block_d(wr, (int) b)));
             tw[nn] = t;
         }
     }
@@ -994,14 +1016,14 @@ struct Kernel {
                     isum[t][i] = 0;
                     acc64[t][i] = 0;
                 }
-            for (int64_t b = 0; b < K / (32 * FXG); ++b)
+            for (int64_t b = 0; b < K / Dec<TY>::QK; ++b)
                 twl = sycl::max(twl, canon::fx_exp(Dec<TY>::block_d(wx, (int) b)));
             for (int j = 0; j < XR; ++j) {
                 const int64_t rr = (int64_t) j * IN + lane;
                 ta_r[j] = canon::kFxNone;
                 if (rr < live)
-                    for (int64_t b = 0; b < K / (32 * FXG); ++b)
-                        ta_r[j] = sycl::max(ta_r[j], canon::fx_exp(xs[(row0 + m0 + rr) * kb + FXG * b]));
+                    for (int64_t b = 0; b < kb; b += FXG)
+                        ta_r[j] = sycl::max(ta_r[j], canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
             }
         }
         const int64_t b0 = ks * kspan / 32, b1 = sycl::min(K, (ks + 1) * kspan) / 32;
@@ -1892,13 +1914,13 @@ bool iq_mmq_type_ok(int t) {
         case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
         case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 42: return true;
         case kIqMmqFx + 16: case kIqMmqFx + 17: case kIqMmqFx + 18: case kIqMmqFx + 20: case kIqMmqFx + 21:
-        case kIqMmqFx + 22: return true;
+        case kIqMmqFx + 22: case kIqMmqFx + 42: return true;
         default: return false;
     }
 }
 
 int iq_mmq_fx(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 ? kIqMmqFx + t : 0;
+    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 42 ? kIqMmqFx + t : 0;
 }
 
 size_t iq_mmq_row_bytes(int t, int64_t cols) {
@@ -1922,7 +1944,7 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 23: return (size_t) (cols / Dec<23>::QK) * Dec<23>::BSZ;
         case 29: return (size_t) (cols / Dec<29>::QK) * Dec<29>::BSZ;
         case 19: return (size_t) (cols / Dec<19>::QK) * Dec<19>::BSZ;
-        case 42: return (size_t) (cols / Dec<42>::QK) * Dec<42>::BSZ;
+        case 42: case kIqMmqFx + 42: return (size_t) (cols / Dec<42>::QK) * Dec<42>::BSZ;
         default: return 0;
     }
 }
@@ -2003,6 +2025,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(kIqMmqFx + 20);
         STRATA_MMQ_CASE(kIqMmqFx + 21);
         STRATA_MMQ_CASE(kIqMmqFx + 22);
+        STRATA_MMQ_CASE(kIqMmqFx + 42);
         STRATA_MMQ_CASE(20);
         STRATA_MMQ_CASE(21);
         STRATA_MMQ_CASE(22);

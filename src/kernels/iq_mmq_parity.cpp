@@ -12,10 +12,11 @@
 // shapes of 16, 32 and 64 rows).  The weights are random block bytes with a sane d: every bit pattern of the grid
 // indices and signs is a valid block.  Exit 77 (skipped) where the GPU runs neither form.
 //
-// The fixed-point forms (iq_mmq_fx: the gate/up's i-quants and IQ4_NL's down) against the CPU's canonical rows
-// (canon_expert.hpp, iq256_canon_rows), every bit: the activations' int8 values and fp16 scales the two quantized, and
-// each output.  The rows' 256s at scales 2^-6 to 2^6, a row of zeros among them, so the rows' tops and the blocks'
-// shifts both ways are taken.
+// The fixed-point forms (iq_mmq_fx: the gate/up's i-quants and Q2_0, the down's IQ4_NL and Q2_0) against the CPU's
+// canonical rows (canon_expert.hpp, iq256_canon_rows), every bit: the activations' int8 values and fp16 scales the two
+// quantized, and each output.  The rows' 256s at scales 2^-6 to 2^6, a row of zeros among them, so the rows' tops and
+// the blocks' shifts both ways are taken.
+#include "strata/kernels/canon_math.hpp"
 #include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
@@ -240,12 +241,12 @@ int check_fx(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& coun
     return ok ? 0 : 1;
 }
 
-// The fixed-point down products of IQ4_NL (a scale for each 32 of the activations) against the CPU's canonical down
-// rows (native_down_rows on a canonical layer's blob), bit for bit: the activations' scales and each output
-int check_fx_down(int64_t N, int64_t K, const std::vector<int32_t>& counts) {
+// The fixed-point down products of type t (IQ4_NL, Q2_0: a scale for each 32 of the activations) against the CPU's
+// canonical down rows (native_down_rows on a canonical layer's blob), bit for bit: the activations' scales and each
+// output
+int check_fx_down(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts) {
     namespace k = strata::kernels;
     namespace cpu = strata::kernels::cpu;
-    const ggml_type t = GGML_TYPE_IQ4_NL;
     sycl::queue& q = strata::core::Runtime::get().compute();
     cpu::NativeFmt f;
     std::string err;
@@ -327,6 +328,86 @@ int check_fx_down(int64_t N, int64_t K, const std::vector<int32_t>& counts) {
                 "%lld differ  %s\n",
                 ggml_type_name(t), (long long) K, n, (long long) max_rows, scale_diff, diff, (long long) (R * N),
                 ok ? "ok" : "*** FAIL ***");
+    return ok ? 0 : 1;
+}
+
+// Q2_0's fixed-point gate and up products against the CPU's canonical gate/up rows (native_gu_rows, which give their
+// SwiGLU): the GPU's two products through canon_math.hpp's SwiGLU on the host, every bit
+int check_fx_q20_gu(int64_t N, int64_t FF, const std::vector<int32_t>& counts) {
+    namespace k = strata::kernels;
+    namespace cpu = strata::kernels::cpu;
+    const ggml_type t = (ggml_type) 42;
+    sycl::queue& q = strata::core::Runtime::get().compute();
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt(42, (int) GGML_TYPE_IQ4_NL, N, FF, f, err) || !cpu::canon_layer(f)) {
+        std::printf("  q2_0 fixed-point gate/up: no canonical layer (%s)  *** FAIL ***\n", err.c_str());
+        return 1;
+    }
+    const int n = (int) counts.size();
+    std::vector<int32_t> bounds(1, 0);
+    int64_t max_rows = 0;
+    for (int32_t c : counts) {
+        bounds.push_back(bounds.back() + c);
+        max_rows = std::max<int64_t>(max_rows, c);
+    }
+    const int64_t R = bounds.back();
+    std::vector<std::vector<uint8_t>> blobs;   // each expert's gate rows then up rows (FF each), then zeros
+    std::vector<uint8_t> all;
+    for (int e = 0; e < n; ++e) {
+        std::vector<uint8_t> g = weights(t, 2 * FF, N), b(f.bytes, 0);
+        std::memcpy(b.data(), g.data(), g.size());
+        blobs.push_back(b);
+        all.insert(all.end(), g.begin(), g.end());
+    }
+    std::vector<float> x((size_t) (R * N));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int64_t r = 0; r < R; ++r)
+        for (int64_t i = 0; i < N; ++i) {
+            const int g = (int) ((r + i / 256) % 5) * 3 - 6;
+            x[(size_t) (r * N + i)] = r == 3 ? 0.0f : std::ldexp(nd(rng()), g);
+        }
+    std::vector<int32_t> ids((size_t) R);
+    for (int64_t i = 0; i < R; ++i) ids[(size_t) i] = (int32_t) i;
+    P::Device dev;
+    const size_t xq_bytes = k::iq_mmq_act_bytes(R, N);
+    float* dx = dev.upload(x);
+    uint8_t* dw = dev.upload(all);
+    int32_t* db = dev.upload(bounds);
+    int32_t* di = dev.upload(ids);
+    uint8_t* dxq = dev.alloc<uint8_t>(xq_bytes);
+    float* dy = dev.alloc<float>((size_t) (R * 2 * FF));
+    k::iq_mmq_quantize(q, dx, nullptr, dxq, N, N, R, false, false, 256).wait();
+    k::iq_mmq_grouped(q, k::iq_mmq_fx(42), dw, all.size() / (size_t) n, 2 * FF, N, n, dxq, R, db, max_rows, di, dy,
+                      2 * FF).wait();
+    std::vector<float> y((size_t) (R * 2 * FF));
+    P::copy_out(y.data(), dy, y.size());
+
+    std::vector<cpu::NativeAct> act((size_t) R);
+    for (int64_t r = 0; r < R; ++r) cpu::native_quant_act(f, x.data() + r * N, act[(size_t) r].bytes);
+    size_t diff = 0;
+    std::vector<float> ff((size_t) (8 * FF));
+    for (int e = 0; e < n; ++e)
+        for (int64_t r0 = bounds[(size_t) e]; r0 < bounds[(size_t) e + 1]; r0 += 8) {
+            const int nt = (int) std::min<int64_t>(8, bounds[(size_t) e + 1] - r0);
+            const void* a[8];
+            float* out[8];
+            for (int j = 0; j < nt; ++j) {
+                a[j] = act[(size_t) (r0 + j)].bytes;
+                out[j] = ff.data() + (size_t) j * (size_t) FF;
+            }
+            cpu::native_gu_rows(f, blobs[(size_t) e].data(), a, nt, out, 0, (int) FF);
+            for (int j = 0; j < nt; ++j)
+                for (int64_t o = 0; o < FF; ++o) {
+                    const float* g = y.data() + (r0 + j) * 2 * FF;
+                    const float h = strata::kernels::canon::silu_mul(g[o], g[FF + o]);
+                    diff += std::memcmp(&ff[(size_t) j * (size_t) FF + (size_t) o], &h, 4) != 0;
+                }
+        }
+    const bool ok = diff == 0;
+    std::printf("  q2_0     fixed-point gate/up, K %4lld, %d experts of up to %3lld rows: SwiGLU %zu of %lld differ"
+                "  %s\n",
+                (long long) N, n, (long long) max_rows, diff, (long long) (R * FF), ok ? "ok" : "*** FAIL ***");
     return ok ? 0 : 1;
 }
 
@@ -491,7 +572,8 @@ int main(int argc, char** argv) try {
             for (const ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
                                       GGML_TYPE_IQ2_S})
                 bad += check_fx(t, 256, 2560, c);
-            bad += check_fx_down(512, 640, c);
+            bad += check_fx_q20_gu(2560, 640, c);
+            for (const ggml_type t : {GGML_TYPE_IQ4_NL, (ggml_type) 42}) bad += check_fx_down(t, 512, 640, c);
         }
     }
     // last: the parts' buffer it reserves stays with the queue
