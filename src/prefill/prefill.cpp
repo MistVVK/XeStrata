@@ -445,15 +445,29 @@ inline strata::prefill::switch_point::Card sp_card() {
     c.blob_mb = g_sp_blob_mb; c.link_gbps = g_sp_link_gbps; c.sm = g_sp_sm;
     return c;
 }
+// A build without MMQ (STRATA_PF_OWN_ONLY) loading a pack that is not a native one (the AVX-512 Q2_0 pack) whose layers the plan marks fused (mmq_plan(): `!lay.native && fused::enabled()`).
+// The staged fused entry (fz_staged) and the int8 kernels (i8_l) read the native layout only, so below the floor each routed expert of such a layer runs on the dequantize + FP16 path.
+// False without a loaded layout (the caller does not cache then) and in a build with MMQ.
+inline bool plain_pack_all_fused() {
+#if defined(STRATA_PF_OWN_ONLY)
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (lay.native || lay.n_layers <= 0) return false;
+    if (const char* e = std::getenv("STRATA_PREFILL_MMQ"); e != nullptr && std::atoi(e) == 0) return false;   // mmq_plan(): no plan, no fused layers
+    return fused::built() && fused::enabled();
+#else
+    return false;
+#endif
+}
 // The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
 inline int64_t default_stream_floor() {
     static std::atomic<int64_t> cached{-1};
     const int64_t c = cached.load(std::memory_order_acquire);
     if (c >= 0) return c;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    if (!lay.native || lay.fmt.empty()) return strata::prefill::kStreamFloorDefault;
-    const bool cls = stream_floor_class_measured();
-    int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on());
+    const bool plain = plain_pack_all_fused();   // a build without MMQ and a non-native pack on the fused kernels: no staged entry or int8 path exists for its layout (stream_floor_rule.hpp)
+    if ((!lay.native || lay.fmt.empty()) && !plain) return strata::prefill::kStreamFloorDefault;
+    const bool cls = !plain && stream_floor_class_measured();
+    int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on(), plain);
 #if !defined(STRATA_USE_HIP) && !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     // the card's counts are not known yet (set_card_expert_share has not run) and the rule is not switched off: the default, not cached
     if (v == strata::prefill::kStreamFloorDefault && switch_point_env() != 0 && !switch_point_known()) return v;

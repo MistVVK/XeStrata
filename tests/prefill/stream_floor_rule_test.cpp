@@ -24,6 +24,13 @@ int main() {
     CHECK(stream_floor_default(true, false, true) == kStreamFloorDefault);
     CHECK(stream_floor_default(false, true, true) == kStreamFloorDefault);    // STRATA_PF_STAGED_FO=1 on another class: the floor stays
     CHECK(stream_floor_default(false, false, true) == kStreamFloorDefault);
+    // a build without MMQ with a non-native pack on the fused kernels (the Q2_0 pack): no staged entry or int8 path reads its layout, so the floor is 64 on every class, whatever the other flags
+    CHECK(stream_floor_default(false, false, false, true) == kFusedOnlyFloor);
+    CHECK(stream_floor_default(true, true, true, true) == kFusedOnlyFloor);
+    CHECK(stream_floor_default(false, true, true, true) == kFusedOnlyFloor);
+    // a build with MMQ, or a pack that is not plain-and-fused, passes false: the rows above are unchanged
+    CHECK(stream_floor_default(false, false, false, false) == kStreamFloorDefault);
+    CHECK(stream_floor_default(true, true, true, false) == kStreamFloorDefault);
     if (failed) {
         std::fprintf(stderr, "stream_floor_rule_test: %d check(s) failed\n", failed);
         return 1;
