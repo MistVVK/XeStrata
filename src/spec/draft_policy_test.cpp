@@ -9,7 +9,8 @@
 //   3. lookup drafts that are always accepted are taken, and the window grows with them;
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
 //   5. the policy never proposes a window beyond its cap;
-//   6. XESTRATA_SPEC_COST's auto runs the plain window below the deep context bucket and the cost-aware one from it.
+//   6. XESTRATA_SPEC_COST's auto runs the plain window below the second context bucket and the cost-aware one
+//      from it.
 #include "strata/spec/draft_policy.hpp"
 
 #include <cstdio>
@@ -136,6 +137,10 @@ int main() {
         p.set_context(1000);
         for (int i = 0; i < 20; ++i) p.observe(false, 4, 2, 0, 40.0);
         check(p.cost_ms(4) < 45.0, "auto at 1K: a round of the shallow table");
+        p.set_context(6143);
+        check(!p.cost_aware(), "auto below the second bucket: the plain window");
+        p.set_context(6144);
+        check(p.cost_aware(), "auto at the second bucket: the cost-aware window");
         p.set_context(32768);
         for (int i = 0; i < 20; ++i) p.observe(false, 4, 2, 0, 120.0);
         check(p.cost_ms(4) > 100.0, "auto at 32K: a table of its own");

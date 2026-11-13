@@ -28,11 +28,12 @@ public:
     static constexpr int kMaxT = 8;
     static constexpr int kBuckets = 4;
     static constexpr int kCtxBuckets = 3;   // XESTRATA_SPEC_COST: round costs per context (< 6K, < 24K, longer)
-    // XESTRATA_SPEC_COST=auto (the default): the cost-aware window from this bucket of context length on.  Measured
-    // with Qwen3.8 IQ3_XXS through generate, the text followed (2026-10-26): the decode of a 1K prompt is 2.6-4.7%
-    // slower on the B70 and 1.4% on the RTX 4070, and 32K is 1.3% and 3.2% faster, so the shallow two buckets run the
-    // plain window (the loss is the same without the look-ahead: 2.9% / 2.6% at 1K).
-    static constexpr int kCostBucket = 2;
+    // XESTRATA_SPEC_COST=auto (the default): the cost-aware window from this bucket of context length on, below it
+    // the plain window.  Measured again on 2026-11-13 (Qwen3.8 IQ3_XXS and Qwen3.6-35B-A3B through generate, the text
+    // followed, the B70 and the RTX 4070): at 1K it chose narrower windows than the plain rule and decoded 2.7%
+    // slower on the B70; from 4K up it chose the same windows as the plain rule on both GPUs, so the shallow bucket is
+    // where it costs.  (0.2.6 measured the same 1K loss and a 1.3-3.2% gain at 32K.)
+    static constexpr int kCostBucket = 1;
 
     explicit DraftPolicy(int max_t, double margin = 0.03);
 
@@ -81,8 +82,8 @@ public:
     /// measurement yet starts from the nearest one that has); a round far above what is known for its width (the first
     /// use of a width captures its graph) counts as a tenth of a sample, the first samples as a running mean; and a
     /// draft that does not pay by itself is kept when it and the next one together would.  auto (the default): from
-    /// kCostBucket on, where it was measured faster; below, the plain window, where it was measured slower.  1: always
-    /// (the opt-in as it was); 0: never.  Call before each round.
+    /// kCostBucket on; below, the plain window, where it was measured slower.  1: always (the opt-in as it was); 0:
+    /// never.  Call before each round.
     void set_context(int64_t pos);
     /// The window rule the next round runs: the cost-aware one now, or the plain one.
     bool cost_aware() const {
