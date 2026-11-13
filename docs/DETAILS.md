@@ -1489,7 +1489,7 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.
   `penalty_last_n` caps how many recent tokens they count over, 64 by default when any penalty is set.
   llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request (upstream #1819).
-  They count the tokens the request has consumed, so a repetition penalty suppresses what the model itself just said, not the prompt alone.
+  They count the reply's tokens (and the last prompt token the first step feeds in), not the prompt: `XESTRATA_PENALTY_PROMPT=1` brings the old window back (the last `penalty_last_n` tokens of prompt and reply together).
   They apply to every token speculative decoding checks at once, exactly as if it decoded one token at a time.
   The draft layer guesses without penalties, so more of its guesses are rejected and requests with penalties run slower.
 - `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.

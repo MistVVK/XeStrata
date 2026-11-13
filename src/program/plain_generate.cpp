@@ -1239,7 +1239,16 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // a request with any of them decodes a token a window (each pick its own mask, history and logits)
         // (a bias is the same for every row of a spec window, and the script guard sets each window's masks)
         const bool constrained = grammar.active() || penalties || req_logprobs >= 0;
-        std::vector<int32_t> seen(ids.begin(), ids.end());   // what the penalties count: the prompt, then the reply
+        // #4590 (upstream 31c3a16f): the penalties count the reply's tokens (and the fed-back last prompt token), not
+        // the prompt; XESTRATA_PENALTY_PROMPT=1 restores the old window (the last penalty_last_n tokens of the whole
+        // prompt and reply).
+        static const bool pen_prompt = [] {
+            const char* v = strata::env_get("PENALTY_PROMPT");
+            return v != nullptr && v[0] == '1';
+        }();
+        std::vector<int32_t> seen;
+        if (pen_prompt || ids.empty()) seen.assign(ids.begin(), ids.end());
+        else seen.assign(1, ids.back());
         std::vector<float> lrow(req_logprobs >= 0 ? (size_t) V : 0);   // the logits the next pick comes from
         // before a pick after the window that reads `fed`
         auto constrain = [&](int32_t fed) -> bool {
