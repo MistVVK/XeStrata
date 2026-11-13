@@ -1093,8 +1093,8 @@ sycl::event launch_mmvq_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, co
     });
 }
 
-// up to 16 columns in one pass, the count exact (upstream 2715a752: 3, 5, 6 and 7 took two or three passes; a window
-// of 9..16 rows its own instances, so up to 8 the ones it always ran); 16 at a time past 16
+// up to 8 columns in one pass, the count exact (upstream 2715a752: 3, 5, 6 and 7 took two or three passes); 8 at a
+// time past 8 (the verify window takes up to 8 tokens)
 template<int TY>
 sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y, int n_in,
                         int n_out, int ncols) {
@@ -1103,16 +1103,8 @@ sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, cons
         const int n = ncols - c0;
         const block_q8_1* xc = x + (size_t) c0 * (n_in / 32);
         float* yc = y + (size_t) c0 * n_out;
-        const int take = n >= 16 ? 16 : n;
+        const int take = n >= 8 ? 8 : n;
         switch (take) {
-            case 16: e = launch_mmvq_n<TY, 16>(q, w, row_bytes, xc, yc, n_in, n_out); break;
-            case 15: e = launch_mmvq_n<TY, 15>(q, w, row_bytes, xc, yc, n_in, n_out); break;
-            case 14: e = launch_mmvq_n<TY, 14>(q, w, row_bytes, xc, yc, n_in, n_out); break;
-            case 13: e = launch_mmvq_n<TY, 13>(q, w, row_bytes, xc, yc, n_in, n_out); break;
-            case 12: e = launch_mmvq_n<TY, 12>(q, w, row_bytes, xc, yc, n_in, n_out); break;
-            case 11: e = launch_mmvq_n<TY, 11>(q, w, row_bytes, xc, yc, n_in, n_out); break;
-            case 10: e = launch_mmvq_n<TY, 10>(q, w, row_bytes, xc, yc, n_in, n_out); break;
-            case 9: e = launch_mmvq_n<TY, 9>(q, w, row_bytes, xc, yc, n_in, n_out); break;
             case 8: e = launch_mmvq_n<TY, 8>(q, w, row_bytes, xc, yc, n_in, n_out); break;
             case 7: e = launch_mmvq_n<TY, 7>(q, w, row_bytes, xc, yc, n_in, n_out); break;
             case 6: e = launch_mmvq_n<TY, 6>(q, w, row_bytes, xc, yc, n_in, n_out); break;

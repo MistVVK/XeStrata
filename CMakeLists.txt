@@ -423,7 +423,8 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-load PRIVATE strata_core)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
-                                    src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
+                                    src/kernels/xe/native_mmvq.cpp src/kernels/xe/native_mmvq_wide.cpp
+                                    src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
                                     src/kernels/xe/kv_q8.cpp src/kernels/xe/kv_q4.cpp
