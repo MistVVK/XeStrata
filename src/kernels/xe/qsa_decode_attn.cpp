@@ -182,7 +182,7 @@ template <int HD, int G, int KV_MODE, bool LOOP, int NC>
 sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools p, const int32_t* ids_all,
                          const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
                          float* part_m_all, float* part_l_all, int n_slots, size_t n_q, int cap,
-                         long long scratch_stride, int window, int kv_div, int min_chunk) {
+                         long long scratch_stride, int window, int kv_div, int min_chunk, bool percell) {
     static_assert(G >= 1 && G <= 16, "reduce12 sums at most 16 heads");
     static_assert(HD % 128 == 0 && HD <= 256, "a lane holds HD/32 dimensions inside one Q4_0 half");
     constexpr int THREADS = HD;           // one work-item per dimension in the value loop
@@ -244,6 +244,22 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                     srow[t] = r;
                 }
                 sycl::group_barrier(grp);
+                if (percell) {
+                    // A work-item takes one selected cell and all its head products.  This trades the subgroup
+                    // butterflies for a serial dot and changes the FP32 addition order.
+                    if (t < CHUNK) {
+                        float sums[G] = {};
+                        if (t < n_here && srow[t] >= 0) {
+                            for (int d = 0; d < HD; d += N) {
+                                float key[N];
+                                loadn<HD, KV_MODE>(p, false, srow[t], d, key);
+                                for (int h = 0; h < G; ++h) sums[h] += dotn<N>(key, &sq[h * HD + d]);
+                            }
+                        }
+                        for (int h = 0; h < G; ++h)
+                            sp[h * CHUNK + t] = t < n_here && srow[t] >= 0 ? sums[h] * scale : -FLT_MAX;
+                    }
+                } else {
                 // scores: each sub-group takes cells warp, warp+WARPS, ...; each lane holds N of the HD dimensions.
                 // NC cells per step (warp + WARPS * (i + j)): a lane's q slice comes out of local memory once for all
                 // of them (upstream fd95405); every dot product is the same expression as for a single cell, so the
@@ -303,6 +319,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                             }
                         }
                     }
+                }
                 }
                 sycl::group_barrier(grp);
                 // per-head chunk max and exp-sum: sub-group w handles heads w, w+WARPS, ...
@@ -472,14 +489,14 @@ int kv_mode_of(const QsaAttnPools& pools) {
 template <int HD, int G, bool LOOP>
 void launch_kv(int kv_mode, int nc, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
-               int n_slots, size_t n_q, int cap, long long stride, int window = 0, int kv_div = 1,
-               int min_chunk = CHUNK) {
-    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else launch_chunk<HD, G, 0, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+               int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div,
+               int min_chunk, bool percell) {
+    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, percell);
+    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, percell);
+    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, percell);
+    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, percell);
+    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, percell);
+    else launch_chunk<HD, G, 0, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, percell);
 }
 
 // The decode attention's form on a GPU, for a shape (head_dim, query heads per KV head): the cells a step of the fp16
@@ -529,12 +546,61 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     float* part_m = scratch + (size_t) n_slots * s.n_head * HD;
     float* part_l = part_m + (size_t) n_slots * s.n_head;
     const float scale = 1.0f / std::sqrt((float) HD);
-    if (n_slots < (cap + CHUNK - 1) / CHUNK)
-        launch_kv<HD, G, true>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                               n_slots, n_q, (int) cap, stride, window, split, min_chunk);
-    else
-        launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                                n_slots, n_q, (int) cap, stride, window, split, min_chunk);
+    auto chunks = [&](bool cell, size_t rows) {
+        if (n_slots < (cap + CHUNK - 1) / CHUNK)
+            launch_kv<HD, G, true>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
+                                   n_slots, rows, (int) cap, stride, window, split, min_chunk, cell);
+        else
+            launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
+                                    n_slots, rows, (int) cap, stride, window, split, min_chunk, cell);
+    };
+    // Compare the complete attention on the actual pools before choosing the different FP32 order.  The upstream
+    // parity line is a maximum difference of 1e-4 of the output scale.  No timing is started inside a graph capture.
+    using CellKey = std::tuple<int, int, int, int, int, int, int>;
+    static core::TimedCache<sycl::device, CellKey, bool> cell_choices;
+    static core::TimedCache<sycl::device, int, bool> cell_warmed;
+    const CellKey cell_key{n_slots, (int) n_q, (int) s.n_head, kv_mode, ids == nullptr, window, min_chunk};
+    const char* cell_mode = strata::env_get("QSA_PERCELL");
+    bool percell = false;
+    if (cell_mode && cell_mode[0] == '1' && cell_mode[1] == '\0') percell = true;
+    else if (!cell_mode || !*cell_mode || std::string(cell_mode) == "auto") {
+        const auto cached = cell_choices.get(queue.get_device(), cell_key);
+        if (cached) percell = *cached;
+        else if (core::timing_depth == 0 &&
+                 queue.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
+            const size_t rows = std::min<size_t>(n_q, 8), count = rows * (size_t) s.n_head * HD;
+            std::vector<float> baseline(count), candidate(count);
+            auto trial = [&](bool cell) {
+                chunks(cell, rows);
+                launch_merge<HD, G, false>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, rows,
+                                            stride, steps, ids == nullptr, window, min_chunk);
+                return true;
+            };
+            trial(false); queue.memcpy(baseline.data(), attn, count * sizeof(float)).wait_and_throw();
+            trial(true); queue.memcpy(candidate.data(), attn, count * sizeof(float)).wait_and_throw();
+            float diff = 0.0f, scale_out = 0.0f;
+            bool finite = true;
+            for (size_t i = 0; i < count; ++i) {
+                finite = finite && std::isfinite(baseline[i]) && std::isfinite(candidate[i]);
+                diff = std::max(diff, std::fabs(baseline[i] - candidate[i]));
+                scale_out = std::max(scale_out, std::fabs(baseline[i]));
+            }
+            bool faster = false;
+            if (finite && diff <= 1e-4f * scale_out) {
+                const bool first = cell_warmed.put_first(queue.get_device(), 0, true, [](int) { return true; }).second;
+                const auto measured = core::timed_choice({{[&] { return trial(false); }}, {[&] { return trial(true); }}},
+                    [&] { queue.wait_and_throw(); }, 5, 1.10, first ? 0.5 : 0.0);
+                faster = measured.pick == 1;
+                std::fprintf(stderr, "xestrata: attention cells %s (%.1f / %.1f us, difference %.3g)\n",
+                             faster ? "per work-item" : "per subgroup", measured.seconds[0] * 1e6,
+                             measured.seconds[1] * 1e6, diff);
+            }
+            percell = cell_choices.put(queue.get_device(), cell_key, faster);
+        }
+    } else if (!(cell_mode[0] == '0' && cell_mode[1] == '\0')) {
+        throw core::DeviceError("XESTRATA_QSA_PERCELL must be auto, 0 or 1");
+    }
+    chunks(percell, n_q);
     // Measure both forms on this device and shape, outside graph capture.  The new form keeps the fold order but
     // brings eight independent partials into registers before using them.  A 10% margin keeps the old form at a tie.
     using MergeKey = std::tuple<int, int, int, int, int, int, int>;
