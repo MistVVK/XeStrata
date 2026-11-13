@@ -21,7 +21,8 @@ def tool(name, **props):
 
 S = {"type": "string"}
 TOOLS = [tool("read", path=S), tool("write_file", path=S, content=S)]
-DOC = "# Tool calls\n\nThe closing tags, in order:\n\n</parameter>\n</function>\n</tool_call>\n\nNothing may follow them."
+DOC = ("# Tool calls\n\nThe closing tags, in order:\n\n</parameter>\n</function>\n</tool_call>\n\n"
+       "Nothing may follow them.")
 READ = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
 WRITE = ("<tool_call>\n<function=write_file>\n<parameter=path>\nd.md\n</parameter>\n<parameter=content>\n" + DOC
          + "\n</parameter>\n</function>\n</tool_call>")
@@ -94,7 +95,7 @@ class Streaming(unittest.TestCase):
         got = [e for e in p.feed(READ + "\n\n" + "word " * 200) if e.kind == "tool_call"]
         self.assertEqual(len(got), 0)                       # still inside the bound
         got = [e for e in p.feed("more " * 200) if e.kind == "tool_call"]
-        self.assertEqual(len(got), 1)                       # past it: the call goes out while the model is still talking
+        self.assertEqual(len(got), 1)                       # past it: the call goes out while the model talks
 
 
 if __name__ == "__main__":

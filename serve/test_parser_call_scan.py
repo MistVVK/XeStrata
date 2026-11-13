@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Wrapped-call precheck parity against the original structural walk."""
 import itertools
 import random
