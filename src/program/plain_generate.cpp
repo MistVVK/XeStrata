@@ -592,7 +592,7 @@ struct PlainDrafters {
             err = "the DFlash2 pack " + pack + " is another model's (its hidden size, vocabulary or taps)";
             return false;
         }
-        if (!df2.load(pack, 0, err)) return false;
+        if (!df2.loaded() && !df2.load(pack, 0, err)) return false;   // (--draft dflash2: before the model's tier)
         const strata::core::PlainModel::HeadView h = model.draft_head_view();
         const strata::core::PlainModel* m = &model;
         auto embed = [m](int32_t tok, float* row) { return m->embed_token(tok, row); };
@@ -2903,7 +2903,16 @@ int plain_main(int argc, char** argv) {
         }
     }
     if (opt.draft == "off") opt.spec = 0;   // no drafter (the suffix lookup may still propose)
-    if (opt.draft == "dflash2") opt.spec = 0;   // DFlash2 alone: the MTP layer is not loaded
+    if (opt.draft == "dflash2" && !dr.pack.empty()) {
+        // DFlash2 alone: no MTP layer; the pack and its windows' recurrent copies before the tier is sized from what
+        // is left (loaded after it, a 12 GB RTX 4070 had no room for its buffers and the B70 was left 17 MiB free)
+        opt.spec = 0;
+        opt.draft_windows = strata::core::Dflash2Drafter::kDrafts;
+        if (!dr.df2.load(dr.pack, 0, err)) {
+            std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
+            return 1;
+        }
+    }
     if (!model.load(opt, err) || !model.prompt_warm(err)) {
         std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
         // --serve: said where the server waits for READY, and ended at once: the clean-up of a model half loaded can

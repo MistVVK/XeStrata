@@ -259,9 +259,10 @@ bool PlainModel::load_glm5(std::string& err) {
         gdn_conv_[(size_t) i] = cv;
     }
     // the KDA states after a window's rows but its last, for going back to the last accepted draft (every stage's)
-    if (model_mtp_) {
-        opt_.spec = std::min({opt_.spec, opt_.max_t, k::kGlm5MaxSnaps + 1});
-        n_snap_ = n_mtp_ = opt_.spec - 1;
+    if (model_mtp_ || opt_.draft_windows > 0) {   // (--draft dflash2: its windows' copies)
+        if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kGlm5MaxSnaps + 1});
+        n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
+        n_snap_ = std::max(n_mtp_, std::min({opt_.draft_windows, opt_.max_t - 1, k::kGlm5MaxSnaps}));
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
         for (size_t g = 0; g < gdn_state_.size(); ++g)
