@@ -350,8 +350,8 @@ bool Dflash2Drafter::alloc(std::string& err) {
     vram_ += slab_total;
     rt_ctx_ = reinterpret_cast<float*>(d_meta_ + kMetaInts);
     rt_blk_ = rt_ctx_ + B * 128;
-    history_.init((size_t) N_, 32, kRing, window_);
-    if (!strata::gpu::alloc_host(&h_meta_, meta_bytes() + (size_t) N_ * 4) || !strata::gpu::alloc_host(&h_out_, 64 * sizeof(int32_t))) {
+    cur_ = Lineage{(size_t) N_, {}, {}};
+    if (!strata::gpu::alloc_host(&h_meta_, kMetaBytes + (size_t) N_ * 4) || !strata::gpu::alloc_host(&h_out_, 64 * 4)) {
         err = "dflash2: host staging";
         return false;
     }
@@ -460,7 +460,7 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const ModelGeometry& g, const N
     const WeightTable* wtp = &wt;
     const ModelGeometry* gp = &g;
     EmbedFn embed = [wtp, gp](const int32_t* tok, int n, float* out, void* s, std::string& e) {
-        return embed_rows(*wtp, *gp, tok, 0, n, out, s, e);
+        return ::strata::core::embed_rows(*wtp, *gp, tok, 0, n, out, s, e);
     };
     HeadFn head_fn = [this](const uint8_t* rows, const uint8_t* xq, const float*, int n, float* y, void* s) {
         strata::kernels::native_mmvq(head_type_, rows, xq, y, N_, (int) n_dvocab_, n, s);
@@ -751,7 +751,7 @@ uint64_t Dflash2Drafter::ring_stash_bytes() const {
 
 void Dflash2Drafter::reset() {
     have_ctx_ = 0;
-    cur_ = Lineage{(size_t) N_};
+    cur_ = Lineage{(size_t) N_, {}, {}};
     stash_.clear();
     invalidate_ring();
 }
@@ -880,7 +880,7 @@ bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume
     }
     if (!covered) {   // another conversation: the live lineage is parked, this one starts empty
         stash_push(std::move(cur_));
-        cur_ = Lineage{(size_t) N_};
+        cur_ = Lineage{(size_t) N_, {}, {}};
         invalidate_ring();
         ++ring_stats.cold_starts;
     } else if ((int64_t) cur_.hist.size() >= resume + 128) {
