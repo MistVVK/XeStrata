@@ -55,6 +55,8 @@ class ReadyPipe(unittest.TestCase):
         v.spawn = ([sys.executable, "-u", str(script)], None, None)
         v.dir = Path(self.tmp.name)
         v.stopped, v.proc, v.dead, v.cache = True, None, None, {}
+        v.fallback = v.fallback_why = v.cpu_note = v.cpu_spawn = v.cpu_label = None
+        v.gpu_spawn, v.on_cpu, v.elastic, v.label = v.spawn, False, False, "the GPU encoder"
         return v
 
     def start(self, v):

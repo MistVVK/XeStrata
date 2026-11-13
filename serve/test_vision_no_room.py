@@ -71,6 +71,8 @@ class AStartOnAFullCard(unittest.TestCase):
             v = server.Vision.__new__(server.Vision)
             v.spawn = ([sys.executable, "-u", str(script)], log, None)
             v.dir, v.stopped, v.proc, v.dead, v.cache = Path(d), True, None, None, {}
+            v.fallback = v.fallback_why = v.cpu_note = v.cpu_spawn = v.cpu_label = None
+            v.gpu_spawn, v.on_cpu, v.elastic, v.label = v.spawn, False, False, "the GPU encoder"
             with mock.patch.object(server, "VISION_READY_S", 30):
                 with self.assertRaises(server.VisionNoRoom) as cm:
                     v._start()

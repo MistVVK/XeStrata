@@ -2828,6 +2828,17 @@ class Vision:
         self.label = vision_label(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload (#208)
+        # the processor's reader (setup writes it as the vision section's "fallback"): a GPU reader that does not
+        # start - the card full, a kernel-image error, a card another program holds - reads on the processor instead
+        # of ending the launch, in every mode (resident, lazy, elastic)
+        attempts = vision_attempts(cfg)
+        self.cpu_label = vision_label(attempts[1]) if len(attempts) > 1 else None
+        self.cpu_spawn = (self.reader_args(attempts[1]), log, env) if len(attempts) > 1 else None
+        self.gpu_spawn = self.spawn
+        self.fallback = self.cpu_spawn
+        self.on_cpu = False                             # the processor's reader is what runs
+        self.cpu_note = None                            # why, in the person's words, when the card had no room
+        self.fallback_why = None                        # why the GPU one did not start (the /health "fallback")
         self.proc: subprocess.Popen | None = None
         self.dead: str | None = None
         self.stopped = True                             # until _start: a lazy encoder starts with the model
@@ -2909,6 +2920,39 @@ class Vision:
             self.cache.clear()
 
     def _start(self):
+        """Start the reader; a GPU reader that does not start gives way to the processor's (RuntimeError only when
+        nothing starts).  The reason stays in `fallback_why` and, for a full card or any other cause, in `cpu_note`."""
+        try:
+            self._start_reader()
+        except (OSError, RuntimeError) as e:
+            if self.fallback is None or self.spawn == self.fallback:
+                raise
+            why = " ".join(str(e).split())[:240]
+            self.cpu_note = self._no_room_note(e.room) if isinstance(e, VisionNoRoom) else None
+            self.fallback_why = why
+            again = " until it is idle" if self.elastic else ""
+            print(f"[xestrata] the GPU picture reader did not start ({why}); pictures are read on the CPU{again}",
+                  flush=True)
+            self.spawn, self.fallback, self.on_cpu = self.fallback, None, True
+            self.label = self.cpu_label
+            self._start_reader()
+
+    def _no_room_note(self, room) -> str:
+        """The sentence for the person when the card had no room for the reader and the processor reads instead: the
+        card (by the PCI address the config names), what the reader needs (what its line says, else its mmproj's size)
+        and the card's free memory now that the reader is gone."""
+        args = [str(a) for a in self.spawn[0]]
+        card = args[args.index("--gpu-pci") + 1] if "--gpu-pci" in args[:-1] else None
+        need = room.need_mib or (reader_room.weights_mib(args[args.index("--mmproj") + 1])
+                                 if "--mmproj" in args[:-1] else None)
+        try:
+            from serve.telemetry import free_vram_mib
+            free = free_vram_mib(card)
+        except Exception:                               # noqa: BLE001 - a message is a convenience
+            free = None
+        return reader_room.on_processor(card, need, free)
+
+    def _start_reader(self):
         """Start the encoder process and wait (bounded) for its READY; RuntimeError when it does not come."""
         args, log, env = self.spawn
         self.dead = None
@@ -3242,6 +3286,9 @@ class Vision:
         if self.proc is not None:
             self._end()
         self.stopped = True
+        if self.elastic and self.on_cpu:                # the next start tries the card again
+            self.spawn, self.fallback, self.on_cpu = self.gpu_spawn, self.cpu_spawn, False
+            self.cpu_note = None
 
     def shutdown(self):
         """#914: close() for good: the server ends, so the encoder's directory (the pictures, their embeddings and the
@@ -5071,6 +5118,9 @@ class Service:
                       "error": getattr(vision, "dead", None) or self.vision_error, "fallback": self.vision_fallback},
                   "image_models": self.images.about() if self.images is not None else [],
                   **dict(getattr(self.engine, "info", {}) or {})}
+        person_note = getattr(vision, "cpu_note", None)    # why the processor reads, in the person's words
+        if person_note:
+            engine["vision_note"] = person_note
         tel = (self.telemetry.snapshot() if getattr(self, "telemetry", None)
                else {"now": {}, "history": {}, "static": {}})
         engine["image_gpu"] = self.image_gpu_mode()
@@ -11473,23 +11523,16 @@ def main() -> int:
                 print('[xestrata] images: on a layer split the expert cache cannot make room for the image encoder '
                       '(the engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
                       "encoder's GPU, or the first picture may not get it", flush=True)
-            failed: list = []
-            for vc in vision_attempts(vcfg):
-                if failed:
-                    print(f"[xestrata] images: trying {vision_label(vc)} instead", flush=True)
-                try:
-                    vision = Vision(vc, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                                    env=env, lazy=lazy)
-                    break
-                except (OSError, RuntimeError) as e:    # the next one; with none left the model still serves text
-                    failed.append(f"{vision_label(vc)}: {e}")
-                    print(f"[xestrata] images: {failed[-1]}", flush=True)
-            if vision is None:
-                vision_error = "; ".join(failed)
-                print("[xestrata] images are off: no image encoder started", flush=True)
-            elif failed:
-                vision_fallback = "; ".join(failed)
-                print(f"[xestrata] images: {vision.label} serves them ({vision_fallback})", flush=True)
+            try:                                        # the GPU reader, or the processor's when it does not start
+                vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                                env=env, lazy=lazy)
+            except (OSError, RuntimeError) as e:        # the model still serves text
+                vision_error = f"{vision_label(vcfg)}: {e}"
+                print(f"[xestrata] images are off: {vision_error}", flush=True)
+            else:
+                if vision.fallback_why:
+                    vision_fallback = vision.fallback_why
+                    print(f"[xestrata] images: {vision.label} serves them ({vision_fallback})", flush=True)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         try:
