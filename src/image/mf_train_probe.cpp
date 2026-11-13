@@ -306,7 +306,7 @@ int main(int argc, char** argv) {
             Dev DY(dy), X16T(load(dir, "x16t")), H16T(load(dir, "h16t")), XR(load(dir, "xr")),
                 HR(load(dir, "hr")), BT16(load(dir, "bt16")), dB(rows * rank * 4),
                 dA(rank * cols * 4), scratch((T * rank + T * rows + rows * rank + rank * cols) * 4),
-                tmp16(T * rows + rows * T + rank * T), rsT(T * 4);
+                tmp16((2 * T * rows + T * rank) * 2), rsT(T * 4);   // FP16: 2 T N + T rank halves
             zero(dB, rows * rank * 4, s);
             zero(dA, rank * cols * 4, s);
             strata::prefill::Gemm gemm;

@@ -443,7 +443,7 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
             return false;
         }
         uint64_t total = d.get_info<sycl::info::device::global_mem_size>(), margin = 0;
-        if (core::integrated_gpu(d)) core::apply_uma_limit(free);   // its memory is the system RAM
+        if (core::integrated_gpu(d)) core::apply_uma_limit(free, total);   // its memory is the system RAM
         else if (d.has(sycl::aspect::ext_intel_pci_address)) {
             std::string pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
             for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
