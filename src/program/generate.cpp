@@ -25,6 +25,7 @@
 #include "strata/core/control_vector.hpp"
 #include "strata/core/stdin_lines.hpp"
 #include "strata/core/watchdog.hpp"
+#include "strata/core/context_fit.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_tier.hpp"
@@ -4071,7 +4072,27 @@ int main(int argc, char** argv) {
     const int64_t hi0 = carve ? split_at[0] : -1;
     auto stage_lo = [&](size_t i) { return split_at[i]; };
     auto stage_hi = [&](size_t i) { return i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers; };
-    if (!strata::gpu::alloc_device(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0))) {
+    // #5715: the room the session has now, read before its allocation, so a start that does not fit says the largest
+    // context that does (context_fit.hpp) instead of only that the allocation failed
+    size_t sess_free_b = 0, sess_total_b = 0;
+    const bool sess_room_known = strata::gpu::mem_info(&sess_free_b, &sess_total_b) && sess_free_b > 0;
+    const uint64_t sess_bytes = strata::core::session_bytes(g, o.max_context, K, 0, hi0);
+    if (!strata::gpu::alloc_device(&sbuf, sess_bytes)) {
+        if (sess_room_known) {
+            const auto fit = strata::core::context_that_fits(
+                o.max_context, sess_free_b,
+                [&](int64_t cells) { return strata::core::session_bytes(g, cells, K, 0, hi0); });
+            if (fit.cells > 0)
+                std::fprintf(stderr, "xestrata generate: a context of %lld tokens does not fit on this graphics card: its "
+                                     "session needs %.2f GiB and only %.2f GiB is free; a context of %lld tokens fits here\n",
+                             (long long) o.max_context, (double) fit.need / 1073741824.0,
+                             (double) fit.room / 1073741824.0, (long long) fit.cells);
+            else
+                std::fprintf(stderr, "xestrata generate: a context of %lld tokens does not fit on this graphics card: its "
+                                     "session needs %.2f GiB and only %.2f GiB is free (not even 1024 tokens fit here)\n",
+                             (long long) o.max_context, (double) fit.need / 1073741824.0,
+                             (double) fit.room / 1073741824.0);
+        }
         std::fprintf(stderr, "xestrata generate: session state allocation failed\n");
         return 1;
     }
