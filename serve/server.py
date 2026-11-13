@@ -48,6 +48,7 @@ import select
 import shutil
 import signal
 import socket
+import socketserver
 import struct
 import subprocess
 import sys
@@ -10355,6 +10356,13 @@ class Server(ThreadingHTTPServer):
         if ":" in server_address[0]:                    # an IPv6 address (`::`): an IPv6 socket (upstream eba3106c0)
             self.address_family = socket.AF_INET6
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
+
+    def server_bind(self):
+        # http.server's server_bind also asks socket.getfqdn(host) for a server_name nothing here reads; a machine
+        # whose reverse lookup stalls (GitHub's macOS runner: 35 s on the first lookup of every new process) then
+        # listens that long after the start
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
