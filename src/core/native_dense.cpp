@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/native_dense.hpp"
+#include "strata/core/dense_slab.hpp"
 #include "strata/core/run_manifest.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -82,7 +83,10 @@ bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
            ref.bytes == (uint64_t) ref.elements * 2 && tensor.shape[0] == (uint64_t) ref.ne0 &&
            tensor.shape[1] == (uint64_t) ref.ne1;
 }
-struct DeviceFree { void operator()(void* p) const { if (p) strata::gpu::free(p); } };
+struct DeviceFree {
+    DenseSlab* slab = nullptr;
+    void operator()(void* p) const { if (p && (!slab || !slab->owns(p))) strata::gpu::free(p); }
+};
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
     WeightRef* ref;
@@ -205,9 +209,12 @@ namespace {
 void* g_hc_scratch[4] = {nullptr, nullptr, nullptr, nullptr};
 }
 
+NativeDense::NativeDense() = default;
+
 NativeDense::~NativeDense() {
     if (scratch_) strata::gpu::free(scratch_);
-    for (void* p : weights_) strata::gpu::free(p);
+    for (void* p : weights_) if (!slab_ || !slab_->owns(p)) strata::gpu::free(p);
+    slab_.reset();
     for (void* p : hc_q8_) strata::gpu::free(p);
     if (hc_side_)
         for (void*& p : g_hc_scratch) { strata::gpu::free(p); p = nullptr; }
@@ -273,6 +280,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
         sycl::queue& compute = strata::core::Runtime::get().compute();
+        auto slab = std::make_unique<DenseSlab>();
         std::vector<Pending> pending;
         std::set<std::string> seen;
         int max_in = 0;
@@ -359,9 +367,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (bf16_as_q8_0(tensor, ref)) {   // #4741: a BF16 projection of the pack, served as Q8_0
                     const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
-                    void* allocation = nullptr;
-                    bool status = strata::gpu::alloc_device(&allocation, bytes);
-                    DevicePtr data(allocation);
+                    void* allocation = slab->alloc(bytes);
+                    bool status = allocation != nullptr;
+                    DevicePtr data(allocation, DeviceFree{slab.get()});
                     if (status)
                         strata::kernels::fused_gr_quantize_q8_0(static_cast<const uint16_t*>(ref.data),
                                                                 static_cast<uint8_t*>(data.get()), (int64_t) nb,
@@ -391,9 +399,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     (int) tensor.type, (int) ref.ne0, (int) ref.ne1);
-                void* allocation = nullptr;
-                bool status = strata::gpu::alloc_device(&allocation, bytes);
-                DevicePtr data(allocation);
+                void* allocation = slab->alloc(bytes);
+                bool status = allocation != nullptr;
+                DevicePtr data(allocation, DeviceFree{slab.get()});
                 if (status)
                     status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
                 if (!status) {
@@ -501,6 +509,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (!status) { err = std::string("native dense scratch: ") + strata::gpu::last_error(); return false; }
         // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
+        slab_ = std::move(slab);   // owns every slab before any weight is published, including on a timing failure
         // the timing's launches read the weights uploaded here, as the decode reads a matrix after the others (not a
         // span allocated for it, which a GPU's driver may keep from the free memory after it is freed)
         std::vector<const void*> at;
