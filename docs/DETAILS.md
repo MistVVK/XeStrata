@@ -77,6 +77,34 @@ It speeds up handing back a given text nearly as it was, and slows ordinary chat
 (B70, IQ2_XS, K=3: rewriting a document 109.6 → 129.2, ordinary chat 71.1 → 68.3 tokens/s).
 `--lookup-chain-min M` is the match it needs before adding any (default 3 tokens).
 
+#### DFlash2 (Qwen3.8-Flash-Next's other drafter)
+
+`--draft mtp|dflash2|auto|off` picks the drafter (default mtp). DFlash2 is a block drafter for Qwen3.8-Flash-Next
+([incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2), Apache-2.0). It reads
+the target's hidden states after layers 5/15/25/35/45, proposes 7 tokens in one forward pass of an anchor row and 7
+mask rows, and picks them left to right with a top-16 and a rank-256 selector. It is a different drafter from the MTP
+layer; `--draft-model PACK` takes a `tools/dflash2_pack.py` pack (Q4_0 matrices, Q4_0 selector, about 0.5 GB). Setup
+fetches it from the pinned revision and packs it on this PC when `--drafting auto|dflash2`
+(`tools/dflash2_fetch.py`, checked against its SHA-256).
+
+`--draft auto` loads both the MTP and DFlash2 and picks one per request. A request's `xestrata_draft`
+(`mtp|dflash2|auto`) wins when given; otherwise `--draft-rule df2|mtp|learn` (default learn). learn keeps, per kind of
+request (its first 32 prompt tokens) and context depth (the 2K/8K/32K boundaries), the drafter with the better
+measured decode speed (an EMA), and tries the loser now and then (every 6th request when they are within 4%, every
+12th otherwise). It starts with the MTP and measures both over the first requests. Nothing is written to disk (in the
+process only). The drafter not chosen is kept current too (DFlash2's ring through context updates, the MTP through the
+prompt re-read).
+
+DFlash2's window closes where the product of its selector probabilities falls below `--draft-conf P` (the default
+comes from the expert slots the card holds after the drafter loads; an explicit `--draft-conf` wins). `--draft dflash2`
+loads no MTP layer by default (`--draft-fallback mtp` loads both). DFlash2 runs on one GPU, one request at a time (a
+layer split, `--batch` and pipeline windows keep the MTP). The greedy answer is the same whichever drafter proposes
+(the verify window emits the target's argmax).
+
+The plain engine (Qwen3.6, Ornith and the others) shares the same `--draft`, `xestrata_draft` and tap mechanism, but
+DFlash2's weights are trained for Qwen3.8-Flash-Next, so there is no pack for the plain models yet: `--draft dflash2`
+is refused and auto keeps the MTP.
+
 In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
 top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
 low is neither read nor computed (`XESTRATA_ROUTE_TAIL_SKIP`, default 7, upstream b4e3407b). The other experts keep their

@@ -515,6 +515,10 @@ void MtpDrafter::set_draft_history(const int32_t* tail, int64_t n_tail, int32_t 
 }
 
 
+MtpDrafter::SharedHead MtpDrafter::shared_head() const {
+    return {dhead_, dvocab_, n_dvocab_, head_ != nullptr ? head_->type() : -1};
+}
+
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
                       const MtpDrafter* shared) {
     const OnDevice on_device(device_);
