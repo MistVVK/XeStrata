@@ -998,41 +998,38 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         strata::core::window_choices_paused() = false;
         const long long free_during = free_mib();
         const strata::spec::DraftProbe judge;
-        const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, dr.loaded, model.drafts() + 1);
+        const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, model.drafts() + 1);
         std::fprintf(stderr, "xestrata (%s): %s (%.1f s)\n", arch.c_str(), v.line.c_str(),
                      std::chrono::duration<double>(Clock::now() - probe_t0).count());
         strata::spec::Drafter keep = v.measured ? v.keep : strata::spec::Drafter::Mtp;
-        bool both = v.measured && v.keep_both;
         // DFlash2 kept only where the VRAM it took from the reserve leaves the reserve the start had (a long prompt's
         // buffers come out of it)
         size_t fb = 0, tb = 0;
         strata::gpu::mem_info(&fb, &tb);
         const long long reserve = opt.reserve_mib >= 0 ? (long long) opt.reserve_mib : (long long) (tb >> 20) / 32;
-        if ((keep == strata::spec::Drafter::Df2 || both) && free_during < reserve) {
+        if (keep == strata::spec::Drafter::Df2 && free_during < reserve) {
             std::fprintf(stderr, "xestrata (%s): DFlash2 is not kept: with it %lld MiB of VRAM stay free, less than the "
                                  "%lld MiB reserve: the MTP layer drafts\n", arch.c_str(), free_during, reserve);
             keep = strata::spec::Drafter::Mtp;
-            both = false;
         }
-        if (dr.loaded && keep != strata::spec::Drafter::Df2 && !both) dr.release(model);
+        if (dr.loaded && keep != strata::spec::Drafter::Df2) dr.release(model);   // one drafter is kept
         // the MTP layer that lost: its own weights, graphs and 2-bit head back (its K/V pool and its experts' places
         // in the tier stay: a saved state carries the one, the tier's layout holds the other)
-        if (keep != strata::spec::Drafter::Mtp && !both && model.drafts() > 0) {
+        if (keep != strata::spec::Drafter::Mtp && model.drafts() > 0) {
             const uint64_t back = model.release_mtp(dr.loaded);
             std::fprintf(stderr, "xestrata (%s): the MTP layer's weights released (%llu MiB of VRAM back; its K/V and "
                                  "its experts' places stay)\n", arch.c_str(), (unsigned long long) (back >> 20));
         }
         if (dr.loaded) {
             dr.deferred = false;
-            draft_rule = both ? "learn" : "df2";
+            draft_rule = "df2";
         }
-        drafting_off = keep == strata::spec::Drafter::None && !both;
+        drafting_off = keep == strata::spec::Drafter::None;
         if (keep == strata::spec::Drafter::Mtp && v.spec > 0) model.set_mtp_drafts(v.spec - 1);
         drafter_policy = strata::spec::DrafterPolicy();
         std::fprintf(stderr, "xestrata (%s): drafting: %s; VRAM free %lld MiB before the measurement, %lld with every "
                              "drafter loaded, %lld now\n", arch.c_str(),
-                     dr.loaded && both ? "the MTP layer and DFlash2 (picked per request)"
-                     : dr.loaded       ? "DFlash2"
+                     dr.loaded      ? "DFlash2"
                      : drafting_off    ? "no drafter"
                                        : ("the MTP layer, window " + std::to_string(model.drafts() + 1)).c_str(),
                      (long long) (probe_free0 >> 20), free_during, free_mib());
@@ -1088,7 +1085,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             const std::vector<int> plan = strata::spec::DraftProbe::plan((int) probe_arms.size());
             for (int k : plan) {
                 const strata::spec::ProbeArm& a = probe_arms[(size_t) std::max(k, 0)];
-                probe_lines.push_back("GEN " + std::to_string(strata::spec::probe_tokens()) + " ckpt=0 draft=" +
+                probe_lines.push_back("GEN " + std::to_string(k < 0 ? strata::spec::kProbeWarmTokens
+                                                                  : strata::spec::probe_tokens()) + " ckpt=0 draft=" +
                                       (a.drafter == strata::spec::Drafter::None ? std::string("off")
                                                                                 : strata::spec::drafter_name(a.drafter)) +
                                       " spec=" + std::to_string(a.spec) + " probe=" + std::to_string(k) + " " + ids);
@@ -2248,9 +2246,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                                      (double) (model.file_read_bytes() - file_bytes0) / 1e6, (int64_t) (n_end - resume),
                                      (int64_t) (model.offloaded() - offload0), ""});
         std::fflush(stdout);
-        if (req_probe >= 0)   // the start's measurement: this run's speed
+        if (req_probe >= 0) {   // the start's measurement: this run's speed; a round that settles it ends it
             probe_runs.push_back({req_probe, (int64_t) produced, decode_ms, (int64_t) (model.spec_drafted() - off0),
                                   (int64_t) (model.spec_accepted() - acc0)});
+            if (probe_runs.size() % probe_arms.size() == 0 && strata::spec::DraftProbe::settled(probe_arms, probe_runs))
+                probe_lines.clear();
+        }
         else if (dr.loaded && req_kind != 0 && req_probe == -2 && !req_off)   // both kept: what this request taught
             drafter_policy.observe(req_kind, (int64_t) ids.size(), req_df2 ? strata::spec::DrafterPolicy::Df2
                                                                            : strata::spec::DrafterPolicy::Mtp,

@@ -90,16 +90,17 @@ setup は `--drafting auto|dflash2` のとき、モデルごとに版を固定�
 `--serve` の `--draft auto` は、起動の最後（READY の前）に、読み込んだ drafter（MTP、DFlash2 の pack があれば
 DFlash2）と「drafter なし」を、固定の短い英文で交互に decode して比べ、速いものを残します。負けた drafter は
 VRAM と RAM から外します（MTP の層の K/V は、会話のキャッシュと保存した会話が持つので残します）。`--spec auto`（setup が書きます）なら窓の上限も候補にします（Qwen3.8-Flash-Next は 4 と 2、
-plain エンジンは 3 と 2）。最速が他より 3%（と自身の回の間のぶれ）以上速くなければ、安い形（MTP、DFlash2、なしの順、
-設定の窓）を残します。MTP と DFlash2 がその幅の中なら両方を残し、要求ごとに選びます（下）。測りに使う DFlash2 は
+plain エンジンは 3 と 2）。既定の形（設定の窓の MTP）を外すのは、ほかの形がすべての回で既定の形より速く、速さが
+10%（と両方の回の間のぶれ）以上上回るときだけです。そのうち最も速い形を残します。残す drafter は 1 つです。1 巡目で
+ほかの形が既定の形を上回る見込みがなくなれば、2 巡目は回しません。測りに使う DFlash2 は
 起動の最後に読み込み、エキスパートのキャッシュは MTP だけのときと同じ大きさで取るので、MTP が勝てば pack が
 ないときと同じ状態になります。DFlash2 を残すのは、それを載せても `--vram-reserve-mib` の予備が空いているときだけ
 です。測りの間はエキスパートの入れ替えと、最初の窓で決める切り替えは動きません。測りは浅い文脈（百数十トークン）で
 行い、深い文脈では窓の規則（`--spec-window auto`）が回ごとに補います。結果はファイルに残さず、起動ごとに測ります。
-`XESTRATA_DRAFT_PROBE=0` で測らず（auto は両方を読みます）、`XESTRATA_DRAFT_PROBE_TOKENS` で 1 回の長さ（既定 64）を
+`XESTRATA_DRAFT_PROBE=0` で測らず（auto は両方を読みます）、`XESTRATA_DRAFT_PROBE_TOKENS` で 1 回の長さ（既定 48）を
 変えます。`--draft mtp|dflash2|off` と数字の `--spec` はそのとおりにします。`--serve` なしの auto は MTP の層です。
 
-両方を残したときは、要求の `xestrata_draft`（`mtp|dflash2|auto|off`）が明示ならそれに従い、なければ
+`XESTRATA_DRAFT_PROBE=0` で両方を読んだときは、要求の `xestrata_draft`（`mtp|dflash2|auto|off`）が明示ならそれに従い、なければ
 `--draft-rule df2|mtp|learn`（既定 learn）です。learn は要求の種類（prompt 先頭 32 トークン）× 文脈の深さ
 （2K/8K/32K の境）ごとに、実測の decode 速度（EMA）の良い方を選び、負けた側も時々試します（差 4% 未満で 6 回に
 1 回、以上で 12 回に 1 回）。

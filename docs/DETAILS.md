@@ -92,18 +92,19 @@ With `--serve`, `--draft auto` decodes a short fixed English text at the end of 
 drafter loaded (the MTP and, with a DFlash2 pack, DFlash2) and with no drafter, in turn, and keeps the fastest; the
 drafters that lose are released from VRAM and RAM (the MTP layer's K/V stays: the conversation cache and the saved
 conversations carry it). With `--spec auto` (setup writes it) the largest window is a
-candidate too (4 and 2 for Qwen3.8-Flash-Next, 3 and 2 in the plain engine). Unless the fastest is 3% (and its own
-runs' spread) ahead of the others, the cheaper form stays (the MTP, DFlash2, none in that order; the configured window).
-When the MTP and DFlash2 are within that margin both stay and each request picks one (below). The DFlash2 that is
+candidate too (4 and 2 for Qwen3.8-Flash-Next, 3 and 2 in the plain engine). The default form (the MTP at the
+configured window) is left only for a form that is faster in every run and by 10% (and both forms' spread between runs);
+of those, the fastest stays. One drafter is kept. When after the first round no other form can still beat the default,
+the second round is not run. The DFlash2 that is
 measured is loaded at the end of the start and the expert cache is sized as for the MTP alone, so when the MTP wins the
 engine is as it is without the pack; DFlash2 stays only where the `--vram-reserve-mib` reserve is still free beside it.
 While the measurement runs no expert moves and the switches chosen on the first windows are not measured. It reads a
 shallow context (a hundred-odd tokens); at depth the window rule (`--spec-window auto`) adapts each round. Nothing is
 written to disk: every start measures again. `XESTRATA_DRAFT_PROBE=0` measures nothing (auto then loads both), and
-`XESTRATA_DRAFT_PROBE_TOKENS` sets a run's length (default 64). `--draft mtp|dflash2|off` and a number for `--spec` are
+`XESTRATA_DRAFT_PROBE_TOKENS` sets a run's length (default 48). `--draft mtp|dflash2|off` and a number for `--spec` are
 kept as given. Without `--serve`, auto is the MTP layer.
 
-When both stay, a request's `xestrata_draft` (`mtp|dflash2|auto|off`) wins when given; otherwise
+When `XESTRATA_DRAFT_PROBE=0` loads both, a request's `xestrata_draft` (`mtp|dflash2|auto|off`) wins when given; otherwise
 `--draft-rule df2|mtp|learn` (default learn). learn keeps, per kind of request (its first 32 prompt tokens) and context
 depth (the 2K/8K/32K boundaries), the drafter with the better measured decode speed (an EMA), and tries the loser now and
 then (every 6th request when they are within 4%, every 12th otherwise).
