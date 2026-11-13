@@ -781,7 +781,8 @@ class _CpuRamFallback:
 
     def _times(self):
         try:
-            f = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+            with open("/proc/stat") as fh:      # closed after reading: no ResourceWarning on every sample
+                f = [int(x) for x in fh.readline().split()[1:]]
             return f[3] + f[4], sum(f)
         except (OSError, ValueError):
             return None
