@@ -31,9 +31,9 @@ inline int code_of(int bits, int st) { return bits == 4 ? kCode4[st] : kCode5[st
 
 inline int row_bytes(int head_dim, int bits) { return head_dim * bits / 8 + 4; }
 
-// The row's scale over 256: a code times it is the value
+// The row's scale: a code over 256 times it is the value
 inline float row_scale(const uint8_t* r, int head_dim, int bits) {
-    return *reinterpret_cast<const float*>(r + head_dim * bits / 8) * (1.0f / 256.0f);
+    return *reinterpret_cast<const float*>(r + head_dim * bits / 8);
 }
 
 // 64 bits of a row's code from bit `at` on, the first the most significant.  The words read stay inside the row: the
@@ -44,21 +44,26 @@ inline uint64_t bits64(const uint32_t* w, int at) {
     return o == 0 ? z : (z << o) | (w[wi + 2] >> (32 - o));
 }
 
+// A code's value over 256 from the codebook in local memory (tab, code_of(bits, i) / 256), else from the constant one
+inline float code_val(int bits, int st, const float* tab) {
+    return tab != nullptr ? tab[st] : (float) code_of(bits, st) * (1.0f / 256.0f);
+}
+
 // Value d of a row (r: its first byte)
-inline float value(const uint8_t* r, int head_dim, int bits, int d) {
+inline float value(const uint8_t* r, int head_dim, int bits, int d, const float* tab = nullptr) {
     const uint32_t* w = reinterpret_cast<const uint32_t*>(r);
     const int end = bits * (d + 1), first = bits * (d & ~(kTcqChain - 1));
     const int lo = sycl::max(end - 8, first), n = end - lo;
     const int wi = lo >> 5, o = lo & 31;
     const uint64_t z = ((uint64_t) w[wi] << 32) | w[wi + 1];
     const int st = (int) (z >> (64 - o - n)) & ((1 << n) - 1);
-    return (float) code_of(bits, st) * row_scale(r, head_dim, bits);
+    return code_val(bits, st, tab) * row_scale(r, head_dim, bits);
 }
 
 // Values dd .. dd + N - 1 of a row (dd a multiple of N, N of 4 or 8, inside one chain): one 64-bit window of code
 // holds them and the bits before the first (none at a chain's start)
 template<int N>
-inline void values(const uint8_t* r, int head_dim, int bits, int dd, float* out) {
+inline void values(const uint8_t* r, int head_dim, int bits, int dd, float* out, const float* tab = nullptr) {
     static_assert(N == 4 || N == 8, "a 64-bit window holds 8 values of 5 bits and the 3 before");
     const uint32_t* w = reinterpret_cast<const uint32_t*>(r);
     const float sc = row_scale(r, head_dim, bits);
@@ -67,7 +72,7 @@ inline void values(const uint8_t* r, int head_dim, int bits, int dd, float* out)
 #pragma unroll
     for (int e = 0; e < N; ++e) {
         const int end = pre + bits * (e + 1);
-        out[e] = (float) code_of(bits, (int) (z >> (64 - end)) & 0xFF) * sc;
+        out[e] = code_val(bits, (int) (z >> (64 - end)) & 0xFF, tab) * sc;
     }
 }
 

@@ -116,8 +116,9 @@ inline int head_of_lane(int lane) {
 }
 
 // One V element of pool row `row`, dimension `d` (the value loop's own work-item), per KV format.
+// tab: the trellis code's codebook in local memory (KV_MODE 4; the kernel fills it), else null
 template <int HD, int KV_MODE>
-inline float load_v1(const QsaAttnPools& p, long long row, int d) {
+inline float load_v1(const QsaAttnPools& p, long long row, int d, const float* tab) {
     if constexpr (KV_MODE == 0) {
         return h2f(p.v_pool[row * HD + d]);
     } else if constexpr (KV_MODE == 1) {
@@ -125,7 +126,7 @@ inline float load_v1(const QsaAttnPools& p, long long row, int d) {
         return (float) p.v_q[row * HD + d] * sc;
     } else if constexpr (KV_MODE == 4) {   // trellis-coded, rotated (kv_tcq.hpp); the caller rotates the output back
         const int bits = p.tc_bits;
-        return tcq::value(p.v_tc + row * (long long) tcq::row_bytes(HD, bits), HD, bits, d);
+        return tcq::value(p.v_tc + row * (long long) tcq::row_bytes(HD, bits), HD, bits, d, tab);
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;
@@ -144,15 +145,15 @@ inline float load_v1(const QsaAttnPools& p, long long row, int d) {
 // (kv_tcq.hpp).  N divides 16, so the run stays inside one Q4_0 half (the low nibbles hold elements 0-15 of a block,
 // the high ones 16-31) and inside one chain of the trellis code.
 template <int HD, int KV_MODE>
-inline void loadn(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
+inline void loadn(const QsaAttnPools& p, bool value, long long row, int d0, float* out, const float* tab) {
     constexpr int N = HD / WARP;
     if constexpr (KV_MODE == 4) {
         const int bits = p.tc_bits;
         tcq::values<N>((value ? p.v_tc : p.k_tc) + row * (long long) tcq::row_bytes(HD, bits), HD, bits,
-                       d0, out);
+                       d0, out, tab);
     } else if constexpr (KV_MODE == 3) {
-        if (value) loadn<HD, 2>(p, true, row, d0, out);
-        else loadn<HD, 1>(p, false, row, d0, out);
+        if (value) loadn<HD, 2>(p, true, row, d0, out, tab);
+        else loadn<HD, 1>(p, false, row, d0, out, tab);
     } else if constexpr (KV_MODE == 0) {
         const uint16_t* base = (value ? p.v_pool : p.k_pool) + row * HD + d0;
         for (int j = 0; j < N; ++j) out[j] = h2f(base[j]);
@@ -206,6 +207,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
     const bool dense = ids_all == nullptr;
     return queue.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sq(sycl::range<1>(G * HD), hd);          // this KV head's query heads
+        sycl::local_accessor<float, 1> stab(sycl::range<1>(KV_MODE == 4 ? 256 : 1), hd);   // the trellis codebook
         sycl::local_accessor<float, 1> sp(sycl::range<1>((size_t) G * CHUNK), hd);       // scores
         sycl::local_accessor<sycl::float4, 1> spt(sycl::range<1>(CHUNK * GP / 4), hd);  // probabilities, cell-major
         sycl::local_accessor<long long, 1> srow(sycl::range<1>(CHUNK), hd);     // pool row of each cell
@@ -243,6 +245,11 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 return;
             }
             for (int i = t; i < G * HD; i += THREADS) sq[i] = q[(size_t) (kvh * G) * HD + i];
+            // the codebook's values over 256 (a code's value is it times the row's scale): a value read from local
+            // memory, not a gather from the constant table, in the loops below (the barrier after srow orders it)
+            if constexpr (KV_MODE == 4)
+                for (int i = t; i < 256; i += THREADS) stab[i] = (float) tcq::code_of(p.tc_bits, i) * (1.0f / 256.0f);
+            const float* tab = KV_MODE == 4 ? &stab[0] : nullptr;
             // chunks first, first + n_slots, ... in turn, each folded into the running max, sum and values (online
             // softmax); with one chunk a slot (n_slots the chunks) these are the chunk's own, as before
             float run_m[G], run_l[G], run_acc[G];
@@ -270,7 +277,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                         if (t < n_here && srow[t] >= 0) {
                             for (int d = 0; d < HD; d += N) {
                                 float key[N];
-                                loadn<HD, KV_MODE>(p, false, srow[t], d, key);
+                                loadn<HD, KV_MODE>(p, false, srow[t], d, key, tab);
                                 for (int h = 0; h < G; ++h) sums[h] += dotn<N>(key, &sq[h * HD + d]);
                             }
                         }
@@ -292,7 +299,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                     }
                     if (all_ok) {
                         float kk[NC][N];
-                        for (int j = 0; j < NC; ++j) loadn<HD, KV_MODE>(p, false, srow[cc[j]], lane * N, kk[j]);
+                        for (int j = 0; j < NC; ++j) loadn<HD, KV_MODE>(p, false, srow[cc[j]], lane * N, kk[j], tab);
                         constexpr int HP = G <= 4 ? 4 : 16;   // the heads reduce4 or reduce12 sums
                         float pp[NC][HP];
     #pragma unroll
@@ -322,7 +329,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                                 continue;
                             }
                             float kn[N];
-                            loadn<HD, KV_MODE>(p, false, srow[c], lane * N, kn);
+                            loadn<HD, KV_MODE>(p, false, srow[c], lane * N, kn, tab);
                             constexpr int HP = G <= 4 ? 4 : 16;
                             float part[HP];
                             for (int h = 0; h < G; ++h) part[h] = dotn<N>(kn, &sq[h * HD + lane * N]);
@@ -385,8 +392,8 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 for (; c + 4 <= n_here; c += 4) {
                     const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
                     if ((r0 | r1 | r2 | r3) < 0) break;
-                    const float v0 = load_v1<HD, KV_MODE>(p, r0, t), v1 = load_v1<HD, KV_MODE>(p, r1, t);
-                    const float v2 = load_v1<HD, KV_MODE>(p, r2, t), v3 = load_v1<HD, KV_MODE>(p, r3, t);
+                    const float v0 = load_v1<HD, KV_MODE>(p, r0, t, tab), v1 = load_v1<HD, KV_MODE>(p, r1, t, tab);
+                    const float v2 = load_v1<HD, KV_MODE>(p, r2, t, tab), v3 = load_v1<HD, KV_MODE>(p, r3, t, tab);
                     fold(c, v0);
                     fold(c + 1, v1);
                     fold(c + 2, v2);
@@ -394,7 +401,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 }
                 for (; c < n_here; ++c) {
                     if (srow[c] < 0) continue;   // masked above, weight 0
-                    fold(c, load_v1<HD, KV_MODE>(p, srow[c], t));
+                    fold(c, load_v1<HD, KV_MODE>(p, srow[c], t, tab));
                 }
                 if constexpr (!LOOP) {   // the chunk's own partials
                     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
