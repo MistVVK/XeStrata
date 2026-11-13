@@ -11241,6 +11241,17 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
 
 
 def main() -> int:
+    """The server.  Its console output goes through a bounded queue (serve/nonblocking_out.py, upstream b776e1cd0): a
+    console that stops taking output must not hold a request's turn, a cancel or an admission.
+    XESTRATA_BLOCKING_CONSOLE=1 turns it off (testers)."""
+    if envvars.get("BLOCKING_CONSOLE") == "1":
+        return _main()
+    from serve.nonblocking_out import decoupled_console
+    with decoupled_console():
+        return _main()
+
+
+def _main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "xestrata", "strata"], default="mock")   # strata: upstream's name
     ap.add_argument("--config", help="xestrata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
