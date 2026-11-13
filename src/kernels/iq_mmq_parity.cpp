@@ -461,7 +461,8 @@ int bench() {
                             {"ornith-3bit", GGML_TYPE_Q3_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 2048, 512},
                             {"llmjp-q4_k_m", GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, 2560, 960},
                             {"qwen-iq2_xs", GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, 2560, 640},
-                            {"qwen-iq3_xxs", GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 2560, 640}};
+                            {"qwen-iq3_xxs", GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 2560, 640},
+                            {"qwen-iq2_xs-q2_0", GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, (ggml_type) 42, 2560, 640}};
     constexpr int G = 16;
     for (const Combo& c : combos) {
         const int64_t N = c.N, FF = c.FF;
@@ -475,10 +476,12 @@ int bench() {
         q.memset(wd, 0x11, db * G).wait();
         uint16_t* dq_gu = dev.alloc<uint16_t>((size_t) G * 2 * (size_t) (FF * N));
         uint16_t* dq_d = dev.alloc<uint16_t>((size_t) (G * N * FF));
-        const int fx = one ? k::iq_mmq_fx((int) c.gate) : 0;   // the gate/up's fixed-point form, where it has one
+        // the fixed-point forms of the gate/up and the down, where they have them
+        const int fx = one ? k::iq_mmq_fx((int) c.gate) : 0, fxd = fx != 0 ? k::iq_mmq_fx((int) c.down) : 0;
         if (one) {   // the forms the engine's warming chooses (iq_mmq_choose_forms)
             k::iq_mmq_choose_forms(q, (int) c.gate, 2 * FF, N, G);
             if (fx != 0) k::iq_mmq_choose_forms(q, fx, 2 * FF, N, G);
+            if (fxd != 0) k::iq_mmq_choose_forms(q, fxd, N, FF, G);
         } else {
             k::iq_mmq_choose_forms(q, (int) c.gate, FF, N, G);
             k::iq_mmq_choose_forms(q, (int) c.up, FF, N, G);
@@ -501,12 +504,14 @@ int bench() {
                 return p;
             };
             const uint8_t *xg = xq_of(c.gate, N), *xu = one ? xg : xq_of(c.up, N), *xh = xq_of(c.down, FF);
-            uint8_t* xc = nullptr;   // the fixed-point form's canonical rows (of zeros)
+            uint8_t *xc = nullptr, *hc = nullptr;   // the fixed-point forms' canonical rows (of zeros)
             if (fx != 0) {
                 xc = io.alloc<uint8_t>(k::iq_mmq_act_bytes(R, N));
+                hc = io.alloc<uint8_t>(k::iq_mmq_act_bytes(R, FF));
                 float* z = io.alloc<float>((size_t) (R * N));
                 q.memset(z, 0, (size_t) (R * N) * 4).wait();
                 k::iq_mmq_quantize(q, z, nullptr, xc, N, N, R, false, false, 256).wait();
+                k::iq_mmq_quantize(q, z, nullptr, hc, FF, FF, R, false, false, 32).wait();
             }
             float* gu = io.alloc<float>((size_t) (R * 2 * FF));
             float* dn = io.alloc<float>((size_t) (R * N));
@@ -537,15 +542,25 @@ int bench() {
                 k::xmx_gemm_grouped(x16, dq_gu, 2 * FF * N, gu, db_, G, r, 2 * FF, N, s);
                 k::xmx_gemm_grouped(h16, dq_d, N * FF, dn, db_, G, r, N, FF, s);
             });
-            double usfx = 0.0;   // the gate/up's fixed-point form, the same down
-            if (fx != 0)
-                usfx = time_us(q, [&] {
+            std::printf("  %-16s %3lld rows an expert: int8 %8.1f us  FP16 %8.1f us  %s", c.name, (long long) r, us8,
+                        us16, us8 < us16 ? "int8" : "FP16");
+            if (fx != 0) {   // the gate/up and the down apart, int8 against the fixed-point forms
+                const double gu8 = time_us(q, [&] {
+                    k::iq_mmq_grouped(q, (int) c.gate, wg, gb + ub, 2 * FF, cols(c.gate, N), G, xg, R, db_, r, di, gu,
+                                      2 * FF);
+                });
+                const double gufx = time_us(q, [&] {
                     k::iq_mmq_grouped(q, fx, wg, gb + ub, 2 * FF, N, G, xc, R, db_, r, di, gu, 2 * FF);
+                });
+                const double d8 = time_us(q, [&] {
                     k::iq_mmq_grouped(q, (int) c.down, wd, db, N, cols(c.down, FF), G, xh, R, db_, r, di, dn, N);
                 });
-            std::printf("  %-14s %3lld rows an expert: int8 %8.1f us  FP16 %8.1f us  %s", c.name, (long long) r, us8,
-                        us16, us8 < us16 ? "int8" : "FP16");
-            if (fx != 0) std::printf("  fixed-point %8.1f us (%+.1f%% of int8)", usfx, 100.0 * (usfx / us8 - 1.0));
+                const double dfx = fxd == 0 ? d8 : time_us(q, [&] {
+                    k::iq_mmq_grouped(q, fxd, wd, db, N, FF, G, hc, R, db_, r, di, dn, N);
+                });
+                std::printf("  fixed-point: gate/up %.1f / %.1f us (%+.1f%%), down %.1f / %.1f us (%+.1f%%)", gufx, gu8,
+                            100.0 * (gufx / gu8 - 1.0), dfx, d8, 100.0 * (dfx / d8 - 1.0));
+            }
             std::printf("\n");
         }
     }
