@@ -79,6 +79,15 @@ Every copyright holder whose work is in this repository, its license and where t
   window's half over the overlap's middle third), after https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
   (src/core/generation_utils.py); that code stays under Apache-2.0, the file as a whole is under the LGPL
   (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright (c) 2026 the YASAKANI authors
+  Apache-2.0 - the .yskn models (YASAKANI's trellis-coded Qwen3.8-27B): the container's reader and the reference of
+  its products (src/artifact/yskn.cpp, include/strata/artifact/yskn.hpp), the integer sums of the products
+  (include/strata/kernels/yskn_sum.hpp), the GPU kernels (src/kernels/xe/yskn.cpp, include/strata/kernels/yskn.hpp)
+  and the GGUF skeleton's writer (tools/yskn_skeleton.py), written in SYCL and C++ after
+  https://github.com/yasakani-dev/yasakani (0205f06: src/format.hpp, src/signs.hpp, src/loader.cpp, src/repack.cu,
+  src/lnord.cu, src/a8_prologue.cuh, src/q35_kernels.cu); that code stays under Apache-2.0, the files as a whole are
+  under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt. The models' files are under Apache-2.0
+  as well; XeStrata does not bundle them
 - Copyright (c) 2024 Sahand Ahmadian; Copyright (c) 2024 Jonseed
   MIT - the image engine's Detail Daemon (src/image/guidance.cpp, include/strata/image/guidance.hpp: its schedule, the
   sigma the model is asked at, their constants and the settings' defaults), written after
