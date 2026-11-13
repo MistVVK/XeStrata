@@ -11,6 +11,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include "parity_device.hpp"
 
@@ -345,6 +346,50 @@ int test_kda() {
     strata::parity::copy_out(state.data(), dstate, state.size());
     bad += compare("kda_step out (3 steps)", out_all, rout_all, 1e-4);
     bad += compare("kda_step state", state, rs, 1e-4);
+
+    // glm5_kda_scan over a wide window (16 tokens, 15 state snapshots: the snapshots' wide argument) against
+    // glm5_kda_step token by token: every output, snapshot and the final state bit for bit
+    {
+        const int TW = strata::kernels::kVerifyMaxT;
+        const size_t TS = (size_t) H * S;
+        std::vector<float> s0 = randn((size_t) S * H * S, 0.1f), qw = randn(TW * TS), kw = randn(TW * TS),
+                           vw = randn(TW * TS), gw = randn(TW * TS, 0.1f), bw((size_t) TW * H);
+        for (auto& x : gw) x = -std::fabs(x);
+        for (int i = 0; i < TW * H; ++i) bw[(size_t) i] = (float) sigm(0.1 * i - 0.5);
+        for (auto* p : {&qw, &kw})
+            for (size_t r = 0; r < (size_t) TW * H; ++r) {
+                double n = 0;
+                for (int i = 0; i < S; ++i) n += (double) (*p)[r * S + i] * (*p)[r * S + i];
+                for (int i = 0; i < S; ++i) (*p)[r * S + i] = (float) ((*p)[r * S + i] / std::sqrt(n + 1e-6));
+            }
+        float *dsa = dev.upload(s0), *dsb = dev.upload(s0), *dqw = dev.upload(qw), *dkw = dev.upload(kw),
+              *dvw = dev.upload(vw), *dgw = dev.upload(gw), *dbw = dev.upload(bw);
+        float *doa = dev.alloc<float>(TW * TS), *dob = dev.alloc<float>(TW * TS);
+        std::vector<float*> snaps((size_t) TW - 1);
+        for (auto& p : snaps) p = dev.alloc<float>(s0.size());
+        strata::kernels::glm5_kda_scan(dsa, dqw, dkw, dvw, dgw, dbw, doa, H, TW, nullptr, snaps.data(), TW - 1);
+        strata::parity::sync();
+        int wbad = 0;
+        std::vector<float> a(s0.size()), b(s0.size());
+        for (int t = 0; t < TW; ++t) {
+            strata::kernels::glm5_kda_step(dsb, dqw + t * TS, dkw + t * TS, dvw + t * TS, dgw + t * TS, dbw + t * H,
+                                           dob + t * TS, H, nullptr);
+            strata::parity::sync();
+            if (t == TW - 1) break;
+            strata::parity::copy_out(a.data(), snaps[(size_t) t], a.size());
+            strata::parity::copy_out(b.data(), dsb, b.size());
+            wbad += a != b;
+        }
+        std::vector<float> oa(TW * TS), ob(TW * TS);
+        strata::parity::copy_out(oa.data(), doa, oa.size());
+        strata::parity::copy_out(ob.data(), dob, ob.size());
+        strata::parity::copy_out(a.data(), dsa, a.size());
+        strata::parity::copy_out(b.data(), dsb, b.size());
+        wbad += (oa != ob) + (a != b);
+        std::printf("  %-40s %s\n", "kda_scan 16 tokens, 15 snapshots",
+                    wbad ? "*** DIFFER from kda_step ***" : "bitwise");
+        bad += wbad;
+    }
     return bad;
 }
 

@@ -16,6 +16,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include "parity_device.hpp"
 
@@ -116,6 +117,42 @@ int main(int argc, char** argv) {
             std::printf("      %-30s %s (%.4f%% apart)\n", "fp32 vs bf16 activation",
                         visible ? "yes" : "*** NO ***", rv * 100);
             if (!visible) ++bad;
+        }
+    }
+
+    // ---- the multi-row calls over a wide window: 16 rows in one call (the 16-row instances) against two calls of 8
+    // (the instances a window of up to 8 rows takes), bit for bit, BF16 and F32 weights
+    {
+        const long long n_in = 2560, n_out = 512;
+        const int T = strata::kernels::kVerifyMaxT, H = strata::kernels::kVerifyNarrowT;
+        std::mt19937 rng(1616);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        std::vector<float> fx((size_t) (T * n_in)), fw((size_t) (n_in * n_out));
+        for (auto& v : fx) v = g(rng);
+        for (auto& v : fw) v = g(rng) * 0.05f;
+        std::vector<uint16_t> w((size_t) (n_in * n_out));
+        for (size_t i = 0; i < fw.size(); ++i) w[i] = bf16_from_f32(fw[i]);
+        strata::parity::Device dev;
+        float *d_x = dev.upload(fx), *d_fw = dev.upload(fw);
+        uint16_t* d_w = dev.upload(w);
+        float *d_a = dev.alloc<float>((size_t) (T * n_out)), *d_b = dev.alloc<float>((size_t) (T * n_out));
+        std::vector<float> a((size_t) (T * n_out)), b((size_t) (T * n_out));
+        for (int f32 = 0; f32 < 2; ++f32) {
+            auto run = [&](float* y, int t0, int n) {
+                if (f32) strata::kernels::f32_gemv_fp32_mmvf_multi(d_x + t0 * n_in, n_in, d_fw, y + t0 * n_out, n_out,
+                                                                   n_in, n_out, n, nullptr);
+                else strata::kernels::bf16_gemv_fp32_mmvf_multi(d_x + t0 * n_in, n_in, d_w, y + t0 * n_out, n_out, n_in,
+                                                                n_out, n, nullptr);
+            };
+            run(d_a, 0, T);
+            run(d_b, 0, H);
+            run(d_b, H, T - H);
+            strata::parity::copy_out(a.data(), d_a, a.size());
+            strata::parity::copy_out(b.data(), d_b, b.size());
+            const bool same = a == b;
+            std::printf("  %-34s %s\n", f32 ? "F32 multi, 16 rows vs 8 + 8" : "BF16 multi, 16 rows vs 8 + 8",
+                        same ? "bitwise" : "*** DIFFER ***");
+            if (!same) ++bad;
         }
     }
 
