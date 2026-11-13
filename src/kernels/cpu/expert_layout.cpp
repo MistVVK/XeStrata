@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/core/latent.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/platform/env.hpp"
 
@@ -369,6 +370,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
+    int64_t expert_embd = 0, expert_ff = 0;   // v6: the header's own widths (the latent MoE), 0 when absent
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
@@ -384,9 +386,9 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                     const int v = (int) std::strtol(num, nullptr, 10);
                     // xs2: xs1's lines with Hadamard-folded experts (hadamard.txt), what upstream's v5 says
                     L.version = up ? v : v >= 2 ? 5 : 4;
-                    if (v > (up ? 5 : 2)) {
+                    if (v > (up ? 6 : 2)) {
                         err = std::string("native_experts.txt is ") + (up ? "v" : "xs") + std::to_string(v) +
-                              "; this engine reads upstream's v2-v5 and XeStrata's xs1-xs2 (repack with this "
+                              "; this engine reads upstream's v2-v6 and XeStrata's xs1-xs2 (repack with this "
                               "checkout's tools/iq_pack.py)";
                         return false;
                     }
@@ -396,6 +398,11 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // default, so the header wins.
                 const size_t at = line.find("(n_expert ");
                 if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                // v6 (the latent MoE): the experts' widths, the shell's hidden width and FF when absent
+                const size_t eb = line.find("expert_embd ");
+                if (eb != std::string::npos) expert_embd = std::atoll(line.c_str() + eb + 12);
+                const size_t ef = line.find("expert_ff ");
+                if (ef != std::string::npos) expert_ff = std::atoll(line.c_str() + ef + 10);
             }
             continue;
         }
@@ -407,7 +414,8 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, expert_embd ? expert_embd : H, expert_ff ? expert_ff : FF, f, err))
+            return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -463,12 +471,15 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
     }
     L.total = at;
+    L.expert_embd = expert_embd;
+    L.expert_ff = expert_ff;
     // v5: Agention's Hadamard-folded experts (prism.hadamard, hadamard.hpp).  The pack must say which layers are
     // rotated and with what signs; a v5 pack without hadamard.txt (or the reverse) is refused, never run unrotated.
+    // v6 (the latent A-only pack) carries no hadamard.txt: its expert rows are latent, not Hadamard-folded.
     {
         std::ifstream probe(pack_dir + "/hadamard.txt");
         const bool have = (bool) probe;
-        if (L.version >= 5 && !have) {
+        if (L.version == 5 && !have) {
             err = "native_experts.txt v5 declares Hadamard-folded experts, but " + pack_dir + "/hadamard.txt is missing";
             return false;
         }
@@ -505,9 +516,48 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             }
         }
     }
+    // v6 (the latent MoE): the Q3_K shared column scales.  The gate/up rows are A*diag(s), so the D stage's
+    // rows take 1/s where they are produced, before every consumer (the GPU experts' q8_1, the CPU share's
+    // rows, the U stage) reads them; native_quant_act does NOT multiply.  All or none: a half-scaled pack is
+    // refused rather than run wrong.  The reciprocals outlive g_layout (its NativeFmt points into them).
+    {
+        const int64_t width = expert_embd ? expert_embd : H;
+        std::vector<float> inv;
+        if (!strata::core::latent_colscale_read(pack_dir, n_layers, width, inv, err)) return false;
+        if (!inv.empty()) {
+            for (int64_t l = 0; l < n_layers; ++l) {
+                // the scales are the Q3_K gate/up's: beside other experts (an NVFP4 pack has none) they were taken
+                // all the same and every answer was wrong (a Q3_K folder turned NVFP4 by hand kept its scales/)
+                if (L.fmt[(size_t) l].gu_type != 11) {
+                    err = "scales: the Q3_K experts' shared column scales, but layer " + std::to_string(l) +
+                          "'s gate/up is ggml type " + std::to_string(L.fmt[(size_t) l].gu_type) +
+                          " (an NVFP4 pack has no scales/: remove the folder)";
+                    return false;
+                }
+                if (L.fmt[(size_t) l].n_embd != width) {
+                    err = "scales: layer " + std::to_string(l) + " has n_embd " +
+                          std::to_string(L.fmt[(size_t) l].n_embd) + ", the manifest says " + std::to_string(width);
+                    return false;
+                }
+            }
+            static std::vector<float> storage;
+            storage = std::move(inv);
+            for (int64_t l = 0; l < n_layers; ++l)
+                L.fmt[(size_t) l].gu_colscale = storage.data() + (size_t) l * (size_t) width;
+        }
+    }
     g_layout = L;
     return true;
 #endif
+}
+
+const float* latent_gu_colscale(int layer, int* width) {
+    const ExpertLayout& L = expert_layout();
+    if (width != nullptr) *width = 0;
+    if (layer < 0 || (size_t) layer >= L.fmt.size()) return nullptr;
+    const float* s = L.fmt[(size_t) layer].gu_colscale;
+    if (s != nullptr && width != nullptr) *width = (int) L.fmt[(size_t) layer].n_embd;
+    return s;
 }
 
 }  // namespace strata::kernels::cpu

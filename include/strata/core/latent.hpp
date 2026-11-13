@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -111,8 +112,33 @@ bool latent_labels_read(const std::string& path, int64_t n_layers, int64_t n_exp
 /// The Q3_K shared column scales (scales/l{l}.f32 beside the manifest): the gate/up rows are A*diag(s), so
 /// every consumer of the D stage's rows multiplies by 1/s first.  All layers or none: a half-scaled pack is
 /// refused.  `inv` comes back n_layers * width floats (layer-major), empty when the pack has no scales.
-/// A scale that is not positive reads as 1 (edge0-strata's rule).
-bool latent_colscale_read(const std::string& pack_dir, int64_t n_layers, int64_t width, std::vector<float>& inv,
-                          std::string& err);
+/// A scale that is not positive reads as 1 (edge0-strata's rule).  Inline: expert_layout_load reads the same
+/// files into NativeFmt::gu_colscale (one implementation, two callers).
+inline bool latent_colscale_read(const std::string& pack_dir, int64_t n_layers, int64_t width, std::vector<float>& inv,
+                                 std::string& err) {
+    inv.clear();
+    if (n_layers <= 0 || width <= 0) { err = "scales: the geometry is empty"; return false; }
+    {
+        std::ifstream probe(pack_dir + "/scales/l0.f32", std::ios::binary);
+        if (!probe) return true;   // no scales: the pack's rows are not column-scaled
+    }
+    inv.reserve((size_t) (n_layers * width));
+    for (int64_t l = 0; l < n_layers; ++l) {
+        const std::string p = pack_dir + "/scales/l" + std::to_string(l) + ".f32";
+        std::ifstream f(p, std::ios::binary | std::ios::ate);
+        if (!f) { err = "scales: " + p + " is missing (all-or-none)"; return false; }
+        const std::streamsize want = (std::streamsize) (width * 4);
+        if (f.tellg() != want) {
+            err = "scales: " + p + ": size " + std::to_string((long long) f.tellg()) + " != " +
+                  std::to_string((long long) want);
+            return false;
+        }
+        f.seekg(0);
+        std::vector<float> s((size_t) width);
+        if (!f.read(reinterpret_cast<char*>(s.data()), want)) { err = "scales: " + p + ": short read"; return false; }
+        for (float v : s) inv.push_back(v > 0.0f ? 1.0f / v : 1.0f);
+    }
+    return true;
+}
 
 }  // namespace strata::core
