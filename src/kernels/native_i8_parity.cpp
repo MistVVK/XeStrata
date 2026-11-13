@@ -198,6 +198,94 @@ uint64_t hash_bits(const std::vector<float>& v) {
     return h;
 }
 
+// The prompt path's call for a layer the CPU share took experts of (include/strata/prefill/share_own_rule.hpp): the GPU's experts sit in the first `rows_local` rows of the layer's
+// rows in groups of 16, the CPU's experts' rows are the LAST block [rows_local, cap) of the layer's output and nobody on the GPU writes them.  Each group is one launch exactly as
+// i8grp::run makes it: bounds relative to the group's first row r0, the entry-to-place table the identity from there, the rows' tokens src + r0, the scratch at r0 * (2 * FF) floats,
+// the output at out + r0 * H.  Checked against native_expert_grouped on the same layout: the GPU rows are finite and agree (relative RMS under 5e-3), the CPU block is untouched
+// (the 0xFF pattern) in both, and a second run gives the same bits.
+void check_carved(const Setup& S, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng, int tm, int& bad, double& worst, int& calls) {
+    const int E = 20;   // experts of the GPU's part (some with no rows)
+    std::uniform_int_distribution<int> cnt_d(0, 14), tk(0, S.T - 1);
+    std::vector<int> order, cnt(E), off(E);
+    int rows_local = 0;
+    for (int e = 0; e < E; ++e) {
+        cnt[(size_t) e] = cnt_d(rng);
+        off[(size_t) e] = rows_local;
+        rows_local += cnt[(size_t) e];
+        if (cnt[(size_t) e] > 0) order.push_back(e);
+    }
+    const int rows_cpu = std::min(S.cap - rows_local, 57);   // the CPU's block after them
+    if (rows_cpu <= 0 || order.empty()) return;
+    const size_t gu_row = (size_t) 2 * FF;
+    uint8_t* scr_i8 = dalloc<uint8_t>((size_t) S.cap * gu_row * 4);
+    uint8_t* scr_ref = dalloc<uint8_t>(k::native_expert_scratch_bytes(S.cap, FF));
+    float* out_i8 = dalloc<float>((size_t) S.cap * (size_t) H);
+    float* out_ref = dalloc<float>((size_t) S.cap * (size_t) H);
+    std::vector<int32_t> ident((size_t) S.cap), tok_h((size_t) S.cap);
+    std::iota(ident.begin(), ident.end(), 0);
+    for (auto& t : tok_h) t = tk(rng);
+    int32_t* d_ident = dalloc<int32_t>((size_t) S.cap);
+    int32_t* d_tok = dalloc<int32_t>((size_t) S.cap);
+    ck(cudaMemcpy(d_ident, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice), "ident");
+    ck(cudaMemcpy(d_tok, tok_h.data(), tok_h.size() * 4, cudaMemcpyHostToDevice), "tok");
+    std::vector<std::vector<float>> got(2);   // two runs of the i8 side
+    std::vector<float> ref_h;
+    for (int pass = 0; pass < 3; ++pass) {   // 0, 1: the int8 kernel (twice), 2: the grouped reference
+        const bool i8 = pass < 2;
+        float* out = i8 ? out_i8 : out_ref;
+        ck(cudaMemsetAsync(out, 0xFF, (size_t) S.cap * (size_t) H * 4, s), "memset out");
+        ck(cudaMemsetAsync(i8 ? scr_i8 : scr_ref, pass == 1 ? 0x7F : 0, i8 ? (size_t) S.cap * gu_row * 4 : k::native_expert_scratch_bytes(S.cap, FF), s), "memset scr");
+        ck(cudaStreamSynchronize(s), "memset sync");
+        for (size_t a = 0; a < order.size(); a += 16) {
+            const size_t b = std::min(order.size(), a + 16);
+            const int ne = (int) (b - a);
+            const int r0 = off[(size_t) order[a]];
+            const int nr = off[(size_t) order[b - 1]] + cnt[(size_t) order[b - 1]] - r0;
+            std::vector<unsigned long long> p((size_t) ne);
+            std::vector<int32_t> st((size_t) ne + 1);
+            for (int i = 0; i < ne; ++i) {
+                p[(size_t) i] = (unsigned long long) (S.blobs + S.slot * (size_t) (order[a + (size_t) i] % S.n_blobs));
+                st[(size_t) i] = off[(size_t) order[a + (size_t) i]] - r0;
+            }
+            st[(size_t) ne] = nr;
+            ck(cudaMemcpy(S.ptr, p.data(), p.size() * 8, cudaMemcpyHostToDevice), "ptr");
+            ck(cudaMemcpy(S.start, st.data(), st.size() * 4, cudaMemcpyHostToDevice), "start");
+            ck(cudaMemcpy(S.n, &ne, 4, cudaMemcpyHostToDevice), "n");
+            if (i8) k::native_expert_i8(S.L, S.ptr, S.start, S.n, d_ident, d_tok + r0, ne, nr, S.xq8, scr_i8 + (size_t) r0 * gu_row * 4, out + (size_t) r0 * (size_t) H, s);
+            else k::native_expert_grouped(S.L, S.ptr, S.start, S.n, d_ident, d_tok + r0, ne, nr, S.xq, scr_ref, out + (size_t) r0 * (size_t) H, s, 0);
+            ck(cudaStreamSynchronize(s), "carved sync");
+        }
+        std::vector<float> o((size_t) S.cap * (size_t) H);
+        ck(cudaMemcpy(o.data(), out, o.size() * 4, cudaMemcpyDeviceToHost), "carved out");
+        if (i8) got[(size_t) pass] = std::move(o); else ref_h = std::move(o);
+    }
+    ++calls;
+    bool fail = false;
+    if (hash_bits(got[0]) != hash_bits(got[1])) { std::printf("  carved tm %d: the bits changed between runs  FAIL\n", tm); fail = true; }
+    double e2 = 0, r2 = 0;
+    for (int r = 0; r < S.cap && !fail; ++r)
+        for (int64_t col = 0; col < H; ++col) {
+            const size_t i = (size_t) r * (size_t) H + (size_t) col;
+            uint32_t ua, ur;
+            std::memcpy(&ua, &got[0][i], 4);
+            std::memcpy(&ur, &ref_h[i], 4);
+            if (r >= rows_local) {   // the CPU's block: nobody wrote it
+                if (ua != 0xFFFFFFFFu || ur != 0xFFFFFFFFu) { std::printf("  carved tm %d: row %d of the CPU's block was written  FAIL\n", tm, r); fail = true; break; }
+                continue;
+            }
+            if (!std::isfinite(got[0][i])) { std::printf("  carved tm %d: row %d col %lld is not finite  FAIL\n", tm, r, (long long) col); fail = true; break; }
+            const double d = (double) got[0][i] - (double) ref_h[i];
+            e2 += d * d;
+            r2 += (double) ref_h[i] * (double) ref_h[i];
+        }
+    const double rel = r2 > 0 ? std::sqrt(e2 / r2) : 0;
+    worst = std::max(worst, rel);
+    if (!fail && r2 == 0) { std::printf("  carved tm %d: nothing was written  FAIL\n", tm); fail = true; }
+    if (!fail && rel > 5e-3) { std::printf("  carved tm %d: relative RMS against grouped %.3e > 5e-3  FAIL\n", tm, rel); fail = true; }
+    bad += fail;
+    cudaFree(scr_i8); cudaFree(scr_ref); cudaFree(out_i8); cudaFree(out_ref); cudaFree(d_ident); cudaFree(d_tok);
+}
+
 void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
     const int tokens = 40, kpt = 8;   // cap 320 entries
     // A pair the device does not cover (its smallest tile does not fit the shared memory per block, or the layout is out of range) is skipped, not an error;
@@ -293,6 +381,11 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
                 bad += fail;
             }
         }
+    }
+    set_env("STRATA_I8_SMEM_LIMIT", "0");
+    for (const int tm : {2, 3, 4, 8}) {   // the carved layer of a CPU share (check_carved), the device's own limit
+        set_env("STRATA_I8_TM", std::to_string(tm).c_str());
+        check_carved(S, H, FF, s, rng, tm, bad, worst, calls);
     }
     std::printf("%-8s/%-7s %5lld x %4lld  %d calls: %s (worst relative RMS against grouped %.3e)\n", name_of(gu), name_of(dt), (long long) H,
                 (long long) FF, calls, bad ? "FAIL" : "ok", worst);
