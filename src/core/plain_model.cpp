@@ -3713,6 +3713,10 @@ uint64_t PlainModel::release_mtp(bool keep_head) {
     return fb1 > fb0 ? (uint64_t) (fb1 - fb0) : 0;
 }
 
+const strata::kernels::YsknDev* PlainModel::yskn_draft_head() const {
+    return tail().head_.yk;
+}
+
 PlainModel::HeadView PlainModel::draft_head_view() const {
     const PlainModel& t = tail();
     HeadView v;

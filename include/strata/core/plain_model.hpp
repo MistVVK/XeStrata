@@ -481,6 +481,8 @@ public:
         const int32_t* vocab_dev = nullptr;   ///< row i's token (null: row i is token i)
     };
     HeadView draft_head_view() const;
+    /// The target's whole yskn head, owned by the model (null for a GGUF head). It outlives an attached drafter.
+    const strata::kernels::YsknDev* yskn_draft_head() const;
     /// After load: room for windows of `drafts` drafts (the recurrent states' copies, the extra ones from the VRAM free
     /// now; fewer than the load made: the extra ones freed).  False with `err`, nothing changed, when they do not fit.
     /// The window graphs are captured again.  One GPU only.
