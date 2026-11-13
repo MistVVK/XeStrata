@@ -7161,6 +7161,15 @@ def saved_draft_vocab(cfg_path: Path) -> str | None:
     return v if v in DRAFT_VOCABS else None
 
 
+def saved_drafting(cfg_path: Path) -> str | None:
+    """The drafter a model's config chose earlier (--drafting), or None: a setup run again without the flag keeps it."""
+    try:
+        v = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("drafting")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if v in ("auto", "mtp", "dflash2", "off") else None
+
+
 PLE_IO = ("auto", "direct", "ram")   # --ple-io: how the engine reads the n-gram table; auto lets setup choose (#49)
 
 
@@ -8777,6 +8786,16 @@ OPTIONS = [
                      ["cyrillic", "English, code and the Cyrillic script"],
                      ["fr", "English, code and French"]],
             default=""),
+    _option("drafting", "How the model guesses ahead (speculative decoding)",
+            "the drafter: auto = the model's MTP layer, and DFlash2 too only if its pack is already on this PC "
+            "(then the faster is chosen per request by the measured speed and the context depth; default, no "
+            "download), mtp = the MTP layer only, dflash2 = fetch the DFlash2 block drafter (~0.5 GB, "
+            "Qwen3.8-Flash-Next only) and use it, off = no drafter",
+            choices=[["auto", "Auto: the MTP layer, DFlash2 too if its pack is present (recommended, no download)"],
+                     ["mtp", "The model's MTP layer only"],
+                     ["dflash2", "DFlash2: fetch the pack (Qwen3.8-Flash-Next only)"],
+                     ["off", "Off: no speculative decoding"]],
+            default="auto", when=["download"], question="How should the model guess ahead?"),
     _option("script-guard", "Other languages' characters in the answers, for every model (the thinking is left as "
             "it is)",
             "keep other languages' characters out of the answers of every model (serve/script_guard.py): ja keeps "
@@ -9967,6 +9986,29 @@ def main() -> int:
     for line in draft_vocab_note(gpu_expert_vram(gpu), draft_vocab):   # #474: a recommendation, nothing changes
         say("  " + line)
 
+    # the DFlash2 block drafter (--drafting dflash2): a pinned download packed on this PC (tools/dflash2_fetch.py).
+    # Only an explicit dflash2 choice fetches it. auto does NOT download: the engine runs the MTP alone unless a pack
+    # is already on this PC (a previous dflash2 install), and only then loads both and learns which drafter is faster.
+    # DFlash2 measured slower than the MTP on every B70/RTX 4070 depth, so its cost is not paid by everyone.
+    drafting = getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json") or "auto"
+    df2_dir = data / "dflash2"
+    df2_pack = df2_dir / "qwen3.8-flash-next-dflash2.q4_0-selq4.pack"
+    if drafting == "dflash2":
+        say("  The DFlash2 drafter (a second way to guess ahead, ~0.5 GB packed) comes from")
+        say("  incoai/Qwen3.8-Flash-Next-DFlash2 (Apache-2.0); it is packed on this PC.")
+        run([sys.executable, str(ROOT / "tools" / "dflash2_fetch.py"), "fetch", "--out", str(df2_dir)],
+            env=env, check=False)
+        have_pack = df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists()
+        if not have_pack:   # offline or a failed check: the MTP layer continues (the install goes on)
+            warn("the DFlash2 drafter is not on this PC (the download did not complete): the MTP layer continues")
+            drafting = "mtp"
+    # the draft vocabulary subset beside the pack (when a pack is present), the choice this model's config keeps
+    if df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists():
+        src_vocab = ROOT / "data" / DRAFT_VOCABS.get(draft_vocab or "cjk", "draft_vocab.bin")
+        if src_vocab.exists():
+            shutil.copyfile(src_vocab, df2_dir / "draft_vocab.bin")
+    ok(f"drafting: {drafting}")
+
     # ---- 7. the start script
     step(7, "writing the model's settings" if PACKAGED else "writing the start script")
     sys.path.insert(0, str(ROOT / "tools"))
@@ -9978,6 +10020,17 @@ def main() -> int:
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
             "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
+    df2_use = df2_pack if df2_pack.exists() else df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack"
+    if drafting == "off":
+        args += ["--draft", "off"]
+    elif drafting == "dflash2" and df2_use.exists():
+        args += ["--draft", "dflash2", "--draft-model", str(df2_use), "--spec", "6"]   # the anchor + up to 7 drafts
+    elif drafting == "auto":
+        args += ["--draft", "auto"]
+        if df2_use.exists():   # a pack is present (a previous dflash2 install): auto may load both and learn
+            args += ["--draft-model", str(df2_use)]
+    elif drafting == "mtp":
+        args += ["--draft", "mtp"]
     if scaling is not None:     # the resolved configuration: the explicit flags, or yarn and the derived factor
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
     if ctx > 8192:
@@ -10072,6 +10125,9 @@ def main() -> int:
     replicas_config(a, cfg)
     if draft_vocab:
         cfg["draft_vocab"] = draft_vocab
+    cfg["drafting"] = drafting
+    if "--draft-model" in args:
+        cfg["draft_model"] = args[args.index("--draft-model") + 1]
     if ple_io != "auto":
         cfg["ple_io"] = ple_io
     if a.host:

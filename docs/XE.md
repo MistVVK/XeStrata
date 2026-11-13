@@ -208,7 +208,7 @@ The main ones:
 - The resident RAM mode: with room left in the budget, the experts of the slots the prompt path borrows are kept in RAM too (#1683).
 - `--layer-split auto`: when two cards leave a small stage, it picks again by the ratio of their room (#2644).
 - serve: the thinking limit (`max_tokens` and Anthropic's `budget_tokens`), the model card's sampling for a request without one, the prompt tokenized from the last shared prefix (#1852), the next turn sent to the slot that holds the conversation's checkpoint (#2518), short prompts admitted first (`XESTRATA_ADMIT_SHORT_FIRST`, opt-in), parser fixes.
-- Carried as opt-in: `STRATA_EXCHANGE_ROTATE`, `XESTRATA_RAM_ADAPT`, `XESTRATA_SPLIT_UNIFORM`.
+- Carried as opt-in: `STRATA_EXCHANGE_ROTATE`, `XESTRATA_RAM_ADAPT`.
 
 Fixed on XeStrata's side during the integration:
 
@@ -446,7 +446,6 @@ The paths meant to be faster are not carried: measured on the B70, none was fast
 | GDN key-head sharing (`XESTRATA_GDN_KEYHEAD`) | 0.54x of the default path |
 | Split hyper-connection read (`XESTRATA_GR_V3`) | Decode about 18% slower |
 | P-core / E-core placement of the CPU pool (`--pool-affinity`) | Decode 1–4% slower |
-| AVX2 multi-token K-quant products (`XESTRATA_KQ256`) | Within the spread |
 | Software prefetch in the AVX2 IQ kernels | Within the spread |
 | Routing-aware prefetch of the file tier (`XESTRATA_LOOKAHEAD`) | Decode about 2% slower |
 

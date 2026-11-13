@@ -211,7 +211,7 @@ upstream の Strata 0.1.44.1 から 0.1.45（`477ac13c`）までの変更を Xe 
 - RAM 常駐の形: 予算に余りがあれば、prompt の経路が借りる枠のエキスパートも RAM に置く（#1683）。
 - `--layer-split auto`: 2 枚で小さな段ができたら置き場所の広さの割合で選び直す（#2644）。
 - serve: 思考の上限（`max_tokens` と Anthropic の `budget_tokens`）、sampling のない要求にモデルカードの値、プロンプトを最後に共有した前置きからトークン化する（#1852）、次のターンを会話のチェックポイントを持つスロットへ送る（#2518）、短い prompt を先に受け入れる（`XESTRATA_ADMIT_SHORT_FIRST`、opt-in）、パーサーの修正。
-- opt-in のまま移したもの: `STRATA_EXCHANGE_ROTATE`、`XESTRATA_RAM_ADAPT`、`XESTRATA_SPLIT_UNIFORM`。
+- opt-in のまま移したもの: `STRATA_EXCHANGE_ROTATE`、`XESTRATA_RAM_ADAPT`。
 
 この取り込みの間に XeStrata の側で直したもの:
 
@@ -430,7 +430,6 @@ CUDA、HIP、Windows の実装は移していません。複数の GPU の実装
 | GDN の key-head の共有（`XESTRATA_GDN_KEYHEAD`） | 既定の経路の 0.54 倍 |
 | hyper-connection の分割読み出し（`XESTRATA_GR_V3`） | decode が約 18% 遅い |
 | CPU のプールの P コアと E コアの配置（`--pool-affinity`） | decode が 1〜4% 遅い |
-| K-quant の AVX2 の多トークンの積（`XESTRATA_KQ256`） | 差はばらつきの範囲 |
 | AVX2 の IQ カーネルのソフトウェアのプリフェッチ | 差はばらつきの範囲 |
 | ファイルの層のルーティングによる先読み（`XESTRATA_LOOKAHEAD`） | decode が約 2% 遅い |
 

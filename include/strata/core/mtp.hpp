@@ -65,6 +65,10 @@ public:
     static bool top2_env();
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     uint64_t vram_bytes() const { return vram_; }
+    /// DF-05: the gathered draft-head rows and vocabulary (this drafter keeps owning them), for the DFlash2 drafter
+    /// to share when they are the same bytes (the same head and vocabulary file).  rows null: the whole head.
+    struct SharedHead { const uint8_t* rows; const int32_t* vocab_dev; int64_t n; int type; };
+    SharedHead shared_head() const;
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at

@@ -515,6 +515,10 @@ void MtpDrafter::set_draft_history(const int32_t* tail, int64_t n_tail, int32_t 
 }
 
 
+MtpDrafter::SharedHead MtpDrafter::shared_head() const {
+    return {dhead_, dvocab_, n_dvocab_, head_ != nullptr ? head_->type() : -1};
+}
+
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
                       const MtpDrafter* shared) {
     const OnDevice on_device(device_);
@@ -667,11 +671,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         native_mmvq(q8_type("self_attn.k_proj.weight"), q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
         native_mmvq(q8_type("self_attn.v_proj.weight"), q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
         // the T tokens' K norm, rotation and K/V append each run once over all T rows (the rope keeps each token's
-        // positions); STRATA_NO_BATCH_KV_STEP=1 appends per token
-        static const bool no_batch_kv = [] {
-            const char* v = strata::env_get("NO_BATCH_KV_STEP");
-            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-        }();
+        // positions)
         native_qsa_rms_norm_weighted(kcur_, f32("self_attn.k_norm.weight"), kcur_, (int) HD, (int) (T * NKV), EPS, cs);
         for (int t = 0; t < T; ++t) {
             float* kc = kcur_ + t * NKV * HD;
@@ -681,9 +681,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
             fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
             fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
         }
-        if (!no_batch_kv && st_.kv_q4)
+        if (st_.kv_q4)
             kv_append_q4_steps(st_.k_q4, st_.v_q4, st_.page_table, step, 4, T, kcur_, vcur_, s, cs, &st_.host);
-        else if (!no_batch_kv && st_.kv_int8)
+        else if (st_.kv_int8)
             kv_append_q8_steps(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step, 4, kcur_, vcur_,
                                (int) (NKV * HD), T, s, cs, &st_.host);
         else
