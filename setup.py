@@ -465,6 +465,27 @@ def proxy_hint() -> str:
             "terminal first")
 
 
+def net_say():
+    """The network rule's waiting line in setup's own indentation (serve/download.py's open_url): what the transfer
+    waits for, said after 5 s and every 10 s after that, instead of a silent console."""
+    return lambda line: say(f"  {line}")
+
+
+def net_fail(e: "download_core.NetFailure", what=None) -> NoReturn:
+    """setup's stop for a host that did not answer: the plain sentence, the one next step, then the proxy and source
+    hints (serve/download.py's rule, upstream fd40eb0fd)."""
+    fail(e.headline(what), e.next_step() + "".join(h for h in (proxy_hint(), source_hint(str(e))) if h))
+
+
+def disk_fail(e: BaseException, part: Path) -> NoReturn:
+    """setup's stop for a file that cannot be written (full drive, quota, a read-only folder): what happened and the one
+    next step, in plain words instead of the raw errno (upstream 0771e3555)."""
+    words = download_core.disk_words(e)
+    if words is not None:
+        fail(f"cannot write {part.name}: {words[0]}", words[1] + " and run it again")
+    fail(f"cannot write {part.name}: {e}", "free some disk space (or pick another --models-dir) and run it again")
+
+
 def ms_file(url: str):
     """(repo, path) when `url` is a Hugging Face file of a repository setup knows (HF_REVISIONS), else None."""
     m = HF_FILE.match(url)
@@ -482,8 +503,8 @@ def ms_meta(repo: str, path: str):
     if repo not in _ms_files:
         try:
             api = f"{ms_endpoint()}/api/v1/models/{repo}/repo/files?Recursive=true"
-            with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "xestrata-setup"}),
-                                        timeout=60) as r:
+            with download_core.open_url(urllib.request.Request(api, headers={"User-Agent": "xestrata-setup"}),
+                                        say=net_say()) as r:
                 files = json.loads(r.read())["Data"]["Files"]
             _ms_files[repo] = {f["Path"]: (int(f.get("Size") or 0), (f.get("Sha256") or "").lower()) for f in files}
         except (OSError, ValueError, KeyError, TypeError):
@@ -3339,7 +3360,7 @@ class _Source:
             if stale is not None and self.final is not None and self.final != stale:
                 return self.final                        # another connection already got a fresh address
             req = urllib.request.Request(self.url, headers={"User-Agent": "xestrata-setup", "Range": "bytes=0-0"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with download_core.open_url(req, say=net_say()) as r:
                 cr = (r.headers.get("Content-Range") or "").strip()
                 if r.status != 206 or cr != f"bytes 0-0/{self.total}":
                     raise _NoRange(f"HTTP {r.status}, Content-Range {cr!r}")
@@ -3539,7 +3560,7 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
         try:
             url = src.get()
             req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={pos}-{end}"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with download_core.open_url(req, say=net_say()) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
                     if st.stop.is_set():
@@ -3564,7 +3585,7 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
                                         st.flight.pop(i, None)
                             return
             return
-        except (_NoRange, _DiskError, _Changed):
+        except (_NoRange, _DiskError, _Changed, download_core.NetFailure):
             raise
         except urllib.error.HTTPError as e:
             err = e
@@ -3605,7 +3626,7 @@ def _piece_worker(src: _Source, st: _Pieces, todo: list, part: Path):
     except _PieceFailed as e:
         st.errors.append(e)
         st.abort_round.set()
-    except (_NoRange, _DiskError, _Changed) as e:
+    except (_NoRange, _DiskError, _Changed, download_core.NetFailure) as e:
         st.fatal = st.fatal or e
         st.stop.set()
     except OSError as e:                                # the .part itself could not be opened
@@ -3741,10 +3762,12 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
         part.with_name(part.name + ".src").unlink(missing_ok=True)
         fail(f"{name} changed on the server while it was downloading: the part that was there was deleted",
              "run it again (the download starts over with the file that is there now)")
+    if isinstance(st.fatal, download_core.NetFailure):
+        _save_pieces(part, total, st.snapshot())
+        net_fail(st.fatal, name)
     if isinstance(st.fatal, _DiskError):
         _save_pieces(part, total, st.snapshot())
-        fail(f"cannot write {part.name}: {st.fatal}",
-             "free some disk space (or pick another --models-dir) and run it again")
+        disk_fail(st.fatal, part)
     if isinstance(st.fatal, _NoRange):
         _save_pieces(part, total, st.snapshot())
         return False                                    # the server stopped doing ranges: one stream from the start
@@ -3779,7 +3802,7 @@ def _repair_piece(src: _Source, st: _Pieces, f, i: int, stats: dict):
         try:
             url = src.get()
             req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={pos}-{end}"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with download_core.open_url(req, say=net_say()) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
                     if st.stop.is_set():
@@ -3798,7 +3821,7 @@ def _repair_piece(src: _Source, st: _Pieces, f, i: int, stats: dict):
                     pos += len(b)
                     st.add(i, len(b))
             return
-        except (_NoRange, _DiskError, _Changed):
+        except (_NoRange, _DiskError, _Changed, download_core.NetFailure):
             raise
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 410) and url is not None:
@@ -3890,7 +3913,7 @@ def download_single(url: str, part: Path, total: int, label: str):
             break                                      # ask for (a range past the end is a 416, retried 30 times)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={have}-"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with download_core.open_url(req, say=net_say()) as r:
                 try:
                     have = download_core.resumed_at(r, have, total)
                 except OSError:
@@ -3911,8 +3934,13 @@ def download_single(url: str, part: Path, total: int, label: str):
             progress_end()
             if not total or have >= total:
                 break
+        except download_core.NetFailure:
+            progress_end()
+            raise                                      # the rule's window is spent: download_file says it once
         except (OSError, http.client.HTTPException) as e:
             progress_end()
+            if download_core.disk_words(e) is not None:   # a .part that cannot be written: no retry helps
+                disk_fail(e, part)
             if part.exists() and total and part.stat().st_size > total:
                 part.unlink(missing_ok=True)           # more than the file has can only be wrong bytes
             warn(f"download interrupted ({e}); retrying in 10 s ...")
@@ -3924,7 +3952,7 @@ def range_total(url: str) -> int:
     (ModelScope's: #1915); 0 when it does not say.  With the length known the file comes over several connections."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": "bytes=0-0"})
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with download_core.open_url(req, timeout=download_core.FIRST_CONNECT_S) as r:
             m = re.match(r"\s*bytes 0-0/(\d+)\s*$", r.headers.get("Content-Range") or "")
             return int(m.group(1)) if r.status == 206 and m else 0
     except (OSError, http.client.HTTPException):
@@ -3969,7 +3997,14 @@ def download_file(url, dst: Path, what=None):
         src = Path(url[7:] if url.startswith("file://") else url)
         if not src.exists():
             fail(f"not found: {src}")
-        shutil.copyfile(src, dst)
+        try:
+            shutil.copyfile(src, dst)
+        except OSError as e:      # a source that cannot be opened: no waiting, one sentence (upstream 465fcbbc9)
+            words = download_core.disk_words(e)
+            if words is not None and words[0].startswith(("the drive", "the drive's quota")):
+                disk_fail(e, dst)
+            fail(f"cannot copy {src}: {e}", "check that the file is there and readable, and that the "
+                                            "destination can be written, then run it again")
         mark(dst)
         ok(f"{what or dst.name} copied")
         return
@@ -3987,8 +4022,10 @@ def download_file(url, dst: Path, what=None):
     for attempt in range(5):
         try:
             req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "xestrata-setup"})
-            total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
+            total = int(download_core.open_url(req, say=net_say()).headers.get("Content-Length", 0))
             break
+        except download_core.NetFailure as e:   # 12 s then 30 s: about 44 s for a silent host, not 320
+            net_fail(e, what or dst.name)
         except urllib.error.HTTPError as e:
             if e.code == 404 and hf_unpinned(url) != url:  # the pinned revision is gone from the repository
                 if not allow_unpinned():
@@ -4029,7 +4066,10 @@ def download_file(url, dst: Path, what=None):
         return
     if not (total >= DL_MIN_PARALLEL and conns > 1 and parallel_download(url, part, total, label, conns, dst.name)):
         _claim_part(part, url)
-        download_single(url, part, total, label)
+        try:
+            download_single(url, part, total, label)
+        except download_core.NetFailure as e:
+            net_fail(e, what or dst.name)
     if total and part.stat().st_size != total:
         fail(f"could not finish downloading {dst.name}: {part.stat().st_size:,} bytes on disk, "
              f"the server says {total:,}",
@@ -5451,7 +5491,7 @@ def write_ratio_head(QI, models_dir: Path) -> None:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup",
                                                            "Range": f"bytes={start}-{end}"})
-                data = urllib.request.urlopen(req, timeout=120).read()
+                data = download_core.open_url(req, say=net_say()).read()
                 if len(data) == end - start + 1:
                     return data
             except (urllib.error.URLError, OSError):

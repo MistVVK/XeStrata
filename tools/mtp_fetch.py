@@ -143,7 +143,7 @@ def get(url, start=None, end=None, retries=6):
             req = urllib.request.Request(used, headers={"User-Agent": "xestrata-mtp-fetch"})
             if start is not None:
                 req.add_header("Range", "bytes=%d-%d" % (start, end))
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with download_core.open_url(req, say=lambda line: print(line, file=sys.stderr, flush=True)) as r:
                 if start is not None:
                     check_range(r.status, r.headers.get("Content-Range"), start, end)
                 data = r.read()
@@ -154,6 +154,10 @@ def get(url, start=None, end=None, retries=6):
                 with _cdn_lock:
                     _cdn[url] = (landed, time.monotonic() + CDN_TTL)
             return data
+        except download_core.NetFailure:   # the rule's window is spent: no retry here (serve/download.py)
+            with _cdn_lock:
+                _cdn.pop(url, None)
+            raise
         except Exception as e:  # network errors are retried, then surfaced
             with _cdn_lock:
                 _cdn.pop(url, None)
@@ -313,7 +317,7 @@ def resolve_repo():
     try:
         req = urllib.request.Request(REPO + "model.safetensors.index.json", method="HEAD",
                                      headers={"User-Agent": "xestrata-mtp-fetch"})
-        urllib.request.urlopen(req, timeout=120).close()
+        download_core.open_url(req, tries=1, timeout=download_core.FIRST_CONNECT_S).close()
     except urllib.error.HTTPError as e:
         if e.code == 404 and "/resolve/%s/" % REVISION in REPO:
             if (envvars.get("ALLOW_UNPINNED") or "").strip() != "1":
@@ -414,6 +418,10 @@ def fetch(out, only):
                         f.write(data)
                         pos += len(data)
                         progress.add(len(data))
+            except download_core.NetFailure as e:
+                # a host that spent the rule's window (serve/download.py): the plain sentence, at once
+                sys.exit("%s: %s. Check the connection and try again - what is downloaded is kept."
+                         % (r["name"], e.headline()))
             except (OSError, urllib.error.URLError) as e:
                 # upstream #3214: a timeout or a dropped connection mid-tensor ends only this try: what was written
                 # stays, the next try continues after it with fewer connections (a link that drops 16 at once often
