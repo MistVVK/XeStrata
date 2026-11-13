@@ -751,8 +751,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         std::nth_element(top.begin(), top.begin() + (ptrdiff_t) (top.size() / 2), top.end());
         const double med = top[top.size() / 2];
         std::sort(rel.rbegin(), rel.rend());
-        std::printf("%s - fused vs MMQ per pair (information): %zu of %lld pairs above 1e-5, largest %.3e, second %.3e, median %.3e
-", p.name, above, (long long) rows,
+        std::printf("%s - fused vs MMQ per pair (information): %zu of %lld pairs above 1e-5, largest %.3e, second %.3e, median %.3e\n", p.name, above, (long long) rows,
                     rel.size() > 0 ? rel[0] : 0.0, rel.size() > 1 ? rel[1] : 0.0, med);
     }
     {   // the grouping: every pair in its expert's rows (the near-identical blobs here would hide a wrong expert)
