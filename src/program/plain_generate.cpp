@@ -2795,8 +2795,11 @@ int plain_main(int argc, char** argv) {
         return 2;
     }
     // the window's rows (window_rows.hpp), before anything is sized for them: --max-t, else 16 with --wide-window on or
-    // under auto where a drafter of this run takes wide windows, else the 8 a window always had
-    if (!max_t_given) opt.max_t = strata::core::window_rows_for(wants_wide_window(opt, serve));
+    // under auto where a drafter of this run takes wide windows or a batch has more than 8 slots, else the 8 a window
+    // always had
+    if (!max_t_given)
+        opt.max_t = strata::core::window_rows_for(wants_wide_window(opt, serve) ||
+                                                  opt.batch_slots > (int) strata::kernels::kVerifyNarrowT);
     // the last window's drafts and the MTP layer's cells reach a window past the last token
     if ((int64_t) prompt.size() + n_new + opt.max_t > opt.max_cells)
         opt.max_cells = (int64_t) prompt.size() + n_new + opt.max_t;
