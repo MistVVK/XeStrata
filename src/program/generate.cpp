@@ -90,6 +90,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/run_manifest.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -8655,6 +8656,30 @@ int main(int argc, char** argv) {
         strata::gpu::pin_reserve_release();   // the engine is up: the pinned memory's last reserve goes back
         strata::platform::settle_before_ready();
         strata::platform::downgrades_say();   // the start's fallbacks (the server keeps them: /v1/status)
+        if (strata::core::manifest::enabled()) {   // upstream 89f4fa18 (XESTRATA_MANIFEST): the engine choice and budgets
+            auto& M = strata::core::manifest::instance();
+            M.engine("version", STRATA_VERSION);
+            M.engine("engine", stages.empty() ? "native-single-gpu" : "native-layer-split");
+            M.engine("stages", std::to_string(stages.size() + 1));
+            M.engine("kv_format", o.kv);
+            M.engine("spec_window", std::to_string(o.spec));
+            M.engine("prompt_experts", strata::prefill::experts_path());
+            M.budget("context", o.max_context);
+            M.budget("expert_cache_mib", xcache.bytes() >> 20);
+            M.budget("expert_slots", xcache.slots());
+            M.budget("vram_reserve_mib", o.vram_reserve_mib);
+            M.budget("prefill_chunk", o.prefill_chunk);
+            M.budget("pool_workers", pool.workers());
+            M.budget("conversation_cache_mib", o.conversation_cache_mib);
+            M.budget("batch_slots", o.batch);
+            // upstream 445cdf45: an unset XESTRATA_ROUTE_TAIL_SKIP means the engine default applies (tails are skipped
+            // only where the configuration allows), not "off"
+            const int tail = strata::core::tail_skip_rank();
+            M.path("experts", "route_tail_skip", tail > 0,
+                   tail > 0 ? "XESTRATA_ROUTE_TAIL_SKIP=" + std::to_string(tail)
+                            : "XESTRATA_ROUTE_TAIL_SKIP is unset: the engine default applies, tails are skipped only where the configuration allows");
+            M.write("ready");
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -9678,6 +9703,7 @@ int main(int argc, char** argv) {
             return pmtp_settle();
         };
         for (;;) {
+            strata::core::manifest::instance().flush_if_dirty("request");   // XESTRATA_MANIFEST: what the last request added (a no-op when off)
             strata::platform::downgrades_say();   // a request's fallbacks, between whole lines
             if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
                 if (!in.try_next(line)) {

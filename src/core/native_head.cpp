@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/native_head.hpp"
+#include "strata/core/run_manifest.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -84,6 +85,14 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = type;
+        if (strata::core::manifest::enabled()) {   // upstream 89f4fa18 (XESTRATA_MANIFEST): what the head holds and where
+            namespace mf = strata::core::manifest;
+            mf::instance().tensors("head", strata::ggml_type_name((uint32_t) tensor->type), 1, bytes);
+            mf::instance().path("head", "output.weight", true, "held in VRAM",
+                                std::string("type ") + strata::ggml_type_name((uint32_t) tensor->type) +
+                                    (type == strata::kernels::kNativeQ6KRows ? ", repacked (aligned rows)" : "") +
+                                    (type == strata::kernels::kNativeQ8Rows ? ", repacked (aligned rows)" : ""));
+        }
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();

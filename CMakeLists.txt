@@ -1600,6 +1600,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(stream_watch_test tests/core/stream_watch_test.cpp)
   target_include_directories(stream_watch_test PRIVATE include)
   add_test(NAME stream_watch_test COMMAND stream_watch_test)
+  # upstream 89f4fa18: the run manifest (XESTRATA_MANIFEST), off by default, the same text in any recording order - no GPU
+  add_executable(run_manifest_test tests/core/run_manifest_test.cpp)
+  target_include_directories(run_manifest_test PRIVATE include)
+  target_link_libraries(run_manifest_test PRIVATE strata_platform)
+  add_test(NAME run_manifest_test COMMAND run_manifest_test)
   set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
 endif()
 
