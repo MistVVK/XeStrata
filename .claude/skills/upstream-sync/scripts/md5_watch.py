@@ -7,8 +7,9 @@
 
 A cell is one model at one length, or one image model at one size.  An LLM's cell: its fixed prompt
 (<data>/ids/release/<tier>.ids, sync_prompts.py's), the settings that decide its answer (greedy, --adapt-every 0,
---pcie-frac 0, the context setup writes for that length) and 32 tokens through the engine; the md5 is of the answer's
-line, and the logits those 32 tokens were chosen from are kept beside it (--dump-logits: the KL of a cell that moved).
+--pcie-frac 0, --prefill-cpu-share 0, the context setup writes for that length) and 32 tokens through the engine; the
+md5 is of the answer's line, and the logits those 32 tokens were chosen from are kept beside it (--dump-logits: the KL
+of a cell that moved).
 An image model's cell: one image from its fixed prompt, IMAGE_SIZE, IMAGE_STEPS and IMAGE_SEED; the md5 is of the PNG.
 
 XE: the text engine (its binary, or `env K=V ...` around it, as in the merge's scripts).  XE_ROOT: the tree the image
@@ -41,7 +42,7 @@ import bench_md5 as M  # noqa: E402
 TREE = Path(__file__).resolve().parents[4]
 # each model's files in the data folder, and the settings that decide its answer: the merge's (--expert-cache auto,
 # --prefill auto for the generate engine, the MTP drafter and its 4 drafts); the runs add greedy, --adapt-every 0,
-# --pcie-frac 0 and the tier's context (bench_core's, as setup writes it).
+# --pcie-frac 0, --prefill-cpu-share 0 (COMMON) and the tier's context (bench_core's, as setup writes it).
 MODELS = {
     "q38": ["--pack", "<data>/packs/qwen-iq3_xxs",
             "--native", "<data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
@@ -57,7 +58,10 @@ MODELS = {
     "glm53": ["--native", "<data>/models/GLM-5.3-Flash/UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00004.gguf",
               "--mmap-experts"],
 }
-COMMON = ["--greedy", "--max-new", str(M.NEW), "--adapt-every", "0", "--pcie-frac", "0"]
+# --prefill-cpu-share 0: the prompt's experts all on the GPU, as a fixed share.  A share measured per run (the engine's
+# old default) moves between runs, and the CPU's rows are not the GPU's bits: the answer would differ from run to run
+# and the watch could not read it (2026-11-13, the B70: 0.53 to 0.83 over five runs).
+COMMON = ["--greedy", "--max-new", str(M.NEW), "--adapt-every", "0", "--pcie-frac", "0", "--prefill-cpu-share", "0"]
 
 args = [a for a in sys.argv[1:] if a != "--dry-run"]
 if len(args) != 2:
