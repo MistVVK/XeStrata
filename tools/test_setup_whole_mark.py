@@ -29,7 +29,7 @@ class WholeMarkNeedsThePin(unittest.TestCase):
         self.repo = next(r for r, files in setup.REPO_PINS.items() if files)
         self.name = next(iter(setup.REPO_PINS[self.repo]))
         self.hf = f"https://huggingface.co/{self.repo}/resolve/main/"
-        patch = mock.patch.object(setup, "whole_shard", return_value=True)   # the test is about the mark, not the header
+        patch = mock.patch.object(setup, "whole_shard", return_value=True)   # about the mark, not the header
         patch.start()
         self.addCleanup(patch.stop)
 
