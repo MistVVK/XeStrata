@@ -18,11 +18,13 @@ const char* drafter_name(Drafter d) {
         case Drafter::None: return "none";
         case Drafter::Mtp: return "mtp";
         case Drafter::Df2: return "dflash2";
+        case Drafter::Bdraft2: return "bdraft2";
     }
     return "?";
 }
 
-std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec) {
+std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec,
+                                       bool bdraft2, int bdraft2_spec) {
     std::vector<ProbeArm> a;
     if (mtp) {
         a.push_back({Drafter::Mtp, spec});
@@ -30,7 +32,8 @@ std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spe
         if (spec_auto && spec > 2) a.push_back({Drafter::Mtp, 2});
     }
     if (df2) a.push_back({Drafter::Df2, df2_spec});
-    if (none_ok && (mtp || df2)) a.push_back({Drafter::None, 1});
+    if (bdraft2) a.push_back({Drafter::Bdraft2, bdraft2_spec});
+    if (none_ok && (mtp || df2 || bdraft2)) a.push_back({Drafter::None, 1});
     if (a.size() < 2) a.clear();
     return a;
 }
@@ -90,7 +93,7 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
     // the cheaper form first among ties: the MTP, then DFlash2, then none; the configured window before another
     auto rank = [&](size_t i) {
         const ProbeArm& a = arms[i];
-        const int d = a.drafter == Drafter::Mtp ? 0 : a.drafter == Drafter::Df2 ? 1 : 2;
+        const int d = a.drafter == Drafter::Mtp ? 0 : a.drafter == Drafter::Df2 || a.drafter == Drafter::Bdraft2 ? 1 : 2;
         return d * 2 + (a.spec == spec_default || a.drafter != Drafter::Mtp ? 0 : 1);
     };
     std::vector<size_t> order(n);
