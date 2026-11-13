@@ -36,6 +36,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -114,6 +115,7 @@ PlainModel::~PlainModel() {
     if (route_dump_ != nullptr && root_ == this) std::fclose(route_dump_);
     if (swap_cs_ != nullptr) strata::gpu::stream_sync(swap_cs_);
     if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+    strata::gpu::free(tap_dev_);
     prompt_gemm_.reset();   // the products' state before the stream
     strata::gpu::free(prompt_host_);
     if (opt_.encoder)   // an encoder's prompt buffers are its own (encoder_buffers)
@@ -784,6 +786,19 @@ bool PlainModel::load_qwen(std::string& err) {
         const bool ok = l < lb_ || l >= le_ || load_block(m, l, b, err);
         stream_into_ = nullptr;
         if (!ok) return false;
+    }
+    // the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last
+    tap_local_.clear();
+    tap_slot_.assign((size_t) s.n_layer, -1);
+    for (int l : tap_req_)
+        if (l >= lb_ && l < le_ && l < s.n_layer - 1) {
+            tap_slot_[(size_t) l] = (int) tap_local_.size();
+            tap_local_.push_back(l);
+        }
+    if (!tap_local_.empty() && tap_dev_ == nullptr &&
+        !strata::gpu::alloc_device(&tap_dev_, (size_t) opt_.max_t * tap_local_.size() * s.n_embd * 4)) {
+        err = "plain model: the DFlash2 tap staging does not fit";
+        return false;
     }
     // the MTP layer, when the window checks drafts and the file has it (its K/V the last attention block's): the last
     // stage's
@@ -3171,6 +3186,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
         }
         steer(b, T, x_, cs);
+        tap_block(b, T, cs);
         return true;
     }
 
@@ -3200,6 +3216,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     win_.combine(0, 0, T, w_, has_shared_ ? shared_ : nullptr, moe_out_, has_shared_ ? sh_g_ : nullptr, cs);
     k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
     steer(b, T, x_, cs);
+    tap_block(b, T, cs);
     return true;
 }
 
@@ -3236,6 +3253,15 @@ bool PlainModel::moe_experts(int64_t ml, int T, uint32_t ring, std::vector<strat
     MoeExpertsMode mode;
     mode.resident = res_rec_;
     return win_.experts(ml, ring, 0, 1, 0, T, cs, err, mode);
+}
+
+// the DFlash2 tap of a block: its completed output (the plain residual has one hc stream), the window's rows
+void PlainModel::tap_block(const Block& b, int T, strata::gpu::Stream cs) {
+    if (tap_dev_ == nullptr) return;
+    const int64_t l = &b >= blocks_.data() && &b < blocks_.data() + blocks_.size() ? &b - blocks_.data() : -1;
+    if (l < 0 || l >= (int64_t) tap_slot_.size() || tap_slot_[(size_t) l] < 0) return;
+    const int64_t N = spec_.n_embd, nt = (int64_t) tap_local_.size();
+    strata::kernels::df2_tap_rows(x_, tap_dev_ + (size_t) tap_slot_[(size_t) l] * N, nt * N, N, 1, T, cs);
 }
 
 void PlainModel::steer(const Block& b, int64_t T, float* x, strata::gpu::Stream cs) const {

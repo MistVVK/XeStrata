@@ -221,6 +221,14 @@ public:
     /// K/V from them.  The prefill stream is synchronized before the call.
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
 
+    /// The DFlash2 drafter's prompt taps: the completed output (the mean of the hyper-connection streams) of these
+    /// layers, for the rows at or after `first_pos`, gathered into a staging of `cap_rows` rows and reported through
+    /// on_taps after each chunk (the prefill stream synchronized).  Set before init; empty allocates nothing.
+    void set_taps(const std::vector<int>& layers, int64_t first_pos, int64_t cap_rows) {
+        tap_layers_ = layers; tap_first_ = first_pos; tap_cap_ = cap_rows;
+    }
+    std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on_taps;
+
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
     /// is still at that chunk's end (its stream synchronized; the last stage calls it just before `on_chunk`).  An
     /// earlier stage is a chunk or more ahead of the last one by the time `on_chunk` runs, so this is where a
@@ -279,6 +287,9 @@ private:
     std::future<bool> lm_next_run_;   ///< a layer split: the next stage's run of the last super-chunk handed on
     std::string lm_next_err_;
     int64_t stage_lb_ = 0, stage_le_ = -1;
+    std::vector<int> tap_layers_, tap_local_, tap_slot_;   ///< set_taps: the drafter's tap layers (this stage's share)
+    int64_t tap_first_ = 0, tap_cap_ = 0;
+    float* tap_dev_ = nullptr;       ///< [tap_cap_][ntap][n_embd] staging (null: no taps)
     PrefillLink* next_ = nullptr;       ///< set_stage: the next stage, through this link only
     InProcessPrefill local_next_;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
