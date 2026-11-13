@@ -141,13 +141,13 @@ class TheStart(unittest.TestCase):
         for n in (3, 4, 8):
             c = self.cfg()
             d = self.apply(c, slots=n)
-            self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_HERE), n)
+            self.assertEqual((d.drafter, d.note), ("mtp", drafting.NONE_IN_SLOTS), n)
             self.assertEqual(c["args"], self.args, n)
 
     def test_no_pack_is_the_mtp_with_the_usual_line(self):
         c = self.cfg()
         d = self.apply(c, slots=2)
-        self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_HERE))
+        self.assertEqual((d.drafter, d.note), ("mtp", drafting.NONE_IN_SLOTS))
         self.assertEqual(c["args"], self.args)
 
     def test_the_ways_back(self):
@@ -160,7 +160,7 @@ class TheStart(unittest.TestCase):
         c = self.cfg()
         with mock.patch.dict(os.environ, {"STRATA_BATCH_DF2": "0"}):
             d = self.apply(c, slots=2)
-        self.assertEqual((d.drafter, d.note, c["args"]), ("mtp", drafting.NOT_HERE, self.args))
+        self.assertEqual((d.drafter, d.note, c["args"]), ("mtp", drafting.NONE_IN_SLOTS, self.args))
 
     def test_the_server_adds_the_slots_and_says_nothing_new(self):
         from serve.server import engine_args
@@ -174,7 +174,7 @@ class TheStart(unittest.TestCase):
             for n in (3, 4):
                 got = engine_args(self.cfg(parallel=n))
                 self.assertEqual((got[:len(self.args)], got[-2:]), (self.args, ["--batch", str(n)]), "%d requests: the MTP loaded, slots with no drafts, as today" % n)
-                self.assertEqual(drafting.take_note(), drafting.NOT_HERE)
+                self.assertEqual(drafting.take_note(), drafting.NONE_IN_SLOTS)
             # one request at a time: the same arguments with the rule on or off, byte for byte
             for parallel in (None, 1):
                 cfg = self.cfg() if parallel is None else self.cfg(parallel=parallel)
@@ -188,6 +188,66 @@ class TheStart(unittest.TestCase):
                 got = engine_args(self.cfg(parallel=2))
                 self.assertEqual(got[:len(self.args)], self.args)
             drafting.take_note()
+
+    def lines(self, cfg, **env):
+        """The `[strata]` lines the server prints while it builds the engine arguments for this config (nothing is started)."""
+        import contextlib
+        import io
+        from serve.server import engine_args
+        out = io.StringIO()
+        with mock.patch("serve.server.drafting_vram_mib", return_value=PRO5000), mock.patch.object(drafting, "data_dir_of", return_value=self.data), \
+                mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out):
+            engine_args(cfg)
+        drafting.take_note()
+        return [x for x in out.getvalue().splitlines() if "rafting" in x]
+
+    def test_the_server_says_what_each_kind_of_start_drafts(self):
+        self.pack()
+        old_slots, old_none = "[strata] Drafting: MTP (DFlash2 isn't available in this mode)", "[strata] drafting: DFlash2 alone"
+        # request slots that draft with DFlash2 (Auto on the measured class: 2 requests; or DFlash2 by name with any number of requests)
+        want = ["[strata] Drafting: DFlash2, one guess window per request slot (spare rows only)"]
+        self.assertEqual([x for x in self.lines(self.cfg(parallel=2)) if "vocab" not in x], want)
+        self.assertEqual([x for x in self.lines(self.cfg(parallel=4, drafting="dflash2")) if "vocab" not in x], want)
+        # request slots with no drafts: Auto with 3 or more requests, and the way back (STRATA_BATCH_DF2=0) with 2
+        none = ["[strata] Drafting: none in parallel slots (one token per request and step); a single request still drafts"]
+        self.assertEqual(self.lines(self.cfg(parallel=3)), none)
+        self.assertEqual(self.lines(self.cfg(parallel=2), STRATA_BATCH_DF2="0"), none)
+        # request slots whose slots carry MTP drafts (--batch-mtp, or STRATA_BATCH_MTP): the line that was always printed there stays, and it is true (the MTP drafts, DFlash2 is not the drafter)
+        self.assertEqual(self.lines(self.cfg(parallel=3, args=[*self.args, "--batch-mtp"])), [old_slots])
+        self.assertEqual(self.lines(self.cfg(parallel=3), STRATA_BATCH_MTP="1"), [old_slots])
+        # one request at a time: today's DFlash2 line, word for word (the conf is the card's)
+        for cfg in (self.cfg(), self.cfg(parallel=1), self.cfg(drafting="dflash2")):
+            got = [x for x in self.lines(cfg) if "vocab" not in x]
+            self.assertEqual(len(got), 1, cfg)
+            self.assertRegex(got[0], r"^\[strata\] drafting: DFlash2 alone \(--draft dflash2, --draft-conf [0-9.]+\)$")
+            self.assertNotIn("slot", got[0])
+        self.assertNotIn(old_none, "".join(self.lines(self.cfg(parallel=2))), "slots with drafts no longer say 'DFlash2 alone'")
+
+    def test_the_words_come_from_pure_functions(self):
+        flag = ["--batch-mtp"]
+        self.assertTrue(drafting.slots_draft_nothing([], 2) and drafting.slots_draft_nothing(["--batch", "4"], 0))
+        self.assertFalse(drafting.slots_draft_nothing([], 1) or drafting.slots_draft_nothing([], 0), "one request at a time is not slots")
+        self.assertFalse(drafting.slots_draft_nothing(flag, 3), "--batch-mtp: the slots carry MTP drafts")
+        self.assertFalse(drafting.slots_draft_nothing(["--pipeline-windows", "2"], 3))
+        with mock.patch.dict(os.environ, {"STRATA_BATCH_MTP": "1"}):
+            self.assertFalse(drafting.slots_draft_nothing([], 3))
+        with mock.patch.dict(os.environ, {"STRATA_BATCH_MTP": "0"}):
+            self.assertTrue(drafting.slots_draft_nothing([], 3))
+        self.assertTrue(drafting.slot_drafts_run([], 2) and drafting.slot_drafts_run(["--batch", "8"], 0))
+        self.assertFalse(drafting.slot_drafts_run([], 1) or drafting.slot_drafts_run([], 0))
+        self.assertFalse(drafting.slot_drafts_run([], 2, split=True) or drafting.slot_drafts_run(["--layer-split", "auto"], 2) or drafting.slot_drafts_run(["--pipeline-windows", "2"], 2))
+        with mock.patch.dict(os.environ, {"STRATA_BATCH_DF2": "0"}):
+            self.assertFalse(drafting.slot_drafts_run([], 2))
+        self.assertEqual(drafting.line("mtp", drafting.NONE_IN_SLOTS), "Drafting: none in parallel slots (one token per request and step); a single request still drafts")
+        self.assertEqual(drafting.line("mtp", drafting.NOT_HERE), "Drafting: MTP (DFlash2 isn't available in this mode)", "the other reasons keep their form")
+        self.assertEqual(drafting.engine_info(["--mtp", "/m", "--batch", "3"], note=drafting.NONE_IN_SLOTS)["drafting_note"], drafting.line("mtp", drafting.NONE_IN_SLOTS), "/metrics and the app")
+
+    def test_mtp_slot_drafts_keep_their_line_through_apply(self):
+        self.pack()
+        c = self.cfg(args=[*self.args, "--batch-mtp"])
+        d = self.apply(c, slots=3)
+        self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_HERE))
+        self.assertIn("--batch-mtp", c["args"])
 
     def test_the_plan_agrees_with_the_start(self):
         from strata_cli import drafting_cmd

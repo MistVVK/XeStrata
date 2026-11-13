@@ -20,5 +20,6 @@
  "df19": "Le moteur réparti sur toutes les cartes n’a pas pu démarrer, la répartition normale par couches est donc utilisée.",
  "df20": "Anticipation : désactivée (les cartes manquaient de mémoire)",
  "df21": "Sur votre Mac, DFlash2 a été plus rapide que MTP avec ce modèle lors de nos tests.",
- "df22": "DFlash2 est désactivé par défaut sur cette carte graphique pour le moment ; choisissez-le dans Anticipation pour l’utiliser."
+ "df22": "DFlash2 est désactivé par défaut sur cette carte graphique pour le moment ; choisissez-le dans Anticipation pour l’utiliser.",
+ "df23": "Anticipation : aucune dans les emplacements parallèles (un token par requête et par étape) ; une requête unique anticipe toujours"
 }

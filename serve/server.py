@@ -3900,6 +3900,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
                                        vram_mib=drafting_vram_mib(cfg, backend, archs))
             if hint:
                 print(f"[strata] {hint}", flush=True)
+        elif decision.flags and drafting.slot_drafts_run(args, parallel_n, layer_split_of(cfg)):
+            print(f"[strata] {drafting.SLOT_DRAFTS_LINE}", flush=True)
         elif decision.flags:
             print(f"[strata] drafting: DFlash2 alone ({' '.join(decision.flags[:2])}, --draft-conf {args[args.index('--draft-conf') + 1] if '--draft-conf' in args else '-'})", flush=True)
         if decision.vocab:                                   # log only (a support log shows which draft vocabulary was used and why)

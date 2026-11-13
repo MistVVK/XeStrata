@@ -20,5 +20,6 @@
  "df19": "The all-cards split engine could not start, so the normal layer split runs.",
  "df20": "Drafting: off (the cards were short of memory)",
  "df21": "On your Mac, DFlash2 was faster than MTP on this model in our tests.",
- "df22": "DFlash2 is off by default on this graphics card for now; choose it in Drafting to use it."
+ "df22": "DFlash2 is off by default on this graphics card for now; choose it in Drafting to use it.",
+ "df23": "Drafting: none in parallel slots (one token per request and step); a single request still drafts"
 }

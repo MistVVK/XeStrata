@@ -838,13 +838,39 @@ FETCH_HINT = "Run strata drafting fetch to get the DFlash2 drafter now."
 DIDNT_START = "DFlash2 didn't start"          # Auto picked DFlash2, the engine ended before it was ready, and the start was repeated once with the MTP (serve/server.py)
 NOT_SERVED = NOT_HERE
 SHORT_OF_VRAM = "the cards were short of memory"   # the engine ended before it was ready for lack of graphics memory: the start was repeated once with no drafter (serve/server.py), never with the MTP
-REASONS = (DIDNT_FIT, NOT_HERE, NOT_SUPPORTED, NOT_DOWNLOADED, NOT_THIS_CARD, NO_MTP, NONE_HERE, DIDNT_START, SHORT_OF_VRAM)
+#: Request slots (2 or more requests at once) with the MTP layer loaded but no ``--batch-mtp``: the slots draft nothing and only a single request drafts. This reason is the whole line after
+#: "Drafting: " (``line`` prints it as it is, not inside "MTP (...)"); ``slots_draft_nothing`` says when it is true.
+NONE_IN_SLOTS = "none in parallel slots (one token per request and step); a single request still drafts"
+REASONS = (DIDNT_FIT, NOT_HERE, NOT_SUPPORTED, NOT_DOWNLOADED, NOT_THIS_CARD, NO_MTP, NONE_HERE, DIDNT_START, SHORT_OF_VRAM, NONE_IN_SLOTS)
+#: The server's line for a DFlash2 start whose request slots draft too (a drafter per request slot, guesses only in the rows the slots leave spare); ``slot_drafts_run`` says when.
+SLOT_DRAFTS_LINE = "Drafting: DFlash2, one guess window per request slot (spare rows only)"
 
 
 def line(drafter: str, reason: str = "") -> str:
-    """``Drafting: DFlash2``, ``Drafting: MTP (DFlash2 isn't available in this mode)``, ``Drafting: off (no drafter is downloaded yet)``."""
+    """``Drafting: DFlash2``, ``Drafting: MTP (DFlash2 isn't available in this mode)``, ``Drafting: off (no drafter is downloaded yet)``, ``Drafting: none in parallel slots (...)``."""
+    if reason == NONE_IN_SLOTS:
+        return f"Drafting: {NONE_IN_SLOTS}"
     word = {"mtp": "MTP", "dflash2": "DFlash2", "off": "off"}.get(drafter, drafter)
     return f"Drafting: {word} ({reason})" if reason else f"Drafting: {word}"
+
+
+def slots_draft_nothing(args: list[Any], slots: int | float | None = 0) -> bool:
+    """Do this start's request slots draft nothing? Yes for 2 or more requests at once with no ``--batch-mtp`` (and no ``STRATA_BATCH_MTP``, no ``--pipeline-windows``) in the arguments:
+    the engine runs the slots with one token per request and step, and only a single request drafts. (Called for a start that runs the MTP layer: the slots' own DFlash2 drafts are
+    ``slot_drafts_run``; with ``--batch-mtp`` the slots carry MTP drafts and the usual line stays.)"""
+    items = [str(a) for a in args or []]
+    if request_count(items, slots) < 2 or "--batch-mtp" in items or "--pipeline-windows" in items:
+        return False
+    return os.environ.get("STRATA_BATCH_MTP", "0") in ("", "0")
+
+
+def slot_drafts_run(args: list[Any], slots: int | float | None = 0, split: bool = False) -> bool:
+    """Does a DFlash2 start draft in its request slots too (``--draft dflash2 --batch N``, a drafter per slot)? Yes for 2 or more requests at once, unless ``STRATA_BATCH_DF2=0`` (the way back,
+    as the engine reads it), a layer split (``split`` or ``--layer-split``: its slots draft only where they run as one group, not decided here) or ``--pipeline-windows``."""
+    items = [str(a) for a in args or []]
+    if split or request_count(items, slots) < 2 or "--layer-split" in items or "--pipeline-windows" in items:
+        return False
+    return os.environ.get("STRATA_BATCH_DF2", "") != "0"
 
 
 def mtp_line(reason: str) -> str:
@@ -1531,6 +1557,8 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     decision = decide(mode, model_name=name, family=family, data_dir=data_dir, backend=backend, archs=archs,
                       mtp_here=mtp_here, blocked=blocked_by(strip_draft_flags(args), split=split, slots=slots, named=normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts) or form == FORM_NONE,
                       vocab_here=vocab is not None, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
+    if decision.drafter == "mtp" and decision.note == NOT_HERE and slots_draft_nothing(args, slots):
+        decision.note = NONE_IN_SLOTS                         # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
     mine = cfg.get("user_args") or []
     pack = None
     if decision.drafter == "dflash2":
