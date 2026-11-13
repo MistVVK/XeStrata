@@ -13,6 +13,7 @@
 #include "strata/prefill/fp16_rows_rule.hpp"
 #include "strata/prefill/own_only_line.hpp"
 #include "strata/prefill/stream_floor_rule.hpp"
+#include "strata/prefill/switch_point_rule.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/fewrows.hpp"
 #include "strata/prefill/gp100_prompt_default.hpp"
@@ -204,7 +205,10 @@ std::vector<std::string>& own_only_switches() {
 const bool g_own_only_defaults = [] {
     strata::kernels::native_expert_i8_set_mmq_free();   // the int8 expert kernels are the default prompt-expert kernels here (i8_expert_rule.hpp, i8_switch_effective)
 #if defined(STRATA_USE_HIP) || defined(__HIPCC__)
-    static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_KQ"};
+    // (gfx12 only: every one of these is read behind the device's own gfx12 check, moe_fused_iq.cu q8d_hip_requested .. q6k_hip_requested, so a gfx11
+    // card keeps the rules it has: its layers of those formats take the FP16 path here as before)
+    static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_Q8D", "STRATA_PF_FUSED_Q8GU",
+                                      "STRATA_PF_FUSED_Q6K", "STRATA_PF_FUSED_KQ", "STRATA_PF_FUSED_TQ"};
 #else
     // (not STRATA_PF_FUSED_Q2N: the GGUF Q2_0 / Q2_0 pair on sm_80+ misses its worst-row bound against MMQ at 20K / 32K tokens on sm_86,
     // not explained yet; those layers take the FP16 path here unless the user sets it)
@@ -416,6 +420,44 @@ inline bool share_keeps_own_kernels(int64_t rows_cpu) {
 #endif
     return strata::prefill::share_layer_keeps_own_kernels(own_only, env, rows_cpu);
 }
+// STRATA_SWITCH_POINT (CUDA builds only): the floor of a card that streams part of the experts comes from switch_point_rule.hpp's cost estimate.  ON BY DEFAULT for the class
+// in_default_class() names (NVIDIA discrete card on PCIe, one GPU, link probe ran, compute capability 8.6); STRATA_SWITCH_POINT=0 is the way back, =1 asks for it on any other CUDA card.
+// The card's counts arrive from Prefill::set_card_expert_share (the cache's slots and layers x experts, known before the first lend); until then the default answers.
+std::atomic<int64_t> g_sp_resident{-1}, g_sp_total{0};
+double g_sp_blob_mb = 0.0, g_sp_link_gbps = 0.0;   // the cache's mean blob (MB) and the start-up probe (GB/s), from Prefill::set_card_expert_share
+int g_sp_sm = 0;                                   // the card's multiprocessor count
+int g_sp_cc_major = 0, g_sp_cc_minor = 0;          // the card's compute capability
+bool g_sp_integrated = true;                       // not known as discrete until the card answered
+// STRATA_SWITCH_POINT as set: -1 unset, 1 for "1", 0 for any other value (the way back)
+inline int switch_point_env() {
+    static const int e = [] {
+        const char* v = std::getenv("STRATA_SWITCH_POINT");
+        return v != nullptr && v[0] != '\0' ? strata::prefill::switch_point::env_state(v) : -1;
+    }();
+    return e;
+}
+// the card's counts have arrived (set_card_expert_share ran: a single card, no batch slots)
+inline bool switch_point_known() { return g_sp_resident.load(std::memory_order_acquire) >= 0; }
+inline bool switch_point_on() {
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
+    return false;   // measured on CUDA only
+#else
+    if (!switch_point_known()) return false;
+    strata::prefill::switch_point::DeviceClass d;
+    d.cuda = true;
+    d.discrete = !g_sp_integrated;
+    d.single_gpu = true;   // set_card_expert_share is called from the single-card, no-batch paths only
+    d.link_probed = g_sp_link_gbps > 0.0;
+    d.cc_major = g_sp_cc_major; d.cc_minor = g_sp_cc_minor;
+    return strata::prefill::switch_point::enabled(d, switch_point_env());
+#endif
+}
+// the card as the rule scales it; a field not set gives card_known() == false and the default floor
+inline strata::prefill::switch_point::Card sp_card() {
+    strata::prefill::switch_point::Card c;
+    c.blob_mb = g_sp_blob_mb; c.link_gbps = g_sp_link_gbps; c.sm = g_sp_sm;
+    return c;
+}
 // The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
 inline int64_t default_stream_floor() {
     static std::atomic<int64_t> cached{-1};
@@ -424,7 +466,22 @@ inline int64_t default_stream_floor() {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return strata::prefill::kStreamFloorDefault;
     const bool cls = stream_floor_class_measured();
-    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on());
+    int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on());
+#if !defined(STRATA_USE_HIP) && !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    // the card's counts are not known yet (set_card_expert_share has not run) and the rule is not switched off: the default, not cached
+    if (v == strata::prefill::kStreamFloorDefault && switch_point_env() != 0 && !switch_point_known()) return v;
+#endif
+    if (v == strata::prefill::kStreamFloorDefault && switch_point_on()) {
+        const int64_t res = g_sp_resident.load(std::memory_order_acquire), tot = g_sp_total.load(std::memory_order_acquire);
+        const auto card = sp_card();
+        if (!strata::prefill::switch_point::card_known(card)) return v;   // the link or the card is not known: the default, not cached
+        v = strata::prefill::switch_point::floor_for_card(res, tot, card);
+        if (v != strata::prefill::kStreamFloorDefault)
+            std::fprintf(stderr, "prefill: prompt chunks of %lld tokens or more stream every expert the card does not hold (%lld of %lld experts resident; %.2f MB experts, %.1f GB/s link, %d SMs); a shorter chunk stages only the routed ones. STRATA_SWITCH_POINT=0 keeps the fixed 1,024.\n",
+                         (long long) v, (long long) res, (long long) tot, card.blob_mb, card.link_gbps, card.sm);
+        cached.store(v, std::memory_order_release);
+        return v;
+    }
     cached.store(v, std::memory_order_release);
     if (v != strata::prefill::kStreamFloorDefault)
         std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
@@ -1414,7 +1471,8 @@ struct Prefill::Impl {
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
     // only write stream_all_min() - 1 of its rows into them; fused_layout() keeps the two in step (#583, #954)
     bool fused_bufs = false;
-    std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
+    int64_t tail_req = -1;   // the MMQ tail (tokens) the fused layout was carved for: -1 = stream_all_min() - 1 (start-up, the way back); relayout's `tail`
+    std::unique_ptr<Stager> stager;         // the unpinned experts' host copies (step 4)
     std::unique_ptr<PrefillWarmer> warmer;   // STRATA_PREFILL_WARM=1: the per-layer walk's page warming
     std::vector<std::vector<int64_t>> warm_prev;   // per layer: the file-tier experts of the previous chunk
     cudaEvent_t copied[RING_MAX] = {}, used[RING_MAX] = {};
@@ -1984,21 +2042,24 @@ bool fused_layout(size_t T, bool src) {
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens.
 struct MoeBufs { size_t gu, h, xq, hq; };
-MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
+// `tail` (>= 0, fused only): the MMQ rows a chunk below the floor may bring, in tokens (a lent layout sized for its
+// segment's own last chunk, loan_rules.hpp); -1: stream_all_min() - 1, as the start-up layout.
+MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused, int64_t tail = -1) {
     if (!fused && pf_group_scratch()) {   // GU, H, Hq: one group's rows (Xq keeps every row: gate/up reads the layer's)
         const size_t gc = (size_t) group_cap_rows(T, n_expert);
         return {gc * kFF2, gc * kFF, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) gc, kFF)};
     }
     if (!fused) return {T * K * kFF2, T * K * kFF, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), kFF)};
-    const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
+    const int64_t tail_tokens = tail >= 0 ? std::min<int64_t>(tail, std::max<int64_t>(stream_all_min() - 1, 0)) : stream_all_min() - 1;
+    const size_t ts = (size_t) std::min<int64_t>((int64_t) T, tail_tokens);   // MMQ's last small chunk
     return {std::max<size_t>(ts * K * kFF2, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
             std::max<size_t>(ts * K * kFF, (fused::act_bytes((int64_t) (T * K), kFF) + 3) / 4),
             std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
             mmq::q8_bytes((int64_t) (ts * K), kFF)};
 }
-uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
+uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused, int64_t tail = -1) {
     const MmqPlan& mp = mmq_plan();
-    const MoeBufs mb = moe_bufs(T, n_expert, fused);
+    const MoeBufs mb = moe_bufs(T, n_expert, fused, tail);
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
@@ -2362,9 +2423,9 @@ bool Prefill::carve(size_t T, void* alloc) {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const bool fz = fused_layout(T, m.src != nullptr);
         m.fused_bufs = fz;
-        const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
+        const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz, m.tail_req);
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz),
+                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz, m.tail_req),
                                            hcr ? hc_set_bytes(T, m.f16_io) : (uint64_t) 0});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         // No region: the sub-allocators below would each cudaMalloc their share (hundreds of MiB) on a card that has just
@@ -2495,8 +2556,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     return ok;
 }
 
-bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
+bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, int64_t tail) {
     Impl& m = *impl_;
+    m.tail_req = tail;   // read by carve (a failure leaves the layout unusable as before; the caller ends the request)
     if (m.borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
         return false;
@@ -2534,6 +2596,14 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+int64_t Prefill::layout_tail() const { return impl_->tail_req; }
+int64_t Prefill::tail_room() const {
+    const Impl& m = *impl_;
+    if (!m.fused_bufs) return std::numeric_limits<int64_t>::max();   // MMQ-sized buffers: any chunk the layout has
+    const int64_t d = std::max<int64_t>(stream_all_min() - 1, 0);
+    return m.tail_req >= 0 ? std::min(m.tail_req, d) : d;
+}
+bool Prefill::tail_matters(int64_t chunk, bool src) { return chunk > 0 && fused_layout((size_t) chunk, src); }
 
 void Prefill::set_ring_room_active(bool on) {
     ring_room_active_ = on;
@@ -3087,6 +3157,21 @@ int64_t Prefill::short_read_default(int64_t base) {
     const bool cls = stream_floor_class_measured();
     return strata::prefill::short_read_default(base, cls, cls && layers_all_fused_only(), staged_fo_on());
 }
+void Prefill::set_card_expert_share(int64_t resident_slots, int64_t total_pairs, double blob_mb, double link_gbps) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    int dev = 0;
+    cudaDeviceProp prop;
+    const bool got = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
+    g_sp_sm = got ? prop.multiProcessorCount : 0;
+    g_sp_cc_major = got ? prop.major : 0;
+    g_sp_cc_minor = got ? prop.minor : 0;
+    g_sp_integrated = got ? prop.integrated != 0 : true;
+#endif
+    g_sp_blob_mb = blob_mb;
+    g_sp_link_gbps = link_gbps;
+    g_sp_total.store(total_pairs, std::memory_order_release);
+    g_sp_resident.store(resident_slots, std::memory_order_release);
+}
 
 // --prefill-pipe (opt-in; STRATA_PREFILL_PIPE): a layer split reads a prompt as a pipeline - stage s reads chunk c while
 // stage s+1 reads chunk c-1. A stage-chunk costs its layers x (b + a C): a fixed part per chunk (b: the pass over the
@@ -3187,8 +3272,8 @@ int64_t Prefill::chain_experts_streamed() const {
     return sum;
 }
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
-    return bytes_needed_impl(g, ss, chunk, false, src);
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src, int64_t tail) {
+    return bytes_needed_impl(g, ss, chunk, false, src, tail);
 }
 
 // What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
@@ -3199,7 +3284,7 @@ uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::S
 }
 
 uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                    bool owned_pages, bool src) {
+                                    bool owned_pages, bool src, int64_t tail) {
     // the same allocation sequence as `init` (`carve`), counted - with the MoE layout `carve` picks for the same source
     const size_t T = (size_t) chunk;
     bool ok = true;
@@ -3234,7 +3319,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
-                                       moe_set_bytes(T, g.n_expert, fused_layout(T, src)),
+                                       moe_set_bytes(T, g.n_expert, fused_layout(T, src), tail),
                                        hcr ? hc_set_bytes(T, f16_io) : (uint64_t) 0}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(kFF2 * kEmbd, ok); o.take<uint16_t>(kEmbd * kFF, ok); }
     if (mmq_plan().any) {
@@ -3296,6 +3381,12 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
         g_share_default = true;
+        if (switch_point_on() && g_sp_resident.load(std::memory_order_acquire) >= 0 && strata::prefill::switch_point::card_known(sp_card())) {
+            // STRATA_SWITCH_POINT (on by default for its class, 0 = off): the share's limit scales with the card's own floor (floor x kShareRatio), not the fixed 3,072
+            const int64_t lim = strata::prefill::switch_point::share_limit_for(strata::prefill::switch_point::floor_for_card(
+                g_sp_resident.load(std::memory_order_acquire), g_sp_total.load(std::memory_order_acquire), sp_card()));
+            if (lim > 0) g_share_limit_arch = lim;
+        }
         std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks up to %lld tokens (the idle CPU "
                              "takes some of the experts the GPU would stream; answers can differ slightly from 0.1.40.3, "
                              "mean KL ~0.004 below 1024 tokens, ~0.011 at 1-3K). STRATA_PREFILL_CPU_SHARE=0 turns it off, "
@@ -3812,6 +3903,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::fflush(stderr);
         }
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
+        // A fused layout carved with a tail (relayout's `tail`, loan_rules.hpp) holds MMQ's rows for that many tokens of a
+        // chunk below the stream floor: a longer one would overrun GU / H / Xq / Hq (an illegal access, or a hang).  The
+        // lend sizes the tail from the segment, so this is the clean error for anything that drifts from it.
+        if (m.fused_bufs && T < stream_all_min() && T > tail_room()) {
+            err = "prefill: a chunk of " + std::to_string((long long) T) + " tokens below the stream floor does not fit the fused layout's tail of " +
+                  std::to_string((long long) tail_room()) + " tokens";
+            return false;
+        }
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
         // before the request's full-computation suffix; a chunk in the suffix runs the ordinary path everywhere.
         const bool kva_approx = kva_run && (p0 + T <= kva_frontier);

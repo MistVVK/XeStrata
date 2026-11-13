@@ -1599,7 +1599,7 @@ bool Prefill::carve(size_t T, void* alloc) {
 }
 
 bool Prefill::relayout(int64_t chunk, void *borrow, uint64_t borrow_bytes,
-                       std::string &err) try {
+                       std::string &err, int64_t /*tail*/) try {
     Impl& m = *impl_;
     if (!m.borrowed || borrow == nullptr || chunk <= 0 || chunk > m.T_max) {
         err = "prefill: relayout needs borrowed buffers and a chunk of at most " + std::to_string(m.T_max);
@@ -2197,9 +2197,16 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
 double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src, int64_t /*tail*/) {
     return bytes_needed_impl(g, ss, chunk, false, src);
 }
+// The shared header (include/strata/prefill/prefill.hpp) carries the lent layout's MMQ tail (loan_rules.hpp) and the card's expert share for the
+// switch-point rule. The SYCL engine has no tail buffers (no MMQ), so these members answer "no tail" (-1, room for any chunk) and the parameters
+// are accepted and ignored; the interface is kept in step with the header, the layouts behave as before the tail existed.
+int64_t Prefill::layout_tail() const { return -1; }
+int64_t Prefill::tail_room() const { return INT64_MAX; }
+bool Prefill::tail_matters(int64_t, bool) { return false; }
+void Prefill::set_card_expert_share(int64_t, int64_t, double, double) {}
 
 // What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
 // page, and the ring is one allocation (carve).  `bytes_needed` stays the borrowed region's sum.
@@ -2209,7 +2216,7 @@ uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::S
 }
 
 uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                    bool owned_pages, bool src) {
+                                    bool owned_pages, bool src, int64_t /*tail*/) {
     // the same allocation sequence as `init`, counted
     const size_t T = (size_t) chunk;
     bool ok = true;
