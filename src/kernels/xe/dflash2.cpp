@@ -427,32 +427,37 @@ bool df2_attn_256_pays(sycl::queue& qu, const float* q, const float* kring, cons
     static core::TimedCache<sycl::device, Key, bool> choices;
     const Key key{ring_slots, window};
     if (const auto cached = choices.get(qu.get_device(), key)) return *cached;
-    if (core::timing_depth != 0 || qu.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording)
-        return false;
+    if (core::timing_depth != 0) return false;
+    // The decode windows first come here while their queue records a graph: the two forms are then timed on a queue
+    // of this function's own (in order, as the engine's), on the caller's buffers - the inputs are only read, and the
+    // outputs are the ones the recorded launch writes again.
+    sycl::queue own(qu.get_context(), qu.get_device(), sycl::property::queue::in_order{});
+    const bool recording = qu.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;
+    sycl::queue& pq = recording ? own : qu;
     constexpr size_t NQ = 32 * HD;   // the quantized rows: int8 values + their fp32 block scales
     const size_t nxq = NQ, nxd = (size_t) 32 * HD / 32;
     std::vector<int8_t> b0(nxq), b1(nxq);
     std::vector<float> d0(nxd), d1(nxd);
     auto trial = [&](bool two) {
-        (two ? df2_attention_v2(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr)
-             : df2_attention_v1(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr))
+        (two ? df2_attention_v2(pq, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr)
+             : df2_attention_v1(pq, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr))
             .wait_and_throw();
-        df2_attention_combine(qu, part, xq, xd).wait_and_throw();
+        df2_attention_combine(pq, part, xq, xd).wait_and_throw();
         return true;
     };
     trial(false);
-    qu.memcpy(b0.data(), xq, nxq).wait_and_throw();
-    qu.memcpy(d0.data(), xd, nxd * sizeof(float)).wait_and_throw();
+    pq.memcpy(b0.data(), xq, nxq).wait_and_throw();
+    pq.memcpy(d0.data(), xd, nxd * sizeof(float)).wait_and_throw();
     trial(true);
-    qu.memcpy(b1.data(), xq, nxq).wait_and_throw();
-    qu.memcpy(d1.data(), xd, nxd * sizeof(float)).wait_and_throw();
+    pq.memcpy(b1.data(), xq, nxq).wait_and_throw();
+    pq.memcpy(d1.data(), xd, nxd * sizeof(float)).wait_and_throw();
     const bool same = std::memcmp(b0.data(), b1.data(), nxq) == 0 && std::memcmp(d0.data(), d1.data(), nxd * sizeof(float)) == 0;
     bool two = false;
     if (same) {
         static core::TimedCache<sycl::device, int, bool> warmed;
         const bool first = warmed.put_first(qu.get_device(), 0, true, [](int) { return true; }).second;
         const auto measured = core::timed_choice({{[&] { return trial(false); }}, {[&] { return trial(true); }}},
-                                                 [&] { qu.wait_and_throw(); }, 5, 1.05, first ? 0.5 : 0.0);
+                                                 [&] { pq.wait_and_throw(); }, 5, 1.05, first ? 0.005 : 0.0);
         two = measured.pick == 1;
         std::fprintf(stderr, "xestrata: DFlash2 attention %s (%.1f / %.1f us, %s)\n",
                      two ? "one 256-work-item group" : "an 8-query group", measured.seconds[0] * 1e6,
@@ -620,7 +625,7 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
                     const auto measured = core::timed_choice({
                         {[&] { for (int r = 0; r < 4; ++r) gemm_nc<true, false>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols); return true; }},
                         {[&] { for (int r = 0; r < 4; ++r) gemm_nc<true, true>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols); return true; }}
-                    }, [&] { qu.wait_and_throw(); }, 5, 1.10, first ? 0.5 : 0.0);
+                    }, [&] { qu.wait_and_throw(); }, 5, 1.10, first ? 0.005 : 0.0);
                     pair16 = choices.put(qu.get_device(), key, measured.pick == 1);
                     std::fprintf(stderr, "xestrata: DFlash2 Q4 GEMM %s (%d x %d x %d; %.1f / %.1f us)\n",
                                  pair16 ? "paired subgroup" : "one subgroup", mats[i].n_out, n_in, ncols,
