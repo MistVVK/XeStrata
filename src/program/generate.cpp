@@ -4079,17 +4079,41 @@ int main(int argc, char** argv) {
     const uint64_t sess_bytes = strata::core::session_bytes(g, o.max_context, K, 0, hi0);
     if (!strata::gpu::alloc_device(&sbuf, sess_bytes)) {
         if (sess_room_known) {
+            // The session is not the last allocation: leave the native head, the later prompt buffers and the
+            // engine's VRAM reserve out of its room.  The prompt estimate is the same one used by auto cache sizing.
+            uint64_t later = (uint64_t) std::max(0, o.vram_reserve_mib) << 20;
+            if (o.prefill_chunk > 0)
+                later += (uint64_t) (160 + o.prefill_chunk * 680 / 1024) << 20;
+            if (!o.native_head_gguf.empty() && !multi_gpu) {
+                try {
+                    const auto hm = strata::GgufModel::open(o.native_head_gguf);
+                    size_t at = 0;
+                    if (const auto* t = hm.find("output.weight", &at)) later += strata::tensor_payload_bytes(*t);
+                } catch (const std::exception&) {
+                    std::fprintf(stderr, "xestrata generate: cannot estimate the later head allocation\n");
+                    std::fprintf(stderr, "xestrata generate: session state allocation failed\n");
+                    return 1;
+                }
+            }
+            if (!o.mtp.empty()) {
+                for (const char* f : {"dense.bin", "experts.bin"}) {
+                    std::error_code ec;
+                    const auto b = std::filesystem::file_size(std::filesystem::path(o.mtp) / f, ec);
+                    if (!ec) later += b;
+                }
+            }
+            const uint64_t room = sess_free_b > later ? sess_free_b - later : 0;
             const auto fit = strata::core::context_that_fits(
-                o.max_context, sess_free_b,
+                o.max_context, room,
                 [&](int64_t cells) { return strata::core::session_bytes(g, cells, K, 0, hi0); });
             if (fit.cells > 0)
                 std::fprintf(stderr, "xestrata generate: a context of %lld tokens does not fit on this graphics card: its "
-                                     "session needs %.2f GiB and only %.2f GiB is free; a context of %lld tokens fits here\n",
+                                     "session needs %.2f GiB and %.2f GiB remains after later allocations; try a context of %lld tokens\n",
                              (long long) o.max_context, (double) fit.need / 1073741824.0,
                              (double) fit.room / 1073741824.0, (long long) fit.cells);
             else
                 std::fprintf(stderr, "xestrata generate: a context of %lld tokens does not fit on this graphics card: its "
-                                     "session needs %.2f GiB and only %.2f GiB is free (not even 1024 tokens fit here)\n",
+                                     "session needs %.2f GiB and %.2f GiB remains after later allocations (not even 1024 tokens fit)\n",
                              (long long) o.max_context, (double) fit.need / 1073741824.0,
                              (double) fit.room / 1073741824.0);
         }
