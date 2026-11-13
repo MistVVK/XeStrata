@@ -22,6 +22,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/session_save_reclaim.hpp"
+#include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -1436,12 +1437,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 live_to_folder("too large for the RAM cache");
                 return;
             }
+            bool dropped = false;
             while (!cache.parked.empty() &&
                    ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget)) {
                 if (std::prev(cache.parked.end()) == keep) break;
                 to_folder(cache.parked.back().ids, cache.parked.back().snap, cache.parked.back().checks, "evicted");
                 cache.parked.pop_back();
+                dropped = true;
             }
+            // upstream 8c71c492 (#5697): the next admission reads MemAvailable, and a dropped image's memory may sit in
+            // the C library's heap otherwise
+            if (dropped) strata::core::release_free_heap();
             if ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget) {
                 live_to_folder("no room in the RAM cache");
                 return;
@@ -1464,11 +1470,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             for (const Checkpoint& c : sl.checks) need += (int64_t) c.snap->bytes();
             const auto avail = strata::core::available_host_bytes();
             if (need > cache.budget || !avail || (int64_t) *avail - need <= cache.min_free) return;
+            bool dropped = false;
             while (!cache.parked.empty() &&
                    ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget)) {
                 to_folder(cache.parked.back().ids, cache.parked.back().snap, cache.parked.back().checks, "evicted");
                 cache.parked.pop_back();
+                dropped = true;
             }
+            if (dropped) strata::core::release_free_heap();
             ConversationCache::Entry e;
             std::string perr;
             if (!model.save_slot(b, (int64_t) sl.ids.size(), e.snap, perr)) return;

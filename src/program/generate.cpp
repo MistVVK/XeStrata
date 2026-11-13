@@ -7614,12 +7614,17 @@ int main(int argc, char** argv) {
                     return strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
-                while (!admit() && conversations.size() > 0 && freed < conversations.slots() &&
+                // upstream 8c71c492 (#5697): freed memory can stay in the C library's heap, which MemAvailable does not
+                // count (make_room's evictions, dropped checkpoints): a failed check hands it back first, and
+                // evict_oldest() hands back each entry it drops, so the next check reads it from /proc/meminfo.
+                bool fits = admit() || (strata::core::release_free_heap() && admit());
+                while (!fits && conversations.size() > 0 && freed < conversations.slots() &&
                        conversations.evict_oldest(disk.enabled() ? &evicted : nullptr)) {
                     ++freed;
                     save_evicted();
+                    fits = admit();
                 }
-                if (!admit()) {
+                if (!fits) {
                     std::fprintf(stderr, "xestrata serve: conversation cache: skip parking (physical RAM admission; need "
                                          "%zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
