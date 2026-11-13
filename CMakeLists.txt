@@ -424,7 +424,7 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(staged_fo_rule_test PRIVATE include)
   add_test(NAME staged_fo_rule_test COMMAND staged_fo_rule_test)
 
-  # STRATA_SWITCH_POINT (research): the floor from the card's share of non-resident experts, a cost estimate of the staged and the streamed walk (header-only, no GPU)
+  # STRATA_SWITCH_POINT (on by default for NVIDIA sm_86, one GPU): the floor from the card's share of non-resident experts, a cost estimate of the staged and the streamed walk (header-only, no GPU)
   add_executable(switch_point_rule_test tests/prefill/switch_point_rule_test.cpp)
   target_include_directories(switch_point_rule_test PRIVATE include)
   add_test(NAME switch_point_rule_test COMMAND switch_point_rule_test)

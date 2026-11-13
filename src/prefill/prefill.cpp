@@ -390,19 +390,38 @@ inline bool staged_fo_on() {
     cached.store(v ? 1 : 0, std::memory_order_release);
     return v;
 }
-// STRATA_SWITCH_POINT=1 (research, default off; CUDA builds only): the floor of a card that streams part of the experts comes from switch_point_rule.hpp's cost estimate.
+// STRATA_SWITCH_POINT (CUDA builds only): the floor of a card that streams part of the experts comes from switch_point_rule.hpp's cost estimate.  ON BY DEFAULT for the class
+// in_default_class() names (NVIDIA discrete card on PCIe, one GPU, link probe ran, compute capability 8.6); STRATA_SWITCH_POINT=0 is the way back, =1 asks for it on any other CUDA card.
 // The card's counts arrive from Prefill::set_card_expert_share (the cache's slots and layers x experts, known before the first lend); until then the default answers.
+std::atomic<int64_t> g_sp_resident{-1}, g_sp_total{0};
+double g_sp_blob_mb = 0.0, g_sp_link_gbps = 0.0;   // the cache's mean blob (MB) and the start-up probe (GB/s), from Prefill::set_card_expert_share
+int g_sp_sm = 0;                                   // the card's multiprocessor count
+int g_sp_cc_major = 0, g_sp_cc_minor = 0;          // the card's compute capability
+bool g_sp_integrated = true;                       // not known as discrete until the card answered
+// STRATA_SWITCH_POINT as set: -1 unset, 1 for "1", 0 for any other value (the way back)
+inline int switch_point_env() {
+    static const int e = [] {
+        const char* v = std::getenv("STRATA_SWITCH_POINT");
+        return v != nullptr && v[0] != '\0' ? strata::prefill::switch_point::env_state(v) : -1;
+    }();
+    return e;
+}
+// the card's counts have arrived (set_card_expert_share ran: a single card, no batch slots)
+inline bool switch_point_known() { return g_sp_resident.load(std::memory_order_acquire) >= 0; }
 inline bool switch_point_on() {
 #if defined(STRATA_USE_HIP) || defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
     return false;   // measured on CUDA only
 #else
-    static const bool on = [] { const char* e = std::getenv("STRATA_SWITCH_POINT"); return e != nullptr && e[0] == '1' && e[1] == '\0'; }();
-    return on;
+    if (!switch_point_known()) return false;
+    strata::prefill::switch_point::DeviceClass d;
+    d.cuda = true;
+    d.discrete = !g_sp_integrated;
+    d.single_gpu = true;   // set_card_expert_share is called from the single-card, no-batch paths only
+    d.link_probed = g_sp_link_gbps > 0.0;
+    d.cc_major = g_sp_cc_major; d.cc_minor = g_sp_cc_minor;
+    return strata::prefill::switch_point::enabled(d, switch_point_env());
 #endif
 }
-std::atomic<int64_t> g_sp_resident{-1}, g_sp_total{0};
-double g_sp_blob_mb = 0.0, g_sp_link_gbps = 0.0;   // the cache's mean blob (MB) and the start-up probe (GB/s), from Prefill::set_card_expert_share
-int g_sp_sm = 0;                                   // the card's multiprocessor count
 // the card as the rule scales it; a field not set gives card_known() == false and the default floor
 inline strata::prefill::switch_point::Card sp_card() {
     strata::prefill::switch_point::Card c;
@@ -418,14 +437,18 @@ inline int64_t default_stream_floor() {
     if (!lay.native || lay.fmt.empty()) return strata::prefill::kStreamFloorDefault;
     const bool cls = stream_floor_class_measured();
     int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on());
+#if !defined(STRATA_USE_HIP) && !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    // the card's counts are not known yet (set_card_expert_share has not run) and the rule is not switched off: the default, not cached
+    if (v == strata::prefill::kStreamFloorDefault && switch_point_env() != 0 && !switch_point_known()) return v;
+#endif
     if (v == strata::prefill::kStreamFloorDefault && switch_point_on()) {
         const int64_t res = g_sp_resident.load(std::memory_order_acquire), tot = g_sp_total.load(std::memory_order_acquire);
-        if (res < 0) return v;   // the card's counts are not known yet: the default, not cached
         const auto card = sp_card();
         if (!strata::prefill::switch_point::card_known(card)) return v;   // the link or the card is not known: the default, not cached
         v = strata::prefill::switch_point::floor_for_card(res, tot, card);
-        std::fprintf(stderr, "prefill: STRATA_SWITCH_POINT=1: prompt chunks of %lld tokens or more stream every expert the card does not hold (%lld of %lld experts resident; %.2f MB experts, %.1f GB/s link, %d SMs); a shorter chunk stages only the routed ones\n",
-                     (long long) v, (long long) res, (long long) tot, card.blob_mb, card.link_gbps, card.sm);
+        if (v != strata::prefill::kStreamFloorDefault)
+            std::fprintf(stderr, "prefill: prompt chunks of %lld tokens or more stream every expert the card does not hold (%lld of %lld experts resident; %.2f MB experts, %.1f GB/s link, %d SMs); a shorter chunk stages only the routed ones. STRATA_SWITCH_POINT=0 keeps the fixed 1,024.\n",
+                         (long long) v, (long long) res, (long long) tot, card.blob_mb, card.link_gbps, card.sm);
         cached.store(v, std::memory_order_release);
         return v;
     }
@@ -3050,7 +3073,11 @@ void Prefill::set_card_expert_share(int64_t resident_slots, int64_t total_pairs,
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     int dev = 0;
     cudaDeviceProp prop;
-    g_sp_sm = (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess) ? prop.multiProcessorCount : 0;
+    const bool got = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
+    g_sp_sm = got ? prop.multiProcessorCount : 0;
+    g_sp_cc_major = got ? prop.major : 0;
+    g_sp_cc_minor = got ? prop.minor : 0;
+    g_sp_integrated = got ? prop.integrated != 0 : true;
 #endif
     g_sp_blob_mb = blob_mb;
     g_sp_link_gbps = link_gbps;
@@ -3263,7 +3290,7 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
         g_share_default = true;
         if (switch_point_on() && g_sp_resident.load(std::memory_order_acquire) >= 0 && strata::prefill::switch_point::card_known(sp_card())) {
-            // STRATA_SWITCH_POINT=1 (research): the share's limit scales with the card's own floor (floor x kShareRatio), not the fixed 3,072
+            // STRATA_SWITCH_POINT (on by default for its class, 0 = off): the share's limit scales with the card's own floor (floor x kShareRatio), not the fixed 3,072
             const int64_t lim = strata::prefill::switch_point::share_limit_for(strata::prefill::switch_point::floor_for_card(
                 g_sp_resident.load(std::memory_order_acquire), g_sp_total.load(std::memory_order_acquire), sp_card()));
             if (lim > 0) g_share_limit_arch = lim;

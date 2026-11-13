@@ -1,6 +1,8 @@
 // include/strata/prefill/switch_point_rule.hpp - the chunk size below which a prompt chunk takes the STAGED walk and from which it takes the STREAMED walk
 // (src/prefill/prefill.cpp stream_all_min()), chosen by estimated cost from the card's share of non-resident experts instead of the fixed 1,024.
-// Research switch STRATA_SWITCH_POINT=1, default off.  Pure: no GPU, no environment read here.
+// ON BY DEFAULT for one class of card (enabled() below): CUDA, NVIDIA discrete card on PCIe, one GPU, the start-up link probe ran, compute capability 8.6 (RTX A6000 and
+// RTX A4000 measured).  STRATA_SWITCH_POINT=0 is the way back; STRATA_SWITCH_POINT=1 asks for the rule on any other CUDA card (not measured there).
+// Pure: no GPU, no environment read here.
 //
 // The two walks (prefill.cpp):
 //   streamed: every expert the card does not hold is copied through a ring in layer order, whatever the chunk routes; the copy runs through the attention
@@ -92,6 +94,31 @@ inline constexpr double kShareRatio = 1.6;
 inline int64_t share_limit_for(int64_t floor) {
     if (floor <= kFloorDefault) return 0;
     return std::min<int64_t>(2 * kFloorMax, ((int64_t) ((double) floor * kShareRatio) / kGrid) * kGrid);
+}
+
+// ---- the class the rule is on for by default ----
+// The device facts the engine reads once the card's expert cache is built (src/prefill/prefill.cpp, Prefill::set_card_expert_share).
+struct DeviceClass {
+    bool cuda = false;          // a CUDA build (HIP builds: never)
+    bool discrete = false;      // a discrete card, not an integrated / shared-memory GPU
+    bool single_gpu = false;    // the engine runs on one card: no layer split, no second card
+    bool link_probed = false;   // the start-up host-to-device probe ran and gave a rate (the PCIe cost the rule scales with)
+    int cc_major = 0, cc_minor = 0;   // compute capability
+};
+/// Measured: RTX A6000 (Boston) and RTX A4000 (z440), both 8.6.  Every other compute capability (6.0, 7.0, 7.5, 8.0, 8.9, 12.0, 12.1) is outside the class until it is measured.
+inline constexpr int kClassCcMajor = 8, kClassCcMinor = 6;
+inline bool in_default_class(const DeviceClass& d) {
+    return d.cuda && d.discrete && d.single_gpu && d.link_probed && d.cc_major == kClassCcMajor && d.cc_minor == kClassCcMinor;
+}
+/// STRATA_SWITCH_POINT as the engine reads it: -1 unset (or empty), 1 for exactly "1", 0 for any other value.
+inline int env_state(const char* v) {
+    if (v == nullptr || v[0] == '\0') return -1;
+    return (v[0] == '1' && v[1] == '\0') ? 1 : 0;
+}
+/// Whether the rule runs: HIP never; STRATA_SWITCH_POINT=0 (or any value but 1) never; =1 on every CUDA card; unset: the class above.
+inline bool enabled(const DeviceClass& d, int env) {
+    if (!d.cuda || env == 0) return false;
+    return env == 1 || in_default_class(d);
 }
 
 }  // namespace strata::prefill::switch_point

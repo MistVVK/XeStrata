@@ -11146,7 +11146,7 @@ int main(int argc, char** argv) {
                                  "nothing to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
                          (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
         if (share_pool && stages.empty() && !multi_gpu && share_has_work && !share_default_ok()) share_has_work = false;   // H11
-        if (stages.empty() && !multi_gpu && o.batch <= 0)   // STRATA_SWITCH_POINT (research): one card, no batch slots; before any bytes_needed, like the share
+        if (stages.empty() && !multi_gpu && o.batch <= 0)   // STRATA_SWITCH_POINT: one card, no batch slots; before any bytes_needed, like the share
             strata::prefill::Prefill::set_card_expert_share((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert), xcache.slots() > 0 ? (double) xcache.bytes() / (double) xcache.slots() / 1e6 : 0.0, o.pcie_probe_gbps);
         strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work);
         void* borrow = nullptr;
@@ -20829,7 +20829,7 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = strata::spec::kSpecNotStarted;   // plan v0.3 P6: where the speculative loop starts (0 is a real position: a 1-token prompt on a native pack)
     strata::prefill::Prefill prefill;
-    if (!multi_gpu && o.batch <= 0)   // STRATA_SWITCH_POINT (research): before any bytes_needed, like the share
+    if (!multi_gpu && o.batch <= 0)   // STRATA_SWITCH_POINT: before any bytes_needed, like the share
         strata::prefill::Prefill::set_card_expert_share((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert), xcache.slots() > 0 ? (double) xcache.bytes() / (double) xcache.slots() / 1e6 : 0.0, o.pcie_probe_gbps);
     // #1595: not by default when the cache holds every expert (nothing to take)
     strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool,

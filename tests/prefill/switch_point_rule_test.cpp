@@ -92,6 +92,45 @@ int main() {
     CHECK(sp::share_limit_for(2048) == 3072);                        // A4000: measured break-even about 2,900
     CHECK(sp::share_limit_for(3840) % sp::kGrid == 0 && sp::share_limit_for(3840) > 3840);
 
+    // the class the rule is on for by default: CUDA, discrete, one GPU, link probe ran, compute capability 8.6; STRATA_SWITCH_POINT=0 is the way back, =1 asks for it elsewhere
+    {
+        sp::DeviceClass in;
+        in.cuda = true; in.discrete = true; in.single_gpu = true; in.link_probed = true; in.cc_major = 8; in.cc_minor = 6;
+        CHECK(sp::in_default_class(in));
+        CHECK(sp::enabled(in, -1));                                  // nothing set: on
+        CHECK(!sp::enabled(in, 0));                                  // STRATA_SWITCH_POINT=0 (or any value but 1): the way back
+        CHECK(sp::enabled(in, 1));                                   // STRATA_SWITCH_POINT=1: on
+        // every other compute capability is out of the class with nothing set
+        const int other[][2] = {{6, 0}, {6, 1}, {7, 0}, {7, 5}, {8, 0}, {8, 7}, {8, 9}, {9, 0}, {10, 0}, {12, 0}, {12, 1}, {0, 0}};
+        for (const auto& cc : other) {
+            sp::DeviceClass d = in;
+            d.cc_major = cc[0]; d.cc_minor = cc[1];
+            CHECK(!sp::in_default_class(d));
+            CHECK(!sp::enabled(d, -1));
+            CHECK(sp::enabled(d, 1));                                // the explicit opt-in still works on another CUDA card
+            CHECK(!sp::enabled(d, 0));
+        }
+        // each other condition on its own takes a card out of the class
+        { sp::DeviceClass d = in; d.single_gpu = false; CHECK(!sp::enabled(d, -1)); CHECK(!sp::enabled(d, 0)); }    // two cards / a layer split
+        { sp::DeviceClass d = in; d.link_probed = false; CHECK(!sp::enabled(d, -1)); }                              // no probe
+        { sp::DeviceClass d = in; d.discrete = false; CHECK(!sp::enabled(d, -1)); }                                 // integrated / shared memory
+        { sp::DeviceClass d = in; d.cuda = false; CHECK(!sp::enabled(d, -1)); CHECK(!sp::enabled(d, 1)); CHECK(!sp::enabled(d, 0)); }   // HIP: never, whatever the cc says
+        { sp::DeviceClass d; CHECK(!sp::enabled(d, -1)); CHECK(!sp::enabled(d, 1)); }                               // nothing known
+        // the variable: unset or empty = default, exactly "1" = on, anything else = off
+        CHECK(sp::env_state(nullptr) == -1);
+        CHECK(sp::env_state("") == -1);
+        CHECK(sp::env_state("1") == 1);
+        CHECK(sp::env_state("0") == 0);
+        CHECK(sp::env_state("off") == 0);
+        CHECK(sp::env_state("11") == 0);
+        // the class gives the measured floors: the A6000 and the A4000 are both 8.6
+        CHECK(sp::kClassCcMajor == 8 && sp::kClassCcMinor == 6);
+        CHECK(sp::floor_for_card(13580, total, sp::Card{3.14, 12.2, 84}) == 3584);
+        CHECK(sp::share_limit_for(3584) == 5632);
+        CHECK(sp::floor_for_card(7836, total, sp::Card{1.44, 11.0, 48}) == 2048);
+        CHECK(sp::share_limit_for(2048) == 3072);
+    }
+
     if (failed) {
         std::fprintf(stderr, "switch_point_rule_test: %d check(s) failed\n", failed);
         return 1;
