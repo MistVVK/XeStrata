@@ -5573,8 +5573,8 @@ class Service:
                 budget = max(1, max_new - reserve)
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
-                  reader(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-                         declared_only=declared_only))
+                  reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
+                         recover=self.tool_call_recovery, declared_only=declared_only))
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         # the loop guard (serve/loop_guard.py): every id goes through it before the parser; it holds back a short
@@ -6314,6 +6314,31 @@ class ToolHubs:
         text = f"error: there is no tool named {name!r}"
         return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
                 "tool": name}
+
+
+def with_history_tools(tools, req) -> list:
+    """#4663: an agent's tool set changes between turns (deferred tools, MCP servers, a compacted history), and the
+    model calls a tool it used earlier in this conversation that this turn's `tools` no longer lists.  That call came
+    back as raw text with finish_reason "stop", and the client took it for prose and stopped.  A name the
+    conversation's own assistant messages called is a tool the client has, so it counts as declared (the call comes
+    back as a tool call; the client says what it does with it).  Nothing is added when the request declared no tools at
+    all, or for a name that is already declared."""
+    if not tools or not isinstance(req, dict):
+        return tools
+    try:
+        have = {t.get("name") for t in tools if isinstance(t, dict)}
+        extra = []
+        for message in req.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                name = (call.get("function") or {}).get("name") if isinstance(call, dict) else None
+                if isinstance(name, str) and name and name not in have:
+                    have.add(name)
+                    extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
+        return [*tools, *extra] if extra else tools
+    except Exception:  # noqa: BLE001 - a shape this reader does not know leaves the tools as they were
+        return tools
 
 
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
