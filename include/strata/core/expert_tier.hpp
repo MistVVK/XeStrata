@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -256,12 +257,44 @@ void add_route_rows(std::vector<float>& usage, const std::vector<int32_t>& rec, 
     }
 }
 
-// The staged prompt walk can split one expert's rows into multi-token CPU jobs for short chunks.
-inline bool cpu_share_staged_3k() {
-    static const bool enabled = [] { const char* v = strata::env_get("PREFILL_STAGED_3K"); return v && *v == '1'; }();
-    return enabled;
+// auto tunes the staged walk; 0 keeps streaming and 1 forces the CPU jobs.
+inline int cpu_share_staged_3k_mode() {
+    static const int mode = [] {
+        const char* v = strata::env_get("PREFILL_STAGED_3K");
+        if (!v || std::strcmp(v, "auto") == 0) return -1;
+        return *v == '1' ? 1 : 0;
+    }();
+    return mode;
 }
-inline bool cpu_share_batched(int64_t rows) { return cpu_share_staged_3k() && rows >= 2048 && rows <= 3072; }
+inline bool cpu_share_batched(int64_t rows, bool qualified = false) {
+    const int mode = cpu_share_staged_3k_mode();
+    return (mode == 1 || (mode < 0 && qualified)) && rows >= 2048 && rows <= 3072;
+}
+
+// Compare adjacent layers after warm-up. Require two ratios to beat the unshared layer by 10%, so a
+// near-tie keeps the earlier path. One instance belongs to one model/device.
+struct PromptShareChoice {
+    int attempts = 0, samples = 0, ratios = 0, last_arm = -1;
+    int64_t last_layer = -1;
+    double last_cost = 0, values[2] = {};
+    bool selected = false;
+    bool decided() const { return ratios >= 2; }
+    bool next() { return decided() ? selected : (attempts++ & 1) != 0; }
+    void add(bool arm, int64_t layer, int64_t missed, double ms, const char* who) {
+        if (decided() || missed <= 0 || ms <= 0) return;
+        const double cost = ms / (double) missed;
+        if (++samples > 1 && last_arm >= 0 && last_arm != (int) arm && layer > last_layer) {
+            values[ratios++] = arm ? cost / last_cost : last_cost / cost;
+            if (decided()) {
+                const double slower = std::max(values[0], values[1]);
+                selected = slower < 0.90;
+                std::fprintf(stderr, "xestrata: CPU prompt share auto (%s): slower shared/unshared %.3f, %s\n",
+                             who, slower, selected ? "share" : "do not share");
+            }
+        }
+        last_arm = (int) arm; last_layer = layer; last_cost = cost;
+    }
+};
 
 /// A prompt chunk's layer: missed experts and those the CPU can read, fewest rows first. max_rows bounds an
 /// expert's rows; the default is one multi-token job. The blob must stay at its address during the jobs.

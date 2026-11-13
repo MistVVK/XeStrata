@@ -96,8 +96,9 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
         const char* v = strata::env_get("PLAIN_CPU_SHARE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool cpu_share = cpu_env && strata::prefill::cpu_share_setting() != 0.0 && split_.c > 0.0 && split_.p > 0.0 &&
-                           P.cpu_cap > 0;
+    const double share_setting = strata::prefill::cpu_share_setting();
+    const bool cpu_share = cpu_env && share_setting != 0.0 &&
+                           (share_setting > 0.0 || (split_.c > 0.0 && split_.p > 0.0)) && P.cpu_cap > 0;
     static const bool profile = strata::env_get("PROMPT_PROFILE") != nullptr;
     // 0 KDA (its parts 5 projections, 6 convolutions and gates, 7 recurrence, 8 output), 1 DSA, 2 the grouping, 3 the
     // experts, 4 the shared expert, mHC and dense FFN
@@ -257,7 +258,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                                            P.ids, P.w, cs);
                     if (P.f16) kernels::f32_to_f16_bulk(P.hn, P.x16, T * N, cs);   // the FP16 path's routed rows
                     const int64_t ml = s.moe_index(l);
-                    if (!prompt_routed(ml, T, cpu_share, routes.empty() ? nullptr : routes.data() + ml * P.T * K,
+                    if (!prompt_routed_tuned(ml, T, cpu_share, routes.empty() ? nullptr : routes.data() + ml * P.T * K,
                                        [&](int stage) { mark(stage == 1 ? 2 : 3); }, rst, err))
                         return false;
                     swiglu(b, P.shared);   // the shared expert (no gate)

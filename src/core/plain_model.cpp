@@ -114,6 +114,7 @@ PlainModel::~PlainModel() {
     if (route_dump_ != nullptr && root_ == this) std::fclose(route_dump_);
     if (swap_cs_ != nullptr) strata::gpu::stream_sync(swap_cs_);
     if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+    for (auto* e : prompt_share_events_) if (e) strata::gpu::event_destroy(e);
     prompt_gemm_.reset();   // the products' state before the stream
     strata::gpu::free(prompt_host_);
     if (opt_.encoder)   // an encoder's prompt buffers are its own (encoder_buffers)
