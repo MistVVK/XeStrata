@@ -809,6 +809,22 @@ Every model file setup downloads has a fixed size and SHA-256 (upstream e193161d
 When the server's size is not the pinned one, setup stops before the download; a downloaded file that does not match its SHA-256 is deleted and setup stops.
 When the pinned revision is gone from the repository, setup stops (for testing, `XESTRATA_ALLOW_UNPINNED=1` takes the current files without the check).
 
+**Fetching the files yourself (the `hf` command)**: setup downloads over 16 connections (`XESTRATA_DL_CONNECTIONS` 1 to 32), resumes a stopped download and checks every file's SHA-256 against the pinned value.
+Measured by upstream from two computers (a home PC and a server in China), anonymous downloads from Hugging Face ran at 16 to 19 MB/s whatever the connection count (one stream 7 MB/s, 16 connections 17, 32 connections 19).
+Hugging Face's own `hf` command with its Xet backend gave 16 to 24 MB/s anonymously in the same test, so it is not faster by itself.
+Hugging Face limits anonymous requests per IP address and says a login (a token of your own account) raises the limits, so if the download is slow you can fetch the file with the `hf` command, optionally after `hf auth login`, and give the folder to setup:
+
+```bash
+uvx hf auth login            # optional: your own Hugging Face account; XeStrata does not read or send this token
+uvx hf download agentionai/Qwen3.8-Flash-Next-Gyro-GGUF Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf \
+    --revision 1ada08422e404aca51ab9df665f089f34c419c6b --local-dir /data/gyro-s
+./setup.sh --gguf-dir /data/gyro-s       # Windows: xestrata-cli --gguf-dir D:\gyro-s
+```
+
+Use the file names and the revision setup shows for your model (the revision above is the one this version pins for Gyro-S: another version of XeStrata may pin another).
+Keep the file's original name. Setup finds the files in `--gguf-dir`, checks their SHA-256 and does not download them again; a file that does not match the published one is reported and, for files in your own folder, never deleted.
+Without `uvx`, `pip install -U huggingface_hub` gives the same `hf` command.
+
 **From ModelScope** (mainland China, upstream #908): every repository setup downloads from (the GSQ-RCO models, Swift 1.5, the Coder, Unsloth's files, and the original checkpoint the MTP draft layer is taken from) is on [ModelScope](https://www.modelscope.cn) under the same name, with the same files.
 Setup never switches to it by itself (a download that fails says how).
 Choose it with `--source modelscope` (`XESTRATA_SOURCE=modelscope`).
