@@ -46,7 +46,7 @@ int code_of(int bits, int st) { return bits == 4 ? k::tcq::kCode4[st] : k::tcq::
 void viterbi_host(const float* x, float sc, int bits, uint8_t* states) {
     const int uu = 256 >> bits;
     const float inv = 256.0f / sc;
-    int cost[256], next[256];
+    int cost[256], next[256] = {};
     uint8_t bp[k::kTcqChain][256];
     for (int s = 0; s < 256; ++s) cost[s] = s == 0 ? 0 : (1 << 29);
     for (int t = 0; t < k::kTcqChain; ++t) {
@@ -180,7 +180,8 @@ void run(int bits) {
             for (int is_v = 0; is_v < 2; ++is_v) {
                 const long long row = ((long long) table[t / P] * H + h) * P + t % P;
                 const uint8_t* g = (is_v ? v1 : k1).data() + row * row_b;
-                const float* x = (is_v ? vh : kh).data() + ((size_t) t * H + h) * D;
+                const std::vector<float>& src = is_v ? vh : kh;
+                const float* x = &src[((size_t) t * H + h) * D];
                 float sc;
                 std::memcpy(&sc, g + D * bits / 8, 4);
                 double ssq = 0.0;
