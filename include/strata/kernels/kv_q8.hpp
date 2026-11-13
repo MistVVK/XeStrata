@@ -30,7 +30,8 @@ inline constexpr int KV_Q8_GROUP = 64;
 /// 64 values: scale = fp16(max|x| / 127), code = clamp(rint(x / scale), -127, 127)) or Q4_0 ones (k_q4, v_q4: a
 /// block_q4_0 per 32 values, kv_q4.hpp; head_dim 256); with k_q == v_q (k_q4 == v_q4) and k == v (K8V4's folded
 /// halves) one plane.  A page of -1 (KV streaming: not resident) is not written in VRAM; `host` (the
-/// streaming's host copy) and `stage` (its staging pool) get every cell, at the cell's own row.
+/// streaming's host copy) and `stage` (its staging pool) get every cell, at the cell's own row.  Trellis-coded pools
+/// (k_tc, v_tc: kv_tcq.hpp, tc_bits 4 or 5 a value; head_dim 256) have no host copy.
 struct KvAppend {
     const int32_t* step = nullptr;
     int step_stride = 0;
@@ -47,11 +48,16 @@ struct KvAppend {
     uint16_t* v_scale = nullptr;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
+    uint8_t* k_tc = nullptr;
+    uint8_t* v_tc = nullptr;
+    int tc_bits = 0;
     const int32_t* page_table = nullptr;
     const KvHostPools* host = nullptr;
     const KvHostPools* stage = nullptr;
 };
 void kv_append_cells(const KvAppend& a, const QsaShapes& s, void* stream);
+/// kv_append_cells' trellis-coded pools (kv_tcq.cpp)
+void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream);
 
 /// Bytes per cell (one token, one layer): K and V codes plus their scales.
 inline uint64_t kv_q8_bytes_per_cell(const QsaShapes& s) {

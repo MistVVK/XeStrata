@@ -426,7 +426,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
-                                    src/kernels/xe/kv_q8.cpp src/kernels/xe/kv_q4.cpp
+                                    src/kernels/xe/kv_q8.cpp src/kernels/xe/kv_q4.cpp src/kernels/xe/kv_tcq.cpp
                                     src/kernels/xe/qsa_decode_attn.cpp src/kernels/xe/kv_stream.cpp
                                     src/kernels/xe/gdn.cpp src/kernels/xe/gr.cpp src/kernels/xe/fused_gr.cpp
                                     src/kernels/xe/cvec.cpp src/kernels/xe/verify_kernels.cpp

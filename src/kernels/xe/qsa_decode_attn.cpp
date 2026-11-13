@@ -16,6 +16,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "kv_tcq_parts.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/timed_choice.hpp"
 #include "strata/core/runtime.hpp"
@@ -124,6 +125,9 @@ inline float load_v1(const QsaAttnPools& p, long long row, int d) {
     } else if constexpr (KV_MODE == 1) {
         const float sc = h2f(p.v_scale[row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP]);
         return (float) p.v_q[row * HD + d] * sc;
+    } else if constexpr (KV_MODE == 4) {   // trellis-coded, rotated (kv_tcq.hpp); the caller rotates the output back
+        const int bits = p.tc_bits;
+        return tcq::value(p.v_tc + row * (long long) tcq::row_bytes(HD, bits), HD, bits, p.tc_tab, d);
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;
@@ -138,12 +142,17 @@ inline float load_v1(const QsaAttnPools& p, long long row, int d) {
 }
 
 // N = HD / 32 consecutive values of one cell's key or value row, dimensions [d0, d0+N).  KV_MODE 0: FP16, 1: INT8,
-// 2: rotated Q4_0, 3: the hybrid K8V4 (K as INT8, V as rotated Q4_0; upstream 2aa8f72).  N divides 16, so the run
-// stays inside one Q4_0 half (the low nibbles hold elements 0-15 of a block, the high ones 16-31).
+// 2: rotated Q4_0, 3: the hybrid K8V4 (K as INT8, V as rotated Q4_0; upstream 2aa8f72), 4: trellis-coded K and V
+// (kv_tcq.hpp).  N divides 16, so the run stays inside one Q4_0 half (the low nibbles hold elements 0-15 of a block,
+// the high ones 16-31) and inside one chain of the trellis code.
 template <int HD, int KV_MODE>
 inline void loadn(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
     constexpr int N = HD / WARP;
-    if constexpr (KV_MODE == 3) {
+    if constexpr (KV_MODE == 4) {
+        const int bits = p.tc_bits;
+        tcq::values<N>((value ? p.v_tc : p.k_tc) + row * (long long) tcq::row_bytes(HD, bits), HD, bits,
+                       p.tc_tab, d0, out);
+    } else if constexpr (KV_MODE == 3) {
         if (value) loadn<HD, 2>(p, true, row, d0, out);
         else loadn<HD, 1>(p, false, row, d0, out);
     } else if constexpr (KV_MODE == 0) {
@@ -696,6 +705,7 @@ int slots_for(sycl::queue& q, int64_t cap, int nkv, size_t n_q) {
 }
 
 int kv_mode_of(const QsaAttnPools& pools) {
+    if (pools.k_tc != nullptr) return 4;
     return pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3 : (pools.k_q != nullptr ? 1 : 0));
 }
 
@@ -705,12 +715,14 @@ void launch_kv_form(int kv_mode, int nc, sycl::queue& queue, const float* q, con
                int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div,
                int min_chunk, const QsaAttnPoolsRows& rows) {
     if constexpr (PERCELL) {
-        if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+        if (kv_mode == 4) launch_chunk<HD, G, 4, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+        else if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
         else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
         else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
         else launch_chunk<HD, G, 0, LOOP, 2, true, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     } else {
-    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    if (kv_mode == 4) launch_chunk<HD, G, 4, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
@@ -1093,7 +1105,8 @@ Form time_forms(void* stream, const QsaShapes& s, int64_t cells) {
 
 bool pools_ok(const QsaAttnPools& pools) {
     const int kv_mode = kv_mode_of(pools);
-    return kv_mode == 3 ? pools.k_scale != nullptr
+    return kv_mode == 4 ? pools.v_tc != nullptr && (pools.tc_bits == 4 || pools.tc_bits == 5)
+         : kv_mode == 3 ? pools.k_scale != nullptr
          : kv_mode == 2 ? pools.v_q4 != nullptr
          : kv_mode == 1 ? (pools.v_q && pools.k_scale && pools.v_scale) : (pools.k_pool && pools.v_pool);
 }

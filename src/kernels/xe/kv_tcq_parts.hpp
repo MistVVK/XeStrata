@@ -1,0 +1,76 @@
+// SPDX-FileCopyrightText: 2026 the YASAKANI authors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND Apache-2.0
+// src/kernels/xe/kv_tcq_parts.hpp - a trellis-coded K/V row's values (kv_tcq.hpp) for the attention kernels that read
+// the cache (qsa_decode_attn.cpp, prompt_attn.cpp), and the rotation's signs; after YASAKANI's kvx_codec.cuh and
+// kvq_attn.cuh (TbLaneDec), rewritten for SYCL.
+#pragma once
+
+#include "strata/kernels/kv_tcq.hpp"
+#include "strata/kernels/kv_tcq_tables.hpp"
+
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+
+namespace strata::kernels::tcq {
+
+// The rotation's sign of dimension d (kvx_codec.cuh's kvx_sign: a 32-bit integer hash of d + 1, its lowest bit)
+inline float sign_of(int d) {
+    uint32_t x = (uint32_t) d + 1u;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return (x & 1u) ? -1.0f : 1.0f;
+}
+
+// State st's value in 1/256 of the row's scale.  tab: kv_tcq_table() (uniform across a launch).
+inline int code_of(int tab, int bits, int st) {
+    return bits == 4 ? kCode4[st] : tab == 1 ? kCode5Yasakani[st] : kCode5[st];
+}
+
+inline int row_bytes(int head_dim, int bits) { return head_dim * bits / 8 + 4; }
+
+// The row's scale over 256: a code times it is the value
+inline float row_scale(const uint8_t* r, int head_dim, int bits) {
+    return *reinterpret_cast<const float*>(r + head_dim * bits / 8) * (1.0f / 256.0f);
+}
+
+// 64 bits of a row's code from bit `at` on, the first the most significant.  The words read stay inside the row: the
+// code's last word is followed by the scale's.
+inline uint64_t bits64(const uint32_t* w, int at) {
+    const int wi = at >> 5, o = at & 31;
+    const uint64_t z = ((uint64_t) w[wi] << 32) | w[wi + 1];
+    return o == 0 ? z : (z << o) | (w[wi + 2] >> (32 - o));
+}
+
+// Value d of a row (r: its first byte)
+inline float value(const uint8_t* r, int head_dim, int bits, int tab, int d) {
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(r);
+    const int end = bits * (d + 1), first = bits * (d & ~(kTcqChain - 1));
+    const int lo = sycl::max(end - 8, first), n = end - lo;
+    const int wi = lo >> 5, o = lo & 31;
+    const uint64_t z = ((uint64_t) w[wi] << 32) | w[wi + 1];
+    const int st = (int) (z >> (64 - o - n)) & ((1 << n) - 1);
+    return (float) code_of(tab, bits, st) * row_scale(r, head_dim, bits);
+}
+
+// Values dd .. dd + N - 1 of a row (dd a multiple of N, N of 4 or 8, inside one chain): one 64-bit window of code
+// holds them and the bits before the first (none at a chain's start)
+template<int N>
+inline void values(const uint8_t* r, int head_dim, int bits, int tab, int dd, float* out) {
+    static_assert(N == 4 || N == 8, "a 64-bit window holds 8 values of 5 bits and the 3 before");
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(r);
+    const float sc = row_scale(r, head_dim, bits);
+    const int pre = (dd & (kTcqChain - 1)) == 0 ? 0 : 8 - bits;
+    const uint64_t z = bits64(w, bits * dd - pre);
+#pragma unroll
+    for (int e = 0; e < N; ++e) {
+        const int end = pre + bits * (e + 1);
+        out[e] = (float) code_of(tab, bits, (int) (z >> (64 - end)) & 0xFF) * sc;
+    }
+}
+
+}  // namespace strata::kernels::tcq
