@@ -5390,7 +5390,7 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
             q8 = False
             if text_gb is not None:
                 left = usable_ram_gb(a) - text_gb
-                q8 = QI.ram_need_gb(asked, enc, QI.default_text_quant(dit), dit, q8=False) > left
+                q8 = not QI.fit_ram(left, enc, asked, QI.default_text_quant(dit), dit, q8=False)[2]
     dit_keep = getattr(a, "image_dit_keep", None) != "off"
     tasked = "" if hunyuan else QI.default_text_quant(dit)   # HunyuanImage 3.0 has no text encoder
     shared = shared_text_quant(QI, dit, enc, chat_gguf)
