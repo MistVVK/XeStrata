@@ -24,6 +24,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/yskn.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
@@ -319,9 +320,12 @@ bool PlainModel::prompt_warm_products(std::string& err) {
     PromptBufs& P = pb_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     const int64_t T = P.T, HV = spec_.ssm_dt_rank;
-    auto cold = [&](const W& w, int64_t ldy = 0) { return gm.native_cold(w.type, w.n_out, w.n_in, ldy); };
+    // (a .yskn matrix's FP16 product is warmed by its first prompt: its rows exist only while it runs)
+    auto cold = [&](const W& w, int64_t ldy = 0) {
+        return w.yk == nullptr && gm.native_cold(w.type, w.n_out, w.n_in, ldy);
+    };
     auto warm = [&](const W& w, float* y, int64_t ldy = 0) {
-        gm.native_warm(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
+        if (w.yk == nullptr) gm.native_warm(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
     try {
         if (!strata::gpu::memset_async(P.x16, 0, (size_t) (T * spec_.n_embd) * 2, cs_)) {
@@ -373,6 +377,22 @@ bool PlainModel::prompt_warm_products(std::string& err) {
         return false;
     }
     return true;
+}
+
+void PlainModel::prompt_yskn(const W& w, const uint16_t* x16, int64_t ldx, float* y, int64_t T, int64_t ldy) {
+    const k::YsknDev& d = *w.yk;
+    prefill::Gemm& gm = prompt_gemm().gemm;
+    // the scratch taken at the load (yskn_scratch): the FP16 matrix of the largest matrix but the head (178 MB for
+    // Qwen3.8-27B), the rotated rows of the widest / tallest one (1,024 rows of 17,408: 35 MB of FP16, 71 MB of FP32)
+    if (w.yk == head_.yk) throw std::runtime_error("plain prompt: the .yskn head takes the decode's product");
+    k::yskn_dequant_f16(d, yskn_w16_, cs_);
+    const int64_t ld = ldy > 0 ? ldy : w.n_out;
+    for (int64_t t0 = 0; t0 < T; t0 += kYsknPromptRows) {
+        const int64_t n = std::min(kYsknPromptRows, T - t0);
+        k::yskn_rotate_in_f16(d, x16 + (size_t) t0 * ldx, ldx, (int) n, yskn_x16_, cs_);
+        gm.native(yskn_x16_, /*F16*/ 1, yskn_w16_, yskn_yrot_, n, d.rows, d.cols);
+        k::yskn_rotate_out(d, yskn_yrot_, (int) n, y + (size_t) t0 * ld, ld, cs_);
+    }
 }
 
 bool PlainModel::dense_int8_ok(const W& w) const {
@@ -1116,6 +1136,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         return !hooked && T < dense_native_rows_ && prompt_dense_int8(w, x, ldx, y, T, ldy);
     };
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0, bool half_sums = false) {
+        if (w.yk != nullptr) {
+            prompt_yskn(w, P.x16, w.n_in, y, T, ldy);
+            return;
+        }
         gm.native_llm(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, dense_, ldy, half_sums);
     };
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a where the
@@ -1231,7 +1255,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             // their FP16 sums are taken (not widened into FP32 first: a pass over every sum, the RTX 4070's Qwen3.5-9B
             // prompt 75 ms of 1.0 s at 4K, 2026-11-07); y16 in the FP32 buffer's room
             // (not with plamo3's norms after the mixer and the FFN: their inputs are the products' FP32 rows)
-            const bool half_rows = dense_half_sums_ && !hooked && !plamo_ && T >= dense_native_rows_ && gm.half_ok(cs);
+            // (nor with a .yskn model's: its products' sums leave through their rotation in FP32)
+            const bool half_rows = dense_half_sums_ && !hooked && !plamo_ && yskn_ == nullptr && T >= dense_native_rows_ &&
+                                   gm.half_ok(cs);
             auto proj_h = [&](const W& w, void* y) {
                 gm.native_half(P.x16, w.type, w.data, static_cast<uint16_t*>(y), T, w.n_out, w.n_in);
             };
@@ -1239,7 +1265,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             auto last_logits = [&] {
                 if (c0 + T < n || enc_out_ != nullptr) return;
                 k::native_qsa_rms_norm_weighted(P.x + (T - 1) * N, out_norm_, P.hn, (int) N, 1, eps, cs);
-                if (head_.type == 30) {   // a BF16 head, as the decode reads it
+                if (head_.yk != nullptr) {   // a .yskn head, as the decode reads it
+                    k::yskn_proj(*head_.yk, P.hn, head_.n_in, 1, logits_, head_.n_out, yskn_scratch_, cs);
+                } else if (head_.type == 30) {   // a BF16 head, as the decode reads it
                     k::bf16_gemv_fp32_mmvf_multi(P.hn, head_.n_in, static_cast<const uint16_t*>(head_.data), logits_,
                                                  head_.n_out, head_.n_in, head_.n_out, 1, cs);
                 } else {
@@ -1332,6 +1360,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     if (half_rows) {
                         gm.native_half(P.y16, b.ssm_out.type, b.ssm_out.data, reinterpret_cast<uint16_t*>(P.mix), T,
                                        b.ssm_out.n_out, b.ssm_out.n_in);
+                    } else if (b.ssm_out.yk != nullptr) {
+                        prompt_yskn(b.ssm_out, P.y16, b.ssm_out.n_in, P.mix, T, 0);
                     } else {
                         gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in, 0,
                                   dense_half_sums_);

@@ -58,6 +58,9 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/yskn.hpp"
+#include "strata/artifact/yskn.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -154,9 +157,228 @@ PlainModel::~PlainModel() {
     if (cs_ != nullptr) strata::gpu::stream_destroy(cs_);
 }
 
+// ---- .yskn matrices (strata/artifact/yskn.hpp, strata/kernels/yskn.hpp)
+
+namespace {
+
+// The .yskn's name of a GGUF matrix (YASAKANI's engine35.cpp names, llama.cpp's qwen35 ones), and how the GDN's V heads
+// lie: 0 as they are, 1 the rows past q and k grouped (in_proj_qkv), 2 every row grouped (in_proj_z), 3 the columns
+// grouped (out_proj).  llama.cpp's converter puts the V heads in tiled order (_LinearAttentionVReorderBase); YASAKANI
+// keeps Hugging Face's grouped order, and the rotations mix the rows of a 512-block, so the order is mapped at the
+// product's input or output instead of moving the codes.
+bool yskn_name(const std::string& gguf, std::string& out, int& vorder) {
+    vorder = 0;
+    if (gguf == "output.weight") { out = "lm_head"; return true; }
+    if (gguf.rfind("blk.", 0) != 0) return false;
+    const size_t dot = gguf.find('.', 4);
+    if (dot == std::string::npos) return false;
+    const std::string l = gguf.substr(4, dot - 4), w = gguf.substr(dot + 1);
+    static const struct { const char* g; const char* y; int v; } kMap[] = {
+        {"attn_q.weight", "self_attn.q_proj", 0},       {"attn_k.weight", "self_attn.k_proj", 0},
+        {"attn_v.weight", "self_attn.v_proj", 0},       {"attn_output.weight", "self_attn.o_proj", 0},
+        {"attn_qkv.weight", "linear_attn.in_proj_qkv", 1}, {"attn_gate.weight", "linear_attn.in_proj_z", 2},
+        {"ssm_out.weight", "linear_attn.out_proj", 3},  {"ffn_gate.weight", "mlp.gate_proj", 0},
+        {"ffn_up.weight", "mlp.up_proj", 0},            {"ffn_down.weight", "mlp.down_proj", 0},
+    };
+    for (const auto& e : kMap)
+        if (w == e.g) {
+            out = "layers." + l + "." + e.y;
+            vorder = e.v;
+            return true;
+        }
+    return false;
+}
+
+// the work-items a row's columns are divided among: enough rows x workers to fill the device (its compute units times
+// 256 lanes; measured on no card yet), a divisor of the 512-groups; XESTRATA_YSKN_WORKERS fixes it.  The load's upload
+// and the VRAM estimate (auto_gpu_layers) ask the same question of the same device
+int yskn_workers(int rows, int cols, int64_t lanes) {
+    const int G = cols / strata::yskn::kGroup;
+    int want = 1;
+    if (const char* e = strata::env_get("YSKN_WORKERS"); e != nullptr && std::atoi(e) > 0) want = std::atoi(e);
+    else want = (int) std::max<int64_t>(1, (lanes + rows - 1) / rows);
+    int nw = 1;
+    for (int c = 1; c <= G; ++c)
+        if (G % c == 0) {
+            nw = c;
+            if (c >= want) break;
+        }
+    return nw;
+}
+
+// the prompt scratch's three buffers (prompt_yskn, yskn_scratch): the FP16 matrix of the largest matrix but the head,
+// the rotated input rows of the widest one, the rotated output rows of the tallest one (kYsknPromptRows rows; the head
+// takes the decode's product).  From the container's header, so the VRAM estimate (auto_gpu_layers, before the upload)
+// and the load's allocation take the same bytes
+void yskn_prompt_sizes(const strata::yskn::Container& c, size_t& w16, size_t& x16, size_t& yrot) {
+    size_t wmax = 0, cmax = 0, rmax = 0;
+    for (const strata::yskn::TensorDesc& t : c.tensors()) {
+        if (t.role == "embedding" || t.name == "lm_head") continue;
+        wmax = std::max(wmax, (size_t) t.physical_rows * t.cols);
+        cmax = std::max(cmax, (size_t) t.cols);
+        rmax = std::max(rmax, (size_t) t.physical_rows);
+    }
+    w16 = wmax * 2;
+    x16 = (size_t) kYsknPromptRows * cmax * 2;
+    yrot = (size_t) kYsknPromptRows * rmax * 4;
+}
+
+}  // namespace
+
+bool PlainModel::open_yskn(std::string& err) {
+    const MetaValue* v = model_->meta().get("xestrata.yskn.file");
+    if (v == nullptr) return true;
+    if (v->type != MetaType::STRING || v->s.empty()) {
+        err = "plain model: xestrata.yskn.file is not a file name";
+        return false;
+    }
+    // beside the skeleton, unless absolute
+    std::string path = v->s;
+    if (path[0] != '/' && !(path.size() > 1 && path[1] == ':')) {
+        const size_t slash = opt_.gguf.find_last_of("/\\");
+        if (slash != std::string::npos) path = opt_.gguf.substr(0, slash + 1) + path;
+    }
+    try {
+        yskn_ = std::make_unique<strata::yskn::Container>(path);
+    } catch (const std::exception& e) {
+        err = std::string("plain model: ") + e.what();
+        return false;
+    }
+    const strata::yskn::ModelDesc& d = yskn_->model();
+    if (d.arch != "qwen3_5" || spec_.arch != ModelArch::Qwen35 || d.hidden != spec_.n_embd || d.layers != spec_.n_layer ||
+        d.ffn != spec_.n_ff) {
+        err = "plain model: " + path + " is another model than its skeleton (" + d.arch + ", hidden " +
+              std::to_string(d.hidden) + ", " + std::to_string(d.layers) + " layers)";
+        return false;
+    }
+    if (opt_.cpu || opt_.encoder || opt_.vision) {
+        err = "plain model: a .yskn model runs on the GPU, as a chat model (no --device cpu, encoder or pictures)";
+        return false;
+    }
+    if (!opt_.draft_model.empty()) {
+        err = "plain model: a .yskn model does not take a DFlash2 pack yet: the drafter reads the head as GGUF rows, "
+              "not the .yskn's codes";
+        return false;
+    }
+    std::fprintf(stderr, "xestrata plain: the matrices from %s (%zu coded)\n", path.c_str(), yskn_->tensors().size());
+    return true;
+}
+
+bool PlainModel::upload_yskn(const std::string& name, W& w, std::string& err) {
+    std::string yn;
+    int vorder = 0;
+    if (!yskn_name(name, yn, vorder)) return false;
+    const strata::yskn::TensorDesc* t = yskn_->find_tensor(yn);
+    if (t == nullptr) return false;
+    if (t->role == "embedding") {
+        err = "plain model: " + yn + " is an embedding table, not a matrix";
+        return false;
+    }
+    auto dev = std::make_unique<k::YsknDev>();
+    k::YsknDev& d = *dev;
+    d.rows = t->physical_rows;
+    d.rows_used = t->rows;
+    d.cols = t->cols;
+    d.bits = t->bits;
+    std::vector<uint16_t> lut8;
+    std::vector<float> tau;
+    std::vector<int32_t> perm;
+    try {
+        strata::yskn::lut8_tau(*yskn_, *t, lut8, tau);
+        if (vorder != 0) {   // grouped (k head, v per k, dim) -> tiled (v per k, k head, dim): llama.cpp's index map
+            const int64_t nk = spec_.ssm_n_group, nv = spec_.ssm_dt_rank, dv = spec_.ssm_d_inner / nv,
+                          vpk = nv / nk, qk = 2 * nk * spec_.ssm_d_state;
+            const int64_t n = vorder == 3 ? d.cols : d.rows_used, base = vorder == 1 ? qk : 0;
+            if (nv % nk != 0 || n - base != nv * dv) {
+                err = "plain model: " + yn + "'s V heads are not the GDN's (" + std::to_string(n) + " rows)";
+                return false;
+            }
+            perm.resize((size_t) n);
+            for (int64_t i = 0; i < n; ++i) perm[(size_t) i] = (int32_t) i;
+            for (int64_t i = 0; i < nk; ++i)
+                for (int64_t j = 0; j < vpk; ++j)
+                    for (int64_t c = 0; c < dv; ++c)
+                        perm[(size_t) (base + (i * vpk + j) * dv + c)] = (int32_t) (base + (j * nk + i) * dv + c);
+        }
+        const std::vector<uint32_t> words = strata::yskn::device_order(*yskn_, *t);
+        const std::vector<int8_t> si =
+            strata::yskn::sign_stream(t->rot_in.rule, t->rot_in.sign_seed, t->rot_in.sign_offset, (size_t) d.cols);
+        std::vector<int8_t> so;
+        if (t->has_rot_out)
+            so = strata::yskn::sign_stream(t->rot_out.rule, t->rot_out.sign_seed, t->rot_out.sign_offset, (size_t) d.rows);
+        auto put = [&](const void* src, size_t bytes) -> void* {
+            void* p = strata::gpu::alloc_device(bytes);
+            if (p == nullptr) return nullptr;
+            allocs_.push_back(p);
+            return strata::gpu::copy(p, src, bytes) ? p : nullptr;
+        };
+        d.words = static_cast<const uint32_t*>(put(words.data(), words.size() * 4));
+        d.lut8 = static_cast<const uint16_t*>(put(lut8.data(), lut8.size() * 2));
+        d.lut16 = static_cast<const uint16_t*>(put(yskn_->lut16(*t), (size_t) strata::yskn::kStates * 4));
+        d.tau = static_cast<const float*>(put(tau.data(), tau.size() * 4));
+        d.scale16 = static_cast<const uint16_t*>(put(yskn_->scale16(*t), (size_t) d.rows * 2));
+        d.sign_in = static_cast<const int8_t*>(put(si.data(), si.size()));
+        const bool ok_out = so.empty() || (d.sign_out = static_cast<const int8_t*>(put(so.data(), so.size()))) != nullptr;
+        bool ok_perm = true;
+        if (!perm.empty()) {
+            const auto* p = static_cast<const int32_t*>(put(perm.data(), perm.size() * 4));
+            ok_perm = p != nullptr;
+            (vorder == 3 ? d.perm_in : d.perm_out) = p;
+        }
+        if (!d.words || !d.lut8 || !d.lut16 || !d.tau || !d.scale16 || !d.sign_in || !ok_out || !ok_perm) {
+            err = "plain model: no VRAM for " + yn + " (" + strata::gpu::last_error() + ")";
+            return false;
+        }
+    } catch (const std::exception& e) {
+        err = "plain model: " + yn + ": " + e.what();
+        return false;
+    }
+    // the work-items a row's columns are divided among (yskn_workers): the device's lanes from its compute units
+    const int64_t lanes =
+        (int64_t) Runtime::get().stream(cs_).get_device().get_info<sycl::info::device::max_compute_units>() * 256;
+    d.n_workers = yskn_workers(d.rows, d.cols, lanes);
+    w.type = -1;   // no GGUF type: every reader of w checks yk first
+    w.data = d.words;
+    w.n_in = d.cols;
+    w.n_out = d.rows_used;
+    w.yk = dev.get();
+    yskn_devs_.push_back(std::move(dev));
+    return true;
+}
+
+bool PlainModel::yskn_scratch(std::string& err) {
+    if (yskn_devs_.empty()) return true;
+    size_t bytes = 0;
+    for (const auto& d : yskn_devs_) bytes = std::max(bytes, k::yskn_scratch_bytes(*d, opt_.max_t));
+    // the prompt's scratch too, taken here (not at the first prompt): the VRAM the load leaves for the K/V pool and
+    // the context's guidance (auto_gpu_layers counts the same bytes) must not hold it
+    size_t w16 = 0, x16 = 0, yrot = 0;
+    yskn_prompt_sizes(*yskn_, w16, x16, yrot);
+    auto take = [&](size_t b) -> void* {
+        void* p = strata::gpu::alloc_device(b);
+        if (p != nullptr) allocs_.push_back(p);
+        return p;
+    };
+    yskn_scratch_ = take(bytes);
+    yskn_w16_ = static_cast<uint16_t*>(take(w16));
+    yskn_x16_ = static_cast<uint16_t*>(take(x16));
+    yskn_yrot_ = static_cast<float*>(take(yrot));
+    if (yskn_scratch_ == nullptr || yskn_w16_ == nullptr || yskn_x16_ == nullptr || yskn_yrot_ == nullptr) {
+        err = "plain model: no VRAM for the .yskn products' scratch";
+        return false;
+    }
+    return true;
+}
+
+bool PlainModel::q8_in(const W& w) { return w.type != kBF16 && w.type != kF32 && w.yk == nullptr; }
+
 bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32, bool widen) {
     size_t at = 0;
     const TensorInfo* t = m.find(name, &at);
+    if (t == nullptr && yskn_) {
+        if (upload_yskn(name, w, err)) return true;
+        if (!err.empty()) return false;
+    }
     if (t == nullptr || t->shape.size() < 2 || !m.in_bounds(*t, at)) {
         err = "plain model: " + name + " is missing, not a matrix, or truncated";
         return false;
@@ -234,6 +456,7 @@ bool PlainModel::tune_uploaded(std::string& err) {
 
 const char* PlainModel::head_name() const {
     size_t at = 0;
+    if (yskn_ && yskn_->find_tensor("lm_head") != nullptr) return "output.weight";
     return model_->find("output.weight", &at) != nullptr ? "output.weight" : "token_embd.weight";
 }
 
@@ -456,7 +679,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         err = std::string("plain model: ") + e.what();
         return false;
     }
-    if (!read_model_spec(model_->meta(), spec_, err)) return false;
+    if (!read_model_spec(model_->meta(), spec_, err) || !open_yskn(err)) return false;
     // the layer split: its points (given, or from the GPUs' memory), each rising inside the trunk, a GPU each
     const int64_t nl = spec_.n_layer;
     // the GPUs a split takes, as generate.cpp's: the runtime's first, then the ones --split-device names, else the
@@ -496,6 +719,11 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     if (opt_.gpu_layers < 0 && spec_.dense() && at.empty() && !opt_.split_auto && opt_.batch_slots == 0 &&
         !opt_.encoder && !opt_.vision && k::cpu::cpu_avx2_ok() && !auto_gpu_layers(err))
         return false;
+    if (opt_.gpu_layers >= 0 && opt_.gpu_layers < nl && yskn_) {
+        err = "plain model: a .yskn model's matrices run on the GPU only: every block on it (--gpu-layers, the free "
+              "VRAM)";
+        return false;
+    }
     if (opt_.gpu_layers >= 0 && opt_.gpu_layers < nl) {
         if (!spec_.dense() || !at.empty() || opt_.split_auto || opt_.batch_slots > 0 || opt_.encoder || opt_.vision) {
             err = "plain model: --gpu-layers splits a dense model (qwen35, plamo3) between one GPU and the CPU, with no "
@@ -584,7 +812,7 @@ bool PlainModel::load_stage(const PlainOptions& opt, PlainModel* root, int64_t l
         err = std::string("plain model: ") + e.what();
         return false;
     }
-    if (!read_model_spec(model_->meta(), spec_, err)) return false;
+    if (!read_model_spec(model_->meta(), spec_, err) || !open_yskn(err)) return false;
     return load_arch(err);
 }
 
@@ -622,6 +850,35 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
                 head += b;
             }
         }
+    uint64_t yskn_scratch_b = 0;
+    if (yskn_) {   // the matrices the skeleton lacks: their codes, tables, scales and signs, and the products' scratch
+        const int64_t lanes = (int64_t) Runtime::get().device().get_info<sycl::info::device::max_compute_units>() * 256;
+        for (const strata::yskn::TensorDesc& t : yskn_->tensors()) {
+            if (t.role == "embedding") continue;
+            // the codes in the device order, the int8 and FP16 tables (24 KiB), tau and the scale (6 a row), the
+            // signs, the GDN's V-head order (upload_yskn)
+            uint64_t b = t.stream_bytes + 24576 + (uint64_t) t.physical_rows * 6 + (uint64_t) t.cols +
+                         (t.has_rot_out ? (uint64_t) t.physical_rows : 0);
+            if (t.name.find("linear_attn.out_proj") != std::string::npos) b += (uint64_t) t.cols * 4;
+            else if (t.name.find("linear_attn.in_proj_qkv") != std::string::npos ||
+                     t.name.find("linear_attn.in_proj_z") != std::string::npos)
+                b += (uint64_t) t.rows * 4;
+            if (t.name.rfind("layers.", 0) == 0) {
+                const int64_t l = std::strtoll(t.name.c_str() + 7, nullptr, 10);
+                if (l >= 0 && l < nl) block[(size_t) l] += b;
+            } else if (t.name == "lm_head") {
+                head += b;
+            }
+            k::YsknDev d;
+            d.rows = t.physical_rows;
+            d.cols = t.cols;
+            d.n_workers = yskn_workers(d.rows, d.cols, lanes);
+            yskn_scratch_b = std::max<uint64_t>(yskn_scratch_b, k::yskn_scratch_bytes(d, opt_.max_t));
+        }
+        size_t w16 = 0, x16 = 0, yrot = 0;
+        yskn_prompt_sizes(*yskn_, w16, x16, yrot);
+        yskn_scratch_b += w16 + x16 + yrot;
+    }
     const int64_t nkv = std::max<int64_t>(1, s.n_head_kv.empty() ? 1 : *std::max_element(s.n_head_kv.begin(), s.n_head_kv.end()));
     const int64_t chunk = std::max<int64_t>(opt_.prompt_chunk, opt_.max_t);
     // a cell's K and V of one KV head in the --kv format (int8, q4: kv_q4 1 or 2, tcq: its bits)
@@ -648,7 +905,7 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
                                  : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
     // the blocks the GPU holds in order with the K/V's rows of `row` bytes, and the bytes they take
     const auto fits = [&](uint64_t row, uint64_t* bytes) {
-        uint64_t used = head + reserve;
+        uint64_t used = head + reserve + yskn_scratch_b;
         int64_t n = 0;
         while (n < nl && used + block[(size_t) n] + kv_cells[(size_t) n] * row <= free_b) {
             used += block[(size_t) n] + kv_cells[(size_t) n] * row;
@@ -682,9 +939,9 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
     uint64_t total = 0;
     const int64_t fit = fits(kv_row(opt_.kv_int8, opt_.kv_q4, opt_.kv_tcq), &total);
     if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
-    opt_.gpu_layers = head + reserve > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
+    opt_.gpu_layers = head + reserve + yskn_scratch_b > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
     std::fprintf(stderr, "xestrata plain: %.2f GiB of VRAM free, the head and a reserve %.2f GiB, the blocks %.2f GiB: %s\n",
-                 free_b / 1073741824.0, (head + reserve) / 1073741824.0, total / 1073741824.0,
+                 free_b / 1073741824.0, (head + reserve + yskn_scratch_b) / 1073741824.0, total / 1073741824.0,
                  opt_.gpu_layers == 0 ? "the CPU alone" : ("the first " + std::to_string(fit) + " blocks on the GPU").c_str());
     return true;
 }
@@ -884,7 +1141,7 @@ bool PlainModel::load_qwen(std::string& err) {
               "are " + std::to_string((long long) s.key_length) + " wide";
         return false;
     }
-    if (!tune_uploaded(err)) return false;
+    if (!tune_uploaded(err) || !yskn_scratch(err)) return false;
     // the BF16 projections' two GEMV forms timed for each shape a window takes, before any graph is recorded; the
     // head is left to the default form (its timing would allocate a second copy of it)
     try {
@@ -2605,6 +2862,29 @@ bool PlainModel::load_embedding(std::string& err) {
     const GgufModel& m = *model_;
     size_t at = 0;
     const TensorInfo* t = m.find("token_embd.weight", &at);
+    if (t == nullptr && yskn_ != nullptr && (yskn_emb_ = yskn_->find_tensor("embed_tokens")) != nullptr) {
+        // YASAKANI's coded table (engine35.cpp's checks): rows of the vocabulary, the hidden size, row layout, an H512
+        // input rotation; its residual tables (.res, .res2) of the same rotation add before it
+        const strata::yskn::TensorDesc& d = *yskn_emb_;
+        if (d.role != "embedding" || d.layout != "row" || d.cols != spec_.n_embd || d.has_rot_out) {
+            err = "plain model: the .yskn's embed_tokens is not the coded embedding this engine reads";
+            return false;
+        }
+        for (const char* r : {"embed_tokens.res", "embed_tokens.res2"})
+            if (const strata::yskn::TensorDesc* e = yskn_->find_tensor(r)) {
+                if (e->layout != "row" || e->rows != d.rows || e->cols != d.cols ||
+                    e->rot_in.sign_offset != d.rot_in.sign_offset || e->rot_in.sign_seed != d.rot_in.sign_seed) {
+                    err = std::string("plain model: the .yskn's ") + r + " is not a residual of embed_tokens";
+                    return false;
+                }
+                yskn_emb_extra_.push_back(e);
+            }
+        yskn_emb_signs_ = strata::yskn::sign_stream(d.rot_in.rule, d.rot_in.sign_seed, d.rot_in.sign_offset, (size_t) d.cols);
+        n_vocab_ = d.rows;
+        emb_ = nullptr;
+        emb_row_ = 0;
+        return true;
+    }
     if (t == nullptr || t->shape.size() != 2 || t->shape[0] != (uint64_t) spec_.n_embd || !m.in_bounds(*t, at)) {
         err = "plain model: token_embd.weight is missing or of another width";
         return false;
@@ -2625,6 +2905,11 @@ bool PlainModel::embed(int32_t tok, int64_t pos, float* dst) const {
     if (tok < 0 || tok >= n_vocab_) return false;
     if (emb_rows_ != nullptr && pos >= 0 && pos < (int64_t) emb_rows_->size() && (*emb_rows_)[(size_t) pos] != nullptr) {
         std::memcpy(dst, (*emb_rows_)[(size_t) pos], (size_t) spec_.n_embd * 4);
+        return true;
+    }
+    if (yskn_emb_ != nullptr) {   // decoded on the host, rounded to BF16 as YASAKANI's embedding kernel writes it
+        strata::yskn::embedding_row(*yskn_, *yskn_emb_, yskn_emb_extra_, yskn_emb_signs_, tok, dst);
+        for (int64_t i = 0; i < spec_.n_embd; ++i) dst[i] = k::f32_from_bf16(k::bf16_from_f32(dst[i]));
         return true;
     }
     return k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, dst, spec_.n_embd);
@@ -3230,6 +3515,10 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     const int32_t* pos_q = pos_;
     const int32_t* pos_k = pos_ + (size_t) opt_.max_t * NH;
     auto proj = [&](const W& w, const float* x, float* y, int ncols, bool quantize) {
+        if (w.yk != nullptr) {   // a .yskn matrix: from the FP32 rows (its own rotation and int8)
+            k::yskn_proj(*w.yk, x, w.n_in, ncols, y, w.n_out, yskn_scratch_, cs);
+            return;
+        }
         if (w.type == kBF16) {   // from the FP32 rows x (row stride n_in), as llama.cpp's float products
             k::bf16_gemv_fp32_mmvf_multi(x, w.n_in, static_cast<const uint16_t*>(w.data), y, w.n_out, w.n_in, w.n_out,
                                          ncols, cs);
@@ -3257,7 +3546,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         // gates in one; the conv, SiLU and q/k norms of every row in one; the recurrence and the output norm in one,
         // writing ssm_out's q8_1 input as well.  The conv history and the state go on over the rows (counts_[n]: the
         // kernels' count of rows kept), and the drafts' rows to go back to are written beside (spec_step).
-        const bool q8_out = b.ssm_out.type != kBF16 && b.ssm_out.type != kF32;
+        const bool q8_out = q8_in(b.ssm_out);
         const size_t q8_row = (size_t) (ZV / 32) * 36;
         const W& wa = b.alpha_f.type >= 0 ? b.alpha_f : b.alpha;
         const W& wb = b.alpha_f.type >= 0 ? b.beta_f : b.beta;
@@ -3370,7 +3659,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     }
 
     if (dense_) {   // qwen35's FFN: the shared expert's products, from the norm's q8_1 rows where the weights take them
-        const bool q8 = b.sh_gate.type != kBF16 && b.sh_up.type != kBF16 && b.sh_down.type != kBF16;
+        const bool q8 = q8_in(b.sh_gate) && q8_in(b.sh_up) && q8_in(b.sh_down);
         if (!q8) {
             k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
             proj(b.sh_gate, hn_, sh_gate_, T, true);   // (each quantizes hn_ again: a file may mix the types)
@@ -3712,6 +4001,10 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err,
 }
 
 void PlainModel::head_logits(const float* x, int T, strata::gpu::Stream cs) {
+    if (head_.yk != nullptr) {
+        k::yskn_proj(*head_.yk, x, head_.n_in, T, logits_, head_.n_out, yskn_scratch_, cs);
+        return;
+    }
     if (head_.type == kBF16) {
         k::bf16_gemv_fp32_mmvf_multi(x, head_.n_in, static_cast<const uint16_t*>(head_.data), logits_, head_.n_out,
                                      head_.n_in, head_.n_out, T, cs);
