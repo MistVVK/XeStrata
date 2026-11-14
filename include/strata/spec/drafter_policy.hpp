@@ -25,7 +25,9 @@ public:
     static constexpr int kDepthBuckets = 4;   // [0,2K) [2K,8K) [8K,32K) [32K,...)
     static constexpr int kMinTokens = 48;     // a request shorter than this teaches nothing (its speed is noise)
 
-    DrafterPolicy() = default;
+    // A per-window caller can lower the minimum sample and prefer the first arm on near ties.
+    explicit DrafterPolicy(int min_tokens = kMinTokens, bool prefer_df2 = true)
+        : min_tokens_(min_tokens), prefer_df2_(prefer_df2) {}
 
     /// The request's kind: FNV-1a of its first prompt tokens (the system prompt decides the kind; the first token,
     /// a BOS, is skipped).  Upstream's bandit key.
@@ -56,6 +58,8 @@ private:
         int64_t reqs = 0;
     };
     std::map<uint64_t, Cell> cells_;
+    int min_tokens_;
+    bool prefer_df2_;
 };
 
 }  // namespace strata::spec

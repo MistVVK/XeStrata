@@ -87,7 +87,6 @@
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_probe.hpp"
-#include "strata/spec/df2_block_policy.hpp"
 #include "strata/spec/drafter_policy.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
@@ -10780,9 +10779,8 @@ int main(int argc, char** argv) {
                 ? probe_arms[(size_t) std::max(req_probe, 0)].static_table : static_selected);
             const int req_block = probe_running && req_probe >= -1
                 ? probe_arms[(size_t) std::max(req_probe, 0)].block : block_selected;
-            strata::spec::Df2BlockPolicy block_policy(req_block == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
-                                                      : req_block == 2 ? strata::spec::Df2BlockPolicy::Mode::Adaptive
-                                                                       : strata::spec::Df2BlockPolicy::Mode::Short);
+            strata::spec::DrafterPolicy block_policy(1, false);
+            Clock::time_point df2_started;
             const bool req_mtp = use_mtp && mtp.loaded() && !req_df2 && !req_off;   // the MTP drafts this request
             // the windows this request checks: the measurement's arm, else the window the measurement kept
             const int req_cap = req_spec_cap > 0 ? req_spec_cap : req_df2 ? 0 : spec_cap;
@@ -12980,9 +12978,13 @@ int main(int argc, char** argv) {
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
-                if (req_df2 && !first_window && !static_window && !from_sfx && chain_n == 0 && T == df2_width &&
-                    produced_n + a + 1 < max_new)
-                    block_policy.observe(df2_width, a);
+                if (req_block == 2 && req_df2 && !first_window && !static_window && !from_sfx && chain_n == 0 &&
+                    produced_n + a + 1 < max_new) {
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - df2_started).count();
+                    block_policy.observe(0, 0, df2_width == strata::kernels::kWindowMaxT
+                                                ? strata::spec::DrafterPolicy::Df2 : strata::spec::DrafterPolicy::Mtp,
+                                         a + 1, ms);
+                }
                 draft_offered += T - 1;
                 draft_accepted += a;
                 first_window = false;
@@ -13032,8 +13034,11 @@ int main(int argc, char** argv) {
                                           outv[(size_t) a]);
                 bool drafted = eos || produced_n >= max_new;
                 if (!drafted && req_df2) {
-                    df2_width = block_policy.choose(S_r);
+                    const bool wide = S_r >= strata::kernels::kWindowMaxT &&
+                        (req_block == 1 || (req_block == 2 && block_policy.choose(0, 0, true) == strata::spec::DrafterPolicy::Df2));
+                    df2_width = wide ? strata::kernels::kWindowMaxT : strata::kernels::kVerifyNarrowT;
                     df2.set_block_rows(df2_width);
+                    df2_started = Clock::now();
                     int32_t dd[strata::core::Dflash2Drafter::kMaxDrafts] = {};
                     float pp[strata::core::Dflash2Drafter::kMaxDrafts] = {};
                     drafted = df2.draft(ver.tap_dev(), a + 1, p, outv[(size_t) a], dd, pp, err);
@@ -14047,8 +14052,6 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         const bool use_df2 = df2_loaded;   // the CLI: DFlash2 is the drafter when loaded (--draft auto acts as dflash2)
-        strata::spec::Df2BlockPolicy block_policy(block_selected == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
-                                                                      : strata::spec::Df2BlockPolicy::Mode::Short);
         int df2_width = strata::kernels::kVerifyNarrowT;
         const double df2_conf = o.draft_conf > 0.0 ? o.draft_conf : df2_default_conf(xcache.slots());
         if (use_df2) df2.set_max_drafts(o.spec - 1);
@@ -14325,7 +14328,8 @@ int main(int argc, char** argv) {
             }
             bool drafted = (int64_t) produced.size() >= max_new;
             if (!drafted && use_df2) {
-                df2_width = block_policy.choose(o.spec);
+                df2_width = block_selected == 1 && o.spec >= strata::kernels::kWindowMaxT
+                    ? strata::kernels::kWindowMaxT : strata::kernels::kVerifyNarrowT;
                 df2.set_block_rows(df2_width);
                 int32_t dd[strata::core::Dflash2Drafter::kMaxDrafts] = {};
                 float pp[strata::core::Dflash2Drafter::kMaxDrafts] = {};

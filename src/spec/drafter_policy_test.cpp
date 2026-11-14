@@ -91,6 +91,14 @@ int main() {
         check(DrafterPolicy::depth_bucket(8192) == 2 && DrafterPolicy::depth_bucket(32767) == 2, "depth bucket 2: 8K..32K");
         check(DrafterPolicy::depth_bucket(32768) == 3 && DrafterPolicy::depth_bucket(1000000) == 3, "depth bucket 3: >= 32K");
     }
+    {
+        DrafterPolicy p(1, false);
+        teach(p, ka, 0, DrafterPolicy::Mtp, 2, 4, 10);
+        teach(p, ka, 0, DrafterPolicy::Df2, 2, 4, 10);
+        check(p.choose(ka, 0, true) == DrafterPolicy::Mtp, "per-window learner: short block wins a tie");
+        teach(p, ka, 0, DrafterPolicy::Df2, 4, 8, 10);
+        check(p.choose(ka, 0, true) == DrafterPolicy::Df2, "per-window learner: faster long block wins");
+    }
     std::printf("drafter_policy_test: %s\n", g_fail ? "FAILED" : "all ok");
     return g_fail ? 1 : 0;
 }

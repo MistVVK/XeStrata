@@ -115,7 +115,7 @@ Qwen3.8-Flash-Next `--draft-fallback mtp` loads both). DFlash2 runs on one GPU, 
 answer is the same whichever drafter proposes (the verify window emits the target's argmax).
 
 With `--wide-window auto`, the start measurement compares DFlash2's 8-row block, 16-row block and a switch based on an
-EMA of accepted drafts, where the configuration permits them. `off` caps it at 8 rows; `on` takes 16. The verification
+EMA of measured generation speed, where the configuration permits them. `off` caps it at 8 rows; `on` takes 16. The verification
 window still respects the remaining context and the configured limit.
 
 Set `XESTRATA_DF2_STATIC_TABLE` to a YD1S table for the target model to propose from two-token, then one-token entries.

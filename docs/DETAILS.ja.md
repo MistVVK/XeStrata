@@ -110,7 +110,7 @@ DFlash2 の窓は `--draft-conf P` で、selector 確率の積が P を下回る
 MTP のまま）。plain エンジンの `--draft dflash2` は `--serve` だけです。greedy の答えは drafter によらず同じです
 （検証の窓が target の argmax を出します）。
 
-`--wide-window auto` の起動時の測りは、対応する設定では DFlash2 の 8 行・16 行・受理数の EMA による切り替えを
+`--wide-window auto` の起動時の測りは、対応する設定では DFlash2 の 8 行・16 行・生成速度の EMA による切り替えを
 比べます。`off` は 8 行まで、`on` は 16 行です。窓の残りや設定の上限が小さいときはその範囲で検証します。
 
 `XESTRATA_DF2_STATIC_TABLE` に対象モデル専用の YD1S 表を指定すると、DFlash2 の候補として 2 語、次に 1 語の
