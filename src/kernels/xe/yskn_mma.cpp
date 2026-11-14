@@ -182,7 +182,7 @@ inline void gemv_body(sycl::nd_item<1> it, const Fields& f, Ops& ops) {
 // row, so its layout is not read (iq_mmq.cpp's intel_body reads it by lane; the tail here does not need to)
 template<int IN>
 struct IsOps {
-    static constexpr bool VNNI = true;
+    [[maybe_unused]] static constexpr bool VNNI = true;
     static constexpr int IM = 8, IK = 32;
     mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
     int rt, ct;
@@ -209,7 +209,7 @@ struct IsOps {
 // joint_matrix's 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores from sm_72; a device reporting the shape): B
 // column-major ([output][K]), the sub-group a 16 x 16 tile (a column tile ct, all 16 rows)
 struct JmOps {
-    static constexpr bool VNNI = false;
+    [[maybe_unused]] static constexpr bool VNNI = false;
     mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, 16, 16> ci;
     int ct;
     explicit JmOps(int sgid) : ct(sgid) {}
@@ -235,7 +235,7 @@ struct JmOps {
 // RDNA3's and RDNA4's int8 WMMA, 16 x 16 x 16 on 32 lanes (amd_wmma.hpp): lane l row l % 16 of A, column l % 16 of B
 // and of the accumulator, its rows row_of(l / 16, e); the same tiles as JmOps in the instructions' own layouts
 struct WmOps {
-    static constexpr bool VNNI = false;
+    [[maybe_unused]] static constexpr bool VNNI = false;
     xe::wmma::iv8 ci;
     int ct, lo, hi;
     WmOps(int sgid, int lane) : ct(sgid), lo(lane & 15), hi(lane >> 4) {}
