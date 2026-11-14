@@ -1719,6 +1719,10 @@ set_source_files_properties(src/kernels/cpu/resize_rows_avx2.cpp PROPERTIES COMP
 # The AVX-512 VNNI copy is compiled the same way: its functions alone are target("avx512f,avx512vnni").
 set_source_files_properties(src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
                             PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+# the latent MoE's CPU U rows (latent_rows.hpp): the AVX2 / AVX-VNNI / AVX-512 VNNI copies are target-attribute
+# functions in the anonymous namespace, chosen by latent_u_row's cpu reports.  The file gets NO wide flags: its
+# dispatcher and scalar form stay on the baseline x86-64 (a non-AVX2 CPU takes the scalar), so it is a wide-ISA
+# object for check_isa_guard.py without a file-level -mavx2/-mavx512.
 # AVX-VNNI (Alder Lake, Sapphire Rapids and later; upstream b211ba17): the AVX-2 expert kernels' vpdpwssd / vpdpbusd
 # copies (q2_avx2.cpp, iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok().  Only those functions are
 # compiled with target("avxvnni") - never -mavxvnni on a file, which would let the compiler use it anywhere.  A compiler

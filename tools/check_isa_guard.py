@@ -51,7 +51,12 @@ WIDE_PUBLIC = {
 }
 WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq_avx2.cpp", "tq_avx512.cpp",
                 "i8_gemm_vnni.cpp", "i8_gemm_avx512.cpp", "bf16_gemm_avx512.cpp", "vision_cpu_avx512.cpp",
-                "resize_rows_avx2.cpp")
+                "resize_rows_avx2.cpp",
+                # the latent MoE's CPU U rows (latent_rows.hpp): the VNNI / AVX-512 VNNI copies are target-attribute
+                # functions in the anonymous namespace, reached only through latent_u_row's cpu_avx512vnni_ok /
+                # cpu_avxvnni_ok / cpu_avx2_ok; the file itself stays on the baseline so the dispatcher and the
+                # scalar form run on any x86-64
+                "latent_rows.cpp")
 
 # An instruction is "wide" if it is EVEX encoded (first byte 0x62 in 64-bit mode), or one of these VEX / legacy
 # extensions that an AVX2 CPU may lack.  AVX-VNNI is VEX encoded (vpdpbusd, vpdpwssd ...).
