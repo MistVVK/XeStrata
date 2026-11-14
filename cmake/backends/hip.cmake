@@ -99,7 +99,7 @@ macro(strata_hip_mmq)
     set(_strata_pf_tests_lib strata_mmq)
 endmacro()
 
-# P4-SPLIT, HIP without llama.cpp's MMQ (STRATA_PREFILL_MMQ off, or -DSTRATA_MMQ=OFF): Strata's own prompt kernels alone (strata_pf_own, with
+# P4-SPLIT, HIP without llama.cpp's MMQ (STRATA_MMQ=OFF, the default, or STRATA_PREFILL_MMQ off): Strata's own prompt kernels alone (strata_pf_own, with
 # mmq_absent.cpp for the MMQ half of moe_mmq.hpp), compiled as strata_hip_mmq compiles them, with the ggml-base headers only
 macro(strata_hip_pf_own)
     set(_strata_gg "${_strata_ggml_root}/ggml")

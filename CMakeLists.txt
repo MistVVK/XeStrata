@@ -102,12 +102,14 @@ if(STRATA_HIP_GFX906)
   set(STRATA_ENABLE_CUDA ON CACHE BOOL "" FORCE)
 endif()
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
-option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
-# P4-SPLIT: llama.cpp's MMQ prompt kernels (strata_mmq, strata_mmq_w4a4, strata_kq) are built on CUDA, and on HIP with STRATA_PREFILL_MMQ=ON
-# (what setup builds); -DSTRATA_MMQ=OFF leaves them out of either.  Strata's own prompt kernels (strata_pf_own: the fused experts and their
-# helpers) are built either way; without MMQ the prompt path takes them where they cover a layer and the FP16 path elsewhere.  A name of its own
-# rather than STRATA_PREFILL_MMQ for CUDA: every CUDA build folder configured before has STRATA_PREFILL_MMQ=OFF in its cache.
-option(STRATA_MMQ "Build llama.cpp's MMQ prompt kernels (CUDA; HIP together with STRATA_PREFILL_MMQ)" ON)
+option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP (only together with STRATA_MMQ=ON)" OFF)
+# P4-SPLIT: llama.cpp's MMQ prompt kernels (strata_mmq, strata_mmq_w4a4, strata_kq) are built only with -DSTRATA_MMQ=ON: on CUDA, and on HIP
+# together with STRATA_PREFILL_MMQ=ON.  The default (OFF) leaves them out of both.  Strata's own prompt kernels (strata_pf_own: the fused experts
+# and their helpers) are built either way; without MMQ the prompt path takes them where they cover a layer and the FP16 path elsewhere.  A name
+# of its own rather than STRATA_PREFILL_MMQ for CUDA: every CUDA build folder configured before has STRATA_PREFILL_MMQ=OFF in its cache.
+# A build folder configured before the default changed keeps STRATA_MMQ=ON in its cache: setup and the packaging scripts pass the value.
+# -DSTRATA_MMQ=ON builds the old path (for A/B runs).
+option(STRATA_MMQ "Build llama.cpp's MMQ prompt kernels (CUDA; HIP together with STRATA_PREFILL_MMQ)" OFF)
 # The community-made AMD changes (include/strata/core/amd_community.hpp): on by default.  This option is the build half of the one
 # switch STRATA_AMD_COMMUNITY_TUNING: OFF compiles the portable signed-byte dot for gfx1010 again (the SDWA sequence of #4855).
 # The rocBLAS tables are switched at run time (STRATA_AMD_COMMUNITY_TUNING=0).

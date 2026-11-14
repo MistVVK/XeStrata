@@ -13,7 +13,8 @@ same architectures (packaging\\build_vision_windows.bat), BUILD.json, then packa
 imports from the toolkit), --verify and binary_deps.py.
 
 Settings (environment, all optional):
-  STRATA_CMAKE_EXTRA  more engine configure arguments, e.g. -DSTRATA_MMQ=OFF: the engine without llama.cpp's MMQ, and so without strata_kq.dll
+  STRATA_CMAKE_EXTRA  more engine configure arguments, e.g. -DSTRATA_MMQ=ON: the old engine with llama.cpp's MMQ and strata_kq.dll (A/B;
+                      the configure line names -DSTRATA_MMQ=OFF, and this comes after it)
   BUILD / BUILD_VISION_DIR / OUT   the engine build folder, the reader's build folder, the package folder
   ARCHS               the architecture list instead of the variant's (semicolons, e.g. 120; the last one also gets PTX), as in build_cuda_linux.sh
   BUILD_JOBS          compile jobs (default 6: the CUDA compiler takes several GB of RAM per job)
@@ -68,6 +69,7 @@ def configure_args(src: Path, build: Path, variant: str, cuda: Path, extra: list
     cu = cuda.as_posix()
     args = ["-G", "Ninja", "-S", str(src), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON",
             "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_PORTABLE=ON", *VARIANTS[variant][3],
+            "-DSTRATA_MMQ=OFF",   # without llama.cpp's MMQ, also in a build folder configured before (its cache says ON)
             "-DCMAKE_CUDA_ARCHITECTURES=" + cuda_arch_list(archs or VARIANTS[variant][1]), "-DCMAKE_CUDA_COMPILER=%s/bin/nvcc.exe" % cu,
             "-DCUDAToolkit_ROOT=" + cu]
     if ggml_dir:
@@ -77,7 +79,7 @@ def configure_args(src: Path, build: Path, variant: str, cuda: Path, extra: list
 
 def engine_targets(cmake: str, build: Path, env=None) -> list[str]:
     """['strata', 'strata_kq'] when the build tree has the strata_kq target (a build with llama.cpp's MMQ), ['strata'] when ninja names it
-    unknown (-DSTRATA_MMQ=OFF). The tree is asked with a dry run, as packaging/engine_targets.sh does; any other failure stops the build."""
+    unknown (STRATA_MMQ=OFF, the default). The tree is asked with a dry run, as packaging/engine_targets.sh does; any other failure stops the build."""
     r = subprocess.run([cmake, "--build", str(build), "--target", "strata_kq", "--", "-n"], capture_output=True, text=True, env=env,
                        errors="replace")
     if r.returncode == 0:

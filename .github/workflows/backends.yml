@@ -2,7 +2,7 @@ name: Backend compile checks
 
 # Compile and link every engine backend with a pinned toolchain, without a GPU: nothing is run, so a call into a kernel that only
 # exists for another backend (or an API a toolkit version dropped) fails here instead of on a user's machine.  Hardware runs are separate.
-#   CUDA 12.9 and 13.0   nvidia/cuda devel container   targets strata, strata_kq          (CMake preset cuda-compile)
+#   CUDA 12.9 and 13.0   nvidia/cuda devel container   target strata (no MMQ, the default) (CMake preset cuda-compile)
 #   HIP (ROCm 7.2)       rocm/dev container            target strata                      (CMake preset hip-compile)
 #   SYCL (oneAPI 2026.1) ubuntu + Intel's apt repo     target strata of sycl/             (the commands of packaging/build_sycl_linux.sh)
 #   Metal                macOS runner                  target strata                      (metal/; metal-build.yml keeps its own strata build)
@@ -87,8 +87,8 @@ jobs:
           cmake --preset cuda-compile -B build \
             "-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.archs }}" -DSTRATA_EXPERIMENTAL_SM60=${{ matrix.sm60 }} \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
-      - name: Build strata and strata_kq
-        run: cmake --build build --target strata strata_kq -j "$(nproc)"
+      - name: Build strata
+        run: cmake --build build --target strata -j "$(nproc)"
       - name: Cache statistics
         run: ccache -s | head -8
 
