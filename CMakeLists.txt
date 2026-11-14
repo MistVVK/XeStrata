@@ -1859,6 +1859,13 @@ if(STRATA_NATIVE_EXPERTS)
         set_tests_properties(native_expert_parity_${gu}_${down} PROPERTIES TIMEOUT 120)
       endforeach()
     endforeach()
+    # the canonical rows in the fixed-point sums (XESTRATA_EXACT=1, include/strata/kernels/exact.hpp): the CPU's and the
+    # GPU decode's bits alike, on Qwen3.8's gate/up and down types
+    foreach(pair iq2_xxs/q2_0 iq2_xs/iq4_nl iq3_xxs/iq4_nl iq3_s/q2_0 iq2_s/iq4_nl)
+      string(REPLACE "/" "_" pair_name "${pair}")
+      add_test(NAME native_expert_parity_exact_${pair_name} COMMAND native_expert_parity --synthetic ${pair})
+      set_tests_properties(native_expert_parity_exact_${pair_name} PROPERTIES TIMEOUT 120 ENVIRONMENT XESTRATA_EXACT=1)
+    endforeach()
     # APR (prism.hadamard, upstream fbf045eb6): a Hadamard-folded expert, the GPU rotation (float and the prompt path's
     # FP16) against the CPU's, and the folded expert on the GPU and the CPU against the float reference
     foreach(pair q4_K/q8_0 iq3_xxs/iq4_nl)

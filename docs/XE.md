@@ -659,6 +659,10 @@ A run whose answer must be the same every time (comparisons across machines or s
 The three gave the same answer in five 64K A/A runs (2026-11-14).
 Prefill ran at 890 to 906 tokens/s and decode at 34.2 to 34.9 (the default: 962 to 977 and 37.5 to 40.7), 6 to 7% and 8 to 10% slower, so the default keeps the measured path for speed.
 
+In a short prompt (a chunk whose experts the CPU shares) the CPU's share is measured chunk by chunk, and its movement changes the answer too (the CPU and the GPU round an expert's rows differently).
+`XESTRATA_EXACT=1` computes the experts' rows in the same fixed-point integer sums on the CPU and the GPU, so the answer stays as it is when the share moves (Qwen3.8 IQ3_XXS on Strix Halo: five 1K greedy runs gave one answer, against four in five by default).
+It costs the 1K prefill about 7% and decode about 3%, so it is not the default.
+
 ### The output head's VRAM refusal
 
 Sometimes the upload of the output head is refused VRAM at start.

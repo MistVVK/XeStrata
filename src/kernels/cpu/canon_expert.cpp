@@ -14,6 +14,7 @@
 #include "strata/kernels/cpu/canon_expert.hpp"
 
 #include "strata/kernels/canon_math.hpp"
+#include "strata/kernels/exact.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/platform/env.hpp"
@@ -24,6 +25,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -82,11 +84,17 @@ constexpr PosTables kPos{};
 
 // one IQ2_XS row of n values against an activation with a scale per 256 values (the reference loops)
 float iq2xs_row(const block_iq2_xs* w, int n, const void* a) {
-    STRATA_CANON_NO_CONTRACT
     const int8_t* xq = act_values(a, n, QK_K);
     const float* xd = act_scales(a);
-    float s[2] = {0.0f, 0.0f};
     const int nb = n / QK_K;
+    int ta = canon::kFxNone, tw = canon::kFxNone;   // canon_math.hpp's fixed-point sums: the row's top
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        ta = std::max(ta, canon::fx_exp(xd[kbx]));
+        tw = std::max(tw, canon::fx_exp(h2f(w[kbx].d)));
+    }
+    ta = canon::fx_row_top(canon::fx_exp(xd[0]), ta);
+    tw = canon::fx_row_top(canon::fx_exp(h2f(w[0].d)), tw);
+    int64_t s = 0;
     for (int kbx = 0; kbx < nb; ++kbx) {
         int t = 0;
         for (int ib = 0; ib < 8; ++ib) {
@@ -103,36 +111,35 @@ float iq2xs_row(const block_iq2_xs* w, int n, const void* a) {
             }
             t += sum[0] * (2 * (w[kbx].scales[ib] & 0x0F) + 1) + sum[1] * (2 * (w[kbx].scales[ib] >> 4) + 1);
         }
-        const float c = h2f(w[kbx].d) * xd[kbx] * 0.125f;
-        s[kbx & 1] = canon::fma(c, (float) t, s[kbx & 1]);
+        s += (int64_t) canon::fx_scale(xd[kbx], h2f(w[kbx].d), ta + tw) * t;
     }
-    return s[0] + s[1];
+    return canon::fx_value(s, ta + tw, -3);
 }
 
 // one IQ4_NL row of n values against an activation with a scale per 32 values (the reference loops): the GPU's lane
 // 2 (block % 4) + call, a call the block's values 0-7 and 16-23, or 8-15 and 24-31
 float iq4nl_row(const block_iq4_nl* w, int n, const void* a) {
-    STRATA_CANON_NO_CONTRACT
     const int8_t* xq = act_values(a, n, QK4_NL);
     const float* xd = act_scales(a);
-    float s[8] = {};
     const int nb = n / QK4_NL;
+    int ta = canon::kFxNone, tw = canon::kFxNone;   // canon_math.hpp's fixed-point sums: the row's top
     for (int kbx = 0; kbx < nb; ++kbx) {
-        const float c = h2f(w[kbx].d) * xd[kbx];
-        for (int call = 0; call < 2; ++call) {
-            int t = 0;
-            for (int i = 8 * call; i < 8 * call + 8; ++i) {
-                t += (int) kvalues_iq4nl[w[kbx].qs[i] & 0x0F] * (int) xq[act_pos(32 * kbx + i, CanonOrder::iq4nl_calls, n)];
-                t += (int) kvalues_iq4nl[w[kbx].qs[i] >> 4] *
-                     (int) xq[act_pos(32 * kbx + i + 16, CanonOrder::iq4nl_calls, n)];
-            }
-            float& l = s[2 * (kbx % 4) + call];
-            l = canon::fma(c, (float) t, l);
-        }
+        ta = std::max(ta, canon::fx_exp(xd[kbx]));
+        tw = std::max(tw, canon::fx_exp(h2f(w[kbx].d)));
     }
-    for (int o = 4; o > 0; o >>= 1)
-        for (int l = 0; l < o; ++l) s[l] += s[l + o];
-    return s[0];
+    ta = canon::fx_row_top(canon::fx_exp(xd[0]), ta);
+    tw = canon::fx_row_top(canon::fx_exp(h2f(w[0].d)), tw);
+    int64_t s = 0;
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        int t = 0;
+        for (int i = 0; i < 16; ++i) {
+            t += (int) kvalues_iq4nl[w[kbx].qs[i] & 0x0F] * (int) xq[act_pos(32 * kbx + i, CanonOrder::iq4nl_calls, n)];
+            t += (int) kvalues_iq4nl[w[kbx].qs[i] >> 4] *
+                 (int) xq[act_pos(32 * kbx + i + 16, CanonOrder::iq4nl_calls, n)];
+        }
+        s += (int64_t) canon::fx_scale(xd[kbx], h2f(w[kbx].d), ta + tw) * t;
+    }
+    return canon::fx_value(s, ta + tw, 0);
 }
 
 // canon::silu_mul 8 at a time: the same operations in the same order (exp's range reduction, its polynomial and the
@@ -171,6 +178,81 @@ inline __m256 silu_mul8(__m256 g, __m256 u) {
 // loops): call k (32 values) d x the scale x its exact (code - 1) x q sum into the sum of k modulo 16, the 16 added
 // as the GPU's butterfly
 float q20_gu_row(const block_q2_0* w, int n, const void* a) {
+    const int8_t* xq = act_values(a, n, QK_K);
+    const float* xd = act_scales(a);
+    int ta = canon::kFxNone, tw = canon::kFxNone;   // canon_math.hpp's fixed-point sums: the row's top
+    for (int k = 0; k < n / QK_K; ++k) ta = std::max(ta, canon::fx_exp(xd[k]));
+    for (int k = 0; k < n / 64; ++k) tw = std::max(tw, canon::fx_exp(h2f(w[k].d)));
+    ta = canon::fx_row_top(canon::fx_exp(xd[0]), ta);
+    tw = canon::fx_row_top(canon::fx_exp(h2f(w[0].d)), tw);
+    int64_t s = 0;
+    for (int k = 0; k < n / 32; ++k) {
+        const block_q2_0& b = w[k / 2];
+        int t = 0;
+        for (int i = 0; i < 32; ++i) {
+            const int v = 32 * (k % 2) + i;   // the value in its block
+            const int code = (b.qs[v / 4] >> (2 * (v % 4))) & 3;
+            t += (code - 1) * (int) xq[act_pos(32 * k + i, CanonOrder::q2_planes, n)];
+        }
+        s += (int64_t) canon::fx_scale(xd[(32 * k) / QK_K], h2f(b.d), ta + tw) * t;
+    }
+    return canon::fx_value(s, ta + tw, 0);
+}
+
+// the reference loops in the float sums (exact.hpp's default)
+float iq2xs_row_f(const block_iq2_xs* w, int n, const void* a) {
+    STRATA_CANON_NO_CONTRACT
+    const int8_t* xq = act_values(a, n, QK_K);
+    const float* xd = act_scales(a);
+    float s[2] = {0.0f, 0.0f};
+    const int nb = n / QK_K;
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        int t = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int8_t* q = xq + (ptrdiff_t) kbx * QK_K + 32 * (ptrdiff_t) ib;
+            int sum[2] = {0, 0};
+            for (int l = 0; l < 4; ++l) {
+                const uint16_t qv = w[kbx].qs[4 * ib + l];
+                const uint8_t* g = (const uint8_t*) (iq2xs_grid + (qv & 511));
+                const uint8_t signs = ksigns_iq2xs[qv >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    const int v = (int) g[j] * (int) q[8 * l + j];
+                    sum[l / 2] += (signs >> j) & 1 ? -v : v;
+                }
+            }
+            t += sum[0] * (2 * (w[kbx].scales[ib] & 0x0F) + 1) + sum[1] * (2 * (w[kbx].scales[ib] >> 4) + 1);
+        }
+        const float c = h2f(w[kbx].d) * xd[kbx] * 0.125f;
+        s[kbx & 1] = canon::fma(c, (float) t, s[kbx & 1]);
+    }
+    return s[0] + s[1];
+}
+
+float iq4nl_row_f(const block_iq4_nl* w, int n, const void* a) {
+    STRATA_CANON_NO_CONTRACT
+    const int8_t* xq = act_values(a, n, QK4_NL);
+    const float* xd = act_scales(a);
+    float s[8] = {};
+    const int nb = n / QK4_NL;
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        const float c = h2f(w[kbx].d) * xd[kbx];
+        for (int call = 0; call < 2; ++call) {
+            int t = 0;
+            for (int i = 8 * call; i < 8 * call + 8; ++i) {
+                t += (int) kvalues_iq4nl[w[kbx].qs[i] & 0x0F] * (int) xq[act_pos(32 * kbx + i, CanonOrder::iq4nl_calls, n)];
+                t += (int) kvalues_iq4nl[w[kbx].qs[i] >> 4] *
+                     (int) xq[act_pos(32 * kbx + i + 16, CanonOrder::iq4nl_calls, n)];
+            }
+            float& l = s[2 * (kbx % 4) + call];
+            l = canon::fma(c, (float) t, l);
+        }
+    }
+    for (int o = 4; o > 0; o >>= 1)
+        for (int l = 0; l < o; ++l) s[l] += s[l + o];
+    return s[0];
+}
+
+float q20_gu_row_f(const block_q2_0* w, int n, const void* a) {
     STRATA_CANON_NO_CONTRACT
     const int8_t* xq = act_values(a, n, QK_K);
     const float* xd = act_scales(a);
@@ -189,6 +271,23 @@ float q20_gu_row(const block_q2_0* w, int n, const void* a) {
     for (int o = 8; o > 0; o >>= 1)
         for (int l = 0; l < o; ++l) s[l] += s[l + o];
     return s[0];
+}
+
+// A down activation's scales as canon_math.hpp's fx parts, for the IQ4_NL rows' fixed-point sums: each block's
+// mantissa and exponent, and the largest exponent
+struct FxAct {
+    alignas(32) int32_t m[kNativeMaxFF / QK4_NL], e[kNativeMaxFF / QK4_NL];
+    int top;
+};
+void fx_act(const float* dx, int nb, FxAct& a) {
+    a.top = canon::kFxNone;
+    for (int b = 0; b < nb; ++b) {
+        const canon::FxPart p = canon::fx_part(dx[b]);   // a scale is never negative
+        a.m[b] = (int32_t) p.m;
+        a.e[b] = p.e;
+        a.top = std::max(a.top, p.e);
+    }
+    a.top = canon::fx_row_top(a.e[0], a.top);   // the activation's part of the top, as the weights'
 }
 
 // ---- the AVX2 forms of the down rows (the gate/up rows: iq_avx2's iq256_canon_rows)
@@ -352,29 +451,45 @@ void canon_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* a
         if (scalar && f.gu_type == 42) {
             for (int r = c0; r < c1; ++r)
                 for (int t = 0; t < nt; ++t) {
-                    g[t][r] = q20_gu_row(reinterpret_cast<const block_q2_0*>(blob + (size_t) r * f.gu_row), n, act[t]);
-                    u[t][r] = q20_gu_row(reinterpret_cast<const block_q2_0*>(blob + f.up_off + (size_t) r * up_row), n, act[t]);
+                    const auto* gw = reinterpret_cast<const block_q2_0*>(blob + (size_t) r * f.gu_row);
+                    const auto* uw = reinterpret_cast<const block_q2_0*>(blob + f.up_off + (size_t) r * up_row);
+                    g[t][r] = exact_sums() ? q20_gu_row(gw, n, act[t]) : q20_gu_row_f(gw, n, act[t]);
+                    u[t][r] = exact_sums() ? q20_gu_row(uw, n, act[t]) : q20_gu_row_f(uw, n, act[t]);
                 }
         } else if (scalar) {
             for (int r = c0; r < c1; ++r)
                 for (int t = 0; t < nt; ++t) {
-                    g[t][r] = iq2xs_row(reinterpret_cast<const block_iq2_xs*>(blob + (size_t) r * f.gu_row), n, act[t]);
-                    u[t][r] = iq2xs_row(reinterpret_cast<const block_iq2_xs*>(blob + f.up_off + (size_t) r * up_row), n, act[t]);
+                    const auto* gw = reinterpret_cast<const block_iq2_xs*>(blob + (size_t) r * f.gu_row);
+                    const auto* uw = reinterpret_cast<const block_iq2_xs*>(blob + f.up_off + (size_t) r * up_row);
+                    g[t][r] = exact_sums() ? iq2xs_row(gw, n, act[t]) : iq2xs_row_f(gw, n, act[t]);
+                    u[t][r] = exact_sums() ? iq2xs_row(uw, n, act[t]) : iq2xs_row_f(uw, n, act[t]);
                 }
         } else if (f.gu_type == 42) {   // Q2_0 (the activation in its order)
             with_nt(nt, [&](auto NTc) {
                 constexpr int NT = decltype(NTc)::value;
                 float gr[NT], ur[NT];
+                FxAct fa[NT];   // the activations' parts once for the chunk's rows (the fixed-point sums)
+                const bool fx = exact_sums();
+                if (fx)
+                    for (int t = 0; t < NT; ++t) fx_act(dx[t], n / QK_K, fa[t]);
                 for (int r = c0; r < c1; ++r) {
 #if STRATA_AVXVNNI
                     if (vnni_on()) {
-                        vnni::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, dx, qs32, gr);
-                        vnni::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, dx, qs32, ur);
+                        if (fx) {
+                            vnni::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, fa, qs32, gr);
+                            vnni::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, fa, qs32, ur);
+                        } else {
+                            vnni::q20_gu_rows_nt_f<NT>(blob + (size_t) r * f.gu_row, n, x, dx, qs32, gr);
+                            vnni::q20_gu_rows_nt_f<NT>(blob + f.up_off + (size_t) r * up_row, n, x, dx, qs32, ur);
+                        }
                     } else
 #endif
-                    {
-                        plain::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, dx, qs32, gr);
-                        plain::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, dx, qs32, ur);
+                    if (fx) {
+                        plain::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, fa, qs32, gr);
+                        plain::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, fa, qs32, ur);
+                    } else {
+                        plain::q20_gu_rows_nt_f<NT>(blob + (size_t) r * f.gu_row, n, x, dx, qs32, gr);
+                        plain::q20_gu_rows_nt_f<NT>(blob + f.up_off + (size_t) r * up_row, n, x, dx, qs32, ur);
                     }
                     for (int t = 0; t < NT && t < nt; ++t) {
                         g[t][r] = gr[t];
@@ -410,14 +525,21 @@ void canon_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const*
         for (int t = 0; t < nt; ++t) qs32[t] = act_sums(hq[t], n, 32);
         with_nt(nt, [&](auto NTc) {
             constexpr int NT = decltype(NTc)::value;
+            FxAct fa[NT];   // the activations' parts once for every row (the fixed-point sums)
+            const bool fx = exact_sums();
+            if (fx)
+                for (int t = 0; t < NT; ++t) fx_act(dx[t], n / 32, fa[t]);
             for (int r = r0; r < r1; ++r) {
                 const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
                 float o[NT];
 #if STRATA_AVXVNNI
-                if (vnni_on()) vnni::q20_rows_nt<NT>(dr, n, x, dx, qs32, o);
-                else
+                if (vnni_on()) {
+                    if (fx) vnni::q20_rows_nt<NT>(dr, n, x, fa, qs32, o);
+                    else vnni::q20_rows_nt_f<NT>(dr, n, x, dx, qs32, o);
+                } else
 #endif
-                    plain::q20_rows_nt<NT>(dr, n, x, dx, qs32, o);
+                if (fx) plain::q20_rows_nt<NT>(dr, n, x, fa, qs32, o);
+                else plain::q20_rows_nt_f<NT>(dr, n, x, dx, qs32, o);
                 for (int t = 0; t < NT; ++t) out[t][r] = o[t];
             }
         });
@@ -425,17 +547,25 @@ void canon_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const*
     }
     with_nt(nt, [&](auto NTc) {
         constexpr int NT = decltype(NTc)::value;
+        FxAct fa[NT];   // the activations' parts once for every row (the fixed-point sums)
+        const bool fx = exact_sums();
+        if (!scalar && fx)
+            for (int t = 0; t < NT; ++t) fx_act(dx[t], n / QK4_NL, fa[t]);
         for (int r = r0; r < r1; ++r) {
             const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
+            const auto* dw = reinterpret_cast<const block_iq4_nl*>(dr);
             float o[NT];
             if (scalar)
-                for (int t = 0; t < NT; ++t) o[t] = iq4nl_row(reinterpret_cast<const block_iq4_nl*>(dr), n, hq[t]);
+                for (int t = 0; t < NT; ++t) o[t] = fx ? iq4nl_row(dw, n, hq[t]) : iq4nl_row_f(dw, n, hq[t]);
             else
 #if STRATA_AVXVNNI
-                if (vnni_on()) vnni::iq4nl_rows_nt<NT>(dr, n, x, dx, o);
-                else
+                if (vnni_on()) {
+                    if (fx) vnni::iq4nl_rows_nt<NT>(dr, n, x, fa, o);
+                    else vnni::iq4nl_rows_nt_f<NT>(dr, n, x, dx, o);
+                } else
 #endif
-                    plain::iq4nl_rows_nt<NT>(dr, n, x, dx, o);
+                if (fx) plain::iq4nl_rows_nt<NT>(dr, n, x, fa, o);
+                else plain::iq4nl_rows_nt_f<NT>(dr, n, x, dx, o);
             for (int t = 0; t < NT; ++t) out[t][r] = o[t];
         }
     });
