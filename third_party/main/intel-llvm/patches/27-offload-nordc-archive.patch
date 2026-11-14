@@ -1,0 +1,59 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+offload-nordc-archive: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
+
+Linked without RDC (-fno-sycl-rdc), a fat static archive's device code goes through sycl-post-link once
+per archive member, and its output is a list of file tables.  The SPIR-V path extracts the code column of
+each table and merges the lists and the tables; the NVPTX and AMDGCN path extracted the code column from
+the list itself, so every link of a program with a static library of SYCL code for an NVIDIA or AMD GPU
+stopped with "column not found Code".  Fixed, that path extracts and merges as the SPIR-V one does.
+---
+diff --git a/clang/lib/Driver/Driver.cpp b/clang/lib/Driver/Driver.cpp
+index 7a0d816746..fe6081bb1f 100644
+--- a/clang/lib/Driver/Driver.cpp
++++ b/clang/lib/Driver/Driver.cpp
+@@ -5818,6 +5818,26 @@ class OffloadingActionBuilder final {
+           Action *ExtractIRFilesAction = createExtractIRFilesAction();
+ 
+           if (IsNVPTX || IsAMDGCN) {
++            // Modified 2026 by MistVVK and the XeStrata contributors: with a
++            // fat static archive and no RDC, sycl-post-link runs once per
++            // archive member and its output is a list of tables, as on the
++            // SPIR-V path below.  Extract the code of each table and merge the
++            // lists, and merge the tables for the replacement, as that path
++            // does; the code column was extracted from the list itself, and
++            // the link stopped with "column not found Code".
++            if (NoRDCFatStaticArchive) {
++              ExtractIRFilesAction = C.MakeAction<ForEachWrappingAction>(
++                  cast<JobAction>(FullDeviceLinkAction),
++                  cast<JobAction>(ExtractIRFilesAction));
++
++              auto *MergeAllTablesIntoOne =
++                  C.MakeAction<FileTableTformJobAction>(ExtractIRFilesAction,
++                                                        types::TY_Tempfilelist,
++                                                        types::TY_Tempfilelist);
++              MergeAllTablesIntoOne->addMergeTform(
++                  FileTableTformJobAction::COL_ZERO);
++              ExtractIRFilesAction = MergeAllTablesIntoOne;
++            }
+             JobAction *FinAction =
+                 IsNVPTX ? finalizeNVPTXDependences(ExtractIRFilesAction,
+                                                    TC->getTriple())
+@@ -5826,6 +5846,15 @@ class OffloadingActionBuilder final {
+             auto *ForEachWrapping = C.MakeAction<ForEachWrappingAction>(
+                 cast<JobAction>(ExtractIRFilesAction), FinAction);
+ 
++            if (NoRDCFatStaticArchive) {
++              auto *MergeAllTablesIntoOne =
++                  C.MakeAction<FileTableTformJobAction>(PostLinkAction,
++                                                        types::TY_Tempfilelist,
++                                                        types::TY_Tempfilelist);
++              MergeAllTablesIntoOne->addMergeTform(
++                  FileTableTformJobAction::COL_ZERO);
++              PostLinkAction = MergeAllTablesIntoOne;
++            }
+             ActionList TformInputs{PostLinkAction, ForEachWrapping};
+             auto *ReplaceFilesAction = C.MakeAction<FileTableTformJobAction>(
+                 TformInputs, types::TY_Tempfiletable, types::TY_Tempfiletable);
