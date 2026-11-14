@@ -121,19 +121,26 @@ int main() {
     {
         using strata::prefill::floor_with_share;
         using strata::prefill::OwnOnlyLineDeferred;
-        const char* tail = " tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.";
+        const char* tail = " tokens or more read on the fused kernels, as long prompts do. STRATA_PF_PLAIN_FLOOR=0 keeps the earlier rule; STRATA_PREFILL_STREAM_MIN=N sets the number by hand.";
         const std::string p1536 = std::string("prefill: prompt pieces of 1536") + tail;
         const std::string p3072 = std::string("prefill: prompt pieces of 3072") + tail;
         const std::string p64 = std::string("prefill: prompt pieces of 64") + tail;
         OwnOnlyLineDeferred d;
-        d.want_pieces();
+        d.want_pieces(true);
         if (d.pieces_due() || d.due()) { std::fprintf(stderr, "FAIL %s:%d: pieces line due before the share is armed\n", __FILE__, __LINE__); ++failed; }
         d.mark_ready();
         if (!d.pieces_due() || d.due()) { std::fprintf(stderr, "FAIL %s:%d: pieces line not due (or the plan line due without counts)\n", __FILE__, __LINE__); ++failed; }
         CHECK_LINE(d.take_pieces(floor_with_share(true, 3072, 64)), p1536.c_str());   // discrete card, plain pack, share armed
         if (d.pieces_due()) { std::fprintf(stderr, "FAIL %s:%d: pieces line printed twice\n", __FILE__, __LINE__); ++failed; }
-        CHECK_LINE(strata::prefill::stream_floor_pieces_line(floor_with_share(false, 3072, 64)), p3072.c_str());   // rule off / integrated, share armed
-        CHECK_LINE(strata::prefill::stream_floor_pieces_line(floor_with_share(false, 0, 64)), p64.c_str());        // rule off / integrated, no share: as before
+        CHECK_LINE(strata::prefill::stream_floor_pieces_line(floor_with_share(false, 3072, 64), true), p3072.c_str());   // rule off / integrated, share armed
+        CHECK_LINE(strata::prefill::stream_floor_pieces_line(floor_with_share(false, 0, 64), true), p64.c_str());        // rule off / integrated, no share: as before
+        // a trellis pack's line does not name STRATA_PF_PLAIN_FLOOR, which never moves its floor
+        CHECK_LINE(strata::prefill::stream_floor_pieces_line(1536, false),
+                   "prefill: prompt pieces of 1536 tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=N sets the number by hand.");
+        OwnOnlyLineDeferred t;
+        t.want_pieces(false);
+        t.mark_ready();
+        CHECK_LINE(t.take_pieces(1536), "prefill: prompt pieces of 1536 tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=N sets the number by hand.");
     }
     if (failed) {
         std::fprintf(stderr, "own_only_line_test: %d check(s) failed\n", failed);
