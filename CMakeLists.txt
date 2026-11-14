@@ -440,6 +440,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/native_ple_postops.cpp src/kernels/xe/native_qsa.cpp
                                     src/kernels/xe/native_qsa_score.cpp src/kernels/xe/native_qsa_indexer.cpp
                                     src/kernels/xe/native_flash_attn.cpp src/kernels/xe/qsa_select.cpp
+                                    src/kernels/xe/latent.cpp
                                     src/kernels/xe/dequant_bf16.cpp src/kernels/xe/ple.cpp
                                     src/kernels/xe/s2_expert_grouped.cpp
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
@@ -567,6 +568,7 @@ if(STRATA_ENABLE_XE)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
+                                   src/core/latent.cpp
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/artifact/yskn.cpp
                                    src/core/mtp.cpp src/core/dflash2.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
@@ -1686,7 +1688,8 @@ add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu
             src/kernels/cpu/bf16_gemm_avx512.cpp
             src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
             src/kernels/cpu/cpu_ops.cpp src/kernels/cpu/vision_cpu.cpp src/kernels/cpu/vision_cpu_avx2.cpp
-            src/kernels/cpu/vision_cpu_avx512.cpp src/kernels/cpu/resize_rows.cpp src/kernels/cpu/resize_rows_avx2.cpp)
+            src/kernels/cpu/vision_cpu_avx512.cpp src/kernels/cpu/resize_rows.cpp src/kernels/cpu/resize_rows_avx2.cpp
+            src/kernels/cpu/latent_rows.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1819,6 +1822,18 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)
     target_link_libraries(dequant_q5_1_test PRIVATE strata_artifact ggml-base)
     add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
+    # the latent MoE pack's readers (Edge0's D/U, A, labels, v6 manifest, column scales): synthetic packs and the
+    # real Edge0 manifests, the layouts against ggml's own.  No model, no GPU, no engine (the reader compiles in)
+    add_executable(latent_pack_test tests/core/latent_pack_test.cpp src/core/latent.cpp)
+    target_link_libraries(latent_pack_test PRIVATE strata_artifact ggml-base)
+    add_test(NAME latent_pack_test COMMAND latent_pack_test)
+    # the latent MoE layer's references against each other (float vs the scalar integer chains), both widths and
+    # both D/U formats: no model, no GPU.  The GPU parity is latent_parity
+    add_executable(latent_ref_test tests/kernels/latent_ref_test.cpp)
+    target_include_directories(latent_ref_test PRIVATE src/kernels)
+    target_link_libraries(latent_ref_test PRIVATE strata_artifact ggml-cpu ggml-base)
+    add_test(NAME latent_ref_test COMMAND latent_ref_test)
+    set_tests_properties(latent_ref_test PROPERTIES TIMEOUT 600)
     # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp: gathered, AVX-VNNI) bit for bit against each other
     # at 1..8 tokens and against ggml-cpu's dot, on random blocks (upstream a7336175, b211ba17); --bench: ms per expert
     add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
@@ -1843,6 +1858,13 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
     target_include_directories(native_expert_parity PRIVATE third_party/main/ggml)
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact)
+    # the latent MoE layer (Edge0's D -> A -> U -> combine) on the engine's kernels at both published widths and
+    # both D/U formats, against latent_ref.hpp's references (no GPU: skipped; the references alone: latent_ref_test)
+    add_executable(latent_parity src/kernels/latent_parity.cpp)
+    target_include_directories(latent_parity PRIVATE third_party/main/ggml)
+    target_link_libraries(latent_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact)
+    add_test(NAME latent_parity COMMAND latent_parity)
+    set_tests_properties(latent_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     # the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit: synthetic, so in CTest
     add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
     # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
@@ -1855,7 +1877,8 @@ if(STRATA_NATIVE_EXPERTS)
     # GSQ-RCO files' (Q2_K and Q3_K both ways); at llm-jp-4.1's (2560/960): Q4_K with its Q8_0 and Q5_0 down
     foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl q5_0/q8_0 q4_0/q4_0 q4_0/q4_1
                  q6_K/q8_0 q6_K/q6_K@2048x512 q4_K/q4_K@2048x512 q5_K/q5_K@2048x512 q8_0/q8_0@2048x512
-                 bf16/bf16@2048x512 q2_K/q3_K@2048x512 q3_K/q2_K@2048x512 q4_K/q8_0@2560x960 q4_K/q5_0@2560x960)
+                 bf16/bf16@2048x512 q2_K/q3_K@2048x512 q3_K/q2_K@2048x512 q4_K/q8_0@2560x960 q4_K/q5_0@2560x960
+                 q3_K/iq4_nl@1792x640 q3_K/iq4_nl@1280x640)
       string(REPLACE "/" "_" pair_name "${pair}")
       string(REPLACE "@" "_" pair_name "${pair_name}")
       add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})

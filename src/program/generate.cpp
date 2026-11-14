@@ -45,6 +45,8 @@
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/latent.hpp"
+#include "strata/core/latent_share.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -2030,6 +2032,75 @@ void seed_usage_from_prompt(std::vector<float>& usage, const strata::prefill::Pr
                             std::vector<int64_t>& seen, int64_t n_expert, int64_t period, double decay) {
     strata::core::seed_usage(usage, ps.routed, ps.routed_k, seen, n_expert, period, decay);
 }
+
+// The latent MoE (Edge0): the session's D/U pair, uploaded once and shared by every window and the prompt path
+// (latent_share.hpp).  Detected from the expert layout: the experts' width differs from the shell's hidden width.
+// The labels come from labels.bin beside the A pack; the D/U file and the A pack are the environment's
+// (XESTRATA_LATENT_DENSE / XESTRATA_LATENT_A, the model's model.json gives them).
+struct LatentTab {
+    strata::core::LatentDense dense;
+    uint8_t* d = nullptr;
+    uint8_t* u = nullptr;
+    std::vector<int32_t> labels;
+    int64_t lat_H = 0, lat_ELL = 0, lat_I = 0, n_layers = 0;
+    int lat_G = 8, lat_E = 0, lat_fmt = 8;
+    bool latent = false;
+    uint64_t device_bytes() const { return (uint64_t) n_layers * (dense.d_bytes() + dense.u_bytes()); }
+    void publish() {
+        strata::core::latent_shared_d() = d;
+        strata::core::latent_shared_u() = u;
+        strata::core::latent_shared_fmt() = lat_fmt;
+    }
+    bool load(const strata::core::ModelGeometry& g, std::string& err) {
+        if (d != nullptr) { publish(); return true; }
+        const auto& lay0 = strata::kernels::cpu::expert_layout();
+        if (!(lay0.native && !lay0.fmt.empty() && lay0.fmt[0].n_embd != (int64_t) g.n_embd)) return true;
+        latent = true;
+        lat_H = (int64_t) g.n_embd;
+        lat_ELL = lay0.fmt[0].n_embd;
+        lat_I = lay0.fmt[0].n_ff;
+        lat_E = (int) g.n_expert;
+        n_layers = g.n_layers;
+        const char* f = strata::env_get("LATENT_DENSE");
+        if (f == nullptr || f[0] == '\0') {
+            err = "the latent layout needs XESTRATA_LATENT_DENSE=<latent_dense_q8.bin>";
+            return false;
+        }
+        if (!dense.open(f, g.n_layers, lat_G, (int64_t) g.n_embd, lat_ELL, err)) {
+            err = "latent dense: " + err;
+            return false;
+        }
+        lat_fmt = dense.fmt();
+        const char* apack = strata::env_get("LATENT_A");
+        if (apack == nullptr || apack[0] == '\0') {
+            err = "the latent layout needs XESTRATA_LATENT_A=<experts.bin>";
+            return false;
+        }
+        const std::string lp = apack;
+        const size_t slash = lp.find_last_of('/');
+        const std::string labels_path = slash == std::string::npos ? "labels.bin" : lp.substr(0, slash + 1) + "labels.bin";
+        if (!strata::core::latent_labels_read(labels_path, g.n_layers, g.n_expert, lat_G, labels, err)) {
+            err = "latent dense: " + err;
+            return false;
+        }
+        const uint64_t db = (uint64_t) g.n_layers * dense.d_bytes(), ub = (uint64_t) g.n_layers * dense.u_bytes();
+        if (!strata::gpu::alloc_device((void**) &d, db) || !strata::gpu::alloc_device((void**) &u, ub)) {
+            err = "the latent D/U device buffers (" + std::to_string((db + ub) >> 20) + " MiB) do not fit";
+            return false;
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (!strata::gpu::copy(d + (size_t) l * dense.d_bytes(), dense.d(l), dense.d_bytes()) ||
+                !strata::gpu::copy(u + (size_t) l * dense.u_bytes(), dense.u(l), dense.u_bytes())) {
+                err = "the latent D/U upload failed at layer " + std::to_string(l);
+                return false;
+            }
+        }
+        publish();
+        std::fprintf(stderr, "xestrata generate: latent MoE: ELL %lld, I %lld, G %d, D/U fmt %d, %.2f GiB on the device\n",
+                     (long long) lat_ELL, (long long) lat_I, lat_G, lat_fmt, (double) (db + ub) / 1073741824.0);
+        return true;
+    }
+};
 }  // namespace
 
 // The prompt path gets the CPU pool beside --batch slots too (upstream 1b1a28e77's opt-in, on by default here: RX
@@ -5367,6 +5438,19 @@ int main(int argc, char** argv) {
     }
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
+    // the latent MoE's D/U pair: uploaded before the cache is sized, so the auto sizing leaves room for it
+    LatentTab lat_tab;
+    {
+        std::string le;
+        if (!lat_tab.load(g, le)) {
+            std::fprintf(stderr, "xestrata generate: %s\n", le.c_str());
+            return 1;
+        }
+        if (lat_tab.latent && o.expert_cache_remote[0] > 0) {
+            std::fprintf(stderr, "xestrata generate: the latent MoE does not support helper GPUs (--expert-cache-remote)\n");
+            return 1;
+        }
+    }
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
     const int64_t pipe_first = o.pipeline_windows <= 0 ? 0
@@ -5391,6 +5475,10 @@ int main(int argc, char** argv) {
         auto size_cache = [&] {
             strata::gpu::mem_info(&free_b, &total_b);
             free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
+            if (lat_tab.latent) {   // the D/U pair is already on the device (LatentTab::load)
+                const size_t du = (size_t) lat_tab.device_bytes();
+                free_b -= du < free_b ? du : free_b;
+            }
             // --vram-free-mib: what was free at the start beyond it is not counted, so a start with a few MiB more
             // free gets the same cache
             free_b = (size_t) strata::core::counted_free(free_b, start_free_b, o.vram_free_mib);
@@ -5906,6 +5994,16 @@ int main(int argc, char** argv) {
     drive.d.pool = &pool;
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
+    drive.d.latent = lat_tab.latent;
+    drive.d.lat_H = lat_tab.lat_H;
+    drive.d.lat_ELL = lat_tab.lat_ELL;
+    drive.d.lat_I = lat_tab.lat_I;
+    drive.d.lat_G = lat_tab.lat_G;
+    drive.d.lat_E = lat_tab.lat_E;
+    drive.d.lat_fmt = lat_tab.lat_fmt;
+    drive.d.lat_u_gpu = strata::core::pick_from_env("LATENT_U_GPU") != strata::core::Pick::Off;
+    drive.d.lat_dense = lat_tab.latent ? &lat_tab.dense : nullptr;
+    drive.d.lat_labels = lat_tab.labels.empty() ? nullptr : lat_tab.labels.data();
     drive.d.jobs.resize((size_t) K);
     // upstream 994029b02 (PR 4972): when every routed expert sits in the GPU's caches the decode reads nothing from the
     // file tier, and its Linux defaults (io prefetch, the decode gate) and the routing-aware prefetch only cost time
@@ -7349,6 +7447,10 @@ int main(int argc, char** argv) {
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) std::lround(f * 256.0))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
+        if (lat_tab.latent && n_stages > 1) {
+            std::fprintf(stderr, "xestrata generate: the latent MoE runs on one GPU (a layer split is not wired yet)\n");
+            return 1;
+        }
         // --pipeline-windows (decided where the split was): two verifiers per stage, one for the even windows and one
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
@@ -8399,6 +8501,9 @@ int main(int argc, char** argv) {
             }
         }
         drive.d.plan = ver.plan_sink();
+        drive.d.lat_xl = ver.latent_xl_mapped();
+        drive.d.lat_xlseq = ver.latent_xlseq();
+        drive.d.lat_act0 = ver.latent_act0_mapped();
         drive.d.pcie_num = std::max(0, std::min(256, (int) std::lround(o.pcie_frac * 256.0)));
         strata::core::PcieSplitTimes pcie_split;   // the measured split, kept for the requests that set no share
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
@@ -14094,6 +14199,9 @@ int main(int argc, char** argv) {
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         drive.d.plan = ver.plan_sink();
+        drive.d.lat_xl = ver.latent_xl_mapped();
+        drive.d.lat_xlseq = ver.latent_xlseq();
+        drive.d.lat_act0 = ver.latent_act0_mapped();
         drive.d.pcie_num = (int) std::lround(o.pcie_frac * 256.0);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;

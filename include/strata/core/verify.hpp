@@ -424,6 +424,12 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return win_.sink(); }
+    /// The latent MoE (Edge0): the window's mapped D rows, their doorbell and their Q8_0 image, for the pool's
+    /// CPU share (ExpertDispatch's lat_* fields); null when the pack is not a latent one.
+    const float* latent_xl_mapped() const { return win_.latent_xl_mapped(); }
+    const uint32_t* latent_xlseq() const { return win_.latent_xlseq(); }
+    const uint8_t* latent_act0_mapped() const { return win_.latent_act0_mapped(); }
+    bool latent() const { return win_.latent(); }
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }

@@ -42,6 +42,7 @@ PERMISSIVE_OTHER = {"contributors to the vLLM-Omni project": "Apache-2.0", "The 
                     "the comfyui_controlnet_aux contributors": "Apache-2.0",
                     "the ComfyUI-SeedVR2_VideoUpscaler contributors": "Apache-2.0",
                     "the YASAKANI authors": "Apache-2.0",
+                    "Edge0": "Apache-2.0",
                     "Secret Labs AB": "MIT-CMU", "Fredrik Lundh and contributors": "MIT-CMU",
                     "Jeffrey A. Clark and contributors": "MIT-CMU"}
 OWN = "LGPL-3.0-or-later"
@@ -159,7 +160,7 @@ def expected(path: str, data: bytes, hs: list[str], up: Upstream) -> tuple[str, 
     others = [h for h in hs if h != XE] or bhs or [STRATA]
     if base and strip(data) == strip(base):
         return ("unchanged", others, bid or "MIT")
-    # a mixed file keeps the license of every project it names (YASAKANI's Apache-2.0 beside Strata's MIT)
+    # a mixed file keeps the license of every project it names (YASAKANI's and Edge0's Apache-2.0 beside Strata's MIT)
     other = sorted({lic for h in hs for k, lic in PERMISSIVE_OTHER.items() if k in h})
     return ("mixed", others + [XE], " AND ".join([MIXED] + other))
 

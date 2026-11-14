@@ -4,10 +4,12 @@
 #include "strata/core/moe_window.hpp"
 
 #include "strata/core/device.hpp"
+#include "strata/core/latent_share.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/latent.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -58,8 +60,13 @@ MoeWindow::~MoeWindow() {
         strata::gpu::stream_destroy(c);
     }
     for (void* p : {(void*) h_x_, (void*) h_ids_, (void*) h_w_, (void*) h_ymiss_, (void*) h_seq_, (void*) h_flag_,
-                    (void*) h_flagA_, (void*) h_flagB_, (void*) h_plan_, arena_, (void*) skip_, (void*) slot_off_d_})
+                    (void*) h_flagA_, (void*) h_flagB_, (void*) h_plan_, arena_, (void*) skip_, (void*) slot_off_d_,
+                    (void*) h_latxl_, (void*) h_latact0_, (void*) h_xlseq_, (void*) lat_labels_dev_})
         if (p != nullptr) strata::gpu::free(p);
+    if (lat_du_owned_) {
+        if (lat_d_ != nullptr) strata::gpu::free(lat_d_);
+        if (lat_u_ != nullptr) strata::gpu::free(lat_u_);
+    }
 }
 
 bool MoeWindow::resident_graph_on() {
@@ -90,6 +97,87 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         bf16_ = bf16_ || (lay.native && lay.fmt[(size_t) l].gu_type == 30);
     }
 
+    // ---- the latent MoE (Edge0): the experts' width differs from the shell's.  D/U are one pair a layer,
+    // shared by every window of the session when the driver passed them in (set_shared_latent).
+    latent_ = lay.native && !lay.fmt.empty() && lay.fmt[0].n_embd != shape.n_embd;
+    if (latent_) {
+        lat_ELL_ = lay.fmt[0].n_embd;
+        lat_I_ = lay.fmt[0].n_ff;
+        lat_G_ = 8;
+        for (int64_t l = 0; l < lay.n_layers; ++l) {
+            if (lay.fmt[(size_t) l].n_embd != lat_ELL_ || lay.fmt[(size_t) l].n_ff != lat_I_) {
+                err = "moe window: latent layer " + std::to_string(l) + "'s experts differ from layer 0's";
+                return false;
+            }
+        }
+        if (lat_d_shared_ != nullptr) {
+            lat_d_ = const_cast<uint8_t*>(lat_d_shared_);
+            lat_u_ = const_cast<uint8_t*>(lat_u_shared_);
+            lat_fmt_ = lat_fmt_shared_;
+        } else if (latent_shared_d() != nullptr) {   // the session's pair (the driver uploaded it once)
+            lat_d_ = const_cast<uint8_t*>(latent_shared_d());
+            lat_u_ = const_cast<uint8_t*>(latent_shared_u());
+            lat_fmt_ = latent_shared_fmt();
+        } else {
+            const char* dense = strata::env_get("LATENT_DENSE");
+            if (dense == nullptr || dense[0] == '\0') {
+                err = "moe window: the latent layout needs XESTRATA_LATENT_DENSE=<latent_dense_q8.bin>";
+                return false;
+            }
+            if (!lat_dense_.open(dense, lay.n_layers, lat_G_, shape.n_embd, lat_ELL_, err)) {
+                err = "moe window latent dense: " + err;
+                return false;
+            }
+            lat_fmt_ = lat_dense_.fmt();
+            const uint64_t db = (uint64_t) lay.n_layers * lat_dense_.d_bytes();
+            const uint64_t ub = (uint64_t) lay.n_layers * lat_dense_.u_bytes();
+            if (!strata::gpu::alloc_device((void**) &lat_d_, db) || !strata::gpu::alloc_device((void**) &lat_u_, ub)) {
+                err = "moe window: the latent D/U device buffers do not fit";
+                return false;
+            }
+            lat_du_owned_ = true;
+            for (int64_t l = 0; l < lay.n_layers; ++l) {
+                if (!strata::gpu::copy(lat_d_ + (size_t) l * lat_dense_.d_bytes(), lat_dense_.d(l),
+                                       lat_dense_.d_bytes()) ||
+                    !strata::gpu::copy(lat_u_ + (size_t) l * lat_dense_.u_bytes(), lat_dense_.u(l),
+                                       lat_dense_.u_bytes())) {
+                    err = "moe window: the latent D/U upload failed at layer " + std::to_string(l);
+                    return false;
+                }
+            }
+        }
+        const char* apack = strata::env_get("LATENT_A");
+        if (apack == nullptr || apack[0] == '\0') {
+            err = "moe window: the latent layout needs XESTRATA_LATENT_A=<experts.bin>";
+            return false;
+        }
+        const std::string lp = std::string(apack);
+        const size_t slash = lp.find_last_of('/');
+        const std::string labels_path = slash == std::string::npos ? "labels.bin" : lp.substr(0, slash + 1) + "labels.bin";
+        if (!latent_labels_read(labels_path, lay.n_layers, lay.n_expert, lat_G_, lat_labels_, err)) {
+            err = "moe window latent: " + err;
+            return false;
+        }
+        if (!strata::gpu::alloc_device((void**) &lat_labels_dev_, lat_labels_.size() * sizeof(int32_t)) ||
+            !strata::gpu::copy(lat_labels_dev_, lat_labels_.data(), lat_labels_.size() * sizeof(int32_t))) {
+            err = "moe window: the latent labels upload failed";
+            return false;
+        }
+        // XESTRATA_LATENT_U_GPU: auto (the default) computes the CPU share's U on the GPU from its q8_1 rows of h
+        // (5x smaller across PCIe than the H-wide contributions, and the pool's U work moves to the device);
+        // off keeps the CPU's U.  The auto choice is to be confirmed on the three GPUs (EDGE/measure-plan.md).
+        lat_u_gpu_ = strata::core::pick_from_env("LATENT_U_GPU") != strata::core::Pick::Off;
+        // the column scales on the device NOW, in plain stream context: the D stage's first call can otherwise
+        // land inside a graph capture, where an allocation is not permitted
+        for (int64_t l = 0; l < lay.n_layers; ++l) {
+            int w = 0;
+            if (strata::kernels::cpu::latent_gu_colscale((int) l, &w) != nullptr &&
+                strata::kernels::latent_colscale_dev((int) l, (int) lat_ELL_) == nullptr) {
+                err = "moe window: the column-scale vectors could not be uploaded";
+                return false;
+            }
+        }
+    }
     const uint64_t T = (uint64_t) shape.max_t, N = (uint64_t) shape.n_embd, K = (uint64_t) shape.k;
     bool ok = mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
@@ -99,6 +187,12 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+    if (ok && latent_) {
+        const uint64_t ELL = (uint64_t) lat_ELL_, G = (uint64_t) lat_G_;
+        ok = mapped(T * G * ELL * 4, (void**) &h_latxl_, (void**) &m_latxl_) &&
+             mapped(T * G * (ELL / 32) * 34, (void**) &h_latact0_, (void**) &m_latact0_) &&
+             mapped(64, (void**) &h_xlseq_, (void**) &m_xlseq_);
+    }
     if (!ok) { err = "moe window: mapped staging allocation failed"; return false; }
     {   // a plan for each of the two token groups a window may be cut into
         const int64_t cap = (int64_t) (T * K);
@@ -124,6 +218,13 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), shape.n_embd, max_ff),
             strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), max_ff)));
+        if (latent_) {
+            const uint64_t ELL = (uint64_t) lat_ELL_, G = (uint64_t) lat_G_;
+            lat_xl_ = b.take<float>(T * G * ELL);
+            lat_xlq_ = b.take<uint8_t>(T * G * (ELL / 32) * 36);
+            lat_ylq_ = b.take<uint8_t>(T * K * (ELL / 32) * 36);
+            lat_act0_ = b.take<uint8_t>(T * G * (ELL / 32) * 34);
+        }
     };
     Bump count;
     carve(count);
@@ -275,6 +376,30 @@ void MoeWindow::publish(int tb, int n, const float* x, const int32_t* ids, const
     expert_input(tb, n, x, cs);
 }
 
+void MoeWindow::latent_d_stage(int64_t layer, int tb, int n, const float* x, strata::gpu::Stream cs) {
+    using namespace strata::kernels;
+    if (!latent_ || n <= 0) return;
+    const int64_t N = sh_.n_embd, ELL = lat_ELL_, G = lat_G_;
+    const size_t row_b = lat_fmt_ == 4 ? 18 : 34;
+    const size_t d_bytes = (size_t) G * (size_t) ELL * (size_t) (N / 32) * row_b;
+    const size_t lq_row = (size_t) (ELL / 32) * 36;
+    // the input's q8_1 rows (the same bytes expert_input writes; the window's first group runs this before the
+    // router, so the pool's D rows have the router + plan + doorbell stretch of head start)
+    quantize_q8_1_rows(x, n, N, nat_xq(tb), cs);
+    iq_mmvq(lat_fmt_ == 4 ? 2 : 8, lat_d_ + (size_t) layer * d_bytes, nat_xq(tb), lat_xl_ + (size_t) tb * G * ELL,
+            (int) N, (int) (G * ELL), n, cs);
+    // the Q3_K pack's shared column scales: the D rows take 1/s once, before every consumer reads them
+    latent_colscale_rows(lat_xl_ + (size_t) tb * G * ELL, (int64_t) n * G, (int) ELL,
+                         latent_colscale_dev((int) layer, (int) ELL), cs);
+    quantize_q8_1_rows(lat_xl_ + (size_t) tb * G * ELL, (int64_t) n * G, ELL, lat_xlq_ + (size_t) tb * G * lq_row, cs);
+    quantize_q8_0(lat_xl_ + (size_t) tb * G * ELL, lat_act0_ + (size_t) tb * G * (ELL / 32) * 34,
+                  (int64_t) n * G * ELL, cs);
+    // the f32 rows and their Q8_0 image to the pool's mapped memory, then the doorbell (layer + 1)
+    latent_publish_d(lat_xl_ + (size_t) tb * G * ELL, lat_act0_ + (size_t) tb * G * (ELL / 32) * 34,
+                     (int64_t) n * G, (int) ELL, m_latxl_ + (size_t) tb * G * ELL,
+                     m_latact0_ + (size_t) tb * G * (ELL / 32) * 34, m_xlseq_, (uint32_t) (layer + 1), cs);
+}
+
 void MoeWindow::resident_plan(const int32_t* res_layer, int grp, int n, const int32_t* ids, uint32_t ring,
                               strata::gpu::Stream cs) {
     strata::kernels::resident_plan(ids, n * (int) sh_.k, (int) sh_.k, res_layer, (int) sh_.n_expert, tier_.cache_base,
@@ -353,6 +478,78 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
             rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(layer), on);
         }
     };
+    // ---- the latent MoE: A reads the D stage's q8_1 rows (row = token*G + label), U projects each route back
+    // to the shell's width.  The window's resident / device-plan graphs are off for a latent pack (verify forces
+    // the host plan), so the ids the plan rewrite reads are the doorbell's mapped ones.
+    if (latent_) {
+        const int64_t ELL = lat_ELL_, G = lat_G_;
+        const size_t row_b = lat_fmt_ == 4 ? 18 : 34;
+        const size_t u_bytes = (size_t) G * (size_t) N * (size_t) (ELL / 32) * row_b;
+        const size_t lq_row = (size_t) (ELL / 32) * 36;
+        const auto& f = *fp;
+        const int32_t* labels = lat_labels_dev_ + (size_t) layer * (size_t) lay.n_expert;
+        const int32_t* ids = m_ids_ + (size_t) tb * K;
+        uint8_t* xlq = lat_xlq_ + (size_t) tb * G * lq_row;
+        uint8_t* ylq = lat_ylq_ + (size_t) tb * K * lq_row;
+        float* yl = hit_out;   // A's output: cap rows of ELL (the buffer is N >= ELL wide)
+        // the plan's activation rows: token*G + the expert's group label
+        latent_plan_rows(const_cast<int32_t*>(p_tok), p_dst, p_counts, ids, labels, lay.n_expert, tb, (int) G, (int) K,
+                         cs);
+        const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, ELL, lat_I_, f.up_type);
+        auto grouped_lat = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid) {
+            native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, xlq, hit_scratch_, yl, cs, grid);
+        };
+        try {
+            const bool fb = mode.fetch_side != nullptr && !mode.resident;
+            if (fb) {
+                if (!strata::gpu::stream_fork(cs, mode.fetch_side)) {
+                    err = std::string("moe window fetch branch: ") + strata::gpu::last_error();
+                    return false;
+                }
+                pcie_share(mode.fetch_side);
+            }
+            grouped_lat(p_ptr, p_start, p_counts, cap);
+            stamp(20);
+            if (!mode.resident) {
+                if (fb) {
+                    if (!strata::gpu::stream_join(cs, mode.fetch_side)) {
+                        err = std::string("moe window fetch branch: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                } else {
+                    pcie_share(cs);
+                }
+                stamp(21);
+                grouped_lat(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
+            }
+            stamp(22);
+            // the A outputs' q8_1 image, then U for the GPU's rows (hit_out, now H wide)
+            quantize_q8_1_rows(yl, cap, ELL, ylq, cs);
+            latent_u_grouped(lat_u_ + (size_t) layer * u_bytes, ylq, ids, labels, lay.n_expert, cap, (int) ELL, (int) N,
+                             hit_out, cs, lat_fmt_);
+            if (mode.resident || dp) {   // no CPU share: its rows are zeros
+                copy_or_zero_from_mapped(parts, ymiss, (long long) n * K * N, skip, ring, cs);
+            } else if (lat_u_gpu_) {
+                // the pool's q8_1 rows of h are in the mapped buffer (its U on the GPU, into parts; the GPU's own
+                // rows zeroed there, the hit path adds their U product)
+                if (!segmented_) wait_flag_ge(m_flag_, ring, cs);
+                stamp(23);
+                latent_u_matvec(lat_u_ + (size_t) layer * u_bytes, reinterpret_cast<const uint8_t*>(ymiss), ids, labels, p_dst,
+                                p_counts + 1, lay.n_expert, cap, (int) ELL, (int) N, (int) G, parts, cs, lat_fmt_);
+            } else {
+                if (!segmented_) wait_flag_ge(m_flag_, ring, cs);   // the CPU's H-wide contributions
+                stamp(23);
+                if (mode.rows_only)
+                    copy_rows_from_mapped(parts, ymiss, (int64_t) n * K, N, p_dst, p_counts + 1, cs);
+                else
+                    copy_from_mapped(parts, ymiss, (int64_t) n * K * N, cs);
+            }
+        } catch (const std::exception& e) {
+            err = "moe window, latent MoE layer " + std::to_string(layer) + ": " + e.what();
+            return false;
+        }
+        return true;
+    }
     try {
         // on a side branch beside the VRAM hits: the fetch waits on the link, the hits on the GPU (the fetch kernel
         // leaves the hits their work-groups)
