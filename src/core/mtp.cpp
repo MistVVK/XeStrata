@@ -231,7 +231,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
-    if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
+    if (max_t < 1 || max_t > strata::kernels::kVerifyNarrowT) { err = "mtp: max_t out of range"; return false; }
     if (shared != nullptr) {   // --batch-mtp: a slot's drafter on the main one's weights
         if (shared->device_ != device_ || shared->g_ != &g || shared->dense_ == nullptr || shared->experts_ == nullptr ||
             shared->rt_dir_ != rt_dir) {
@@ -1149,6 +1149,17 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, const More& more, int* n_drafts) {
     const OnDevice on_device(device_);
+    if (T > max_t_ && a >= 0 && a < T && T <= strata::kernels::kVerifyMaxT && !chain_live_) {
+        // A window wider than the draft layer's rows (a lookup's or DFlash2's window past 8, window_rows.hpp): the
+        // cells before the accepted row are caught up as a prompt's are (in batches of max_t rows), and the round
+        // drafts from the accepted row alone.  The rejected rows' cells are not caught up (the next round writes them
+        // first), as a round does without STRATA_MTP_CATCHUP_ALL.
+        const float* src = src_R_ != nullptr ? src_R_ : window_R_;
+        if (a == 0) return draft(1, tokens, p, 0, drafts, err, probs, more, n_drafts);
+        if (!prefill(src, tokens, a, p, err)) return false;
+        return draft_first(1, src + (size_t) a * (size_t) (g_->hc * g_->n_embd), tokens[a], p + a, drafts, err, probs,
+                           more, n_drafts);
+    }
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
     // the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected rows is not caught
@@ -1220,7 +1231,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!wait_step(0)) return false;
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
-    float pl[strata::kernels::kVerifyMaxT];   // the drafts' probabilities for `more`, where the caller keeps none
+    float pl[strata::kernels::kVerifyNarrowT];   // the drafts' probabilities for `more`, where the caller keeps none
     float* pr = probs != nullptr ? probs : pl;
     pr[0] = ((volatile float*) h_prob_)[0];
     int n = 1;

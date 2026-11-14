@@ -14,6 +14,7 @@
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/router_top10.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "parity_device.hpp"
 
@@ -124,7 +125,7 @@ int main() {
     const int N = 2048;
     for (const Cfg& c : cfgs) {
         int cfg_bad = 0, cases = 0;
-        for (int n = 1; n <= 8; ++n) {
+        for (int n = 1; n <= kVerifyMaxT; ++n) {   // (a window's rows, a wide window's included)
             std::vector<float> parts((size_t) n * c.k * N), w((size_t) n * c.k), sh((size_t) n * N);
             for (auto& v : parts) v = gauss(rng);
             for (auto& v : w) v = (float) (rng() % 1000) / 1000.0f;

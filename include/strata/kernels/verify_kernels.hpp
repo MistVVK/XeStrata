@@ -17,18 +17,25 @@
 // Everything that varies per window (token ids, `n_keep`) is read from DEVICE memory so the kernels can be captured.
 #pragma once
 
+#include "strata/kernels/window_limits.hpp"
+
 #include <cstdint>
 
 namespace strata::kernels {
 
-inline constexpr int kVerifyMaxT = 8;
+/// The most rows one verify / batch window holds (window_limits.hpp; whether a run goes past kVerifyNarrowT is
+/// core::window_rows_cap).  A window of up to kVerifyNarrowT rows runs the kernels it always ran.
+inline constexpr int kVerifyMaxT = kWindowMaxT;
 
 /// Per-row copies a window keeps to go back to (the plain engine's drafts): row t's copy goes to p[t] when t < n
-/// and p[t] is set.  The verify window's own protocol (verify, then commit) needs none.
-struct GdnRowCopies {
-    float* p[kVerifyMaxT] = {};
+/// and p[t] is set.  The verify window's own protocol (verify, then commit) needs none.  (N: the kernels take the
+/// narrow form for n <= kVerifyNarrowT, so a window of up to 8 rows passes them the argument it always did.)
+template <int N>
+struct GdnRowCopiesN {
+    float* p[N] = {};
     int n = 0;
 };
+using GdnRowCopies = GdnRowCopiesN<kVerifyMaxT>;
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, except with `commit` (one token, t_begin 0: a one-token window keeps its token), which
 /// leaves it as gdn_conv_commit with n_keep 1 would.  Bitwise `fused_gdn_conv_l2` per token.  `copies`: the history

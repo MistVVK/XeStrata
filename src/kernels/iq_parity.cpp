@@ -9,6 +9,7 @@
 // matrix-vector product within the activation rounding (a few 1e-3 relative).
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include "strata/core/runtime.hpp"
 
@@ -97,9 +98,37 @@ int main(int argc, char** argv) try {
                 den += std::fabs(acc);
             }
         const double mm_err = num / (den + 1e-30);
-        const bool ok = dq_err < 1e-6 && mm_err < 2e-2;
-        std::printf("%-8s type %2d %4d x %5d  dequant rel %.2e  mmvq rel %.2e  %s\n", nm, type, rows, cols, dq_err, mm_err,
-                    ok ? "ok" : "FAIL");
+        // a wide window's 16 columns in one call (the 9..16-column instances) against two calls of 8 (the instances a
+        // window of up to 8 rows takes), bit for bit
+        bool wide_same = true;
+        {
+            const int W = strata::kernels::kWindowMaxT, N8 = strata::kernels::kVerifyNarrowT;
+            std::vector<float> xw((size_t) W * cols);
+            for (auto& v : xw) v = nd(rng);
+            float* dxw = dev.alloc<float>(xw.size() * 4);
+            void* xqw = dev.alloc<uint8_t>((size_t) W * cols / 32 * 36);
+            float *dya = dev.alloc<float>((size_t) W * rows * 4), *dyb = dev.alloc<float>((size_t) W * rows * 4);
+            upload(dxw, xw.data(), xw.size() * 4);
+            strata::kernels::quantize_q8_1_rows(dxw, W, cols, xqw, s);
+            const size_t col_bytes = (size_t) cols / 32 * 36;
+            try {
+                strata::kernels::native_mmvq(type, dw, xqw, dya, cols, rows, W, s);
+                strata::kernels::native_mmvq(type, dw, xqw, dyb, cols, rows, N8, s);
+                strata::kernels::native_mmvq(type, dw, static_cast<uint8_t*>(xqw) + (size_t) N8 * col_bytes,
+                                             dyb + (size_t) N8 * rows, cols, rows, W - N8, s);
+            } catch (const std::exception& e) {
+                std::printf("%-8s mmvq 16 columns: %s\n", nm, e.what());
+                ++failures;
+                continue;
+            }
+            std::vector<float> ya((size_t) W * rows), yb((size_t) W * rows);
+            download(ya.data(), dya, ya.size() * 4);
+            download(yb.data(), dyb, yb.size() * 4);
+            wide_same = ya == yb;
+        }
+        const bool ok = dq_err < 1e-6 && mm_err < 2e-2 && wide_same;
+        std::printf("%-8s type %2d %4d x %5d  dequant rel %.2e  mmvq rel %.2e  16 columns %s  %s\n", nm, type, rows,
+                    cols, dq_err, mm_err, wide_same ? "= 8 + 8" : "DIFFER", ok ? "ok" : "FAIL");
         if (!ok) ++failures;
     }
     std::printf("iq_parity: %d failures\n", failures);

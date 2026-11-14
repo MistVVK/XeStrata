@@ -520,10 +520,12 @@ bool Verifier::set_allowed(const uint32_t* rows, int T, std::string& err) {
     if (le_ < g_->n_layers) return true;
     allowed_on_ = rows != nullptr;
     if (rows != nullptr) {
-        if (T < 1 || T > strata::kernels::kVerifyMaxT) { err = "grammar mask: window rows out of range"; return false; }
+        // (the mask's rows: the window's, at least the 8 a window always had)
+        const int cap_rows = std::max(max_t_, (int) strata::kernels::kVerifyNarrowT);
+        if (T < 1 || T > cap_rows) { err = "grammar mask: window rows out of range"; return false; }
         const OnDevice on_device(device_);
         const size_t row = (size_t) ((n_vocab_ + 31) / 32) * sizeof(uint32_t);
-        if (!constraint_upload(allowed_device_, rows, row * strata::kernels::kVerifyMaxT, row * (size_t) T)) {
+        if (!constraint_upload(allowed_device_, rows, row * (size_t) cap_rows, row * (size_t) T)) {
             err = "cannot upload the grammar's token masks"; return false;
         }
     }
@@ -562,7 +564,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
-    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
+    // (the CPU experts take a wider window than cpu::MAXT tokens as jobs of at most MAXT)
+    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT) {
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
@@ -622,8 +625,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
-              mapped((size_t) strata::kernels::kVerifyMaxT * strata::kernels::kNonfiniteBlocks * 4, (void**) &h_nf_,
-                     (void**) &m_nf_) &&
+              mapped((size_t) std::max(max_t, (int) strata::kernels::kVerifyNarrowT) *
+                         strata::kernels::kNonfiniteBlocks * 4,
+                     (void**) &h_nf_, (void**) &m_nf_) &&
               mapped((size_t) g.n_layers * T * K * 4, (void**) &h_route_, (void**) &m_route_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     {   // the routed experts' window (moe_window.hpp)
@@ -963,10 +967,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             }
             pending = false;
         }
+        // (in reads of at most kFusedGrMaxT rows: a wider window's rows in two, each row's arithmetic its own)
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+            for (int c0 = tb; c0 < te; c0 += kFusedGrMaxT) {
+            const int c1 = std::min(te, c0 + kFusedGrMaxT);
             FusedGrArgs fa[kFusedGrMaxT];
-            for (int t = tb; t < te; ++t) {
-                FusedGrArgs& a = fa[t - tb];
+            for (int t = c0; t < c1; ++t) {
+                FusedGrArgs& a = fa[t - c0];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = apply;
                 a.bo_prev = bo_ + t * N; a.inj_prev = inj_prev + t * HC;
                 a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
@@ -979,8 +986,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
+            fused_gr_read_multi(fa, c1 - c0, xn_ + (size_t) c0 * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+            }
         };
         gr_read_group(0, pending, inj2_, inj_);
         // the read wrote mixed's q8_1 into xq_ itself (STRATA_HC_Q8's 32-column up)
@@ -1269,30 +1277,35 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                         same = sx.kv_mode != 1 &&  // a streamed slot resolves its blocks before its attention
                                qsa_kv_format(sx) == qsa_kv_format(slot_ss(tb).qsa_states[qi]);
                     }
-                    // every slot's rows in one launch (upstream 7a9245b6c); auto times the scores' two forms
+                    // every slot's rows in one launch (upstream 7a9245b6c); auto times the scores' two forms.  A
+                    // launch takes kQsaRowsMax rows: a wider window's rows go in launches of that many
                     const core::Pick ar = core::pick_from_env("BATCH_ATTN_ROWS");
                     const bool one = same &&
                                      (ar == core::Pick::On ||
-                                      (ar == core::Pick::Auto && qsa_rows_pays(nrows, max_blocks_, s, cs)));
-                    if (one) {
+                                      (ar == core::Pick::Auto &&
+                                       qsa_rows_pays(std::min(nrows, kQsaRowsMax), max_blocks_, s, cs)));
+                    if (one)
+                    for (int c0 = tb; c0 < te; c0 += kQsaRowsMax) {
+                        const int c1 = std::min(te, c0 + kQsaRowsMax), cn = c1 - c0;
                         QsaScoreRows sr;
                         QsaAttnPoolsRows pr;
-                        sr.n = pr.n = nrows;
-                        for (int t = tb; t < te; ++t) {
+                        sr.n = pr.n = cn;
+                        for (int t = c0; t < c1; ++t) {
                             const QsaState& sx = slot_ss(t).qsa_states[qi];
-                            sr.pooled[t - tb] = sx.idx_pooled;
-                            sr.dead[t - tb] = sx.idx_dead;
-                            pr.p[t - tb] = qsa_attn_pools(sx);
+                            sr.pooled[t - c0] = sx.idx_pooled;
+                            sr.dead[t - c0] = sx.idx_dead;
+                            pr.p[t - c0] = qsa_attn_pools(sx);
                         }
-                        qsa_block_scores_rows(sr, qidx_ + (size_t) tb * IQ * ID, step_ + (size_t) tb * kStepCount, nrows,
-                                              max_blocks_, s, scores_ + (size_t) tb * max_blocks_, cs);
-                        qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + (size_t) tb * kStepCount, nrows,
-                                       max_blocks_, cap_, s, sel_ + (size_t) tb * cap_, cs);
-                        qsa_decode_attn_batch_rows(qcur_ + (size_t) tb * NH * HD, pr, sel_ + (size_t) tb * cap_,
-                                                   step_ + (size_t) tb * kStepCount, cap_, s,
-                                                   attn_scratch_ + (size_t) tb * attn_scratch_floats_,
-                                                   attn_ + (size_t) tb * NH * HD, nrows, cs);
-                    } else
+                        qsa_block_scores_rows(sr, qidx_ + (size_t) c0 * IQ * ID, step_ + (size_t) c0 * kStepCount, cn,
+                                              max_blocks_, s, scores_ + (size_t) c0 * max_blocks_, cs);
+                        qsa_block_topk(scores_ + (size_t) c0 * max_blocks_, step_ + (size_t) c0 * kStepCount, cn,
+                                       max_blocks_, cap_, s, sel_ + (size_t) c0 * cap_, cs);
+                        qsa_decode_attn_batch_rows(qcur_ + (size_t) c0 * NH * HD, pr, sel_ + (size_t) c0 * cap_,
+                                                   step_ + (size_t) c0 * kStepCount, cap_, s,
+                                                   attn_scratch_ + (size_t) c0 * attn_scratch_floats_,
+                                                   attn_ + (size_t) c0 * NH * HD, cn, cs);
+                    }
+                    else
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
                         const int32_t* step_t = step_ + (size_t) t * kStepCount;
@@ -1404,7 +1417,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
-                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs, (int) NE);
+                                      rr_stats_ != nullptr ? rr_stats_ + (n <= kVerifyMaxT ? 4 : 0) : nullptr, cs,
+                                      (int) NE);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (rt_replay_ && !batch_rec_) {   // STRATA_ROUTE_REPLAY: the dump's experts and weights for these rows (RouteTrace)
@@ -1565,16 +1579,20 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 err = "verify: the output_hc_* weights have the wrong engine forms";
                 return false;
             }
-            FusedGrArgs fa[kFusedGrMaxT];
-            for (int t = 0; t < T; ++t) {
-                fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
-                fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
-                fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
-                if (mix_q8) { fa[t].q8_down = (const uint8_t*) hd->hc_q8; fa[t].q8_up = (const uint8_t*) hu->hc_q8; }
-                fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
-            }
             try {
-                fused_gr_read_multi(fa, T, xn_, cs);
+                for (int c0 = 0; c0 < T; c0 += kFusedGrMaxT) {   // (reads of at most kFusedGrMaxT rows)
+                    const int c1 = std::min(T, c0 + kFusedGrMaxT);
+                    FusedGrArgs fa[kFusedGrMaxT];
+                    for (int t = c0; t < c1; ++t) {
+                        FusedGrArgs& a = fa[t - c0];
+                        a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
+                        a.w_norm = (const float*) hn->data; a.w_down = (const uint16_t*) hd->data;
+                        a.w_up = (const uint16_t*) hu->data; a.eps = EPS;
+                        if (mix_q8) { a.q8_down = (const uint8_t*) hd->hc_q8; a.q8_up = (const uint8_t*) hu->hc_q8; }
+                        a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC; a.mixed = head_mixed_ + t * N;
+                    }
+                    fused_gr_read_multi(fa, c1 - c0, xn_ + (size_t) c0 * HC * N, cs);
+                }
             } catch (const std::exception& e) {
                 err = std::string("verify head mixer: ") + e.what();
                 return false;
@@ -2225,8 +2243,8 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
 
 bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                          std::string& err) {
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = t;
+    int rows[strata::kernels::kVerifyMaxT] = {};
+    for (int t = 0; t < S && t < strata::kernels::kVerifyMaxT; ++t) rows[t] = t;
     return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
 }
 
@@ -2235,9 +2253,9 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     using namespace strata::kernels;
     if (rt_dump_ || rt_replay_) { err = "XESTRATA_ROUTE_DUMP / XESTRATA_ROUTE_REPLAY: one request at a time (no batch slots)"; return false; }
     // a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split, whose hand-off
-    // buffers hold kVerifyMaxT rows (a stage that hands rows on or takes them; upstream 48f2c47d)
+    // buffers hold kVerifyNarrowT rows (a stage that hands rows on or takes them; upstream 48f2c47d)
     // (STRATA_PIPED_MTP: set_handoff_rows holds more)
-    const int hand_rows = handoff_rows_ > 0 ? handoff_rows_ : (int) kVerifyMaxT;
+    const int hand_rows = handoff_rows_ > 0 ? handoff_rows_ : (int) kVerifyNarrowT;
     if (S < 1 || S > max_t_ || hbase < 0 || ((next_ != nullptr || lb_ > 0) && hbase + S > hand_rows)) {
         err = "verify: batch rows out of range (init_slots)";
         return false;
@@ -2425,8 +2443,8 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+    int rows[strata::kernels::kVerifyMaxT] = {};
+    for (int t = 0; t < S && t < strata::kernels::kVerifyMaxT; ++t) rows[t] = base + t;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     // the commit right behind the window: every row of a batch window is kept
     if (!strata::gpu::graph_launch(exec_bm_[batch_key(rows, S, base)], cs_) ||
@@ -2841,7 +2859,7 @@ void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
     nf_mask_ = 0;
     if (!nan_guard_on() || h_nf_ == nullptr || !last_stage()) return;   // (a stage without the head checks nothing)
     const volatile uint32_t* f = h_nf_;
-    for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t)
+    for (int t = 0; t < T && t < std::max(max_t_, (int) strata::kernels::kVerifyNarrowT); ++t)
         for (int b = 0; b < strata::kernels::kNonfiniteBlocks; ++b)
             if (f[t * strata::kernels::kNonfiniteBlocks + b] != 0) { nf_mask_ |= 1u << t; break; }
     const std::vector<long long>& inject = nan_inject_list();

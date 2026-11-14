@@ -3905,6 +3905,11 @@ def engine_args(cfg: dict) -> list[str]:
             args += ["--draft-model", str(cfg["draft_model"])]
         if cfg.get("draft_rule") and "--draft-rule" not in args:
             args += ["--draft-rule", str(cfg["draft_rule"])]
+    # "wide_window": "auto" (the engine's default), "off" or "on" - verify and batch windows of up to 16 rows
+    # (--wide-window; auto takes them where a run's drafter measures them or a batch has more than 8 slots)
+    wide = cfg.get("wide_window")
+    if wide in ("auto", "off", "on") and "--wide-window" not in args:
+        args += ["--wide-window", wide]
     # #533: the expert cache in segments (vram_elastic_on), so an image job, a vision encoder that starts with its
     # picture and POST /v1/vram can take VRAM and give it back; "vram_segment_mib" sets the segment size (the engine's
     # default: 512)
@@ -3937,7 +3942,21 @@ def conversation_cache_args(cfg: dict, args: list[str]) -> list[str]:
     return args + ["--conversation-cache-mib", str(v)]
 
 
-PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
+PARALLEL_MAX = 16     # the engine's batch window holds at most 16 rows (kWindowMaxT); --batch-mtp waves more through it
+PARALLEL_NARROW = 8   # ... and 8 (kVerifyNarrowT) when its wide windows are off
+
+
+def parallel_cap(args: list[str]) -> int:
+    """The most requests the engine's batch window takes together: 8 when the run's wide windows are off (the engine's
+    --wide-window off / 0, else XESTRATA_WIDE_WINDOW read as the engine reads it: a number that is 0), else 16.  The
+    config's "wide_window" is in `args` by now (engine_args adds --wide-window before the batch slots)."""
+    if "--wide-window" in args[:-1]:
+        return PARALLEL_NARROW if args[args.index("--wide-window") + 1] in ("off", "0") else PARALLEL_MAX
+    env = envvars.get("WIDE_WINDOW", "").strip()
+    if env in ("", "auto"):
+        return PARALLEL_MAX
+    m = re.match(r"[+-]?\d+", env)
+    return PARALLEL_MAX if m and int(m.group()) != 0 else PARALLEL_NARROW
 
 
 def parallel_args(cfg: dict, args: list[str]) -> list[str]:
@@ -3953,17 +3972,18 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
         if isinstance(n, bool) or n == autotune.AUTO:
             n = None
         elif n is not None and not isinstance(n, int):
-            print(f'[xestrata] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
-                  flush=True)
+            print(f'[xestrata] "parallel" must be a whole number of requests (2..{parallel_cap(args)}), not {n!r}: '
+                  "ignored", flush=True)
             n = None
         if isinstance(n, int) and n >= 2:
             # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / XESTRATA_BATCH_MTP=0 turn it off)
             env = envvars.get("BATCH_MTP", "")
             batch_mtp = "--batch-mtp" in args or env not in ("", "0") or (
                 "--mtp" in args and "--no-batch-mtp" not in args and env != "0")
-            if n > PARALLEL_MAX and not batch_mtp:
-                print(f'[xestrata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it '
-                      f"will use {PARALLEL_MAX}", flush=True)
+            cap = parallel_cap(args)
+            if n > cap and not batch_mtp:
+                print(f'[xestrata] "parallel": {n} - the engine runs at most {cap} requests together; it '
+                      f"will use {cap}", flush=True)
             out += ["--batch", str(n)]
     g = cfg.get("batch_groups")
     if "--batch-groups" not in args and (g == autotune.AUTO or (
