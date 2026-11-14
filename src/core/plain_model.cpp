@@ -31,6 +31,8 @@
 #include "strata/core/device.hpp"
 #include "strata/core/link_probe.hpp"
 #include "strata/core/split_predict.hpp"
+#include "strata/core/split_role.hpp"
+#include "strata/program/split_rules.hpp"
 #include "strata/core/expert_tier.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -75,6 +77,7 @@
 #include <numeric>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -696,6 +699,191 @@ bool PlainModel::split_auto_points(std::string& err) {
         std::fprintf(stderr, "xestrata plain: --layer-split auto: %s, %.1f GiB for experts, %.1f GB/s from the host: %lld "
                              "MoE layers\n", strata::gpu::device_name(split_devs_[(size_t) d]).c_str(),
                      room[(size_t) d] / 1073741824.0, link[(size_t) d] / 1e9, (long long) count[(size_t) d]);
+    return split_auto_role(err);
+}
+
+// The second GPU's role in --layer-split auto, as generate.cpp's (core/split_role.hpp): a stage of the split the
+// memory gave (split_auto_points), a helper expert cache beside the first GPU alone, or no second GPU at all.  The
+// windows are predicted from the same measured bandwidths and the profile, and the choice keeps the same margins
+// (XESTRATA_SPLIT_GAIN_PCT, XESTRATA_SPLIT_HELPER_GAIN_PCT): the prediction prices decode only, and the split reads a
+// prompt on both GPUs while the helper reads every layer on the first.  Needs --expert-profile, as generate.cpp's auto
+// does; without one the split by memory stands.  Two GPUs only; an explicit --expert-cache-deviceN stands too.
+bool PlainModel::split_auto_role(std::string& err) {
+    const int n = (int) split_devs_.size();
+    if (n != 2) return true;
+    if (opt_.expert_cache_remote[0] > 0 || opt_.expert_cache_remote[1] > 0 || opt_.expert_cache_remote[2] > 0) return true;
+    const ModelSpec& s = spec_;
+    const int64_t L = s.n_layer, E = s.n_expert, M = s.n_moe_layers();
+    if (M < 1 || E < 1 || opt_.profile.empty()) return true;
+    // the profile, its MoE layer indices read as the trunk's blocks (the prediction's layers are the blocks)
+    std::vector<std::pair<int32_t, int32_t>> prof;
+    int64_t pslots = 0;
+    std::string perr;
+    if (!read_expert_profile(opt_.profile, M, E, prof, pslots, perr)) {
+        std::fprintf(stderr, "xestrata plain: --layer-split auto: %s; the split by memory stands\n", perr.c_str());
+        return true;
+    }
+    for (auto& p : prof) p.first = (int32_t) (p.first + s.n_dense_lead);
+    // each block's bytes: its experts' (all E) and its dense ones; the head's
+    std::vector<uint64_t> blk_b((size_t) L, 0), exp_b((size_t) L, 0);
+    for (size_t i = 0; i < model_->size(); ++i)
+        for (const TensorInfo& ti : model_->shard(i).tensors()) {
+            if (ti.name.rfind("blk.", 0) != 0) continue;
+            const int64_t l = std::strtoll(ti.name.c_str() + 4, nullptr, 10);
+            if (l < 0 || l >= L) continue;
+            const uint64_t b = tensor_payload_bytes(ti);
+            blk_b[(size_t) l] += b;
+            if (ti.name.find("_exps.weight") != std::string::npos) exp_b[(size_t) l] += b;
+        }
+    uint64_t head = 0;
+    if (size_t at = 0; const TensorInfo* t = model_->find(head_name(), &at)) head = tensor_payload_bytes(*t);
+    std::vector<double> blob((size_t) L, 0.0);
+    std::vector<int64_t> dense_l((size_t) L, 0), kv_l((size_t) L, 0);
+    uint64_t dense_all = 0;
+    const int64_t nkv = std::max<int64_t>(1, s.n_head_kv.empty() ? 1 : *std::max_element(s.n_head_kv.begin(), s.n_head_kv.end()));
+    const int64_t chunk = std::max<int64_t>(opt_.prompt_chunk, opt_.max_t);
+    for (int64_t l = 0; l < L; ++l) {
+        blob[(size_t) l] = (double) exp_b[(size_t) l] / (double) E;
+        dense_l[(size_t) l] = (int64_t) (blk_b[(size_t) l] - exp_b[(size_t) l]);
+        dense_all += (uint64_t) dense_l[(size_t) l];
+        const int64_t cells = s.layer_swa(l) ? std::min<int64_t>(opt_.max_cells, s.swa_window + chunk) : opt_.max_cells;
+        kv_l[(size_t) l] = s.recurrent[(size_t) l]
+                               ? (int64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state +
+                                            (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4
+                               : cells * nkv * s.key_length * 2 * (opt_.kv_int8 ? 1 : 2);
+    }
+    // the measurements, per GPU (the first, then the second): free memory, read bandwidth, link, small-copy latency
+    std::vector<int64_t> free0((size_t) n), reserve((size_t) n);
+    std::vector<double> bw((size_t) n), link_gbps((size_t) n), side_ms((size_t) n);
+    const double cpu_bw = core::split_cpu_bandwidth();
+    const double rows = strata::env_get("SPLIT_ROWS") ? std::strtod(strata::env_get("SPLIT_ROWS"), nullptr) : 3.0;
+    const double hand_bytes = rows * (double) s.n_embd * sizeof(float);
+    for (int d = 0; d < n; ++d) {
+        const OnDevice on(split_devs_[(size_t) d]);
+        size_t f = 0, t = 0;
+        if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: a GPU's memory is unknown"; return false; }
+        free0[(size_t) d] = (int64_t) f;
+        reserve[(size_t) d] = (int64_t) (core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30));
+        bw[(size_t) d] = core::split_gpu_bandwidth(split_devs_[(size_t) d]);
+        link_gbps[(size_t) d] = std::max(0.0, probe_host_to_device_gbps());
+        const double copy_ms = core::probe_copy_latency_ms();
+        side_ms[(size_t) d] = link_gbps[(size_t) d] > 0.0 && copy_ms >= 0.0
+                                  ? copy_ms + hand_bytes / (link_gbps[(size_t) d] * 1e6) : 0.05;
+    }
+    const std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+    std::vector<int> order((size_t) n);
+    for (int d = 0; d < n; ++d) order[(size_t) d] = d;
+    auto capacity = [&](int i, int64_t lo, int64_t hi, bool last) -> int64_t {
+        if (hi < 0) hi = L;
+        int64_t w = 0;
+        for (int64_t l = lo; l < hi; ++l) w += dense_l[(size_t) l] + kv_l[(size_t) l];
+        return free0[(size_t) order[(size_t) i]] - reserve[(size_t) order[(size_t) i]] - w - (last ? (int64_t) head : 0);
+    };
+    const double mass_exp = strata::env_get("SPLIT_MASS_EXP") ? std::strtod(strata::env_get("SPLIT_MASS_EXP"), nullptr) : 0.8;
+    std::vector<double> mass(prof.size());
+    for (size_t r = 0; r < prof.size(); ++r) mass[r] = std::pow((double) r + 1.0, -mass_exp);
+    const bool mtp = opt_.spec >= 2 && model_->find("blk." + std::to_string(L) + ".nextn.eh_proj.weight") != nullptr;
+    core::SplitPrediction model;
+    model.layers = L;
+    model.profile = prof;
+    model.mass = mass;
+    model.gpu_bw = bw;
+    model.link_scale = link_scale;
+    model.side_ms = side_ms;
+    model.order = order;
+    model.capacity = capacity;
+    model.cost = [&](int64_t l) { return (int64_t) std::ceil(blob[(size_t) l]); };
+    model.blob_bytes = [&](int64_t l) { return blob[(size_t) l]; };
+    model.prompt_min = 0;
+    model.cpu_bw = cpu_bw;
+    model.rows = rows;
+    model.experts_per_row = (double) s.n_expert_used;
+    model.dense_layer = (double) dense_all / (double) L;
+    model.tail_keep = 1.0;   // the plain engine skips no route tail
+    model.head_bytes = (double) head;
+    model.drafts = mtp;
+    model.pipelined = false;
+    // the split the memory gave, and the first GPU alone
+    const core::SplitPredictionResult split_r = core::predict_layer_split(model, opt_.split_at);
+    const core::SplitPredictionResult alone_r = core::predict_layer_split(model, {});
+    const double split_ms = split_r.startable ? split_r.ms : 1e30;
+    const double alone_ms = alone_r.startable ? alone_r.ms : 1e30;
+    const bool alone_holds_all = alone_r.startable && alone_r.held == (int64_t) prof.size();
+    std::fprintf(stderr, "xestrata plain: --layer-split auto: %s alone would take %.1f ms per window (~%.1f%% of the "
+                         "routed mass cached%s)\n", strata::gpu::device_name(split_devs_[0]).c_str(), alone_r.ms,
+                 100.0 * alone_r.held_mass, alone_holds_all ? ", every profiled pair" : "");
+    // the second GPU as a helper expert cache
+    const char* role_env = strata::env_get("SPLIT_ROLE");
+    const std::string role = role_env != nullptr ? role_env : "";
+    const char* gain_env = strata::env_get("SPLIT_GAIN_PCT");
+    const double gain = (gain_env != nullptr ? std::strtod(gain_env, nullptr) : 5.0) / 100.0;
+    const bool helper_eligible = opt_.pipeline_windows <= 0 && opt_.batch_slots <= 0 && role != "split";
+    core::HelperCachePrediction hc;
+    if (helper_eligible) {
+        double submit_ms = 0.0, layer_ms = 0.0;
+        {
+            const OnDevice on(split_devs_[1]);
+            layer_ms = core::probe_helper_layer_ms(submit_ms);
+        }
+        if (layer_ms < 0.0) { layer_ms = 2.0 * side_ms[1]; submit_ms = 0.0; }
+        const double rt = layer_ms + (link_gbps[1] > 0.0 ? 2.0 * hand_bytes / (link_gbps[1] * 1e6) : 0.0);
+        core::HelperCacheInputs hi;
+        hi.layers = L;
+        hi.profile = prof;
+        hi.mass = mass;
+        hi.cost = model.cost;
+        hi.blob_bytes = model.blob_bytes;
+        hi.cap0 = std::max<int64_t>(capacity(0, 0, -1, true), 0);
+        hi.caph = free0[1] - ((int64_t) (512 + 256) << 20);
+        hi.bw0 = bw[0];
+        hi.bwh = bw[1];
+        hi.cpu_bw = cpu_bw;
+        hi.link_scale0 = link_scale[0];
+        hi.rows = rows;
+        hi.experts_per_row = (double) s.n_expert_used;
+        hi.dense_layer = model.dense_layer;
+        hi.tail_keep = model.tail_keep;
+        hi.head_bytes = (double) head;
+        hi.rt = rt;
+        hi.submit_ms = submit_ms;
+        hi.drafts = mtp;
+        hc = core::predict_helper_cache(hi);
+    }
+    const char* hgain_env = strata::env_get("SPLIT_HELPER_GAIN_PCT");
+    const double hgain = hgain_env != nullptr ? std::strtod(hgain_env, nullptr) / 100.0 : gain;
+    core::SplitRoleInputs ri;
+    ri.alone_ms = alone_ms;
+    ri.split_ms = split_ms;
+    ri.helper_ms = hc.ms;
+    ri.alone_holds_all = alone_holds_all;
+    ri.helper_held = hc.held;
+    ri.gain = gain;
+    ri.helper_gain = hgain;
+    ri.roles_helper = opt_.split_roles_helper;
+    ri.skip_if_fits = opt_.split_skip_if_fits;
+    ri.helper_eligible = helper_eligible;
+    ri.role = role;
+    const core::SplitRoleChoice choice = core::choose_split_role(ri);
+    if (helper_eligible)
+        std::fprintf(stderr, "xestrata plain: --layer-split auto: %s as a helper expert cache instead: %.1f ms per window "
+                             "(%lld more experts there, ~%.1f%% of the routed mass on the GPUs) against %.1f split -> %s\n",
+                     strata::gpu::device_name(split_devs_[1]).c_str(), hc.ms, (long long) hc.held, 100.0 * hc.kept_mass,
+                     split_ms, choice.helper_chosen ? "the helper" : "the split");
+    if (choice.role == core::SplitRole::SkipIfFits) {
+        std::fprintf(stderr, "xestrata plain: layer split skipped (--split-skip-if-fits): %s holds every one of the %zu "
+                             "profiled pairs - one GPU\n", strata::gpu::device_name(split_devs_[0]).c_str(), prof.size());
+        opt_.split_at.clear();
+    } else if (choice.role == core::SplitRole::Helper) {
+        opt_.expert_cache_remote[0] = (int) hc.held;
+        opt_.split_at.clear();
+        std::fprintf(stderr, "xestrata plain: --layer-split auto: the second GPU a helper expert cache (%lld experts)\n",
+                     (long long) hc.held);
+    } else if (choice.role == core::SplitRole::Alone) {
+        std::fprintf(stderr, "xestrata plain: --layer-split auto: %s alone (%.1f ms per window) - the second GPU's role is "
+                             "not predicted %.0f%% shorter (XESTRATA_SPLIT_GAIN_PCT, XESTRATA_SPLIT_ROLE)\n",
+                     strata::gpu::device_name(split_devs_[0]).c_str(), alone_ms, 100.0 * gain);
+        opt_.split_at.clear();
+    }
     return true;
 }
 

@@ -2300,6 +2300,8 @@ int main(int argc, char** argv) {
     shared.adapt_mib_clamp0 = true;
     shared.batch = &o.batch;
     shared.expert_cache_remote = o.expert_cache_remote.data();
+    shared.split_roles_helper = &o.split_roles_helper;
+    shared.split_skip_if_fits = &o.split_skip_if_fits;
     shared.pool_tasks = &o.pool_tasks;
     shared.pool_tasks_msg = "xestrata generate: --pool-tasks expects an integer in 0..4096 (0 = automatic)";
     shared.pool_tasks_strict = true;
@@ -2433,8 +2435,6 @@ int main(int argc, char** argv) {
    // applied at startup, before the runtime
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--split-order") o.split_order_given = std::strcmp(next("--split-order"), "as-given") == 0;
-        else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
-        else if (a == "--split-roles") o.split_roles_helper = std::strcmp(next("--split-roles"), "helper") == 0;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, (int) std::strtol(next("--mtp-max-t"), nullptr, 10));
         else if (a == "--mtp-hnorm") {

@@ -2473,8 +2473,13 @@ static void plain_usage(const std::string& arch) {
                  "  --cpu-threads N      --device cpu: the threads the forward takes (default: physical cores, subject to the CPU quota)\n"
                  "  --gpu-layers N       dense models: the first N blocks and the head on the GPU, the rest on the CPU\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
-                 "                       next those from K on, ..; auto: in proportion to each GPU's free memory\n"
-                 "  --split-device D[,D2..]  the later GPUs (engine numbers or PCI addresses; default the other cards)\n",
+                 "                       next those from K on, ..; auto: in proportion to each GPU's free memory, and\n"
+                 "                       with --expert-profile the second GPU a stage or a helper expert cache or none\n"
+                 "                       (the faster predicted decode window; docs/MULTIGPU.md)\n"
+                 "  --split-device D[,D2..]  the later GPUs (engine numbers or PCI addresses; default the other cards)\n"
+                 "  --split-roles any|helper  --layer-split auto: the second GPU a stage or a helper cache (any), or\n"
+                 "                       only a helper cache or none (helper)\n"
+                 "  --split-skip-if-fits  --layer-split auto: the first GPU alone when it holds every profiled expert\n",
                  arch.c_str());
 }
 
@@ -2592,6 +2597,8 @@ int plain_main(int argc, char** argv) {
     shared.batch_clamp0 = true;
     shared.expert_cache_remote = opt.expert_cache_remote.data();
     shared.expert_cache_remote_clamp0 = true;
+    shared.split_roles_helper = &opt.split_roles_helper;
+    shared.split_skip_if_fits = &opt.split_skip_if_fits;
     shared.pool_tasks = &opt.pool_tasks;
     shared.pool_tasks_msg = pool_tasks_msg.c_str();
     shared.prompt_cache_every = &cache.every;
