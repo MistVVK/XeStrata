@@ -11921,9 +11921,9 @@ int main(int argc, char** argv) {
                     return sl != strata::core::kNotResident && sl >= keep_from;
                 });
                 (void) cudaMemGetInfo(&f1, &tb);
-                // [DRAFT]: the owner words this line (par/OWNER-WORDING-1111.md, SPARK); only when pages were given back
+                // only when pages were given back
                 if (freed > 0)
-                    std::fprintf(stderr, "[DRAFT] strata serve: this GPU shares the system memory and holds every expert, so the "
+                    std::fprintf(stderr, "strata serve: this GPU shares the system memory and holds every expert, so the "
                                          "model file's cached copy of them is given back.\n");
                 const char* tr = std::getenv("STRATA_UMA_DROP_PAGES");   // 2: the numbers too (research)
                 if (tr != nullptr && tr[0] == '2')
@@ -17445,7 +17445,7 @@ int main(int argc, char** argv) {
                     }
             }
             if (reply_replaced)
-                std::fprintf(stderr, "[DRAFT] strata serve: conversation cache: the reply this request replaces is not parked (%lld "
+                std::fprintf(stderr, "strata serve: conversation cache: the reply this request replaces is not parked (%lld "
                                      "tokens past the turn checkpoint at %lld)\n", (long long) ((int64_t) live.size() - resume),
                              (long long) resume);
             // --conversation-cache-park-gain N: a park now would supersede the entry parked_prefix_tokens() reports (the copy
