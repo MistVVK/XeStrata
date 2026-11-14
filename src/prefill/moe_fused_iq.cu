@@ -3030,7 +3030,9 @@ bool dm_f16_used() { return g_dm16_used; }
 // when the prompt path handed over the FP16 input (p1a_input), the down rows go out as FP16 (want_dm_f16) and H has room for FP16 rows;
 // every other call, and every call with the switch off, runs as before.
 static const void* g_p1a_x16 = nullptr;
+#if defined(__HIPCC__)
 static size_t g_p1a_h_bytes = 0;
+#endif
 static bool g_p1a_used = false;
 bool p1a_wanted() {
 #if defined(__HIPCC__)
@@ -3053,7 +3055,11 @@ bool p1a_wanted() {
 }
 void p1a_input(const void* x16, size_t h_bytes) {
     g_p1a_x16 = p1a_wanted() ? x16 : nullptr;
+#if defined(__HIPCC__)
     g_p1a_h_bytes = g_p1a_x16 != nullptr ? h_bytes : 0;
+#else
+    (void) h_bytes;   // (g_p1a_h_bytes is read in the HIP-only P1A launch only)
+#endif
 }
 bool p1a_used() { return g_p1a_used; }
 #if defined(__HIPCC__)
