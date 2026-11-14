@@ -163,6 +163,7 @@ setup は、BIOS の割り当てをエキスパートの置き場（低 RAM モ�
 Strix Halo（gfx1151）は名前で見分け、Radeon 8060S / 8050S / 8040S を名前に出し、メモリが約 80 GB 以上なら UD-IQ4_XS を勧めます。
 GPU が使える共有のメモリを増やすのは、カーネルの起動の選択肢 `ttm.pages_limit` と `ttm.page_pool_size`（4 KiB のページの数）です。
 setup はホストの設定を変えません。
+Linux では、内蔵の Radeon が画面を描くとき（KFD のノードが統合 GPU のとき）、エンジンは nice +5 で起動し、デスクトップの compositor が CPU の持ち分を保ちます。`XESTRATA_ENGINE_NICE=N` で別の値にします（0 で切り、そのようなチップのない PC では常に 0）。
 エンジンは、内蔵 GPU の空きを、ランタイムが報告する値と、Linux が返せるメモリ（`MemAvailable`）から 6 GiB を引いた値の小さい方として数えます（upstream 004b15cd、`XESTRATA_UMA_HEADROOM_GIB` で 6 を変えられます）。
 エキスパートを RAM の予算で持つモデル（Unsloth の版）では、setup はエキスパートのキャッシュを `auto` でなく数で書きます（upstream #1715）。
 キャッシュと予算は同じ RAM を使うので、起動時の空きから決める `auto` は予算がまだ取っていない分まで数え、OS の分が残らなくなります。

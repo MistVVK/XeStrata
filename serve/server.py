@@ -1006,6 +1006,42 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) 
             "last_prompt": last.get("prompt_tokens") if last else None}
 
 
+def hip_igpu_present() -> bool:
+    """Linux AMD: whether a KFD GPU node is integrated — its node reports CPU cores (cpu_cores_count > 0), an APU that
+    shares the system RAM and usually draws the desktop.  The device's own report, not a gfx name (AGENTS.md).  False
+    off Linux or without the ROCm driver."""
+    try:
+        nodes = sorted(int(n) for n in os.listdir("/sys/class/kfd/kfd/topology/nodes") if n.isdigit())
+    except OSError:
+        return False
+    for n in nodes:
+        try:
+            with open(f"/sys/class/kfd/kfd/topology/nodes/{n}/properties") as fh:
+                props = dict(line.split() for line in fh if len(line.split()) == 2)
+            if int(props.get("simd_count", "0")) > 0 and int(props.get("cpu_cores_count", "0")) > 0:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def engine_nice(env: dict | None = None, platform: str | None = None) -> int:
+    """Linux only: the nice value the engine starts with (upstream v0.2.13.1's engine_nice, a sync gap).  The engine's
+    CPU pool spins on every physical core but one and its host thread on another; with the desktop drawn by a built-in
+    Radeon (an APU) the compositor competes for the CPU and the screen reads as frozen.  +5 gives the desktop its share
+    and costs nothing when nothing else runs.  XESTRATA_ENGINE_NICE=N sets it (0 = off, also for any PC without such a
+    chip).  Not on Windows / macOS.  The integrated judgement is the KFD node's cpu_cores_count, not a gfx name list."""
+    if not (platform or sys.platform).startswith("linux"):
+        return 0
+    asked = envvars.get("ENGINE_NICE", env=env)
+    if asked is not None and str(asked).strip() != "":
+        try:
+            return max(0, min(19, int(str(asked).strip())))
+        except ValueError:
+            return 0
+    return 5 if hip_igpu_present() else 0
+
+
 class StrataEngine:
     """The resident engine: `xestrata-engine --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -1093,6 +1129,10 @@ class StrataEngine:
         pin: dict[str, Any] = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+        nice = engine_nice(env)                          # Linux with a built-in Radeon: the desktop keeps its share of the CPU
+        if nice:
+            say_nice = pin.get("preexec_fn")
+            pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
         if fds:
             pin["pass_fds"] = tuple(fds)
         spawned_at = time.monotonic()

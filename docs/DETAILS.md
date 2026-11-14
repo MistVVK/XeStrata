@@ -184,6 +184,7 @@ Setup counts the carve-out as room for experts (the low-RAM mode) and the carve-
 It tells Strix Halo (gfx1151) apart by name, names the Radeon 8060S / 8050S / 8040S, and recommends UD-IQ4_XS from about 80 GB of memory.
 The kernel's boot options `ttm.pages_limit` and `ttm.page_pool_size` (in 4 KiB pages) give the GPU more of the shared memory.
 Setup changes no host setting.
+On Linux the engine starts at nice +5 when a built-in Radeon draws the desktop (an integrated KFD node), so the compositor keeps its share of the CPU; `XESTRATA_ENGINE_NICE=N` sets another value (0 turns it off, and it is off on any PC without such a chip).
 The engine counts an integrated GPU's free memory as the smaller of what its runtime reports and what Linux can give back (`MemAvailable`) less 6 GiB (upstream 004b15cd; `XESTRATA_UMA_HEADROOM_GIB` changes the 6).
 For the models that keep a RAM budget of their experts (Unsloth's), setup writes the expert cache as a number, not `auto` (upstream #1715).
 The cache and the budget draw on the same RAM, so `auto`, sized from the memory free at start, would count what the budget has not taken yet and leave the OS nothing.
