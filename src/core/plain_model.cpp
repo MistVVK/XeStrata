@@ -827,6 +827,34 @@ bool PlainModel::load_arch(std::string& err) {
     return spec_.arch == ModelArch::Glm5Next ? load_glm5(err) : load_qwen(err);
 }
 
+// --kv not given: the FP16 cache unless it leaves blocks off the GPU (whose CPU forward costs far more than the
+// cache's rounding); then the first of INT8, tcq5 and tcq4 (heads of 256, not PLaMo 3's: kv_tcq.hpp) with which the
+// GPU holds them all, else the smallest.  In this order each rounds the cache a little more than the one before.
+// The trellis forms are only taken within kTcqAutoMaxCells: past that context their kl_median crosses the quality
+// line (kv_tcq.hpp), so the pick keeps INT8 rather than round the cache below the line.  The dense and the MoE pick
+// share this, so the line is the same rule wherever the cache is chosen automatically; an explicit --kv is untouched.
+template <typename Fits, typename KvRow>
+void PlainModel::auto_kv_format(Fits fits, KvRow kv_row, int64_t nl) {
+    if (!(opt_.kv_auto && opt_.kv_tcq == 0 && opt_.kv_q4 == 0 && !opt_.kv_int8)) return;
+    const int64_t f16 = fits(kv_row(false, 0, 0), nullptr);
+    if (f16 >= nl) return;   // FP16 holds every block: keep it
+    const ModelSpec& s = spec_;
+    const bool tc_ok = s.key_length == 256 && s.arch != ModelArch::Plamo3;
+    const bool tc_line = opt_.max_cells <= k::kTcqAutoMaxCells;
+    struct Pick { bool i8; int tcq; const char* name; };
+    const Pick picks[] = {{true, 0, "int8"}, {false, 5, "tcq5"}, {false, 4, "tcq4"}};
+    const Pick* take = &picks[0];
+    for (const Pick& p : picks) {
+        if (p.tcq != 0 && (!tc_ok || !tc_line)) continue;
+        take = &p;
+        if (fits(kv_row(p.i8, 0, p.tcq), nullptr) == nl) break;
+    }
+    opt_.kv_int8 = take->i8;
+    opt_.kv_tcq = take->tcq;
+    std::fprintf(stderr, "xestrata plain: the K/V cache in %s (with FP16's, the GPU would hold %lld of the %lld "
+                         "blocks; --kv fp16 keeps it)\n", take->name, (long long) f16, (long long) nl);
+}
+
 // The points from the GPUs' memory and links.  Each GPU's share of the MoE layers is in proportion to the memory it has
 // for them (its free memory, less its reserve, and the head on the last), so that each GPU's tier holds about the same
 // part of its layers' experts; except a GPU whose link from the host is less than half the first's: it takes only the
@@ -922,27 +950,7 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
             for (int64_t l = 0; l < nl; ++l) *bytes += block[(size_t) l] + kv_cells[(size_t) l] * row;
         return n;
     };
-    // --kv not given: the FP16 cache unless it leaves blocks off the GPU (whose CPU forward costs far more than the
-    // cache's rounding); then the first of INT8, tcq5 and tcq4 (heads of 256, not PLaMo 3's: kv_tcq.hpp) with which the
-    // GPU holds them all, else the smallest.  In this order each rounds the cache a little more than the one before
-    if (opt_.kv_auto && opt_.kv_tcq == 0 && opt_.kv_q4 == 0 && !opt_.kv_int8) {
-        const int64_t f16 = fits(kv_row(false, 0, 0), nullptr);
-        if (f16 < nl) {
-            const bool tc_ok = s.key_length == 256 && s.arch != ModelArch::Plamo3;
-            struct Pick { bool i8; int tcq; const char* name; };
-            const Pick picks[] = {{true, 0, "int8"}, {false, 5, "tcq5"}, {false, 4, "tcq4"}};
-            const Pick* take = &picks[0];
-            for (const Pick& p : picks) {
-                if (p.tcq != 0 && !tc_ok) continue;
-                take = &p;
-                if (fits(kv_row(p.i8, 0, p.tcq), nullptr) == nl) break;
-            }
-            opt_.kv_int8 = take->i8;
-            opt_.kv_tcq = take->tcq;
-            std::fprintf(stderr, "xestrata plain: the K/V cache in %s (with FP16's, the GPU would hold %lld of the %lld "
-                                 "blocks; --kv fp16 keeps it)\n", take->name, (long long) f16, (long long) nl);
-        }
-    }
+    auto_kv_format(fits, kv_row, nl);
     uint64_t total = 0;
     const int64_t fit = fits(kv_row(opt_.kv_int8, opt_.kv_q4, opt_.kv_tcq), &total);
     if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
@@ -1492,6 +1500,50 @@ bool PlainModel::load_qwen(std::string& err) {
         std::fprintf(stderr, "xestrata plain: KV streaming: the last %lld cells a layer in VRAM, the rest in RAM "
                              "(~%.2f GiB of host copy)\n", (long long) kv_resident_cells_,
                      (double) kv_host_bytes() / 1073741824.0);
+    // --kv not given, a MoE model: the same auto pick as the dense one (auto_kv_format), the same quality line
+    // (kTcqAutoMaxCells).  The K/V is allocated before the experts' tier (open_experts takes what VRAM is left), so the
+    // pick sizes the cache against the free VRAM less a reserve and the tier's estimate: the experts it would hold,
+    // capped at half the free VRAM so a large expert set (read from RAM) does not push the cache below FP16.
+    if (!dense_ && root_ == this && !opt_.encoder && opt_.kv_auto && opt_.kv_tcq == 0 && opt_.kv_q4 == 0 &&
+        !opt_.kv_int8) {
+        size_t f = 0, t = 0;
+        std::vector<int64_t> moe_blocks;
+        for (int64_t l = 0; l < s.n_layer; ++l)
+            if (s.layer_routes(l)) moe_blocks.push_back(l);
+        if (model_mtp_) moe_blocks.push_back(s.n_layer);
+        if (strata::gpu::mem_info(&f, &t) &&
+            expert_layout_from_gguf(opt_.gguf, moe_blocks, s.n_expert, s.n_embd, s.n_ff_exp, err)) {
+            const auto& lay = k::cpu::expert_layout();
+            const uint64_t free_b = counted_free(f, f, opt_.vram_free_mib);
+            const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
+                                     : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
+            const uint64_t tier_b = std::min<uint64_t>(lay.total + lay.max_blob, free_b / 2);
+            const uint64_t kv_room = free_b > reserve + tier_b ? free_b - reserve - tier_b : 0;
+            const int hd = qs.head_dim;
+            auto kv_row = [&](bool i8, int q4, int tcq) -> uint64_t {
+                const uint64_t i8_row = (uint64_t) hd + (uint64_t) hd / k::KV_Q8_GROUP * 2;
+                if (tcq != 0) return 2 * k::kv_tcq_bytes_per_head(hd, tcq);
+                if (q4 == 1) return 2 * k::kv_q4_bytes_per_head(hd);
+                if (q4 == 2) return i8_row + k::kv_q4_bytes_per_head(hd);
+                return i8 ? 2 * i8_row : 4 * (uint64_t) hd;
+            };
+            auto fits = [&](uint64_t row, uint64_t* bytes) -> int64_t {
+                uint64_t kv = 0;
+                for (int64_t i = 0; i < n_attn; ++i) {
+                    bool mine = has_mtp_ && i == mtp_.attn;
+                    for (int64_t l = lb_; l < le_ && !mine; ++l) mine = blocks_[(size_t) l].attn == i;
+                    if (!mine || (opt_.encoder && i > 0)) continue;
+                    const int64_t cells = kv_streamed((size_t) i) ? (int64_t) kv_stream_slots_ * qs.page_size
+                                        : ringed((size_t) i) ? std::min<int64_t>(opt_.max_cells, ring_pages_ * qs.page_size)
+                                        : opt_.max_cells;
+                    kv += (uint64_t) cells * (uint64_t) qs.n_head_kv * row;
+                }
+                if (bytes != nullptr) *bytes = kv;
+                return kv <= kv_room ? n_attn : 0;   // the whole cache on the GPU, or the pick rounds it
+            };
+            auto_kv_format(fits, kv_row, n_attn);
+        }
+    }
     // the decode attention's form for this GPU (an fp16 cache), timed before any graph is recorded and before the cache
     // takes its VRAM (an encoder does not decode)
     if (!opt_.kv_int8 && opt_.kv_q4 == 0 && opt_.kv_tcq == 0 && !opt_.encoder) {
