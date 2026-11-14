@@ -17,6 +17,14 @@
 // 6,978 or more; its one smaller split (10,100 as 2 x 5,050) was 1.009.  So with a configured chunk of kEqualMinApplies
 // or more, an equal chunk under kEqualMinChunk keeps today's cut; a smaller configured chunk keeps the rule as before.
 //
+// Two chunks take a lower minimum (kEqualMinChunk2).  Equal cut against today's, prompt ms, by equal chunk:
+//   RTX 4090 24 GB, IQ3_S, chunk 8,192 (pod, 11-14): two chunks 4,140: 1.34, 4,224: 1.25, 4,596: 1.15, 5,596: 1.01,
+//     5,725: 0.938, 5,950: 0.938, 6,125: 0.977; three chunks 5,628: 1.13, 5,717: 1.111, 5,933: 1.084, 6,133: 1.058,
+//     6,667: 0.98; four chunks of 8,000: 0.986.
+//   RTX 5070 12 GB, Q2_0 plain pack, chunk 10,496 (11-14): two chunks 5,250: 1.04, 5,750: 0.83, 6,100: 0.86.
+// So two chunks take the equal cut from 5,700 tokens each, three or more from 6,144.  Both values are measured on these
+// two cards; they are not a model.
+//
 // The rule applies where a segment's chunk is chosen (generate.cpp: the serve lend and generate's prompt) and only on
 // one GPU: a layer split keeps today's cut (prefill.cpp pipeline_chunk: evening out a short tail added a full pass
 // over the experts there, two RTX 4090: 25 % slower).  STRATA_PREFILL_EQUAL=0 keeps today's cut everywhere;
@@ -51,11 +59,17 @@ constexpr int64_t today_chunk(int64_t tokens, int64_t max_chunk) {
     return rounded < max_chunk ? rounded : max_chunk;
 }
 
-/// The shortest equal chunk taken with a configured chunk of kEqualMinApplies or more (see the top of this file).
+/// The shortest equal chunk taken with a configured chunk of kEqualMinApplies or more (see the top of this file):
+/// kEqualMinChunk2 when the equal cut has exactly two chunks, kEqualMinChunk for three or more.
 inline constexpr int64_t kEqualMinChunk = 6144;
+inline constexpr int64_t kEqualMinChunk2 = 5700;
 inline constexpr int64_t kEqualMinApplies = 8192;
-constexpr bool short_equal(int64_t per, int64_t max_chunk) {
-    return max_chunk >= kEqualMinApplies && per < kEqualMinChunk;
+constexpr int64_t equal_min_chunk(int64_t n) {
+    return n == 2 ? kEqualMinChunk2 : kEqualMinChunk;
+}
+/// `per`: the equal chunk; `n`: the number of chunks of the equal cut.
+constexpr bool short_equal(int64_t per, int64_t n, int64_t max_chunk) {
+    return max_chunk >= kEqualMinApplies && per < equal_min_chunk(n);
 }
 
 /// The number of chunks a segment of `tokens` is read in at chunk `chunk` (prefill.cpp run_impl: c0 += C).
@@ -90,18 +104,18 @@ constexpr int64_t equal_chunk(int64_t tokens, int64_t max_chunk, int64_t floor) 
     const int64_t per = tokens / n + (tokens % n != 0);
     const int64_t last = tokens - (n - 1) * per;
     if (per > max_chunk || last < floor || last <= 0) return plain;
-    if (short_equal(per, max_chunk)) return plain;
+    if (short_equal(per, n, max_chunk)) return plain;
     return per;
 }
 
-/// The equal chunk that only the kEqualMinChunk condition turned down (today's cut was handed back for it), 0 otherwise.
+/// The equal chunk that only the kEqualMinChunk / kEqualMinChunk2 condition turned down (today's cut was handed back for it), 0 otherwise.
 constexpr int64_t declined_equal(int64_t tokens, int64_t max_chunk, int64_t floor) {
     if (tokens <= max_chunk || max_chunk <= 0) return 0;
     const int64_t n = chunk_count(tokens, max_chunk);
     const int64_t per = tokens / n + (tokens % n != 0);
     const int64_t last = tokens - (n - 1) * per;
     if (per > max_chunk || last < floor || last <= 0) return 0;
-    return short_equal(per, max_chunk) ? per : 0;
+    return short_equal(per, n, max_chunk) ? per : 0;
 }
 
 /// Today's cut was handed back for a short equal chunk (declined_equal() > 0), but its loan does not fit while the equal
