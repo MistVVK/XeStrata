@@ -160,5 +160,2806 @@
       }
     ]
   },
+  "sm_75": {
+    "measured_with": "Build cuda_12.8.r12.8/compiler.35538042_0",
+    "instances": [
+      {
+        "name": "q36k::k_route_group<false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "q36k::k_route_group<true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::route_resident_k",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::attn_chunk_kernel<0, true, false, false>",
+        "stack": 400,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::attn_chunk_kernel<1, true, false, false>",
+        "stack": 384,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::attn_chunk_kernel<2, true, false, false>",
+        "stack": 384,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::attn_chunk_kernel<3, true, false, false>",
+        "stack": 384,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::attn_chunk_slots_kernel<0, true>",
+        "stack": 384,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::attn_chunk_slots_kernel<1, true>",
+        "stack": 400,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::attn_chunk_slots_kernel<2, true>",
+        "stack": 384,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::attn_chunk_slots_kernel<3, true>",
+        "stack": 384,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::block_topk_reg_kernel<33>",
+        "stack": 96,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::copy_kernel",
+        "stack": 88,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::dequant_gu_kernel",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::dequant_kernel<11, float, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::dequant_kernel<11, float, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::dequant_kernel<11, strata::kernels::{anonymous}::H16, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::dequant_kernel<11, strata::kernels::{anonymous}::H16, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::dequant_kernel<11, unsigned short, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::dequant_kernel<11, unsigned short, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::dequant_kernel<14, unsigned short, true>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_down_kernel<20, 2>",
+        "stack": 72,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_down_kernel<20, 4>",
+        "stack": 280,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_down_kernel<42, 4>",
+        "stack": 168,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<16, 1, 4>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<16, 2, 4>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<17, 1, 4>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<17, 2, 4>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<18, 1, 4>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<18, 2, 4>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<21, 1, 4>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<21, 2, 4>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<22, 1, 4>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::expdec_gu_kernel<22, 2, 4>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::gdn_step_commit_kernel<true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::gemm4_rows_kernel<4, 1, 8>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::gemm4_rows_kernel<4, 2, 4>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::gemm8_kernel<2, true, 4>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::gemm8_kernel<4, true, 4>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::gr_down_q8_kernel<4>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::hcp::persist_kernel<1, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::hcp::persist_kernel<5, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::hcp::persist_kernel<6, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<13, false, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<13, true, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<144, false, true>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<144, true, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<144, true, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<146, false, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<146, true, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<146, true, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<147, false, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<147, true, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<148, false, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<148, true, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<149, false, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<149, true, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<20, false, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<20, true, false>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<23, false, false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<23, true, false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<40, false, false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<40, true, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<42, false, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<42, true, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<8, false, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_down_multi_kernel<8, true, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<12, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<12, false, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<13, false, false>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<13, false, true>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<144, false, false>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<144, false, true>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<144, true, false>",
+        "stack": 96,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<144, true, true>",
+        "stack": 176,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<145, false, false>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<145, false, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<145, true, false>",
+        "stack": 96,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<145, true, true>",
+        "stack": 144,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<147, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<147, false, true>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<148, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<148, false, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<149, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<149, false, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<16, false, false>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<16, false, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<16, true, false>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<16, true, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<17, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<17, false, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<17, true, false>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<17, true, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<18, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<18, false, true>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<18, true, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<18, true, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<21, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<21, false, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<21, true, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<21, true, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<22, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<22, false, true>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<22, true, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<22, true, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<23, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<23, false, true>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<29, false, false>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<29, false, true>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<29, true, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<29, true, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<40, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<40, false, true>",
+        "stack": 96,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<42, false, false>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<42, false, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<8, false, false>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_multi_kernel<8, false, true>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_swiglu_kernel<21, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_gu_swiglu_kernel<21, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 1, 2, 2, 4, true>",
+        "stack": 120,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 1, 2, 2, 5, true>",
+        "stack": 328,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 1, 4, 0, 4, false>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 1, 4, 0, 4, true>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 1, 4, 0, 5, true>",
+        "stack": 224,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 1, 4, 2, 4, true>",
+        "stack": 800,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 1, 4, 2, 5, true>",
+        "stack": 928,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 2, 2, 0, 5, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 2, 2, 2, 4, true>",
+        "stack": 208,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 2, 2, 2, 5, true>",
+        "stack": 344,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 2, 4, 0, 4, false>",
+        "stack": 216,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 2, 4, 0, 4, true>",
+        "stack": 216,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 2, 4, 0, 5, true>",
+        "stack": 352,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 2, 4, 2, 4, true>",
+        "stack": 864,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 2, 4, 2, 5, true>",
+        "stack": 960,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 1, 0, 5, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 1, 2, 5, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 2, 0, 4, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 2, 0, 4, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 2, 0, 5, true>",
+        "stack": 136,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 2, 2, 4, true>",
+        "stack": 264,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 2, 2, 5, true>",
+        "stack": 456,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 4, 0, 4, false>",
+        "stack": 336,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 4, 0, 4, true>",
+        "stack": 336,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 4, 0, 5, true>",
+        "stack": 464,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 4, 2, 4, true>",
+        "stack": 936,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 3, 4, 2, 5, true>",
+        "stack": 1064,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 1, 2, 5, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 2, 0, 4, false>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 2, 0, 4, true>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 2, 0, 5, true>",
+        "stack": 176,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 2, 2, 4, true>",
+        "stack": 304,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 2, 2, 5, true>",
+        "stack": 512,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 4, 0, 4, false>",
+        "stack": 432,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 4, 0, 4, true>",
+        "stack": 440,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 4, 0, 5, true>",
+        "stack": 592,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 4, 2, 4, true>",
+        "stack": 984,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 4, 4, 2, 5, true>",
+        "stack": 1184,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 5, 1, 2, 5, true>",
+        "stack": 88,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 5, 2, 0, 4, false>",
+        "stack": 128,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 5, 2, 0, 4, true>",
+        "stack": 112,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 5, 2, 0, 5, true>",
+        "stack": 248,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 5, 2, 2, 4, true>",
+        "stack": 392,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 5, 2, 2, 5, true>",
+        "stack": 536,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 6, 1, 2, 4, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 6, 1, 2, 5, true>",
+        "stack": 120,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 6, 2, 0, 4, false>",
+        "stack": 144,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 6, 2, 0, 4, true>",
+        "stack": 152,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 6, 2, 0, 5, true>",
+        "stack": 280,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 6, 2, 2, 4, true>",
+        "stack": 408,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 6, 2, 2, 5, true>",
+        "stack": 560,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 1, 0, 4, false>",
+        "stack": 88,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 1, 0, 4, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 1, 0, 5, true>",
+        "stack": 88,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 1, 2, 4, true>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 1, 2, 5, true>",
+        "stack": 208,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 2, 0, 4, false>",
+        "stack": 160,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 2, 0, 4, true>",
+        "stack": 176,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 2, 0, 5, true>",
+        "stack": 296,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 2, 2, 4, true>",
+        "stack": 456,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 7, 2, 2, 5, true>",
+        "stack": 648,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 8, 1, 0, 4, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 8, 1, 0, 5, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 8, 1, 2, 4, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 8, 1, 2, 5, true>",
+        "stack": 152,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 8, 2, 0, 4, false>",
+        "stack": 240,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 8, 2, 0, 4, true>",
+        "stack": 216,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 8, 2, 0, 5, true>",
+        "stack": 376,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 8, 2, 2, 4, true>",
+        "stack": 536,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlIQ4XS, 8, 2, 2, 5, true>",
+        "stack": 704,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 1, 2, 2, 5, true>",
+        "stack": 192,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 1, 4, 0, 4, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 1, 4, 0, 4, true>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 1, 4, 0, 5, true>",
+        "stack": 240,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 1, 4, 2, 4, true>",
+        "stack": 688,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 1, 4, 2, 5, true>",
+        "stack": 824,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 2, 2, 2, 4, true>",
+        "stack": 72,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 2, 2, 2, 5, true>",
+        "stack": 304,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 2, 4, 0, 4, false>",
+        "stack": 216,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 2, 4, 0, 4, true>",
+        "stack": 176,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 2, 4, 0, 5, true>",
+        "stack": 456,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 2, 4, 2, 4, true>",
+        "stack": 800,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 2, 4, 2, 5, true>",
+        "stack": 936,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 1, 2, 5, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 2, 0, 4, true>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 2, 0, 5, true>",
+        "stack": 88,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 2, 2, 4, true>",
+        "stack": 176,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 2, 2, 5, true>",
+        "stack": 336,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 4, 0, 4, false>",
+        "stack": 296,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 4, 0, 4, true>",
+        "stack": 352,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 4, 0, 5, true>",
+        "stack": 504,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 4, 2, 4, true>",
+        "stack": 824,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 3, 4, 2, 5, true>",
+        "stack": 968,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 1, 2, 5, true>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 2, 0, 4, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 2, 0, 4, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 2, 0, 5, true>",
+        "stack": 152,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 2, 2, 4, true>",
+        "stack": 232,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 2, 2, 5, true>",
+        "stack": 360,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 4, 0, 4, false>",
+        "stack": 440,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 4, 0, 4, true>",
+        "stack": 408,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 4, 0, 5, true>",
+        "stack": 552,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 4, 2, 4, true>",
+        "stack": 912,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 4, 4, 2, 5, true>",
+        "stack": 1048,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 5, 1, 0, 4, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 5, 1, 0, 5, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 5, 1, 2, 4, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 5, 1, 2, 5, true>",
+        "stack": 72,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 5, 2, 0, 4, false>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 5, 2, 0, 4, true>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 5, 2, 0, 5, true>",
+        "stack": 200,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 5, 2, 2, 4, true>",
+        "stack": 288,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 5, 2, 2, 5, true>",
+        "stack": 416,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 6, 1, 0, 4, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 6, 1, 2, 4, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 6, 1, 2, 5, true>",
+        "stack": 96,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 6, 2, 0, 4, false>",
+        "stack": 144,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 6, 2, 0, 4, true>",
+        "stack": 144,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 6, 2, 0, 5, true>",
+        "stack": 256,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 6, 2, 2, 4, true>",
+        "stack": 328,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 6, 2, 2, 5, true>",
+        "stack": 456,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 1, 0, 4, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 1, 0, 4, true>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 1, 0, 5, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 1, 2, 4, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 1, 2, 5, true>",
+        "stack": 136,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 2, 0, 4, false>",
+        "stack": 168,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 2, 0, 4, true>",
+        "stack": 184,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 2, 0, 5, true>",
+        "stack": 320,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 2, 2, 4, true>",
+        "stack": 376,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 7, 2, 2, 5, true>",
+        "stack": 504,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 1, 0, 4, false>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 1, 0, 4, true>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 1, 0, 5, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 1, 2, 4, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 1, 2, 5, true>",
+        "stack": 128,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 2, 0, 4, false>",
+        "stack": 192,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 2, 0, 4, true>",
+        "stack": 224,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 2, 0, 5, true>",
+        "stack": 352,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 2, 2, 4, true>",
+        "stack": 400,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ4K, 8, 2, 2, 5, true>",
+        "stack": 520,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 1, 2, 2, 4, true>",
+        "stack": 184,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 1, 2, 2, 5, true>",
+        "stack": 432,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 1, 4, 0, 4, false>",
+        "stack": 176,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 1, 4, 0, 4, true>",
+        "stack": 200,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 1, 4, 0, 5, true>",
+        "stack": 424,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 1, 4, 2, 4, true>",
+        "stack": 1008,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 1, 4, 2, 5, true>",
+        "stack": 1144,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 2, 1, 2, 5, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 2, 2, 0, 5, true>",
+        "stack": 72,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 2, 2, 2, 4, true>",
+        "stack": 288,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 2, 2, 2, 5, true>",
+        "stack": 464,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 2, 4, 0, 4, false>",
+        "stack": 368,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 2, 4, 0, 4, true>",
+        "stack": 352,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 2, 4, 0, 5, true>",
+        "stack": 536,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 2, 4, 2, 4, true>",
+        "stack": 1056,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 2, 4, 2, 5, true>",
+        "stack": 1192,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 1, 0, 5, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 1, 2, 4, true>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 1, 2, 5, true>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 2, 0, 4, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 2, 0, 5, true>",
+        "stack": 120,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 2, 2, 4, true>",
+        "stack": 312,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 2, 2, 5, true>",
+        "stack": 456,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 4, 0, 4, false>",
+        "stack": 504,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 4, 0, 4, true>",
+        "stack": 488,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 4, 0, 5, true>",
+        "stack": 632,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 4, 2, 4, true>",
+        "stack": 1208,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 3, 4, 2, 5, true>",
+        "stack": 1264,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 1, 2, 4, true>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 1, 2, 5, true>",
+        "stack": 104,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 2, 0, 4, false>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 2, 0, 4, true>",
+        "stack": 72,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 2, 0, 5, true>",
+        "stack": 192,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 2, 2, 4, true>",
+        "stack": 360,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 2, 2, 5, true>",
+        "stack": 512,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 4, 0, 4, false>",
+        "stack": 608,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 4, 0, 4, true>",
+        "stack": 584,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 4, 0, 5, true>",
+        "stack": 760,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 4, 2, 4, true>",
+        "stack": 1192,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 4, 4, 2, 5, true>",
+        "stack": 1336,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 5, 1, 0, 4, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 5, 1, 0, 5, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 5, 1, 2, 4, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 5, 1, 2, 5, true>",
+        "stack": 136,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 5, 2, 0, 4, false>",
+        "stack": 120,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 5, 2, 0, 4, true>",
+        "stack": 112,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 5, 2, 0, 5, true>",
+        "stack": 240,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 5, 2, 2, 4, true>",
+        "stack": 400,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 5, 2, 2, 5, true>",
+        "stack": 528,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 6, 1, 0, 5, true>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 6, 1, 2, 4, true>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 6, 1, 2, 5, true>",
+        "stack": 176,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 6, 2, 0, 4, false>",
+        "stack": 168,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 6, 2, 0, 4, true>",
+        "stack": 168,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 6, 2, 0, 5, true>",
+        "stack": 296,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 6, 2, 2, 4, true>",
+        "stack": 440,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 6, 2, 2, 5, true>",
+        "stack": 576,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 1, 0, 4, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 1, 0, 4, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 1, 0, 5, true>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 1, 2, 4, true>",
+        "stack": 72,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 1, 2, 5, true>",
+        "stack": 216,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 2, 0, 4, false>",
+        "stack": 208,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 2, 0, 4, true>",
+        "stack": 208,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 2, 0, 5, true>",
+        "stack": 368,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 2, 2, 4, true>",
+        "stack": 512,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 7, 2, 2, 5, true>",
+        "stack": 656,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 1, 0, 4, false>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 1, 0, 4, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 1, 0, 5, true>",
+        "stack": 96,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 1, 2, 4, true>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 1, 2, 5, true>",
+        "stack": 192,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 2, 0, 4, false>",
+        "stack": 232,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 2, 0, 4, true>",
+        "stack": 248,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 2, 0, 5, true>",
+        "stack": 408,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 2, 2, 4, true>",
+        "stack": 520,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ5K, 8, 2, 2, 5, true>",
+        "stack": 664,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 1, 2, 2, 5, true>",
+        "stack": 104,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 1, 4, 0, 5, true>",
+        "stack": 72,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 1, 4, 2, 4, true>",
+        "stack": 440,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 1, 4, 2, 5, true>",
+        "stack": 624,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 2, 2, 2, 4, true>",
+        "stack": 112,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 2, 2, 2, 5, true>",
+        "stack": 328,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 2, 4, 0, 5, true>",
+        "stack": 160,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 2, 4, 2, 4, true>",
+        "stack": 504,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 2, 4, 2, 5, true>",
+        "stack": 688,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 3, 1, 2, 5, true>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 3, 2, 2, 4, true>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 3, 2, 2, 5, true>",
+        "stack": 360,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 3, 4, 0, 4, false>",
+        "stack": 96,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 3, 4, 0, 4, true>",
+        "stack": 112,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 3, 4, 0, 5, true>",
+        "stack": 280,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 3, 4, 2, 4, true>",
+        "stack": 584,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 3, 4, 2, 5, true>",
+        "stack": 768,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 4, 2, 0, 5, true>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 4, 2, 2, 4, true>",
+        "stack": 128,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 4, 2, 2, 5, true>",
+        "stack": 408,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 4, 4, 0, 4, false>",
+        "stack": 208,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 4, 4, 0, 4, true>",
+        "stack": 200,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 4, 4, 0, 5, true>",
+        "stack": 368,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 4, 4, 2, 4, true>",
+        "stack": 664,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 4, 4, 2, 5, true>",
+        "stack": 856,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 5, 1, 2, 5, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 5, 2, 0, 5, true>",
+        "stack": 104,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 5, 2, 2, 4, true>",
+        "stack": 192,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 5, 2, 2, 5, true>",
+        "stack": 320,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 6, 2, 0, 4, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 6, 2, 0, 5, true>",
+        "stack": 144,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 6, 2, 2, 4, true>",
+        "stack": 224,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 6, 2, 2, 5, true>",
+        "stack": 368,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 7, 1, 0, 4, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 7, 1, 0, 5, true>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 7, 1, 2, 4, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 7, 1, 2, 5, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 7, 2, 0, 4, false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 7, 2, 0, 4, true>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 7, 2, 0, 5, true>",
+        "stack": 184,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 7, 2, 2, 4, true>",
+        "stack": 272,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 7, 2, 2, 5, true>",
+        "stack": 400,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 8, 1, 0, 4, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 8, 1, 0, 5, true>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 8, 1, 2, 5, true>",
+        "stack": 88,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 8, 2, 0, 4, false>",
+        "stack": 104,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 8, 2, 0, 4, true>",
+        "stack": 128,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 8, 2, 0, 5, true>",
+        "stack": 256,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 8, 2, 2, 4, true>",
+        "stack": 288,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel<strata::kernels::{anonymous}::IlQ6K, 8, 2, 2, 5, true>",
+        "stack": 416,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::pair_kernel",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::rope_table_inv_kernel",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::rope_table_kernel",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::route",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::route_multi",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::route_prior_k",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::route_topk<256, 8>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::s26_gu_l_kernel<true, true, 4, true, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::s27_gu_kernel<12, true, 4, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::s27_gu_kernel<13, true, 4, true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<12, true, 2, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<12, true, 4, 512, false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<13, true, 2, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<13, true, 4, 512, false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<14, true, 2, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<14, true, 4, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<16, true, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<17, true, 2, 256, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<17, true, 2, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<17, true, 4, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<18, true, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<21, true, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<22, true, 2, 256, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<22, true, 2, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<22, true, 4, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<40, false, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<40, false, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<40, true, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<40, true, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<42, false, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<42, true, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<42, true, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<42, true, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<7, false, 2, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<7, false, 4, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<8, false, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<8, false, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<12, true, 2, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<12, true, 4, 512, false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<13, false, 2, 512, false>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<13, false, 4, 512, false>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<13, true, 2, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<13, true, 4, 512, false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<14, false, 2, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<14, false, 4, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<14, true, 2, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<14, true, 4, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<146, false, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<146, false, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<16, true, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<17, true, 2, 256, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<17, true, 2, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<17, true, 4, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<18, true, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<21, true, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<22, true, 2, 256, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<22, true, 2, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<22, true, 4, 512, false>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<40, false, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<40, false, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<40, true, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<40, true, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<42, false, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<42, true, 2, 256, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<42, true, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<42, true, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<7, false, 2, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<7, false, 4, 512, false>",
+        "stack": 24,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<8, false, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<8, false, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::{anonymous}::gr_write_cvec_norm_rs_kernel",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::{anonymous}::gr_write_norm_rs_kernel",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::{anonymous}::rms_rope_rows_kernel<false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::{anonymous}::rms_rope_rows_kernel<true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::{anonymous}::rope_kernel<false>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::{anonymous}::rope_kernel<true>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::{anonymous}::route_kernel<16>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::{anonymous}::route_kernel<8>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "{anonymous}::k_attn_prep",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      }
+    ]
+  },
   "sm_60": null
 }

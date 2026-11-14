@@ -105,6 +105,19 @@ int run(int ty, int n_out, int K, std::mt19937& rng) {
     ck(cudaMemset(dy, 0xff, (size_t) total * n_out * 4), "y");
     ck(cudaMalloc(&dq, (size_t) E * n_out * K * 2), "dq");
     const int maxr = *std::max_element(rows.begin(), rows.end());
+    {   // the kernel's shared memory (iq_kernels.cu: WG_BN 128 weight columns of wk + 8 halves, WG_BM 64 rows of WG_XK 128 + 8 halves; wk 128 for Q2_0 and the IQ4_NL down, else 256): a card whose
+        // opt-in limit is lower (Turing: 64 KB) has no launch of it - skipped with that reason, not a failure
+        const int wk = (ty == 42 || (ty == 20 && K % 256 != 0)) ? 128 : 256;
+        const size_t need = (size_t) 128 * (wk + 8) * 2 + (size_t) 64 * (128 + 8) * 2;
+        int cur = 0, optin = 0;
+        cudaGetDevice(&cur);
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, cur);
+        if (need > (size_t) optin) {
+            std::printf("%-8s %5d x %4d: skipped, its tile needs %zu B of shared memory and this card allows %d B per block\n", name_of(ty), n_out, K, need, optin);
+            cudaFree(dw); cudaFree(dx); cudaFree(db); cudaFree(dy); cudaFree(dq);
+            return 0;
+        }
+    }
     if (!k::gemm_iq_f16_grouped(ty, dw, eb, n_out, K, dx, K, db, E, maxr, dy, n_out, nullptr)) {
         std::printf("%-8s %5d x %4d: not launched\n", name_of(ty), n_out, K);
         return 1;
