@@ -63,6 +63,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/card_node.hpp"
 #include "strata/kernels/cpu/numa_pool.hpp"
+#include "strata/platform/home_cpus.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
@@ -2494,11 +2495,9 @@ public:
     static void spread_current_thread() {
 #if defined(__linux__)
         // wide first: the mask the aux placement keeps as this thread's own is the one restore() puts back (a request
-        // with aux_cpus=0), and the host's one CPU must not be it
-        cpu_set_t all;
-        CPU_ZERO(&all);
-        for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
-        (void) sched_setaffinity(0, sizeof all, &all);   // the kernel keeps the CPUs the process may use
+        // with aux_cpus=0), and the host's one CPU must not be it; wide = the process's CPU set from the start-up
+        // (strata/platform/home_cpus.hpp)
+        strata::platform::widen_to_home();               // the kernel keeps the CPUs the cgroup allows
         strata::aux_cpus::pin_current_thread();          // (a no-op while the feature is off)
 #endif
     }
@@ -4235,6 +4234,10 @@ int main(int argc, char** argv) {
         const kc::CardNodeDecision cd = kc::decide_card_node(ci);
         int moved = 0, refused = 0;
         if (cd.on) moved = kc::restrict_process_cpus(cd.cpus, refused);
+        // the threads that widen their mask later (background copies, checkpoint helpers) widen to the process's CPU set
+        // as it is now: the card's node, or the set the process was started with (a taskset is kept); the switch off:
+        // every CPU, as before
+        if (!ci.switch_off) strata::platform::set_home_cpus(kc::card_node_thread_cpus());
         if (std::getenv("STRATA_TRACE") != nullptr) {
             std::string cpus;
             for (size_t i = 0; i < cd.cpus.size(); ++i) cpus += (i ? "," : "") + std::to_string(cd.cpus[i]);
