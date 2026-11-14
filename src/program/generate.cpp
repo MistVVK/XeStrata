@@ -277,6 +277,12 @@ static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token
 
 namespace {
 namespace nib = strata::core::nibble;
+// llama.cpp's MMQ prompt kernels are in this build (STRATA_PREFILL_MMQ, defined on strata_prefill only): the start-up lines that name them ask
+#if defined(STRATA_PREFILL_MMQ)
+[[maybe_unused]] constexpr bool kMmqBuilt = true;
+#else
+[[maybe_unused]] constexpr bool kMmqBuilt = false;
+#endif
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -3994,7 +4000,7 @@ int main(int argc, char** argv) {
                 strata::core::apply_gdn_chunked_default(true, all_gfx12);
 #endif
             }
-            strata::core::apply_arch_defaults(ad.gcnArchName, all_igpu, o.batch);
+            strata::core::apply_arch_defaults(ad.gcnArchName, all_igpu, o.batch, kMmqBuilt);
 #if defined(_WIN32)
             const bool win_host = true;
 #else
@@ -4927,7 +4933,7 @@ int main(int argc, char** argv) {
             kq_types.reserve(lay.fmt.size());
             for (const auto& f : lay.fmt) kq_types.emplace_back(f.gu_type, f.d_type);
             if (strata::core::nv_kq_line_wanted(kq_types))
-                std::fprintf(stderr, "%s\n", strata::core::nv_kq_default_line(kq_line_fused).c_str());
+                std::fprintf(stderr, "%s\n", strata::core::nv_kq_default_line(kq_line_fused, kMmqBuilt).c_str());
         }
 #endif
         // APR (prism.hadamard) packs: every expert path rotates its activations (CPU pool: native_quant_act / _h;

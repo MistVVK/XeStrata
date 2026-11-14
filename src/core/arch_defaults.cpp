@@ -294,7 +294,7 @@ std::vector<std::pair<std::string, std::string>> launch_default_env(const char* 
     return t;
 }
 
-std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrated, int batch_slots) {
+std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrated, int batch_slots, bool mmq_built) {
     std::vector<std::string> set;
     // the community-made gfx1010 / gfx1030 changes (amd_community.hpp): one line, and only on those two cards
     if (const std::string note = strata::amd_community::startup_line(gcn_arch); !note.empty())
@@ -325,7 +325,10 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrat
             set_default(kv);
             if (kv.first == "STRATA_MMQ_KQ") kq = true; else any = true;
         }
-        if (kq)   // the engine says nothing more on a pack without K-quant experts: the variable is never read there
+        if (kq && !mmq_built)   // a build without MMQ: the 'prompt kernels' line (prefill.cpp mmq_plan) follows in every such build once a prompt runs
+            std::fprintf(stderr, "strata: gfx12 (RDNA4): a model with K-quant experts (Unsloth UD-Q4/Q5/Q6_K_XL) reads its prompt on Strata's own kernels; "
+                                 "the 'prompt kernels' line below gives the counts\n");
+        else if (kq)   // the engine says nothing more on a pack without K-quant experts: the variable is never read there
             std::fprintf(stderr, "strata: gfx12 (RDNA4): a model with K-quant experts (Unsloth UD-Q4/Q5/Q6_K_XL) reads its prompt on llama.cpp's MMQ kernels (+10..17%% prompt speed on an R9700, "
                                  "first-token KL against the FP16 path about 0.03; STRATA_MMQ_KQ=0 or STRATA_GFX12_DEFAULTS=0 turns it off)\n");
         const char* wm = std::getenv("STRATA_SELECT_WMMA");   // the line is only true while the scorer switch is not set to 0

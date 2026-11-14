@@ -547,7 +547,7 @@ inline int64_t default_stream_floor() {
     if (v != strata::prefill::kStreamFloorDefault) {   // printed with the floor in force once the share is armed (own_only_line_flush)
         {
             std::lock_guard<std::mutex> lk(g_own_line_mu);
-            g_own_line.want_pieces();
+            g_own_line.want_pieces(plain);
         }
         own_only_line_flush();
     }

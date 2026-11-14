@@ -62,9 +62,11 @@ inline std::string own_only_line(int64_t layers, int64_t floor_tokens, const Own
 }
 
 /// The other start-up line that names the floor (prefill.cpp default_stream_floor(), when the pack's own floor differs from the default 1,024: the plain pack, the trellis packs).
-inline std::string stream_floor_pieces_line(int64_t floor_tokens) {
+/// STRATA_PF_PLAIN_FLOOR changes only the plain pack's floor (plain_floor_rule.hpp), so only that pack's line names it.
+inline std::string stream_floor_pieces_line(int64_t floor_tokens, bool plain_pack) {
     return "prefill: prompt pieces of " + std::to_string(floor_tokens) +
-           " tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.";
+           " tokens or more read on the fused kernels, as long prompts do. " +
+           (plain_pack ? "STRATA_PF_PLAIN_FLOOR=0 keeps the earlier rule; " : "") + "STRATA_PREFILL_STREAM_MIN=N sets the number by hand.";
 }
 
 /// When the line is printed.  The counts are known when the prompt plan is made (early in the start, before the expert cache), but the floor is not: the CPU share's limit
@@ -87,18 +89,18 @@ public:
         return own_only_line(layers_, floor_tokens, big_, small_, peer_off_);
     }
     /// The pack's own floor was decided and differs from the default (stream_floor_pieces_line is wanted).  The same wait for the share.
-    void want_pieces() { pieces_wanted_ = true; }
+    void want_pieces(bool plain_pack) { pieces_wanted_ = true; plain_pack_ = plain_pack; }
     bool pieces_due() const { return pieces_wanted_ && ready_ && !pieces_printed_; }
     std::string take_pieces(int64_t floor_tokens) {
         pieces_printed_ = true;
-        return stream_floor_pieces_line(floor_tokens);
+        return stream_floor_pieces_line(floor_tokens, plain_pack_);
     }
 
 private:
     int64_t layers_ = 0;
     OwnOnlySplit big_, small_;
     bool peer_off_ = false, have_ = false, ready_ = false, printed_ = false;
-    bool pieces_wanted_ = false, pieces_printed_ = false;
+    bool pieces_wanted_ = false, pieces_printed_ = false, plain_pack_ = false;
 };
 
 }  // namespace strata::prefill

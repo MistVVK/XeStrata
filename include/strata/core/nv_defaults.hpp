@@ -62,6 +62,8 @@ bool nv_kq_line_wanted(const std::vector<std::pair<int, int>>& layer_gate_up_dow
 bool nv_kq_fused_here(int major, int minor, int sms);
 /// The line apply_nv_kq_default prints (without the newline).
 std::string nv_kq_default_line(bool fused_here);
+/// The same line for a build with (mmq_built) or without llama.cpp's MMQ kernels; the caller knows the build (STRATA_PREFILL_MMQ is defined on strata_prefill only).
+std::string nv_kq_default_line(bool fused_here, bool mmq_built);
 
 /// dflash2-kern: the speculative runs' faster start-up adaptation of the expert tier (opt-in on sm_86 with STRATA_SPEC_ADAPT_SM86=1 since owner round 9; STRATA_SPEC_ADAPT_EVERY / _WARM, read by
 /// generate.cpp): sm_86 only (z440 A4000 Q2_0; the P100 is opt-in through the two variables, notes-dflash2-kern.md).  Not part of
