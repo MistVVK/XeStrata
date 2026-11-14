@@ -178,7 +178,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         lat_u_mmu_ = ummu == 1 || (ummu < 0 && strata::prefill::mmq::built());
         if (lat_u_mmu_) {
             lat_mmq_ctx_ = std::make_unique<strata::prefill::mmq::Context>();
-            strata::prefill::mmq::choose_forms(lat_fmt_, shape.n_embd, lat_ELL_, lat_G_, nullptr);
+            strata::prefill::mmq::choose_forms(lat_fmt_ == 4 ? 2 : 8, shape.n_embd, lat_ELL_, lat_G_, nullptr);
         }
         // the column scales on the device NOW, in plain stream context: the D stage's first call can otherwise
         // land inside a graph capture, where an allocation is not permitted
@@ -584,10 +584,12 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 }
                 copy_i32_from_mapped(lat_u_mmq_ids_, idsU, cap, cs);
                 copy_i32_from_mapped(lat_u_mmq_bounds_, ubnd, G + 1, cs);
-                strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, lat_fmt_, ELL, ELL, cap, cs);
+                // the U's ggml type: the latent fmt codes Q4_0 as 4, but ggml's Q4_0 is 2 (Q8_0 is 8)
+                const int du_t = lat_fmt_ == 4 ? 2 : 8;
+                strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, du_t, ELL, ELL, cap, cs);
                 strata::prefill::mmq::Product up;
-                up.w = lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes; up.type = lat_fmt_; up.w_rows = N; up.w_cols = ELL;
-                up.expert_bytes = strata::prefill::mmq::matrix_bytes(lat_fmt_, N, ELL); up.n = G;
+                up.w = lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes; up.type = du_t; up.w_rows = N; up.w_cols = ELL;
+                up.expert_bytes = strata::prefill::mmq::matrix_bytes(du_t, N, ELL); up.n = G;
                 up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
                 up.total_rows = cap; up.max_rows = maxr; up.rows = cap; up.dst = hit_out; up.ld_dst = N;
                 lat_mmq_ctx_->run(up, cs);

@@ -1409,6 +1409,9 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
     const auto& lay = cpu::expert_layout();
     const auto& f = lay.fmt[(size_t) l];
     const int fmt = m.lat_fmt_;
+    // the D/U's ggml type: the latent pack codes Q4_0 as fmt 4 and Q8_0 as fmt 8, but ggml's Q4_0 is 2 (Q8_0 is 8).
+    // The mmq products/quantizer take the ggml type, not the latent fmt (as the dp4a arm's iq_mmvq(fmt==4?2:8) does).
+    const int du_t = fmt == 4 ? 2 : 8;
     const size_t row_b = fmt == 4 ? 18 : 34;
     const size_t d_bytes = (size_t) G * (size_t) ELL * (size_t) (N / 32) * row_b;
     const size_t u_bytes = (size_t) G * (size_t) N * (size_t) (ELL / 32) * row_b;
@@ -1447,8 +1450,8 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
         m.lmmq_scratch_T_ = TMM;
         mmq::choose_forms(f.gu_type, 2 * I, ELL, MMQ_GROUP, m.cs);
         mmq::choose_forms(f.d_type, ELL, I, MMQ_GROUP, m.cs);
-        mmq::choose_forms(fmt, G * ELL, N, 1, m.cs);
-        mmq::choose_forms(fmt, N, ELL, G, m.cs);
+        mmq::choose_forms(du_t, G * ELL, N, 1, m.cs);
+        mmq::choose_forms(du_t, N, ELL, G, m.cs);
         strata::gpu::event_record(m.used[0], m.cs);   // a valid marker: the first group's DMA may wait on it
     }
     if (m.ids_identity == nullptr) { err = "prefill: the latent mmq arm needs the identity rows"; return false; }
@@ -1528,11 +1531,11 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
     m.lmmq_ids_h_.to_device(m.lmmq_ids_, m.cs);
     m.lmmq_bnd_h_.to_device(m.lmmq_bounds_, m.cs);
     // D: the chunk's rows through the layer's D, then the column scales
-    mmq::quantize(m.mixed, nullptr, m.lmmq_xq_, fmt, N, N, T, m.cs);
+    mmq::quantize(m.mixed, nullptr, m.lmmq_xq_, du_t, N, N, T, m.cs);
     {
         mmq::Product d;
-        d.w = m.lat_d_ + (size_t) (l - m.lat_layer0_) * d_bytes; d.type = fmt; d.w_rows = G * ELL; d.w_cols = N;
-        d.expert_bytes = mmq::matrix_bytes(fmt, G * ELL, N); d.n = 1; d.xq = m.lmmq_xq_;
+        d.w = m.lat_d_ + (size_t) (l - m.lat_layer0_) * d_bytes; d.type = du_t; d.w_rows = G * ELL; d.w_cols = N;
+        d.expert_bytes = mmq::matrix_bytes(du_t, G * ELL, N); d.n = 1; d.xq = m.lmmq_xq_;
         d.bounds = m.lmmq_bounds_ + DBND; d.ids = m.ids_identity; d.total_rows = T; d.max_rows = T; d.rows = T;
         d.dst = m.lmmq_xl_; d.ld_dst = G * ELL;
         m.mmq_ctx->run(d, m.cs);
@@ -1576,14 +1579,14 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
         strata::gpu::event_record(m.used[0], m.cs);
     }
     // U: the G groups as experts; the rows back to the shell's width, the combine in routing order
-    mmq::quantize(m.lmmq_yl_, idsU, m.lmmq_ylq_, fmt, ELL, ELL, T * K, m.cs);
+    mmq::quantize(m.lmmq_yl_, idsU, m.lmmq_ylq_, du_t, ELL, ELL, T * K, m.cs);
     {
         int64_t maxr = 0;
         for (int gg = 0; gg < G; ++gg)
             maxr = std::max<int64_t>(maxr, m.lmmq_bnd_h_[(size_t) (UBND + gg + 1)] - m.lmmq_bnd_h_[(size_t) (UBND + gg)]);
         mmq::Product up;
-        up.w = m.lat_u_ + (size_t) (l - m.lat_layer0_) * u_bytes; up.type = fmt; up.w_rows = N; up.w_cols = ELL;
-        up.expert_bytes = mmq::matrix_bytes(fmt, N, ELL); up.n = G; up.xq = m.lmmq_ylq_;
+        up.w = m.lat_u_ + (size_t) (l - m.lat_layer0_) * u_bytes; up.type = du_t; up.w_rows = N; up.w_cols = ELL;
+        up.expert_bytes = mmq::matrix_bytes(du_t, N, ELL); up.n = G; up.xq = m.lmmq_ylq_;
         up.bounds = m.lmmq_bounds_ + UBND; up.ids = m.ids_identity; up.total_rows = T * K; up.max_rows = maxr; up.rows = T * K;
         up.dst = m.Dm; up.ld_dst = N;
         m.mmq_ctx->run(up, m.cs);
