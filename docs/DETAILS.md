@@ -196,6 +196,17 @@ Only the part the attention reads stays in VRAM (`--kv-resident 32768`), so more
 The attention reads exactly the same values; only where the KV lives changes.
 It costs about 13.7 KB of RAM per context token, about 1.7 GB at 128K.
 
+**KV streaming for the plain models** (`--kv-resident N|auto|off`, default `auto`, `XESTRATA_KV_RESIDENT`):
+the full-attention (GQA) layers of Ornith, Qwen3.6, Qwen3.5, llm-jp and PLaMo stream their KV to RAM in the same
+shape as Qwen3.8. The authoritative K/V lives in pinned RAM (the identity layout); VRAM keeps a ring of the last N
+cells. The decode reads the older cells from RAM over PCIe (the shared attention kernel) and the recent ones from
+VRAM; a prompt chunk stages one layer's cells into a borrowed VRAM pool. `auto` is Qwen3.8's rule (from 64K up,
+when the RAM holds the experts beside the KV host copy and headroom), N defaulting to 32768. It works with int8,
+q4_0 and k8v4 KV, the speculative window, and conversation save and restore. The answers are bitwise the same as
+without streaming; only where the KV lives changes. GLM-5.3-Flash's DSA uses `--kv-ram`, the sliding-window layers
+keep their own ring, and `--batch` and an encoder are excluded. Streaming fixes the KV's VRAM, so `--kv-grow`
+stays off (the engine says so).
+
 **The elastic K/V** (`--kv-grow` or `XESTRATA_KV_GROW=1`, upstream 9e3dbfe7): the whole KV cache in VRAM, taking VRAM only for the cells the requests reach.
 The expert cache holds the rest, giving slots to the K/V as the context grows and taking them back after a short request.
 Both live in virtual memory (`sycl_ext_oneapi_virtual_mem`) and neither address moves, so the captured graphs stay valid.
@@ -558,6 +569,7 @@ The engine's options (added to the settings' `args`):
 | --- | --- |
 | `--max-context N` | the KV cache's tokens (setup picks it from the GPU's VRAM) |
 | `--kv-ram on\|off` | GLM-5.3-Flash: the DSA layers' latent cells (1 KB a position) in RAM instead of VRAM, which goes to the experts (on by default); a decode window copies the positions each token selected into VRAM, a prompt chunk each layer's cells up to it. With 128K positions the B70's VRAM tier went from 2,150 to 2,322 experts, the RTX 4070 could start at 128K at all, and at 64K its prompt went from 3.3 to 7.1 tokens/s |
+| `--kv-resident N\|auto\|off` | stream the attention layers' KV to RAM (Qwen3.8's shape): the authoritative K/V in pinned RAM, VRAM a ring of the last N cells, the decode reading the older cells over PCIe. `auto` (the default) from 64K up when the experts and the KV host copy fit in RAM (N defaults to 32768); `off` keeps every cell in VRAM. Works with int8, q4_0 and k8v4, the speculative window and conversation save; the answers are bitwise the same. Not GLM's DSA (`--kv-ram`), the sliding-window layers, `--batch` or an encoder; streaming turns `--kv-grow` off (`XESTRATA_KV_RESIDENT`) |
 | `--kv fp16\|int8\|q4_0\|k8v4` | the attention layers' KV cache in FP16 (the default) or as int8 codes with an FP16 scale per 64 values: half the VRAM, the answers differ slightly. `q4_0` keeps K and V as Q4_0 after the Hadamard rotation (about 28% of FP16), `k8v4` K in int8 and V as rotated Q4_0 (about 40%); these two for the models with heads of 256 (Ornith, Qwen3.6, Qwen3.5-9B). Qwen3.5-9B's 32K prefill on the B70: FP16 20.6 s, `q4_0` 20.4 s, `k8v4` 19.8 s (none of them for GLM-5.3-Flash) |
 | `--kv-grow`, `--no-kv-grow` | with `--serve` on one GPU, the KV cache in virtual memory, taking VRAM only for the cells the requests reach: the VRAM tier of experts (in `--vram-elastic`'s segments) gives it up before a long request and takes it back after a short one. On by default, as Qwen3.8-Flash-Next's, where the GPU's virtual memory pages are 2 MiB or more (the RTX 4070, not the B70). On the RTX 4070, Qwen3.6-35B-A3B at a 128K context started with 4,182 slots instead of 2,870 and its 32K prefill went from 32.9 s to 29.0 s (not with the batch slots) |
 | `--control-vector-scaled FILE:SCALE[,...]`, `--control-vector FILE`, `--control-vector-layer-range A B`, `--cvec-mode`, `--cvec-dir` | a control vector in llama.cpp's format on the residual stream after each layer's FFN (Qwen3.8-Flash-Next's meanings). With `--serve` a request switches it (`experimental_speed_projection`), and a switch reads the conversations again (not for GLM-5.3-Flash yet) |
