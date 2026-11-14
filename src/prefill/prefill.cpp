@@ -729,6 +729,21 @@ struct Prefill::Impl {
     int32_t* lat_dst_ = nullptr;
     int32_t* lat_tok_ = nullptr;
     int64_t lat_scratch_T_ = 0;              // the chunk the scratch was sized for
+    // the latent mmq fast path's scratch (the int8 matrix-unit products, iq_mmq)
+    uint8_t* lmmq_xq_ = nullptr;               // D input (q8, T rows of N)
+    float* lmmq_xl_ = nullptr;                 // D output (T*G rows of ELL)
+    uint8_t* lmmq_xlq_ = nullptr;              // A gu input (q8, T*K expert-order rows of ELL)
+    float* lmmq_gu_ = nullptr;                 // A gate/up (a group's rows of 2*I)
+    float* lmmq_h_ = nullptr;                  // A swiglu (a group's rows of I)
+    uint8_t* lmmq_hq_ = nullptr;               // A down input (q8, a group's rows of I)
+    float* lmmq_yl_ = nullptr;                 // A down output (T*K expert-order rows of ELL)
+    uint8_t* lmmq_ylq_ = nullptr;              // U input (q8, T*K group-order rows of ELL)
+    uint8_t* lmmq_grp_gu_ = nullptr;           // a group's gathered gate/up weights
+    uint8_t* lmmq_grp_d_ = nullptr;            // a group's gathered down weights
+    int32_t* lmmq_ids_ = nullptr;              // the quantize row maps (idsA | ids_rel | idsU, T*K each)
+    int32_t* lmmq_bounds_ = nullptr;           // babs (E+1) | brel_all (E*(MMQ_GROUP+1)) | dbnd (2) | ubnd (G+1)
+    HostVec<int32_t> lmmq_ids_h_, lmmq_bnd_h_; // their pinned host tables, built and uploaded once a layer
+    int64_t lmmq_scratch_T_ = 0;
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -1329,8 +1344,205 @@ void ple_landing_probe(void* stream, strata::kernels::PleTable& table, int64_t c
 // reads them where they are (a resident expert in its cache slot), the buffers go back to the next batch once the
 // kernel has read them.  The rows stay in routing order (ent_dst = the route), so U and the combine read them as
 // the router gave them.  Written after edge0-strata's prefill latent arm, on XeStrata's grouped native kernel.
+// The latent MoE's prompt arm on the int8 matrix units (iq_mmq): D, the experts (Q3_K gate/up, IQ4_NL down at the
+// latent width), U, each a grouped MMQ product.  The same implementation the standard experts take (Intel's XMX,
+// NVIDIA's mma, RDNA's WMMA, dp4a where no matrix unit), so the fast path is not a second copy.  The latent-specific
+// glue is only the row maps: D's group rows, the experts' token*G+label activation rows, U's bucketing by group.
+// gu reads the absolute expert-order bounds (the whole xlq), down the group's relative ones (its own hq); U treats
+// the G groups as experts.  Written after edge0-strata's moe_fused, on XeStrata's mmq.
+bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err) {
+    using namespace strata::kernels;
+    const int64_t N = m.g->n_embd, ELL = m.lat_ELL_, I = m.lat_I_;
+    const int G = m.lat_G_, E = (int) m.g->n_expert;
+    const auto& lay = cpu::expert_layout();
+    const auto& f = lay.fmt[(size_t) l];
+    const int fmt = m.lat_fmt_;
+    const size_t row_b = fmt == 4 ? 18 : 34;
+    const size_t d_bytes = (size_t) G * (size_t) ELL * (size_t) (N / 32) * row_b;
+    const size_t u_bytes = (size_t) G * (size_t) N * (size_t) (ELL / 32) * row_b;
+    const size_t blob_bytes = (size_t) lay.blob_bytes(l);
+    const size_t gub = mmq::matrix_bytes(f.gu_type, 2 * I, ELL);
+    const size_t db = mmq::matrix_bytes(f.d_type, ELL, I);
+    const int64_t GR = mmq_group_rows_cap((size_t) T);
+    const int64_t TM = m.T_max > T ? m.T_max : T;
+    // the scratch, sized once for the largest chunk (freed with the object)
+    if (m.lmmq_scratch_T_ == 0) {
+        auto take = [&](void** p, size_t bytes) {
+            if (!strata::gpu::alloc_device(p, bytes)) return false;
+            m.owned.push_back(*p);
+            return true;
+        };
+        const int64_t TMM = m.T_max > 0 ? m.T_max : T;
+        const int64_t GRM = mmq_group_rows_cap((size_t) TMM);
+        bool ok = take((void**) &m.lmmq_xq_, mmq::q8_bytes(TMM, N)) &&
+                  take((void**) &m.lmmq_xl_, (size_t) TMM * G * ELL * 4) &&
+                  take((void**) &m.lmmq_xlq_, mmq::q8_bytes(TMM * K, ELL)) &&
+                  take((void**) &m.lmmq_gu_, (size_t) GRM * 2 * I * 4) &&
+                  take((void**) &m.lmmq_h_, (size_t) GRM * I * 4) &&
+                  take((void**) &m.lmmq_hq_, mmq::q8_bytes(GRM, I)) &&
+                  take((void**) &m.lmmq_yl_, (size_t) TMM * K * ELL * 4) &&
+                  take((void**) &m.lmmq_ylq_, mmq::q8_bytes(TMM * K, ELL)) &&
+                  take((void**) &m.lmmq_grp_gu_, (size_t) MMQ_GROUP * gub) &&
+                  take((void**) &m.lmmq_grp_d_, (size_t) MMQ_GROUP * db) &&
+                  take((void**) &m.lmmq_ids_, (size_t) 3 * TMM * K * 4) &&
+                  take((void**) &m.lmmq_bounds_, (size_t) (E + 1 + E * (MMQ_GROUP + 1) + 2 + (G + 1)) * 4) &&
+                  take((void**) &m.lat_blobs_, (size_t) MMQ_GROUP * blob_bytes);
+        if (!ok) { err = "prefill: the latent mmq scratch does not fit"; return false; }
+        m.lmmq_scratch_T_ = TMM;
+        mmq::choose_forms(f.gu_type, 2 * I, ELL, MMQ_GROUP, m.cs);
+        mmq::choose_forms(f.d_type, ELL, I, MMQ_GROUP, m.cs);
+        mmq::choose_forms(fmt, G * ELL, N, 1, m.cs);
+        mmq::choose_forms(fmt, N, ELL, G, m.cs);
+        strata::gpu::event_record(m.used[0], m.cs);   // a valid marker: the first group's DMA may wait on it
+    }
+    if (m.ids_identity == nullptr) { err = "prefill: the latent mmq arm needs the identity rows"; return false; }
+    mmq::iota(m.ids_identity, T * K, m.cs);
+    // The row maps and bounds are built once and uploaded once (HostVec: pinned host USM a copy kernel reads in
+    // place, so these small tables never queue behind the streamed experts on the copy engine).  The host rewrites
+    // them only after the next layer's routing sync, when this layer's copies are done.
+    const int BREL = E + 1;                          // brel_all: every group's relative bounds (MMQ_GROUP + 1 each)
+    const int DBND = BREL + E * (MMQ_GROUP + 1);     // the D product's {0, T}
+    const int UBND = DBND + 2;                       // the U product's group bounds (G + 1)
+    const int BND_TOTAL = UBND + (G + 1);
+    int32_t* idsA = m.lmmq_ids_;                     // expert-order row -> its xl row
+    int32_t* ids_rel = m.lmmq_ids_ + TM * K;         // expert-order row -> the group's relative row
+    int32_t* idsU = m.lmmq_ids_ + 2 * TM * K;        // group-order row -> its expert-order yl row
+    int32_t* babs = m.lmmq_bounds_;                  // absolute expert-order bounds (n + 1)
+    // the routes of each expert, the experts this layer routes to, and the groups (up to MMQ_GROUP experts, ended
+    // early when the rows would pass the group scratch's cap)
+    const int32_t* labels = m.lat_labels_.data() + (size_t) l * E;
+    std::vector<std::vector<int32_t>> routes((size_t) E);
+    for (int64_t i = 0; i < T * K; ++i) routes[(size_t) m.ids_host[(size_t) i]].push_back((int32_t) i);
+    std::vector<int32_t> order;
+    for (int32_t e = 0; e < E; ++e) if (!routes[(size_t) e].empty()) order.push_back(e);
+    const int n = (int) order.size();
+    std::vector<int32_t> grp_start;
+    for (int j = 0, rows = 0; j < n; ++j) {
+        const int64_t c = (int64_t) routes[(size_t) order[j]].size();
+        if (grp_start.empty() || j - grp_start.back() >= MMQ_GROUP || (int64_t) rows + c > GR) {
+            grp_start.push_back(j);
+            rows = 0;
+        }
+        rows += (int) c;
+    }
+    grp_start.push_back(n);
+    const int ng = (int) grp_start.size() - 1;
+    // the host tables: idsA / ids_rel / idsU, and babs / brel_all / dbnd / ubnd
+    m.lmmq_ids_h_.resize((size_t) (3 * T * K));
+    m.lmmq_bnd_h_.resize((size_t) BND_TOTAL);
+    std::vector<int32_t> ent((size_t) (T * K));
+    {
+        int64_t r = 0;
+        for (int j = 0; j < n; ++j) {
+            const int32_t e = order[j];
+            m.lmmq_bnd_h_[(size_t) j] = (int32_t) r;
+            for (const int32_t i : routes[(size_t) e]) {
+                ent[(size_t) r] = i;
+                m.lmmq_ids_h_[(size_t) r] = (i / (int32_t) K) * G + labels[e];   // row r reads xl row (token*G + label)
+                ++r;
+            }
+        }
+        m.lmmq_bnd_h_[(size_t) n] = (int32_t) r;
+    }
+    for (int g = 0; g < ng; ++g) {
+        const int j0 = grp_start[(size_t) g], j1 = grp_start[(size_t) g + 1];
+        const int64_t r0 = m.lmmq_bnd_h_[(size_t) j0], r1 = m.lmmq_bnd_h_[(size_t) j1];
+        int32_t* brel = &m.lmmq_bnd_h_[(size_t) (BREL + g * (MMQ_GROUP + 1))];
+        brel[0] = 0;
+        for (int q = 0; q < j1 - j0; ++q)
+            brel[q + 1] = brel[q] + (int32_t) routes[(size_t) order[j0 + q]].size();
+        for (int64_t r = r0; r < r1; ++r) m.lmmq_ids_h_[(size_t) (TM * K + r)] = (int32_t) (r - r0);
+    }
+    m.lmmq_bnd_h_[(size_t) DBND] = 0;
+    m.lmmq_bnd_h_[(size_t) DBND + 1] = (int32_t) T;
+    {   // U: the routes bucketed by their expert's label (group order), and each route's group-order slot
+        int64_t u = 0;
+        m.lmmq_bnd_h_[(size_t) UBND] = 0;
+        for (int gg = 0; gg < G; ++gg) {
+            for (int64_t r = 0; r < T * K; ++r) {
+                const int32_t i = ent[(size_t) r];
+                if (labels[m.ids_host[(size_t) i]] != gg) continue;
+                m.lmmq_ids_h_[(size_t) (2 * TM * K + u)] = (int32_t) r;
+                m.slot_host[(size_t) i] = (int32_t) u;
+                ++u;
+            }
+            m.lmmq_bnd_h_[(size_t) (UBND + gg + 1)] = (int32_t) u;
+        }
+    }
+    m.lmmq_ids_h_.to_device(m.lmmq_ids_, m.cs);
+    m.lmmq_bnd_h_.to_device(m.lmmq_bounds_, m.cs);
+    // D: the chunk's rows through the layer's D, then the column scales
+    mmq::quantize(m.mixed, nullptr, m.lmmq_xq_, fmt, N, N, T, m.cs);
+    {
+        mmq::Product d;
+        d.w = m.lat_d_ + (size_t) l * d_bytes; d.type = fmt; d.w_rows = G * ELL; d.w_cols = N;
+        d.expert_bytes = mmq::matrix_bytes(fmt, G * ELL, N); d.n = 1; d.xq = m.lmmq_xq_;
+        d.bounds = m.lmmq_bounds_ + DBND; d.ids = m.ids_identity; d.total_rows = T; d.max_rows = T; d.rows = T;
+        d.dst = m.lmmq_xl_; d.ld_dst = G * ELL;
+        m.mmq_ctx->run(d, m.cs);
+    }
+    latent_colscale_rows(m.lmmq_xl_, T * G, (int) ELL, latent_colscale_dev((int) l, (int) ELL), m.cs);
+    mmq::quantize(m.lmmq_xl_, idsA, m.lmmq_xlq_, f.gu_type, ELL, ELL, T * K, m.cs);
+    // the groups: gather the experts, gate/up, SwiGLU, the group's H to int8, down
+    for (int g = 0; g < ng; ++g) {
+        const int j0 = grp_start[(size_t) g], j1 = grp_start[(size_t) g + 1], ngx = j1 - j0;
+        const int64_t r0 = m.lmmq_bnd_h_[(size_t) j0], nr = m.lmmq_bnd_h_[(size_t) j1] - r0;
+        int64_t maxr = 0;
+        // gather the group's experts into the group buffers (a resident one from its cache slot, the rest DMA)
+        for (int q = 0; q < ngx; ++q) {
+            const int32_t e = order[j0 + q];
+            maxr = std::max<int64_t>(maxr, (int64_t) routes[(size_t) e].size());
+            const int32_t slot = (m.host_res && m.cache) ? m.host_res[(size_t) l * E + e] : -1;
+            const uint8_t* blob = slot >= 0 ? m.cache->device_slot(slot) : m.src->blob(l, e);
+            if (blob == nullptr) { err = "prefill: the latent mmq arm needs the experts in RAM"; return false; }
+            if (slot < 0) {
+                strata::gpu::stream_wait_event(m.copy, m.used[0]);
+                strata::gpu::copy_async(m.lat_blobs_ + (size_t) q * blob_bytes, blob, blob_bytes, m.copy);
+                strata::gpu::event_record(m.copied[0], m.copy);
+                strata::gpu::stream_wait_event(m.cs, m.copied[0]);
+                blob = m.lat_blobs_ + (size_t) q * blob_bytes;
+            }
+            mmq::gather_native(blob, blob + f.up_off, gub / 2, blob + f.down_off, db,
+                               m.lmmq_grp_gu_ + (size_t) q * gub, m.lmmq_grp_d_ + (size_t) q * db, m.cs);
+        }
+        mmq::Product gu;
+        gu.w = m.lmmq_grp_gu_; gu.type = f.gu_type; gu.w_rows = 2 * I; gu.w_cols = ELL; gu.expert_bytes = gub;
+        gu.n = ngx; gu.xq = m.lmmq_xlq_; gu.bounds = babs + j0; gu.ids = ids_rel;
+        gu.total_rows = T * K; gu.max_rows = maxr; gu.rows = nr; gu.dst = m.lmmq_gu_; gu.ld_dst = 2 * I;
+        m.mmq_ctx->run(gu, m.cs);
+        mmq::swiglu(m.lmmq_gu_, m.lmmq_h_, nr, I, /*interleaved=*/false, m.cs);
+        mmq::quantize(m.lmmq_h_, nullptr, m.lmmq_hq_, f.d_type, I, I, nr, m.cs);
+        mmq::Product dn;
+        dn.w = m.lmmq_grp_d_; dn.type = f.d_type; dn.w_rows = ELL; dn.w_cols = I; dn.expert_bytes = db;
+        dn.n = ngx; dn.xq = m.lmmq_hq_; dn.bounds = m.lmmq_bounds_ + BREL + g * (MMQ_GROUP + 1); dn.ids = m.ids_identity;
+        dn.total_rows = nr; dn.max_rows = maxr; dn.rows = nr; dn.dst = m.lmmq_yl_ + r0 * ELL; dn.ld_dst = ELL;
+        m.mmq_ctx->run(dn, m.cs);
+        strata::gpu::event_record(m.used[0], m.cs);
+    }
+    // U: the G groups as experts; the rows back to the shell's width, the combine in routing order
+    mmq::quantize(m.lmmq_yl_, idsU, m.lmmq_ylq_, fmt, ELL, ELL, T * K, m.cs);
+    {
+        int64_t maxr = 0;
+        for (int gg = 0; gg < G; ++gg)
+            maxr = std::max<int64_t>(maxr, m.lmmq_bnd_h_[(size_t) (UBND + gg + 1)] - m.lmmq_bnd_h_[(size_t) (UBND + gg)]);
+        mmq::Product up;
+        up.w = m.lat_u_ + (size_t) l * u_bytes; up.type = fmt; up.w_rows = N; up.w_cols = ELL;
+        up.expert_bytes = mmq::matrix_bytes(fmt, N, ELL); up.n = G; up.xq = m.lmmq_ylq_;
+        up.bounds = m.lmmq_bounds_ + UBND; up.ids = m.ids_identity; up.total_rows = T * K; up.max_rows = maxr; up.rows = T * K;
+        up.dst = m.Dm; up.ld_dst = N;
+        m.mmq_ctx->run(up, m.cs);
+    }
+    m.slot_host.to_device(m.slot_dev, m.cs);
+    moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+    return true;
+}
+
 bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err) {
     using namespace strata::kernels;
+    // XESTRATA_LATENT_FUSED: the int8 matrix-unit arm (iq_mmq).  on takes it; off the dp4a arm below; auto follows
+    // the device as iq_mmq's other products do (mmq::built): the matrix units where it reports them, else dp4a.
+    const int fused = strata::env_auto("LATENT_FUSED");
+    if (fused == 1 || (fused < 0 && strata::prefill::mmq::built())) return latent_experts_mmq(l, T, K, m, err);
     const int64_t N = m.g->n_embd, ELL = m.lat_ELL_, I = m.lat_I_;
     const int G = m.lat_G_, E = (int) m.g->n_expert;
     const auto& lay = cpu::expert_layout();

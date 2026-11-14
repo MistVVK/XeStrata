@@ -309,6 +309,7 @@ private:
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
     bool latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err);   // the latent MoE arm (Edge0)
+    bool latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err);   // the latent arm on iq_mmq
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };

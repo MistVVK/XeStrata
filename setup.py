@@ -130,6 +130,8 @@ HF_REVISIONS = {
     # Edge0's latent-MoE packs (EDGE0_REVISIONS below pins the same by model name; setup_edge0 fetches the files)
     "Edge0/Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",                            # 2026-11-13
     "Edge0/Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",                            # 2026-11-13
+    "Edge0/Edge0-145B-NVFP4": "a3778c635f2e97323132ff0b5fe3e093cd48e634",                          # 2026-11-15
+    "Edge0/Edge0-120B-NVFP4": "f2c72e69c8649e3718b17b2b942e364d730a2dcd",                          # 2026-11-15
     # the translation models (serve/translate.py's MODELS)
     "pfnet/plamo-3-translate-2b-GGUF": "4f672106b847200bfdc0f6af6c321cd94eba1aed",                  # 2026-11-09
     "pfnet/plamo-3-translate-0.8b-GGUF": "1cf96ae02133958a20074bfdfab76517bb737d00",                # 2026-11-09
