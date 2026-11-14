@@ -20,8 +20,10 @@ namespace strata::core {
 //
 // Usage is memory.current as the kernel reports it, less the group's clean file cache, which the kernel gives back at
 // memory.high or the limit before it kills anything (cache_credit_from_stat below).  Under a limit below MemTotal (a
-// container) every clean page on the evictable file lists counts (active_file + inactive_file); otherwise, and with
-// STRATA_MEM_CREDIT_INACTIVE=1, only inactive_file does, as before.  The lists are list state, not page types
+// container) every clean page on the evictable file lists counts (active_file + inactive_file) except this process's
+// own resident file mappings (the PLE table, mapped model files, the libraries: the engine reads them, so planning their
+// RAM for something else would push them out); otherwise, and with STRATA_MEM_CREDIT_INACTIVE=1, only inactive_file
+// does, as before.  The lists are list state, not page types
 // (cgroup-v2 memory.stat): mlocked pages are on the unevictable list and shmem (the pinned complements, the KV pool)
 // is on the anon lists, so neither is ever credited.  A memory.stat that is missing or unparsable gives no credit (it
 // does not make the sample unknown).
@@ -52,6 +54,7 @@ struct MemoryProbePaths {
     std::string meminfo = "/proc/meminfo";
     std::string self_cgroup = "/proc/self/cgroup";
     std::string cgroup_root = "/sys/fs/cgroup";
+    std::string self_status = "/proc/self/status";
 };
 
 /// One group's reclaimable file cache from its memory.stat text (v2 names, or v1's total_* names), each less the dirty
@@ -66,10 +69,20 @@ CacheCredit cache_credit_from_stat(const std::string& stat, uint64_t current, bo
 /// STRATA_MEM_CREDIT_INACTIVE=1: the inactive-only credit everywhere (the way back for testing).
 bool mem_credit_inactive_only(const char* env_value);
 
-/// The credit a cgroup limit gets: `lists` under a limit below MemTotal (a container: /proc/meminfo is the host's),
-/// `inactive` otherwise (no MemTotal, a limit at or above it, or the switch above).
-uint64_t cache_credit_for_limit(const CacheCredit& credit, uint64_t limit, std::optional<uint64_t> mem_total, bool inactive_only);
+/// The file bytes this process holds locked in RAM (the PLE table when its lock worked; 0 = none).  Locked pages are in
+/// RssFile but on the unevictable list, not on the file lists: they are added back to own_evictable_mapped_bytes().
+void set_locked_own_file_bytes(uint64_t bytes);
+uint64_t locked_own_file_bytes();
 
+/// This process's resident file mappings that sit on the file lists: RssFile from a /proc/self/status text, less the
+/// locked bytes above (floor 0).  nullopt when the text has no readable RssFile line.
+std::optional<uint64_t> own_evictable_mapped_bytes(const std::string& status_text, uint64_t locked_file_bytes);
+
+/// The credit a cgroup limit gets.  Under a limit below MemTotal (a container: /proc/meminfo is the host's) `lists` less
+/// this process's own evictable mappings (`own_mapped`; floor 0); when those cannot be told, `inactive`.  Otherwise
+/// (no MemTotal, a limit at or above it, or STRATA_MEM_CREDIT_INACTIVE=1) `inactive`, as before.
+uint64_t cache_credit_for_limit(const CacheCredit& credit, uint64_t limit, std::optional<uint64_t> mem_total, bool inactive_only,
+                                std::optional<uint64_t> own_mapped);
 /// The operator's cap in bytes for the container/cgroup this engine runs in (0 = none).  Set once at start.
 void set_memory_limit_bytes(uint64_t bytes);
 uint64_t memory_limit_bytes();

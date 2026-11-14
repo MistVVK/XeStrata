@@ -37,6 +37,8 @@ struct Fixture {
         dir = fs::temp_directory_path() / ("strata_memory_guard_" + std::to_string((long) ::getpid()) + "_" + std::to_string(n++));
         fs::remove_all(dir);
         fs::create_directories(dir / "cgroup");
+        // this process's own mappings: none unless a test says so (the real /proc/self/status is never read)
+        std::ofstream(dir / "status", std::ios::binary) << "Name:\tstrata\nRssAnon:\t    1024 kB\nRssFile:\t       0 kB\nRssShmem:\t       0 kB\n";
     }
     ~Fixture() { std::error_code ec; fs::remove_all(dir, ec); }
     void put(const std::string& rel, const std::string& text) {
@@ -50,7 +52,10 @@ struct Fixture {
                            std::to_string(available / 1024) + " kB\n");
     }
     void self(const std::string& text) { put("self_cgroup", text + "\n"); }
-    MemoryProbePaths paths() const { return {(dir / "meminfo").string(), (dir / "self_cgroup").string(), (dir / "cgroup").string()}; }
+    MemoryProbePaths paths() const {
+        return {(dir / "meminfo").string(), (dir / "self_cgroup").string(), (dir / "cgroup").string(), (dir / "status").string()};
+    }
+    void rss_file(uint64_t bytes) { put("status", "Name:\tstrata\nRssFile:\t" + std::to_string(bytes / 1024) + " kB\n"); }
     std::optional<HostMemoryReading> sample(uint64_t explicit_limit = 0) const { return sample_host_memory(paths(), explicit_limit); }
 };
 
@@ -352,11 +357,27 @@ int main() {
         c = cache_credit_from_stat("active_file 30\ninactive_file 20\ntotal_active_file 300\ntotal_inactive_file 200\n"
                                    "total_dirty 10\ntotal_writeback 0\n", 10000, true);
         check(c.inactive == 190 && c.lists == 490, "v1 reads the total_ names");
-        check(cache_credit_for_limit({5, 9}, 10, std::optional<uint64_t>(11), false) == 9, "a limit below MemTotal: lists");
-        check(cache_credit_for_limit({5, 9}, 11, std::optional<uint64_t>(11), false) == 5, "a limit at MemTotal: inactive");
-        check(cache_credit_for_limit({5, 9}, 12, std::optional<uint64_t>(11), false) == 5, "a limit above MemTotal: inactive");
-        check(cache_credit_for_limit({5, 9}, 10, std::nullopt, false) == 5, "MemTotal unknown: inactive");
-        check(cache_credit_for_limit({5, 9}, 10, std::optional<uint64_t>(11), true) == 5, "the switch: inactive");
+        const std::optional<uint64_t> total11(11), none0(0), own3(3), own20(20);
+        check(cache_credit_for_limit({5, 9}, 10, total11, false, none0) == 9, "a limit below MemTotal: lists");
+        check(cache_credit_for_limit({5, 9}, 10, total11, false, own3) == 6, "... less the process's own mappings");
+        check(cache_credit_for_limit({5, 9}, 10, total11, false, own20) == 0, "... floor 0");
+        check(cache_credit_for_limit({5, 9}, 10, total11, false, std::nullopt) == 5, "own mappings unknown: inactive");
+        check(cache_credit_for_limit({5, 9}, 11, total11, false, none0) == 5, "a limit at MemTotal: inactive");
+        check(cache_credit_for_limit({5, 9}, 12, total11, false, own3) == 5, "a limit above MemTotal: inactive, own mappings ignored");
+        check(cache_credit_for_limit({5, 9}, 10, std::nullopt, false, none0) == 5, "MemTotal unknown: inactive");
+        check(cache_credit_for_limit({5, 9}, 10, total11, true, none0) == 5, "the switch: inactive");
+        // RssFile from /proc/self/status, less the locked file bytes
+        const std::string status = "Name:\tstrata\nVmLck:\t  999 kB\nRssAnon:\t 100 kB\nRssFile:\t 2048 kB\nRssShmem:\t 64 kB\n";
+        check(own_evictable_mapped_bytes(status, 0) == std::optional<uint64_t>(2 * MiB), "RssFile in bytes");
+        check(own_evictable_mapped_bytes(status, 1 * MiB) == std::optional<uint64_t>(1 * MiB), "locked file bytes come off");
+        check(own_evictable_mapped_bytes(status, 3 * MiB) == std::optional<uint64_t>(0), "floor 0");
+        check(!own_evictable_mapped_bytes("Name:\tstrata\nRssAnon:\t 1 kB\n", 0), "no RssFile: unknown");
+        check(!own_evictable_mapped_bytes("RssFile:\t 12 MB\n", 0) && !own_evictable_mapped_bytes("RssFile:\t x kB\n", 0) &&
+                  !own_evictable_mapped_bytes("RssFile:\t 1 kB\nRssFile:\t 2 kB\n", 0), "malformed RssFile: unknown");
+        check(locked_own_file_bytes() == 0, "nothing locked by default");
+        set_locked_own_file_bytes(5 * MiB);
+        check(locked_own_file_bytes() == 5 * MiB, "locked bytes round trip");
+        set_locked_own_file_bytes(0);
         check(mem_credit_inactive_only("1") && !mem_credit_inactive_only("0") && !mem_credit_inactive_only(nullptr) &&
                   !mem_credit_inactive_only(""), "STRATA_MEM_CREDIT_INACTIVE=1 only");
     }
@@ -397,6 +418,22 @@ int main() {
         unsetenv("STRATA_MEM_CREDIT_INACTIVE");
 #endif
         check(f.sample() && f.sample()->available == cold->available, "switch cleared: the lists rule again");
+        // the engine maps the table (ram mode, lock refused): its resident pages are its own, not free - cold and warm alike
+        f.rss_file(table + 300 * MiB);   // the table and 300 MiB of libraries
+        const auto mapped = f.sample();
+        check(mapped && mapped->credit == 1 * GiB - 300 * MiB && mapped->available == limit - (7 * GiB + table - (1 * GiB - 300 * MiB)),
+              "own mapped table and libraries: not credited");
+        // the lock worked: the table is on the unevictable list, not on the file lists, and is added back
+        f.put("cgroup/memory.stat", stat(0, 1 * GiB));   // the locked table is in neither list
+        set_locked_own_file_bytes(table);
+        const auto locked = f.sample();
+        check(locked && locked->credit == 1 * GiB - 300 * MiB, "locked table: only the libraries come off the file credit");
+        set_locked_own_file_bytes(0);
+        // no status file: the own mappings cannot be told, the inactive credit is taken
+        f.put("cgroup/memory.stat", stat(table, 1 * GiB));
+        fs::remove(f.dir / "status");
+        check(f.sample() && f.sample()->credit == 1 * GiB, "no /proc/self/status: inactive credit");
+        f.rss_file(0);
         // a limit at or above MemTotal (not a container's view): the inactive rule, bit for bit
         f.meminfo(57 * GiB, 50 * GiB);
         const auto at = f.sample();
