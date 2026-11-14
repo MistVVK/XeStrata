@@ -234,7 +234,7 @@ struct GdnChunkScan {
     static constexpr int QK4 = 2 * CK * S / 4, V4 = CK * CPW / 4, TP4 = 2 * CK * CK / 4;
     static constexpr int NKQ = (QK4 + NT - 1) / NT, NV = (V4 + NT - 1) / NT, NTP = (TP4 + NT - 1) / NT;
     static_assert(S % TN == 0 && S % TM == 0 && CK % TM == 0 && CK == TK && TK % TM == 0 && NW >= 1, "the tiles");
-    static_assert(3 * CK <= NT && (!NORM || NWI == 0), "the scalars a work-item each; the norm over all columns");
+    static_assert(!NORM || NWI == 0, "the norm over all columns");
 
     float* state;
     const float* h;
@@ -266,7 +266,7 @@ struct GdnChunkScan {
         sycl::vec<half, 4> kq[NKQ];
         sycl::float4 v[NV];
         sycl::vec<half, 4> tpv[NTP];
-        float s;
+        float s[(3 * CK + NT - 1) / NT];   // e, f and beta: a work-item one or more (NT can be under 3 CK)
     };
 
     // chunk `ch` of the super-block (its first token tb) into registers
@@ -302,7 +302,8 @@ struct GdnChunkScan {
             if (p >= TP4) break;
             pre.tpv[n] = *reinterpret_cast<const sycl::vec<half, 4>*>(tpc + 4 * p);
         }
-        if (tid < 3 * CK) pre.s = sc[((size_t) ch * HV + (size_t) vh) * (3 * CK) + (size_t) tid];
+        for (int p = tid; p < 3 * CK; p += NT)
+            pre.s[p / NT] = sc[((size_t) ch * HV + (size_t) vh) * (3 * CK) + (size_t) p];
     }
 
     // the registers into local memory
@@ -336,7 +337,8 @@ struct GdnChunkScan {
             const int m = p / (CK * CK / 4), w = p % (CK * CK / 4), t = w / (CK / 4), i = (w % (CK / 4)) * 4;
             for (int e = 0; e < 4; ++e) lh[(m ? O_SP : O_ST) + (size_t) (t * KTP + i + e)] = pre.tpv[n][e];
         }
-        if (tid < 3 * CK) lf[O_SE + (size_t) tid] = pre.s;   // e, f and beta lie one after the other
+        for (int p = tid; p < 3 * CK; p += NT)   // e, f and beta lie one after the other
+            lf[O_SE + (size_t) p] = pre.s[p / NT];
     }
 
     void operator()(sycl::nd_item<1> it) const {
