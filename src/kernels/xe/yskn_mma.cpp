@@ -274,7 +274,7 @@ struct KernelIs {
 template<int K>
 struct KernelJm {
     Fields f;
-    [[sycl::reqd_work_group_size(LANES, 1, 1), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(32))]]
+    [[sycl::reqd_work_group_size(LANES), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(32))]]
     void operator()(sycl::nd_item<1> it) const {
 #if YSKN_MMA_JOINT
         JmOps ops((int) it.get_sub_group().get_group_linear_id());
@@ -287,7 +287,7 @@ struct KernelJm {
 template<int K>
 struct KernelWm {
     Fields f;
-    [[sycl::reqd_work_group_size(LANES, 1, 1), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(32))]]
+    [[sycl::reqd_work_group_size(LANES), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(32))]]
     void operator()(sycl::nd_item<1> it) const {
 #if YSKN_MMA_WMMA
         WmOps ops((int) it.get_sub_group().get_group_linear_id(), (int) it.get_sub_group().get_local_linear_id());
