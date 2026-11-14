@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <random>
 #include <set>
 #include <vector>
@@ -170,7 +171,7 @@ bool run(int fmt) {
             const int64_t width = std::min<int64_t>(n_kv, cap);
             const std::vector<int32_t> sel = selection(n_kv, width, rng);
             if ((int64_t) sel.size() != width) { std::fprintf(stderr, "selection size %zu != %lld\n", sel.size(), (long long) width); return false; }
-            std::copy(sel.begin(), sel.end(), hids.begin() + (size_t) t * cap);
+            std::copy(sel.begin(), sel.end(), hids.begin() + (ptrdiff_t) ((size_t) t * cap));
             hst[t * 4 + 0] = (int32_t) p; hst[t * 4 + 1] = (int32_t) n_kv; hst[t * 4 + 2] = (int32_t) (n_kv / 4);
             hst[t * 4 + 3] = (int32_t) width;
         }
@@ -308,7 +309,7 @@ bool run_dense(int fmt) {
 }
 }  // namespace
 
-int main() {
+int main() try {
     // one KV-head group for both the resident and the streamed call (the streamed kernel forces it): the same head
     // grouping and cells-a-step form, so the comparison is the host read alone, not a different reduction order
 #if defined(_WIN32)
@@ -323,4 +324,7 @@ int main() {
     if (!e || !f || !g || !h) ++g_fail;
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
+} catch (const std::exception& e) {
+    std::fprintf(stderr, "kv_stream_parity: %s\n", e.what());
+    return 1;
 }
