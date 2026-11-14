@@ -387,26 +387,46 @@ if(STRATA_ENABLE_XE)
   # quantize_act_parity sees the one-ulp difference in Q8_K's 1/iscale.
   target_compile_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
                          -foffload-fp32-prec-sqrt)
-  # SPV_KHR_integer_dot_product carries CUDA's __dp4a (src/kernels/xe/cuda_intrinsics.hpp); device code becomes
-  # SPIR-V when the executable links.
-  # SPIR-V when the executable links (with several targets, the translator's option names the SPIR-V one).
+  # SPV_KHR_integer_dot_product carries CUDA's __dp4a (src/kernels/xe/cuda_intrinsics.hpp); with several targets,
+  # the translator's option names the SPIR-V one.
   set(_strata_spirv_translator -Xspirv-translator)
   if(_strata_sycl_targets)
     set(_strata_spirv_translator -Xspirv-translator=spir64)
   endif()
-  # The device code of every target (SPIR-V, each NVIDIA and AMD architecture) is made when the executable links, one
-  # target after another on one thread unless the compiler is let run them side by side (a contrib package's strata
-  # took 10-15 minutes so).
+  # The device code is linked once for each library and program, from its own objects (-fsycl-link, at the end of
+  # this file), and the programs link without -fsycl.  A -fsycl link makes every target's code (SPIR-V, each NVIDIA and
+  # AMD architecture) of all the objects it takes, the libraries' among them, so each of the 130-odd programs made
+  # the kernels' code again: a contrib-llvm build with the tests spent most of its 15 minutes there, and a change to
+  # one kernel file linked them all again.  The parts' images are separate (no SYCL_EXTERNAL, device_global or
+  # specialization constant crosses them); a kernel two parts instantiate is in both, which the runtime takes.
+  # The compiler is let run the targets side by side (a contrib package's strata took 10-15 minutes one at a time).
   cmake_host_system_information(RESULT _strata_link_jobs QUERY NUMBER_OF_LOGICAL_CORES)
-  target_link_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
-                      -foffload-fp32-prec-sqrt -fsycl-max-parallel-link-jobs=${_strata_link_jobs}
-                      "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
-  # The SYCL runtime's own libraries beside libsycl, for the linker to find what libsycl's libraries need: where the
-  # system's Level Zero is new enough (Fedora 44), intel/llvm v7.2.0 builds UR's loader as a library of its own, and
-  # ld.bfd warned at every link that the libumf it needs was not found.
-  if(NOT WIN32)
-    get_filename_component(_strata_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    get_filename_component(_strata_sycl_lib "${_strata_sycl_lib}/../lib" ABSOLUTE)
+  set(_strata_sycl_device_link -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div -foffload-fp32-prec-sqrt
+      -fsycl-max-parallel-link-jobs=${_strata_link_jobs} ${_strata_spirv_translator}
+      --spirv-ext=+SPV_KHR_integer_dot_product)
+  if(CMAKE_CXX_COMPILER_TARGET)
+    list(APPEND _strata_sycl_device_link --target=${CMAKE_CXX_COMPILER_TARGET})
+  endif()
+  # the optimization and debug information the build asks of the code, as a -fsycl link took them from its flags
+  string(TOUPPER "${CMAKE_BUILD_TYPE}" _strata_build_type)
+  separate_arguments(_strata_flags NATIVE_COMMAND "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_strata_build_type}}")
+  foreach(flag IN LISTS _strata_flags)
+    if(flag MATCHES "^-(O|g)")
+      list(APPEND _strata_sycl_device_link ${flag})
+    endif()
+  endforeach()
+  # The SYCL runtime that a -fsycl link adds: libsycl and its host library.  Windows: the runtime's import libraries,
+  # in STRATA_SYCL_WINDOWS/lib, on the toolchain's library path.
+  get_filename_component(_strata_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  get_filename_component(_strata_sycl_lib "${_strata_sycl_lib}/../lib" ABSOLUTE)
+  if(WIN32)
+    target_link_libraries(strata_sycl INTERFACE sycl9 sycl-devicelib-host)
+  else()
+    target_link_libraries(strata_sycl INTERFACE ${_strata_sycl_lib}/libsycl.so
+                          ${_strata_sycl_lib}/libsycl-devicelib-host.a)
+    # The SYCL runtime's own libraries beside libsycl, for the linker to find what libsycl's libraries need: where
+    # the system's Level Zero is new enough (Fedora 44), intel/llvm v7.2.0 builds UR's loader as a library of its
+    # own, and ld.bfd warned at every link that the libumf it needs was not found.
     target_link_options(strata_sycl INTERFACE "LINKER:-rpath-link,${_strata_sycl_lib}")
   endif()
 
@@ -2059,3 +2079,88 @@ file(WRITE ${CMAKE_BINARY_DIR}/PARTS.json
 if(STRATA_PACKAGE)
   include(cmake/packaging.cmake)
 endif()
+
+# Each library's and program's device code, made once from its own objects (see strata_sycl): every target that
+# compiles with strata_sycl, in this directory and below.  A library's code object is linked into the programs
+# that take the library (an archive member nothing refers to would not be), a program's into the program.
+if(STRATA_ENABLE_XE)
+  # whether target compiles with strata_sycl, through what it links
+  function(strata_uses_sycl target out)
+    get_property(known GLOBAL PROPERTY STRATA_SYCL_USER_${target} SET)
+    if(known)
+      get_property(uses GLOBAL PROPERTY STRATA_SYCL_USER_${target})
+      set(${out} ${uses} PARENT_SCOPE)
+      return()
+    endif()
+    set_property(GLOBAL PROPERTY STRATA_SYCL_USER_${target} FALSE)   # a cycle reads as no
+    set(uses FALSE)
+    if(target STREQUAL "strata_sycl")
+      set(uses TRUE)
+    else()
+      get_target_property(type ${target} TYPE)
+      set(libs "")
+      if(NOT type STREQUAL "INTERFACE_LIBRARY")
+        get_target_property(own ${target} LINK_LIBRARIES)
+        if(own)
+          list(APPEND libs ${own})
+        endif()
+      endif()
+      get_target_property(iface ${target} INTERFACE_LINK_LIBRARIES)
+      if(iface)
+        list(APPEND libs ${iface})
+      endif()
+      foreach(lib IN LISTS libs)
+        string(REGEX REPLACE "^\\$<(LINK_ONLY|BUILD_INTERFACE):(.*)>$" "\\2" lib "${lib}")
+        if(TARGET ${lib})
+          strata_uses_sycl(${lib} sub)
+          if(sub)
+            set(uses TRUE)
+            break()
+          endif()
+        endif()
+      endforeach()
+    endif()
+    set_property(GLOBAL PROPERTY STRATA_SYCL_USER_${target} ${uses})
+    set(${out} ${uses} PARENT_SCOPE)
+  endfunction()
+
+  # the device code objects of the targets in dir and below
+  function(strata_sycl_device_links dir)
+    get_property(targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(tgt IN LISTS targets)
+      get_target_property(type ${tgt} TYPE)
+      get_target_property(imported ${tgt} IMPORTED)
+      if(imported OR NOT type MATCHES "^(EXECUTABLE|STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY)$")
+        continue()
+      endif()
+      strata_uses_sycl(${tgt} uses)
+      if(NOT uses)
+        continue()
+      endif()
+      set(out ${CMAKE_BINARY_DIR}/sycl-device/${tgt}${CMAKE_CXX_OUTPUT_EXTENSION})
+      # a shared library's device code is position-independent too: the HIP image's wrapper puts pointers in its
+      # read-only data, which ld refuses in a shared object without it (libxestrata_sdpa_aotriton.so)
+      set(pic "")
+      if(NOT WIN32 AND type MATCHES "^(SHARED|MODULE)_LIBRARY$")
+        set(pic -fPIC)
+      endif()
+      add_custom_command(OUTPUT ${out}
+        COMMAND ${CMAKE_CXX_COMPILER} ${_strata_sycl_device_link} ${pic} -fsycl-link "$<TARGET_OBJECTS:${tgt}>"
+                -o ${out}
+        DEPENDS "$<TARGET_OBJECTS:${tgt}>"
+        COMMENT "SYCL device code of ${tgt}" COMMAND_EXPAND_LISTS VERBATIM)
+      add_custom_target(${tgt}_sycl_device DEPENDS ${out} COMMENT "SYCL device code of ${tgt}")
+      if(type STREQUAL "STATIC_LIBRARY")
+        target_link_libraries(${tgt} INTERFACE ${out})
+      else()
+        target_link_libraries(${tgt} PRIVATE ${out})
+      endif()
+    endforeach()
+    get_property(subdirs DIRECTORY ${dir} PROPERTY SUBDIRECTORIES)
+    foreach(sub IN LISTS subdirs)
+      strata_sycl_device_links(${sub})
+    endforeach()
+  endfunction()
+  strata_sycl_device_links(${CMAKE_SOURCE_DIR})
+endif()
+
