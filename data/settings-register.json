@@ -15571,9 +15571,9 @@
    "since": "v0.1.40.1",
    "last_commit": "f0356cb25f",
    "last_date": "2026-11-14",
-   "status": "opt-in",
+   "status": "rollback",
    "owner": "prefill",
-   "note": "[auto] documented for users (docs/TROUBLESHOOTING.md:326)",
+   "note": "[11-14] CUDA: on by default (include/strata/core/kv_host_dma.hpp kv_host_dma_on): on a streamed layer (--kv-resident) the prompt's new K/V cells go from the staging pool to the RAM copy by one DMA copy, and no kernel writes the RAM copy; =0 gives back the kernel's own stores to the RAM copy. AMD (HIP) and Intel Arc (SYCL): off by default; =1 turns the DMA copy on (docs/TROUBLESHOOTING.md:325, the Windows AMD driver-reset steps). The K/V bytes every reader sees are the same with the switch on or off.",
    "retire_after": "",
    "retired_in": ""
   },

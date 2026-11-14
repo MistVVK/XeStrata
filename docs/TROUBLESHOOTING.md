@@ -323,7 +323,8 @@ in order, one at a time, and tell us what changed:
    in a source checkout) and restart. The prompt path then waits for the GPU after each step and logs any step over 250 ms, so the log names
    the step. It is slower; use it to diagnose, then take it out.
 3. **`"STRATA_KV_HOST_DMA": "1"`** in the same `"env"` block: no GPU kernel writes the RAM copy of the K/V during a
-   prompt, it is copied by DMA instead. Same answers.
+   prompt, it is copied by DMA instead. Same answers. On AMD and Intel Arc this is off until you set it. NVIDIA cards do it by
+   default; setting it to `"0"` there goes back to the earlier way of writing.
 4. **No KV streaming:** run setup again and pick 32K context (or remove `--kv-resident` and its number from
    `"args"` in the JSON, with a context that fits the VRAM).
 5. **A smaller prompt chunk:** change `--prefill` in `"args"` (for example `--prefill 512`): each GPU launch then does
