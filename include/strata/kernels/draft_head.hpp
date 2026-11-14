@@ -32,7 +32,8 @@ constexpr int kTopKSelectionMax = 512;   ///< the shared selector's limit
 /// The scratch topk needs for `n` values.
 std::size_t topk_scratch_bytes(int64_t n, int k);
 
-/// The indices of the `k` (1..kTopKSelectionMax) largest of the `n` values in `v`, ties to the lower index, into `ids`. Device pointers;
+/// The indices of the `k` (1..kTopKSelectionMax) largest of the `n` values in `v`, into `ids`. The existing small-k
+/// path keeps its work-item tie rule; the wide path breaks ties by index. Device pointers;
 /// `scratch` holds topk_scratch_bytes(n, k).
 void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* stream);
 /// The same selection with an optional input ID map and optional output values. IDs must be distinct and nonnegative;

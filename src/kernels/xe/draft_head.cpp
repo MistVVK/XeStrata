@@ -26,6 +26,7 @@ constexpr int kTopWG = 256, kTopPer = 16, kTopChunk = kTopWG * kTopPer;   // top
 // One stage of topk: each work-group the k largest of its kTopChunk of the `n` values (their indices `ids_in[i]`, or
 // i without), into out_v / out_i at k a group.  Each work-item holds kTopPer of them; the group's reductions pick one
 // a turn, so no local memory and no barrier of its own.
+template <bool Stable>
 sycl::event topk_stage(sycl::queue& q, const float* v, const int32_t* ids_in, int64_t n, int k, float* out_v,
                        int32_t* out_i) {
     const int64_t groups = (n + kTopChunk - 1) / kTopChunk;
@@ -45,20 +46,30 @@ sycl::event topk_stage(sycl::queue& q, const float* v, const int32_t* ids_in, in
             float best = kNone;
             int slot = -1;
 #pragma unroll
-            for (int i = 0; i < kTopPer; ++i)
-                if (id[i] >= 0 && (slot < 0 || val[i] > best || (val[i] == best && id[i] < id[slot]))) {
+            for (int i = 0; i < kTopPer; ++i) {
+                if (id[i] < 0) continue;
+                if (slot < 0 || val[i] > best || (Stable && val[i] == best && id[i] < id[slot])) {
                     best = val[i]; slot = i;
                 }
+            }
             const float top = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<float>());
-            const int winner = sycl::reduce_over_group(it.get_group(), slot >= 0 && best == top ? id[slot] : INT32_MAX,
-                                                       sycl::minimum<int>());
-            if (slot >= 0 && id[slot] == winner) {
-                out_v[g * k + j] = top;
-                out_i[g * k + j] = winner;
-                id[slot] = -1;
-            } else if (winner == INT32_MAX && t == 0) {   // fewer than k values in the chunk
-                out_v[g * k + j] = kNone;
-                out_i[g * k + j] = -1;
+            if constexpr (Stable) {
+                const int winner = sycl::reduce_over_group(it.get_group(), slot >= 0 && best == top ? id[slot] : INT32_MAX,
+                                                           sycl::minimum<int>());
+                if (slot >= 0 && id[slot] == winner) {
+                    out_v[g * k + j] = top; out_i[g * k + j] = winner; id[slot] = -1;
+                } else if (winner == INT32_MAX && t == 0) {
+                    out_v[g * k + j] = kNone; out_i[g * k + j] = -1;
+                }
+            } else {
+                // The original draft-head path: equal values go to the lowest work-item, not the lowest ID.
+                const int who = sycl::reduce_over_group(it.get_group(), slot >= 0 && best == top ? t : kTopWG,
+                                                        sycl::minimum<int>());
+                if (t == who) {
+                    out_v[g * k + j] = top; out_i[g * k + j] = id[slot]; id[slot] = -1;
+                } else if (who == kTopWG && t == 0) {
+                    out_v[g * k + j] = kNone; out_i[g * k + j] = -1;
+                }
             }
         }
     });
@@ -102,6 +113,86 @@ sycl::event topk_stage_small(sycl::queue& q, const float* v, const int32_t* ids_
                 sycl::group_barrier(group);
             }
         });
+    });
+}
+
+// A tile holds twice the largest supported k. A larger selection replaces hundreds of sequential reductions with
+// a local sort and a merge of retained lists. The cutoff is structural (k and input size), not a GPU model; speed has
+// not yet been measured. All indices in scratch are input offsets so an ID map works at every merge level.
+constexpr int kWideTile = 1024;
+constexpr int kWideMinK = kTopKMax * 2;
+bool topk_wide_shape(int64_t n, int k) { return k >= kWideMinK && n >= (int64_t) 2 * k; }
+
+sycl::event topk_wide(sycl::queue& q, const float* v, const int32_t* map, int64_t n, int k, int32_t* ids,
+                      float* values, void* scratch, int wg) {
+    const int chunks = (int) ((n - 1) / kWideTile + 1);
+    int32_t* src = static_cast<int32_t*>(scratch);
+    int32_t* dst = src + (size_t) chunks * k;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> score(kWideTile, h);
+        sycl::local_accessor<int32_t, 1> index(kWideTile, h);
+        h.parallel_for(sycl::nd_range<1>((size_t) chunks * wg, (size_t) wg), [=](sycl::nd_item<1> it) {
+            const int chunk = (int) it.get_group(0), t = (int) it.get_local_id(0);
+            const auto group = it.get_group();
+            for (int i = t; i < kWideTile; i += wg) {
+                const int64_t at = (int64_t) chunk * kWideTile + i;
+                index[i] = at < n ? (int32_t) at : INT32_MAX;
+                score[i] = at < n ? v[at] : -std::numeric_limits<float>::infinity();
+            }
+            sycl::group_barrier(group);
+            for (int span = 2; span <= kWideTile; span *= 2) {
+                for (int stride = span / 2; stride > 0; stride /= 2) {
+                    for (int i = t; i < kWideTile; i += wg) {
+                        const int j = i ^ stride;
+                        if (j <= i) continue;
+                        const int ii = index[i], jj = index[j];
+                        const int ki = ii == INT32_MAX ? INT32_MAX : map ? map[ii] : ii;
+                        const int kj = jj == INT32_MAX ? INT32_MAX : map ? map[jj] : jj;
+                        const bool j_better = score[j] > score[i] || (score[j] == score[i] && kj < ki);
+                        const bool i_better = score[i] > score[j] || (score[i] == score[j] && ki < kj);
+                        if (((i & span) == 0 && j_better) || ((i & span) != 0 && i_better)) {
+                            const float tmp = score[i]; score[i] = score[j]; score[j] = tmp;
+                            index[i] = jj; index[j] = ii;
+                        }
+                    }
+                    sycl::group_barrier(group);
+                }
+            }
+            for (int i = t; i < k; i += wg) src[(size_t) chunk * k + i] = index[i];
+        });
+    });
+    int lists = chunks;
+    while (lists > 1) {
+        const int next = (lists + 1) / 2;
+        const size_t work = (size_t) next * 2 * k;
+        q.parallel_for(sycl::nd_range<1>(((work + wg - 1) / wg) * wg, (size_t) wg), [=](sycl::nd_item<1> it) {
+            const size_t j = it.get_global_id(0);
+            if (j >= work) return;
+            const int pair = (int) (j / (2 * k)), item = (int) (j % (2 * k));
+            const int side = item / k, row = item % k, left = pair * 2, right = left + 1;
+            int32_t* out = dst + (size_t) pair * k;
+            if (right >= lists) { if (side == 0) out[row] = src[(size_t) left * k + row]; return; }
+            const int ix = src[(size_t) (left + side) * k + row];
+            if (ix == INT32_MAX) return;
+            const float value = v[ix];
+            const int id = map ? map[ix] : ix;
+            const int32_t* other = src + (size_t) (left + 1 - side) * k;
+            int lo = 0, hi = k;
+            while (lo < hi) {
+                const int mid = (lo + hi) / 2, ox = other[mid];
+                const float ov = ox == INT32_MAX ? -std::numeric_limits<float>::infinity() : v[ox];
+                const int oid = ox == INT32_MAX ? INT32_MAX : map ? map[ox] : ox;
+                if (ov > value || (ov == value && oid < id)) lo = mid + 1; else hi = mid;
+            }
+            if (row + lo < k) out[row + lo] = ix;
+        });
+        lists = next;
+        int32_t* swap = src; src = dst; dst = swap;
+    }
+    return q.parallel_for(sycl::range<1>((size_t) k), [=](sycl::id<1> p) {
+        const int ix = src[p[0]];
+        ids[p[0]] = ix == INT32_MAX ? -1 : map ? map[ix] : ix;
+        if (values) values[p[0]] = ix == INT32_MAX ? -std::numeric_limits<float>::infinity() : v[ix];
     });
 }
 
@@ -185,7 +276,9 @@ void int2_gemv(const uint8_t* w, const float* x, float* y, int n_in, int64_t n_o
 std::size_t topk_scratch_bytes(int64_t n, int k) {
     // the first stage's candidates at most, twice (the stages go back and forth), values and indices
     const int64_t c = ((n + kTopChunk - 1) / kTopChunk) * k;
-    return (std::size_t) (2 * c) * (sizeof(float) + sizeof(int32_t));
+    const size_t narrow = (std::size_t) (2 * c) * (sizeof(float) + sizeof(int32_t));
+    const size_t wide = topk_wide_shape(n, k) ? (size_t) 2 * ((n - 1) / kWideTile + 1) * k * sizeof(int32_t) : 0;
+    return std::max(narrow, wide);
 }
 
 void topk_mapped(const float* v, const int32_t* id_map, int64_t n, int k, int32_t* ids, float* values,
@@ -198,6 +291,12 @@ void topk_mapped(const float* v, const int32_t* id_map, int64_t n, int k, int32_
                                   dev.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]);
     int wg = 1;
     while ((size_t) wg * 2 <= limit && wg < kTopWG) wg *= 2;
+    const size_t local = dev.get_info<sycl::info::device::local_mem_size>();
+    if (topk_wide_shape(n, k) && local >= kWideTile * (sizeof(float) + sizeof(int32_t))) {
+        const auto e = topk_wide(q, v, id_map, n, k, ids, values, scratch, wg);
+        done(stream, e, "topk");
+        return;
+    }
     if (wg < kTopWG && dev.get_info<sycl::info::device::local_mem_size>() < kTopChunk)
         throw std::runtime_error("topk: the device cannot hold the selection flags");
     const int64_t cap = ((n + kTopChunk - 1) / kTopChunk) * k;   // topk_scratch_bytes' room for one side
@@ -211,7 +310,8 @@ void topk_mapped(const float* v, const int32_t* id_map, int64_t n, int k, int32_
     sycl::event e;
     while (true) {
         const int64_t groups = (n + kTopChunk - 1) / kTopChunk;
-        e = wg == kTopWG ? topk_stage(q, in_v, in_i, n, k, bv[side], bi[side])
+        e = wg == kTopWG ? (id_map ? topk_stage<true>(q, in_v, in_i, n, k, bv[side], bi[side])
+                                      : topk_stage<false>(q, in_v, in_i, n, k, bv[side], bi[side]))
                          : topk_stage_small(q, in_v, in_i, n, k, bv[side], bi[side], wg);
         n = groups * k;
         in_v = bv[side];
