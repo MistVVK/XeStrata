@@ -4,9 +4,9 @@
 // STRATA_PARK_ASYNC) and the checkpoint helpers start on the host's single CPU, which they inherited, and must not take
 // turns with the decode there.  They used to widen to every CPU number; the kernel then keeps the CPUs the cgroup allows,
 // so a thread left a CPU set the person gave the process (taskset, numactl) or the one the engine gave itself on the
-// card's NUMA node (strata/kernels/cpu/card_node.hpp).  widen_to_home() widens to the CPUs the process had when it set
-// its placement at start-up (set_home_cpus, called once on the main thread before any of these threads exists); without
-// that call (one NUMA node, STRATA_NUMA_CARD=0, or any start the rule leaves as it is) it widens to every CPU, as before.
+// card's NUMA node (strata/kernels/cpu/card_node.hpp).  widen_to_home() widens to the home CPUs, which generate.cpp sets
+// once at start-up, before these threads exist, to the main thread's CPU set after the card-node step (the card's node, or
+// the set it started with on one node or when the rule declined); not set (STRATA_NUMA_CARD=0, unreadable set): every CPU.
 //
 // Linux only (the other systems get an empty function).  Header-only: the callers sit in libraries that do not link each other.
 #pragma once
