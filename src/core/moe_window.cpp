@@ -558,17 +558,17 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 // rows back to route order, so hit_out stays in the order the combine adds
                 const int32_t* hlabels = lat_labels_.data() + (size_t) layer * lay.n_expert;
                 const int32_t* hids = h_ids_ + (size_t) tb * K;
-                std::vector<int32_t> idsU((size_t) cap), bU((size_t) G + 1);
+                std::vector<int32_t> idsU((size_t) cap), ubnd((size_t) G + 1);
                 int64_t u = 0, maxr = 0;
-                bU[0] = 0;
+                ubnd[0] = 0;
                 for (int gg = 0; gg < G; ++gg) {
                     for (int64_t r = 0; r < cap; ++r)
                         if (hlabels[hids[r]] == gg) idsU[u++] = (int32_t) r;
-                    bU[gg + 1] = (int32_t) u;
-                    maxr = std::max<int64_t>(maxr, bU[gg + 1] - bU[gg]);
+                    ubnd[gg + 1] = (int32_t) u;
+                    maxr = std::max<int64_t>(maxr, ubnd[gg + 1] - ubnd[gg]);
                 }
                 strata::gpu::copy(lat_u_mmq_ids_, idsU.data(), (size_t) cap * 4);
-                strata::gpu::copy(lat_u_mmq_bounds_, bU.data(), (size_t) (G + 1) * 4);
+                strata::gpu::copy(lat_u_mmq_bounds_, ubnd.data(), (size_t) (G + 1) * 4);
                 strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, lat_fmt_, ELL, ELL, cap, cs);
                 strata::prefill::mmq::Product up;
                 up.w = lat_u_ + (size_t) layer * u_bytes; up.type = lat_fmt_; up.w_rows = N; up.w_cols = ELL;
