@@ -123,7 +123,7 @@ in 4.9 s, 1,480 MiB). It releases its VRAM when idle (30,585 to 32,098 MiB while
 With `"vram_elastic": true` as well (opt-in) the expert cache gives the room instead of the reserve:
 
 - **A picture's turn** (the same FIFO turn an encode always takes): if the encoder is not running, the engine's
-  `VRAM` command first keeps `"elastic_mib"` (default 2048) free on top of the reserve - the last `POST /v1/vram`, or 0
+  `VRAM` command first keeps `"elastic_mib"` free (when it is not set: 2,048 MiB at the default picture limit of 1,024 tokens; from a limit of about 4,700 tokens up, what the reader is estimated to need at that limit, for example 3,674 MiB at 16,384 or with no limit (0)) on top of the reserve - the last `POST /v1/vram`, or 0
   when none was made - and then the encoder starts. If the cache cannot shrink (the resident low-RAM mode, an engine
   without `--vram-elastic`, a layer split) the encoder starts in the VRAM that is free, if that is 1,536 MiB or more, and the CPU reader reads
   the picture if it is not; the log says why. On a layer split the server says at start that the encoder's VRAM has to be kept free
