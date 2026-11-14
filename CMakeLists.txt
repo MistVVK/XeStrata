@@ -852,7 +852,7 @@ if(STRATA_ENABLE_XE)
   # The experts' quantized products (moe_mmq.cpp) run on the int8 matrix engines where the GPU reports the shape
   # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
   # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
-  add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp
+  add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/gdn_chunk.cpp
                                     src/prefill/prefill.cpp src/prefill/moe_mmq.cpp src/prefill/plain_prompt.cpp
                                     src/prefill/plain_prompt_glm5.cpp)
   target_include_directories(strata_prefill PUBLIC include)
@@ -1349,6 +1349,11 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(gemm_w8a8_llm_parity PRIVATE strata_prefill)
   add_test(NAME gemm_w8a8_llm_parity COMMAND gemm_w8a8_llm_parity)
   set_tests_properties(gemm_w8a8_llm_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  # the chunked DeltaNet scan (src/prefill/gdn_chunk.cpp) against an FP64 recurrence (skipped where the GPU takes none)
+  add_executable(gdn_chunk_parity src/prefill/gdn_chunk_parity.cpp)
+  target_link_libraries(gdn_chunk_parity PRIVATE strata_prefill)
+  add_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity)
+  set_tests_properties(gdn_chunk_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   add_executable(strata-image-mf-probe src/image/mf_probe.cpp)
   target_link_libraries(strata-image-mf-probe PRIVATE strata_image)
   add_executable(strata-image-seedvr2-probe src/upscale/seedvr2_probe.cpp)

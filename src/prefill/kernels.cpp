@@ -6,6 +6,7 @@
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the
 // precise SYCL functions.
 #include "strata/prefill/kernels.hpp"
+#include "gdn_chunk.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/bf16_to_f16.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -26,11 +27,14 @@
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#include <algorithm>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 
 namespace strata::prefill {
@@ -817,9 +821,7 @@ struct Gdn {
         // 1016 tokens, 5.3x at 16384), and the output copy of a 16384-token chunk (256 MiB) did not fit beside a full
         // expert cache, which left the 5x slower D-2 on unmeasured (32K serve prompt 1,943 -> 1,687 tok/s).
         static int pick = -1;   // 1: the key-head form
-        if (gdn_lane_ok(q))
-            q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
-        else {
+        if (!gdn_lane_ok(q)) {
             if (pick < 0 && kh_on && T >= 64) {
                 const int64_t tn = std::min<int64_t>(T, 1024);
                 const size_t ns = (size_t) S * HV * S, ny = (size_t) tn * HV * S;
@@ -851,26 +853,145 @@ struct Gdn {
                 if (st != nullptr) sycl::free(st, q);
                 if (yy != nullptr) sycl::free(yy, q);
             }
-            if (kh_on && pick == 1) launch_kh(state, y, T);
-            else launch_d2(state, y, T);
+        }
+        // the token-by-token form this device takes, on `st` and `yy` over n tokens
+        auto seq = [&](float* st, float* yy, const int64_t n) {
+            if (gdn_lane_ok(q))
+                q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{st, h, gate, beta, yy, n});
+            else if (kh_on && pick == 1) launch_kh(st, yy, n);
+            else launch_d2(st, yy, n);
+        };
+        auto launch_norm = [&](const float* yy, uint16_t* yo, const int64_t n) {
+            q.submit([&](sycl::handler& hd) {
+                sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
+                hd.parallel_for(sycl::nd_range<2>({(size_t) n, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                    const sycl::sub_group sg = it.get_sub_group();
+                    const int64_t t = (int64_t) it.get_group(0);
+                    const int head = (int) it.get_group(1), col = (int) it.get_local_id(1);
+                    const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
+                    const float oc = yy[at];
+                    const float sp = warp_sum(sg, oc * oc);
+                    if ((col & 31) == 0) wsum[col >> 5] = sp;
+                    sycl::group_barrier(it.get_group());
+                    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+                    // FP16 only: the out projection reads y16, nothing reads the normalized value in FP32 (upstream
+                    // a7ce31b)
+                    yo[at] = hf(oc * sycl::rsqrt(ss / (float) S + eps) * gamma[col] * zgate(z[at], silu));
+                });
+            });
+        };
+        const GdnChunkNorm nm{z, gamma, eps, silu, y16};
+        if (chunked(q, T, with_out, seq, launch_norm, state, h, gate, beta, z, gamma, eps, silu)) {
+            if (gdn_chunk_run(q, chunk_pick(q).form, HK, HV, state, h, gate, beta, y, with_out ? &nm : nullptr, T))
+                return;   // the scan normalized the outputs itself
+        } else {
+            seq(state, y, T);
         }
         if (!with_out) return;
-        q.submit([&](sycl::handler& hd) {
-            sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
-            hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
-                const sycl::sub_group sg = it.get_sub_group();
-                const int64_t t = (int64_t) it.get_group(0);
-                const int head = (int) it.get_group(1), col = (int) it.get_local_id(1);
-                const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
-                const float oc = y[at];
-                const float sp = warp_sum(sg, oc * oc);
-                if ((col & 31) == 0) wsum[col >> 5] = sp;
-                sycl::group_barrier(it.get_group());
-                const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-                // FP16 only: the out projection reads y16, nothing reads the normalized value in FP32 (upstream a7ce31b)
-                y16[at] = hf(oc * sycl::rsqrt(ss / (float) S + eps) * gamma[col] * zgate(z[at], silu));
-            });
-        });
+        launch_norm(y, y16, T);
+    }
+
+    // The chunked scan (gdn_chunk.cpp) or the token-by-token kernels, for each device.  XESTRATA_GDN_CHUNKED unset or
+    // auto: the faster one, timed once on copies of the state at the first call of kChunkTimeMin tokens or more (each
+    // with its output norm), at 256 tokens and at the call's first 2048 at most.  A scan form at least 3% faster at
+    // the longer length takes the calls from where the two lines (time = a + b tokens) cross: a device where the scan
+    // is slower at both lengths never takes it.  Nothing is written down: every start times again.  =0: never; =1:
+    // every call of 64 tokens or more, in the first form that fits.
+    struct ChunkPick {
+        bool decided = false;
+        int form = -1;   // -1: the token-by-token kernels
+        int64_t min_t = INT64_MAX;
+    };
+    static constexpr int64_t kChunkTimeMin = 512;
+    static ChunkPick& chunk_pick(sycl::queue& q) {
+        static core::PerDevice<std::unique_ptr<ChunkPick>> per_device;
+        return *per_device.get(q.get_device(), [] { return std::make_unique<ChunkPick>(); });
+    }
+    template <class Seq, class Norm>
+    static bool chunked(sycl::queue& q, int64_t T, bool with_out, Seq&& seq, Norm&& launch_norm, const float* state,
+                        const float* h, const float* gate, const float* beta, const float* z, const float* gamma,
+                        float eps, bool silu) {
+        static const int mode = strata::env_auto("GDN_CHUNKED");   // -1 automatic, 0 off, 1 on
+        if (mode == 0 || T < 64) return false;
+        ChunkPick& cp = chunk_pick(q);
+        if (!cp.decided && mode == 1) {
+            const auto& forms = gdn_chunk_forms(q, HK, HV);
+            cp.decided = true;
+            if (!forms.empty()) {
+                cp.form = forms.front();
+                cp.min_t = 64;
+            }
+        }
+        if (!cp.decided && T >= kChunkTimeMin) {
+            const auto& forms = gdn_chunk_forms(q, HK, HV);
+            if (forms.empty()) {
+                cp.decided = true;
+                return false;
+            }
+            const int64_t n1 = 256, n2 = std::min<int64_t>(T, 2048);
+            const size_t ns = (size_t) S * HV * S, ny = (size_t) n2 * HV * S;
+            float* st = sycl::malloc_device<float>(ns, q);
+            float* yy = sycl::malloc_device<float>(ny, q);
+            uint16_t* yo = with_out ? sycl::malloc_device<uint16_t>(ny, q) : nullptr;
+            if (st != nullptr && yy != nullptr && (yo != nullptr || !with_out)) {
+                auto time = [&](auto&& launch, int64_t n) {   // the second run: the first may compile the kernels
+                    double us = 0;
+                    for (int r = 0; r < 2; ++r) {
+                        q.copy(state, st, ns).wait();
+                        const auto t0 = std::chrono::steady_clock::now();
+                        launch(n);
+                        q.wait();
+                        us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                    }
+                    return us;
+                };
+                auto tok = [&](int64_t n) {
+                    seq(st, yy, n);
+                    if (with_out) launch_norm(yy, yo, n);
+                };
+                const GdnChunkNorm nt{z, gamma, eps, silu, yo};
+                const double s1 = time(tok, n1), s2 = time(tok, n2);
+                double c1 = 0, c2 = 0;
+                int best = -1;
+                for (const int f : forms) {
+                    auto chunk = [&](int64_t n) {
+                        const bool normed = gdn_chunk_run(q, f, HK, HV, st, h, gate, beta, yy,
+                                                          with_out ? &nt : nullptr, n);
+                        if (with_out && !normed) launch_norm(yy, yo, n);
+                    };
+                    const double b2 = time(chunk, n2);
+                    if (best < 0 || b2 < c2) {
+                        best = f;
+                        c2 = b2;
+                        c1 = time(chunk, n1);
+                    }
+                }
+                cp.decided = true;
+                if (c2 < 0.97 * s2) {
+                    cp.form = best;
+                    const double bs = (s2 - s1) / (double) (n2 - n1), bc = (c2 - c1) / (double) (n2 - n1);
+                    const double cross = c1 <= s1 ? 0.0 : bs > bc ? (double) n1 + (c1 - s1) / (bs - bc) : (double) n2;
+                    cp.min_t = std::max<int64_t>(64, std::min<int64_t>(n2, (int64_t) std::ceil(cross)));
+                }
+                if (cp.form >= 0)
+                    std::fprintf(stderr, "xestrata: the DeltaNet recurrence, %lld / %lld tokens: token by token %.0f / "
+                                 "%.0f us, the chunked scan (form %d) %.0f / %.0f us: the scan from %lld tokens\n",
+                                 (long long) n1, (long long) n2, s1, s2, best, c1, c2, (long long) cp.min_t);
+                else
+                    std::fprintf(stderr, "xestrata: the DeltaNet recurrence, %lld tokens: token by token %.0f us, the "
+                                 "chunked scan %.0f us: token by token\n", (long long) n2, s2, c2);
+            } else {
+                static bool said = false;   // token by token meanwhile; the next call tries again
+                if (!said)
+                    std::fprintf(stderr, "xestrata: the DeltaNet recurrence: no VRAM to time the chunked scan on %lld "
+                                         "tokens, token by token until it can be timed\n", (long long) n2);
+                said = true;
+            }
+            if (st != nullptr) sycl::free(st, q);
+            if (yy != nullptr) sycl::free(yy, q);
+            if (yo != nullptr) sycl::free(yo, q);
+        }
+        return cp.decided && cp.form >= 0 && T >= cp.min_t;
     }
 };
 
