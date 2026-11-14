@@ -250,8 +250,6 @@ struct PlainOptions {
 };
 
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): one object, its members grouped by what they serve
-class DenseSlab;
-
 class PlainModel {
 public:
     PlainModel();
@@ -1108,7 +1106,6 @@ private:
     W mtp_eh_;
     const float *mtp_enorm_ = nullptr, *mtp_hnorm_ = nullptr, *mtp_head_norm_ = nullptr;
     int64_t n_moe_ = 0;   ///< MoE layers of the tiers: the trunk's, then the MTP layer's
-    std::unique_ptr<DenseSlab> dense_slab_;  ///< long-lived weight slabs, selected by a device timing
     std::vector<void*> allocs_;      ///< every device allocation, freed in the destructor
     std::vector<const W*> tune_wait_;              ///< upload's matrices not yet timed (tune_uploaded)
     std::vector<const void*> weight_at_;           ///< upload's matrices on the GPU, and their bytes
