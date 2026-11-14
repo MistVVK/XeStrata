@@ -150,6 +150,44 @@ template<> struct Dec<18> {   // IQ3_XXS: d (0.5 + ls) / 2
         return r;
     }
 };
+// An i-quant gate/up in the fixed-point sums (canon_math.hpp's fx_*; iq_mmq_grouped's kIqMmqFx + its type, on canonical
+// activations): Dec<T>'s values, s0 the 32's integer scale and s1 the 256's d, which the FX bodies take apart; K its
+// power of two.  IQ2_XXS (2 ls + 1, K 1/8), IQ3_XXS (2 ls + 1, K 1/4), IQ3_S (1 + 2 ls, K 1).
+template<int T> struct FxOf;
+template<> struct FxOf<16> {
+    using B = block_iq2_xxs;
+    static constexpr int log2k() { return -3; }
+    static int scale(const B* b, int ib) { return (int) (2 * ((uint32_t) get_int_b2(b->qs, 2 * ib + 1) >> 28) + 1); }
+};
+template<> struct FxOf<18> {
+    using B = block_iq3_xxs;
+    static constexpr int log2k() { return -2; }
+    static int scale(const B* b, int ib) {
+        return (int) (2 * ((uint32_t) get_int_b2(b->qs, QK_K / 16 + ib) >> 28) + 1);
+    }
+};
+template<> struct FxOf<21> {
+    using B = block_iq3_s;
+    static constexpr int log2k() { return 0; }
+    static int scale(const B* b, int ib) { return 1 + 2 * ((b->scales[ib / 2] >> (4 * (ib & 1))) & 0x0F); }
+};
+template<int T> struct DecFx {
+    using F = FxOf<T>;
+    static constexpr int QK = 256, BSZ = (int) sizeof(typename F::B);
+    static constexpr int group32() { return 8; }   // the blocks of 32 a group (FXG)
+    static constexpr int fx_log2() { return F::log2k(); }
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        Sub r = Dec<T>::get(row, sb, row_bytes);
+        const auto* b = reinterpret_cast<const typename F::B*>(row) + sb / 8;
+        r.s0 = (float) F::scale(b, sb % 8);
+        r.s1 = (float) b->d;
+        return r;
+    }
+    // the d of block b of 256 (fx_tops)
+    static float block_d(const uint8_t* row, int b) {
+        return (float) (reinterpret_cast<const typename F::B*>(row) + b)->d;
+    }
+};
 template<> struct Dec<21> {   // IQ3_S: d (1 + 2 ls)
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq3_s);
     static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
@@ -506,10 +544,71 @@ template<> struct Dec<kNativeQ8Rows> {   // Q8_0 split by row (native_mmvq.hpp):
     }
 };
 
+template<> struct Dec<kIqMmqFx + 16> : DecFx<16> {};
+template<> struct Dec<kIqMmqFx + 18> : DecFx<18> {};
+template<> struct Dec<kIqMmqFx + 21> : DecFx<21> {};
+// IQ2_XS and IQ2_S (a scale for each 16): Dec<T>'s values, s0 and s1 the halves' integer scales 2 ls + 1, m the 256's d
+// (K 1/8)
+template<int T, class B> struct DecFxHalf {
+    static constexpr int QK = 256, BSZ = (int) sizeof(B);
+    static constexpr int group32() { return 8; }   // the blocks of 32 a group (FXG)
+    static constexpr int fx_log2() { return -3; }
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        Sub r = Dec<T>::get(row, sb, row_bytes);
+        const B* b = reinterpret_cast<const B*>(row) + sb / 8;
+        r.s0 = (float) (2 * (b->scales[sb % 8] & 0x0F) + 1);
+        r.s1 = (float) (2 * (b->scales[sb % 8] >> 4) + 1);
+        r.m = (float) b->d;
+        return r;
+    }
+    static float block_d(const uint8_t* row, int b) { return (float) (reinterpret_cast<const B*>(row) + b)->d; }
+};
+template<> struct Dec<kIqMmqFx + 17> : DecFxHalf<17, block_iq2_xs> {};
+template<> struct Dec<kIqMmqFx + 22> : DecFxHalf<22, block_iq2_s> {};
+// IQ4_NL (a down projection's, on activations with a scale for each 32): Dec<20>'s values, s0 1, s1 the block's d
+template<> struct Dec<kIqMmqFx + 20> {
+    static constexpr int QK = 32, BSZ = (int) sizeof(block_iq4_nl);
+    static constexpr int group32() { return 1; }   // the blocks of 32 a group (FXG)
+    static constexpr int fx_log2() { return 0; }
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        Sub r = Dec<20>::get(row, sb, row_bytes);
+        r.s0 = 1.0f;
+        r.s1 = (float) (reinterpret_cast<const block_iq4_nl*>(row) + sb)->d;
+        return r;
+    }
+    static float block_d(const uint8_t* row, int b) {
+        return (float) (reinterpret_cast<const block_iq4_nl*>(row) + b)->d;
+    }
+};
+
+// Q2_0 (gate/up on a scale for each 256, down on one for each 32): Dec<42>'s values (code - 1), s0 1, s1 the 64's d; a
+// group of one block of 32, whichever its activation
+template<> struct Dec<kIqMmqFx + 42> {
+    static constexpr int QK = 64, BSZ = (int) sizeof(block_q2_0);
+    static constexpr int group32() { return 1; }   // the blocks of 32 a group (FXG)
+    static constexpr int fx_log2() { return 0; }
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        Sub r = Dec<42>::get(row, sb, row_bytes);
+        r.s0 = 1.0f;
+        return r;
+    }
+    static float block_d(const uint8_t* row, int b) {
+        return (float) (reinterpret_cast<const block_q2_0*>(row) + b)->d;
+    }
+};
+
 template<int TY>
-constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11; }
+constexpr bool half_scales() {
+    return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11 ||
+           TY == kIqMmqFx + 17 || TY == kIqMmqFx + 22;
+}
 template<int TY>
 constexpr bool has_min() { return TY == 7 || TY == 12 || TY == 13; }
+template<int TY>
+constexpr bool fx_form() {
+    return TY == kIqMmqFx + 16 || TY == kIqMmqFx + 17 || TY == kIqMmqFx + 18 || TY == kIqMmqFx + 20 ||
+           TY == kIqMmqFx + 21 || TY == kIqMmqFx + 22 || TY == kIqMmqFx + 42;
+}
 
 // ---------------------------------------------------------------- the products
 template<typename T>
@@ -545,6 +644,19 @@ struct Kernel {
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
     static constexpr bool HALF = half_scales<TY>();
     static constexpr bool MIN = has_min<TY>();
+    // FX: the fixed-point sums (canon_math.hpp's fx_*): a group's FXG blocks' int32 sums times their integer scale s0
+    // (exact), then that sum times the group's fx_scale added in int64 (any order: the CPU's canonical rows give the
+    // same bits); the activations canonical (iq_mmq_quantize's canon: one fp16 scale a group), K whole
+    static constexpr bool FX = fx_form<TY>();
+    // FX: the blocks of 32 that share one activation scale and one d (8: a 256's, gate/up; 1: IQ4_NL's, Q2_0's)
+    static constexpr int FXG = [] {
+        if constexpr (FX) return Dec<TY>::group32();
+        else return 1;
+    }();
+    static_assert(!FX || !MIN, "the fixed-point sums take no min");
+    // FX with a scale for each 16 (HALF): the halves' integer scales in the weights' two scale slots, the group's d in
+    // the min's (wml, Sub::m)
+    static constexpr bool FXH = FX && HALF;
     static constexpr int ISG = IS == 1 ? 16 : IS == 2 ? 8 : SG;   // the sub-group size, and Intel's tile width
     static constexpr int LANES = REG ? WN : NSG * SG;              // the work-group: REG, WN / ISG sub-groups
     static constexpr int A_N = IS != 0 && HALF ? 2 : 1;           // copies of the activations' tile
@@ -554,7 +666,11 @@ struct Kernel {
                          XU_OFF = up128(ST_OFF + NSG * TM * TN * 4), WM_OFF = up128(XU_OFF + NB * WM * 4),
                          // REG: a sub-group's B tiles, and on 8 lanes its A tiles
                          SG_LOCAL = (HALF ? 2 : 1) * 32 * ISG + (IS == 1 ? 0 : WM * 32),
-                         LOCAL = REG ? WN / ISG * SG_LOCAL : MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF;
+                         // FX: the rows' and the outputs' tops (fx_tops) past what the body uses (FXH: the d's
+                         // in the min's slot)
+                         FX_OFF = FXH ? up128(WM_OFF + NB * WN * 4) : XU_OFF,
+                         LOCAL = REG ? WN / ISG * SG_LOCAL : MIN ? up128(WM_OFF + NB * WN * 4)
+                                 : FX ? up128(FX_OFF + (WM + WN) * 4) : XU_OFF;
     const uint8_t* w;
     const uint8_t* const* wtab;   // expert e's weights at wtab[e] + woff when set, else at w + e expert_bytes
     size_t woff, expert_bytes, row_bytes;
@@ -578,6 +694,39 @@ struct Kernel {
         else part[(ks * total_rows + row) * n_out + col] = v;
     }
 
+    // FX: the tile's rows' tops (the largest exponent of their scales, one each FXG blocks) into ta, its outputs' (of
+    // their blocks' d) into tw, over the whole of K: canon_math.hpp's top of row and output is ta + tw.  The step
+    // loop's first barrier publishes them.
+    void fx_tops(int lid, int lanes, int64_t row0, int64_t rows, int64_t m0, int64_t n0, const uint8_t* wx, int* ta,
+                 int* tw) const {
+        const int64_t kb = K / 32, nw = K / Dec<TY>::QK;
+        for (int rr = lid; rr < WM; rr += lanes) {
+            int t = canon::kFxNone;
+            if (m0 + rr < rows)
+                for (int64_t b = 0; b < kb; b += FXG) t = sycl::max(t, canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
+            ta[rr] = m0 + rr < rows ? canon::fx_row_top(canon::fx_exp(xs[(row0 + m0 + rr) * kb]), t) : t;
+        }
+        for (int nn = lid; nn < WN; nn += lanes) {
+            int t = canon::kFxNone;
+            const uint8_t* wr = wx + (size_t) (n0 + nn) * row_bytes;
+            for (int64_t b = 0; b < nw; ++b) t = sycl::max(t, canon::fx_exp(Dec<TY>::block_d(wr, (int) b)));
+            tw[nn] = canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wr, 0)), t);
+        }
+    }
+    // FX: a group's integer scale from its activation scale and its d at a row and output's top
+    static int32_t fx_a(float xsv, float wd, int top) {
+        return canon::fx_scale(canon::fx_part(xsv), canon::fx_part(wd), top);
+    }
+    // FX: block b's group d of output column `col` in the tile (FXH: the min's slot)
+    static float fx_wd(const float* wsl, const float* wml, int b, int col) {
+        if constexpr (FXH) return wml[b * WN + col];
+        else return wsl[(2 * b + 1) * WN + col];
+    }
+    static float fx_out(int64_t sum, int top) {
+        if constexpr (FX) return canon::fx_value(sum, top, Dec<TY>::fx_log2());
+        else return 0.0f;
+    }
+
     void dp4a_body(sycl::nd_item<1> it, int64_t ks) const {
         constexpr int lanes = NSG * SG, RSTEP = lanes / WN, RPT = WM / RSTEP;
         const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
@@ -596,6 +745,17 @@ struct Kernel {
         float* wsl = local_as<float>(base + WS_OFF).get();
         float acc[RPT];
         for (int i = 0; i < RPT; ++i) acc[i] = 0.0f;
+        [[maybe_unused]] int32_t isum[FX ? RPT : 1];
+        [[maybe_unused]] int64_t acc64[FX ? RPT : 1];
+        [[maybe_unused]] int* ta = local_as<int>(base + FX_OFF).get();
+        [[maybe_unused]] int* tw = ta + WM;
+        if constexpr (FX) {
+            for (int i = 0; i < RPT; ++i) {
+                isum[i] = 0;
+                acc64[i] = 0;
+            }
+            fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+        }
         const int64_t kb = K / 32;   // activation scales a row
         for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
             sycl::group_barrier(it.get_group());   // the last step's tiles are read
@@ -622,7 +782,7 @@ struct Kernel {
                 o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                 wsl[(2 * b) * WN + nn] = d.s0;
                 wsl[(2 * b + 1) * WN + nn] = d.s1;
-                if constexpr (MIN) wml[b * WN + nn] = d.m;
+                if constexpr (MIN || FXH) wml[b * WN + nn] = d.m;
             }
             sycl::group_barrier(it.get_group());
             for (int b = 0; b < NB; ++b) {
@@ -636,14 +796,26 @@ struct Kernel {
                     int s0 = 0, s1 = 0;
                     for (int j = 0; j < 4; ++j) s0 = xe::dp4a(ap[j], wv[j], s0);
                     for (int j = 4; j < 8; ++j) s1 = xe::dp4a(ap[j], wv[j], s1);
+                    if constexpr (FX) {   // ws0 (ws1 FXH: the second 16's) the integer scale
+                        isum[i] += FXH ? (int32_t) ws0 * s0 + (int32_t) ws1 * s1 : (int32_t) ws0 * (s0 + s1);
+                        if ((k0 / 32 + b) % FXG == FXG - 1) {
+                            acc64[i] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, n), ta[rr] + tw[n]) *
+                                        isum[i];
+                            isum[i] = 0;
+                        }
+                        continue;
+                    }
                     acc[i] += xsl[b * WM + rr] * (ws0 * (float) s0 + ws1 * (float) s1);
                     if constexpr (MIN) acc[i] -= wml[b * WN + n] * xul[b * WM + rr];
                 }
             }
         }
         for (int i = 0; i < RPT; ++i) {
-            const int64_t row = m0 + rbase + (int64_t) i * RSTEP;
-            if (row < rows) out(ks, row0 + row, n0 + n, acc[i]);
+            const int rr = rbase + i * RSTEP;
+            const int64_t row = m0 + rr;
+            float v = acc[i];
+            if constexpr (FX) v = fx_out(acc64[i], ta[rr] + tw[n]);
+            if (row < rows) out(ks, row0 + row, n0 + n, v);
         }
     }
 
@@ -684,6 +856,18 @@ struct Kernel {
         for (int t = 0; t < TPS; ++t)
             for (int i = 0; i < IM; ++i) acc[t][i] = 0.0f;
         mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
+        [[maybe_unused]] int32_t isum[FX ? TPS : 1][IM];
+        [[maybe_unused]] int64_t acc64[FX ? TPS : 1][IM];
+        [[maybe_unused]] int* ta = local_as<int>(base + FX_OFF).get();
+        [[maybe_unused]] int* tw = ta + WM;
+        if constexpr (FX) {
+            for (int t = 0; t < TPS; ++t)
+                for (int i = 0; i < IM; ++i) {
+                    isum[t][i] = 0;
+                    acc64[t][i] = 0;
+                }
+            fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+        }
 
         const int64_t kb = K / 32;   // activation scales a row
         for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
@@ -722,7 +906,7 @@ struct Kernel {
                 for (int j = 0; j < 8; ++j) bw[(b * 8 + j) * WN + nn] = d.v[j];
                 wsl[(2 * b) * WN + nn] = d.s0;
                 wsl[(2 * b + 1) * WN + nn] = d.s1;
-                if constexpr (MIN) wml[b * WN + nn] = d.m;
+                if constexpr (MIN || FXH) wml[b * WN + nn] = d.m;
             }
             sycl::group_barrier(it.get_group());
             for (int b = 0; b < NB; ++b) {
@@ -737,6 +921,14 @@ struct Kernel {
                         mx::joint_matrix_mad(sg, ci, a, bm, ci);
                         const float* xr = xsl + static_cast<ptrdiff_t>(b * WM + rs + t * IM);
                         int i = 0;
+                        if constexpr (FX) {   // ws: the lane's column's integer scale
+                            const int32_t cw = (int32_t) ws;
+                            mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
+                                isum[t][i] += cw * c;
+                                ++i;
+                            });
+                            continue;
+                        }
                         // the int32 sum converted by one instruction (exact_float's two are for NVIDIA's slow
                         // conversion) and added in one fma: B70, Ornith Q4_K_M at 256 rows an expert 988 -> 898 us
                         mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
@@ -745,6 +937,17 @@ struct Kernel {
                         });
                     }
                 }
+                if constexpr (FX)
+                    if ((k0 / 32 + b) % FXG == FXG - 1) {   // into int64 (lane: column, element i: row)
+                        const float wd = fx_wd(wsl, wml, b, cs + lane);
+                        const int twl = tw[cs + lane];
+                        for (int t = 0; t < TPS; ++t)
+                            for (int i = 0; i < IM; ++i) {
+                                const int rr = rs + t * IM + i;
+                                acc64[t][i] += (int64_t) fx_a(xsl[b * WM + rr], wd, ta[rr] + twl) * isum[t][i];
+                                isum[t][i] = 0;
+                            }
+                    }
                 if constexpr (MIN) {   // less the weights' min of the lane's column times each row's sum
                     const float wmn = wml[b * WN + cs + lane];
                     for (int t = 0; t < TPS; ++t)
@@ -755,7 +958,9 @@ struct Kernel {
         for (int t = 0; t < TPS; ++t)
             for (int i = 0; i < IM; ++i) {
                 const int64_t row = m0 + rs + (int64_t) t * IM + i;
-                if (row < rows) out(ks, row0 + row, n0 + cs + lane, acc[t][i]);
+                float v = acc[t][i];
+                if constexpr (FX) v = fx_out(acc64[t][i], ta[rs + t * IM + i] + tw[cs + lane]);
+                if (row < rows) out(ks, row0 + row, n0 + cs + lane, v);
             }
 #else
         (void) it;
@@ -800,6 +1005,30 @@ struct Kernel {
         mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
 
         const int64_t kb = K / 32;
+        // FX: the lane's output's top and its rows' (row j IN + l in lane l), the sums as in intel_body
+        [[maybe_unused]] int32_t isum[FX ? TPS : 1][IM];
+        [[maybe_unused]] int64_t acc64[FX ? TPS : 1][IM];
+        [[maybe_unused]] int ta_r[XR];
+        [[maybe_unused]] int twl = canon::kFxNone;
+        if constexpr (FX) {
+            for (int t = 0; t < TPS; ++t)
+                for (int i = 0; i < IM; ++i) {
+                    isum[t][i] = 0;
+                    acc64[t][i] = 0;
+                }
+            for (int64_t b = 0; b < K / Dec<TY>::QK; ++b)
+                twl = sycl::max(twl, canon::fx_exp(Dec<TY>::block_d(wx, (int) b)));
+            twl = canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wx, 0)), twl);
+            for (int j = 0; j < XR; ++j) {
+                const int64_t rr = (int64_t) j * IN + lane;
+                ta_r[j] = canon::kFxNone;
+                if (rr < live) {
+                    for (int64_t b = 0; b < kb; b += FXG)
+                        ta_r[j] = sycl::max(ta_r[j], canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
+                    ta_r[j] = canon::fx_row_top(canon::fx_exp(xs[(row0 + m0 + rr) * kb]), ta_r[j]);
+                }
+            }
+        }
         const int64_t b0 = ks * kspan / 32, b1 = sycl::min(K, (ks + 1) * kspan) / 32;
         for (int64_t b = b0; b < b1; ++b) {
             const Sub d = Dec<TY>::get(wx, (int) b, row_bytes);
@@ -842,6 +1071,14 @@ struct Kernel {
                     mx::joint_matrix_fill(sg, ci, 0);
                     mx::joint_matrix_mad(sg, ci, a, bm[h], ci);
                     int i = 0;
+                    if constexpr (FX) {   // d.s0: the lane's output's integer scale
+                        const int32_t cw = (int32_t) (h == 1 ? d.s1 : d.s0);
+                        mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
+                            isum[t][i] += cw * c;
+                            ++i;
+                        });
+                        continue;
+                    }
                     mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
                         const int rr = t * IM + i;
                         const float x = sycl::select_from_group(sg, xr[rr / IN], rr % IN);
@@ -857,11 +1094,28 @@ struct Kernel {
                         acc[t][i] -= d.m * sycl::select_from_group(sg, xu_r[rr / IN], rr % IN);
                     }
             }
+            if constexpr (FX)
+                if (b % FXG == FXG - 1)   // the group's sums into int64 (d.s1: its d)
+                    for (int t = 0; t < TPS; ++t) {
+                        if (t >= tiles) break;
+                        for (int i = 0; i < IM; ++i) {
+                            const int rr = t * IM + i;
+                            const float x = sycl::select_from_group(sg, xr[rr / IN], rr % IN);
+                            const int tr = sycl::select_from_group(sg, ta_r[rr / IN], rr % IN);
+                            acc64[t][i] += (int64_t) fx_a(x, FXH ? d.m : d.s1, tr + twl) * isum[t][i];
+                            isum[t][i] = 0;
+                        }
+                    }
         }
         for (int t = 0; t < TPS; ++t)
             for (int i = 0; i < IM; ++i) {
                 const int64_t row = m0 + (int64_t) t * IM + i;
-                if (row < rows) out(ks, row0 + row, col, acc[t][i]);
+                float v = acc[t][i];
+                if constexpr (FX) {
+                    const int rr = t * IM + i;
+                    v = fx_out(acc64[t][i], sycl::select_from_group(sg, ta_r[rr / IN], rr % IN) + twl);
+                }
+                if (row < rows) out(ks, row0 + row, col, v);
             }
 #else
         (void) it;
@@ -929,6 +1183,24 @@ struct Kernel {
             mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, TM, TN> ci[SGM][SGN];
             for (int i = 0; i < SGM; ++i)
                 for (int j = 0; j < SGN; ++j) mx::joint_matrix_fill(sg, acc[i][j], 0.0f);
+            // FX: a group's int32 sums as tiles (each block's times its integer scale, a tile of the outputs' loaded
+            // with stride 0), then through the sub-group's staging tile into int64 sums a lane holds by position
+            // (element q = lane + SG k of the tile): the tiles do not say where their elements sit
+            constexpr int FQ = TM * TN / SG;
+            [[maybe_unused]] mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, TM, TN>
+                fxs[FX ? SGM : 1][FX ? SGN : 1];
+            [[maybe_unused]] int64_t acc64[FX ? SGM : 1][FX ? SGN : 1][FX ? FQ : 1];
+            [[maybe_unused]] int* ta = local_as<int>(base + FX_OFF).get();
+            [[maybe_unused]] int* tw = ta + WM;
+            [[maybe_unused]] const auto sti = local_as<int32_t>(base + ST_OFF) + static_cast<int>(sgid * TM * TN);
+            if constexpr (FX) {
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j) {
+                        mx::joint_matrix_fill(sg, fxs[i][j], 0);
+                        for (int k = 0; k < FQ; ++k) acc64[i][j][k] = 0;
+                    }
+                fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+            }
 
             const int64_t kb = K / 32;   // activation scales a row
             for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
@@ -956,13 +1228,15 @@ struct Kernel {
                     o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                     wsl[(2 * b) * WN + nn] = d.s0;
                     wsl[(2 * b + 1) * WN + nn] = d.s1;
-                    if constexpr (MIN) wml[b * WN + nn] = d.m;
+                    if constexpr (MIN || FXH) wml[b * WN + nn] = d.m;
                 }
                 sycl::group_barrier(it.get_group());
                 for (int b = 0; b < NB; ++b) {
                     mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> xsf[SGM];
-                    for (int i = 0; i < SGM; ++i)   // element (r, c): the scale of row r
-                        mx::joint_matrix_load(sg, xsf[i], xsp + static_cast<int>(b * WM + ms + i * TM), 0, mx::layout::col_major);
+                    if constexpr (!FX)
+                        for (int i = 0; i < SGM; ++i)   // element (r, c): the scale of row r
+                            mx::joint_matrix_load(sg, xsf[i], xsp + static_cast<int>(b * WM + ms + i * TM), 0,
+                                                  mx::layout::col_major);
                     for (int h = 0; h < (HALF ? 2 : 1); ++h) {
                         for (int i = 0; i < SGM; ++i)
                             for (int j = 0; j < SGN; ++j) mx::joint_matrix_fill(sg, ci[i][j], 0);
@@ -976,6 +1250,21 @@ struct Kernel {
                             for (int i = 0; i < SGM; ++i)
                                 for (int j = 0; j < SGN; ++j) mx::joint_matrix_mad(sg, ci[i][j], a[i], bm[j], ci[i][j]);
                         }
+                        if constexpr (FX) {
+                            for (int j = 0; j < SGN; ++j) {
+                                // element (r, c): the integer scale of column c
+                                mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> sc;
+                                mx::joint_matrix_load(sg, sc, wsp + static_cast<int>((2 * b + h) * WN + ns + j * TN), 0,
+                                                      mx::layout::row_major);
+                                for (int i = 0; i < SGM; ++i) {
+                                    mx::joint_matrix_apply(sg, ci[i][j], sc,
+                                                           [](int32_t& c, float& w) { c *= (int32_t) w; });
+                                    mx::joint_matrix_apply(sg, fxs[i][j], ci[i][j],
+                                                           [](int32_t& a, int32_t& c) { a += c; });
+                                }
+                            }
+                            continue;
+                        }
                         for (int j = 0; j < SGN; ++j)
                             for (int i = 0; i < SGM; ++i) {
                                 // the pair of scales (r, c): the weights' of column c along each row, times the row's
@@ -987,6 +1276,21 @@ struct Kernel {
                                 mx::joint_matrix_apply(sg, acc[i][j], sc, [](float& a, float& s) { a += s; });
                             }
                     }
+                    if constexpr (FX)
+                        if ((k0 / 32 + b) % FXG == FXG - 1)   // the group's sums out by position, into int64
+                            for (int i = 0; i < SGM; ++i)
+                                for (int j = 0; j < SGN; ++j) {
+                                    mx::joint_matrix_store(sg, fxs[i][j], sti, TN, mx::layout::row_major);
+                                    sycl::group_barrier(sg);
+                                    for (int k = 0; k < FQ; ++k) {
+                                        const int q = lane + SG * k, rr = ms + i * TM + q / TN;
+                                        const int nn = ns + j * TN + q % TN;
+                                        acc64[i][j][k] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, nn),
+                                                                         ta[rr] + tw[nn]) * sti[q];
+                                    }
+                                    sycl::group_barrier(sg);
+                                    mx::joint_matrix_fill(sg, fxs[i][j], 0);
+                                }
                     if constexpr (MIN)   // less the weights' min of column c times row r's sum
                         for (int i = 0; i < SGM; ++i) {
                             mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> xuf;
@@ -1001,6 +1305,16 @@ struct Kernel {
                             }
                         }
                 }
+            }
+            if constexpr (FX) {   // straight out of the lanes' int64 sums
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j)
+                        for (int k = 0; k < FQ; ++k) {
+                            const int q = lane + SG * k, rr = ms + i * TM + q / TN, nn = ns + j * TN + q % TN;
+                            const float v = fx_out(acc64[i][j][k], ta[rr] + tw[nn]);
+                            if (m0 + rr < rows) out(ks, row0 + m0 + rr, n0 + nn, v);
+                        }
+                return;
             }
             // out through local memory, the rows past the expert's last not written
             for (int i = 0; i < SGM; ++i)
@@ -1046,6 +1360,20 @@ struct Kernel {
             for (int i = 0; i < SGM; ++i)
                 for (int j = 0; j < SGN; ++j)
                     for (int el = 0; el < 8; ++el) acc[i][j][el] = 0.0f;
+            // FX: as intel_body, by the elements' positions
+            [[maybe_unused]] int32_t isum[FX ? SGM : 1][FX ? SGN : 1][8];
+            [[maybe_unused]] int64_t acc64[FX ? SGM : 1][FX ? SGN : 1][8];
+            [[maybe_unused]] int* ta = local_as<int>(base + FX_OFF).get();
+            [[maybe_unused]] int* tw = ta + WM;
+            if constexpr (FX) {
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j)
+                        for (int el = 0; el < 8; ++el) {
+                            isum[i][j][el] = 0;
+                            acc64[i][j][el] = 0;
+                        }
+                fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+            }
 
             const int64_t kb = K / 32;   // activation scales a row
             for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
@@ -1073,7 +1401,7 @@ struct Kernel {
                     o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                     wsl[(2 * b) * WN + nn] = d.s0;
                     wsl[(2 * b + 1) * WN + nn] = d.s1;
-                    if constexpr (MIN) wml[b * WN + nn] = d.m;
+                    if constexpr (MIN || FXH) wml[b * WN + nn] = d.m;
                 }
                 sycl::group_barrier(it.get_group());
                 for (int b = 0; b < NB; ++b) {
@@ -1096,11 +1424,40 @@ struct Kernel {
                         }
                         for (int j = 0; j < SGN; ++j) {
                             const float ws = wsl[(2 * b + h) * WN + ns + j * TN + lo];   // this lane's column's
+                            if constexpr (FX) {   // ws: the integer scale
+                                for (int i = 0; i < SGM; ++i)
+                                    for (int el = 0; el < 8; ++el) isum[i][j][el] += (int32_t) ws * ci[i][j][el];
+                                continue;
+                            }
                             for (int i = 0; i < SGM; ++i)
                                 for (int el = 0; el < 8; ++el)
                                     acc[i][j][el] += ws * xsr[i][el] * exact_float(ci[i][j][el]);
                         }
                     }
+                    if constexpr (FX)
+                        if ((k0 / 32 + b) % FXG == FXG - 1) {   // the group's sums into int64
+                            // fx_scale's parts, a row's and an output's apart: m = ma mw, s = (ea - ta + kFxHead) +
+                            // (ew - tw)
+                            uint32_t am[SGM][8];
+                            int as[SGM][8];
+                            for (int i = 0; i < SGM; ++i)
+                                for (int el = 0; el < 8; ++el) {
+                                    const canon::FxPart p = canon::fx_part(xsr[i][el]);
+                                    am[i][el] = p.m;
+                                    as[i][el] = p.e - ta[ms + i * TM + row_of(el)] + canon::kFxHead;
+                                }
+                            for (int j = 0; j < SGN; ++j) {
+                                const int nn = ns + j * TN + lo;
+                                const canon::FxPart wp = canon::fx_part(fx_wd(wsl, wml, b, nn));
+                                const int ws = wp.e - tw[nn];
+                                for (int i = 0; i < SGM; ++i)
+                                    for (int el = 0; el < 8; ++el) {
+                                        acc64[i][j][el] += (int64_t) canon::fx_shift(am[i][el] * wp.m, as[i][el] + ws,
+                                                                                     wp.neg) * isum[i][j][el];
+                                        isum[i][j][el] = 0;
+                                    }
+                            }
+                        }
                     if constexpr (MIN)
                         for (int j = 0; j < SGN; ++j) {
                             const float wm = wml[b * WN + ns + j * TN + lo];
@@ -1116,7 +1473,10 @@ struct Kernel {
                     const int64_t cb = n0 + ns + (int64_t) j * TN + lo;
                     for (int el = 0; el < 8; ++el) {
                         const int64_t row = m0 + ms + (int64_t) i * TM + row_of(el);
-                        if (row < rows) out(ks, row0 + row, cb, acc[i][j][el]);
+                        float v = acc[i][j][el];
+                        if constexpr (FX)
+                            v = fx_out(acc64[i][j][el], ta[ms + i * TM + row_of(el)] + tw[ns + j * TN + lo]);
+                        if (row < rows) out(ks, row0 + row, cb, v);
                     }
                 }
 #endif
@@ -1191,7 +1551,8 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     // 4070 (Qwen3.5-9B's 52 tokens 1127 -> 1083 tok/s, PLaMo 3 Translate 2B's 64 3810 -> 3372, 2026-11-11).
     int64_t kspan = steps * KC, ksplit = 1;
     float* part = nullptr;
-    if (n == 1 && total_rows <= kIqMmqSplitRows && steps >= 4) {
+    // (the fixed-point sums take K whole: a part's int64 sums would need a pass of their own)
+    if (!KT::FX && n == 1 && total_rows <= kIqMmqSplitRows && steps >= 4) {
         const int64_t want = std::min<int64_t>(kIqMmqSplitMax, steps / 2);
         const int64_t span = (steps + want - 1) / want * KC, parts = (steps * KC + span - 1) / span;
         part = part_buffer(q, (size_t) (parts * total_rows * w_rows));
@@ -1426,6 +1787,16 @@ bool takes_work_group(sycl::queue& q) {
     });
 }
 
+// The fixed-point products' tiles: a sub-group's rows halved (twice the sub-groups for the tile), so its int64 sums fit
+// its registers.  XESTRATA_IQ_MMQ_FX_SPLIT=0: the int8 products' shapes (an experiment, measured on the RX 8060S only)
+bool fx_split() {
+    static const bool on = [] {
+        const char* v = std::getenv("XESTRATA_IQ_MMQ_FX_SPLIT");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
 template<int TY>
 sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                     int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
@@ -1436,6 +1807,12 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
 #define STRATA_MMQ_ROWS(DP4A, TAIL, IS)                                                        \
     do {                                                                                        \
         if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, DP4A, TAIL, IS);                     \
+        if constexpr (fx_form<TY>())                                                            \
+            if (fx_split()) {                                                                   \
+                if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(1, 2, DP4A, TAIL, IS); \
+                if (takes_work_group<Kernel<TY, 1, 4, DP4A, TAIL, IS>>(q))                      \
+                    return STRATA_MMQ_LAUNCH(1, 4, DP4A, TAIL, IS);                             \
+            }                                                                                   \
         if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, DP4A, TAIL, IS);  \
         return STRATA_MMQ_LAUNCH(2, 2, DP4A, TAIL, IS);                                         \
     } while (0)
@@ -1615,8 +1992,14 @@ bool iq_mmq_type_ok(int t) {
     switch (t) {
         case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
         case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 42: return true;
+        case kIqMmqFx + 16: case kIqMmqFx + 17: case kIqMmqFx + 18: case kIqMmqFx + 20: case kIqMmqFx + 21:
+        case kIqMmqFx + 22: case kIqMmqFx + 42: return true;
         default: return false;
     }
+}
+
+int iq_mmq_fx(int t) {
+    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 42 ? kIqMmqFx + t : 0;
 }
 
 size_t iq_mmq_row_bytes(int t, int64_t cols) {
@@ -1631,16 +2014,16 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 14: return (size_t) (cols / Dec<14>::QK) * Dec<14>::BSZ;
         case kNativeQ6KRows: return (size_t) (cols / Dec<kNativeQ6KRows>::QK) * Dec<kNativeQ6KRows>::BSZ;
         case kNativeQ8Rows: return (size_t) (cols / Dec<kNativeQ8Rows>::QK) * Dec<kNativeQ8Rows>::BSZ;
-        case 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
-        case 17: return (size_t) (cols / Dec<17>::QK) * Dec<17>::BSZ;
-        case 18: return (size_t) (cols / Dec<18>::QK) * Dec<18>::BSZ;
-        case 20: return (size_t) (cols / Dec<20>::QK) * Dec<20>::BSZ;
-        case 21: return (size_t) (cols / Dec<21>::QK) * Dec<21>::BSZ;
-        case 22: return (size_t) (cols / Dec<22>::QK) * Dec<22>::BSZ;
+        case 16: case kIqMmqFx + 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
+        case 17: case kIqMmqFx + 17: return (size_t) (cols / Dec<17>::QK) * Dec<17>::BSZ;
+        case 18: case kIqMmqFx + 18: return (size_t) (cols / Dec<18>::QK) * Dec<18>::BSZ;
+        case 20: case kIqMmqFx + 20: return (size_t) (cols / Dec<20>::QK) * Dec<20>::BSZ;
+        case 21: case kIqMmqFx + 21: return (size_t) (cols / Dec<21>::QK) * Dec<21>::BSZ;
+        case 22: case kIqMmqFx + 22: return (size_t) (cols / Dec<22>::QK) * Dec<22>::BSZ;
         case 23: return (size_t) (cols / Dec<23>::QK) * Dec<23>::BSZ;
         case 29: return (size_t) (cols / Dec<29>::QK) * Dec<29>::BSZ;
         case 19: return (size_t) (cols / Dec<19>::QK) * Dec<19>::BSZ;
-        case 42: return (size_t) (cols / Dec<42>::QK) * Dec<42>::BSZ;
+        case 42: case kIqMmqFx + 42: return (size_t) (cols / Dec<42>::QK) * Dec<42>::BSZ;
         default: return 0;
     }
 }
@@ -1650,7 +2033,7 @@ size_t iq_mmq_act_bytes(int64_t rows, int64_t cols) { return (size_t) (rows * co
 bool iq_mmq_type_dup(int t) { return t == 10; }
 
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                            int64_t rows, bool sums, bool dup) {
+                            int64_t rows, bool sums, bool dup, int canon) {
     // dup (Q2_K, Dec<10>): each block written twice, as a row of 2 cols values.  8 values a lane (a block 4 lanes):
     // 8,192 rows of 3,072 took the B70 264 us and the RTX 4070 285 where a block a work-item took 299 and 296, and a
     // block a sub-group (a value a lane) 626 and 394 (2026-11-05)
@@ -1659,6 +2042,11 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
     auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
     float* xu = xs + rows * (oc / 32);
     const q8act::FloatRows src{x, ids, ld};
+    if (canon != 0) {   // the fixed-point sums' (iq_mmq_fx): the CPU's canonical rows' values and fp16 scales
+        q8act::Rows<false, false, true> out{x8, xs, xu, oc, oc / 32, 1};
+        if (canon == 32) return q8act::quantize<8, q8act::Canon<32>>(q, rows * nb, nb, src, out);
+        return q8act::quantize<8, q8act::Canon<256>>(q, rows * nb, nb, src, out);
+    }
     if (sums) {
         q8act::Rows<true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
         return q8act::quantize<8, q8act::Mul>(q, rows * nb, nb, src, out);
@@ -1668,13 +2056,18 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
 }
 
 sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_t* slot, void* xq, int64_t cols,
-                                    int64_t ld, int64_t tokens, int k_used, bool sums, bool dup) {
+                                    int64_t ld, int64_t tokens, int k_used, bool sums, bool dup, int canon) {
     // as iq_mmq_quantize, with the rows reached from the token: the block of token t goes to its k_used rows
     const int64_t oc = dup ? 2 * cols : cols, rows = tokens * k_used, nb = cols / 32;
     auto* x8 = static_cast<int8_t*>(xq);
     auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
     float* xu = xs + rows * (oc / 32);
     const q8act::FloatRows src{x, nullptr, ld};
+    if (canon != 0) {
+        q8act::Rows<false, true, true> out{x8, xs, xu, oc, oc / 32, 1, slot, k_used};
+        if (canon == 32) return q8act::quantize<8, q8act::Canon<32>>(q, tokens * nb, nb, src, out);
+        return q8act::quantize<8, q8act::Canon<256>>(q, tokens * nb, nb, src, out);
+    }
     if (sums) {
         q8act::Rows<true, true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1, slot, k_used};
         return q8act::quantize<8, q8act::Mul>(q, tokens * nb, nb, src, out);
@@ -1705,6 +2098,13 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(16);
         STRATA_MMQ_CASE(17);
         STRATA_MMQ_CASE(18);
+        STRATA_MMQ_CASE(kIqMmqFx + 16);
+        STRATA_MMQ_CASE(kIqMmqFx + 17);
+        STRATA_MMQ_CASE(kIqMmqFx + 18);
+        STRATA_MMQ_CASE(kIqMmqFx + 20);
+        STRATA_MMQ_CASE(kIqMmqFx + 21);
+        STRATA_MMQ_CASE(kIqMmqFx + 22);
+        STRATA_MMQ_CASE(kIqMmqFx + 42);
         STRATA_MMQ_CASE(20);
         STRATA_MMQ_CASE(21);
         STRATA_MMQ_CASE(22);

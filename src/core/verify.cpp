@@ -444,6 +444,7 @@ Verifier::~Verifier() {
     for (float* b : slot_bias_dev_)
         if (b != nullptr) strata::gpu::free(b);
     if (slot_hist_d_) strata::gpu::free(slot_hist_d_);
+    if (slot_params_d_) strata::gpu::free(slot_params_d_);
     if (allowed_device_) strata::gpu::free(allowed_device_);
     if (rp_lambda_d_) strata::gpu::free(rp_lambda_d_);
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
@@ -781,6 +782,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     res_graph_ = !always_publish_ && hits.h_res != nullptr && hits.d_res != nullptr && MoeWindow::resident_graph_on();
     if (!win_.device_plans()) { device_plan_ = false; res_graph_ = false; }
+    // a latent pack keeps the host plan: the plan's activation-row rewrite reads the doorbell's mapped ids, which
+    // the resident / device-plan graphs do not write (EDGE design §4.4; their speed is a later measurement)
+    if (win_.latent()) { device_plan_ = false; res_graph_ = false; }
     std::fprintf(stderr, "xestrata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
     return true;
@@ -1363,6 +1367,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }
         stamp(l, 16, grp);
         gr_read_group(1, true, inj_, inj2_);
+        // the latent MoE's D stage (Edge0): the whole window's rows through D before the router, so the pool's
+        // expert work has the router + plan + doorbell stretch of head start (the pool waits on the D doorbell)
+        if (win_.latent() && grp == 0) {
+            const int n_all = te_[G - 1] - tb_[0];
+            win_.latent_d_stage(l, tb_[0], n_all, mixed_ + (size_t) tb_[0] * N, cs);
+        }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
@@ -2807,18 +2817,38 @@ bool Verifier::sample_rows(int S, std::string& err) {
             return false;
         }
     }
+    std::vector<strata::kernels::SamplerParams> params((size_t) S);
     for (int t = 0; t < S; ++t) {
-        strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
+        auto& sp = params[(size_t) t];
+        sp = slot_sp_[(size_t) last_rows_[t]];
         const bool pen = h > 0 && penalised(sp);
-        const bool bias = sp.logit_bias != nullptr;
-        if (!allowed_on_ && !bias && !pen && (sp.greedy || sp.temperature <= 0.0f)) continue;
-        sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        if (!pen) sp.penalty_last_n = 0;          // no history handed to this row: no window to count
+        if (!allowed_on_ && !sp.logit_bias && !pen && (sp.greedy || sp.temperature <= 0.0f)) {
+            sp.penalty_last_n = -1;  // keep the window's argmax
+            continue;
+        }
+        sp.counter = (uint64_t) last_pos_b_[t];
+        if (!pen) sp.penalty_last_n = 0;
         sp.allowed = allowed_on_ ? allowed_device_ + (size_t) t * words : nullptr;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
-                                       pen ? slot_hist_d_ + (size_t) t * (size_t) h : nullptr, pen ? h : 0, sp,
-                                       m_out_ + t, cs_);
         any = true;
+    }
+    if (any) {
+        const OnDevice on_params(device_);
+        if (slot_params_cap_ < (size_t) S) {
+            if (slot_params_d_) strata::gpu::free(slot_params_d_);
+            slot_params_d_ = nullptr;
+            slot_params_cap_ = 0;
+            if (!strata::gpu::alloc_device(&slot_params_d_, (size_t) S * sizeof(params[0]))) {
+                err = "verify batch: the sampler parameters' allocation failed";
+                return false;
+            }
+            slot_params_cap_ = (size_t) S;
+        }
+        if (!strata::gpu::copy(slot_params_d_, params.data(), (size_t) S * sizeof(params[0]))) {
+            err = "verify batch: the sampler parameters' upload failed";
+            return false;
+        }
+        strata::kernels::sample_token_rows(head_logits_, S, (int) n_vocab_, h ? slot_hist_d_ : nullptr, h,
+                                           slot_params_d_, m_out_, cs_);
     }
     if (any && !strata::gpu::stream_sync(cs_)) { err = "verify batch: the row sampling failed"; return false; }
     return true;

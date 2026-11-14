@@ -32,6 +32,8 @@
 #include "strata/core/script_guard.hpp"
 #include "strata/core/logit_bias.hpp"
 #include "strata/core/dflash2.hpp"
+#include "strata/core/bdraft2_runner.hpp"
+#include "strata/core/window_rows.hpp"
 #include "strata/core/plain_model.hpp"
 #include "strata/core/auto_pick.hpp"
 #include "strata/core/runtime.hpp"
@@ -42,6 +44,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/platform/memory.hpp"
@@ -49,8 +52,10 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/spec/draft_probe.hpp"
+#include "strata/spec/df2_block_policy.hpp"
 #include "strata/spec/drafter_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/static_drafter.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/platform/downgrade.hpp"
 #include "strata/platform/env.hpp"
@@ -204,12 +209,20 @@ void linkless_gpu_adapter() {
 // starts over, or from the conversation cache).
 namespace {
 
-// Whether a drafter of this run takes windows of more than 8 rows, so that under --wide-window auto the model sizes its
-// windows for 16 (window_rows_for) before it loads (`serve`: the run serves requests).  No drafter does yet.
+// Reserve the wider tap and verifier buffers before loading where the DFlash2 start probe can compare both blocks.
 bool wants_wide_window(const strata::core::PlainOptions& opt, bool serve) {
-    (void) opt;
-    (void) serve;
-    return false;
+    if (!serve || (opt.draft != "auto" && opt.draft != "dflash2") || opt.draft_model.empty() ||
+        !opt.split_at.empty() || opt.split_auto || opt.batch_slots != 0 || opt.cpu || opt.pipeline_windows >= 2 ||
+        !strata::spec::probe_enabled()) return false;
+    strata::core::Dflash2Drafter::PackShape shape;
+    std::string err;
+    return strata::core::Dflash2Drafter::read_shape(opt.draft_model, shape, err);
+}
+
+// The K/V cache's format, as --kv names it
+const char* kv_name(const strata::core::PlainOptions& o) {
+    return o.kv_tcq == 4 ? "tcq4" : o.kv_tcq == 5 ? "tcq5" : o.kv_q4 == 1 ? "q4_0" : o.kv_q4 == 2 ? "k8v4"
+                                                                         : o.kv_int8 ? "int8" : "fp16";
 }
 
 // The conversation cache (--conversation-cache-mib, sized from the free RAM by default as Qwen3.8-Flash-Next's, #3493):
@@ -585,6 +598,8 @@ constexpr int64_t kProbeFreeMib = 160;
 // pack's shape (read before the load, which takes its taps), the drafter and its widest window
 struct PlainDrafters {
     strata::core::Dflash2Drafter df2;
+    strata::core::Bdraft2Runner bdraft;
+    bool is_bdraft = false;
     strata::core::Dflash2Drafter::PackShape shape;
     std::string pack;
     bool deferred = false;   ///< auto: loaded at the end of the --serve start, to be measured
@@ -601,7 +616,24 @@ struct PlainDrafters {
             err = "the DFlash2 pack " + pack + " is another model's (its hidden size, vocabulary or taps)";
             return false;
         }
-        if (!df2.load(pack, 0, err)) return false;
+        if (is_bdraft) {
+            const auto head = std::filesystem::path(pack).parent_path() / "bdraft2_k8.shead";
+            const std::string head_path = std::filesystem::is_regular_file(head) ? head.string() : std::string();
+            if (!bdraft.load(pack, head_path, model, 0, err)) return false;
+            if (!model.set_window_drafts(7, err)) { bdraft.release(); return false; }
+            window = std::min(8, model.window_drafts() + 1);
+            if (window < 2) { err = "bdraft2: no verification window"; release(model); return false; }
+            loaded = true;
+            std::fprintf(stderr, "xestrata (%s): block drafter %s: window %d, %.0f MiB of VRAM\n", arch.c_str(),
+                         pack.c_str(), window, (double) bdraft.bytes() / 1048576.0);
+            return true;
+        }
+        if (model.tap_dev() == nullptr || model.n_taps() != (int) shape.taps.size()) {
+            err = "the model's windows hold no DFlash2 taps (its layers " + std::to_string(model.n_taps()) + " of " +
+                  std::to_string(shape.taps.size()) + ")";
+            return false;
+        }
+        if (!df2.loaded() && !df2.load(pack, 0, err)) return false;   // (--draft dflash2: before the model's tier)
         const strata::core::PlainModel::HeadView h = model.draft_head_view();
         const strata::core::PlainModel* m = &model;
         auto embed = [m](int32_t tok, float* row) { return m->embed_token(tok, row); };
@@ -617,9 +649,14 @@ struct PlainDrafters {
             return false;
         }
         std::string e;
-        if (!model.set_window_drafts(strata::core::Dflash2Drafter::kDrafts, e))
+        if (!model.set_window_drafts(strata::core::window_rows_cap() - 1, e))
             std::fprintf(stderr, "xestrata (%s): %s: DFlash2's windows are the MTP layer's\n", arch.c_str(), e.c_str());
-        window = std::min(strata::core::Dflash2Drafter::kRows, model.window_drafts() + 1);
+        window = std::min(strata::core::window_rows_cap(), model.window_drafts() + 1);
+        if (strata::core::wide_window() == strata::core::WideWindow::On && window < strata::kernels::kWindowMaxT) {
+            err = "DFlash2: wide windows need a 16-row verifier";
+            release(model);
+            return false;
+        }
         df2.set_max_drafts(window - 1);
         if (!df2.prepare(model.tap_dev(), err)) {
             release(model);
@@ -630,9 +667,23 @@ struct PlainDrafters {
                      pack.c_str(), window, (double) df2.vram_bytes() / 1048576.0);
         return true;
     }
+    bool begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold, std::string& err) {
+        return is_bdraft ? bdraft.begin_request(ids, n, resume, cold, err) : df2.begin_request(ids, n, resume, cold);
+    }
+    bool context(const float* taps, int64_t rows, int64_t pos, std::string& err) {
+        return is_bdraft ? bdraft.context(taps, rows, pos, err) : df2.context(taps, rows, pos, err);
+    }
+    bool draft(const float* taps, int rows, int64_t pos, int32_t anchor, int32_t* out, float* prob, std::string& err) {
+        return is_bdraft ? bdraft.draft(taps, rows, pos, anchor, out, prob, err)
+                         : df2.draft(taps, rows, pos, anchor, out, prob, err);
+    }
+    void note_rows(const int32_t* ids, int64_t n, int64_t pos) {
+        if (is_bdraft) bdraft.note_rows(ids, n, pos); else df2.note_rows(ids, n, pos);
+    }
     /// Released from VRAM and RAM, the model's taps off and its windows' extra copies freed (as without the pack)
     void release(strata::core::PlainModel& model) {
         df2.release();
+        bdraft.release();
         loaded = deferred = false;
         model.taps_off();
         std::string e;
@@ -900,7 +951,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     if (folder.on()) {
         folder.id = "engine=" STRATA_VERSION "\n" + model_id + "\nmodel=" +
                     strata::core::conversation_file_identity(opt.gguf) + "\nkv_int8=" +
-                    std::to_string((int) opt.kv_int8) + " kv_q4=" + std::to_string(opt.kv_q4) + " kv_ram=" +
+                    std::to_string((int) model.options().kv_int8) + " kv_q4=" + std::to_string(model.options().kv_q4) +
+                    " kv_tcq=" + std::to_string(model.options().kv_tcq) + " kv_ram=" +
                     std::to_string((int) opt.kv_ram) + " kv_page=" + std::to_string((long long) model.attn_shapes().page_size) +
                     " cvec=" + std::to_string((unsigned long long) cvecs.digest) +
                     " split=";
@@ -948,6 +1000,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     std::deque<std::string> probe_lines;
     std::vector<strata::spec::ProbeArm> probe_arms;
     std::vector<strata::spec::ProbeRun> probe_runs;
+    strata::spec::StaticDrafter static_drafter;
+    const int static_mode = static_drafter.configure((int32_t) model.vocab());
+    bool static_selected = static_mode == 1;
+    int block_selected = strata::core::wide_window() == strata::core::WideWindow::On ? 1 : 0;
     bool probe_running = false, drafting_off = false;
     int probe_stdout = -1;
     size_t probe_free0 = 0;
@@ -969,7 +1025,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             strata::program::InfoLine()
                 .add("logit_bias", 1)
                 .add("context", (long long) ctx)
-                .add("kv", opt.kv_q4 == 1 ? "q4_0" : opt.kv_q4 == 2 ? "k8v4" : opt.kv_int8 ? "int8" : "fp16")
+                .add("kv", kv_name(model.options()))
+                .add("kv_resident", (long long) model.kv_resident())
                 .add("expert_slots", (long long) model.slots())
                 .add("expert_cache_mib", (long long) (model.tier_bytes() >> 20))
                 .add("spec", drafting_off ? 1 : dr.loaded && !model.drafts() ? dr.window : model.drafts() + 1)
@@ -1007,41 +1064,51 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         strata::core::window_choices_paused() = false;
         const long long free_during = free_mib();
         const strata::spec::DraftProbe judge;
-        const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, dr.loaded, model.drafts() + 1);
+        const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, model.drafts() + 1);
         std::fprintf(stderr, "xestrata (%s): %s (%.1f s)\n", arch.c_str(), v.line.c_str(),
                      std::chrono::duration<double>(Clock::now() - probe_t0).count());
-        strata::spec::Drafter keep = v.measured ? v.keep : strata::spec::Drafter::Mtp;
-        bool both = v.measured && v.keep_both;
+        if (v.measured && static_mode < 0) static_selected = v.df2_static;
+        if (v.measured && strata::core::wide_window() == strata::core::WideWindow::Auto) block_selected = v.df2_block;
+        strata::spec::Drafter keep = v.measured ? v.keep : model.drafts() > 0 ? strata::spec::Drafter::Mtp
+                                                                             : dr.is_bdraft ? strata::spec::Drafter::Bdraft2
+                                                                                            : strata::spec::Drafter::Df2;
+        if (dr.loaded && dr.is_bdraft && dr.bdraft.head_auto() && keep == strata::spec::Drafter::Bdraft2) {
+            std::string e;
+            if (!dr.bdraft.finish_head_choice(v.measured && v.bdraft_shead, e)) {
+                std::fprintf(stderr, "xestrata (%s): bdraft2 head selection: %s\n", arch.c_str(), e.c_str());
+                dr.release(model);
+                keep = strata::spec::Drafter::None;
+            }
+        }
         // DFlash2 kept only where the VRAM it took from the reserve leaves the reserve the start had (a long prompt's
         // buffers come out of it)
         size_t fb = 0, tb = 0;
         strata::gpu::mem_info(&fb, &tb);
         const long long reserve = opt.reserve_mib >= 0 ? (long long) opt.reserve_mib : (long long) (tb >> 20) / 32;
-        if ((keep == strata::spec::Drafter::Df2 || both) && free_during < reserve) {
-            std::fprintf(stderr, "xestrata (%s): DFlash2 is not kept: with it %lld MiB of VRAM stay free, less than the "
-                                 "%lld MiB reserve: the MTP layer drafts\n", arch.c_str(), free_during, reserve);
-            keep = strata::spec::Drafter::Mtp;
-            both = false;
+        if ((keep == strata::spec::Drafter::Df2 || keep == strata::spec::Drafter::Bdraft2) && free_during < reserve) {
+            std::fprintf(stderr, "xestrata (%s): the drafter is not kept: with it %lld MiB of VRAM stay free, less than the "
+                                 "%lld MiB reserve\n", arch.c_str(), free_during, reserve);
+            keep = model.drafts() > 0 ? strata::spec::Drafter::Mtp : strata::spec::Drafter::None;
         }
-        if (dr.loaded && keep != strata::spec::Drafter::Df2 && !both) dr.release(model);
+        if (dr.loaded && keep != strata::spec::Drafter::Df2 && keep != strata::spec::Drafter::Bdraft2)
+            dr.release(model);   // one drafter is kept
         // the MTP layer that lost: its own weights, graphs and 2-bit head back (its K/V pool and its experts' places
         // in the tier stay: a saved state carries the one, the tier's layout holds the other)
-        if (keep != strata::spec::Drafter::Mtp && !both && model.drafts() > 0) {
+        if (keep != strata::spec::Drafter::Mtp && model.drafts() > 0) {
             const uint64_t back = model.release_mtp(dr.loaded);
             std::fprintf(stderr, "xestrata (%s): the MTP layer's weights released (%llu MiB of VRAM back; its K/V and "
                                  "its experts' places stay)\n", arch.c_str(), (unsigned long long) (back >> 20));
         }
         if (dr.loaded) {
             dr.deferred = false;
-            draft_rule = both ? "learn" : "df2";
+            draft_rule = dr.is_bdraft ? "bdraft2" : "df2";
         }
-        drafting_off = keep == strata::spec::Drafter::None && !both;
+        drafting_off = keep == strata::spec::Drafter::None;
         if (keep == strata::spec::Drafter::Mtp && v.spec > 0) model.set_mtp_drafts(v.spec - 1);
         drafter_policy = strata::spec::DrafterPolicy();
         std::fprintf(stderr, "xestrata (%s): drafting: %s; VRAM free %lld MiB before the measurement, %lld with every "
                              "drafter loaded, %lld now\n", arch.c_str(),
-                     dr.loaded && both ? "the MTP layer and DFlash2 (picked per request)"
-                     : dr.loaded       ? "DFlash2"
+                     dr.loaded      ? (dr.is_bdraft ? "block drafter" : "DFlash2")
                      : drafting_off    ? "no drafter"
                                        : ("the MTP layer, window " + std::to_string(model.drafts() + 1)).c_str(),
                      (long long) (probe_free0 >> 20), free_during, free_mib());
@@ -1054,33 +1121,50 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     probe_arms.clear();
     {
         const bool probe_ok = strata::spec::probe_enabled() && model.stages() == 1 && bs.empty() && !model.on_cpu();
-        const bool want_arms = probe_ok && (opt.draft == "auto" || opt.spec_auto) && model.drafts() > 0;
+        const bool want_arms = probe_ok && (((opt.draft == "auto" || opt.spec_auto) &&
+                                              (model.drafts() > 0 || dr.deferred)) ||
+                                             (dr.loaded && dr.is_bdraft && dr.bdraft.head_auto() && dr.bdraft.has_shead()) ||
+                                             (dr.loaded && !dr.is_bdraft && static_mode < 0 && static_drafter.loaded()) ||
+                                             (dr.loaded && !dr.is_bdraft && dr.window >= strata::kernels::kWindowMaxT &&
+                                              strata::core::wide_window() == strata::core::WideWindow::Auto));
         size_t fb = 0, tb = 0;
         strata::gpu::mem_info(&fb, &tb);
         probe_free0 = fb;
         if (dr.deferred && want_arms) {
             const int64_t need = (int64_t) dr.shape.bytes + (256ll << 20);   // the pack, its buffers and logits (about)
+            // measured only where it could stay: the reserve still free beside it (probe_finish's rule); GLM-5.3-Flash on
+            // the B70 left 230 MiB beside it, was measured for 128 s and could not stay
+            const int64_t keep_free = std::max<int64_t>(kProbeFreeMib,
+                                                        opt.reserve_mib >= 0 ? opt.reserve_mib : (int64_t) (tb >> 20) / 32);
             std::string e;
-            if ((int64_t) fb - need < (kProbeFreeMib << 20)) {
+            if ((int64_t) fb - need < (keep_free << 20)) {
                 std::fprintf(stderr, "xestrata (%s): DFlash2 is not measured: %lld MiB of VRAM free, it takes about %lld "
-                                     "and %lld must stay free: the MTP layer drafts\n", arch.c_str(),
-                             (long long) (fb >> 20), (long long) (need >> 20), (long long) kProbeFreeMib);
+                                     "and %lld must stay free (the reserve: it could not stay): the MTP layer drafts\n",
+                             arch.c_str(), (long long) (fb >> 20), (long long) (need >> 20), (long long) keep_free);
                 dr.release(model);
             } else if (!dr.load(model, arch, e)) {
                 std::fprintf(stderr, "xestrata (%s): DFlash2 not loaded (%s): the MTP layer drafts\n", arch.c_str(),
                              e.c_str());
                 dr.release(model);
-            } else if (free_mib() < (long long) kProbeFreeMib) {
-                std::fprintf(stderr, "xestrata (%s): DFlash2 released: less VRAM is left free beside it than the "
-                                     "measurement needs\n", arch.c_str());
+            } else if (free_mib() < (long long) keep_free) {
+                std::fprintf(stderr, "xestrata (%s): DFlash2 released: less VRAM than the reserve is left free beside "
+                                     "it: it could not stay\n", arch.c_str());
                 dr.release(model);
             }
         } else if (dr.deferred) {
             dr.release(model);
         }
-        if (want_arms)
-            probe_arms = strata::spec::DraftProbe::arms(true, dr.loaded, opt.draft == "auto", model.drafts() + 1,
-                                                         opt.spec_auto, dr.window);
+        if (want_arms) {
+            probe_arms = strata::spec::DraftProbe::arms(model.drafts() > 0, dr.loaded && !dr.is_bdraft,
+                opt.draft == "auto", model.drafts() + 1, opt.spec_auto, dr.window,
+                dr.loaded && dr.is_bdraft, dr.window, static_mode < 0 && static_drafter.loaded(),
+                dr.window < strata::kernels::kWindowMaxT ? 0 : strata::core::wide_window() == strata::core::WideWindow::On ? 1
+                    : strata::core::wide_window() == strata::core::WideWindow::Auto ? 2 : 0,
+                dr.loaded && dr.is_bdraft && dr.bdraft.head_auto() && dr.bdraft.has_shead(), static_mode == 1);
+            if (dr.loaded && dr.is_bdraft && !dr.bdraft.head_auto() && dr.bdraft.uses_shead())
+                for (auto& arm : probe_arms)
+                    if (arm.drafter == strata::spec::Drafter::Bdraft2) arm.shead = true;
+        }
         std::vector<int32_t> prompt;
         if (probe_arms.size() >= 2) {
             try {
@@ -1097,7 +1181,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             const std::vector<int> plan = strata::spec::DraftProbe::plan((int) probe_arms.size());
             for (int k : plan) {
                 const strata::spec::ProbeArm& a = probe_arms[(size_t) std::max(k, 0)];
-                probe_lines.push_back("GEN " + std::to_string(strata::spec::probe_tokens()) + " ckpt=0 draft=" +
+                probe_lines.push_back("GEN " + std::to_string(k < 0 ? strata::spec::kProbeWarmTokens
+                                                                  : strata::spec::probe_tokens()) + " ckpt=0 draft=" +
                                       (a.drafter == strata::spec::Drafter::None ? std::string("off")
                                                                                 : strata::spec::drafter_name(a.drafter)) +
                                       " spec=" + std::to_string(a.spec) + " probe=" + std::to_string(k) + " " + ids);
@@ -1114,6 +1199,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         } else if (dr.loaded && dr.deferred) {
             std::fprintf(stderr, "xestrata (%s): DFlash2 released: the drafters could not be measured\n", arch.c_str());
             dr.release(model);
+        }
+    }
+    if (!probe_running && dr.loaded && dr.is_bdraft && dr.bdraft.head_auto()) {
+        std::string e;
+        if (!dr.bdraft.finish_head_choice(false, e)) {
+            std::fprintf(stderr, "xestrata (%s): bdraft2 head selection: %s\n", arch.c_str(), e.c_str());
+            dr.release(model);
+            drafting_off = true;
         }
     }
     if (!probe_running) announce();
@@ -1411,10 +1504,22 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::vector<int64_t> head(ids.begin(), ids.begin() + (std::ptrdiff_t) std::min<size_t>(ids.size(), 64));
             req_kind = strata::spec::DrafterPolicy::kind_of(head.data(), (int64_t) head.size());
             const std::string& d = !req_draft.empty() ? req_draft : draft_rule;
-            if (d == "dflash2" || d == "df2" || model.drafts() == 0) req_df2 = true;
+            if (d != "mtp" && (d == "dflash2" || d == "df2" || d == "bdraft2" || model.drafts() == 0)) req_df2 = true;
             else if (d == "learn")
                 req_df2 = drafter_policy.choose(req_kind, (int64_t) ids.size(), true) == strata::spec::DrafterPolicy::Df2;
         }
+        if (dr.loaded && dr.is_bdraft && dr.bdraft.head_auto() && probe_running && req_probe >= -1) {
+            const auto& arm = probe_arms[(size_t) std::max(req_probe, 0)];
+            if (arm.drafter == strata::spec::Drafter::Bdraft2) dr.bdraft.set_probe_shead(arm.shead);
+        }
+        const int64_t df2_short0 = dr.df2.rounds_short, df2_wide0 = dr.df2.rounds_wide;
+        const bool req_static = req_df2 && !dr.is_bdraft && (probe_running && req_probe >= -1
+            ? probe_arms[(size_t) std::max(req_probe, 0)].static_table : static_selected);
+        const int req_block = probe_running && req_probe >= -1
+            ? probe_arms[(size_t) std::max(req_probe, 0)].block : block_selected;
+        strata::spec::Df2BlockPolicy block_policy(req_block == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
+                                                  : req_block == 2 ? strata::spec::Df2BlockPolicy::Mode::Adaptive
+                                                                   : strata::spec::Df2BlockPolicy::Mode::Short);
         if (req_spec_cap > 0 && !req_df2 && model.drafts() > 0) model.set_mtp_drafts(req_spec_cap - 1);
         if (req_prefill && (geni || ids.size() < 2 || admit_slot >= 0)) {
             std::printf("ERR prefill=1 needs a text prompt of at least 2 tokens and no batch slot\n");
@@ -2041,17 +2146,21 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // and the prompt's last 2047 rows' taps (its window) handed to it as the prompt is read
         if (dr.loaded) {
             bool cold = false;
-            dr.df2.begin_request(ids.data(), n, resume, &cold);
+            if (!dr.begin_request(ids.data(), n, resume, &cold, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                std::fflush(stdout);
+                continue;
+            }
             const int64_t cap = dr.deferred ? 256 : 2048;   // the measurement's prompts are short
             if (!model.set_prompt_taps(std::max<int64_t>(0, n - 2047), cap,
                                        [&](const float* taps, int64_t rows, int64_t p0, std::string& e) {
-                                           return dr.df2.context(taps, rows, p0, e);
+                                           return dr.context(taps, rows, p0, e);
                                        }, err)) {
                 std::printf("ERR %s\n", err.c_str());
                 std::fflush(stdout);
                 continue;
             }
-            dr.df2.note_rows(ids.data() + resume, n - resume, resume);
+            dr.note_rows(ids.data() + resume, n - resume, resume);
         }
         for (const Cut& c : cuts) {
             if (c.to <= read_to) continue;   // (prefill=1: a cut at the token it leaves out)
@@ -2110,10 +2219,11 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::vector<int32_t> ext((size_t) opt.max_t + 1);
         const bool spec = ((model.drafts() > 0 && !req_off) || lookup || req_df2) && !constrained;
         // DFlash2's drafts for the next window (none before the first: its first window is the pending token alone)
-        constexpr int kD2 = strata::core::Dflash2Drafter::kDrafts;
+        constexpr int kD2 = strata::core::Dflash2Drafter::kMaxDrafts;
         int32_t d2[kD2] = {};
         float d2p[kD2] = {};
         bool d2_have = false;
+        int d2_width = strata::kernels::kVerifyNarrowT;
         const double d2_conf = opt.draft_conf > 0.0 ? opt.draft_conf : strata::spec::df2_default_conf(model.slots());
         if (spec && lookup) {
             sfx.reset();
@@ -2162,30 +2272,43 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             }
             if (spec && req_df2) {   // DFlash2: its window (its own rule over its selector's probabilities), then its next
                 int n_emit = 0;
-                const int n_ext = d2_have ? strata::spec::df2_window(d2p, dr.window, d2_conf) - 1 : 0;
+                int n_ext = d2_have ? strata::spec::df2_window(d2p, std::min(d2_width, dr.window), d2_conf) - 1 : 0;
+                const int32_t* candidate = d2;
+                bool static_window = false;
+                if (req_static && d2_have) {
+                    const int32_t prev = live.empty() ? -1 : live.back();
+                    const int count = static_drafter.propose(prev, next, std::min(d2_width, dr.window) - 1, ext.data());
+                    if (count > 0) { candidate = ext.data(); n_ext = count; static_window = true; }
+                }
                 const int64_t p0 = model.pending_pos();
                 const int32_t pending = next;
-                if (!model.spec_step(eos, max_new - produced, out.data(), n_emit, nullptr, err, nullptr, d2, n_ext, 0,
+                if (!model.spec_step(eos, max_new - produced, out.data(), n_emit, nullptr, err, nullptr, candidate, n_ext, 0,
                                      true)) {
                     ok = false;
                     break;
                 }
+                if (d2_have && !static_window && n_ext == d2_width - 1 && n_emit <= n_ext + 1 &&
+                    produced + n_emit < max_new &&
+                    std::find(eos.begin(), eos.end(), out[(size_t) n_emit - 1]) == eos.end())
+                    block_policy.observe(d2_width, n_emit - 1);
                 // the window's committed rows: the pending token and the accepted drafts; the token after them anchors
                 // the next block
-                int32_t rows[strata::core::Dflash2Drafter::kRows + 1];
+                int32_t rows[strata::core::Dflash2Drafter::kMaxRows + 1];
                 rows[0] = pending;
-                for (int i = 1; i < n_emit && i <= strata::core::Dflash2Drafter::kRows; ++i) rows[i] = out[(size_t) i - 1];
+                for (int i = 1; i < n_emit && i <= strata::core::Dflash2Drafter::kMaxRows; ++i) rows[i] = out[(size_t) i - 1];
                 d2_have = false;
                 const bool ends = produced + n_emit >= max_new ||
                                   std::find(eos.begin(), eos.end(), out[(size_t) n_emit - 1]) != eos.end();
                 if (!ends) {
-                    if (!dr.df2.draft(model.tap_dev(), n_emit, p0, out[(size_t) n_emit - 1], d2, d2p, err)) {
+                    d2_width = block_policy.choose(dr.window);
+                    if (!dr.is_bdraft) dr.df2.set_block_rows(d2_width);
+                    if (!dr.draft(model.tap_dev(), n_emit, p0, out[(size_t) n_emit - 1], d2, d2p, err)) {
                         ok = false;
                         break;
                     }
                     d2_have = true;
                 }
-                dr.df2.note_rows(rows, n_emit, p0);
+                dr.note_rows(rows, n_emit, p0);
                 script.commit(out.data(), n_emit);
                 live.push_back(next);
                 pend.assign(out.begin(), out.begin() + n_emit);
@@ -2257,9 +2380,21 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                                      (double) (model.file_read_bytes() - file_bytes0) / 1e6, (int64_t) (n_end - resume),
                                      (int64_t) (model.offloaded() - offload0), ""});
         std::fflush(stdout);
-        if (req_probe >= 0)   // the start's measurement: this run's speed
+        if (req_df2 && !dr.is_bdraft && strata::env_auto("DF2_BLOCK_LOG") == 1)
+            std::fprintf(stderr, "xestrata dflash2: block rounds 8=%lld 16=%lld static=%d\n",
+                         (long long) (dr.df2.rounds_short - df2_short0), (long long) (dr.df2.rounds_wide - df2_wide0),
+                         (int) req_static);
+        if (req_probe == -1 && decode_ms > 0.0) {   // the warm-up: the counted runs about a second of decode each
+            const int nt = strata::spec::probe_run_tokens(1000.0 * (double) produced / decode_ms);
+            for (std::string& pl : probe_lines) pl = strata::spec::probe_line_tokens(pl, nt);
+        } else if (req_probe >= 0) {   // a counted run; a round that settles it, or past the budget, ends it
             probe_runs.push_back({req_probe, (int64_t) produced, decode_ms, (int64_t) (model.spec_drafted() - off0),
                                   (int64_t) (model.spec_accepted() - acc0)});
+            const bool round = probe_runs.size() % probe_arms.size() == 0;
+            if (round && (strata::spec::DraftProbe::settled(probe_arms, probe_runs) ||
+                          std::chrono::duration<double>(Clock::now() - probe_t0).count() > strata::spec::probe_budget_s()))
+                probe_lines.clear();
+        }
         else if (dr.loaded && req_kind != 0 && req_probe == -2 && !req_off)   // both kept: what this request taught
             drafter_policy.observe(req_kind, (int64_t) ids.size(), req_df2 ? strata::spec::DrafterPolicy::Df2
                                                                            : strata::spec::DrafterPolicy::Mtp,
@@ -2381,6 +2516,10 @@ static void plain_usage(const std::string& arch) {
                  "  --pcie-frac F        that share of the missed experts over PCIe, not the measured split (0 .. 1)\n"
                  "  --kv fp16|int8       the attention layers' K/V cache: FP16 (the default) or int8 codes with a scale\n"
                  "                       per 64 values (half the VRAM; the answers differ slightly; not GLM-5.3-Flash)\n"
+                 "  --kv q4_0|k8v4|tcq4|tcq5  heads of 256: K and V rotated, Q4_0 (144 B a head's row), INT8 K with\n"
+                 "                       Q4_0 V, or trellis-coded at 4 or 5 bits a value (132 or 164 B: less error\n"
+                 "                       than Q4_0's).  Not given: a dense model whose blocks the GPU would not hold\n"
+                 "                       with FP16 takes the first of int8, tcq5 and tcq4 with which it holds them\n"
                  "  --prefill-cpu-share S  the CPU pool's share of the prompt's experts the VRAM tier misses (0-1;\n"
                  "                       auto = from the times measured at load, the default; 0: all on the GPU)\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default:\n"
@@ -2393,6 +2532,10 @@ static void plain_usage(const std::string& arch) {
                  "                       too, the CLI's greedy runs)\n"
                  "  --coupled-draft, --no-coupled-draft  sample the MTP drafts with the request's chain (default: off)\n"
                  "  --kv-ram on|off      GLM-5.3-Flash: the DSA layers' latent cells in RAM, their VRAM to the experts (on)\n"
+                 "  --kv-resident N|auto|off  stream the attention layers' K/V: the last N cells a layer in VRAM, the\n"
+                 "                       rest in RAM (the decode reads it over PCIe). auto (default): from 64K up when\n"
+                 "                       the RAM holds the experts beside the KV; off: every cell in VRAM. Not GLM's DSA\n"
+                 "                       (--kv-ram), the sliding-window layers, --batch or an encoder (XESTRATA_KV_RESIDENT)\n"
                  "  --spec-window all|auto|min-p  how many drafts a window checks: all (default); auto while each is\n"
                  "                       expected to raise the tokens per ms at the measured window costs; or while\n"
                  "                       each is at least --spec-min-p P likely under the MTP layer\n"
@@ -2401,11 +2544,15 @@ static void plain_usage(const std::string& arch) {
                  "                       the model's DFlash2 pack (--draft-model; GLM-5.3-Flash, Qwen3.6-35B-A3B);\n"
                  "                       auto: --serve measures the MTP, DFlash2 and none at its start and keeps the\n"
                  "                       fastest; without --serve the MTP\n"
-                 "  --draft-model PACK   the model's DFlash2 pack (tools/dflash2_fetch.py --model, setup fetches it)\n"
+                 "  --draft-model FILE   the model's DFlash2 pack, or its YASAKANI block drafter .yskn\n"
+                 "                       XESTRATA_BDRAFT_SHEAD=auto|off|on selects its output head (default auto)\n"
                  "  --suffix-draft N     --serve: drafts from an earlier repeat of the context's last N+ tokens, a window\n"
                  "                       of them where they go past the MTP's (also without an MTP layer; default 0 = off)\n"
                  "  --lookup-chain K     --serve: after the MTP's drafts, up to K lookup drafts that continue them\n"
                  "  --lookup-chain-min M  the shortest match --lookup-chain extends on (default 3)\n"
+                 "  --window-hashes PATH per verify window, a line with its index, position, size, a 64-bit hash of\n"
+                 "                       its final normed rows and its argmaxes: two builds that do the same\n"
+                 "                       arithmetic write the same file (use with --spec-follow, --adapt-every 0)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --rope-freq-base F, --rope-freq-scale F   the rotation's base and frequency scale\n"
                  "  --yarn-ext-factor F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F  YaRN's knobs\n"
@@ -2473,8 +2620,13 @@ static void plain_usage(const std::string& arch) {
                  "  --cpu-threads N      --device cpu: the threads the forward takes (default: physical cores, subject to the CPU quota)\n"
                  "  --gpu-layers N       dense models: the first N blocks and the head on the GPU, the rest on the CPU\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
-                 "                       next those from K on, ..; auto: in proportion to each GPU's free memory\n"
-                 "  --split-device D[,D2..]  the later GPUs (engine numbers or PCI addresses; default the other cards)\n",
+                 "                       next those from K on, ..; auto: in proportion to each GPU's free memory, and\n"
+                 "                       with --expert-profile the second GPU a stage or a helper expert cache or none\n"
+                 "                       (the faster predicted decode window; docs/MULTIGPU.md)\n"
+                 "  --split-device D[,D2..]  the later GPUs (engine numbers or PCI addresses; default the other cards)\n"
+                 "  --split-roles any|helper  --layer-split auto: the second GPU a stage or a helper cache (any), or\n"
+                 "                       only a helper cache or none (helper)\n"
+                 "  --split-skip-if-fits  --layer-split auto: the first GPU alone when it holds every profiled expert\n",
                  arch.c_str());
 }
 
@@ -2536,6 +2688,7 @@ int plain_main(int argc, char** argv) {
     shared.spec_window = &opt.spec_window;
     shared.spec_window_all = true;
     shared.spec_min_p = &opt.spec_min_p;
+    shared.window_hashes = &opt.window_hashes;
     shared.mmap_experts = &opt.mmap_experts;
     shared.vram_free_mib = &opt.vram_free_mib;
     shared.vram_elastic = &opt.vram_elastic;
@@ -2592,6 +2745,8 @@ int plain_main(int argc, char** argv) {
     shared.batch_clamp0 = true;
     shared.expert_cache_remote = opt.expert_cache_remote.data();
     shared.expert_cache_remote_clamp0 = true;
+    shared.split_roles_helper = &opt.split_roles_helper;
+    shared.split_skip_if_fits = &opt.split_skip_if_fits;
     shared.pool_tasks = &opt.pool_tasks;
     shared.pool_tasks_msg = pool_tasks_msg.c_str();
     shared.prompt_cache_every = &cache.every;
@@ -2623,6 +2778,19 @@ int plain_main(int argc, char** argv) {
     shared.session_min_free_mib = &conv_session_min_free;
     shared.memory_limit_mib = &conv_memory_limit;
     shared.ram_reserve_mib = &conv_ram_reserve;
+    shared.kv_resident = &opt.kv_resident;
+    // --kv-resident's default from the environment (XESTRATA_KV_RESIDENT=auto|off|N); the command line overrides it
+    if (const char* v = strata::env_get("KV_RESIDENT")) {
+        if (std::strcmp(v, "auto") == 0) opt.kv_resident = -1;
+        else if (std::strcmp(v, "off") == 0) opt.kv_resident = 0;
+        else {
+            char* end = nullptr;
+            const long long n = std::strtoll(v, &end, 10);
+            if (end != v && *end == '\0' && n >= 0) opt.kv_resident = n;
+            else std::fprintf(stderr, "xestrata (%s): XESTRATA_KV_RESIDENT takes N, auto or off, not \"%s\"\n",
+                              arch.c_str(), v);
+        }
+    }
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -2761,13 +2929,15 @@ int plain_main(int argc, char** argv) {
         else if (a == "--kv") {   // as Qwen3.8-Flash-Next's (q4 is q4_0); the rotated ones for heads of 256
             std::string v = next("--kv");
             if (v == "q4") v = "q4_0";
-            if (v != "fp16" && v != "int8" && v != "q4_0" && v != "k8v4") {
-                std::fprintf(stderr, "xestrata (%s): --kv takes fp16, int8, q4_0 or k8v4, not \"%s\"\n", arch.c_str(),
-                             v.c_str());
+            if (v != "fp16" && v != "int8" && v != "q4_0" && v != "k8v4" && v != "tcq4" && v != "tcq5") {
+                std::fprintf(stderr, "xestrata (%s): --kv takes fp16, int8, q4_0, k8v4, tcq4 or tcq5, not \"%s\"\n",
+                             arch.c_str(), v.c_str());
                 return 2;
             }
             opt.kv_int8 = v == "int8";
             opt.kv_q4 = v == "q4_0" ? 1 : v == "k8v4" ? 2 : 0;
+            opt.kv_tcq = v == "tcq4" ? 4 : v == "tcq5" ? 5 : 0;
+            opt.kv_auto = false;
         }
         else {
             switch (option_scope(a)) {
@@ -2833,11 +3003,13 @@ int plain_main(int argc, char** argv) {
             std::fprintf(stderr, "xestrata (%s): --vision is off: the CPU's forward reads text only\n", arch.c_str());
             opt.vision = false;
         }
-        if (opt.kv_int8 || opt.kv_q4 != 0) {
+        if (opt.kv_int8 || opt.kv_q4 != 0 || opt.kv_tcq != 0) {
             std::fprintf(stderr, "xestrata (%s): --kv is FP32 on the CPU\n", arch.c_str());
             opt.kv_int8 = false;
             opt.kv_q4 = 0;
+            opt.kv_tcq = 0;
         }
+        opt.kv_auto = false;
         opt.kv_grow = 0;
         opt.vram_elastic = false;
         opt.batch_slots = 0;
@@ -2880,6 +3052,13 @@ int plain_main(int argc, char** argv) {
             if (strata::kernels::cpu::parse_pool_cores(text, cpus, why)) strata::kernels::cpu::set_pool_cores(cpus);
             else std::fprintf(stderr, "xestrata (%s): --pool-cores: %s; the pool uses its default placement\n", arch.c_str(),
                               why.c_str());
+        } else {   // XESTRATA_POOL_PLACE: the fast cores on a CPU whose cores are not all alike, when measured faster
+            std::string why;
+            const std::vector<int> cpus = strata::kernels::cpu::auto_pool_cores(why);
+            if (!cpus.empty()) {
+                strata::kernels::cpu::set_pool_cores(cpus);
+                std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), why.c_str());
+            }
         }
         std::string ac = aux_cpus, aerr;
         if (ac.empty())
@@ -2909,7 +3088,23 @@ int plain_main(int argc, char** argv) {
                                  "--batch\n", arch.c_str());
             return 2;
         }
-        if (want && !strata::core::Dflash2Drafter::read_shape(opt.draft_model, dr.shape, err)) {
+        dr.is_bdraft = want && std::filesystem::path(opt.draft_model).extension() == ".yskn";
+        bool shape_ok = true;
+        if (want && dr.is_bdraft) {
+            try {
+                const strata::yskn::Container c(opt.draft_model);
+                const auto& d = c.model();
+                if (d.arch != "bdraft2" || d.target_layers.size() != 5)
+                    throw std::runtime_error("bdraft2: invalid draft model");
+                dr.shape.taps = d.target_layers; dr.shape.hidden = d.hidden; dr.shape.vocab = d.vocab;
+                dr.shape.bytes = c.size();
+                const auto head = std::filesystem::path(opt.draft_model).parent_path() / "bdraft2_k8.shead";
+                if (std::filesystem::is_regular_file(head)) dr.shape.bytes += std::filesystem::file_size(head);
+            } catch (const std::exception& e) { err = e.what(); shape_ok = false; }
+        } else if (want) {
+            shape_ok = strata::core::Dflash2Drafter::read_shape(opt.draft_model, dr.shape, err);
+        }
+        if (want && !shape_ok) {
             std::fprintf(stderr, "xestrata (%s): %s%s\n", arch.c_str(), err.c_str(),
                          opt.draft == "auto" ? ": the MTP layer drafts" : "");
             if (opt.draft == "dflash2") return 2;
@@ -2918,12 +3113,24 @@ int plain_main(int argc, char** argv) {
                                  "the drafters at its start)\n", arch.c_str());
         } else if (want) {
             dr.pack = opt.draft_model;
+            if (!dr.is_bdraft) dr.df2.set_capacity_rows(opt.max_t > strata::kernels::kVerifyNarrowT &&
+                                      strata::core::window_rows_cap() >= strata::kernels::kWindowMaxT
+                                          ? strata::kernels::kWindowMaxT : strata::kernels::kVerifyNarrowT);
             dr.deferred = opt.draft == "auto";
             model.set_taps(dr.shape.taps);   // the windows' tap staging (small) is the load's
         }
     }
     if (opt.draft == "off") opt.spec = 0;   // no drafter (the suffix lookup may still propose)
-    if (opt.draft == "dflash2") opt.spec = 0;   // DFlash2 alone: the MTP layer is not loaded
+    if (opt.draft == "dflash2" && !dr.pack.empty()) {
+        // DFlash2 alone: no MTP layer; the pack and its windows' recurrent copies before the tier is sized from what
+        // is left (loaded after it, a 12 GB RTX 4070 had no room for its buffers and the B70 was left 17 MiB free)
+        opt.spec = 0;
+        opt.draft_windows = strata::core::Dflash2Drafter::kDrafts;
+        if (!dr.df2.load(dr.pack, 0, err)) {
+            std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
+            return 1;
+        }
+    }
     if (!model.load(opt, err) || !model.prompt_warm(err)) {
         std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
         // --serve: said where the server waits for READY, and ended at once: the clean-up of a model half loaded can
@@ -2935,6 +3142,12 @@ int plain_main(int argc, char** argv) {
             std::_Exit(1);
         }
         return 1;
+    }
+    if (const auto& rs = model.rope_full(); rs.type != strata::kernels::RopeScalingType::None) {
+        std::fprintf(stderr, "xestrata (%s): rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), "
+                             "--max-context %lld against a trained context of %.0f\n",
+                     arch.c_str(), rs.type == strata::kernels::RopeScalingType::YaRN ? "yarn" : "linear", rs.factor,
+                     rs.freq_scale(), rs.freq_base, rs.mscale(), (long long) opt.max_cells, rs.orig_ctx);
     }
     {   // --aux-cpus: the threads that are neither pool workers nor the host thread beside the workers
         const std::vector<int> wc = model.pool_worker_cpus();

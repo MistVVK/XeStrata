@@ -230,12 +230,97 @@ bool run(int fmt) {
     }
     return bad == 0;
 }
+
+// The plain engine's streamed dense attention (--kv-resident): the last R cells a layer in a VRAM ring, the older
+// cells read from the host copy over PCIe (qsa_dense_attn's host path), against a fully resident identity pool.
+// Every cell is read each token (no selection), so the ring needs no resolve: the kernel reads a cell below
+// n_kv - R from the host, the rest through the ring table. Bitwise equal outputs, every KV format.
+bool run_dense(int fmt) {
+    const char* name = fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
+    k::QsaShapes s = k::qsa_real_shapes();
+    s.n_head = 16; s.n_head_kv = 2;   // Ornith-1.5's full attention (8 query heads a KV head), a dense shape
+    const int64_t N = 20000, ps = s.page_size, n_blocks = (N + ps - 1) / ps;
+    const int64_t R = 4096, max_t = 16, ring_slots = (R + max_t + ps - 1) / ps;   // the ring holds R + a window
+    const int64_t H = s.n_head_kv, D = s.head_dim, NH = s.n_head, NQ = 8;
+    std::mt19937 rng(11 + 4 * fmt);
+    std::normal_distribution<float> nd(0.f, 1.f);
+
+    Pools ref, ring, host;
+    ref.alloc(n_blocks, s, fmt, false);
+    ring.alloc(ring_slots, s, fmt, false);
+    host.alloc(n_blocks, s, fmt, true);
+    int32_t* ident = dalloc<int32_t>(n_blocks);
+    {
+        std::vector<int32_t> t(n_blocks);
+        for (int64_t i = 0; i < n_blocks; ++i) t[i] = (int32_t) i;
+        strata::parity::copy_bytes_in(ident, t.data(), n_blocks * 4);
+    }
+    int32_t* rt = dalloc<int32_t>(n_blocks);
+    k::kv_ring_table(rt, n_blocks, ring_slots, nullptr);
+
+    float* kc = dalloc<float>(H * D);
+    float* vc = dalloc<float>(H * D);
+    int32_t* step = dalloc<int32_t>(k::kStepCount);
+    int32_t* steps = dalloc<int32_t>(NQ * k::kStepCount);
+    float* q = dalloc<float>(NQ * NH * D);
+    const uint64_t scr = k::qsa_decode_attn_scratch_floats(N, s);
+    float* scratch = dalloc<float>(NQ * scr);
+    float* out_ref = dalloc<float>(NQ * NH * D);
+    float* out_str = dalloc<float>(NQ * NH * D);
+    std::vector<float> hk(H * D), hv(H * D), hq(NQ * NH * D), a((size_t) NQ * NH * D), b2((size_t) NQ * NH * D);
+
+    int checks = 0, bad = 0;
+    for (int64_t pos = 0; pos < N; ++pos) {
+        for (auto& x : hk) x = nd(rng) * ((pos % 17 == 0) ? 30.f : 1.f);
+        for (auto& x : hv) x = nd(rng);
+        const int32_t st[4] = {(int32_t) pos, (int32_t) (pos + 1), (int32_t) ((pos + 1) / ps), 0};
+        strata::parity::copy_bytes_in(kc, hk.data(), hk.size() * 4);
+        strata::parity::copy_bytes_in(vc, hv.data(), hv.size() * 4);
+        strata::parity::copy_bytes_in(step, st, sizeof(st));
+        append(ref, ident, step, kc, vc, s, fmt, nullptr);
+        append(ring, rt, step, kc, vc, s, fmt, &host.p);
+        if (pos % 997 != 996 && pos != N - 1) continue;
+        const int n_q = 1 + (int) (rng() % NQ);   // a window's rows at the last n_q positions
+        std::vector<int32_t> hst(NQ * 4, 0);
+        for (int t = 0; t < n_q; ++t) {
+            const int64_t p = std::max<int64_t>(0, pos - (n_q - 1 - t));
+            hst[t * 4 + 0] = (int32_t) p; hst[t * 4 + 1] = (int32_t) (p + 1);
+            hst[t * 4 + 2] = (int32_t) ((p + 1) / ps); hst[t * 4 + 3] = 0;
+        }
+        for (auto& x : hq) x = nd(rng);
+        strata::parity::copy_bytes_in(steps, hst.data(), hst.size() * 4);
+        strata::parity::copy_bytes_in(q, hq.data(), hq.size() * 4);
+        k::QsaAttnPools sp = ring.attn(rt);
+        sp.host = host.p; sp.resident = (int32_t) R;
+        k::qsa_dense_attn_batch(q, ref.attn(ident), steps, N, s, scratch, out_ref, n_q, nullptr, 0);
+        k::qsa_dense_attn_batch(q, sp, steps, N, s, scratch, out_str, n_q, nullptr, 0);
+        strata::parity::sync();
+        strata::parity::copy_bytes_out(a.data(), out_ref, (size_t) n_q * NH * D * 4);
+        strata::parity::copy_bytes_out(b2.data(), out_str, (size_t) n_q * NH * D * 4);
+        if (std::memcmp(a.data(), b2.data(), (size_t) n_q * NH * D * 4) != 0) {
+            if (bad++ < 5) std::fprintf(stderr, "  %s dense pos %lld n_q %d: streamed attention differs\n",
+                                        name, (long long) pos, n_q);
+        }
+        ++checks;
+    }
+    std::printf("  %s dense: %d windows, %d failures\n", name, checks, bad);
+    return bad == 0;
+}
 }  // namespace
 
 int main() {
+    // one KV-head group for both the resident and the streamed call (the streamed kernel forces it): the same head
+    // grouping and cells-a-step form, so the comparison is the host read alone, not a different reduction order
+#if defined(_WIN32)
+    _putenv_s("XESTRATA_QSA_SPLIT", "1");
+#else
+    setenv("XESTRATA_QSA_SPLIT", "1", 1);
+#endif
     std::printf("kv_stream_parity: streamed vs resident KV, bitwise\n");
     const bool a = run(k::kKvInt8), b = run(k::kKvF16), c = run(k::kKvQ4), d = run(k::kKvHybrid);
     if (!a || !b || !c || !d) ++g_fail;
+    const bool e = run_dense(k::kKvInt8), f = run_dense(k::kKvF16), g = run_dense(k::kKvQ4), h = run_dense(k::kKvHybrid);
+    if (!e || !f || !g || !h) ++g_fail;
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

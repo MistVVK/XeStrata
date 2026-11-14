@@ -4,6 +4,7 @@
 // strata::kernels' int8 products (iq_mmq.hpp).
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
+#include "strata/kernels/canon_math.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
@@ -49,22 +50,24 @@ bool supported(int t) { return kernels::iq_mmq_type_ok(t); }
 size_t matrix_bytes(int t, int64_t rows, int64_t cols) { return (size_t) rows * kernels::iq_mmq_row_bytes(t, cols); }
 size_t q8_bytes(int64_t rows, int64_t cols) { return kernels::iq_mmq_act_bytes(rows, cols); }
 
-void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream,
+              int canon) {
     if (rows > 0)
-        kernels::iq_mmq_quantize(Q(stream), x, ids, xq, cols, ld, rows, kernels::iq_mmq_type_sums(t),
-                                 kernels::iq_mmq_type_dup(t));
+        kernels::iq_mmq_quantize(Q(stream), x, ids, xq, cols, ld, rows, canon == 0 && kernels::iq_mmq_type_sums(t),
+                                 canon == 0 && kernels::iq_mmq_type_dup(t), canon);
 }
 
 void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int t, int64_t cols,
-                      int64_t ld, int64_t tokens, int k_used, void* stream) {
+                      int64_t ld, int64_t tokens, int k_used, void* stream, int canon) {
     static const bool gather = [] {
         const char* e = strata::env_get("QUANT_GATHER");
         return e != nullptr && e[0] == '1';
     }();
-    if (gather) return quantize(x, src, xq, t, cols, ld, tokens * k_used, stream);
+    if (gather) return quantize(x, src, xq, t, cols, ld, tokens * k_used, stream, canon);
     if (tokens > 0)
-        kernels::iq_mmq_quantize_scatter(Q(stream), x, slot, xq, cols, ld, tokens, k_used, kernels::iq_mmq_type_sums(t),
-                                         kernels::iq_mmq_type_dup(t));
+        kernels::iq_mmq_quantize_scatter(Q(stream), x, slot, xq, cols, ld, tokens, k_used,
+                                         canon == 0 && kernels::iq_mmq_type_sums(t),
+                                         canon == 0 && kernels::iq_mmq_type_dup(t), canon);
 }
 
 void choose_forms(int t, int64_t w_rows, int64_t w_cols, int n, void* stream) {
@@ -154,7 +157,7 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
     return true;
 }
 
-void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
+void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream, bool canon) {
     if (rows <= 0) return;
     const float lim = kernels::expert_swiglu_limit();   // GLM-5.3-Flash's clamp (0: none)
     Q(stream).parallel_for(sycl::range<1>((size_t) (rows * n_ff)), [=](sycl::id<1> id) {
@@ -162,7 +165,7 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
         const float* row = gu + r * 2 * n_ff;
         float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
         kernels::swiglu_clamp(g, u, lim);
-        h[i] = g / (1.0f + sycl::exp(-g)) * u;
+        h[i] = canon ? kernels::canon::silu_mul(g, u) : g / (1.0f + sycl::exp(-g)) * u;
     });
 }
 

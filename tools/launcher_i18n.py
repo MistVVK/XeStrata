@@ -58,7 +58,7 @@ def setup_texts() -> dict:
     def key(v: str) -> str:
         return "unset" if v == "" else re.sub(r"[^\w\-]", "_", v)
 
-    text: dict[str, str] = {}
+    text: dict[str, str] = {f"imgpick.origin.{key}": name for name, key in setup._qimage().IMAGE_ORIGIN_KEYS.items()}
     for o in setup.OPTIONS:
         for part in ("label", "hint", "takes", "about", "needed"):
             if o.get(part):

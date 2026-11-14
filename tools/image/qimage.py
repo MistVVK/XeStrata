@@ -847,7 +847,24 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
 DEFAULT_MODEL = "qwen-image-turbo"
 # the image models setup's question and the Windows launcher's checkboxes offer a text model set up for the first
 # time (the first the default model); one set up again offers what it has
-SETUP_DEFAULT = ("mage-flow-turbo", "qwen-image-turbo", "moss-image")
+SETUP_DEFAULT = ("mage-flow-turbo-uncensored", "qwen-image-turbo-uncensored", "moss-image-uncensored")
+# The picker levels, in display order: family title, file origin and its versions (choice, version title).
+# Parameter counts are the DiT's; the Anima 2.9B preview is named at its version level.
+IMAGE_FAMILIES = (
+    ("Qwen-Image 2.1 (7B)", "Unsloth GGUF", (("qwen-image-turbo", "Turbo"), ("qwen-image-base", "Base"))),
+    ("Mage-Flow (4B)", "Original files, quantized by XeStrata when read",
+     (("mage-flow-turbo", "Turbo"), ("mage-flow", "Instruct"), ("mage-flow-base", "Base"))),
+    ("MageTrail (2.9B)", "Original files, quantized by XeStrata when read", (("magetrail", "MageTrail"),)),
+    ("MOSS-Image (5B)", "Original files, quantized by XeStrata when read",
+     (("moss-image", "SFT"), ("moss-image-base", "Base"), ("moss-image-4-step", "4-step (darask0)"))),
+    ("Anima (2B)", "Original files, quantized by XeStrata when read",
+     (("anima-base", "Anima"), ("anima-aesthetic", "Aesthetic"), ("anima-turbo", "Turbo"),
+      ("anima-2.9b", "2.9B (preview)"))),
+    ("HunyuanImage 3.0 (80B-A13B)", "PedroMarinhoDev quantization",
+     (("hunyuan-image-3-distil", "Instruct-Distil"),)),
+)
+IMAGE_ORIGIN_KEYS = {"Unsloth GGUF": "unsloth", "Original files, quantized by XeStrata when read": "original",
+                     "PedroMarinhoDev quantization": "pedro"}
 # what a front end (setup --describe, the Windows launcher) says of each choice without -uncensored
 ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
          "qwen-image-base": "Turbo's base model: the steps can be changed, about 5 times as long an image",

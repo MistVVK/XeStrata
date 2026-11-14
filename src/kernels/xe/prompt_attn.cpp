@@ -11,6 +11,7 @@
 #include "attn_parts.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tcq.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/sdpa_aotriton.hpp"
 #include "strata/kernels/sdpa_select.hpp"
@@ -43,11 +44,13 @@ using xe::attn::kFmtF16;
 using xe::attn::kFmtI8;
 using xe::attn::kFmtQ4;
 using xe::attn::kFmtK8V4;
+using xe::attn::kFmtTcq;
 using xe::attn::kFmtNames;
 using xe::attn::h8;
 using xe::attn::i8_row8;
 using xe::attn::pool_format;
 using xe::attn::q4_row8;
+using xe::attn::tcq_row8;
 
 // the shared attention for the pools (below)
 bool flash_pools(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int fmt, int64_t pos0, int64_t T,
@@ -240,7 +243,9 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
     const int fmt = pool_format(pools);
     const uint16_t *kf = pools.k_pool, *vf = pools.v_pool, *ksc = pools.k_scale, *vsc = pools.v_scale;
     const int8_t *ki = pools.k_q, *vi = pools.v_q;
-    const uint8_t *k4 = pools.k_q4, *v4 = pools.v_q4;
+    const uint8_t *k4 = pools.k_q4, *v4 = pools.v_q4, *ktc = pools.k_tc, *vtc = pools.v_tc;
+    const int tc_bits = pools.tc_bits, tc_kv = pools.tc_ring_kv;
+    const uint8_t* ring = pools.tc_ring;
     const int32_t* tbl = pools.page_table;
     const int64_t PS = page_size, CK = KH * HD;
     queue.parallel_for(sycl::range<1>((size_t) (Tk * CK / 8)), [=](sycl::id<1> id) {
@@ -248,7 +253,14 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
         const int dd = (int) (i - j * CK - g * HD);
         const int64_t row = ((int64_t) tbl[c / PS] * KH + g) * PS + c % PS;
         h8 kv, vv;
-        if (fmt == kFmtF16) {
+        if (fmt == kFmtTcq && ring != nullptr && c >= tcq::ring_coded(ring, HD, tc_kv)) {   // not coded yet
+            const int kr = tcq::ring_row(0, (int) (c % kTcqRing), (int) g, tc_kv), vr = kr + kTcqRing * tc_kv;
+            kv = i8_row8<HD>(tcq::ring_codes(ring, 0, HD), tcq::ring_scales(ring, 0, HD, tc_kv), kr, dd);
+            vv = i8_row8<HD>(tcq::ring_codes(ring, 0, HD), tcq::ring_scales(ring, 0, HD, tc_kv), vr, dd);
+        } else if (fmt == kFmtTcq) {
+            kv = tcq_row8<HD>(ktc, tc_bits, row, dd);
+            vv = tcq_row8<HD>(vtc, tc_bits, row, dd);
+        } else if (fmt == kFmtF16) {
             kv = *reinterpret_cast<const h8*>(kf + row * HD + dd);
             vv = *reinterpret_cast<const h8*>(vf + row * HD + dd);
         } else {
@@ -360,6 +372,12 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
         if (fmt == kFmtI8) {
             pools.v_q = static_cast<int8_t*>(dev((size_t) (rows * hd)));
             pools.v_scale = static_cast<uint16_t*>(dev((size_t) (rows * hd / 64) * 2));
+        }
+        if (fmt == kFmtTcq) {   // zero rows (a scale of 0) of 5 bits a value: the read is as long as with real ones
+            const size_t tc = (size_t) rows * (size_t) kv_tcq_bytes_per_head((int) hd, 5);
+            pools.k_tc = static_cast<uint8_t*>(dev(tc));
+            pools.v_tc = static_cast<uint8_t*>(dev(tc));
+            pools.tc_bits = 5;
         }
         if (fmt == kFmtQ4) pools.k_q4 = static_cast<uint8_t*>(dev(q4));
         if (fmt == kFmtQ4 || fmt == kFmtK8V4) pools.v_q4 = static_cast<uint8_t*>(dev(q4));
@@ -490,7 +508,7 @@ int forced_pick() {
 
 void prompt_attn_tune(const QsaShapes& s, int fmt, int64_t max_cells, void* stream) {
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0 || max_cells <= 0 || fmt < kFmtF16 ||
-        fmt > kFmtK8V4)
+        fmt > kFmtTcq)
         return;
     sycl::queue& queue = core::Runtime::get().stream(stream);
     picks_for(s, fmt).get(queue.get_device(), [&] {

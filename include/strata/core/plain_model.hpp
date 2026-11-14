@@ -88,6 +88,13 @@ struct PlainOptions {
     /// and the output back); --kv k8v4 (2): K in INT8 (kv_int8's codes and scales), V rotated Q4_0.  head_dim 256 only;
     /// not GLM-5.3-Flash's caches.
     int kv_q4 = 0;
+    /// --kv tcq4 / tcq5 (4, 5): K and V trellis-coded at 4 or 5 bits a value after the signed 256-point Hadamard
+    /// rotation (kv_tcq.hpp, the query rotated the same way and the output back): 132 and 164 B a head's row, against
+    /// Q4_0's 144 and INT8's 264.  head_dim 256 only; not GLM-5.3-Flash's caches.
+    int kv_tcq = 0;
+    /// --kv not given: a dense model whose blocks the GPU would not all hold with the FP16 cache takes the first of
+    /// INT8, tcq5 and tcq4 with which it holds them (auto_gpu_layers), else tcq4
+    bool kv_auto = true;
     /// --kv-ram on|off (GLM-5.3-Flash): the DSA layers' MLA latent cells in host memory instead of VRAM, which goes to
     /// the expert tier: a window copies the cells each token selected into VRAM once (glm5_latent_gather), a prompt
     /// chunk the layer's cells up to it (Project Maya #86's idea, written anew: there the cells live in VRAM slots).
@@ -95,6 +102,13 @@ struct PlainOptions {
     /// of RAM; the RTX 4070 started at all (it had 161 MiB left for the tier), and at 64K went 86 -> 172 slots, its
     /// prompt 3.3 -> 7.1 tok/s and decode 2.32 -> 2.30 (UD-IQ3_XXS, 1K + 256, 2026-10-26).  The other models: off.
     bool kv_ram = true;
+    /// --kv-resident N|auto|off: stream the attention layers' K/V (Qwen3.8-Flash-Next's --kv-resident, the same shape).
+    /// The authoritative K/V lives in pinned host memory; VRAM keeps a ring of the last N cells a layer, and the decode
+    /// attention reads the older cells from the host copy over PCIe (the shared qsa_dense_attn kernel). A prompt chunk
+    /// stages one layer's cells into a borrowed VRAM pool (kv_stage_from_host). N the resident cells a layer; auto (the
+    /// default, -1): from 64K up when the RAM holds the experts beside the KV host copy; off (0): every cell in VRAM.
+    /// The sliding-window layers keep their own ring; GLM-5.3-Flash's DSA caches stream with --kv-ram, not this.
+    int64_t kv_resident = -1;
     /// --vision (qwen35, qwen35moe): pictures among the prompt's tokens (plain_generate's GENI): their rows in place
     /// of the token embeddings (set_embeddings) and every cell's M-RoPE position from a table (set_positions)
     bool vision = false;
@@ -182,6 +196,10 @@ struct PlainOptions {
     /// (--expert-cache-remote-placement)
     std::array<int, 3> expert_cache_remote{};
     std::string expert_cache_remote_placement = "stripe";
+    /// --split-roles any|helper and --split-skip-if-fits: the second GPU's role in --layer-split auto (a stage of the
+    /// split, a helper expert cache, or none), as Qwen3.8-Flash-Next's (core/split_role.hpp)
+    bool split_roles_helper = false;
+    bool split_skip_if_fits = false;
     bool pcie_split = true;         ///< split the missed experts between the CPU and PCIe by measured times
     /// --pcie-frac F: that share of the missed experts over PCIe in every window, instead of the measured split and the
     /// decode's first windows' choice (< 0: measured)
@@ -204,6 +222,9 @@ struct PlainOptions {
     /// The routed experts written here, a record a token and MoE layer as generate.cpp's --dump-routing writes them
     /// (int32 layer, int32 k, k int32 ids, k float weights, 0 here): tools/make_profile.py reads them.  Empty: none.
     std::string dump_routing;
+    /// --window-hashes PATH: a line per serial verify window (index, position, size, a hash of its final normed rows,
+    /// its argmaxes), the answer-drift fingerprint generate.cpp writes (strata/spec/window_hash.hpp).  Empty: none.
+    std::string window_hashes;
     double rope_freq_base = 0;      ///< the rotation's base (0: the file's)
     double rope_freq_scale = 0;     ///< ... and its frequency scale, as llama.cpp's --rope-freq-scale (0: none)
     /// The most tokens a prompt chunk takes through the batched products (`prompt`; a shorter prompt, one chunk of its
@@ -240,6 +261,9 @@ struct PlainOptions {
     std::string draft_model;   ///< --draft-model: the model's DFlash2 pack
     double draft_conf = 0.0;   ///< --draft-conf: DFlash2's window confidence (0: the engine's default)
     bool spec_auto = false;    ///< --spec auto: the window is one of the start's candidates (spec and 2)
+    /// --draft dflash2: windows of this many drafts (the recurrent states' copies taken at the load, before the tier
+    /// is sized, as the MTP layer's are); 0: the MTP layer's
+    int draft_windows = 0;
     std::string draft_rule = "learn";   ///< --draft-rule: a request without a draft= key (--draft auto)
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points
@@ -251,8 +275,6 @@ struct PlainOptions {
 };
 
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): one object, its members grouped by what they serve
-class DenseSlab;
-
 class PlainModel {
 public:
     PlainModel();
@@ -281,6 +303,8 @@ public:
     /// The forward runs on the CPU (--device cpu): no GPU, no drafts, no pictures, no batches.
     bool on_cpu() const { return cpu_ != nullptr; }
     int64_t max_cells() const { return opt_.max_cells; }
+    /// The options as loaded (the --kv format auto_gpu_layers chose)
+    const PlainOptions& options() const { return opt_; }
     /// The prompt's chunk (0: the prompt runs in windows; GLM-5.3-Flash's for now, whatever the options asked).
     int64_t prompt_chunk() const { return opt_.prompt_chunk; }
     /// --vision: the M-RoPE positions (t, h, w) of cells 0 .. n - 1, `pos3` 3 n of them on the host
@@ -470,6 +494,9 @@ public:
 
     /// Drafts a window can check (0: no speculative decoding): spec - 1 when the model has its MTP layer.
     int drafts() const { return tail().has_mtp_ ? tail().n_mtp_ : 0; }
+    /// The resolved rope scaling of the full-attention layers (the file's and the options' meet, load_qwen): the
+    /// startup summary reads it.  A GLM-5.3-Flash (nope MLA) keeps the identity (its rotation is none).
+    const strata::kernels::RopeScaling& rope_full() const { return tail().rope_full_; }
     /// The DFlash2 drafter's taps (the shared mechanism, core/dflash2.hpp): the completed output of these layers,
     /// gathered for every window row into tap_dev() ([max_t][ntap][n_embd]; the plain residual has one stream).
     /// Set before load; empty (the default) allocates nothing and records nothing.
@@ -485,6 +512,8 @@ public:
         const int32_t* vocab_dev = nullptr;   ///< row i's token (null: row i is token i)
     };
     HeadView draft_head_view() const;
+    /// The target's whole yskn head, owned by the model (null for a GGUF head). It outlives an attached drafter.
+    const strata::kernels::YsknDev* yskn_draft_head() const;
     /// After load: room for windows of `drafts` drafts (the recurrent states' copies, the extra ones from the VRAM free
     /// now; fewer than the load made: the extra ones freed).  False with `err`, nothing changed, when they do not fit.
     /// The window graphs are captured again.  One GPU only.
@@ -544,6 +573,9 @@ public:
     bool spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
                    std::string& err, const int32_t* follow = nullptr, const int32_t* ext = nullptr, int n_ext = 0,
                    int match = 0, bool ext_only = false);
+    /// --window-hashes: this window's fingerprint line (strata/spec/window_hash.hpp), from the last stage's final
+    /// normed rows.  Opens the file on the first call; a no-op when --window-hashes was not given.
+    bool write_window_hash(int64_t index, int64_t pos, int T, const int32_t* argmax, std::string& err);
     /// The position of the pending token (spec_start's, then each window's).
     int64_t pending_pos() const { return tail().cur_pos_; }
     /// The windows and the drafts they checked and accepted since the load, for the report.
@@ -590,6 +622,8 @@ public:
     bool kv_grow_to(int64_t cells, std::string& err);
     bool kv_trim(int64_t cells, int64_t hold, std::string& err);
     bool kv_elastic() const { return kv_cells_ >= 0; }
+    /// --kv-resident: the trailing cells a streamed attention layer keeps in VRAM (0: not streaming)
+    int64_t kv_resident() const { return kv_resident_cells_; }
     /// --control-vector: the loaded vector's tables (kernels/cvec.hpp, cvec_upload) on every stage's GPU too, before
     /// the first window; the blocks then apply it after their FFN (steer)
     bool replicate_cvec(std::string& err);
@@ -631,6 +665,9 @@ private:
     bool load_stage(const PlainOptions& opt, PlainModel* root, int64_t lb, int64_t le, int dev, std::string& err);
     /// The split's points from each GPU's free memory (split_auto)
     bool split_auto_points(std::string& err);
+    /// The second GPU's role in --layer-split auto (split_auto_points): a stage, a helper expert cache, or none
+    /// (core/split_role.hpp, as generate.cpp).  Needs --expert-profile; without one the split by memory stands.
+    bool split_auto_role(std::string& err);
     /// The architecture's part of the load (the blocks of this stage), and after every stage's: the RAM copy of the
     /// experts no GPU holds, each stage's PCIe split, the report
     bool load_arch(std::string& err);
@@ -759,6 +796,8 @@ private:
     /// The control vector after block b's FFN write, on T rows of x (kernels/cvec.hpp), where it covers the layer
     void steer(const Block& b, int64_t T, float* x, strata::gpu::Stream cs) const;
     void tap_block(const Block& b, int T, strata::gpu::Stream cs);
+    /// set_taps' layers on this stage and the window's tap staging (both loads: load_qwen's and load_glm5's)
+    bool setup_taps(std::string& err);
     /// A tapped layer's output rows (R: [T][hc][n_embd]) into the window's taps (`window`) or the prompt's staging
     void tap_rows(int64_t l, const float* R, int hc, int64_t T, int64_t p0, bool window, strata::gpu::Stream cs);
     /// The prompt's staging handed on after a chunk or a window of rows from p0 (prompt_taps_)
@@ -773,6 +812,7 @@ private:
         std::vector<uint16_t*> k_pool, v_pool, k_scale, v_scale;
         std::vector<int8_t*> k_q, v_q;
         std::vector<uint8_t*> k_q4, v_q4;
+        std::vector<uint8_t*> k_tc, v_tc, tc_ring;
     };
     std::vector<SlotSession> bslots_;
     bool bslot_snaps_ = false;   ///< the slots keep the states after their first row (--batch-mtp)
@@ -891,6 +931,9 @@ private:
         uint8_t* xq2 = nullptr;            ///< the routed rows for the up product of a layer whose gate and up
                                            ///< differ in the blocks' repetition (iq_mmq_type_dup); else null
         int32_t* identity = nullptr;       ///< row i is row i (the int8 products' output map)
+        /// --kv-resident: one attention layer's whole K/V, staged from the host copy per layer and chunk (the identity
+        /// layout, page_table_ its table); the prompt attention reads it, then the next layer overwrites it
+        strata::kernels::KvHostPools kv_stage;
         const uint8_t** wtab = nullptr;    ///< a layer's experts' blobs, for the int8 products
         int32_t* rbounds = nullptr;        ///< each group's bounds from its first row (the down product's)
         int32_t* dense_bounds = nullptr;   ///< {0, T}: a dense product as one int8 "expert"
@@ -1136,7 +1179,6 @@ private:
     W mtp_eh_;
     const float *mtp_enorm_ = nullptr, *mtp_hnorm_ = nullptr, *mtp_head_norm_ = nullptr;
     int64_t n_moe_ = 0;   ///< MoE layers of the tiers: the trunk's, then the MTP layer's
-    std::unique_ptr<DenseSlab> dense_slab_;  ///< long-lived weight slabs, selected by a device timing
     std::vector<void*> allocs_;      ///< every device allocation, freed in the destructor
     std::vector<const W*> tune_wait_;              ///< upload's matrices not yet timed (tune_uploaded)
     std::vector<const void*> weight_at_;           ///< upload's matrices on the GPU, and their bytes
@@ -1159,6 +1201,7 @@ private:
     std::vector<int64_t> slot_layer_;             ///< per slot, the moe layer it holds experts of
     std::vector<double> heat_;                    ///< [moe layer][expert] routed entries since the load
     std::FILE* route_dump_ = nullptr;             ///< --dump-routing's file, or null
+    std::FILE* hash_file_ = nullptr;              ///< --window-hashes' file, opened on the first window, or null
     /// `n` tokens' `k` routed experts of MoE layer `layer` into --dump-routing's file
     void dump_routes(int64_t layer, const int32_t* ids, int64_t n, int64_t k);
     struct StatePart { void* dev; size_t bytes; int typesize = 0; };   ///< typesize: as Snapshot's
@@ -1171,17 +1214,23 @@ private:
         uint16_t *k_pool = nullptr, *v_pool = nullptr, *k_scale = nullptr, *v_scale = nullptr;
         int8_t *k_q = nullptr, *v_q = nullptr;
         uint8_t *k_q4 = nullptr, *v_q4 = nullptr;
+        uint8_t *k_tc = nullptr, *v_tc = nullptr;
+        uint8_t* tc_ring = nullptr;   ///< --kv tcq's INT8 ring of the cells not coded yet (deferred coding)
     };
     KvPtrs kv_ptrs(size_t a, int slot) const;
     /// The buffers of attention block a in session `slot` for `cells` (cell, KV head) pairs and their bytes, in one
     /// order: the state's parts (state_parts), what reset zeroes
     std::vector<StatePart> kv_planes(size_t a, int slot, size_t cells) const;
+    /// the streamed layer a's host copy as state parts (the identity layout, `cells` (cell, KV head) pairs): a
+    /// snapshot reads and writes the authoritative host copy, not the VRAM ring
+    std::vector<StatePart> kv_host_planes(size_t a, size_t cells) const;
     /// Allocates them for `cells` pairs in the --kv format (the live session's or a slot's), into allocs_
     bool alloc_kv(KvPtrs& p, size_t cells, bool vmm = false);
     /// `n` cells' K and V (n rows of n_head_kv x head_dim, rotated as the format keeps them) at steps[t * kStepCount]
-    /// into session `slot`'s pools of attention block a
+    /// into session `slot`'s pools of attention block a; a streamed layer also writes its host copy, and `stage` (the
+    /// prompt path's staging pool) when given
     void kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
-                         strata::gpu::Stream cs);
+                         strata::gpu::Stream cs, const strata::kernels::KvHostPools* stage = nullptr);
     bool restore_parts(const Snapshot& snap, bool recurrent_only, std::string& err);
     std::vector<std::pair<int32_t, int32_t>> prior_;   ///< the profile the tier was filled from
     int64_t n_slots_ = 0;
@@ -1278,6 +1327,11 @@ private:
     std::vector<std::pair<int32_t, int32_t>> vram_evicted_;   ///< `vram`'s shrinks: (residency index, slot)
     std::vector<int8_t*> k_q_, v_q_;              ///< ...kv_int8's codes (K8V4's K)
     std::vector<uint8_t*> k_q4_, v_q4_;           ///< ...kv_q4's Q4_0 blocks (K8V4's V)
+    std::vector<uint8_t*> k_tc_, v_tc_;           ///< ...kv_tcq's trellis-coded rows
+    std::vector<uint8_t*> tc_ring_;               ///< ...and their INT8 ring (kv_tcq.hpp), null when not deferred
+    /// --kv tcq: the cells kept as INT8 until their block of 16 is complete, then coded (kv_tcq.hpp); 0 with
+    /// STRATA_KV_TCQ_DEFER=0 (each cell coded as it is written), for the comparison
+    bool tcq_defer_ = true;
     std::vector<uint16_t*> k_scale_, v_scale_;    ///< ...and their scales
     /// The attention block a's pools, for the kernels
     strata::kernels::QsaAttnPools kv_pools(size_t a, int slot = -1) const;
@@ -1290,7 +1344,25 @@ private:
     int32_t* swa_table_ = nullptr;
     std::vector<bool> attn_swa_;              ///< per attention block: a sliding-window layer's
     int64_t ring_end_ = 0, ring_from_ = 0;    ///< the position after the last run, and the first the rings still hold
+    /// --kv-resident (KV streaming): the attention layers' authoritative K/V in pinned host memory (kv_host_, the
+    /// identity layout), VRAM a ring of the last kv_stream_slots_ pages. The decode reads the trailing
+    /// kv_resident_cells_ cells from the ring, the older cells from the host copy. 0: not streaming. The
+    /// sliding-window layers keep their own ring (attn_swa_), never streamed; the MTP layer's attention streams too.
+    int64_t kv_resident_cells_ = 0;
+    int64_t kv_stream_slots_ = 0;             ///< the ring's pages (0: not streaming)
+    std::vector<strata::kernels::KvHostPools> kv_host_;   ///< per attention block: the host copy (empty: not streamed)
+    int32_t* kv_stream_table_ = nullptr;      ///< the ring table, block % kv_stream_slots_ (the streamed layers)
+    std::vector<bool> attn_stream_;           ///< per attention block: streamed
+    bool kv_streamed(size_t a) const { return kv_stream_slots_ > 0 && a < attn_stream_.size() && attn_stream_[a]; }
+    /// resolve --kv-resident (auto/off/N) to the resident cells a layer (0: off), before the K/V is sized; the root
+    /// writes the resolved value into opt_.kv_resident so the layer split's stages inherit it
+    bool resolve_kv_resident(std::string& err);
+    /// the host copy's bytes for this stage's streamed attention layers at the whole context (the auto rule's figure)
+    uint64_t kv_host_bytes() const;
+    /// allocate attention block a's host copy (the identity layout, the whole context); false on a failed allocation
+    bool alloc_kv_host(size_t a, std::string& err);
     const int32_t* table_of(size_t a) const {
+        if (kv_streamed(a)) return kv_stream_table_;
         return swa_table_ != nullptr && a < attn_swa_.size() && attn_swa_[a] ? swa_table_ : page_table_;
     }
     bool ringed(size_t a) const { return ring_pages_ > 0 && a < attn_swa_.size() && attn_swa_[a]; }
@@ -1330,6 +1402,8 @@ private:
     std::vector<float*> slot_bias_dev_;   ///< per slot: its bias array on the device (kept for the slot's next one)
     std::vector<char> slot_bias_on_;      ///< ... and whether the slot's current request has a bias
     int32_t* slot_hist_dev_ = nullptr;    ///< the batch window's slots' penalty-history rows (device)
+    strata::kernels::SamplerParams* slot_params_dev_ = nullptr;
+    size_t slot_params_cap_ = 0;
     size_t slot_hist_cap_ = 0;            ///< ... how many int32 fit; grows to the widest window
     bool bias_on_ = false, allowed_on_ = false;
     std::function<bool(const int32_t*, int, std::string&)> window_masks_;   ///< set_window_masks

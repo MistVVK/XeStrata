@@ -26,6 +26,7 @@
 #include "strata/core/auto_pick.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/core/latent.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -80,6 +81,25 @@ public:
     MoeWindow& operator=(const MoeWindow&) = delete;
 
     bool init(const MoeWindowShape& shape, const MoeWindowTier& tier, std::string& err);
+
+    /// The latent MoE (Edge0): the session's D/U pair on the device, uploaded once by the driver and shared by
+    /// every window (call before init; init opens and uploads its own pair when nobody passed one in).
+    void set_shared_latent(const uint8_t* d, const uint8_t* u, int fmt) {
+        lat_d_shared_ = d; lat_u_shared_ = u; lat_fmt_shared_ = fmt;
+    }
+    /// Whether this window's pack is a latent one (the experts' width differs from the shell's).
+    bool latent() const { return latent_; }
+    /// The D stage of MoE layer `layer`, tokens [tb, tb + n) of the WHOLE window (call once a layer, at the first
+    /// token group, before the router): x's q8_1 rows through D, the column scales, the rows' q8_1 image for the
+    /// experts, and the f32 rows + their Q8_0 image to mapped memory with the pool's doorbell (layer + 1).
+    void latent_d_stage(int64_t layer, int tb, int n, const float* x, strata::gpu::Stream cs);
+    /// The pool's side of the latent window: the mapped D rows, their doorbell and their Q8_0 image (the CPU share
+    /// reads them; ExpertDispatch's lat_* fields).
+    const float* latent_xl_mapped() const { return h_latxl_; }
+    const uint32_t* latent_xlseq() const { return h_xlseq_; }
+    const uint8_t* latent_act0_mapped() const { return h_latact0_; }
+    int latent_fmt() const { return lat_fmt_; }
+    int64_t latent_ell() const { return lat_ELL_; }
 
     /// The running kernels of this device do not see the host's writes (doorbell_visible) or it is the processor's own
     /// graphics: the caller records the window as segments that end before each `experts`, and `serve` (or
@@ -207,6 +227,32 @@ private:
     uint8_t* hit_scratch_ = nullptr;
     uint32_t* skip_ = nullptr;                   ///< per group: the ring resident_plan planned, else 0 (device)
     unsigned long long* slot_off_d_ = nullptr;   ///< the tier's slot offsets on the device (resident_plan)
+
+    // ---- the latent MoE (Edge0): the experts run at lat_ELL_, D/U project between the shell's width and it
+    bool latent_ = false;
+    int64_t lat_ELL_ = 0, lat_I_ = 0;
+    int lat_G_ = 8;
+    int lat_fmt_ = 8;                  ///< the D/U pack's format (8 Q8_0 / 4 Q4_0)
+    bool lat_u_gpu_ = true;            ///< XESTRATA_LATENT_U_GPU: the CPU share's U on the GPU (auto: on)
+    LatentDense lat_dense_;            ///< the D/U file, mapped (when the pair is not shared)
+    const uint8_t* lat_d_shared_ = nullptr;   ///< the session's pair (set_shared_latent), null: own
+    const uint8_t* lat_u_shared_ = nullptr;
+    int lat_fmt_shared_ = 8;
+    uint8_t* lat_d_ = nullptr;         ///< the pair on the device (shared or own), layer-major
+    uint8_t* lat_u_ = nullptr;
+    bool lat_du_owned_ = false;
+    std::vector<int32_t> lat_labels_;  ///< [layers * E] group labels, host
+    int32_t* lat_labels_dev_ = nullptr;
+    float* lat_xl_ = nullptr;          ///< device: T*G rows of ELL (the D products)
+    uint8_t* lat_xlq_ = nullptr;       ///< their q8_1 image (the experts' input)
+    uint8_t* lat_ylq_ = nullptr;       ///< the A outputs' q8_1 image (T*K rows of ELL)
+    uint8_t* lat_act0_ = nullptr;      ///< the D rows as Q8_0 (the CPU share's activation), device
+    float* h_latxl_ = nullptr;         ///< mapped: the D rows, f32 (the pool reads them)
+    float* m_latxl_ = nullptr;
+    uint8_t* h_latact0_ = nullptr;     ///< mapped: the D rows as Q8_0 (the pool's GPU-made activation)
+    uint8_t* m_latact0_ = nullptr;
+    uint32_t* h_xlseq_ = nullptr;      ///< mapped: the D stage's doorbell (layer + 1)
+    uint32_t* m_xlseq_ = nullptr;
 };
 
 }  // namespace strata::core

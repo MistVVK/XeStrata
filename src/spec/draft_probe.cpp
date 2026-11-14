@@ -4,8 +4,12 @@
 #include "strata/spec/draft_probe.hpp"
 
 #include "strata/platform/env.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,19 +22,33 @@ const char* drafter_name(Drafter d) {
         case Drafter::None: return "none";
         case Drafter::Mtp: return "mtp";
         case Drafter::Df2: return "dflash2";
+        case Drafter::Bdraft2: return "bdraft2";
     }
     return "?";
 }
 
-std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec) {
+std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec,
+                                       bool bdraft2, int bdraft2_spec, bool static_available, int wide_mode, bool bdraft_shead, bool static_forced) {
     std::vector<ProbeArm> a;
     if (mtp) {
         a.push_back({Drafter::Mtp, spec});
         // the smallest window with a draft: on a machine where a verify row costs much it can beat the larger one
         if (spec_auto && spec > 2) a.push_back({Drafter::Mtp, 2});
     }
-    if (df2) a.push_back({Drafter::Df2, df2_spec});
-    if (none_ok && (mtp || df2)) a.push_back({Drafter::None, 1});
+    if (df2) {
+        const int first = wide_mode == 1 && df2_spec >= kernels::kWindowMaxT ? 1 : 0;
+        const int last = wide_mode == 2 && df2_spec >= kernels::kWindowMaxT ? 2 : first;
+        for (int block = first; block <= last; ++block) {
+            const int cap = block == 0 ? std::min(df2_spec, kernels::kVerifyNarrowT) : df2_spec;
+            if (!static_forced) a.push_back({Drafter::Df2, cap, false, block});
+            if (static_available || static_forced) a.push_back({Drafter::Df2, cap, true, block});
+        }
+    }
+    if (bdraft2) {
+        a.push_back({Drafter::Bdraft2, bdraft2_spec});
+        if (bdraft_shead) a.push_back({Drafter::Bdraft2, bdraft2_spec, false, 0, true});
+    }
+    if (none_ok && (mtp || df2 || bdraft2)) a.push_back({Drafter::None, 1});
     if (a.size() < 2) a.clear();
     return a;
 }
@@ -45,7 +63,7 @@ std::vector<int> DraftProbe::plan(int n_arms, int rounds) {
     return p;
 }
 
-ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::vector<ProbeRun>& runs, bool both_ok,
+ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::vector<ProbeRun>& runs,
                                 int spec_default) const {
     ProbeVerdict v;
     const size_t n = arms.size();
@@ -72,6 +90,9 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
                       arms[i].drafter == Drafter::None ? " " : (" window " + std::to_string(arms[i].spec) + " ").c_str(),
                       v.tps[i]);
         v.line += buf;
+        if (arms[i].drafter == Drafter::Df2 && arms[i].block == 2) v.line += " adaptive block";
+        if (arms[i].static_table) v.line += " + static table";
+        if (arms[i].shead) v.line += " + SHEAD 512";
         if (drafted[i] > 0) {
             std::snprintf(buf, sizeof buf, " (drafts kept %.2f)", (double) accepted[i] / (double) drafted[i]);
             v.line += buf;
@@ -82,39 +103,52 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
         v.line += " - not every arm ran: the drafters stay as loaded";
         return v;
     }
-    // a clear win: `margin` over the arm, and over that arm's own spread between its runs
-    auto beats = [&](size_t a, size_t b) {
-        const double spread = hi[b] > 0.0 && lo[b] < 1e299 ? (hi[b] - lo[b]) / hi[b] : 0.0;
-        return v.tps[a] >= v.tps[b] * (1.0 + std::max(margin_, spread));
+    // The default form (the first arm: the MTP at its configured window) stays unless another beats it clearly, and
+    // in every run: each of the other's runs faster than each of the default's, and its speed `switch_` (10%) and its
+    // own and the default's spread between runs above.  A single shallow measurement must not leave a start at a
+    // worse form for good (RTX 4070, Qwen3.8: one start in 8 kept "none" at 50.8 against the MTP's 49.2 tok/s, and
+    // that start decoded 17% slower).  Of the arms that beat it so, the fastest.
+    const size_t def = 0;
+    auto spread = [&](size_t i) { return hi[i] > 0.0 && lo[i] < 1e299 ? (hi[i] - lo[i]) / hi[i] : 0.0; };
+    auto beats_default = [&](size_t i) {
+        const double bar = std::max({switch_, margin_, spread(i), spread(def)});
+        return lo[i] > hi[def] && v.tps[i] >= v.tps[def] * (1.0 + bar);
     };
-    // the cheaper form first among ties: the MTP, then DFlash2, then none; the configured window before another
-    auto rank = [&](size_t i) {
-        const ProbeArm& a = arms[i];
-        const int d = a.drafter == Drafter::Mtp ? 0 : a.drafter == Drafter::Df2 ? 1 : 2;
-        return d * 2 + (a.spec == spec_default || a.drafter != Drafter::Mtp ? 0 : 1);
-    };
-    std::vector<size_t> order(n);
-    for (size_t i = 0; i < n; ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return rank(a) < rank(b); });
-    size_t best = 0;
+    size_t pick = def;
     for (size_t i = 1; i < n; ++i)
-        if (v.tps[i] > v.tps[best]) best = i;
-    // among the arms the fastest does not clearly beat (itself included), the cheapest form
-    size_t pick = best;
-    for (size_t i : order)
-        if (i == best || !beats(best, i)) { pick = i; break; }
+        if (beats_default(i) && (pick == def || v.tps[i] > v.tps[pick])) pick = i;
     v.keep = arms[pick].drafter;
     v.spec = arms[pick].drafter == Drafter::None ? 1 : arms[pick].spec;
-    // the MTP and DFlash2 both within the margin of the fastest: both stay and DrafterPolicy picks per request
-    if (both_ok && (v.keep == Drafter::Mtp || v.keep == Drafter::Df2)) {
-        const Drafter other = v.keep == Drafter::Mtp ? Drafter::Df2 : Drafter::Mtp;
-        for (size_t i = 0; i < n; ++i)
-            if (arms[i].drafter == other && (i == best || !beats(best, i))) v.keep_both = true;
+    (void) spec_default;
+    // the kept arm's form (Y6): DFlash2's block mode and static table, the yskn drafter's output head
+    v.df2_static = v.keep == Drafter::Df2 && arms[pick].static_table;
+    v.df2_block = v.keep == Drafter::Df2 ? arms[pick].block : 0;
+    v.bdraft_shead = v.keep == Drafter::Bdraft2 && arms[pick].shead;
+    v.line += std::string(" - keeps ") + drafter_name(v.keep) +
+              (v.keep == Drafter::None ? std::string() : " window " + std::to_string(v.spec));
+    if (v.keep == Drafter::Df2) {
+        v.line += std::string(" (DFlash2 block ") + (v.df2_block == 0 ? "8" : v.df2_block == 1 ? "16" : "adaptive") +
+                  (v.df2_static ? ", static table on)" : ", static table off)");
     }
-    v.line += v.keep_both ? " - both drafters stay (within the margin), picked per request"
-                          : std::string(" - keeps ") + drafter_name(v.keep) +
-                                (v.keep == Drafter::None ? std::string() : " window " + std::to_string(v.spec));
+    if (v.keep == Drafter::Bdraft2) v.line += v.bdraft_shead ? " (SHEAD 512)" : " (full head)";
     return v;
+}
+
+bool DraftProbe::settled(const std::vector<ProbeArm>& arms, const std::vector<ProbeRun>& runs) {
+    // every other arm has a run no faster than one of the default's: none can beat it in every run any more
+    const size_t n = arms.size();
+    if (n < 2) return true;
+    std::vector<double> lo(n, 1e300), hi(n, 0.0);
+    for (const ProbeRun& r : runs) {
+        if (r.arm < 0 || (size_t) r.arm >= n || r.ms <= 0.0 || r.tokens <= 0) continue;
+        const double t = 1000.0 * (double) r.tokens / r.ms;
+        lo[(size_t) r.arm] = std::min(lo[(size_t) r.arm], t);
+        hi[(size_t) r.arm] = std::max(hi[(size_t) r.arm], t);
+    }
+    if (hi[0] <= 0.0) return false;
+    for (size_t i = 1; i < n; ++i)
+        if (hi[i] <= 0.0 || lo[i] > hi[0]) return false;
+    return true;
 }
 
 bool probe_enabled() {
@@ -124,8 +158,39 @@ bool probe_enabled() {
 
 int probe_tokens() {
     const char* v = strata::env_get("DRAFT_PROBE_TOKENS");
-    const int n = v != nullptr && v[0] != '\0' ? std::atoi(v) : 64;
-    return std::max(16, n);
+    long n = 48;   // a value that is not a whole number keeps the default
+    if (v != nullptr && v[0] != '\0') {
+        char* end = nullptr;
+        errno = 0;
+        const long r = std::strtol(v, &end, 10);
+        if (*end == '\0' && errno == 0 && r <= INT_MAX) n = r;
+    }
+    return std::max(16, (int) std::max(n, 0L));
+}
+
+int probe_run_tokens(double warm_tps) {
+    const int most = probe_tokens();
+    if (!(warm_tps > 0.0)) return most;
+    return std::clamp((int) std::lround(warm_tps * 1.0), 16, std::max(16, most));
+}
+
+double probe_budget_s() {
+    const char* v = strata::env_get("DRAFT_PROBE_S");
+    double s = 20.0;   // a value that is not a number keeps the default
+    if (v != nullptr && v[0] != '\0') {
+        char* end = nullptr;
+        errno = 0;
+        const double r = std::strtod(v, &end);
+        if (*end == '\0' && errno == 0) s = r;
+    }
+    return s > 0.0 ? s : 20.0;
+}
+
+std::string probe_line_tokens(const std::string& line, int n) {
+    if (line.rfind("GEN ", 0) != 0) return line;
+    const size_t sp = line.find(' ', 4);
+    if (sp == std::string::npos) return line;
+    return "GEN " + std::to_string(n) + line.substr(sp);
 }
 
 std::vector<int32_t> probe_prompt(const std::vector<std::string>& vocab) {

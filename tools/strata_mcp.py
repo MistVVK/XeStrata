@@ -163,6 +163,10 @@ FALLBACK_FAMILIES = {
     "atomicchat": {"title": "Qwen3.8-Flash-Next (AtomicChat)",
                    "about": "AD-4.27bpw and AD-5.00bpw: experts stored like IQ3_S's (61 GB of RAM), the n-gram table "
                             "at 5 or 8 bits; 94 and 110 GB downloads", "tag": "atomicchat-"},
+    "edge0": {"title": "Edge0 (latent MoE)",
+              "about": "145B and 120B latent sparse MoE, Q3_K or NVFP4 experts; a pre-built pack, ~86 to ~105 GB "
+                       "on disk",
+              "tag": "edge0-", "vision": False},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community "
                                                        "GSQ-RCO 3 and 3.5 bits", "tag": "ornith-"},
     "ornith-uncensored": {"title": "Ornith-1.5-35B-A3B (uncensored)",
@@ -194,7 +198,7 @@ FALLBACK_FAMILIES = {
               "about": "320B, 18B active; a large MoE for the PCs whose RAM and VRAM hold 95 GB or more",
               "tag": "glm53-"},
 }
-FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
+FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 196608, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
                 "Plain prose, no title.")
 

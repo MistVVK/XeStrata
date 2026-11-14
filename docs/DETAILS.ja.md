@@ -90,25 +90,37 @@ setup は `--drafting auto|dflash2` のとき、モデルごとに版を固定�
 `--serve` の `--draft auto` は、起動の最後（READY の前）に、読み込んだ drafter（MTP、DFlash2 の pack があれば
 DFlash2）と「drafter なし」を、固定の短い英文で交互に decode して比べ、速いものを残します。負けた drafter は
 VRAM と RAM から外します（MTP の層の K/V は、会話のキャッシュと保存した会話が持つので残します）。`--spec auto`（setup が書きます）なら窓の上限も候補にします（Qwen3.8-Flash-Next は 4 と 2、
-plain エンジンは 3 と 2）。最速が他より 3%（と自身の回の間のぶれ）以上速くなければ、安い形（MTP、DFlash2、なしの順、
-設定の窓）を残します。MTP と DFlash2 がその幅の中なら両方を残し、要求ごとに選びます（下）。測りに使う DFlash2 は
+plain エンジンは 3 と 2）。既定の形（設定の窓の MTP）を外すのは、ほかの形がすべての回で既定の形より速く、速さが
+10%（と両方の回の間のぶれ）以上上回るときだけです。そのうち最も速い形を残します。残す drafter は 1 つです。1 巡目で
+ほかの形が既定の形を上回る見込みがなくなれば、2 巡目は回しません。測りに使う DFlash2 は
 起動の最後に読み込み、エキスパートのキャッシュは MTP だけのときと同じ大きさで取るので、MTP が勝てば pack が
 ないときと同じ状態になります。DFlash2 を残すのは、それを載せても `--vram-reserve-mib` の予備が空いているときだけ
 です。測りの間はエキスパートの入れ替えと、最初の窓で決める切り替えは動きません。測りは浅い文脈（百数十トークン）で
 行い、深い文脈では窓の規則（`--spec-window auto`）が回ごとに補います。結果はファイルに残さず、起動ごとに測ります。
-`XESTRATA_DRAFT_PROBE=0` で測らず（auto は両方を読みます）、`XESTRATA_DRAFT_PROBE_TOKENS` で 1 回の長さ（既定 64）を
+`XESTRATA_DRAFT_PROBE=0` で測らず（auto は両方を読みます）、`XESTRATA_DRAFT_PROBE_TOKENS` で 1 回の長さ（既定 48）を
 変えます。`--draft mtp|dflash2|off` と数字の `--spec` はそのとおりにします。`--serve` なしの auto は MTP の層です。
 
-両方を残したときは、要求の `xestrata_draft`（`mtp|dflash2|auto|off`）が明示ならそれに従い、なければ
+`XESTRATA_DRAFT_PROBE=0` で両方を読んだときは、要求の `xestrata_draft`（`mtp|dflash2|auto|off`）が明示ならそれに従い、なければ
 `--draft-rule df2|mtp|learn`（既定 learn）です。learn は要求の種類（prompt 先頭 32 トークン）× 文脈の深さ
 （2K/8K/32K の境）ごとに、実測の decode 速度（EMA）の良い方を選び、負けた側も時々試します（差 4% 未満で 6 回に
 1 回、以上で 12 回に 1 回）。
 
 DFlash2 の窓は `--draft-conf P` で、selector 確率の積が P を下回る所で閉じます（既定は expert slots から決めます。
 `--draft-conf` の明示が優先）。`--draft dflash2` は既定で MTP の層を読みません（Qwen3.8-Flash-Next は
-`--draft-fallback mtp` で両方）。DFlash2 は 1 枚の GPU・1 要求ずつです（層分割・`--batch`・pipeline windows は
+`--draft-fallback mtp` で両方）。`--draft-fallback` と `--draft-mtp-spec` は Qwen3.8-Flash-Next だけです: この 2 つは
+DFlash2 と MTP の層を一緒に走らせ、静的な主役と予備（その窓）を決めるものですが、plain エンジンは両方を読んだ上で
+要求ごとに実測の速い方を選び（`--draft auto`、上の DFlash2 の節）、MTP の窓は `--spec` で決めるので、静的なつまみは
+要りません。DFlash2 は 1 枚の GPU・1 要求ずつです（層分割・`--batch`・pipeline windows は
 MTP のまま）。plain エンジンの `--draft dflash2` は `--serve` だけです。greedy の答えは drafter によらず同じです
 （検証の窓が target の argmax を出します）。
+
+`--wide-window auto` の起動時の測りは、対応する設定では DFlash2 の 8 行・16 行・受理数の EMA による切り替えを
+比べます。`off` は 8 行まで、`on` は 16 行です。窓の残りや設定の上限が小さいときはその範囲で検証します。
+
+`XESTRATA_DF2_STATIC_TABLE` に対象モデル専用の YD1S 表を指定すると、DFlash2 の候補として 2 語、次に 1 語の
+表を使えます。`XESTRATA_DF2_STATIC=auto|0|1` は起動時に表ありとなしを測る・使わない・使うを選びます（既定 auto）。
+表には tokenizer の識別子がないため、同じ語彙数だけでは足りません。対象モデルと同じ tokenizer の表を指定してください。
+表の候補も target が検証します。
 
 サーバーの decode では、VRAM にないエキスパートを順位 7 以下（上位 10 のうち重みの小さい 8〜10 番目）で選んだトークンでは、その寄与を 0 にし、検証の窓のどのトークンもその順位でしか選ばないものは読まず計算もしません（`XESTRATA_ROUTE_TAIL_SKIP`、既定 7、upstream b4e3407b）。
 残りのエキスパートの重みは正規化し直しません。そのぶん答えが少し変わります。upstream は窓のほかのトークンがそのエキスパートを使わないときだけ 0 にするので、トークンの出力が窓のほかの行で変わりました。XeStrata はトークンごとに決めます。
@@ -175,6 +187,17 @@ VRAM には、アテンションが読む部分（`--kv-resident 32768`）だけ
 アテンションが読む値は同じで、変わるのは KV の置き場所だけです。
 RAM は文脈 1 トークンあたり約 13.7 KB 使い、128K で約 1.7 GB です。
 
+**plain のモデルの KV ストリーミング**（`--kv-resident N|auto|off`、既定 `auto`、`XESTRATA_KV_RESIDENT`）:
+Ornith・Qwen3.6・Qwen3.5・llm-jp・PLaMo の全注意（GQA）の層も、Qwen3.8 と同じ形で KV を RAM に流します。
+権威ある K/V はページ固定の RAM に置き（identity 配置）、VRAM には末尾 N セルのリングだけを置きます。
+decode は古いセルを RAM から PCIe で読み（共通の attention カーネル）、新しいセルは VRAM から読みます。
+プロンプトは層ごとに 1 層分のセルを借りた VRAM の staging pool に写して attention します。
+`auto` は Qwen3.8 と同じ決まり（64K 以上で、エキスパートと余裕と KV のホスト写しが RAM に収まるとき）で、N の既定は 32768 です。
+int8・q4_0・k8v4 の KV、推測デコードの窓、会話の保存と戻しとともに動きます。
+答えは流さないときとビット一致で、変わるのは KV の置き場所だけです。
+GLM-5.3-Flash の DSA は `--kv-ram`、sliding-window の層は自分のリング、`--batch` と encoder は対象外です。
+流すとき KV の VRAM は固定なので `--kv-grow` は無効になります（エンジンがそう言います）。
+
 **伸びる KV**（`--kv-grow` か `XESTRATA_KV_GROW=1`、upstream 9e3dbfe7）: KV キャッシュを全部 VRAM に置き、要求が届いたセルの分だけ VRAM を取ります。
 残りはエキスパートのキャッシュが使い、文脈が伸びるとスロットを KV に渡し、短い要求のあとに取り戻します。
 KV とキャッシュは仮想メモリ（`sycl_ext_oneapi_virtual_mem`）の上にあり、どちらのアドレスも動かないので、捕まえたグラフはそのまま使えます。
@@ -214,10 +237,10 @@ setup（`./setup.sh`、パッケージの `xestrata`、ランチャーの窓）�
 コマンドラインでは、段ごとに `--base`・`--variant`・`--quantizer` で選ぶか、`--family` でまとめて選びます（`--base qwen3.8-flash-next --variant sc117` は `--family sc117` と同じです）。
 `--model` は大きさです。
 
-最初に選ばれているモデルは、Qwen3.8-Flash-Next の Swift 1.5 の SC117 版（IQ3_XXS が入るとき）、Gyro-Coder-L（エキスパートが全部 RAM に入るとき）、Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B、Qwen3.5-2B の順に見て、この PC で動く最初のものです（GPU のない PC では Qwen3.5-2B）。
+最初に選ばれているモデルは、Qwen3.8-Flash-Next の Swift 1.5 の SC117 版（IQ3_XXS が入るとき）、Gyro-Coder-L（エキスパートが全部 RAM に入るとき）、Gyro-Coder（同じく）、Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B、Qwen3.5-2B の順に見て、この PC で動く最初のものです（GPU のない PC では Qwen3.5-2B）。
 大きさは品質で勧めます。
 
-- ISTA-DASLab の GSQ-RCO のファイル（元のもの、Swift 1.5、Coder、SC117 と huihui-ai の版）は IQ3_XXS です。この PC に入らなければ、入るうちで品質のいちばん高いものです（省 RAM モードで入るものも含みます）。
+- ISTA-DASLab の GSQ-RCO のファイル（元のもの、Swift 1.5、Coder、SC117 と huihui-ai の版）は、入れば IQ3_S、次に IQ3_XXS です。どちらも入らなければ、入るうちで品質のいちばん高いものです（省 RAM モードで入るものも含みます）。
 - RAM の予算で動くファイル（Unsloth、Gyro、AtomicChat の AD）は、エキスパートが全部 RAM に入るうちで品質のいちばん高いものです。実験的な版は勧めません。
 - Qwen3.8-Flash-Next 以外の MoE（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、GLM-5.3-Flash）は、RAM と VRAM の合計に入るうちで品質のいちばん高いものです。
 - Qwen3.5（9B、2B、0.8B）は、VRAM に入るうちで最も大きなものです。GPU のない PC では、2B は UD-Q5_K_XL、0.8B は Q8_0 です。
@@ -427,7 +450,7 @@ Qwen3.5 の 9B・2B・0.8B は、重みをすべて GPU の VRAM に置きます
 - **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)**（Ornith AI、MIT）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の MoE です。文脈は 256K まで。
   公式の Q4_K_M〜BF16 と、pfeifferj による GSQ-RCO の 3 ビットと 3.5 ビット（[コミュニティの再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)で、ISTA-DASLab のものではありません）があります。
   dealignai による拒否を外した版の [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)（MIT、Q4_K_M・Q5_K_M・Q6_K・Q8_0。テンソルの型は公式の同じ版と同じです）も選べます（`--family ornith-uncensored`）。拒否がずっと少なく、安全のための絞り込みも弱いので、書いたものを確かめてください。
-- **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)**（LLM-jp、Apache-2.0）: 32B、1 トークンで使うのは 3B の、日本語と英語の思考するモデルです。文脈は 256K まで。
+- **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)**（LLM-jp、Apache-2.0）: 32B、1 トークンで使うのは 3B の、日本語と英語の思考するモデルです。文脈は 64K です。
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)**（Qwen、Apache-2.0）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の思考する MoE です。文脈は 256K まで。
   GGUF は Unsloth が MTP の層付きで作った UD-Q4_K_XL・UD-Q6_K_XL・Q8_0 です。
   llmfan46 が Heretic と MPOA で拒否を外し MTP の層を残した版を、SC117 が APEX で量子化した [Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)（Apache-2.0、APEX-I-Quality・APEX-I-Balanced・APEX-I-Compact・APEX-I-MINI、14.3〜26.0 GB）も選べます（`--family qwen36-uncensored`）。拒否がずっと少なく、安全のための絞り込みも弱いので、書いたものを確かめてください。
@@ -497,7 +520,7 @@ API は、思考と答えの分離、ストリーミング、ツールの呼び�
 Ornith の公式の版（Q4_K_M〜BF16）と拒否を外した版、Qwen3.6、GLM-5.3-Flash は、モデルの MTP の層で 2 つ先までの下書きを作り、窓でまとめて確かめます（推測デコード。GSQ-RCO の版と llm-jp には MTP の層がありません）。
 温度つきの要求でも使います。窓の各行は位置で決まる乱数で引き、下書きはその引きと同じときだけ使うので、文は下書きがないときと同じです（B70 の Qwen3.6-35B-A3B、温度 0.8 の 400 トークンで decode 92.9 → 131.7 トークン/秒）。
 `setup --gpus` で 2 枚以上の GPU を選ぶと、層を GPU に分けて動かします（最初の GPU が前の層、次の GPU がその後の層と head と MTP の層。分割点は各 GPU の空いたメモリの割合から決めます）。VRAM に置けるエキスパートは GPU を合わせた分になります。
-`setup` の `--kv`、`--parallel`、`--replicas`、`--resident-budget-gib N`（GPU が持たないエキスパートのうち N GiB を RAM に置き、残りをファイルから読む）は、Qwen3.8-Flash-Next と同じく設定に書かれます（`--kv` の `q4_0`・`k8v4` はヘッドが 256 のモデル、llm-jp は `fp16`・`int8`、GLM-5.3-Flash は `fp16` だけ。`--parallel` は GLM-5.3-Flash と画像では使えません）。
+`setup` の `--kv`、`--parallel`、`--replicas`、`--resident-budget-gib N`（GPU が持たないエキスパートのうち N GiB を RAM に置き、残りをファイルから読む）は、Qwen3.8-Flash-Next と同じく設定に書かれます（`--kv` の `q4_0`・`k8v4`・`tcq4`・`tcq5` はヘッドが 256 のモデル、llm-jp は `fp16`・`int8`、GLM-5.3-Flash は `fp16` だけ。`--parallel` は GLM-5.3-Flash と画像では使えません）。
 Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5 の 9B・2B・0.8B は画像を読めます（2B と 0.8B は GPU で動かすときだけ。setup が Qwen3.8-Flash-Next と同じく聞き、24 GB 以上の GPU では GPU の、それ未満では CPU の読み手を使います）。
 画像の読み手（mmproj）は、それぞれの配布元のものです。Ornith-1.5 は Ornith AI の BF16（pfeifferj の GSQ-RCO の版も同じものを使います）、拒否を外した版は dealignai のもの、Qwen3.6-35B-A3B と Qwen3.5 の 9B・2B・0.8B は Unsloth の BF16（それぞれのリポジトリのもの）、Qwen3.6-35B-A3B の拒否を外した版は SC117 の F16 です。
 まだ使えないのは、llm-jp-4.1 と GLM-5.3-Flash の画像、省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです（KV キャッシュの精度は GLM-5.3-Flash ではまだ FP16 だけです）。
@@ -511,7 +534,8 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | --- | --- |
 | `--max-context N` | KV キャッシュのトークン数（setup が GPU の VRAM から選びます） |
 | `--kv-ram on\|off` | GLM-5.3-Flash の DSA の層の潜在（1 位置 1 KB）を VRAM でなく RAM に持ち、空いた VRAM をエキスパートに回す（既定 on）。decode の窓は各トークンが選んだ位置だけを VRAM に写して読み、prompt の塊は層ごとにその時点までを写して読む。128K の文脈で B70 の VRAM のエキスパートが 2,150 から 2,322 枠に増え、RTX 4070 は 128K で起動できるようになり、64K で prompt が 3.3 から 7.1 トークン/秒になりました |
-| `--kv fp16\|int8\|q4_0\|k8v4` | 注意の層の KV キャッシュを FP16（既定）か、64 値ごとに FP16 の倍率を持つ int8 で持つ。int8 は VRAM が半分になり、答えが少し変わります。`q4_0` は K と V を Hadamard の回転の後に Q4_0 で（FP16 の約 28%）、`k8v4` は K を int8、V を回転した Q4_0 で持ちます（約 40%）。この 2 つはヘッドが 256 のモデル（Ornith、Qwen3.6、Qwen3.5-9B）だけです。B70 の Qwen3.5-9B の 32K の prefill は FP16 20.6 秒、`q4_0` 20.4 秒、`k8v4` 19.8 秒でした（GLM-5.3-Flash ではどれも使えません） |
+| `--kv-resident N\|auto\|off` | 注意の層の KV を RAM に流す（Qwen3.8 と同じ形）。権威ある K/V はページ固定の RAM、VRAM は末尾 N セルのリングだけで、decode は古いセルを PCIe で読む。`auto`（既定）は 64K 以上でエキスパートと KV のホスト写しが RAM に収まるとき（N の既定 32768）、`off` で全部 VRAM。int8・q4_0・k8v4、推測の窓、会話の保存とともに動き、答えはビット一致。GLM の DSA（`--kv-ram`）・sliding-window の層・`--batch`・encoder は対象外で、流すとき `--kv-grow` は無効（`XESTRATA_KV_RESIDENT`）。`tcq4`・`tcq5` はホスト写しを持たないので対象外（流す形は off） |
+| `--kv fp16\|int8\|q4_0\|k8v4\|tcq4\|tcq5` | 注意の層の KV キャッシュを FP16（既定）か、64 値ごとに FP16 の倍率を持つ int8 で持つ。int8 は VRAM が半分になり、答えが少し変わります。`q4_0` は K と V を Hadamard の回転の後に Q4_0 で（FP16 の約 28%）、`k8v4` は K を int8、V を回転した Q4_0 で持ちます（約 40%）。`tcq5`・`tcq4` は K と V を符号つきの回転の後に、1 値 5 ビット・4 ビットのトレリス符号（YASAKANI の KV5 の方式）で持ちます（約 32%・26%）。RX 9060 XT の Qwen3.5-9B と Qwen3.6-35B-A3B で、FP16 の KV に対する KL は `tcq5` が `k8v4` と、`tcq4` が `q4_0` と同じかそれより小さくなりました。トレリス符号は 16 トークンそろうまで int8 で持ち、そろったところでまとめて符号にします（`XESTRATA_KV_TCQ_DEFER=0` で 1 トークンずつ）。この 4 つはヘッドが 256 のモデル（Ornith、Qwen3.6、Qwen3.5-9B）だけです。`--kv` を渡さない密なモデル（Qwen3.5-9B）は、FP16 では全部の層が GPU に載らないとき、int8・`tcq5`・`tcq4` のうち全部の層が載る最初のものを選びます（RX 9060 XT を 12 GB に絞った 262K で int8、10 GB で `tcq5`）。B70 の Qwen3.5-9B の 32K の prefill は FP16 20.6 秒、`q4_0` 20.4 秒、`k8v4` 19.8 秒でした（GLM-5.3-Flash ではどれも使えません） |
 | `--kv-grow`、`--no-kv-grow` | `--serve` で 1 GPU のとき、KV キャッシュを仮想メモリに置き、要求が届く位置の分だけ VRAM を使う。エキスパートの VRAM の段（`--vram-elastic` の区切り）が長い要求の前にその分を譲り、短い要求の後に取り戻します。既定は Qwen3.8-Flash-Next と同じく、GPU の仮想メモリのページが 2 MiB 以上のとき有効です（RTX 4070 は有効、B70 は無効）。RTX 4070 の Qwen3.6-35B-A3B（128K の文脈）では、起動時の段が 2,870 から 4,182 枠になり、32K の prefill が 32.9 秒から 29.0 秒になりました（並列スロットとは一緒に使えません） |
 | `--control-vector-scaled FILE:SCALE[,...]`、`--control-vector FILE`、`--control-vector-layer-range A B`、`--cvec-mode`、`--cvec-dir` | llama.cpp の形式の制御ベクトルを、各層の FFN の後の残差に足す（Qwen3.8-Flash-Next と同じ意味）。`--serve` では要求ごとに切り替えられ（`experimental_speed_projection`）、切り替えたときは、それまでの会話の状態を読み直します（GLM-5.3-Flash ではまだ使えません） |
 | `--expert-profile PATH` | 起動時に、このプロファイルの順で VRAM のエキスパートを埋める |
@@ -530,7 +554,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--vram-elastic` | `--serve` で 1 GPU のとき、VRAM のエキスパートの段をセグメント（`--vram-segment-mib`、既定 512）に分けて持ち、画像の仕事の前に空けて後で戻す（`--image-gpu-policy shrink`） |
 | `--prefill-cpu-share S` | prefill で VRAM にないエキスパートのうち、CPU のプールが計算する割合（0〜1。既定は `auto` でプロンプトごとに測る。0 ですべて GPU）。CPU と GPU は丸めが違うので、割合が実行ごとに動くと貪欲な答えも動きます。setup は PC とモデルの組ごとに一度だけ測った値を設定に書きます。0 なら毎回同じです |
 | `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少なく、多くて 32。Linux のコンテナで CPU の割り当て（cgroup）があれば、その数より 1 少ない数まで） |
-| `--pool-cores LIST`、`--aux-cpus SET`、`--pool-tasks N`、`--no-host-worker`、`--memory-limit-mib N` | CPU のワーカーを置く CPU、ワーカーでもホストでもないスレッドを置く CPU（要求ごとの `strata_tune` の `aux_cpus` も効きます）、プールの 1 段の仕事の数、ホストのスレッドを仕事に加えないこと、会話の退避と保存が数える RAM の上限（Qwen3.8-Flash-Next と同じ意味） |
+| `--pool-cores LIST`、`--aux-cpus SET`、`--pool-tasks N`、`--no-host-worker`、`--memory-limit-mib N` | CPU のワーカーを置く CPU、ワーカーでもホストでもないスレッドを置く CPU（要求ごとの `strata_tune` の `aux_cpus` も効きます）、プールの 1 段の仕事の数、ホストのスレッドを仕事に加えないこと、会話の退避と保存が数える RAM の上限（Qwen3.8-Flash-Next と同じ意味）。`--pool-cores` を指定しないとき、`XESTRATA_POOL_PLACE`（`auto`（既定）・`off`・`on`）は、P コアと E コアの混ざる CPU でワーカーを「すべての物理コア」と「速いコアだけ」のどちらに置くかを起動時に測って選びます（速いコアだけがはっきり速いときだけそちら。同じコアばかりの CPU では何もしません） |
 | `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定は 4096。VRAM のエキスパートの枠がもっと大きい塊を貸せるときはそれ。32768 まで、塊のバッファーが枠の 85% 以内に収まるもの。0 でまとめない） |
 | `--max-t N` | decode の窓の最大のトークン数（既定 8。`--wide-window on` か、9 以上のスロットを頼んだとき 16） |
 | `--wide-window auto\|off\|on` | 検証とバッチの窓を 16 行まで広げるか。`auto`（既定）は 9 以上のスロットを頼んだときと 9 以上の `--spec` のとき、`off` は 8 行のまま、`on` は広げられるところすべて（設定の `"wide_window"`、`XESTRATA_WIDE_WINDOW` でも指定できます）。8 行までの窓は、広げても同じカーネルで動きます |
@@ -539,8 +563,10 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
 | `--coupled-draft`、`--no-coupled-draft` | 温度つきの要求で、MTP の層の下書きも要求の引き方（温度、top_k、top_p、min_p）で、それを確かめる窓の行と同じ乱数で引く（Qwen3.8-Flash-Next と同じ。既定はオフ） |
 | `--suffix-draft N`、`--lookup-chain K`、`--lookup-chain-min M` | `--serve` で、会話の文の前の繰り返し（直近の N トークン以上の一致）から下書きを作り、MTP の層の下書きより長いときはそれを窓で確かめる（MTP の層のないモデルでも）。`--lookup-chain` は MTP の下書きの後に K トークンまで続けます（既定は無効） |
-| `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます） |
+| `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます）。`auto` で `--expert-profile` があるときは、2 枚目の GPU を分担の段・補助のエキスパートキャッシュ・使わない（1 枚目単独）のどれにするかも、測った帯域とプロファイルから decode の窓を見積もって選びます（Qwen3.8-Flash-Next と同じ。幅は `XESTRATA_SPLIT_GAIN_PCT`・`XESTRATA_SPLIT_HELPER_GAIN_PCT`、`XESTRATA_SPLIT_ROLE` で役目を固定。プロファイルが無ければメモリの割合の分担のまま） |
 | `--split-device D[,D2..]` | 2 枚目以降の GPU（エンジンの番号か PCI アドレス。既定はほかの単体の GPU） |
+| `--split-roles any\|helper` | `--layer-split auto` で 2 枚目の GPU に任せる役目。`any`（既定）は分担の段か補助のキャッシュかを使わないかも見積もりで選び、`helper` は分担の段にせず補助のキャッシュか使わないかにします（Qwen3.8-Flash-Next と同じ） |
+| `--split-skip-if-fits` | `--layer-split auto` で、1 枚目の GPU がプロファイルのエキスペアをすべて持つときは分担せず 1 枚だけで動かします（Qwen3.8-Flash-Next と同じ） |
 | `--pipeline-windows N` | 層を分けたとき、1（既定）はプロンプトを窓で読む分を段をまたいで流す（前の段が次の窓を計算する間に、後の段がこの窓を計算する。行と順は直列と同じなので、状態も同じ）。2 は、2 段で MTP の層のあるとき decode も流す: 最後の段がこの窓を確かめる間に、最初の段が次の窓を推測で計算する（この窓がまるごと当たり、続くトークンが下書きの層の予想どおりなら、それがそのまま次の窓になる。外れたら最初の段を戻す）。推測するのは、当たる見込み（下書きの層の確率を、これまでの推測が当たった割合で補正したもの）と当たったときに省ける最初の段の時間の積が、推測を横で走らせると窓が延びる時間を上回るときだけで、どの時間も窓ごとに測ります。測れるまでは見込みが 0.5 以上のとき（Qwen3.8-Flash-Next の既定は 0.2）。窓の長さは直列と同じ規則（`--spec-window`）で選びます。文は、エキスパートの置き場が同じ直列と同じです（2 は 2 つ目の検証の分の VRAM をエキスパートから外すので置き場が変わり、温度をかけた文は CPU と GPU の丸めの違いで変わることがあります）。B70 と RTX 4070 の分割（層 20）の Qwen3.6-35B-A3B では、入力を写す返事が 187.2 から 247.2 トークン/秒になり、温度 0.8 の物語は 134.5・135.7 から 133.0・134.1 トークン/秒でした。同じ 2 枚の分割（層 24）の Qwen3.8-Flash-Next（エキスパートの入れ替えなし）では、物語が貪欲で直列の 65.9 から 67.2・67.5、温度 0.8 で 60.7 から 60.9・64.0 トークン/秒でした（窓の長さが `--spec` で決まっていたときは 57.6・57.9 と 54.7・55.1）。0 は直列。B70 と RTX 4070 の分割（層 20）の Qwen3.6-35B-A3B で、`--prompt-chunk 0` の 819 トークンの prefill が 108.5 から 139.3 トークン/秒になり、答えは同じでした。長いプロンプトをチャンクで読むときも、チャンクを同じように段をまたいで流します（同じ分割の 13,506 トークンの prefill が 1,030.8 から 1,357.9 トークン/秒、答えは同じ） |
 | `--vram-reserve-later-mib N` | 層を分けたとき、2 枚目以降の GPU に空けておく VRAM（既定は `--vram-reserve-mib` と同じ） |
 | `--vision` | `--serve` で画像つきの要求を受ける（Qwen3.5-9B と qwen35moe のモデル。setup が画像を選んだとき書きます） |
@@ -548,7 +574,8 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--batch N`（`"parallel": N`、既定は `"auto"`） | `--serve` で最大 N 個の会話をまとめて decode する（[BATCHING](BATCHING.ja.md#ほかのモデルplain-のエンジン)。GLM-5.3-Flash と `--vision` ではまだ使えません） |
 | `--prompt-cache N`、`--prompt-cache-every N`、`--prompt-cache-root N`、`--turn-token ID`、`--conversation-save-checkpoints N` | `--serve` で、再帰の状態を持つモデル（Ornith、Qwen3.6、Qwen3.5-9B）の会話のチェックポイント。再帰の状態は前の位置へ戻せないので、会話の途中から続く要求（描き方の違う返答の次のターン、書き換えた発言、同じシステムプロンプトの新しい会話）は、チェックポイントがなければ全部を読み直します。意味と既定は Qwen3.8-Flash-Next と同じで（[会話のキャッシュ](#会話のキャッシュ)）、要求の `pin` と `"strata_checkpoint": false` も効きます。チェックポイントは再帰の状態だけで（Qwen3.6 で約 60 MB）、その下の位置の K/V は会話のものを使います。`--turn-token` の既定は語彙の `<|im_start|>`、なければ `<|start|>` です。注意の層だけのモデル（llm-jp、GLM-5.3-Flash）は、どの位置までの K/V も使えるので要りません |
 | `--tail-role-token ID`、`--prompt-cache-tail`、`--prompt-cache-spread`、`--conversation-cache-min-tokens N`、`--conversation-cache-park-gain N`、`--short-read N`、`--session-save-reclaim` | `--serve` の会話のキャッシュとチェックポイントの方針（Qwen3.8-Flash-Next と同じ意味）。`--short-read` の既定は `--max-t` です |
-| `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N`、`--yarn-ext-factor F`、`--yarn-attn-factor F`、`--yarn-beta-fast F`、`--yarn-beta-slow F` | 文脈の延長（YaRN の値は llama.cpp と同じ意味） |
+| `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N`、`--yarn-ext-factor F`、`--yarn-attn-factor F`、`--yarn-beta-fast F`、`--yarn-beta-slow F` | 文脈の延長（YaRN の値は llama.cpp と同じ意味）。学習した長さ（262,144）を超える文脈で、回転の角度を縮めて（linear）YaRN で伸ばします。GGUF の `rope.scaling.*` と回転の次元（全部か一部か）を読み、層ごとに効かせます。Ornith・Qwen3.6・Qwen3.5 が使えます。llm-jp-4.1 は学習した 64K のまま、GLM-5.3-Flash は MLA が nope（回転がない）ので伸ばしません。伸ばさない設定の答えは、この機能のない実行とビットで同じです。setup は 384K・512K の選択肢と RoPE の問いをこれらのモデルにも出します（[上](#setupsh-を実行する)） |
+| `--window-hashes PATH` | 検証の窓ごとに、index・位置・大きさ・その窓の最終の正規化された行の 64 ビットハッシュ・argmax を 1 行で書きます（Qwen3.8-Flash-Next のエンジンと同じ形、`strata/spec/window_hash.hpp`）。答えの揺れを調べる道具: 同じ計算をする 2 つの実行物は同じファイルを書きます。`--spec-follow` と `--adapt-every 0` と一緒に使います（直列の検証の窓。`--pipeline-windows 2` の窓は書きません） |
 
 #### GPU のない PC
 
@@ -891,7 +918,14 @@ worker は `xs-pool-N`、host は `xs-host` という名前を持ち（ほかの
 worker の数はリストの長さで、`--pool-workers N` ならリストの最初の N 個です。
 断ることはなく、警告だけします: 1 つのコアの 2 つのスレッドを並べたとき、host の論理プロセッサーを並べたとき、このプロセスが使えない論理プロセッサーを並べたとき（それは外します）。使えるものが残らなければ既定の置き方になり、読めないリストは警告して無視します。
 host は最初のコアのままなので、リストから外してください。スレッドを動かすだけで、答えは変わりません。
-効くのは Qwen3.8-Flash-Next 系のエンジンだけで、ほかの MoE（Ornith、llm-jp、Qwen3.6、GLM-5.3-Flash）は既定の置き方です。
+Qwen3.8-Flash-Next 系のエンジンも plain のエンジン（Ornith、llm-jp、Qwen3.6、GLM-5.3-Flash）も取ります。
+
+`XESTRATA_POOL_PLACE`（`auto`（既定）・`off`・`on`）は、`--pool-cores` を指定しないとき、P コアと E コアの混ざる CPU で
+worker を「すべての物理コア」（既定）と「速いコアだけ」のどちらに置くかを起動時に測って選びます。
+両方のコアの集まりで RAM を読む速さを測り、速いコアだけが 5% より速いときだけそちらにします（`auto`）。
+`off` は既定のまま、`on` は速いコアだけに固定します。コアの速さは OS の `cpuinfo_max_freq` で読み、名前では選びません。
+同じコアばかりの CPU・周波数を読めない CPU では何もしません。スレッドを動かすだけで、答えは変わりません。
+効くかは実測で決めます（i7-14700 では上流の P 寄りの置き方が遅かった記録があるので、既定が勝つ見込み。記録の measure-plan）。
 
 `--aux-cpus` は、CPU のプールの worker でも host でもないスレッドを、どの CPU で動かすかを決めます（Linux、既定は `off`、upstream 91f1e85d）。
 対象は、エキスパートのキャッシュの入れ替え、prefill のコピー、ファイルの読み込み、GPU のランタイムのスレッドなどです。
@@ -1103,7 +1137,7 @@ print(r.choices[0].message.content)
   ガードを使っても、推測デコードはガードなしと同じように効きます。B70 で同じ質問を 3 回ずつ比べた decode は、Qwen3.8-Flash-Next で 97.9 と 97.7 トークン/秒、Ornith-1.5-35B-A3B で 141.9 と 144 トークン/秒でした（それまでの Ornith は 106.5 トークン/秒で、ガードが推測デコードを止めていました）。
   本文に項目を足せないクライアントは、ヘッダー `X-XeStrata-Script-Guard: ja` で同じ指定ができます（本文の `script_guard` が優先します）。
   指定のない要求には、Web のチャット設定の「他のアプリにも使う」、環境変数 `XESTRATA_SCRIPT_GUARD=ja`、`xestrata-<model>.json` の `"script_guard": "ja"`、全モデル共通の設定（`settings.json`）の `"script_guard"` の順に効きます。設定ファイルの 2 つは Web の Settings でも変えられます。どれもなければオフで、要求の `"script_guard": "off"` でその要求だけ切れます。
-  setup は、対話で動かした最初の 1 回と `--setup` のときに、使うかを尋ねて `settings.json` に書きます（`--script-guard ja|en|ko|zh-cn|zh-tw|off` で尋ねずに決められます）。勧める答えは、システムの言語が日本語なら `ja`、韓国語なら `ko`、中国語なら `zh-cn`（台湾・香港は `zh-tw`）、ベトナム語なら `off`、それ以外は `en` です。
+  setup は、対話で動かした最初の 1 回と `--setup` のときに、使うかを尋ねて `settings.json` に書きます（`--script-guard ja|en|ko|zh-cn|zh-tw|off` で尋ねずに決められます）。勧める答えは `off`（使わない）で、使うときは答えの言語を選びます。
   XeStrata の計測（`xestrata --setup --bench`、`tools/` の計測の道具、リリースと upstream の追従の比べ）は、どの要求にも `"script_guard": "off"` を付けるので、この設定に左右されません。
   Web のチャット設定では、最初は表示言語が日本語なら「日本語」、韓国語なら「韓国語」、中国語なら「中国語（簡体）」、それ以外なら「英語など（CJKV 以外）」が選ばれています。止める字の言語で書かせるときはオフにします。
   logit_bias を受け付けないエンジン（古いエンジン）と、`"parallel"` のバッチの枠（この守りは 1 度に 1 つの要求の分しか持ちません）では効かず、server のウィンドウにそう 1 行出します。

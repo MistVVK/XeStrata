@@ -35,6 +35,9 @@ struct ExpertLayout {
     /// same numbers.
     std::vector<int64_t> block;
     int version = 0;                      ///< native_experts.txt's header version (0 = none given)
+    /// v6 (the latent MoE, Edge0): the experts' own widths from the header, 0 when it does not name them.
+    /// They differ from the shell's hidden width and expert FF: the experts run at the latent width.
+    int64_t expert_embd = 0, expert_ff = 0;
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
 
@@ -95,6 +98,12 @@ void expert_layout_set(const ExpertLayout& layout);
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 /// v5 = v4 plus `hadamard.txt` beside it: Hadamard-folded experts (hadamard.hpp), written only for such models,
 /// so an engine that cannot rotate the activations refuses the pack instead of running it wrong.
-inline constexpr int kExpertLayoutVersion = 5;
+/// v6 = the latent MoE's A-only pack (Edge0): the header names expert_embd / expert_ff (the experts' widths),
+/// there is no hadamard.txt, and scales/l*.f32 beside the manifest hold the Q3_K shared column scales.
+inline constexpr int kExpertLayoutVersion = 6;
+
+/// The layer's Q3_K column-scale reciprocals (NativeFmt::gu_colscale) and their width, for the GPU side to
+/// upload.  nullptr when the pack has no scales; *width 0 then.
+const float* latent_gu_colscale(int layer, int* width);
 
 }  // namespace strata::kernels::cpu

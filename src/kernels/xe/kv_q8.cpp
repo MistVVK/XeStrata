@@ -40,6 +40,10 @@ void validate(const QsaShapes& s, const char* what) {
 void kv_append_cells(const KvAppend& a, const QsaShapes& s, void* stream) {
     validate(s, "kv_append_cells");
     if (a.n_tok < 1) return;
+    if (a.k_tc != nullptr) {
+        kv_append_tcq(a, s, stream);
+        return;
+    }
     const bool f16 = a.k_pool != nullptr, q4 = a.k_q4 != nullptr;
     if (!f16 && !q4 && a.k_q == nullptr) throw core::DeviceError("kv_append_cells: no pools");
     if (q4 && s.head_dim != 256)

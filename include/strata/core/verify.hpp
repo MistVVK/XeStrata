@@ -424,6 +424,12 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return win_.sink(); }
+    /// The latent MoE (Edge0): the window's mapped D rows, their doorbell and their Q8_0 image, for the pool's
+    /// CPU share (ExpertDispatch's lat_* fields); null when the pack is not a latent one.
+    const float* latent_xl_mapped() const { return win_.latent_xl_mapped(); }
+    const uint32_t* latent_xlseq() const { return win_.latent_xlseq(); }
+    const uint8_t* latent_act0_mapped() const { return win_.latent_act0_mapped(); }
+    bool latent() const { return win_.latent(); }
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
@@ -496,6 +502,8 @@ private:
     std::vector<float*> slot_bias_dev_;              ///< per slot: its logit bias on the device (null: none)
     std::vector<std::vector<int32_t>> slot_tail_;    ///< per slot: its reply tail for the penalty window
     int32_t* slot_hist_d_ = nullptr;                 ///< the current batch window's penalty-history rows (device)
+    strata::kernels::SamplerParams* slot_params_d_ = nullptr;
+    size_t slot_params_cap_ = 0;
     size_t slot_hist_cap_ = 0;                       ///< ... and how many int32 fit (grows to the widest window)
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;

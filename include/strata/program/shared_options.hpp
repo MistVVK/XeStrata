@@ -53,6 +53,7 @@ struct SharedOptionFields {
     bool* spec_window_given = nullptr;
     bool spec_window_all = false;   ///< --spec-window all is taken (PlainModel's every-draft window)
     double* spec_min_p = nullptr;
+    std::string* window_hashes = nullptr;   ///< --window-hashes PATH: a fingerprint line per verify window
     // memory
     bool* mmap_experts = nullptr;
     int64_t* vram_free_mib = nullptr;
@@ -82,6 +83,9 @@ struct SharedOptionFields {
     bool* adapt_async_bool = nullptr;    ///< plain's bool
     bool* coupled_draft = nullptr;
     int* kv_grow = nullptr;
+    /// --kv-resident N|auto|off (the plain engine): -1 auto, 0 off, >0 the resident cells a layer. generate.cpp keeps
+    /// its own parse (N, 0 off; setup decides its auto), so it leaves this null
+    int64_t* kv_resident = nullptr;
     std::string* conversation_save = nullptr;
     std::string* dump_logits = nullptr;
     std::string* dump_routing = nullptr;
@@ -110,6 +114,8 @@ struct SharedOptionFields {
     bool batch_clamp0 = false;           ///< plain: max 0; generate as it is
     int* expert_cache_remote = nullptr;  ///< --expert-cache-device1/2/3, an array of 3
     bool expert_cache_remote_clamp0 = false;   ///< plain: max 0
+    bool* split_roles_helper = nullptr;  ///< --split-roles any|helper (helper: true), --layer-split auto's second GPU
+    bool* split_skip_if_fits = nullptr;  ///< --split-skip-if-fits: the first GPU alone when it holds every profiled pair
     int* pool_tasks = nullptr;
     const char* pool_tasks_msg = nullptr;      ///< the engine's own error line
     bool pool_tasks_strict = false;            ///< generate: the whole value an integer
@@ -227,6 +233,7 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
         *f.spec_min_p = std::clamp(std::strtod(next(a.c_str()), nullptr), 0.0, 1.0);
         return 1;
     }
+    if (a == "--window-hashes" && f.window_hashes) { *f.window_hashes = next(a.c_str()); return 1; }
     if (a == "--mmap-experts" && f.mmap_experts) { *f.mmap_experts = true; return 1; }
     if (a == "--vram-free-mib" && f.vram_free_mib) {
         *f.vram_free_mib = std::max<int64_t>(0, std::strtoll(next(a.c_str()), nullptr, 10));
@@ -272,6 +279,21 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
     if (a == "--no-coupled-draft" && f.coupled_draft) { *f.coupled_draft = false; return 1; }
     if (a == "--kv-grow" && f.kv_grow) { *f.kv_grow = 1; return 1; }
     if (a == "--no-kv-grow" && f.kv_grow) { *f.kv_grow = 0; return 1; }
+    if (a == "--kv-resident" && f.kv_resident) {
+        const std::string v = next(a.c_str());
+        if (v == "auto") *f.kv_resident = -1;
+        else if (v == "off") *f.kv_resident = 0;
+        else {
+            char* end = nullptr;
+            const long long n = std::strtoll(v.c_str(), &end, 10);
+            if (end == v.c_str() || *end != '\0' || n < 0) {
+                std::fprintf(stderr, "%s: --kv-resident takes N, auto or off, not \"%s\"\n", f.who, v.c_str());
+                return -1;
+            }
+            *f.kv_resident = n;
+        }
+        return 1;
+    }
     if (a == "--conversation-save" && f.conversation_save) { *f.conversation_save = next(a.c_str()); return 1; }
     if (a == "--dump-logits" && f.dump_logits) { *f.dump_logits = next(a.c_str()); return 1; }
     if (a == "--dump-routing" && f.dump_routing) { *f.dump_routing = next(a.c_str()); return 1; }
@@ -354,6 +376,11 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
         f.expert_cache_remote) {
         const int v = (int) std::strtol(next(a.c_str()), nullptr, 10);
         f.expert_cache_remote[(size_t) (a.back() - '1')] = f.expert_cache_remote_clamp0 ? std::max(0, v) : v;
+        return 1;
+    }
+    if (a == "--split-skip-if-fits" && f.split_skip_if_fits) { *f.split_skip_if_fits = true; return 1; }
+    if (a == "--split-roles" && f.split_roles_helper) {
+        *f.split_roles_helper = std::string(next(a.c_str())) == "helper";
         return 1;
     }
     if (a == "--pool-tasks" && f.pool_tasks) {

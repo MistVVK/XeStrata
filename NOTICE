@@ -43,6 +43,15 @@ Every copyright holder whose work is in this repository, its license and where t
   under the LGPL: LGPL-3.0-or-later AND MIT) - text below and in
   third_party/main/ggml/LICENSE. setup also fetches llama.cpp (MIT, the same authors) into third_party/main/llama.cpp,
   with its own LICENSE
+- Copyright (c) 2026 Edge0
+  Apache-2.0 - the latent MoE support (Edge0-145B / Edge0-120B, Qwen3.8-Flash-Next's shell with experts at a latent
+  width): the pack readers (src/core/latent.cpp, include/strata/core/latent.hpp), the latent kernels
+  (src/kernels/xe/latent.cpp, include/strata/kernels/latent.hpp) and the layer parity (src/kernels/latent_parity.cpp),
+  written after the latent additions of edge0-strata (https://github.com/Edge0-AI/Edge0, branch feat/edge0-strata at
+  761f14a), a fork of Strata whose directory keeps Strata's MIT; Edge0's contributions carry the Edge0 repository's
+  Apache-2.0. The files keep both notices and are under the LGPL as a whole (LGPL-3.0-or-later AND MIT AND
+  Apache-2.0) - LICENSES/Apache-2.0.txt. The models' weights are under the Edge0 Community Model License 1.0 and the
+  Qwen Community License 1.0 (non-free): XeStrata does not bundle them; setup fetches them to the user's machine
 - Copyright (c) 2026 Peasant Smith and the Project Maya contributors
   MIT - the loop guard of the server (serve/loop_guard.py and its tests), transcribed from Project Maya
   (https://github.com/mw00/project-maya), a fork of Strata; the code stays under MIT, the files as a whole are under
@@ -84,15 +93,32 @@ Every copyright holder whose work is in this repository, its license and where t
   noise hashed from (seed, position, token id) and the cut to the 20 most likely tokens before the draws), written
   after YASAKANI's smp_hash.cuh (kh_mix, kh_gumbel) and q35_sample.cu (its version-3 pick)
   (https://github.com/yasakani-dev/yasakani, 0.1.0 at 0205f06); that code stays under Apache-2.0, the files as a
-  whole are under the LGPL (LGPL-3.0-or-later AND MIT AND Apache-2.0) - LICENSES/Apache-2.0.txt.  The .yskn models
-  (YASAKANI's trellis-coded Qwen3.8-27B): the container's reader and the reference of its products
-  (include/strata/artifact/yskn.hpp, src/artifact/yskn.cpp), the products' integer sums
-  (include/strata/kernels/yskn_sum.hpp), the trellis state window the readers share
-  (include/strata/kernels/trellis.hpp), the GPU products (include/strata/kernels/yskn.hpp, src/kernels/xe/yskn.cpp,
-  src/kernels/xe/yskn_mma.cpp)
-  and the GGUF skeleton's writer (tools/yskn_skeleton.py), written after YASAKANI's format.hpp, signs.hpp, loader.cpp,
-  repack.cu, lnord.cu, a8_prologue.cuh and q35_kernels.cu; those files as a whole are under the LGPL
-  (LGPL-3.0-or-later AND Apache-2.0)
+  whole are under the LGPL (LGPL-3.0-or-later AND MIT AND Apache-2.0) - LICENSES/Apache-2.0.txt.  The trellis-coded
+  K/V cache (--kv tcq4, tcq5: include/strata/kernels/kv_tcq.hpp, include/strata/kernels/kv_tcq_tables.hpp,
+  src/kernels/xe/kv_tcq.cpp, src/kernels/xe/kv_tcq_parts.hpp, tools/kv_tcq_table.py), written after YASAKANI's KV5
+  (kvx_codec.cuh, kvq_fast.cuh, kvq_vit2.cuh, kvq_attn.cuh; tools/kv_tcq_table.py reads its kvq_u5.bin to compare
+  the codebooks); those files as a whole are under the LGPL (LGPL-3.0-or-later AND Apache-2.0)
+  The fixed-point sums of the experts' products (include/strata/kernels/canon_math.hpp, fx_*: each block's scale
+  rounded to a fixed-point integer, the int8 sums times it added in int64, so the CPU's rows and every GPU's products
+  give the same bits in any order), written after YASAKANI's XSUM rows (lnord.cu, gemm_compressed.cu); that code stays
+  under Apache-2.0, the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0)
+  The SHEAD output head (include/strata/kernels/shead.hpp, src/kernels/xe/shead.cpp,
+  include/strata/core/shead.hpp, src/core/shead.cpp) is written after YASAKANI's q35_bdraft.cu and engine35.cpp.
+  It stays under Apache-2.0; these files as a whole are under the LGPL (LGPL-3.0-or-later AND Apache-2.0) -
+  LICENSES/Apache-2.0.txt.
+  The YD1S static draft table (include/strata/spec/static_drafter.hpp, src/spec/static_drafter.cpp) is written after
+  YASAKANI's specx.cpp. It stays under Apache-2.0; these files as a whole are under the LGPL
+  (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt.
+  The adaptive DFlash2 block-width rule (include/strata/spec/df2_block_policy.hpp) is written after that same source.
+  It stays under Apache-2.0; the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0).
+  The .yskn models' container reader and reference products (include/strata/artifact/yskn.hpp,
+  src/artifact/yskn.cpp), integer sums, the trellis state window the readers share
+  (include/strata/kernels/trellis.hpp) and GPU products (include/strata/kernels/yskn.hpp, src/kernels/xe/yskn.cpp,
+  src/kernels/xe/yskn_mma.cpp), and GGUF skeleton writer (tools/yskn_skeleton.py)
+  are written after YASAKANI's format.hpp, signs.hpp, loader.cpp, repack.cu, lnord.cu, a8_prologue.cuh and
+  q35_kernels.cu. The block drafter weights and context update (include/strata/core/bdraft2.hpp,
+  src/core/bdraft2.cpp) are written after YASAKANI's engine35.cpp. These files stay under Apache-2.0; as a whole
+  they are under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt.
 - Copyright (c) 2024 Sahand Ahmadian; Copyright (c) 2024 Jonseed
   MIT - the image engine's Detail Daemon (src/image/guidance.cpp, include/strata/image/guidance.hpp: its schedule, the
   sigma the model is asked at, their constants and the settings' defaults), written after

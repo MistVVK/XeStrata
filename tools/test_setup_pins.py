@@ -60,8 +60,19 @@ class HuggingFacePins(unittest.TestCase):
                     with self.subTest(family=name, version=version):
                         self.assertRegex(setup.hf(m["repo"]), SHA)
                 continue
+            if fam.get("edge0"):   # Edge0: a pack a size, each from its own repository, pinned in HF_REVISIONS
+                for version, m in fam["models"].items():
+                    with self.subTest(family=name, version=version):
+                        self.assertRegex(setup.hf(m["repo"]), SHA)
+                        # the same commit setup_edge0 fetches the files at (EDGE0_REVISIONS, EDGE0_FILES' pins)
+                        self.assertIn("/resolve/" + setup.EDGE0_REVISIONS[version] + "/", setup.hf(m["repo"]))
             for key in ("hf", "mmproj_hf"):
                 with self.subTest(family=name, key=key):
+                    # a family with no picture reader says so: "vision" False and both mmproj keys None
+                    if key == "mmproj_hf" and fam[key] is None:
+                        self.assertIs(fam.get("vision"), False)
+                        self.assertIsNone(fam["mmproj"])
+                        continue
                     self.assertRegex(fam[key], SHA)
                     self.assertNotIn("/resolve/main/", fam[key])
         self.assertRegex(setup.HF, SHA)

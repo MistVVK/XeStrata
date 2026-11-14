@@ -25,10 +25,10 @@ def room(ram: float, vram: float | None) -> setup.Room:
 
 
 class SizeByQuality(unittest.TestCase):
-    def test_gsq_rco_is_iq3_xxs_where_it_runs(self):
-        self.assertEqual(setup.recommend_size("qwen", room(64, 16)), "IQ3_XXS")    # IQ3_S fits too
+    def test_gsq_rco_is_iq3_s_where_it_runs_else_iq3_xxs(self):
+        self.assertEqual(setup.recommend_size("qwen", room(64, 16)), "IQ3_S")
         self.assertEqual(setup.recommend_size("qwen", room(48, 8)), "IQ3_XXS")     # in the low-RAM mode
-        self.assertEqual(setup.recommend_size("sc117-swift", room(128, 24)), "IQ3_XXS")
+        self.assertEqual(setup.recommend_size("sc117-swift", room(128, 24)), "IQ3_S")
 
     def test_gsq_rco_without_iq3_xxs_running_takes_the_best_that_runs(self):
         self.assertEqual(setup.recommend_size("qwen", room(48, 0)), "IQ2_XS")
@@ -61,7 +61,8 @@ class SizeByQuality(unittest.TestCase):
 
 
 class FirstModel(unittest.TestCase):
-    fams = [f for f in setup.FAMILIES if f != setup.CUSTOM]
+    # edge0, like CUSTOM, is outside the recommendation ladder (--family edge0, setup_edge0; setup's list excludes it)
+    fams = [f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")]
 
     def test_the_first_this_pc_runs_in_the_users_order(self):
         self.assertEqual(setup.recommend_family(self.fams, room(64, 16)), "sc117-swift")
@@ -79,7 +80,7 @@ class FirstModel(unittest.TestCase):
 
 class Levels(unittest.TestCase):
     def test_every_family_has_its_place(self):
-        self.assertEqual(set(setup.TIERS), {f for f in setup.FAMILIES if f != setup.CUSTOM})
+        self.assertEqual(set(setup.TIERS), {f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")})
         self.assertEqual(len(set(setup.TIERS.values())), len(setup.TIERS))
 
     def test_the_levels_name_the_family(self):

@@ -28,6 +28,8 @@
 // This file is compiled for AVX2 and must not run anything before the engine's cpu_avx2_ok() check: no runtime
 // initializer at namespace scope (#391, 016ea2e), the switches are read on first use.
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/canon_math.hpp"
+#include "strata/kernels/exact.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/platform/env.hpp"
@@ -38,6 +40,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>

@@ -53,6 +53,10 @@ struct NativeFmt {
     bool had_gu = false, had_d = false;
     const float* gu_signs = nullptr;    ///< n_embd signs for x (nullptr: identity)
     const float* d_signs = nullptr;     ///< n_ff signs for h (nullptr: identity)
+    /// The latent MoE's Q3_K shared column scales (native_experts.txt v6, scales/l*.f32): the gate/up rows are
+    /// A*diag(s), so the D stage's rows take 1/s before any consumer reads them (the vector is the reciprocals,
+    /// n_embd floats, layer-major in the layout's storage).  nullptr: the pack has no column scales.
+    const float* gu_colscale = nullptr;
 };
 
 /// Whether the layer's gate and up rows are of different types (a NativeFmt filled by native_fmt; one built another

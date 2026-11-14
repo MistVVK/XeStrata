@@ -109,10 +109,22 @@ type Family =
       Contexts: int[]
       Models: Model[] }
 
+type ImageSize =
+    { Id: string
+      DownloadGb: float
+      RamGb: float }
+
 /// An image model setup can add (--images), its -uncensored text encoder a choice of its own where it has one.
 type ImageModel =
     { Id: string
       Title: string
+      Family: string
+      Version: string
+      Origin: string
+      OriginKey: string
+      Own: bool
+      Sizes: ImageSize[]
+      UncensoredSizes: ImageSize[]
       About: string
       DownloadGb: float
       /// besides the text model's

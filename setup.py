@@ -127,6 +127,9 @@ HF_REVISIONS = {
     "unsloth/Qwen3.5-0.8B-GGUF": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",                        # 2026-11-08
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
+    # Edge0's latent-MoE packs (EDGE0_REVISIONS below pins the same by model name; setup_edge0 fetches the files)
+    "Edge0/Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",                            # 2026-11-13
+    "Edge0/Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",                            # 2026-11-13
     # the translation models (serve/translate.py's MODELS)
     "pfnet/plamo-3-translate-2b-GGUF": "4f672106b847200bfdc0f6af6c321cd94eba1aed",                  # 2026-11-09
     "pfnet/plamo-3-translate-0.8b-GGUF": "1cf96ae02133958a20074bfdfab76517bb737d00",                # 2026-11-09
@@ -923,9 +926,208 @@ UMA_DENSE_ROOM_GB = 8          # in the GPU's own pool: the dense weights' buffe
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
 # --rope-scaling / --rope-scale, and refuses an explicit --rope-scaling none there.
+EDGE0_FILES = {
+    "Edge0-145B-q3k": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (32435, "a6c9e1e8250cf0b4b72527bf932bed0f993e8ac2750823faacdbf67c3e672a1a"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (40076574720, "947d15f3d69ecdb45d602a62bc84803451da779a22294e1db5b3568290b42879"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1981808640, "e31e11f36c7e5a23c82550b524fd44fb28cfa821ef59fd688b8d2339137ab287"),
+        "latent_dense_q8.bin": (3743416320, "fbb25caaa0dcf45ef62f1a4945dcf98a53a166934a3b461b166fbafa831d87ca"),
+        "model-bench.json": (1248, "f26262014dbd7ae0fa5de9ea5cbf67ca8689122954dbd2a66e4d8079b42fa67b"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1531, "95b8280bf5151e11cf7b0622688172c9572dd8fd13558bb64d7e8edfc8c32ed4"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1463, "0de7b81744e89f722374842a73b8b26a8a6145c645493471a9c10a4f5f566e70"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2534, "9ab2d5f7bb8fef4caf664502a73a6b4371c56ad0244e81571df48587a69a11f4"),
+        "scales/l0.f32": (7168, "ccfb45da4cb91bf0cc19d867472ddfb5c2175640046f6bfc754aa4e344855972"),
+        "scales/l1.f32": (7168, "73a4a4964c59fe2ae6eebd994f099fde0389ddf7c49fe5994ea372d7f826a5c6"),
+        "scales/l10.f32": (7168, "30d4046e0efc59b0ff81d74d1da05f41661d12f3cdc3cade317d646b15aef135"),
+        "scales/l11.f32": (7168, "d41bc1a5fc130916cea24416da58d6c3edac68c6a27f24719c885083aef13d8f"),
+        "scales/l12.f32": (7168, "877b3eaac39446fe23023a06a643a0783f6604e4a722dcd5ed40e6976cb68408"),
+        "scales/l13.f32": (7168, "b62631e02ddf5ae3be123d4385ae1d147a13253e250a4d645a4e5f77673aeaa7"),
+        "scales/l14.f32": (7168, "547f5bd37f52a0e913532c90fb7ad11658ac4fabc6b2a28be159c4e07b1e286b"),
+        "scales/l15.f32": (7168, "374222a8750c7aa5e72f5a2b05229521931be61f99778b841d571ca1b19ae4d4"),
+        "scales/l16.f32": (7168, "de4aaf5ddc41a6b961db1e786929aad539da114495867cc3ee2283f77cb10a0a"),
+        "scales/l17.f32": (7168, "c29c3976ce49f137147213a84dece24c4221dae5326f1a0cf45717b03624368b"),
+        "scales/l18.f32": (7168, "aaf7450624f01bb074bae633f17432841a3794c8efaa76202f3d259046d2f679"),
+        "scales/l19.f32": (7168, "81625f559d0218685104a168d32ac8cabfb271531a8e8e9c8282df25f2754884"),
+        "scales/l2.f32": (7168, "1e2ad898903d58779bddef0708f6b9b605376f451da7d4a3e092c75921abee0e"),
+        "scales/l20.f32": (7168, "0effc90ca93708fc835a5fee3a51a9e4e8e28139e7d289e618bb160fbacc6de4"),
+        "scales/l21.f32": (7168, "4643ac0076f9df916418a8ea58ff70dfb5cd3ce8f8220686698dd1011ed70c48"),
+        "scales/l22.f32": (7168, "8c15e401e96b52144fab43ca05e312d9cd12a6ced369aff85b55bb4e8233e45d"),
+        "scales/l23.f32": (7168, "c737877b64bb32eb444eb497db2b1661c5f92bd35716a2b5ed57fa27c9c5bedc"),
+        "scales/l24.f32": (7168, "e708f5923e499b338c1e95b633eef61e75034ec68d8ea1a9579c159cdc372b5b"),
+        "scales/l25.f32": (7168, "f0ac87f861b8c85065e09fdef886f957f73e6ef7d42ef86d6bc6e4abe2daafd3"),
+        "scales/l26.f32": (7168, "14adbeb9d6dcb10dafe0912d897eb02e2aa6abdb9e0a56f377945697bee02630"),
+        "scales/l27.f32": (7168, "1003f7dbacce30b7d2e1d758cfb7057a742bdf648472fcbd63333234f076e515"),
+        "scales/l28.f32": (7168, "e912c6d85335fc9ec83635064e523b0efe19fd5ef4de4f299bddfd1203c33693"),
+        "scales/l29.f32": (7168, "8c186910f9afcecd23abdbaf2eee52f48360b114f4e47543a41922414db1fd5b"),
+        "scales/l3.f32": (7168, "5b4b1994bcb00a0e78150152ed4d3eba1c90203f3772fc9d3b01bb133661949a"),
+        "scales/l30.f32": (7168, "b5cd2e55d0baeed12a8479feb5df830817821a1d00ff24050c451ecdf4913404"),
+        "scales/l31.f32": (7168, "b65fc3a4d56ca8ec2bd59b41ca63e0946ce30f27e4380477a79e7bcb868bef34"),
+        "scales/l32.f32": (7168, "4590579308a3973129592ced56ff24ed38f3bfe3ef4a8412c9dc2dbd40d170a7"),
+        "scales/l33.f32": (7168, "b8e28a6a3a4e68b935d8779bc43f0cca8a7c87e43cfe0cdcb9ce757631c5bd79"),
+        "scales/l34.f32": (7168, "bad3b4908fecfd92429cdc1b16c0b00314a8f843f9510b8a87afdd297a348c65"),
+        "scales/l35.f32": (7168, "2bc0b3d52dbc8ff6079cf978307698aede8a7ebb0084ba746f6164ce020c4fb1"),
+        "scales/l36.f32": (7168, "d6627bdbf25218a3dd429fa752a1ef882fd610eb23b66871b42b078713059356"),
+        "scales/l37.f32": (7168, "8afc17ed3b68756be8e5590ecbebb3e36179fabafb71901faf63e67ffe02f244"),
+        "scales/l38.f32": (7168, "445fbb2f2365079f06569460e6a905dad3e7f475d23af5ac2b967ab548e27c27"),
+        "scales/l39.f32": (7168, "020697f9289610c49dea1b47b72dd7f0f3746352c52b02f7d9d05db9011ddb07"),
+        "scales/l4.f32": (7168, "223b5a8a9fef3fb289915b985f0492db776be6ee4bc794af6bd6b40bc73f5951"),
+        "scales/l40.f32": (7168, "64b0d2d16992197dc7e2f0986f3d71ab0b744b4df0bdbab15bf08450c0919b00"),
+        "scales/l41.f32": (7168, "a75175bdc03d571f557d59aede6de9a0e734c61b03cfacc4ceb74c19b3787b7d"),
+        "scales/l42.f32": (7168, "e6596c611be63531fbf46fc73c1d1fcf86d38b09cfb27f97ee63571eea4be9cd"),
+        "scales/l43.f32": (7168, "e6e2227612938fac5320a81970215dac65bbee6e555573a5a3da7632adfe6087"),
+        "scales/l44.f32": (7168, "4187577ae6c484c700dfbf003a698aef48ce27fff9035ba40781abec05b58bf7"),
+        "scales/l45.f32": (7168, "270938e5d001b88e23a01d7c0f967ca165f1ac35adeff23f6401365d4d381430"),
+        "scales/l46.f32": (7168, "e3c18301cbfdf48eaa11cbb657f0696d3582aad5f68e2c9c27bafa3481b5a4e2"),
+        "scales/l47.f32": (7168, "552e22ee2bf8dbce16b68ac95a1146a141443a42e3326f7115d47dbe0ec9b845"),
+        "scales/l5.f32": (7168, "2b54008e9681de98a3590ab2d87eccda2f0ce4cfb6a99c91ddea2bfaf7ee9103"),
+        "scales/l6.f32": (7168, "7c0475b18ff380f4fc900ef308226b0a98ef855e793add4c1d149a3620a18f30"),
+        "scales/l7.f32": (7168, "ffb91ee9d1abf5ce63a07c1cc6f8182849700c9701705c3a386398fde797771b"),
+        "scales/l8.f32": (7168, "2ef5f3fdea5a3bc49e8b7cd93a41a793460da3685ed9d0ea10e9aae053c85477"),
+        "scales/l9.f32": (7168, "788cb1c638605ac71728913ce4fcb14c008dbbf46982c4c9c9d1f7af90e03ba5"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
+    "Edge0-120B-q3k": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (32744, "6f91e1e1810a789a368765f263f2b95ddaf2a0c9626d6cf06ebc325fe1be1b75"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (28626124800, "ffa87de634deb4d0a65b82b06748aef2cbe649838e20f239730cc62a0e3c7c80"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1415577600, "4824fb68c5dceb94c33bae0fda3801b1f26f65eb8b9ea0dfac0450fc2bfa41b5"),
+        "latent_dense_q8.bin": (2673868800, "fec3adc0b7b3b0798127550951e541823a0c96ca136911332ee050e39c302c91"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1531, "7dd6161693d6af7c7ae3b664e546b44120c6e7b3725b4234dd0bbb9172a0b5ba"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1458, "28566dc85c852619f81afbe368dd0e361df5db06b23e98b41b5ac838e0c29df8"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2534, "f5a88536e8159fac311adaa16e8b44433d047ab580a568028c2cc557aac6c6b6"),
+        "scales/l0.f32": (5120, "85e8d36581a6e0b2fb8a22f12f6625ef467281bf8d8bc526c68741bdcb7ddbe6"),
+        "scales/l1.f32": (5120, "3e0a6fff0f1201ca1fd345b1e47fa5bdc2d5bcd4405e58ecc496f6103e12d299"),
+        "scales/l10.f32": (5120, "4b2035666630fb86f2adcbd630506305ceea48c98e3bbe3bc2f248e9f5ccc7f9"),
+        "scales/l11.f32": (5120, "8e0aebd966a8687c5a28826611bbce3dfec31b968d9ab24241aa934e93165456"),
+        "scales/l12.f32": (5120, "74d8083edca0925e1f1a8ecda7ce0c18617170799f3a0569d5722b1a02718619"),
+        "scales/l13.f32": (5120, "cb9b543a3d1e64e5985fd5e16938f8dc257d33e56282ff5b1f14027b4c56b989"),
+        "scales/l14.f32": (5120, "95af2b87fcae0bc7dbf0b916957ec51e97d82f10409a0cbaf7327c7972ca9347"),
+        "scales/l15.f32": (5120, "8d94319506c360b0cdcf0bfc987d4685a21dcf905bf02b9344c2bd485bdaa019"),
+        "scales/l16.f32": (5120, "32373bfb26bb63695cd41e2fdeee3e4cd6bd744c9b1f1b4a9e130ea782399db6"),
+        "scales/l17.f32": (5120, "c492007a2d14eb49ee744ba0afe268e2433c6f63937f5b599a89e222f64dcf41"),
+        "scales/l18.f32": (5120, "d93f01aaa68d51faf05b0d6c6c55825e3b2f434bdd0f3816c91352953964c841"),
+        "scales/l19.f32": (5120, "3fc5e3cd3afa52b11337756fb814230797c4d51f34ef1b036df34e917300bf67"),
+        "scales/l2.f32": (5120, "2eeb3efeafd713dd4e8e7bb8c2abb85ac54f4ecc14e474ea841087500121d5b2"),
+        "scales/l20.f32": (5120, "6701c6dbf754d580b8fb72a33866115c46563d17a5536950a5d86fe3e6654587"),
+        "scales/l21.f32": (5120, "c59bcf8ab53fa1d22b7b235adff7003e92201079d376c7339e12ccdca62d84f8"),
+        "scales/l22.f32": (5120, "fd71197a966c96bc7fa6f0012ef4dad0339280a4df5b4aea05806732ffdb9a16"),
+        "scales/l23.f32": (5120, "1aa2dded4c52631fccbb7d3ac02528ecc60b69e1cef9380d364b73d6a22fec9a"),
+        "scales/l24.f32": (5120, "99302c6a43e44d709bda4a09d90a889844fa5fd6cfe544ddfbd037d953866b14"),
+        "scales/l25.f32": (5120, "1483f9ce27321e6b8d10c9306f7c40136f1e7e1adf3aa7606138af8130ab51de"),
+        "scales/l26.f32": (5120, "29915afbc4dea9c8045ccbbee2d5ac94e6aea8e496545ed9b727b19140636dba"),
+        "scales/l27.f32": (5120, "25239299177bbab603db755fb3739c7227c91204e0093b6c2e986ac100845fdb"),
+        "scales/l28.f32": (5120, "1720ba26be65dc87ec49a4bd9c3fe1b6b4b92ea2754a7cab942db0c3665a1fb5"),
+        "scales/l29.f32": (5120, "b9320996043f4df4fe235eca0683e7078e9a8ac7ae212a0a89b57554bf7338c0"),
+        "scales/l3.f32": (5120, "fd2401ccb2d2d15f3b63e33586b46c447dbc974608409af4992df91c0b70c171"),
+        "scales/l30.f32": (5120, "1159fbf1ac7e1fd20d6cd82fb14f1be91d53c7462785449872e57344176aca37"),
+        "scales/l31.f32": (5120, "7098314f9d94022ca159dd279b9e7198c9e64e8e48923934659e52519d88e692"),
+        "scales/l32.f32": (5120, "fe82b2cc3d4b1335357216a56ac5f2800b4c392c58e093c2ab8a7bc169dba811"),
+        "scales/l33.f32": (5120, "51d0fb481ce58aca0e9ce133a75af614edb63c2876505cf5e36da63a7c295b2d"),
+        "scales/l34.f32": (5120, "5218e92125014bf751d6374a52c997ea6875e1f812af5bc189e149b17ce68a40"),
+        "scales/l35.f32": (5120, "9522b0e703aeb0843a4695b15126763906fc100474aa980f77ed598d1ef590d3"),
+        "scales/l36.f32": (5120, "65c83633c75aff863e3187c75a9de44ae6f45678cf78c3e057a752fa04c062d7"),
+        "scales/l37.f32": (5120, "dcfa6fe6abb0e8235a0864c05e1fc8a836c9641e6ac11d30197c95fa21f4b713"),
+        "scales/l38.f32": (5120, "50a47c31ca71ad178a0d254304f8e90ed2fbee4e306e67cae64dac90ce3dff09"),
+        "scales/l39.f32": (5120, "38732ae23e0f9603c549a7c125e47592a3195d13b79bb7c2de56e23a4d1b894b"),
+        "scales/l4.f32": (5120, "90abd2538b48544cc485cd856c42114f901d14356bf0a86857a9fd3a3c5a09a7"),
+        "scales/l40.f32": (5120, "a10316a6e129834a2db7c7d1b1b5db88a0b00468f4d58f354265c7249c11d6a6"),
+        "scales/l41.f32": (5120, "9e624d36588778350bcb7afde14e36b21a3b70e59b1660f1b581fcfad83f82b9"),
+        "scales/l42.f32": (5120, "8c2774c473010bd59ea6dc7c972b470dae8f76b852f075213677d5ee53a0af5c"),
+        "scales/l43.f32": (5120, "b183a20b1c168d445dafb9b9249143972b9febc3af7d7c9f10d84c8b4426eaf5"),
+        "scales/l44.f32": (5120, "5dd13b9160ba411c7a0aba2089235a2b32ad8efdad2fc922b959b17a90a2c916"),
+        "scales/l45.f32": (5120, "269cf0a2043b02abaabd991d514d91dd375cc633c432d188157e50e1470632d0"),
+        "scales/l46.f32": (5120, "01ae36b1f210e9d7790bd311870fa2cac543d5551c50269db70b9386974d9420"),
+        "scales/l47.f32": (5120, "9b612fcdc354854717f42a7b46d186304f51e95bfc8561a49b159e8db33a1736"),
+        "scales/l5.f32": (5120, "28e0e050ac722705694ab3d1ffcec262b94a6139db1ece3b7b29779e233d7014"),
+        "scales/l6.f32": (5120, "b43b04e83c260a609c8ae5e38bf1cecfddcfc9f76fc79ca7e0097728dbeb5f57"),
+        "scales/l7.f32": (5120, "af2f95705b96b7e640d73b214d756d9e4f3dcad6754161bf516beb1f0da09db5"),
+        "scales/l8.f32": (5120, "7660bac487ec9d9605c704267ebcf5f53193094581587fdfd40d948c5cf4e1b4"),
+        "scales/l9.f32": (5120, "263225e5e897c64c631ed492d6a0686c0f5df1a51d06f666a7137732c314a8b5"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
+}
+EDGE0_SHARED = [
+    "LICENSE",
+    "NOTICE",
+    "dense.bin",
+    "index.txt",
+    "labels.bin",
+    "model-skeleton.gguf",
+    "mtp/dense.bin",
+    "mtp/dense.txt",
+    "mtp/draft_vocab.bin",
+    "mtp/experts.bin",
+    "ple-fp8.gguf",
+    "profile.bin",
+    "start.sh",
+    "third-party/Qwen-LICENSE.txt",
+    "tokenizer/chat_template.jinja",
+    "tokenizer/merges.txt",
+    "tokenizer/token_type.json",
+    "tokenizer/tokenizer.json",
+    "tokenizer/vocab.json",
+]
+
+# Edge0's latent-MoE releases (Edge0-145B-q3k / Edge0-120B-q3k): a pre-built Strata pack (experts.bin + the v6
+# native_experts.txt + dense.bin + the skeleton GGUF + the fp8 n-gram table + the latent D/U files + labels + scales),
+# not a GGUF the packer converts.  The two share 19 files (the n-gram table, the skeleton, dense.bin, the MTP layer,
+# labels, the tokenizer, ...): setup downloads them once and hardlinks the second model's copy.  The weights are
+# non-free (Edge0 Community Model License 1.0 + Qwen Community License 1.0): setup fetches them to the user's machine,
+# XeStrata bundles nothing.  Files pinned at the revision (the Hub's LFS SHA-256; the small files' own SHA-256).
+EDGE0_REVISIONS = {
+    "Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",
+    "Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",
+}
+EDGE0_MODELS: dict[str, dict[str, Any]] = {
+    "Edge0-145B-q3k": {"repo": "Edge0/Edge0-145B-q3k", "latent_dim": 1792, "dense_fmt": "8",
+                       "dense_file": "latent_dense_q8.bin", "download_gb": 105.4, "ram_gb": 64,
+                       "about": "145B latent MoE (latent width 1792), Q3_K experts; ~99 GB on disk"},
+    "Edge0-120B-q3k": {"repo": "Edge0/Edge0-120B-q3k", "latent_dim": 1280, "dense_fmt": "4",
+                       "dense_file": "latent_dense_q4.bin", "download_gb": 92.3, "ram_gb": 48,
+                       "about": "120B latent MoE (latent width 1280), Q3_K experts; ~86 GB on disk"},
+}
+EDGE0_LICENSE = ("Edge0 Community Model License 1.0 (personal, research and non-commercial sharing; commercial use "
+                 "needs a separate Edge0 license) and Qwen Community License 1.0 (the Qwen3.8-Flash-Next base): "
+                 "https://huggingface.co/Edge0/Edge0-145B-q3k/blob/main/LICENSE")
+
 # 204800 (200K) sits between 128K and 256K: it is inside the trained 262144, so it needs no rope scaling and
 # costs ~2.8 GB of 8-bit KV with IQ3_S (vs ~3.6 GB at 256K) - a middle step for PCs that cannot hold 256K.
-CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
+CONTEXTS = [8192, 32768, 65536, 131072, 196608, 204800, 262144, 393216, 524288]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
 HUIHUI = "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF"
 HUIHUI_URL = "https://huggingface.co/" + HUIHUI
@@ -1057,6 +1259,14 @@ FAMILIES: dict[str, dict[str, Any]] = {
                    "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the AD files are AtomicChat's "
                               "quantization): https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF"},
 }
+# Edge0's latent MoE (the Qwen3.8-Flash-Next engine with the experts at a latent width): a pre-built pack, its own
+# install path (setup_edge0).  Listed for --family edge0; the models are the two sizes in Q3_K and NVFP4, each from
+# its own repository (EDGE0_MODELS' "repo").  No picture reader: the pack has none ("vision" False, no mmproj).
+FAMILIES["edge0"] = {"title": "Edge0 (latent MoE)", "by": "Edge0's latent-MoE distillations of Qwen3.8-Flash-Next",
+                     "about": "145B and 120B latent sparse MoE, Q3_K experts; a pre-built pack, ~99 / ~86 GB on disk",
+                     "hf": hf("Edge0/Edge0-145B-q3k"), "file": "", "tag": "edge0-",
+                     "name": "edge0", "models": EDGE0_MODELS, "license": EDGE0_LICENSE, "edge0": True,
+                     "vision": False, "mmproj_hf": None, "mmproj": None}
 # The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `xestrata-engine --native` with
 # another architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or
 # its "parts" (a model in several files: each one's path in the repository, size and SHA-256; "file" is the first, which
@@ -1168,7 +1378,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
         }},
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "by": "LLM-jp (Apache-2.0)",
               "about": "32B, 3B active; Japanese and English, a thinking model", "tag": "llmjp-",
-              "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 262144, "plain": True,
+              "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 65536, "plain": True,
               "profile": "expert-profile-llmjp.bin",
               "models": {
                   "Q4_K_M": {"repo": _LLMJP, "file": "llm-jp-4.1-32b-a3b-thinking-Q4_K_M.gguf", "size": 21522488192,
@@ -1331,6 +1541,61 @@ PLAIN_FAMILIES["glm53"] = {
         "UD-IQ4_XS": {"repo": _GLM53, "file": _GLM53_IQ4[0]["path"], "parts": _GLM53_IQ4,
                       "size": sum(x["size"] for x in _GLM53_IQ4), "about": "4-bit (Unsloth Dynamic), the best quality"},
     }}
+# The pinned YASAKANI files; the models are not offered until the yskn engine can run them.
+YASAKANI_REPOS = {
+    "quality": "yasakani-dev/Qwen3.8-27B-YASAKANI-quality",
+    "speed": "yasakani-dev/Qwen3.8-27B-YASAKANI-speed",
+}
+HF_REVISIONS.update({
+    YASAKANI_REPOS["quality"]: "c1ca9235876d32fe21a4d5a5dd08e0000dee58ca",
+    YASAKANI_REPOS["speed"]: "cd78f90d205677f8b3d2ce95eae82a64e278b910",
+})
+YASAKANI_FILES = {
+    "quality": {
+        "LICENSE": (11544, "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        "NOTICE": (2102, "cd9ee7bacf223cec64d8f336ad684307531db3c54487aa70812fd97997757837"),
+        "bdraft2_k8.shead": (1411010584, "b412bdcf949fe372a3a452316c5f1c80e39f38845efd69a6b623f52a73066620"),
+        "bdraft2_k8.yskn": (1164969472, "631fa2ae75029897377837910227ec5ef19ce529515626049819e9367fdb53cc"),
+        "chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "config.json": (4312, "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab"),
+        "generation_config.json": (202, "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"),
+        "kvq_u5.bin": (17432, "a4760d46ecb8869bfdd808b01994cb65cd9b245c3c3eadd930a5b2bab2ea7570"),
+        "qwen38_27b_quality.yskn": (12365242368, "6493983cf95391823dfd8b4477733649fc20b0ddfd39fdc773cf2fa0ed46d18b"),
+        "selfcheck.json": (1192, "4d4bb670afcdc97efb7d2e84d16b1c9c10cb47d2d644030bec059c9239142827"),
+        "tokenizer.json": (12809320, "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"),
+        "tokenizer_config.json": (17928, "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"),
+        "yasakani.json": (1322, "b3c139568132e2f9ad4bffc55d2cd8546773c4d2a5f1aa96c378529beab0505c"),
+    },
+    "speed": {
+        "LICENSE": (11544, "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        "NOTICE": (2100, "a48f63c844b1d7bd63a613952b3c25d2725af3cc4ac2dd6d34c06a7ab7d2ad43"),
+        "bdraft2_k8.shead": (1411010584, "b412bdcf949fe372a3a452316c5f1c80e39f38845efd69a6b623f52a73066620"),
+        "bdraft2_k8.yskn": (1164969472, "631fa2ae75029897377837910227ec5ef19ce529515626049819e9367fdb53cc"),
+        "chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "config.json": (4312, "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab"),
+        "generation_config.json": (202, "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"),
+        "kvq_u5.bin": (17432, "a4760d46ecb8869bfdd808b01994cb65cd9b245c3c3eadd930a5b2bab2ea7570"),
+        "qwen38_27b_speed.yskn": (10311344128, "3ba17a76871a2b5e86fb1d01ab677e6b35ff5ccc27d4f03ad941501e3319d1ca"),
+        "selfcheck.json": (1192, "3e5efb03ecc2dec1c6fce4c9b87ee48d4e43ce84a074a8d3591eb3bc3ddb0ab6"),
+        "tokenizer.json": (12809320, "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"),
+        "tokenizer_config.json": (17928, "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"),
+        "yasakani.json": (1318, "de4445e3f542aaf03187d92479aa4a82b874f8be85bf497dce7b9725614cab38"),
+    },
+}
+YASAKANI_MODELS = {
+    kind: {"repo": repo, "file": f"qwen38_27b_{kind}.yskn",
+           "size": YASAKANI_FILES[kind][f"qwen38_27b_{kind}.yskn"][0],
+           "sha256": YASAKANI_FILES[kind][f"qwen38_27b_{kind}.yskn"][1]}
+    for kind, repo in YASAKANI_REPOS.items()
+}
+PLAIN_FAMILIES["qwen38-yasakani"] = {
+    "title": "Qwen3.8-27B YASAKANI", "by": "Qwen and yasakani-dev (Apache-2.0)",
+    "about": "27B dense: YASAKANI's trellis-coded quality and speed models",
+    "tag": "qwen3.8-27b-yasakani-", "name": "qwen3.8-27b-yasakani", "max_context": 262144,
+    "plain": True, "dense": True, "yskn": True, "kv_bytes": 65536,
+    "models": {kind: {**d, "about": "higher quality" if kind == "quality" else "smaller and faster"}
+               for kind, d in YASAKANI_MODELS.items()},
+}
 FAMILIES.update(PLAIN_FAMILIES)
 
 # How setup's questions and the launcher's window list the families: the model, its version (the original, or whose
@@ -1338,7 +1603,8 @@ FAMILIES.update(PLAIN_FAMILIES)
 # one level mixed models, copies and quantizers).  A family is one (model, version, quantization), its --family ID
 # kept; Ornith-1.5's sizes are of two quantizations (a size's own "quantizer").  BASES in the order setup lists them:
 # FIRST_CHOICE's models first.
-BASES = {"qwen3.8-flash-next": "Qwen3.8-Flash-Next", "ornith-1.5": "Ornith-1.5-35B-A3B",
+BASES = {"qwen3.8-27b": "Qwen3.8-27B", "qwen3.8-flash-next": "Qwen3.8-Flash-Next",
+         "ornith-1.5": "Ornith-1.5-35B-A3B",
          "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
          "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B"}
 VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)",
@@ -1346,11 +1612,13 @@ VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)
             "swift-sc117": "Swift 1.5, abliterated by SC117", "huihui-ai": "abliterated by huihui-ai",
             "swift-huihui-ai": "Swift 1.5, abliterated by huihui-ai", "dealignai": "uncensored by dealignai",
             "llmfan46": "uncensored by llmfan46", "hauhaucs": "uncensored by HauhauCS"}
-QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth", "gyro": "Gyro by agentionai",
+QUANTIZERS = {"yasakani": "YASAKANI", "gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth",
+              "gyro": "Gyro by agentionai",
               "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
               "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
               "hauhaucs": "GGUFs by HauhauCS", "own": "your own files"}
 TIERS = {  # family: (model, version, quantization), in the order each level lists them
+    "qwen38-yasakani": ("qwen3.8-27b", "original", "yasakani"),
     "qwen": ("qwen3.8-flash-next", "original", "gsq-rco"),
     "unsloth": ("qwen3.8-flash-next", "original", "unsloth"),
     "gyro": ("qwen3.8-flash-next", "original", "gyro"),
@@ -1376,10 +1644,10 @@ TIERS = {  # family: (model, version, quantization), in the order each level lis
 # a model's line in setup's first question where its original family's "about" does not say what the model is
 BASE_ABOUT = {"qwen3.8-flash-next": "Qwen's model, the one XeStrata is made for"}
 # the families a first install is offered, in this order: the first this PC runs (recommend_family), with the size it
-# must hold where one is named (the user's decisions of 2026-11-09: Swift 1.5's SC117 copy where its IQ3_XXS runs, else
-# Gyro-Coder-L where its experts all fit the RAM, then the smaller models)
-FIRST_CHOICE = (("sc117-swift", "IQ3_XXS"), ("gyro-coder", "Gyro-Coder-L"), ("ornith", None), ("qwen36", None),
-                ("qwen35", None), ("qwen35-2b", None))
+# must hold where one is named (the user's decisions of 2026-11-09 and 2026-11-14: Swift 1.5's SC117 copy where its
+# IQ3_XXS runs, else Gyro-Coder-L where its experts all fit the RAM, else Gyro-Coder, then the smaller models)
+FIRST_CHOICE = (("sc117-swift", "IQ3_XXS"), ("gyro-coder", "Gyro-Coder-L"), ("gyro-coder", "Gyro-Coder"),
+                ("ornith", None), ("qwen36", None), ("qwen35", None), ("qwen35-2b", None))
 
 
 def plain_parts(d: dict) -> list[dict[str, Any]]:
@@ -1410,6 +1678,9 @@ for _fam in PLAIN_FAMILIES.values():                 # the other models' files, 
     if _fam.get("mmproj"):
         _m = _fam["mmproj"]
         REPO_PINS.setdefault(_m["repo"], {})[_m["path"].rsplit("/", 1)[-1]] = (_m["size"], _m["sha256"])
+
+for _kind, _repo in YASAKANI_REPOS.items():
+    REPO_PINS[_repo] = YASAKANI_FILES[_kind]
 
 # the translation models' GGUFs (serve/translate.py's MODELS), at HF_REVISIONS' commits: file -> (bytes, sha256)
 TRANSLATE_FILES = {
@@ -5373,6 +5644,9 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
     asked = size or a.image_quant or QI.default_quant(dit)
     hunyuan = QI.is_hunyuanimage3(dit)
+    auto_largest = bool(getattr(a, "image_auto_largest", False) and size is None and not a.image_quant)
+    if auto_largest and hunyuan:
+        asked = QI.HUNYUANIMAGE3_QUANTS[-1]
     if hunyuan and asked not in QI.HUNYUANIMAGE3_QUANTS:   # Qwen-Image's --image-quant, given for this model too
         warn(f"--image-quant {asked}: {label} comes as w4a8 or int8 (Tencent's quantizations); w4a8 taken (int8 is "
              "the nearer the model's bf16 weights, and about twice as slow a step)")
@@ -5383,6 +5657,11 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
             warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
                  "(--image-dit-q8 auto|on|off)")
         asked = QI.dit_quants(dit)[-1]
+        if auto_largest and getattr(a, "image_dit_q8", None) in (None, "auto"):
+            q8 = False
+            if text_gb is not None:
+                left = usable_ram_gb(a) - text_gb
+                q8 = not QI.fit_ram(left, enc, asked, QI.default_text_quant(dit), dit, q8=False)[2]
     dit_keep = getattr(a, "image_dit_keep", None) != "off"
     tasked = "" if hunyuan else QI.default_text_quant(dit)   # HunyuanImage 3.0 has no text encoder
     shared = shared_text_quant(QI, dit, enc, chat_gguf)
@@ -5432,60 +5711,164 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     names = QI.file_names(quant, enc, tquant, dit)
     if user:   # its DiT is the user's file, not one to fetch
         names = names[1:]
-    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered, "q8": q8, "names": names}
+    return {"choice": choice, "requested_size": size, "quant": quant, "tquant": tquant, "lowered": lowered,
+            "q8": q8, "names": names}
+
+
+def image_descriptions(models_dir: Path) -> list[dict]:
+    """Image picker levels and size estimates, from the same files and RAM table as installation."""
+    qi = _qimage()
+    result = []
+    for family, origin, versions in qi.IMAGE_FAMILIES:
+        versions = list(versions)
+        if versions[0][0] == "anima-base":
+            versions.extend((name, f"Your own: {name[len(qi.ANIMA_USER):]}")
+                            for name in qi.anima_user_dits(models_dir))
+        for choice, version in versions:
+            own = choice.startswith(qi.ANIMA_USER)
+            _, dit, enc = qi.IMAGE_MODELS["anima-base" if own else choice]
+
+            def estimates(encoder: str) -> list[dict]:
+                sizes = []
+                for size in reversed(qi.size_choices(dit)):
+                    quant = qi.default_quant(dit) if qi.engine_quantized(dit) else size
+                    names = qi.file_names(quant, encoder, qi.default_text_quant(dit), dit)
+                    download = sum(qi.FILES[n][2] for n in names[1 if own else 0:]) / 1e9
+                    ram = qi.ram_need_gb(quant, encoder, qi.default_text_quant(dit), dit, q8=qi.mage_q8(size))
+                    if own:
+                        weight = (models_dir / qi.ANIMA_DIR / (choice[len(qi.ANIMA_USER):] + ".safetensors"))
+                        share = qi.MF_Q8_SHARE if size == "int8" else 1
+                        ram += (weight.stat().st_size - qi.FILES["anima-base-bf16"][2]) * share / 1e9
+                    sizes.append({"id": size, "download_gb": round(download, 1), "ram_gb": round(ram, 1)})
+                return sizes
+            sizes = estimates(enc)
+            uncensored = choice + "-uncensored" in qi.IMAGE_MODELS
+            uncensored_sizes = estimates(qi.IMAGE_MODELS[choice + "-uncensored"][2]) if uncensored else sizes
+            result.append({"id": choice, "title": choice if own else qi.DITS[dit][0],
+                           "family": family, "version": version, "origin": origin,
+                           "origin_key": qi.IMAGE_ORIGIN_KEYS[origin],
+                           "own": own,
+                           "about": "A DiT made from Anima on this PC" if own else qi.ABOUT.get(choice, ""),
+                           "download_gb": sizes[0]["download_gb"], "ram_gb": sizes[0]["ram_gb"],
+                           "sizes": sizes, "uncensored_sizes": uncensored_sizes, "quants": [x["id"] for x in sizes],
+                           "edits": dit in qi.MF_EDIT or (qi.is_moss(dit) and dit not in qi.MOSS_FEW_STEP)
+                           or not qi.engine_quantized(dit), "license": qi.license_note(dit),
+                           "tools": list(qi.IMAGE_TOOLS), "uncensored": uncensored})
+    return result
+
+
+def import_anima(path: Path, models_dir: Path) -> str:
+    """Check an Anima DiT and copy it without overwriting an existing model."""
+    qi = _qimage()
+    path = path.expanduser().resolve()
+    if path.suffix != ".safetensors" or any(c in path.stem for c in ",:/\\"):
+        raise ValueError("choose an Anima .safetensors file without commas or colons in its name")
+    why = qi.anima_header(path)
+    if why:
+        raise ValueError(why)
+    folder = models_dir / qi.ANIMA_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / path.name
+    reserved = {qi.local_path(models_dir, k).name for k in qi.FILES if k.startswith(("anima-", "llm-anima-"))}
+    if dest.name in reserved or "anima-" + path.stem in {v[0] for v in qi.IMAGE_MODELS.values()}:
+        raise ValueError("the name is reserved for an Anima release")
+    if dest.resolve() != path:
+        with path.open("rb") as src, dest.open("xb") as out:
+            try:
+                shutil.copyfileobj(src, out)
+            except BaseException:
+                dest.unlink()
+                raise
+    name = qi.ANIMA_USER + path.stem
+    if name not in qi.anima_user_dits(models_dir):
+        raise ValueError("the name is reserved for an Anima release")
+    return name
 
 
 def ask_images(cfg_path: Path) -> str | None:
-    """Image generation asked on the console: the image models (numbers, comma-separated), the default of several, and
-    their -uncensored text encoder -> an --images value; None to leave the config's as it is (none before, none now).
-    The answers the model's config `cfg_path` was written with are the defaults."""
-    QI = _qimage()
-    plain = [c for c in QI.IMAGE_MODELS if not c.endswith("-uncensored")]
-    by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}
-    now: list[str] = []
+    """Choose image models one at a time; the first is the default."""
+    qi = _qimage()
+    if ARGS is not None:
+        ARGS.image_auto_largest = True
+    models_dir = (Path(ARGS.models_dir) if ARGS and ARGS.models_dir
+                  else data_folder_path(None, load_settings()) / "models")
+    by_name = {v[0]: k for k, v in qi.IMAGE_MODELS.items()}
+    for k in qi.anima_user_dits(models_dir):
+        by_name.setdefault("anima-" + k[len(qi.ANIMA_USER):], k)
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         cfg = {}
     if isinstance(cfg, dict) and isinstance(cfg.get("images"), dict):
-        now = [by_name[s["model_name"]] for s in [cfg["images"], *(cfg.get("image_models") or [])]
-               if isinstance(s, dict) and s.get("model_name") in by_name]
-    had = [c.removesuffix("-uncensored") for c in now]
-    say()
-    say("  Image generation: models that make images besides the text model (POST /v1/images/generations and the")
-    say("  web page's Images tab). One runs on the GPU at a time; with several, the web page and the API's \"model\"")
-    say("  choose, and a request that names none gets the default.")
-    for i, c in enumerate(plain, 1):
-        _, dit, enc = QI.IMAGE_MODELS[c]
-        names = QI.file_names(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit)
-        need = QI.ram_need_gb(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit)
-        say(f"    {i}. {c}: {QI.ABOUT.get(c, '')} (download {sum(QI.FILES[n][2] for n in names) / 1e9:.0f} GB, "
-            f"~{need:.0f} GB of RAM)")
-    # a model set up for the first time: SETUP_DEFAULT; set up again: what it has (none included)
-    default = ",".join(str(plain.index(c) + 1) for c in (had if cfg else QI.SETUP_DEFAULT) if c in plain) or "none"
+        picks = [x.get("setup_choice") or by_name[x["model_name"]]
+                 for x in [cfg["images"], *(cfg.get("image_models") or [])]
+                 if isinstance(x, dict) and (x.get("setup_choice") or x.get("model_name") in by_name)]
+    else:
+        picks = [] if cfg else list(qi.SETUP_DEFAULT)
     while True:
-        got = ask("Which image models? (numbers, comma-separated; none: no image generation)", [], default, False,
-                  free=True)
-        if got.lower() in ("none", "no", "n", ""):
-            return "no" if now else None
-        try:
-            picks = [plain[int(x) - 1] for x in got.replace(" ", "").split(",")]
-            if len(set(picks)) == len(picks) and all(int(x) >= 1 for x in got.replace(" ", "").split(",")):
-                break
-        except (ValueError, IndexError):
-            pass
-        say(f"  please answer numbers from 1 to {len(plain)}, comma-separated, or none")
-    if len(picks) > 1:
-        first = had[0] if had and had[0] in picks else picks[0]
-        say("  " + ", ".join(f"{i}. {c}" for i, c in enumerate(picks, 1)))
-        d = int(ask("Which is the default?", [str(i) for i in range(1, len(picks) + 1)], str(picks.index(first) + 1),
-                    False))
-        picks = [picks[d - 1], *(c for i, c in enumerate(picks, 1) if i != d)]
-    if any(c + "-uncensored" in QI.IMAGE_MODELS for c in picks):
-        unc = ask("Their text encoder with its refusal direction removed (-uncensored)?", ["y", "n"],
-                  "y" if any(c.endswith("-uncensored") for c in now) else "n", False) == "y"
-        picks = [c + "-uncensored" if unc and c + "-uncensored" in QI.IMAGE_MODELS else c for c in picks]
-    return ",".join(picks)
+        say("  Image models chosen (the first is the default):")
+        for i, choice in enumerate(picks, 1):
+            say(f"    {i}. {choice}")
+        say("  a) add one   r) remove one   d) choose the default   k) keep these   n) none")
+        action = ask("What next?", ["a", "r", "d", "k", "n"], "k", False)
+        if action == "k":
+            return ",".join(picks) if picks else "no"
+        if action == "n":
+            return "no"
+        if action in ("r", "d"):
+            if picks:
+                n = int(ask("Which one?", [str(i) for i in range(1, len(picks) + 1)], "1", False)) - 1
+                item = picks.pop(n)
+                if action == "d":
+                    picks.insert(0, item)
+            continue
+        models = image_descriptions(models_dir)
+        families = list(dict.fromkeys(m["family"] for m in models))
+        for i, family in enumerate(families, 1):
+            say(f"    {i}) {family}")
+        index = int(ask("Which model?", [str(i) for i in range(1, len(families) + 1)], "1", False)) - 1
+        family = families[index]
+        versions = [m for m in models if m["family"] == family]
+        own = versions[0]["id"] == "anima-base"
+        if len(versions) > 1 or own:
+            for i, m in enumerate(versions, 1):
+                say(f"    {i}) {m['version']}")
+            if own:
+                say("    f) a file on this PC (an Anima DiT, .safetensors)")
+            choices = [str(i) for i in range(1, len(versions) + 1)] + (["f"] if own else [])
+            selected = ask("Which version?", choices, "1", False)
+            if selected == "f":
+                path = ask("Path to the Anima DiT", [], "", False, free=True)
+                try:
+                    name = import_anima(Path(path), models_dir)
+                    versions = image_descriptions(models_dir)
+                    model = next(m for m in versions if m["id"] == name)
+                except (OSError, ValueError) as e:
+                    say(f"  {e}")
+                    continue
+            else:
+                model = versions[int(selected) - 1]
+        else:
+            model = versions[0]
+        name = model["id"]
+        if model["uncensored"]:
+            say("    1) refusal direction removed (-uncensored)   2) original")
+            if ask("Its text encoder?", ["1", "2"], "1", False) == "1":
+                name += "-uncensored"
+        if picks and name in [n for n, _ in qi.parse_choices(",".join(picks))]:
+            say("  That model and text encoder are already chosen.")
+            continue
+        sizes = model["uncensored_sizes"] if name.endswith("-uncensored") else model["sizes"]
+        if len(sizes) > 1:
+            say("    1) auto (the largest that fits the RAM)")
+            for i, size in enumerate(sizes, 2):
+                say(f"    {i}) {size['id']}: download {size['download_gb']:.1f} GB, "
+                    f"~{size['ram_gb']:.1f} GB of RAM")
+            size = int(ask("Which size?", [str(i) for i in range(1, len(sizes) + 2)], "1", False)) - 1
+            if size:
+                name += ":" + sizes[size - 1]["id"]
+        picks.append(name)
+        say(f"  Added: {name}")
 
 
 def write_ratio_head(QI, models_dir: Path) -> None:
@@ -5553,13 +5936,6 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
     choices = QI.parse_choices(a.images)
-    if any(QI.is_anima(QI.IMAGE_MODELS[c][1]) for c, _ in choices if c in QI.IMAGE_MODELS):
-        # the derivatives the user put in Anima's folder: models of their own beside the ones asked for
-        user = QI.anima_user_dits(models_dir)
-        for name, path in user.items():
-            if all(c != name for c, _ in choices):
-                ok(f"{name}: a derivative of Anima in {path.parent}, set up as an image model of its own")
-                choices.append((name, None))
     for c, _ in choices:
         if c.startswith(QI.ANIMA_USER):
             path = models_dir / QI.ANIMA_DIR / (c[len(QI.ANIMA_USER):] + ".safetensors")
@@ -5593,6 +5969,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
                               uma=bool((gpu or {}).get("integrated")), policy=a.image_gpu_policy or "auto",
                               ssd_offload=getattr(a, "image_ssd_offload", None) == "on", text_quant=p["tquant"],
                               dit_q8=p["q8"], dit_keep=getattr(a, "image_dit_keep", None) != "off")
+        cfg["setup_choice"] = p["choice"] + ((":" + p["requested_size"]) if p["requested_size"] else "")
         if p["lowered"]:
             cfg["quant_lowered"] = p["lowered"]
         cfgs.append(cfg)
@@ -6112,17 +6489,17 @@ def size_fits(family: str, size: str, room: Room) -> bool:
     return gsq and low_ram_fits(size, room.ram, room.vram)
 
 
-# The recommendations by quality (the user's decisions of 2026-11-09): a GSQ-RCO family's IQ3_XXS where this PC runs it;
-# a model of PLAIN_FAMILIES up to Q8_0, never its unquantized weights (BF16 answers as Q8_0 does, in twice the memory)
-GSQ_RCO_PICK = "IQ3_XXS"
+# The recommendations by quality (the user's decisions of 2026-11-09 and 2026-11-14): a GSQ-RCO family's best size this
+# PC runs (IQ3_S before IQ3_XXS); a model of PLAIN_FAMILIES up to Q8_0, never its unquantized weights (BF16 answers as
+# Q8_0 does, in twice the memory)
 PLAIN_TOP = "Q8_0"
 UNQUANTIZED = ("BF16", "F16", "F32")
 
 
 def recommend_size(family: str, room: Room, names: list | None = None) -> str:
     """The size setup recommends of `family` (of `names`, a quantization's): the best quality this PC runs with its
-    weights in memory (size_fits), never an experimental one - a GSQ-RCO family's IQ3_XXS where it runs, a model of
-    PLAIN_FAMILIES' at most Q8_0, on the CPU the family's own choice - else the smallest"""
+    weights in memory (size_fits), never an experimental one - a GSQ-RCO family's IQ3_S where it runs, else its
+    IQ3_XXS, a model of PLAIN_FAMILIES' at most Q8_0, on the CPU the family's own choice - else the smallest"""
     fam = FAMILIES[family]
     names = names or family_sizes(family)
     if room.on_cpu and fam.get("default") in names:
@@ -6134,8 +6511,6 @@ def recommend_size(family: str, room: Room, names: list | None = None) -> str:
                (PLAIN_TOP not in kept or size_quality(family, m) <= size_quality(family, PLAIN_TOP))]
         kept = top or kept
     fits = [m for m in kept if size_fits(family, m, room)]
-    if GSQ_RCO_PICK in fits:
-        return GSQ_RCO_PICK
     return fits[-1] if fits else kept[0]
 
 
@@ -6677,7 +7052,7 @@ def choices_from_config(cfg_path: Path) -> dict:
     return {"family": family, "model": model if family == CUSTOM or model in FAMILIES[family].get("models", MODELS)
             else None,
             "context": int(ctx) if (ctx := val("--max-context")) else None,
-            "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4") else None,
+            "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4", "tcq4", "tcq5") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
@@ -8180,9 +8555,33 @@ DENSE_MARGIN_GB = 1.0
 DENSE_RAM_GB = 8
 
 
-def dense_vram_gb(fam: dict, d: dict, ctx: int) -> float:
-    """The VRAM (GB) a dense model of PLAIN_FAMILIES needs at a context of `ctx`: its weights, its K/V and the margin"""
-    return d["size"] / 1e9 + fam["kv_bytes"] * ctx / 1e9 + DENSE_MARGIN_GB
+def dense_vram_gb(fam: dict, d: dict, ctx: int, streaming: bool = False) -> float:
+    """The VRAM (GB) a dense model of PLAIN_FAMILIES needs at a context of `ctx`: its weights, its K/V and the margin.
+    With KV streaming (--kv-resident) the K/V's VRAM is the resident cells a layer, not the whole context."""
+    kv_cells = PLAIN_KV_RESIDENT if streaming else ctx
+    return d["size"] / 1e9 + fam["kv_bytes"] * kv_cells / 1e9 + DENSE_MARGIN_GB
+
+
+PLAIN_KV_RESIDENT = 32768   # the resident cells a layer --kv-resident auto keeps in VRAM (the engine's resolve_kv_resident)
+
+
+def plain_kv_host_gb(fam: dict, ctx: int, kv: str) -> float:
+    """The RAM a plain model's streamed KV host copy takes at a context of `ctx`: its K/V bytes a token (kv_bytes,
+    FP16 across the attention layers), scaled by the --kv format.  An estimate (the engine's figure is per layer and
+    head, and counts the MTP layer's)."""
+    factor = {"fp16": 1.0, "int8": 0.52, "q4_0": 0.28, "k8v4": 0.40}.get(kv, 1.0)
+    return ctx * fam.get("kv_bytes", 0) * factor / 1e9
+
+
+def plain_kv_streaming_wanted(fam: dict, d: dict, ctx: int, ram: float, kv: str) -> bool:
+    """Does the engine stream this plain model's KV (--kv-resident auto): from 64K up, when the RAM holds the experts
+    (a dense model: none) beside the KV host copy and the engine's headroom.  The engine decides the same at load
+    (resolve_kv_resident, the experts' real bytes); setup uses the model file as the experts' upper bound, for the
+    context guidance."""
+    if ctx < 65536:
+        return False
+    experts = 0.0 if fam.get("dense") else d["size"] / 1e9
+    return ram >= experts + LOW_RAM_HEADROOM_GB + plain_kv_host_gb(fam, ctx, kv) + 1
 
 
 # A dense model on the CPU (--device cpu, the families with "cpu"): its weights repacked as int8 (one byte a weight, a
@@ -8235,13 +8634,25 @@ def replicas_config(a, cfg: dict) -> None:
          "check that the RAM holds them")
 
 
+def plain_rope_extend(family: str, fam: dict) -> bool:
+    """Whether a plain family's context can go past its trained length by rope scaling: the Qwen-family rotations
+    (Ornith-1.5, Qwen3.6, Qwen3.5) take it, as Qwen3.8-Flash-Next does.  llm-jp-4.1 keeps its trained 64K (the user's
+    decision), and GLM-5.3-Flash's MLA is nope-only (no rotation to scale).  A model of the user's own files: by its
+    architecture."""
+    if family == "llmjp":
+        return False
+    arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
+    return not (family == "glm53" or arch in ("glm5-next", "glm5next"))
+
+
 def plain_kv_takes(family: str) -> tuple:
     """The KV cache precisions a plain family's engine path takes (--kv), FP16 the default: the Hadamard-rotated Q4_0
-    forms for heads of 256; GLM-5.3-Flash's DSA caches in FP16 only.  A model of the user's own files: by its
-    architecture, as the family of that architecture."""
+    and trellis-coded forms for heads of 256; GLM-5.3-Flash's DSA caches in FP16 only.  A model of the user's own
+    files: by its architecture, as the family of that architecture."""
     arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
     return ("fp16",) if family == "glm53" or arch in ("glm5-next", "glm5next") else \
-        ("fp16", "int8") if family == "llmjp" or arch == "qwen3moe" else ("fp16", "int8", "q4_0", "k8v4")
+        ("fp16", "int8") if family == "llmjp" or arch == "qwen3moe" else \
+        ("fp16", "int8", "q4_0", "k8v4", "tcq4", "tcq5")
 
 
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
@@ -8255,6 +8666,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     --resident-budget-gib N keeps N GiB of them in RAM and reads the rest from the file;
     --gpus with several cards splits the layers across them (docs/MULTIGPU.md).  A dense model's sizes are recommended
     by the GPU's memory, which holds all of its weights."""
+    if fam.get("yskn") and a.gguf_dir:
+        fail("--gguf-dir is for GGUF models", "use --models-dir for the YASAKANI files")
     models = fam["models"]
     names = list(models)
     if a.model and a.model not in names:
@@ -8311,13 +8724,15 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if fam.get("mmproj") and not on_cpu:
         ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                          "cpu": "on (encoder on the CPU)"}[vision])
-    # the context: up to the model's, recommended by the smallest card's memory as for Qwen3.8-Flash-Next
-    contexts = [c for c in CONTEXTS if c <= fam["max_context"]]
+    # the context: up to the model's trained length, recommended by the smallest card's memory as for
+    # Qwen3.8-Flash-Next; past it by rope scaling where the model's rotation takes it (the 384K and 512K steps too)
+    rope_extend = plain_rope_extend(family, fam)
+    trained = fam["max_context"]
+    contexts = [c for c in CONTEXTS if c <= trained or rope_extend]
     if a.context:
         ctx = a.context
-        if ctx > fam["max_context"]:
-            fail(f"{fam['title']} takes up to {fam['max_context']} tokens of context",
-                 f"--context {fam['max_context']}")
+        if ctx > trained and not rope_extend:
+            fail(f"{fam['title']} takes up to {trained} tokens of context", f"--context {trained}")
     else:
         say()
         if on_cpu:
@@ -8328,16 +8743,43 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
             say("  experts fit on the GPU:")
         for i, c in enumerate(contexts, 1):
             rec_mark = "   (recommended for your " + ("PC)" if on_cpu else "GPU)")
-            say(f"  {i}) {c // 1024}K tokens" + (rec_mark if c == rec_ctx else ""))
+            say(f"  {i}) {c // 1024}K tokens" + (rec_mark if c == rec_ctx else "") +
+                ("   (experimental: setup adds rope scaling)" if c > trained else ""))
         ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)],
                                str(contexts.index(rec_ctx) + 1), a.yes)) - 1]
+    # the rope scaling for the context actually served, as for Qwen3.8-Flash-Next: past the trained length an omitted
+    # method is yarn (asked when interactive) and the factor final / trained; an explicit --rope-scaling / --rope-scale
+    # wins.  A model whose rotation does not take it (llm-jp-4.1, GLM-5.3-Flash) keeps its trained angles.
+    scaling = rope_scale = None
+    if rope_extend:
+        scaling = a.rope_scaling
+        if ctx > trained and scaling is None and not a.yes:
+            scaling = ask_option("rope-scaling", a.yes)
+        try:
+            scaling, rope_scale = resolve_rope(ctx, scaling, a.rope_scale, trained=trained)
+        except ValueError as e:
+            fail(str(e))
+        if scaling is not None:
+            origin = (f"final context / trained {trained}; override with --rope-scale" if a.rope_scale is None
+                      else "as requested")
+            ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
+    elif a.rope_scaling is not None or a.rope_scale is not None:
+        arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
+        nope = family == "glm53" or arch in ("glm5-next", "glm5next")
+        why = "its MLA is nope-only, with no rotation to scale" if nope else "it keeps its trained context"
+        warn(f"--rope-scaling / --rope-scale do not apply to {fam['title']}: {why}")
     ok(f"context: {ctx} tokens")
+    kv_fmt = a.kv if (a.kv and a.kv in plain_kv_takes(family)) else "fp16"
+    streaming = not on_cpu and plain_kv_streaming_wanted(fam, d, ctx, ram, kv_fmt)
+    if streaming:
+        ok(f"KV streaming (auto): the last {PLAIN_KV_RESIDENT // 1024}K cells a layer stay in VRAM, the rest in RAM "
+           f"(~{plain_kv_host_gb(fam, ctx, kv_fmt):.1f} GB), so the long context fits and more experts stay on the GPU")
     if on_cpu and ram < cpu_ram_gb(fam, ctx):
         warn(f"{fam['title']} on the CPU keeps its weights as int8 and the KV cache in FP32: "
              f"~{cpu_ram_gb(fam, ctx):.0f} GB at a {ctx // 1024}K context, and this PC has {ram:.0f} GB, so the engine "
              "may not start; a shorter context fits")
-    elif dense and not on_cpu and gpu_gb < dense_vram_gb(fam, d, ctx):
-        warn(f"{fam['title']} {model} keeps every weight in VRAM: ~{dense_vram_gb(fam, d, ctx):.0f} GB at a "
+    elif dense and not on_cpu and gpu_gb < dense_vram_gb(fam, d, ctx, streaming):
+        warn(f"{fam['title']} {model} keeps every weight in VRAM: ~{dense_vram_gb(fam, d, ctx, streaming):.0f} GB at a "
              f"{ctx // 1024}K context, and the GPU has {gpu_gb:.0f} GB, so the engine may not start; a smaller size "
              "or context fits")
     parts = plain_parts(d)
@@ -8357,6 +8799,11 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     gguf = models_dir / names_of[0]
     have = all_there(models_dir)
     left = 0 if have else d["size"] / 1e9
+    if fam.get("yskn"):
+        shared = models_dir.parent / "qwen3.8-27b-yasakani-draft"
+        left = sum(size for name, (size, _) in YASAKANI_FILES[model].items()
+                   if name != "kvq_u5.bin" and not (models_dir / name).exists() and
+                   not (name in ("bdraft2_k8.yskn", "bdraft2_k8.shead") and (shared / name).exists())) / 1e9
     mm = fam.get("mmproj") if vision != "none" else None
     mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
     if mm is not None and mmproj is not None and not mmproj.exists():
@@ -8382,12 +8829,15 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if not have:
         say(f"  The model file{'s go' if len(parts) > 1 else ' goes'} in {models_dir} (a copy you already have: put "
             f"it there with its name, {', '.join(names_of)}, or use --gguf-dir <its folder>)")
-    for x, n in zip(parts, names_of):
-        if d.get("custom"):                            # what setup read of them; the engine checked the rest
-            continue
-        if not ((models_dir / n).exists() and (done(models_dir / n) or own)):
-            download(hf(d["repo"]) + x["path"], models_dir / n)
-        verify_sha256(models_dir / n, x["size"], x["sha256"], own=own)
+    if fam.get("yskn"):
+        fetch_yasakani(model, models_dir.parent)
+    else:
+        for x, n in zip(parts, names_of):
+            if d.get("custom"):                        # what setup read of them; the engine checked the rest
+                continue
+            if not ((models_dir / n).exists() and (done(models_dir / n) or own)):
+                download(hf(d["repo"]) + x["path"], models_dir / n)
+            verify_sha256(models_dir / n, x["size"], x["sha256"], own=own)
     more = f" and {len(parts) - 1} more beside it" if len(parts) > 1 else ""
     ok(f"model file present: {gguf}{more}")
     if mm is not None and mmproj is not None:
@@ -8409,6 +8859,12 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
 
     # ---- 6. the tokenizer and the chat template, for the server
     step(6, "preparing the model for XeStrata")
+    if fam.get("yskn"):
+        skeleton = gguf.with_suffix(".gguf")
+        if not skeleton.exists():
+            run([sys.executable, str(ROOT / "tools" / "yskn_skeleton.py"), str(models_dir), "--yskn", gguf.name,
+                 "--out", str(skeleton)])
+        gguf = skeleton
     tok_dir = (find_in(roots, f"tokenizers/{tag.lower()}") or roots[0] / "tokenizers" / tag.lower())
     if not (tok_dir / "tokenizer" / "vocab.json").exists():
         env = dict(os.environ, XESTRATA_GGUF_PY=str(llama / "gguf-py"))
@@ -8419,6 +8875,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # ---- 7. the settings
     step(7, "writing the model's settings" if PACKAGED else "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx)]
+    if scaling is not None:     # the resolved rope configuration: the explicit flags, or yarn and the derived factor
+        args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
     if on_cpu:
         args += ["--device", "cpu"]
     if fam.get("profile"):                             # the experts filled into VRAM at start, most routed first
@@ -8431,7 +8889,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     drafting = getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json") or "auto"
     df2_key = fam.get("dflash2")
     df2_pack = None
-    if df2_key and drafting in ("auto", "dflash2") and not on_cpu:
+    if fam.get("yskn") and drafting in ("auto", "dflash2") and not on_cpu:
+        df2_pack = models_dir / "bdraft2_k8.yskn"
+    elif df2_key and drafting in ("auto", "dflash2") and not on_cpu:
         df2_dir = models_dir / "dflash2"
         say(f"  The DFlash2 drafter of {fam['title']} (a second way to guess ahead) comes from Inco AI (Apache-2.0);")
         say("  it is packed on this PC.")
@@ -8616,7 +9076,7 @@ def vram_ctx(cards: list) -> int:
     """The context the GPUs' memory recommends: each card keeps its layers' KV of the whole context, so the smallest
     decides; an AMD APU, in the memory it can use in all."""
     small = min(x.get("uma_gb", x["vram_gb"]) for x in cards)
-    return 32768 if small < 14 else 65536 if small < 20 else 131072
+    return 131072 if small < 14 else 196608 if small < 20 else 262144
 
 
 # ------------------------------------------------------------------------------------------------ the options
@@ -8922,7 +9382,7 @@ OPTIONS = [
                      [OV.GUARD_LANGS[3], "Chinese (Simplified): no kana, Hangul or Japanese-only characters"],
                      [OV.GUARD_LANGS[4], "Chinese (Traditional): no kana, Hangul or Japanese-only characters"],
                      [OV.GUARD_OFF, "Off: answers as the model writes them"]],
-            default="en", keep=True, question="Keep other languages' characters out?"),
+            default=OV.GUARD_OFF, keep=True, question="Keep other languages' characters out?"),
     _option("ple-io", "Qwen3.8-Flash-Next's n-gram table",
             "how the engine reads Qwen3.8-Flash-Next's n-gram table, kept for the model: ram = the whole table in RAM "
             "(faster new prompts, ~29 GB more RAM), direct = read from the SSD as needed, auto = setup chooses by the "
@@ -8983,12 +9443,7 @@ def option_default(name: str):
         modes = [v for v, _ in OPTION[name]["choices"]]
         if settings.get("script_guard") in modes:
             return settings["script_guard"]
-        import locale                                   # the environment's on Linux, the system's on Windows
-        lang = (next((os.environ[k] for k in ("LC_ALL", "LC_MESSAGES", "LANG") if os.environ.get(k)), "")
-                or locale.getlocale()[0] or "").lower()
-        return "ja" if lang.startswith(("ja", "japanese")) else "ko" if lang.startswith(("ko", "korean")) else \
-            "zh-tw" if lang.startswith(("zh_tw", "zh_hk", "zh-tw", "zh-hk", "chinese (traditional)")) else \
-            "zh-cn" if lang.startswith(("zh", "chinese")) else "off" if lang.startswith(("vi", "vietnamese")) else "en"
+        return OV.GUARD_OFF          # off until the user chooses a language
     if name == "data-dir":
         return str(data_folder_path(None, settings))
     o = OPTION[name]
@@ -9079,7 +9534,7 @@ def describe() -> dict:
                                "experimental": False, "recommended": m == by_quant[size_quantizer(f, m)],
                                "quantizer": size_quantizer(f, m), "context": ctx_f,
                                "vision": bool(fam.get("mmproj")), "budget": not fam.get("dense")})
-            max_ctx = fam["max_context"]
+            max_ctx = CONTEXTS[-1] if plain_rope_extend(f, fam) else fam["max_context"]
         else:
             for m in names:
                 d = MODELS[m]
@@ -9109,24 +9564,11 @@ def describe() -> dict:
                                      if fam.get("plain") else {}),
                          "contexts": [c for c in CONTEXTS if c <= max_ctx], "models": models})
     QI = _qimage()
-    images = []
-    for choice, (_, dit, enc) in QI.IMAGE_MODELS.items():
-        if choice.endswith("-uncensored"):
-            continue
-        names = QI.file_names(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit)
-        images.append({"id": choice, "title": QI.DITS[dit][0], "about": QI.ABOUT.get(choice, ""),
-                       "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
-                       "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit), 1),
-                       "edits": dit in QI.MF_EDIT or (QI.is_moss(dit) and dit not in QI.MOSS_FEW_STEP)
-                       or not QI.engine_quantized(dit),
-                       "license": QI.license_note(dit), "tools": list(QI.IMAGE_TOOLS),
-                       "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
-                       # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K, magetrail:int8,
-                       # hunyuan-image-3-distil:int8), largest first; Mage-Flow's: 8 bits always (int8) or 16 (bf16),
-                       # not the file's
-                       "quants": list(QI.size_choices(dit)) if QI.engine_quantized(dit)
-                       else list(reversed(QI.size_choices(dit)))})
+    images = image_descriptions(data_folder_path(getattr(ARGS, "data_dir", None), load_settings()) / "models")
     by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
+    for m in images:
+        if m["id"].startswith(QI.ANIMA_USER):
+            by_name.setdefault("anima-" + m["id"][len(QI.ANIMA_USER):], m["id"])
     installed = []
     for c in installed_configs():
         ch = choices_from_config(c)
@@ -9134,8 +9576,9 @@ def describe() -> dict:
         secs = [cfg.get("images"), *(cfg.get("image_models") or [])] if isinstance(cfg.get("images"), dict) else []
         installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
                           "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095,
-                          "images": [by_name[s["model_name"]] for s in secs
-                                     if isinstance(s, dict) and s.get("model_name") in by_name]})
+                          "images": [s.get("setup_choice") or by_name[s["model_name"]] for s in secs
+                                     if isinstance(s, dict)
+                                     and (s.get("setup_choice") or s.get("model_name") in by_name)]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
             "ram_gb": round(ram_gb(), 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
             "gpu": gpu["index"] if gpu else None,
@@ -9160,6 +9603,86 @@ def describe() -> dict:
             "custom": getattr(ARGS, "custom", None),
             # the fields of the options (OPTIONS), each with what setup offers now
             "options": options_described()}
+
+
+def setup_edge0(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
+                ram: float, roots: list, elsewhere: list, port: int, adopted: Path | None) -> int:
+    """Steps 5-7 for Edge0's latent MoE (the Qwen3.8-Flash-Next engine, experts at a latent width): the pre-built
+    pack downloaded file by file (each checked against its SHA-256 at the pinned revision), the files the two models
+    share hardlinked from the one already here, and the config from the pack's model.json (the engine's args and the
+    latent environment, paths made absolute).  The weights are non-free (Edge0 Community Model License 1.0 + Qwen
+    Community License 1.0): their terms are accepted before the download.  XeStrata bundles nothing."""
+    names = list(EDGE0_MODELS)
+    if a.model and a.model not in names:
+        fail(f"{fam['title']} has no {a.model}", "choose one of: " + ", ".join(names))
+    for i, m in enumerate(names, 1):
+        d = EDGE0_MODELS[m]
+        fit = "" if ram >= d["ram_gb"] else f"   <- needs ~{d['ram_gb']} GB of RAM, this PC has {ram:.0f}"
+        say(f"  {i}) {m:16s} {d['about']}; download ~{d['download_gb']:.0f} GB{fit}")
+    model = a.model or names[int(ask("Which model?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1]
+    d = EDGE0_MODELS[model]
+    say(f"  Its license: {EDGE0_LICENSE}")
+    if ask("  Accept these terms and download the weights?", ["y", "n"], "n", a.yes) != "y":
+        fail("the Edge0 weights need their license accepted; nothing was downloaded")
+    models_dir = Path(a.models_dir)
+    pack = models_dir / model
+    rev, repo, files = EDGE0_REVISIONS[model], d["repo"], EDGE0_FILES[model]
+    step(5, f"downloading {model}")
+    say(f"  The model files go in {pack} (the two Edge0 models share {len(EDGE0_SHARED)} files: one download,")
+    say("  hardlinked into the other model's folder; a different filesystem downloads its own copy)")
+    for path, (size, sha) in sorted(files.items(), key=lambda kv: (kv[1][0], kv[0])):
+        dst = pack / path
+        if dst.exists() and done(dst):
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if path in EDGE0_SHARED:
+            src = next((models_dir / o / path for o in EDGE0_MODELS
+                        if o != model and (models_dir / o / path).exists() and done(models_dir / o / path)), None)
+            if src is not None:
+                try:
+                    dst.unlink(missing_ok=True)
+                    os.link(src, dst)
+                    mark(dst, f"hardlink {src}")
+                    ok(f"{path} linked from {src.parent.name}")
+                    continue
+                except OSError:
+                    pass   # a different filesystem: download it
+        download_file(f"{hf_endpoint()}/{repo}/resolve/{rev}/{path}", dst, path)
+        verify_sha256(dst, size, sha, own=True)
+    ok(f"model files present: {pack}")
+    llama, eng, lib_dirs = prepare_engine(a, gpu)
+    # the config from the pack's model.json: the engine's args and the latent environment, paths made absolute
+    mj = json.loads((pack / "model.json").read_text(encoding="utf-8"))
+
+    def abs_path(p: str) -> str:
+        p = p.lstrip("./")
+        return str(pack / p) if p not in (".", "") else str(pack)
+
+    path_flags = {"--pack", "--native", "--native-dense-gguf", "--ple-gguf", "--expert-profile", "--mtp"}
+    args: list[str] = []
+    it = iter(mj.get("args", []))
+    for tok in it:
+        if tok in path_flags:
+            args += [tok, abs_path(next(it))]
+        else:
+            args.append(tok)
+    env: dict[str, str] = {}
+    for k, v in (mj.get("env") or {}).items():
+        name = "XESTRATA_" + k[len("STRATA_"):] if k.startswith("STRATA_") else k
+        if name in ("XESTRATA_LATENT_DENSE", "XESTRATA_LATENT_A", "XESTRATA_LATENT_LABELS"):
+            v = abs_path(v)
+        env[name] = str(v)
+    tag = model.lower()
+    cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(pack),
+                           "tokenizer": str(pack / "tokenizer"), "model_name": tag, "family": family,
+                           "log": str(STATE / f"xestrata-{tag}.log"), "lib_dirs": lib_dirs, "port": port,
+                           "env": env, "model_gb": d["download_gb"],
+                           "experts_gb": files["experts.bin"][0] / 1e9}
+    if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
+        cfg["gpu_pci"] = gpu["pci"]
+    return finish_setup(a, cfg, tag, port, adopted, False,
+                        notes=("The latent MoE runs its experts at the latent width on the GPU; D/U and the column "
+                               "scales are the pack's. First runs: see docs/DETAILS.md (Edge0).",))
 
 
 def main() -> int:
@@ -9250,6 +9773,8 @@ def main() -> int:
     ap.add_argument("--json", action="store_true",
                     help="one JSON object a line for a front end (the Windows launcher): messages, steps, progress and "
                          "questions, whose answers are read as lines on stdin")
+    ap.add_argument("--image-auto-largest", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--import-anima", metavar="PATH", help="add an Anima DiT from this PC")
     ap.add_argument("--describe", action="store_true",
                     help="print this PC, the model families and sizes (with the RAM they need and the recommended "
                          "ones), the data folder and the installed models as one JSON object, and exit (the Windows "
@@ -9384,6 +9909,14 @@ def main() -> int:
         a.custom = custom_info(shards, mid)
         register_custom(a.custom)
         a.family, a.model = CUSTOM, mid
+    if a.import_anima:
+        try:
+            name = import_anima(Path(a.import_anima), data_folder_path(a.data_dir, load_settings()) / "models")
+        except (OSError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        emit({"type": "anima_imported", "name": name})
+        return 0
     if a.describe:
         emit(describe())
         return 0
@@ -9701,7 +10234,7 @@ def main() -> int:
     if on_cpu and a.family == CUSTOM:
         fail("a model of your own files needs a GPU: without one the CPU runs " +
              " and ".join(PLAIN_FAMILIES[f]["title"] for f in cpu_fams))
-    fams = cpu_fams if on_cpu else [f for f in FAMILIES if f != CUSTOM]
+    fams = cpu_fams if on_cpu else [f for f in FAMILIES if f != CUSTOM and f != "edge0"]   # edge0: --family edge0
     # a Strix Halo with the memory for it: UD-IQ4_XS is the recommendation, the menus list the rest (upstream c4a329fe)
     halo = gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu and ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB
     halo_fam = (next((f for f in fams if f in MODELS.get(STRIX_HALO_MODEL, {}).get("families", ())), None)
@@ -9718,6 +10251,8 @@ def main() -> int:
         say(f"  Its license: {lic}")
     if fam.get("plain"):
         return setup_plain(a, family, fam, gpu, chosen, sel, found, gpu_chosen, ram, roots, elsewhere, port, adopted)
+    if fam.get("edge0"):
+        return setup_edge0(a, family, fam, gpu, chosen, sel, found, gpu_chosen, ram, roots, elsewhere, port, adopted)
     say()
     # an experimental size sorts last (UD-IQ4_XS before UD-Q4_K_XL); --model takes the names as they are
     names = sorted((m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))),

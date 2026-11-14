@@ -19,10 +19,10 @@
 // src/models/qwen35.cpp at de7fa0a3) is qwen35moe's with the MoE replaced by a dense SwiGLU, down(silu(gate(h)) * up(h)),
 // in every block and in the MTP layer: no experts, so none of the tiers, the CPU pool or the window protocol.
 #include "strata/core/context_fit.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "strata/core/kv_elastic.hpp"
 #include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/plain_model.hpp"
-#include "strata/core/dense_slab.hpp"
 #include "strata/core/constraint_upload.hpp"
 
 #include "strata/core/plain_cpu.hpp"
@@ -31,6 +31,8 @@
 #include "strata/core/device.hpp"
 #include "strata/core/link_probe.hpp"
 #include "strata/core/split_predict.hpp"
+#include "strata/core/split_role.hpp"
+#include "strata/program/split_rules.hpp"
 #include "strata/core/expert_tier.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -55,7 +57,9 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tcq.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/yskn.hpp"
@@ -63,6 +67,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
+#include "strata/spec/window_hash.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/sampler_host.hpp"
@@ -78,6 +83,7 @@
 #include <numeric>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -113,6 +119,7 @@ bool mapped(size_t bytes, void** h, void** d) {
 PlainModel::PlainModel() = default;
 
 PlainModel::~PlainModel() {
+    if (hash_file_ != nullptr) std::fclose(hash_file_);
     if (cpu_ != nullptr) {   // --device cpu: no GPU was opened, nothing of its to give back
         if (route_dump_ != nullptr) std::fclose(route_dump_);
         return;
@@ -149,7 +156,6 @@ PlainModel::~PlainModel() {
             strata::gpu::free(conv_snap_[g][t]);
         }
     for (void* p : allocs_) strata::gpu::free(p);
-    dense_slab_.reset();
     for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) h_prob_, (void*) fill_tmp_,
                     (void*) hand_host_, (void*) h_rroute_})
         strata::gpu::free(p);
@@ -415,13 +421,12 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
         w.data = nullptr;
         return true;
     }
-    if (!dense_slab_) dense_slab_ = std::make_unique<DenseSlab>();
-    void* d = dense_slab_->alloc(bytes);
-    if (!d) {
+    void* d = nullptr;
+    if (!strata::gpu::alloc_device(&d, bytes)) {
         err = "plain model: no VRAM for " + name;
         return false;
     }
-    if (!dense_slab_->owns(d)) allocs_.push_back(d);
+    allocs_.push_back(d);
     if (!strata::gpu::copy(d, src, bytes)) {
         err = "plain model: uploading " + name + " failed";
         return false;
@@ -481,13 +486,12 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
         }
         src = wide.data();
     }
-    if (!dense_slab_) dense_slab_ = std::make_unique<DenseSlab>();
-    void* d = dense_slab_->alloc(elements * 4);
-    if (!d) {
+    void* d = nullptr;
+    if (!strata::gpu::alloc_device(&d, elements * 4)) {
         err = "plain model: no VRAM for " + name;
         return false;
     }
-    if (!dense_slab_->owns(d)) allocs_.push_back(d);
+    allocs_.push_back(d);
     if (!strata::gpu::copy(d, src, elements * 4)) {
         err = "plain model: uploading " + name + " failed";
         return false;
@@ -884,25 +888,67 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
     }
     const int64_t nkv = std::max<int64_t>(1, s.n_head_kv.empty() ? 1 : *std::max_element(s.n_head_kv.begin(), s.n_head_kv.end()));
     const int64_t chunk = std::max<int64_t>(opt_.prompt_chunk, opt_.max_t);
+    // a cell's K and V of one KV head in the --kv format (int8, q4: kv_q4 1 or 2, tcq: its bits)
+    const auto kv_row = [&](bool i8, int q4, int tcq) -> uint64_t {
+        const int hd = (int) s.key_length;
+        const uint64_t i8_row = (uint64_t) hd + (uint64_t) hd / k::KV_Q8_GROUP * 2;
+        if (tcq != 0) return 2 * k::kv_tcq_bytes_per_head(hd, tcq);
+        if (q4 == 1) return 2 * k::kv_q4_bytes_per_head(hd);
+        if (q4 == 2) return i8_row + k::kv_q4_bytes_per_head(hd);
+        return i8 ? 2 * i8_row : 4 * (uint64_t) hd;
+    };
+    std::vector<uint64_t> kv_cells((size_t) nl, 0);
     for (int64_t l = 0; l < nl; ++l) {
         const int64_t cells = s.layer_swa(l) ? std::min<int64_t>(opt_.max_cells, s.swa_window + chunk) : opt_.max_cells;
-        block[(size_t) l] += s.recurrent[(size_t) l]
-                                 ? (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state + (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4
-                                 : (uint64_t) (cells * nkv * s.key_length) * 2 * (opt_.kv_int8 ? 1 : 2);
+        if (s.recurrent[(size_t) l])
+            block[(size_t) l] += (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state + (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4;
+        else
+            kv_cells[(size_t) l] = (uint64_t) (cells * nkv);
     }
     // the window's and the prompt's buffers and the driver's share: the layer split's reserve (split_auto_points)
     // - the device's room, core::vram_room, plus the 1 GiB this stage's windows and prompt path take
     const uint64_t reserve = opt_.reserve_mib >= 0
                                  ? (uint64_t) opt_.reserve_mib << 20
                                  : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
-    uint64_t used = head + reserve + yskn_scratch_b;
-    int64_t fit = 0;
-    while (fit < nl && used + block[(size_t) fit] <= free_b) used += block[(size_t) fit++];
+    // the blocks the GPU holds in order with the K/V's rows of `row` bytes, and the bytes they take
+    const auto fits = [&](uint64_t row, uint64_t* bytes) {
+        uint64_t used = head + reserve + yskn_scratch_b;
+        int64_t n = 0;
+        while (n < nl && used + block[(size_t) n] + kv_cells[(size_t) n] * row <= free_b) {
+            used += block[(size_t) n] + kv_cells[(size_t) n] * row;
+            ++n;
+        }
+        if (bytes != nullptr)
+            for (int64_t l = 0; l < nl; ++l) *bytes += block[(size_t) l] + kv_cells[(size_t) l] * row;
+        return n;
+    };
+    // --kv not given: the FP16 cache unless it leaves blocks off the GPU (whose CPU forward costs far more than the
+    // cache's rounding); then the first of INT8, tcq5 and tcq4 (heads of 256, not PLaMo 3's: kv_tcq.hpp) with which the
+    // GPU holds them all, else the smallest.  In this order each rounds the cache a little more than the one before
+    if (opt_.kv_auto && opt_.kv_tcq == 0 && opt_.kv_q4 == 0 && !opt_.kv_int8) {
+        const int64_t f16 = fits(kv_row(false, 0, 0), nullptr);
+        if (f16 < nl) {
+            const bool tc_ok = s.key_length == 256 && s.arch != ModelArch::Plamo3;
+            struct Pick { bool i8; int tcq; const char* name; };
+            const Pick picks[] = {{true, 0, "int8"}, {false, 5, "tcq5"}, {false, 4, "tcq4"}};
+            const Pick* take = &picks[0];
+            for (const Pick& p : picks) {
+                if (p.tcq != 0 && !tc_ok) continue;
+                take = &p;
+                if (fits(kv_row(p.i8, 0, p.tcq), nullptr) == nl) break;
+            }
+            opt_.kv_int8 = take->i8;
+            opt_.kv_tcq = take->tcq;
+            std::fprintf(stderr, "xestrata plain: the K/V cache in %s (with FP16's, the GPU would hold %lld of the %lld "
+                                 "blocks; --kv fp16 keeps it)\n", take->name, (long long) f16, (long long) nl);
+        }
+    }
+    uint64_t total = 0;
+    const int64_t fit = fits(kv_row(opt_.kv_int8, opt_.kv_q4, opt_.kv_tcq), &total);
     if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
     opt_.gpu_layers = head + reserve + yskn_scratch_b > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
     std::fprintf(stderr, "xestrata plain: %.2f GiB of VRAM free, the head and a reserve %.2f GiB, the blocks %.2f GiB: %s\n",
-                 free_b / 1073741824.0, (head + reserve + yskn_scratch_b) / 1073741824.0,
-                 std::accumulate(block.begin(), block.end(), uint64_t{0}) / 1073741824.0,
+                 free_b / 1073741824.0, (head + reserve + yskn_scratch_b) / 1073741824.0, total / 1073741824.0,
                  opt_.gpu_layers == 0 ? "the CPU alone" : ("the first " + std::to_string(fit) + " blocks on the GPU").c_str());
     return true;
 }
@@ -953,6 +999,191 @@ bool PlainModel::split_auto_points(std::string& err) {
         std::fprintf(stderr, "xestrata plain: --layer-split auto: %s, %.1f GiB for experts, %.1f GB/s from the host: %lld "
                              "MoE layers\n", strata::gpu::device_name(split_devs_[(size_t) d]).c_str(),
                      room[(size_t) d] / 1073741824.0, link[(size_t) d] / 1e9, (long long) count[(size_t) d]);
+    return split_auto_role(err);
+}
+
+// The second GPU's role in --layer-split auto, as generate.cpp's (core/split_role.hpp): a stage of the split the
+// memory gave (split_auto_points), a helper expert cache beside the first GPU alone, or no second GPU at all.  The
+// windows are predicted from the same measured bandwidths and the profile, and the choice keeps the same margins
+// (XESTRATA_SPLIT_GAIN_PCT, XESTRATA_SPLIT_HELPER_GAIN_PCT): the prediction prices decode only, and the split reads a
+// prompt on both GPUs while the helper reads every layer on the first.  Needs --expert-profile, as generate.cpp's auto
+// does; without one the split by memory stands.  Two GPUs only; an explicit --expert-cache-deviceN stands too.
+bool PlainModel::split_auto_role(std::string& err) {
+    const int n = (int) split_devs_.size();
+    if (n != 2) return true;
+    if (opt_.expert_cache_remote[0] > 0 || opt_.expert_cache_remote[1] > 0 || opt_.expert_cache_remote[2] > 0) return true;
+    const ModelSpec& s = spec_;
+    const int64_t L = s.n_layer, E = s.n_expert, M = s.n_moe_layers();
+    if (M < 1 || E < 1 || opt_.profile.empty()) return true;
+    // the profile, its MoE layer indices read as the trunk's blocks (the prediction's layers are the blocks)
+    std::vector<std::pair<int32_t, int32_t>> prof;
+    int64_t pslots = 0;
+    std::string perr;
+    if (!read_expert_profile(opt_.profile, M, E, prof, pslots, perr)) {
+        std::fprintf(stderr, "xestrata plain: --layer-split auto: %s; the split by memory stands\n", perr.c_str());
+        return true;
+    }
+    for (auto& p : prof) p.first = (int32_t) (p.first + s.n_dense_lead);
+    // each block's bytes: its experts' (all E) and its dense ones; the head's
+    std::vector<uint64_t> blk_b((size_t) L, 0), exp_b((size_t) L, 0);
+    for (size_t i = 0; i < model_->size(); ++i)
+        for (const TensorInfo& ti : model_->shard(i).tensors()) {
+            if (ti.name.rfind("blk.", 0) != 0) continue;
+            const int64_t l = std::strtoll(ti.name.c_str() + 4, nullptr, 10);
+            if (l < 0 || l >= L) continue;
+            const uint64_t b = tensor_payload_bytes(ti);
+            blk_b[(size_t) l] += b;
+            if (ti.name.find("_exps.weight") != std::string::npos) exp_b[(size_t) l] += b;
+        }
+    uint64_t head = 0;
+    if (size_t at = 0; const TensorInfo* t = model_->find(head_name(), &at)) head = tensor_payload_bytes(*t);
+    std::vector<double> blob((size_t) L, 0.0);
+    std::vector<int64_t> dense_l((size_t) L, 0), kv_l((size_t) L, 0);
+    uint64_t dense_all = 0;
+    const int64_t nkv = std::max<int64_t>(1, s.n_head_kv.empty() ? 1 : *std::max_element(s.n_head_kv.begin(), s.n_head_kv.end()));
+    const int64_t chunk = std::max<int64_t>(opt_.prompt_chunk, opt_.max_t);
+    for (int64_t l = 0; l < L; ++l) {
+        blob[(size_t) l] = (double) exp_b[(size_t) l] / (double) E;
+        dense_l[(size_t) l] = (int64_t) (blk_b[(size_t) l] - exp_b[(size_t) l]);
+        dense_all += (uint64_t) dense_l[(size_t) l];
+        const int64_t cells = s.layer_swa(l) ? std::min<int64_t>(opt_.max_cells, s.swa_window + chunk) : opt_.max_cells;
+        kv_l[(size_t) l] = s.recurrent[(size_t) l]
+                               ? (int64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state +
+                                            (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4
+                               : cells * nkv * s.key_length * 2 * (opt_.kv_int8 ? 1 : 2);
+    }
+    // the measurements, per GPU (the first, then the second): free memory, read bandwidth, link, small-copy latency
+    std::vector<int64_t> free0((size_t) n), reserve((size_t) n);
+    std::vector<double> bw((size_t) n), link_gbps((size_t) n), side_ms((size_t) n);
+    const double cpu_bw = core::split_cpu_bandwidth();
+    const double rows = strata::env_get("SPLIT_ROWS") ? std::strtod(strata::env_get("SPLIT_ROWS"), nullptr) : 3.0;
+    const double hand_bytes = rows * (double) s.n_embd * sizeof(float);
+    for (int d = 0; d < n; ++d) {
+        const OnDevice on(split_devs_[(size_t) d]);
+        size_t f = 0, t = 0;
+        if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: a GPU's memory is unknown"; return false; }
+        free0[(size_t) d] = (int64_t) f;
+        reserve[(size_t) d] = (int64_t) (core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30));
+        bw[(size_t) d] = core::split_gpu_bandwidth(split_devs_[(size_t) d]);
+        link_gbps[(size_t) d] = std::max(0.0, probe_host_to_device_gbps());
+        const double copy_ms = core::probe_copy_latency_ms();
+        side_ms[(size_t) d] = link_gbps[(size_t) d] > 0.0 && copy_ms >= 0.0
+                                  ? copy_ms + hand_bytes / (link_gbps[(size_t) d] * 1e6) : 0.05;
+    }
+    const std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+    std::vector<int> order((size_t) n);
+    for (int d = 0; d < n; ++d) order[(size_t) d] = d;
+    auto capacity = [&](int i, int64_t lo, int64_t hi, bool last) -> int64_t {
+        if (hi < 0) hi = L;
+        int64_t w = 0;
+        for (int64_t l = lo; l < hi; ++l) w += dense_l[(size_t) l] + kv_l[(size_t) l];
+        return free0[(size_t) order[(size_t) i]] - reserve[(size_t) order[(size_t) i]] - w - (last ? (int64_t) head : 0);
+    };
+    const double mass_exp = strata::env_get("SPLIT_MASS_EXP") ? std::strtod(strata::env_get("SPLIT_MASS_EXP"), nullptr) : 0.8;
+    std::vector<double> mass(prof.size());
+    for (size_t r = 0; r < prof.size(); ++r) mass[r] = std::pow((double) r + 1.0, -mass_exp);
+    const bool mtp = opt_.spec >= 2 && model_->find("blk." + std::to_string(L) + ".nextn.eh_proj.weight") != nullptr;
+    core::SplitPrediction model;
+    model.layers = L;
+    model.profile = prof;
+    model.mass = mass;
+    model.gpu_bw = bw;
+    model.link_scale = link_scale;
+    model.side_ms = side_ms;
+    model.order = order;
+    model.capacity = capacity;
+    model.cost = [&](int64_t l) { return (int64_t) std::ceil(blob[(size_t) l]); };
+    model.blob_bytes = [&](int64_t l) { return blob[(size_t) l]; };
+    model.prompt_min = 0;
+    model.cpu_bw = cpu_bw;
+    model.rows = rows;
+    model.experts_per_row = (double) s.n_expert_used;
+    model.dense_layer = (double) dense_all / (double) L;
+    model.tail_keep = 1.0;   // the plain engine skips no route tail
+    model.head_bytes = (double) head;
+    model.drafts = mtp;
+    model.pipelined = false;
+    // the split the memory gave, and the first GPU alone
+    const core::SplitPredictionResult split_r = core::predict_layer_split(model, opt_.split_at);
+    const core::SplitPredictionResult alone_r = core::predict_layer_split(model, {});
+    const double split_ms = split_r.startable ? split_r.ms : 1e30;
+    const double alone_ms = alone_r.startable ? alone_r.ms : 1e30;
+    const bool alone_holds_all = alone_r.startable && alone_r.held == (int64_t) prof.size();
+    std::fprintf(stderr, "xestrata plain: --layer-split auto: %s alone would take %.1f ms per window (~%.1f%% of the "
+                         "routed mass cached%s)\n", strata::gpu::device_name(split_devs_[0]).c_str(), alone_r.ms,
+                 100.0 * alone_r.held_mass, alone_holds_all ? ", every profiled pair" : "");
+    // the second GPU as a helper expert cache
+    const char* role_env = strata::env_get("SPLIT_ROLE");
+    const std::string role = role_env != nullptr ? role_env : "";
+    const char* gain_env = strata::env_get("SPLIT_GAIN_PCT");
+    const double gain = (gain_env != nullptr ? std::strtod(gain_env, nullptr) : 5.0) / 100.0;
+    const bool helper_eligible = opt_.pipeline_windows <= 0 && opt_.batch_slots <= 0 && role != "split";
+    core::HelperCachePrediction hc;
+    if (helper_eligible) {
+        double submit_ms = 0.0, layer_ms = 0.0;
+        {
+            const OnDevice on(split_devs_[1]);
+            layer_ms = core::probe_helper_layer_ms(submit_ms);
+        }
+        if (layer_ms < 0.0) { layer_ms = 2.0 * side_ms[1]; submit_ms = 0.0; }
+        const double rt = layer_ms + (link_gbps[1] > 0.0 ? 2.0 * hand_bytes / (link_gbps[1] * 1e6) : 0.0);
+        core::HelperCacheInputs hi;
+        hi.layers = L;
+        hi.profile = prof;
+        hi.mass = mass;
+        hi.cost = model.cost;
+        hi.blob_bytes = model.blob_bytes;
+        hi.cap0 = std::max<int64_t>(capacity(0, 0, -1, true), 0);
+        hi.caph = free0[1] - ((int64_t) (512 + 256) << 20);
+        hi.bw0 = bw[0];
+        hi.bwh = bw[1];
+        hi.cpu_bw = cpu_bw;
+        hi.link_scale0 = link_scale[0];
+        hi.rows = rows;
+        hi.experts_per_row = (double) s.n_expert_used;
+        hi.dense_layer = model.dense_layer;
+        hi.tail_keep = model.tail_keep;
+        hi.head_bytes = (double) head;
+        hi.rt = rt;
+        hi.submit_ms = submit_ms;
+        hi.drafts = mtp;
+        hc = core::predict_helper_cache(hi);
+    }
+    const char* hgain_env = strata::env_get("SPLIT_HELPER_GAIN_PCT");
+    const double hgain = hgain_env != nullptr ? std::strtod(hgain_env, nullptr) / 100.0 : gain;
+    core::SplitRoleInputs ri;
+    ri.alone_ms = alone_ms;
+    ri.split_ms = split_ms;
+    ri.helper_ms = hc.ms;
+    ri.alone_holds_all = alone_holds_all;
+    ri.helper_held = hc.held;
+    ri.gain = gain;
+    ri.helper_gain = hgain;
+    ri.roles_helper = opt_.split_roles_helper;
+    ri.skip_if_fits = opt_.split_skip_if_fits;
+    ri.helper_eligible = helper_eligible;
+    ri.role = role;
+    const core::SplitRoleChoice choice = core::choose_split_role(ri);
+    if (helper_eligible)
+        std::fprintf(stderr, "xestrata plain: --layer-split auto: %s as a helper expert cache instead: %.1f ms per window "
+                             "(%lld more experts there, ~%.1f%% of the routed mass on the GPUs) against %.1f split -> %s\n",
+                     strata::gpu::device_name(split_devs_[1]).c_str(), hc.ms, (long long) hc.held, 100.0 * hc.kept_mass,
+                     split_ms, choice.helper_chosen ? "the helper" : "the split");
+    if (choice.role == core::SplitRole::SkipIfFits) {
+        std::fprintf(stderr, "xestrata plain: layer split skipped (--split-skip-if-fits): %s holds every one of the %zu "
+                             "profiled pairs - one GPU\n", strata::gpu::device_name(split_devs_[0]).c_str(), prof.size());
+        opt_.split_at.clear();
+    } else if (choice.role == core::SplitRole::Helper) {
+        opt_.expert_cache_remote[0] = (int) hc.held;
+        opt_.split_at.clear();
+        std::fprintf(stderr, "xestrata plain: --layer-split auto: the second GPU a helper expert cache (%lld experts)\n",
+                     (long long) hc.held);
+    } else if (choice.role == core::SplitRole::Alone) {
+        std::fprintf(stderr, "xestrata plain: --layer-split auto: %s alone (%.1f ms per window) - the second GPU's role is "
+                             "not predicted %.0f%% shorter (XESTRATA_SPLIT_GAIN_PCT, XESTRATA_SPLIT_ROLE)\n",
+                     strata::gpu::device_name(split_devs_[0]).c_str(), alone_ms, 100.0 * gain);
+        opt_.split_at.clear();
+    }
     return true;
 }
 
@@ -962,6 +1193,10 @@ bool PlainModel::rope_scalings(const ModelSpec& s, const PlainOptions& opt, k::R
     k::RopeScaling rs;
     rs.freq_base = opt.rope_freq_base > 0 ? opt.rope_freq_base : s.rope_base;
     const std::string type = !opt.rope_scaling.empty() ? opt.rope_scaling : s.rope_scaling_type;
+    if (!type.empty() && type != "none" && type != "linear" && type != "yarn") {
+        err = "plain model: rope scaling type '" + type + "' - none, linear or yarn only";
+        return false;
+    }
     rs.type = type == "yarn" ? RST::YaRN : type == "linear" ? RST::Linear : RST::None;
     if (rs.type != RST::None) {
         rs.factor = opt.rope_scale > 0 ? opt.rope_scale : s.rope_scaling_factor > 1.0 ? s.rope_scaling_factor : 1.0;
@@ -1006,7 +1241,7 @@ bool PlainModel::load_qwen(std::string& err) {
         err = "plain model: an encoder (streamed or not) is a dense model (qwen35, qwen3) on one GPU";
         return false;
     }
-    if (plamo_ && (opt_.encoder || opt_.vision || opt_.kv_q4 != 0)) {
+    if (plamo_ && (opt_.encoder || opt_.vision || opt_.kv_q4 != 0 || opt_.kv_tcq != 0)) {
         err = "plain model: plamo3 is not an encoder, has no pictures and keeps its K/V in FP16 or int8";
         return false;
     }
@@ -1062,19 +1297,7 @@ bool PlainModel::load_qwen(std::string& err) {
         stream_into_ = nullptr;
         if (!ok) return false;
     }
-    // the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last
-    tap_local_.clear();
-    tap_slot_.assign((size_t) s.n_layer, -1);
-    for (int l : tap_req_)
-        if (l >= lb_ && l < le_ && l < s.n_layer - 1) {
-            tap_slot_[(size_t) l] = (int) tap_local_.size();
-            tap_local_.push_back(l);
-        }
-    if (!tap_local_.empty() && tap_dev_ == nullptr &&
-        !strata::gpu::alloc_device(&tap_dev_, (size_t) opt_.max_t * tap_local_.size() * s.n_embd * 4)) {
-        err = "plain model: the DFlash2 tap staging does not fit";
-        return false;
-    }
+    if (!setup_taps(err)) return false;
     // the MTP layer, when the window checks drafts and the file has it (its K/V the last attention block's): the last
     // stage's
     {
@@ -1109,9 +1332,9 @@ bool PlainModel::load_qwen(std::string& err) {
     }
 
     if (nkv_ == 0) { err = "plain model: the model has no attention block"; return false; }
-    if (opt_.kv_q4 != 0 && s.key_length != 256) {
-        err = "plain model: --kv q4_0 and k8v4 rotate heads of 256 (kv_q4.hpp); this model's are " +
-              std::to_string((long long) s.key_length) + " wide";
+    if ((opt_.kv_q4 != 0 || opt_.kv_tcq != 0) && s.key_length != 256) {
+        err = "plain model: --kv q4_0, k8v4, tcq4 and tcq5 rotate heads of 256 (kv_q4.hpp, kv_tcq.hpp); this model's "
+              "are " + std::to_string((long long) s.key_length) + " wide";
         return false;
     }
     if (!tune_uploaded(err) || !yskn_scratch(err)) return false;
@@ -1168,7 +1391,8 @@ bool PlainModel::load_qwen(std::string& err) {
     // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
     // spec - 1 drafts (at most the window kernel's snapshots); every stage's recurrent blocks
     // (--suffix-draft, --lookup-chain: as many as a window's drafts can be, MTP layer or not)
-    const int lookup = opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1 : 0;
+    const int lookup = std::max(opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1 : 0,
+                                std::min(opt_.draft_windows, std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1));
     if (model_mtp_ || lookup > 0) {
         if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kVerifyMaxT + 1});
         n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
@@ -1255,9 +1479,29 @@ bool PlainModel::load_qwen(std::string& err) {
             std::fprintf(stderr, "xestrata plain: the sliding-window layers' K/V in a ring of %lld cells (window %lld)\n",
                          (long long) (ring_pages_ * qs.page_size), (long long) s.swa_window);
     }
+    // --kv-resident: resolve auto/off/N, then plan the streamed layers' ring (the trailing cells in VRAM, the rest in
+    // the host copy). The sliding-window layers keep their own ring; the MTP layer's attention streams too. The ring
+    // holds the resident cells and a window's own (a verify window appends its drafts before it reads, and a rejected
+    // draft's cells must not overwrite the tail the next window reads).
+    if (!resolve_kv_resident(err)) return false;
+    attn_stream_.assign((size_t) n_attn, false);
+    kv_host_.assign((size_t) n_attn, k::KvHostPools{});
+    if (kv_resident_cells_ > 0) {
+        const int64_t slots = (kv_resident_cells_ + opt_.max_t + qs.page_size - 1) / qs.page_size;
+        if (slots < n_pages_) {
+            kv_stream_slots_ = slots;
+            for (size_t a = 0; a < (size_t) n_attn; ++a) attn_stream_[a] = !attn_swa_[a];
+        } else {
+            kv_resident_cells_ = 0;   // the whole context fits the ring: fully resident, as without --kv-resident
+        }
+    }
+    if (kv_stream_slots_ > 0 && first())
+        std::fprintf(stderr, "xestrata plain: KV streaming: the last %lld cells a layer in VRAM, the rest in RAM "
+                             "(~%.2f GiB of host copy)\n", (long long) kv_resident_cells_,
+                     (double) kv_host_bytes() / 1073741824.0);
     // the decode attention's form for this GPU (an fp16 cache), timed before any graph is recorded and before the cache
     // takes its VRAM (an encoder does not decode)
-    if (!opt_.kv_int8 && opt_.kv_q4 == 0 && !opt_.encoder) {
+    if (!opt_.kv_int8 && opt_.kv_q4 == 0 && opt_.kv_tcq == 0 && !opt_.encoder) {
         try {
             k::qsa_dense_attn_tune(qs, opt_.max_cells, cs_);
         } catch (const std::exception& e) {
@@ -1268,7 +1512,8 @@ bool PlainModel::load_qwen(std::string& err) {
     // and the prompt attention's kernel (prompt_attn: the matrix engines', the FP16 one or the decode one), as long
     // as the VRAM is free; GLM-5.3-Flash's prompt takes its own (plain_prompt_glm5.cpp)
     if (opt_.prompt_chunk > 0 && !glm_)
-        k::prompt_attn_tune(qs, opt_.kv_q4 == 1 ? 2 : opt_.kv_q4 == 2 ? 3 : opt_.kv_int8 ? 1 : 0, opt_.max_cells, cs_);
+        k::prompt_attn_tune(qs, opt_.kv_tcq != 0 ? 4 : opt_.kv_q4 == 1 ? 2 : opt_.kv_q4 == 2 ? 3 : opt_.kv_int8 ? 1 : 0,
+                            opt_.max_cells, cs_);
     {
         const size_t cells = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
         k_pool_.assign((size_t) n_attn, nullptr);
@@ -1279,6 +1524,10 @@ bool PlainModel::load_qwen(std::string& err) {
         v_scale_.assign((size_t) n_attn, nullptr);
         k_q4_.assign((size_t) n_attn, nullptr);
         v_q4_.assign((size_t) n_attn, nullptr);
+        k_tc_.assign((size_t) n_attn, nullptr);
+        v_tc_.assign((size_t) n_attn, nullptr);
+        tc_ring_.assign((size_t) n_attn, nullptr);
+        tcq_defer_ = strata::env_auto("KV_TCQ_DEFER") != 0;
         // --kv-grow: Qwen3.8-Flash-Next's rule for the default (the B70 reports 64 KiB pages, and that engine's cache
         // in 2 MiB segments ran its prompts 45% slower there; the RTX 4070 reports 2 MiB and was faster)
         const bool asked = opt_.kv_grow > 0 || (opt_.kv_grow < 0 && vmm_large_pages());
@@ -1286,6 +1535,7 @@ bool PlainModel::load_qwen(std::string& err) {
                         : !(first() && last()) ? "a layer split"
                         : opt_.batch_slots > 0 ? "--batch"
                         : opt_.encoder ? "an encoder"
+                        : kv_stream_slots_ > 0 ? "KV streaming keeps the K/V's VRAM fixed (the ring)"
                         : !vmm_available() || !strata::gpu::vmem_supported() ? "no virtual memory on this GPU"
                         : opt_.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
         const bool grow = asked && why == nullptr;
@@ -1299,22 +1549,27 @@ bool PlainModel::load_qwen(std::string& err) {
         size_t kv_room_b = 0, kv_total_b = 0;
         const bool kv_room_known = strata::gpu::mem_info(&kv_room_b, &kv_total_b) && kv_room_b > 0;
         const size_t kv_head_dim = (size_t) qs.head_dim;
-        auto kv_block_bytes = [&](int64_t want) -> uint64_t {   // one attention block's K/V at `want` cells (alloc_kv)
-            const uint64_t cells = (uint64_t) std::max<int64_t>(want, 0);
+        // one attention block's K/V at a context of `want` tokens (alloc_kv): every KV head has its own cells
+        auto kv_block_bytes = [&](int64_t want) -> uint64_t {
+            const uint64_t cells = (uint64_t) std::max<int64_t>(want, 0) * (uint64_t) qs.n_head_kv;
             const uint64_t codes = cells * kv_head_dim, scales = cells * (kv_head_dim / k::KV_Q8_GROUP) * 2,
                            q4 = cells * (uint64_t) k::kv_q4_bytes_per_head((int) kv_head_dim);
-            return opt_.kv_q4 == 1 ? 2 * q4
+            return opt_.kv_tcq != 0 ? 2 * cells * k::kv_tcq_bytes_per_head((int) kv_head_dim, opt_.kv_tcq)
+                   : opt_.kv_q4 == 1 ? 2 * q4
                    : opt_.kv_q4 == 2 ? codes + scales + q4
                    : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
         };
-        auto kv_bytes_at = [&](int64_t want) -> uint64_t {   // this stage's blocks at `want` cells
+        auto kv_bytes_at = [&](int64_t want) -> uint64_t {   // this stage's blocks at a context of `want` tokens
             uint64_t total = 0;
             for (int64_t i2 = 0; i2 < n_attn; ++i2) {
                 bool mine2 = has_mtp_ && i2 == mtp_.attn;
                 for (int64_t l = lb_; l < le_ && !mine2; ++l) mine2 = blocks_[(size_t) l].attn == i2;
                 if (!mine2 || (opt_.encoder && i2 > 0)) continue;   // an encoder's layers share the first's cells
-                total += kv_block_bytes(ringed((size_t) i2) ? std::min<int64_t>(want, ring_pages_ * qs.page_size)
-                                                            : want);
+                if (kv_streamed((size_t) i2))   // streamed: the ring's VRAM, fixed (the rest is the host copy, in RAM)
+                    total += kv_block_bytes(kv_stream_slots_ * qs.page_size);
+                else
+                    total += kv_block_bytes(ringed((size_t) i2) ? std::min<int64_t>(want, ring_pages_ * qs.page_size)
+                                                                : want);
             }
             return total;
         };
@@ -1327,7 +1582,8 @@ bool PlainModel::load_qwen(std::string& err) {
             // an encoder reads the whole prompt in one chunk (encode), so a layer's attention reads only the K/V it
             // wrote itself: every layer shares the first's cells (Qwen3-VL-8B's 36 layers of 4096 cells: 16 MiB, not
             // 590)
-            if (opt_.encoder && i > 0 && (k_pool_[0] != nullptr || k_q_[0] != nullptr || k_q4_[0] != nullptr)) {
+            if (opt_.encoder && i > 0 &&
+                (k_pool_[0] != nullptr || k_q_[0] != nullptr || k_q4_[0] != nullptr || k_tc_[0] != nullptr)) {
                 k_pool_[a] = k_pool_[0];
                 v_pool_[a] = v_pool_[0];
                 k_scale_[a] = k_scale_[0];
@@ -1336,9 +1592,14 @@ bool PlainModel::load_qwen(std::string& err) {
                 v_q_[a] = v_q_[0];
                 k_q4_[a] = k_q4_[0];
                 v_q4_[a] = v_q4_[0];
+                k_tc_[a] = k_tc_[0];
+                v_tc_[a] = v_tc_[0];
+                tc_ring_[a] = tc_ring_[0];
                 continue;
             }
-            const bool ok = alloc_kv(p, ringed(a) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : cells, grow);
+            const size_t vram_cells = kv_streamed(a) ? (size_t) (kv_stream_slots_ * qs.n_head_kv * qs.page_size)
+                                    : ringed(a) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : cells;
+            const bool ok = alloc_kv(p, vram_cells, grow && !kv_streamed(a));
             k_pool_[a] = p.k_pool;
             v_pool_[a] = p.v_pool;
             k_scale_[a] = p.k_scale;
@@ -1347,6 +1608,10 @@ bool PlainModel::load_qwen(std::string& err) {
             v_q_[a] = p.v_q;
             k_q4_[a] = p.k_q4;
             v_q4_[a] = p.v_q4;
+            k_tc_[a] = p.k_tc;
+            v_tc_[a] = p.v_tc;
+            tc_ring_[a] = p.tc_ring;
+            if (ok && kv_streamed(a) && !alloc_kv_host(a, err)) return false;
             if (!ok) {
                 err = "plain model: no VRAM for the K/V cache (" + std::to_string(opt_.max_cells) + " cells)";
                 if (kv_room_known) {   // #5715: the context that would fit, from this engine's own K/V figure
@@ -1385,6 +1650,15 @@ bool PlainModel::load_qwen(std::string& err) {
                 return false;
             }
             allocs_.push_back(swa_table_);
+        }
+        if (kv_stream_slots_ > 0) {   // the streamed layers' ring: logical page p in page p % kv_stream_slots_
+            for (int64_t i = 0; i < n_pages_; ++i) table[(size_t) i] = (int32_t) (i % kv_stream_slots_);
+            if (!strata::gpu::alloc_device(&kv_stream_table_, table.size() * 4) ||
+                !strata::gpu::copy(kv_stream_table_, table.data(), table.size() * 4)) {
+                err = "plain model: the streamed layers' page table";
+                return false;
+            }
+            allocs_.push_back(kv_stream_table_);
         }
         if (grow) {   // the first cells (STRATA_KV_GROW_INIT, 16384 by default) mapped now
             const char* iv = strata::env_get("KV_GROW_INIT");
@@ -1613,6 +1887,19 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     b.cpu_cap = std::min<int64_t>((int64_t) TK, (int64_t) k::cpu::MAXT * (int64_t) E);
     take(b.cpu, (uint64_t) b.cpu_cap * N * 4); take(b.cpu_row, (uint64_t) b.cpu_cap * 4);
     take(b.gemm_scratch, (uint64_t) b.gemm_elems * 2);
+    if (kv_stream_slots_ > 0) {   // --kv-resident: one attention layer's whole K/V, staged from the host copy per
+        const auto qs = attn_shapes();   // layer and chunk (the identity layout, page_table_ its table)
+        const uint64_t pairs = (uint64_t) n_pages_ * NKV * (uint64_t) qs.page_size;
+        const uint64_t codes = pairs * HD, scales = pairs * (HD / k::KV_Q8_GROUP) * 2,
+                       q4 = pairs * (uint64_t) k::kv_q4_bytes_per_head((int) HD);
+        if (opt_.kv_q4 == 1) { take(b.kv_stage.k_q4, q4); take(b.kv_stage.v_q4, q4); }
+        else if (opt_.kv_q4 == 2) {
+            take(b.kv_stage.k_q, codes); take(b.kv_stage.k_scale, scales); take(b.kv_stage.v_q4, q4);
+        } else if (opt_.kv_int8) {
+            take(b.kv_stage.k_q, codes); take(b.kv_stage.v_q, codes);
+            take(b.kv_stage.k_scale, scales); take(b.kv_stage.v_scale, scales);
+        } else { take(b.kv_stage.k_pool, codes * 2); take(b.kv_stage.v_pool, codes * 2); }
+    }
     if (glm_) {   // plain_prompt_glm5.cpp
         const uint64_t HC = 4, MIX = (2 + HC) * HC, S = (uint64_t) s.kda_head_dim, GC = NH * S;
         const uint64_t QLR = (uint64_t) s.q_lora_rank, KVR = (uint64_t) s.kv_lora_rank;
@@ -1900,6 +2187,29 @@ bool PlainModel::open_experts(std::string& err) {
                 slot_layer_.push_back(l);
                 slot_bytes.push_back((int64_t) lay.bytes[(size_t) l]);
             }
+    // the free memory read again just before the tier is opened: what was allocated since it was read above (the
+    // prompt path's pinned buffers count against the device on some drivers) comes off the last slots, so the tier
+    // and the reserve still fit (GLM-5.3-Flash without its MTP layer asked 164 MiB more than the B70 had free and the
+    // start stopped, 2026-11-13)
+    if (opt_.expert_slots < 0) {
+        size_t f = 0, t = 0;
+        if (strata::gpu::mem_info(&f, &t)) {
+            const uint64_t now = counted_free(f, f, opt_.vram_free_mib);
+            const uint64_t limit = now > window_b + reserve ? now - window_b - reserve : 0;
+            uint64_t need = 0;
+            for (const int64_t b : slot_bytes) need += ((uint64_t) b + 255) / 256 * 256;
+            const size_t before = slot_bytes.size();
+            while (!slot_bytes.empty() && need > limit) {
+                need -= ((uint64_t) slot_bytes.back() + 255) / 256 * 256;
+                free_[(size_t) slot_layer_.back()].pop_back();   // (before the reverse: its last is this slot)
+                slot_layer_.pop_back();
+                slot_bytes.pop_back();
+            }
+            if (slot_bytes.size() < before)
+                std::fprintf(stderr, "xestrata plain: %lld MiB of VRAM free now, less than when the tier was planned: "
+                                     "%zu slots instead of %zu\n", (long long) (now >> 20), slot_bytes.size(), before);
+        }
+    }
     for (auto& f : free_) std::reverse(f.begin(), f.end());   // taken from the back: the lowest slot first
     cache_.set_max_piece(max_alloc_bytes());   // in pieces where the tier passes the device's largest allocation
     if (opt_.vram_elastic) {   // #533: in segments, as generate.cpp's cache; one GPU only (a split has a tier per GPU)
@@ -2442,9 +2752,11 @@ PlainModel::KvPtrs PlainModel::kv_ptrs(size_t a, int slot) const {
     KvPtrs p;
     if (slot >= 0) {
         const SlotSession& ss = bslots_[(size_t) slot];
-        p = {ss.k_pool[a], ss.v_pool[a], ss.k_scale[a], ss.v_scale[a], ss.k_q[a], ss.v_q[a], ss.k_q4[a], ss.v_q4[a]};
+        p = {ss.k_pool[a], ss.v_pool[a], ss.k_scale[a], ss.v_scale[a], ss.k_q[a], ss.v_q[a], ss.k_q4[a], ss.v_q4[a],
+             ss.k_tc[a], ss.v_tc[a], ss.tc_ring[a]};
     } else {
-        p = {k_pool_[a], v_pool_[a], k_scale_[a], v_scale_[a], k_q_[a], v_q_[a], k_q4_[a], v_q4_[a]};
+        p = {k_pool_[a], v_pool_[a], k_scale_[a], v_scale_[a], k_q_[a], v_q_[a], k_q4_[a], v_q4_[a], k_tc_[a],
+             v_tc_[a], tc_ring_[a]};
     }
     return p;
 }
@@ -2460,8 +2772,17 @@ k::QsaAttnPools PlainModel::kv_pools(size_t a, int slot) const {
     pools.v_scale = p.v_scale;
     pools.k_q4 = p.k_q4;
     pools.v_q4 = p.v_q4;
+    pools.k_tc = p.k_tc;
+    pools.v_tc = p.v_tc;
+    pools.tc_bits = opt_.kv_tcq;
+    pools.tc_ring = p.tc_ring;
+    pools.tc_ring_kv = (int) attn_shapes().n_head_kv;
     pools.page_table = table_of(a);   // the identity (a ring's for a sliding-window layer): a slot's pools have the
                                       // live session's shape
+    if (slot < 0 && kv_streamed(a)) {   // the streamed layer: the host copy and the trailing cells the ring holds
+        pools.host = kv_host_[a];
+        pools.resident = (int32_t) kv_resident_cells_;
+    }
     return pools;
 }
 
@@ -2469,13 +2790,125 @@ std::vector<PlainModel::StatePart> PlainModel::kv_planes(size_t a, int slot, siz
     const KvPtrs p = kv_ptrs(a, slot);
     const size_t HD = (size_t) attn_shapes().head_dim;
     const size_t codes = cells * HD, scales = cells * (HD / k::KV_Q8_GROUP) * 2,
-                 q4 = cells * (size_t) k::kv_q4_bytes_per_head((int) HD);
+                 q4 = cells * (size_t) k::kv_q4_bytes_per_head((int) HD),
+                 tc = cells * (size_t) k::kv_tcq_bytes_per_head((int) HD, opt_.kv_tcq);
     std::vector<StatePart> v;
-    if (p.k_pool != nullptr) v = {{p.k_pool, codes * 2, 2}, {p.v_pool, codes * 2, 2}};
+    if (p.k_tc != nullptr) {
+        v = {{p.k_tc, tc}, {p.v_tc, tc}};
+        if (p.tc_ring != nullptr)   // the whole ring and its coded bound, whatever the cells
+            v.push_back({p.tc_ring, k::kv_tcq_ring_bytes((int) HD, (int) attn_shapes().n_head_kv)});
+    }
+    else if (p.k_pool != nullptr) v = {{p.k_pool, codes * 2, 2}, {p.v_pool, codes * 2, 2}};
     else if (p.k_q4 != nullptr) v = {{p.k_q4, q4}, {p.v_q4, q4}};
     else if (p.v_q4 != nullptr) v = {{p.k_q, codes}, {p.k_scale, scales}, {p.v_q4, q4}};
     else if (p.k_q != nullptr) v = {{p.k_q, codes}, {p.v_q, codes}, {p.k_scale, scales}, {p.v_scale, scales}};
     return v;
+}
+
+std::vector<PlainModel::StatePart> PlainModel::kv_host_planes(size_t a, size_t cells) const {
+    const k::KvHostPools& h = kv_host_[a];
+    const size_t HD = (size_t) attn_shapes().head_dim;
+    const size_t codes = cells * HD, scales = cells * (HD / k::KV_Q8_GROUP) * 2,
+                 q4 = cells * (size_t) k::kv_q4_bytes_per_head((int) HD);
+    std::vector<StatePart> v;
+    if (h.k_pool != nullptr) v = {{h.k_pool, codes * 2, 2}, {h.v_pool, codes * 2, 2}};
+    else if (h.k_q4 != nullptr) v = {{h.k_q4, q4}, {h.v_q4, q4}};
+    else if (h.v_q4 != nullptr) v = {{h.k_q, codes}, {h.k_scale, scales}, {h.v_q4, q4}};
+    else if (h.k_q != nullptr) v = {{h.k_q, codes}, {h.v_q, codes}, {h.k_scale, scales}, {h.v_scale, scales}};
+    return v;
+}
+
+uint64_t PlainModel::kv_host_bytes() const {
+    const k::QsaShapes qs = attn_shapes();
+    const uint64_t HD = (uint64_t) qs.head_dim;
+    const uint64_t pairs = (uint64_t) n_pages_ * qs.n_head_kv * qs.page_size;   // one layer, the whole context
+    const uint64_t codes = pairs * HD, scales = pairs * (HD / k::KV_Q8_GROUP) * 2,
+                   q4 = pairs * (uint64_t) k::kv_q4_bytes_per_head((int) HD);
+    const uint64_t per = opt_.kv_q4 == 1 ? 2 * q4
+                       : opt_.kv_q4 == 2 ? codes + scales + q4
+                       : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
+    uint64_t layers = 0;   // the attention layers that would stream: non-recurrent, non-sliding-window, and the MTP's
+    for (int64_t l = 0; l < spec_.n_layer; ++l)
+        if (!spec_.recurrent[(size_t) l] && !spec_.layer_swa(l)) ++layers;
+    if (has_mtp_) ++layers;
+    return per * layers;
+}
+
+bool PlainModel::resolve_kv_resident(std::string& err) {
+    kv_resident_cells_ = 0;
+    if (glm_ || opt_.cpu || cpu_tail_ != nullptr || opt_.encoder || opt_.batch_slots > 0) {
+        if (opt_.kv_resident > 0 && first())
+            std::fprintf(stderr, "xestrata plain: --kv-resident is off: %s\n",
+                         glm_ ? "GLM-5.3-Flash's DSA caches stream with --kv-ram"
+                              : opt_.encoder ? "an encoder reads no decode context"
+                              : opt_.batch_slots > 0 ? "--batch" : "the CPU's forward");
+        opt_.kv_resident = 0;
+        return true;
+    }
+    if (opt_.kv_tcq != 0) {   // the trellis-coded pools have no host copy (kv_q8.hpp)
+        if (opt_.kv_resident > 0 && first())
+            std::fprintf(stderr, "xestrata plain: --kv-resident is off: the trellis-coded K/V (tcq4/tcq5) has no host copy\n");
+        opt_.kv_resident = 0;
+        return true;
+    }
+    int64_t want = opt_.kv_resident;
+    if (want == 0) return true;
+    if (want < 0) {   // auto: Qwen3.8-Flash-Next's rule (setup's kv_streaming_wanted), from the engine's own figures
+        if (opt_.max_cells < 65536) { opt_.kv_resident = 0; return true; }
+        uint64_t experts = 0;
+        if (!dense_) {
+            if (root_ == this) {   // the layout open_experts reads again (metadata only); the stages inherit it
+                std::vector<int64_t> blocks;
+                for (int64_t l = 0; l < spec_.n_layer; ++l)
+                    if (spec_.layer_routes(l)) blocks.push_back(l);
+                if (model_mtp_) blocks.push_back(spec_.n_layer);
+                if (!expert_layout_from_gguf(opt_.gguf, blocks, spec_.n_expert, spec_.n_embd, spec_.n_ff_exp, err))
+                    return false;
+            }
+            const auto& lay = k::cpu::expert_layout();
+            experts = lay.total + lay.max_blob;
+        }
+        const uint64_t need = experts + (8ull << 30) + kv_host_bytes() + (1ull << 30);   // the arena's 8 GiB beside
+        const auto avail = strata::core::available_host_bytes();
+        if (!avail || *avail < need) {
+            if (first())
+                std::fprintf(stderr, "xestrata plain: KV streaming off: the experts and the KV host copy need %.1f GiB "
+                                     "of RAM, %.1f GiB is available\n", (double) need / 1073741824.0,
+                             avail ? (double) *avail / 1073741824.0 : 0.0);
+            opt_.kv_resident = 0;
+            return true;
+        }
+        want = 32768;   // the resident cells setup's --kv-resident 32768 keeps
+    }
+    want = std::max<int64_t>(want, attn_shapes().page_size);
+    opt_.kv_resident = want;   // resolved: a layer split's stages inherit it
+    kv_resident_cells_ = want;
+    return true;
+}
+
+bool PlainModel::alloc_kv_host(size_t a, std::string& err) {
+    const k::QsaShapes qs = attn_shapes();
+    const size_t HD = (size_t) qs.head_dim;
+    const size_t pairs = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
+    const size_t codes = pairs * HD, scales = pairs * (HD / k::KV_Q8_GROUP) * 2,
+                 q4 = pairs * (size_t) k::kv_q4_bytes_per_head((int) HD);
+    k::KvHostPools h;
+    bool ok = true;
+    auto take = [&](auto*& q, size_t bytes) {
+        if (!ok) return;
+        void* hp = nullptr;
+        void* dp = nullptr;
+        if (!mapped(bytes, &hp, &dp)) { ok = false; return; }
+        allocs_.push_back(hp);   // host USM, freed in the destructor (as --kv-ram's latent)
+        q = (std::remove_reference_t<decltype(q)>) dp;
+    };
+    if (opt_.kv_q4 == 1) { take(h.k_q4, q4); take(h.v_q4, q4); }
+    else if (opt_.kv_q4 == 2) { take(h.k_q, codes); take(h.k_scale, scales); take(h.v_q4, q4); }
+    else if (opt_.kv_int8) { take(h.k_q, codes); take(h.v_q, codes); take(h.k_scale, scales); take(h.v_scale, scales); }
+    else { take(h.k_pool, codes * 2); take(h.v_pool, codes * 2); }
+    if (!ok) { err = "plain model: no RAM for the streamed K/V host copy"; return false; }
+    kv_host_[a] = h;
+    return true;
 }
 
 bool PlainModel::alloc_kv(KvPtrs& p, size_t cells, bool vmm) {
@@ -2497,7 +2930,17 @@ bool PlainModel::alloc_kv(KvPtrs& p, size_t cells, bool vmm) {
         allocs_.push_back(q);
         return true;
     };
-    if (opt_.kv_q4 == 1) {
+    if (opt_.kv_tcq != 0) {
+        const size_t tc = cells * (size_t) k::kv_tcq_bytes_per_head((int) HD, opt_.kv_tcq);
+        take(p.k_tc, tc);
+        take(p.v_tc, tc);
+        // the ring outside --kv-grow's mapping (which follows the cells): small and read by position
+        const size_t ring = k::kv_tcq_ring_bytes((int) HD, (int) attn_shapes().n_head_kv);
+        if (ok && tcq_defer_) {
+            if (!strata::gpu::alloc_device(&p.tc_ring, ring) || !strata::gpu::memset(p.tc_ring, 0, ring)) return false;
+            allocs_.push_back(p.tc_ring);
+        }
+    } else if (opt_.kv_q4 == 1) {
         take(p.k_q4, q4);
         take(p.v_q4, q4);
     } else if (opt_.kv_q4 == 2) {
@@ -2592,26 +3035,62 @@ bool PlainModel::kv_trim(int64_t cells, int64_t hold, std::string& err) {
 }
 
 void PlainModel::kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
-                                 strata::gpu::Stream cs) {
+                                 strata::gpu::Stream cs, const k::KvHostPools* stage) {
     const KvPtrs p = kv_ptrs(a, slot);
     const k::QsaShapes qs = attn_shapes();
     const int row = (int) (qs.n_head_kv * qs.head_dim);
-    if (p.k_q4 != nullptr) {
-        k::kv_append_q4_steps(p.k_q4, p.v_q4, table_of(a), steps, k::kStepCount, n, kc, vc, qs, cs);
-    } else if (p.v_q4 != nullptr) {   // K8V4: K's INT8 codes and scales (one plane), V's Q4_0 (one plane)
-        k::kv_append_q8_steps(p.k_q, p.k_q, p.k_scale, p.k_scale, table_of(a), steps, k::kStepCount, kc, kc, row, n, qs,
-                              cs);
-        k::kv_append_q4_steps(p.v_q4, p.v_q4, table_of(a), steps, k::kStepCount, n, vc, vc, qs, cs);
-    } else if (n == 1) {   // a window's row (the one-cell kernels the windows always took)
-        if (p.k_q != nullptr)
-            k::kv_append_q8_step(p.k_q, p.v_q, p.k_scale, p.v_scale, table_of(a), steps, kc, vc, qs, cs);
-        else
-            k::kv_append_step(p.k_pool, p.v_pool, table_of(a), steps, kc, vc, qs, cs);
-    } else if (p.k_q != nullptr) {
-        k::kv_append_q8_steps(p.k_q, p.v_q, p.k_scale, p.v_scale, table_of(a), steps, k::kStepCount, kc, vc, row, n, qs,
-                              cs);
-    } else {
-        k::kv_append_steps(p.k_pool, p.v_pool, table_of(a), steps, k::kStepCount, kc, vc, row, n, qs, cs);
+    // --kv-resident: the host copy gets every cell (the identity layout), the VRAM ring its resident pages, and the
+    // prompt's staging pool its copy; the one shared append (kv_q8.hpp), so the cells are bit for bit a fully
+    // resident layer's (the individual kv_append_* are its wrappers).  The trellis-coded pools have no host copy.
+    const bool streamed = slot < 0 && kv_streamed(a);
+    const k::KvHostPools host = streamed ? kv_host_[a] : k::KvHostPools{};
+    auto base = [&]() {
+        k::KvAppend ap;
+        ap.step = steps; ap.step_stride = k::kStepCount; ap.cur_stride = row; ap.n_tok = n;
+        ap.page_table = table_of(a);
+        ap.k_pool = p.k_pool; ap.v_pool = p.v_pool;
+        ap.k_q = p.k_q; ap.v_q = p.v_q; ap.k_scale = p.k_scale; ap.v_scale = p.v_scale;
+        ap.k_q4 = p.k_q4; ap.v_q4 = p.v_q4;
+        return ap;
+    };
+    if (p.k_tc != nullptr) {   // trellis-coded (Y5): no host copy, the ring and the codebook on the device
+        k::KvAppend ka;
+        ka.step = steps;
+        ka.step_stride = k::kStepCount;
+        ka.k = kc;
+        ka.v = vc;
+        ka.cur_stride = row;
+        ka.n_tok = n;
+        ka.k_tc = p.k_tc;
+        ka.v_tc = p.v_tc;
+        ka.tc_bits = opt_.kv_tcq;
+        ka.tc_ring = p.tc_ring;
+        ka.page_table = table_of(a);
+        k::kv_append_cells(ka, qs, cs);
+    } else if (p.k_q4 != nullptr) {   // Q4_0 (rotated)
+        k::KvAppend ap = base();
+        ap.k = kc; ap.v = vc;
+        ap.host = streamed ? &host : nullptr; ap.stage = stage;
+        k::kv_append_cells(ap, qs, cs);
+    } else if (p.v_q4 != nullptr) {   // K8V4: K's INT8 half, V's Q4_0 half (the folded calls, as Qwen3.8's prompt)
+        const k::KvHostPools hk = k::kv_hybrid_k_half(host), hv = k::kv_hybrid_v_half(host);
+        const k::KvHostPools sk = stage ? k::kv_hybrid_k_half(*stage) : k::KvHostPools{};
+        const k::KvHostPools sv = stage ? k::kv_hybrid_v_half(*stage) : k::KvHostPools{};
+        k::KvAppend ak = base();
+        ak.k = kc; ak.v = kc; ak.k_q = p.k_q; ak.v_q = p.k_q; ak.k_scale = p.k_scale; ak.v_scale = p.k_scale;
+        ak.k_q4 = nullptr; ak.v_q4 = nullptr;
+        ak.host = streamed ? &hk : nullptr; ak.stage = stage ? &sk : nullptr;
+        k::kv_append_cells(ak, qs, cs);
+        k::KvAppend av = base();
+        av.k = vc; av.v = vc; av.k_q4 = p.v_q4; av.v_q4 = p.v_q4;
+        av.k_q = nullptr; av.v_q = nullptr; av.k_scale = nullptr; av.v_scale = nullptr;
+        av.host = streamed ? &hv : nullptr; av.stage = stage ? &sv : nullptr;
+        k::kv_append_cells(av, qs, cs);
+    } else {   // FP16 or INT8
+        k::KvAppend ap = base();
+        ap.k = kc; ap.v = vc;
+        ap.host = streamed ? &host : nullptr; ap.stage = stage;
+        k::kv_append_cells(ap, qs, cs);
     }
 }
 
@@ -3100,6 +3579,10 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens, bool 
             continue;
         }
         if (recurrent_only) continue;
+        if (slot < 0 && kv_streamed(a)) {   // the authoritative host copy (the identity layout), not the VRAM ring
+            for (const StatePart& p : kv_host_planes(a, cells)) parts.push_back(p);
+            continue;
+        }
         for (const StatePart& p : kv_planes(a, slot, cells)) parts.push_back(p);
     }
     return parts;
@@ -3251,7 +3734,7 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
         ss.conv_snap.assign(snaps ? gdn_conv_.size() : 0, nullptr);
         for (auto* v : {&ss.k_pool, &ss.v_pool, &ss.k_scale, &ss.v_scale}) v->assign(k_pool_.size(), nullptr);
         for (auto* v : {&ss.k_q, &ss.v_q}) v->assign(k_pool_.size(), nullptr);
-        for (auto* v : {&ss.k_q4, &ss.v_q4}) v->assign(k_pool_.size(), nullptr);
+        for (auto* v : {&ss.k_q4, &ss.v_q4, &ss.k_tc, &ss.v_tc, &ss.tc_ring}) v->assign(k_pool_.size(), nullptr);
         bool ok = true;
         auto take = [&](auto*& p, size_t bytes) {
             if (!ok || !strata::gpu::alloc_device(&p, bytes) || !strata::gpu::memset(p, 0, bytes)) return ok = false;
@@ -3279,6 +3762,9 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
             ss.v_q[a] = p.v_q;
             ss.k_q4[a] = p.k_q4;
             ss.v_q4[a] = p.v_q4;
+            ss.k_tc[a] = p.k_tc;
+            ss.v_tc[a] = p.v_tc;
+            ss.tc_ring[a] = p.tc_ring;
         }
         if (!ok) break;   // what this slot took stays in allocs_ (freed with the model)
         bslots_.push_back(std::move(ss));
@@ -3357,6 +3843,17 @@ bool PlainModel::restore_parts(const Snapshot& snap, bool recurrent_only, std::s
         // the rings hold the window before the state's tokens, and nothing older
         st->ring_end_ = snap.tokens;
         st->ring_from_ = std::max<int64_t>(0, snap.tokens - spec_.swa_window);
+        if (!recurrent_only && st->kv_stream_slots_ > 0) {   // refill the streamed layers' ring from the host copy
+            const k::QsaShapes qs = st->attn_shapes();
+            const int64_t pages = (snap.tokens + qs.page_size - 1) / qs.page_size;
+            const int64_t b0 = std::max<int64_t>(0, pages - st->kv_stream_slots_);
+            const int fmt = st->opt_.kv_q4 == 1 ? k::kKvQ4 : st->opt_.kv_q4 == 2 ? k::kKvHybrid
+                          : st->opt_.kv_int8 ? k::kKvInt8 : k::kKvF16;
+            for (size_t a = 0; a < st->k_pool_.size(); ++a)
+                if (st->kv_streamed(a))
+                    k::kv_ring_restore(st->kv_pools(a), st->kv_host_[a], fmt, b0, pages, st->kv_stream_slots_, qs,
+                                       st->cs_);
+        }
     }
     return true;
 }
@@ -3380,9 +3877,14 @@ bool PlainModel::reset(std::string& err) {
     // (--kv-grow: the cells mapped)
     const size_t live = kv_cells_ < 0 ? cells
                                       : (size_t) ((kv_cells_ + qs.page_size - 1) / qs.page_size * qs.n_head_kv * qs.page_size);
-    for (size_t i = 0; i < k_pool_.size(); ++i)
-        for (const StatePart& p : kv_planes(i, -1, ringed(i) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : live))
+    for (size_t i = 0; i < k_pool_.size(); ++i) {
+        // a streamed layer's VRAM is the ring (the host copy keeps its cells: a fresh sequence reads only below its
+        // own count, and the appends overwrite them); a sliding-window layer's ring; the rest the mapped cells
+        const size_t n = kv_streamed(i) ? (size_t) (kv_stream_slots_ * qs.n_head_kv * qs.page_size)
+                       : ringed(i) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : live;
+        for (const StatePart& p : kv_planes(i, -1, n))
             ok = ok && strata::gpu::memset(p.dev, 0, p.bytes);
+    }
     ring_end_ = ring_from_ = 0;
     cur_ = -1;
     drafts_.clear();
@@ -3520,8 +4022,13 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
                                     (int) s.rope_dims, eps, rs, pos_q, cs);
         k::native_qsa_rms_norm_rope(kr, (int) HD, b.k_norm, kcur_, (int) (T * NKV), (int) HD,
                                     (int) s.rope_dims, eps, rs, pos_k, cs);
-        // --kv q4_0: K, V and the queries rotated (kv_q4.hpp); k8v4: V alone; the output back below
-        if (opt_.kv_q4 == 1) {
+        // --kv q4_0: K, V and the queries rotated (kv_q4.hpp); k8v4: V alone; tcq4/5: all three with the signs
+        // (kv_tcq.hpp); the output back below
+        if (opt_.kv_tcq != 0) {
+            k::fwht256_signed(kcur_, (int64_t) T * NKV, false, cs);
+            k::fwht256_signed(vc, (int64_t) T * NKV, false, cs);
+            k::fwht256_signed(qcur_, (int64_t) T * NH, false, cs);
+        } else if (opt_.kv_q4 == 1) {
             k::fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
             k::fwht256_inplace_cuda(vc, (int64_t) T * NKV, cs);
             k::fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
@@ -3539,7 +4046,8 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         else
             k::qsa_dense_attn_batch(qcur_, kv_pools((size_t) a), step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs,
                                     window_of(b));
-        if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+        if (opt_.kv_tcq != 0) k::fwht256_signed(attn_, (int64_t) T * NH, true, cs);
+        else if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         if (has_gate_) {
             k::native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
             proj(b.o, attn32_, mix_, T, true);
@@ -3822,6 +4330,28 @@ uint64_t PlainModel::release_mtp(bool keep_head) {
     dprob_.clear();
     strata::gpu::mem_info(&fb1, &tb);
     return fb1 > fb0 ? (uint64_t) (fb1 - fb0) : 0;
+}
+
+// the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last; every model's load
+bool PlainModel::setup_taps(std::string& err) {
+    const ModelSpec& s = spec_;
+    tap_local_.clear();
+    tap_slot_.assign((size_t) s.n_layer, -1);
+    for (int l : tap_req_)
+        if (l >= lb_ && l < le_ && l < s.n_layer - 1) {
+            tap_slot_[(size_t) l] = (int) tap_local_.size();
+            tap_local_.push_back(l);
+        }
+    if (!tap_local_.empty() && tap_dev_ == nullptr &&
+        !strata::gpu::alloc_device(&tap_dev_, (size_t) opt_.max_t * tap_local_.size() * s.n_embd * 4)) {
+        err = "plain model: the DFlash2 tap staging does not fit";
+        return false;
+    }
+    return true;
+}
+
+const strata::kernels::YsknDev* PlainModel::yskn_draft_head() const {
+    return tail().head_.yk;
 }
 
 PlainModel::HeadView PlainModel::draft_head_view() const {
@@ -4545,18 +5075,31 @@ bool PlainModel::stage_slots(const int32_t* tokens, const int* slot, const int64
                 return false;
             }
         }
+        std::vector<k::SamplerParams> params(sp, sp + T);
         for (int t = 0; t < T; ++t) {
-            k::SamplerParams p = sp[t];
+            auto& p = params[(size_t) t];
             p.counter = (uint64_t) pos[t];
             const int b = slot[t];
             const bool pen = h > 0 && penalised(p);
             const bool bias = b >= 0 && b < (int) slot_bias_on_.size() && slot_bias_on_[(size_t) b] != 0;
             if (bias) p.logit_bias = slot_bias_dev_[(size_t) b];
-            if (!pen) p.penalty_last_n = 0;   // no history handed to this row: nothing for it to count
-            k::sample_tokens(logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
-                             pen ? slot_hist_dev_ + (size_t) t * (size_t) h : nullptr, pen ? h : 0, p, m_out_ + t,
-                             cs_);
+            if (!pen) p.penalty_last_n = 0;
         }
+        if (slot_params_cap_ < (size_t) T) {
+            k::SamplerParams* d = nullptr;
+            if (!strata::gpu::alloc_device(&d, (size_t) T * sizeof(params[0]))) {
+                err = std::string("plain model: the slots' sampler parameters: ") + strata::gpu::last_error();
+                return false;
+            }
+            allocs_.push_back(d);
+            slot_params_dev_ = d;
+            slot_params_cap_ = (size_t) T;
+        }
+        if (!strata::gpu::copy(slot_params_dev_, params.data(), (size_t) T * sizeof(params[0]))) {
+            err = std::string("plain model: the slots' sampler parameters: ") + strata::gpu::last_error();
+            return false;
+        }
+        k::sample_token_rows(logits_, T, (int) n_vocab_, h ? slot_hist_dev_ : nullptr, h, slot_params_dev_, m_out_, cs_);
     }
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("plain model: the batch window: ") + strata::gpu::last_error();
@@ -4780,6 +5323,28 @@ bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err, bool n
     return pipelined_spec() ? pl_chain(pos + 1, err) : mtp_chain(n_mtp_, pos + 1, err);
 }
 
+bool PlainModel::write_window_hash(int64_t index, int64_t pos, int T, const int32_t* argmax, std::string& err) {
+    if (opt_.window_hashes.empty()) return true;
+    if (hash_file_ == nullptr) {
+        hash_file_ = std::fopen(opt_.window_hashes.c_str(), "w");
+        if (hash_file_ == nullptr) {
+            err = "plain model: --window-hashes: cannot write " + opt_.window_hashes;
+            return false;
+        }
+    }
+    PlainModel& t = tail();
+    const OnDevice on(t.dev_);   // the window's final normed rows (the head's input), after forward's stream sync
+    const size_t n_floats = (size_t) T * (size_t) spec_.n_embd;
+    std::vector<float> rows(n_floats);
+    if (!strata::gpu::copy(rows.data(), t.hn_, n_floats * sizeof(float))) {
+        err = std::string("plain model: --window-hashes: ") + strata::gpu::last_error();
+        return false;
+    }
+    const uint64_t h = strata::spec::window_hash_fnv1a(rows.data(), n_floats * sizeof(float));
+    strata::spec::window_hash_line(hash_file_, index, pos, T, h, argmax, T);
+    return true;
+}
+
 bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
                            std::string& err, const int32_t* follow, const int32_t* ext, int n_ext, int match,
                            bool ext_only) {
@@ -4836,6 +5401,8 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     if (!root_->forward(win, T, cur_pos_, out, logits, err, true)) return false;
     const auto t1 = std::chrono::steady_clock::now();
     spec_ms_check_ += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    // --window-hashes: the window's own picks (before --spec-follow stands in for them), as generate.cpp writes them
+    if (!write_window_hash(spec_windows_, cur_pos_, T, out, err)) return false;
     if (follow != nullptr)   // --spec-follow: the continuation in place of the window's picks
         for (int j = 0; j < T; ++j) out[j] = follow[j];
     // accepted: the drafts the window's own picks agree with, up to the first stop token among the emitted

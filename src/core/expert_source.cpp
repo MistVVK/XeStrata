@@ -18,6 +18,8 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
+#include "strata/kernels/cpu/latent_rows.hpp"
+#include "strata/core/latent.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
@@ -2997,6 +2999,130 @@ void expert_pool_count(ExpertDispatch& d, const int32_t* ids, int64_t n_tok, int
     }
 }
 
+// ---- latent MoE: the CPU share's expert arithmetic (Edge0).  The window's D stage ran on the GPU; its rows
+// (f32 and their Q8_0 image) are in mapped memory behind the xlseq doorbell.  Per CPU entry: the A blob on the
+// pool's native row phases (the activation is the D row of the entry's token and group), then h's q8_1 image.
+// The U either goes to the GPU (the hq rows into the mapped out buffer, XESTRATA_LATENT_U_GPU) or runs here on
+// the pool's workers.  Written after edge0-strata's latent_cpu_run, without its diagnostics.
+static void latent_cpu_run(ExpertDispatch& d, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
+                           float* out) {
+    using namespace strata::kernels::cpu;
+    const int64_t l = d.layers;
+    const NativeFmt& f = expert_layout().fmt[(size_t) l];
+    const int64_t ELL = d.lat_ELL, H = d.lat_H;
+    const int G = d.lat_G, E = d.lat_E;
+    const int32_t* labels = d.lat_labels + (size_t) l * (size_t) E;
+    const size_t hq_row = (size_t) (ELL / 32) * 36;
+    static thread_local std::vector<int64_t> ent_i;
+    static thread_local std::vector<int> ent_t, ent_e, ent_g;
+    ent_i.clear(); ent_t.clear(); ent_e.clear(); ent_g.clear();
+    for (int64_t i = 0; i < n_tok * k; ++i) {
+        if (kind[i] != -1) continue;
+        const int32_t e = ids[i];
+        if (e < 0 || e >= E) {
+            d.failed = true; d.fail = "a routed expert id is out of range"; d.fail_layer = l; d.fail_expert = e;
+            return;
+        }
+        const int g = labels[e];
+        if (g < 0 || g >= G) {
+            d.failed = true; d.fail = "latent: a bad group label"; d.fail_layer = l; d.fail_expert = e;
+            return;
+        }
+        ent_i.push_back(i); ent_t.push_back((int) (i / k)); ent_e.push_back(e); ent_g.push_back(g);
+    }
+    if (ent_t.empty()) return;
+    if (d.lat_xlseq != nullptr) {   // the D stage's doorbell: layer l's rows are in when it reaches l + 1
+        const uint32_t want = (uint32_t) (l + 1);
+        const auto t0 = std::chrono::steady_clock::now();
+        while (*(volatile const uint32_t*) d.lat_xlseq < want) {
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > 20000.0) {
+                d.failed = true; d.fail = "latent CPU share: the D rows never arrived for this layer";
+                d.fail_layer = l;
+                return;
+            }
+            std::this_thread::yield();
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    const float* xl = d.lat_xl;
+    if (xl == nullptr) {
+        d.failed = true; d.fail = "latent CPU share: no D result for this window"; d.fail_layer = l;
+        return;
+    }
+    // the activations: the GPU-made Q8_0 rows where the layer's own activation format is Q8_0; a Q3_K layer
+    // reads Q8_K (292 B a 256), which the host quantizes from the f32 rows - the GPU rows are Q8_0 only, and
+    // misreading them would bleed the row stride into the next row
+    NativeFmt f_nr = f;
+    f_nr.had_gu = false;   // no rotation: the D output is the blob's own basis
+    const size_t act_row = f.act_bytes;
+    const size_t act_q8_0_row = (size_t) (ELL / 32) * 34;
+    const bool act_gpu = d.lat_act0 != nullptr && act_row == act_q8_0_row;
+    static thread_local std::vector<uint8_t> act;
+    act.assign(ent_t.size() * act_row, 0);
+    if (act_gpu) {
+        for (size_t j = 0; j < ent_t.size(); ++j)
+            std::memcpy(act.data() + j * act_row, d.lat_act0 + ((size_t) ent_t[j] * G + ent_g[j]) * act_row, act_row);
+    } else {
+        for (size_t j = 0; j < ent_t.size(); ++j)
+            native_quant_act(f_nr, xl + ((size_t) ent_t[j] * G + ent_g[j]) * ELL, act.data() + j * act_row);
+    }
+    // A: one job per expert, its entries together, on the pool's native row phases
+    static thread_local std::vector<float> lh;
+    static thread_local std::vector<ExpertJobMulti> jobs;
+    static thread_local std::vector<char> taken;
+    lh.assign(ent_t.size() * (size_t) ELL, 0.f);
+    jobs.clear();
+    taken.assign(ent_t.size(), 0);
+    for (size_t i0 = 0; i0 < ent_t.size(); ++i0) {
+        if (taken[i0]) continue;
+        const int e = ent_e[i0];
+        ExpertJobMulti jb{};
+        jb.blob = d.src->blob(l, e);
+        if (jb.blob == nullptr) {
+            d.failed = true; d.fail = "the expert source could not produce a blob"; d.fail_layer = l;
+            d.fail_expert = e; ++d.missing;
+            return;
+        }
+        for (size_t i = i0; i < ent_t.size() && jb.nt < MAXT; ++i) {
+            if (taken[i] || ent_e[i] != e) continue;
+            taken[i] = 1;
+            jb.nact[jb.nt] = act.data() + i * act_row;
+            jb.out[jb.nt] = lh.data() + i * (size_t) ELL;
+            ++jb.nt;
+        }
+        jobs.push_back(jb);
+    }
+    d.pool->run_split_multi_native(f_nr, jobs.data(), (int) jobs.size());
+    // h -> q8_1 (the engine's rule, the same bits the GPU's quantize_q8_1_rows writes)
+    static thread_local std::vector<uint8_t> hq;
+    hq.resize(ent_t.size() * hq_row);
+    for (size_t j = 0; j < ent_t.size(); ++j)
+        latent_quant_q8_1_rows(lh.data() + j * (size_t) ELL, 1, ELL, hq.data() + j * hq_row);
+    if (d.lat_u_gpu) {
+        // the GPU computes U from these rows: the mapped out buffer holds them in routing order; a skipped
+        // entry's row is zero (its U product is zero), the GPU's own rows' hq is not read
+        uint8_t* lhq = reinterpret_cast<uint8_t*>(out);
+        std::memset(lhq, 0, (size_t) n_tok * k * hq_row);
+        for (size_t j = 0; j < ent_t.size(); ++j)
+            std::memcpy(lhq + (size_t) ent_i[j] * hq_row, hq.data() + j * hq_row, hq_row);
+        d.multi_entries += (int64_t) ent_t.size();
+        return;
+    }
+    // U on the pool's workers: one entry a task, its group's H rows against its q8_1 row of h
+    if (d.lat_dense == nullptr) {
+        d.failed = true; d.fail = "latent CPU share: no D/U file for the CPU U"; d.fail_layer = l;
+        return;
+    }
+    const uint8_t* U = d.lat_dense->u(l);
+    const size_t u_row = d.lat_dense->u_row_bytes();
+    const int fmt = d.lat_fmt;
+    d.pool->run((int) ent_t.size(), [&](int j) {
+        latent_u_row(U + (size_t) ent_g[j] * H * u_row, (int) H, (int) ELL, fmt, hq.data() + j * hq_row,
+                     out + (size_t) ent_i[j] * H);
+    });
+    d.multi_entries += (int64_t) ent_t.size();
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -3242,6 +3368,42 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }();
     const bool gpu_zeroes_hits = d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan;
     const bool any_cpu = std::any_of(kind, kind + n, [](int32_t v) { return v == -1; });   // -2: skipped, no work
+    // ---- the latent MoE (Edge0): the CPU share runs the A blobs over the window's D rows (the GPU computed D
+    // and published them through the doorbell), then the U on the GPU from its q8_1 rows of h, or here.
+    if (d.latent && any_cpu) {
+        if (d.remote_count > 0) {
+            d.failed = true; d.fail = "the latent MoE does not support helper GPUs"; d.fail_layer = d.layers;
+            return;
+        }
+        static thread_local std::vector<int64_t> lmiss;
+        static thread_local std::vector<uint8_t> lmiss_mark;
+        lmiss.clear();
+        if (lmiss_mark.size() < (size_t) d.n_expert) lmiss_mark.assign((size_t) d.n_expert, 0);
+        for (int64_t i = 0; i < n; ++i)
+            if (kind[i] == -1) {
+                const int32_t e = ids[i];
+                if (e < 0 || e >= d.n_expert || lmiss_mark[(size_t) e]) continue;
+                lmiss_mark[(size_t) e] = 1;
+                lmiss.push_back(e);
+            }
+        if (!lmiss.empty()) d.src->prefetch(d.layers, lmiss.data(), (int64_t) lmiss.size());
+        for (const int64_t e : lmiss) lmiss_mark[(size_t) e] = 0;
+        if (!d.lat_u_gpu) {   // the H-wide rows: a skipped entry contributes zero, the GPU's rows are zeroed here
+            for (int64_t i = 0; i < n; ++i)
+                if (kind[i] == -2 || kind[i] >= 0)
+                    std::memset(out + (size_t) i * d.lat_H, 0, (size_t) d.lat_H * sizeof(float));
+        }
+        latent_cpu_run(d, ids, n_tok, k, kind, out);
+        if (d.failed) return;
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t e = ids[i];
+            if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
+        }
+        d.multi_misses += (int64_t) lmiss.size();
+        ++d.layers;
+        d.experts += n_tok * k;
+        return;
+    }
     const auto c1 = std::chrono::steady_clock::now();
     if (!any_cpu) {
     } else if (native) {

@@ -16,6 +16,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "kv_tcq_parts.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/timed_choice.hpp"
 #include "strata/core/runtime.hpp"
@@ -114,14 +115,31 @@ inline int head_of_lane(int lane) {
     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
 }
 
+// The host copy (KV streaming) as attention pools: the same fields, so the loads below read it with the one code
+// path. Its page table is unused (the host row is the identity layout, computed where the cell is mapped).
+inline QsaAttnPools host_pools(const KvHostPools& h) {
+    QsaAttnPools p;
+    p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q;
+    p.k_scale = h.k_scale; p.v_scale = h.v_scale; p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+    return p;
+}
+
 // One V element of pool row `row`, dimension `d` (the value loop's own work-item), per KV format.
+// tab: the trellis code's codebook in local memory (KV_MODE 4; the kernel fills it), else null
 template <int HD, int KV_MODE>
-inline float load_v1(const QsaAttnPools& p, long long row, int d) {
+inline float load_v1(const QsaAttnPools& p, long long row, int d, const float* tab, int ring) {
     if constexpr (KV_MODE == 0) {
         return h2f(p.v_pool[row * HD + d]);
     } else if constexpr (KV_MODE == 1) {
         const float sc = h2f(p.v_scale[row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP]);
         return (float) p.v_q[row * HD + d] * sc;
+    } else if constexpr (KV_MODE == 4) {   // trellis-coded, rotated (kv_tcq.hpp); the caller rotates the output back
+        if (ring >= 0) {   // a cell not coded yet: the ring's INT8 (V's plane, ring + kTcqRing x the KV heads)
+            const int8_t* c = tcq::ring_codes(p.tc_ring, ring, HD);
+            return (float) c[d] * h2f(tcq::ring_scales(p.tc_ring, ring, HD, p.tc_ring_kv)[d / 64]);
+        }
+        const int bits = p.tc_bits;
+        return tcq::value(p.v_tc + row * (long long) tcq::row_bytes(HD, bits), HD, bits, d, tab);
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;
@@ -136,14 +154,25 @@ inline float load_v1(const QsaAttnPools& p, long long row, int d) {
 }
 
 // N = HD / 32 consecutive values of one cell's key or value row, dimensions [d0, d0+N).  KV_MODE 0: FP16, 1: INT8,
-// 2: rotated Q4_0, 3: the hybrid K8V4 (K as INT8, V as rotated Q4_0; upstream 2aa8f72).  N divides 16, so the run
-// stays inside one Q4_0 half (the low nibbles hold elements 0-15 of a block, the high ones 16-31).
+// 2: rotated Q4_0, 3: the hybrid K8V4 (K as INT8, V as rotated Q4_0; upstream 2aa8f72), 4: trellis-coded K and V
+// (kv_tcq.hpp).  N divides 16, so the run stays inside one Q4_0 half (the low nibbles hold elements 0-15 of a block,
+// the high ones 16-31) and inside one chain of the trellis code.
 template <int HD, int KV_MODE>
-inline void loadn(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
+inline void loadn(const QsaAttnPools& p, bool value, long long row, int d0, float* out, const float* tab, int ring) {
     constexpr int N = HD / WARP;
-    if constexpr (KV_MODE == 3) {
-        if (value) loadn<HD, 2>(p, true, row, d0, out);
-        else loadn<HD, 1>(p, false, row, d0, out);
+    if constexpr (KV_MODE == 4) {
+        if (ring >= 0) {   // a cell not coded yet: the ring's INT8 (K's plane)
+            const int8_t* c = tcq::ring_codes(p.tc_ring, ring, HD) + d0;
+            const float sc = h2f(tcq::ring_scales(p.tc_ring, ring, HD, p.tc_ring_kv)[d0 / 64]);
+            for (int j = 0; j < N; ++j) out[j] = (float) c[j] * sc;
+            return;
+        }
+        const int bits = p.tc_bits;
+        tcq::values<N>((value ? p.v_tc : p.k_tc) + row * (long long) tcq::row_bytes(HD, bits), HD, bits,
+                       d0, out, tab);
+    } else if constexpr (KV_MODE == 3) {
+        if (value) loadn<HD, 2>(p, true, row, d0, out, tab, ring);
+        else loadn<HD, 1>(p, false, row, d0, out, tab, ring);
     } else if constexpr (KV_MODE == 0) {
         const uint16_t* base = (value ? p.v_pool : p.k_pool) + row * HD + d0;
         for (int j = 0; j < N; ++j) out[j] = h2f(base[j]);
@@ -197,9 +226,13 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
     const bool dense = ids_all == nullptr;
     return queue.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sq(sycl::range<1>(G * HD), hd);          // this KV head's query heads
+        sycl::local_accessor<float, 1> stab(sycl::range<1>(KV_MODE == 4 ? 256 : 1), hd);   // the trellis codebook
         sycl::local_accessor<float, 1> sp(sycl::range<1>((size_t) G * CHUNK), hd);       // scores
         sycl::local_accessor<sycl::float4, 1> spt(sycl::range<1>(CHUNK * GP / 4), hd);  // probabilities, cell-major
         sycl::local_accessor<long long, 1> srow(sycl::range<1>(CHUNK), hd);     // pool row of each cell
+        // KV_MODE 4, deferred coding: each cell's K row in the ring (a cell not coded yet), else -1
+        sycl::local_accessor<int, 1> sring(sycl::range<1>(KV_MODE == 4 ? CHUNK : 1), hd);
+        sycl::local_accessor<int, 1> shost(sycl::range<1>(CHUNK), hd);         // 1: the cell's row is in the host copy
         sycl::local_accessor<float, 1> sml(sycl::range<1>(2 * G), hd);           // a chunk's max and sum per head
         hd.parallel_for(sycl::nd_range<3>({n_q, (size_t) n_kv_heads, (size_t) n_slots * THREADS}, {1, 1, THREADS}),
                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -212,6 +245,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 if constexpr (ROWS) return rows.p[z];
                 else return pools;
             }();
+            const QsaAttnPools hp = host_pools(p.host);   // the host copy as pools (streamed dense attention)
             const float* q = q_all + z * (size_t) (n_kv_heads * G) * HD;
             const int32_t* ids = dense ? nullptr : ids_all + z * (size_t) cap;
             const int32_t* step = step_all + z * kStepCount;
@@ -234,6 +268,19 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 return;
             }
             for (int i = t; i < G * HD; i += THREADS) sq[i] = q[(size_t) (kvh * G) * HD + i];
+            // the codebook's values over 256 (a code's value is it times the row's scale): a value read from local
+            // memory, not a gather from the constant table, in the loops below (the barrier after srow orders it)
+            if constexpr (KV_MODE == 4)
+                for (int i = t; i < 256; i += THREADS) stab[i] = (float) tcq::code_of(p.tc_bits, i) * (1.0f / 256.0f);
+            const float* tab = KV_MODE == 4 ? &stab[0] : nullptr;
+            // the cells below `coded` are trellis-coded, the rest still in the ring (kv_tcq.hpp); V's rows follow K's
+            const int coded =
+                KV_MODE == 4 && p.tc_ring != nullptr ? tcq::ring_coded(p.tc_ring, HD, p.tc_ring_kv) : 1 << 30;
+            const int v_ring = kTcqRing * p.tc_ring_kv;
+            const auto ring_of = [&](int c) -> int {
+                if constexpr (KV_MODE == 4) return sring[c];
+                else return -1;
+            };
             // chunks first, first + n_slots, ... in turn, each folded into the running max, sum and values (online
             // softmax); with one chunk a slot (n_slots the chunks) these are the chunk's own, as before
             float run_m[G], run_l[G], run_acc[G];
@@ -243,14 +290,25 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 const int n_here = sycl::min(csz, n_ids - c0);
                 if (t < CHUNK) {
                     long long r = -1;
+                    int rr = -1;
+                    int host = 0;
                     if (t < n_here) {
                         const int cell = dense ? lo + c0 + t : ids[c0 + t];
-                        const long long page = (long long) p.page_table[cell / page_size];
-                        // a block the KV streaming could not make resident keeps page -1; its cells are masked (score
-                        // -FLT_MAX, weight 0) instead of being read from before the pool (upstream f3925cf)
-                        if (page >= 0) r = (page * n_kv_real + kv_real) * page_size + (cell % page_size);
+                        if (dense && p.host.present() && cell < n_all - p.resident) {
+                            // the host copy, identity layout: block cell / page_size, its own KV head's run
+                            r = ((long long) (cell / page_size) * n_kv_real + kv_real) * page_size + (cell % page_size);
+                            host = 1;
+                        } else {
+                            const long long page = (long long) p.page_table[cell / page_size];
+                            // a block the KV streaming could not make resident keeps page -1; its cells are masked (score
+                            // -FLT_MAX, weight 0) instead of being read from before the pool (upstream f3925cf)
+                            if (page >= 0) r = (page * n_kv_real + kv_real) * page_size + (cell % page_size);
+                        }
+                        if (!host && cell >= coded) rr = tcq::ring_row(0, cell % kTcqRing, kv_real, p.tc_ring_kv);
                     }
                     srow[t] = r;
+                    if constexpr (KV_MODE == 4) sring[t] = rr;
+                    shost[t] = host;
                 }
                 sycl::group_barrier(grp);
                 if constexpr (PERCELL) {
@@ -261,7 +319,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                         if (t < n_here && srow[t] >= 0) {
                             for (int d = 0; d < HD; d += N) {
                                 float key[N];
-                                loadn<HD, KV_MODE>(p, false, srow[t], d, key);
+                                loadn<HD, KV_MODE>(shost[t] ? hp : p, false, srow[t], d, key, tab, ring_of(t));
                                 for (int h = 0; h < G; ++h) sums[h] += dotn<N>(key, &sq[h * HD + d]);
                             }
                         }
@@ -283,7 +341,8 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                     }
                     if (all_ok) {
                         float kk[NC][N];
-                        for (int j = 0; j < NC; ++j) loadn<HD, KV_MODE>(p, false, srow[cc[j]], lane * N, kk[j]);
+                        for (int j = 0; j < NC; ++j)
+                            loadn<HD, KV_MODE>(shost[cc[j]] ? hp : p, false, srow[cc[j]], lane * N, kk[j], tab, ring_of(cc[j]));
                         constexpr int HP = G <= 4 ? 4 : 16;   // the heads reduce4 or reduce12 sums
                         float pp[NC][HP];
     #pragma unroll
@@ -313,7 +372,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                                 continue;
                             }
                             float kn[N];
-                            loadn<HD, KV_MODE>(p, false, srow[c], lane * N, kn);
+                            loadn<HD, KV_MODE>(shost[c] ? hp : p, false, srow[c], lane * N, kn, tab, ring_of(c));
                             constexpr int HP = G <= 4 ? 4 : 16;
                             float part[HP];
                             for (int h = 0; h < G; ++h) part[h] = dotn<N>(kn, &sq[h * HD + lane * N]);
@@ -376,8 +435,11 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 for (; c + 4 <= n_here; c += 4) {
                     const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
                     if ((r0 | r1 | r2 | r3) < 0) break;
-                    const float v0 = load_v1<HD, KV_MODE>(p, r0, t), v1 = load_v1<HD, KV_MODE>(p, r1, t);
-                    const float v2 = load_v1<HD, KV_MODE>(p, r2, t), v3 = load_v1<HD, KV_MODE>(p, r3, t);
+                    const auto vr = [&](int k) { const int g = ring_of(c + k); return g >= 0 ? g + v_ring : -1; };
+                    const float v0 = load_v1<HD, KV_MODE>(shost[c] ? hp : p, r0, t, tab, vr(0));
+                    const float v1 = load_v1<HD, KV_MODE>(shost[c + 1] ? hp : p, r1, t, tab, vr(1));
+                    const float v2 = load_v1<HD, KV_MODE>(shost[c + 2] ? hp : p, r2, t, tab, vr(2));
+                    const float v3 = load_v1<HD, KV_MODE>(shost[c + 3] ? hp : p, r3, t, tab, vr(3));
                     fold(c, v0);
                     fold(c + 1, v1);
                     fold(c + 2, v2);
@@ -385,7 +447,8 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 }
                 for (; c < n_here; ++c) {
                     if (srow[c] < 0) continue;   // masked above, weight 0
-                    fold(c, load_v1<HD, KV_MODE>(p, srow[c], t));
+                    const int g = ring_of(c);
+                    fold(c, load_v1<HD, KV_MODE>(shost[c] ? hp : p, srow[c], t, tab, g >= 0 ? g + v_ring : -1));
                 }
                 if constexpr (!LOOP) {   // the chunk's own partials
                     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
@@ -492,6 +555,7 @@ int slots_for(sycl::queue& q, int64_t cap, int nkv, size_t n_q) {
 }
 
 int kv_mode_of(const QsaAttnPools& pools) {
+    if (pools.k_tc != nullptr) return 4;
     return pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3 : (pools.k_q != nullptr ? 1 : 0));
 }
 
@@ -501,7 +565,8 @@ void launch_kv_form(int kv_mode, int nc, sycl::queue& queue, const float* q, con
                int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div,
                int min_chunk, const QsaAttnPoolsRows& rows) {
     constexpr int N8 = PERCELL ? 2 : 8, N4 = PERCELL ? 2 : 4;   // the per-cell form has no cells-a-step forms
-    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    if (kv_mode == 4) launch_chunk<HD, G, 4, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else if (nc == 8) launch_chunk<HD, G, 0, LOOP, N8, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
@@ -773,6 +838,10 @@ void run_form(const float* q, const QsaAttnPools& pools, const int32_t* ids, con
               const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window,
               const QsaAttnPoolsRows& rows = {}) {
     const Form f = form_of<HD, G>(queue_for(stream));
+    // streamed dense attention reads the host copy with the SAME form as a resident layer (the split, the cells a
+    // step, the chunk size): the chunk distribution sets the online-softmax folding order, so a different form would
+    // change the answer's bits. A split > 1 reads each host cell once per group (the traffic the form costs); the
+    // long contexts streaming engages usually time split 1.
     const bool ok = with_split<HD>(G / f.split, [&]<int GS>() {
         run_shape<HD, GS>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, f.nc, f.split,
                           f.min_chunk, rows);
@@ -907,7 +976,8 @@ Form time_forms(void* stream, const QsaShapes& s, int64_t cells) {
 
 bool pools_ok(const QsaAttnPools& pools) {
     const int kv_mode = kv_mode_of(pools);
-    return kv_mode == 3 ? pools.k_scale != nullptr
+    return kv_mode == 4 ? pools.v_tc != nullptr && (pools.tc_bits == 4 || pools.tc_bits == 5)
+         : kv_mode == 3 ? pools.k_scale != nullptr
          : kv_mode == 2 ? pools.v_q4 != nullptr
          : kv_mode == 1 ? (pools.v_q && pools.k_scale && pools.v_scale) : (pools.k_pool && pools.v_pool);
 }

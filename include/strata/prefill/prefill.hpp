@@ -308,6 +308,7 @@ private:
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
+    bool latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err);   // the latent MoE arm (Edge0)
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };

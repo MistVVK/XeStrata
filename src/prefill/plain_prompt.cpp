@@ -35,7 +35,9 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tcq.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -1386,16 +1388,40 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     };
                     norm_rope(P.qfull, qw / NH, b.q_norm, P.qcur, NH, P.pos_q);
                     norm_rope(P.kraw, HD, b.k_norm, P.kcur, NKV, P.pos_k);
-                    // --kv q4_0: K, V and the queries rotated (kv_q4.hpp); k8v4: V alone; the output back below
-                    if (opt_.kv_q4 == 1) {
+                    // --kv q4_0: K, V and the queries rotated (kv_q4.hpp); k8v4: V alone; tcq4/5: all three with
+                    // the signs (kv_tcq.hpp); the output back below
+                    if (opt_.kv_tcq != 0) {
+                        k::fwht256_signed(P.kcur, T * NKV, false, cs);
+                        k::fwht256_signed(P.vcur, T * NKV, false, cs);
+                        k::fwht256_signed(P.qcur, T * NH, false, cs);
+                    } else if (opt_.kv_q4 == 1) {
                         k::fwht256_inplace_cuda(P.kcur, T * NKV, cs);
                         k::fwht256_inplace_cuda(P.vcur, T * NKV, cs);
                         k::fwht256_inplace_cuda(P.qcur, T * NH, cs);
                     } else if (opt_.kv_q4 == 2) {
                         k::fwht256_inplace_cuda(P.vcur, T * NKV, cs);
                     }
-                    kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs);
-                    const k::QsaAttnPools pools = kv_pools((size_t) a);
+                    const bool streamed = kv_streamed((size_t) a);
+                    k::QsaAttnPools pools = kv_pools((size_t) a);
+                    if (streamed) {
+                        // --kv-resident: stage this layer's cells [0, pa) from the host copy into the staging pool
+                        // (the identity layout), then the chunk's cells go to the host copy, the staging pool and the
+                        // VRAM ring; the prompt attention reads the staging pool (Qwen3.8-Flash-Next's prompt path)
+                        const int fmt = opt_.kv_q4 == 1 ? k::kKvQ4 : opt_.kv_q4 == 2 ? k::kKvHybrid
+                                      : opt_.kv_int8 ? k::kKvInt8 : k::kKvF16;
+                        k::QsaAttnPools stage;
+                        stage.k_pool = P.kv_stage.k_pool; stage.v_pool = P.kv_stage.v_pool;
+                        stage.k_q = P.kv_stage.k_q; stage.v_q = P.kv_stage.v_q;
+                        stage.k_scale = P.kv_stage.k_scale; stage.v_scale = P.kv_stage.v_scale;
+                        stage.k_q4 = P.kv_stage.k_q4; stage.v_q4 = P.kv_stage.v_q4;
+                        stage.page_table = page_table_;   // the identity: the staging pool is a fully resident layout
+                        k::kv_stage_from_host(stage, kv_host_[(size_t) a], fmt, (pa + qs.page_size - 1) / qs.page_size,
+                                              qs, cs);
+                        kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs, &P.kv_stage);
+                        pools = stage;
+                    } else {
+                        kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs);
+                    }
                     // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
                     // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
                     // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes
@@ -1409,7 +1435,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
                                                 attn_scratch_, P.attn + t * NH * HD, nq, cs, window_of(b));
                     }
-                    if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(P.attn, T * NH, cs);
+                    if (opt_.kv_tcq != 0) k::fwht256_signed(P.attn, T * NH, true, cs);
+                    else if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(P.attn, T * NH, cs);
                     const float* ao = P.attn;
                     if (has_gate_) {
                         k::native_qsa_gate_apply(P.attn, P.qfull, P.attn32, (int) (T * NH), (int) HD, cs);

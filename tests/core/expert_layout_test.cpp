@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// tests/core/expert_layout_test.cpp - native_experts.txt (v2/v3/v4) and the expert arena filled from GGUF shards,
+// tests/core/expert_layout_test.cpp - native_experts.txt (v2/v3/v4, v6 latent) and the expert arena filled from GGUF shards,
 // without a model or a GPU.
 //
 //   1. Copies of the real packs' native_experts.txt (tests/data/native_experts: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S,
@@ -147,6 +147,60 @@ void columns() {
     check(!load(d.path, 2, 512, err), "two names are refused");
     write_text(d.path / "native_experts.txt", manifest(4, "a extra", blob));
     check(!load(d.path, 2, 512, err), "a column after the shard column is refused");
+}
+
+// ---- 2b. v6: the latent MoE's A-only pack (Edge0): the header's widths, no hadamard.txt, the column scales
+void latent_v6() {
+    strata::kernels::cpu::NativeFmt f;
+    std::string err;
+    if (!strata::kernels::cpu::native_fmt(11, 20, 1792, 640, f, err)) {
+        check(false, "Q3_K/IQ4_NL at the latent width: " + err);
+        return;
+    }
+    const int64_t blob = (int64_t) f.bytes;
+    check(blob == 1630720, "one latent expert's blob at ELL 1792 is 1,630,720 B");
+    TempDir d;
+    auto v6_manifest = [&](int64_t embd, int64_t ff, int64_t b) {
+        std::string s = "# strata native experts v6: latent A-only, Q3_K gu + shared colscale (expert_embd " +
+                        std::to_string(embd) + ", expert_ff " + std::to_string(ff) + ")\n";
+        s += "0 11 20 0 " + std::to_string(b) + "\n";
+        s += "1 11 20 " + std::to_string(2 * b) + " " + std::to_string(b) + "\n";
+        return s;
+    };
+    write_text(d.path / "native_experts.txt", v6_manifest(1792, 640, blob));
+    bool ok = load(d.path, 2, 2, err);
+    const ExpertLayout& L = strata::kernels::cpu::expert_layout();
+    check(ok && L.version == 6 && L.expert_embd == 1792 && L.expert_ff == 640 && L.fmt[0].n_embd == 1792 &&
+              L.fmt[0].n_ff == 640 && L.fmt[0].gu_type == 11 && L.fmt[0].d_type == 20 && L.fmt[0].bytes == (size_t) blob &&
+              L.fmt[0].gu_colscale == nullptr,
+          "v6: the header's widths reach the formats, no hadamard.txt needed" + (ok ? "" : ": " + err));
+    int w = 0;
+    check(strata::kernels::cpu::latent_gu_colscale(0, &w) == nullptr && w == 0, "no scales: the accessor is null");
+    // the column scales: both layers, the reciprocals
+    fs::create_directories(d.path / "scales");
+    {
+        std::vector<float> s0(1792), s1(1792);
+        for (int64_t c = 0; c < 1792; ++c) { s0[(size_t) c] = 2.0f; s1[(size_t) c] = 0.5f; }
+        std::ofstream(d.path / "scales/l0.f32", std::ios::binary).write(reinterpret_cast<const char*>(s0.data()), 1792 * 4);
+        std::ofstream(d.path / "scales/l1.f32", std::ios::binary).write(reinterpret_cast<const char*>(s1.data()), 1792 * 4);
+    }
+    ok = load(d.path, 2, 2, err);
+    const float* sc0 = strata::kernels::cpu::latent_gu_colscale(0, &w);
+    const float* sc1 = strata::kernels::cpu::latent_gu_colscale(1, &w);
+    check(ok && sc0 != nullptr && sc1 != nullptr && w == 1792 && sc0[0] == 0.5f && sc0[1791] == 0.5f &&
+              sc1[0] == 2.0f && L.fmt[1].gu_colscale == sc1,
+          "v6 scales: the reciprocals per layer, the accessor's width" + (ok ? "" : ": " + err));
+    fs::remove(d.path / "scales/l1.f32");
+    check(!load(d.path, 2, 2, err) && err.find("all-or-none") != std::string::npos,
+          "v6 scales: one layer of two is refused");
+    fs::remove_all(d.path / "scales");
+    write_text(d.path / "native_experts.txt", v6_manifest(1792, 640, blob + 1));
+    check(!load(d.path, 2, 2, err), "v6: a blob the formats do not make is refused");
+    write_text(d.path / "native_experts.txt", v6_manifest(1790, 640, blob));
+    check(!load(d.path, 2, 2, err), "v6: a latent width that is not whole Q3_K blocks is refused");
+    write_text(d.path / "native_experts.txt",
+               "# strata native experts v7: x\n0 11 20 0 " + std::to_string(blob) + "\n");
+    check(!load(d.path, 2, 2, err) && err.find("v7") != std::string::npos, "v7 is refused");
 }
 
 // ---- 3. the arena from synthetic shards
@@ -351,6 +405,7 @@ int main(int argc, char** argv) try {
     }
     real_packs(argv[1]);
     columns();
+    latent_v6();
     arena();
     std::printf(g_fail ? "expert_layout_test: %d FAILED\n" : "expert_layout_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;

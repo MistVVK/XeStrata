@@ -101,6 +101,12 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
   選んだ方はログに出ます（`as a helper expert cache instead: ... -> the helper`）。
   `--pipeline-windows`、`--no-pool`、`--batch` のときは分割のままです。
 
+plain のエンジン（Qwen3.6-35B-A3B・Ornith-1.5 など）も、2 枚目の役目のこの選び（補助のキャッシュか分担か単独か）を
+同じ共通の部品（`core/split_role.hpp`）で行います。ただし分割点は上の探索ではなく各 GPU の空いたメモリの割合
+（`choose_split_by_room`）で決め、役目の選びは `--expert-profile` があるときだけ働きます（無いときはメモリの割合の分担のまま）。
+`--split-roles`・`--split-skip-if-fits` と上の環境変数も同じ意味で取ります。見積もりは decode の窓だけのものであることは
+同じで、prompt の速さは実測で確かめます（`--layer-split auto` の選びが plain で効くかは記録の measure-plan で測ります）。
+
 見積もりの前提は、環境変数で変えられます。
 
 | 変数 | 既定 | 意味 |

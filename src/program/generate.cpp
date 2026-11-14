@@ -22,6 +22,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/core/link_probe.hpp"
 #include "strata/core/split_predict.hpp"
+#include "strata/core/split_role.hpp"
 #include "strata/core/control_vector.hpp"
 #include "strata/core/stdin_lines.hpp"
 #include "strata/core/watchdog.hpp"
@@ -45,6 +46,8 @@
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/latent.hpp"
+#include "strata/core/latent_share.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -73,6 +76,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/dflash2.hpp"
+#include "strata/core/window_rows.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the engine's part (kva_engine)
@@ -87,12 +91,15 @@
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_probe.hpp"
+#include "strata/spec/df2_block_policy.hpp"
 #include "strata/spec/drafter_policy.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/guess_gate.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/static_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
+#include "strata/spec/window_hash.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -1411,48 +1418,6 @@ void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExpe
                          "tokens route to (links %.1f and %.1f GB/s)\n", who, (long long) rows, l0, lh);
 }
 
-// A helper GPU's fixed cost a layer (RemoteExperts::begin and finish): a small upload and three small commands on one
-// of its streams, then polled until done, the median of 16 after one warm-up.  `submit_ms`: the host's part, the
-// submissions, which come before the CPU pool's work; the return: launch to done.  -1 where it could not run.
-double probe_helper_layer_ms(double& submit_ms) {
-    constexpr size_t kMeta = (size_t) 2 << 10, kBytes = (size_t) 64 << 10;
-    submit_ms = -1.0;
-    void* h = nullptr;
-    void* d = nullptr;
-    strata::gpu::Stream s = strata::gpu::stream_create();
-    if (s == nullptr) return -1.0;
-    if (!strata::gpu::alloc_host(&h, kMeta) || !strata::gpu::alloc_device(&d, kBytes)) {
-        if (h != nullptr) strata::gpu::free(h);
-        strata::gpu::stream_destroy(s);
-        return -1.0;
-    }
-    std::memset(h, 0, kMeta);
-    std::vector<double> sub, all;
-    for (int i = 0; i < 17; ++i) {
-        const Clock::time_point t0 = Clock::now();
-        bool ok = strata::gpu::copy_async(d, h, kMeta, s);
-        for (int c = 0; c < 3 && ok; ++c) ok = strata::gpu::memset_async((char*) d + kMeta, c, kBytes - kMeta, s);
-        if (!ok) break;
-        const Clock::time_point t1 = Clock::now();
-        strata::gpu::Status st = strata::gpu::Status::Pending;
-        while ((st = strata::gpu::stream_status(s)) == strata::gpu::Status::Pending) std::this_thread::yield();
-        if (st == strata::gpu::Status::Failed) break;
-        if (i > 0) {
-            sub.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
-            all.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-        }
-    }
-    strata::gpu::stream_sync(s);
-    strata::gpu::free(d);
-    strata::gpu::free(h);
-    strata::gpu::stream_destroy(s);
-    if (all.empty()) return -1.0;
-    std::sort(sub.begin(), sub.end());
-    std::sort(all.begin(), all.end());
-    submit_ms = sub[sub.size() / 2];
-    return all[all.size() / 2];
-}
-
 // The PCIe share of the missed experts for a link measured at `gbps`: `base` (the share measured on x16 links) from
 // 20 GB/s up, and below that in proportion to the bandwidth, so the time the link spends on its share stays about
 // what the x16 share costs.  Continuous (#485): before, 19.9 GB/s gave 0.42 and 20.0 the full 0.55 (and 4.0 GB/s
@@ -2027,6 +1992,75 @@ void seed_usage_from_prompt(std::vector<float>& usage, const strata::prefill::Pr
                             std::vector<int64_t>& seen, int64_t n_expert, int64_t period, double decay) {
     strata::core::seed_usage(usage, ps.routed, ps.routed_k, seen, n_expert, period, decay);
 }
+
+// The latent MoE (Edge0): the session's D/U pair, uploaded once and shared by every window and the prompt path
+// (latent_share.hpp).  Detected from the expert layout: the experts' width differs from the shell's hidden width.
+// The labels come from labels.bin beside the A pack; the D/U file and the A pack are the environment's
+// (XESTRATA_LATENT_DENSE / XESTRATA_LATENT_A, the model's model.json gives them).
+struct LatentTab {
+    strata::core::LatentDense dense;
+    uint8_t* d = nullptr;
+    uint8_t* u = nullptr;
+    std::vector<int32_t> labels;
+    int64_t lat_H = 0, lat_ELL = 0, lat_I = 0, n_layers = 0;
+    int lat_G = 8, lat_E = 0, lat_fmt = 8;
+    bool latent = false;
+    uint64_t device_bytes() const { return (uint64_t) n_layers * (dense.d_bytes() + dense.u_bytes()); }
+    void publish() {
+        strata::core::latent_shared_d() = d;
+        strata::core::latent_shared_u() = u;
+        strata::core::latent_shared_fmt() = lat_fmt;
+    }
+    bool load(const strata::core::ModelGeometry& g, std::string& err) {
+        if (d != nullptr) { publish(); return true; }
+        const auto& lay0 = strata::kernels::cpu::expert_layout();
+        if (!(lay0.native && !lay0.fmt.empty() && lay0.fmt[0].n_embd != (int64_t) g.n_embd)) return true;
+        latent = true;
+        lat_H = (int64_t) g.n_embd;
+        lat_ELL = lay0.fmt[0].n_embd;
+        lat_I = lay0.fmt[0].n_ff;
+        lat_E = (int) g.n_expert;
+        n_layers = g.n_layers;
+        const char* f = strata::env_get("LATENT_DENSE");
+        if (f == nullptr || f[0] == '\0') {
+            err = "the latent layout needs XESTRATA_LATENT_DENSE=<latent_dense_q8.bin>";
+            return false;
+        }
+        if (!dense.open(f, g.n_layers, lat_G, (int64_t) g.n_embd, lat_ELL, err)) {
+            err = "latent dense: " + err;
+            return false;
+        }
+        lat_fmt = dense.fmt();
+        const char* apack = strata::env_get("LATENT_A");
+        if (apack == nullptr || apack[0] == '\0') {
+            err = "the latent layout needs XESTRATA_LATENT_A=<experts.bin>";
+            return false;
+        }
+        const std::string lp = apack;
+        const size_t slash = lp.find_last_of('/');
+        const std::string labels_path = slash == std::string::npos ? "labels.bin" : lp.substr(0, slash + 1) + "labels.bin";
+        if (!strata::core::latent_labels_read(labels_path, g.n_layers, g.n_expert, lat_G, labels, err)) {
+            err = "latent dense: " + err;
+            return false;
+        }
+        const uint64_t db = (uint64_t) g.n_layers * dense.d_bytes(), ub = (uint64_t) g.n_layers * dense.u_bytes();
+        if (!strata::gpu::alloc_device((void**) &d, db) || !strata::gpu::alloc_device((void**) &u, ub)) {
+            err = "the latent D/U device buffers (" + std::to_string((db + ub) >> 20) + " MiB) do not fit";
+            return false;
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (!strata::gpu::copy(d + (size_t) l * dense.d_bytes(), dense.d(l), dense.d_bytes()) ||
+                !strata::gpu::copy(u + (size_t) l * dense.u_bytes(), dense.u(l), dense.u_bytes())) {
+                err = "the latent D/U upload failed at layer " + std::to_string(l);
+                return false;
+            }
+        }
+        publish();
+        std::fprintf(stderr, "xestrata generate: latent MoE: ELL %lld, I %lld, G %d, D/U fmt %d, %.2f GiB on the device\n",
+                     (long long) lat_ELL, (long long) lat_I, lat_G, lat_fmt, (double) (db + ub) / 1073741824.0);
+        return true;
+    }
+};
 }  // namespace
 
 // The prompt path gets the CPU pool beside --batch slots too (upstream 1b1a28e77's opt-in, on by default here: RX
@@ -2291,6 +2325,7 @@ int main(int argc, char** argv) {
     shared.spec_window = &o.spec_window;
     shared.spec_window_given = &o.spec_window_given;
     shared.spec_min_p = &o.spec_min_p;
+    shared.window_hashes = &o.window_hashes;
     shared.mmap_experts = &o.mmap_experts;
     shared.vram_free_mib = &o.vram_free_mib;
     shared.vram_elastic = &o.vram_elastic;
@@ -2341,6 +2376,8 @@ int main(int argc, char** argv) {
     shared.adapt_mib_clamp0 = true;
     shared.batch = &o.batch;
     shared.expert_cache_remote = o.expert_cache_remote.data();
+    shared.split_roles_helper = &o.split_roles_helper;
+    shared.split_skip_if_fits = &o.split_skip_if_fits;
     shared.pool_tasks = &o.pool_tasks;
     shared.pool_tasks_msg = "xestrata generate: --pool-tasks expects an integer in 0..4096 (0 = automatic)";
     shared.pool_tasks_strict = true;
@@ -2466,7 +2503,6 @@ int main(int argc, char** argv) {
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = (int) std::strtol(next("--spec-corrupt"), nullptr, 10);
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
-        else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::strtoll(next("--mtp-window"), nullptr, 10);
         else if (a == "--spec-split") o.spec_split = true;
@@ -2474,8 +2510,6 @@ int main(int argc, char** argv) {
    // applied at startup, before the runtime
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--split-order") o.split_order_given = std::strcmp(next("--split-order"), "as-given") == 0;
-        else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
-        else if (a == "--split-roles") o.split_roles_helper = std::strcmp(next("--split-roles"), "helper") == 0;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, (int) std::strtol(next("--mtp-max-t"), nullptr, 10));
         else if (a == "--mtp-hnorm") {
@@ -2819,6 +2853,21 @@ int main(int argc, char** argv) {
         const int chain_base = o.spec;
         o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, spec_rows));
     }
+    // Reserve the wide DFlash2 probe's window before the verifier and tap buffers are allocated. Keep an explicitly
+    // numbered --spec as given unless --wide-window on asks for the wider form. A missing pack cannot be measured.
+    if ((o.draft == "auto" || o.draft == "dflash2") && !o.draft_model.empty() &&
+        o.batch == 0 && o.pipeline_windows < 2 && strata::core::window_rows_cap() == strata::kernels::kWindowMaxT) {
+        bool wide = strata::core::wide_window() == strata::core::WideWindow::On;
+        if (!wide && o.serve && o.spec_auto && strata::spec::probe_enabled()) {
+            strata::core::Dflash2Drafter::PackShape shape;
+            std::string why;
+            wide = strata::core::Dflash2Drafter::read_shape(o.draft_model, shape, why);
+        }
+        if (wide) {
+            if (o.mtp_max_t == 0 && o.spec > 0) o.mtp_max_t = o.spec;
+            o.spec = strata::core::window_rows_cap();
+        }
+    }
     // the MTP's own windows stay at 8 rows (its draft layer's kernels are the narrow window's); a lookup or DFlash2
     // window goes on to --spec
     if (!o.mtp.empty() && o.spec > (int) strata::kernels::kVerifyNarrowT &&
@@ -2946,6 +2995,13 @@ int main(int argc, char** argv) {
             std::string why;
             if (strata::kernels::cpu::parse_pool_cores(text, cpus, why)) strata::kernels::cpu::set_pool_cores(cpus);
             else std::fprintf(stderr, "xestrata generate: --pool-cores: %s; the pool uses its default placement\n", why.c_str());
+        } else {   // XESTRATA_POOL_PLACE: the fast cores on a CPU whose cores are not all alike, when measured faster
+            std::string why;
+            const std::vector<int> cpus = strata::kernels::cpu::auto_pool_cores(why);
+            if (!cpus.empty()) {
+                strata::kernels::cpu::set_pool_cores(cpus);
+                std::fprintf(stderr, "xestrata generate: %s\n", why.c_str());
+            }
         }
     }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
@@ -3407,8 +3463,6 @@ int main(int argc, char** argv) {
         const double mass_exp = strata::env_get("SPLIT_MASS_EXP") ? std::strtod(strata::env_get("SPLIT_MASS_EXP"), nullptr) : 0.8;
         std::vector<double> mass(prof.size());
         for (size_t r = 0; r < prof.size(); ++r) mass[r] = std::pow((double) r + 1.0, -mass_exp);
-        std::vector<double> layer_mass((size_t) L, 0.0);
-        for (size_t r = 0; r < prof.size(); ++r) layer_mass[(size_t) prof[r].first] += mass[r];
         auto cost = [&](int64_t l) -> int64_t {
             return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
         };
@@ -3750,10 +3804,88 @@ int main(int argc, char** argv) {
         // against the split, and either against CUDA0 alone (below)
         const char* gain_env = strata::env_get("SPLIT_GAIN_PCT");
         const double gain = (gain_env != nullptr ? std::strtod(gain_env, nullptr) : 5.0) / 100.0;
-        double chosen_ms = o.split_roles_helper ? 1e30 : best_ms;   // the second GPU's role, as predicted
-        std::string chosen = o.split_roles_helper ? "none" : "the split at K=" + ks;
         if (o.split_roles_helper) o.pipeline_windows = 0;   // a split's own (its 2 for two Xe2 GPUs, above)
-        if (o.split_skip_if_fits && alone_holds_all && role.empty()) {
+        const bool skip_fits = o.split_skip_if_fits && alone_holds_all && role.empty();
+        // two GPUs only, with the expert pool (the helper's rows are the pool's), without --pipeline-windows (a
+        // split's own) and without --batch slots (their groups run one a GPU on a split; the helper was not tried
+        // with them)
+        const bool helper_eligible = ns == 2 && !o.no_pool && o.pipeline_windows <= 0 && o.batch <= 0 && role != "split";
+        const int h = 1;   // the second GPU's index in the measurements above
+        // the helper cache's window, predicted by the part the plain engine calls too (split_role.hpp)
+        strata::core::HelperCachePrediction hc;
+        if (helper_eligible && !skip_fits) {
+            // its round trip a layer it computes in: the commands and the wait measured on it (the probe), and the
+            // window's activations there and its rows back over its link; the submissions are the host's, before the
+            // CPU pool's work.  Priced as two copies of a stage hand-off before (#53: predicted 40.8 ms a window
+            // against CUDA0's 50.4 alone, measured 15% slower)
+            double submit_ms = 0.0, layer_ms = 0.0;
+            {
+                const strata::core::OnDevice on(dev_of_stage(h));
+                layer_ms = strata::core::probe_helper_layer_ms(submit_ms);
+            }
+            if (layer_ms < 0.0) {
+                layer_ms = 2.0 * side_ms(h);
+                submit_ms = 0.0;
+            }
+            const double rt = layer_ms + (link_gbps[(size_t) h] > 0.0 ? 2.0 * hand_bytes / (link_gbps[(size_t) h] * 1e6) : 0.0);
+            std::fprintf(stderr, "xestrata generate: layer split auto: CUDA%d as a helper: %.3f ms a layer it computes in "
+                                 "(%.3f ms of it the host's submissions)\n", dev_of_stage(h), rt, submit_ms);
+            strata::core::HelperCacheInputs hi;
+            hi.layers = L;
+            hi.profile = prof;
+            hi.mass = mass;
+            hi.cost = cost;
+            hi.blob_bytes = [&](int64_t l) { return (double) lay.blob_bytes(l); };
+            hi.cap0 = std::max<int64_t>(cap_raw(0, 0, -1, true), 0);
+            hi.caph = free0[(size_t) h] - ((int64_t) (512 + 256) << 20);
+            hi.bw0 = bw[0];
+            hi.bwh = bw[(size_t) h];
+            hi.cpu_bw = cpu_bw;
+            hi.link_scale0 = link_scale[0];
+            hi.rows = rows;
+            hi.experts_per_row = (double) Ka;
+            hi.dense_layer = dense_layer;
+            hi.tail_keep = tail_keep;
+            hi.head_bytes = (double) head_bytes;
+            hi.rt = rt;
+            hi.submit_ms = submit_ms;
+            hi.drafts = drafts;
+            hc = strata::core::predict_helper_cache(hi);
+        }
+        // #34: the helper only when its window is predicted faster by more than the model's error.  The model
+        // prices decode only, and the split reads a prompt on both GPUs, the helper every layer on CUDA0: on two
+        // B70s the helper, predicted 1.7% faster, read a 2.5K prompt in 1.8x the time and decoded slower; on a
+        // B70 + RTX 4070 (IQ3_XXS, serve) predicted 2.4 to 3% faster, it read 4K 21% faster and 32K as fast,
+        // and decoded 32K 10 to 25% slower (2026-10-21).  With --split-roles helper the split is no choice.
+        // STRATA_SPLIT_HELPER_GAIN_PCT: this margin alone, 0 = any (STRATA_SPLIT_GAIN_PCT otherwise).
+        const char* hgain_env = strata::env_get("SPLIT_HELPER_GAIN_PCT");
+        const double hgain = hgain_env != nullptr ? std::strtod(hgain_env, nullptr) / 100.0 : gain;
+        strata::core::SplitRoleInputs ri;
+        ri.alone_ms = alone_ms;
+        ri.split_ms = best_ms;
+        ri.helper_ms = hc.ms;
+        ri.alone_holds_all = alone_holds_all;
+        ri.helper_held = hc.held;
+        ri.gain = gain;
+        ri.helper_gain = hgain;
+        ri.roles_helper = o.split_roles_helper;
+        ri.skip_if_fits = o.split_skip_if_fits;
+        ri.helper_eligible = helper_eligible;
+        ri.role = role;
+        const strata::core::SplitRoleChoice choice = strata::core::choose_split_role(ri);
+        if (helper_eligible && !skip_fits) {
+            std::fprintf(stderr, "xestrata generate: layer split auto: CUDA%d as a helper expert cache instead: %.1f ms per "
+                                 "decode window (%lld more experts there, ~%.1f%% of the routed mass on the GPUs) "
+                                 "against %.1f split at K=%s -> %s%s\n",
+                         dev_of_stage(h), hc.ms, (long long) hc.held, 100.0 * hc.kept_mass, best_ms, ks.c_str(),
+                         choice.helper_chosen ? "the helper" : "the split",
+                         !role.empty() ? " (XESTRATA_SPLIT_ROLE)"
+                         : o.split_roles_helper ? " (--split-roles helper)"
+                         : !choice.helper_chosen && hc.held > 0 && hc.ms < best_ms
+                             ? " (not faster by XESTRATA_SPLIT_HELPER_GAIN_PCT; the "
+                               "split also reads the prompt on both GPUs)" : "");
+        }
+        if (choice.role == strata::core::SplitRole::SkipIfFits) {
             // upstream 18ad40c0d: every profiled pair in CUDA0's cache beside its session, drafter and reserve (the
             // room predict() gives a lone CUDA0); a split would only add hand-offs.  Two R9700-class cards, upstream:
             // 4K 1,244 -> 1,776 tok/s, decode 51 -> 60, 16K prompts 5% slower.
@@ -3765,106 +3897,33 @@ int main(int argc, char** argv) {
             o.layer_split.clear();
             o.pipeline_windows = 0;   // a split's own (its 2 for two Xe2 GPUs, above)
             multi_gpu = false;
-            chosen_ms = -1;           // decided
-        } else if (ns == 2 && !o.no_pool && o.pipeline_windows <= 0 && o.batch <= 0 && role != "split") {
-            const int h = 1;   // the second GPU's index in the measurements above
-            std::vector<double> held0_l((size_t) L, 0.0), heldh_l((size_t) L, 0.0);
-            const int64_t cap0 = std::max<int64_t>(cap_raw(0, 0, -1, true), 0);
-            const int64_t caph = free0[(size_t) h] - ((int64_t) (512 + 256) << 20);
-            int64_t u0 = 0, uh = 0, nh = 0;
-            bool full0 = false;
-            for (size_t r = 0; r < prof.size(); ++r) {
-                const int64_t l = prof[r].first, c = cost(l);
-                if (!full0) {
-                    if (u0 + c <= cap0) {
-                        u0 += c;
-                        held0_l[(size_t) l] += mass[r];
-                        continue;
-                    }
-                    full0 = true;
-                }
-                if (uh + c > caph) break;
-                uh += c;
-                heldh_l[(size_t) l] += mass[r];
-                ++nh;
-            }
-            // its round trip a layer it computes in: the commands and the wait measured on it (the probe above), and
-            // the window's activations there and its rows back over its link; the submissions are the host's, before
-            // the CPU pool's work.  Priced as two copies of a stage hand-off before (#53: predicted 40.8 ms a window
-            // against CUDA0's 50.4 alone, measured 15% slower)
-            double submit_ms = 0.0, layer_ms = 0.0;
-            {
-                const strata::core::OnDevice on(dev_of_stage(h));
-                layer_ms = probe_helper_layer_ms(submit_ms);
-            }
-            if (layer_ms < 0.0) {
-                layer_ms = 2.0 * side_ms(h);
-                submit_ms = 0.0;
-            }
-            const double rt = layer_ms + (link_gbps[(size_t) h] > 0.0 ? 2.0 * hand_bytes / (link_gbps[(size_t) h] * 1e6) : 0.0);
-            std::fprintf(stderr, "xestrata generate: layer split auto: CUDA%d as a helper: %.3f ms a layer it computes in "
-                                 "(%.3f ms of it the host's submissions)\n", dev_of_stage(h), rt, submit_ms);
-            double ms = 0, kept = 0, all = 0;
-            for (int64_t l = 0; l < L; ++l) {
-                const double lm = layer_mass[(size_t) l];
-                const double hit0 = lm > 0 ? held0_l[(size_t) l] / lm : 1.0, hith = lm > 0 ? heldh_l[(size_t) l] / lm : 0.0;
-                const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
-                const double gpu = experts * hit0 / bw[0];
-                const double cpu = experts * std::max(0.0, 1.0 - hit0 - hith) * tail_keep / cpu_bw * link_scale[0];
-                const double help = hith > 0 ? experts * hith / bw[(size_t) h] + rt : 0.0;
-                ms += dense_layer / bw[0] + (hith > 0 ? submit_ms : 0.0) + std::max({gpu, cpu, help});
-                kept += held0_l[(size_t) l] + heldh_l[(size_t) l];
-                all += lm;
-            }
-            ms += ((double) head_bytes + (drafts ? (rows - 1.0) * dense_layer : 0.0)) / bw[0];
-            // #34: the helper only when its window is predicted faster by more than the model's error.  The model
-            // prices decode only, and the split reads a prompt on both GPUs, the helper every layer on CUDA0: on two
-            // B70s the helper, predicted 1.7% faster, read a 2.5K prompt in 1.8x the time and decoded slower; on a
-            // B70 + RTX 4070 (IQ3_XXS, serve) predicted 2.4 to 3% faster, it read 4K 21% faster and 32K as fast,
-            // and decoded 32K 10 to 25% slower (2026-10-21).  With --split-roles helper the split is no choice.
-            // STRATA_SPLIT_HELPER_GAIN_PCT: this margin alone, 0 = any (STRATA_SPLIT_GAIN_PCT otherwise).
-            const char* hgain_env = strata::env_get("SPLIT_HELPER_GAIN_PCT");
-            const double hgain = hgain_env != nullptr ? std::strtod(hgain_env, nullptr) / 100.0 : gain;
-            const bool faster = o.split_roles_helper || ms < best_ms * (1.0 - hgain);
-            const bool helper = nh > 0 && (role == "helper" || (role.empty() && faster));
-            std::fprintf(stderr, "xestrata generate: layer split auto: CUDA%d as a helper expert cache instead: %.1f ms per "
-                                 "decode window (%lld more experts there, ~%.1f%% of the routed mass on the GPUs) "
-                                 "against %.1f split at K=%s -> %s%s\n",
-                         dev_of_stage(h), ms, (long long) nh, all > 0 ? 100.0 * kept / all : 0.0, best_ms, ks.c_str(),
-                         helper ? "the helper" : "the split",
-                         !role.empty() ? " (XESTRATA_SPLIT_ROLE)"
-                         : o.split_roles_helper ? " (--split-roles helper)"
-                         : !helper && nh > 0 && ms < best_ms ? " (not faster by XESTRATA_SPLIT_HELPER_GAIN_PCT; the "
-                                                               "split also reads the prompt on both GPUs)" : "");
-            if (helper) {
-                chosen_ms = ms;
-                chosen = "the helper";
-                o.expert_cache_remote[0] = (int) nh;
-                remote_dev[0] = dev_of_stage(h);
-                split_devs.clear();
-                split_at.clear();
-                o.layer_split.clear();
-                multi_gpu = false;
-            }
-        }
-        // CUDA0 alone, last: the second GPU only when its role is predicted shorter than CUDA0 alone by the margin.
-        // On a B70 + RTX 4070 (serve, 4K and 32K) CUDA0 alone decoded IQ3_XXS fastest (78 / 104 tok/s against the
-        // helper's 78 / 96 and the split's 90 / 79; predicted 12.0 ms against 12.1 and 12.3), and the helper won where
-        // it was predicted 9% faster or more (IQ3_S; both GPUs at 12 GiB).  A second GPU left alone is free for the
-        // images (serve's separate image card).  STRATA_SPLIT_ROLE names a role whatever the prediction.
-        if (chosen_ms >= 0 && role.empty() && !(chosen_ms < alone_ms * (1.0 - gain))) {
+        } else if (choice.role == strata::core::SplitRole::Helper) {
+            o.expert_cache_remote[0] = (int) hc.held;
+            remote_dev[0] = dev_of_stage(h);
+            split_devs.clear();
+            split_at.clear();
+            o.layer_split.clear();
+            multi_gpu = false;
+        } else if (choice.role == strata::core::SplitRole::Alone) {
+            // CUDA0 alone, last: the second GPU only when its role is predicted shorter than CUDA0 alone by the margin.
+            // On a B70 + RTX 4070 (serve, 4K and 32K) CUDA0 alone decoded IQ3_XXS fastest (78 / 104 tok/s against the
+            // helper's 78 / 96 and the split's 90 / 79; predicted 12.0 ms against 12.1 and 12.3), and the helper won
+            // where it was predicted 9% faster or more (IQ3_S; both GPUs at 12 GiB).  A second GPU left alone is free
+            // for the images (serve's separate image card).  STRATA_SPLIT_ROLE names a role whatever the prediction.
+            const std::string chosen = choice.helper_chosen ? "the helper"
+                                     : o.split_roles_helper ? "none" : "the split at K=" + ks;
             char cms[32] = "no other role";
-            if (chosen_ms < 1e29) std::snprintf(cms, sizeof cms, "%.1f ms", chosen_ms);
+            if (choice.ms < 1e29) std::snprintf(cms, sizeof cms, "%.1f ms", choice.ms);
             std::fprintf(stderr, "xestrata generate: layer split auto: CUDA0 alone (%.1f ms per decode window) - %s is not "
                                  "predicted %.0f%% shorter (%s; XESTRATA_SPLIT_GAIN_PCT, XESTRATA_SPLIT_ROLE)\n", alone_ms,
                          chosen.c_str(), 100.0 * gain, cms);
-            if (chosen == "the helper") o.expert_cache_remote[0] = 0;
             split_devs.clear();
             split_at.clear();
             o.layer_split.clear();
             o.pipeline_windows = 0;
             multi_gpu = false;
         }
+
     }
     // Layer split across GPUs (upstream e50f2663, 12c099b3, 13f70a34): every GPU holds only the dense weights of ITS
     // layers (the PLE tensors stay everywhere).  A full copy on each card (~1.5 GB for IQ2_XS) is VRAM the expert cache
@@ -4788,6 +4847,10 @@ int main(int argc, char** argv) {
     const strata::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "xestrata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
+    strata::spec::StaticDrafter static_drafter;
+    const int static_mode = static_drafter.configure((int32_t) n_vocab);
+    bool static_selected = static_mode == 1;
+    int block_selected = strata::core::wide_window() == strata::core::WideWindow::On ? 1 : 0;
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
@@ -5345,6 +5408,19 @@ int main(int argc, char** argv) {
     }
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
+    // the latent MoE's D/U pair: uploaded before the cache is sized, so the auto sizing leaves room for it
+    LatentTab lat_tab;
+    {
+        std::string le;
+        if (!lat_tab.load(g, le)) {
+            std::fprintf(stderr, "xestrata generate: %s\n", le.c_str());
+            return 1;
+        }
+        if (lat_tab.latent && o.expert_cache_remote[0] > 0) {
+            std::fprintf(stderr, "xestrata generate: the latent MoE does not support helper GPUs (--expert-cache-remote)\n");
+            return 1;
+        }
+    }
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
     const int64_t pipe_first = o.pipeline_windows <= 0 ? 0
@@ -5369,6 +5445,10 @@ int main(int argc, char** argv) {
         auto size_cache = [&] {
             strata::gpu::mem_info(&free_b, &total_b);
             free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
+            if (lat_tab.latent) {   // the D/U pair is already on the device (LatentTab::load)
+                const size_t du = (size_t) lat_tab.device_bytes();
+                free_b -= du < free_b ? du : free_b;
+            }
             // --vram-free-mib: what was free at the start beyond it is not counted, so a start with a few MiB more
             // free gets the same cache
             free_b = (size_t) strata::core::counted_free(free_b, start_free_b, o.vram_free_mib);
@@ -5884,6 +5964,16 @@ int main(int argc, char** argv) {
     drive.d.pool = &pool;
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
+    drive.d.latent = lat_tab.latent;
+    drive.d.lat_H = lat_tab.lat_H;
+    drive.d.lat_ELL = lat_tab.lat_ELL;
+    drive.d.lat_I = lat_tab.lat_I;
+    drive.d.lat_G = lat_tab.lat_G;
+    drive.d.lat_E = lat_tab.lat_E;
+    drive.d.lat_fmt = lat_tab.lat_fmt;
+    drive.d.lat_u_gpu = strata::core::pick_from_env("LATENT_U_GPU") != strata::core::Pick::Off;
+    drive.d.lat_dense = lat_tab.latent ? &lat_tab.dense : nullptr;
+    drive.d.lat_labels = lat_tab.labels.empty() ? nullptr : lat_tab.labels.data();
     drive.d.jobs.resize((size_t) K);
     // upstream 994029b02 (PR 4972): when every routed expert sits in the GPU's caches the decode reads nothing from the
     // file tier, and its Linux defaults (io prefetch, the decode gate) and the routing-aware prefetch only cost time
@@ -7327,6 +7417,10 @@ int main(int argc, char** argv) {
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) std::lround(f * 256.0))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
+        if (lat_tab.latent && n_stages > 1) {
+            std::fprintf(stderr, "xestrata generate: the latent MoE runs on one GPU (a layer split is not wired yet)\n");
+            return 1;
+        }
         // --pipeline-windows (decided where the split was): two verifiers per stage, one for the even windows and one
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
@@ -7536,6 +7630,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "xestrata serve: %s\n", err.c_str());
                 return 1;
             }
+            df2.set_max_drafts(o.spec - 1);
             if (!df2.prepare(ver.tap_dev(), err)) {
                 std::fprintf(stderr, "xestrata serve: %s\n", err.c_str());
                 return 1;
@@ -8376,6 +8471,9 @@ int main(int argc, char** argv) {
             }
         }
         drive.d.plan = ver.plan_sink();
+        drive.d.lat_xl = ver.latent_xl_mapped();
+        drive.d.lat_xlseq = ver.latent_xlseq();
+        drive.d.lat_act0 = ver.latent_act0_mapped();
         drive.d.pcie_num = std::max(0, std::min(256, (int) std::lround(o.pcie_frac * 256.0)));
         strata::core::PcieSplitTimes pcie_split;   // the measured split, kept for the requests that set no share
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
@@ -9175,27 +9273,26 @@ int main(int argc, char** argv) {
             strata::core::window_choices_paused() = false;
             const long long free_during = free_mib();
             const strata::spec::DraftProbe judge;
-            const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, df2_loaded && use_mtp, S_mtp);
+            const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, S_mtp);
             std::fprintf(stderr, "xestrata serve: %s (%.1f s)\n", v.line.c_str(),
                          std::chrono::duration<double>(Clock::now() - probe_t0).count());
             if (v.measured) {
+                if (static_mode < 0) static_selected = v.df2_static;
+                if (strata::core::wide_window() == strata::core::WideWindow::Auto) block_selected = v.df2_block;
                 strata::spec::Drafter keep = v.keep;
-                // DFlash2 alone or beside the MTP keeps the VRAM it took from the reserve: only where the reserve the
-                // engine started with is still free beside it (a long prompt's buffers come out of the reserve)
-                if ((keep == strata::spec::Drafter::Df2 || v.keep_both) &&
+                // DFlash2 keeps the VRAM it took from the reserve: only where the reserve the engine started with is
+                // still free beside it (a long prompt's buffers come out of the reserve)
+                if (keep == strata::spec::Drafter::Df2 &&
                     free_during < (long long) o.vram_reserve_mib) {
                     std::fprintf(stderr, "xestrata serve: DFlash2 is not kept: with it %lld MiB of VRAM stay free, less "
                                          "than the %d MiB reserve: the MTP drafts\n", free_during, o.vram_reserve_mib);
                     keep = use_mtp ? strata::spec::Drafter::Mtp : strata::spec::Drafter::None;
                 }
-                const bool both = v.keep_both && keep != strata::spec::Drafter::None &&
-                                  free_during >= (long long) o.vram_reserve_mib;
-                if (df2_loaded && keep != strata::spec::Drafter::Df2 && !both)
-                    df2_drop(nullptr);
+                if (df2_loaded && keep != strata::spec::Drafter::Df2) df2_drop(nullptr);   // one drafter is kept
                 // the MTP released where nothing else needs it: a parked or saved conversation carries its K/V
                 const bool conv_needs_mtp = (o.prompt_cache > 0 && o.conversation_cache_mib > 0) ||
                                             !o.conversation_save.empty();
-                if (use_mtp && keep != strata::spec::Drafter::Mtp && !both) {
+                if (use_mtp && keep != strata::spec::Drafter::Mtp) {
                     if (conv_needs_mtp) {
                         // a parked or saved conversation carries the draft layer's K/V: that part stays, the rest goes
                         const long long f0 = free_mib();
@@ -9208,8 +9305,9 @@ int main(int argc, char** argv) {
                         if (df2_loaded && df2.head_shared()) {   // DFlash2's head was the MTP's: its own first
                             std::string e;
                             df2.release();
-                            if (!df2.load(o.draft_model, 0, e) || !df2.bind(wt, g, &native_head, df2_vocab, e) ||
-                                !df2.prepare(ver.tap_dev(), e)) {
+                            const bool rebound = df2.load(o.draft_model, 0, e) && df2.bind(wt, g, &native_head, df2_vocab, e);
+                            if (rebound) df2.set_max_drafts(S - 1);
+                            if (!rebound || !df2.prepare(ver.tap_dev(), e)) {
                                 std::fprintf(stderr, "xestrata serve: DFlash2 could not take its own head (%s): the MTP "
                                                      "stays\n", e.c_str());
                                 df2_drop(nullptr);
@@ -9222,7 +9320,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                drafting_off = keep == strata::spec::Drafter::None && !both;
+                drafting_off = keep == strata::spec::Drafter::None;
                 if (keep == strata::spec::Drafter::Mtp && v.spec > 0 && v.spec != S_mtp) spec_cap = v.spec;
                 if (df2_loaded) {   // it stays: the prompt path's taps for the whole window
                     std::string e;
@@ -9238,13 +9336,12 @@ int main(int argc, char** argv) {
             if (!probe_usage.empty()) drive.d.usage = probe_usage;
             policy = strata::spec::DraftPolicy(S);
             policy_idle = strata::spec::DraftPolicy(S);
-            policy_is_df2 = df2_loaded && !use_mtp;
+            policy_is_df2 = df2_loaded;
             drafter_policy = strata::spec::DrafterPolicy();
             sfx.reset();
             std::fprintf(stderr, "xestrata serve: drafting: %s%s%s; VRAM free %lld MiB before the measurement, %lld with "
                                  "every drafter loaded, %lld now\n",
-                         df2_loaded && use_mtp && o.draft_rule != "df2" ? "the MTP and DFlash2 (picked per request)"
-                         : df2_loaded                                    ? "DFlash2"
+                         df2_loaded ? "DFlash2"
                          : use_mtp && !drafting_off ? "the MTP"
                                                      : "no drafter",
                          spec_cap > 0 ? (", window " + std::to_string(spec_cap)).c_str() : "",
@@ -9258,7 +9355,9 @@ int main(int argc, char** argv) {
             return true;
         };
         {
-            const bool want_arms = probe_ok && (o.draft == "auto" || o.spec_auto) && !o.native_head_gguf.empty();
+            const bool want_arms = probe_ok && !o.native_head_gguf.empty() &&
+                (o.draft == "auto" || o.spec_auto || (df2_loaded && static_mode < 0 && static_drafter.loaded()) ||
+                 (df2_loaded && S >= strata::kernels::kWindowMaxT && strata::core::wide_window() == strata::core::WideWindow::Auto));
             if (df2_deferred && want_arms) {
                 // DFlash2 beside everything else, where the VRAM it takes leaves kProbeFreeMib free; its pack must be
                 // this model's
@@ -9270,12 +9369,16 @@ int main(int argc, char** argv) {
                 const bool fits_model = df2_shape.hidden == g.n_embd && df2_shape.vocab == n_vocab &&
                                         *std::max_element(df2_shape.taps.begin(), df2_shape.taps.end()) < g.n_layers;
                 std::string e;
+                // measured only where it could stay: the reserve still free beside it (probe_finish's rule), not less
+                // than the measurement's own room
+                const int64_t keep_free = std::max<int64_t>(kProbeFreeMib, o.vram_reserve_mib);
                 if (!fits_model) {
                     df2_drop("its pack is another model's (hidden size, vocabulary or taps)");
-                } else if (left < (kProbeFreeMib << 20)) {
+                } else if (left < (keep_free << 20)) {
                     std::fprintf(stderr, "xestrata serve: DFlash2 is not measured: %lld MiB of VRAM free, it takes about "
-                                         "%llu and %lld must stay free: the MTP drafts\n", (long long) (fb >> 20),
-                                 (unsigned long long) ((df2_shape.bytes + bind) >> 20), (long long) kProbeFreeMib);
+                                         "%llu and %lld must stay free (the reserve: it could not stay): the MTP drafts\n",
+                                 (long long) (fb >> 20), (unsigned long long) ((df2_shape.bytes + bind) >> 20),
+                                 (long long) keep_free);
                     df2_drop(nullptr);
                 } else {
                     const strata::core::OnDevice on_df2(0);
@@ -9288,21 +9391,32 @@ int main(int argc, char** argv) {
                             if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
                         }
                         df2_loaded = true;
-                        if (!df2.bind(wt, g, &native_head, df2_vocab, e) || !df2.prepare(ver.tap_dev(), e)) {
+                        if (!df2.bind(wt, g, &native_head, df2_vocab, e)) {
                             std::fprintf(stderr, "xestrata serve: DFlash2: %s: the MTP drafts\n", e.c_str());
                             df2_drop(nullptr);
-                        } else if (free_mib() < (long long) kProbeFreeMib) {
-                            df2_drop("less VRAM is left free beside it than the measurement needs");
+                        } else if (free_mib() < (long long) keep_free) {
+                            df2_drop("less VRAM than the reserve is left free beside it: it could not stay");
                         } else {
                             df2.set_max_drafts(S - 1);
+                            if (!df2.prepare(ver.tap_dev(), e)) {
+                                std::fprintf(stderr, "xestrata serve: DFlash2: %s: the MTP drafts\n", e.c_str());
+                                df2_drop(nullptr);
+                            } else if (free_mib() < (long long) kProbeFreeMib) {
+                                df2_drop("less VRAM is left free beside it than the measurement needs");
+                            }
                         }
                     }
                 }
             } else if (df2_deferred) {
                 df2_drop(nullptr);
             }
-            if (want_arms)
-                probe_arms = strata::spec::DraftProbe::arms(use_mtp, df2_loaded, o.draft == "auto", S_mtp, o.spec_auto, S);
+            if (want_arms) {
+                probe_arms = strata::spec::DraftProbe::arms(use_mtp, df2_loaded, o.draft == "auto", S_mtp, o.spec_auto, S,
+                                                             false, 8, static_mode < 0 && static_drafter.loaded(),
+                                                             S < strata::kernels::kWindowMaxT ? 0 : strata::core::wide_window() == strata::core::WideWindow::On ? 1
+                                                                 : strata::core::wide_window() == strata::core::WideWindow::Auto ? 2 : 0,
+                                                             false, static_mode == 1);
+            }
             std::vector<int32_t> prompt;
             if (probe_arms.size() >= 2) {
                 try {
@@ -9320,7 +9434,8 @@ int main(int argc, char** argv) {
                 const std::vector<int> plan = strata::spec::DraftProbe::plan((int) probe_arms.size());
                 for (int k : plan) {
                     const strata::spec::ProbeArm& a = probe_arms[(size_t) std::max(k, 0)];
-                    probe_lines.push_back("GEN " + std::to_string(strata::spec::probe_tokens()) + " ckpt=0 draft=" +
+                    probe_lines.push_back("GEN " + std::to_string(k < 0 ? strata::spec::kProbeWarmTokens
+                                                                      : strata::spec::probe_tokens()) + " ckpt=0 draft=" +
                                           (a.drafter == strata::spec::Drafter::None ? std::string("off")
                                                                                     : strata::spec::drafter_name(a.drafter)) +
                                           " spec=" + std::to_string(a.spec) + " probe=" + std::to_string(k) + " " + ids);
@@ -10898,9 +11013,17 @@ int main(int argc, char** argv) {
                 if (req_off) req_df2 = false;
                 if (req_df2 != policy_is_df2) { std::swap(policy, policy_idle); policy_is_df2 = req_df2; }
             }
+            const int64_t df2_short0 = df2.rounds_short, df2_wide0 = df2.rounds_wide;
+            const bool req_static = req_df2 && (probe_running && req_probe >= -1
+                ? probe_arms[(size_t) std::max(req_probe, 0)].static_table : static_selected);
+            const int req_block = probe_running && req_probe >= -1
+                ? probe_arms[(size_t) std::max(req_probe, 0)].block : block_selected;
+            strata::spec::Df2BlockPolicy block_policy(req_block == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
+                                                      : req_block == 2 ? strata::spec::Df2BlockPolicy::Mode::Adaptive
+                                                                       : strata::spec::Df2BlockPolicy::Mode::Short);
             const bool req_mtp = use_mtp && mtp.loaded() && !req_df2 && !req_off;   // the MTP drafts this request
             // the windows this request checks: the measurement's arm, else the window the measurement kept
-            const int req_cap = req_spec_cap > 0 ? req_spec_cap : spec_cap;
+            const int req_cap = req_spec_cap > 0 ? req_spec_cap : req_df2 ? 0 : spec_cap;
             const int S_r = req_cap > 0 ? std::min(S, req_cap) : S, S_mtp_r = std::min(S_mtp, S_r);
             if (use_mtp && req_mtp)
                 mtp.set_max_drafts(req_cap > 0 ? S_mtp_r - 1 : mtp_drafts0);
@@ -12156,6 +12279,7 @@ int main(int argc, char** argv) {
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
             }
             bool first_window = true;
+            int df2_width = strata::kernels::kVerifyNarrowT;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             // XESTRATA_FOLLOW=<file> (token forcing, measurement only, off by default; tools/force_check.py): one line
             // per request in the order the engine decodes them, comma-separated token ids (an empty line: that request
@@ -12860,8 +12984,20 @@ int main(int argc, char** argv) {
             policy.set_scale_all(req_minp_rule);
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 policy.set_context(p);         // STRATA_SPEC_COST: the round costs of this context length
+                bool static_window = false;
+                if (req_static && !first_window) {
+                    const int32_t prev = consumed.empty() ? -1 : consumed.back();
+                    const int count = static_drafter.propose(prev, x, std::min(S_r, df2_width) - 1, sbuf.data());
+                    if (count > 0) {
+                        static_window = true;
+                        for (int i = 0; i < S_r - 1; ++i) {
+                            if (i < count) drafts[(size_t) i] = sbuf[(size_t) i];
+                            dprob[(size_t) i] = i < count ? 1.0f : 0.0f;
+                        }
+                    }
+                }
                 int T = (req_mtp || req_df2) ? S_mtp_r : 1;   // no drafter: one token a round unless a lookup fires
-                if (req_df2) T = strata::spec::df2_window(dprob.data(), S_r, df2_conf);   // DFlash2's confidence cut
+                if (req_df2) T = strata::spec::df2_window(dprob.data(), std::min(S_r, df2_width), df2_conf);   // DFlash2's confidence cut
                 else if (req_mtp && !req_minp_rule) T = policy.mtp_window(dprob.data(), S_mtp_r);
                 else if (req_mtp && req_spec_min_p > 0.0) {
                     T = 1;
@@ -13082,6 +13218,9 @@ int main(int argc, char** argv) {
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                if (req_df2 && !first_window && !static_window && !from_sfx && chain_n == 0 && T == df2_width &&
+                    produced_n + a + 1 < max_new)
+                    block_policy.observe(df2_width, a);
                 draft_offered += T - 1;
                 draft_accepted += a;
                 first_window = false;
@@ -13131,10 +13270,12 @@ int main(int argc, char** argv) {
                                           outv[(size_t) a]);
                 bool drafted = eos || produced_n >= max_new;
                 if (!drafted && req_df2) {
-                    int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                    float pp[strata::core::Dflash2Drafter::kDrafts];
+                    df2_width = block_policy.choose(S_r);
+                    df2.set_block_rows(df2_width);
+                    int32_t dd[strata::core::Dflash2Drafter::kMaxDrafts] = {};
+                    float pp[strata::core::Dflash2Drafter::kMaxDrafts] = {};
                     drafted = df2.draft(ver.tap_dev(), a + 1, p, outv[(size_t) a], dd, pp, err);
-                    for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                    for (size_t i = 0; i < drafts.size() && i < (size_t) df2_width - 1; ++i) {
                         drafts[(size_t) i] = dd[i];
                         dprob[(size_t) i] = pp[i];
                     }
@@ -13215,8 +13356,20 @@ int main(int argc, char** argv) {
                 }
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
-            if (req_probe >= 0)   // the start's measurement: this run's speed
+            if (req_df2 && strata::env_auto("DF2_BLOCK_LOG") == 1)
+                std::fprintf(stderr, "xestrata dflash2: block rounds 8=%lld 16=%lld static=%d\n",
+                             (long long) (df2.rounds_short - df2_short0), (long long) (df2.rounds_wide - df2_wide0),
+                             (int) req_static);
+            if (req_probe == -1 && decode_ms > 0.0) {   // the warm-up: the counted runs about a second of decode each
+                const int nt = strata::spec::probe_run_tokens(1000.0 * (double) produced_n / decode_ms);
+                for (std::string& pl : probe_lines) pl = strata::spec::probe_line_tokens(pl, nt);
+            } else if (req_probe >= 0) {   // a counted run; a round that settles it, or past the budget, ends it
                 probe_runs.push_back({req_probe, produced_n, decode_ms, draft_offered, draft_accepted});
+                const bool round = probe_runs.size() % probe_arms.size() == 0;
+                if (round && (strata::spec::DraftProbe::settled(probe_arms, probe_runs) ||
+                              std::chrono::duration<double>(Clock::now() - probe_t0).count() > strata::spec::probe_budget_s()))
+                    probe_lines.clear();
+            }
             if (df2_loaded && req_kind != 0 && req_probe == -2)   // --draft auto learn: this request's measured decode speed
                 drafter_policy.observe(req_kind, n, req_df2 ? strata::spec::DrafterPolicy::Df2
                                                             : strata::spec::DrafterPolicy::Mtp, produced_n, decode_ms);
@@ -13996,7 +14149,12 @@ int main(int argc, char** argv) {
                 const auto sh = mtp.shared_head();
                 if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
             }
-            if (!df2.bind(wt, g, &native_head, df2_vocab, err) || !df2.prepare(ver.tap_dev(), err)) {
+            if (!df2.bind(wt, g, &native_head, df2_vocab, err)) {
+                std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
+                return 1;
+            }
+            df2.set_max_drafts(o.spec - 1);
+            if (!df2.prepare(ver.tap_dev(), err)) {
                 std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -14011,6 +14169,9 @@ int main(int argc, char** argv) {
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         drive.d.plan = ver.plan_sink();
+        drive.d.lat_xl = ver.latent_xl_mapped();
+        drive.d.lat_xlseq = ver.latent_xlseq();
+        drive.d.lat_act0 = ver.latent_act0_mapped();
         drive.d.pcie_num = (int) std::lround(o.pcie_frac * 256.0);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
@@ -14135,8 +14296,11 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         const bool use_df2 = df2_loaded;   // the CLI: DFlash2 is the drafter when loaded (--draft auto acts as dflash2)
+        strata::spec::Df2BlockPolicy block_policy(block_selected == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
+                                                                      : strata::spec::Df2BlockPolicy::Mode::Short);
+        int df2_width = strata::kernels::kVerifyNarrowT;
         const double df2_conf = o.draft_conf > 0.0 ? o.draft_conf : df2_default_conf(xcache.slots());
-        if (use_df2) df2.set_max_drafts(S_mtp - 1);
+        if (use_df2) df2.set_max_drafts(o.spec - 1);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         // the window rule, as the chain drafts: another draft after n when the rule would keep it (--spec-window)
         const bool minp_rule = o.spec_window == "min-p";
@@ -14220,8 +14384,19 @@ int main(int argc, char** argv) {
             const Clock::time_point t0 = Clock::now();
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
             policy.set_context(p);   // STRATA_SPEC_COST: the round costs of this context length
+            if (use_df2 && static_selected && !first_window) {
+                const int32_t prev = produced.size() > 1 ? (int32_t) produced[produced.size() - 2]
+                    : o.tokens.empty() ? -1 : (int32_t) o.tokens.back();
+                const int count = static_drafter.propose(prev, x, std::min(o.spec, df2_width) - 1, sbuf.data());
+                if (count > 0) {
+                    for (int i = 0; i < o.spec - 1; ++i) {
+                        if (i < count) drafts[(size_t) i] = sbuf[(size_t) i];
+                        dprob[(size_t) i] = i < count ? 1.0f : 0.0f;
+                    }
+                }
+            }
             int T = S_mtp;
-            if (use_df2) T = strata::spec::df2_window(dprob.data(), S_mtp, df2_conf);
+            if (use_df2) T = strata::spec::df2_window(dprob.data(), std::min(o.spec, df2_width), df2_conf);
             else if (use_mtp && !minp_rule) T = policy.mtp_window(dprob.data(), S_mtp);
             else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
@@ -14310,19 +14485,15 @@ int main(int argc, char** argv) {
                              drive.d.fail ? drive.d.fail : "(no message)");
                 return 1;
             }
-            if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (a test path: a plain copy)
+            if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (the shared --window-hashes form)
                 const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
                 hash_rows.resize(n_floats);
                 if (!strata::gpu::copy(hash_rows.data(), ver.final_R_all(), n_floats * sizeof(float))) {
                     std::fprintf(stderr, "xestrata generate: --window-hashes: %s\n", strata::gpu::last_error());
                     return 1;
                 }
-                uint64_t h = 1469598103934665603ull;
-                const auto* bytes = reinterpret_cast<const uint8_t*>(hash_rows.data());
-                for (size_t i = 0; i < n_floats * sizeof(float); ++i) h = (h ^ bytes[i]) * 1099511628211ull;
-                std::fprintf(hashes, "%lld %lld %d %016llx", (long long) rounds, (long long) p, T, (unsigned long long) h);
-                for (int i = 0; i < T; ++i) std::fprintf(hashes, " %d", (int) outv[(size_t) i]);
-                std::fprintf(hashes, "\n");
+                const uint64_t h = strata::spec::window_hash_fnv1a(hash_rows.data(), n_floats * sizeof(float));
+                strata::spec::window_hash_line(hashes, rounds, p, T, h, outv.data(), T);
             }
             if (!follow.empty()) {   // the continuation stands in for the argmax
                 const size_t k0 = produced.size();
@@ -14399,10 +14570,12 @@ int main(int argc, char** argv) {
             }
             bool drafted = (int64_t) produced.size() >= max_new;
             if (!drafted && use_df2) {
-                int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                float pp[strata::core::Dflash2Drafter::kDrafts];
+                df2_width = block_policy.choose(o.spec);
+                df2.set_block_rows(df2_width);
+                int32_t dd[strata::core::Dflash2Drafter::kMaxDrafts] = {};
+                float pp[strata::core::Dflash2Drafter::kMaxDrafts] = {};
                 drafted = df2.draft(ver.tap_dev(), a + 1, p, outv[(size_t) a], dd, pp, err);
-                for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                for (size_t i = 0; i < drafts.size() && i < (size_t) df2_width - 1; ++i) {
                     drafts[(size_t) i] = dd[i];
                     dprob[(size_t) i] = pp[i];
                 }

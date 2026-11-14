@@ -136,8 +136,9 @@ struct Q8_0 {
 };
 /// MMQ's rows (iq_mmq_quantize): row r's int8 values at x8 + r oc, then a FP32 scale a block (onb a row), then, with
 /// SUMS, d times the block's int8 sum; each block written `rep` times (Q2_K's dup: rows of twice the values).
-/// SCATTER: row r is a token's, stored at rows slot[r k_used + k] for each of its k_used.
-template<bool SUMS, bool SCATTER = false>
+/// SCATTER: row r is a token's, stored at rows slot[r k_used + k] for each of its k_used.  HALF_D: the scale's fp16
+/// value (the canonical rows', canon_math.hpp: the values from the FP32 scale, the products from its fp16).
+template<bool SUMS, bool SCATTER = false, bool HALF_D = false>
 struct Rows {
     static constexpr bool kXSum = false, kQSum = SUMS;
     int8_t* x8;
@@ -171,7 +172,7 @@ struct Rows {
             const int64_t row = row_of(r, k);
             for (int e = 0; e < rep; ++e) {
                 const int64_t ob = row * onb + c * rep + e;
-                xs[ob] = d;
+                xs[ob] = HALF_D ? (float) sycl::half(d) : d;
                 if constexpr (SUMS) xu[ob] = d * (float) qsum;
             }
         }

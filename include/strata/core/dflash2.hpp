@@ -24,9 +24,11 @@
 #pragma once
 
 #include "strata/core/draft_head.hpp"
+#include "strata/core/draft_ring_log.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <cstdint>
 #include <deque>
@@ -41,8 +43,10 @@ class NativeHead;
 
 class Dflash2Drafter {
 public:
-    static constexpr int kRows = 8;           ///< block rows: the anchor + 7 masks
+    static constexpr int kRows = strata::kernels::kVerifyNarrowT;           ///< block rows: the anchor + 7 masks
     static constexpr int kDrafts = kRows - 1;
+    static constexpr int kMaxRows = strata::kernels::kWindowMaxT;
+    static constexpr int kMaxDrafts = kMaxRows - 1;
     static constexpr int kRing = 2064;        ///< K/V slots per layer: the 2048 window + slack for rows written ahead of a rejection
 
     Dflash2Drafter() = default;
@@ -57,6 +61,8 @@ public:
     static bool read_shape(const std::string& pack_path, PackShape& shape, std::string& err);
     /// Reads the pack (tools/dflash2_pack.py) to the GPU `device` and allocates the ring and the buffers.
     bool load(const std::string& pack_path, int device, std::string& err);
+    /// Set before load: reserve the wider buffers only when a caller will measure or use them.
+    void set_capacity_rows(int rows);
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).  The head's
     /// rows over the subset are gathered once (core/draft_head, the MTP drafter's shared part).
     bool bind(const WeightTable& wt, const ModelGeometry& g, const NativeHead* head, const std::string& vocab_file,
@@ -103,11 +109,7 @@ public:
     /// made from (2560 int8 codes + 80 block scales a position, 2.9 KB) into a host log of the lineage; a rebuild runs
     /// the K/V projections, norms, rope and ring writes over the logged rows with the same kernels, so the rebuilt
     /// K/V bytes are those of the original update.
-    struct RingStats {
-        int64_t requests = 0, rebuilds = 0, rows_rebuilt = 0, rows_missing = 0, stash_hits = 0, stash_stores = 0,
-                stash_evictions = 0, cold_starts = 0;
-        double ms_rebuild = 0, ms_swap = 0;
-    };
+    using RingStats = DraftRingHistory::Stats;
     RingStats ring_stats;
     int64_t last_rebuilt = 0, last_missing = 0;
     double last_ms = 0;
@@ -123,19 +125,20 @@ public:
     /// draft / context call, which waits first) finds them done.  --draft auto keeps the idle drafter current this way.
     bool context_async(const float* taps_dev, int64_t n, int64_t pos0, std::string& err);
     bool context_wait(std::string& err);
-    /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][ntap * n_embd],
-    /// positions pos0 ...), then the block for `anchor` (the last committed token, at pos0 + n_new).  `drafts` /
-    /// `probs` get kDrafts entries (the selector's pick and its probability).  The taps pointer must be the same
+    /// One round: the new context rows (n_new in 1..capacity: the committed window rows, taps device
+    /// [n_new][ntap * n_embd], positions pos0 ...), then the block for `anchor` (the last committed token, at
+    /// pos0 + n_new). `drafts` / `probs` each hold the selected block's rows - 1 entries. The taps pointer must be the same
     /// device buffer on every call (the graphs are captured on it).
     bool draft(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs,
                std::string& err);
-    /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
+    /// Captures the round graphs on `taps` now. With 15 drafts enabled this captures both block shapes and context counts.
     bool prepare(const float* taps_dev, std::string& err);
-    /// The most drafts a window will use (the engine's widest window - 1, 1..kDrafts; default kDrafts).  The head,
-    /// the top-k and the selector's walk run for that many rows only: the first `n` drafts and probabilities are the
-    /// ones a full block makes (every row is its own column, the walk goes left to right); draft() returns token 0
-    /// with probability 0 for the rest.  Before prepare() / the first draft(); a later change drops the graphs.
+    /// The most drafts a window will use (1..capacity - 1, default 7). The head and selector stop at that many rows.
+    /// The draft block itself is non-causal: changing its shape can change even the first seven drafts. A later change
+    /// drops the graphs.
     void set_max_drafts(int n);
+    /// Select a captured shape. The caller supplies arrays of rows - 1 entries.
+    void set_block_rows(int rows);
 
     uint64_t vram_bytes() const { return vram_; }
     /// The VRAM bind() will allocate for the draft head over `vocab_file`'s subset (or the whole head): the gathered
@@ -153,7 +156,7 @@ public:
     bool debug_ring(std::vector<float>& kv, std::vector<int64_t>& tags, std::string& err);
 
     double ms_draft = 0, ms_ctx = 0, ms_capture = 0;
-    int64_t rounds = 0;
+    int64_t rounds = 0, rounds_short = 0, rounds_wide = 0;
 
 private:
     struct Tensor { std::string name, dtype; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
@@ -166,12 +169,16 @@ private:
     bool record_kv(int n, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err);
     bool record_block(std::string& err);
     bool capture(int n, const float* taps, std::string& err);
-    /// The block's 8 input rows into h_: the target's embedding of the anchor and the 7 mask tokens
+    /// The block's input rows into h_: the target's embedding of the anchor and the mask tokens
     bool embed_rows(std::string& err);
     bool alloc(std::string& err);
-    /// The host's staging of one launch: positions and rope tables (rows 0..7 context, 8..15 block), the anchor (and
-    /// with bind_host its embedding row, when `block`: a round, not a context update alone), then ONE copy to the device.
+    /// Stage the context and block positions, rope tables, and anchor (and its host embedding) in one device copy.
     void stage(int n_ctx, int64_t pos0, int64_t block_s, int32_t anchor, bool block = true);
+    int meta_ints() const { return capacity_rows_ == kRows ? 32 : 64; }
+    int table_floats() const { return capacity_rows_ * 2 * 128; }
+    size_t meta_bytes() const { return (size_t) (meta_ints() + table_floats()) * 4; }
+    int block_pos_offset() const { return capacity_rows_ == kRows ? 8 : 32; }
+    int token_offset() const { return capacity_rows_ == kRows ? 24 : 48; }
 
     int device_ = -1;
     strata::gpu::Stream cs_ = nullptr;
@@ -201,14 +208,14 @@ private:
     bool bound_ = false;
 
     // device buffers (the slab)
-    int32_t* d_meta_ = nullptr;     ///< ints [0..7] context positions, [8..15] block positions, [16] anchor token,
-                                    ///< [17] anchor position, [18] epoch, [24..31] block tokens; then 16 rope tables of 128 floats
+    int32_t* d_meta_ = nullptr;     ///< context positions, anchor at 16, position 17, epoch 18, block positions/tokens;
+                                    ///< layout offsets and rope-table count depend on capacity_rows_
     int32_t* h_meta_ = nullptr;     ///< host staging of d_meta_ (host USM); then, with bind_host, the anchor's row
     float* emb_mask_ = nullptr;     ///< bind_host: the mask token's embedding row
     bool vocab_borrowed_ = false;   ///< bind_host's vocab_dev: the engine's, not freed here
-    float* rt_ctx_ = nullptr;       ///< d_meta_ + 32 (as floats); rt_blk_ = rt_ctx_ + 8 * 128
+    float* rt_ctx_ = nullptr;       ///< d_meta_ + meta_ints(); rt_blk_ follows capacity_rows_ rope tables
     float* rt_blk_ = nullptr;
-    int32_t* d_out_ = nullptr;      ///< the select kernel's 7 picks, then 9 pad, then 7 probabilities
+    int32_t* d_out_ = nullptr;      ///< up to 15 picks, then probabilities at float offset 16
     int32_t* h_out_ = nullptr;
     float* kring_[8] = {};
     float* vring_[8] = {};
@@ -225,44 +232,31 @@ private:
     int32_t* toptok_ = nullptr;
     uint32_t* topscratch_ = nullptr;
     int64_t* tag_ = nullptr;
-    strata::gpu::Graph* exec_[kRows + 1] = {};
+    strata::gpu::Graph* exec_[2][kMaxRows + 1] = {};
     const float* graph_taps_ = nullptr;
     int ndraft_ = kDrafts;
+    int block_rows_ = kRows;
+    int capacity_rows_ = kRows;
+    int requested_capacity_rows_ = kRows;
     int64_t have_ctx_ = 0;
     bool ctx_pending_ = false;      ///< context_async queued rows nobody has waited for yet
 
     // ---- ring log (see begin_request)
-    static constexpr int kLogChunk = 256;   ///< positions per log chunk (allocated on first use)
-    struct LogChunk { std::vector<int8_t> q; std::vector<float> d; std::vector<uint8_t> ok; };
-    struct Lineage {
-        size_t wq = 2560;                                 ///< a logged row's int8 codes (the drafter's hidden; wq / 32 scales)
-        std::vector<int32_t> hist;                        ///< the token of every position the ring was filled for
-        std::vector<std::shared_ptr<LogChunk>> chunks;    ///< the activation rows by position / 256 (copy on write)
-        bool logged(int64_t pos) const;
-        uint64_t bytes() const;
-        void truncate(int64_t keep);
-        LogChunk& writable(size_t chunk);
-    };
-    Lineage cur_;
-    std::deque<Lineage> stash_;
+    DraftRingHistory history_;
     bool log_on_ = true;
     uint64_t stash_budget_ = 256ull << 20;
     int8_t* h_logq_ = nullptr;      ///< host USM: the last update's codes [8][2560] ...
     float* h_logd_ = nullptr;       ///< ... and scales [8][80], copied from the device after the update
     int64_t pend_pos0_ = -1;
     int pend_n_ = 0;
-    int64_t slot_pos_[kRing] = {};  ///< host shadow of the device ring tags
     uint8_t* rb_q_ = nullptr;       ///< rebuild scratch (device): the window's codes, scales and positions
     float* rb_d_ = nullptr;
     int32_t* rb_pos_ = nullptr;
     void log_stage(int64_t pos0, int n);
     void log_fetch(int n);
     void log_flush();
-    bool rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* missing, std::string& err);
-    void stash_push(Lineage&& l);
-    void invalidate_ring();
-    int64_t ring_hi_ = 0;
-    int32_t epoch_ = 0;
+    bool replay(const int32_t* positions, const int8_t* q, const float* scales, int rows, int32_t epoch,
+                std::string& err);
 };
 
 }  // namespace strata::core

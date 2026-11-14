@@ -92,27 +92,41 @@ With `--serve`, `--draft auto` decodes a short fixed English text at the end of 
 drafter loaded (the MTP and, with a DFlash2 pack, DFlash2) and with no drafter, in turn, and keeps the fastest; the
 drafters that lose are released from VRAM and RAM (the MTP layer's K/V stays: the conversation cache and the saved
 conversations carry it). With `--spec auto` (setup writes it) the largest window is a
-candidate too (4 and 2 for Qwen3.8-Flash-Next, 3 and 2 in the plain engine). Unless the fastest is 3% (and its own
-runs' spread) ahead of the others, the cheaper form stays (the MTP, DFlash2, none in that order; the configured window).
-When the MTP and DFlash2 are within that margin both stay and each request picks one (below). The DFlash2 that is
+candidate too (4 and 2 for Qwen3.8-Flash-Next, 3 and 2 in the plain engine). The default form (the MTP at the
+configured window) is left only for a form that is faster in every run and by 10% (and both forms' spread between runs);
+of those, the fastest stays. One drafter is kept. When after the first round no other form can still beat the default,
+the second round is not run. The DFlash2 that is
 measured is loaded at the end of the start and the expert cache is sized as for the MTP alone, so when the MTP wins the
 engine is as it is without the pack; DFlash2 stays only where the `--vram-reserve-mib` reserve is still free beside it.
 While the measurement runs no expert moves and the switches chosen on the first windows are not measured. It reads a
 shallow context (a hundred-odd tokens); at depth the window rule (`--spec-window auto`) adapts each round. Nothing is
 written to disk: every start measures again. `XESTRATA_DRAFT_PROBE=0` measures nothing (auto then loads both), and
-`XESTRATA_DRAFT_PROBE_TOKENS` sets a run's length (default 64). `--draft mtp|dflash2|off` and a number for `--spec` are
+`XESTRATA_DRAFT_PROBE_TOKENS` sets a run's length (default 48). `--draft mtp|dflash2|off` and a number for `--spec` are
 kept as given. Without `--serve`, auto is the MTP layer.
 
-When both stay, a request's `xestrata_draft` (`mtp|dflash2|auto|off`) wins when given; otherwise
+When `XESTRATA_DRAFT_PROBE=0` loads both, a request's `xestrata_draft` (`mtp|dflash2|auto|off`) wins when given; otherwise
 `--draft-rule df2|mtp|learn` (default learn). learn keeps, per kind of request (its first 32 prompt tokens) and context
 depth (the 2K/8K/32K boundaries), the drafter with the better measured decode speed (an EMA), and tries the loser now and
 then (every 6th request when they are within 4%, every 12th otherwise).
 
 DFlash2's window closes where the product of its selector probabilities falls below `--draft-conf P` (the default comes
 from the expert slots; an explicit `--draft-conf` wins). `--draft dflash2` loads no MTP layer by default (for
-Qwen3.8-Flash-Next `--draft-fallback mtp` loads both). DFlash2 runs on one GPU, one request at a time (a layer split,
+Qwen3.8-Flash-Next `--draft-fallback mtp` loads both). `--draft-fallback` and `--draft-mtp-spec` are Qwen3.8-Flash-Next's
+only: the two run DFlash2 and the MTP layer together and set a static primary with the other as fallback (its window),
+while the plain engine keeps both loaded but picks the faster per request by its measured speed (`--draft auto`, the
+DFlash2 section above) and sets the MTP's window with `--spec`, so the static knobs add nothing there. DFlash2 runs on
+one GPU, one request at a time (a layer split,
 `--batch` and pipeline windows keep the MTP). The plain engine's `--draft dflash2` is for `--serve` only. The greedy
 answer is the same whichever drafter proposes (the verify window emits the target's argmax).
+
+With `--wide-window auto`, the start measurement compares DFlash2's 8-row block, 16-row block and a switch based on an
+EMA of accepted drafts, where the configuration permits them. `off` caps it at 8 rows; `on` takes 16. The verification
+window still respects the remaining context and the configured limit.
+
+Set `XESTRATA_DF2_STATIC_TABLE` to a YD1S table for the target model to propose from two-token, then one-token entries.
+`XESTRATA_DF2_STATIC=auto|0|1` measures both forms at startup, disables the table, or enables it (default auto). The
+table has no tokenizer identity: the same vocabulary size is not enough. Use a table made for this model's tokenizer.
+The target verifies these proposals too.
 
 In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
 top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
@@ -196,6 +210,17 @@ Only the part the attention reads stays in VRAM (`--kv-resident 32768`), so more
 The attention reads exactly the same values; only where the KV lives changes.
 It costs about 13.7 KB of RAM per context token, about 1.7 GB at 128K.
 
+**KV streaming for the plain models** (`--kv-resident N|auto|off`, default `auto`, `XESTRATA_KV_RESIDENT`):
+the full-attention (GQA) layers of Ornith, Qwen3.6, Qwen3.5, llm-jp and PLaMo stream their KV to RAM in the same
+shape as Qwen3.8. The authoritative K/V lives in pinned RAM (the identity layout); VRAM keeps a ring of the last N
+cells. The decode reads the older cells from RAM over PCIe (the shared attention kernel) and the recent ones from
+VRAM; a prompt chunk stages one layer's cells into a borrowed VRAM pool. `auto` is Qwen3.8's rule (from 64K up,
+when the RAM holds the experts beside the KV host copy and headroom), N defaulting to 32768. It works with int8,
+q4_0 and k8v4 KV, the speculative window, and conversation save and restore. The answers are bitwise the same as
+without streaming; only where the KV lives changes. GLM-5.3-Flash's DSA uses `--kv-ram`, the sliding-window layers
+keep their own ring, and `--batch` and an encoder are excluded. Streaming fixes the KV's VRAM, so `--kv-grow`
+stays off (the engine says so).
+
 **The elastic K/V** (`--kv-grow` or `XESTRATA_KV_GROW=1`, upstream 9e3dbfe7): the whole KV cache in VRAM, taking VRAM only for the cells the requests reach.
 The expert cache holds the rest, giving slots to the K/V as the context grows and taking them back after a short request.
 Both live in virtual memory (`sycl_ext_oneapi_virtual_mem`) and neither address moves, so the captured graphs stay valid.
@@ -235,10 +260,10 @@ A level with one choice is not asked.
 On the command line, choose each level with `--base`, `--variant` and `--quantizer`, or all of them with `--family` (`--base qwen3.8-flash-next --variant sc117` is `--family sc117`).
 `--model` is the size.
 
-The model chosen first is the first of Qwen3.8-Flash-Next's Swift 1.5 in SC117's copy (where its IQ3_XXS fits), Gyro-Coder-L (where its experts all fit the RAM), Ornith-1.5, Qwen3.6-35B-A3B, Qwen3.5-9B and Qwen3.5-2B that this PC runs (Qwen3.5-2B on a PC without a GPU).
+The model chosen first is the first of Qwen3.8-Flash-Next's Swift 1.5 in SC117's copy (where its IQ3_XXS fits), Gyro-Coder-L (where its experts all fit the RAM), Gyro-Coder (likewise), Ornith-1.5, Qwen3.6-35B-A3B, Qwen3.5-9B and Qwen3.5-2B that this PC runs (Qwen3.5-2B on a PC without a GPU).
 The size is recommended by quality:
 
-- ISTA-DASLab's GSQ-RCO files (the original, Swift 1.5, the Coder, SC117's and huihui-ai's versions): IQ3_XXS; where this PC does not hold it, the best quality it holds (in the low-RAM mode too).
+- ISTA-DASLab's GSQ-RCO files (the original, Swift 1.5, the Coder, SC117's and huihui-ai's versions): IQ3_S where this PC holds it, else IQ3_XXS; where it holds neither, the best quality it holds (in the low-RAM mode too).
 - The files that run on a RAM budget (Unsloth's, Gyro, AtomicChat's AD): the best quality whose experts all fit the RAM; never an experimental one.
 - The MoE models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, GLM-5.3-Flash): the best quality the RAM and VRAM together hold.
 - Qwen3.5 (9B, 2B, 0.8B): the largest the VRAM holds. On a PC without a GPU, UD-Q5_K_XL for the 2B and Q8_0 for the 0.8B.
@@ -457,7 +482,7 @@ a GPU ([a PC without a GPU](#a-pc-without-a-gpu)).
   Q6_K and Q8_0, with the tensor types of the same official versions), can be chosen too
   (`--family ornith-uncensored`). It refuses far less, and its safety filtering is reduced, so check what it writes.
 - **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)** (LLM-jp,
-  Apache-2.0): a thinking model of 32B with 3B active per token, in Japanese and English, context up to 256K.
+  Apache-2.0): a thinking model of 32B with 3B active per token, in Japanese and English, with a 64K context.
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)** (Qwen, Apache-2.0): a thinking
   Qwen3.5-family MoE of 35B with 3B active per token, context up to 256K. The GGUFs are Unsloth's UD-Q4_K_XL,
   UD-Q6_K_XL and Q8_0 with the MTP layer.
@@ -539,7 +564,7 @@ Requests with a temperature take it too: each row of a window draws from a rando
 With two or more GPUs chosen by `setup --gpus`, the layers are split across them (the first GPU runs the first layers,
 the next the later ones, the head and the MTP layer; the points follow each GPU's share of the free memory), and the
 experts in VRAM are all the GPUs' together.
-`setup`'s `--kv`, `--parallel`, `--replicas` and `--resident-budget-gib N` (N GiB of the experts the GPU does not hold in RAM, the rest read from the file) go into the config as for Qwen3.8-Flash-Next (`--kv`'s `q4_0` and `k8v4` for the models with heads of 256, `fp16` and `int8` for llm-jp, `fp16` alone for GLM-5.3-Flash; `--parallel` not for GLM-5.3-Flash nor with images).
+`setup`'s `--kv`, `--parallel`, `--replicas` and `--resident-budget-gib N` (N GiB of the experts the GPU does not hold in RAM, the rest read from the file) go into the config as for Qwen3.8-Flash-Next (`--kv`'s `q4_0`, `k8v4`, `tcq4` and `tcq5` for the models with heads of 256, `fp16` and `int8` for llm-jp, `fp16` alone for GLM-5.3-Flash; `--parallel` not for GLM-5.3-Flash nor with images).
 Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5's 9B, 2B and 0.8B read images (2B and 0.8B on a GPU only; setup asks as for
 Qwen3.8-Flash-Next, and takes the GPU reader on a GPU of 24 GB and more, the CPU reader below that).
 Each picture reader (mmproj) is its publisher's: Ornith AI's BF16 for Ornith-1.5 (pfeifferj's GSQ-RCO files use it too),
@@ -558,7 +583,8 @@ The engine's options (added to the settings' `args`):
 | --- | --- |
 | `--max-context N` | the KV cache's tokens (setup picks it from the GPU's VRAM) |
 | `--kv-ram on\|off` | GLM-5.3-Flash: the DSA layers' latent cells (1 KB a position) in RAM instead of VRAM, which goes to the experts (on by default); a decode window copies the positions each token selected into VRAM, a prompt chunk each layer's cells up to it. With 128K positions the B70's VRAM tier went from 2,150 to 2,322 experts, the RTX 4070 could start at 128K at all, and at 64K its prompt went from 3.3 to 7.1 tokens/s |
-| `--kv fp16\|int8\|q4_0\|k8v4` | the attention layers' KV cache in FP16 (the default) or as int8 codes with an FP16 scale per 64 values: half the VRAM, the answers differ slightly. `q4_0` keeps K and V as Q4_0 after the Hadamard rotation (about 28% of FP16), `k8v4` K in int8 and V as rotated Q4_0 (about 40%); these two for the models with heads of 256 (Ornith, Qwen3.6, Qwen3.5-9B). Qwen3.5-9B's 32K prefill on the B70: FP16 20.6 s, `q4_0` 20.4 s, `k8v4` 19.8 s (none of them for GLM-5.3-Flash) |
+| `--kv-resident N\|auto\|off` | stream the attention layers' KV to RAM (Qwen3.8's shape): the authoritative K/V in pinned RAM, VRAM a ring of the last N cells, the decode reading the older cells over PCIe. `auto` (the default) from 64K up when the experts and the KV host copy fit in RAM (N defaults to 32768); `off` keeps every cell in VRAM. Works with int8, q4_0 and k8v4, the speculative window and conversation save; the answers are bitwise the same. Not GLM's DSA (`--kv-ram`), the sliding-window layers, `--batch` or an encoder; streaming turns `--kv-grow` off (`XESTRATA_KV_RESIDENT`); the trellis codes (`tcq4`, `tcq5`) have no host copy and keep streaming off |
+| `--kv fp16\|int8\|q4_0\|k8v4\|tcq4\|tcq5` | the attention layers' KV cache in FP16 (the default) or as int8 codes with an FP16 scale per 64 values: half the VRAM, the answers differ slightly. `q4_0` keeps K and V as Q4_0 after the Hadamard rotation (about 28% of FP16), `k8v4` K in int8 and V as rotated Q4_0 (about 40%). `tcq5` and `tcq4` keep K and V, after a signed rotation, in a trellis code of 5 and 4 bits a value (YASAKANI's KV5 scheme; about 32% and 26%). On the RX 9060 XT with Qwen3.5-9B and Qwen3.6-35B-A3B, their KL against the FP16 cache was as small as or smaller than `k8v4`'s (`tcq5`) and `q4_0`'s (`tcq4`). The trellis code keeps cells in int8 until 16 tokens are there and codes them together (`XESTRATA_KV_TCQ_DEFER=0`: one token at a time). These four are for the models with heads of 256 (Ornith, Qwen3.6, Qwen3.5-9B). A dense model (Qwen3.5-9B) without `--kv` takes, when the GPU would not hold all its layers with FP16, the first of int8, `tcq5` and `tcq4` with which it holds them all (262K on the RX 9060 XT limited to 12 GB: int8; to 10 GB: `tcq5`). Qwen3.5-9B's 32K prefill on the B70: FP16 20.6 s, `q4_0` 20.4 s, `k8v4` 19.8 s (none of them for GLM-5.3-Flash) |
 | `--kv-grow`, `--no-kv-grow` | with `--serve` on one GPU, the KV cache in virtual memory, taking VRAM only for the cells the requests reach: the VRAM tier of experts (in `--vram-elastic`'s segments) gives it up before a long request and takes it back after a short one. On by default, as Qwen3.8-Flash-Next's, where the GPU's virtual memory pages are 2 MiB or more (the RTX 4070, not the B70). On the RTX 4070, Qwen3.6-35B-A3B at a 128K context started with 4,182 slots instead of 2,870 and its 32K prefill went from 32.9 s to 29.0 s (not with the batch slots) |
 | `--control-vector-scaled FILE:SCALE[,...]`, `--control-vector FILE`, `--control-vector-layer-range A B`, `--cvec-mode`, `--cvec-dir` | a control vector in llama.cpp's format on the residual stream after each layer's FFN (Qwen3.8-Flash-Next's meanings). With `--serve` a request switches it (`experimental_speed_projection`), and a switch reads the conversations again (not for GLM-5.3-Flash yet) |
 | `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
@@ -577,7 +603,7 @@ The engine's options (added to the settings' `args`):
 | `--vram-elastic` | with `--serve` on one GPU: the experts' VRAM tier in segments (`--vram-segment-mib`, default 512), given back before an image job and taken again after it (`--image-gpu-policy shrink`) |
 | `--prefill-cpu-share S` | the CPU pool's share of the experts outside VRAM in prefill (0-1; `auto` by default, measured per prompt; 0: every expert on the GPU). The CPU rounds differently from the GPU, so a share that moves between runs moves a greedy answer with it; setup measures it once per PC and model and writes that value into the config. With 0 it is the same each time |
 | `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores, at most 32; in a Linux container with a CPU quota (cgroup), at most one fewer than the quota) |
-| `--pool-cores LIST`, `--aux-cpus SET`, `--pool-tasks N`, `--no-host-worker`, `--memory-limit-mib N` | the CPUs of the expert workers, the CPUs of the threads that are neither workers nor the host (a request's `strata_tune` `aux_cpus` too), the pool's tasks a phase, the host thread kept out of the drain, the RAM the parking and saving of conversations counts (Qwen3.8-Flash-Next's meanings) |
+| `--pool-cores LIST`, `--aux-cpus SET`, `--pool-tasks N`, `--no-host-worker`, `--memory-limit-mib N` | the CPUs of the expert workers, the CPUs of the threads that are neither workers nor the host (a request's `strata_tune` `aux_cpus` too), the pool's tasks a phase, the host thread kept out of the drain, the RAM the parking and saving of conversations counts (Qwen3.8-Flash-Next's meanings). Without `--pool-cores`, `XESTRATA_POOL_PLACE` (`auto` (the default), `off`, `on`) chooses the workers between every physical core and the fast cores only on a CPU whose cores are not all alike (the P and E cores of a hybrid part), by a start-up measurement of their RAM read bandwidth (the fast cores only when clearly faster; a CPU whose cores are all alike is left untouched) |
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096, or a larger chunk the VRAM tier of experts lends, up to 32768, its buffers within 85% of the slots; 0: none at once) |
 | `--max-t N` | the decode window's most tokens (default 8; 16 with `--wide-window on` or a batch of 9 slots or more) |
 | `--wide-window auto\|off\|on` | whether the verify and batch windows go up to 16 rows: `auto` (the default) for a batch of 9 slots or more and a `--spec` of 9 or more, `off` never, `on` wherever they can (the config's `"wide_window"` and `XESTRATA_WIDE_WINDOW` set it too). A window of up to 8 rows runs the same kernels either way |
@@ -586,8 +612,10 @@ The engine's options (added to the settings' `args`):
 | `--draft-vocab PATH` | the MTP layer drafts only tokens of this subset (`data/draft_vocab*.bin`), reading less of the head (setup writes it into Qwen3.6's settings, after its `--draft-vocab` choice) |
 | `--coupled-draft`, `--no-coupled-draft` | under sampling, the MTP layer's drafts are drawn too, with the request's chain (temperature, top_k, top_p, min_p) and the random number of the window row that checks each (Qwen3.8-Flash-Next's; off by default) |
 | `--suffix-draft N`, `--lookup-chain K`, `--lookup-chain-min M` | with `--serve`, drafts from an earlier repeat of the conversation's text (a match of its last N tokens or more), checked in a window where they go past the MTP layer's drafts (also on a model without that layer); `--lookup-chain` adds up to K such tokens after the MTP's drafts (off by default) |
-| `--layer-split K[,K2..]` / `auto` | split the layers across the GPUs: the first runs the layers before K, the next those from K on, ... (`auto`: by each GPU's share of the free memory; setup's `--gpus` writes it) |
+| `--layer-split K[,K2..]` / `auto` | split the layers across the GPUs: the first runs the layers before K, the next those from K on, ... (`auto`: by each GPU's share of the free memory; setup's `--gpus` writes it). With `auto` and `--expert-profile`, the second GPU's role is chosen too - a stage of the split, a helper expert cache, or none (the first GPU alone) - from the measured bandwidths and the profile's predicted decode window (as Qwen3.8-Flash-Next's; the margins `XESTRATA_SPLIT_GAIN_PCT` and `XESTRATA_SPLIT_HELPER_GAIN_PCT`, the role fixed by `XESTRATA_SPLIT_ROLE`; without a profile the split by memory stands) |
 | `--split-device D[,D2..]` | the later GPUs (engine numbers or PCI addresses; by default the other discrete GPUs) |
+| `--split-roles any\|helper` | the second GPU's role in `--layer-split auto`: `any` (the default) chooses a stage, a helper cache or none by the prediction; `helper` keeps it out of the split (a helper cache or none) (as Qwen3.8-Flash-Next's) |
+| `--split-skip-if-fits` | `--layer-split auto`: the first GPU alone when it holds every profiled expert pair (as Qwen3.8-Flash-Next's) |
 | `--pipeline-windows N` | with a layer split, 1 (the default) pipelines the windows a prompt is read through over the stages (an earlier stage computes the next window while a later one computes this one; the rows and their order are the serial ones, so the state is too); 2, with two stages and the MTP layer, the decode too: the first stage computes a guess of the next window while the last checks this one (when this one holds whole and its next token is the draft layer's, the guess is the next window; else the first stage goes back), only where the chance that it holds (the draft layer's probability, scaled by the share of the guesses so far that held) times the first stage's time it saves exceeds the time a guess beside a window adds to it, each time measured over the windows; until they are measured, where that chance is 0.5 or more (Qwen3.8-Flash-Next's default is 0.2). The windows are sized by the serial rule (`--spec-window`). The text is that of the serial windows with the experts in the same places (2 keeps the second verifier's VRAM out of the experts, so their places change, and a text at temperature can change with the CPU's and the GPU's rounding). Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20: a copy reply 187.2 -> 247.2 tokens/s, a story at temperature 0.8 134.5 and 135.7 -> 133.0 and 134.1. Qwen3.8-Flash-Next on the same pair split at layer 24 (the experts not swapped): a story, greedy, serial 65.9 -> 67.2 and 67.5 tokens/s, at temperature 0.8 60.7 -> 60.9 and 64.0 (57.6 and 57.9, 54.7 and 55.1 when `--spec` sized the windows). 0: serial. Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20, 819 tokens with `--prompt-chunk 0`: prefill 108.5 -> 139.3 tokens/s, the same answer. A long prompt read in chunks has its chunks pipelined over the stages the same way (13,506 tokens on the same split: prefill 1,030.8 -> 1,357.9 tokens/s, the same answer) |
 | `--vram-reserve-later-mib N` | with a layer split, the VRAM left free on the later GPUs (by default as `--vram-reserve-mib`) |
 | `--vision` | with `--serve`, take requests with images (Qwen3.5-9B and the qwen35moe models; setup writes it when images are chosen) |
@@ -595,7 +623,8 @@ The engine's options (added to the settings' `args`):
 | `--batch N` (`"parallel": N`, `"auto"` by default) | with `--serve`, decode up to N conversations together ([BATCHING](BATCHING.md#the-other-models-the-plain-engine); not GLM-5.3-Flash nor `--vision` yet) |
 | `--prompt-cache N`, `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID`, `--conversation-save-checkpoints N` | with `--serve`, the conversation checkpoints of a model with a recurrent state (Ornith, Qwen3.6, Qwen3.5-9B). A recurrent state cannot go back to an earlier position, so a request that takes a conversation up short of its end (the next turn after a reply rendered otherwise, an edited message, a new chat on the same system prompt) reads all of it again without one. The meanings and defaults are Qwen3.8-Flash-Next's ([the conversation cache](#the-conversation-cache)), and a request's `pin` and `"strata_checkpoint": false` apply. A checkpoint is the recurrent state only (about 60 MB for Qwen3.6); the K/V of the positions below it are the conversation's. `--turn-token` defaults to the vocabulary's `<|im_start|>`, else `<|start|>`. A model of attention layers only (llm-jp, GLM-5.3-Flash) needs none: the K/V up to any position serve |
 | `--tail-role-token ID`, `--prompt-cache-tail`, `--prompt-cache-spread`, `--conversation-cache-min-tokens N`, `--conversation-cache-park-gain N`, `--short-read N`, `--session-save-reclaim` | `--serve`'s policies of the conversation cache and the checkpoints (Qwen3.8-Flash-Next's meanings); `--short-read` defaults to `--max-t` |
-| `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N`, `--yarn-ext-factor F`, `--yarn-attn-factor F`, `--yarn-beta-fast F`, `--yarn-beta-slow F` | context extension (the YaRN knobs as llama.cpp's) |
+| `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N`, `--yarn-ext-factor F`, `--yarn-attn-factor F`, `--yarn-beta-fast F`, `--yarn-beta-slow F` | context extension (the YaRN knobs as llama.cpp's): a context past the trained length (262,144) shrinks the rotation's angles (linear) or extends them with YaRN. It reads the GGUF's `rope.scaling.*` and the rotation's dimensions (all or a part) and applies them per layer. Ornith, Qwen3.6 and Qwen3.5 take it; llm-jp-4.1 keeps its trained 64K, and GLM-5.3-Flash's MLA is nope (no rotation), so neither extends. An unscaled run answers bit for bit as it did before this feature. setup offers the 384K and 512K choices and the RoPE question for these models too ([above](#run-setupsh)) |
+| `--window-hashes PATH` | per verify window, a line with its index, position, size, a 64-bit hash of its final normed rows and its argmaxes (the same form as Qwen3.8-Flash-Next's engine, `strata/spec/window_hash.hpp`). A tool for answer drift: two builds that do the same arithmetic write the same file. Use it with `--spec-follow` and `--adapt-every 0` (the serial verify window; it does not write `--pipeline-windows 2`'s windows) |
 
 #### A PC without a GPU
 
@@ -953,7 +982,15 @@ The list is numbers, ranges and `first-last:step` (`0,2,4,6`, `2-14:2`), numbere
 The worker count is the list's length; `--pool-workers N` takes its first N entries.
 Nothing is refused; the engine warns when two entries are the two threads of one core, when an entry is the host's logical processor, and when one is a processor this process may not use (left out). With nothing usable left the pool keeps its default placement, and a list that cannot be read is said and ignored.
 The host keeps the first core, so leave it out of the list. It moves threads only and does not change the answers.
-It applies to the Qwen3.8-Flash-Next engines; the other MoE models (Ornith, llm-jp, Qwen3.6, GLM-5.3-Flash) keep the default placement.
+Both the Qwen3.8-Flash-Next engine and the plain engine (Ornith, llm-jp, Qwen3.6, GLM-5.3-Flash) take it.
+
+`XESTRATA_POOL_PLACE` (`auto` (the default), `off`, `on`), when `--pool-cores` is not given, chooses the workers between
+every physical core (the default) and the fast cores only on a CPU whose cores are not all alike (the P and E cores of a
+hybrid part). It measures both core sets' RAM read bandwidth at start-up and takes the fast cores only when they are more
+than 5% faster (`auto`); `off` keeps the default, `on` forces the fast cores. The cores' speed is read from the OS's
+`cpuinfo_max_freq`, never from a name. A CPU whose cores are all alike, or that does not report a frequency, is left
+untouched. It moves threads only and does not change the answers. Whether it helps is decided by measurement (on the
+i7-14700 upstream's P-leaning placement was slower, so the default is expected to win; the record's measure-plan).
 
 `--aux-cpus` decides which CPUs run the threads that are neither CPU pool workers nor the host thread (Linux, `off` by
 default, upstream 91f1e85d): the expert cache's refills, the prefill copies, the file reads, the GPU runtime's threads
@@ -1176,7 +1213,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Speculative decoding works with the guard as without it. The same question three times each on the B70 decoded at 97.9 and 97.7 tokens/s on Qwen3.8-Flash-Next and at 141.9 and 144 tokens/s on Ornith-1.5-35B-A3B (Ornith had been at 106.5 tokens/s, the guard turning speculative decoding off).
   A client that cannot add a field to the body sends the header `X-XeStrata-Script-Guard: ja` instead (the body's `script_guard` wins).
   A request that names none gets, in this order, the web app's Chat settings shared with other apps ("Use for other apps too"), `XESTRATA_SCRIPT_GUARD=ja`, `"script_guard": "ja"` in `xestrata-<model>.json`, or `"script_guard"` in the settings every model shares (`settings.json`); the two files can also be changed in the web app's Settings. Without any of them it is off, and a request's `"script_guard": "off"` turns it off for that request.
-  Setup asks whether to use it the first time it runs interactively and with `--setup`, and writes the answer to `settings.json` (`--script-guard ja|en|ko|zh-cn|zh-tw|off` decides without asking). The answer it offers is `ja` when the system's language is Japanese, `ko` for Korean, `zh-cn` for Chinese (`zh-tw` in Taiwan and Hong Kong), `off` for Vietnamese, and `en` otherwise.
+  Setup asks whether to use it the first time it runs interactively and with `--setup`, and writes the answer to `settings.json` (`--script-guard ja|en|ko|zh-cn|zh-tw|off` decides without asking). The answer it offers is `off` (not used); to use it, choose the answers' language.
   XeStrata's measurements (`xestrata --setup --bench`, the measuring tools in `tools/`, the release's and the upstream syncs' comparisons) send `"script_guard": "off"` with every request, so this setting does not touch them.
   The web app's Chat settings start at "Japanese" when the page is in Japanese, "Korean" in Korean, "Chinese (Simplified)" in Chinese and "English etc. (non-CJKV)" in any other language; turn it off to have the model write a language whose characters it bans.
   An engine that takes no logit_bias (an older engine), and a `"parallel"` batch slot (this guard holds one request at a time), do not apply it, and the server's window says so in a line.

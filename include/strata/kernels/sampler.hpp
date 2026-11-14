@@ -57,6 +57,11 @@ inline constexpr int kGumbelK = 20;
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
+// One parameter record per row, on the device. A negative penalty_last_n leaves that row's output unchanged.
+// Each record's counter and allowed pointer belong to that row (not row zero of a window).
+void sample_token_rows(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                       const SamplerParams* params, int* out, void* stream);
+
 // ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp, STRATA_SPEC_COUPLED=1).  Device pointers
 // throughout; every per-request / per-round value comes from device memory, so the calls can be captured.
 //
