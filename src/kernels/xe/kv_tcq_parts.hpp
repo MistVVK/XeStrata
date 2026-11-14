@@ -8,6 +8,7 @@
 
 #include "strata/kernels/kv_tcq.hpp"
 #include "strata/kernels/kv_tcq_tables.hpp"
+#include "strata/kernels/trellis.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -36,27 +37,20 @@ inline float row_scale(const uint8_t* r, int head_dim, int bits) {
     return *reinterpret_cast<const float*>(r + head_dim * bits / 8);
 }
 
-// 64 bits of a row's code from bit `at` on, the first the most significant.  The words read stay inside the row: the
-// code's last word is followed by the scale's.
-inline uint64_t bits64(const uint32_t* w, int at) {
-    const int wi = at >> 5, o = at & 31;
-    const uint64_t z = ((uint64_t) w[wi] << 32) | w[wi + 1];
-    return o == 0 ? z : (z << o) | (w[wi + 2] >> (32 - o));
-}
+// 64 bits of a row's code from bit `at` on, the first the most significant: the shared trellis window
+// (kernels/trellis.hpp, Order::Msb).  The words read stay inside the row: the code's last word is followed by the scale's.
+inline uint64_t bits64(const uint32_t* w, int at) { return trellis::window_msb(w, at); }
 
 // A code's value over 256 from the codebook in local memory (tab, code_of(bits, i) / 256), else from the constant one
 inline float code_val(int bits, int st, const float* tab) {
     return tab != nullptr ? tab[st] : (float) code_of(bits, st) * (1.0f / 256.0f);
 }
 
-// Value d of a row (r: its first byte)
+// Value d of a row (r: its first byte): the shared trellis state (kernels/trellis.hpp, Order::Msb)
 inline float value(const uint8_t* r, int head_dim, int bits, int d, const float* tab = nullptr) {
     const uint32_t* w = reinterpret_cast<const uint32_t*>(r);
     const int end = bits * (d + 1), first = bits * (d & ~(kTcqChain - 1));
-    const int lo = sycl::max(end - 8, first), n = end - lo;
-    const int wi = lo >> 5, o = lo & 31;
-    const uint64_t z = ((uint64_t) w[wi] << 32) | w[wi + 1];
-    const int st = (int) (z >> (64 - o - n)) & ((1 << n) - 1);
+    const int st = (int) trellis::state_msb(w, end, first);
     return code_val(bits, st, tab) * row_scale(r, head_dim, bits);
 }
 
