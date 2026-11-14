@@ -39,19 +39,21 @@ class ReleaseManifest(unittest.TestCase):
         self.assertIn("asset list has no Strata-0.2.99-windows-x64-setup.exe", problems)
 
     def test_a_control_only_hotfix_is_allowed_and_a_drifting_control_is_not(self):
-        """0.2.13.1: the Terminal and Control are one hotfix part ahead of the app and the engines; nothing else may differ."""
+        """0.2.13.1: the Terminal and Control are one hotfix part ahead of the app and the engines; nothing else may differ.
+        Written so it holds for a release with a hotfix part (0.2.13.1) and without one (0.2.14)."""
         m = rm.load()
         self.assertEqual(rm.check(m), [])
         wrong = copy.deepcopy(m)
-        wrong["control_version"] = m["engine_version"]              # the manifest says the hotfix is not there, the source says it is
+        wrong["control_version"] = m["engine_version"] + ".9"       # the manifest names a Control hotfix the source does not have
         problems = "\n".join(rm.check(wrong))
         self.assertIn("CMakeLists.txt (Control) says", problems)
         wrong = copy.deepcopy(m)
         wrong["engine_version"] = "0.1.58"                          # engines two builds behind Control: not a hotfix
         self.assertIn("CMakeLists.txt (engine) says", "\n".join(rm.check(wrong)))
         wrong = copy.deepcopy(m)
-        del wrong["terminal_version"]                               # no terminal_version: the Terminal must say the product version
-        self.assertIn("strata_cli/__init__.py says 0.2.13.1", "\n".join(rm.check(wrong)))
+        wrong["terminal_version"] = m["product_version"] + ".9"     # the manifest names a Terminal the source does not say
+        terminal = rm.code_versions()["strata_cli/__init__.py"][0]
+        self.assertIn("strata_cli/__init__.py says %s" % terminal, "\n".join(rm.check(wrong)))
 
     def test_installer_names_in_the_manifest_asset_list(self):
         m = rm.load()
