@@ -18,6 +18,8 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/latent_rows.hpp"
+#include "strata/kernels/cpu/iq_avx2.hpp"
+#include "ggml-cpu.h"
 #include "strata/core/latent.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -3114,10 +3116,26 @@ static void latent_cpu_run(ExpertDispatch& d, const int32_t* ids, int64_t n_tok,
     const uint8_t* U = d.lat_dense->u(l);
     const size_t u_row = d.lat_dense->u_row_bytes();
     const int fmt = d.lat_fmt;
-    d.pool->run((int) ent_t.size(), [&](int j) {
-        latent_u_row(U + (size_t) ent_g[j] * H * u_row, (int) H, (int) ELL, fmt, hq.data() + j * hq_row,
-                     out + (size_t) ent_i[j] * H);
-    });
+    if (fmt == 8) {
+        // Q8_0 U rides the existing Q8_0 row product (q80_256_rows: AVX2, AVX-VNNI by cpu_avxvnni_ok), h as Q8_0
+        const size_t q8_row = (size_t) (ELL / 32) * 34;
+        static thread_local std::vector<uint8_t> hq8;
+        hq8.resize(ent_t.size() * q8_row);
+        const auto* tr = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+        for (size_t j = 0; j < ent_t.size(); ++j)
+            tr->from_float(lh.data() + j * (size_t) ELL, hq8.data() + j * q8_row, ELL);
+        d.pool->run((int) ent_t.size(), [&](int j) {
+            const void* act[1] = {hq8.data() + j * q8_row};
+            float* o[1] = {out + (size_t) ent_i[j] * H};
+            q80_256_rows(U + (size_t) ent_g[j] * H * u_row, u_row, (int) H, act, 1, o, 0, (int) H);
+        });
+    } else {
+        // Q4_0 U: the existing CPU row family has no Q4_0 product, so the latent kernel (AVX2/VNNI/AVX-512 VNNI)
+        d.pool->run((int) ent_t.size(), [&](int j) {
+            latent_u_row(U + (size_t) ent_g[j] * H * u_row, (int) H, (int) ELL, fmt, hq.data() + j * hq_row,
+                         out + (size_t) ent_i[j] * H);
+        });
+    }
     d.multi_entries += (int64_t) ent_t.size();
 }
 
