@@ -63,8 +63,6 @@
 
 namespace strata::kernels {
 namespace {
-// the kernels and the formats' traits (native_mmvq_kernels.hpp, shared with native_mmvq_wide.cpp)
-using namespace mmvq_xe;
 
 // NW warps per work-group and ROWS rows per work-group.  The EXACT layout (NW = 4, ROWS = 1, or 4 for small K) is
 // the ncols = 1 layout and keeps every column bitwise equal to a single-column call.  The UPSTREAM layout is
@@ -274,7 +272,9 @@ void mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out
         case 6: launch_n<F, 6>(q, weights, x_q8_1, y, n_in, n_out, row); break;
         case 7: launch_n<F, 7>(q, weights, x_q8_1, y, n_in, n_out, row); break;
         case 8: launch_n<F, 8>(q, weights, x_q8_1, y, n_in, n_out, row); break;
-        default: mmvq_wide<F>(q, weights, x_q8_1, y, n_in, n_out, ncols, row, g_multi_exact); break;   // 9..16
+        default:   // 9..16: native_mmvq_wide.cpp
+            mmvq_xe::mmvq_wide(kWideFmt<F>, q, weights, x_q8_1, y, n_in, n_out, ncols, row, g_multi_exact);
+            break;
     }
 }
 

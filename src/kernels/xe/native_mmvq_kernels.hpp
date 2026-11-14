@@ -44,6 +44,16 @@
 #include <cstdint>
 
 namespace strata::kernels::mmvq_xe {
+/// Columns 9..16 of a wide window for the format numbered `fmt` (kWideFmt), as native_mmvq.cpp's launch_n takes 1..8
+/// (`row`: a sub-group a row; `exact`: the exact layouts, native_mmvq_set_multi_exact): native_mmvq_wide.cpp.
+void mmvq_wide(int fmt, sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
+               int ncols, bool row, bool exact);
+}  // namespace strata::kernels::mmvq_xe
+
+// Internal to each source that includes this (as they were in native_mmvq.cpp alone): the device compiler keeps a
+// source's kernels and their helpers its own, and each source instantiates its own column counts.
+namespace strata::kernels {
+namespace {   // NOLINT(google-build-namespaces,cert-dcl59-cpp,misc-anonymous-namespace-in-header)
 
 constexpr int QK = 256;
 constexpr int Q8K = 32;
@@ -639,10 +649,21 @@ struct Q80RowTraits {
 };
 using IQ4NLTraits = SmallTraits<IQ4NLBlock, 4>;
 
-/// Columns 9..16 of a wide window, as native_mmvq.cpp's launch_n takes 1..8 (`row`: a sub-group a row; `exact`: the
-/// exact layouts, native_mmvq_set_multi_exact): native_mmvq_wide.cpp, for each format above.
-template <typename F>
-void mmvq_wide(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
-               bool row, bool exact);
+// the formats' numbers for mmvq_wide
+template <typename F> inline constexpr int kWideFmt = -1;
+template <> inline constexpr int kWideFmt<Q5KTraits> = 0;
+template <> inline constexpr int kWideFmt<Q4KTraits> = 1;
+template <> inline constexpr int kWideFmt<Q20Traits> = 2;
+template <> inline constexpr int kWideFmt<Q3KTraits> = 3;
+template <> inline constexpr int kWideFmt<Q2KTraits> = 4;
+template <> inline constexpr int kWideFmt<Q6KTraits> = 5;
+template <> inline constexpr int kWideFmt<Q6KRowTraits> = 6;
+template <> inline constexpr int kWideFmt<IQ4XSTraits> = 7;
+template <> inline constexpr int kWideFmt<Q40Traits> = 8;
+template <> inline constexpr int kWideFmt<Q50Traits> = 9;
+template <> inline constexpr int kWideFmt<Q80Traits> = 10;
+template <> inline constexpr int kWideFmt<Q80RowTraits> = 11;
+template <> inline constexpr int kWideFmt<IQ4NLTraits> = 12;
 
-}  // namespace strata::kernels::mmvq_xe
+}  // namespace
+}  // namespace strata::kernels
