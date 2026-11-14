@@ -16,7 +16,7 @@ namespace strata_vit {
 // how a BF16 matrix reaches the GPU's products (STRATA_VIT_BF16_AS_F16)
 enum Bf16Mode {
     BF16_STORED = 0,     // BF16 weights, BF16 inputs
-    BF16_ROUNDED = 1,    // weights as F16, inputs rounded to BF16 and then written as F16 (the Pascal / gfx1151 kind: the products see BF16 values)
+    BF16_ROUNDED = 1,    // weights as F16, inputs rounded to BF16 and then written as F16 (the gfx1151 kind: the products see BF16 values)
     BF16_TO_F16 = 2,     // weights as F16, inputs written as F16 (10-bit mantissa instead of BF16's 7)
 };
 

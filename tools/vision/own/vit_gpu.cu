@@ -68,7 +68,7 @@ namespace strata_vit {
 namespace {
 
 // the 16-bit kind a GEMM's input takes (its weight's).  K_BH: a BF16 matrix held as F16 (every BF16 value of the weights' and activations' range is an F16 value;
-// the activations are rounded to BF16 first, so the products see the BF16 values), for cards whose BLAS has no fast BF16 kernel (Pascal: STRATA_VIT_BF16_AS_F16).
+// the activations are rounded to BF16 first, so the products see the BF16 values): gfx1151's default, elsewhere STRATA_VIT_BF16_AS_F16=1.
 // K_HF: a BF16 matrix held as F16 with the activations written as F16 directly (clamped to +-65,504), the default for BF16 matrices elsewhere: BF16's 7-bit
 // mantissa on the inputs of the 27 blocks' products left 50 picture tokens of 12,308 under cosine 0.99 against the float32 reference on the CUDA reader,
 // 10 bits (F16) none in a CPU emulation (RESULTS-OWN-B18.md BLOCKS 16-18).  A matrix with a weight beyond F16's range stays K_BF16.
@@ -470,9 +470,11 @@ struct VitGpuImpl {
     int pad_for(size_t n) const { return n_pad ? n_pad : n > 16384 ? 64 : 8; }
     int align_for(size_t n) const { return q_align ? q_align : n > 16384 ? 64 : 1; }
     size_t padded(size_t n) const { const size_t p = (size_t) pad_for(n); return (n + p - 1) / p * p; }
-    // BF16 matrices held as F16 (K_BH): on by default on Pascal (compute capability 6.x), where cuBLAS has no fast BF16 kernel (a P100 spent 645 ms of a
-    // 1,024-token picture in magma_sgemmEx for BF16 against 497 ms with F16 inputs; the 12-token picture 44 ms against 15; RESULTS-OWN-3V.md 16.1).
-    // Every other card: BF16 matrices as F16 with F16 inputs (K_HF).  STRATA_VIT_BF16_AS_F16 (a diagnostic) overrides: 0 = BF16 as stored (K_BF16), 1 = K_BH,
+    // BF16 matrices as F16 with F16 inputs (K_HF) on every CUDA card, Pascal included, and on every HIP card but gfx1151 (Strix Halo: K_BH, the BF16-rounded
+    // kind, not measured with K_HF).  Pascal needs one of the F16 kinds: cuBLAS has no fast BF16 kernel there (a P100 spent 645 ms of a 1,024-token picture in
+    // magma_sgemmEx for BF16 against 497 ms with F16 inputs; the 12-token picture 44 ms against 15; RESULTS-OWN-3V.md 16.1).  P100, 16 pictures against the
+    // float32 reference: K_HF no token under cosine 0.99 (smallest 0.9970), K_BH 44 under 0.99 (smallest 0.866), the same encode time (13.23 against 13.24 s),
+    // loaded in 0.6 against 1.5 s (K_BH converts on the host).  STRATA_VIT_BF16_AS_F16 (a diagnostic) overrides: 0 = BF16 as stored (K_BF16), 1 = K_BH,
     // 2 = K_HF (vit_gpu_bf16_mode in vit_f16.h).
     int bf16_mode = BF16_TO_F16;
     struct F16Note { std::string name; Kind kind; Bf16F16Count c; long long n; };
@@ -901,9 +903,9 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
 #endif
 #if !defined(STRATA_VIT_HIP)
     bool pascal = false;
-    {   // Pascal (compute capability 6.x): BF16 matrices as F16 (and the larger score chunk below)
+    {   // Pascal (compute capability 6.x): the larger score chunk below; BF16 matrices take K_HF as on every other CUDA card (see bf16_mode)
         cudaDeviceProp p;
-        if (cudaGetDeviceProperties(&p, device) == cudaSuccess && p.major == 6) { pascal = true; m.bf16_mode = BF16_ROUNDED; }
+        if (cudaGetDeviceProperties(&p, device) == cudaSuccess && p.major == 6) pascal = true;
         (void) cudaGetLastError();
     }
 #else
