@@ -123,6 +123,24 @@ int main() {
     CHECK(fo::region_slots(3417, 3624, -1) == 3417);   // today's count: today's region
     CHECK(fo::region_holds(3624, -1) && fo::region_holds(3624, 3624) && !fo::region_holds(3624, 3623));
 
+    // the RAM-copy mode on a 12 GB card: the pinned share is below 0.9, so the ring is 96 slots, not 1,024, and the cache 3,899
+    // slots.  Measured with and without this rule: chunk 13,056, start-up loan 3,277 slots, region 3,293; the tail-0 scan finds no
+    // larger chunk there.  With the region kept whole or short (2,469 at a 29.8 GiB budget) the chunk stays 13,056: the guard has
+    // nothing to undo, the layout is unchanged and nothing is refused.  One measured loan only: this is not a model of the 96-slot
+    // ring scan.
+    {
+        const int64_t slots = 3899, today = 13056, k_today = 3277, region = 3293;
+        CHECK(fo::loan_fits(k_today, slots, 128, 90, true));   // the scan's test passes at the measured loan
+        CHECK(fo::region_slots(k_today, 0, 0) == k_today);     // no tail-0 chunk above today's: today's loan
+        CHECK(k_today <= region);
+        CHECK(fo::region_holds(k_today, region) && !fo::region_holds(k_today, 2469));
+        for (const int64_t kept : {region, region - 1, k_today, int64_t(2469), int64_t(-1)}) {
+            int64_t chunk = fo::pick(today, today, fo::scan_tail(on));
+            if (chunk != today && !fo::region_holds(k_today, kept)) chunk = today;   // the scan's guard
+            CHECK(chunk == today);
+        }
+    }
+
     if (failed) { std::fprintf(stderr, "fit_out_rule_test: %d failed\n", failed); return 1; }
     std::printf("fit_out_rule_test: all passed\n");
     return 0;
