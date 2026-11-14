@@ -740,8 +740,9 @@ struct Prefill::Impl {
     uint8_t* lmmq_ylq_ = nullptr;              // U input (q8, T*K group-order rows of ELL)
     uint8_t* lmmq_grp_gu_ = nullptr;           // a group's gathered gate/up weights
     uint8_t* lmmq_grp_d_ = nullptr;            // a group's gathered down weights
-    int32_t* lmmq_ids_ = nullptr;              // the quantize row map (T*K)
-    int32_t* lmmq_bounds_ = nullptr;           // the grouped products' bounds (n_expert+1 + G+1)
+    int32_t* lmmq_ids_ = nullptr;              // the quantize row maps (idsA | ids_rel | idsU, T*K each)
+    int32_t* lmmq_bounds_ = nullptr;           // babs (E+1) | brel_all (E*(MMQ_GROUP+1)) | dbnd (2) | ubnd (G+1)
+    HostVec<int32_t> lmmq_ids_h_, lmmq_bnd_h_; // their pinned host tables, built and uploaded once a layer
     int64_t lmmq_scratch_T_ = 0;
     // PLE
     float* ple_emb = nullptr;
@@ -1435,59 +1436,37 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
                   take((void**) &m.lmmq_grp_gu_, (size_t) MMQ_GROUP * gub) &&
                   take((void**) &m.lmmq_grp_d_, (size_t) MMQ_GROUP * db) &&
                   take((void**) &m.lmmq_ids_, (size_t) 3 * TMM * K * 4) &&
-                  take((void**) &m.lmmq_bounds_, (size_t) (E + 1 + E * (MMQ_GROUP + 1)) * 4);
+                  take((void**) &m.lmmq_bounds_, (size_t) (E + 1 + E * (MMQ_GROUP + 1) + 2 + (G + 1)) * 4) &&
+                  take((void**) &m.lat_blobs_, (size_t) MMQ_GROUP * blob_bytes);
         if (!ok) { err = "prefill: the latent mmq scratch does not fit"; return false; }
         m.lmmq_scratch_T_ = TMM;
         mmq::choose_forms(f.gu_type, 2 * I, ELL, MMQ_GROUP, m.cs);
         mmq::choose_forms(f.d_type, ELL, I, MMQ_GROUP, m.cs);
         mmq::choose_forms(fmt, G * ELL, N, 1, m.cs);
         mmq::choose_forms(fmt, N, ELL, G, m.cs);
+        strata::gpu::event_record(m.used[0], m.cs);   // a valid marker: the first group's DMA may wait on it
     }
     if (m.ids_identity == nullptr) { err = "prefill: the latent mmq arm needs the identity rows"; return false; }
     mmq::iota(m.ids_identity, T * K, m.cs);
-    int32_t* idsA = m.lmmq_ids_;                 // expert-order row -> its xl row
-    int32_t* ids_rel = m.lmmq_ids_ + TM * K;     // expert-order row -> the group's relative row
-    int32_t* idsU = m.lmmq_ids_ + 2 * TM * K;    // group-order row -> its expert-order yl row
-    int32_t* babs = m.lmmq_bounds_;              // absolute expert-order bounds (n + 1)
-    int32_t* brel = m.lmmq_bounds_ + E + 1;      // a group's relative bounds (MMQ_GROUP + 1)
-    // D: the chunk's rows through the layer's D, then the column scales
-    mmq::quantize(m.mixed, nullptr, m.lmmq_xq_, fmt, N, N, T, m.cs);
-    {
-        mmq::Product d;
-        d.w = m.lat_d_ + (size_t) l * d_bytes; d.type = fmt; d.w_rows = G * ELL; d.w_cols = N;
-        d.expert_bytes = mmq::matrix_bytes(fmt, G * ELL, N); d.n = 1; d.xq = m.lmmq_xq_;
-        d.bounds = babs; d.ids = m.ids_identity; d.total_rows = T; d.max_rows = T; d.rows = T;
-        d.dst = m.lmmq_xl_; d.ld_dst = G * ELL;
-        const int32_t db2[2] = {0, (int32_t) T};
-        strata::gpu::copy(babs, db2, 2 * 4);
-        m.mmq_ctx->run(d, m.cs);
-    }
-    latent_colscale_rows(m.lmmq_xl_, T * G, (int) ELL, latent_colscale_dev((int) l, (int) ELL), m.cs);
-    // the experts' activation rows: expert order, row r reads xl row (entry/K)*G + label[expert]
+    // The row maps and bounds are built once and uploaded once (HostVec: pinned host USM a copy kernel reads in
+    // place, so these small tables never queue behind the streamed experts on the copy engine).  The host rewrites
+    // them only after the next layer's routing sync, when this layer's copies are done.
+    const int BREL = E + 1;                          // brel_all: every group's relative bounds (MMQ_GROUP + 1 each)
+    const int DBND = BREL + E * (MMQ_GROUP + 1);     // the D product's {0, T}
+    const int UBND = DBND + 2;                       // the U product's group bounds (G + 1)
+    const int BND_TOTAL = UBND + (G + 1);
+    int32_t* idsA = m.lmmq_ids_;                     // expert-order row -> its xl row
+    int32_t* ids_rel = m.lmmq_ids_ + TM * K;         // expert-order row -> the group's relative row
+    int32_t* idsU = m.lmmq_ids_ + 2 * TM * K;        // group-order row -> its expert-order yl row
+    int32_t* babs = m.lmmq_bounds_;                  // absolute expert-order bounds (n + 1)
+    // the routes of each expert, the experts this layer routes to, and the groups (up to MMQ_GROUP experts, ended
+    // early when the rows would pass the group scratch's cap)
     const int32_t* labels = m.lat_labels_.data() + (size_t) l * E;
     std::vector<std::vector<int32_t>> routes((size_t) E);
     for (int64_t i = 0; i < T * K; ++i) routes[(size_t) m.ids_host[(size_t) i]].push_back((int32_t) i);
     std::vector<int32_t> order;
     for (int32_t e = 0; e < E; ++e) if (!routes[(size_t) e].empty()) order.push_back(e);
     const int n = (int) order.size();
-    std::vector<int32_t> ent((size_t) (T * K)), exprow((size_t) (T * K)), idsA_h((size_t) (T * K)), babs_h((size_t) (n + 1));
-    {
-        int64_t r = 0;
-        for (int j = 0; j < n; ++j) {
-            const int32_t e = order[j];
-            babs_h[j] = (int32_t) r;
-            for (const int32_t i : routes[(size_t) e]) {
-                ent[r] = i; exprow[i] = (int32_t) r;
-                idsA_h[r] = (i / (int32_t) K) * G + labels[e];
-                ++r;
-            }
-        }
-        babs_h[n] = (int32_t) r;
-    }
-    strata::gpu::copy(idsA, idsA_h.data(), (size_t) (T * K) * 4);
-    strata::gpu::copy(babs, babs_h.data(), (size_t) (n + 1) * 4);
-    mmq::quantize(m.lmmq_xl_, idsA, m.lmmq_xlq_, f.gu_type, ELL, ELL, T * K, m.cs);
-    // the groups: up to MMQ_GROUP experts, ended early when the rows would pass the group scratch's cap
     std::vector<int32_t> grp_start;
     for (int j = 0, rows = 0; j < n; ++j) {
         const int64_t c = (int64_t) routes[(size_t) order[j]].size();
@@ -1498,10 +1477,67 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
         rows += (int) c;
     }
     grp_start.push_back(n);
-    std::vector<int32_t> ids_rel_h((size_t) (T * K)), brel_h((size_t) (MMQ_GROUP + 1));
-    for (size_t g = 0; g + 1 < grp_start.size(); ++g) {
-        const int j0 = grp_start[g], j1 = grp_start[g + 1], ngx = j1 - j0;
-        const int64_t r0 = babs_h[j0], nr = babs_h[j1] - r0;
+    const int ng = (int) grp_start.size() - 1;
+    // the host tables: idsA / ids_rel / idsU, and babs / brel_all / dbnd / ubnd
+    m.lmmq_ids_h_.resize((size_t) (3 * T * K));
+    m.lmmq_bnd_h_.resize((size_t) BND_TOTAL);
+    std::vector<int32_t> ent((size_t) (T * K));
+    {
+        int64_t r = 0;
+        for (int j = 0; j < n; ++j) {
+            const int32_t e = order[j];
+            m.lmmq_bnd_h_[(size_t) j] = (int32_t) r;
+            for (const int32_t i : routes[(size_t) e]) {
+                ent[(size_t) r] = i;
+                m.lmmq_ids_h_[(size_t) r] = (i / (int32_t) K) * G + labels[e];   // row r reads xl row (token*G + label)
+                ++r;
+            }
+        }
+        m.lmmq_bnd_h_[(size_t) n] = (int32_t) r;
+    }
+    for (int g = 0; g < ng; ++g) {
+        const int j0 = grp_start[(size_t) g], j1 = grp_start[(size_t) g + 1];
+        const int64_t r0 = m.lmmq_bnd_h_[(size_t) j0], r1 = m.lmmq_bnd_h_[(size_t) j1];
+        int32_t* brel = &m.lmmq_bnd_h_[(size_t) (BREL + g * (MMQ_GROUP + 1))];
+        brel[0] = 0;
+        for (int q = 0; q < j1 - j0; ++q)
+            brel[q + 1] = brel[q] + (int32_t) routes[(size_t) order[j0 + q]].size();
+        for (int64_t r = r0; r < r1; ++r) m.lmmq_ids_h_[(size_t) (TM * K + r)] = (int32_t) (r - r0);
+    }
+    m.lmmq_bnd_h_[(size_t) DBND] = 0;
+    m.lmmq_bnd_h_[(size_t) DBND + 1] = (int32_t) T;
+    {   // U: the routes bucketed by their expert's label (group order), and each route's group-order slot
+        int64_t u = 0;
+        m.lmmq_bnd_h_[(size_t) UBND] = 0;
+        for (int gg = 0; gg < G; ++gg) {
+            for (int64_t r = 0; r < T * K; ++r) {
+                const int32_t i = ent[(size_t) r];
+                if (labels[m.ids_host[(size_t) i]] != gg) continue;
+                m.lmmq_ids_h_[(size_t) (2 * TM * K + u)] = (int32_t) r;
+                m.slot_host[(size_t) i] = (int32_t) u;
+                ++u;
+            }
+            m.lmmq_bnd_h_[(size_t) (UBND + gg + 1)] = (int32_t) u;
+        }
+    }
+    m.lmmq_ids_h_.to_device(m.lmmq_ids_, m.cs);
+    m.lmmq_bnd_h_.to_device(m.lmmq_bounds_, m.cs);
+    // D: the chunk's rows through the layer's D, then the column scales
+    mmq::quantize(m.mixed, nullptr, m.lmmq_xq_, fmt, N, N, T, m.cs);
+    {
+        mmq::Product d;
+        d.w = m.lat_d_ + (size_t) l * d_bytes; d.type = fmt; d.w_rows = G * ELL; d.w_cols = N;
+        d.expert_bytes = mmq::matrix_bytes(fmt, G * ELL, N); d.n = 1; d.xq = m.lmmq_xq_;
+        d.bounds = m.lmmq_bounds_ + DBND; d.ids = m.ids_identity; d.total_rows = T; d.max_rows = T; d.rows = T;
+        d.dst = m.lmmq_xl_; d.ld_dst = G * ELL;
+        m.mmq_ctx->run(d, m.cs);
+    }
+    latent_colscale_rows(m.lmmq_xl_, T * G, (int) ELL, latent_colscale_dev((int) l, (int) ELL), m.cs);
+    mmq::quantize(m.lmmq_xl_, idsA, m.lmmq_xlq_, f.gu_type, ELL, ELL, T * K, m.cs);
+    // the groups: gather the experts, gate/up, SwiGLU, the group's H to int8, down
+    for (int g = 0; g < ng; ++g) {
+        const int j0 = grp_start[(size_t) g], j1 = grp_start[(size_t) g + 1], ngx = j1 - j0;
+        const int64_t r0 = m.lmmq_bnd_h_[(size_t) j0], nr = m.lmmq_bnd_h_[(size_t) j1] - r0;
         int64_t maxr = 0;
         // gather the group's experts into the group buffers (a resident one from its cache slot, the rest DMA)
         for (int q = 0; q < ngx; ++q) {
@@ -1520,13 +1556,6 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
             mmq::gather_native(blob, blob + f.up_off, gub / 2, blob + f.down_off, db,
                                m.lmmq_grp_gu_ + (size_t) q * gub, m.lmmq_grp_d_ + (size_t) q * db, m.cs);
         }
-        // the group's relative bounds and the rows' relative ids
-        brel_h[0] = 0;
-        for (int q = 0; q < ngx; ++q) brel_h[q + 1] = brel_h[q] + (int32_t) routes[(size_t) order[j0 + q]].size();
-        for (int64_t r = r0; r < r0 + nr; ++r) ids_rel_h[r] = (int32_t) (r - r0);
-        strata::gpu::copy(brel, brel_h.data(), (size_t) (ngx + 1) * 4);
-        strata::gpu::copy(ids_rel, ids_rel_h.data() + r0, (size_t) nr * 4);
-        // gate/up, SwiGLU, the group's H to int8, down
         mmq::Product gu;
         gu.w = m.lmmq_grp_gu_; gu.type = f.gu_type; gu.w_rows = 2 * I; gu.w_cols = ELL; gu.expert_bytes = gub;
         gu.n = ngx; gu.xq = m.lmmq_xlq_; gu.bounds = babs + j0; gu.ids = ids_rel;
@@ -1536,41 +1565,24 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
         mmq::quantize(m.lmmq_h_, nullptr, m.lmmq_hq_, f.d_type, I, I, nr, m.cs);
         mmq::Product dn;
         dn.w = m.lmmq_grp_d_; dn.type = f.d_type; dn.w_rows = ELL; dn.w_cols = I; dn.expert_bytes = db;
-        dn.n = ngx; dn.xq = m.lmmq_hq_; dn.bounds = brel; dn.ids = m.ids_identity;
+        dn.n = ngx; dn.xq = m.lmmq_hq_; dn.bounds = m.lmmq_bounds_ + BREL + g * (MMQ_GROUP + 1); dn.ids = m.ids_identity;
         dn.total_rows = nr; dn.max_rows = maxr; dn.rows = nr; dn.dst = m.lmmq_yl_ + r0 * ELL; dn.ld_dst = ELL;
         m.mmq_ctx->run(dn, m.cs);
         strata::gpu::event_record(m.used[0], m.cs);
     }
-    // U: the G groups as experts, the routes bucketed by their expert's label; the rows back to the shell's width
-    std::vector<int32_t> idsU_h((size_t) (T * K)), bU_h((size_t) (G + 1)), slot_h((size_t) (T * K));
-    {
-        int64_t u = 0;
-        bU_h[0] = 0;
-        for (int gg = 0; gg < G; ++gg) {
-            for (int64_t r = 0; r < T * K; ++r) {
-                const int32_t i = ent[r];
-                if (labels[m.ids_host[(size_t) i]] != gg) continue;
-                idsU_h[u] = (int32_t) r;
-                slot_h[i] = (int32_t) u;
-                ++u;
-            }
-            bU_h[gg + 1] = (int32_t) u;
-        }
-    }
-    strata::gpu::copy(idsU, idsU_h.data(), (size_t) (T * K) * 4);
-    strata::gpu::copy(babs, bU_h.data(), (size_t) (G + 1) * 4);   // reuse babs for U's group bounds
+    // U: the G groups as experts; the rows back to the shell's width, the combine in routing order
     mmq::quantize(m.lmmq_yl_, idsU, m.lmmq_ylq_, fmt, ELL, ELL, T * K, m.cs);
     {
         int64_t maxr = 0;
-        for (int gg = 0; gg < G; ++gg) maxr = std::max<int64_t>(maxr, bU_h[gg + 1] - bU_h[gg]);
+        for (int gg = 0; gg < G; ++gg)
+            maxr = std::max<int64_t>(maxr, m.lmmq_bnd_h_[(size_t) (UBND + gg + 1)] - m.lmmq_bnd_h_[(size_t) (UBND + gg)]);
         mmq::Product up;
         up.w = m.lat_u_ + (size_t) l * u_bytes; up.type = fmt; up.w_rows = N; up.w_cols = ELL;
         up.expert_bytes = mmq::matrix_bytes(fmt, N, ELL); up.n = G; up.xq = m.lmmq_ylq_;
-        up.bounds = babs; up.ids = m.ids_identity; up.total_rows = T * K; up.max_rows = maxr; up.rows = T * K;
+        up.bounds = m.lmmq_bounds_ + UBND; up.ids = m.ids_identity; up.total_rows = T * K; up.max_rows = maxr; up.rows = T * K;
         up.dst = m.Dm; up.ld_dst = N;
         m.mmq_ctx->run(up, m.cs);
     }
-    for (int64_t i = 0; i < T * K; ++i) m.slot_host[(size_t) i] = slot_h[i];
     m.slot_host.to_device(m.slot_dev, m.cs);
     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
     return true;
