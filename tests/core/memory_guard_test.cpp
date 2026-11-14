@@ -473,6 +473,23 @@ int main() {
         check(a.applies && a.room == 0, "usage over the limit: 0");
         a = arena_cgroup_room(48 * GiB, 16 * GiB, "", host, false);
         check(a.applies && a.credit == 0 && a.room == 32 * GiB, "no memory.stat text: no credit");
+        // STRATA_ARENA_OWN_MAPPED=1: the process's own mapped table is not room for the arena (the 24 GiB scope, 11 GiB table
+        // mapped: 23.57 GiB without it, the memory guard's 12.95 with it, less this figure's margin on what is left)
+        const std::string mapped = "file " + std::to_string(11 * GiB) + "\nfile_mapped " + std::to_string(11 * GiB) + "\nactive_file " +
+                                   std::to_string(11 * GiB) + "\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n";
+        const uint64_t cur = 11 * GiB + 50 * MiB;
+        a = arena_cgroup_room(24 * GiB, cur, mapped, host, false);
+        check(a.credit == 11 * GiB - 24 * GiB / 64, "switch off (default): the own table is credited, as the earlier figure did");
+        a = arena_cgroup_room(24 * GiB, cur, mapped, host, false, true, std::optional<uint64_t>(11 * GiB));
+        check(a.applies && a.credit == 0 && a.room == 24 * GiB - cur, "switch on: the own table is not credited");
+        a = arena_cgroup_room(24 * GiB, cur, mapped, host, false, true, std::optional<uint64_t>(10 * GiB));
+        check(a.credit == 1 * GiB - 24 * GiB / 64, "switch on: only the rest is credited");
+        a = arena_cgroup_room(24 * GiB, cur, mapped, host, false, true, std::nullopt);
+        check(a.credit == 0, "switch on, own mappings unknown: the inactive credit (0 here)");
+        check(!arena_cgroup_room(24 * GiB, cur, mapped, std::optional<uint64_t>(20 * GiB), false, true, std::optional<uint64_t>(11 * GiB)).applies,
+              "switch on, limit above MemTotal: the earlier rule");
+        check(arena_exclude_own_mapped("1") && !arena_exclude_own_mapped("0") && !arena_exclude_own_mapped(nullptr) &&
+                  !arena_exclude_own_mapped(""), "STRATA_ARENA_OWN_MAPPED=1 only");
     }
     // the limit on a parent level, credited from that level's own memory.stat; memory.high below memory.max
     {

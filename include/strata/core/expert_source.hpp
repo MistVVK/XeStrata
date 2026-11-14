@@ -93,7 +93,8 @@ struct HostMemory {
 /// MemAvailable alone.  False when the RAM cannot be determined.
 bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",
                            const std::string& self_cgroup = "/proc/self/cgroup",
-                           const std::string& cgroup_root = "/sys/fs/cgroup");
+                           const std::string& cgroup_root = "/sys/fs/cgroup",
+                           const std::string& self_status = "/proc/self/status");
 
 /// #4051: wait for the RAM an arena needs to come back.  An engine that was still exiting (or a program that was ending)
 /// holds memory a few seconds longer than its process; loading into that shortfall sent a 60 GiB host into reclaim for

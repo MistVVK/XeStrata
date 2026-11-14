@@ -682,6 +682,15 @@ void test_host_memory() {
     put("meminfo", "MemTotal: 41943040 kB\nMemAvailable: 104857600 kB\n");   // 40 GiB: the 48 GiB limit is not a container's
     require(probe("0::/box\n") && m.available == 44 * GiB - 48 * GiB / 64, "a limit above MemTotal: the earlier file credit");
     put("meminfo", "MemTotal: 134217728 kB\nMemAvailable: 104857600 kB\n");
+    // STRATA_ARENA_OWN_MAPPED=1: this process's own mapped file pages (RssFile) are not room for the arena
+    put("status", "Name:\tstrata\nRssFile:\t" + std::to_string(8 * GiB / 1024) + " kB\n");
+    const std::string st = (t.path / "status").string();
+    auto probe_own = [&](const std::string& self) { put("cgroup", self); return host_available_memory(m, mi, cg, root, st); };
+    require(probe_own("0::/box\n") && m.available == 41 * GiB - 48 * GiB / 64, "switch off: own mappings still credited");
+    set_env("STRATA_ARENA_OWN_MAPPED", "1");
+    require(probe_own("0::/box\n") && m.available == 33 * GiB - std::min<uint64_t>(2 * GiB, 48 * GiB / 64),
+            "switch on: 8 GiB of own mappings not credited");
+    set_env("STRATA_ARENA_OWN_MAPPED", nullptr);
     put("fs/box/memory.current", std::to_string(16 * GiB) + "\n");
     put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
     put("fs/box/memory.max", "max\n");
