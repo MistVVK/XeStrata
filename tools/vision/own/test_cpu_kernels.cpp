@@ -270,10 +270,11 @@ static void test_team() {
     }
 }
 
-// the CPU tower's rounding default by weight type (owner 11-09): BF16 on, F16 off, float32 / Q8_0-expanded none; STRATA_VIT_REF_ROUND=0/1 overrides
+// the CPU tower's rounding default: none for every weight type (BF16 included since 11-14: code4217.png token 47 0.627 -> 1.000 against float32);
+// STRATA_VIT_REF_ROUND=1 rounds to the weight's 16-bit type, float32 / Q8_0-expanded never round
 static void test_round_choice() {
     struct Case { int kind; const char* env; int want; };
-    const Case cs[] = {{1, nullptr, 1}, {2, nullptr, 0}, {0, nullptr, 0}, {1, "0", 0}, {2, "1", 2}, {1, "1", 1}, {2, "0", 0}, {0, "1", 0}, {1, "", 1}, {2, "", 0}};
+    const Case cs[] = {{1, nullptr, 0}, {2, nullptr, 0}, {0, nullptr, 0}, {1, "0", 0}, {2, "1", 2}, {1, "1", 1}, {2, "0", 0}, {0, "1", 0}, {1, "", 0}, {2, "", 0}};
     bool ok = true;
     for (const Case& c : cs) ok = ok && vit_cpu_round_kind(c.kind, c.env) == c.want;
     check(ok, "rounding default per weight type and its override", "-", 0, 0);

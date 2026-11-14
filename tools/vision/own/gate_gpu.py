@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""The GPU gate of the own vision tower (rule 6 of RESULTS-OWN-3V.md): our GPU tower against mtmd's CPU path, and no noisier than mtmd's GPU path.
+"""The GPU gate of the own vision tower (rule 6 of RESULTS-OWN-3V.md): our GPU tower against the float32 reference, and no noisier than mtmd's GPU path.
 
     python3 gate_gpu.py --helper <strata-vision> --compare <strata-vision-own-compare> --mmproj <mmproj.gguf> --model <text model .gguf> --out <dir>
                         [--max-tokens 1024] [--repeat 4] [--ref-dir <dir of our float32 reference's <picture>.sve>] [--cpu-dir <dir of stored mtmd-CPU <picture>.sve>]
                         <image> [<image> ...]
 
-One strata-vision per reader (mtmd on the CPU unless --cpu-dir gives its files, mtmd on the GPU, own on the GPU), every picture through each.  Per picture:
-  main      cosine(own GPU, mtmd CPU)              must be >= --min-cos (0.999)
-  floor     cosine(mtmd GPU, mtmd CPU)             what users run today
-  no-worse  main >= floor - 1e-4  or  main >= 0.9999   our GPU tower is at least as close to mtmd-CPU as mtmd-GPU is (the coordinator's tolerance, 11-09)
-  info      cosine(own GPU, mtmd GPU), cosine(own GPU, float32 reference) (with --ref-dir)
+The reference is our float32 tower (VitRef: the own tower on the CPU with STRATA_VIT_CPU=ref), from --ref-dir where it holds the picture's file, else made
+here.  Until 11-14 the reference was mtmd's CPU path; mtmd itself sits up to 0.0168 below float32 (16 pictures: global cosine min 0.983 on its GPU, 0.998
+on its CPU), so it stays only as an information column.  One strata-vision per reader (VitRef on the CPU, mtmd on the CPU unless --cpu-dir gives its
+files, mtmd on the GPU, own on the GPU), every picture through each.  Per picture:
+  main      cosine(own GPU, float32)               must be >= --min-cos (0.999)
+  floor     cosine(mtmd GPU, float32)              what llama.cpp's reader gives
+  no-worse  main >= floor - 1e-4  or  main >= 0.9999   our GPU tower is at least as close to float32 as mtmd-GPU is (the coordinator's tolerance, 11-09)
+  info      cosine(own GPU, mtmd CPU), cosine(own GPU, mtmd GPU) (printed, no pass / fail)
 and the times of the two GPU readers (median of --repeat further encodes, after the first); the GPU memory (nvidia-smi, rocm-smi or Linux DRM fdinfo); whether
 our GPU tower gives byte-identical output on every encode (REPEATABLE line; information, the exit code does not depend on it).  Exit 0 when every picture passes main and no-worse.  Standard library only.
 """
@@ -75,7 +78,7 @@ def mac_footprint_mib(pid):
 
 
 class Reader:
-    def __init__(self, exe, tower, mmproj, model, gpu, max_tokens, threads, out, label):
+    def __init__(self, exe, tower, mmproj, model, gpu, max_tokens, threads, out, label, env=None):
         args = [exe, "--mmproj", mmproj, "--model", model, "--tower", tower]
         if gpu:
             args.append("--gpu")
@@ -84,7 +87,8 @@ class Reader:
         if threads and not gpu:
             args += ["--threads", str(threads)]
         self.label = label
-        self.p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(os.path.join(out, label + ".stderr"), "w"), text=True)
+        self.p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(os.path.join(out, label + ".stderr"), "w"), text=True,
+                                  env=dict(os.environ, **env) if env else None)
         line = self.p.stdout.readline().strip()
         if not line.startswith("READY"):
             raise SystemExit("%s reader did not start: %r" % (label, line))
@@ -138,6 +142,14 @@ def cmp(compare, a, b):
     return dict(p.split("=") for p in r.split())
 
 
+def gate_pass(main, floor, min_cos=0.999, skip_cpu=False):
+    """main = cosine(own GPU, float32), floor = cosine(mtmd GPU, float32).  Rule 1: main >= min_cos; rule 2: main >= floor - 1e-4, or main >= 0.9999.
+    With --skip-cpu (no float32 reference: pictures at the largest token limit) main compares the two GPU readers and only has to reach 0.99."""
+    if skip_cpu:
+        return main >= 0.99
+    return main >= min_cos and (main >= floor - 1e-4 or main >= 0.9999)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--helper", required=True)
@@ -154,9 +166,12 @@ def main():
     ap.add_argument("--skip-cpu", action="store_true", help="no mtmd-CPU run: for pictures at the largest token limit (the columns then compare the two GPU readers)")
     ap.add_argument("images", nargs="+")
     a = ap.parse_args()
-    for d in ("mtmd-cpu", "mtmd-gpu", "own-gpu"):
+    for d in ("ref-cpu", "mtmd-cpu", "mtmd-gpu", "own-gpu"):
         os.makedirs(os.path.join(a.out, d), exist_ok=True)
-    mk = lambda tower, gpu, label: Reader(a.helper, tower, a.mmproj, a.model, gpu, a.max_tokens, a.threads, a.out, label)  # noqa: E731
+    mk = lambda tower, gpu, label, env=None: Reader(a.helper, tower, a.mmproj, a.model, gpu, a.max_tokens, a.threads, a.out, label, env)  # noqa: E731
+    ref_of = lambda name: os.path.join(a.ref_dir, name + ".sve") if a.ref_dir and os.path.isfile(os.path.join(a.ref_dir, name + ".sve")) else None  # noqa: E731
+    need_ref = not a.skip_cpu and any(ref_of(os.path.basename(i)) is None for i in a.images)
+    r_ref = mk("own", False, "ref-cpu", {"STRATA_VIT_CPU": "ref"}) if need_ref else None     # the float32 reference, made here where --ref-dir lacks it
     r_cpu = None if (a.cpu_dir or a.skip_cpu) else mk("mtmd", False, "mtmd-cpu")
     r_mg = mk("mtmd", True, "mtmd-gpu")
     r_og = mk("own", True, "own-gpu")
@@ -167,14 +182,14 @@ def main():
         with open(path, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()
 
-    def run(r, img, name):
+    def run(r, img, name, repeat=None):
         out = os.path.join(a.out, r.label, name + ".sve")
         res = r.enc(os.path.abspath(img), out)
         if not res.startswith("OK"):
             return out, None, res
         ms = []
         seen = {digest(out)} if r is r_og else set()
-        for _ in range(a.repeat):
+        for _ in range(a.repeat if repeat is None else repeat):
             again = r.enc(os.path.abspath(img), out)
             if again.startswith("OK"):
                 ms.append(float(again.split()[4]))
@@ -185,49 +200,54 @@ def main():
         return out, statistics.median(ms) if ms else float(res.split()[4]), res
 
     hdr = "%-22s %6s | %9s %9s %9s | %9s %9s | %8s %8s %6s | %s"
-    print(hdr % ("picture", "tokens", "own/cpu", "mtmdG/cpu", "own/mtmdG", "own/ref", "tokmin", "mtmdG ms", "own ms", "ratio", "gate"), flush=True)
+    print(hdr % ("picture", "tokens", "own/ref", "mtmdG/ref", "own/mtmdG", "own/mtmdC", "tokmin", "mtmdG ms", "own ms", "ratio", "gate"), flush=True)
     ok_all, main_c, floor_c = True, [], []
     for img in a.images:
         name = os.path.basename(img)
+        res_r, res_c, cpu_f = "OK", "OK", None
         if a.skip_cpu:
-            cpu_f, res_c = None, "OK"      # a picture at the largest token limit: mtmd on the CPU would take many minutes; the GPU reader of mtmd is the yardstick
-        elif a.cpu_dir:
-            cpu_f, res_c = os.path.join(a.cpu_dir, name + ".sve"), "OK"
+            ref_f = None      # a picture at the largest token limit: the CPU readers would take many minutes; the GPU reader of mtmd is the yardstick
         else:
-            cpu_f, _, res_c = run(r_cpu, img, name)
+            ref_f = ref_of(name)
+            if ref_f is None:
+                ref_f, _, res_r = run(r_ref, img, name, 0)
+            if a.cpu_dir:
+                cpu_f = os.path.join(a.cpu_dir, name + ".sve")
+            elif r_cpu:
+                cpu_f, _, res_c = run(r_cpu, img, name, 0)
         mg_f, mg_ms, res_m = run(r_mg, img, name)
         og_f, og_ms, res_o = run(r_og, img, name)
-        if cpu_f is None:
-            cpu_f = mg_f
-        if not (str(res_c).startswith("OK") and res_m.startswith("OK") and res_o.startswith("OK")) or mg_ms is None or og_ms is None:
-            print("%-22s FAILED: cpu=%s mtmd-gpu=%s own-gpu=%s" % (name, res_c, res_m, res_o), flush=True)
+        if ref_f is None:
+            ref_f = mg_f
+        if not (str(res_r).startswith("OK") and str(res_c).startswith("OK") and res_m.startswith("OK") and res_o.startswith("OK")) or mg_ms is None or og_ms is None:
+            print("%-22s FAILED: ref=%s mtmd-cpu=%s mtmd-gpu=%s own-gpu=%s" % (name, res_r, res_c, res_m, res_o), flush=True)
             ok_all = False
             continue
-        main = cmp(a.compare, og_f, cpu_f)
-        floor = cmp(a.compare, mg_f, cpu_f)
+        main = cmp(a.compare, og_f, ref_f)
+        floor = cmp(a.compare, mg_f, ref_f)
         info = cmp(a.compare, og_f, mg_f)
-        ref = cmp(a.compare, og_f, os.path.join(a.ref_dir, name + ".sve")) if a.ref_dir and os.path.isfile(os.path.join(a.ref_dir, name + ".sve")) else None
+        info_c = cmp(a.compare, og_f, cpu_f) if cpu_f and os.path.isfile(cpu_f) else None
         if not (main and floor and info):
             print("%-22s shapes differ between readers" % name, flush=True)
             ok_all = False
             continue
         m, f = float(main["global"]), float(floor["global"])
-        passed = (m >= 0.99) if a.skip_cpu else (m >= a.min_cos and (m >= f - 1e-4 or m >= 0.9999))     # rule 1: >= 0.999; rule 2: ours >= mtmd-GPU - 1e-4, or ours >= 0.9999 (coordinator, 11-09)  --skip-cpu: no error and the two GPU readers agree (0.99); the time and memory are the point
+        passed = gate_pass(m, f, a.min_cos, a.skip_cpu)
         ok_all &= passed
         main_c.append(m)
         floor_c.append(f)
-        print(hdr % (name, main["n"], main["global"], floor["global"], info["global"], ref["global"] if ref else "-", main["tokmin"], "%.0f" % mg_ms, "%.0f" % og_ms,
+        print(hdr % (name, main["n"], main["global"], floor["global"], info["global"], info_c["global"] if info_c else "-", main["tokmin"], "%.0f" % mg_ms, "%.0f" % og_ms,
                      "%.2f" % (og_ms / mg_ms), "ok" if passed else "FAIL (%s)" % ("main < %.4f" % a.min_cos if m < a.min_cos else "noisier than mtmd-GPU")), flush=True)
     vram = "GPU memory of the reader (nvidia-smi / rocm-smi / DRM fdinfo / macOS footprint, peak after the pictures): mtmd-gpu %d MiB, own-gpu %d MiB%s" % (
         r_mg.peak_mib, r_og.peak_mib, "" if r_og.peak_mib <= r_mg.peak_mib else "  (own is larger)")
     print("REPEATABLE own-gpu: %s" % ("yes, every picture byte-identical over %d encodes" % (a.repeat + 1) if not unrepeatable else "NO: " + "; ".join(unrepeatable)),
           flush=True)
-    for r in (r_cpu, r_mg, r_og):
+    for r in (r_ref, r_cpu, r_mg, r_og):
         if r:
             r.close()
     print(vram, flush=True)
     if main_c:
-        print("SUMMARY own GPU vs mtmd CPU: %d pictures, min %.6f mean %.6f; mtmd GPU vs mtmd CPU (the floor): min %.6f mean %.6f" %
+        print("SUMMARY own GPU vs float32: %d pictures, min %.6f mean %.6f; mtmd GPU vs float32 (the floor): min %.6f mean %.6f" %
               (len(main_c), min(main_c), sum(main_c) / len(main_c), min(floor_c), sum(floor_c) / len(floor_c)), flush=True)
     print("RESULT %s" % ("PASS" if ok_all and main_c else "FAIL"), flush=True)
     return 0 if ok_all and main_c else 1
