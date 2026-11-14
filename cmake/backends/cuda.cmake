@@ -31,8 +31,12 @@ macro(strata_cuda_toolchain)
                     "card pass it: -DCMAKE_CUDA_ARCHITECTURES=native (the GPUs in this PC), 75 (RTX 20), 86 (RTX 30), "
                     "89 (RTX 40), or a list like \"86;120\".")
   endif()
+  set(_strata_cuda_below75 OFF)   # an architecture below sm_75 in the list (only with STRATA_EXPERIMENTAL_SM60): tests of sm_75+ device code are not built
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
+    if(_base MATCHES "^[0-9]+$" AND _base LESS 75)
+      set(_strata_cuda_below75 ON)
+    endif()
     # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
     # portable fp32-FMA fallback, so RTX 20 (75), 30 (86), RTX 40 (89) and RTX 50 (120) build too.
     # Pre-sm_75 is refused.
@@ -316,14 +320,19 @@ macro(strata_cuda_prompt_tests)
     endif()
     if(STRATA_BUILD_TESTS)
       # the fused prompt kernels' weight decode (moe_fused_iq.cu's load_unit / convert, compiled as the library compiles them) against
-      # stored digests: the same file on CUDA and HIP (exit 77 without a card)
-      add_executable(prefill_decode_golden tests/cuda/prefill_decode_golden.cu)
-      target_include_directories(prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_pf_own,INCLUDE_DIRECTORIES>)
-      target_compile_definitions(prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_pf_own,COMPILE_DEFINITIONS>)
-      target_compile_options(prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_pf_own,COMPILE_OPTIONS>)
-      target_link_libraries(prefill_decode_golden PRIVATE ggml-base ${_strata_gpu_runtime_target})
-      add_test(NAME prefill_decode_golden COMMAND prefill_decode_golden ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/prefill_decode_golden.txt)
-      set_tests_properties(prefill_decode_golden PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+      # stored digests: the same file on CUDA and HIP (exit 77 without a card).  Those device functions exist only for sm_75 and newer
+      # (moe_fused_iq.cu's __CUDA_ARCH__ >= 750 sections), so a list with an older architecture (STRATA_EXPERIMENTAL_SM60) does not build it
+      if(_strata_cuda_below75)
+        message(STATUS "Strata: prefill_decode_golden not built: ${CMAKE_CUDA_ARCHITECTURES} has an architecture below sm_75")
+      else()
+        add_executable(prefill_decode_golden tests/cuda/prefill_decode_golden.cu)
+        target_include_directories(prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_pf_own,INCLUDE_DIRECTORIES>)
+        target_compile_definitions(prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_pf_own,COMPILE_DEFINITIONS>)
+        target_compile_options(prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_pf_own,COMPILE_OPTIONS>)
+        target_link_libraries(prefill_decode_golden PRIVATE ggml-base ${_strata_gpu_runtime_target})
+        add_test(NAME prefill_decode_golden COMMAND prefill_decode_golden ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/prefill_decode_golden.txt)
+        set_tests_properties(prefill_decode_golden PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+      endif()
       # #136: the fused int8 experts against a double-precision reference and the MMQ path (exit 77 below sm_80)
       add_executable(prefill_fused_moe_test tests/cuda/prefill_fused_moe_test.cpp)
       target_link_libraries(prefill_fused_moe_test PRIVATE ${_strata_pf_tests_lib} ggml-base ${_strata_gpu_runtime_target})
