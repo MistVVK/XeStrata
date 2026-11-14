@@ -214,7 +214,7 @@ setup（`./setup.sh`、パッケージの `xestrata`、ランチャーの窓）�
 コマンドラインでは、段ごとに `--base`・`--variant`・`--quantizer` で選ぶか、`--family` でまとめて選びます（`--base qwen3.8-flash-next --variant sc117` は `--family sc117` と同じです）。
 `--model` は大きさです。
 
-最初に選ばれているモデルは、Qwen3.8-Flash-Next の Swift 1.5 の SC117 版（IQ3_XXS が入るとき）、Gyro-Coder-L（エキスパートが全部 RAM に入るとき）、Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B、Qwen3.5-2B の順に見て、この PC で動く最初のものです（GPU のない PC では Qwen3.5-2B）。
+最初に選ばれているモデルは、Qwen3.8-Flash-Next の Swift 1.5 の SC117 版（IQ3_XXS が入るとき）、Gyro-Coder-L（エキスパートが全部 RAM に入るとき）、Gyro-Coder（同じく）、Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B、Qwen3.5-2B の順に見て、この PC で動く最初のものです（GPU のない PC では Qwen3.5-2B）。
 大きさは品質で勧めます。
 
 - ISTA-DASLab の GSQ-RCO のファイル（元のもの、Swift 1.5、Coder、SC117 と huihui-ai の版）は IQ3_XXS です。この PC に入らなければ、入るうちで品質のいちばん高いものです（省 RAM モードで入るものも含みます）。
