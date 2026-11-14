@@ -84,6 +84,13 @@ struct PlainOptions {
     /// of RAM; the RTX 4070 started at all (it had 161 MiB left for the tier), and at 64K went 86 -> 172 slots, its
     /// prompt 3.3 -> 7.1 tok/s and decode 2.32 -> 2.30 (UD-IQ3_XXS, 1K + 256, 2026-10-26).  The other models: off.
     bool kv_ram = true;
+    /// --kv-resident N|auto|off: stream the attention layers' K/V (Qwen3.8-Flash-Next's --kv-resident, the same shape).
+    /// The authoritative K/V lives in pinned host memory; VRAM keeps a ring of the last N cells a layer, and the decode
+    /// attention reads the older cells from the host copy over PCIe (the shared qsa_dense_attn kernel). A prompt chunk
+    /// stages one layer's cells into a borrowed VRAM pool (kv_stage_from_host). N the resident cells a layer; auto (the
+    /// default, -1): from 64K up when the RAM holds the experts beside the KV host copy; off (0): every cell in VRAM.
+    /// The sliding-window layers keep their own ring; GLM-5.3-Flash's DSA caches stream with --kv-ram, not this.
+    int64_t kv_resident = -1;
     /// --vision (qwen35, qwen35moe): pictures among the prompt's tokens (plain_generate's GENI): their rows in place
     /// of the token embeddings (set_embeddings) and every cell's M-RoPE position from a table (set_positions)
     bool vision = false;
@@ -859,6 +866,9 @@ private:
         uint8_t* xq2 = nullptr;            ///< the routed rows for the up product of a layer whose gate and up
                                            ///< differ in the blocks' repetition (iq_mmq_type_dup); else null
         int32_t* identity = nullptr;       ///< row i is row i (the int8 products' output map)
+        /// --kv-resident: one attention layer's whole K/V, staged from the host copy per layer and chunk (the identity
+        /// layout, page_table_ its table); the prompt attention reads it, then the next layer overwrites it
+        strata::kernels::KvHostPools kv_stage;
         const uint8_t** wtab = nullptr;    ///< a layer's experts' blobs, for the int8 products
         int32_t* rbounds = nullptr;        ///< each group's bounds from its first row (the down product's)
         int32_t* dense_bounds = nullptr;   ///< {0, T}: a dense product as one int8 "expert"
@@ -1133,12 +1143,16 @@ private:
     /// The buffers of attention block a in session `slot` for `cells` (cell, KV head) pairs and their bytes, in one
     /// order: the state's parts (state_parts), what reset zeroes
     std::vector<StatePart> kv_planes(size_t a, int slot, size_t cells) const;
+    /// the streamed layer a's host copy as state parts (the identity layout, `cells` (cell, KV head) pairs): a
+    /// snapshot reads and writes the authoritative host copy, not the VRAM ring
+    std::vector<StatePart> kv_host_planes(size_t a, size_t cells) const;
     /// Allocates them for `cells` pairs in the --kv format (the live session's or a slot's), into allocs_
     bool alloc_kv(KvPtrs& p, size_t cells, bool vmm = false);
     /// `n` cells' K and V (n rows of n_head_kv x head_dim, rotated as the format keeps them) at steps[t * kStepCount]
-    /// into session `slot`'s pools of attention block a
+    /// into session `slot`'s pools of attention block a; a streamed layer also writes its host copy, and `stage` (the
+    /// prompt path's staging pool) when given
     void kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
-                         strata::gpu::Stream cs);
+                         strata::gpu::Stream cs, const strata::kernels::KvHostPools* stage = nullptr);
     bool restore_parts(const Snapshot& snap, bool recurrent_only, std::string& err);
     std::vector<std::pair<int32_t, int32_t>> prior_;   ///< the profile the tier was filled from
     int64_t n_slots_ = 0;
@@ -1247,7 +1261,25 @@ private:
     int32_t* swa_table_ = nullptr;
     std::vector<bool> attn_swa_;              ///< per attention block: a sliding-window layer's
     int64_t ring_end_ = 0, ring_from_ = 0;    ///< the position after the last run, and the first the rings still hold
+    /// --kv-resident (KV streaming): the attention layers' authoritative K/V in pinned host memory (kv_host_, the
+    /// identity layout), VRAM a ring of the last kv_stream_slots_ pages. The decode reads the trailing
+    /// kv_resident_cells_ cells from the ring, the older cells from the host copy. 0: not streaming. The
+    /// sliding-window layers keep their own ring (attn_swa_), never streamed; the MTP layer's attention streams too.
+    int64_t kv_resident_cells_ = 0;
+    int64_t kv_stream_slots_ = 0;             ///< the ring's pages (0: not streaming)
+    std::vector<strata::kernels::KvHostPools> kv_host_;   ///< per attention block: the host copy (empty: not streamed)
+    int32_t* kv_stream_table_ = nullptr;      ///< the ring table, block % kv_stream_slots_ (the streamed layers)
+    std::vector<bool> attn_stream_;           ///< per attention block: streamed
+    bool kv_streamed(size_t a) const { return kv_stream_slots_ > 0 && a < attn_stream_.size() && attn_stream_[a]; }
+    /// resolve --kv-resident (auto/off/N) to the resident cells a layer (0: off), before the K/V is sized; the root
+    /// writes the resolved value into opt_.kv_resident so the layer split's stages inherit it
+    bool resolve_kv_resident(std::string& err);
+    /// the host copy's bytes for this stage's streamed attention layers at the whole context (the auto rule's figure)
+    uint64_t kv_host_bytes() const;
+    /// allocate attention block a's host copy (the identity layout, the whole context); false on a failed allocation
+    bool alloc_kv_host(size_t a, std::string& err);
     const int32_t* table_of(size_t a) const {
+        if (kv_streamed(a)) return kv_stream_table_;
         return swa_table_ != nullptr && a < attn_swa_.size() && attn_swa_[a] ? swa_table_ : page_table_;
     }
     bool ringed(size_t a) const { return ring_pages_ > 0 && a < attn_swa_.size() && attn_swa_[a]; }
