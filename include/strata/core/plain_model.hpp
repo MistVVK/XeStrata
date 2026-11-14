@@ -236,6 +236,9 @@ struct PlainOptions {
     std::string draft_model;   ///< --draft-model: the model's DFlash2 pack
     double draft_conf = 0.0;   ///< --draft-conf: DFlash2's window confidence (0: the engine's default)
     bool spec_auto = false;    ///< --spec auto: the window is one of the start's candidates (spec and 2)
+    /// --draft dflash2: windows of this many drafts (the recurrent states' copies taken at the load, before the tier
+    /// is sized, as the MTP layer's are); 0: the MTP layer's
+    int draft_windows = 0;
     std::string draft_rule = "learn";   ///< --draft-rule: a request without a draft= key (--draft auto)
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points
@@ -736,6 +739,8 @@ private:
     /// The control vector after block b's FFN write, on T rows of x (kernels/cvec.hpp), where it covers the layer
     void steer(const Block& b, int64_t T, float* x, strata::gpu::Stream cs) const;
     void tap_block(const Block& b, int T, strata::gpu::Stream cs);
+    /// set_taps' layers on this stage and the window's tap staging (both loads: load_qwen's and load_glm5's)
+    bool setup_taps(std::string& err);
     /// A tapped layer's output rows (R: [T][hc][n_embd]) into the window's taps (`window`) or the prompt's staging
     void tap_rows(int64_t l, const float* R, int hc, int64_t T, int64_t p0, bool window, strata::gpu::Stream cs);
     /// The prompt's staging handed on after a chunk or a window of rows from p0 (prompt_taps_)

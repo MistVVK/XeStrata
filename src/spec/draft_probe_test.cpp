@@ -3,12 +3,10 @@
 // src/spec/draft_probe_test.cpp - DraftProbe: which drafter an engine keeps after its start's measurement.
 //
 //   1. the arms of a start (one drafter alone: none to measure);
-//   2. a clear win keeps that drafter alone;
-//   3. within the margin the cheaper form stays (the MTP over DFlash2 over none);
-//   4. the MTP and DFlash2 within the margin are both kept where the engine can hold both;
-//   5. no drafter wins where a window costs more than its drafts bring;
-//   6. a noisy arm's spread raises the bar to beat it;
-//   7. the prompt from a vocabulary (the byte-level BPE's and SentencePiece's word marks).
+//   2. another form replaces the default (the MTP at its window) only 10% ahead and in every run;
+//   3. no drafter wins where a window costs more than its drafts bring, by that bar;
+//   4. a round settles the measurement once no other arm can still win; a run's length from the warm-up's speed;
+//   5. the prompt from a vocabulary (the byte-level BPE's and SentencePiece's word marks).
 #include "strata/spec/draft_probe.hpp"
 
 #include <cstdio>
@@ -52,25 +50,34 @@ int main() {
               DraftProbe::plan(3)[4] == 2,
           "a warm-up, then a b c c b a");
 
-    auto v = probe.decide(a3, runs({{100, 100}, {75, 75}, {60, 60}}), true, 4);
-    check(v.measured && v.keep == Drafter::Mtp && !v.keep_both && v.spec == 4, "the MTP 25% ahead: the MTP alone");
-    v = probe.decide(a3, runs({{80, 80}, {100, 100}, {60, 60}}), true, 4);
-    check(v.keep == Drafter::Df2 && !v.keep_both, "DFlash2 25% ahead: DFlash2 alone");
-    v = probe.decide(a3, runs({{100, 100}, {101.5, 101.5}, {60, 60}}), false, 4);
-    check(v.keep == Drafter::Mtp && !v.keep_both, "within the margin, both not possible: the MTP");
-    v = probe.decide(a3, runs({{100, 100}, {101.5, 101.5}, {60, 60}}), true, 4);
-    check(v.keep == Drafter::Mtp && v.keep_both, "within the margin, both possible: both stay");
-    v = probe.decide(a3, runs({{50, 50}, {45, 45}, {70, 70}}), true, 4);
-    check(v.keep == Drafter::None && v.spec == 1, "no drafter 40% ahead: none");
-    v = probe.decide(a3, runs({{70, 70}, {45, 45}, {71, 71}}), true, 4);
-    check(v.keep == Drafter::Mtp, "none within the margin of the MTP: the MTP");
-    v = probe.decide(a4, runs({{100, 100}, {110, 110}, {60, 60}}), true, 4);
-    check(v.keep == Drafter::Mtp && v.spec == 2, "the window 2 10% ahead: the MTP with window 2");
-    v = probe.decide(a3, runs({{100, 80}, {95, 95}, {60, 60}}), true, 4);
-    check(v.keep == Drafter::Mtp && v.keep_both, "a noisy MTP: DFlash2 does not clear its spread");
-    std::vector<ProbeRun> part = runs({{100, 100}, {75, 75}});
-    v = probe.decide(a3, part, true, 4);
+    auto v = probe.decide(a3, runs({{100, 100}, {75, 75}, {60, 60}}), 4);
+    check(v.measured && v.keep == Drafter::Mtp && v.spec == 4, "the MTP 25% ahead: the MTP");
+    v = probe.decide(a3, runs({{80, 80}, {100, 100}, {60, 60}}), 4);
+    check(v.keep == Drafter::Df2, "DFlash2 25% ahead in every run: DFlash2");
+    v = probe.decide(a3, runs({{100, 100}, {106, 106}, {60, 60}}), 4);
+    check(v.keep == Drafter::Mtp, "DFlash2 6% ahead: under the 10% to leave the MTP");
+    v = probe.decide(a3, runs({{50, 50}, {45, 45}, {70, 70}}), 4);
+    check(v.keep == Drafter::None && v.spec == 1, "no drafter 40% ahead in every run: none");
+    // RTX 4070, Qwen3.8: one start's MTP arm drafted little (49.2 tok/s against none's 50.8)
+    v = probe.decide(a3, runs({{49.2, 49.2}, {45, 45}, {50.8, 50.8}}), 4);
+    check(v.keep == Drafter::Mtp, "none 3% ahead: the MTP stays");
+    v = probe.decide(a3, runs({{60, 100}, {45, 45}, {90, 90}}), 4);
+    check(v.keep == Drafter::Mtp, "none faster on average but not in every run: the MTP stays");
+    v = probe.decide(a4, runs({{100, 100}, {115, 115}, {60, 60}}), 4);
+    check(v.keep == Drafter::Mtp && v.spec == 2, "the window 2 15% ahead in every run: window 2");
+    v = probe.decide(a3, runs({{100, 100}, {75, 75}}), 4);
     check(!v.measured, "an arm that did not run: nothing changes");
+
+    std::vector<ProbeRun> r1 = {{0, 48, 480.0, 0, 0}, {1, 48, 640.0, 0, 0}, {2, 48, 960.0, 0, 0}};
+    check(DraftProbe::settled(a3, r1), "a round where every other arm is slower: settled");
+    std::vector<ProbeRun> r2 = {{0, 48, 480.0, 0, 0}, {1, 48, 400.0, 0, 0}, {2, 48, 960.0, 0, 0}};
+    check(!DraftProbe::settled(a3, r2), "an arm faster than the default: another round");
+
+    check(strata::spec::probe_run_tokens(10.0) == 16 && strata::spec::probe_run_tokens(30.0) == 30 &&
+              strata::spec::probe_run_tokens(200.0) == strata::spec::probe_tokens(),
+          "a run's tokens: about a second of decode, 16 .. probe_tokens()");
+    check(strata::spec::probe_line_tokens("GEN 48 ckpt=0 draft=mtp 1,2", 16) == "GEN 16 ckpt=0 draft=mtp 1,2",
+          "a plan line's token count rewritten");
 
     std::vector<std::string> bpe(300), spm(300);
     for (size_t i = 0; i < bpe.size(); ++i) bpe[i] = spm[i] = "<unused" + std::to_string(i) + ">";

@@ -9175,27 +9175,24 @@ int main(int argc, char** argv) {
             strata::core::window_choices_paused() = false;
             const long long free_during = free_mib();
             const strata::spec::DraftProbe judge;
-            const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, df2_loaded && use_mtp, S_mtp);
+            const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, S_mtp);
             std::fprintf(stderr, "xestrata serve: %s (%.1f s)\n", v.line.c_str(),
                          std::chrono::duration<double>(Clock::now() - probe_t0).count());
             if (v.measured) {
                 strata::spec::Drafter keep = v.keep;
-                // DFlash2 alone or beside the MTP keeps the VRAM it took from the reserve: only where the reserve the
-                // engine started with is still free beside it (a long prompt's buffers come out of the reserve)
-                if ((keep == strata::spec::Drafter::Df2 || v.keep_both) &&
+                // DFlash2 keeps the VRAM it took from the reserve: only where the reserve the engine started with is
+                // still free beside it (a long prompt's buffers come out of the reserve)
+                if (keep == strata::spec::Drafter::Df2 &&
                     free_during < (long long) o.vram_reserve_mib) {
                     std::fprintf(stderr, "xestrata serve: DFlash2 is not kept: with it %lld MiB of VRAM stay free, less "
                                          "than the %d MiB reserve: the MTP drafts\n", free_during, o.vram_reserve_mib);
                     keep = use_mtp ? strata::spec::Drafter::Mtp : strata::spec::Drafter::None;
                 }
-                const bool both = v.keep_both && keep != strata::spec::Drafter::None &&
-                                  free_during >= (long long) o.vram_reserve_mib;
-                if (df2_loaded && keep != strata::spec::Drafter::Df2 && !both)
-                    df2_drop(nullptr);
+                if (df2_loaded && keep != strata::spec::Drafter::Df2) df2_drop(nullptr);   // one drafter is kept
                 // the MTP released where nothing else needs it: a parked or saved conversation carries its K/V
                 const bool conv_needs_mtp = (o.prompt_cache > 0 && o.conversation_cache_mib > 0) ||
                                             !o.conversation_save.empty();
-                if (use_mtp && keep != strata::spec::Drafter::Mtp && !both) {
+                if (use_mtp && keep != strata::spec::Drafter::Mtp) {
                     if (conv_needs_mtp) {
                         // a parked or saved conversation carries the draft layer's K/V: that part stays, the rest goes
                         const long long f0 = free_mib();
@@ -9222,7 +9219,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                drafting_off = keep == strata::spec::Drafter::None && !both;
+                drafting_off = keep == strata::spec::Drafter::None;
                 if (keep == strata::spec::Drafter::Mtp && v.spec > 0 && v.spec != S_mtp) spec_cap = v.spec;
                 if (df2_loaded) {   // it stays: the prompt path's taps for the whole window
                     std::string e;
@@ -9238,13 +9235,12 @@ int main(int argc, char** argv) {
             if (!probe_usage.empty()) drive.d.usage = probe_usage;
             policy = strata::spec::DraftPolicy(S);
             policy_idle = strata::spec::DraftPolicy(S);
-            policy_is_df2 = df2_loaded && !use_mtp;
+            policy_is_df2 = df2_loaded;
             drafter_policy = strata::spec::DrafterPolicy();
             sfx.reset();
             std::fprintf(stderr, "xestrata serve: drafting: %s%s%s; VRAM free %lld MiB before the measurement, %lld with "
                                  "every drafter loaded, %lld now\n",
-                         df2_loaded && use_mtp && o.draft_rule != "df2" ? "the MTP and DFlash2 (picked per request)"
-                         : df2_loaded                                    ? "DFlash2"
+                         df2_loaded ? "DFlash2"
                          : use_mtp && !drafting_off ? "the MTP"
                                                      : "no drafter",
                          spec_cap > 0 ? (", window " + std::to_string(spec_cap)).c_str() : "",
@@ -9270,12 +9266,16 @@ int main(int argc, char** argv) {
                 const bool fits_model = df2_shape.hidden == g.n_embd && df2_shape.vocab == n_vocab &&
                                         *std::max_element(df2_shape.taps.begin(), df2_shape.taps.end()) < g.n_layers;
                 std::string e;
+                // measured only where it could stay: the reserve still free beside it (probe_finish's rule), not less
+                // than the measurement's own room
+                const int64_t keep_free = std::max<int64_t>(kProbeFreeMib, o.vram_reserve_mib);
                 if (!fits_model) {
                     df2_drop("its pack is another model's (hidden size, vocabulary or taps)");
-                } else if (left < (kProbeFreeMib << 20)) {
+                } else if (left < (keep_free << 20)) {
                     std::fprintf(stderr, "xestrata serve: DFlash2 is not measured: %lld MiB of VRAM free, it takes about "
-                                         "%llu and %lld must stay free: the MTP drafts\n", (long long) (fb >> 20),
-                                 (unsigned long long) ((df2_shape.bytes + bind) >> 20), (long long) kProbeFreeMib);
+                                         "%llu and %lld must stay free (the reserve: it could not stay): the MTP drafts\n",
+                                 (long long) (fb >> 20), (unsigned long long) ((df2_shape.bytes + bind) >> 20),
+                                 (long long) keep_free);
                     df2_drop(nullptr);
                 } else {
                     const strata::core::OnDevice on_df2(0);
@@ -9291,8 +9291,8 @@ int main(int argc, char** argv) {
                         if (!df2.bind(wt, g, &native_head, df2_vocab, e) || !df2.prepare(ver.tap_dev(), e)) {
                             std::fprintf(stderr, "xestrata serve: DFlash2: %s: the MTP drafts\n", e.c_str());
                             df2_drop(nullptr);
-                        } else if (free_mib() < (long long) kProbeFreeMib) {
-                            df2_drop("less VRAM is left free beside it than the measurement needs");
+                        } else if (free_mib() < (long long) keep_free) {
+                            df2_drop("less VRAM than the reserve is left free beside it: it could not stay");
                         } else {
                             df2.set_max_drafts(S - 1);
                         }
@@ -9320,7 +9320,8 @@ int main(int argc, char** argv) {
                 const std::vector<int> plan = strata::spec::DraftProbe::plan((int) probe_arms.size());
                 for (int k : plan) {
                     const strata::spec::ProbeArm& a = probe_arms[(size_t) std::max(k, 0)];
-                    probe_lines.push_back("GEN " + std::to_string(strata::spec::probe_tokens()) + " ckpt=0 draft=" +
+                    probe_lines.push_back("GEN " + std::to_string(k < 0 ? strata::spec::kProbeWarmTokens
+                                                                      : strata::spec::probe_tokens()) + " ckpt=0 draft=" +
                                           (a.drafter == strata::spec::Drafter::None ? std::string("off")
                                                                                     : strata::spec::drafter_name(a.drafter)) +
                                           " spec=" + std::to_string(a.spec) + " probe=" + std::to_string(k) + " " + ids);
@@ -13215,8 +13216,16 @@ int main(int argc, char** argv) {
                 }
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
-            if (req_probe >= 0)   // the start's measurement: this run's speed
+            if (req_probe == -1 && decode_ms > 0.0) {   // the warm-up: the counted runs about a second of decode each
+                const int nt = strata::spec::probe_run_tokens(1000.0 * (double) produced_n / decode_ms);
+                for (std::string& pl : probe_lines) pl = strata::spec::probe_line_tokens(pl, nt);
+            } else if (req_probe >= 0) {   // a counted run; a round that settles it, or past the budget, ends it
                 probe_runs.push_back({req_probe, produced_n, decode_ms, draft_offered, draft_accepted});
+                const bool round = probe_runs.size() % probe_arms.size() == 0;
+                if (round && (strata::spec::DraftProbe::settled(probe_arms, probe_runs) ||
+                              std::chrono::duration<double>(Clock::now() - probe_t0).count() > strata::spec::probe_budget_s()))
+                    probe_lines.clear();
+            }
             if (df2_loaded && req_kind != 0 && req_probe == -2)   // --draft auto learn: this request's measured decode speed
                 drafter_policy.observe(req_kind, n, req_df2 ? strata::spec::DrafterPolicy::Df2
                                                             : strata::spec::DrafterPolicy::Mtp, produced_n, decode_ms);

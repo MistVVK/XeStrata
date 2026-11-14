@@ -848,19 +848,7 @@ bool PlainModel::load_qwen(std::string& err) {
         stream_into_ = nullptr;
         if (!ok) return false;
     }
-    // the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last
-    tap_local_.clear();
-    tap_slot_.assign((size_t) s.n_layer, -1);
-    for (int l : tap_req_)
-        if (l >= lb_ && l < le_ && l < s.n_layer - 1) {
-            tap_slot_[(size_t) l] = (int) tap_local_.size();
-            tap_local_.push_back(l);
-        }
-    if (!tap_local_.empty() && tap_dev_ == nullptr &&
-        !strata::gpu::alloc_device(&tap_dev_, (size_t) opt_.max_t * tap_local_.size() * s.n_embd * 4)) {
-        err = "plain model: the DFlash2 tap staging does not fit";
-        return false;
-    }
+    if (!setup_taps(err)) return false;
     // the MTP layer, when the window checks drafts and the file has it (its K/V the last attention block's): the last
     // stage's
     {
@@ -947,7 +935,8 @@ bool PlainModel::load_qwen(std::string& err) {
     // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
     // spec - 1 drafts (at most the window kernel's snapshots); every stage's recurrent blocks
     // (--suffix-draft, --lookup-chain: as many as a window's drafts can be, MTP layer or not)
-    const int lookup = opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1 : 0;
+    const int lookup = std::max(opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1 : 0,
+                                std::min(opt_.draft_windows, std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1));
     if (model_mtp_ || lookup > 0) {
         if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kVerifyMaxT + 1});
         n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
@@ -1692,6 +1681,29 @@ bool PlainModel::open_experts(std::string& err) {
                 slot_layer_.push_back(l);
                 slot_bytes.push_back((int64_t) lay.bytes[(size_t) l]);
             }
+    // the free memory read again just before the tier is opened: what was allocated since it was read above (the
+    // prompt path's pinned buffers count against the device on some drivers) comes off the last slots, so the tier
+    // and the reserve still fit (GLM-5.3-Flash without its MTP layer asked 164 MiB more than the B70 had free and the
+    // start stopped, 2026-11-13)
+    if (opt_.expert_slots < 0) {
+        size_t f = 0, t = 0;
+        if (strata::gpu::mem_info(&f, &t)) {
+            const uint64_t now = counted_free(f, f, opt_.vram_free_mib);
+            const uint64_t limit = now > window_b + reserve ? now - window_b - reserve : 0;
+            uint64_t need = 0;
+            for (const int64_t b : slot_bytes) need += ((uint64_t) b + 255) / 256 * 256;
+            const size_t before = slot_bytes.size();
+            while (!slot_bytes.empty() && need > limit) {
+                need -= ((uint64_t) slot_bytes.back() + 255) / 256 * 256;
+                free_[(size_t) slot_layer_.back()].pop_back();   // (before the reverse: its last is this slot)
+                slot_layer_.pop_back();
+                slot_bytes.pop_back();
+            }
+            if (slot_bytes.size() < before)
+                std::fprintf(stderr, "xestrata plain: %lld MiB of VRAM free now, less than when the tier was planned: "
+                                     "%zu slots instead of %zu\n", (long long) (now >> 20), slot_bytes.size(), before);
+        }
+    }
     for (auto& f : free_) std::reverse(f.begin(), f.end());   // taken from the back: the lowest slot first
     cache_.set_max_piece(max_alloc_bytes());   // in pieces where the tier passes the device's largest allocation
     if (opt_.vram_elastic) {   // #533: in segments, as generate.cpp's cache; one GPU only (a split has a tier per GPU)
@@ -3628,6 +3640,24 @@ uint64_t PlainModel::release_mtp(bool keep_head) {
     dprob_.clear();
     strata::gpu::mem_info(&fb1, &tb);
     return fb1 > fb0 ? (uint64_t) (fb1 - fb0) : 0;
+}
+
+// the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last; every model's load
+bool PlainModel::setup_taps(std::string& err) {
+    const ModelSpec& s = spec_;
+    tap_local_.clear();
+    tap_slot_.assign((size_t) s.n_layer, -1);
+    for (int l : tap_req_)
+        if (l >= lb_ && l < le_ && l < s.n_layer - 1) {
+            tap_slot_[(size_t) l] = (int) tap_local_.size();
+            tap_local_.push_back(l);
+        }
+    if (!tap_local_.empty() && tap_dev_ == nullptr &&
+        !strata::gpu::alloc_device(&tap_dev_, (size_t) opt_.max_t * tap_local_.size() * s.n_embd * 4)) {
+        err = "plain model: the DFlash2 tap staging does not fit";
+        return false;
+    }
+    return true;
 }
 
 PlainModel::HeadView PlainModel::draft_head_view() const {

@@ -177,6 +177,11 @@ bool PlainModel::load_glm5(std::string& err) {
     model_mtp_ = opt_.spec >= 2 && s.n_nextn == 1 &&
                  model_->find("blk." + std::to_string(s.n_layer) + ".nextn.eh_proj.weight") != nullptr;
     has_mtp_ = model_mtp_ && last();
+    // its decode windows keep their graphs, as the other MoE models' (load_qwen): a window answers the CPU's rings
+    // between its graph segments, which the straight form does not.  Timed against it on the one-row windows, a
+    // one-row window ran straight, its experts' ids were garbage and the GPU faulted on them (B70, UD-IQ3_XXS:
+    // --draft off stopped at its first token, the MTP's windows at a one-row window after 63 or 127 tokens)
+    step_form_.fix(0);
     opt_.max_cells = (opt_.max_cells + s.idx_kpool - 1) / s.idx_kpool * s.idx_kpool;
     cs_ = strata::gpu::stream_create();
     if (cs_ == nullptr) { err = "plain model: stream create failed"; return false; }
@@ -213,6 +218,7 @@ bool PlainModel::load_glm5(std::string& err) {
         if (l >= lb_ && l < le_ && !load_gblock(m, l, b, err)) return false;
     }
     if (n_dsa == 0) { err = "plain model: the model has no DSA block"; return false; }
+    if (!setup_taps(err)) return false;   // DFlash2's (GLM-5.3-Flash's drafter reads the four streams' mean)
     if (has_mtp_) {   // a DSA block of its own caches, after the trunk's
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
         mtp_allocs_[0] = allocs_.size();   // the layer's own weights (release_mtp)
@@ -260,9 +266,10 @@ bool PlainModel::load_glm5(std::string& err) {
         gdn_conv_[(size_t) i] = cv;
     }
     // the KDA states after a window's rows but its last, for going back to the last accepted draft (every stage's)
-    if (model_mtp_) {
-        opt_.spec = std::min({opt_.spec, opt_.max_t, k::kGlm5MaxSnaps + 1});
-        n_snap_ = n_mtp_ = opt_.spec - 1;
+    if (model_mtp_ || opt_.draft_windows > 0) {   // (--draft dflash2: its windows' copies)
+        if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kGlm5MaxSnaps + 1});
+        n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
+        n_snap_ = std::max(n_mtp_, std::min({opt_.draft_windows, opt_.max_t - 1, k::kGlm5MaxSnaps}));
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
         for (size_t g = 0; g < gdn_state_.size(); ++g)
