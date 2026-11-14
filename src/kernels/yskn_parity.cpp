@@ -226,14 +226,15 @@ int main(int argc, char** argv) {
         uint16_t* r16d = dv.alloc<uint16_t>(r16.size());
         k::yskn_rotate_in_f16(d, x16d, K, 2, r16d, p::stream());
         p::copy_out(r16.data(), r16d, r16.size());
-        bool rin = true;
+        bool rot_in_ok = true;
         for (int r = 0; r < 2; ++r) {
             std::vector<float> v(K);
             for (int i = 0; i < K; ++i) v[(size_t) i] = k::f32_from_f16(x16[(size_t) r * K + i]) * (float) si[(size_t) i];
             y::fwht512(v.data(), (size_t) K);
-            for (int i = 0; i < K; ++i) rin = rin && r16[(size_t) r * K + i] == k::f16_from_f32(v[(size_t) i]);
+            for (int i = 0; i < K; ++i)
+                rot_in_ok = rot_in_ok && r16[(size_t) r * K + i] == k::f16_from_f32(v[(size_t) i]);
         }
-        check(rin, t->name + ": the input's rotation in FP16");
+        check(rot_in_ok, t->name + ": the input's rotation in FP16");
 
         std::vector<float> yr((size_t) 2 * N), yo((size_t) 2 * N);
         for (auto& v : yr) v = gauss(rng);

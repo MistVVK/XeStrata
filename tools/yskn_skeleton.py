@@ -36,7 +36,7 @@ NORMAL, USER_DEFINED, CONTROL = 1, 4, 3
 
 
 def read_header(path: pathlib.Path) -> dict:
-    """The .yskn's JSON header (strata/artifact/yskn.hpp: "YSKN", version 1, the JSON's length at 8, the JSON at 0x20)"""
+    """The .yskn's JSON header (artifact/yskn.hpp: "YSKN", version 1, the JSON's length at 8, the JSON at 0x20)"""
     with open(path, "rb") as f:
         head = f.read(0x20)
         if len(head) < 0x20 or head[:4] != b"YSKN":
