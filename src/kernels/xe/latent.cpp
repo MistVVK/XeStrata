@@ -155,6 +155,30 @@ void latent_u_grouped(const uint8_t* u, const uint8_t* ylq, const int32_t* ids, 
     sync_if_needed(stream, e, "latent_u_grouped");
 }
 
+void latent_u_bucket(const int32_t* ids, const int32_t* labels, int64_t E, int64_t cap, int G,
+                     int32_t* idsU, int32_t* bounds, void* stream) {
+    if (ids == nullptr || labels == nullptr || idsU == nullptr || bounds == nullptr || G <= 0)
+        throw core::DeviceError("latent_u_bucket: a null pointer or a bad geometry");
+    auto& q = queue_for(stream);
+    // one work-item walks the routes group by group (cap is a verify window's few rows): the same bucketing the
+    // dp4a U does in its kernel, here ahead of the mmq quantize and product.  On the device so the captured window
+    // reads the doorbell's ids of the replay, not the capture's; a route's place within its group does not matter
+    // (the quantize gathers and the product scatters by the same idsU).
+    const auto e = q.parallel_for(sycl::range<1>(1), [=](sycl::id<1>) {
+        int32_t u = 0;
+        bounds[0] = 0;
+        for (int g = 0; g < G; ++g) {
+            for (int64_t r = 0; r < cap; ++r) {
+                const int32_t ee = ids[r];
+                const int gg = (ee >= 0 && ee < E) ? labels[ee] : 0;
+                if (gg == g) idsU[u++] = (int32_t) r;
+            }
+            bounds[g + 1] = u;
+        }
+    });
+    sync_if_needed(stream, e, "latent_u_bucket");
+}
+
 void latent_u_matvec(const uint8_t* u, const uint8_t* hq, const int32_t* ids, const int32_t* labels,
                      const int32_t* dst, const int32_t* count, int64_t E, int64_t n_entries, int ELL, int H,
                      int G, float* parts, void* stream, int fmt) {

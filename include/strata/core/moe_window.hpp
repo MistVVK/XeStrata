@@ -262,8 +262,6 @@ private:
     uint8_t* lat_u_mmq_ylq_ = nullptr; ///< the A outputs quantized for MMQ (group order, T*K rows of ELL)
     int32_t* lat_u_mmq_ids_ = nullptr; ///< group-order row -> its route (the quantize and the product's dst map)
     int32_t* lat_u_mmq_bounds_ = nullptr;  ///< the G groups' entry bounds (G + 1)
-    int32_t* h_u_mmq_ids_ = nullptr;   ///< host USM, a layer's slice each: the bucketing the copy kernel reads
-    int32_t* h_u_mmq_bounds_ = nullptr;
     std::unique_ptr<strata::prefill::mmq::Context> lat_mmq_ctx_;
 };
 

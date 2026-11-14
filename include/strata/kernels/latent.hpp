@@ -34,6 +34,13 @@ void latent_colscale_rows(float* x, int64_t rows, int width, const float* inv, v
 void latent_u_grouped(const uint8_t* u, const uint8_t* ylq, const int32_t* ids, const int32_t* labels,
                       int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt = 8);
 
+/// Bucket the cap routes by their expert's group for the U mmq arm: idsU[u] = the route of the u-th group-order
+/// row, bounds[g..g+1] its span (bounds[G] = cap).  `ids` outside [0, E) reads group 0, as latent_u_grouped does.
+/// On the device (one kernel, no host copy) so a captured verify window replays with the doorbell's fresh ids,
+/// not the capture's; the mmq launch takes cap for its row shape, the bounds alone count each group's rows.
+void latent_u_bucket(const int32_t* ids, const int32_t* labels, int64_t E, int64_t cap, int G,
+                     int32_t* idsU, int32_t* bounds, void* stream);
+
 /// The CPU share's U on the GPU (XESTRATA_LATENT_U_GPU): one work-group a (group, hidden-row tile); an entry
 /// whose expert is in the group and is NOT one of the GPU's own rows (dst[0..count)) gets
 /// parts[r*H + h] = U[g][h] . hq[r].  `hq`: the pool's q8_1 rows of h, entry-major, in mapped host memory
