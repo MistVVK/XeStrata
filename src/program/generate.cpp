@@ -66,6 +66,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/exact.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/rope_scaling.hpp"
@@ -6291,6 +6292,7 @@ int main(int argc, char** argv) {
     sp.top_k = o.top_k;
     sp.top_p = o.top_p;
     sp.temperature = o.temperature;
+    sp.gumbel = strata::kernels::gumbel_active();   // the coupled drafter takes the same arm as the target
     // what this run actually samples with (the speculative loop below gets the same parameters); serve samples
     // per request instead
     if (!o.serve) {
@@ -9229,6 +9231,7 @@ int main(int argc, char** argv) {
         strata::spec::DraftPolicy policy_idle(S);   // --draft auto: the other drafter's costs (swapped in per request)
         bool policy_is_df2 = df2_loaded;   // which drafter's costs `policy` holds
         strata::spec::DrafterPolicy drafter_policy;   // --draft auto: MTP or DFlash2 per request (kind x context depth)
+        strata::spec::DrafterPolicy gumbel_policy(1.01, 24);    // XESTRATA_SPEC_GUMBEL=auto: off (First) or on (Second)
         const double df2_conf = o.draft_conf > 0.0 ? o.draft_conf : df2_default_conf(xcache.slots());
         if (df2_loaded) df2.set_max_drafts(S - 1);
         strata::spec::GuessGate pl_guess(0.2);   // --pipeline-windows 2: which guessed windows start, learned the same way
@@ -12066,12 +12069,32 @@ int main(int argc, char** argv) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
             }
+            // XESTRATA_SPEC_GUMBEL=auto: the arm this request runs, from the tokens per ms both arms measured
+            // (spec/drafter_policy.hpp's learner; arm First = Gumbel off, Second = on).  A batch window samples its
+            // slots in one launch and shares one flag, so a batch request keeps the fixed setting.
+            bool req_gumbel = false;
+            uint64_t req_kind_g = 0;
+            const bool gumbel_auto = strata::kernels::gumbel_mode() == strata::kernels::GumbelMode::kAuto &&
+                                     !strata::kernels::exact_sums();
+            if (gumbel_auto) {
+                if (req_temperature > 0.0f && o.batch <= 0) {
+                    req_kind_g = strata::spec::DrafterPolicy::kind_of(ids.data(), n);
+                    req_gumbel = gumbel_policy.choose(req_kind_g, n, true) == strata::spec::DrafterPolicy::Second;
+                    std::fprintf(stderr, "xestrata serve: XESTRATA_SPEC_GUMBEL=auto: %s for this request "
+                                         "(learned %.2f tok/s off, %.2f on)\n",
+                                 req_gumbel ? "on" : "off",
+                                 gumbel_policy.tps(req_kind_g, n, strata::spec::DrafterPolicy::First),
+                                 gumbel_policy.tps(req_kind_g, n, strata::spec::DrafterPolicy::Second));
+                }
+                strata::kernels::set_gumbel_auto(req_gumbel);
+            }
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
             req_sp.temperature = req_temperature;
             req_sp.top_p = req_top_p;
             req_sp.top_k = req_top_k;
+            req_sp.gumbel = strata::kernels::gumbel_active();   // the arm the sampler and the coupled drafter both take
             req_sp.seed = req_seed ? req_seed
                                    : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
             req_sp.min_p = std::clamp(req_min_p, 0.0f, 1.0f);
@@ -13373,6 +13396,10 @@ int main(int argc, char** argv) {
             if (df2_loaded && req_kind != 0 && req_probe == -2)   // --draft auto learn: this request's measured decode speed
                 drafter_policy.observe(req_kind, n, req_df2 ? strata::spec::DrafterPolicy::Df2
                                                             : strata::spec::DrafterPolicy::Mtp, produced_n, decode_ms);
+            if (gumbel_auto && req_kind_g != 0 && decode_ms > 0.0)   // XESTRATA_SPEC_GUMBEL=auto learn: the same speed
+                gumbel_policy.observe(req_kind_g, n, req_gumbel ? strata::spec::DrafterPolicy::Second
+                                                                : strata::spec::DrafterPolicy::First,
+                                      produced_n, decode_ms);
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());

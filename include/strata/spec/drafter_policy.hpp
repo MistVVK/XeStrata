@@ -20,12 +20,21 @@ namespace strata::spec {
 
 class DrafterPolicy {
 public:
-    enum Arm { Mtp = 0, Df2 = 1 };
+    // Two arms and the same learner with the same cell key.  The default use is which drafter proposes: arm `First`
+    // is the MTP (the startup prior) and `Second` DFlash2.  A second instance of this class serves
+    // XESTRATA_SPEC_GUMBEL: arm `First` is Gumbel off (the prior) and `Second` Gumbel on (sampler.hpp).
+    enum Arm { First = 0, Second = 1, Mtp = First, Df2 = Second };
     static constexpr int kArms = 2;
     static constexpr int kDepthBuckets = 4;   // [0,2K) [2K,8K) [8K,32K) [32K,...)
     static constexpr int kMinTokens = 48;     // a request shorter than this teaches nothing (its speed is noise)
 
     DrafterPolicy() = default;
+    /// `second_margin`: the second arm must measure at least this fraction of the first to be taken at a tie
+    /// (0.99 = the second unless the first is clearly ahead; the Gumbel arm uses 1.01 - it must be measurably,
+    /// by 1%, faster than off, the prior).  `min_tokens`: a request shorter than this teaches nothing (the default
+    /// is kMinTokens; the Gumbel arm's rates are steady enough that shorter replies teach it too).
+    explicit DrafterPolicy(double second_margin, int min_tokens = kMinTokens)
+        : second_margin_(second_margin), min_tokens_(min_tokens) {}
 
     /// The request's kind: FNV-1a of its first prompt tokens (the system prompt decides the kind; the first token,
     /// a BOS, is skipped).  Upstream's bandit key.
@@ -33,10 +42,10 @@ public:
     /// The context-depth bucket of a position.
     static int depth_bucket(int64_t pos);
 
-    /// Pick the drafter for a request of `kind` starting at context position `pos`.  `df2_avail`: DFlash2 is loaded.
-    /// Each arm is tried twice in a cell before the faster is exploited; the loser is retried every 6th request
-    /// when the two are within 4%, every 12th otherwise.  Without DFlash2 the MTP is the only arm.
-    Arm choose(uint64_t kind, int64_t pos, bool df2_avail);
+    /// Pick the arm for a request of `kind` starting at context position `pos`.  `second_avail`: the second arm can
+    /// run.  Each arm is tried twice in a cell before the faster is exploited; the loser is retried every 6th request
+    /// when the two are within 4%, every 12th otherwise.  Without the second arm the first is the only one.
+    Arm choose(uint64_t kind, int64_t pos, bool second_avail);
     /// After a request: the arm it used, the tokens it committed, its decode time (ms).  Only >= kMinTokens teaches.
     void observe(uint64_t kind, int64_t pos, Arm arm, int64_t committed, double decode_ms);
 
@@ -56,6 +65,8 @@ private:
         int64_t reqs = 0;
     };
     std::map<uint64_t, Cell> cells_;
+    double second_margin_ = 0.99;   // the second arm's bar over the first (choose())
+    int min_tokens_ = kMinTokens;   // a shorter request teaches nothing (observe())
 };
 
 }  // namespace strata::spec

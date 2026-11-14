@@ -1708,7 +1708,7 @@
   },
   "SPEC_GUMBEL": {
    "reads": [
-    "src/kernels/xe/sampler.cpp:479"
+    "src/kernels/xe/sampler.cpp:502"
    ]
   },
   "SPEC_WATCH": {

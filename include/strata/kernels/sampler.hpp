@@ -34,13 +34,23 @@ struct SamplerParams {
     // after the window's tokens 0..t
     const uint32_t* allowed = nullptr;
     // Gumbel-max pick: argmax_i z_i + G_i, G_i a Gumbel noise hashed from (seed, counter, token id), over the top
-    // kGumbelK of the surviving list (sampler.cpp).  XESTRATA_SPEC_GUMBEL=1 turns it on for every sampled request.
+    // kGumbelK of the surviving list (sampler.cpp).  XESTRATA_SPEC_GUMBEL (auto|0|1) and gumbel_active() decide.
     bool gumbel = false;
 };
 
 // The most candidates a Gumbel draw is made for (YASAKANI's Q35_SMP_K, q35.hpp): a tail beyond them would rarely
 // win a draw, and the list is cut before the draws so their cost stays small whatever top_k the request asked for.
 inline constexpr int kGumbelK = 20;
+
+// XESTRATA_SPEC_GUMBEL: auto (unset or "auto"), 0, 1.  Auto: for a request that samples, the serve loop learns both
+// arms (Gumbel off and on) by the tokens per ms the request decoded at - spec/drafter_policy.hpp's two-arm learner -
+// and sets the arm the request runs (set_gumbel_auto).  Either arm samples the same distribution, so the choice
+// changes which tokens are drawn, never the distribution.  XESTRATA_EXACT=1 fixes it off (a run whose answers must
+// repeat); 0 and 1 force it off and on.
+enum class GumbelMode { kAuto, kOff, kOn };
+GumbelMode gumbel_mode();
+void set_gumbel_auto(bool on);   // the arm for the request now decoding (auto mode only)
+bool gumbel_active();            // what the sampler consults: the mode, and in auto the arm last set
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
 //

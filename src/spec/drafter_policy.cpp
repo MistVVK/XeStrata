@@ -22,15 +22,15 @@ int DrafterPolicy::depth_bucket(int64_t pos) {
     return 3;
 }
 
-DrafterPolicy::Arm DrafterPolicy::choose(uint64_t kind, int64_t pos, bool df2_avail) {
-    if (!df2_avail) return Mtp;
+DrafterPolicy::Arm DrafterPolicy::choose(uint64_t kind, int64_t pos, bool second_avail) {
+    if (!second_avail) return First;
     Cell& c = cells_[kind];
     Bucket& b = c.b[depth_bucket(pos)];
     // explore each arm twice before exploiting (the MTP first: the conservative startup prior)
     if (b.n[Mtp] < 2) return Mtp;
     if (b.n[Df2] < 2) return Df2;
     const double t0 = b.tps[Mtp], t1 = b.tps[Df2];
-    const bool df_better = t1 >= 0.99 * t0;   // DFlash2 unless the MTP is clearly ahead
+    const bool df_better = t1 >= second_margin_ * t0;   // the second arm unless the first is clearly ahead
     const int every = (t0 > 0 && std::fabs(t1 / t0 - 1.0) < 0.04) ? 6 : 12;
     const int64_t r = b.reqs++;
     const bool explore = r % every == every - 1;
@@ -39,7 +39,7 @@ DrafterPolicy::Arm DrafterPolicy::choose(uint64_t kind, int64_t pos, bool df2_av
 }
 
 void DrafterPolicy::observe(uint64_t kind, int64_t pos, Arm arm, int64_t committed, double decode_ms) {
-    if (committed < kMinTokens || decode_ms <= 0.0 || (int) arm < 0 || (int) arm >= kArms) return;
+    if (committed < min_tokens_ || decode_ms <= 0.0 || (int) arm < 0 || (int) arm >= kArms) return;
     const double speed = (double) committed / (decode_ms / 1000.0);
     Cell& c = cells_[kind];
     ++c.reqs;

@@ -13,6 +13,7 @@
 // pass against either order.
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/sampler_host.hpp"
+#include "strata/kernels/exact.hpp"
 
 #include "parity_device.hpp"
 
@@ -877,7 +878,7 @@ int main(int argc, char** argv) {
         bad += !valid;
     }
 
-    // ---- GUMBEL-MAX (STRATA_SPEC_GUMBEL, p.gumbel; upstream 6381df34).  (a) The kernel's pick equals the host
+    // ---- GUMBEL-MAX (XESTRATA_SPEC_GUMBEL, p.gumbel; upstream 6381df34).  (a) The kernel's pick equals the host
     // reference's, draw for draw, under the chains the server uses (top_k / top_p / min_p / temperature) - on a GPU with
     // FP64 (one without sums and hashes in float).  (b) It is an exact sample: over many counters the picks' frequencies
     // match the softmax of the surviving logits.  (c) It is a different stream from the inverse-CDF draw (the flag is
@@ -972,6 +973,23 @@ int main(int argc, char** argv) {
             std::printf("  %-34s %s (%d of %d picks beyond the cut)\n", "gumbel: top-k cut",
                         outside ? "*** WRONG ***" : "matches", outside, R3 * launches3);
             bad += outside != 0;
+        }
+
+        // (e) the auto arm (XESTRATA_SPEC_GUMBEL=auto): set_gumbel_auto(true) makes a sampled request draw Gumbel with
+        // p.gumbel clear - the arm the serve loop's measurement sets - and (false) takes it back off
+        if (strata::kernels::gumbel_mode() == strata::kernels::GumbelMode::kAuto && !strata::kernels::exact_sums()) {
+            strata::kernels::SamplerParams off;
+            off.top_k = 20; off.top_p = 0.95f; off.temperature = 1.0f; off.seed = 21; off.counter = 5;
+            strata::kernels::SamplerParams on = off; on.gumbel = true;
+            const std::vector<int> a_off = sample_rows(l, T, off), a_on = sample_rows(l, T, on);
+            strata::kernels::set_gumbel_auto(true);
+            const std::vector<int> auto_on = sample_rows(l, T, off);
+            strata::kernels::set_gumbel_auto(false);
+            const std::vector<int> auto_off = sample_rows(l, T, off);
+            const bool auto_bad = auto_on != a_on || auto_off != a_off;
+            std::printf("  %-34s %s (the auto arm on/off matches the flag)\n", "gumbel: auto arm",
+                        auto_bad ? "*** WRONG ***" : "matches");
+            bad += auto_bad;
         }
     }
 

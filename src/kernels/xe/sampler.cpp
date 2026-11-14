@@ -11,11 +11,13 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/kernels/exact.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_sampler
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/platform/env.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -54,8 +56,8 @@ inline float philox_uniform(uint64_t seed, uint64_t counter) {
     return (float) (c0 >> 8) * (1.0f / 16777216.0f);   // 24 bits: uniform in [0,1), never 1.0
 }
 
-// GUMBEL-MAX COUPLING (XESTRATA_SPEC_GUMBEL=1, upstream 6381df34, from llama.cpp-lab's --spec-coupled; the hash and
-// the top-k cut are YASAKANI's smp_hash.cuh `kh_gumbel` and q35_sample.cu's version-3 pick).  The pick is
+// GUMBEL-MAX COUPLING (XESTRATA_SPEC_GUMBEL=auto|0|1, upstream 6381df34, from llama.cpp-lab's --spec-coupled; the
+// hash and the top-k cut are YASAKANI's smp_hash.cuh `kh_gumbel` and q35_sample.cu's version-3 pick).  The pick is
 // argmax_i z_i + G_i with G_i a Gumbel noise hashed from (seed, counter, TOKEN ID) and z_i the temperature-scaled
 // logit - exactly argmax(log p_i + Gumbel_i), an exact sample of p.  Unlike the inverse-CDF pick over a
 // probability-sorted list, the noise a token gets does not depend on which other tokens survived the cut, so a
@@ -186,11 +188,13 @@ inline void block_argmax(const sycl::nd_item<1>& it, int n_vocab, float* sv, int
     }
 }
 
-// top_p, min_p, temperature and one Philox draw over a row's top_k list (ids, logits in the selection order),
-// computed redundantly by every work-item
+// top_p, min_p, temperature and the pick over a row's top_k list (ids, logits in the selection order).  The inverse-CDF
+// pick is computed redundantly by every work-item; the Gumbel pick is drawn by the row's first warp, one candidate a
+// lane, and the warp's (value, index) argmax gives the row's pick (see below).
 template <typename D>
 inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& pp, int t,
-                          float* probability = nullptr, const int32_t* sub_to_id = nullptr, bool primary = true) {
+                          const sycl::sub_group& sg, int tid, float* probability = nullptr,
+                          const int32_t* sub_to_id = nullptr) {
     const float inv_t = pp.temperature > 0.0f ? 1.0f / pp.temperature : 0.0f;
     int n_keep = k;
     float mx = sel_logit[0];
@@ -224,14 +228,22 @@ inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, con
     int selected = nb - 1;
     int pick = sel_ids[selected];
     if (pp.gumbel) {
-        // one work-item writes the row's pick, so one draws: the other 255 or 1023 compute the same answer for nothing
-        if (!primary) return pick;
+        // the row's first warp draws: lane i takes candidate i (one 64-bit mix and two logs a lane, in parallel), and
+        // the warp's (value, index) argmax gives the pick; the other warps' work-items have nothing to draw
+        if (tid >= WARP) return pick;
         D best = -std::numeric_limits<D>::infinity();
-        for (int i = 0; i < nb; ++i) {
-            const int id = sub_to_id != nullptr ? sub_to_id[sel_ids[i]] : sel_ids[i];
-            const D g = (D) scaled(i) - (D) smx + gumbel_noise<D>(pp.seed, pp.counter + (uint64_t) t, (uint32_t) id);
-            if (g > best) { best = g; pick = sel_ids[i]; selected = i; }
+        int bi = nb;
+        if (tid < nb) {
+            const int id = sub_to_id != nullptr ? sub_to_id[sel_ids[tid]] : sel_ids[tid];
+            best = (D) scaled(tid) - (D) smx + gumbel_noise<D>(pp.seed, pp.counter + (uint64_t) t, (uint32_t) id);
+            bi = tid;
         }
+        for (int off = WARP / 2; off > 0; off >>= 1) {   // the same total order as argmax_step: larger value, then lower index
+            const D ov = sycl::permute_group_by_xor(sg, best, off);
+            const int oi = sycl::permute_group_by_xor(sg, bi, off);
+            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+        }
+        if (tid == 0 && bi < nb) { pick = sel_ids[bi]; selected = bi; }
     } else {
         const float u = philox_uniform(pp.seed, pp.counter + (uint64_t) t);
         D cum = 0;
@@ -264,6 +276,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int t = (int) it.get_group(0);
             const int tid = (int) it.get_local_id(0);
+            const sycl::sub_group sg = it.get_sub_group();
             SamplerParams row = rows ? rows[t] : pp;
             if (rows && row.penalty_last_n < 0) return;
             row.gumbel = row.gumbel || gumbel;
@@ -300,7 +313,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                 sycl::group_barrier(it.get_group());
             }
 
-            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], k, row, draw_row, nullptr, nullptr, tid == 0);
+            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], k, row, draw_row, sg, tid, nullptr, nullptr);
             if (tid == 0) out[t] = pick;
         });
     });
@@ -424,6 +437,7 @@ sycl::event split_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParam
         h.parallel_for(sycl::nd_range<2>({(size_t) n_tokens, (size_t) SPLIT_T}, {1, (size_t) SPLIT_T}),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int t = (int) it.get_group(0), tid = (int) it.get_local_id(1);
+            const sycl::sub_group sg = it.get_sub_group();
             for (int c = tid; c < m; c += SPLIT_T) {
                 const int id = li[(size_t) t * m + c];
                 // an empty entry is never a candidate (the stage-1 sentinel)
@@ -448,7 +462,7 @@ sycl::event split_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParam
             keep = sycl::min(keep, n_vocab);
             if (step_rec) chain.counter = core::coupled_draft_counter(step_rec[0]);
             float prob = 0;
-            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t, &prob, sub_to_id, tid == 0);
+            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t, sg, tid, &prob, sub_to_id);
             if (tid == 0) {
                 const int id = sub_to_id ? sub_to_id[pick] : pick;
                 out[t] = id;
@@ -479,19 +493,34 @@ void* split_scratch(sycl::queue& q, size_t bytes) {
     return sc.p;
 }
 
-bool gumbel_env() {
-    static const bool on = [] {
-        const char* e = strata::env_get("SPEC_GUMBEL");
-        return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
-    }();
-    return on;
-}
+std::atomic<bool> g_gumbel_arm{false};   // the auto arm for the request now decoding
+
 }  // namespace
+
+GumbelMode gumbel_mode() {
+    static const GumbelMode m = [] {
+        const char* e = strata::env_get("SPEC_GUMBEL");
+        if (e == nullptr || e[0] == '\0' || std::strcmp(e, "auto") == 0) return GumbelMode::kAuto;
+        return std::strcmp(e, "0") == 0 ? GumbelMode::kOff : GumbelMode::kOn;
+    }();
+    return m;
+}
+
+void set_gumbel_auto(bool on) { g_gumbel_arm.store(on, std::memory_order_relaxed); }
+
+bool gumbel_active() {
+    switch (gumbel_mode()) {
+        case GumbelMode::kOn: return true;
+        case GumbelMode::kOff: return false;
+        case GumbelMode::kAuto: break;
+    }
+    return !exact_sums() && g_gumbel_arm.load(std::memory_order_relaxed);
+}
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p_in, int* out, void* stream) {
     SamplerParams p = p_in;
-    p.gumbel = p_in.gumbel || gumbel_env();   // the target's pick; greedy rows never read it
+    p.gumbel = p_in.gumbel || gumbel_active();   // the target's pick; greedy rows never read it
     if (n_tokens <= 0 || n_vocab <= 0) return;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0))
         throw core::DeviceError("sample_tokens: penalty_last_n " + std::to_string(p.penalty_last_n) +
@@ -543,7 +572,7 @@ void sample_token_rows(const float* logits, int n_tokens, int n_vocab, const int
                       : (wg == 1024 ? sample_launch<1024, float> : wg == 512 ? sample_launch<512, float>
                                                                       : sample_launch<256, float>);
     const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, SamplerParams{}, false, words, out,
-                          params, gumbel_env());
+                          params, gumbel_active());
     if (!stream) core::Runtime::get().wait(e, "sample_token_rows");
 }
 
@@ -558,10 +587,10 @@ size_t coupled_draft_scratch_bytes(int nv) {
 void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapped_hist, SamplerParams* params,
                          int32_t* ring, int cap, void* stream) {
     auto& q = core::Runtime::get().stream(stream);
-    const bool gumbel = gumbel_env();
+    // `gumbel` comes in mapped_params too: the serve loop writes the request's arm there (set_draft_sampling) and the
+    // stage runs inside the round's captured graph, so it must not bake in a value read when the graph was captured
     q.single_task([=] {
         *params = *mapped_params;
-        params->gumbel = gumbel;
     });
     q.parallel_for(sycl::range<1>((size_t) cap), [=](sycl::id<1> i) {
         ring[i] = mapped_hist[i];
