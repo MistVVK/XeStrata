@@ -500,6 +500,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(fused_tq_default_test PRIVATE include)
   add_test(NAME fused_tq_default_test COMMAND fused_tq_default_test)
 
+  # whether a HIP device's fused prompt kernels take the Gyro trellis experts (gfx12 with STRATA_PF_FUSED_TQ=1; gfx1151 by STRATA_PF_TQ_G1151 and its Windows
+  # default): the pure rule, pinned over every input (header-only, no GPU)
+  add_executable(fused_tq_hip_test tests/prefill/fused_tq_hip_test.cpp)
+  target_include_directories(fused_tq_hip_test PRIVATE include)
+  add_test(NAME fused_tq_hip_test COMMAND fused_tq_hip_test)
+
   # STRATA_SELECT_TWO_PASS: the bound between the single-pass and 3xTF32 QSA block scores and the cut-off rule that
   # keeps the selection (header-only, no GPU)
   add_executable(qsa_two_pass_test tests/prefill/qsa_two_pass_test.cpp)
