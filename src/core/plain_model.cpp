@@ -222,6 +222,11 @@ bool PlainModel::open_yskn(std::string& err) {
         err = "plain model: a .yskn model runs on the GPU, as a chat model (no --device cpu, encoder or pictures)";
         return false;
     }
+    if (!opt_.draft_model.empty()) {
+        err = "plain model: a .yskn model does not take a DFlash2 pack yet: the drafter reads the head as GGUF rows, "
+              "not the .yskn's codes";
+        return false;
+    }
     std::fprintf(stderr, "xestrata plain: the matrices from %s (%zu coded)\n", path.c_str(), yskn_->tensors().size());
     return true;
 }
