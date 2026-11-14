@@ -12,6 +12,8 @@
 // Plain C++ with no library call: the host compiler and every SYCL device compile it the same.
 #pragma once
 
+#include "strata/kernels/canon_math.hpp"
+
 #include <cstdint>
 
 namespace strata::kernels::yskn {
@@ -19,14 +21,8 @@ namespace strata::kernels::yskn {
 /// 2^24 / max alpha (0 for a row of zeros), the factor that takes each group's alpha to its fixed-point integer
 inline float fixed_factor(float alpha_max) { return alpha_max > 0.f ? 16777216.f / alpha_max : 0.f; }
 
-/// round(alpha * factor), to nearest with ties to even (CUDA's __float2int_rn), for alpha * factor in [0, 2^24]
-inline int64_t fixed_scale(float alpha, float factor) {
-    const float v = alpha * factor;
-    int64_t i = (int64_t) v;   // v >= 0: the truncation is the floor, and exact below 2^24
-    const float frac = v - (float) i;
-    if (frac > 0.5f || (frac == 0.5f && (i & 1) != 0)) ++i;
-    return i;
-}
+/// round(alpha * factor), to nearest with ties to even (the shared canon::round_even), for alpha * factor in [0, 2^24]
+inline int64_t fixed_scale(float alpha, float factor) { return canon::round_even(alpha * factor); }
 
 /// one group's contribution
 inline int64_t group_term(int32_t dot, int64_t fixed) { return (int64_t) dot * fixed; }

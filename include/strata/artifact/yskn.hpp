@@ -145,4 +145,8 @@ void gemv_reference(const Container& c, const TensorDesc& t, const float* x, flo
 /// consecutive 16 bytes whatever the sub-group's width
 std::vector<uint32_t> device_order(const Container& c, const TensorDesc& t);
 
+/// The words in the row layout: row r's units one after another (row r at (r * seqs) * words), the layout the iq_mmq
+/// body's .yskn decoder reads (Dec<kIqMmqYskn>)
+std::vector<uint32_t> row_order(const Container& c, const TensorDesc& t);
+
 }  // namespace strata::yskn

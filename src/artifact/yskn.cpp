@@ -458,4 +458,13 @@ std::vector<uint32_t> device_order(const Container& c, const TensorDesc& t) {
     return out;
 }
 
+std::vector<uint32_t> row_order(const Container& c, const TensorDesc& t) {
+    const int N = t.physical_rows, S = t.seqs(), wps = t.words();
+    std::vector<uint32_t> out((size_t) N * S * wps);
+    for (int r = 0; r < N; ++r)
+        for (int s = 0; s < S; ++s)
+            c.unit_words(t, r, s, &out[((size_t) r * S + s) * wps]);
+    return out;
+}
+
 }  // namespace strata::yskn

@@ -9,8 +9,10 @@
 
 #include "cuda_intrinsics.hpp"
 #include "hadamard_device.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/trellis.hpp"
 #include "strata/kernels/yskn_sum.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_yskn
@@ -19,6 +21,7 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -217,7 +220,67 @@ size_t yskn_scratch_bytes(const YsknDev& w, int T) {
     return q + a + (size_t) w.n_workers * rows * (size_t) w.rows * 8;
 }
 
+// The iq_mmq body's .yskn product (XESTRATA_YSKN_DECODE=iqmmq, the weights in the row layout): the same DP4a multiply
+// and integer sums as the forms below, the sum rules yskn_sum.hpp's (the body's YSKN branch).  yskn_act's alpha (per
+// 512) is replicated per 32 for the body's activation scale; the body writes the rotated-basis rows, yskn_rotate_out
+// applies the output rotation after
+void yskn_proj_iqmmq(const YsknDev& w, const float* x, int64_t ldx, int T, float* y, int64_t ldy, void* scratch,
+                     void* stream) {
+    auto& q = queue_for(stream);
+    const YsknScratch s = yskn_scratch_parts(w, scratch);
+    const int kb = w.cols / 32, G = w.cols / 512;
+    struct Bufs {
+        float* xs = nullptr;
+        float* yrot = nullptr;
+        int32_t* bounds = nullptr;
+        int32_t* ids = nullptr;
+        int64_t xs_cap = 0, yrot_cap = 0;
+    };
+    static core::PerDevice<std::shared_ptr<Bufs>> per_device;
+    Bufs& b = *per_device.get(q.get_device(), [] { return std::make_shared<Bufs>(); });
+    const int64_t xs_need = (int64_t) kYsknMmaRows * kb, yrot_need = (int64_t) kYsknMmaRows * w.rows;
+    if (b.xs_cap < xs_need) {
+        if (b.xs != nullptr) sycl::free(b.xs, q);
+        b.xs = sycl::malloc_device<float>((size_t) xs_need, q);
+        b.xs_cap = xs_need;
+    }
+    if (b.yrot_cap < yrot_need) {
+        if (b.yrot != nullptr) sycl::free(b.yrot, q);
+        b.yrot = sycl::malloc_device<float>((size_t) yrot_need, q);
+        b.yrot_cap = yrot_need;
+    }
+    if (b.bounds == nullptr) b.bounds = sycl::malloc_device<int32_t>(2, q);
+    if (b.ids == nullptr) {
+        b.ids = sycl::malloc_device<int32_t>((size_t) kYsknMmaRows, q);
+        std::vector<int32_t> id((size_t) kYsknMmaRows);
+        for (int i = 0; i < kYsknMmaRows; ++i) id[(size_t) i] = i;
+        q.memcpy(b.ids, id.data(), id.size() * 4).wait();
+    }
+    if (b.xs == nullptr || b.yrot == nullptr || b.bounds == nullptr || b.ids == nullptr)
+        throw core::DeviceError("yskn_proj_iqmmq: no VRAM for the buffers");
+    yskn_act(w, x, ldx, T, s.xq, s.alpha, stream);
+    // the per-512 alpha replicated per 32 (the body's activation scale): xs[t * kb + b] = alpha[t * G + b / 16]
+    const auto e = q.parallel_for(sycl::range<1>((size_t) T * kb), [=](sycl::id<1> i) {
+        const int t = (int) (i[0] / kb), bb = (int) (i[0] % kb);
+        b.xs[(size_t) t * kb + bb] = s.alpha[(size_t) t * G + bb / 16];
+    });
+    const int32_t bd[2] = {0, T};
+    q.memcpy(b.bounds, bd, sizeof bd).wait();
+    if (!stream) core::Runtime::get().wait(e, "yskn_alpha");
+    const auto pe = iq_mmq_yskn(q, w.words, w.rows, w.cols, s.xq, b.xs, T, b.bounds, b.ids, b.yrot, w.rows, w.lut8,
+                                w.bits, w.tau);
+    if (!stream) core::Runtime::get().wait(pe, "iq_mmq_yskn");
+    yskn_rotate_out(w, b.yrot, T, y, ldy, stream);
+}
+
 void yskn_proj(const YsknDev& w, const float* x, int64_t ldx, int T, float* y, int64_t ldy, void* scratch, void* stream) {
+    if (w.row_layout) {   // the iq_mmq body (XESTRATA_YSKN_DECODE=iqmmq)
+        for (int t0 = 0; t0 < T; t0 += kYsknMmaRows) {
+            const int n = std::min(kYsknMmaRows, T - t0);
+            yskn_proj_iqmmq(w, x + (size_t) t0 * ldx, ldx, n, y + (size_t) t0 * ldy, ldy, scratch, stream);
+        }
+        return;
+    }
     const YsknScratch s = yskn_scratch_parts(w, scratch);
     if (yskn_mma_take(T, stream)) {   // the matrix form: the whole window a launch (up to kYsknMmaRows)
         for (int t0 = 0; t0 < T; t0 += kYsknMmaRows) {

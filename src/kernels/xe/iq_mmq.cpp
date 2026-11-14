@@ -26,6 +26,8 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/q8_act.hpp"
 #include "strata/kernels/matrix_report.hpp"
+#include "strata/kernels/trellis.hpp"
+#include "strata/kernels/yskn_sum.hpp"
 #include "device_target.hpp"
 #include "amd_wmma.hpp"
 #include "strata/core/graph.hpp"
@@ -50,6 +52,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -117,7 +120,7 @@ inline uint32_t signed_bytes(uint32_t g, uint32_t m) { return (g ^ m) + (m & 0x0
 template<int TY> struct Dec;
 template<> struct Dec<16> {   // IQ2_XXS: d (0.5 + ls) / 4
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq2_xxs);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_iq2_xxs* b = reinterpret_cast<const block_iq2_xxs*>(row) + sb / 8;
         const int ib = sb % 8;
         const uint32_t q2 = (uint32_t) get_int_b2(b->qs, 2 * ib), aux = (uint32_t) get_int_b2(b->qs, 2 * ib + 1);
@@ -134,7 +137,7 @@ template<> struct Dec<16> {   // IQ2_XXS: d (0.5 + ls) / 4
 };
 template<> struct Dec<18> {   // IQ3_XXS: d (0.5 + ls) / 2
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq3_xxs);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_iq3_xxs* b = reinterpret_cast<const block_iq3_xxs*>(row) + sb / 8;
         const int ib = sb % 8;
         const U2 pk = get_int2_b2(b->qs, 2 * ib);
@@ -176,7 +179,7 @@ template<int T> struct DecFx {
     static constexpr int QK = 256, BSZ = (int) sizeof(typename F::B);
     static constexpr int group32() { return 8; }   // the blocks of 32 a group (FXG)
     static constexpr int fx_log2() { return F::log2k(); }
-    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         Sub r = Dec<T>::get(row, sb, row_bytes);
         const auto* b = reinterpret_cast<const typename F::B*>(row) + sb / 8;
         r.s0 = (float) F::scale(b, sb % 8);
@@ -190,7 +193,7 @@ template<int T> struct DecFx {
 };
 template<> struct Dec<21> {   // IQ3_S: d (1 + 2 ls)
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq3_s);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_iq3_s* b = reinterpret_cast<const block_iq3_s*>(row) + sb / 8;
         const int ib = sb % 8;
         const U2 pk = get_int2_b2(b->qs, 2 * ib);
@@ -210,7 +213,7 @@ template<> struct Dec<21> {   // IQ3_S: d (1 + 2 ls)
 };
 template<> struct Dec<17> {   // IQ2_XS: d (0.5 + ls) / 4, a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq2_xs);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_iq2_xs* b = reinterpret_cast<const block_iq2_xs*>(row) + sb / 8;
         const int ib = sb % 8;
         const U2 pk = get_int2_b2(b->qs, 2 * ib);
@@ -231,7 +234,7 @@ template<> struct Dec<17> {   // IQ2_XS: d (0.5 + ls) / 4, a scale per 16
 };
 template<> struct Dec<22> {   // IQ2_S: d (0.5 + ls) / 4, a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq2_s);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_iq2_s* b = reinterpret_cast<const block_iq2_s*>(row) + sb / 8;
         const int ib = sb % 8;
         const uint32_t qs = (uint32_t) get_int_b2(b->qs, ib);
@@ -252,7 +255,7 @@ template<> struct Dec<22> {   // IQ2_S: d (0.5 + ls) / 4, a scale per 16
 };
 template<> struct Dec<20> {   // IQ4_NL: d
     static constexpr int QK = 32, BSZ = (int) sizeof(block_iq4_nl);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_iq4_nl* b = reinterpret_cast<const block_iq4_nl*>(row) + sb;
         Sub r;
         for (int j = 0; j < 4; ++j) {
@@ -266,7 +269,7 @@ template<> struct Dec<20> {   // IQ4_NL: d
 };
 template<> struct Dec<23> {   // IQ4_XS: d (ls - 32)
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq4_xs);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_iq4_xs* b = reinterpret_cast<const block_iq4_xs*>(row) + sb / 8;
         const int ib = sb % 8;
         Sub r;
@@ -282,7 +285,7 @@ template<> struct Dec<23> {   // IQ4_XS: d (ls - 32)
 };
 template<> struct Dec<42> {   // Q2_0: d (code - 1), 64 values a block
     static constexpr int QK = 64, BSZ = (int) sizeof(block_q2_0);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_q2_0* b = reinterpret_cast<const block_q2_0*>(row) + sb / 2;
         const uint16_t* qs = reinterpret_cast<const uint16_t*>(b->qs) + (ptrdiff_t) (sb % 2) * 4;
         Sub r;
@@ -299,7 +302,7 @@ template<> struct Dec<42> {   // Q2_0: d (code - 1), 64 values a block
 
 template<> struct Dec<19> {   // IQ1_S: d (2 ls + 1) (grid +- 1/8), one scale and one delta a 32 (dequantize_row_iq1_s)
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq1_s);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_iq1_s* b = reinterpret_cast<const block_iq1_s*>(row) + sb / 8;
         const int ib = sb % 8;
         const int qh = b->qh[ib];
@@ -319,7 +322,7 @@ template<> struct Dec<19> {   // IQ1_S: d (2 ls + 1) (grid +- 1/8), one scale an
 
 template<> struct Dec<29> {   // IQ1_M: d (2 ls + 1) (grid +- 1/8), a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq1_m);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_iq1_m* b = reinterpret_cast<const block_iq1_m*>(row) + sb / 8;
         const int ib = sb % 8;
         Sub r;
@@ -344,7 +347,7 @@ template<> struct Dec<29> {   // IQ1_M: d (2 ls + 1) (grid +- 1/8), a scale per 
 
 template<> struct Dec<8> {   // Q8_0: d
     static constexpr int QK = 32, BSZ = (int) sizeof(block_q8_0);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_q8_0* b = reinterpret_cast<const block_q8_0*>(row) + sb;
         Sub r;
         for (int j = 0; j < 8; ++j) r.v[j] = (uint32_t) get_int_b2(b->qs, j);
@@ -354,7 +357,7 @@ template<> struct Dec<8> {   // Q8_0: d
 };
 template<> struct Dec<14> {   // Q6_K: d scale (6-bit value - 32), a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q6_K);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_q6_K* b = reinterpret_cast<const block_q6_K*>(row) + sb / 8;
         // block of 32 ib: half n of the 256 (ql, qh and the scales 64, 32 and 8 bytes on), quarter j of the half: the
         // low nibbles (j 0, 1) or high ones (j 2, 3) of ql's first or second 32 bytes, and qh's 2 bits at 2 j
@@ -375,7 +378,7 @@ template<> struct Dec<14> {   // Q6_K: d scale (6-bit value - 32), a scale per 1
 
 template<> struct Dec<6> {   // Q5_0: d ((5-bit value) - 16), the high bits in qh
     static constexpr int QK = 32, BSZ = (int) sizeof(block_q5_0);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_q5_0* b = reinterpret_cast<const block_q5_0*>(row) + sb;
         const uint32_t qh = (uint32_t) get_int_b2(b->qh, 0);
         Sub r;
@@ -395,7 +398,7 @@ template<> struct Dec<6> {   // Q5_0: d ((5-bit value) - 16), the high bits in q
 };
 template<> struct Dec<7> {   // Q5_1: d (5-bit value) + m: Q5_0's bits without its offset, and a min
     static constexpr int QK = 32, BSZ = (int) sizeof(block_q5_1);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_q5_1* b = reinterpret_cast<const block_q5_1*>(row) + sb;
         const uint32_t qh = (uint32_t) get_int_b2(b->qh, 0);
         Sub r;
@@ -426,7 +429,7 @@ inline void scale_min_k4(int j, const uint8_t* q, int& d, int& m) {
 }
 template<> struct Dec<12> {   // Q4_K: d sc value - dmin m, block ib the low (even ib) or high nibbles of qs[32 (ib / 2)..]
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q4_K);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_q4_K* b = reinterpret_cast<const block_q4_K*>(row) + sb / 8;
         const int ib = sb % 8;
         Sub r;
@@ -441,7 +444,7 @@ template<> struct Dec<12> {   // Q4_K: d sc value - dmin m, block ib the low (ev
 };
 template<> struct Dec<13> {   // Q5_K: Q4_K's nibbles with bit ib of qh as the fifth
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q5_K);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_q5_K* b = reinterpret_cast<const block_q5_K*>(row) + sb / 8;
         const int ib = sb % 8;
         Sub r;
@@ -466,7 +469,7 @@ template<> struct Dec<11> {   // Q3_K: d (6-bit scale - 32) ((2-bit value | high
         const int hi = (s[8 + (is & 3)] >> (2 * (is >> 2))) & 0x03;
         return (lo | (hi << 4)) - 32;
     }
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const block_q3_K* b = reinterpret_cast<const block_q3_K*>(row) + sb / 8;
         const int ib = sb % 8, n = ib / 4, j = ib % 4;   // 128-value half n, its 2-bit field j
         Sub r;
@@ -487,7 +490,7 @@ template<> struct Dec<11> {   // Q3_K: d (6-bit scale - 32) ((2-bit value | high
 // -dmin m, against activations whose blocks come twice each (iq_mmq_quantize's dup).  QK: 256 values per 512 read.
 template<> struct Dec<10> {
     static constexpr int QK = 512, BSZ = (int) sizeof(block_q2_K);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const int rb = sb / 2;
         const block_q2_K* b = reinterpret_cast<const block_q2_K*>(row) + rb / 8;
         const int ib = rb % 8, n = ib / 4, j = ib % 4;
@@ -513,7 +516,7 @@ template<> struct Dec<10> {
 
 template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp): a row's ql, then qh, scales and d
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q6_K);
-    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const size_t bpr = row_bytes / BSZ, blk = (size_t) sb / 8;
         const int ib = sb % 8, n = ib / 4, j = ib % 4;
         const uint8_t* ql = row + blk * 128 + (size_t) 64 * n;
@@ -534,7 +537,7 @@ template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp)
 
 template<> struct Dec<kNativeQ8Rows> {   // Q8_0 split by row (native_mmvq.hpp): a row's qs, then its d
     static constexpr int QK = 32, BSZ = (int) sizeof(block_q8_0);
-    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         const size_t bpr = row_bytes / BSZ;
         const uint8_t* qs = row + (size_t) sb * 32;
         Sub r;
@@ -553,7 +556,7 @@ template<int T, class B> struct DecFxHalf {
     static constexpr int QK = 256, BSZ = (int) sizeof(B);
     static constexpr int group32() { return 8; }   // the blocks of 32 a group (FXG)
     static constexpr int fx_log2() { return -3; }
-    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         Sub r = Dec<T>::get(row, sb, row_bytes);
         const B* b = reinterpret_cast<const B*>(row) + sb / 8;
         r.s0 = (float) (2 * (b->scales[sb % 8] & 0x0F) + 1);
@@ -570,7 +573,7 @@ template<> struct Dec<kIqMmqFx + 20> {
     static constexpr int QK = 32, BSZ = (int) sizeof(block_iq4_nl);
     static constexpr int group32() { return 1; }   // the blocks of 32 a group (FXG)
     static constexpr int fx_log2() { return 0; }
-    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         Sub r = Dec<20>::get(row, sb, row_bytes);
         r.s0 = 1.0f;
         r.s1 = (float) (reinterpret_cast<const block_iq4_nl*>(row) + sb)->d;
@@ -587,7 +590,7 @@ template<> struct Dec<kIqMmqFx + 42> {
     static constexpr int QK = 64, BSZ = (int) sizeof(block_q2_0);
     static constexpr int group32() { return 1; }   // the blocks of 32 a group (FXG)
     static constexpr int fx_log2() { return 0; }
-    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes, [[maybe_unused]] const void* ctx = nullptr) {
         Sub r = Dec<42>::get(row, sb, row_bytes);
         r.s0 = 1.0f;
         return r;
@@ -607,8 +610,40 @@ constexpr bool has_min() { return TY == 7 || TY == 12 || TY == 13; }
 template<int TY>
 constexpr bool fx_form() {
     return TY == kIqMmqFx + 16 || TY == kIqMmqFx + 17 || TY == kIqMmqFx + 18 || TY == kIqMmqFx + 20 ||
-           TY == kIqMmqFx + 21 || TY == kIqMmqFx + 22 || TY == kIqMmqFx + 42;
+           TY == kIqMmqFx + 21 || TY == kIqMmqFx + 22 || TY == kIqMmqFx + 42 || TY == kIqMmqYskn;
 }
+
+// ---------------------------------------------------------------- the .yskn decoder and its sum rules
+// The .yskn weights are trellis codes (kernels/trellis.hpp) read through a per-matrix int8 table, in the row layout (a
+// row's units one after another), not GGUF blocks.  The decoder's context (the launch passes it; the GGUF types take
+// null) carries the table and the codes' K.  The product's sum rules are yskn_sum.hpp's (a 512-group's activation scale
+// rounded to 2^24/max, ties to even, the int32 dots times it added in int64, the finish times max alpha * 2^-24 and the
+// row's tau), not the experts' canon fx — the body's multiply is the same, the sum rules are the parameter (YsknFx).
+struct YsknDecCtx {
+    const uint16_t* lut8;   // the 4,096 int8 pairs
+    int bits;               // K: bits a step
+    int cols;               // the matrix's columns (a multiple of 512)
+    const float* tau;       // [rows]: the row's scale times the table's int8 step (the finish)
+};
+template<> struct Dec<kIqMmqYskn> {
+    static constexpr int QK = 256;   // values a unit
+    static constexpr int BSZ = 0;    // the row's bytes come from the context (K varies), the entry passes row_bytes
+    static constexpr int group32() { return 16; }   // a 512-group: 16 blocks of 32
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes, const void* ctx) {
+        const auto* c = static_cast<const YsknDecCtx*>(ctx);
+        const int K = c->bits, wps = 4 * K;
+        const int unit = sb / 8, j0 = (sb % 8) * 16;   // 32 values = 16 steps of the unit
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(row) + (size_t) unit * wps;
+        Sub r;
+        r.s0 = r.s1 = 1.0f;   // pure int8 weights (the table's gamma); the row's tau is applied at the finish
+        for (int j = 0; j < 8; ++j) r.v[j] = 0;
+        for (int j = 0; j < 16; ++j) {
+            const uint32_t pair = c->lut8[trellis::state(w, K, j0 + j, 12)];   // value 2j low, 2j+1 high
+            r.v[j / 2] |= pair << (16 * (j % 2));
+        }
+        return r;
+    }
+};
 
 // ---------------------------------------------------------------- the products
 template<typename T>
@@ -648,6 +683,10 @@ struct Kernel {
     // (exact), then that sum times the group's fx_scale added in int64 (any order: the CPU's canonical rows give the
     // same bits); the activations canonical (iq_mmq_quantize's canon: one fp16 scale a group), K whole
     static constexpr bool FX = fx_form<TY>();
+    // the .yskn sum rules (yskn_sum.hpp): a 512-group's alpha rounded to 2^24/max (ties to even), the finish times max
+    // alpha * 2^-24 and the row's tau.  The per-row state is max alpha (float), the per-output the row's tau (float);
+    // the experts' canon fx uses int exponent tops instead
+    static constexpr bool YSKN = TY == kIqMmqYskn;
     // FX: the blocks of 32 that share one activation scale and one d (8: a 256's, gate/up; 1: IQ4_NL's, Q2_0's)
     static constexpr int FXG = [] {
         if constexpr (FX) return Dec<TY>::group32();
@@ -683,6 +722,7 @@ struct Kernel {
     float* dst;
     int64_t ld_dst, tiles_m, tiles_n;
     sycl::local_accessor<uint8_t, 1> lm;
+    const void* ctx = nullptr;   // the decoder's context (the .yskn table; null for the GGUF types)
     // K in ksplit parts of kspan values (launch's), a work-group each, each part's sums into part[ks][row][col] (n_out
     // columns), which launch adds up in order; part null: one part, the sums straight into dst
     int64_t ksplit = 1, kspan = 0;
@@ -712,6 +752,20 @@ struct Kernel {
             for (int64_t b = 0; b < nw; ++b) t = sycl::max(t, canon::fx_exp(Dec<TY>::block_d(wr, (int) b)));
             tw[nn] = canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wr, 0)), t);
         }
+    }
+    // YSKN: the per-row state is max alpha over the 512-groups (the activation scale xs holds alpha replicated per 32),
+    // the per-output the row's tau (the context).  The finish scales by max alpha * 2^-24 and tau (yskn_sum.hpp)
+    void yskn_tops(int lid, int lanes, int64_t row0, int64_t rows, int64_t m0, int64_t n0, float* ta,
+                   float* tw) const {
+        const int64_t kb = K / 32, G = K / 512;
+        const auto* c = static_cast<const YsknDecCtx*>(ctx);
+        for (int rr = lid; rr < WM; rr += lanes) {
+            float amax = 0.f;
+            if (m0 + rr < rows)
+                for (int64_t g = 0; g < G; ++g) amax = sycl::fmax(amax, xs[(row0 + m0 + rr) * kb + g * 16]);
+            ta[rr] = amax;
+        }
+        for (int nn = lid; nn < WN; nn += lanes) tw[nn] = c->tau[n0 + nn];
     }
     // FX: a group's integer scale from its activation scale and its d at a row and output's top
     static int32_t fx_a(float xsv, float wd, int top) {
@@ -747,14 +801,16 @@ struct Kernel {
         for (int i = 0; i < RPT; ++i) acc[i] = 0.0f;
         [[maybe_unused]] int32_t isum[FX ? RPT : 1];
         [[maybe_unused]] int64_t acc64[FX ? RPT : 1];
-        [[maybe_unused]] int* ta = local_as<int>(base + FX_OFF).get();
-        [[maybe_unused]] int* tw = ta + WM;
+        using Top = std::conditional_t<YSKN, float, int>;   // YSKN: max alpha / tau; the experts: exponent tops
+        [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
+        [[maybe_unused]] Top* tw = ta + WM;
         if constexpr (FX) {
             for (int i = 0; i < RPT; ++i) {
                 isum[i] = 0;
                 acc64[i] = 0;
             }
-            fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+            if constexpr (YSKN) yskn_tops(lid, lanes, row0, rows, m0, n0, ta, tw);
+            else fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
         }
         const int64_t kb = K / 32;   // activation scales a row
         for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
@@ -775,7 +831,7 @@ struct Kernel {
             }
             for (int v = lid; v < WN * NB; v += lanes) {
                 const int nn = v / NB, b = v % NB;
-                const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
+                const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes, ctx)
                                                 : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                 u32x4* o = reinterpret_cast<u32x4*>(bl + static_cast<ptrdiff_t>(nn) * LDB + static_cast<ptrdiff_t>(b) * 32);
                 o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
@@ -799,8 +855,13 @@ struct Kernel {
                     if constexpr (FX) {   // ws0 (ws1 FXH: the second 16's) the integer scale
                         isum[i] += FXH ? (int32_t) ws0 * s0 + (int32_t) ws1 * s1 : (int32_t) ws0 * (s0 + s1);
                         if ((k0 / 32 + b) % FXG == FXG - 1) {
-                            acc64[i] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, n), ta[rr] + tw[n]) *
-                                        isum[i];
+                            if constexpr (YSKN)   // the 512-group's alpha to its fixed-point integer (yskn_sum.hpp)
+                                acc64[i] += yskn::group_term(isum[i],
+                                                             yskn::fixed_scale(xsl[b * WM + rr],
+                                                                               yskn::fixed_factor(ta[rr])));
+                            else
+                                acc64[i] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, n), ta[rr] + tw[n]) *
+                                            isum[i];
                             isum[i] = 0;
                         }
                         continue;
@@ -814,7 +875,8 @@ struct Kernel {
             const int rr = rbase + i * RSTEP;
             const int64_t row = m0 + rr;
             float v = acc[i];
-            if constexpr (FX) v = fx_out(acc64[i], ta[rr] + tw[n]);
+            if constexpr (YSKN) v = yskn::finish(acc64[i], ta[rr], tw[n]);
+            else if constexpr (FX) v = fx_out(acc64[i], ta[rr] + tw[n]);
             if (row < rows) out(ks, row0 + row, n0 + n, v);
         }
     }
@@ -901,7 +963,7 @@ struct Kernel {
                 // 8-lane 16-row tile 6-23% slower
                 constexpr bool by_block = IS == 1 && WN * NB >= 4 * lanes;
                 const int nn = by_block ? v / NB : v % WN, b = by_block ? v % NB : v / WN;
-                const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
+                const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes, ctx)
                                                 : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                 for (int j = 0; j < 8; ++j) bw[(b * 8 + j) * WN + nn] = d.v[j];
                 wsl[(2 * b) * WN + nn] = d.s0;
@@ -1031,7 +1093,7 @@ struct Kernel {
         }
         const int64_t b0 = ks * kspan / 32, b1 = sycl::min(K, (ks + 1) * kspan) / 32;
         for (int64_t b = b0; b < b1; ++b) {
-            const Sub d = Dec<TY>::get(wx, (int) b, row_bytes);
+            const Sub d = Dec<TY>::get(wx, (int) b, row_bytes, ctx);
             float xr[XR];
             [[maybe_unused]] float xu_r[XR];
             for (int j = 0; j < XR; ++j) {
@@ -1221,7 +1283,7 @@ struct Kernel {
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
-                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
+                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes, ctx)
                                                 : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + static_cast<int>(nn * LDB + b * 32));
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
@@ -1394,7 +1456,7 @@ struct Kernel {
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
-                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
+                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes, ctx)
                                                 : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
@@ -1523,12 +1585,15 @@ float* part_buffer(sycl::queue& q, size_t floats) {
 template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL, int IS, bool REG = false>
 sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                    int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
-                   int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
+                   int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst, const void* ctx = nullptr,
+                   const float* xs_in = nullptr) {
     using KT = Kernel<TY, SGM, NSGM, DP4A, TAIL, IS, REG>;
     const int64_t tiles_m = (max_rows + KT::WM - 1) / KT::WM, tiles_n = w_rows / KT::WN;
-    const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
+    const size_t row_bytes = KT::YSKN   // the .yskn row layout: a unit's 4 K words, K from the context
+                                 ? (size_t) (w_cols / 256) * 16 * (size_t) static_cast<const YsknDecCtx*>(ctx)->bits
+                                 : (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
     const auto* x8 = static_cast<const int8_t*>(xq);
-    const auto* xs = reinterpret_cast<const float*>(x8 + total_rows * w_cols);
+    const auto* xs = xs_in != nullptr ? xs_in : reinterpret_cast<const float*>(x8 + total_rows * w_cols);
     const auto* xu = xs + total_rows * (w_cols / 32);
     const int64_t steps = (w_cols + KC - 1) / KC;
     // One expert's few rows, where the queue holds the parts' buffer: K in kIqMmqSplitMax parts (two steps a part at
@@ -1571,6 +1636,7 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
         k.part = part;
         k.total_rows = total_rows;
         k.n_out = w_rows;
+        k.ctx = ctx;
         h.parallel_for(sycl::nd_range<1>((size_t) n * (size_t) (tiles_m * tiles_n * ksplit) * wg, wg), k);
     });
     if (part == nullptr) return e;
@@ -2115,6 +2181,17 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         default: return {};
     }
 #undef STRATA_MMQ_CASE
+}
+
+sycl::event iq_mmq_yskn(sycl::queue& q, const void* w, int64_t w_rows, int64_t w_cols, const void* xq, const float* xs,
+                        int64_t T, const int32_t* bounds, const int32_t* ids, float* dst, int64_t ld_dst,
+                        const uint16_t* lut8, int bits, const float* tau) {
+    // the .yskn decode's DP4a product on the shared body (the YSKN sum rules): T rows (<= 16) of int8 activations xq
+    // (yskn_act), xs the per-512 alpha replicated per 32, w the trellis codes in the row layout, dst the rotated-basis
+    // rows (yskn_rotate_out applies the output rotation after).  bounds {0, T}, ids the identity (one group)
+    YsknDecCtx ctx{lut8, bits, (int) w_cols, tau};
+    return launch<kIqMmqYskn, 1, 1, true, false, 0, false>(q, w, nullptr, 0, 0, w_rows, w_cols, 1, xq, T, bounds, T,
+                                                           ids, dst, ld_dst, &ctx, xs);
 }
 
 void iq_mmq_choose_forms(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, int n) {

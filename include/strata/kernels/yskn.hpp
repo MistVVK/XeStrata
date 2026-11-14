@@ -51,6 +51,7 @@ struct YsknDev {
     int cols = 0;          ///< a multiple of 512
     int bits = 6;          ///< K: bits a step, 4..8
     int n_workers = 1;     ///< the work-items a row's columns are divided among (a divisor of cols / 512)
+    bool row_layout = false;   ///< words in the row layout (the iq_mmq body's decoder), not device_order (XESTRATA_YSKN_DECODE=iqmmq)
 };
 
 /// The int8 activations of T rows of x (row stride ldx, cols values read through perm_in): q [T][cols], alpha

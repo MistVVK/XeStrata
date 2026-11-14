@@ -176,6 +176,16 @@ inline int32_t fx_scale(float a, float w, int top) { return fx_scale(fx_part(a),
 /// 2^k for k in [-126, 127]
 inline float pow2(int k) { return from_bits((uint32_t) (k + 127) << 23); }
 
+/// A non-negative float rounded to an integer, to nearest with ties to even (CUDA's __float2int_rn): the .yskn
+/// products' group scale (yskn_sum.hpp) rounds this way, the experts' fx_scale half away from zero (fx_shift) — the
+/// two sum rules differ here, the rounding itself is one part
+inline int64_t round_even(float v) {
+    int64_t i = (int64_t) v;   // v >= 0: the truncation is the floor, exact below 2^53
+    const float frac = v - (float) i;
+    if (frac > 0.5f || (frac == 0.5f && (i & 1) != 0)) ++i;
+    return i;
+}
+
 /// A row's value from its int64 sum (sum of A_b I_b), its `top` and log2 of its format's K: the sum to FP32 (nearest),
 /// then times 2^(top - kFxHead + k_log2) in two exact steps.  0 for a 0 sum (a row or an activation of zeros, whose
 /// top is not a number's).
