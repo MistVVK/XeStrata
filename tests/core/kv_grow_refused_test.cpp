@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 using namespace strata::core;
@@ -41,7 +42,7 @@ bool fill_and_check(const QsaState& st, const strata::kernels::QsaShapes& s, int
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cudaFree(nullptr) != cudaSuccess || !vmm_available()) {
         std::printf("kv_grow_refused_test: no CUDA device with virtual memory - skipped\n");
         return 77;
@@ -79,6 +80,31 @@ int main() {
     const int64_t cells1 = qsa_kv_elastic_cells();
     CHECK(cells1 >= target);
     CHECK(fill_and_check(st, s, cells1, 0x22));
+    // --full-card (not in ctest: it takes every free byte of the card for a moment): with no new VRAM either, the grow
+    // reports false (generate.cpp's callers then end the request with their "no VRAM is left" line), the cells mapped
+    // so far stay mapped and usable, the device has no sticky error, and the grow succeeds once memory is free again
+    bool full_card = false;
+    for (int i = 1; i < argc; ++i) full_card = full_card || std::string(argv[i]) == "--full-card";
+    if (full_card) {
+        std::vector<void*> hog;
+        for (const size_t block : {(size_t) 256 << 20, (size_t) 2 << 20}) {
+            void* p = nullptr;
+            while (cudaMalloc(&p, block) == cudaSuccess) hog.push_back(p);
+            (void) cudaGetLastError();
+        }
+        size_t free_b = 0, total_b = 0;
+        (void) cudaMemGetInfo(&free_b, &total_b);
+        std::printf("kv_grow_refused_test: full card: %zu blocks taken, %.1f MiB free\n", hog.size(), (double) free_b / 1048576.0);
+        const bool grew = qsa_kv_elastic_grow(max_cells, [] { return (VmmChunk) 0; });
+        (void) cudaGetLastError();
+        std::printf("kv_grow_refused_test: full card: the grow to %lld cells returned %s; %lld cells mapped\n",
+                    (long long) max_cells, grew ? "true" : "false", (long long) qsa_kv_elastic_cells());
+        CHECK(!grew);
+        CHECK(qsa_kv_elastic_cells() >= cells1);
+        CHECK(cudaDeviceSynchronize() == cudaSuccess);
+        CHECK(fill_and_check(st, s, cells1, 0x44));
+        for (void* p : hog) cudaFree(p);
+    }
     // the whole context: every cell of --max-context can be mapped the same way
     CHECK(qsa_kv_elastic_grow(max_cells, [] { return (VmmChunk) 0; }));
     CHECK(qsa_kv_elastic_cells() >= max_cells && qsa_kv_elastic_need(max_cells) == 0);
