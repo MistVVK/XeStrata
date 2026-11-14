@@ -41,7 +41,8 @@ RUN set -e; \
         -DSTRATA_EXPERIMENTAL_SM60=$sm60 \
         -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
         "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
-    /venv/bin/cmake --build build --target strata strata_kq -j "$(nproc)"; \
+    . packaging/engine_targets.sh; targets=$(engine_targets /venv/bin/cmake build); \
+    /venv/bin/cmake --build build --target $targets -j "$(nproc)"; \
     if [ "$BUILD_VISION" = "1" ]; then \
       /venv/bin/cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release \
           -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \

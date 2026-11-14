@@ -51,7 +51,8 @@ cd "$repo"
 "$cmake" -G Ninja -S . -B "$build" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
     -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_SKIP_BUILD_RPATH=OFF '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
-    "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake
+    -DSTRATA_MMQ=ON "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake
+# -DSTRATA_MMQ=ON: not measured without MMQ; kept as in 0.2.13 (the engine default is OFF since then)
 # strata_kq (libstrata_kq.so) exists only in a build with llama.cpp's MMQ: STRATA_CMAKE_EXTRA=-DSTRATA_MMQ=OFF builds without it
 . "$repo/packaging/engine_targets.sh"
 targets=$(engine_targets "$cmake" "$build")

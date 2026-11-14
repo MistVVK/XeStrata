@@ -4,7 +4,7 @@
 #   "$cmake" --build "$build" --target $targets ...
 #
 # Prints "strata strata_kq" when the tree has the strata_kq target (libstrata_kq.so, the K-quant prompt kernels of a build with
-# llama.cpp's MMQ, the default) and "strata" when it has not (a build configured with -DSTRATA_MMQ=OFF). The build tree is asked
+# llama.cpp's MMQ, -DSTRATA_MMQ=ON) and "strata" when it has not (STRATA_MMQ=OFF, the default). The build tree is asked
 # (a dry run of strata_kq), not the configure line: whether strata_kq exists also depends on STRATA_MMQ_KQUANTS and on defaults
 # the line need not name. Any other failure of the dry run stops the build instead of leaving the library out.
 engine_targets() {

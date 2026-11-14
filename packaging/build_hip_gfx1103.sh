@@ -15,7 +15,7 @@ st "start"
 rm -rf src stage components; mkdir src; tar xzf $R/tq3-src.tar.gz -C src
 cd src
 cmake -S . -B b1103 -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_PREFILL_MMQ=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON \
-  -DCMAKE_HIP_ARCHITECTURES=gfx1103 \
+  -DSTRATA_MMQ=OFF -DCMAKE_HIP_ARCHITECTURES=gfx1103 \
   -DCMAKE_HIP_COMPILER=$SDK/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$SDK \
   "-DCMAKE_PREFIX_PATH=$SDK;$SDK/lib/rocm_sysdeps;$SDK/lib/llvm" \
   "-DCMAKE_HIP_FLAGS=--rocm-path=$SDK --rocm-device-lib-path=$SDK/lib/llvm/amdgcn/bitcode" > $R/cfg.log 2>&1

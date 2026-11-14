@@ -77,7 +77,7 @@ if not exist "%BUILD_DIR%\build.ninja" (
     "-DCMAKE_C_COMPILER=%ROCM_F%/lib/llvm/bin/clang.exe" "-DCMAKE_CXX_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" ^
     "-DCMAKE_HIP_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" "-DCMAKE_HIP_COMPILER_ROCM_ROOT=%ROCM_F%" ^
     "-DCMAKE_PREFIX_PATH=%ROCM_F%" "-DCMAKE_HIP_FLAGS=--rocm-path=%ROCM_F% --rocm-device-lib-path=%BITCODE%" ^
-    %GGML% %STRATA_CMAKE_EXTRA% || exit /b 1
+    -DSTRATA_MMQ=OFF %GGML% %STRATA_CMAKE_EXTRA% || exit /b 1
 )
 if "%TESTS%"=="ON" (
   cmake --build "%BUILD_DIR%" || exit /b 1

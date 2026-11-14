@@ -104,6 +104,16 @@ class BuildEngineStamp(unittest.TestCase):
         self.assertNotIn("-DSTRATA_Q6K_EXPERTS=OFF", self.defs)
         self.assertIn("-DSTRATA_MMQ_KQUANTS=ON", self.defs)  # flipped OFF -> ON in the same commit (465cd61d)
 
+    def test_the_build_without_mmq_is_named_on_the_configure_line(self):
+        """STRATA_MMQ's default became OFF; a build/ folder configured before keeps ON in CMakeCache.txt, so the line names it.
+        ARM64 (DGX Spark) keeps the build with MMQ (not measured without it)."""
+        for arm, want in ((False, "-DSTRATA_MMQ=OFF"), (True, "-DSTRATA_MMQ=ON")):
+            with mock.patch.object(setup, "is_arm64", lambda arm=arm: arm):
+                (self.eng / "BUILD.json").write_text(json.dumps(self.old_stamp))
+                setup.build_engine(GPU, "none", True, Path("llama"), toolkit=13)
+            self.assertIn(want, self.defs)
+            self.assertEqual(sum(d.startswith("-DSTRATA_MMQ=") for d in self.defs), 1)
+
     def test_a_build_that_leaves_the_old_binary_is_not_stamped_or_installed(self):
         self.built = binary("0.1.42")                     # the build "succeeded" without producing the new engine
         with self.assertRaises(SystemExit):

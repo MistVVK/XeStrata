@@ -40,8 +40,9 @@ ggml=""; [ -z "${STRATA_GGML_DIR:-}" ] || ggml="-DSTRATA_GGML_DIR=$STRATA_GGML_D
 # shellcheck disable=SC2086
 cmake -G Ninja -S . -B "$build" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
     -DSTRATA_EXPERIMENTAL_SM60=$sm60 -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
-    "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake
-# strata_kq (libstrata_kq.so) exists only in a build with llama.cpp's MMQ: STRATA_CMAKE_EXTRA=-DSTRATA_MMQ=OFF packages without it
+    -DSTRATA_MMQ=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake
+# without llama.cpp's MMQ (named here: a build folder configured before keeps ON in its cache); strata_kq (libstrata_kq.so) exists only
+# in a build with it: STRATA_CMAKE_EXTRA=-DSTRATA_MMQ=ON packages the old path (A/B)
 . "$repo/packaging/engine_targets.sh"
 targets=$(engine_targets cmake "$build")
 # shellcheck disable=SC2086

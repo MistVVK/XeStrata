@@ -282,7 +282,7 @@ macro(strata_cuda_mmq)
     set(_strata_pf_tests_lib strata_mmq)
 endmacro()
 
-# P4-SPLIT, -DSTRATA_MMQ=OFF: Strata's own prompt kernels without llama.cpp's MMQ (strata_pf_own alone, with mmq_absent.cpp for the MMQ half
+# P4-SPLIT, STRATA_MMQ=OFF (the default): Strata's own prompt kernels without llama.cpp's MMQ (strata_pf_own alone, with mmq_absent.cpp for the MMQ half
 # of moe_mmq.hpp); the same sources and options as strata_cuda_mmq gives them, the ggml-base headers only
 macro(strata_cuda_pf_own)
     set(_strata_gg ${_strata_ggml_root}/ggml)
