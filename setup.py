@@ -1129,7 +1129,7 @@ EDGE0_LICENSE = ("Edge0 Community Model License 1.0 (personal, research and non-
 
 # 204800 (200K) sits between 128K and 256K: it is inside the trained 262144, so it needs no rope scaling and
 # costs ~2.8 GB of 8-bit KV with IQ3_S (vs ~3.6 GB at 256K) - a middle step for PCs that cannot hold 256K.
-CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
+CONTEXTS = [8192, 32768, 65536, 131072, 196608, 204800, 262144, 393216, 524288]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
 HUIHUI = "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF"
 HUIHUI_URL = "https://huggingface.co/" + HUIHUI
@@ -1380,7 +1380,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
         }},
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "by": "LLM-jp (Apache-2.0)",
               "about": "32B, 3B active; Japanese and English, a thinking model", "tag": "llmjp-",
-              "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 262144, "plain": True,
+              "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 65536, "plain": True,
               "profile": "expert-profile-llmjp.bin",
               "models": {
                   "Q4_K_M": {"repo": _LLMJP, "file": "llm-jp-4.1-32b-a3b-thinking-Q4_K_M.gguf", "size": 21522488192,
@@ -9012,7 +9012,7 @@ def vram_ctx(cards: list) -> int:
     """The context the GPUs' memory recommends: each card keeps its layers' KV of the whole context, so the smallest
     decides; an AMD APU, in the memory it can use in all."""
     small = min(x.get("uma_gb", x["vram_gb"]) for x in cards)
-    return 32768 if small < 14 else 65536 if small < 20 else 131072
+    return 131072 if small < 14 else 196608 if small < 20 else 262144
 
 
 # ------------------------------------------------------------------------------------------------ the options
