@@ -2,11 +2,14 @@
 // keeps every slot left exactly as it was (same address, same bytes); a grow maps them again at the same addresses.
 // Uniform and sized slots.  Needs a CUDA device with virtual memory management (exits 77 without one).
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_cache_refuse.hpp"
+#include "strata/core/residency_trim.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -92,10 +95,56 @@ int main() {
         c.close();
         if (c.valid() || c.slots() != 0) return fail("close");
     }
+    // a shrink the driver refuses part way (strata/core/expert_cache_refuse.hpp): what was given back before the refusal
+    // is gone, the rest keeps its bytes, the residency entries past it are taken (strata/core/residency_trim.hpp), and a
+    // grow maps everything again.  12 segments of 8 MiB; a shrink to 30 MiB walks segments 11 down to 4.
+    {
+        strata::core::ExpertCache c;
+        c.set_segment_bytes(kSeg);
+        std::string err;
+        if (!c.open(kSlots, 4, 64, kBlob, err) || !fill(c, 0, kSlots, kBlob)) return fail("refusal: open", err);
+        std::vector<int32_t> res((size_t) kSlots);
+        for (int64_t i = 0; i < kSlots; ++i) res[(size_t) i] = (int32_t) i;   // expert i in slot i
+        // (a) the release of segment 9 refused after its unmap: segments 11 and 10 are gone, 9 is unmapped, 72 slots stay
+        strata::core::ec_test::refuse_segment_call = [](const char* call, int64_t seg) {
+            return seg == 9 && std::string(call) == "release";
+        };
+        const bool ok_a = c.shrink(30ll << 20, err);
+        strata::core::ec_test::refuse_segment_call = nullptr;
+        if (ok_a || err.empty()) return fail("refusal (a): the shrink reported no error");
+        if (c.slots() != 72 || c.mapped_bytes() != 72ll << 20) {
+            std::fprintf(stderr, "slots %lld mapped %lld\n", (long long) c.slots(), (long long) c.mapped_bytes());
+            return fail("refusal (a): an unmapped segment is still counted");
+        }
+        if (!check(c, 72, kBlob)) return fail("refusal (a): the slots kept");
+        std::vector<std::pair<int32_t, int32_t>> ev;
+        if (strata::core::evict_slots_past(res, c.slots(), ev) != 24 || ev.size() != 24 || ev.front() != std::make_pair(72, 72) ||
+            res[71] != 71 || res[72] != strata::core::kNotResident || res[95] != strata::core::kNotResident)
+            return fail("refusal (a): the residency entries past the mapped slots");
+        // (b) the unmap of segment 6 refused: 8 and 7 go, 6 stays mapped, 56 slots stay
+        strata::core::ec_test::refuse_segment_call = [](const char* call, int64_t seg) {
+            return seg == 6 && std::string(call) == "unmap";
+        };
+        const bool ok_b = c.shrink(30ll << 20, err);
+        strata::core::ec_test::refuse_segment_call = nullptr;
+        if (ok_b || c.slots() != 56 || c.mapped_bytes() != 56ll << 20 || !check(c, 56, kBlob))
+            return fail("refusal (b): a segment the driver kept mapped");
+        if (strata::core::evict_slots_past(res, c.slots(), ev) != 16 || ev.size() != 40 || res[55] != 55 ||
+            res[56] != strata::core::kNotResident)
+            return fail("refusal (b): the residency entries past the mapped slots");
+        // a grow maps all of it again, segment 9's kept handle included, and every slot holds what is written to it
+        if (!c.grow(1ll << 40, err) || c.slots() != kSlots || c.mapped_bytes() < kSlots * kBlob) return fail("refusal: grow", err);
+        if (!check(c, 56, kBlob) || !fill(c, 56, kSlots, kBlob) || !check(c, kSlots, kBlob)) return fail("refusal: the grown slots");
+        // a clean shrink after it, then close
+        if (!c.shrink(30ll << 20, err) || c.slots() != 32) return fail("refusal: a later shrink", err);
+        c.close();
+        if (c.valid()) return fail("refusal: close");
+    }
     // the default (no segment size): one allocation, shrink refused
     strata::core::ExpertCache d;
     std::string err;
     if (!d.open(8, 2, 4, kBlob, err) || d.segmented() || d.shrink(0, err)) return fail("unsegmented", err);
-    std::puts("expert cache segments: shrink gives VRAM back and keeps the slots, grow maps them again");
+    std::puts("expert cache segments: shrink gives VRAM back and keeps the slots, grow maps them again, a refused shrink "
+              "counts only what stays mapped");
     return 0;
 }

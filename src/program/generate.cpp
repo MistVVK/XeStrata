@@ -20,6 +20,7 @@
 #include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/reader_room.hpp"
+#include "strata/core/residency_trim.hpp"
 #include "strata/core/kfd_settle.hpp"
 #include "strata/core/page_cache_drop.hpp"
 #include "strata/core/gfx12_chunk.hpp"
@@ -14918,14 +14919,15 @@ int main(int argc, char** argv) {
                     keep = floor_b;
                     note = " (the cache keeps its smallest size: the prompt path's buffers)";
                 }
-                if (!xcache.shrink(keep, e)) return false;
-                const int64_t live = xcache.slots();
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= live) {
-                        vram_evicted.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
-                    }
+                // a shrink the driver refused part way has given segments back too: the slots past what stays mapped
+                // hold nothing either way, so the tables and the loan follow what is left before the error goes out
+                const bool shrunk = xcache.shrink(keep, e);
+                strata::core::evict_slots_past(host_res, xcache.slots(), vram_evicted);
                 res_upload();
+                if (!shrunk) {
+                    relend();
+                    return false;
+                }
             } else if (mapped < xcache.full_bytes()) {
                 std::string gerr;
                 if (!xcache.grow(mapped + ((int64_t) free_b - want_free), gerr)) note = " (" + gerr + ")";
