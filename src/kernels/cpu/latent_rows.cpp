@@ -85,12 +85,29 @@ void u_row_scalar(const uint8_t* u, int H, int ELL, int fmt, const uint8_t* hq, 
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
+// the weight block's 32 centred codes and the activation codes with the weight's signs folded in (the u8 x s8
+// pair the byte-dot instructions take): |w| and sign(qy, w).  Q4_0's nibbles unpacked and centred first.
+__attribute__((target("avx2,fma,f16c")))
+static inline void block_codes_avx2(const uint8_t* wb, const uint8_t* xb, int fmt, __m256i& aw, __m256i& sq) {
+    const __m256i qy = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 4));
+    __m256i wq;
+    if (fmt == 4) {
+        const __m128i nib = _mm_loadu_si128(reinterpret_cast<const __m128i*>(wb + 2));
+        const __m128i lo = _mm_and_si128(nib, _mm_set1_epi8(0xF));
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(nib, 4), _mm_set1_epi8(0xF));
+        wq = _mm256_sub_epi8(_mm256_set_m128i(hi, lo), _mm256_set1_epi8(8));
+    } else {
+        wq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wb + 2));
+    }
+    aw = _mm256_sign_epi8(wq, wq);
+    sq = _mm256_sign_epi8(qy, wq);
+}
+
 __attribute__((target("avx2,fma,f16c")))
 void u_row_avx2(const uint8_t* u, int H, int ELL, int fmt, const uint8_t* hq, float* out) {
     const int nb = ELL / 32;
     const size_t wrow = (size_t) nb * (fmt == 4 ? 18 : 34);
     const __m256i ones = _mm256_set1_epi16(1);
-    const __m256i mask = _mm256_set1_epi8(0xF);
     for (int h = 0; h < H; ++h) {
         const uint8_t* w = u + (size_t) h * wrow;
         __m256 acc = _mm256_setzero_ps();
@@ -101,23 +118,87 @@ void u_row_avx2(const uint8_t* u, int H, int ELL, int fmt, const uint8_t* hq, fl
             std::memcpy(&dw, wb, 2);
             std::memcpy(&dx, xb, 2);
             const __m256 d = _mm256_set1_ps(h2f(dx) * h2f(dw));
-            const __m256i qy = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 4));
-            __m256i wq;
-            if (fmt == 4) {
-                const __m128i nib = _mm_loadu_si128(reinterpret_cast<const __m128i*>(wb + 2));
-                const __m128i lo = _mm_and_si128(nib, _mm256_castsi256_si128(mask));
-                const __m128i hi = _mm_and_si128(_mm_srli_epi16(nib, 4), _mm256_castsi256_si128(mask));
-                wq = _mm256_sub_epi8(_mm256_set_m128i(hi, lo), _mm256_set1_epi8(8));   // 32 centred codes
-            } else {
-                wq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wb + 2));
-            }
-            const __m256i aw = _mm256_sign_epi8(wq, wq);          // |w|, the u8 side of maddubs
-            const __m256i sq = _mm256_sign_epi8(qy, wq);          // the activation codes, flipped where w < 0
+            __m256i aw, sq;
+            block_codes_avx2(wb, xb, fmt, aw, sq);
             const __m256i p16 = _mm256_maddubs_epi16(aw, sq);
             const __m256i si = _mm256_madd_epi16(ones, p16);
             acc = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(si), acc);
         }
         __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+        out[h] = _mm_cvtss_f32(s);
+    }
+}
+
+// AVX-VNNI: the byte dot is one vpdpbusd (u8 x s8 -> int32) instead of maddubs + madd.
+__attribute__((target("avx2,fma,f16c,avxvnni")))
+void u_row_vnni(const uint8_t* u, int H, int ELL, int fmt, const uint8_t* hq, float* out) {
+    const int nb = ELL / 32;
+    const size_t wrow = (size_t) nb * (fmt == 4 ? 18 : 34);
+    for (int h = 0; h < H; ++h) {
+        const uint8_t* w = u + (size_t) h * wrow;
+        __m256 acc = _mm256_setzero_ps();
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* wb = w + (size_t) b * (fmt == 4 ? 18 : 34);
+            const uint8_t* xb = hq + (size_t) b * 36;
+            uint16_t dw, dx;
+            std::memcpy(&dw, wb, 2);
+            std::memcpy(&dx, xb, 2);
+            const __m256 d = _mm256_set1_ps(h2f(dx) * h2f(dw));
+            __m256i aw, sq;
+            block_codes_avx2(wb, xb, fmt, aw, sq);
+            const __m256i si = _mm256_dpbusd_epi32(_mm256_setzero_si256(), aw, sq);
+            acc = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(si), acc);
+        }
+        __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+        out[h] = _mm_cvtss_f32(s);
+    }
+}
+
+// AVX-512 VNNI: two blocks a vpdpbusd (the low 8 int32 are block b's, the high 8 block b+1's), each half scaled
+// by its own block's (dx * dw).  nb is even at both latent widths (56, 40); an odd tail takes the 256-bit form.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma,f16c")))
+void u_row_avx512vnni(const uint8_t* u, int H, int ELL, int fmt, const uint8_t* hq, float* out) {
+    const int nb = ELL / 32;
+    const size_t bs = (size_t) (fmt == 4 ? 18 : 34);
+    const size_t wrow = (size_t) nb * bs;
+    for (int h = 0; h < H; ++h) {
+        const uint8_t* w = u + (size_t) h * wrow;
+        __m512 acc = _mm512_setzero_ps();
+        int b = 0;
+        for (; b + 1 < nb; b += 2) {
+            const uint8_t* wb0 = w + (size_t) b * bs;
+            const uint8_t* wb1 = wb0 + bs;
+            const uint8_t* xb0 = hq + (size_t) b * 36;
+            const uint8_t* xb1 = xb0 + 36;
+            uint16_t dw0, dx0, dw1, dx1;
+            std::memcpy(&dw0, wb0, 2); std::memcpy(&dx0, xb0, 2);
+            std::memcpy(&dw1, wb1, 2); std::memcpy(&dx1, xb1, 2);
+            __m256i aw0, sq0, aw1, sq1;
+            block_codes_avx2(wb0, xb0, fmt, aw0, sq0);
+            block_codes_avx2(wb1, xb1, fmt, aw1, sq1);
+            const __m512i aw = _mm512_inserti64x4(_mm512_castsi256_si512(aw0), aw1, 1);
+            const __m512i sq = _mm512_inserti64x4(_mm512_castsi256_si512(sq0), sq1, 1);
+            const __m512i si = _mm512_dpbusd_epi32(_mm512_setzero_si512(), aw, sq);
+            const __m512 d = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(h2f(dx0) * h2f(dw0))),
+                                                _mm256_set1_ps(h2f(dx1) * h2f(dw1)), 1);
+            acc = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(si), acc);
+        }
+        __m256 acc256 = _mm256_add_ps(_mm512_castps512_ps256(acc), _mm512_extractf32x8_ps(acc, 1));
+        for (; b < nb; ++b) {   // an odd tail block
+            const uint8_t* wb = w + (size_t) b * bs;
+            const uint8_t* xb = hq + (size_t) b * 36;
+            uint16_t dw, dx;
+            std::memcpy(&dw, wb, 2); std::memcpy(&dx, xb, 2);
+            __m256i aw, sq;
+            block_codes_avx2(wb, xb, fmt, aw, sq);
+            const __m256i si = _mm256_dpbusd_epi32(_mm256_setzero_si256(), aw, sq);
+            acc256 = _mm256_fmadd_ps(_mm256_set1_ps(h2f(dx) * h2f(dw)), _mm256_cvtepi32_ps(si), acc256);
+        }
+        __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc256), _mm256_extractf128_ps(acc256, 1));
         s = _mm_add_ps(s, _mm_movehl_ps(s, s));
         s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
         out[h] = _mm_cvtss_f32(s);
@@ -129,6 +210,15 @@ void u_row_avx2(const uint8_t* u, int H, int ELL, int fmt, const uint8_t* hq, fl
 
 void latent_u_row(const uint8_t* u_group, int H, int ELL, int fmt, const uint8_t* hq, float* out) {
 #if defined(__x86_64__) || defined(_M_X64)
+    // the device's own reports, fastest first (never a maker's name); scalar is the reference fallback
+    if (cpu_avx512vnni_ok()) {
+        u_row_avx512vnni(u_group, H, ELL, fmt, hq, out);
+        return;
+    }
+    if (cpu_avxvnni_ok()) {
+        u_row_vnni(u_group, H, ELL, fmt, hq, out);
+        return;
+    }
     if (cpu_avx2_ok()) {
         u_row_avx2(u_group, H, ELL, fmt, hq, out);
         return;
