@@ -107,7 +107,7 @@ inline void gemv_body(sycl::nd_item<1> it, const Fields& f, Ops& ops) {
     auto lut = local_as<uint16_t>(base + LUT_OFF);
     auto al = local_as<int8_t>(base + A_OFF);
     auto bl = local_as<int8_t>(base + B_OFF);
-    auto bw = local_as<uint32_t>(base + B_OFF);
+    [[maybe_unused]] auto bw = local_as<uint32_t>(base + B_OFF);   // the VNNI layout's words (the XMX form only)
     auto cp = local_as<int32_t>(base + C_OFF);
     for (int i = lid; i < kStates; i += LANES) lut[i] = f.lut8[i];
     const int G = f.cols / kGroup;
