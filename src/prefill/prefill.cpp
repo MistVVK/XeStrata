@@ -1439,7 +1439,11 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
                   take((void**) &m.lmmq_ids_, (size_t) 3 * TMM * K * 4) &&
                   take((void**) &m.lmmq_bounds_, (size_t) (E + 1 + E * (MMQ_GROUP + 1) + 2 + (G + 1)) * 4) &&
                   take((void**) &m.lat_blobs_, (size_t) MMQ_GROUP * blob_bytes);
+        // the identity rows and the launch context: the standard carve makes them only where mmq_plan().any, which a
+        // latent pack is not (its experts' width differs from the shell's), so the mmq arm makes its own here
+        if (ok && m.ids_identity == nullptr) ok = take((void**) &m.ids_identity, (size_t) TMM * K * 4);
         if (!ok) { err = "prefill: the latent mmq scratch does not fit"; return false; }
+        if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
         m.lmmq_scratch_T_ = TMM;
         mmq::choose_forms(f.gu_type, 2 * I, ELL, MMQ_GROUP, m.cs);
         mmq::choose_forms(f.d_type, ELL, I, MMQ_GROUP, m.cs);
