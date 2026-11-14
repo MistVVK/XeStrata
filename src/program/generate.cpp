@@ -5127,9 +5127,8 @@ int main(int argc, char** argv) {
         strata::kernels::cpu::cpu_require_expert_support();
     } else if (!strata::kernels::cpu::cpu_vnni_ok())
 #if defined(__aarch64__)
-        // arm64: every x86 test above is false, so say which expert pool this build links (the line is a [DRAFT]
-        // until the owner words it, par\OWNER-WORDING-1111.md "ARM POOL")
-        std::fprintf(stderr, "strata generate: [DRAFT] CPU expert kernels: %s\n",
+        // arm64: every x86 test above is false, so say which expert pool this build links
+        std::fprintf(stderr, "strata generate: CPU expert kernels: %s\n",
 #if defined(STRATA_OWN_CPU_QUANT)
                      "the Strata quant layer (NEON)");
 #else
