@@ -31,6 +31,7 @@
 #endif
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
+#include "strata/core/kv_host_dma.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
@@ -4792,13 +4793,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // resident slots only, and one DMA copies the chunk's blocks from the staging pool to the host copy
                     // - no kernel writes host memory over PCIe.  The bytes every reader sees are the same (the staged
                     // first block is complete; past the chunk's last cell nothing is read until a later append writes
-                    // it).  CUDA: never.
+                    // it).  CUDA: the default (core/kv_host_dma.hpp: the kernel's own stores to the host copy ran at
+                    // about 0.24 GB/s, 50 us a prompt token); STRATA_KV_HOST_DMA=0 gives the kernel's stores back.
 #if defined(STRATA_USE_HIP)
                     static const bool kv_host_dma = [] { const char* e = std::getenv("STRATA_KV_HOST_DMA"); return e && e[0] == '1'; }();
 #else
-                    constexpr bool kv_host_dma = false;
+                    static const bool kv_host_dma = core::kv_host_dma_on(std::getenv("STRATA_KV_HOST_DMA"), true);
 #endif
-                    const bool host_by_dma = staged && kv_host_dma;
+                    const bool host_by_dma = core::kv_host_dma_use(kv_host_dma, staged, m.stage.present());
                     const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
                     if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
                         // streamed: each half writes its part of the host copy and of the staging pool
@@ -8487,9 +8489,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
 #if defined(STRATA_USE_HIP)
                         static const bool kv_host_dma = [] { const char* e = std::getenv("STRATA_KV_HOST_DMA"); return e && e[0] == '1'; }();
 #else
-                        constexpr bool kv_host_dma = false;
+                        static const bool kv_host_dma = core::kv_host_dma_on(std::getenv("STRATA_KV_HOST_DMA"), true);
 #endif
-                        const bool host_by_dma = staged && kv_host_dma;
+                        const bool host_by_dma = core::kv_host_dma_use(kv_host_dma, staged, m.stage.present());
                         const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
                         if (st.kv_hybrid) {
                             // streamed: each half writes its part of the host copy and of the staging pool

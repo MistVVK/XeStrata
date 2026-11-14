@@ -463,6 +463,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_rocblas PRIVATE hip::host roc::rocblas)
   endif()
 
+  # the prompt path's K/V append under KV streaming, both ways (the kernel's own stores to the host copy against the
+  # staging pool's DMA, core/kv_host_dma.hpp): host copies, a read-back on another stream and the VRAM slots byte-equal
+  # (GPU, synthetic, no model; skips with 77 without a GPU).  CUDA only: HIP keeps the kernel's stores by default.
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(kv_host_dma_parity src/prefill/kv_host_dma_parity.cpp)
+    target_include_directories(kv_host_dma_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(kv_host_dma_parity PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME kv_host_dma_parity COMMAND kv_host_dma_parity)
+    set_tests_properties(kv_host_dma_parity PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+
   # DFlash2 drafter tools (not built by default: cmake --build <dir> --target dflash2_parity dflash2_gemm_bench dflash2_attn_bench): the drafter against
   # the torch port on a synthetic case (needs the pack and a case file, tools/dflash2/mk_parity_case.py), and the timing of its Q8 GEMM and attention
   add_executable(dflash2_parity EXCLUDE_FROM_ALL src/core/dflash2_parity.cpp)
