@@ -28,7 +28,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_ARGMAX_ROWS_SM70` | number | NVIDIA and AMD | [NVIDIA_V100.md](NVIDIA_V100.md) |
 | `STRATA_ATTN_PRE75` | on / off | NVIDIA and AMD, Intel Arc | [NVIDIA_V100.md](NVIDIA_V100.md), [OLDER_GPUS.md](OLDER_GPUS.md) |
 | `STRATA_ATTN_RS` | number | Intel Arc | [INTEL.md](INTEL.md) |
-| `STRATA_AUX_CPUS` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
+| `STRATA_AUX_CPUS` | text | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_AUX_STAGER` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_BATCH_DECODE_SHARE` | number | NVIDIA and AMD, Intel Arc | [BATCHING.md](BATCHING.md) |
 | `STRATA_BATCH_MTP` | on / off | NVIDIA and AMD, Intel Arc | [BATCHING.md](BATCHING.md) |
@@ -208,7 +208,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PREFILL_BORROW` | text | NVIDIA, AMD | [STRIX_HALO.md](STRIX_HALO.md), [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) |
 | `STRATA_PREFILL_CPU_SHARE_BATCH` | on / off | NVIDIA and AMD | - |
 | `STRATA_PREFILL_CPU_SHARE_MAX` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
-| `STRATA_PREFILL_EQUAL` | on / off | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
+| `STRATA_PREFILL_EQUAL` | text | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
 | `STRATA_PREFILL_FIRST` | number | Intel Arc | [INTEL.md](INTEL.md) |
 | `STRATA_PREFILL_HELP` | number | NVIDIA and AMD, Intel Arc | [BATCHING.md](BATCHING.md), [GYRO.md](GYRO.md), [MULTI_GPU.md](MULTI_GPU.md) |
 | `STRATA_PREFILL_HELP_FRAC` | number | NVIDIA and AMD, Intel Arc | [MULTI_GPU.md](MULTI_GPU.md) |
@@ -288,7 +288,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WS_FAST` | number | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
 
-## Switches that go back to earlier behaviour (80)
+## Switches that go back to earlier behaviour (82)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -327,12 +327,14 @@ version made it the default.
 | `STRATA_MTP_BATCH_RING` | on / off | NVIDIA and AMD, Intel Arc | v0.1.40.1 | - |
 | `STRATA_NAN_GUARD` | number | NVIDIA and AMD | v0.1.43 | [DETAILS.md](DETAILS.md) |
 | `STRATA_NO_IQ512` | on / off | CPU | v0.1.40.1 | - |
-| `STRATA_NUMA_POOL` | on / off | CPU | v0.2.2 | [DETAILS.md](DETAILS.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
-| `STRATA_NUMA_SPLIT` | text | CPU | v0.2.2 | [DETAILS.md](DETAILS.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
+| `STRATA_NUMA_CARD` | text | NVIDIA and AMD | - | - |
+| `STRATA_NUMA_POOL` | on / off | NVIDIA and AMD, CPU | v0.2.2 | [DETAILS.md](DETAILS.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
+| `STRATA_NUMA_SPLIT` | text | NVIDIA and AMD, CPU | v0.2.2 | [DETAILS.md](DETAILS.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
 | `STRATA_NV_CHUNK` | on / off | NVIDIA | v0.2.11 | [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_FUSED_IQ2X` | text | AMD | - | - |
 | `STRATA_PF_FUSED_KQ` | text | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [DGX_SPARK_LINUX.md](DGX_SPARK_LINUX.md), [QUANTS.md](QUANTS.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_PF_FUSED_Q50` | on / off | NVIDIA and AMD | v0.2.12 | - |
+| `STRATA_PF_FUSED_SM75_IQ` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_PF_PLAIN_FLOOR` | text | NVIDIA and AMD | - | - |
 | `STRATA_PF_SHARE_OWN` | text | NVIDIA and AMD | - | - |
 | `STRATA_PF_SMALL_FUSED` | on / off | NVIDIA and AMD | - | - |
