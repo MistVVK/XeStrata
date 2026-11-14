@@ -449,7 +449,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/i8_gemm.cpp src/kernels/xe/rows_i8.cpp
                                     src/kernels/xe/sdpa_aotriton.cpp
                                     src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp
-                                    src/kernels/xe/draft_head.cpp src/kernels/xe/dflash2.cpp)
+                                    src/kernels/xe/draft_head.cpp src/kernels/xe/dflash2.cpp src/kernels/xe/shead.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
@@ -570,6 +570,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/artifact/yskn.cpp
                                    src/core/mtp.cpp src/core/dflash2.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
+                                   src/core/shead.cpp src/core/bdraft2.cpp src/core/draft_ring_log.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/control_vector.cpp
                                    src/core/vmm.cpp src/core/draft_head.cpp
@@ -1597,7 +1598,7 @@ endif()
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
 add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
-                             src/spec/drafter_policy.cpp src/spec/draft_probe.cpp
+                             src/spec/drafter_policy.cpp src/spec/draft_probe.cpp src/spec/static_drafter.cpp
             src/spec/draft_source.cpp src/spec/guess_gate.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)

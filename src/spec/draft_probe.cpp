@@ -4,6 +4,7 @@
 #include "strata/spec/draft_probe.hpp"
 
 #include "strata/platform/env.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -21,19 +22,33 @@ const char* drafter_name(Drafter d) {
         case Drafter::None: return "none";
         case Drafter::Mtp: return "mtp";
         case Drafter::Df2: return "dflash2";
+        case Drafter::Bdraft2: return "bdraft2";
     }
     return "?";
 }
 
-std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec) {
+std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec,
+                                       bool bdraft2, int bdraft2_spec, bool static_available, int wide_mode, bool bdraft_shead, bool static_forced) {
     std::vector<ProbeArm> a;
     if (mtp) {
         a.push_back({Drafter::Mtp, spec});
         // the smallest window with a draft: on a machine where a verify row costs much it can beat the larger one
         if (spec_auto && spec > 2) a.push_back({Drafter::Mtp, 2});
     }
-    if (df2) a.push_back({Drafter::Df2, df2_spec});
-    if (none_ok && (mtp || df2)) a.push_back({Drafter::None, 1});
+    if (df2) {
+        const int first = wide_mode == 1 && df2_spec >= kernels::kWindowMaxT ? 1 : 0;
+        const int last = wide_mode == 2 && df2_spec >= kernels::kWindowMaxT ? 2 : first;
+        for (int block = first; block <= last; ++block) {
+            const int cap = block == 0 ? std::min(df2_spec, kernels::kVerifyNarrowT) : df2_spec;
+            if (!static_forced) a.push_back({Drafter::Df2, cap, false, block});
+            if (static_available || static_forced) a.push_back({Drafter::Df2, cap, true, block});
+        }
+    }
+    if (bdraft2) {
+        a.push_back({Drafter::Bdraft2, bdraft2_spec});
+        if (bdraft_shead) a.push_back({Drafter::Bdraft2, bdraft2_spec, false, 0, true});
+    }
+    if (none_ok && (mtp || df2 || bdraft2)) a.push_back({Drafter::None, 1});
     if (a.size() < 2) a.clear();
     return a;
 }
@@ -75,6 +90,9 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
                       arms[i].drafter == Drafter::None ? " " : (" window " + std::to_string(arms[i].spec) + " ").c_str(),
                       v.tps[i]);
         v.line += buf;
+        if (arms[i].drafter == Drafter::Df2 && arms[i].block == 2) v.line += " adaptive block";
+        if (arms[i].static_table) v.line += " + static table";
+        if (arms[i].shead) v.line += " + SHEAD 512";
         if (drafted[i] > 0) {
             std::snprintf(buf, sizeof buf, " (drafts kept %.2f)", (double) accepted[i] / (double) drafted[i]);
             v.line += buf;
@@ -102,8 +120,17 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
     v.keep = arms[pick].drafter;
     v.spec = arms[pick].drafter == Drafter::None ? 1 : arms[pick].spec;
     (void) spec_default;
+    // the kept arm's form (Y6): DFlash2's block mode and static table, the yskn drafter's output head
+    v.df2_static = v.keep == Drafter::Df2 && arms[pick].static_table;
+    v.df2_block = v.keep == Drafter::Df2 ? arms[pick].block : 0;
+    v.bdraft_shead = v.keep == Drafter::Bdraft2 && arms[pick].shead;
     v.line += std::string(" - keeps ") + drafter_name(v.keep) +
               (v.keep == Drafter::None ? std::string() : " window " + std::to_string(v.spec));
+    if (v.keep == Drafter::Df2) {
+        v.line += std::string(" (DFlash2 block ") + (v.df2_block == 0 ? "8" : v.df2_block == 1 ? "16" : "adaptive") +
+                  (v.df2_static ? ", static table on)" : ", static table off)");
+    }
+    if (v.keep == Drafter::Bdraft2) v.line += v.bdraft_shead ? " (SHEAD 512)" : " (full head)";
     return v;
 }
 

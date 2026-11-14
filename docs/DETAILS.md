@@ -115,6 +115,15 @@ Qwen3.8-Flash-Next `--draft-fallback mtp` loads both). DFlash2 runs on one GPU, 
 `--batch` and pipeline windows keep the MTP). The plain engine's `--draft dflash2` is for `--serve` only. The greedy
 answer is the same whichever drafter proposes (the verify window emits the target's argmax).
 
+With `--wide-window auto`, the start measurement compares DFlash2's 8-row block, 16-row block and a switch based on an
+EMA of accepted drafts, where the configuration permits them. `off` caps it at 8 rows; `on` takes 16. The verification
+window still respects the remaining context and the configured limit.
+
+Set `XESTRATA_DF2_STATIC_TABLE` to a YD1S table for the target model to propose from two-token, then one-token entries.
+`XESTRATA_DF2_STATIC=auto|0|1` measures both forms at startup, disables the table, or enables it (default auto). The
+table has no tokenizer identity: the same vocabulary size is not enough. Use a table made for this model's tokenizer.
+The target verifies these proposals too.
+
 In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
 top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
 low is neither read nor computed (`XESTRATA_ROUTE_TAIL_SKIP`, default 7, upstream b4e3407b). The other experts keep their

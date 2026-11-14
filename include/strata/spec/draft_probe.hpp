@@ -22,13 +22,16 @@
 
 namespace strata::spec {
 
-enum class Drafter : int { None = 0, Mtp = 1, Df2 = 2 };
+enum class Drafter : int { None = 0, Mtp = 1, Df2 = 2, Bdraft2 = 3 };
 
 const char* drafter_name(Drafter d);
 
 struct ProbeArm {
     Drafter drafter = Drafter::Mtp;
     int spec = 1;   ///< the largest window: the pending token and spec - 1 drafts (1: no drafts)
+    bool static_table = false;   ///< DFlash2 with static table proposals
+    int block = 0;               ///< DFlash2: 0 = 8 rows, 1 = 16 rows, 2 = adaptive
+    bool shead = false;          ///< the yskn drafter with its model-specific SHEAD
 };
 
 /// One run of an arm: the tokens it decoded and the time it took (ms), the drafts it checked and kept.
@@ -42,6 +45,9 @@ struct ProbeRun {
 struct ProbeVerdict {
     bool measured = false;      ///< every arm ran (else nothing changes: the engine keeps what it loaded)
     Drafter keep = Drafter::Mtp;   ///< the drafter the engine keeps
+    bool df2_static = false;    ///< the winning DFlash2 form
+    int df2_block = 0;          ///< that form's block mode
+    bool bdraft_shead = false;  ///< the winning yskn output-head form
     int spec = 0;               ///< the kept drafter's window (0: as configured)
     std::vector<double> tps;    ///< each arm's tokens per second (the sum of its runs)
     std::string line;           ///< the start log's line: every arm's speed and the choice
@@ -58,8 +64,11 @@ public:
 
     /// The arms of a start: `mtp` / `df2`: the drafters loaded; `none_ok`: no drafter is a candidate (an engine whose
     /// --draft is auto); `spec`: the configured window, `spec_auto`: the window is a candidate too (--spec auto:
-    /// spec and 2); `df2_spec`: DFlash2's window.  Fewer than two arms: no measurement.
-    static std::vector<ProbeArm> arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec);
+    /// spec and 2); `df2_spec`: DFlash2's window. `bdraft2` and `bdraft2_spec` name the YASAKANI block
+    /// drafter and its window. Fewer than two arms: no measurement.
+    static std::vector<ProbeArm> arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec,
+                                      bool bdraft2 = false, int bdraft2_spec = 8, bool static_available = false,
+                                      int wide_mode = 0, bool bdraft_shead = false, bool static_forced = false);
 
     /// The runs in the order they are made: each arm `rounds` times, interleaved (a b c a b c), after one warm-up
     /// run of the first arm (index -1 in the plan: not counted).

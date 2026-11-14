@@ -48,15 +48,17 @@ void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int3
                  float* kring, float* vring, int slots, int rows, int heads, float eps, void* stream,
                  int64_t* tag = nullptr, const int32_t* epoch = nullptr);
 
-/// Attention of the block's 8 query rows (q: [8][32][128], already normed and rotated) over the context ring
-/// (kring, vring: head-major [8][ring_slots][128]) and the block's own keys (kblk, vblk: [8][8][128]).  Row i at
-/// position s + i sees context position j when s + i - j < window (j in [max(0, s - window + 1), s - 1], slot
-/// j % ring_slots) and every block key.  `s` is read from *anchor_pos on the device.  Partials in `part`
-/// ([kDf2PartChunks][8][32][130] floats: max, sum, 128 outputs) are combined and the 8 output rows (4096 wide)
-/// written planar-quantized to xq / xd.
+/// Attention of the block's `rows` query rows (8 or 16; q [rows][32][128]) over the context ring and the block's
+/// own keys (kblk, vblk [rows][8][128]). Each row sees the whole block and the ring within `window` positions.
+/// Partials are [kDf2PartChunks][8][rows * 4][130]. The output is planar quantized [rows][4096].
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
                    const int32_t* anchor_pos, int ring_slots, int window, float* part, void* xq, float* xd,
-                   void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr);
+                   void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr, int rows = 8);
+/// The same attention, returning eight FP32 rows [8][4096] instead of quantizing them. The output can feed
+/// a weight format with its own activation quantizer. The rings, block keys and partials have the same layout.
+void df2_attention_f32(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
+                       const int32_t* anchor_pos, int ring_slots, int window, float* part, float* out, void* stream,
+                       const int64_t* tag = nullptr, const int32_t* epoch = nullptr);
 /// 0: XESTRATA_DF2_ATTN_256 (auto: timed on the first window), 1: the 8-query-group form, 2: the 256-work-item
 /// form (the tests run both; the engine leaves 0).
 void df2_attention_variant(int v);
@@ -64,7 +66,7 @@ void df2_attention_variant(int v);
 /// The drafter's GEMM: up to 3 tiled weight matrices that share the input, times the planar activations.  A matrix
 /// is TILED (df2_q4_tile / df2_q8_tile make it from ggml blocks): the int8 / nibble plane then the fp16 scale plane.
 /// Activations: xq int8 [col][n_in], xd float [col][n_in / 32].  y (matrix i) is [ncols][n_out].  n_in a multiple of
-/// 512, n_out of 16, ncols 1..8.
+/// 512, n_out of 16, ncols 1..16 (above 8 is split into two launches).
 struct Df2Mat { const void* w; float* y; int n_out; bool q4 = false; };
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream);
 

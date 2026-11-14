@@ -1331,6 +1331,61 @@ PLAIN_FAMILIES["glm53"] = {
         "UD-IQ4_XS": {"repo": _GLM53, "file": _GLM53_IQ4[0]["path"], "parts": _GLM53_IQ4,
                       "size": sum(x["size"] for x in _GLM53_IQ4), "about": "4-bit (Unsloth Dynamic), the best quality"},
     }}
+# The pinned YASAKANI files; the models are not offered until the yskn engine can run them.
+YASAKANI_REPOS = {
+    "quality": "yasakani-dev/Qwen3.8-27B-YASAKANI-quality",
+    "speed": "yasakani-dev/Qwen3.8-27B-YASAKANI-speed",
+}
+HF_REVISIONS.update({
+    YASAKANI_REPOS["quality"]: "c1ca9235876d32fe21a4d5a5dd08e0000dee58ca",
+    YASAKANI_REPOS["speed"]: "cd78f90d205677f8b3d2ce95eae82a64e278b910",
+})
+YASAKANI_FILES = {
+    "quality": {
+        "LICENSE": (11544, "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        "NOTICE": (2102, "cd9ee7bacf223cec64d8f336ad684307531db3c54487aa70812fd97997757837"),
+        "bdraft2_k8.shead": (1411010584, "b412bdcf949fe372a3a452316c5f1c80e39f38845efd69a6b623f52a73066620"),
+        "bdraft2_k8.yskn": (1164969472, "631fa2ae75029897377837910227ec5ef19ce529515626049819e9367fdb53cc"),
+        "chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "config.json": (4312, "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab"),
+        "generation_config.json": (202, "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"),
+        "kvq_u5.bin": (17432, "a4760d46ecb8869bfdd808b01994cb65cd9b245c3c3eadd930a5b2bab2ea7570"),
+        "qwen38_27b_quality.yskn": (12365242368, "6493983cf95391823dfd8b4477733649fc20b0ddfd39fdc773cf2fa0ed46d18b"),
+        "selfcheck.json": (1192, "4d4bb670afcdc97efb7d2e84d16b1c9c10cb47d2d644030bec059c9239142827"),
+        "tokenizer.json": (12809320, "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"),
+        "tokenizer_config.json": (17928, "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"),
+        "yasakani.json": (1322, "b3c139568132e2f9ad4bffc55d2cd8546773c4d2a5f1aa96c378529beab0505c"),
+    },
+    "speed": {
+        "LICENSE": (11544, "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        "NOTICE": (2100, "a48f63c844b1d7bd63a613952b3c25d2725af3cc4ac2dd6d34c06a7ab7d2ad43"),
+        "bdraft2_k8.shead": (1411010584, "b412bdcf949fe372a3a452316c5f1c80e39f38845efd69a6b623f52a73066620"),
+        "bdraft2_k8.yskn": (1164969472, "631fa2ae75029897377837910227ec5ef19ce529515626049819e9367fdb53cc"),
+        "chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "config.json": (4312, "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab"),
+        "generation_config.json": (202, "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"),
+        "kvq_u5.bin": (17432, "a4760d46ecb8869bfdd808b01994cb65cd9b245c3c3eadd930a5b2bab2ea7570"),
+        "qwen38_27b_speed.yskn": (10311344128, "3ba17a76871a2b5e86fb1d01ab677e6b35ff5ccc27d4f03ad941501e3319d1ca"),
+        "selfcheck.json": (1192, "3e5efb03ecc2dec1c6fce4c9b87ee48d4e43ce84a074a8d3591eb3bc3ddb0ab6"),
+        "tokenizer.json": (12809320, "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"),
+        "tokenizer_config.json": (17928, "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"),
+        "yasakani.json": (1318, "de4445e3f542aaf03187d92479aa4a82b874f8be85bf497dce7b9725614cab38"),
+    },
+}
+YASAKANI_MODELS = {
+    kind: {"repo": repo, "file": f"qwen38_27b_{kind}.yskn",
+           "size": YASAKANI_FILES[kind][f"qwen38_27b_{kind}.yskn"][0],
+           "sha256": YASAKANI_FILES[kind][f"qwen38_27b_{kind}.yskn"][1]}
+    for kind, repo in YASAKANI_REPOS.items()
+}
+PLAIN_FAMILIES["qwen38-yasakani"] = {
+    "title": "Qwen3.8-27B YASAKANI", "by": "Qwen and yasakani-dev (Apache-2.0)",
+    "about": "27B dense: YASAKANI's trellis-coded quality and speed models",
+    "tag": "qwen3.8-27b-yasakani-", "name": "qwen3.8-27b-yasakani", "max_context": 262144,
+    "plain": True, "dense": True, "yskn": True, "kv_bytes": 65536,
+    "models": {kind: {**d, "about": "higher quality" if kind == "quality" else "smaller and faster"}
+               for kind, d in YASAKANI_MODELS.items()},
+}
 FAMILIES.update(PLAIN_FAMILIES)
 
 # How setup's questions and the launcher's window list the families: the model, its version (the original, or whose
@@ -1338,7 +1393,7 @@ FAMILIES.update(PLAIN_FAMILIES)
 # one level mixed models, copies and quantizers).  A family is one (model, version, quantization), its --family ID
 # kept; Ornith-1.5's sizes are of two quantizations (a size's own "quantizer").  BASES in the order setup lists them:
 # FIRST_CHOICE's models first.
-BASES = {"qwen3.8-flash-next": "Qwen3.8-Flash-Next", "ornith-1.5": "Ornith-1.5-35B-A3B",
+BASES = {"qwen3.8-27b": "Qwen3.8-27B", "qwen3.8-flash-next": "Qwen3.8-Flash-Next", "ornith-1.5": "Ornith-1.5-35B-A3B",
          "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
          "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B"}
 VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)",
@@ -1346,11 +1401,12 @@ VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)
             "swift-sc117": "Swift 1.5, abliterated by SC117", "huihui-ai": "abliterated by huihui-ai",
             "swift-huihui-ai": "Swift 1.5, abliterated by huihui-ai", "dealignai": "uncensored by dealignai",
             "llmfan46": "uncensored by llmfan46", "hauhaucs": "uncensored by HauhauCS"}
-QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth", "gyro": "Gyro by agentionai",
+QUANTIZERS = {"yasakani": "YASAKANI", "gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth", "gyro": "Gyro by agentionai",
               "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
               "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
               "hauhaucs": "GGUFs by HauhauCS", "own": "your own files"}
 TIERS = {  # family: (model, version, quantization), in the order each level lists them
+    "qwen38-yasakani": ("qwen3.8-27b", "original", "yasakani"),
     "qwen": ("qwen3.8-flash-next", "original", "gsq-rco"),
     "unsloth": ("qwen3.8-flash-next", "original", "unsloth"),
     "gyro": ("qwen3.8-flash-next", "original", "gyro"),
@@ -1410,6 +1466,9 @@ for _fam in PLAIN_FAMILIES.values():                 # the other models' files, 
     if _fam.get("mmproj"):
         _m = _fam["mmproj"]
         REPO_PINS.setdefault(_m["repo"], {})[_m["path"].rsplit("/", 1)[-1]] = (_m["size"], _m["sha256"])
+
+for _kind, _repo in YASAKANI_REPOS.items():
+    REPO_PINS[_repo] = YASAKANI_FILES[_kind]
 
 # the translation models' GGUFs (serve/translate.py's MODELS), at HF_REVISIONS' commits: file -> (bytes, sha256)
 TRANSLATE_FILES = {
@@ -8362,6 +8421,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     --resident-budget-gib N keeps N GiB of them in RAM and reads the rest from the file;
     --gpus with several cards splits the layers across them (docs/MULTIGPU.md).  A dense model's sizes are recommended
     by the GPU's memory, which holds all of its weights."""
+    if fam.get("yskn") and a.gguf_dir:
+        fail("--gguf-dir is for GGUF models", "use --models-dir for the YASAKANI files")
     models = fam["models"]
     names = list(models)
     if a.model and a.model not in names:
@@ -8489,12 +8550,15 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if not have:
         say(f"  The model file{'s go' if len(parts) > 1 else ' goes'} in {models_dir} (a copy you already have: put "
             f"it there with its name, {', '.join(names_of)}, or use --gguf-dir <its folder>)")
-    for x, n in zip(parts, names_of):
-        if d.get("custom"):                            # what setup read of them; the engine checked the rest
-            continue
-        if not ((models_dir / n).exists() and (done(models_dir / n) or own)):
-            download(hf(d["repo"]) + x["path"], models_dir / n)
-        verify_sha256(models_dir / n, x["size"], x["sha256"], own=own)
+    if fam.get("yskn"):
+        fetch_yasakani(model, models_dir.parent)
+    else:
+        for x, n in zip(parts, names_of):
+            if d.get("custom"):                        # what setup read of them; the engine checked the rest
+                continue
+            if not ((models_dir / n).exists() and (done(models_dir / n) or own)):
+                download(hf(d["repo"]) + x["path"], models_dir / n)
+            verify_sha256(models_dir / n, x["size"], x["sha256"], own=own)
     more = f" and {len(parts) - 1} more beside it" if len(parts) > 1 else ""
     ok(f"model file present: {gguf}{more}")
     if mm is not None and mmproj is not None:
@@ -8516,6 +8580,12 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
 
     # ---- 6. the tokenizer and the chat template, for the server
     step(6, "preparing the model for XeStrata")
+    if fam.get("yskn"):
+        skeleton = gguf.with_suffix(".gguf")
+        if not skeleton.exists():
+            run([sys.executable, str(ROOT / "tools" / "yskn_skeleton.py"), str(models_dir), "--yskn", gguf.name,
+                 "--out", str(skeleton)])
+        gguf = skeleton
     tok_dir = (find_in(roots, f"tokenizers/{tag.lower()}") or roots[0] / "tokenizers" / tag.lower())
     if not (tok_dir / "tokenizer" / "vocab.json").exists():
         env = dict(os.environ, XESTRATA_GGUF_PY=str(llama / "gguf-py"))
@@ -8536,6 +8606,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # into dflash2/ beside the model for auto (the default) and dflash2; with auto the engine measures it, the MTP layer
     # and no drafter at its start and keeps the fastest (the window too, --spec auto)
     drafting = getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json") or "auto"
+    if fam.get("yskn"):
+        if drafting != "off":
+            warn("the YASAKANI block drafter is not connected yet: starting without drafts")
+        drafting = "off"
     df2_key = fam.get("dflash2")
     df2_pack = None
     if df2_key and drafting in ("auto", "dflash2") and not on_cpu:

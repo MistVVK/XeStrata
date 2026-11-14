@@ -200,6 +200,16 @@ void Container::parse(const std::string& text) {
     model_.vocab = as_int(need(m, "vocab", "model"), "model.vocab");
     model_.eps = as_float(need(m, "eps", "model"), "model.eps");
     model_.rope_theta = as_float(need(m, "rope_theta", "model"), "model.rope_theta");
+    if (has(m, "target_layers")) {
+        const auto& taps = m.at("target_layers");
+        if (!taps.is<picojson::array>()) throw std::runtime_error("yskn: model.target_layers is not an array");
+        for (const auto& tap : taps.get<picojson::array>()) model_.target_layers.push_back(as_int(tap, "model.target_layers[]"));
+    }
+    if (has(m, "block")) model_.block = as_int(m.at("block"), "model.block");
+    if (has(m, "mask_token")) model_.mask_token = as_int(m.at("mask_token"), "model.mask_token");
+    if (has(m, "window")) model_.window = as_int(m.at("window"), "model.window");
+    if (has(m, "top_k")) model_.top_k = as_int(m.at("top_k"), "model.top_k");
+    if (has(m, "rank")) model_.rank = as_int(m.at("rank"), "model.rank");
     if (has(m, "tie_embeddings")) model_.tie_embeddings = m.at("tie_embeddings").evaluate_as_boolean();
     if (has(m, "layer_types")) {
         const picojson::value& lt = m.at("layer_types");

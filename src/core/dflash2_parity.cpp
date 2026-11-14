@@ -170,7 +170,7 @@ void test_quant_rows(void* s) {
 void test_gemm(void* s, bool q4) {
     struct Case { int n_out, n_in, ncols; };
     const Case cases[] = {{2560, 2560, 8}, {1024, 2560, 3}, {7680, 2560, 8}, {2560, 7680, 1}, {640, 2560, 8},
-                          {256, 2560, 7}, {2560, 12800, 2}};
+                          {256, 2560, 7}, {2560, 12800, 2}, {256, 512, 9}, {256, 512, 15}, {256, 512, 16}};
     for (const Case& c : cases) {
         std::vector<float> w;
         const std::vector<uint8_t> blocks = ggml_blocks(c.n_out, c.n_in, q4, w);
@@ -385,8 +385,8 @@ void test_norm_rope_kv(void* s) {
     report("kv_ring", bad, worst);
 }
 
-void test_attention(void* s) {
-    const int rows = k::kDf2Rows, NH = 32, NKV = k::kDf2Kv, HD = k::kDf2Hd;
+void test_attention(void* s, int rows) {
+    const int NH = 32, NKV = k::kDf2Kv, HD = k::kDf2Hd;
     const int slots = 2064, window = 2048;
     const int anchor = 3000;   // a position past the window: the ring wraps
     std::vector<float> q((size_t) rows * NH * HD), kring((size_t) NKV * slots * HD), vring(kring.size());
@@ -446,13 +446,13 @@ void test_attention(void* s) {
     const int32_t epoch = 3;
     parity::copy_in(danchor, &anchor, 1);
     parity::copy_in(depoch, &epoch, 1);
-    auto* dpart = dev.alloc<float>((size_t) k::kDf2PartChunks * NKV * 32 * 130);
+    auto* dpart = dev.alloc<float>((size_t) k::kDf2PartChunks * NKV * rows * 4 * 130);
     const int K = NH * HD;
     auto* dxq = dev.alloc<int8_t>((size_t) rows * K);
     auto* dxd = dev.alloc<float>((size_t) rows * (K / 32));
     auto run = [&](int variant) {
         k::df2_attention_variant(variant);
-        k::df2_attention(dq, dkring, dvring, dkblk, dvblk, danchor, slots, window, dpart, dxq, dxd, s, dtag, depoch);
+        k::df2_attention(dq, dkring, dvring, dkblk, dvblk, danchor, slots, window, dpart, dxq, dxd, s, dtag, depoch, rows);
         parity::sync();
         std::vector<int8_t> xq((size_t) rows * K);
         std::vector<float> xd((size_t) rows * (K / 32));
@@ -461,10 +461,12 @@ void test_attention(void* s) {
         k::df2_attention_variant(0);
         return std::pair<std::vector<int8_t>, std::vector<float>>(std::move(xq), std::move(xd));
     };
-    const auto v1 = run(1), v2 = run(2);
-    report("attention variants (bytes)", std::memcmp(v1.first.data(), v2.first.data(), v1.first.size()) != 0 ||
-                                            std::memcmp(v1.second.data(), v2.second.data(), v1.second.size() * sizeof(float)) != 0,
-           0);
+    const auto v1 = run(1);
+    const auto v2 = rows == k::kDf2Rows ? run(2) : v1;
+    if (rows == k::kDf2Rows)
+        report("attention variants (bytes)", std::memcmp(v1.first.data(), v2.first.data(), v1.first.size()) != 0 ||
+                                                std::memcmp(v1.second.data(), v2.second.data(), v1.second.size() * sizeof(float)) != 0,
+               0);
     // dequantize and compare within one quantization step (the fp order differs, a code may differ by 1)
     auto check = [&](const char* name, const std::vector<int8_t>& xq, const std::vector<float>& xd) {
         int64_t bad = 0; double worst = 0;
@@ -481,8 +483,8 @@ void test_attention(void* s) {
             }
         report(name, bad, worst);
     };
-    check("attention (8-query groups)", v1.first, v1.second);
-    check("attention (256 work-items)", v2.first, v2.second);
+    check(rows == k::kDf2Rows ? "attention (8-query groups)" : "attention (16 rows)", v1.first, v1.second);
+    if (rows == k::kDf2Rows) check("attention (256 work-items)", v2.first, v2.second);
 }
 
 void test_topk(void* s) {
@@ -654,7 +656,8 @@ int main() {
     test_rms_swiglu(s);
     test_rope(s);
     test_norm_rope_kv(s);
-    test_attention(s);
+    test_attention(s, k::kDf2Rows);
+    test_attention(s, 16);
     test_topk(s);
     test_select(s, false);
     test_select(s, true);
