@@ -31,6 +31,8 @@ PAGES = ["docs/AI_SETUP.md", "docs/AI_REFERENCE.md"]
 ASSET_RE = re.compile(r"^strata-(engine|dsv41)-(\d+(?:\.\d+)*)-(windows|linux|macos)-(x86_64|aarch64|arm64)-(cuda|hip|sycl|metal)(?:-(.+?))?\.(?:tar\.gz|zip)$")
 COLUMN_OF = {("windows", "cuda"): "nvidia_win", ("linux", "cuda", "x86_64"): "nvidia_linux", ("linux", "cuda", "aarch64"): "nvidia_spark",
              ("windows", "hip"): "amd_win", ("linux", "hip"): "amd_linux", ("linux", "sycl"): "intel_linux", ("macos", "metal"): "mac"}
+PKG_RE = re.compile(r"^strata-(control|dsv41|engine)-(\d+(?:\.\d+)*)-(.+?)\.(?:tar\.gz|zip)$")
+KIND_WORDS = {"control": "Control", "dsv41": "DeepSeek engines", "engine": "engines"}
 MARK_RE = re.compile(r"<!-- cap:(\S+?) -->(.*?)<!-- /cap -->", re.S)
 STATUS_WORD = {"yes": "supported", "untested": "package present, untested", "no": "does not run"}
 
@@ -85,6 +87,25 @@ def validate(cap, release):
     return problems
 
 
+def carried(release):
+    """version -> kind -> platforms of the packages in the asset list that are not at the release's Control / engine version
+    (a package carried over from an earlier release unchanged)."""
+    out = {}
+    for name in release["assets"]:
+        m = PKG_RE.match(name)
+        if m and m.group(2) != release["control_version" if m.group(1) == "control" else "engine_version"]:
+            out.setdefault(m.group(2), {}).setdefault(m.group(1), []).append(m.group(3))
+    return out
+
+
+def versions_line(release):
+    s = "App and Terminal %s, Control and engines %s" % (release["product_version"], release["engine_version"])
+    for ver, kinds in sorted(carried(release).items()):
+        s += "; these packages stay at %s: %s" % (ver, "; ".join("%s %s" % (KIND_WORDS[k], ", ".join(sorted(p)))
+                                                                for k, p in sorted(kinds.items())))
+    return s + ". App, Control and engine versions differ on purpose."
+
+
 def label(cap, col):
     return next(c["label"] for c in cap["columns"] if c["id"] == col)
 
@@ -130,7 +151,7 @@ def page(cap, release):
            "- **Supported**: what these docs commit to. *untested* means a package exists and nothing is claimed.",
            "- **Measured**: where numbers for that combination are published. Empty means none are published; it does not mean the combination fails.",
            "",
-           "App and Terminal %s, Control and engines %s. App, Control and engine versions differ on purpose." % (release["product_version"], release["engine_version"]),
+           versions_line(release),
            "", "## At a glance", "",
            "| Model | " + " | ".join(c["label"] for c in cols) + " |",
            "| --- |" + " --- |" * len(cols)]
