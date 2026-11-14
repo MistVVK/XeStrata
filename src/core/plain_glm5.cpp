@@ -176,6 +176,11 @@ bool PlainModel::load_glm5(std::string& err) {
     model_mtp_ = opt_.spec >= 2 && s.n_nextn == 1 &&
                  model_->find("blk." + std::to_string(s.n_layer) + ".nextn.eh_proj.weight") != nullptr;
     has_mtp_ = model_mtp_ && last();
+    // its decode windows keep their graphs, as the other MoE models' (load_qwen): a window answers the CPU's rings
+    // between its graph segments, which the straight form does not.  Timed against it on the one-row windows, a
+    // one-row window ran straight, its experts' ids were garbage and the GPU faulted on them (B70, UD-IQ3_XXS:
+    // --draft off stopped at its first token, the MTP's windows at a one-row window after 63 or 127 tokens)
+    step_form_.fix(0);
     opt_.max_cells = (opt_.max_cells + s.idx_kpool - 1) / s.idx_kpool * s.idx_kpool;
     cs_ = strata::gpu::stream_create();
     if (cs_ == nullptr) { err = "plain model: stream create failed"; return false; }
