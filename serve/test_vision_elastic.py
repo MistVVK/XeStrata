@@ -143,6 +143,15 @@ class Elastic(unittest.TestCase):
         self.assertFalse(v.elastic)
         self.assertEqual((v.elastic_mib, v.elastic_idle_s), (2048, 120.0))
 
+    def test_the_ask_follows_the_image_limit(self):
+        """Without the person's own elastic_mib the cache keeps the reader's need at its image limit free, never less than 2,048 MiB."""
+        base = {"exe": "e", "mmproj": "m", "model": "t", "gpu": True, "elastic": True}
+        for limit, ask in ((None, 2048), (1024, 2048), (4096, 2048), (16384, 3674), (0, 3674)):
+            cfg = dict(base) if limit is None else {**base, "max_tokens": limit}
+            self.assertEqual(Vision(cfg, lazy=True).elastic_mib, ask, limit)
+        self.assertEqual(Vision({**base, "max_tokens": 16384, "elastic_mib": 2500}, lazy=True).elastic_mib, 2500)
+        self.assertEqual(Vision({**base, "max_tokens": 1024, "elastic_mib": 5000}, lazy=True).elastic_mib, 5000)
+
 
 class OnDemandReader(unittest.TestCase):
     """The reader that starts with the first picture: no room on the card -> the CPU reader reads it, the cache grows back at once,
