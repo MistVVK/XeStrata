@@ -17,6 +17,7 @@
 // refuses the rest with the tensor's name.
 #pragma once
 
+#include "strata/kernels/trellis.hpp"
 #include "strata/platform/mapped_file.hpp"
 
 #include <cstddef>
@@ -109,14 +110,9 @@ private:
 
 // ---- the reference: the formulas YASAKANI's kernels compute, on the CPU (the GPU kernels are checked against it)
 
-/// The state of step j (0..127) of a unit of K-bit steps (start "zero")
+/// The state of step j (0..127) of a unit of K-bit steps (start "zero"): the shared trellis window (kernels/trellis.hpp)
 inline uint32_t unit_state(const uint32_t* w, int K, int j) {
-    const int e = K * (j + 1);
-    if (e < kStateBits) return (w[0] & ((1u << e) - 1u)) << (kStateBits - e);
-    const int start = e - kStateBits, word = start >> 5, sh = start & 31;
-    uint32_t v = w[word] >> sh;
-    if (sh + kStateBits > 32) v |= w[word + 1] << (32 - sh);
-    return v & (kStates - 1u);
+    return strata::kernels::trellis::state(w, K, j, kStateBits);
 }
 
 /// The table as int8 pairs (YASAKANI's build_lut8_tau): one scale gamma = max |lut16| / 127 for the whole table, each
@@ -148,5 +144,9 @@ void gemv_reference(const Container& c, const TensorDesc& t, const float* x, flo
 /// physical rows one after another - [s][chunk][row][4] - so the lanes of a sub-group, consecutive rows, read
 /// consecutive 16 bytes whatever the sub-group's width
 std::vector<uint32_t> device_order(const Container& c, const TensorDesc& t);
+
+/// The words in the row layout: row r's units one after another (row r at (r * seqs) * words), the layout the iq_mmq
+/// body's .yskn decoder reads (Dec<kIqMmqYskn>)
+std::vector<uint32_t> row_order(const Container& c, const TensorDesc& t);
 
 }  // namespace strata::yskn

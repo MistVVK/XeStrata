@@ -8,15 +8,22 @@
 #include "strata/kernels/yskn.hpp"
 
 #include "cuda_intrinsics.hpp"
+#include "hadamard_device.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/trellis.hpp"
 #include "strata/kernels/yskn_sum.hpp"
+#include "strata/platform/env.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_yskn
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -42,27 +49,16 @@ void check(const YsknDev& w, const char* what) {
         throw core::DeviceError(std::string(what) + ": invalid .yskn matrix");
 }
 
-// the orthonormal Hadamard transform of buf[0..511], 256 work-items each one butterfly a stage (the CPU reference's
-// pairs: (lo, lo + h), lo the k-th index whose bit h is clear)
+// the orthonormal Hadamard transform of buf[0..511]: the shared butterfly (hadamard_device.hpp, the APR experts'
+// hadamard_rows and the CPU's hadamard_rotate), 256 work-items each one pair a stage; the trailing barrier leaves the
+// result ready to read (the caller's barrier after the load is covered by the first stage's own)
 inline void fwht512_local(float* buf, int lane, const sycl::nd_item<1>& it) {
-    for (int h = 1; h < kGroup; h <<= 1) {
-        const int lo = ((lane & ~(h - 1)) << 1) | (lane & (h - 1));
-        const float a = buf[lo], b = buf[lo + h];
-        buf[lo] = a + b;
-        buf[lo + h] = a - b;
-        sycl::group_barrier(it.get_group());
-    }
+    xe::hadamard_block(buf, kGroup, lane, 256, it.get_group());
+    sycl::group_barrier(it.get_group());
 }
 
-// the state of step j: bits [K (j + 1) - 12, K (j + 1)) of the unit's words, zeros below its start
-template<int K> inline uint32_t state_of(const uint32_t* w, int j) {
-    const int e = K * (j + 1);
-    if (e < 12) return (w[0] & ((1u << e) - 1u)) << (12 - e);
-    const int start = e - 12, word = start >> 5, sh = start & 31;
-    uint32_t v = w[word] >> sh;
-    if (sh + 12 > 32) v |= w[word + 1] << (32 - sh);
-    return v & 0xFFFu;
-}
+// the state of step j: the shared trellis window (kernels/trellis.hpp, the reader's unit_state)
+using strata::kernels::trellis::state_of;
 
 template<int K>
 sycl::event gemv_launch(sycl::queue& q, const YsknDev& w, const int8_t* xq, const float* alpha, int T, int64_t* part) {
@@ -204,7 +200,7 @@ void yskn_gemv(const YsknDev& w, const int8_t* xq, const float* alpha, int T, in
 
 void yskn_finish(const YsknDev& w, const int64_t* part, const float* alpha, int T, float* y, int64_t ldy, void* stream) {
     check(w, "yskn_finish");
-    if (!part || !alpha || !y || T <= 0 || T > kYsknMaxRows) throw core::DeviceError("yskn_finish: invalid arguments");
+    if (!part || !alpha || !y || T <= 0 || T > kWindowMaxT) throw core::DeviceError("yskn_finish: invalid arguments");
     auto& q = queue_for(stream);
     const int rows = w.rows, G = w.cols / kGroup, nw = w.n_workers;
     const float* tau = w.tau;
@@ -219,24 +215,92 @@ void yskn_finish(const YsknDev& w, const int64_t* part, const float* alpha, int 
 }
 
 size_t yskn_scratch_bytes(const YsknDev& w, int T) {
-    const size_t rows = (size_t) std::min(T, kYsknMaxRows);
+    (void) T;   // sized for the widest window (kYsknMmaRows rows), either form reads it
+    const size_t rows = (size_t) kYsknMmaRows;
     const size_t q = (rows * (size_t) w.cols + 255) / 256 * 256;
     const size_t a = (rows * (size_t) (w.cols / kGroup) * 4 + 255) / 256 * 256;
     return q + a + (size_t) w.n_workers * rows * (size_t) w.rows * 8;
 }
 
+// The iq_mmq body's .yskn product (XESTRATA_YSKN_DECODE=iqmmq, the weights in the row layout): the same DP4a multiply
+// and integer sums as the forms below, the sum rules yskn_sum.hpp's (the body's YSKN branch).  yskn_act's alpha (per
+// 512) is replicated per 32 for the body's activation scale; the body writes the rotated-basis rows, yskn_rotate_out
+// applies the output rotation after
+void yskn_proj_iqmmq(const YsknDev& w, const float* x, int64_t ldx, int T, float* y, int64_t ldy, void* scratch,
+                     void* stream) {
+    auto& q = queue_for(stream);
+    const YsknScratch s = yskn_scratch_parts(w, scratch);
+    const int kb = w.cols / 32, G = w.cols / 512;
+    struct Bufs {
+        float* xs = nullptr;
+        float* yrot = nullptr;
+        int32_t* bounds = nullptr;
+        int32_t* ids = nullptr;
+        int64_t xs_cap = 0, yrot_cap = 0;
+    };
+    static core::PerDevice<std::shared_ptr<Bufs>> per_device;
+    Bufs& b = *per_device.get(q.get_device(), [] { return std::make_shared<Bufs>(); });
+    const int64_t xs_need = (int64_t) kYsknMmaRows * kb, yrot_need = (int64_t) kYsknMmaRows * w.rows;
+    if (b.xs_cap < xs_need) {
+        if (b.xs != nullptr) sycl::free(b.xs, q);
+        b.xs = sycl::malloc_device<float>((size_t) xs_need, q);
+        b.xs_cap = xs_need;
+    }
+    if (b.yrot_cap < yrot_need) {
+        if (b.yrot != nullptr) sycl::free(b.yrot, q);
+        b.yrot = sycl::malloc_device<float>((size_t) yrot_need, q);
+        b.yrot_cap = yrot_need;
+    }
+    if (b.bounds == nullptr) b.bounds = sycl::malloc_device<int32_t>(2, q);
+    if (b.ids == nullptr) {
+        b.ids = sycl::malloc_device<int32_t>((size_t) kYsknMmaRows, q);
+        std::vector<int32_t> id((size_t) kYsknMmaRows);
+        for (int i = 0; i < kYsknMmaRows; ++i) id[(size_t) i] = i;
+        q.memcpy(b.ids, id.data(), id.size() * 4).wait();
+    }
+    if (b.xs == nullptr || b.yrot == nullptr || b.bounds == nullptr || b.ids == nullptr)
+        throw core::DeviceError("yskn_proj_iqmmq: no VRAM for the buffers");
+    yskn_act(w, x, ldx, T, s.xq, s.alpha, stream);
+    // the per-512 alpha replicated per 32 (the body's activation scale): xs[t * kb + b] = alpha[t * G + b / 16]
+    const auto e = q.parallel_for(sycl::range<1>((size_t) T * kb), [=](sycl::id<1> i) {
+        const int t = (int) (i[0] / kb), bb = (int) (i[0] % kb);
+        b.xs[(size_t) t * kb + bb] = s.alpha[(size_t) t * G + bb / 16];
+    });
+    const int32_t bd[2] = {0, T};
+    q.memcpy(b.bounds, bd, sizeof bd).wait();
+    if (!stream) core::Runtime::get().wait(e, "yskn_alpha");
+    const auto pe = iq_mmq_yskn(q, w.words, w.rows, w.cols, s.xq, b.xs, T, b.bounds, b.ids, b.yrot, w.rows, w.lut8,
+                                w.bits, w.tau);
+    if (!stream) core::Runtime::get().wait(pe, "iq_mmq_yskn");
+    yskn_rotate_out(w, b.yrot, T, y, ldy, stream);
+}
+
 void yskn_proj(const YsknDev& w, const float* x, int64_t ldx, int T, float* y, int64_t ldy, void* scratch, void* stream) {
-    const size_t rows = (size_t) std::min(T, kYsknMaxRows);
-    auto* xq = static_cast<int8_t*>(scratch);
-    const size_t qb = (rows * (size_t) w.cols + 255) / 256 * 256;
-    auto* alpha = reinterpret_cast<float*>(static_cast<uint8_t*>(scratch) + qb);
-    const size_t ab = (rows * (size_t) (w.cols / kGroup) * 4 + 255) / 256 * 256;
-    auto* part = reinterpret_cast<int64_t*>(static_cast<uint8_t*>(scratch) + qb + ab);
+    if (w.row_layout) {   // the iq_mmq body (XESTRATA_YSKN_DECODE=iqmmq)
+        for (int t0 = 0; t0 < T; t0 += kYsknMmaRows) {
+            const int n = std::min(kYsknMmaRows, T - t0);
+            yskn_proj_iqmmq(w, x + (size_t) t0 * ldx, ldx, n, y + (size_t) t0 * ldy, ldy, scratch, stream);
+        }
+        return;
+    }
+    const YsknScratch s = yskn_scratch_parts(w, scratch);
+    // XESTRATA_YSKN_DECODE: mma forces yskn_mma.cpp, dp4a forces yskn.cpp's DP4a; else the timed choice (yskn_mma_take)
+    const char* dm = strata::env_get("YSKN_DECODE");
+    const bool force_dp4a = dm != nullptr && std::strcmp(dm, "dp4a") == 0;
+    const bool force_mma = dm != nullptr && std::strcmp(dm, "mma") == 0;
+    const bool mma = !force_dp4a && (force_mma ? yskn_mma_usable(stream) : yskn_mma_take(T, stream));
+    if (mma) {   // the matrix form: the whole window a launch (up to kYsknMmaRows)
+        for (int t0 = 0; t0 < T; t0 += kYsknMmaRows) {
+            const int n = std::min(kYsknMmaRows, T - t0);
+            yskn_mma_proj(w, x + (size_t) t0 * ldx, ldx, n, y + (size_t) t0 * ldy, ldy, scratch, stream);
+        }
+        return;
+    }
     for (int t0 = 0; t0 < T; t0 += kYsknMaxRows) {
         const int n = std::min(kYsknMaxRows, T - t0);
-        yskn_act(w, x + (size_t) t0 * ldx, ldx, n, xq, alpha, stream);
-        yskn_gemv(w, xq, alpha, n, part, stream);
-        yskn_finish(w, part, alpha, n, y + (size_t) t0 * ldy, ldy, stream);
+        yskn_act(w, x + (size_t) t0 * ldx, ldx, n, s.xq, s.alpha, stream);
+        yskn_gemv(w, s.xq, s.alpha, n, s.part, stream);
+        yskn_finish(w, s.part, s.alpha, n, y + (size_t) t0 * ldy, ldy, stream);
     }
 }
 

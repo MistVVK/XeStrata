@@ -437,7 +437,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/sampler_host.cpp
                                     src/kernels/xe/native_gdn.cpp src/kernels/xe/native_moe.cpp
                                     src/kernels/xe/fused_gdn.cpp src/kernels/xe/native_gdn_preprocess.cpp
-                                    src/kernels/xe/yskn.cpp
+                                    src/kernels/xe/yskn.cpp src/kernels/xe/yskn_mma.cpp
                                     src/kernels/xe/native_ple_postops.cpp src/kernels/xe/native_qsa.cpp
                                     src/kernels/xe/native_qsa_score.cpp src/kernels/xe/native_qsa_indexer.cpp
                                     src/kernels/xe/native_flash_attn.cpp src/kernels/xe/qsa_select.cpp
@@ -1581,7 +1581,7 @@ if(STRATA_ENABLE_XE)
     # the .yskn products on the GPU (decode, the prompt's FP16 rows and rotations) against the CPU reference, on a
     # synthetic container; the reader compiles in (picojson through strata_xgrammar's include)
     add_executable(yskn_parity src/kernels/yskn_parity.cpp src/artifact/yskn.cpp)
-    target_link_libraries(yskn_parity PRIVATE strata_kernels strata_xgrammar)
+    target_link_libraries(yskn_parity PRIVATE strata_kernels strata_kernels_cpu strata_xgrammar)
     add_test(NAME yskn_parity COMMAND yskn_parity --selftest)
     add_test(NAME device_selftest COMMAND strata-device --selftest)
     set_tests_properties(elementwise_parity device_selftest PROPERTIES TIMEOUT 60)

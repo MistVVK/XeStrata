@@ -192,6 +192,33 @@ int main(int argc, char** argv) {
                   std::memcmp(got1.data(), got8.data() + (size_t) 2 * N, (size_t) N * 4) == 0,
               t->name + ": a row the same bits at 1, 3 and 8 rows");
 
+        // the matrix form's arm (where the device runs it): the same integer sums as the DP4a form (the rows above,
+        // untimed: DP4a), against the reference and bit for bit, at 8 and 16 rows (the widest window)
+        if (k::yskn_mma_usable(p::stream())) {
+            constexpr int TM = 16;
+            std::vector<float> xm((size_t) TM * K);
+            std::copy(x.begin(), x.end(), xm.begin());
+            for (size_t i = x.size(); i < xm.size(); ++i) xm[i] = gauss(rng);
+            std::vector<float> wantm((size_t) TM * N);
+            for (int r = 0; r < TM; ++r)
+                y::gemv_reference(c, *t, xm.data() + (size_t) r * K, wantm.data() + (size_t) r * N);
+            float* xmd = dv.upload(xm);
+            auto* scratchm = dv.alloc<uint8_t>(k::yskn_scratch_bytes(d, TM));
+            float* ymd = dv.alloc<float>((size_t) TM * N);
+            std::vector<float> gotm((size_t) TM * N);
+            bool same = true;
+            double wm = 0;
+            for (int rows : {8, 16}) {
+                k::yskn_mma_proj(d, xmd, K, rows, ymd, N, scratchm, p::stream());
+                p::copy_out(gotm.data(), ymd, (size_t) rows * N);
+                for (int r = 0; r < rows; ++r)
+                    wm = std::max(wm, rel_err(gotm.data() + (size_t) r * N, wantm.data() + (size_t) r * N, (size_t) N));
+                same = same && std::memcmp(gotm.data(), got8.data(), (size_t) std::min(rows, T) * N * 4) == 0;
+            }
+            check(wm < 1e-3 && same,
+                  t->name + ": the matrix form against the reference and the DP4a bits (" + std::to_string(wm) + ")");
+        }
+
         // the engine's row order: row r written at perm[r]
         if (t == up) {
             std::vector<int32_t> perm(N);

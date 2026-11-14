@@ -4,6 +4,7 @@
 // src/artifact/yskn.cpp - the .yskn reader and the CPU reference of its products (strata/artifact/yskn.hpp).
 #include "strata/artifact/yskn.hpp"
 
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/yskn_sum.hpp"
 
@@ -368,17 +369,9 @@ void row_rotated(const Container& c, const TensorDesc& t, int r, float* out) {
 }
 
 void fwht512(float* x, size_t n) {
-    for (size_t b = 0; b + kGroup <= n; b += kGroup) {
-        float* v = x + b;
-        for (int h = 1; h < kGroup; h <<= 1)
-            for (int i = 0; i < kGroup; i += 2 * h)
-                for (int k = i; k < i + h; ++k) {
-                    const float a = v[k], c = v[k + h];
-                    v[k] = a + c;
-                    v[k + h] = a - c;
-                }
-        for (int i = 0; i < kGroup; ++i) v[i] *= 0.044194173824159216f;   // 1 / sqrt(512)
-    }
+    // the shared CPU rotation (cpu/hadamard.hpp, the APR experts' own): the same Sylvester order and 1 / sqrt(512)
+    // scale (the float this file's literal was), no signs (the caller applies them)
+    strata::kernels::cpu::hadamard_rotate(x, (int) n, kGroup, nullptr);
 }
 
 void embedding_row(const Container& c, const TensorDesc& t, const std::vector<const TensorDesc*>& extra,
@@ -462,6 +455,15 @@ std::vector<uint32_t> device_order(const Container& c, const TensorDesc& t) {
             for (int k = 0; k < chunks; ++k)
                 std::memcpy(&out[(((size_t) s * chunks + k) * N + r) * 4], &w[(size_t) k * 4], 16);
         }
+    return out;
+}
+
+std::vector<uint32_t> row_order(const Container& c, const TensorDesc& t) {
+    const int N = t.physical_rows, S = t.seqs(), wps = t.words();
+    std::vector<uint32_t> out((size_t) N * S * wps);
+    for (int r = 0; r < N; ++r)
+        for (int s = 0; s < S; ++s)
+            c.unit_words(t, r, s, &out[((size_t) r * S + s) * wps]);
     return out;
 }
 

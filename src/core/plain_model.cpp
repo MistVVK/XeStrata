@@ -307,7 +307,13 @@ bool PlainModel::upload_yskn(const std::string& name, W& w, std::string& err) {
                     for (int64_t c = 0; c < dv; ++c)
                         perm[(size_t) (base + (i * vpk + j) * dv + c)] = (int32_t) (base + (j * nk + i) * dv + c);
         }
-        const std::vector<uint32_t> words = strata::yskn::device_order(*yskn_, *t);
+        // XESTRATA_YSKN_DECODE=iqmmq: the weights in the row layout for the iq_mmq body's decoder; else device_order
+        // for the DP4a / matrix-unit forms (yskn.cpp, yskn_mma.cpp).  Chosen at the load (the layout is the path's)
+        const char* dm = strata::env_get("YSKN_DECODE");
+        const bool iqmmq = dm != nullptr && std::strcmp(dm, "iqmmq") == 0;
+        const std::vector<uint32_t> words =
+            iqmmq ? strata::yskn::row_order(*yskn_, *t) : strata::yskn::device_order(*yskn_, *t);
+        d.row_layout = iqmmq;
         const std::vector<int8_t> si =
             strata::yskn::sign_stream(t->rot_in.rule, t->rot_in.sign_seed, t->rot_in.sign_offset, (size_t) d.cols);
         std::vector<int8_t> so;
@@ -1338,6 +1344,13 @@ bool PlainModel::load_qwen(std::string& err) {
         return false;
     }
     if (!tune_uploaded(err) || !yskn_scratch(err)) return false;
+    if (yskn_ != nullptr && !yskn_devs_.empty()) {
+        // the decode's matrix form: time its row boundary on the largest matrix (once a GPU, before any graph)
+        const k::YsknDev* big = yskn_devs_.front().get();
+        for (const auto& d : yskn_devs_)
+            if ((int64_t) d->rows * d->cols > (int64_t) big->rows * big->cols) big = d.get();
+        k::yskn_mma_tune(*big, yskn_scratch_, cs_);
+    }
     // the BF16 projections' two GEMV forms timed for each shape a window takes, before any graph is recorded; the
     // head is left to the default form (its timing would allocate a second copy of it)
     try {
