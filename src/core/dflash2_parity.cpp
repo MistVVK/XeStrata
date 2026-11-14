@@ -523,7 +523,7 @@ void test_topk(void* s) {
     report("topk", (val == val_ref ? 0 : 1) + (tok == tok_ref ? 0 : 1), 0);
 }
 
-// The shared selector also supplies SHEAD: a mapped tie is resolved by token ID, even across chunks.
+// The shared selector: a mapped tie is resolved by token ID, even across chunks.
 void test_shared_topk(void* s) {
     constexpr int n = 8193, count = 512;
     std::vector<float> v(n);

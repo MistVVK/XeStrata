@@ -62,8 +62,7 @@ public:
 
     /// The arms of a start: `mtp` / `df2`: the drafters loaded; `none_ok`: no drafter is a candidate (an engine whose
     /// --draft is auto); `spec`: the configured window, `spec_auto`: the window is a candidate too (--spec auto:
-    /// spec and 2); `df2_spec`: DFlash2's window.
-    /// drafter and its window. Fewer than two arms: no measurement.
+    /// spec and 2); `df2_spec`: DFlash2's window. Fewer than two arms: no measurement.
     static std::vector<ProbeArm> arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec,
                                       bool static_available = false, int wide_mode = 0, bool static_forced = false);
 

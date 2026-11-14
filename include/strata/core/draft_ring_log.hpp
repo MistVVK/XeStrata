@@ -19,7 +19,7 @@ struct DraftLineage {
     size_t wq = 2560;   ///< int8 codes per row, with wq / 32 scales
     std::vector<int32_t> hist;
     std::vector<std::shared_ptr<DraftLogChunk>> chunks;
-    size_t scale_group = 32;   ///< one scale per this many codes (yskn: 512)
+    size_t scale_group = 32;   ///< one scale per this many codes
     bool logged(int64_t pos) const;
     uint64_t bytes() const;
     void truncate(int64_t keep);

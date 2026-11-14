@@ -2508,7 +2508,6 @@ static void plain_usage(const std::string& arch) {
                  "                       auto: --serve measures the MTP, DFlash2 and none at its start and keeps the\n"
                  "                       fastest; without --serve the MTP\n"
                  "  --draft-model FILE   the model's DFlash2 pack\n"
-                 "                       XESTRATA_BDRAFT_SHEAD=auto|off|on selects its output head (default auto)\n"
                  "  --suffix-draft N     --serve: drafts from an earlier repeat of the context's last N+ tokens, a window\n"
                  "                       of them where they go past the MTP's (also without an MTP layer; default 0 = off)\n"
                  "  --lookup-chain K     --serve: after the MTP's drafts, up to K lookup drafts that continue them\n"
