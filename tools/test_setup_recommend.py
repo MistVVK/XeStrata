@@ -25,10 +25,10 @@ def room(ram: float, vram: float | None) -> setup.Room:
 
 
 class SizeByQuality(unittest.TestCase):
-    def test_gsq_rco_is_iq3_xxs_where_it_runs(self):
-        self.assertEqual(setup.recommend_size("qwen", room(64, 16)), "IQ3_XXS")    # IQ3_S fits too
+    def test_gsq_rco_is_iq3_s_where_it_runs_else_iq3_xxs(self):
+        self.assertEqual(setup.recommend_size("qwen", room(64, 16)), "IQ3_S")
         self.assertEqual(setup.recommend_size("qwen", room(48, 8)), "IQ3_XXS")     # in the low-RAM mode
-        self.assertEqual(setup.recommend_size("sc117-swift", room(128, 24)), "IQ3_XXS")
+        self.assertEqual(setup.recommend_size("sc117-swift", room(128, 24)), "IQ3_S")
 
     def test_gsq_rco_without_iq3_xxs_running_takes_the_best_that_runs(self):
         self.assertEqual(setup.recommend_size("qwen", room(48, 0)), "IQ2_XS")
