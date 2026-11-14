@@ -16744,6 +16744,45 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_MEM_CREDIT_INACTIVE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/core/conversation_memory.cpp",
+     "line": 357,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/expert_source.cpp",
+     "line": 432,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "e02647b741",
+   "first_date": "2026-11-14",
+   "since": null,
+   "last_commit": "434663b1ba",
+   "last_date": "2026-11-14",
+   "status": "rollback",
+   "owner": "core",
+   "note": "[reviewed] under a container memory limit the memory guard and the expert arena's RAM check credit active and inactive file cache minus the engine's own mapped pages; set to 1 brings back the old inactive-only credit. [src/core/conversation_memory.cpp:363]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_METAL_ALLOC_LOG",
    "backends": [
     "metal"

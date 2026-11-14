@@ -37,6 +37,8 @@ struct Fixture {
         dir = fs::temp_directory_path() / ("strata_memory_guard_" + std::to_string((long) ::getpid()) + "_" + std::to_string(n++));
         fs::remove_all(dir);
         fs::create_directories(dir / "cgroup");
+        // this process's own mappings: none unless a test says so (the real /proc/self/status is never read)
+        std::ofstream(dir / "status", std::ios::binary) << "Name:\tstrata\nRssAnon:\t    1024 kB\nRssFile:\t       0 kB\nRssShmem:\t       0 kB\n";
     }
     ~Fixture() { std::error_code ec; fs::remove_all(dir, ec); }
     void put(const std::string& rel, const std::string& text) {
@@ -50,7 +52,10 @@ struct Fixture {
                            std::to_string(available / 1024) + " kB\n");
     }
     void self(const std::string& text) { put("self_cgroup", text + "\n"); }
-    MemoryProbePaths paths() const { return {(dir / "meminfo").string(), (dir / "self_cgroup").string(), (dir / "cgroup").string()}; }
+    MemoryProbePaths paths() const {
+        return {(dir / "meminfo").string(), (dir / "self_cgroup").string(), (dir / "cgroup").string(), (dir / "status").string()};
+    }
+    void rss_file(uint64_t bytes) { put("status", "Name:\tstrata\nRssFile:\t" + std::to_string(bytes / 1024) + " kB\n"); }
     std::optional<HostMemoryReading> sample(uint64_t explicit_limit = 0) const { return sample_host_memory(paths(), explicit_limit); }
 };
 
@@ -330,6 +335,171 @@ int main() {
         g.put("cgroup/memory/m/memory.stat", "inactive_file " + std::to_string(3 * GiB) + "\n");
         r = g.sample();
         check(r && r->available == 2 * GiB && r->credit == 0, "v1 ignores the non-total inactive_file");
+    }
+    // the credit's two forms from one memory.stat text
+    {
+        const std::string v2 = "anon 9\nfile 999\nshmem 500\nfile_mapped 77\nactive_file 30\ninactive_file 20\n"
+                               "file_dirty 3\nfile_writeback 2\nunevictable 400\nactive_anon 1\n";
+        CacheCredit c = cache_credit_from_stat(v2, 1000, false);
+        check(c.inactive == 15 && c.lists == 45, "inactive 20 and lists 50, each less dirty 3 and writeback 2");
+        check(cache_credit_from_stat(v2, 40, false).lists == 35 && cache_credit_from_stat(v2, 40, false).inactive == 15,
+              "the lists figure stops at memory.current too");
+        c = cache_credit_from_stat("inactive_file 20\nfile 999\nshmem 900\nunevictable 900\n", 1000, false);
+        check(c.inactive == 20 && c.lists == 20, "no active_file line: lists = inactive; file, shmem and unevictable never count");
+        c = cache_credit_from_stat("inactive_file 20\nactive_file x\n", 1000, false);
+        check(c.inactive == 20 && c.lists == 20, "a malformed active_file adds nothing and does not cost the inactive credit");
+        c = cache_credit_from_stat("inactive_file 20\nactive_file 5\nactive_file 6\n", 1000, false);
+        check(c.inactive == 20 && c.lists == 20, "a repeated active_file adds nothing");
+        c = cache_credit_from_stat("active_file 30\n", 1000, false);
+        check(c.inactive == 0 && c.lists == 0, "no inactive_file: no credit at all, as before");
+        c = cache_credit_from_stat("inactive_file 18446744073709551615\nactive_file 18446744073709551615\n", 1000, false);
+        check(c.inactive == 1000 && c.lists == 1000, "no overflow in inactive + active");
+        c = cache_credit_from_stat("active_file 30\ninactive_file 20\ntotal_active_file 300\ntotal_inactive_file 200\n"
+                                   "total_dirty 10\ntotal_writeback 0\n", 10000, true);
+        check(c.inactive == 190 && c.lists == 490, "v1 reads the total_ names");
+        const std::optional<uint64_t> total11(11), none0(0), own3(3), own20(20);
+        check(cache_credit_for_limit({5, 9}, 10, total11, false, none0) == 9, "a limit below MemTotal: lists");
+        check(cache_credit_for_limit({5, 9}, 10, total11, false, own3) == 6, "... less the process's own mappings");
+        check(cache_credit_for_limit({5, 9}, 10, total11, false, own20) == 0, "... floor 0");
+        check(cache_credit_for_limit({5, 9}, 10, total11, false, std::nullopt) == 5, "own mappings unknown: inactive");
+        check(cache_credit_for_limit({5, 9}, 11, total11, false, none0) == 5, "a limit at MemTotal: inactive");
+        check(cache_credit_for_limit({5, 9}, 12, total11, false, own3) == 5, "a limit above MemTotal: inactive, own mappings ignored");
+        check(cache_credit_for_limit({5, 9}, 10, std::nullopt, false, none0) == 5, "MemTotal unknown: inactive");
+        check(cache_credit_for_limit({5, 9}, 10, total11, true, none0) == 5, "the switch: inactive");
+        // RssFile from /proc/self/status, less the locked file bytes
+        const std::string status = "Name:\tstrata\nVmLck:\t  999 kB\nRssAnon:\t 100 kB\nRssFile:\t 2048 kB\nRssShmem:\t 64 kB\n";
+        check(own_evictable_mapped_bytes(status, 0) == std::optional<uint64_t>(2 * MiB), "RssFile in bytes");
+        check(own_evictable_mapped_bytes(status, 1 * MiB) == std::optional<uint64_t>(1 * MiB), "locked file bytes come off");
+        check(own_evictable_mapped_bytes(status, 3 * MiB) == std::optional<uint64_t>(0), "floor 0");
+        check(!own_evictable_mapped_bytes("Name:\tstrata\nRssAnon:\t 1 kB\n", 0), "no RssFile: unknown");
+        check(!own_evictable_mapped_bytes("RssFile:\t 12 MB\n", 0) && !own_evictable_mapped_bytes("RssFile:\t x kB\n", 0) &&
+                  !own_evictable_mapped_bytes("RssFile:\t 1 kB\nRssFile:\t 2 kB\n", 0), "malformed RssFile: unknown");
+        check(locked_own_file_bytes() == 0, "nothing locked by default");
+        set_locked_own_file_bytes(5 * MiB);
+        check(locked_own_file_bytes() == 5 * MiB, "locked bytes round trip");
+        set_locked_own_file_bytes(0);
+        check(mem_credit_inactive_only("1") && !mem_credit_inactive_only("0") && !mem_credit_inactive_only(nullptr) &&
+                  !mem_credit_inactive_only(""), "STRATA_MEM_CREDIT_INACTIVE=1 only");
+    }
+    // a container (limit below MemTotal) restarted with its model file's pages still cached: the same figure cold and warm
+    {
+        const auto stat = [](uint64_t active, uint64_t inactive) {
+            return "anon " + std::to_string(5 * GiB) + "\nfile " + std::to_string(active + inactive) + "\nactive_file " +
+                   std::to_string(active) + "\ninactive_file " + std::to_string(inactive) + "\nfile_dirty 0\nfile_writeback 0\n";
+        };
+        const uint64_t limit = 57 * GiB + 760 * MiB, table = 26 * GiB + 820 * MiB;
+        Fixture f;
+        f.meminfo(503 * GiB, 420 * GiB);   // the host's view
+        f.self("0::/");
+        f.put("cgroup/memory.max", limit);
+        // cold: 7 GiB used, 1 GiB of it inactive cache
+        f.put("cgroup/memory.current", 7 * GiB); f.put("cgroup/memory.stat", stat(0, 1 * GiB));
+        const auto cold = f.sample();
+        check(cold && cold->source == MemorySource::cgroup && cold->available == limit - 6 * GiB, "cold start: limit - (current - cache)");
+        // warm, the table's pages on the active list (the pod: credited 1.0 GiB, available 26.7 GiB under the old rule)
+        f.put("cgroup/memory.current", 7 * GiB + table); f.put("cgroup/memory.stat", stat(table, 1 * GiB));
+        const auto warm = f.sample();
+        check(warm && warm->available == cold->available && warm->credit == table + 1 * GiB, "warm, active: the same figure");
+        f.put("cgroup/memory.stat", stat(1 * GiB, table));
+        check(f.sample() && f.sample()->available == cold->available, "warm, inactive: the same figure");
+        // the way back
+#ifdef _WIN32
+        _putenv_s("STRATA_MEM_CREDIT_INACTIVE", "1");
+#else
+        setenv("STRATA_MEM_CREDIT_INACTIVE", "1", 1);
+#endif
+        f.put("cgroup/memory.stat", stat(table, 1 * GiB));
+        const auto old = f.sample();
+        check(old && old->available == limit - (7 * GiB + table - 1 * GiB) && old->credit == 1 * GiB,
+              "STRATA_MEM_CREDIT_INACTIVE=1: active pages are not credited, as before");
+#ifdef _WIN32
+        _putenv_s("STRATA_MEM_CREDIT_INACTIVE", "");
+#else
+        unsetenv("STRATA_MEM_CREDIT_INACTIVE");
+#endif
+        check(f.sample() && f.sample()->available == cold->available, "switch cleared: the lists rule again");
+        // the engine maps the table (ram mode, lock refused): its resident pages are its own, not free - cold and warm alike
+        f.rss_file(table + 300 * MiB);   // the table and 300 MiB of libraries
+        const auto mapped = f.sample();
+        check(mapped && mapped->credit == 1 * GiB - 300 * MiB && mapped->available == limit - (7 * GiB + table - (1 * GiB - 300 * MiB)),
+              "own mapped table and libraries: not credited");
+        // the lock worked: the table is on the unevictable list, not on the file lists, and is added back
+        f.put("cgroup/memory.stat", stat(0, 1 * GiB));   // the locked table is in neither list
+        set_locked_own_file_bytes(table);
+        const auto locked = f.sample();
+        check(locked && locked->credit == 1 * GiB - 300 * MiB, "locked table: only the libraries come off the file credit");
+        set_locked_own_file_bytes(0);
+        // no status file: the own mappings cannot be told, the inactive credit is taken
+        f.put("cgroup/memory.stat", stat(table, 1 * GiB));
+        fs::remove(f.dir / "status");
+        check(f.sample() && f.sample()->credit == 1 * GiB, "no /proc/self/status: inactive credit");
+        f.rss_file(0);
+        // a limit at or above MemTotal (not a container's view): the inactive rule, bit for bit
+        f.meminfo(57 * GiB, 50 * GiB);
+        const auto at = f.sample();
+        check(at && at->credit == 1 * GiB && at->available == limit - (7 * GiB + table - 1 * GiB) && at->source == MemorySource::cgroup,
+              "limit above MemTotal: active pages are not credited, as before");
+        f.meminfo(limit, 50 * GiB);
+        check(f.sample() && f.sample()->credit == 1 * GiB, "limit equal to MemTotal: inactive only");
+        // no limit at all: MemAvailable, untouched by memory.stat
+        f.meminfo(503 * GiB, 420 * GiB);
+        f.put("cgroup/memory.max", "max\n");
+        check(f.sample() && f.sample()->available == 420 * GiB && f.sample()->source == MemorySource::meminfo && f.sample()->credit == 0,
+              "no limit: MemAvailable");
+        // the operator's cap keeps the inactive rule (its usage is the namespace root's)
+        check(f.sample(40 * GiB) && f.sample(40 * GiB)->credit == 1 * GiB && f.sample(40 * GiB)->source == MemorySource::flag,
+              "--memory-limit-mib: inactive only");
+    }
+    // the expert arena's figure under a container's limit: the same file-list credit (never shmem, never locked pages), its own margin
+    {
+        // the 24 GiB scope with a 3 GiB memfd held (l620, 11-14): the earlier figure credited the shmem in "file" and an
+        // allocation up to it was OOM-killed; this one leaves it charged
+        const std::string memfd = "anon 1048576\nfile " + std::to_string(3 * GiB) + "\nfile_mapped " + std::to_string(3 * GiB) +
+                                  "\nshmem " + std::to_string(3 * GiB) + "\nactive_file 0\ninactive_file 0\nunevictable 0\n"
+                                  "file_dirty 0\nfile_writeback 0\n";
+        const std::optional<uint64_t> host(251 * GiB);
+        ArenaCgroupRoom a = arena_cgroup_room(24 * GiB, 3 * GiB + 20 * MiB, memfd, host, false);
+        check(a.applies && a.credit == 0 && a.room == 21 * GiB - 20 * MiB, "memfd: the shmem stays charged");
+        // active and inactive file pages count, less min(half, limit / 64); locked pages (unevictable) do not
+        const std::string cache = "file " + std::to_string(14 * GiB) + "\nactive_file " + std::to_string(8 * GiB) + "\ninactive_file " +
+                                  std::to_string(4 * GiB) + "\nunevictable " + std::to_string(2 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n";
+        a = arena_cgroup_room(48 * GiB, 16 * GiB, cache, host, false);
+        check(a.applies && a.credit == 12 * GiB - 48 * GiB / 64 && a.room == 44 * GiB - 48 * GiB / 64, "file lists less the margin");
+        a = arena_cgroup_room(48 * GiB, 16 * GiB, cache, std::optional<uint64_t>(48 * GiB), false);
+        check(!a.applies, "a limit at MemTotal: the earlier rule (caller)");
+        check(!arena_cgroup_room(48 * GiB, 16 * GiB, cache, std::nullopt, false).applies, "MemTotal unknown: the earlier rule");
+        check(!arena_cgroup_room(48 * GiB, 16 * GiB, cache, host, true).applies, "STRATA_MEM_CREDIT_INACTIVE=1: the earlier rule");
+        a = arena_cgroup_room(8 * GiB, 9 * GiB, "inactive_file 0\n", host, false);
+        check(a.applies && a.room == 0, "usage over the limit: 0");
+        a = arena_cgroup_room(48 * GiB, 16 * GiB, "", host, false);
+        check(a.applies && a.credit == 0 && a.room == 32 * GiB, "no memory.stat text: no credit");
+    }
+    // the limit on a parent level, credited from that level's own memory.stat; memory.high below memory.max
+    {
+        Fixture f;
+        f.meminfo(256 * GiB, 200 * GiB);
+        f.self("0::/a/b");
+        f.put("cgroup/a/memory.max", 24 * GiB); f.put("cgroup/a/memory.current", 20 * GiB);
+        f.put("cgroup/a/memory.stat", "active_file " + std::to_string(10 * GiB) + "\ninactive_file " + std::to_string(2 * GiB) + "\n");
+        f.put("cgroup/a/b/memory.max", "max\n"); f.put("cgroup/a/b/memory.current", 19 * GiB);
+        f.put("cgroup/a/b/memory.stat", "active_file 0\ninactive_file 0\n");
+        auto r = f.sample();
+        check(r && r->source == MemorySource::cgroup && r->limit == 24 * GiB && r->credit == 12 * GiB && r->available == 16 * GiB,
+              "parent limit: 24 - (20 - 12)");
+        f.put("cgroup/a/memory.high", 18 * GiB);
+        r = f.sample();
+        check(r && r->limit == 18 * GiB && r->available == 10 * GiB && r->credit == 12 * GiB, "memory.high below max: 18 - (20 - 12)");
+    }
+    // cgroup v1 under a limit below MemTotal: total_active_file counts too
+    {
+        Fixture g;
+        g.meminfo(120 * GiB, 80 * GiB);
+        g.self("4:memory:/m");
+        g.put("cgroup/memory/m/memory.limit_in_bytes", 64 * GiB); g.put("cgroup/memory/m/memory.usage_in_bytes", 62 * GiB);
+        g.put("cgroup/memory/m/memory.stat", "total_active_file " + std::to_string(4 * GiB) + "\ntotal_inactive_file " +
+                                                  std::to_string(3 * GiB) + "\ntotal_dirty " + std::to_string(1 * GiB) + "\n");
+        const auto r = g.sample();
+        check(r && r->credit == 6 * GiB && r->available == 8 * GiB && r->source == MemorySource::cgroup, "v1: 64 - (62 - (7 - 1))");
     }
     // the process-wide setting and the real files
     {

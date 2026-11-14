@@ -55,11 +55,11 @@ def memory() -> dict[str, int | None]:
                 pages += int(m.group(1)) if m else 0
             return {"total_mib": total, "available_mib": pages * page // MIB}
         else:
-            info: dict[str, int] = {}
-            for line in Path("/proc/meminfo").read_text().splitlines():
-                key, _, rest = line.partition(":")
-                info[key] = int(rest.split()[0])
-            return {"total_mib": info["MemTotal"] // 1024, "available_mib": info["MemAvailable"] // 1024}
+            # /proc/meminfo; inside a container its memory limit (strata_control/cgroup_memory.py)
+            from strata_control import cgroup_memory
+            total, available = cgroup_memory.ram_bytes()
+            if total is not None and available is not None:
+                return {"total_mib": total // MIB, "available_mib": available // MIB}
     except Exception:  # noqa: BLE001 - a probe must not raise
         pass
     return {"total_mib": None, "available_mib": None}

@@ -5796,6 +5796,8 @@ int main(int argc, char** argv) {
                                      "recommended\n", o.ple_gguf.c_str(), dev.c_str());
         }
 #endif
+        // the memory guard credits the process's own mapped file pages back only when they are not locked (conversation_memory.hpp)
+        strata::core::set_locked_own_file_bytes(ple_table.locked() ? ple_table.table_bytes() : 0);
         if (pio.lock)
             std::fprintf(stderr, "strata generate: PLE table %s (%s) in %.1f s\n",
                          ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
@@ -8039,6 +8041,7 @@ int main(int argc, char** argv) {
                 if (!ple_table.locked()) return 0;
                 const uint64_t held = ple_table.table_bytes();
                 if (!ple_table.unlock()) return 0;
+                strata::core::set_locked_own_file_bytes(0);
                 ple_lock_by_policy = false;   // (given back: the conversation cache's give-back has nothing left to do)
                 return held;
             };
@@ -12498,6 +12501,7 @@ int main(int argc, char** argv) {
                     strata::core::ple_lock_blocks_cache(cache_room, ple_table.table_bytes(), o.conversation_cache_min_free_mib)) {
                     const auto before = cache_room;
                     if (ple_table.unlock()) {
+                        strata::core::set_locked_own_file_bytes(0);
                         cache_room = strata::core::available_host_bytes();
                         std::fprintf(stderr, "strata serve: PLE table lock given back: the lock left %.1f GiB of RAM for the conversation cache, "
                                              "%.1f GiB without it (the table stays cached; --conversation-cache-mib N and --ple-io ram are kept as asked)\n",

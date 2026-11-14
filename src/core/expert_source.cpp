@@ -419,14 +419,17 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     std::ifstream info(meminfo);
     std::string line;
     uint64_t bytes = 0;
+    std::optional<uint64_t> mem_total;   // a limit below it is a container's (its /proc/meminfo is the host's)
     while (std::getline(info, line)) {
         std::istringstream fields(line);
         std::string key, unit;
         uint64_t value = 0;
         if (fields >> key >> value >> unit && key == "MemAvailable:" && unit == "kB" &&
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
+        else if (key == "MemTotal:" && unit == "kB" && value <= std::numeric_limits<uint64_t>::max() / 1024) mem_total = value * 1024;
     }
     if (bytes == 0) return false;
+    const bool inactive_only = strata::core::mem_credit_inactive_only(std::getenv("STRATA_MEM_CREDIT_INACTIVE"));
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
     std::ifstream groups(self_cgroup);
@@ -464,6 +467,13 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
                     if (!read_cgroup_memory_stat(path, current, stat)) return false;
                     uint64_t cgroup_available = 0;
                     if (!cgroup_available_bytes(cap, stat, cgroup_available)) return false;
+                    // a container's limit: the memory guard's file-list credit (no shmem, no locked pages), this margin kept
+                    std::ifstream stat_file(path / "memory.stat");
+                    std::ostringstream stat_text;
+                    if (stat_file) stat_text << stat_file.rdbuf();
+                    const strata::core::ArenaCgroupRoom room =
+                        strata::core::arena_cgroup_room(cap, current, stat_text.str(), mem_total, inactive_only);
+                    if (room.applies) cgroup_available = room.room;
                     bytes = std::min(bytes, cgroup_available);
                     m.cgroup_limit = std::min(m.cgroup_limit, cap);
                 } catch (...) { return false; }

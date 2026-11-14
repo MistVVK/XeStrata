@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <charconv>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +26,91 @@
 namespace strata::core {
 
 namespace fs = std::filesystem;
+
+CacheCredit cache_credit_from_stat(const std::string& stat, uint64_t current, bool v1) {
+    const char* inactive_key = v1 ? "total_inactive_file" : "inactive_file";
+    const char* active_key = v1 ? "total_active_file" : "active_file";
+    const char* dirty_key = v1 ? "total_dirty" : "file_dirty";
+    const char* writeback_key = v1 ? "total_writeback" : "file_writeback";
+    std::optional<uint64_t> inactive, active;
+    bool active_bad = false;
+    uint64_t dirty = 0, writeback = 0;
+    std::istringstream in(stat);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream fields(line);
+        std::string key, value, extra;
+        if (!(fields >> key >> value) || (fields >> extra)) continue;
+        uint64_t* target = key == dirty_key ? &dirty : key == writeback_key ? &writeback : nullptr;
+        uint64_t n = 0;
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), n);
+        const bool ok = parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size();
+        if (key == inactive_key) { if (!ok || inactive) return {}; inactive = n; }
+        else if (key == active_key) { if (!ok || active) active_bad = true; else active = n; }
+        else if (target != nullptr) { if (!ok) return {}; *target = n; }
+    }
+    if (!inactive) return {};
+    auto clean = [&](uint64_t cached) {
+        uint64_t credit = std::min(cached, current);
+        credit = dirty >= credit ? 0 : credit - dirty;
+        credit = writeback >= credit ? 0 : credit - writeback;
+        return credit;
+    };
+    CacheCredit c;
+    c.inactive = clean(*inactive);
+    // an active_file that is missing or cannot be read adds nothing: the lists figure is then the inactive one
+    const uint64_t both = active && !active_bad ? (*active > UINT64_MAX - *inactive ? UINT64_MAX : *inactive + *active) : *inactive;
+    c.lists = clean(both);
+    return c;
+}
+
+bool mem_credit_inactive_only(const char* env_value) {
+    return env_value != nullptr && env_value[0] == '1';
+}
+
+uint64_t cache_credit_for_limit(const CacheCredit& credit, uint64_t limit, std::optional<uint64_t> mem_total, bool inactive_only,
+                                std::optional<uint64_t> own_mapped) {
+    if (inactive_only || !mem_total || limit >= *mem_total || !own_mapped) return credit.inactive;
+    return credit.lists > *own_mapped ? credit.lists - *own_mapped : 0;
+}
+
+ArenaCgroupRoom arena_cgroup_room(uint64_t limit, uint64_t current, const std::string& stat_text, std::optional<uint64_t> mem_total,
+                                  bool inactive_only) {
+    ArenaCgroupRoom r;
+    if (inactive_only || !mem_total || limit >= *mem_total) return r;
+    r.applies = true;
+    uint64_t credit = cache_credit_from_stat(stat_text, current, false).lists;   // <= current
+    credit -= std::min(credit / 2, limit / 64);
+    r.credit = credit;
+    const uint64_t used = current - credit;
+    r.room = used < limit ? limit - used : 0;
+    return r;
+}
+
+namespace {
+std::atomic<uint64_t> g_locked_own_file_bytes{0};
+}
+
+void set_locked_own_file_bytes(uint64_t bytes) { g_locked_own_file_bytes.store(bytes, std::memory_order_relaxed); }
+uint64_t locked_own_file_bytes() { return g_locked_own_file_bytes.load(std::memory_order_relaxed); }
+
+std::optional<uint64_t> own_evictable_mapped_bytes(const std::string& status_text, uint64_t locked_file_bytes) {
+    std::istringstream in(status_text);
+    std::string line;
+    std::optional<uint64_t> rss;
+    while (std::getline(in, line)) {
+        std::istringstream fields(line);
+        std::string key, value, unit, extra;
+        if (!(fields >> key) || key != "RssFile:") continue;
+        if (rss || !(fields >> value >> unit) || unit != "kB" || (fields >> extra)) return {};
+        uint64_t kb = 0;
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), kb);
+        if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || kb > UINT64_MAX / 1024) return {};
+        rss = kb * 1024;
+    }
+    if (!rss) return {};
+    return *rss > locked_file_bytes ? *rss - locked_file_bytes : 0;
+}
 
 namespace {
 
@@ -76,42 +162,22 @@ Value read_value(const fs::path& path) {
     return v;
 }
 
-// The one reclaimable kind that is credited: clean inactive file cache, from the same group's memory.stat
-// (v2 inactive_file, v1 total_inactive_file), less its dirty and writeback pages when those are listed, and never
-// more than the group's charged usage.  active_file (it holds mlocked pages) and shmem (pinned complements, the KV
-// pool) are not credited.  A memory.stat that is missing or unparsable gives no credit - not an unknown sample.
-uint64_t reclaimable_cache(const fs::path& dir, uint64_t current, bool v1) {
+// The reclaimable file cache of one group, from its memory.stat, in the two forms the guard uses
+// (cache_credit_from_stat in the header has the rules).  A memory.stat that is missing gives no credit - not an
+// unknown sample.
+CacheCredit reclaimable_cache(const fs::path& dir, uint64_t current, bool v1) {
     std::ifstream stat(dir / "memory.stat");
-    if (!stat) return 0;
-    const char* inactive_key = v1 ? "total_inactive_file" : "inactive_file";
-    const char* dirty_key = v1 ? "total_dirty" : "file_dirty";
-    const char* writeback_key = v1 ? "total_writeback" : "file_writeback";
-    std::optional<uint64_t> inactive;
-    uint64_t dirty = 0, writeback = 0;
-    std::string line;
-    while (std::getline(stat, line)) {
-        std::istringstream fields(line);
-        std::string key, value, extra;
-        if (!(fields >> key >> value) || (fields >> extra)) continue;
-        uint64_t* target = key == dirty_key ? &dirty : key == writeback_key ? &writeback : nullptr;
-        uint64_t n = 0;
-        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), n);
-        const bool ok = parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size();
-        if (key == inactive_key) { if (!ok || inactive) return 0; inactive = n; }
-        else if (target != nullptr) { if (!ok) return 0; *target = n; }
-    }
-    if (!inactive) return 0;
-    uint64_t credit = std::min(*inactive, current);
-    credit = dirty >= credit ? 0 : credit - dirty;
-    credit = writeback >= credit ? 0 : credit - writeback;
-    return credit;
+    if (!stat) return {};
+    std::ostringstream text;
+    text << stat.rdbuf();
+    return cache_credit_from_stat(text.str(), current, v1);
 }
 
-// What the cgroup files say: every finite limit with the usage charged against it (and the cache credit of that
+// What the cgroup files say: every finite limit with the usage charged against it (and the cache credits of that
 // group), and the usage and credit of the topmost visible group (the root of this namespace - what a container's own
 // limit is measured over).
 struct CgroupScan {
-    struct Limit { uint64_t limit, current, credit; };
+    struct Limit { uint64_t limit, current; CacheCredit credit; };
     std::vector<Limit> limits;
     std::optional<uint64_t> root_current;
     uint64_t root_credit = 0;
@@ -137,8 +203,8 @@ bool scan_levels(const std::vector<fs::path>& dirs, const char* const* limit_nam
             continue;                          // no memory controller at this level (e.g. the host's root group)
         }
         out.any_files = true;
-        const uint64_t credit = reclaimable_cache(dirs[i], current.n, v1);
-        if (i == 0) { out.root_current = current.n; out.root_credit = credit; }
+        const CacheCredit credit = reclaimable_cache(dirs[i], current.n, v1);
+        if (i == 0) { out.root_current = current.n; out.root_credit = credit.inactive; }
         for (const Value& v : limits) {
             if (v.kind != Value::number) continue;
             if (v1 && v.n >= (1ull << 62)) continue;   // v1's "unlimited" is a number near 2^63
@@ -204,7 +270,8 @@ bool scan_cgroups(const MemoryProbePaths& paths, CgroupScan& out) {
 }
 
 std::optional<HostMemoryReading> combine(std::optional<uint64_t> available, std::optional<uint64_t> total,
-                                         const CgroupScan& cg, uint64_t explicit_limit) {
+                                         const CgroupScan& cg, uint64_t explicit_limit, bool inactive_only,
+                                         std::optional<uint64_t> own_mapped) {
     if (!available) return {};
     HostMemoryReading r;
     r.mem_available = *available;
@@ -213,14 +280,15 @@ std::optional<HostMemoryReading> combine(std::optional<uint64_t> available, std:
     r.limit = total.value_or(0);
     r.current = total && *total >= *available ? *total - *available : 0;
     for (const CgroupScan::Limit& l : cg.limits) {
-        const uint64_t used = l.current - l.credit;   // credit <= current
+        const uint64_t credit = cache_credit_for_limit(l.credit, l.limit, total, inactive_only, own_mapped);
+        const uint64_t used = l.current - credit;   // credit <= current
         const uint64_t room = l.limit > used ? l.limit - used : 0;
         if (room < r.available) {
             r.available = room;
             r.source = MemorySource::cgroup;
             r.limit = l.limit;
             r.current = l.current;
-            r.credit = l.credit;
+            r.credit = credit;
         }
     }
     if (explicit_limit != 0) {
@@ -277,7 +345,16 @@ std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& path
                                  "MemAvailable; set --memory-limit-mib to the container's limit\n");
         cg = CgroupScan{};
     }
-    return combine(available, total, cg, explicit_limit);
+    std::optional<uint64_t> own_mapped;
+    if (!cg.limits.empty()) {   // only a limit can use it
+        std::ifstream status(paths.self_status);
+        if (status) {
+            std::ostringstream text;
+            text << status.rdbuf();
+            own_mapped = own_evictable_mapped_bytes(text.str(), locked_own_file_bytes());
+        }
+    }
+    return combine(available, total, cg, explicit_limit, mem_credit_inactive_only(std::getenv("STRATA_MEM_CREDIT_INACTIVE")), own_mapped);
 }
 
 std::optional<HostMemoryReading> sample_host_memory() {
@@ -286,7 +363,7 @@ std::optional<HostMemoryReading> sample_host_memory() {
     status.dwLength = sizeof status;
     // #1607: the commit limit (RAM + page file) refuses an allocation while physical RAM is still free
     if (!GlobalMemoryStatusEx(&status)) return {};
-    return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes());
+    return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes(), true, std::nullopt);
 #elif defined(__linux__)
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
 #elif defined(__APPLE__)
@@ -302,7 +379,7 @@ std::optional<HostMemoryReading> sample_host_memory() {
     const uint64_t available = ((uint64_t) vs.free_count + vs.purgeable_count) * pg +
                                std::min<uint64_t>(((uint64_t) vs.inactive_count + vs.speculative_count) * pg,
                                                   (uint64_t) vs.external_page_count * pg);
-    return combine(available, total, CgroupScan{}, memory_limit_bytes());
+    return combine(available, total, CgroupScan{}, memory_limit_bytes(), true, std::nullopt);
 #else
     return {};
 #endif
