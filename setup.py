@@ -6491,17 +6491,17 @@ def size_fits(family: str, size: str, room: Room) -> bool:
     return gsq and low_ram_fits(size, room.ram, room.vram)
 
 
-# The recommendations by quality (the user's decisions of 2026-11-09): a GSQ-RCO family's IQ3_XXS where this PC runs it;
-# a model of PLAIN_FAMILIES up to Q8_0, never its unquantized weights (BF16 answers as Q8_0 does, in twice the memory)
-GSQ_RCO_PICK = "IQ3_XXS"
+# The recommendations by quality (the user's decisions of 2026-11-09 and 2026-11-14): a GSQ-RCO family's best size this
+# PC runs (IQ3_S before IQ3_XXS); a model of PLAIN_FAMILIES up to Q8_0, never its unquantized weights (BF16 answers as
+# Q8_0 does, in twice the memory)
 PLAIN_TOP = "Q8_0"
 UNQUANTIZED = ("BF16", "F16", "F32")
 
 
 def recommend_size(family: str, room: Room, names: list | None = None) -> str:
     """The size setup recommends of `family` (of `names`, a quantization's): the best quality this PC runs with its
-    weights in memory (size_fits), never an experimental one - a GSQ-RCO family's IQ3_XXS where it runs, a model of
-    PLAIN_FAMILIES' at most Q8_0, on the CPU the family's own choice - else the smallest"""
+    weights in memory (size_fits), never an experimental one - a GSQ-RCO family's IQ3_S where it runs, else its
+    IQ3_XXS, a model of PLAIN_FAMILIES' at most Q8_0, on the CPU the family's own choice - else the smallest"""
     fam = FAMILIES[family]
     names = names or family_sizes(family)
     if room.on_cpu and fam.get("default") in names:
@@ -6513,8 +6513,6 @@ def recommend_size(family: str, room: Room, names: list | None = None) -> str:
                (PLAIN_TOP not in kept or size_quality(family, m) <= size_quality(family, PLAIN_TOP))]
         kept = top or kept
     fits = [m for m in kept if size_fits(family, m, room)]
-    if GSQ_RCO_PICK in fits:
-        return GSQ_RCO_PICK
     return fits[-1] if fits else kept[0]
 
 
