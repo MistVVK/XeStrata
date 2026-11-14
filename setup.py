@@ -6101,7 +6101,7 @@ def size_fits(family: str, size: str, room: Room) -> bool:
         if room.on_cpu:
             return bool(fam.get("cpu")) and cpu_ram_gb(fam, cpu_ctx(fam, room.ram)) <= room.ram
         if fam.get("dense"):
-            return room.gpu_gb >= dense_vram_gb(fam, d, min(room.ctx, fam["max_context"]))
+            return room.gpu_gb >= dense_vram_gb(fam, d, min(DENSE_MIN_CTX, fam["max_context"]))
         return room.ram + room.plain_vram >= d["size"] / 1e9 + 8
     d = MODELS[size]
     if d.get("budget"):
@@ -8183,6 +8183,20 @@ def dense_vram_gb(fam: dict, d: dict, ctx: int) -> float:
     return d["size"] / 1e9 + fam["kv_bytes"] * ctx / 1e9 + DENSE_MARGIN_GB
 
 
+# The shortest context a dense model is offered at: the size runs here when it fits the GPU at this context, and the
+# recommended context is shortened to what fits rather than the size made smaller (the 32K the smaller cards were
+# recommended before 2026-11-14's 128K)
+DENSE_MIN_CTX = 32768
+
+
+def dense_ctx(fam: dict, d: dict, gpu_gb: float, ctx: int) -> int:
+    """The context recommended for a dense model's size `d`: the longest of CONTEXTS up to `ctx` (and the model's)
+    whose K/V fits the GPU beside the weights, at least the shortest it is offered at"""
+    least = min(DENSE_MIN_CTX, fam["max_context"])
+    fit = [c for c in CONTEXTS if least <= c <= min(ctx, fam["max_context"]) and dense_vram_gb(fam, d, c) <= gpu_gb]
+    return fit[-1] if fit else least
+
+
 # A dense model on the CPU (--device cpu, the families with "cpu"): its weights repacked as int8 (one byte a weight, a
 # 4-byte scale and a 4-byte correction for each 32 of a row: 1.25 bytes; 895 MiB measured for Qwen3.5-0.8B), the K/V
 # in FP32 for the whole context from the start (src/core/plain_cpu.cpp), and the rest of the engine and the server
@@ -8275,9 +8289,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
             fit = "" if ram >= need else \
                 f"   <- needs ~{need:.0f} GB of RAM at {rec_ctx // 1024}K, this PC has {ram:.0f} GB"
         elif dense:
-            need = dense_vram_gb(fam, d, rec_ctx)
-            fit = "" if gpu_gb >= need else \
-                f"   <- needs ~{need:.0f} GB of VRAM at {rec_ctx // 1024}K, the GPU has {gpu_gb:.0f} GB"
+            c = dense_ctx(fam, d, gpu_gb, rec_ctx)
+            need = dense_vram_gb(fam, d, c)
+            fit = (f"   (at {c // 1024}K)" if c < rec_ctx else "") if gpu_gb >= need else \
+                f"   <- needs ~{need:.0f} GB of VRAM at {c // 1024}K, the GPU has {gpu_gb:.0f} GB"
         else:
             fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
         say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.0f} GB") + fit)
@@ -8309,8 +8324,11 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if fam.get("mmproj") and not on_cpu:
         ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                          "cpu": "on (encoder on the CPU)"}[vision])
-    # the context: up to the model's, recommended by the smallest card's memory as for Qwen3.8-Flash-Next
+    # the context: up to the model's, recommended by the smallest card's memory as for Qwen3.8-Flash-Next (a dense
+    # model's shortened to what fits the GPU beside its weights)
     contexts = [c for c in CONTEXTS if c <= fam["max_context"]]
+    if dense and not on_cpu:
+        rec_ctx = dense_ctx(fam, d, gpu_gb, rec_ctx)
     if a.context:
         ctx = a.context
         if ctx > fam["max_context"]:
@@ -9662,8 +9680,8 @@ def main() -> int:
         for fam in PLAIN_FAMILIES.values():
             for m, d in fam["models"].items():
                 gb = d["size"] / 1e9
-                if fam.get("dense"):   # every weight in VRAM, at the context the card recommends
-                    c = min(vram_ctx([gpu]), fam["max_context"])
+                if fam.get("dense"):   # every weight in VRAM, at the context the card recommends or that fits
+                    c = dense_ctx(fam, d, gpu_expert_vram(gpu), vram_ctx([gpu]))
                     need = dense_vram_gb(fam, d, c)
                     verdict = "fits" if gpu_expert_vram(gpu) >= need else "does not fit the GPU"
                     say(f"  {fam['title']} {m}: ~{need:.0f} GB of VRAM at {c // 1024}K: {verdict}")

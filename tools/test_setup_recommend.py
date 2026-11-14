@@ -67,7 +67,7 @@ class FirstModel(unittest.TestCase):
         self.assertEqual(setup.recommend_family(self.fams, room(64, 16)), "sc117-swift")
         self.assertEqual(setup.recommend_family(self.fams, room(48, 0)), "gyro-coder")    # IQ2_XS only: not Swift
         self.assertEqual(setup.recommend_family(self.fams, room(36, 4)), "gyro-coder")    # Gyro-Coder-L in RAM
-        self.assertEqual(setup.recommend_family(self.fams, room(32, 8)), "ornith")        # Gyro-Coder alone is not
+        self.assertEqual(setup.recommend_family(self.fams, room(32, 8)), "gyro-coder")    # Gyro-Coder, not -L
         self.assertEqual(setup.recommend_size("gyro-coder", room(36, 4)), "Gyro-Coder-L")
         self.assertEqual(setup.recommend_family(self.fams, room(16, 12)), "ornith")    # its GSQ-RCO 3-bit
         self.assertEqual(setup.recommend_family(self.fams, room(12, 8)), "qwen35")
