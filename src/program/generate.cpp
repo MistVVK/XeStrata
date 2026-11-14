@@ -96,6 +96,7 @@
 #include "strata/prefill/kva_floor.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
+#include "strata/prefill/own_only_switches.hpp"
 #include "strata/prefill/gp100_prompt_default.hpp"
 #include "strata/core/sm120_series.hpp"
 #if defined(STRATA_PREFILL_MMQ)
@@ -11318,14 +11319,16 @@ int main(int argc, char** argv) {
 #endif
                 const char* fe = std::getenv("STRATA_PF_FUSED");
                 const char* le = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
+                // STRATA_PF_FUSED "set by the user": a build without MMQ puts STRATA_PF_FUSED=1 into the environment itself before main (prefill.cpp, own_only_switches.hpp),
+                // which is not a choice of the user's and must not switch the rule off; a value that was in the environment before that stays theirs
                 const strata::SmallCardPromptPath pp = strata::small_card_prompt_path(
                     chunk, pf_small_hip, 1, strata::kernels::cpu::expert_layout().native, strata::qwen_defaults_026(),
-                    fe != nullptr && fe[0] != '\0', le != nullptr && le[0] != '\0');
+                    strata::prefill::own_only_user_named("STRATA_PF_FUSED", fe), le != nullptr && le[0] != '\0');
                 if (pp.any()) {
                     const int64_t chunk_default = chunk;
                     // MMQ's buffer layout (so the layer-major walk runs); the native fused kernels still run in the walk's groups and the streamed chunks
-                    // (pf_fused_override.hpp), unless STRATA_PF_SMALL_FUSED=0 keeps MMQ's kernels there as before
-                    if (pp.fused_off) strata::prefill::pf_fused_override().store(strata::prefill::small_card_kernels_on(std::getenv("STRATA_PF_SMALL_FUSED")) ? strata::prefill::kPfFusedKernelsOnly : 0);
+                    // (pf_fused_override.hpp), unless STRATA_PF_SMALL_FUSED=0 keeps MMQ's kernels there as before (a build without MMQ has none: always the fused kernels)
+                    if (pp.fused_off) strata::prefill::pf_fused_override().store(strata::prefill::own_only_build() || strata::prefill::small_card_kernels_on(std::getenv("STRATA_PF_SMALL_FUSED")) ? strata::prefill::kPfFusedKernelsOnly : 0);
                     if (pp.layer_major) {
 #if defined(_WIN32)
                         _putenv_s("STRATA_PREFILL_LAYER_MAJOR", "1");

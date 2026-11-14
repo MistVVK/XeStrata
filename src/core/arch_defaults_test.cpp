@@ -4,12 +4,14 @@
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
+#include "strata/prefill/own_only_switches.hpp"
 #include "strata/core/spill_gate.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
@@ -695,6 +697,24 @@ int main() {
         CHECK(prefill::pf_fused_env_effective(-1, -1) == -1);               // nothing decided
         CHECK(small_card_prompt_path(2048, false, 1, true, false, true, false).any() == false);   // STRATA_PF_FUSED named by hand: the user's path, no rule
         CHECK(small_card_prompt_path(2048, true, 1, true, false, false, false).any() == false);   // HIP: unchanged
+    }
+    {
+        using namespace strata;
+        // a build without MMQ sets STRATA_PF_FUSED=1 itself before main: the rule reads "named by the user" (prefill::own_only_user_named), not "non-empty"
+        const std::vector<std::string> by_build = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50"};   // what the build's initialiser recorded
+        const std::vector<std::string> none;                                                    // the user named it first (or a build with MMQ)
+        const auto fused_named = [](const std::vector<std::string>& rec) { return prefill::own_only_user_named("STRATA_PF_FUSED", "1", rec); };
+        const auto pp = [&](long long dflt, const std::vector<std::string>& rec) { return small_card_prompt_path(dflt, false, 1, true, false, fused_named(rec), false); };
+        CHECK(pp(2048, by_build).any());                                     // the build's own value: the small-card rule runs (RTX 3060 Ti, default chunk 2,048)
+        CHECK(pp(2048, by_build).fused_off && pp(2048, by_build).layer_major);
+        CHECK(!pp(2048, none).any());                                        // the same text from the user: theirs, the rule steps aside
+        CHECK(!small_card_prompt_path(2048, false, 1, true, false, prefill::own_only_user_named("STRATA_PF_FUSED", "0", none), false).any());   // "0" from the user too
+        for (long long dflt : {8192LL, 12288LL, 20480LL}) CHECK(!pp(dflt, by_build).any());   // a card whose default chunk is 8,192 or more: unchanged either way
+        CHECK(!small_card_prompt_path(2048, true, 1, true, false, false, false).any());       // HIP: unchanged
+        CHECK(!small_card_prompt_path(2048, false, 1, true, true, false, false).any());       // STRATA_DEFAULTS=026: unchanged
+        // the user named the walk's own variable: the expert path still follows the rule, the walk stays theirs
+        CHECK(small_card_prompt_path(2048, false, 1, true, false, fused_named(by_build), true).fused_off);
+        CHECK(!small_card_prompt_path(2048, false, 1, true, false, fused_named(by_build), true).layer_major);
     }
     {
         using namespace strata;

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace strata::prefill {
@@ -29,5 +30,46 @@ inline bool own_only_switch_on(const char* name, bool hip) {
         if (std::strcmp(k, name) == 0) return true;
     return false;
 }
+
+/// The names the build itself put into the environment before main() (a name that was already there, set by the user, is not in it).  One list for the
+/// whole process: the start-up initialiser in prefill.cpp fills it, the engine's start-up rules read it.
+inline std::vector<std::string>& own_only_recorded() {
+    static std::vector<std::string> set;
+    return set;
+}
+
+/// This process is an engine built without llama.cpp's MMQ (the start-up initialiser in prefill.cpp says so, whatever the user had set).  False in every other build.
+inline bool& own_only_build_flag() {
+    static bool v = false;
+    return v;
+}
+inline bool own_only_build() { return own_only_build_flag(); }
+
+/// Sets every default switch that `get` says is not in the environment (get(name) == nullptr: a name that is there, either value, stays the user's) through
+/// `set(name)`, and appends the names it set to `recorded`.  `get` and `set` are getenv and setenv("1", 0) in the engine and a fake environment in the test.
+template <class Get, class Set>
+inline void own_only_apply_defaults(bool hip, Get get, Set set, std::vector<std::string>& recorded) {
+    for (const char* k : own_only_default_switches(hip)) {
+        if (get(k) != nullptr) continue;
+        set(k);
+        recorded.push_back(k);
+    }
+}
+
+/// Whether `name` is in the environment because the build put it there (own_only_apply_defaults ran for it) and not because the user named it.
+inline bool own_only_set_by_build(const char* name, const std::vector<std::string>& recorded) {
+    for (const std::string& k : recorded)
+        if (k == name) return true;
+    return false;
+}
+inline bool own_only_set_by_build(const char* name) { return own_only_set_by_build(name, own_only_recorded()); }
+
+/// A switch the USER named: its text (getenv's answer, nullptr = unset) is non-empty and the build did not put it there.  The start-up rules that step aside for
+/// a variable the user set (the small-card prompt path and STRATA_PF_FUSED) ask this instead of "is it non-empty", so that a build without MMQ, which sets
+/// STRATA_PF_FUSED=1 itself, does not look like a user who chose it.
+inline bool own_only_user_named(const char* name, const char* value, const std::vector<std::string>& recorded) {
+    return value != nullptr && value[0] != '\0' && !own_only_set_by_build(name, recorded);
+}
+inline bool own_only_user_named(const char* name, const char* value) { return own_only_user_named(name, value, own_only_recorded()); }
 
 }  // namespace strata::prefill

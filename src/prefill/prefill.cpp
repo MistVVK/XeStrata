@@ -201,30 +201,31 @@ namespace {
 // Such an engine takes Strata's fused kernels wherever they exist for the card and the layer's formats, so the opt-in switches of those
 // kernels are on by default here (a switch the user set, either value, is kept); every other layer takes the FP16 path.  Set before main(),
 // so the first reader of each (the engine's start-up rules, the kernels' own static reads) sees it.  Listed once in the prompt path's line.
-std::vector<std::string>& own_only_switches() {
-    static std::vector<std::string> set;
-    return set;
-}
+// (the list lives in own_only_switches.hpp: the start-up rules of generate.cpp ask it which names the build set and which the user did)
+std::vector<std::string>& own_only_switches() { return strata::prefill::own_only_recorded(); }
 const bool g_own_only_defaults = [] {
+    strata::prefill::own_only_build_flag() = true;      // (the engine's start-up rules ask own_only_build(): a build without MMQ has no MMQ kernels to go back to)
     strata::kernels::native_expert_i8_set_mmq_free();   // the int8 expert kernels are the default prompt-expert kernels here (i8_expert_rule.hpp, i8_switch_effective)
 #if defined(STRATA_USE_HIP) || defined(__HIPCC__)
     // (gfx12 only: every one of these is read behind the device's own gfx12 check, moe_fused_iq.cu q8d_hip_requested .. q6k_hip_requested, so a gfx11
     // card keeps the rules it has: its layers of those formats take the FP16 path here as before)
-    static const std::vector<const char*> kOn = strata::prefill::own_only_default_switches(true);   // (include/strata/prefill/own_only_switches.hpp)
+    constexpr bool kHipList = true;   // (include/strata/prefill/own_only_switches.hpp)
 #else
     // (STRATA_PF_FUSED_Q2N, the native Q2_0 pack's Q2_0 / Q2_0 layers, is in the list: the kernel reads it behind its own sm_80 check, so a card below sm_80 is unchanged,
     // and =0 takes it back; the reasons and the numbers are in own_only_switches.hpp)
-    static const std::vector<const char*> kOn = strata::prefill::own_only_default_switches(false);
+    constexpr bool kHipList = false;
 #endif
-    for (const char* k : kOn) {
-        if (std::getenv(k) != nullptr) continue;
+    // a name that is already in the environment is the user's and is not recorded (the engine's rules read the record: own_only_user_named)
+    strata::prefill::own_only_apply_defaults(
+        kHipList, [](const char* k) { return std::getenv(k); },
+        [](const char* k) {
 #if defined(_WIN32)
-        _putenv_s(k, "1");
+            _putenv_s(k, "1");
 #else
-        setenv(k, "1", 0);
+            setenv(k, "1", 0);
 #endif
-        own_only_switches().push_back(k);
-    }
+        },
+        own_only_switches());
     return true;
 }();
 }  // namespace
@@ -7411,7 +7412,10 @@ bool lm_fused_layer(int64_t l, bool group_scratch) {
 #else
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     const MmqPlan& mp = mmq_plan();
-    if (group_scratch || !lay.native || l < 0 || l >= (int64_t) mp.layer.size() || l >= (int64_t) lay.fmt.size() || !mp.layer[(size_t) l]) return false;
+    // (a build without MMQ has no layer on MMQ: the layers the fused kernels cover are the plan's `fo` ones, which this walk takes the same way; a build with MMQ keeps
+    // its `fo` layers on the FP16 path in the walk as before)
+    if (group_scratch || !lay.native || l < 0 || l >= (int64_t) mp.layer.size() || l >= (int64_t) lay.fmt.size()) return false;
+    if (!mp.layer[(size_t) l] && !(!mmq::built() && mp.any && mp.fo[(size_t) l])) return false;
     const auto& f = lay.fmt[(size_t) l];
     if (f.had_gu || f.had_d || f.tail_off) return false;
     return fused::native_supported(f.gu_type, f.d_type);
@@ -8065,7 +8069,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         // a layer MMQ does not take runs run_impl's FP16 path (port, 2026-10-24): each expert dequantized to FP16 once
         // per super-chunk, then per entry its rows' FP16 inputs (lb.mixed_h, the bits run_impl's gather reads) through
         // two FP16 GEMMs into the group's Dm rows; the group's rows are added per token as on the MMQ path
-        const bool fp16_l = !mmq_plan().layer[(size_t) l];
+        const bool fp16_l = !mmq_plan().layer[(size_t) l] && !fz_l;   // (fz_l without an MMQ layer: a build without MMQ, a layer of the plan's `fo` set)
         const size_t mmq_gub = fp16_l ? 0 : mmq::matrix_bytes(mmq_gt, kFF2, N), mmq_db = fp16_l ? 0 : mmq::matrix_bytes(mmq_dt, N, kFF);
         size_t staged = 0, u = 0;
         const uint8_t* blob_dev = nullptr;
