@@ -2422,21 +2422,26 @@ bool PlainModel::alloc_kv_host(size_t a, std::string& err) {
     const size_t pairs = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
     const size_t codes = pairs * HD, scales = pairs * (HD / k::KV_Q8_GROUP) * 2,
                  q4 = pairs * (size_t) k::kv_q4_bytes_per_head((int) HD);
-    k::KvHostPools h;
-    bool ok = true;
-    auto take = [&](auto*& q, size_t bytes) {
-        if (!ok) return;
-        void* hp = nullptr;
-        void* dp = nullptr;
-        if (!mapped(bytes, &hp, &dp)) { ok = false; return; }
-        allocs_.push_back(hp);   // host USM, freed in the destructor (as --kv-ram's latent)
-        q = (std::remove_reference_t<decltype(q)>) dp;
+    // One pinned block a layer, the pools its slices (Qwen3.8-Flash-Next's layer.cpp, the same form).
+    const size_t bytes = (opt_.kv_q4 == 1 ? 2 * q4
+                        : opt_.kv_q4 == 2 ? codes + scales + q4
+                        : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes) + 4 * 256;
+    void* hp = nullptr;
+    void* dp = nullptr;
+    if (!mapped(bytes, &hp, &dp)) { err = "plain model: no RAM for the streamed K/V host copy"; return false; }
+    allocs_.push_back(hp);   // host USM, freed in the destructor (as --kv-ram's latent)
+    uint8_t* cur = (uint8_t*) dp;
+    uint64_t used = 0;
+    auto take = [&](auto*& q, size_t n) {
+        using P = std::remove_reference_t<decltype(q)>;
+        q = (P) (cur + used);
+        used = (used + n * sizeof(std::remove_pointer_t<P>) + 15) & ~(uint64_t) 15;
     };
+    k::KvHostPools h;
     if (opt_.kv_q4 == 1) { take(h.k_q4, q4); take(h.v_q4, q4); }
-    else if (opt_.kv_q4 == 2) { take(h.k_q, codes); take(h.k_scale, scales); take(h.v_q4, q4); }
-    else if (opt_.kv_int8) { take(h.k_q, codes); take(h.v_q, codes); take(h.k_scale, scales); take(h.v_scale, scales); }
-    else { take(h.k_pool, codes * 2); take(h.v_pool, codes * 2); }
-    if (!ok) { err = "plain model: no RAM for the streamed K/V host copy"; return false; }
+    else if (opt_.kv_q4 == 2) { take(h.k_q, codes); take(h.k_scale, scales / 2); take(h.v_q4, q4); }
+    else if (opt_.kv_int8) { take(h.k_q, codes); take(h.v_q, codes); take(h.k_scale, scales / 2); take(h.v_scale, scales / 2); }
+    else { take(h.k_pool, codes); take(h.v_pool, codes); }
     kv_host_[a] = h;
     return true;
 }
