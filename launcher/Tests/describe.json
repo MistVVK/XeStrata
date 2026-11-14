@@ -1872,7 +1872,46 @@
     "Q8_0",
     "Q6_K",
     "Q4_K_M"
-   ]
+   ],
+   "family": "Qwen-Image 2.1 (7B)",
+   "origin": "Unsloth GGUF",
+   "version": "Turbo",
+   "sizes": [
+    {
+     "id": "Q8_0",
+     "download_gb": 18.2,
+     "ram_gb": 20.2
+    },
+    {
+     "id": "Q6_K",
+     "download_gb": 16.8,
+     "ram_gb": 18.8
+    },
+    {
+     "id": "Q4_K_M",
+     "download_gb": 14.7,
+     "ram_gb": 16.7
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "Q8_0",
+     "download_gb": 18.2,
+     "ram_gb": 20.2
+    },
+    {
+     "id": "Q6_K",
+     "download_gb": 16.8,
+     "ram_gb": 18.8
+    },
+    {
+     "id": "Q4_K_M",
+     "download_gb": 14.7,
+     "ram_gb": 16.7
+    }
+   ],
+   "origin_key": "unsloth",
+   "own": false
   },
   {
    "id": "qwen-image-base",
@@ -1900,7 +1939,46 @@
     "Q8_0",
     "Q6_K",
     "Q4_K_M"
-   ]
+   ],
+   "family": "Qwen-Image 2.1 (7B)",
+   "origin": "Unsloth GGUF",
+   "version": "Base",
+   "sizes": [
+    {
+     "id": "Q8_0",
+     "download_gb": 18.2,
+     "ram_gb": 20.2
+    },
+    {
+     "id": "Q6_K",
+     "download_gb": 16.8,
+     "ram_gb": 18.8
+    },
+    {
+     "id": "Q4_K_M",
+     "download_gb": 14.7,
+     "ram_gb": 16.7
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "Q8_0",
+     "download_gb": 18.2,
+     "ram_gb": 20.2
+    },
+    {
+     "id": "Q6_K",
+     "download_gb": 16.8,
+     "ram_gb": 18.8
+    },
+    {
+     "id": "Q4_K_M",
+     "download_gb": 14.7,
+     "ram_gb": 16.7
+    }
+   ],
+   "origin_key": "unsloth",
+   "own": false
   },
   {
    "id": "mage-flow-turbo",
@@ -1927,7 +2005,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "Mage-Flow (4B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "Turbo",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 21.9,
+     "ram_gb": 23.9
+    },
+    {
+     "id": "int8",
+     "download_gb": 21.9,
+     "ram_gb": 16.2
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 21.9,
+     "ram_gb": 23.9
+    },
+    {
+     "id": "int8",
+     "download_gb": 21.9,
+     "ram_gb": 16.2
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "mage-flow",
@@ -1954,7 +2061,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "Mage-Flow (4B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "Instruct",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 21.9,
+     "ram_gb": 23.9
+    },
+    {
+     "id": "int8",
+     "download_gb": 21.9,
+     "ram_gb": 16.2
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 21.9,
+     "ram_gb": 23.9
+    },
+    {
+     "id": "int8",
+     "download_gb": 21.9,
+     "ram_gb": 16.2
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "mage-flow-base",
@@ -1981,7 +2117,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "Mage-Flow (4B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "Base",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 21.9,
+     "ram_gb": 23.9
+    },
+    {
+     "id": "int8",
+     "download_gb": 21.9,
+     "ram_gb": 16.2
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 21.9,
+     "ram_gb": 23.9
+    },
+    {
+     "id": "int8",
+     "download_gb": 21.9,
+     "ram_gb": 16.2
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "magetrail",
@@ -2008,7 +2173,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "MageTrail (2.9B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "MageTrail",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 10.4,
+     "ram_gb": 12.4
+    },
+    {
+     "id": "int8",
+     "download_gb": 10.4,
+     "ram_gb": 9.6
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 10.4,
+     "ram_gb": 12.4
+    },
+    {
+     "id": "int8",
+     "download_gb": 10.4,
+     "ram_gb": 9.6
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "hunyuan-image-3-distil",
@@ -2035,7 +2229,36 @@
    "quants": [
     "int8",
     "w4a8"
-   ]
+   ],
+   "family": "HunyuanImage 3.0 (80B-A13B)",
+   "origin": "PedroMarinhoDev quantization",
+   "version": "Instruct-Distil",
+   "sizes": [
+    {
+     "id": "int8",
+     "download_gb": 87.7,
+     "ram_gb": 87.3
+    },
+    {
+     "id": "w4a8",
+     "download_gb": 52.8,
+     "ram_gb": 52.4
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "int8",
+     "download_gb": 87.7,
+     "ram_gb": 87.3
+    },
+    {
+     "id": "w4a8",
+     "download_gb": 52.8,
+     "ram_gb": 52.4
+    }
+   ],
+   "origin_key": "pedro",
+   "own": false
   },
   {
    "id": "moss-image",
@@ -2062,7 +2285,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "MOSS-Image (5B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "SFT",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 22.1,
+     "ram_gb": 24.1
+    },
+    {
+     "id": "int8",
+     "download_gb": 22.1,
+     "ram_gb": 14.5
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 22.1,
+     "ram_gb": 24.1
+    },
+    {
+     "id": "int8",
+     "download_gb": 22.1,
+     "ram_gb": 14.5
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "moss-image-base",
@@ -2089,7 +2341,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "MOSS-Image (5B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "Base",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 22.1,
+     "ram_gb": 24.1
+    },
+    {
+     "id": "int8",
+     "download_gb": 22.1,
+     "ram_gb": 14.5
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 22.1,
+     "ram_gb": 24.1
+    },
+    {
+     "id": "int8",
+     "download_gb": 22.1,
+     "ram_gb": 14.5
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "moss-image-4-step",
@@ -2116,7 +2397,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "MOSS-Image (5B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "4-step (darask0)",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 21.2,
+     "ram_gb": 23.2
+    },
+    {
+     "id": "int8",
+     "download_gb": 21.2,
+     "ram_gb": 13.9
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 21.2,
+     "ram_gb": 23.2
+    },
+    {
+     "id": "int8",
+     "download_gb": 21.2,
+     "ram_gb": 13.9
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "anima-base",
@@ -2143,7 +2453,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "Anima (2B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "Anima",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 5.6,
+     "ram_gb": 7.6
+    },
+    {
+     "id": "int8",
+     "download_gb": 5.6,
+     "ram_gb": 5.7
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 5.6,
+     "ram_gb": 7.6
+    },
+    {
+     "id": "int8",
+     "download_gb": 5.6,
+     "ram_gb": 5.7
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "anima-aesthetic",
@@ -2170,7 +2509,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "Anima (2B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "Aesthetic",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 5.6,
+     "ram_gb": 7.6
+    },
+    {
+     "id": "int8",
+     "download_gb": 5.6,
+     "ram_gb": 5.7
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 5.6,
+     "ram_gb": 7.6
+    },
+    {
+     "id": "int8",
+     "download_gb": 5.6,
+     "ram_gb": 5.7
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "anima-turbo",
@@ -2197,7 +2565,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "Anima (2B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "Turbo",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 5.6,
+     "ram_gb": 7.6
+    },
+    {
+     "id": "int8",
+     "download_gb": 5.6,
+     "ram_gb": 5.7
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 5.6,
+     "ram_gb": 7.6
+    },
+    {
+     "id": "int8",
+     "download_gb": 5.6,
+     "ram_gb": 5.7
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   },
   {
    "id": "anima-2.9b",
@@ -2224,7 +2621,36 @@
    "quants": [
     "int8",
     "bf16"
-   ]
+   ],
+   "family": "Anima (2B)",
+   "origin": "Original files, quantized by XeStrata when read",
+   "version": "2.9B (preview)",
+   "sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 7.3,
+     "ram_gb": 9.3
+    },
+    {
+     "id": "int8",
+     "download_gb": 7.3,
+     "ram_gb": 6.6
+    }
+   ],
+   "uncensored_sizes": [
+    {
+     "id": "bf16",
+     "download_gb": 7.3,
+     "ram_gb": 9.3
+    },
+    {
+     "id": "int8",
+     "download_gb": 7.3,
+     "ram_gb": 6.6
+    }
+   ],
+   "origin_key": "original",
+   "own": false
   }
  ],
  "image_default": [

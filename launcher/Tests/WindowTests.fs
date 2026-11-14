@@ -503,8 +503,7 @@ let ``an installed model's image models are set by install.py`` () =
     let setup = FakeSetup(d, none)
     let w = open' setup
     click w "Images ..."
-    let first = all<CheckBox> w |> List.find (fun b -> match b.Content with :? StackPanel -> true | _ -> false)
-    first.IsChecked <- Nullable true
+    click w "Add to selection"
     // the image jobs on the GPU of the list (by its PCI address), and SAM 3.1's license agreed to
     pick w "image-gpu" "same"
     let sam3 = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text.StartsWith "Agree to Meta's SAM License" | _ -> false)
@@ -514,7 +513,7 @@ let ``an installed model's image models are set by install.py`` () =
     let r = setup.Last
     Assert.Equal(Places.imageInstallPy, r.Script)
     for part in
-        [ [ "--config"; d.Installed[0].Config ]; [ "--model"; d.Images[0].Id ]; [ "--yes" ]; [ "--gpu"; "same" ]
+        [ [ "--config"; d.Installed[0].Config ]; [ "--model"; d.Images[0].Id + "-uncensored" ]; [ "--yes" ]; [ "--gpu"; "same" ]
           [ "--sam3-license"; "agree" ] ] do
         Assert.True(contains part r.Args, sprintf "%A not in %A" part r.Args)
 

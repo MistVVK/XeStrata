@@ -234,80 +234,186 @@ type MainWindow(setup: Setup.Access) as this =
 
     let runPage = runScriptPage Places.setupPy
 
-    /// The image models to choose from (describe's), `current` checked (--images names: the default first) -> the
-    /// control and its --images value (None: none checked).  A choice of the default where several are, of the size
-    /// where a model has several (Auto: by the RAM), and of the text encoder with the refusal direction removed
-    /// (-uncensored) where the models have one.
-    let imagePicker (models: ImageModel[]) (current: string[]) (changed: unit -> unit) =
-        let plain (id: string) =
-            let id = id.Split(':')[0]
-            if id.EndsWith "-uncensored" then id.Substring(0, id.Length - 11) else id
-        let had = current |> Array.map plain
-        let boxes =
-            [| for m in models ->
-                   CheckBox(
-                       IsChecked = Nullable(Array.contains m.Id had),
-                       Content =
-                           stack 2.0 [
-                               row 6.0 [
-                                   yield subheading m.Title
-                                   if not m.Edits then yield badge mutedBrush (tr "img.noEdits" "no edits")
-                               ]
-                               muted (trf "img.size" "{about}; download {download}, needs ~{ram} of RAM besides the text model" [ "about", box m.About; "download", box (gb m.DownloadGb); "ram", box (gb m.RamGb) ])
-                           ]
-                   ) |]
-        // each model's size where it has several: Auto (the largest that fits the RAM) or one of them
-        let sizes =
-            [| for m in models ->
-                   let c = ComboBox(ItemsSource = Array.append [| tr "img.auto" "Auto" |] m.Quants, SelectedIndex = 0, MinWidth = 110.0)
-                   let was = current |> Array.tryFind (fun id -> plain id = m.Id && id.Contains ":")
-                   was |> Option.iter (fun id -> c.SelectedIndex <- 1 + max -1 (Array.IndexOf(m.Quants, id.Split(':')[1])))
-                   c.IsVisible <- m.Quants.Length > 0
-                   c |]
-        let uncensored =
-            CheckBox(
-                Content = text (tr "img.textEncoderWithIts" "Text encoder with its refusal direction removed (-uncensored)"),
-                IsChecked = Nullable(current |> Array.exists (fun c -> c.EndsWith "-uncensored"))
-            )
-        let defaultBox = ComboBox(MinWidth = 260.0)
-        let defaultField = field (tr "img.defaultImageModelThe" "Default image model (the others: chosen on the web page or by the API's \"model\")") defaultBox
-        let checkedModels () = [ for i, b in Array.indexed boxes do if b.IsChecked = Nullable true then models[i] ]
-        let refresh () =
-            let ms = checkedModels ()
-            let was = match defaultBox.SelectedItem with :? string as t -> t | _ -> ""
-            let first = if had.Length > 0 then (models |> Array.tryFind (fun m -> m.Id = had[0])) else None
-            defaultBox.ItemsSource <- [ for m in ms -> m.Title ]
-            defaultBox.SelectedItem <-
-                (match ms |> List.tryFind (fun m -> m.Title = was), first with
-                 | Some m, _ -> m.Title
-                 | None, Some f when List.contains f ms -> f.Title
-                 | _ -> (match ms with m :: _ -> m.Title | [] -> null))
-            defaultField.IsVisible <- ms.Length > 1
-            uncensored.IsVisible <- ms |> List.exists (fun m -> m.Uncensored)
-            changed ()
-        for b in boxes do
-            b.IsCheckedChanged.Add(fun _ -> refresh ())
-        refresh ()
-        let value () =
-            match checkedModels () with
-            | [] -> None
-            | ms ->
-                let def = match defaultBox.SelectedItem with :? string as t -> t | _ -> ms.Head.Title
-                let ordered = (ms |> List.filter (fun m -> m.Title = def)) @ (ms |> List.filter (fun m -> m.Title <> def))
-                let name (m: ImageModel) =
-                    let id = if uncensored.IsChecked = Nullable true && m.Uncensored then m.Id + "-uncensored" else m.Id
-                    let size = sizes[Array.findIndex (fun (x: ImageModel) -> x.Id = m.Id) models]
-                    match size.SelectedIndex with
-                    | i when i > 0 -> id + ":" + m.Quants[i - 1]
-                    | _ -> id
-                Some(ordered |> List.map name |> String.concat ",")
-        let control =
-            stack 8.0 [
-                for i, b in Array.indexed boxes do
-                    yield row 12.0 [ b :> Control; sizes[i] :> Control ] :> Control
-                yield defaultField :> Control
-                yield uncensored :> Control
-            ]
+    /// Image picker. Setup supplies the family, version, origin and per-size estimates.
+    let imagePicker (d: Describe) (current: string[]) (ramLeft: unit -> float) (changed: unit -> unit) =
+        let mutable models = d.Images
+        let mutable chosen = List.ofArray current
+        let family = ComboBox(MinWidth = 320.0)
+        let version = ComboBox(MinWidth = 320.0)
+        let encoder = ComboBox(MinWidth = 320.0)
+        encoder.ItemsSource <- [| tr "imgpick.removed" "Refusal direction removed (-uncensored)"; tr "imgpick.original" "Original" |]
+        encoder.SelectedIndex <- 0
+        let sizes = ListBox(MinWidth = 420.0)
+        sizes.ItemTemplate <-
+            itemTemplate (fun (label: string) ->
+                row 8.0 [
+                    yield text label
+                    if label.StartsWith(tr "imgpick.auto" "Auto (recommended; largest that fits RAM)") then
+                        yield badge okBrush (tr "install.recommended" "recommended")
+                    if label.Contains(tr "install.doesNotFitThe" "does not fit the RAM") then
+                        yield badge failBrush (tr "install.doesNotFitThe" "does not fit the RAM")
+                ])
+        let info = TextBlock(TextWrapping = Media.TextWrapping.Wrap)
+        let origin = muted ""
+        let license = muted ""
+        let duplicate = muted ""
+        let rows = StackPanel(Spacing = 6.0)
+        let total = muted ""
+        let filePath = TextBox(MinWidth = 320.0, Watermark = tr "imgpick.filePath" "Anima .safetensors file")
+        let fileStatus = coloured failBrush ""
+        let ownBox = StackPanel(Spacing = 6.0, IsVisible = false)
+        let versionField = field (tr "imgpick.version" "Version") version
+        let encoderField = field (tr "imgpick.encoder" "Text encoder") encoder
+        let mutable updating = false
+        let selectedFamily () = match family.SelectedItem with :? string as x -> x | _ -> ""
+        let familyModels () = models |> Array.filter (fun m -> m.Family = selectedFamily ())
+        let selected () =
+            let ms = familyModels ()
+            if version.SelectedIndex >= 0 && version.SelectedIndex < ms.Length then Some ms[version.SelectedIndex] else None
+        let choiceModel (choice: string) =
+            models
+            |> Array.sortByDescending (fun m -> m.Id.Length)
+            |> Array.tryFind (fun m -> choice = m.Id || choice.StartsWith(m.Id + ":") || choice.StartsWith(m.Id + "-uncensored"))
+        let choiceSize (m: ImageModel) (choice: string) =
+            let suffix = choice.Substring(m.Id.Length).Replace("-uncensored", "")
+            if suffix.StartsWith ":" then suffix.Substring 1 else ""
+        let estimates (m: ImageModel) (unc: bool) = if m.Uncensored && unc then m.UncensoredSizes else m.Sizes
+        let sizeFor (m: ImageModel) (choice: string) =
+            let size = choiceSize m choice
+            let ss = estimates m (choice.Substring(m.Id.Length).StartsWith "-uncensored")
+            if size <> "" then ss |> Array.find (fun s -> s.Id = size)
+            else ss |> Array.tryFind (fun s -> s.RamGb <= ramLeft ()) |> Option.defaultValue (Array.last ss)
+        let choiceName () =
+            selected () |> Option.map (fun m ->
+                m.Id + (if m.Uncensored && encoder.SelectedIndex = 0 then "-uncensored" else "")
+                + (if sizes.SelectedIndex > 0 then ":" + m.Sizes[sizes.SelectedIndex - 1].Id else ""))
+        let key (v: string) =
+            match choiceModel v with
+            | Some m -> m.Id + (if v.Substring(m.Id.Length).StartsWith "-uncensored" then "-uncensored" else "")
+            | None -> v
+        let mutable refresh = ignore
+        let add = accentButton (tr "imgpick.add" "Add to selection") (fun () ->
+            match choiceName () with
+            | Some v when not (chosen |> List.exists (fun x -> key x = key v)) ->
+                chosen <- chosen @ [ v ]
+                refresh ()
+            | _ -> ())
+        let drawRows () =
+            rows.Children.Clear()
+            let mutable download = 0.0
+            for i, choice in List.indexed chosen do
+                match choiceModel choice with
+                | Some m ->
+                    let s = sizeFor m choice
+                    download <- download + s.DownloadGb
+                    let def = RadioButton(GroupName = "image-default", IsChecked = Nullable(i = 0),
+                                          Content = tr "imgpick.default" "Default")
+                    def.IsCheckedChanged.Add(fun _ ->
+                        if def.IsChecked = Nullable true && i <> 0 then
+                            chosen <- choice :: (chosen |> List.filter ((<>) choice))
+                            refresh ())
+                    let remove = button "×" (fun () -> chosen <- chosen |> List.filter ((<>) choice); refresh ())
+                    let encoderName =
+                        if not m.Uncensored then "—"
+                        elif choice.Substring(m.Id.Length).StartsWith "-uncensored" then tr "imgpick.removed" "Refusal direction removed (-uncensored)"
+                        else tr "imgpick.original" "Original"
+                    rows.Children.Add(row 8.0 [ def; text (m.Title + " · " + (if choiceSize m choice = "" then tr "img.auto" "Auto" else s.Id));
+                                              muted (encoderName + " · " + gb s.DownloadGb + " · RAM " + gb s.RamGb); remove ])
+                | None -> rows.Children.Add(muted choice)
+            total.Text <- trf "imgpick.total" "Total download: {download}" [ "download", box (gb download) ]
+        refresh <- fun () ->
+            if not updating then
+                updating <- true
+                match selected () with
+                | Some m ->
+                    let ms = familyModels ()
+                    versionField.IsVisible <- ms.Length > 1
+                    encoderField.IsVisible <- m.Uncensored
+                    info.Text <- m.Title + " — " + m.About + (if m.Edits then "" else " · " + tr "img.noEdits" "no edits")
+                    origin.Text <- trf "imgpick.origin" "Model files: {origin}" [ "origin", box (tr ("imgpick.origin." + m.OriginKey) m.Origin) ]
+                    license.Text <- m.License
+                    let prev = sizes.SelectedIndex
+                    let ss = estimates m (encoder.SelectedIndex = 0)
+                    let auto = ss |> Array.tryFind (fun s -> s.RamGb <= ramLeft ()) |> Option.defaultValue (Array.last ss)
+                    let labels =
+                        [| yield tr "imgpick.auto" "Auto (recommended; largest that fits RAM)" + " — " + auto.Id + " · " + gb auto.DownloadGb + ", RAM " + gb auto.RamGb
+                           for s in ss do
+                               yield s.Id + " — " + gb s.DownloadGb + ", RAM " + gb s.RamGb
+                                     + (if s.RamGb > ramLeft () then " · " + tr "install.doesNotFitThe" "does not fit the RAM" else "") |]
+                    sizes.ItemsSource <- labels
+                    sizes.SelectedIndex <- if prev >= 0 && prev < labels.Length then prev else 0
+                    let isDuplicate = choiceName () |> Option.exists (fun c -> chosen |> List.exists (fun x -> key x = key c))
+                    add.IsEnabled <- not isDuplicate
+                    duplicate.Text <- if isDuplicate then tr "imgpick.duplicate" "This model and text encoder are already selected." else ""
+                | None -> ()
+                drawRows ()
+                updating <- false
+                changed ()
+        let setFamily () =
+            if not updating then
+                updating <- true
+                version.ItemsSource <- familyModels () |> Array.map (fun m ->
+                    if m.Own then trf "imgpick.ownVersion" "Your own: {name}" [ "name", box (m.Id.Substring(m.Id.IndexOf(':') + 1)) ]
+                    else m.Version)
+                version.SelectedIndex <- 0
+                sizes.SelectedIndex <- 0
+                encoder.SelectedIndex <- 0
+                updating <- false
+                refresh ()
+        family.SelectionChanged.Add(fun _ -> setFamily ())
+        version.SelectionChanged.Add(fun _ ->
+            if not updating then
+                updating <- true
+                sizes.SelectedIndex <- 0
+                encoder.SelectedIndex <- 0
+                updating <- false
+                refresh ())
+        encoder.SelectionChanged.Add(fun _ -> refresh ())
+        sizes.SelectionChanged.Add(fun _ -> refresh ())
+        let browse = button (tr "imgpick.browse" "Browse …") (fun () ->
+            task {
+                let top = TopLevel.GetTopLevel this
+                let kind = FilePickerFileType("safetensors", Patterns = [| "*.safetensors" |])
+                let! files = top.StorageProvider.OpenFilePickerAsync(FilePickerOpenOptions(Title = tr "imgpick.file" "Add from a file on this PC", AllowMultiple = false, FileTypeFilter = [| kind |]))
+                if files.Count > 0 then
+                    match files[0].TryGetLocalPath() with
+                    | null -> ()
+                    | path -> filePath.Text <- path
+            } |> ignore)
+        let import = accentButton (tr "imgpick.import" "Add as an Anima version") (fun () ->
+            task {
+                let path = trimmed filePath
+                let! messages, code = setup.Collect [ "--import-anima"; path ]
+                if code <> 0 then
+                    ui (fun () -> fileStatus.Text <- messages |> List.choose (function Log x | Text x -> Some x | _ -> None) |> String.concat "\n")
+                else
+                    let! descriptions, _ = setup.Collect [ "--describe" ]
+                    ui (fun () ->
+                        match descriptions |> List.tryPick (function Described x -> Some x | _ -> None) with
+                        | Some updated ->
+                            models <- updated.Images
+                            let id = "anima:" + IO.Path.GetFileNameWithoutExtension path
+                            match models |> Array.tryFind (fun m -> m.Id = id) with
+                            | Some m ->
+                                family.ItemsSource <- models |> Array.map (fun x -> x.Family) |> Array.distinct
+                                family.SelectedItem <- m.Family
+                                setFamily ()
+                                version.SelectedIndex <- familyModels () |> Array.findIndex (fun x -> x.Id = id)
+                                ownBox.IsVisible <- false
+                                fileStatus.Text <- ""
+                                refresh ()
+                            | None -> fileStatus.Text <- tr "imgpick.notAdded" "The imported file was not found."
+                        | None -> fileStatus.Text <- tr "imgpick.notAdded" "The imported file was not found.")
+            } |> ignore)
+        ownBox.Children.AddRange [| muted (tr "imgpick.fileHelp" "Only a DiT made from Anima can be added here. Setup checks its header and copies it to the Anima folder."); row 8.0 [ filePath; browse; import ]; fileStatus |]
+        let ownButton = button (tr "imgpick.file" "Add from a file on this PC …") (fun () -> ownBox.IsVisible <- not ownBox.IsVisible)
+        family.ItemsSource <- models |> Array.map (fun m -> m.Family) |> Array.distinct
+        family.SelectedIndex <- 0
+        setFamily ()
+        let value () = if List.isEmpty chosen then None else Some(String.concat "," chosen)
+        let control = stack 8.0 [ field (tr "imgpick.model" "Model") (row 8.0 [ family; ownButton ]); ownBox; versionField; encoderField;
+                                  card (stack 4.0 [ info; origin ]); field (tr "imgpick.size" "Size") sizes; license; duplicate; add;
+                                  subheading (tr "imgpick.chosen" "Selected image models"); rows; total ]
         control, value
 
     // ---------------------------------------------------------------------------------------------- the pages
@@ -503,7 +609,7 @@ type MainWindow(setup: Setup.Access) as this =
         let selectedContext (f: Family) = f.Contexts[max 0 contexts.SelectedIndex]
         let mutable imagesChosen = false
         let mutable refreshFields = ignore
-        let images, imagesValue = imagePicker d.Images d.ImageDefault (fun () -> refreshFields ())
+        let images, imagesValue = imagePicker d d.ImageDefault (fun () -> match selectedModel () with Some m -> max 0.0 (d.RamGb - m.RamGb) | None -> d.RamGb) (fun () -> refreshFields ())
         let imagesField = field (tr "install.imageGenerationModelsTo" "Image generation: models to make images with, besides the text model") images
         // what setup's options are shown for: the family, size and context chosen (step 2's questions where setup
         // would ask them)
@@ -594,7 +700,7 @@ type MainWindow(setup: Setup.Access) as this =
                     collectArgs [
                         Result.Ok [ "--context"; string ctx ]
                         Fields.args (at "install") id
-                        Result.Ok(match imagesValue () with Some v when f.Images -> [ "--images"; v ] | _ -> [])
+                        Result.Ok(match imagesValue () with Some v when f.Images -> [ "--images"; v; "--image-auto-largest" ] | _ -> [])
                         Fields.args (at "advanced") id
                         Fields.args (at "images") id
                         Fields.args (at "start") id
@@ -644,7 +750,11 @@ type MainWindow(setup: Setup.Access) as this =
     /// An installed model's image generation: its image models chosen again (none: taken out), the files downloaded
     /// and its config rewritten by tools/image/install.py; the server takes it at its next start.
     and imagesPage (d: Describe) (m: Installed) =
-        let picker, value = imagePicker d.Images m.Images ignore
+        let textRam =
+            d.Families |> Array.tryFind (fun f -> f.Id = m.Family)
+            |> Option.bind (fun f -> f.Models |> Array.tryFind (fun x -> x.Id = m.Model))
+            |> Option.map (fun x -> x.RamGb) |> Option.defaultValue 0.0
+        let picker, value = imagePicker d m.Images (fun () -> max 0.0 (d.RamGb - textRam)) ignore
         let holds w = match w with "images" -> true | "sam3" -> not (isNull (box d.Sam3)) && not d.Sam3.Agreed | _ -> false
         let options = fieldsOf d [ "images" ] holds (fun () -> None) |> List.collect snd
         Fields.watch options (fun () -> Fields.refresh options)
@@ -657,12 +767,12 @@ type MainWindow(setup: Setup.Access) as this =
             | Error why -> problem.Text <- why
             | Result.Ok more ->
                 runScriptPage Places.imageInstallPy (trf "images.title" "Image generation for {model}" [ "model", box m.ModelName ])
-                    ([ "--config"; m.Config; "--model"; v; "--yes" ] @ more) (fun _ -> None) ignore (fun _ -> home ())
+                    ([ "--config"; m.Config; "--model"; v; "--yes"; "--auto-largest" ] @ more) (fun _ -> None) ignore (fun _ -> home ())
                 |> ignore
         show (
             stack 14.0 [
                 heading (trf "images.title" "Image generation for {model}" [ "model", box m.ModelName ])
-                muted (tr "images.checkTheImageModels" "Check the image models to make images with (none: image generation off). Their files are downloaded, and the model takes them at its next start.")
+                muted (tr "imgpick.instructions" "Choose image models and add them to the list. An empty list turns image generation off. The model takes the changes at its next start.")
                 picker
                 Expander(Header = (tr "common.advanced" "Advanced"), Content = stack 10.0 [ for f in options -> f.Control ], HorizontalAlignment = HorizontalAlignment.Stretch)
                 problem
