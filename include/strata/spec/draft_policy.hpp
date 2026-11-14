@@ -15,8 +15,13 @@
 //
 // and takes the lookup window only when its best E/cost beats the MTP's by `margin`. Costs are the measured round
 // times per window size (EMA; sizes not seen yet are scaled from seen ones by a prior shape), so the policy adapts
-// to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
+// to the machine and the context length. Its sizes are part of what it verifies: the same row of a 3-token window and
+// of a 4-token window got different argmaxes (XeStrata's own products and dense kernels, RX 9060 XT, 2026-11-14), so
+// the sizes moving with the measured times move the answer's last bits. A run whose answer must be the same every time
+// fixes them (--spec-window min-p --spec-min-p 0) and turns the suffix drafts off (--suffix-draft 0).
 #pragma once
+
+#include "strata/kernels/window_limits.hpp"
 
 #include <array>
 #include <cstdint>
@@ -25,7 +30,7 @@ namespace strata::spec {
 
 class DraftPolicy {
 public:
-    static constexpr int kMaxT = 8;
+    static constexpr int kMaxT = strata::kernels::kWindowMaxT;   // (a policy made for 8 rows never looks past them)
     static constexpr int kBuckets = 4;
     static constexpr int kCtxBuckets = 3;   // XESTRATA_SPEC_COST: round costs per context (< 6K, < 24K, longer)
     // XESTRATA_SPEC_COST=auto (the default): the cost-aware window from this bucket of context length on, below it

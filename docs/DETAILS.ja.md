@@ -532,7 +532,8 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少なく、多くて 32。Linux のコンテナで CPU の割り当て（cgroup）があれば、その数より 1 少ない数まで） |
 | `--pool-cores LIST`、`--aux-cpus SET`、`--pool-tasks N`、`--no-host-worker`、`--memory-limit-mib N` | CPU のワーカーを置く CPU、ワーカーでもホストでもないスレッドを置く CPU（要求ごとの `strata_tune` の `aux_cpus` も効きます）、プールの 1 段の仕事の数、ホストのスレッドを仕事に加えないこと、会話の退避と保存が数える RAM の上限（Qwen3.8-Flash-Next と同じ意味） |
 | `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定は 4096。VRAM のエキスパートの枠がもっと大きい塊を貸せるときはそれ。32768 まで、塊のバッファーが枠の 85% 以内に収まるもの。0 でまとめない） |
-| `--max-t N` | decode の窓の最大のトークン数（既定 8） |
+| `--max-t N` | decode の窓の最大のトークン数（既定 8。`--wide-window on` か、9 以上のスロットを頼んだとき 16） |
+| `--wide-window auto\|off\|on` | 検証とバッチの窓を 16 行まで広げるか。`auto`（既定）は 9 以上のスロットを頼んだときと 9 以上の `--spec` のとき、`off` は 8 行のまま、`on` は広げられるところすべて（設定の `"wide_window"`、`XESTRATA_WIDE_WINDOW` でも指定できます）。8 行までの窓は、広げても同じカーネルで動きます |
 | `--spec N` | MTP の層の推測デコードの窓の最大のトークン数（既定 3: 下書き 2 個。0 で使わない） |
 | `--spec-window all\|auto\|min-p` | 窓で確かめる下書きの数の決め方。`all`（既定）は作った下書きをすべて、`auto` は Qwen3.8-Flash-Next と同じく、下書きの確率と測った窓の時間から 1 ms あたりの出力が増える間だけ、`min-p` は下書きの確率が `--spec-min-p P` 以上の間だけ |
 | `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
@@ -733,7 +734,7 @@ Qwen3.8-Flash-Next の大きさの質問では、入っている大きさを `(i
 ./setup.sh --gpus 1,2                       2 枚以上の GPU に層を分けて載せる（記録される。docs/MULTIGPU.ja.md）
 ./setup.sh --vram-reserve-mib 2048          ほかのプログラムのために VRAM を 2 GB 空けておく（記録される）
 ./setup.sh --setup --ram-reserve-gib 16     ほかのプログラムのために RAM を 16 GiB 空けておく（記録される）
-./setup.sh --ple-io ram                     n-gram の表を RAM に置く（記録される。direct は SSD から読む、auto は setup が選ぶ）
+./setup.sh --ple-io ram                     n-gram の表を RAM に置く（記録される。direct は SSD から読む。auto は setup が RAM に置けるなら ram を書き、そうでなければエンジンが direct と mmap を測って速い方を取る）
 ./setup.sh --no-browser                     準備ができてもチャットのページを開かない（記録される。--browser で戻す）
 ./setup.sh --calibrate                      この PC に合わせてエンジンを調整してから起動する（15〜30 分、遅いカードではもっと）
 ./setup.sh --check                          この PC を調べるだけ

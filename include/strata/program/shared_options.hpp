@@ -7,6 +7,7 @@
 // in its code while the other engine took the option, 943abb056).
 #pragma once
 
+#include "strata/core/window_rows.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/platform/aux_cpus.hpp"
 
@@ -102,6 +103,7 @@ struct SharedOptionFields {
     int lookup_chain_min_lo = 1;         ///< generate 3; plain 1
     int* pipeline_windows = nullptr;
     int pipeline_windows_hi = -1;        ///< generate 2; plain no upper bound
+    bool wide_window = false;            ///< --wide-window auto|off|on (core::set_wide_window, window_rows.hpp)
     int* adapt_mib_per_token = nullptr;
     bool adapt_mib_clamp0 = false;       ///< generate: max 0; plain as it is
     int* batch = nullptr;                ///< --batch / --slots
@@ -159,6 +161,16 @@ template <class Next>
 int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFields& f) {
     auto i64 = [&](int64_t* p) { *p = std::strtoll(next(a.c_str()), nullptr, 10); return 1; };
     auto f64 = [&](double* p) { *p = std::strtod(next(a.c_str()), nullptr); return 1; };
+    if (a == "--wide-window" && f.wide_window) {
+        const char* v = next(a.c_str());
+        strata::core::WideWindow w;
+        if (!strata::core::parse_wide_window(v, w)) {
+            std::fprintf(stderr, "%s: --wide-window takes auto, off or on, not %s\n", f.who, v);
+            return -1;
+        }
+        strata::core::set_wide_window(w);
+        return 1;
+    }
     if (a == "--adapt-every" && f.adapt_every) {
         *f.adapt_every = (int) std::strtol(next(a.c_str()), nullptr, 10);
         if (f.adapt_every_given) *f.adapt_every_given = true;

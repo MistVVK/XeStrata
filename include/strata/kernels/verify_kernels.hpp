@@ -17,18 +17,25 @@
 // Everything that varies per window (token ids, `n_keep`) is read from DEVICE memory so the kernels can be captured.
 #pragma once
 
+#include "strata/kernels/window_limits.hpp"
+
 #include <cstdint>
 
 namespace strata::kernels {
 
-inline constexpr int kVerifyMaxT = 8;
+/// The most rows one verify / batch window holds (window_limits.hpp; whether a run goes past kVerifyNarrowT is
+/// core::window_rows_cap).  A window of up to kVerifyNarrowT rows runs the kernels it always ran.
+inline constexpr int kVerifyMaxT = kWindowMaxT;
 
 /// Per-row copies a window keeps to go back to (the plain engine's drafts): row t's copy goes to p[t] when t < n
-/// and p[t] is set.  The verify window's own protocol (verify, then commit) needs none.
-struct GdnRowCopies {
-    float* p[kVerifyMaxT] = {};
+/// and p[t] is set.  The verify window's own protocol (verify, then commit) needs none.  (N: the kernels take the
+/// narrow form for n <= kVerifyNarrowT, so a window of up to 8 rows passes them the argument it always did.)
+template <int N>
+struct GdnRowCopiesN {
+    float* p[N] = {};
     int n = 0;
 };
+using GdnRowCopies = GdnRowCopiesN<kVerifyMaxT>;
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, except with `commit` (one token, t_begin 0: a one-token window keeps its token), which
 /// leaves it as gdn_conv_commit with n_keep 1 would.  Bitwise `fused_gdn_conv_l2` per token.  `copies`: the history
@@ -52,10 +59,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* y_q8_1 = nullptr,
                          const GdnRowCopies* snaps = nullptr);
-/// The groups of a batch window's GDN layer: group gi's recurrence reads state[gi] over its ntok[gi] rows at
-/// h + first[gi] * conv_channels, gate|beta + first[gi] * h_v, z|y + first[gi] * value_dim, and (commit) runs
-/// *keep[gi] tokens and writes the state; without commit the rows run from the untouched state (verify).  One launch
-/// for all groups, each group's arithmetic the same as its own gdn_step_norm_multi call (upstream 7a9245b6c).
+/// The groups of a batch window's GDN layer, a slot each: group gi's recurrence reads state[gi] over its ntok[gi]
+/// rows from row first[gi] of the window's buffers, and (commit) runs *keep[gi] tokens.  Each group is a
+/// gdn_step_norm_multi call of its own.
 struct GdnGroups {
     float* state[kVerifyMaxT] = {};
     const int32_t* keep[kVerifyMaxT] = {};
@@ -64,12 +70,6 @@ struct GdnGroups {
     int ntok[kVerifyMaxT] = {};
     int n = 0;
 };
-void gdn_step_norm_groups(const GdnGroups& g, const float* h, int conv_channels, const float* gate, const float* beta,
-                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream);
-/// Whether one launch of the groups is faster than a gdn_step_norm_multi call a group on this device, for `n` groups
-/// of at most `max_tok` rows (timed once per device and window shape on dummy buffers; the caller's own choice).
-bool gdn_groups_pays(int n, int max_tok, int conv_channels, int h_k, int h_v, void* stream);
 
 /// The commit of `n_layers` GDN layers in two launches (upstream 6f3e3810): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence

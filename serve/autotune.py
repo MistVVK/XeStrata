@@ -28,7 +28,7 @@ from pathlib import Path
 
 AUTO = "auto"
 
-PARALLEL_MAX = 8              # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more
+PARALLEL_MAX = 16             # the engine's batch window holds at most 16 rows (kWindowMaxT); --batch-mtp waves more
 PARALLEL_OFFER = 4            # the slots a machine is offered by the rule
 PARALLEL_SHARE = 0.2          # the slots' sessions may take this share of the VRAM the expert cache would hold
 PARALLEL_HELD = 0.5           # ... and the cache keeps this share of the experts beside them

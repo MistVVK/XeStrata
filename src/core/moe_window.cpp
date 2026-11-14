@@ -73,7 +73,7 @@ bool MoeWindow::resident_graph_on() {
 bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std::string& err) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (shape.n_embd <= 0 || shape.n_embd % 256 || shape.n_expert <= 0 || shape.k < 1 || shape.k > 64 ||
-        shape.max_t < 1 || shape.max_t > strata::kernels::kVerifyMaxT || shape.max_t > strata::kernels::cpu::MAXT) {
+        shape.max_t < 1 || shape.max_t > strata::kernels::kVerifyMaxT) {   // (the CPU's jobs take it in parts)
         err = "moe window: the shape is out of range";
         return false;
     }
@@ -88,23 +88,6 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     for (int64_t l = 0; l < lay.n_layers; ++l) {
         max_ff = std::max<int64_t>(max_ff, lay.native ? lay.fmt[(size_t) l].n_ff : strata::kernels::cpu::FF);
         bf16_ = bf16_ || (lay.native && lay.fmt[(size_t) l].gu_type == 30);
-    }
-
-    // The grouped expert kernel is usually captured in a verify graph; choose its row layout beforehand.
-    if (lay.native) {
-        try {
-            for (int64_t l = 0; l < lay.n_layers; ++l) {
-                const auto& f = lay.fmt[(size_t) l];
-                if (f.gu_type == 30) continue;
-                const auto layout = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
-                const bool mixed = f.up_type >= 0 && f.up_type != f.gu_type;
-                strata::kernels::native_expert_gu_pair_tune(layout, f.gu_type, mixed ? 0 : -1, nullptr);
-                if (mixed) strata::kernels::native_expert_gu_pair_tune(layout, f.up_type, 1, nullptr);
-            }
-        } catch (const std::exception& e) {
-            err = std::string("moe window: gate/up timing: ") + e.what();
-            return false;
-        }
     }
 
     const uint64_t T = (uint64_t) shape.max_t, N = (uint64_t) shape.n_embd, K = (uint64_t) shape.k;
@@ -354,8 +337,8 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
             native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq(tb), hit_scratch_, hit_out, cs,
                                   grid_groups);
         } else {
-            moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
-                           hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
+            moe_grouped_s2_window(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
+                                  hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs, n);   // (<= n a group)
         }
     };
     // the PCIe share: its flag, and in the kernel mode the copy into staging

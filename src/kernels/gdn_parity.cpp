@@ -417,9 +417,11 @@ int main(int argc, char** argv) {
         }
 
     // ================= 5. a window's rows at once, as the plain engine runs them =================
-    {
+    // (3 rows, and a wide window's 16: the kernels' wide instances)
+    for (const int T : {3, strata::kernels::kVerifyMaxT}) {
         namespace sk = strata::kernels;
-        const int T = 3, NE = 256, C = 2 * h_k * S + h_v * S, ZV = h_v * S;
+        std::printf("\n  a window of %d rows\n", T);
+        const int NE = 256, C = 2 * h_k * S + h_v * S, ZV = h_v * S;
         const float eps = 1e-6f;
         auto fill = [&](std::vector<float>& v, size_t n, float scale) {
             v.resize(n);
@@ -443,7 +445,8 @@ int main(int argc, char** argv) {
             if (src != nullptr) strata::parity::copy_bytes_in(d, src, bytes);
             return static_cast<float*>(d);
         };
-        const std::vector<int32_t> counts{0, 1, 2, 3};
+        std::vector<int32_t> counts((size_t) T + 1);
+        for (int i = 0; i <= T; ++i) counts[(size_t) i] = i;
         auto* d_counts = reinterpret_cast<int32_t*>(up(counts.data(), counts.size() * 4));
         float *d_qkv = up(qkv.data(), qkv.size() * 4), *d_cw = up(conv_w.data(), conv_w.size() * 4),
               *d_x = up(x.data(), x.size() * 4), *d_wa = up(wa.data(), wa.size() * 4), *d_wb = up(wb.data(), wb.size() * 4),
@@ -452,7 +455,8 @@ int main(int argc, char** argv) {
         auto* d_wa16 = reinterpret_cast<uint16_t*>(up(wa16.data(), wa16.size() * 2));
         auto* d_wb16 = reinterpret_cast<uint16_t*>(up(wb16.data(), wb16.size() * 2));
         // [0]: the window, [1]: row by row
-        float *d_hist[2], *d_st[2], *d_h[2], *d_gate[2], *d_beta[2], *d_y[2], *d_hsnap[2][T - 1], *d_ssnap[2][T - 1];
+        float *d_hist[2], *d_st[2], *d_h[2], *d_gate[2], *d_beta[2], *d_y[2];
+        float *d_hsnap[2][sk::kVerifyMaxT - 1], *d_ssnap[2][sk::kVerifyMaxT - 1];
         for (int w = 0; w < 2; ++w) {
             d_hist[w] = up(hist.data(), hist.size() * 4);
             d_st[w] = up(st.data(), st.size() * 4);

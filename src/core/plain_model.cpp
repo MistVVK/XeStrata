@@ -18,6 +18,7 @@
 // whole head; the MoE without the shared expert; the second norm named ffn_norm.  qwen35's (Qwen3.5-9B,
 // src/models/qwen35.cpp at de7fa0a3) is qwen35moe's with the MoE replaced by a dense SwiGLU, down(silu(gate(h)) * up(h)),
 // in every block and in the MTP layer: no experts, so none of the tiers, the CPU pool or the window protocol.
+#include "strata/core/context_fit.hpp"
 #include "strata/core/kv_elastic.hpp"
 #include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/plain_model.hpp"
@@ -612,10 +613,14 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
             return false;
         }
     }
-    if (opt_.max_t < 1 || opt_.max_t > k::cpu::MAXT || opt_.max_cells < 16) {
+    // (a window wider than the CPU kernels' MAXT tokens: the CPU's experts take it in jobs of MAXT, plain_prompt.cpp
+    // and expert_pool_dispatch_multi)
+    if (opt_.max_t < 1 || opt_.max_t > k::kVerifyMaxT || opt_.max_cells < 16) {
         err = "plain model: the window or the context is out of range";
         return false;
     }
+    // the window rule's sizes: a wide window's (up to max_t), else the 8 rows it always had
+    if (opt_.max_t > k::kVerifyNarrowT) policy_ = strata::spec::DraftPolicy(opt_.max_t);
     if (opt_.cpu) return cpu_load(err);
     // the processor's own graphics through Level Zero: the first Level Zero adapter only (plain_generate.cpp's
     // linkless_gpu_adapter chooses it before the devices are listed; a user's SYCL_UR_USE_LEVEL_ZERO_V2=1 is refused)
@@ -1224,6 +1229,30 @@ bool PlainModel::load_qwen(std::string& err) {
         if (grow)
             std::fprintf(stderr, "xestrata plain: the elastic K/V: a parked conversation's cells %s\n",
                          strata::core::kv_grow_hold() ? "stay while it waits" : "go back after each request");
+        // #5715: the room this stage's K/V cache has, read before any of it is allocated, so a start that does not fit
+        // says the largest context that does (context_fit.hpp) instead of the number of cells it stopped at
+        size_t kv_room_b = 0, kv_total_b = 0;
+        const bool kv_room_known = strata::gpu::mem_info(&kv_room_b, &kv_total_b) && kv_room_b > 0;
+        const size_t kv_head_dim = (size_t) qs.head_dim;
+        auto kv_block_bytes = [&](int64_t want) -> uint64_t {   // one attention block's K/V at `want` cells (alloc_kv)
+            const uint64_t cells = (uint64_t) std::max<int64_t>(want, 0);
+            const uint64_t codes = cells * kv_head_dim, scales = cells * (kv_head_dim / k::KV_Q8_GROUP) * 2,
+                           q4 = cells * (uint64_t) k::kv_q4_bytes_per_head((int) kv_head_dim);
+            return opt_.kv_q4 == 1 ? 2 * q4
+                   : opt_.kv_q4 == 2 ? codes + scales + q4
+                   : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
+        };
+        auto kv_bytes_at = [&](int64_t want) -> uint64_t {   // this stage's blocks at `want` cells
+            uint64_t total = 0;
+            for (int64_t i2 = 0; i2 < n_attn; ++i2) {
+                bool mine2 = has_mtp_ && i2 == mtp_.attn;
+                for (int64_t l = lb_; l < le_ && !mine2; ++l) mine2 = blocks_[(size_t) l].attn == i2;
+                if (!mine2 || (opt_.encoder && i2 > 0)) continue;   // an encoder's layers share the first's cells
+                total += kv_block_bytes(ringed((size_t) i2) ? std::min<int64_t>(want, ring_pages_ * qs.page_size)
+                                                            : want);
+            }
+            return total;
+        };
         for (int64_t i = 0; i < n_attn; ++i) {   // this stage's attention blocks, the MTP layer on the last
             bool mine = has_mtp_ && i == mtp_.attn;
             for (int64_t l = lb_; l < le_ && !mine; ++l) mine = blocks_[(size_t) l].attn == i;
@@ -1255,6 +1284,23 @@ bool PlainModel::load_qwen(std::string& err) {
             v_q4_[a] = p.v_q4;
             if (!ok) {
                 err = "plain model: no VRAM for the K/V cache (" + std::to_string(opt_.max_cells) + " cells)";
+                if (kv_room_known) {   // #5715: the context that would fit, from this engine's own K/V figure
+                    const auto fit = strata::core::context_that_fits(opt_.max_cells, kv_room_b, kv_bytes_at);
+                    char msg[512];
+                    if (fit.cells > 0)
+                        std::snprintf(msg, sizeof msg,
+                                      "plain model: a context of %lld tokens does not fit on this graphics card: its K/V "
+                                      "cache needs %.2f GiB and only %.2f GiB is free; a context of %lld tokens fits here",
+                                      (long long) opt_.max_cells, (double) fit.need / 1073741824.0,
+                                      (double) fit.room / 1073741824.0, (long long) fit.cells);
+                    else
+                        std::snprintf(msg, sizeof msg,
+                                      "plain model: a context of %lld tokens does not fit on this graphics card: its K/V "
+                                      "cache needs %.2f GiB and only %.2f GiB is free (not even 1024 tokens fit here)",
+                                      (long long) opt_.max_cells, (double) fit.need / 1073741824.0,
+                                      (double) fit.room / 1073741824.0);
+                    err = msg;
+                }
                 return false;
             }
         }
@@ -1847,7 +1893,7 @@ bool PlainModel::open_experts(std::string& err) {
     win_.sink()->pcie_mode = 2;   // the PCIe share staged by the copy kernel inside the window (the split's timing)
     // the windows with every routed expert in VRAM run without the host (resident_plan), as Qwen3.8-Flash-Next's:
     // the residency table on the device, and the ids the host counts after the window (res_count)
-    if (win_.device_plans() && MoeWindow::resident_graph_on() && (int64_t) opt_.max_t * s.n_expert_used <= 128) {
+    if (win_.device_plans() && MoeWindow::resident_graph_on() && (int64_t) opt_.max_t * s.n_expert_used <= 256) {
         void* d = nullptr;
         if (strata::gpu::alloc_device(&d, res_.size() * 4) &&
             mapped((uint64_t) L * (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * 4, (void**) &h_rroute_,
@@ -4699,13 +4745,13 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
         while (keep < nd && probs[keep] >= (float) opt_.spec_min_p) ++keep;
         nd = keep;
     }
-    int32_t win[k::cpu::MAXT];
-    int32_t out[k::cpu::MAXT];
+    int32_t win[k::kVerifyMaxT];
+    int32_t out[k::kVerifyMaxT];
     win[0] = cur_;
     for (int i = 0; i < nd; ++i) win[i + 1] = drafts_[(size_t) i];
     // --suffix-draft / --lookup-chain: the lookup's drafts where they are more and agree with the MTP's first
     const int cap = (int) std::min<int64_t>({(int64_t) n_ext, (int64_t) window_drafts(), limit - 1,
-                                             opt_.max_cells - cur_pos_ - 1, (int64_t) k::cpu::MAXT - 1});
+                                             opt_.max_cells - cur_pos_ - 1, (int64_t) k::kVerifyMaxT - 1});
     bool from_ext = ext != nullptr && cap > nd && (nd == 0 || drafts_.empty() || ext[0] == drafts_[0]);
     if (ext_only) {   // an outside drafter's window (its own rule chose its length)
         nd = std::max(0, cap);
@@ -4904,7 +4950,7 @@ bool PlainModel::spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, i
     }
     for (int j = 0; j < nd && j < strata::spec::DraftPolicy::kMaxT; ++j) probs[j] = prob((size_t) j);
     const int T = nd + 1;
-    int32_t win[k::cpu::MAXT];
+    int32_t win[k::kVerifyMaxT];
     win[0] = cur_;
     for (int i = 0; i < nd; ++i) win[i + 1] = drafts_[(size_t) i];
     // the next window's guess: this one whole, then the chain's next token and its drafts after it
@@ -4951,7 +4997,7 @@ bool PlainModel::spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, i
             }
             pl_hand_.assign(s0.h_hand_, s0.h_hand_ + guess.size() * (size_t) s0.hand_w_);
         });
-    int32_t out[k::cpu::MAXT];
+    int32_t out[k::kVerifyMaxT];
     bool ok = true;
     {
         const OnDevice on(dev_);
