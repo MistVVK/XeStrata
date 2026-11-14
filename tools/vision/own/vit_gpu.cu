@@ -1,5 +1,6 @@
 // tools/vision/own/vit_gpu.cu - see vit_gpu.h.  One source for CUDA and HIP (STRATA_VIT_HIP maps the few runtime / BLAS names).
 #include "vit_gpu.h"
+#include "vit_f16.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -67,8 +68,11 @@ namespace strata_vit {
 namespace {
 
 // the 16-bit kind a GEMM's input takes (its weight's).  K_BH: a BF16 matrix held as F16 (every BF16 value of the weights' and activations' range is an F16 value;
-// the activations are rounded to BF16 first, so the products see the BF16 values), for cards whose BLAS has no fast BF16 kernel (Pascal: STRATA_VIT_BF16_AS_F16)
-enum Kind { K_F32 = 0, K_F16 = 1, K_BF16 = 2, K_BH = 3 };
+// the activations are rounded to BF16 first, so the products see the BF16 values): gfx1151's default, elsewhere STRATA_VIT_BF16_AS_F16=1.
+// K_HF: a BF16 matrix held as F16 with the activations written as F16 directly (clamped to +-65,504), the default for BF16 matrices elsewhere: BF16's 7-bit
+// mantissa on the inputs of the 27 blocks' products left 50 picture tokens of 12,308 under cosine 0.99 against the float32 reference on the CUDA reader,
+// 10 bits (F16) none in a CPU emulation (RESULTS-OWN-B18.md BLOCKS 16-18).  A matrix with a weight beyond F16's range stays K_BF16.
+enum Kind { K_F32 = 0, K_F16 = 1, K_BF16 = 2, K_BH = 3, K_HF = 4 };
 
 struct DevW {            // a weight matrix [rows = out][cols = in] on the device
     void* p = nullptr;
@@ -93,6 +97,7 @@ __device__ __forceinline__ void store_kind(void* out, size_t i, float v, int kin
     if (kind == K_F32) ((float*) out)[i] = v;
     else if (kind == K_F16) ((uint16_t*) out)[i] = f_to_f16bits(v);
     else if (kind == K_BH) ((uint16_t*) out)[i] = f_to_f16bits(__uint_as_float((uint32_t) f_to_bf16(v) << 16));
+    else if (kind == K_HF) ((uint16_t*) out)[i] = f_to_f16bits(f16_clamp(v));
     else ((uint16_t*) out)[i] = f_to_bf16(v);
 }
 
@@ -249,8 +254,14 @@ __global__ void __launch_bounds__(kSoftmaxThreads) k_softmax_rows_long(uint16_t*
 __global__ void k_round(float* __restrict__ y, size_t n, int kind) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
         const float v = y[i];
-        y[i] = kind == K_F16 ? __half2float(__float2half_rn(v)) : __uint_as_float((uint32_t) f_to_bf16(v) << 16);   // K_BF16 and K_BH: BF16
+        y[i] = kind == K_F16 ? __half2float(__float2half_rn(v)) : __uint_as_float((uint32_t) f_to_bf16(v) << 16);   // K_BF16, K_BH and K_HF: BF16
     }
+}
+
+// BF16 weights to F16 in place (K_HF): exact inside F16's range, F16's round to nearest even under 2^-14 (matrices with a weight beyond the range stay BF16)
+__global__ void k_bf16_to_f16(uint16_t* __restrict__ p, size_t n) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        p[i] = f_to_f16bits(__uint_as_float((uint32_t) p[i] << 16));
 }
 
 // n floats to the 16-bit kind
@@ -459,10 +470,15 @@ struct VitGpuImpl {
     int pad_for(size_t n) const { return n_pad ? n_pad : n > 16384 ? 64 : 8; }
     int align_for(size_t n) const { return q_align ? q_align : n > 16384 ? 64 : 1; }
     size_t padded(size_t n) const { const size_t p = (size_t) pad_for(n); return (n + p - 1) / p * p; }
-    // BF16 matrices held as F16 (K_BH): on by default on Pascal (compute capability 6.x), where cuBLAS has no fast BF16 kernel (a P100 spent 645 ms of a
-    // 1,024-token picture in magma_sgemmEx for BF16 against 497 ms with F16 inputs; the 12-token picture 44 ms against 15; RESULTS-OWN-3V.md 16.1).
-    // STRATA_VIT_BF16_AS_F16=0/1 (a diagnostic) overrides.
-    bool bf16_as_f16 = false;
+    // BF16 matrices as F16 with F16 inputs (K_HF) on every CUDA card, Pascal included, and on every HIP card but gfx1151 (Strix Halo: K_BH, the BF16-rounded
+    // kind, not measured with K_HF).  Pascal needs one of the F16 kinds: cuBLAS has no fast BF16 kernel there (a P100 spent 645 ms of a 1,024-token picture in
+    // magma_sgemmEx for BF16 against 497 ms with F16 inputs; the 12-token picture 44 ms against 15; RESULTS-OWN-3V.md 16.1).  P100, 16 pictures against the
+    // float32 reference: K_HF no token under cosine 0.99 (smallest 0.9970), K_BH 44 under 0.99 (smallest 0.866), the same encode time (13.23 against 13.24 s),
+    // loaded in 0.6 against 1.5 s (K_BH converts on the host).  STRATA_VIT_BF16_AS_F16 (a diagnostic) overrides: 0 = BF16 as stored (K_BF16), 1 = K_BH,
+    // 2 = K_HF (vit_gpu_bf16_mode in vit_f16.h).
+    int bf16_mode = BF16_TO_F16;
+    struct F16Note { std::string name; Kind kind; Bf16F16Count c; long long n; };
+    std::vector<F16Note> f16_notes;   // per BF16 matrix in K_HF mode: the kind it got and its counts (printed under STRATA_TRACE)
 
 #if defined(STRATA_VIT_HIPBLASLT)
     // hipBLASLt (HIP builds that found it).  STRATA_VIT_LT=1: the 16-bit weight products; STRATA_VIT_LT_ATT=1: the two batched attention products;
@@ -682,7 +698,17 @@ struct VitGpuImpl {
         w.rows = (int) t->ne[1];
         const size_t n = (size_t) t->nelem();
         std::vector<unsigned char> raw;
-        if (t->type == GT_BF16 && bf16_as_f16) {                 // BF16 -> F16 (K_BH)
+        if (t->type == GT_BF16 && bf16_mode == BF16_TO_F16) {    // BF16 -> F16 (K_HF) unless a weight is beyond F16's range
+            raw.resize(n * 2);
+            if (!gg.read_raw(*t, raw.data(), err)) return false;
+            // the full count (weights not exact in F16, their largest error) only for the trace; the rule needs the overflow count alone
+            Bf16F16Count c;
+            if (trace) c = bf16_count_f16((const uint16_t*) raw.data(), (long long) n);
+            else c.overflow = bf16_count_beyond_f16((const uint16_t*) raw.data(), (long long) n);
+            w.kind = bf16_matrix_fits_f16(c.overflow) ? K_HF : K_BF16;
+            f16_notes.push_back({name, w.kind, c, (long long) n});
+            // uploaded as stored and turned into F16 on the GPU (k_bf16_to_f16): a host loop over the 444 M weights of the Qwen3.8 reader took 0.8 s
+        } else if (t->type == GT_BF16 && bf16_mode == BF16_ROUNDED) {   // BF16 -> F16 (K_BH)
             std::vector<float> f(n);
             if (!gg.read_f32(*t, f.data(), err)) return false;
             raw.resize(n * 2);
@@ -709,9 +735,15 @@ struct VitGpuImpl {
         uint16_t* dev = nullptr;
         if (!alloc(dev, n, err, true)) return false;
         w.p = dev;
-        return cudaMemcpy(w.p, raw.data(), n * 2, cudaMemcpyHostToDevice) == cudaSuccess || (err = "GPU copy failed", false);
+        if (cudaMemcpy(w.p, raw.data(), n * 2, cudaMemcpyHostToDevice) != cudaSuccess) { err = "GPU copy failed"; return false; }
+        if (w.kind == K_HF) {
+            k_bf16_to_f16<<<blocks_for(n), 256>>>(dev, n);
+            if (cudaGetLastError() != cudaSuccess) { err = "the BF16 to F16 conversion failed on the GPU"; return false; }
+        }
+        return true;
     }
-    static cudaDataType_t dtype(Kind k) { return k == K_F32 ? CUDA_R_32F : (k == K_F16 || k == K_BH) ? CUDA_R_16F : CUDA_R_16BF; }
+    bool trace = false;               // STRATA_TRACE: the per-matrix F16 counts
+    static cudaDataType_t dtype(Kind k) { return k == K_F32 ? CUDA_R_32F : (k == K_F16 || k == K_BH || k == K_HF) ? CUDA_R_16F : CUDA_R_16BF; }
 
     // y[M][N] (float32) = A[M][K] (kind of w) * w^T
     bool gemm(const DevW& w, const void* A, int M, void* y, cudaDataType_t kind_a, std::string& err) {
@@ -871,9 +903,9 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
 #endif
 #if !defined(STRATA_VIT_HIP)
     bool pascal = false;
-    {   // Pascal (compute capability 6.x): BF16 matrices as F16 (and the larger score chunk below)
+    {   // Pascal (compute capability 6.x): the larger score chunk below; BF16 matrices take K_HF as on every other CUDA card (see bf16_mode)
         cudaDeviceProp p;
-        if (cudaGetDeviceProperties(&p, device) == cudaSuccess && p.major == 6) pascal = m.bf16_as_f16 = true;
+        if (cudaGetDeviceProperties(&p, device) == cudaSuccess && p.major == 6) pascal = true;
         (void) cudaGetLastError();
     }
 #else
@@ -887,13 +919,15 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
         // until they have their own gate.
         hipDeviceProp_t p;
         if (hipGetDeviceProperties(&p, device) == hipSuccess && vit_gpu_is_gfx1151(p.gcnArchName)) {
-            m.bf16_as_f16 = m.hpa16 = m.hpa16_att = true;
+            m.bf16_mode = BF16_ROUNDED;
+            m.hpa16 = m.hpa16_att = true;
             fa_default = p.warpSize == 32 && g.head_dim <= 96 && g.head_dim % 8 == 0;
         }
         (void) hipGetLastError();
     }
 #endif
-    if (const char* e = std::getenv("STRATA_VIT_BF16_AS_F16")) m.bf16_as_f16 = std::atoi(e) != 0;
+    m.bf16_mode = vit_gpu_bf16_mode(std::getenv("STRATA_VIT_BF16_AS_F16"), m.bf16_mode);
+    m.trace = std::getenv("STRATA_TRACE") != nullptr;
     {
         const cudaError_t se = set_device_retrying(device);
         if (se != cudaSuccess) { err = std::string("cannot use GPU ") + std::to_string(device) + ": " + cudaGetErrorString(se); return false; }
@@ -952,12 +986,17 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
             return false;
     }
     m.n_weight_allocs = m.allocs.size();
+    if (m.trace && !m.f16_notes.empty()) {
+        for (const VitGpuImpl::F16Note& f : m.f16_notes)
+            std::fprintf(stderr, "vit-f16 trace: %s %s, %lld of %lld weights not exact in F16 (%lld beyond its range), largest error %.3g\n", f.name.c_str(),
+                         f.kind == K_HF ? "F16" : "BF16", f.c.not_exact, f.n, f.c.overflow, f.c.max_abs_error);
+    }
 #if !defined(STRATA_VIT_HIP)
     // Pascal with 16-bit matrices (F16, or BF16 held as F16): a 32M-score attention chunk (64 MB): the P*V product's tile is only partly used with a head
     // size of 72, and more queries per product made a 1,024-token picture 1,242 -> 1,064 ms on a P100 (BF16 file: at 1,362 MiB against mtmd-GPU's 1,364;
     // RESULTS-OWN-3V.md 16.1).  F16 file (Qwen3.6) on a P100: 1,243 -> 1,064 ms, 270 -> 263 ms at 350 tokens, rule 1 unchanged (min / mean 0.999865 / 0.999969 on 18 pictures)
     // (RESULTS-OWN-3V.md PART G), 48 MB more than the 16 MB chunk.
-    if (pascal && !m.layers.empty() && (m.layers[0].qkv.kind == K_BH || m.layers[0].qkv.kind == K_F16)) m.kScoreElems = (size_t) 32 << 20;
+    if (pascal && !m.layers.empty() && (m.layers[0].qkv.kind == K_BH || m.layers[0].qkv.kind == K_HF || m.layers[0].qkv.kind == K_F16)) m.kScoreElems = (size_t) 32 << 20;
 #endif
     if (const char* e = std::getenv("STRATA_VIT_REF_ROUND")) m.round_out = std::atoi(e) != 0;
     if (const char* e = std::getenv("STRATA_VIT_ROWS")) { const int v = std::atoi(e); if (v >= 16) m.kRows = v; }
