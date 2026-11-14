@@ -3029,8 +3029,8 @@ bool dm_f16_used() { return g_dm16_used; }
 // layer's FP16 input rows, F16 H, FP16 down rows); STRATA_PF_P1A_L2=1 adds the Q5_K gate/up and Q8_0 down layers.  Taken per call only
 // when the prompt path handed over the FP16 input (p1a_input), the down rows go out as FP16 (want_dm_f16) and H has room for FP16 rows;
 // every other call, and every call with the switch off, runs as before.
-static const void* g_p1a_x16 = nullptr;
 #if defined(__HIPCC__)
+static const void* g_p1a_x16 = nullptr;
 static size_t g_p1a_h_bytes = 0;
 #endif
 static bool g_p1a_used = false;
@@ -3054,11 +3054,11 @@ bool p1a_wanted() {
 #endif
 }
 void p1a_input(const void* x16, size_t h_bytes) {
-    g_p1a_x16 = p1a_wanted() ? x16 : nullptr;
 #if defined(__HIPCC__)
+    g_p1a_x16 = p1a_wanted() ? x16 : nullptr;
     g_p1a_h_bytes = g_p1a_x16 != nullptr ? h_bytes : 0;
 #else
-    (void) h_bytes;   // (g_p1a_h_bytes is read in the HIP-only P1A launch only)
+    (void) x16; (void) h_bytes;   // (g_p1a_x16 / g_p1a_h_bytes are read in the HIP-only P1A launch only)
 #endif
 }
 bool p1a_used() { return g_p1a_used; }
