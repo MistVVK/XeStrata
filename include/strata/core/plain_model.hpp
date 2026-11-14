@@ -1118,13 +1118,6 @@ private:
     /// --gpu-layers not given, a dense model on one GPU: the blocks its free VRAM holds after the head, their K/V and a
     /// reserve (opt_.gpu_layers set: all of them, N, or 0 for the CPU alone)
     bool auto_gpu_layers(std::string& err);
-    /// --kv not given: the FP16 cache unless it leaves blocks off the GPU, then the first of INT8, tcq5 and tcq4 that
-    /// holds them all (quantized forms only within kKvAutoQuantMaxCells, the quality line; past it FP16 is kept).
-    /// `fits(row, &bytes)` the
-    /// blocks a K/V row of `row` bytes holds, `kv_row(i8, q4, tcq)` the row's bytes.  The dense and the MoE pick share
-    /// it, so the quality line is the same rule wherever the cache is chosen automatically.
-    template <typename Fits, typename KvRow>
-    void auto_kv_format(Fits fits, KvRow kv_row, int64_t nl);
     /// --gpu-layers: the blocks after this GPU's on the CPU (null: none); the head stays here
     std::unique_ptr<PlainCpu> cpu_tail_;
     /// the CPU's blocks over the T rows the GPU's handed on (mapped), then the final norm and the head here
