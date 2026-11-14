@@ -11687,9 +11687,13 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
 # run config's `sampling` block says otherwise.  Greedy is only for a request or config that asks for temperature 0.
 # min_p 0, repetition_penalty 1 and presence_penalty 0 are the engine's own "off", so they are not listed.
 MODEL_CARD_SAMPLING = {
-    # Qwen3.8-Flash-Next (and Gyro, the same base model)
+    # Qwen3.8-Flash-Next (and Gyro, the same base model).  Not thinking takes no presence_penalty (the engine's 0): the
+    # card's 1.5 rejects MTP drafts that repeat earlier tokens, which the RDNA3 fork measured as ~11% slower code decode
+    # with no quality gain (reasoning, tool calls and long replies loop no more without it).  A request's own
+    # presence_penalty still wins.  XeStrata's own A/B is in the measure plan; the plain models' 1.5 below stays until
+    # it is measured.
     "qwen4exp": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
-                 "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+                 "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20}},
     # Qwen3.6-35B-A3B and Qwen3.5-9B: the general-task sets (the cards' precise-coding set is temperature 0.6,
     # presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},

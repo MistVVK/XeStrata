@@ -1474,7 +1474,7 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 - 実行の設定の `sampling` のブロックは、項目を省いた要求の既定を決めます（`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`）。
   要求自身の項目がいつも優先します。
   ブロックがなければ、サンプリングの項目のない要求はモデルカードの勧める値で生成します（upstream #2685）。
-  思考の有無で選び、Qwen3.8-Flash-Next（Swift・Gyro も）は思考ありで temperature 1.0・top_p 0.95・top_k 20、思考なしで temperature 0.7・top_p 0.8・top_k 20・presence_penalty 1.5、Qwen3.6-35B-A3B と Qwen3.5-9B は思考ありで 1.0・0.95・20・presence_penalty 1.5、思考なしで 0.7・0.8・20・1.5、HauhauCS の Qwen3.5-9B は思考ありで 0.6・0.95・20、思考なしで 0.7・0.8・20 です。
+  思考の有無で選び、Qwen3.8-Flash-Next（Swift・Gyro も）は思考ありで temperature 1.0・top_p 0.95・top_k 20、思考なしで temperature 0.7・top_p 0.8・top_k 20（presence_penalty はなし。カードの 1.5 は MTP の受理を下げて code の decode を遅くします。要求自身の presence_penalty は優先します）、Qwen3.6-35B-A3B と Qwen3.5-9B は思考ありで 1.0・0.95・20・presence_penalty 1.5、思考なしで 0.7・0.8・20・1.5、HauhauCS の Qwen3.5-9B は思考ありで 0.6・0.95・20、思考なしで 0.7・0.8・20 です。
   Ornith-1.5 は model card の一般用途の 0.6・0.95・20（思考の有無によらず）、dealignai の Ornith-1.5 はそのカードの 1.0・0.95・20（思考の有無によらず）、GLM-5.3-Flash は generation_config の temperature 1.0・top_p 0.95 です。
   llm-jp は model card に推奨がないので表になく、これまでどおり貪欲に生成します。
   優先は要求、web の画面の共有のチャットの設定、設定の `sampling` のブロック、モデルカードの順です。
