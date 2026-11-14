@@ -453,6 +453,13 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(fp16_rows_rule_test PRIVATE include)
   add_test(NAME fp16_rows_rule_test COMMAND fp16_rows_rule_test)
 
+  # the expert-paths bench's per-expert blob change never touches a scale byte of the gate/up format's block (test-only header; no GPU, no ggml)
+  add_executable(bench_blob_layout_test tests/prefill/bench_blob_layout_test.cpp)
+  # with the quant layer (STRATA_NATIVE_EXPERTS, defined further down): the table's geometry against strata::quant::type_info too
+  target_link_libraries(bench_blob_layout_test PRIVATE $<TARGET_NAME_IF_EXISTS:strata_quant>)
+  target_compile_definitions(bench_blob_layout_test PRIVATE $<$<TARGET_EXISTS:strata_quant>:BBL_HAVE_QUANT=1>)
+  add_test(NAME bench_blob_layout_test COMMAND bench_blob_layout_test)
+
   # STRATA_SWITCH_POINT (on by default for NVIDIA sm_86, one GPU): the floor from the card's share of non-resident experts, a cost estimate of the staged and the streamed walk (header-only, no GPU)
   add_executable(switch_point_rule_test tests/prefill/switch_point_rule_test.cpp)
   target_include_directories(switch_point_rule_test PRIVATE include)

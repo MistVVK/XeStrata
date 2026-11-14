@@ -338,7 +338,7 @@ macro(strata_cuda_prompt_tests)
       # the few-row experts, the grouped kernels, the fused kernels where the card has them), hash and error of each against a CPU reference; runs on
       # any card (77 only without one).  The ctest entry is a small smoke run; the grid is `prefill_expert_paths_bench` itself (see its source's head)
       add_executable(prefill_expert_paths_bench tests/cuda/prefill_expert_paths_bench.cpp)
-      target_link_libraries(prefill_expert_paths_bench PRIVATE strata_prefill ${_strata_pf_tests_lib} ggml-base ${_strata_gpu_runtime_target})
+      target_link_libraries(prefill_expert_paths_bench PRIVATE strata_prefill ${_strata_pf_tests_lib} $<TARGET_NAME_IF_EXISTS:strata_quant> ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_expert_paths_bench COMMAND prefill_expert_paths_bench --quick)
       set_tests_properties(prefill_expert_paths_bench PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
       # P4-SMALL: the fused experts for one gathered group (the layer-major walk's entry) against the layer's fused path (bits) and MMQ in the walk
