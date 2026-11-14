@@ -3946,6 +3946,10 @@ bool PlainModel::setup_taps(std::string& err) {
     return true;
 }
 
+const strata::kernels::YsknDev* PlainModel::yskn_draft_head() const {
+    return tail().head_.yk;
+}
+
 PlainModel::HeadView PlainModel::draft_head_view() const {
     const PlainModel& t = tail();
     HeadView v;
