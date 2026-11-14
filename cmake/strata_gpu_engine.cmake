@@ -325,6 +325,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(vmm_test PRIVATE strata_engine)
     add_test(NAME vmm_test COMMAND vmm_test)
     set_tests_properties(vmm_test PROPERTIES TIMEOUT 60)
+    # the elastic K/V's pools when the expert cache cannot give them slots: they grow from new VRAM to a long prompt's
+    # cells and to the whole context, every mapped cell writable (GPU with virtual memory; skips with 77 without one)
+    add_executable(kv_grow_refused_test tests/core/kv_grow_refused_test.cpp)
+    target_link_libraries(kv_grow_refused_test PRIVATE strata_engine)
+    add_test(NAME kv_grow_refused_test COMMAND kv_grow_refused_test)
+    set_tests_properties(kv_grow_refused_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     # The resident RAM mode with a layer split: the copy keeps each stage's lend region, and the experts the
     # prompt path borrows are served from RAM (the file source reads none of them).  The device calls are
     # wrapped - conversation_transfer_test's pattern - and `pin = false` keeps the copy pageable, so this
