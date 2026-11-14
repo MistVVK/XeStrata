@@ -245,7 +245,7 @@ A level with one choice is not asked.
 On the command line, choose each level with `--base`, `--variant` and `--quantizer`, or all of them with `--family` (`--base qwen3.8-flash-next --variant sc117` is `--family sc117`).
 `--model` is the size.
 
-The model chosen first is the first of Qwen3.8-Flash-Next's Swift 1.5 in SC117's copy (where its IQ3_XXS fits), Gyro-Coder-L (where its experts all fit the RAM), Ornith-1.5, Qwen3.6-35B-A3B, Qwen3.5-9B and Qwen3.5-2B that this PC runs (Qwen3.5-2B on a PC without a GPU).
+The model chosen first is the first of Qwen3.8-Flash-Next's Swift 1.5 in SC117's copy (where its IQ3_XXS fits), Gyro-Coder-L (where its experts all fit the RAM), Gyro-Coder (likewise), Ornith-1.5, Qwen3.6-35B-A3B, Qwen3.5-9B and Qwen3.5-2B that this PC runs (Qwen3.5-2B on a PC without a GPU).
 The size is recommended by quality:
 
 - ISTA-DASLab's GSQ-RCO files (the original, Swift 1.5, the Coder, SC117's and huihui-ai's versions): IQ3_XXS; where this PC does not hold it, the best quality it holds (in the low-RAM mode too).

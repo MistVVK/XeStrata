@@ -1646,10 +1646,10 @@ TIERS = {  # family: (model, version, quantization), in the order each level lis
 # a model's line in setup's first question where its original family's "about" does not say what the model is
 BASE_ABOUT = {"qwen3.8-flash-next": "Qwen's model, the one XeStrata is made for"}
 # the families a first install is offered, in this order: the first this PC runs (recommend_family), with the size it
-# must hold where one is named (the user's decisions of 2026-11-09: Swift 1.5's SC117 copy where its IQ3_XXS runs, else
-# Gyro-Coder-L where its experts all fit the RAM, then the smaller models)
-FIRST_CHOICE = (("sc117-swift", "IQ3_XXS"), ("gyro-coder", "Gyro-Coder-L"), ("ornith", None), ("qwen36", None),
-                ("qwen35", None), ("qwen35-2b", None))
+# must hold where one is named (the user's decisions of 2026-11-09 and 2026-11-14: Swift 1.5's SC117 copy where its
+# IQ3_XXS runs, else Gyro-Coder-L where its experts all fit the RAM, else Gyro-Coder, then the smaller models)
+FIRST_CHOICE = (("sc117-swift", "IQ3_XXS"), ("gyro-coder", "Gyro-Coder-L"), ("gyro-coder", "Gyro-Coder"),
+                ("ornith", None), ("qwen36", None), ("qwen35", None), ("qwen35-2b", None))
 
 
 def plain_parts(d: dict) -> list[dict[str, Any]]:
