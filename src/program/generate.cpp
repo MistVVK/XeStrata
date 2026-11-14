@@ -61,6 +61,8 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/cpu/card_node.hpp"
+#include "strata/kernels/cpu/numa_pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
@@ -4168,6 +4170,83 @@ int main(int argc, char** argv) {
     }
 #endif
     strata::core::set_coupled_draft(o.coupled_draft);
+#if defined(__linux__) && !defined(STRATA_GPU_METAL)
+    {   // THE CARD'S NUMA NODE (strata/kernels/cpu/card_node.hpp): on a machine with two or more memory nodes the process
+        // restricts itself to the CPUs of the card's node, here, before the pool, the host thread and the stagers exist
+        // and before the first large allocation, so every thread and the pinned memory they touch first follow.  One node,
+        // STRATA_NUMA_CARD=0, or any case decide_card_node leaves as it is: nothing changes.
+        namespace kc = strata::kernels::cpu;
+        kc::CardNodeInput ci;
+        ci.switch_off = kc::card_node_switch_off(std::getenv("STRATA_NUMA_CARD"));
+        const std::map<int, std::vector<int>> node_cpus =
+            ci.switch_off ? std::map<int, std::vector<int>>{} : kc::card_node_node_cpus("/sys");
+        ci.nodes_with_cpus = ci.switch_off ? 1 : (std::max)(1, (int) node_cpus.size());
+        std::string cards_text;
+        if (!ci.switch_off && ci.nodes_with_cpus >= 2) {
+            ci.mask = kc::card_node_describe("/sys", kc::card_node_thread_cpus(), node_cpus);
+            std::string status;
+            if (kc::card_node_read_file("/proc/self/status", status)) ci.mems_known = kc::card_node_mems_allowed(status, ci.mems_allowed);
+            // the cards the run uses: the primary one; with a layer split, helper caches or a peer card, every visible one
+            const char* pv = std::getenv("STRATA_PRIMARY_DEVICE");
+            const int primary = pv != nullptr && std::atoi(pv) > 0 ? std::atoi(pv) : 0;
+            bool several = !o.layer_split.empty() || o.peer_device >= 1;
+            for (int r = 0; r < 3; ++r) several = several || o.expert_cache_remote[(size_t) r] > 0 || o.expert_cache_remote_auto[(size_t) r];
+            int n_dev = 0;
+            if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
+            (void) cudaGetLastError();
+            for (int d = several ? 0 : primary; d < n_dev && (several || d == primary); ++d) {
+                cudaDeviceProp p{};
+                int node = -1;
+                std::string bdf = "?";
+                if (cudaGetDeviceProperties(&p, d) == cudaSuccess) {
+                    bdf = kc::card_node_bdf((unsigned) p.pciDomainID, (unsigned) p.pciBusID, (unsigned) p.pciDeviceID);
+                    node = kc::card_node_pci_node("/sys", bdf);
+                } else {
+                    (void) cudaGetLastError();
+                }
+                ci.card_nodes.push_back(node);
+                cards_text += (cards_text.empty() ? "" : ", ") + std::string("CUDA") + std::to_string(d) + " " + bdf + " node " + std::to_string(node);
+            }
+            if (ci.card_nodes.empty() && primary >= n_dev) ci.card_nodes.push_back(-1);   // the primary is not visible: unknown
+            if (!ci.card_nodes.empty()) ci.card_node_free_bytes = kc::card_node_free_bytes("/sys", ci.card_nodes.front());
+            ci.pinned_need_bytes = kc::card_node_pinned_need(o.max_context);
+            // the person placed the threads: their placement stays
+            std::string pc = o.pool_cores, ac = o.aux_cpus;
+            if (pc.empty())
+                if (const char* e = std::getenv("STRATA_POOL_CORES")) pc = e;
+            if (ac.empty())
+                if (const char* e = std::getenv("STRATA_AUX_CPUS")) ac = e;
+            const char* split_env = std::getenv("STRATA_NUMA_SPLIT");
+            if (!pc.empty()) ci.user_placed = "--pool-cores is set";
+            else if (split_env != nullptr && *split_env != '\0') ci.user_placed = "STRATA_NUMA_SPLIT is set";
+            else if (!ac.empty() && ac != "auto" && ac != "off") ci.user_placed = "an --aux-cpus list is set";
+            // the pool's worker count without the rule, as ExpertPool picks it (the span plan when the per-node split may run)
+            const kc::CpuTopology topo = kc::detect_cpu_topology(true, o.pool_affinity);
+            ci.hybrid = topo.is_hybrid;
+            ci.cpu_quota = topo.cpu_quota;
+            ci.user_workers = o.pool_workers > 0 ? o.pool_workers : 0;
+            kc::PoolPlanInput pin = kc::pool_plan_input(topo);
+            pin.span_packages = kc::pick_numa_pool(std::getenv("STRATA_NUMA_POOL"), split_env, ci.nodes_with_cpus).choice ==
+                                kc::NumaPoolChoice::Auto;
+            ci.today_workers = ci.user_workers > 0 ? ci.user_workers
+                                                   : (std::min)(kc::plan_pool_workers(pin).workers,
+                                                                (std::max)(1, (int) topo.worker_cores.size()));
+        }
+        const kc::CardNodeDecision cd = kc::decide_card_node(ci);
+        int moved = 0, refused = 0;
+        if (cd.on) moved = kc::restrict_process_cpus(cd.cpus, refused);
+        if (std::getenv("STRATA_TRACE") != nullptr) {
+            std::string cpus;
+            for (size_t i = 0; i < cd.cpus.size(); ++i) cpus += (i ? "," : "") + std::to_string(cd.cpus[i]);
+            std::fprintf(stderr, "strata trace: card node: %d nodes with CPUs; cards: %s; card node free %lld MiB, pinned need %llu MiB; "
+                                 "pool workers now %d, on the card's node %d (%d cores); %s%s (%d threads changed, %d refused)\n",
+                         ci.nodes_with_cpus, cards_text.empty() ? "not read" : cards_text.c_str(),
+                         (long long) (ci.card_node_free_bytes < 0 ? -1 : ci.card_node_free_bytes >> 20),
+                         (unsigned long long) (ci.pinned_need_bytes >> 20), ci.today_workers, cd.node_workers, cd.node_cores,
+                         cd.on ? "restricted to CPUs " : "left as is: ", cd.on ? cpus.c_str() : cd.why.c_str(), moved, refused);
+        }
+    }
+#endif
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
         std::string hc = o.host_core;
         if (hc.empty())
