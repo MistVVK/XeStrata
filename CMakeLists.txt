@@ -1336,6 +1336,7 @@ if(STRATA_ENABLE_XE)
   add_executable(qi_attn_parity src/image/qi_attn_parity.cpp)
   target_link_libraries(qi_attn_parity PRIVATE strata_image)
   add_test(NAME qi_attn_parity COMMAND qi_attn_parity)
+  set_tests_properties(qi_attn_parity PROPERTIES LABELS slow)   # half a minute or more: ctest -LE slow skips it
   add_executable(w8_roundtrip_parity src/image/w8_roundtrip_parity.cpp)
   target_link_libraries(w8_roundtrip_parity PRIVATE strata_image)
   add_test(NAME w8_roundtrip_parity COMMAND w8_roundtrip_parity)
@@ -1407,6 +1408,7 @@ if(STRATA_ENABLE_XE)
   add_executable(moss_text_parity src/image/moss_text_parity.cpp)
   target_link_libraries(moss_text_parity PRIVATE strata_image)
   add_test(NAME moss_text_parity COMMAND moss_text_parity)
+  set_tests_properties(moss_text_parity PROPERTIES LABELS slow)   # half a minute or more: ctest -LE slow skips it
   # the image models' text encoder on a synthetic Qwen3-VL: the M-RoPE's sections and DeepStack against the host's FP64
   add_executable(qwen3vl_text_parity src/image/qwen3vl_text_parity.cpp)
   target_link_libraries(qwen3vl_text_parity PRIVATE strata_image)
@@ -1554,6 +1556,7 @@ if(STRATA_ENABLE_XE)
     add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
     target_link_libraries(kv_stream_parity PRIVATE strata_kernels)
     add_test(NAME kv_stream_parity COMMAND kv_stream_parity)
+    set_tests_properties(kv_stream_parity PROPERTIES LABELS slow)   # half a minute or more: ctest -LE slow skips it
     add_executable(gdn_parity src/kernels/gdn_parity.cpp)
     target_link_libraries(gdn_parity PRIVATE strata_kernels)
     add_test(NAME gdn_parity COMMAND gdn_parity --selftest)

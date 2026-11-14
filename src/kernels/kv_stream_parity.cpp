@@ -114,7 +114,9 @@ std::vector<int32_t> selection(int64_t n_kv, int64_t width, std::mt19937& rng) {
 bool run(int fmt) {
     const char* name = fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
     k::QsaShapes s = k::qsa_real_shapes();
-    const int64_t N = 40000, n_blocks = (N + 3) / 4, n_slots = 8 * 516 + 700;   // must evict: slots < blocks
+    // must evict: slots < blocks.  The 4828 slots are 19312 cells; 24000 cells (6000 blocks) go past them and evict
+    // (the misses are checked below), and each cell is an append and its copies, CTest's time
+    const int64_t N = 24000, n_blocks = (N + 3) / 4, n_slots = 8 * 516 + 700;
     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s), NQ = 8;
     const int64_t H = s.n_head_kv, D = s.head_dim, NH = s.n_head;
     std::mt19937 rng(7 + 4 * fmt);
