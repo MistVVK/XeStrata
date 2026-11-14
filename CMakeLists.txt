@@ -427,7 +427,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
-                                    src/kernels/xe/kv_q8.cpp src/kernels/xe/kv_q4.cpp
+                                    src/kernels/xe/kv_q8.cpp src/kernels/xe/kv_q4.cpp src/kernels/xe/kv_tcq.cpp
                                     src/kernels/xe/qsa_decode_attn.cpp src/kernels/xe/kv_stream.cpp
                                     src/kernels/xe/gdn.cpp src/kernels/xe/gr.cpp src/kernels/xe/fused_gr.cpp
                                     src/kernels/xe/cvec.cpp src/kernels/xe/verify_kernels.cpp
@@ -1514,6 +1514,9 @@ if(STRATA_ENABLE_XE)
     add_executable(kv_q4_parity src/kernels/kv_q4_parity.cpp)
     target_link_libraries(kv_q4_parity PRIVATE strata_kernels)
     add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+    add_executable(kv_tcq_parity src/kernels/kv_tcq_parity.cpp)
+    target_link_libraries(kv_tcq_parity PRIVATE strata_kernels)
+    add_test(NAME kv_tcq_parity COMMAND kv_tcq_parity)
     # #783 PR-d: the batched K/V append (INT8, Q4_0, the hybrid fold) against the per-cell appends, memcmp
     add_executable(kv_steps_parity src/kernels/kv_steps_parity.cpp)
     target_link_libraries(kv_steps_parity PRIVATE strata_kernels)

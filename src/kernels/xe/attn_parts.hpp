@@ -8,6 +8,7 @@
 #include "amd_wmma.hpp"
 #include "device_caps.hpp"
 #include "device_target.hpp"
+#include "kv_tcq_parts.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -121,10 +122,13 @@ inline int path(const sycl::device& d) {
 
 // ---- the K/V cache's formats (qsa_decode_attn.hpp's QsaAttnPools) read as FP16
 
-enum PoolFormat : int { kFmtF16 = 0, kFmtI8 = 1, kFmtQ4 = 2, kFmtK8V4 = 3 };   // K8V4: INT8 K, Q4_0 V
-inline constexpr const char* kFmtNames[4] = {"FP16", "INT8", "Q4_0", "K8V4"};
+// K8V4: INT8 K, Q4_0 V; TCQ: trellis-coded K and V (kv_tcq.hpp), which only the gathers below read (the matrix
+// engines' and the int8 kernels take the other formats)
+enum PoolFormat : int { kFmtF16 = 0, kFmtI8 = 1, kFmtQ4 = 2, kFmtK8V4 = 3, kFmtTcq = 4 };
+inline constexpr const char* kFmtNames[5] = {"FP16", "INT8", "Q4_0", "K8V4", "TCQ"};
 
 inline int pool_format(const QsaAttnPools& p) {
+    if (p.k_tc != nullptr) return p.v_tc != nullptr && (p.tc_bits == 4 || p.tc_bits == 5) ? kFmtTcq : -1;
     if (p.k_q4 != nullptr) return p.v_q4 != nullptr ? kFmtQ4 : -1;
     if (p.v_q4 != nullptr) return p.k_q != nullptr && p.k_scale != nullptr ? kFmtK8V4 : -1;
     if (p.k_q != nullptr) return p.v_q != nullptr && p.k_scale != nullptr && p.v_scale != nullptr ? kFmtI8 : -1;
@@ -183,6 +187,17 @@ inline h8 q4_row8(const uint8_t* q4, int64_t row, int dd) {
     const sycl::vec<uint8_t, 8> codes = u.template as<sycl::vec<uint8_t, 8>>();
     const sycl::vec<sycl::half, 8> v = (codes.template convert<sycl::half>() - (sycl::half) 8.0f) * d;
     return v.template as<h8>();
+}
+
+// 8 values of a trellis-coded pool row (kv_tcq.hpp) from element dd on, as FP16 bits
+template<int HD>
+inline h8 tcq_row8(const uint8_t* pool, int bits, int64_t row, int dd) {
+    float v[8];
+    tcq::values<8>(pool + row * (int64_t) tcq::row_bytes(HD, bits), HD, bits, dd, v);
+    h8 r;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) r[e] = sycl::bit_cast<uint16_t>(sycl::half(v[e]));
+    return r;
 }
 
 // ... a whole block of 32 of a Q4_0 row into dst (4 x 8 values): one scale and 16 bytes read for 32 values

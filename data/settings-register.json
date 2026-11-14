@@ -825,6 +825,11 @@
     "src/prefill/prefill.cpp:778"
    ]
   },
+  "KV_TCQ_DEFER": {
+   "reads": [
+    "src/core/plain_model.cpp:1061"
+   ]
+  },
   "KV_WIDE_HOST": {
    "reads": [
     "src/kernels/xe/kv_q8.cpp:56"

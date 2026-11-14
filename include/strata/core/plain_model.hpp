@@ -77,6 +77,13 @@ struct PlainOptions {
     /// and the output back); --kv k8v4 (2): K in INT8 (kv_int8's codes and scales), V rotated Q4_0.  head_dim 256 only;
     /// not GLM-5.3-Flash's caches.
     int kv_q4 = 0;
+    /// --kv tcq4 / tcq5 (4, 5): K and V trellis-coded at 4 or 5 bits a value after the signed 256-point Hadamard
+    /// rotation (kv_tcq.hpp, the query rotated the same way and the output back): 132 and 164 B a head's row, against
+    /// Q4_0's 144 and INT8's 264.  head_dim 256 only; not GLM-5.3-Flash's caches.
+    int kv_tcq = 0;
+    /// --kv not given: a dense model whose blocks the GPU would not all hold with the FP16 cache takes the first of
+    /// INT8, tcq5 and tcq4 with which it holds them (auto_gpu_layers), else tcq4
+    bool kv_auto = true;
     /// --kv-ram on|off (GLM-5.3-Flash): the DSA layers' MLA latent cells in host memory instead of VRAM, which goes to
     /// the expert tier: a window copies the cells each token selected into VRAM once (glm5_latent_gather), a prompt
     /// chunk the layer's cells up to it (Project Maya #86's idea, written anew: there the cells live in VRAM slots).
@@ -270,6 +277,8 @@ public:
     /// The forward runs on the CPU (--device cpu): no GPU, no drafts, no pictures, no batches.
     bool on_cpu() const { return cpu_ != nullptr; }
     int64_t max_cells() const { return opt_.max_cells; }
+    /// The options as loaded (the --kv format auto_gpu_layers chose)
+    const PlainOptions& options() const { return opt_; }
     /// The prompt's chunk (0: the prompt runs in windows; GLM-5.3-Flash's for now, whatever the options asked).
     int64_t prompt_chunk() const { return opt_.prompt_chunk; }
     /// --vision: the M-RoPE positions (t, h, w) of cells 0 .. n - 1, `pos3` 3 n of them on the host
@@ -741,6 +750,7 @@ private:
         std::vector<uint16_t*> k_pool, v_pool, k_scale, v_scale;
         std::vector<int8_t*> k_q, v_q;
         std::vector<uint8_t*> k_q4, v_q4;
+        std::vector<uint8_t*> k_tc, v_tc, tc_ring;
     };
     std::vector<SlotSession> bslots_;
     bool bslot_snaps_ = false;   ///< the slots keep the states after their first row (--batch-mtp)
@@ -1128,6 +1138,8 @@ private:
         uint16_t *k_pool = nullptr, *v_pool = nullptr, *k_scale = nullptr, *v_scale = nullptr;
         int8_t *k_q = nullptr, *v_q = nullptr;
         uint8_t *k_q4 = nullptr, *v_q4 = nullptr;
+        uint8_t *k_tc = nullptr, *v_tc = nullptr;
+        uint8_t* tc_ring = nullptr;   ///< --kv tcq's INT8 ring of the cells not coded yet (deferred coding)
     };
     KvPtrs kv_ptrs(size_t a, int slot) const;
     /// The buffers of attention block a in session `slot` for `cells` (cell, KV head) pairs and their bytes, in one
@@ -1235,6 +1247,11 @@ private:
     std::vector<std::pair<int32_t, int32_t>> vram_evicted_;   ///< `vram`'s shrinks: (residency index, slot)
     std::vector<int8_t*> k_q_, v_q_;              ///< ...kv_int8's codes (K8V4's K)
     std::vector<uint8_t*> k_q4_, v_q4_;           ///< ...kv_q4's Q4_0 blocks (K8V4's V)
+    std::vector<uint8_t*> k_tc_, v_tc_;           ///< ...kv_tcq's trellis-coded rows
+    std::vector<uint8_t*> tc_ring_;               ///< ...and their INT8 ring (kv_tcq.hpp), null when not deferred
+    /// --kv tcq: the cells kept as INT8 until their block of 16 is complete, then coded (kv_tcq.hpp); 0 with
+    /// STRATA_KV_TCQ_DEFER=0 (each cell coded as it is written), for the comparison
+    bool tcq_defer_ = true;
     std::vector<uint16_t*> k_scale_, v_scale_;    ///< ...and their scales
     /// The attention block a's pools, for the kernels
     strata::kernels::QsaAttnPools kv_pools(size_t a, int slot = -1) const;

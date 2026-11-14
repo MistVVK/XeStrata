@@ -55,6 +55,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tcq.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -627,25 +628,67 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
         }
     const int64_t nkv = std::max<int64_t>(1, s.n_head_kv.empty() ? 1 : *std::max_element(s.n_head_kv.begin(), s.n_head_kv.end()));
     const int64_t chunk = std::max<int64_t>(opt_.prompt_chunk, opt_.max_t);
+    // a cell's K and V of one KV head in the --kv format (int8, q4: kv_q4 1 or 2, tcq: its bits)
+    const auto kv_row = [&](bool i8, int q4, int tcq) -> uint64_t {
+        const int hd = (int) s.key_length;
+        const uint64_t i8_row = (uint64_t) hd + (uint64_t) hd / k::KV_Q8_GROUP * 2;
+        if (tcq != 0) return 2 * k::kv_tcq_bytes_per_head(hd, tcq);
+        if (q4 == 1) return 2 * k::kv_q4_bytes_per_head(hd);
+        if (q4 == 2) return i8_row + k::kv_q4_bytes_per_head(hd);
+        return i8 ? 2 * i8_row : 4 * (uint64_t) hd;
+    };
+    std::vector<uint64_t> kv_cells((size_t) nl, 0);
     for (int64_t l = 0; l < nl; ++l) {
         const int64_t cells = s.layer_swa(l) ? std::min<int64_t>(opt_.max_cells, s.swa_window + chunk) : opt_.max_cells;
-        block[(size_t) l] += s.recurrent[(size_t) l]
-                                 ? (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state + (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4
-                                 : (uint64_t) (cells * nkv * s.key_length) * 2 * (opt_.kv_int8 ? 1 : 2);
+        if (s.recurrent[(size_t) l])
+            block[(size_t) l] += (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state + (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4;
+        else
+            kv_cells[(size_t) l] = (uint64_t) (cells * nkv);
     }
     // the window's and the prompt's buffers and the driver's share: the layer split's reserve (split_auto_points)
     // - the device's room, core::vram_room, plus the 1 GiB this stage's windows and prompt path take
     const uint64_t reserve = opt_.reserve_mib >= 0
                                  ? (uint64_t) opt_.reserve_mib << 20
                                  : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
-    uint64_t used = head + reserve;
-    int64_t fit = 0;
-    while (fit < nl && used + block[(size_t) fit] <= free_b) used += block[(size_t) fit++];
+    // the blocks the GPU holds in order with the K/V's rows of `row` bytes, and the bytes they take
+    const auto fits = [&](uint64_t row, uint64_t* bytes) {
+        uint64_t used = head + reserve;
+        int64_t n = 0;
+        while (n < nl && used + block[(size_t) n] + kv_cells[(size_t) n] * row <= free_b) {
+            used += block[(size_t) n] + kv_cells[(size_t) n] * row;
+            ++n;
+        }
+        if (bytes != nullptr)
+            for (int64_t l = 0; l < nl; ++l) *bytes += block[(size_t) l] + kv_cells[(size_t) l] * row;
+        return n;
+    };
+    // --kv not given: the FP16 cache unless it leaves blocks off the GPU (whose CPU forward costs far more than the
+    // cache's rounding); then the first of INT8, tcq5 and tcq4 (heads of 256, not PLaMo 3's: kv_tcq.hpp) with which the
+    // GPU holds them all, else the smallest.  In this order each rounds the cache a little more than the one before
+    if (opt_.kv_auto && opt_.kv_tcq == 0 && opt_.kv_q4 == 0 && !opt_.kv_int8) {
+        const int64_t f16 = fits(kv_row(false, 0, 0), nullptr);
+        if (f16 < nl) {
+            const bool tc_ok = s.key_length == 256 && s.arch != ModelArch::Plamo3;
+            struct Pick { bool i8; int tcq; const char* name; };
+            const Pick picks[] = {{true, 0, "int8"}, {false, 5, "tcq5"}, {false, 4, "tcq4"}};
+            const Pick* take = &picks[0];
+            for (const Pick& p : picks) {
+                if (p.tcq != 0 && !tc_ok) continue;
+                take = &p;
+                if (fits(kv_row(p.i8, 0, p.tcq), nullptr) == nl) break;
+            }
+            opt_.kv_int8 = take->i8;
+            opt_.kv_tcq = take->tcq;
+            std::fprintf(stderr, "xestrata plain: the K/V cache in %s (with FP16's, the GPU would hold %lld of the %lld "
+                                 "blocks; --kv fp16 keeps it)\n", take->name, (long long) f16, (long long) nl);
+        }
+    }
+    uint64_t total = 0;
+    const int64_t fit = fits(kv_row(opt_.kv_int8, opt_.kv_q4, opt_.kv_tcq), &total);
     if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
     opt_.gpu_layers = head + reserve > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
     std::fprintf(stderr, "xestrata plain: %.2f GiB of VRAM free, the head and a reserve %.2f GiB, the blocks %.2f GiB: %s\n",
-                 free_b / 1073741824.0, (head + reserve) / 1073741824.0,
-                 std::accumulate(block.begin(), block.end(), uint64_t{0}) / 1073741824.0,
+                 free_b / 1073741824.0, (head + reserve) / 1073741824.0, total / 1073741824.0,
                  opt_.gpu_layers == 0 ? "the CPU alone" : ("the first " + std::to_string(fit) + " blocks on the GPU").c_str());
     return true;
 }
@@ -749,7 +792,7 @@ bool PlainModel::load_qwen(std::string& err) {
         err = "plain model: an encoder (streamed or not) is a dense model (qwen35, qwen3) on one GPU";
         return false;
     }
-    if (plamo_ && (opt_.encoder || opt_.vision || opt_.kv_q4 != 0)) {
+    if (plamo_ && (opt_.encoder || opt_.vision || opt_.kv_q4 != 0 || opt_.kv_tcq != 0)) {
         err = "plain model: plamo3 is not an encoder, has no pictures and keeps its K/V in FP16 or int8";
         return false;
     }
@@ -852,9 +895,9 @@ bool PlainModel::load_qwen(std::string& err) {
     }
 
     if (nkv_ == 0) { err = "plain model: the model has no attention block"; return false; }
-    if (opt_.kv_q4 != 0 && s.key_length != 256) {
-        err = "plain model: --kv q4_0 and k8v4 rotate heads of 256 (kv_q4.hpp); this model's are " +
-              std::to_string((long long) s.key_length) + " wide";
+    if ((opt_.kv_q4 != 0 || opt_.kv_tcq != 0) && s.key_length != 256) {
+        err = "plain model: --kv q4_0, k8v4, tcq4 and tcq5 rotate heads of 256 (kv_q4.hpp, kv_tcq.hpp); this model's "
+              "are " + std::to_string((long long) s.key_length) + " wide";
         return false;
     }
     if (!tune_uploaded(err)) return false;
@@ -993,7 +1036,7 @@ bool PlainModel::load_qwen(std::string& err) {
     }
     // the decode attention's form for this GPU (an fp16 cache), timed before any graph is recorded and before the cache
     // takes its VRAM (an encoder does not decode)
-    if (!opt_.kv_int8 && opt_.kv_q4 == 0 && !opt_.encoder) {
+    if (!opt_.kv_int8 && opt_.kv_q4 == 0 && opt_.kv_tcq == 0 && !opt_.encoder) {
         try {
             k::qsa_dense_attn_tune(qs, opt_.max_cells, cs_);
         } catch (const std::exception& e) {
@@ -1004,7 +1047,8 @@ bool PlainModel::load_qwen(std::string& err) {
     // and the prompt attention's kernel (prompt_attn: the matrix engines', the FP16 one or the decode one), as long
     // as the VRAM is free; GLM-5.3-Flash's prompt takes its own (plain_prompt_glm5.cpp)
     if (opt_.prompt_chunk > 0 && !glm_)
-        k::prompt_attn_tune(qs, opt_.kv_q4 == 1 ? 2 : opt_.kv_q4 == 2 ? 3 : opt_.kv_int8 ? 1 : 0, opt_.max_cells, cs_);
+        k::prompt_attn_tune(qs, opt_.kv_tcq != 0 ? 4 : opt_.kv_q4 == 1 ? 2 : opt_.kv_q4 == 2 ? 3 : opt_.kv_int8 ? 1 : 0,
+                            opt_.max_cells, cs_);
     {
         const size_t cells = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
         k_pool_.assign((size_t) n_attn, nullptr);
@@ -1015,6 +1059,10 @@ bool PlainModel::load_qwen(std::string& err) {
         v_scale_.assign((size_t) n_attn, nullptr);
         k_q4_.assign((size_t) n_attn, nullptr);
         v_q4_.assign((size_t) n_attn, nullptr);
+        k_tc_.assign((size_t) n_attn, nullptr);
+        v_tc_.assign((size_t) n_attn, nullptr);
+        tc_ring_.assign((size_t) n_attn, nullptr);
+        tcq_defer_ = strata::env_auto("KV_TCQ_DEFER") != 0;
         // --kv-grow: Qwen3.8-Flash-Next's rule for the default (the B70 reports 64 KiB pages, and that engine's cache
         // in 2 MiB segments ran its prompts 45% slower there; the RTX 4070 reports 2 MiB and was faster)
         const bool asked = opt_.kv_grow > 0 || (opt_.kv_grow < 0 && vmm_large_pages());
@@ -1039,7 +1087,8 @@ bool PlainModel::load_qwen(std::string& err) {
             const uint64_t cells = (uint64_t) std::max<int64_t>(want, 0);
             const uint64_t codes = cells * kv_head_dim, scales = cells * (kv_head_dim / k::KV_Q8_GROUP) * 2,
                            q4 = cells * (uint64_t) k::kv_q4_bytes_per_head((int) kv_head_dim);
-            return opt_.kv_q4 == 1 ? 2 * q4
+            return opt_.kv_tcq != 0 ? 2 * cells * k::kv_tcq_bytes_per_head((int) kv_head_dim, opt_.kv_tcq)
+                   : opt_.kv_q4 == 1 ? 2 * q4
                    : opt_.kv_q4 == 2 ? codes + scales + q4
                    : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
         };
@@ -1063,7 +1112,8 @@ bool PlainModel::load_qwen(std::string& err) {
             // an encoder reads the whole prompt in one chunk (encode), so a layer's attention reads only the K/V it
             // wrote itself: every layer shares the first's cells (Qwen3-VL-8B's 36 layers of 4096 cells: 16 MiB, not
             // 590)
-            if (opt_.encoder && i > 0 && (k_pool_[0] != nullptr || k_q_[0] != nullptr || k_q4_[0] != nullptr)) {
+            if (opt_.encoder && i > 0 &&
+                (k_pool_[0] != nullptr || k_q_[0] != nullptr || k_q4_[0] != nullptr || k_tc_[0] != nullptr)) {
                 k_pool_[a] = k_pool_[0];
                 v_pool_[a] = v_pool_[0];
                 k_scale_[a] = k_scale_[0];
@@ -1072,6 +1122,9 @@ bool PlainModel::load_qwen(std::string& err) {
                 v_q_[a] = v_q_[0];
                 k_q4_[a] = k_q4_[0];
                 v_q4_[a] = v_q4_[0];
+                k_tc_[a] = k_tc_[0];
+                v_tc_[a] = v_tc_[0];
+                tc_ring_[a] = tc_ring_[0];
                 continue;
             }
             const bool ok = alloc_kv(p, ringed(a) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : cells, grow);
@@ -1083,6 +1136,9 @@ bool PlainModel::load_qwen(std::string& err) {
             v_q_[a] = p.v_q;
             k_q4_[a] = p.k_q4;
             v_q4_[a] = p.v_q4;
+            k_tc_[a] = p.k_tc;
+            v_tc_[a] = p.v_tc;
+            tc_ring_[a] = p.tc_ring;
             if (!ok) {
                 err = "plain model: no VRAM for the K/V cache (" + std::to_string(opt_.max_cells) + " cells)";
                 if (kv_room_known) {   // #5715: the context that would fit, from this engine's own K/V figure
@@ -2178,9 +2234,11 @@ PlainModel::KvPtrs PlainModel::kv_ptrs(size_t a, int slot) const {
     KvPtrs p;
     if (slot >= 0) {
         const SlotSession& ss = bslots_[(size_t) slot];
-        p = {ss.k_pool[a], ss.v_pool[a], ss.k_scale[a], ss.v_scale[a], ss.k_q[a], ss.v_q[a], ss.k_q4[a], ss.v_q4[a]};
+        p = {ss.k_pool[a], ss.v_pool[a], ss.k_scale[a], ss.v_scale[a], ss.k_q[a], ss.v_q[a], ss.k_q4[a], ss.v_q4[a],
+             ss.k_tc[a], ss.v_tc[a], ss.tc_ring[a]};
     } else {
-        p = {k_pool_[a], v_pool_[a], k_scale_[a], v_scale_[a], k_q_[a], v_q_[a], k_q4_[a], v_q4_[a]};
+        p = {k_pool_[a], v_pool_[a], k_scale_[a], v_scale_[a], k_q_[a], v_q_[a], k_q4_[a], v_q4_[a], k_tc_[a],
+             v_tc_[a], tc_ring_[a]};
     }
     return p;
 }
@@ -2196,6 +2254,11 @@ k::QsaAttnPools PlainModel::kv_pools(size_t a, int slot) const {
     pools.v_scale = p.v_scale;
     pools.k_q4 = p.k_q4;
     pools.v_q4 = p.v_q4;
+    pools.k_tc = p.k_tc;
+    pools.v_tc = p.v_tc;
+    pools.tc_bits = opt_.kv_tcq;
+    pools.tc_ring = p.tc_ring;
+    pools.tc_ring_kv = (int) attn_shapes().n_head_kv;
     pools.page_table = table_of(a);   // the identity (a ring's for a sliding-window layer): a slot's pools have the
                                       // live session's shape
     return pools;
@@ -2205,9 +2268,15 @@ std::vector<PlainModel::StatePart> PlainModel::kv_planes(size_t a, int slot, siz
     const KvPtrs p = kv_ptrs(a, slot);
     const size_t HD = (size_t) attn_shapes().head_dim;
     const size_t codes = cells * HD, scales = cells * (HD / k::KV_Q8_GROUP) * 2,
-                 q4 = cells * (size_t) k::kv_q4_bytes_per_head((int) HD);
+                 q4 = cells * (size_t) k::kv_q4_bytes_per_head((int) HD),
+                 tc = cells * (size_t) k::kv_tcq_bytes_per_head((int) HD, opt_.kv_tcq);
     std::vector<StatePart> v;
-    if (p.k_pool != nullptr) v = {{p.k_pool, codes * 2, 2}, {p.v_pool, codes * 2, 2}};
+    if (p.k_tc != nullptr) {
+        v = {{p.k_tc, tc}, {p.v_tc, tc}};
+        if (p.tc_ring != nullptr)   // the whole ring and its coded bound, whatever the cells
+            v.push_back({p.tc_ring, k::kv_tcq_ring_bytes((int) HD, (int) attn_shapes().n_head_kv)});
+    }
+    else if (p.k_pool != nullptr) v = {{p.k_pool, codes * 2, 2}, {p.v_pool, codes * 2, 2}};
     else if (p.k_q4 != nullptr) v = {{p.k_q4, q4}, {p.v_q4, q4}};
     else if (p.v_q4 != nullptr) v = {{p.k_q, codes}, {p.k_scale, scales}, {p.v_q4, q4}};
     else if (p.k_q != nullptr) v = {{p.k_q, codes}, {p.v_q, codes}, {p.k_scale, scales}, {p.v_scale, scales}};
@@ -2233,7 +2302,17 @@ bool PlainModel::alloc_kv(KvPtrs& p, size_t cells, bool vmm) {
         allocs_.push_back(q);
         return true;
     };
-    if (opt_.kv_q4 == 1) {
+    if (opt_.kv_tcq != 0) {
+        const size_t tc = cells * (size_t) k::kv_tcq_bytes_per_head((int) HD, opt_.kv_tcq);
+        take(p.k_tc, tc);
+        take(p.v_tc, tc);
+        // the ring outside --kv-grow's mapping (which follows the cells): small and read by position
+        const size_t ring = k::kv_tcq_ring_bytes((int) HD, (int) attn_shapes().n_head_kv);
+        if (ok && tcq_defer_) {
+            if (!strata::gpu::alloc_device(&p.tc_ring, ring) || !strata::gpu::memset(p.tc_ring, 0, ring)) return false;
+            allocs_.push_back(p.tc_ring);
+        }
+    } else if (opt_.kv_q4 == 1) {
         take(p.k_q4, q4);
         take(p.v_q4, q4);
     } else if (opt_.kv_q4 == 2) {
@@ -2332,7 +2411,21 @@ void PlainModel::kv_append_cells(size_t a, int slot, const int32_t* steps, int n
     const KvPtrs p = kv_ptrs(a, slot);
     const k::QsaShapes qs = attn_shapes();
     const int row = (int) (qs.n_head_kv * qs.head_dim);
-    if (p.k_q4 != nullptr) {
+    if (p.k_tc != nullptr) {
+        k::KvAppend ka;
+        ka.step = steps;
+        ka.step_stride = k::kStepCount;
+        ka.k = kc;
+        ka.v = vc;
+        ka.cur_stride = row;
+        ka.n_tok = n;
+        ka.k_tc = p.k_tc;
+        ka.v_tc = p.v_tc;
+        ka.tc_bits = opt_.kv_tcq;
+        ka.tc_ring = p.tc_ring;
+        ka.page_table = table_of(a);
+        k::kv_append_cells(ka, qs, cs);
+    } else if (p.k_q4 != nullptr) {
         k::kv_append_q4_steps(p.k_q4, p.v_q4, table_of(a), steps, k::kStepCount, n, kc, vc, qs, cs);
     } else if (p.v_q4 != nullptr) {   // K8V4: K's INT8 codes and scales (one plane), V's Q4_0 (one plane)
         k::kv_append_q8_steps(p.k_q, p.k_q, p.k_scale, p.k_scale, table_of(a), steps, k::kStepCount, kc, kc, row, n, qs,
@@ -2959,7 +3052,7 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
         ss.conv_snap.assign(snaps ? gdn_conv_.size() : 0, nullptr);
         for (auto* v : {&ss.k_pool, &ss.v_pool, &ss.k_scale, &ss.v_scale}) v->assign(k_pool_.size(), nullptr);
         for (auto* v : {&ss.k_q, &ss.v_q}) v->assign(k_pool_.size(), nullptr);
-        for (auto* v : {&ss.k_q4, &ss.v_q4}) v->assign(k_pool_.size(), nullptr);
+        for (auto* v : {&ss.k_q4, &ss.v_q4, &ss.k_tc, &ss.v_tc, &ss.tc_ring}) v->assign(k_pool_.size(), nullptr);
         bool ok = true;
         auto take = [&](auto*& p, size_t bytes) {
             if (!ok || !strata::gpu::alloc_device(&p, bytes) || !strata::gpu::memset(p, 0, bytes)) return ok = false;
@@ -2987,6 +3080,9 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
             ss.v_q[a] = p.v_q;
             ss.k_q4[a] = p.k_q4;
             ss.v_q4[a] = p.v_q4;
+            ss.k_tc[a] = p.k_tc;
+            ss.v_tc[a] = p.v_tc;
+            ss.tc_ring[a] = p.tc_ring;
         }
         if (!ok) break;   // what this slot took stays in allocs_ (freed with the model)
         bslots_.push_back(std::move(ss));
@@ -3224,8 +3320,13 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
                                     (int) s.rope_dims, eps, rs, pos_q, cs);
         k::native_qsa_rms_norm_rope(kr, (int) HD, b.k_norm, kcur_, (int) (T * NKV), (int) HD,
                                     (int) s.rope_dims, eps, rs, pos_k, cs);
-        // --kv q4_0: K, V and the queries rotated (kv_q4.hpp); k8v4: V alone; the output back below
-        if (opt_.kv_q4 == 1) {
+        // --kv q4_0: K, V and the queries rotated (kv_q4.hpp); k8v4: V alone; tcq4/5: all three with the signs
+        // (kv_tcq.hpp); the output back below
+        if (opt_.kv_tcq != 0) {
+            k::fwht256_signed(kcur_, (int64_t) T * NKV, false, cs);
+            k::fwht256_signed(vc, (int64_t) T * NKV, false, cs);
+            k::fwht256_signed(qcur_, (int64_t) T * NH, false, cs);
+        } else if (opt_.kv_q4 == 1) {
             k::fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
             k::fwht256_inplace_cuda(vc, (int64_t) T * NKV, cs);
             k::fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
@@ -3243,7 +3344,8 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         else
             k::qsa_dense_attn_batch(qcur_, kv_pools((size_t) a), step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs,
                                     window_of(b));
-        if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+        if (opt_.kv_tcq != 0) k::fwht256_signed(attn_, (int64_t) T * NH, true, cs);
+        else if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         if (has_gate_) {
             k::native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
             proj(b.o, attn32_, mix_, T, true);
