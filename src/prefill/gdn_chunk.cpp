@@ -17,13 +17,14 @@
 //
 // Two kernels a super-block of chunks.  The prep (a work-group a chunk and key head, no matrix engines) works out the
 // Gram products in FP32, then for each of the key head's value heads A, T by forward substitution (a work-item a
-// column), P, and the tokens' e, f and beta, and writes T and P in FP16 and the scalars in FP32.  The scan (a
-// work-group a value head's 128 columns, or half or a quarter of them: the form) walks the super-block's chunks in
-// order, each sub-group holding its TN columns of the state in its accumulators throughout.  Per chunk the work-group
-// puts k, q, k^T, T, P, v and the scalars in local memory once for all its sub-groups (read into registers while the
-// chunk before computes), then each sub-group: its state as FP16 B tiles 16 rows at a time for X and Q S0; Y, D and f D
-// as FP16 B tiles; O = e Q S0 + P D; S = e_L S + K^T (f D).  Form 0 then normalizes the outputs (one sub-group a token,
-// all 128 columns) and writes y16; the others write y and kernels.cpp's norm kernel follows.
+// column), P, and the tokens' e, f and beta, and writes T as an FP16 hi/lo pair and P in FP16 and the scalars in
+// FP32.  The scan (a work-group a value head's 128 columns, or half or a quarter of them: the form) walks the
+// super-block's chunks in order, each sub-group holding its TN columns of the state in its accumulators throughout.
+// Per chunk the work-group puts k, q, k^T (hi and lo), T (hi and lo), P, v and the scalars in local memory once for
+// all its sub-groups (read into registers while the chunk before computes), then each sub-group: its state as FP16
+// hi/lo B tiles 16 rows at a time for X (the hi alone for Q S0); Y and f D as FP16 hi/lo B tiles, D as an FP16 B tile;
+// O = e Q S0 + P D; S = e_L S + K^T (f D).  Form 0 then normalizes the outputs (one sub-group a token, all 128 columns)
+// and writes y16; the others write y and kernels.cpp's norm kernel follows.
 //
 // The element-wise steps (Y, the row scales, the FP16 tiles) need where each of a lane's accumulator elements sits in
 // the tile: a small kernel asks the device once (an accumulator loaded from row * TN + col, its elements written out
@@ -31,8 +32,13 @@
 // each element and cost more than the products (flash_attn.cpp); a device whose table is not a permutation of the
 // tile does not take the scan.
 //
-// Numerics (upstream's class): FP16 operands (k, q, the state, Y, D, f D, T, P), FP32 sums, the state and the
-// running sums FP32.  Not the bits of kernels.cpp's recurrence kernels.
+// Numerics: FP32 sums, the state and the running sums FP32 throughout.  The products that only feed the outputs
+// (Q S0, O = e QS + P D) take single FP16 operands (q, the state's hi, P, D).  The products that reach the state take
+// FP16 hi/lo pairs: X = K S0 with the state split (two products, K single: its error feeds the state through
+// Y = beta (v - e X)), and three products each (hi.hi + hi.lo + lo.hi; lo.lo ~ 2^-22 dropped) for D = T Y with T and Y
+// split and S = e_L S + K^T (f D) with K and f D split.  Single FP16 everywhere left the state ~ 5e-4 from the FP64
+// recurrence, over GDN_CONTRACT.md's 1e-4 floor (INT2's CTest, the B70 and the RX 9060 XT); the pairs leave k's own
+// rounding in X, of order 1e-5.  Not the bits of kernels.cpp's recurrence kernels.
 #include "gdn_chunk.hpp"
 
 #include "strata/core/per_device.hpp"
@@ -121,7 +127,8 @@ struct GdnChunkProbe {
 // The prep, a work-group of NT work-items a (chunk, key head): the chunk's k and q rows (zeros past the call's end) in
 // local memory, the Gram products k_t.k_i and q_t.k_i (i <= t) in FP32, then for each of the key head's VPK value
 // heads the gates' running sum, P and A, T = (I + A)^-1 (a work-item a column), written as tp[chunk][value head]
-// [T, P][CK][CK] (FP16) and sc[chunk][value head][e, f, beta][CK] (FP32)
+// [T hi, T lo, P][CK][CK] (FP16; T lo = T - T hi, the state update's pair) and sc[chunk][value head][e, f, beta][CK]
+// (FP32)
 template<int HK, int HV>
 struct GdnChunkPrep {
     static constexpr int C = 2 * HK * S + HV * S, VPK = HV / HK, NT = 256;
@@ -182,7 +189,7 @@ struct GdnChunkPrep {
             const float gt = lm[O_G + (size_t) (j * CK + t)], gi = lm[O_G + (size_t) (j * CK + i)];
             lm[O_A + (size_t) ((j * CK + t) * GP + i)] =
                 i < t ? lm[O_B + (size_t) (j * CK + t)] * sycl::exp(gt - gi) * lm[O_KK + (size_t) (t * GP + i)] : 0.0f;
-            half* pv = tp + ((size_t) ch * HV + (size_t) vh) * (2 * CK * CK) + CK * CK;
+            half* pv = tp + ((size_t) ch * HV + (size_t) vh) * (3 * CK * CK) + 2 * CK * CK;
             pv[t * CK + i] = half(i <= t ? sycl::exp(gt - gi) * lm[O_QK + (size_t) (t * GP + i)] : 0.0f);
         }
         if (tid < VPK * CK) {
@@ -196,7 +203,7 @@ struct GdnChunkPrep {
         sycl::group_barrier(it.get_group());
         if (tid < VPK * CK) {   // column c of T: T[t][c] = [t == c] - sum_{m < t} A[t][m] T[m][c]
             const int j = tid / CK, c = tid % CK, vh = qh + j * HK;
-            half* tv = tp + ((size_t) ch * HV + (size_t) vh) * (2 * CK * CK);
+            half* tv = tp + ((size_t) ch * HV + (size_t) vh) * (3 * CK * CK);
             float tc[CK];
 #pragma unroll
             for (int t = 0; t < CK; ++t) {
@@ -204,7 +211,9 @@ struct GdnChunkPrep {
 #pragma unroll
                 for (int m = 0; m < t; ++m) v = sycl::fma(-lm[O_A + (size_t) ((j * CK + t) * GP + m)], tc[m], v);
                 tc[t] = v;
-                tv[t * CK + c] = half(v);
+                const half hi = half(v);
+                tv[t * CK + c] = hi;
+                tv[CK * CK + t * CK + c] = half(v - (float) hi);   // the lo of the state update's pair
             }
         }
     }
@@ -220,18 +229,21 @@ struct GdnChunkScan {
     static constexpr int C = 2 * HK * S + HV * S, NE = TM * TN / SG, MT = CK / TM, RT = S / TM, KT = S / TK;
     static constexpr int SP = TN + 8, VP = CPW + 4, OP = S + 4;
     static constexpr size_t RS = (size_t) HV * S;
-    // local memory, halves: k and q [CK][KP], k^T [S][KTP], T and P [CK][KTP] (the work-group's); then a sub-group's
-    // two slices of its state [TK][SP] and two FP16 tiles [CK][SP] (Y, then f D; D)
+    // local memory, halves: k and q [CK][KP], k^T hi and lo [S][KTP], T hi, T lo and P [CK][KTP] (the work-group's);
+    // then a sub-group's state hi and lo slices [TK][SP] and two FP16 tiles [CK][SP] (Y hi and lo, then D hi;
+    // f D hi and lo)
     static constexpr size_t O_SK = 0, O_SQ = O_SK + (size_t) CK * KP, O_SKT = O_SQ + (size_t) CK * KP,
-                            O_ST = O_SKT + (size_t) S * KTP, O_SP = O_ST + (size_t) CK * KTP,
+                            O_SKTL = O_SKT + (size_t) S * KTP, O_ST = O_SKTL + (size_t) S * KTP,
+                            O_STL = O_ST + (size_t) CK * KTP, O_SP = O_STL + (size_t) CK * KTP,
                             H_WG = O_SP + (size_t) CK * KTP, H_SG = 2 * (size_t) TK * SP + 2 * (size_t) CK * SP,
                             H_ALL = H_WG + NW * H_SG;
     // floats: v [CK][VP], e, f, beta [CK]; NORM: the outputs [CK][OP]
     static constexpr size_t O_SV = 0, O_SE = (size_t) CK * VP, O_SF = O_SE + CK, O_SB = O_SF + CK, O_SO = O_SB + CK,
                             F_ALL = O_SO + (NORM ? (size_t) CK * OP : 0);
     static constexpr size_t BYTES = H_ALL * sizeof(half) + F_ALL * sizeof(float);
-    // a work-item's share of a chunk's global reads: k and q (float4 each), v, T and P (four halves each)
-    static constexpr int QK4 = 2 * CK * S / 4, V4 = CK * CPW / 4, TP4 = 2 * CK * CK / 4;
+    // a work-item's share of a chunk's global reads: k and q (float4 each, k its lo too), v, T hi, T lo and P
+    // (four halves each)
+    static constexpr int QK4 = 2 * CK * S / 4, V4 = CK * CPW / 4, TP4 = 3 * CK * CK / 4;
     static constexpr int NKQ = (QK4 + NT - 1) / NT, NV = (V4 + NT - 1) / NT, NTP = (TP4 + NT - 1) / NT;
     static_assert(S % TN == 0 && S % TM == 0 && CK % TM == 0 && CK == TK && TK % TM == 0 && NW >= 1, "the tiles");
     static_assert(!NORM || NWI == 0, "the norm over all columns");
@@ -264,6 +276,7 @@ struct GdnChunkScan {
 
     struct Pre {
         sycl::vec<half, 4> kq[NKQ];
+        sycl::vec<half, 4> klo[NKQ];   // k - k hi (the state update's pair; q's entries unused)
         sycl::float4 v[NV];
         sycl::vec<half, 4> tpv[NTP];
         float s[(3 * CK + NT - 1) / NT];   // e, f and beta: a work-item one or more (NT can be under 3 CK)
@@ -282,6 +295,7 @@ struct GdnChunkScan {
             if (tok < T)
                 x = *reinterpret_cast<const sycl::float4*>(h + tok * C + (int64_t) ((isk ? HK * S : 0) + qh * S + r));
             pre.kq[n] = x.template convert<half>();
+            if (isk) pre.klo[n] = (x - pre.kq[n].template convert<float>()).template convert<half>();
         }
 #pragma unroll
         for (int n = 0; n < NV; ++n) {
@@ -295,7 +309,7 @@ struct GdnChunkScan {
                                                             (int64_t) (2 * HK * S + vh * S + cg * CPW + c));
             pre.v[n] = x;
         }
-        const half* tpc = tp + ((size_t) ch * HV + (size_t) vh) * (2 * CK * CK);
+        const half* tpc = tp + ((size_t) ch * HV + (size_t) vh) * (3 * CK * CK);
 #pragma unroll
         for (int n = 0; n < NTP; ++n) {
             const int p = tid + n * NT;
@@ -318,6 +332,7 @@ struct GdnChunkScan {
                 if (isk) {
                     lh[O_SK + (size_t) (t * KP + r + e)] = v;
                     lh[O_SKT + (size_t) ((r + e) * KTP + t)] = v;
+                    lh[O_SKTL + (size_t) ((r + e) * KTP + t)] = pre.klo[n][e];
                 } else {
                     lh[O_SQ + (size_t) (t * KP + r + e)] = v;
                 }
@@ -335,7 +350,8 @@ struct GdnChunkScan {
             const int p = tid + n * NT;
             if (p >= TP4) break;
             const int m = p / (CK * CK / 4), w = p % (CK * CK / 4), t = w / (CK / 4), i = (w % (CK / 4)) * 4;
-            for (int e = 0; e < 4; ++e) lh[(m ? O_SP : O_ST) + (size_t) (t * KTP + i + e)] = pre.tpv[n][e];
+            for (int e = 0; e < 4; ++e)
+                lh[(m == 0 ? O_ST : m == 1 ? O_STL : O_SP) + (size_t) (t * KTP + i + e)] = pre.tpv[n][e];
         }
         for (int p = tid; p < 3 * CK; p += NT)   // e, f and beta lie one after the other
             lf[O_SE + (size_t) p] = pre.s[p / NT];
@@ -376,7 +392,9 @@ struct GdnChunkScan {
             stage(pre, tid);
             sycl::group_barrier(it.get_group());   // (1) the chunk staged
             if (ch + 1 < nch) fetch(pre, tid, vh, cg, tb + CK, ch + 1);
-            // (a) X = K S0 and Q S0, the state as FP16 B tiles TK rows at a time (two slices: one barrier a step)
+            // (a) X = K S0 and Q S0, the state as FP16 hi/lo B tiles TK rows at a time (X takes the pair: its error
+            // feeds the state through Y; Q S0 only the outputs, the hi alone).  One slice a step: the load is done
+            // before the next step writes it.
             typename Ops::C x[MT], qs[MT];
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
@@ -385,64 +403,68 @@ struct GdnChunkScan {
             }
 #pragma unroll
             for (int kk = 0; kk < KT; ++kk) {
-                const size_t o_s = o_sg + (size_t) (kk & 1) * TK * SP;
+                const size_t o_s = o_sg;
 #pragma unroll
                 for (int jj = 0; jj < TK / TM; ++jj)
                     each(sg, sacc[kk * (TK / TM) + jj], [&](float& v, int i) {
-                        lh[o_s + (size_t) ((jj * TM + cr[i]) * SP + cc[i])] = half(v);
+                        const half hi = half(v);
+                        lh[o_s + (size_t) ((jj * TM + cr[i]) * SP + cc[i])] = hi;
+                        lh[o_s + (size_t) (TK * SP) + (size_t) ((jj * TM + cr[i]) * SP + cc[i])] = half(v - (float) hi);
                     });
                 sycl::group_barrier(sg);
-                typename Ops::Br b;
-                Ops::load(sg, b, at(lh, o_s), SP);
+                typename Ops::Br bhi, blo;
+                Ops::load(sg, bhi, at(lh, o_s), SP);
+                Ops::load(sg, blo, at(lh, o_s + (size_t) (TK * SP)), SP);
 #pragma unroll
                 for (int m = 0; m < MT; ++m) {
                     typename Ops::A a;
                     Ops::load(sg, a, at(lh, O_SK + (size_t) (m * TM * KP + kk * TK)), KP);
-                    Ops::mad(sg, x[m], a, b);
+                    Ops::mad(sg, x[m], a, bhi);
+                    Ops::mad(sg, x[m], a, blo);
                     Ops::load(sg, a, at(lh, O_SQ + (size_t) (m * TM * KP + kk * TK)), KP);
-                    Ops::mad(sg, qs[m], a, b);
+                    Ops::mad(sg, qs[m], a, bhi);
                 }
             }
-            // (b) Y = beta (V - e X) as FP16
+            // (b) Y = beta (V - e X) as an FP16 hi/lo pair (D feeds the state)
 #pragma unroll
             for (int m = 0; m < MT; ++m)
                 each(sg, x[m], [&](float& v, int i) {
                     const int t = m * TM + cr[i];
                     const float yv = lf[O_SB + (size_t) t] *
                                      (lf[O_SV + (size_t) (t * VP + g * TN + cc[i])] - lf[O_SE + (size_t) t] * v);
-                    lh[o_y0 + (size_t) (t * SP + cc[i])] = half(yv);
+                    const half hi = half(yv);
+                    lh[o_y0 + (size_t) (t * SP + cc[i])] = hi;
+                    lh[o_y1 + (size_t) (t * SP + cc[i])] = half(yv - (float) hi);
                 });
             sycl::group_barrier(sg);
-            // (c) D = T Y
+            // (c) D = T Y = T hi Y hi + T hi Y lo + T lo Y hi (lo.lo ~ 2^-22 dropped)
             typename Ops::C d[MT];
             {
-                typename Ops::Br b;
-                Ops::load(sg, b, at(lh, o_y0), SP);
+                typename Ops::Br bhi, blo;
+                Ops::load(sg, bhi, at(lh, o_y0), SP);
+                Ops::load(sg, blo, at(lh, o_y1), SP);
 #pragma unroll
                 for (int m = 0; m < MT; ++m) {
                     Ops::zero(sg, d[m]);
-                    typename Ops::A a;
-                    Ops::load(sg, a, at(lh, O_ST + (size_t) (m * TM * KTP)), KTP);
-                    Ops::mad(sg, d[m], a, b);
+                    typename Ops::A ahi, alo;
+                    Ops::load(sg, ahi, at(lh, O_ST + (size_t) (m * TM * KTP)), KTP);
+                    Ops::load(sg, alo, at(lh, O_STL + (size_t) (m * TM * KTP)), KTP);
+                    Ops::mad(sg, d[m], ahi, bhi);
+                    Ops::mad(sg, d[m], ahi, blo);
+                    Ops::mad(sg, d[m], alo, bhi);
                 }
             }
-            // (d) D as FP16, e Q S0
+            // (d) D as FP16 (the outputs' P D), e Q S0
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
-                each(sg, d[m], [&](float& v, int i) { lh[o_y1 + (size_t) ((m * TM + cr[i]) * SP + cc[i])] = half(v); });
+                each(sg, d[m], [&](float& v, int i) { lh[o_y0 + (size_t) ((m * TM + cr[i]) * SP + cc[i])] = half(v); });
                 each(sg, qs[m], [&](float& v, int i) { v *= lf[O_SE + (size_t) (m * TM + cr[i])]; });
             }
-            sycl::group_barrier(sg);   // D written; Y's loads done
-#pragma unroll
-            for (int m = 0; m < MT; ++m)
-                each(sg, d[m], [&](float& v, int i) {
-                    const int t = m * TM + cr[i];
-                    lh[o_y0 + (size_t) (t * SP + cc[i])] = half(v * lf[O_SF + (size_t) t]);
-                });
+            sycl::group_barrier(sg);   // D hi written; Y's loads done
             // (e) O = e Q S0 + P D
             {
                 typename Ops::Br b;
-                Ops::load(sg, b, at(lh, o_y1), SP);
+                Ops::load(sg, b, at(lh, o_y0), SP);
 #pragma unroll
                 for (int m = 0; m < MT; ++m) {
                     typename Ops::A a;
@@ -450,21 +472,35 @@ struct GdnChunkScan {
                     Ops::mad(sg, qs[m], a, b);
                 }
             }
-            sycl::group_barrier(sg);   // f D written
-            // (f) S = e_L S + K^T (f D)
+            // (f) f D as an FP16 hi/lo pair (the state update), from the FP32 D
+#pragma unroll
+            for (int m = 0; m < MT; ++m)
+                each(sg, d[m], [&](float& v, int i) {
+                    const int t = m * TM + cr[i];
+                    const float fd = v * lf[O_SF + (size_t) t];
+                    const half hi = half(fd);
+                    lh[o_y0 + (size_t) (t * SP + cc[i])] = hi;
+                    lh[o_y1 + (size_t) (t * SP + cc[i])] = half(fd - (float) hi);
+                });
+            sycl::group_barrier(sg);   // f D written; D hi's loads done
+            // (g) S = e_L S + K^T (f D) = e_L S + K hi^T f D hi + K hi^T f D lo + K lo^T f D hi
             {
                 const float el = lf[O_SE + CK - 1];
-                typename Ops::Br b;
-                Ops::load(sg, b, at(lh, o_y0), SP);
+                typename Ops::Br bhi, blo;
+                Ops::load(sg, bhi, at(lh, o_y0), SP);
+                Ops::load(sg, blo, at(lh, o_y1), SP);
 #pragma unroll
                 for (int j = 0; j < RT; ++j) {
                     each(sg, sacc[j], [&](float& v, int) { v *= el; });
-                    typename Ops::A a;
-                    Ops::load(sg, a, at(lh, O_SKT + (size_t) (j * TM * KTP)), KTP);
-                    Ops::mad(sg, sacc[j], a, b);
+                    typename Ops::A ahi, alo;
+                    Ops::load(sg, ahi, at(lh, O_SKT + (size_t) (j * TM * KTP)), KTP);
+                    Ops::load(sg, alo, at(lh, O_SKTL + (size_t) (j * TM * KTP)), KTP);
+                    Ops::mad(sg, sacc[j], ahi, bhi);
+                    Ops::mad(sg, sacc[j], ahi, blo);
+                    Ops::mad(sg, sacc[j], alo, bhi);
                 }
             }
-            // (g) the outputs
+            // (h) the outputs
 #pragma unroll
             for (int m = 0; m < MT; ++m)
                 each(sg, qs[m], [&](float& v, int i) {
@@ -608,7 +644,7 @@ const ChunkDev& chunk_dev(sycl::queue& q) {
             // the scratch of NB_MOST chunks a super-block, halved down to 16 while the device has no room
             const size_t most = d.get_info<sycl::info::device::max_mem_alloc_size>();
             for (int nb = NB_MOST; nb >= 16 && r.tp == nullptr; nb /= 2) {
-                const size_t ntp = (size_t) nb * HV * 2 * CK * CK, nsc = (size_t) nb * HV * 3 * CK;
+                const size_t ntp = (size_t) nb * HV * 3 * CK * CK, nsc = (size_t) nb * HV * 3 * CK;
                 if (ntp * sizeof(half) > most) continue;
                 try {
                     r.tp = sycl::malloc_device<half>(ntp, q);
