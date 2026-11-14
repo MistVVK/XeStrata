@@ -5456,6 +5456,7 @@ def image_descriptions(models_dir: Path) -> list[dict]:
         for choice, version in versions:
             own = choice.startswith(qi.ANIMA_USER)
             _, dit, enc = qi.IMAGE_MODELS["anima-base" if own else choice]
+
             def estimates(encoder: str) -> list[dict]:
                 sizes = []
                 for size in reversed(qi.size_choices(dit)):
@@ -5473,7 +5474,8 @@ def image_descriptions(models_dir: Path) -> list[dict]:
             uncensored = choice + "-uncensored" in qi.IMAGE_MODELS
             uncensored_sizes = estimates(qi.IMAGE_MODELS[choice + "-uncensored"][2]) if uncensored else sizes
             result.append({"id": choice, "title": choice if own else qi.DITS[dit][0],
-                           "family": family, "version": version, "origin": origin, "origin_key": qi.IMAGE_ORIGIN_KEYS[origin],
+                           "family": family, "version": version, "origin": origin,
+                           "origin_key": qi.IMAGE_ORIGIN_KEYS[origin],
                            "own": own,
                            "about": "A DiT made from Anima on this PC" if own else qi.ABOUT.get(choice, ""),
                            "download_gb": sizes[0]["download_gb"], "ram_gb": sizes[0]["ram_gb"],
@@ -5517,7 +5519,8 @@ def ask_images(cfg_path: Path) -> str | None:
     qi = _qimage()
     if ARGS is not None:
         ARGS.image_auto_largest = True
-    models_dir = Path(ARGS.models_dir) if ARGS and ARGS.models_dir else data_folder_path(None, load_settings()) / "models"
+    models_dir = (Path(ARGS.models_dir) if ARGS and ARGS.models_dir
+                  else data_folder_path(None, load_settings()) / "models")
     by_name = {v[0]: k for k, v in qi.IMAGE_MODELS.items()}
     for k in qi.anima_user_dits(models_dir):
         by_name.setdefault("anima-" + k[len(qi.ANIMA_USER):], k)
@@ -9225,7 +9228,8 @@ def describe() -> dict:
         installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
                           "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095,
                           "images": [s.get("setup_choice") or by_name[s["model_name"]] for s in secs
-                                     if isinstance(s, dict) and (s.get("setup_choice") or s.get("model_name") in by_name)]})
+                                     if isinstance(s, dict)
+                                     and (s.get("setup_choice") or s.get("model_name") in by_name)]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
             "ram_gb": round(ram_gb(), 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
             "gpu": gpu["index"] if gpu else None,

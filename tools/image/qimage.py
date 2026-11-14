@@ -851,8 +851,7 @@ SETUP_DEFAULT = ("mage-flow-turbo-uncensored", "qwen-image-turbo-uncensored", "m
 # The picker levels, in display order: family title, file origin and its versions (choice, version title).
 # Parameter counts are the DiT's; the Anima 2.9B preview is named at its version level.
 IMAGE_FAMILIES = (
-    ("Qwen-Image 2.1 (7B)", "Unsloth GGUF", (("qwen-image-turbo", "Turbo"),
-                                                ("qwen-image-base", "Base"))),
+    ("Qwen-Image 2.1 (7B)", "Unsloth GGUF", (("qwen-image-turbo", "Turbo"), ("qwen-image-base", "Base"))),
     ("Mage-Flow (4B)", "Original files, quantized by XeStrata when read",
      (("mage-flow-turbo", "Turbo"), ("mage-flow", "Instruct"), ("mage-flow-base", "Base"))),
     ("MageTrail (2.9B)", "Original files, quantized by XeStrata when read", (("magetrail", "MageTrail"),)),

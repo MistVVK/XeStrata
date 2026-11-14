@@ -160,7 +160,8 @@ type private Levels = { Model: ComboBox; Version: ComboBox; Quantization: ComboB
 
 let private installPage (w: Window) =
     click w (tr "home.install" "Install a model ...")
-    let sizes = waitFor "the sizes" (fun () -> match all<ListBox> w with [ s ] -> Some s | _ -> None)
+    let sizes = waitFor "the text model sizes" (fun () ->
+        all<ListBox> w |> List.tryFind (fun s -> s.SelectedItem :? Model))
     { Model = fieldOf<ComboBox> w (tr "install.model" "Model")
       Version = fieldOf<ComboBox> w (tr "install.version" "Version: the original, or whose changed copy")
       Quantization = fieldOf<ComboBox> w (tr "install.quantization" "Quantization: whose model files")

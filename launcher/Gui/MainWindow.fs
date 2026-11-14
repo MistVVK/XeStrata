@@ -259,7 +259,7 @@ type MainWindow(setup: Setup.Access) as this =
         let duplicate = muted ""
         let rows = StackPanel(Spacing = 6.0)
         let total = muted ""
-        let filePath = TextBox(MinWidth = 320.0, Watermark = tr "imgpick.filePath" "Anima .safetensors file")
+        let filePath = TextBox(MinWidth = 320.0, PlaceholderText = tr "imgpick.filePath" "Anima .safetensors file")
         let fileStatus = coloured failBrush ""
         let ownBox = StackPanel(Spacing = 6.0, IsVisible = false)
         let versionField = field (tr "imgpick.version" "Version") version
@@ -315,7 +315,7 @@ type MainWindow(setup: Setup.Access) as this =
                 | Some m ->
                     let s = sizeFor m choice
                     download <- download + s.DownloadGb
-                    let def = RadioButton(GroupName = "image-default", IsChecked = Nullable(i = 0))
+                    let def = RadioButton(GroupName = "image-default", IsChecked = Nullable<bool>((i = 0)))
                     def.IsCheckedChanged.Add(fun _ ->
                         if def.IsChecked = Nullable true && i <> 0 then
                             chosen <- choice :: (chosen |> List.filter ((<>) choice))
@@ -385,7 +385,7 @@ type MainWindow(setup: Setup.Access) as this =
             task {
                 let top = TopLevel.GetTopLevel this
                 let kind = FilePickerFileType("safetensors", Patterns = [| "*.safetensors" |])
-                let! files = top.StorageProvider.OpenFilePickerAsync(FilePickerOpenOptions(Title = tr "imgpick.file" "Add from a file on this PC", AllowMultiple = false, FileTypeFilter = [| kind |]))
+                let! files = top.StorageProvider.OpenFilePickerAsync(FilePickerOpenOptions(Title = tr "imgpick.file" "Add from a file on this PC …", AllowMultiple = false, FileTypeFilter = [| kind |]))
                 if files.Count > 0 then
                     match files[0].TryGetLocalPath() with
                     | null -> ()
