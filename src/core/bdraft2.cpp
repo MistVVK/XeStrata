@@ -66,7 +66,7 @@ bool Bdraft2Weights::load(const std::string& path, const std::string& head, int 
         std::vector<const TensorDesc*> ts;
         std::vector<const VectorDesc*> vs;
         auto add_t = [&](const std::string& name, int r, int k) { ts.push_back(&tensor(*c, name, r, k)); };
-        auto add_v = [&](const std::string& name, int64_t n) { vs.push_back(&vector(*c, name, n)); };
+        auto add_v = [&](const std::string& name, int64_t n) { vs.push_back(&strata::core::vector(*c, name, n)); };
         add_t("bdraft2.fc", m.hidden, 5 * m.hidden);
         add_v("bdraft2.hidden_norm", m.hidden); add_v("bdraft2.norm", m.hidden);
         for (int i = 0; i < m.layers; ++i) {

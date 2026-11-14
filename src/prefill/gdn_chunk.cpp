@@ -83,7 +83,7 @@ inline void each(sycl::sub_group, kernels::xe::wmma::C& c, F&& f) {
 }
 #endif
 
-inline float sigm(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
+[[maybe_unused]] inline float sigm(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }   // the device pass only
 
 // The coordinate probe: one sub-group loads an accumulator tile whose element (row, col) is row * TN + col and writes
 // each lane's elements in their order as row << 8 | col

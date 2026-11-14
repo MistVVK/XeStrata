@@ -171,7 +171,7 @@ void latent_v6() {
     bool ok = load(d.path, 2, 2, err);
     const ExpertLayout& L = strata::kernels::cpu::expert_layout();
     check(ok && L.version == 6 && L.expert_embd == 1792 && L.expert_ff == 640 && L.fmt[0].n_embd == 1792 &&
-              L.fmt[0].n_ff == 640 && L.fmt[0].gu_type == 11 && L.fmt[0].d_type == 20 && L.fmt[0].bytes == blob &&
+              L.fmt[0].n_ff == 640 && L.fmt[0].gu_type == 11 && L.fmt[0].d_type == 20 && L.fmt[0].bytes == (size_t) blob &&
               L.fmt[0].gu_colscale == nullptr,
           "v6: the header's widths reach the formats, no hadamard.txt needed" + (ok ? "" : ": " + err));
     int w = 0;
