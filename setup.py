@@ -5473,7 +5473,8 @@ def image_descriptions(models_dir: Path) -> list[dict]:
             uncensored = choice + "-uncensored" in qi.IMAGE_MODELS
             uncensored_sizes = estimates(qi.IMAGE_MODELS[choice + "-uncensored"][2]) if uncensored else sizes
             result.append({"id": choice, "title": choice if own else qi.DITS[dit][0],
-                           "family": family, "version": version, "origin": origin,
+                           "family": family, "version": version, "origin": origin, "origin_key": qi.IMAGE_ORIGIN_KEYS[origin],
+                           "own": own,
                            "about": "A DiT made from Anima on this PC" if own else qi.ABOUT.get(choice, ""),
                            "download_gb": sizes[0]["download_gb"], "ram_gb": sizes[0]["ram_gb"],
                            "sizes": sizes, "uncensored_sizes": uncensored_sizes, "quants": [x["id"] for x in sizes],

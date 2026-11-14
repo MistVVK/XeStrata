@@ -864,6 +864,8 @@ IMAGE_FAMILIES = (
     ("HunyuanImage 3.0 (80B-A13B)", "PedroMarinhoDev quantization",
      (("hunyuan-image-3-distil", "Instruct-Distil"),)),
 )
+IMAGE_ORIGIN_KEYS = {"Unsloth GGUF": "unsloth", "Original files, quantized by XeStrata when read": "original",
+                     "PedroMarinhoDev quantization": "pedro"}
 # what a front end (setup --describe, the Windows launcher) says of each choice without -uncensored
 ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
          "qwen-image-base": "Turbo's base model: the steps can be changed, about 5 times as long an image",
