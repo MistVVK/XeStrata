@@ -233,6 +233,10 @@ public:
         tap_layers_ = layers; tap_first_ = first_pos; tap_cap_ = cap_rows;
     }
     std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on_taps;
+    /// After init: the staging for `cap_rows` rows (the start's measurement reads short prompts with a small one and
+    /// takes the window's 2048 rows only when DFlash2 stays), or the taps off and their staging freed.
+    bool set_tap_rows(int64_t cap_rows, std::string& err);
+    void taps_off();
 
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
     /// is still at that chunk's end (its stream synchronized; the last stage calls it just before `on_chunk`).  An
@@ -293,7 +297,8 @@ private:
     std::string lm_next_err_;
     int64_t stage_lb_ = 0, stage_le_ = -1;
     std::vector<int> tap_layers_, tap_local_, tap_slot_;   ///< set_taps: the drafter's tap layers (this stage's share)
-    int64_t tap_first_ = 0, tap_cap_ = 0;
+    int64_t tap_first_ = 0, tap_cap_ = 0, tap_n_ = 0;
+    int64_t tap_alloc_ = 0;          ///< the rows tap_dev_ holds (set_taps asks for tap_cap_; a chunk writes at most this)
     float* tap_dev_ = nullptr;       ///< [tap_cap_][ntap][n_embd] staging (null: no taps)
     PrefillLink* next_ = nullptr;       ///< set_stage: the next stage, through this link only
     InProcessPrefill local_next_;

@@ -267,7 +267,9 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                     mark(4);
                 }
                 k::glm5_hc_post(ffn_out, P.g_hs, P.g_post, P.g_comb, P.g_hs, N, T, cs);
+                tap_rows(l, P.g_hs, kHC, T, p0, false, cs);   // DFlash2's prompt taps: the four streams' mean
             }
+            if (!prompt_taps_deliver(ptap_dev_, T, p0, cs, err)) return false;
             // the MTP layer after the trunk, its caches a cell ahead: row t pairs the trunk's normed row t with the
             // token after it (the prompt's last row with a stand-in, rewritten by spec_start once the token is picked).
             // Only its caches are wanted here, so of its block only the latent and the indexer's keys are made.

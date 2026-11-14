@@ -31,6 +31,7 @@
 #include "strata/core/moe_window.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include "strata/core/gpu.hpp"
 
@@ -81,6 +82,9 @@ public:
     virtual bool wait_commit(std::string& err) = 0;
     virtual void set_sampling(const strata::kernels::SamplerParams& sp) = 0;
     virtual void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) = 0;
+    /// A slot's reply tail for its penalty window and its own logit bias (same process: the pointer is copied).
+    virtual void set_slot_history(int slot, const int32_t* tail, int64_t n) = 0;
+    virtual bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) = 0;
     virtual void set_head_sampling(bool on) = 0;
     virtual bool set_logit_bias(const std::vector<float>& bias, std::string& err) = 0;
     /// The grammar's allowed tokens for the next window's T rows (host bitmask rows), uploaded on the last stage's
@@ -118,6 +122,8 @@ public:
     bool wait_commit(std::string& err) override;
     void set_sampling(const strata::kernels::SamplerParams& sp) override;
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) override;
+    void set_slot_history(int slot, const int32_t* tail, int64_t n) override;
+    bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) override;
     void set_head_sampling(bool on) override;
     bool set_logit_bias(const std::vector<float>& bias, std::string& err) override;
     bool set_allowed(const uint32_t* rows, int T, std::string& err) override;
@@ -152,7 +158,7 @@ public:
     /// measurement (about 1 s on an RTX 4070) is not in its time to the first token.  Throws on a device error.
     static void tune_device(const ModelGeometry& g, void* stream);
 
-    /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
+    /// `max_t` <= kVerifyNarrowT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
 
@@ -191,7 +197,7 @@ public:
     /// front slots -1 (the kernel reads only the tail window).  Row t follows the window's drafts 1..t - staging
     /// row 0 alone (before 0.1.19) left the drafted rows with unwritten histories.  Null disables the penalties
     /// entirely - the neutral run's sampling call is byte-for-byte what it was.  The engine re-uploads the rows
-    /// before every window; the buffer must hold kVerifyMaxT rows and stay alive across the request.
+    /// before every window; the buffer must hold kVerifyNarrowT rows and stay alive across the request.
     void set_history(const int32_t* history, int history_len) {
         hist_d_ = history;
         hist_len_ = history_len;
@@ -218,11 +224,14 @@ public:
     /// gathered for every window row into tap_dev() ([T][ntap][n_embd]).  Only the layers this stage runs below the
     /// last are kept.  Set before init; empty (the default) allocates nothing and records nothing.
     void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
+    /// The taps off after init (the start's measurement released DFlash2): the window graphs, captured with the tap
+    /// kernels, are dropped and captured again without them on their next use.
+    void taps_off();
     const float* tap_dev() const { return tap_dev_; }
     int n_taps() const { return (int) tap_layers_.size(); }
 
-    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyMaxT, the default).  STRATA_PIPED_MTP's groups write
-    /// their slots' token and proposal rows at hbase = group * rows-per-group, past kVerifyMaxT with enough slots.
+    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyNarrowT, the default).  STRATA_PIPED_MTP's groups write
+    /// their slots' token and proposal rows at hbase = group * rows-per-group, past kVerifyNarrowT with enough slots.
     void set_handoff_rows(int rows) { handoff_rows_ = rows; }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.  Everything goes through a StageLink (an InProcessStage here).
@@ -353,13 +362,32 @@ public:
                            const int64_t* pos, std::string& err);
     bool batch_commit_rows_submit(const int* rows, int S, int hbase, std::string& err);
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
-    /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
-    /// its row is drawn again with Philox(seed, position), as a solo window draws it.  Greedy by default.  Set on
-    /// the first stage of a layer split, it reaches the last (which draws).
+    /// A slot's sampling (temperature / top_p / top_k / min_p / seed, and with set_slot_history and
+    /// set_slot_logit_bias its penalties and bias): its row is drawn again with Philox(seed, position), as a solo
+    /// window draws it.  Greedy by default.  Set on the first stage of a layer split, it reaches the last (which
+    /// draws).
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
-        if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
+        if (slot >= 0 && slot < (int) slot_sp_.size()) {
+            slot_sp_[(size_t) slot] = sp;
+            // a slot's own bias array stays its row's (set_slot_logit_bias; the request's sp carries no pointer)
+            slot_sp_[(size_t) slot].logit_bias =
+                slot < (int) slot_bias_dev_.size() ? slot_bias_dev_[(size_t) slot] : nullptr;
+        }
         if (next_) next_->set_slot_sampling(slot, sp);
     }
+    /// A slot's reply tail for its penalty window: the `n` tokens its session consumed since the reply began (the
+    /// last penalty_last_n of them are counted), the fed-back head not in it yet.  Set before every batch window
+    /// that holds the slot while it has a penalty; reaches the last stage, which draws the rows.
+    void set_slot_history(int slot, const int32_t* tail, int64_t n) {
+        if (slot >= 0 && slot < (int) slot_tail_.size()) {
+            if (n > 0) slot_tail_[(size_t) slot].assign(tail, tail + n);
+            else slot_tail_[(size_t) slot].clear();
+        }
+        if (next_) next_->set_slot_history(slot, tail, n);
+    }
+    /// A slot's logit bias (n_vocab floats, empty = none), added before its row's penalties and filters as a solo
+    /// request's is.  Reaches the last stage.
+    bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err);
 
     /// Row `t` of the last window's head logits (the distribution token t of the window came from: before sampling,
     /// temperature and penalties) into `host` (vocab() floats); false when there is none.  OpenAI's logprobs.
@@ -427,7 +455,7 @@ private:
     bool head_sampling_ = true;          ///< set_head_sampling
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
-    uint32_t* allowed_device_ = nullptr;   ///< kVerifyMaxT rows of the grammar's mask (set_allowed)
+    uint32_t* allowed_device_ = nullptr;   ///< kVerifyNarrowT rows of the grammar's mask (set_allowed)
     bool allowed_on_ = false;
     float* rp_lambda_d_ = nullptr;          ///< STRATA_ROUTE_PRIOR's lambda on the device (0: off; set_route_prior)
     bool rp_on_ = true;
@@ -441,14 +469,14 @@ private:
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
-    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
+    int brow_[strata::kernels::kWindowMaxT] = {};   ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     /// key: batch_key(rows, S, hand-off base) - the whole row layout (--batch-mtp repeats a slot over its rows)
     std::map<std::vector<int>, strata::gpu::Graph*> exec_bm_, commit_bm_;
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU, with a graph limit)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph; N: LRU-evict beyond N layouts
-    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int last_rows_[strata::kernels::kWindowMaxT] = {};   ///< the slots of the last batch window's rows
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
         std::vector<int> k;
         k.reserve((size_t) S + 1);
@@ -461,15 +489,19 @@ private:
     bool b_running_ = false;
     int64_t b_k_ = 0, b_steps_ = 0;
     std::chrono::steady_clock::time_point b_last_;
-    int32_t b_out_[8] = {};
+    int32_t b_out_[strata::kernels::kWindowMaxT] = {};
     /// The host's half of a batch window: the checks, the graphs, the rows' staging (run_slot_rows, batch_launch).
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     std::vector<strata::kernels::SamplerParams> slot_sp_;
+    std::vector<float*> slot_bias_dev_;              ///< per slot: its logit bias on the device (null: none)
+    std::vector<std::vector<int32_t>> slot_tail_;    ///< per slot: its reply tail for the penalty window
+    int32_t* slot_hist_d_ = nullptr;                 ///< the current batch window's penalty-history rows (device)
+    size_t slot_hist_cap_ = 0;                       ///< ... and how many int32 fit (grows to the widest window)
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
-    int64_t last_pos_b_[8] = {};
+    int64_t last_pos_b_[strata::kernels::kWindowMaxT] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     // STRATA_PIPED_MTP (init_deferred_commit): the saved rows, laid out as the window scratch (global layer index) with
@@ -485,14 +517,14 @@ private:
     bool sample_rows(int S, std::string& err);
     bool res_graph_ = false;
     bool recording_res_ = false;
-    strata::gpu::Graph* exec_res_[9] = {};
+    strata::gpu::Graph* exec_res_[strata::kernels::kWindowMaxT + 1] = {};
     bool all_resident() const;
     bool capture_res(int T, std::string& err);
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     std::vector<int> tap_req_, tap_layers_;   ///< set_taps: the DFlash2 drafter's tap layers (this stage's share)
     std::vector<int> tap_slot_;          ///< layer -> its tap index (-1: not tapped)
     float* tap_dev_ = nullptr;           ///< [max_t][ntap][n_embd], the window's taps (null: none)
-    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
+    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyNarrowT)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
     StageLink* next_ = nullptr;          ///< set_next: the next stage, through this link only
@@ -528,19 +560,19 @@ private:
     int max_t_ = 0;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[strata::kernels::kWindowMaxT] = {};
     int64_t n_vocab_ = 0;
     strata::gpu::Stream cs_ = nullptr;
     strata::gpu::Stream df_side_[2] = {};   ///< STRATA_DF_BRANCH: the mixer's side branches of the window graph
     bool df_branch_ = false;
     strata::gpu::Stream fetch_side_ = nullptr;   ///< STRATA_FETCH_BRANCH: the PCIe share's fetch beside the VRAM hits
     bool fetch_branch_ = false;
-    strata::gpu::Graph* exec_[9] = {};
+    strata::gpu::Graph* exec_[strata::kernels::kWindowMaxT + 1] = {};
     bool captured_last_ = false;
     size_t graph_bytes_max_ = 0;   ///< the most VRAM a window's capture and first run have taken
     size_t graph_free0_ = 0;       ///< the VRAM free before the capture of the window run() is running, else 0
     strata::gpu::Graph* commit_exec_ = nullptr;
-    std::vector<strata::gpu::Graph*> segs_[9];
+    std::vector<strata::gpu::Graph*> segs_[strata::kernels::kWindowMaxT + 1];
     std::vector<strata::gpu::Graph*>* seg_out_ = nullptr;   // the segments of the window being captured
 
     // mapped staging (host pointer, device alias)
@@ -550,7 +582,7 @@ private:
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
-    uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
+    uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyNarrowT * kNonfiniteBlocks flags
     int nf_row_ = -1;                     ///< nonfinite_row()
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
     uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
@@ -572,7 +604,7 @@ private:
     // kernels do not see the host's writes runs a window as segments the host launches (win_.segmented()).
     MoeWindow win_;
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[9] = {};
+    int groups_[strata::kernels::kWindowMaxT + 1] = {};
 
     // device
     void* arena_ = nullptr;

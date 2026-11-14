@@ -44,6 +44,7 @@
 #include <exception>
 #include <fstream>
 #include <immintrin.h>
+#include <new>
 #include <sstream>
 #include <vector>
 
@@ -151,6 +152,59 @@ MtpDrafter::~MtpDrafter() {
     for (void* h : hosts) if (h) strata::gpu::free(h);
 }
 
+void MtpDrafter::release() {
+    this->~MtpDrafter();
+    new (this) MtpDrafter();
+}
+
+void MtpDrafter::release_weights(bool keep_head) {
+    if (dense_ == nullptr) return;
+    const OnDevice on_device(device_);
+    if (cs_) strata::gpu::stream_sync(cs_);
+    if (side_) strata::gpu::stream_sync(side_);
+    for (strata::gpu::Graph** arr : {prefill_exec_, prefill_dev_exec_, round_exec_, step_exec_, round_exec_c_, step_exec_c_})
+        for (int i = 0; i < 9; ++i)
+            if (arr[i]) { strata::gpu::graph_destroy(arr[i]); arr[i] = nullptr; }
+    auto drop = [](auto*& p) {
+        if (p) strata::gpu::free(p);
+        p = nullptr;
+    };
+    drop(pf_dev_);
+    drop(pf_host_);
+    drop(cparams_);
+    drop(cring_);
+    drop(dinv_);
+    drop(cscratch_);
+    drop(h_cparams_);
+    drop(h_chist_);
+    drop(h_force_);
+    drop(arena_);
+    drop(head_logits_);
+    if (owns_weights_) {
+        drop(dense_);
+        drop(experts_);
+    }
+    dense_ = nullptr;
+    experts_ = nullptr;
+    drop(h_tok_);
+    drop(h_step_);
+    drop(h_pos_);
+    drop(h_row_);
+    drop(h_out_);
+    drop(h_prob_);
+    if (pf_ev_) { strata::gpu::event_destroy(pf_ev_); pf_ev_ = nullptr; }
+    if (ev_chain_) { strata::gpu::event_destroy(ev_chain_); ev_chain_ = nullptr; }
+    for (strata::gpu::Event*& e : ev_step_)
+        if (e) { strata::gpu::event_destroy(e); e = nullptr; }
+    int2_.reset();
+    if (!keep_head) {
+        subset_.reset();
+        dhead_ = nullptr;
+        dvocab_ = nullptr;
+    }
+    tensors_.clear();
+}
+
 const float* MtpDrafter::f32(const char* name) const {
     for (const auto& t : tensors_) if (t.name == name && t.kind == "f32") return (const float*) (dense_ + t.off);
     return nullptr;
@@ -177,7 +231,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
-    if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
+    if (max_t < 1 || max_t > strata::kernels::kVerifyNarrowT) { err = "mtp: max_t out of range"; return false; }
     if (shared != nullptr) {   // --batch-mtp: a slot's drafter on the main one's weights
         if (shared->device_ != device_ || shared->g_ != &g || shared->dense_ == nullptr || shared->experts_ == nullptr ||
             shared->rt_dir_ != rt_dir) {
@@ -1095,6 +1149,17 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, const More& more, int* n_drafts) {
     const OnDevice on_device(device_);
+    if (T > max_t_ && a >= 0 && a < T && T <= strata::kernels::kVerifyMaxT && !chain_live_) {
+        // A window wider than the draft layer's rows (a lookup's or DFlash2's window past 8, window_rows.hpp): the
+        // cells before the accepted row are caught up as a prompt's are (in batches of max_t rows), and the round
+        // drafts from the accepted row alone.  The rejected rows' cells are not caught up (the next round writes them
+        // first), as a round does without STRATA_MTP_CATCHUP_ALL.
+        const float* src = src_R_ != nullptr ? src_R_ : window_R_;
+        if (a == 0) return draft(1, tokens, p, 0, drafts, err, probs, more, n_drafts);
+        if (!prefill(src, tokens, a, p, err)) return false;
+        return draft_first(1, src + (size_t) a * (size_t) (g_->hc * g_->n_embd), tokens[a], p + a, drafts, err, probs,
+                           more, n_drafts);
+    }
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
     // the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected rows is not caught
@@ -1166,7 +1231,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!wait_step(0)) return false;
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
-    float pl[strata::kernels::kVerifyMaxT];   // the drafts' probabilities for `more`, where the caller keeps none
+    float pl[strata::kernels::kVerifyNarrowT];   // the drafts' probabilities for `more`, where the caller keeps none
     float* pr = probs != nullptr ? probs : pl;
     pr[0] = ((volatile float*) h_prob_)[0];
     int n = 1;

@@ -1415,6 +1415,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         proj_h(b.sh_down, P.moe_out);
                         prefill::add_h(P.x, reinterpret_cast<const uint16_t*>(P.moe_out), T * N, cs);
                         steer(b, T, P.x, cs);
+                        if (!is_mtp) tap_rows(l, P.x, 1, T, p0, false, cs);   // DFlash2's prompt taps
                         mark(3, t_mark);
                         if (!is_mtp) unbind_block(l);
                         continue;
@@ -1442,6 +1443,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         k::add_inplace(P.x, P.moe_out, T * N, cs);
                     }
                     steer(b, T, P.x, cs);
+                    if (!is_mtp) tap_rows(l, P.x, 1, T, p0, false, cs);
                     mark(3, t_mark);
                     if (!is_mtp) unbind_block(l);
                     continue;
@@ -1474,8 +1476,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                                             cs, has_shared_ ? P.sh_g : nullptr);
                 k::add_inplace(P.x, P.moe_out, T * N, cs);
                 steer(b, T, P.x, cs);
+                if (!is_mtp) tap_rows(l, P.x, 1, T, p0, false, cs);
                 mark(3, t_mark);
             }
+            if (!prompt_taps_deliver(ptap_dev_, T, p0, cs, err)) return false;   // the chunk's DFlash2 taps
             if (enc_out_ != nullptr) {   // encode: every row through the final norm (or as it is), to the host
                 if (enc_norm_) k::native_qsa_rms_norm_weighted(P.x, out_norm_, P.hn, (int) N, (int) T, eps, cs);
                 if (!strata::gpu::stream_sync(cs) ||

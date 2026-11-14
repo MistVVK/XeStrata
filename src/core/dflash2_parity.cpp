@@ -450,26 +450,39 @@ void test_attention(void* s) {
     const int K = NH * HD;
     auto* dxq = dev.alloc<int8_t>((size_t) rows * K);
     auto* dxd = dev.alloc<float>((size_t) rows * (K / 32));
-    k::df2_attention(dq, dkring, dvring, dkblk, dvblk, danchor, slots, window, dpart, dxq, dxd, s, dtag, depoch);
-    parity::sync();
-    std::vector<int8_t> xq((size_t) rows * K);
-    std::vector<float> xd((size_t) rows * (K / 32));
-    parity::copy_out(xq.data(), dxq, xq.size());
-    parity::copy_out(xd.data(), dxd, xd.size());
+    auto run = [&](int variant) {
+        k::df2_attention_variant(variant);
+        k::df2_attention(dq, dkring, dvring, dkblk, dvblk, danchor, slots, window, dpart, dxq, dxd, s, dtag, depoch);
+        parity::sync();
+        std::vector<int8_t> xq((size_t) rows * K);
+        std::vector<float> xd((size_t) rows * (K / 32));
+        parity::copy_out(xq.data(), dxq, xq.size());
+        parity::copy_out(xd.data(), dxd, xd.size());
+        k::df2_attention_variant(0);
+        return std::pair<std::vector<int8_t>, std::vector<float>>(std::move(xq), std::move(xd));
+    };
+    const auto v1 = run(1), v2 = run(2);
+    report("attention variants (bytes)", std::memcmp(v1.first.data(), v2.first.data(), v1.first.size()) != 0 ||
+                                            std::memcmp(v1.second.data(), v2.second.data(), v1.second.size() * sizeof(float)) != 0,
+           0);
     // dequantize and compare within one quantization step (the fp order differs, a code may differ by 1)
-    int64_t bad = 0; double worst = 0;
-    for (int r = 0; r < rows; ++r)
-        for (int b = 0; b < K / 32; ++b) {
-            const float d = xd[(size_t) r * (K / 32) + b];
-            for (int i = 0; i < 32; ++i) {
-                const size_t at = (size_t) r * K + b * 32 + i;
-                const float got = xq[at] * d;
-                const double e = std::fabs((double) got - ref[at]), bound = 1.5 * std::fabs(d) + 1e-5;
-                worst = std::max(worst, e / bound);
-                if (e > bound) ++bad;
+    auto check = [&](const char* name, const std::vector<int8_t>& xq, const std::vector<float>& xd) {
+        int64_t bad = 0; double worst = 0;
+        for (int r = 0; r < rows; ++r)
+            for (int b = 0; b < K / 32; ++b) {
+                const float d = xd[(size_t) r * (K / 32) + b];
+                for (int i = 0; i < 32; ++i) {
+                    const size_t at = (size_t) r * K + b * 32 + i;
+                    const float got = xq[at] * d;
+                    const double e = std::fabs((double) got - ref[at]), bound = 1.5 * std::fabs(d) + 1e-5;
+                    worst = std::max(worst, e / bound);
+                    if (e > bound) ++bad;
+                }
             }
-        }
-    report("attention", bad, worst);
+        report(name, bad, worst);
+    };
+    check("attention (8-query groups)", v1.first, v1.second);
+    check("attention (256 work-items)", v2.first, v2.second);
 }
 
 void test_topk(void* s) {

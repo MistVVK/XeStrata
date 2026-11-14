@@ -193,37 +193,51 @@ class ParallelArgs(unittest.TestCase):
         self.assertEqual(parallel_args({"parallel": 2}, ["--batch", "3"]), [])       # the args' own value wins
         self.assertEqual(parallel_args({"parallel": "4"}, []), [])                   # said and ignored
         self.assertEqual(parallel_args({"parallel": True}, []), [])
-        self.assertEqual(parallel_args({"parallel": 12}, []), ["--batch", "12"])     # the engine warns and caps
+        self.assertEqual(parallel_args({"parallel": 20}, []), ["--batch", "20"])     # the engine warns and caps
 
     def test_parallel_above_the_window_says_so_unless_batch_mtp(self):
         import contextlib
         import io
         import os
 
-        def said(args, env):
+        def said(n, args, env, wide_env=None):
+            """What the server says of "parallel": n with these args, XESTRATA_BATCH_MTP and XESTRATA_WIDE_WINDOW."""
             buf = io.StringIO()
-            old = os.environ.get("XESTRATA_BATCH_MTP")
-            if env is None:
-                os.environ.pop("XESTRATA_BATCH_MTP", None)
-            else:
-                os.environ["XESTRATA_BATCH_MTP"] = env
+            old = {k: os.environ.get(k) for k in ("XESTRATA_BATCH_MTP", "XESTRATA_WIDE_WINDOW")}
+            for k, v in (("XESTRATA_BATCH_MTP", env), ("XESTRATA_WIDE_WINDOW", wide_env)):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
             try:
                 with contextlib.redirect_stdout(buf):
-                    r = parallel_args({"parallel": 12}, args)
+                    r = parallel_args({"parallel": n}, args)
             finally:
-                if old is None:
-                    os.environ.pop("XESTRATA_BATCH_MTP", None)
-                else:
-                    os.environ["XESTRATA_BATCH_MTP"] = old
-            self.assertEqual(r, ["--batch", "12"])
-            return "at most" in buf.getvalue()
-        self.assertTrue(said([], None))                  # 0.1.39: the window holds 8 rows
-        self.assertTrue(said([], "0"))
-        self.assertFalse(said(["--batch-mtp"], None))    # --batch-mtp waves more through the window
-        self.assertFalse(said([], "1"))
+                for k, v in old.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            self.assertEqual(r, ["--batch", str(n)])
+            return buf.getvalue()
+        # the window holds 16 rows (the wide windows' default, auto)
+        self.assertNotIn("at most", said(12, [], None))
+        self.assertIn("at most 16", said(20, [], None))
+        self.assertIn("at most 16", said(20, [], "0"))
+        # the wide windows off - by the args or the environment - hold it at 8, as before
+        self.assertIn("at most 8", said(12, ["--wide-window", "off"], None))
+        self.assertIn("at most 8", said(12, ["--wide-window", "0"], None))
+        self.assertIn("at most 8", said(12, [], None, wide_env="0"))
+        self.assertNotIn("at most", said(8, ["--wide-window", "off"], None))
+        self.assertNotIn("at most", said(12, ["--wide-window", "on"], None, wide_env="0"))   # the args' own value wins
+        # --batch-mtp waves more through the window
+        self.assertNotIn("at most", said(20, ["--batch-mtp"], None))
+        self.assertNotIn("at most", said(12, ["--wide-window", "off"], "1"))
 
         args = engine_args({"args": ["--pack", "p"], "parallel": 2})
         self.assertEqual(args[-2:], ["--batch", "2"])
+        args = engine_args({"args": ["--pack", "p"], "wide_window": "off", "parallel": 2})
+        self.assertIn("--wide-window", args)
 
     def test_auto_is_not_a_count(self):
         # the server fills "auto" in from the machine before the engine starts (serve/autotune.py); one that reaches

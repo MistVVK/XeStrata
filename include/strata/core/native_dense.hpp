@@ -4,11 +4,13 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
 namespace strata::core {
+class DenseSlab;
 class WeightTable;
 struct WeightRef;
 
@@ -25,7 +27,7 @@ const uint16_t* hc_bf16_view(const WeightRef* w, int slot, void* stream);
 // alive until all graphs that reference it have been destroyed and synchronized.
 class NativeDense {
 public:
-    NativeDense() = default;
+    NativeDense();
     ~NativeDense();
     NativeDense(const NativeDense&) = delete;
     NativeDense& operator=(const NativeDense&) = delete;
@@ -66,6 +68,7 @@ public:
     size_t tensor_count() const { return weights_.size(); }
 
 private:
+    std::unique_ptr<DenseSlab> slab_;
     std::vector<void*> weights_;
     std::vector<void*> hc_q8_;   ///< STRATA_HC_Q8=1: the hyper-connection projections' Q8_0 copies
     void* scratch_ = nullptr;

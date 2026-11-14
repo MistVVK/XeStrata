@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
     auto embed = [](const int32_t*, int n, float* out, void* st, std::string&) {
         return strata::gpu::memset_async(out, 0, (size_t) n * 2560 * 4, st);
     };
-    auto headfn = [](const uint8_t* rows, const uint8_t* xq, int n, float* y, void* st) {
+    auto headfn = [](const uint8_t* rows, const uint8_t* xq, const float*, int n, float* y, void* st) {
         strata::kernels::native_mmvq(8, rows, xq, y, 2560, HR, n, st);
     };
     if (!d.bind_raw(embed, headfn, 8, HR, {}, err)) { std::fprintf(stderr, "bind: %s\n", err.c_str()); return 1; }

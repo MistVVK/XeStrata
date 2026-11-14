@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/native_dense.hpp"
+#include "strata/core/dense_slab.hpp"
 #include "strata/core/run_manifest.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -82,7 +83,10 @@ bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
            ref.bytes == (uint64_t) ref.elements * 2 && tensor.shape[0] == (uint64_t) ref.ne0 &&
            tensor.shape[1] == (uint64_t) ref.ne1;
 }
-struct DeviceFree { void operator()(void* p) const { if (p) strata::gpu::free(p); } };
+struct DeviceFree {
+    DenseSlab* slab = nullptr;
+    void operator()(void* p) const { if (p && (!slab || !slab->owns(p))) strata::gpu::free(p); }
+};
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
     WeightRef* ref;
@@ -139,6 +143,48 @@ bool hc_q8_faster(const WeightTable& table, const std::vector<std::pair<WeightRe
         return faster;
     }
     return false;
+}
+
+// XESTRATA_HC_DOWN_ROWS unset: one layer's hyper-connection read (the same work a half-layer does: norm, down, up)
+// timed with one row a sub-group in the down and with two, on one token and on a window of eight; two rows are kept
+// where the eight-token read is faster (from the first window when the one-token read is faster too, else from five
+// tokens, where upstream's row blocking paid).  The read is timed, not the down alone: upstream's down blocking was
+// faster as a kernel and slower in the engine on two of XeStrata's cards.  Said either way.
+void hc_down_rows_choose(const WeightTable& table, void* stream) {
+    for (int l = 0; l < 1024; ++l) {
+        const std::string layer = "blk." + std::to_string(l) + ".";
+        const WeightRef* down = table.find(layer + "hc_attn_down.weight");
+        const WeightRef* up = table.find(layer + "hc_attn_up.weight");
+        const WeightRef* norm = table.find(layer + "hc_attn_norm.weight");
+        if (down == nullptr || up == nullptr || norm == nullptr || down->data == nullptr || up->data == nullptr ||
+            norm->data == nullptr)
+            continue;
+        const WeightRef* inject = table.find(layer + "hc_attn_inject.weight");
+        strata::kernels::FusedGrArgs w;
+        w.w_norm = static_cast<const float*>(norm->data);
+        w.w_down = static_cast<const uint16_t*>(down->data);
+        w.w_up = static_cast<const uint16_t*>(up->data);
+        w.w_inject = inject != nullptr ? static_cast<const uint16_t*>(inject->data) : nullptr;
+        double o1 = 0, t1 = 0, o8 = 0, t8 = 0;
+        try {
+            strata::kernels::fused_gr_time_down(w, 1, 40, stream, o1, t1);
+            strata::kernels::fused_gr_time_down(w, 8, 40, stream, o8, t8);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "xestrata: XESTRATA_HC_DOWN_ROWS: timing the read failed (%s): one row a sub-group\n",
+                         e.what());
+            return;
+        }
+        // the largest window is where the read costs most: a form that loses there is not kept, whatever the one-token
+        // read does (the switch's threshold cannot say "two rows below five, one above")
+        const bool one = t1 < 0.99 * o1, window = t8 < 0.99 * o8;
+        strata::kernels::fused_gr_set_down_rows(window, one ? 1 : 5);
+        std::fprintf(stderr, "xestrata: XESTRATA_HC_DOWN_ROWS: the hyper-connection read, 1 and 8 tokens: one row a "
+                             "sub-group %.1f + %.1f us, two rows %.1f + %.1f us: %s (XESTRATA_HC_DOWN_ROWS=0/1 picks "
+                             "one)\n",
+                     o1, o8, t1, t8,
+                     !window ? "one row" : one ? "two rows, every window" : "two rows, 5-token windows and up");
+        return;
+    }
 }
 }
 
@@ -205,9 +251,12 @@ namespace {
 void* g_hc_scratch[4] = {nullptr, nullptr, nullptr, nullptr};
 }
 
+NativeDense::NativeDense() = default;
+
 NativeDense::~NativeDense() {
     if (scratch_) strata::gpu::free(scratch_);
-    for (void* p : weights_) strata::gpu::free(p);
+    for (void* p : weights_) if (!slab_ || !slab_->owns(p)) strata::gpu::free(p);
+    slab_.reset();
     for (void* p : hc_q8_) strata::gpu::free(p);
     if (hc_side_)
         for (void*& p : g_hc_scratch) { strata::gpu::free(p); p = nullptr; }
@@ -273,6 +322,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
         sycl::queue& compute = strata::core::Runtime::get().compute();
+        auto slab = std::make_unique<DenseSlab>();
         std::vector<Pending> pending;
         std::set<std::string> seen;
         int max_in = 0;
@@ -359,9 +409,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (bf16_as_q8_0(tensor, ref)) {   // #4741: a BF16 projection of the pack, served as Q8_0
                     const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
-                    void* allocation = nullptr;
-                    bool status = strata::gpu::alloc_device(&allocation, bytes);
-                    DevicePtr data(allocation);
+                    void* allocation = slab->alloc(bytes);
+                    bool status = allocation != nullptr;
+                    DevicePtr data(allocation, DeviceFree{slab.get()});
                     if (status)
                         strata::kernels::fused_gr_quantize_q8_0(static_cast<const uint16_t*>(ref.data),
                                                                 static_cast<uint8_t*>(data.get()), (int64_t) nb,
@@ -391,9 +441,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     (int) tensor.type, (int) ref.ne0, (int) ref.ne1);
-                void* allocation = nullptr;
-                bool status = strata::gpu::alloc_device(&allocation, bytes);
-                DevicePtr data(allocation);
+                void* allocation = slab->alloc(bytes);
+                bool status = allocation != nullptr;
+                DevicePtr data(allocation, DeviceFree{slab.get()});
                 if (status)
                     status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
                 if (!status) {
@@ -492,6 +542,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
         }
         if (hc_q8_short) hc_q8.clear();
+        if (hc_q8.empty()) hc_down_rows_choose(table, &compute);
         hc_q8_bytes = 0;
         for (const auto& h : hc_q8) hc_q8_bytes += (uint64_t) h.first->ne0 / 32 * 34 * (uint64_t) h.first->ne1;
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
@@ -501,6 +552,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (!status) { err = std::string("native dense scratch: ") + strata::gpu::last_error(); return false; }
         // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
+        slab_ = std::move(slab);   // owns every slab before any weight is published, including on a timing failure
         // the timing's launches read the weights uploaded here, as the decode reads a matrix after the others (not a
         // span allocated for it, which a GPU's driver may keep from the free memory after it is freed)
         std::vector<const void*> at;

@@ -7,6 +7,7 @@
 // in its code while the other engine took the option, 943abb056).
 #pragma once
 
+#include "strata/core/window_rows.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/platform/aux_cpus.hpp"
 
@@ -44,6 +45,10 @@ struct SharedOptionFields {
     bool* greedy = nullptr;   ///< --seed turns it off
     // speculative decoding
     int* spec = nullptr;
+    /// --spec auto: the window is one of the candidates the serve engine measures at its start (strata/spec/
+    /// draft_probe.hpp), from `spec_auto_default` (its largest) down; a number is kept as given
+    bool* spec_auto = nullptr;
+    int spec_auto_default = 4;
     std::string* spec_window = nullptr;
     bool* spec_window_given = nullptr;
     bool spec_window_all = false;   ///< --spec-window all is taken (PlainModel's every-draft window)
@@ -98,6 +103,7 @@ struct SharedOptionFields {
     int lookup_chain_min_lo = 1;         ///< generate 3; plain 1
     int* pipeline_windows = nullptr;
     int pipeline_windows_hi = -1;        ///< generate 2; plain no upper bound
+    bool wide_window = false;            ///< --wide-window auto|off|on (core::set_wide_window, window_rows.hpp)
     int* adapt_mib_per_token = nullptr;
     bool adapt_mib_clamp0 = false;       ///< generate: max 0; plain as it is
     int* batch = nullptr;                ///< --batch / --slots
@@ -155,6 +161,16 @@ template <class Next>
 int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFields& f) {
     auto i64 = [&](int64_t* p) { *p = std::strtoll(next(a.c_str()), nullptr, 10); return 1; };
     auto f64 = [&](double* p) { *p = std::strtod(next(a.c_str()), nullptr); return 1; };
+    if (a == "--wide-window" && f.wide_window) {
+        const char* v = next(a.c_str());
+        strata::core::WideWindow w;
+        if (!strata::core::parse_wide_window(v, w)) {
+            std::fprintf(stderr, "%s: --wide-window takes auto, off or on, not %s\n", f.who, v);
+            return -1;
+        }
+        strata::core::set_wide_window(w);
+        return 1;
+    }
     if (a == "--adapt-every" && f.adapt_every) {
         *f.adapt_every = (int) std::strtol(next(a.c_str()), nullptr, 10);
         if (f.adapt_every_given) *f.adapt_every_given = true;
@@ -185,7 +201,17 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
         if (f.greedy) *f.greedy = false;
         return 1;
     }
-    if (a == "--spec" && f.spec) { *f.spec = (int) std::strtol(next(a.c_str()), nullptr, 10); return 1; }
+    if (a == "--spec" && f.spec) {
+        const std::string v = next(a.c_str());
+        if (v == "auto" && f.spec_auto) {
+            *f.spec_auto = true;
+            *f.spec = f.spec_auto_default;
+        } else {
+            if (f.spec_auto) *f.spec_auto = false;
+            *f.spec = (int) std::strtol(v.c_str(), nullptr, 10);
+        }
+        return 1;
+    }
     if (a == "--spec-window" && f.spec_window) {
         *f.spec_window = next(a.c_str());
         if (f.spec_window_given) *f.spec_window_given = true;

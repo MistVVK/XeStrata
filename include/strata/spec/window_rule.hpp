@@ -20,6 +20,16 @@ inline int df2_window(const float* probs, int cap, double conf) {
     return t;
 }
 
+/// --draft-conf 0: DFlash2's window confidence from the expert slots the card holds beside the drafter (both engines).
+/// The steps are upstream's CUDA measurement (CONF_STEPS, 6140ce1f3) as the starting point; XeStrata's 3-GPU sweep
+/// replaces them (the Arc A-series measured 0.6 best, upstream b1f4c9296).
+inline double df2_default_conf(long long slots) {
+    if (slots >= 12000) return 0.35;
+    if (slots >= 7500) return 0.5;
+    if (slots >= 3000) return 0.7;
+    return 0.8;
+}
+
 /// The MTP's cost-aware window applies only to candidates the MTP chain drew (not DFlash2's, not a lookup's, not
 /// the prompt's first single-row window).
 inline bool mtp_cost_applies(bool use_mtp, bool spec_cost, bool df2_active, bool first_window) {

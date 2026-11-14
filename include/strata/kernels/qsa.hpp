@@ -89,6 +89,7 @@
 // The RAW tail is fp32 for the same reason and because it is only `idx_block - 1` rows.
 #pragma once
 
+#include "strata/core/layout.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 
 #include <cstdint>
@@ -109,11 +110,17 @@ struct QsaShapes {
     int64_t page_size = 0;  ///< KV page granule in CELLS; 1 is a legal unpaged configuration
 };
 
-/// The real artifact's geometry, so no caller transcribes it by hand.
+/// The real artifact's geometry, so no caller transcribes it by hand.  The heads and their width are the compiled
+/// shape's (kCompiledGeometry); `n_rot`, the indexer's block and the selection budget are the artifact's.
 inline QsaShapes qsa_real_shapes() {
     QsaShapes s;
-    s.n_head = 24; s.n_head_kv = 2; s.head_dim = 256; s.n_rot = 64;
-    s.idx_n_head = 4; s.idx_dim = 128; s.idx_block = 4; s.idx_top_k = 2048;
+    s.n_head = strata::core::kCompiledGeometry.n_head;
+    s.n_head_kv = strata::core::kCompiledGeometry.n_head_kv;
+    s.head_dim = strata::core::kCompiledGeometry.head_dim;
+    s.n_rot = 64;
+    s.idx_n_head = strata::core::kCompiledGeometry.idx_q_heads;
+    s.idx_dim = strata::core::kCompiledGeometry.idx_key_dim;
+    s.idx_block = 4; s.idx_top_k = 2048;
     // one page = one indexer block (4 cells): the granule KV streaming keeps resident (kv_stream.hpp). The readers
     // resolve a row per cell anyway, so the page size costs them nothing (measured: identical output and speed).
     s.page_size = 4;
@@ -223,6 +230,8 @@ struct QsaIndexerBuffers {
 
 /// The largest context the selection's capacity is sized for: `qsa_selection_width(kTopkMaxCells, s)` ids.
 inline constexpr int64_t kTopkMaxCells = 32768;
+/// The most rows one launch of the batch-window kernels takes (a verify window's slots).
+inline constexpr int kQsaRowsMax = 8;
 
 /// Softmax GQA over ONLY the gathered cells.  `q` is (n_head, head_dim) f32, already normed and rotated.
 ///

@@ -23,6 +23,9 @@ string(REPLACE "-" "~" XESTRATA_PACKAGE_UPSTREAM "${STRATA_UPSTREAM_VERSION}")
 add_compile_definitions(STRATA_VERSION="${STRATA_VERSION_NAME}"
   STRATA_BACKEND="xe" STRATA_UPSTREAM_VERSION="${STRATA_UPSTREAM_VERSION}"
   STRATA_UPSTREAM_COMMIT="${STRATA_UPSTREAM_COMMIT}")
+# -DSTRATA_GEOMETRY=<name> / -DSTRATA_GEOMETRY_FILE=<path>: the model shape the Qwen3.8 engine's kernels are compiled
+# for (include/strata/core/layout.hpp's kCompiledGeometry); the default is Flash-Next's header and adds no flag.
+include(cmake/StrataGeometry.cmake)
 # ggml's CPU backend for any AVX2 CPU (the default), or OFF for this machine's (-march=native).  On the B70 machines
 # measured the two decode equally fast, and a native build can stop running when the CPU is changed (Strata's own
 # AVX-512 kernels are per-file and chosen at run time either way).
@@ -247,6 +250,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(penalty_window_test src/kernels/penalty_window_test.cpp)
   target_include_directories(penalty_window_test PRIVATE include)
   add_test(NAME penalty_window_test COMMAND penalty_window_test)
+  # --batch slots keep their request's penalties and logit bias: the per-row histories of a batch window (upstream
+  # 2678c9732); header-only, no GPU
+  add_executable(slot_history_test src/kernels/slot_history_test.cpp)
+  target_include_directories(slot_history_test PRIVATE include)
+  add_test(NAME slot_history_test COMMAND slot_history_test)
   # upstream b89bf5947: an engine started at Low disk priority goes back to Normal (Windows; else it skips)
   add_executable(io_priority_test tests/platform/io_priority_test.cpp)
   target_link_libraries(io_priority_test PRIVATE strata_platform)
@@ -415,7 +423,8 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-load PRIVATE strata_core)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
-                                    src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
+                                    src/kernels/xe/native_mmvq.cpp src/kernels/xe/native_mmvq_wide.cpp
+                                    src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
                                     src/kernels/xe/kv_q8.cpp src/kernels/xe/kv_q4.cpp
@@ -556,7 +565,8 @@ if(STRATA_ENABLE_XE)
   # verify window and the MTP drafter.  Host code over strata_core's GPU operations (strata/core/gpu.hpp).
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
-                                   src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
+                                   src/core/native_dense.cpp src/core/dense_slab.cpp src/core/verify.cpp
+                                   src/core/moe_window.cpp
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/core/mtp.cpp src/core/dflash2.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
@@ -1578,7 +1588,7 @@ endif()
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
 add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
-                             src/spec/drafter_policy.cpp
+                             src/spec/drafter_policy.cpp src/spec/draft_probe.cpp
             src/spec/draft_source.cpp src/spec/guess_gate.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
@@ -1594,6 +1604,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(drafter_policy_test src/spec/drafter_policy_test.cpp)
   target_link_libraries(drafter_policy_test PRIVATE strata_spec)
   add_test(NAME drafter_policy_test COMMAND drafter_policy_test)
+  add_executable(draft_probe_test src/spec/draft_probe_test.cpp)
+  target_link_libraries(draft_probe_test PRIVATE strata_spec)
+  add_test(NAME draft_probe_test COMMAND draft_probe_test)
   add_executable(window_rule_test src/spec/window_rule_test.cpp)
   target_link_libraries(window_rule_test PRIVATE strata_spec)
   add_test(NAME window_rule_test COMMAND window_rule_test)

@@ -24,12 +24,13 @@ Setup says how many slots this machine could hold (whether the expert cache has 
 
 | Option | What it does |
 | --- | --- |
-| `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own session (GDN recurrence, QSA K/V and indexer, PLE history). |
+| `"parallel": N` / `--batch N` / `--slots N` (2..16) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own session (GDN recurrence, QSA K/V and indexer, PLE history). |
 | `"batch_groups": G` / `--batch-groups G` | On a layer split, the N slots in G groups, a stage on another group at once ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)); `auto` with a layer split and 2 or more slots: the most groups that divide them. |
 | `--batch-mtp` / `--no-batch-mtp` | On by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. On a layer split the slots' drafters sit on the last GPU ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)). `XESTRATA_BATCH_MTP=0` turns it off as well (`auto`, the default, keeps it where `--mtp` and the slots allow it; `0` and `1` fix it). |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can.
-That is at most 8 slots (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit.
+That is at most 16 slots, as many as fit in VRAM, or none (one request at a time) when not two fit.
+Up to 8 slots a window holds 8 rows; asked for 9 slots or more, the window grows to 16 rows (`--wide-window`, `auto` by default). With `--wide-window off` a window holds 8 rows and 8 slots at most.
 To fit, the slots' sessions, with `--batch-mtp` each slot's drafter, and an expert cache that works must all go in; when they do not, the engine gives slots back from the last and its start log says how many run.
 The server reads the count the engine reports (`INFO batch_slots=N`), and `GET /v1/status` says it (`concurrency.serving`).
 
@@ -118,7 +119,7 @@ An earlier GPU's commit is queued only while no window there waits on the host (
 A slot's drafter catches up on its own rows and drafts the next proposals as an asynchronous chain; a group whose chain has not landed lets another group start first.
 Anything that reads a slot's state (an admission, a parked conversation, the solo path taking a slot back) first finishes the groups in flight and the queued commits.
 
-It runs on a layer split with two or more groups whose windows (the group's slots x (1 + N)) hold at most 8 rows.
+It runs on a layer split with two or more groups whose windows (the group's slots x (1 + N)) hold at most a window's rows (8, or 16 when 9 slots or more were asked for).
 When it cannot run, the engine says why and leaves it off, and turns `--batch-mtp` off as well if the slots stay in pipelined groups.
 Every GPU keeps the saved rows (25.5 MiB at `=1` and 38.2 MiB at `=2` with 4 slots, upstream's numbers), taken from the expert cache.
 
@@ -141,11 +142,12 @@ These settings make the comparison exact:
 With the default settings the outputs stay coherent but drift apart after some tokens, as two solo runs whose windows differ can.
 
 Sampled requests (temperature, top_p, top_k, min_p, seed) are drawn row by row with the solo window's counter-based draw (Philox(seed, position)).
+The repetition / frequency / presence penalties and the logit bias are the request's own as well: the slot stages its reply's tail (from the token its reply began at) before each window, and its rows are drawn with the history a solo window gives them (a request that continues an earlier leg names where its reply began, `pen_from`).
+A plain greedy slot with no penalty and no bias keeps the window's argmax token, as before.
 
 ## Limits (for now)
 
 - Batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo path keeps its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
-- Repetition / frequency / presence penalties are not applied in batch windows.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
@@ -156,7 +158,7 @@ Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B and Qwen3.5-9B take the slots with the s
 How many this machine could hold is Qwen3.8-Flash-Next's rule: the models' weights and experts' sizes and the cards' VRAM, not the model's kind.
 How the server uses them (moving from the solo path into a slot, each slot's conversation cache, `prompt_cache_key`) is Qwen3.8-Flash-Next's.
 
-- At most `--max-t` slots (8 by default). Each slot's state is taken before the VRAM tier of experts, within half the VRAM free then, and the start log says how many were taken.
+- At most `--max-t` slots (8 by default, 16 when 9 slots or more are asked for). Each slot's state is taken before the VRAM tier of experts, within half the VRAM free then, and the start log says how many were taken.
 - A slot grows with the context (Qwen3.6-35B-A3B: 414 MiB at a 16K context, 2,878 MiB at 128K; Qwen3.5-9B: 562 MiB at 16K).
 - With the MTP layer, each slot also checks one MTP draft a window, as Qwen3.8-Flash-Next's, and moves two tokens when it holds (`--batch-mtp`, on by default; `--no-batch-mtp` or `XESTRATA_BATCH_MTP=0` turns it off; `XESTRATA_BATCH_MTP=auto` is the default). A window holds `--max-t` rows, so the slots past that go without a draft in it. Each slot keeps a copy of its recurrent states after its first row (about 60 MiB for Qwen3.6-35B-A3B).
 - While a prompt is read the slots wait (they do not decode between its chunks); `BYIELD` is taken and does nothing.

@@ -25,6 +25,7 @@
 #include "strata/core/control_vector.hpp"
 #include "strata/core/stdin_lines.hpp"
 #include "strata/core/watchdog.hpp"
+#include "strata/core/context_fit.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_tier.hpp"
@@ -35,9 +36,7 @@
 #include "strata/program/info_line.hpp"
 #include "strata/program/shared_options.hpp"
 #include "strata/core/conversation_snapshot.hpp"
-#if defined(STRATA_USE_HIP)
 #include "strata/core/serve_stop_bound.hpp"
-#endif
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/logit_bias.hpp"
@@ -87,6 +86,7 @@
 #include "strata/program/split_rules.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
+#include "strata/spec/draft_probe.hpp"
 #include "strata/spec/drafter_policy.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
@@ -99,6 +99,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/run_manifest.hpp"
+#include "strata/core/window_rows.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -128,6 +129,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/platform/downgrade.hpp"
 #include "strata/platform/env.hpp"
+#include "strata/platform/process.hpp"
 
 #include <array>
 #include <exception>
@@ -158,6 +160,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <set>
@@ -248,7 +251,7 @@ struct Options {
     /// stream-token path.  The arithmetic is the native one with or without it.
     std::string native_preset;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
-    std::string ple_io = "direct";
+    std::string ple_io = "auto";
     bool ple_io_explicit = false;      ///< --ple-io was given: the engine only warns when direct measures slow
     /// The token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py: BF16 as shipped)
     std::string embd_gguf;
@@ -393,6 +396,8 @@ struct Options {
     /// spec-1 drafts); 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for
     /// the exactness test); `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
     int spec = 0;
+    /// --spec auto: the window is measured at the --serve start among 4 and 2 (strata/spec/draft_probe.hpp)
+    bool spec_auto = false;
     /// --serve runs up to this many sequences at once, one token each per batch window (0 = off; upstream PR #559,
     /// #465).  A request sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual
     /// path, then continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
@@ -551,8 +556,10 @@ struct Options {
     /// its own (llama.cpp's qwen4exp MTP graph) instead of one RMS over all four (the default, tools/mtp_probe.py).
     bool mtp_hnorm_stream = false;
     /// --draft mtp|dflash2|auto|off: which drafter proposes (default mtp).  dflash2 loads the DFlash2 block drafter
-    /// (--draft-model) instead of the MTP layer; auto loads both and each request picks one (draft= key, else
-    /// --draft-rule).  off: no drafter (the suffix lookup may still propose).
+    /// (--draft-model) instead of the MTP layer; auto (--serve): the start measures the MTP, DFlash2 (with a pack) and
+    /// no drafter on a short text and keeps the fastest, the others released (strata/spec/draft_probe.hpp), or both
+    /// drafters when they are within the margin (each request then picks one: draft= key, else --draft-rule); auto
+    /// without --serve: the MTP.  off: no drafter (the suffix lookup may still propose).
     std::string draft = "mtp";
     std::string draft_model;   ///< --draft-model: the DFlash2 pack (tools/dflash2_pack.py)
     /// --draft-conf P: DFlash2's window ends where the product of its selector probabilities falls below P
@@ -570,15 +577,26 @@ struct Options {
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
 };
 
-/// --draft-conf 0: DFlash2's window confidence from the expert slots the card holds after the drafter.  The steps
-/// are upstream's CUDA measurement (CONF_STEPS, 6140ce1f3) as the starting point; XeStrata's 3-GPU sweep replaces
-/// them (the Arc A-series measured 0.6 best, upstream b1f4c9296).  A value measured on this card is written here.
-static double df2_default_conf(int64_t slots) {
-    if (slots >= 12000) return 0.35;
-    if (slots >= 7500) return 0.5;
-    if (slots >= 3000) return 0.7;
-    return 0.8;
+using strata::spec::df2_default_conf;   // --draft-conf 0 (strata/spec/window_rule.hpp)
+
+/// Two files of the same bytes (setup writes the draft vocabulary beside the MTP layer and again beside the DFlash2
+/// pack: the two drafters share one gathered head when they are the same subset, ~180 MiB of VRAM).
+static bool same_bytes(const std::string& a, const std::string& b) {
+    if (a == b) return true;
+    std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+    if (!fa || !fb) return false;
+    const std::string da((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
+    const std::string db((std::istreambuf_iterator<char>(fb)), std::istreambuf_iterator<char>());
+    return !da.empty() && da == db;
 }
+
+/// The start's measurement of the drafters (strata/spec/draft_probe.hpp): the prompt path's DFlash2 tap staging while
+/// it runs (its prompts are a hundred-odd tokens; 2048 rows only if DFlash2 stays), and the VRAM that must stay free
+/// beside DFlash2 while it is measured - the window graphs of a short context are captured on first use, and a card
+/// near full pages (a 128K start with 30 MiB free stalled for good at its first window).  Not measured on the three
+/// GPUs yet (unverified): a smaller card measures nothing and keeps the MTP.
+constexpr int64_t kProbeTapRows = 256;
+constexpr int64_t kProbeFreeMib = 160;
 
 void usage() {
     std::fprintf(stderr,
@@ -589,9 +607,12 @@ void usage() {
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-gguf PATH      the PLE table (with --native: default the shard of --native's model that holds it)\n"
                  "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
-                 "  --ple-io direct|mmap|ram  n-gram table reads (plan v0.3 P2). direct (default): unbuffered SSD\n"
-                 "                       reads, the table never enters RAM or the file cache; mmap: A/B arm;\n"
-                 "                       ram: mmap with the whole table locked in RAM at start\n"
+                 "  --ple-io auto|direct|mmap|ram  n-gram table reads (plan v0.3 P2). auto (default): the reads\n"
+                 "                       are measured here and the faster of direct and mmap is taken; direct:\n"
+                 "                       unbuffered SSD reads, the table never enters RAM or the file cache; mmap:\n"
+                 "                       mapped reads (the OS file cache); ram: mmap with the table locked in RAM\n"
+                 "                       (XESTRATA_PLE_AUTO_RAM=1 lets the RAM policy choose it; XESTRATA_PLE_AUTO_MMAP\n"
+                 "                       =0/1 keeps direct or takes mmap without measuring it)\n"
                  "  --embd-gguf PATH     the token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py:\n"
                  "                       BF16 as the checkpoint ships it; mapped host memory, no VRAM)\n"
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
@@ -691,8 +712,12 @@ void usage() {
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
-                 "  --spec N             the MTP drafter's verify window: how many tokens it proposes per check (setup\n"
-                 "                       writes 4; --suffix-draft lets it grow by 2, up to 8, where a repeat is likely)\n"
+                 "  --spec N|auto        the MTP drafter's verify window: how many tokens it proposes per check (--suffix-\n"
+                 "                       draft lets it grow by 2, up to 8, where a repeat is likely); auto (setup's): 4 or\n"
+                 "                       2, measured at the --serve start.  Past 8 (up to 16): the MTP's own windows\n"
+                 "                       stay at 8, the lookup's or DFlash2's take the rest\n"
+                 "  --wide-window auto|off|on  verify and batch windows of up to 16 rows: auto (default) for --spec\n"
+                 "                       past 8 and a batch of more than 8 slots, off never, on wherever they fit\n"
                  "  --spec-window R      auto (default): each round keeps a draft while the tokens it is expected to\n"
                  "                       add raise the window's tokens per ms, at the measured window costs; min-p:\n"
                  "                       the floor below\n"
@@ -705,7 +730,9 @@ void usage() {
                  "  --mtp-hnorm pooled|stream  the draft layer's hidden-input norm: one RMS over all four streams\n"
                  "                       (default) or one per stream (llama.cpp's MTP graph)\n"
                  "  --draft mtp|dflash2|auto|off  which drafter proposes (default mtp).  dflash2: the DFlash2 block\n"
-                 "                       drafter (--draft-model); auto: both loaded, each request picks (draft= key)\n"
+                 "                       drafter (--draft-model); auto: --serve measures the MTP, DFlash2 and none at\n"
+                 "                       its start and keeps the fastest (XESTRATA_DRAFT_PROBE=0: both loaded, each\n"
+                 "                       request picks); without --serve the MTP\n"
                  "  --draft-model PACK   the DFlash2 pack (tools/dflash2_pack.py, setup fetches it)\n"
                  "  --draft-conf P       DFlash2's window ends where its selector-probability product falls below P\n"
                  "                       (0 = the per-device default from the card's expert slots)\n"
@@ -1676,7 +1703,7 @@ int check_model(const std::string& gguf) {
             problems.push_back(err);
         } else {
             const bool q38 = s.arch == strata::ModelArch::Qwen4Exp;
-            strata::core::ModelGeometry g;
+            strata::core::ModelGeometry g = strata::core::kCompiledGeometry;
             if (q38 && !strata::core::geometry_from_spec(s, g, err)) problems.push_back(err);
             std::vector<int64_t> blocks;
             for (int64_t l = 0; l < s.n_layer; ++l)
@@ -2193,6 +2220,14 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
+    // `xestrata --geometry`: the model shape the kernels are compiled for (the geometry header's kGeometryName;
+    // flash_next for the default build), one line and nothing else, before any GPU is touched
+    for (int i = 1; i < argc && i < 3; ++i) {
+        if (std::strcmp(argv[i], "--geometry") == 0) {
+            std::printf("%s\n", strata::core::kGeometryName);
+            return 0;
+        }
+    }
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
@@ -2251,6 +2286,8 @@ int main(int argc, char** argv) {
     shared.seed = &o.seed;
     shared.greedy = &o.greedy;
     shared.spec = &o.spec;
+    shared.spec_auto = &o.spec_auto;
+    shared.spec_auto_default = 4;
     shared.spec_window = &o.spec_window;
     shared.spec_window_given = &o.spec_window_given;
     shared.spec_min_p = &o.spec_min_p;
@@ -2299,6 +2336,7 @@ int main(int argc, char** argv) {
     shared.lookup_chain_min_lo = 3;
     shared.pipeline_windows = &o.pipeline_windows;
     shared.pipeline_windows_hi = 2;
+    shared.wide_window = true;
     shared.adapt_mib_per_token = &o.adapt_mib_per_token;
     shared.adapt_mib_clamp0 = true;
     shared.batch = &o.batch;
@@ -2730,7 +2768,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if ((o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
+    if ((o.ple_io != "auto" && o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
         o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
         std::fprintf(stderr, "xestrata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
         return 2;
@@ -2753,12 +2791,25 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
+    // The windows' rows (window_rows.hpp): --spec past 8 needs the wide windows, which --wide-window off and
+    // --pipeline-windows (its windows are captured for every size up to 8) leave out; a lookup lengthens a window up to
+    // 8, or with --spec past 8 or --wide-window on up to the wide window's 16.
+    const int spec_row_cap = o.pipeline_windows >= 2 ? (int) strata::kernels::kVerifyNarrowT
+                                                     : strata::core::window_rows_cap();
+    if (o.spec > spec_row_cap) {
+        std::fprintf(stderr, "xestrata generate: --spec %d: a window holds %d rows here, so %d\n", o.spec, spec_row_cap,
+                     spec_row_cap);
+        o.spec = spec_row_cap;
+    }
+    const bool wide_on = strata::core::wide_window() == strata::core::WideWindow::On && o.pipeline_windows < 2;
+    const int narrow_rows = strata::kernels::kVerifyNarrowT;
+    const int spec_rows = o.spec > narrow_rows || wide_on ? spec_row_cap : narrow_rows;
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
-        o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
+        o.spec = std::min(o.spec + 2, spec_rows);
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
@@ -2766,8 +2817,13 @@ int main(int argc, char** argv) {
     if (o.lookup_chain > 0 && o.spec >= 2) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
         const int chain_base = o.spec;
-        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));   // kVerifyMaxT
+        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, spec_rows));
     }
+    // the MTP's own windows stay at 8 rows (its draft layer's kernels are the narrow window's); a lookup or DFlash2
+    // window goes on to --spec
+    if (!o.mtp.empty() && o.spec > (int) strata::kernels::kVerifyNarrowT &&
+        (o.mtp_max_t == 0 || o.mtp_max_t > (int) strata::kernels::kVerifyNarrowT))
+        o.mtp_max_t = strata::kernels::kVerifyNarrowT;
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         // every shard of --native's model, once: a missing shard is an error that names it (upstream 02cfe36; the
@@ -2926,7 +2982,7 @@ int main(int argc, char** argv) {
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
-        const strata::core::ModelGeometry g0;
+        const strata::core::ModelGeometry& g0 = strata::core::kCompiledGeometry;
         if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
             return 1;
@@ -3128,7 +3184,7 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
+        const strata::core::ModelGeometry& g0 = strata::core::kCompiledGeometry;
         const auto embed_t0 = std::chrono::steady_clock::now();
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_preset : o.embd_gguf, g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
@@ -3174,7 +3230,7 @@ int main(int argc, char** argv) {
     //   STRATA_SPLIT_ROWS, default 3, the average verify window with MTP drafts).
     if (multi_gpu && split_auto) {
         // the geometry, as set up below (the canonical one, the model file's MoE shape)
-        strata::core::ModelGeometry ga;
+        strata::core::ModelGeometry ga = strata::core::kCompiledGeometry;
         int64_t Ka = 10;
         if (!o.native_preset.empty()) {
             try {
@@ -3941,7 +3997,7 @@ int main(int argc, char** argv) {
         }
         strata::kernels::mrope_table_set(d_mrope);
     }
-    strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
+    strata::core::ModelGeometry g = strata::core::kCompiledGeometry;   // the compiled shape; the model file may lower the expert count below
     int64_t K = 10;
     // the model file's rope keys (llama.cpp's names; the artifact ships none today)
     std::string gguf_rope_type;
@@ -4071,7 +4127,51 @@ int main(int argc, char** argv) {
     const int64_t hi0 = carve ? split_at[0] : -1;
     auto stage_lo = [&](size_t i) { return split_at[i]; };
     auto stage_hi = [&](size_t i) { return i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers; };
-    if (!strata::gpu::alloc_device(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0))) {
+    // #5715: the room the session has now, read before its allocation, so a start that does not fit says the largest
+    // context that does (context_fit.hpp) instead of only that the allocation failed
+    size_t sess_free_b = 0, sess_total_b = 0;
+    const bool sess_room_known = strata::gpu::mem_info(&sess_free_b, &sess_total_b) && sess_free_b > 0;
+    const uint64_t sess_bytes = strata::core::session_bytes(g, o.max_context, K, 0, hi0);
+    if (!strata::gpu::alloc_device(&sbuf, sess_bytes)) {
+        if (sess_room_known) {
+            // The session is not the last allocation: leave the native head, the later prompt buffers and the
+            // engine's VRAM reserve out of its room.  The prompt estimate is the same one used by auto cache sizing.
+            uint64_t later = (uint64_t) std::max(0, o.vram_reserve_mib) << 20;
+            if (o.prefill_chunk > 0)
+                later += (uint64_t) (160 + o.prefill_chunk * 680 / 1024) << 20;
+            if (!o.native_head_gguf.empty() && !multi_gpu) {
+                try {
+                    const auto hm = strata::GgufModel::open(o.native_head_gguf);
+                    size_t at = 0;
+                    if (const auto* t = hm.find("output.weight", &at)) later += strata::tensor_payload_bytes(*t);
+                } catch (const std::exception&) {
+                    std::fprintf(stderr, "xestrata generate: cannot estimate the later head allocation\n");
+                    std::fprintf(stderr, "xestrata generate: session state allocation failed\n");
+                    return 1;
+                }
+            }
+            if (!o.mtp.empty()) {
+                for (const char* f : {"dense.bin", "experts.bin"}) {
+                    std::error_code ec;
+                    const auto b = std::filesystem::file_size(std::filesystem::path(o.mtp) / f, ec);
+                    if (!ec) later += b;
+                }
+            }
+            const uint64_t room = sess_free_b > later ? sess_free_b - later : 0;
+            const auto fit = strata::core::context_that_fits(
+                o.max_context, room,
+                [&](int64_t cells) { return strata::core::session_bytes(g, cells, K, 0, hi0); });
+            if (fit.cells > 0)
+                std::fprintf(stderr, "xestrata generate: a context of %lld tokens does not fit on this graphics card: its "
+                                     "session needs %.2f GiB and %.2f GiB remains after later allocations; try a context of %lld tokens\n",
+                             (long long) o.max_context, (double) fit.need / 1073741824.0,
+                             (double) fit.room / 1073741824.0, (long long) fit.cells);
+            else
+                std::fprintf(stderr, "xestrata generate: a context of %lld tokens does not fit on this graphics card: its "
+                                     "session needs %.2f GiB and %.2f GiB remains after later allocations (not even 1024 tokens fit)\n",
+                             (long long) o.max_context, (double) fit.need / 1073741824.0,
+                             (double) fit.room / 1073741824.0);
+        }
         std::fprintf(stderr, "xestrata generate: session state allocation failed\n");
         return 1;
     }
@@ -4233,41 +4333,85 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // Recommend, never force: when the default direct reads measure slow, say so.  The switch to the mapped reads
-        // (40-100x faster on some DRAM-less NVMe drives) is made only with STRATA_PLE_AUTO_MMAP=1 (upstream #2040: the
-        // 15K rows/s bar is NVMe-calibrated, a SATA SSD tops out at 10-14K with direct's 16 reads in flight, and mapped
-        // reads were 7x slower there); an explicit --ple-io direct is kept and only warned about.
-        if (pio.mode == strata::kernels::PleIo::Direct && strata::env_get("PLE_PROBE") == nullptr) {
+        // The default (--ple-io auto) measures the reads here; nothing about a drive is assumed.  direct's unbuffered
+        // reads are the fastest where the drive serves them (a healthy NVMe: >100K rows/s), but some DRAM-less NVMe
+        // drives served the mapped reads 40-100x faster (upstream #2040); there the table stays in the file cache and
+        // mmap wins.  A SATA SSD is the other way (mapped reads 7x slower): so the mapped reads are measured too, and
+        // only a clear win (5%) takes them.  XESTRATA_PLE_AUTO_MMAP=0 keeps direct and only warns; =1 takes mmap
+        // wherever direct is slow, without measuring it.  --ple-io (not auto) wins over both and is only warned about.
+        if (pio.mode == strata::kernels::PleIo::Direct && !o.ple_io_explicit && strata::env_get("PLE_PROBE") == nullptr) {
             constexpr double kSlowRowsPerS = 15000.0;   // ~60 MB/s of 4 KiB pages; a healthy NVMe is >100k
             const double rps = ple_direct_rows_per_s(ple_table);
             if (rps >= kSlowRowsPerS)
                 std::fprintf(stderr, "xestrata generate: PLE direct read probe: %.0f rows/s (fine)\n", rps);
-            static const bool auto_mmap = [] {
+            static const int auto_mmap = [] {
                 const char* v = strata::env_get("PLE_AUTO_MMAP");
-                return v != nullptr && std::strtol(v, nullptr, 10) == 1;
+                if (v == nullptr || *v == '\0' || std::strcmp(v, "auto") == 0) return -1;   // measure both
+                return std::strtol(v, nullptr, 10) != 0 ? 1 : 0;
             }();
             if (rps > 0 && rps < kSlowRowsPerS) {
-                if (!o.ple_io_explicit && auto_mmap) {
-                    std::fprintf(stderr, "xestrata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f MB/s of "
-                                         "random 4 KiB reads): using --ple-io mmap instead (the OS file cache holds the pages; "
-                                         "--ple-io direct forces the old mode, --ple-io ram keeps the table in RAM)\n",
-                                 rps, rps * 4096.0 / 1e6);
-                    ple_table.close();
-                    pio.mode = strata::kernels::PleIo::Mmap;
-                    pio.keepalive_ms = 0;
-                    if (!ple_table.open(o.ple_gguf, err, pio)) {
-                        std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
-                        return 1;
-                    }
-                } else {
+                bool use_mmap = false;
+                double mmap_rps = 0;
+                if (auto_mmap == 0) {
                     std::fprintf(stderr, "xestrata generate: WARNING: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
                                          "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
-                                         "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on some DRAM-less "
-                                         "NVMe drives but 7x slower on a SATA SSD (#2040), so it is not chosen for you; "
-                                         "--ple-io ram needs the RAM for the table%s\n", rps, rps * 4096.0 / 1e6,
-                                 o.ple_io_explicit ? "" : " (kept direct: pass --ple-io mmap or --ple-io ram to change it; in a "
-                                                          "config file's \"args\" they are two entries: \"--ple-io\", "
-                                                          "\"mmap\")");
+                                         "stall watchdog (#1425, #1629). XESTRATA_PLE_AUTO_MMAP=0 keeps it; leave it unset "
+                                         "to measure the mapped reads instead, or pass --ple-io mmap / --ple-io ram\n",
+                                 rps, rps * 4096.0 / 1e6);
+                } else {
+                    // the mapped reads through the same probe: the file's pages in the OS cache, one row a read
+                    if (auto_mmap < 0) {
+                        ple_table.close();
+                        pio.mode = strata::kernels::PleIo::Mmap;
+                        pio.keepalive_ms = 0;
+                        std::string mmap_err;
+                        if (ple_table.open(o.ple_gguf, mmap_err, pio)) {
+                            mmap_rps = ple_direct_rows_per_s(ple_table);
+                            use_mmap = mmap_rps > rps * 1.05;   // a clear win, not run-to-run noise
+                        } else {
+                            std::fprintf(stderr, "xestrata generate: the mapped reads cannot open the table (%s); "
+                                                 "direct stays\n", mmap_err.c_str());
+                        }
+                        if (!use_mmap) {   // back to the reads that were there: mmap must beat direct clearly
+                            ple_table.close();
+                            pio.mode = strata::kernels::PleIo::Direct;
+                            if (!ple_table.open(o.ple_gguf, err, pio)) {
+                                std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
+                                return 1;
+                            }
+                        }
+                    } else {
+                        use_mmap = true;
+                    }
+                    if (use_mmap) {
+                        if (pio.mode == strata::kernels::PleIo::Direct) {
+                            ple_table.close();
+                            pio.mode = strata::kernels::PleIo::Mmap;
+                            pio.keepalive_ms = 0;
+                            if (!ple_table.open(o.ple_gguf, err, pio)) {
+                                std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
+                                return 1;
+                            }
+                        }
+                        if (mmap_rps > 0)
+                            std::fprintf(stderr, "xestrata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
+                                                 "MB/s of random 4 KiB reads), the mapped reads %.0f rows/s: using --ple-io "
+                                                 "mmap (the OS file cache holds the pages; --ple-io direct forces the old "
+                                                 "mode, --ple-io ram keeps the table in RAM)\n",
+                                         rps, rps * 4096.0 / 1e6, mmap_rps);
+                        else
+                            std::fprintf(stderr, "xestrata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
+                                                 "MB/s of random 4 KiB reads): using --ple-io mmap (XESTRATA_PLE_AUTO_MMAP=1; "
+                                                 "the OS file cache holds the pages, --ple-io direct forces the old mode, "
+                                                 "--ple-io ram keeps the table in RAM)\n",
+                                         rps, rps * 4096.0 / 1e6);
+                    } else {
+                        std::fprintf(stderr, "xestrata generate: WARNING: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
+                                             "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
+                                             "stall watchdog (#1425, #1629); the mapped reads measured %.0f rows/s here, so "
+                                             "direct stays. --ple-io ram needs the RAM for the table\n",
+                                     rps, rps * 4096.0 / 1e6, mmap_rps);
+                    }
                 }
             }
         }
@@ -4616,11 +4760,12 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyNarrowT
+                                                  : std::min(o.spec, (int) strata::kernels::kVerifyNarrowT);
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "xestrata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
     }
-    if (want_df2) {
+    if (want_df2 && !df2_deferred) {
         const strata::core::OnDevice on_df2(0);
         if (!df2.load(o.draft_model, 0, err)) {
             if (o.draft == "auto") {
@@ -4698,14 +4843,16 @@ int main(int argc, char** argv) {
         else
             std::fprintf(stderr, "xestrata generate: --batch is off: two slots leave %s no VRAM on this GPU\n", beside);
     };
+    // a batch window's rows: 16 where it has more than 8 slots and the wide windows are not off (window_rows.hpp)
+    const int batch_rows = strata::core::window_rows_for(o.batch > (int) strata::kernels::kVerifyNarrowT);
     if (o.batch != 0) {
         const char* why = !o.serve ? "it needs --serve"
                         : o.batch < 2 ? "it needs at least 2 slots"
                         : nullptr;
-        if (o.batch > strata::kernels::kVerifyMaxT && !batch_mtp) {   // --batch-mtp: the slots rotate through the windows
+        if (o.batch > batch_rows && !batch_mtp) {   // --batch-mtp: the slots rotate through the windows
             std::fprintf(stderr, "xestrata generate: --batch %d: a window holds %d rows, so %d slots\n", o.batch,
-                         strata::kernels::kVerifyMaxT, strata::kernels::kVerifyMaxT);
-            o.batch = strata::kernels::kVerifyMaxT;
+                         batch_rows, batch_rows);
+            o.batch = batch_rows;
         }
         if (why != nullptr) {
             std::fprintf(stderr, "xestrata generate: --batch is off: %s\n", why);
@@ -4823,17 +4970,17 @@ int main(int argc, char** argv) {
         // --batch-mtp goes on as it would without it: in serial windows, or off beside the pipelined groups.
         if (batch_mtp && piped_mtp_asked && !stages.empty() && o.batch > 0) {
             pm_drafts = std::clamp((int) std::strtol(piped_mtp_env, nullptr, 10), 1,
-                                   std::max(1, std::min(o.spec - 1, (int) strata::kernels::kVerifyMaxT - 1)));
+                                   std::max(1, std::min(o.spec - 1, batch_rows - 1)));
             char buf[160];
             const char* why = nullptr;
             if (o.batch_groups <= 1) {
                 std::snprintf(buf, sizeof buf, "it needs 2 or more pipelined groups and %d slot%s in %d group%s are left",
                               o.batch, o.batch == 1 ? "" : "s", o.batch_groups, o.batch_groups == 1 ? "" : "s");
                 why = buf;
-            } else if ((o.batch / o.batch_groups) * (1 + pm_drafts) > (int) strata::kernels::kVerifyMaxT) {
+            } else if ((o.batch / o.batch_groups) * (1 + pm_drafts) > batch_rows) {
                 std::snprintf(buf, sizeof buf, "a group's window would hold %d rows (%d slots x %d), more than %d",
                               (o.batch / o.batch_groups) * (1 + pm_drafts), o.batch / o.batch_groups, 1 + pm_drafts,
-                              (int) strata::kernels::kVerifyMaxT);
+                              batch_rows);
                 why = buf;
             }
             if (why != nullptr) {
@@ -4923,6 +5070,7 @@ int main(int argc, char** argv) {
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
+    bool io_pf_by_default = false;   // the file tier's Linux defaults turned io prefetch on (no XESTRATA_IO_PREFETCH given)
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     std::vector<uint8_t> fill_tmp;   // blob_to_copy's buffer for a transient source
@@ -4955,8 +5103,8 @@ int main(int argc, char** argv) {
                                    ? std::min(hm.available - std::min(hm.available, strata::platform::cma_free_bytes()),
                                               hm.cgroup_limit)
                                    : 0;
-        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && avail > 0 &&
-            !strata::core::detail::resident_pin_fits(need, 0, headroom, avail, why)) {
+        const bool room_short = avail > 0 && !strata::core::detail::resident_pin_fits(need, 0, headroom, avail, why);
+        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && room_short) {
             std::fprintf(stderr, "xestrata generate: the expert arena needs %.2f GiB of RAM and %.0f GiB beside it, but "
                                  "%.2f GiB is available: starting as with --resident-experts (the experts the GPU does "
                                  "not hold in RAM as far as it has room, the rest from the model files; "
@@ -4967,6 +5115,24 @@ int main(int argc, char** argv) {
             if (!o.shared_expert_arena.empty())
                 std::fprintf(stderr, "xestrata generate: the shared expert arena is not used (it needs the room)\n");
             o.shared_expert_arena.clear();
+        } else if (room_short && ple_lock_by_policy && ple_table.locked()) {
+            // #4846 (upstream eb8917247): the arena is loaded anyway (XESTRATA_ARENA_LOW_RAM=keep, or a shared arena
+            // another engine filled), and the RAM is short.  The PLE table's lock the residency policy took is RAM this
+            // start needs: give it back before the arena is registered, as #4518 gives it back for the conversation
+            // cache (the pages stay cached, the OS may reclaim them).  --ple-io ram asked for by hand is never touched.
+            const uint64_t table_b = ple_table.table_bytes();
+            if (ple_table.unlock()) {
+                strata::core::detail::HostMemory after;
+                std::string now;
+                if (strata::core::detail::host_available_memory(after)) {
+                    char b[64];
+                    std::snprintf(b, sizeof b, " (%.2f GiB available now)", (double) after.available / 1073741824.0);
+                    now = b;
+                }
+                std::fprintf(stderr, "xestrata generate: the RAM is short for the expert arena; the PLE table's lock "
+                                     "(%.2f GiB) is given back before the arena is loaded%s\n",
+                             (double) table_b / 1073741824.0, now.c_str());
+            }
         }
     }
     if (o.mmap_experts) {
@@ -5004,6 +5170,7 @@ int main(int argc, char** argv) {
         if (io_pf_default || (io_pf_env != nullptr && std::strtol(io_pf_env, nullptr, 10) != 0)) {
             const char* th = strata::env_get("IO_PF_THREADS");
             src.set_io_prefetch(true, th != nullptr ? (int) std::strtol(th, nullptr, 10) : 0);
+            io_pf_by_default = io_pf_default && src.io_prefetch();
             const char* cv = strata::env_get("COLD_OVERLAP");
             const bool zc = cv != nullptr && cv[0] != '\0' ? std::strtol(cv, nullptr, 10) == 4 : src.gguf_mode();
             if (src.io_prefetch())
@@ -5283,14 +5450,16 @@ int main(int argc, char** argv) {
                     ? ", a smaller --vram-reserve-mib (" + std::to_string(o.vram_reserve_mib) + " now; " +
                           std::to_string(kSmallReserveMib) + " is enough on a small card)"
                     : std::string();
+            const char* batch_tip = o.batch > 1 ? "fewer simultaneous requests (--batch / parallel), " : "";
             std::fprintf(stderr, "xestrata generate: no VRAM is left for the expert cache: it needs at least %lld slots "
-                                 "(%lld MiB), about %lld MiB more than this card has free. To make room: a smaller "
+                                 "(%lld MiB), about %lld MiB more than this card has free. To make room: %sa smaller "
                                  "--max-context (the session, mostly its KV cache, takes %lld MiB at %lld tokens), "
                                  "--kv q4_0, the English draft subset (setup --draft-vocab en; the draft head takes "
                                  "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU\n",
                          (long long) min_slots, (long long) ((min_slots * blob) >> 20), (long long) short_mib,
-                         (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
+                         batch_tip, (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
                          reserve_tip.c_str());
+            if (o.spec > 0) return 1;   // the verify window cannot start without a tier; the line above is the refusal
         }
     } else if (multi_gpu && o.expert_cache > 0 && o.no_prefill_borrow) {
         // a layer split's prompt path with buffers of its own (--no-prefill-borrow): an explicit cache size leaves
@@ -5716,6 +5885,48 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    // upstream 994029b02 (PR 4972): when every routed expert sits in the GPU's caches the decode reads nothing from the
+    // file tier, and its Linux defaults (io prefetch, the decode gate) and the routing-aware prefetch only cost time
+    // (2x W7900D gfx1100, all 24576 pairs resident: decode 57 -> 80 tok/s, the answer byte-identical).  Only what the
+    // defaults switched on is suspended: XESTRATA_IO_PREFETCH=1 and XESTRATA_LOOKAHEAD=1 keep their own, and
+    // XESTRATA_FILE_TIER_IDLE=0 turns the policy off.  Checked at the start; the serve's VRAM command (a smaller cache
+    // later) does not turn them back on - the resize cases are rarer than the start this helps.
+    int64_t gpu_held_now = 0;
+    bool gpu_holds_all = false;
+    auto count_gpu_held = [&]() -> int64_t {
+        int64_t held = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const int st = multi_gpu ? stage_of(l) : 0;
+            strata::core::ExpertCache& c = st > 0 ? stages[(size_t) st - 1]->cache : xcache;
+            const int64_t live = c.slots();
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const int32_t slot = c.slot_of(l, e);
+                held += slot != strata::core::kNotResident && slot < live;
+            }
+        }
+        return held;
+    };
+    const bool file_tier_idle_ok = [] {
+        const char* v = strata::env_get("FILE_TIER_IDLE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    const bool la_asked = [] {
+        const char* v = strata::env_get("LOOKAHEAD");
+        const char* p = strata::env_get("IO_PREFETCH");
+        return (v != nullptr && v[0] != '\0' && std::strtol(v, nullptr, 10) != 0) ||
+               (p != nullptr && p[0] != '\0' && std::strtol(p, nullptr, 10) != 0);
+    }();
+    if (srcp == &src && file_tier_idle_ok) {
+        gpu_held_now = count_gpu_held();
+        gpu_holds_all = gpu_held_now == g.n_layers * g.n_expert;
+        if (gpu_holds_all && io_pf_by_default) {
+            src.set_io_prefetch(false, 0);
+            std::fprintf(stderr, "xestrata generate: every expert is in the GPU caches (%lld of %lld): the file tier's "
+                                 "Linux defaults (io prefetch, the decode gate) are off; the decode reads nothing from "
+                                 "it (XESTRATA_IO_PREFETCH=1 keeps them, XESTRATA_FILE_TIER_IDLE=0 this policy)\n",
+                         (long long) gpu_held_now, (long long) (g.n_layers * g.n_expert));
+        }
+    }
     // CS-T: routing-aware prefetch of the file tier: the next layer's router on this layer's MoE input predicts its
     // experts, and with io prefetch (upstream 149) the I/O threads read them ahead (else their pages are only advised).
     // It never changes what is computed; STRATA_LOOKAHEAD=0 is the A/B arm, STRATA_LOOKAHEAD_K the experts per token
@@ -5735,13 +5946,19 @@ int main(int argc, char** argv) {
         }
         const char* kv = strata::env_get("LOOKAHEAD_K");
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? (int) std::strtol(kv, nullptr, 10) : 10, &src, err)) {
-            drive.d.lookahead = &lookahead;
-            // two layers ahead with io prefetch (upstream 149's default); STRATA_IO_PREFETCH_DEPTH 1..4
-            if (const char* dv = strata::env_get("IO_PREFETCH_DEPTH"); dv != nullptr && std::strtol(dv, nullptr, 10) > 0)
-                lookahead.set_depth((int) std::strtol(dv, nullptr, 10));
-            else if (src.io_prefetch())
-                lookahead.set_depth(2);
-            std::fprintf(stderr, "xestrata generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
+            if (gpu_holds_all && !la_asked) {
+                std::fprintf(stderr, "xestrata generate: routing-aware prefetch off (every expert is in the GPU caches; "
+                                     "XESTRATA_LOOKAHEAD=1 runs it)\n");
+            } else {
+                drive.d.lookahead = &lookahead;
+                // two layers ahead with io prefetch (upstream 149's default); STRATA_IO_PREFETCH_DEPTH 1..4
+                if (const char* dv = strata::env_get("IO_PREFETCH_DEPTH"); dv != nullptr && std::strtol(dv, nullptr, 10) > 0)
+                    lookahead.set_depth((int) std::strtol(dv, nullptr, 10));
+                else if (src.io_prefetch())
+                    lookahead.set_depth(2);
+                std::fprintf(stderr, "xestrata generate: routing-aware prefetch of the file tier on (the next layer's "
+                                     "router)\n");
+            }
         } else {
             std::fprintf(stderr, "xestrata generate: routing-aware prefetch off (%s)\n",
                          ok ? err.c_str() : "the routers are not BF16 in the arena");
@@ -6922,6 +7139,9 @@ int main(int argc, char** argv) {
     // (the arena mode has no RAM copy to exchange with: its experts are always in RAM, the tier only copies them in)
     if (o.adapt_async && !src.complement_ready() && srcp != &arena_src)
         adapt_async_off("the resident RAM mode is not running");
+    // the verify windows' most rows in this run (the verifier's max_t: --spec's, the batch's), at least the 8 a window
+    // always had: what the buffers that follow the window (the hand-off, the penalty rows) hold
+    const int win_rows = std::max({(int) strata::kernels::kVerifyNarrowT, o.spec, batch_mtp ? batch_rows : o.batch});
     if (o.serve) {
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -6932,7 +7152,7 @@ int main(int argc, char** argv) {
         // --mtp is optional (upstream 3216d271): without it the drafts come from the suffix / prompt-lookup drafter
         // only, or one token a round, and every token is still verified; the draft layer's VRAM goes to the expert
         // cache.  The parked and saved conversations carry the draft layer's K/V, so they are off without it.
-        const bool use_mtp = !o.mtp.empty();
+        bool use_mtp = !o.mtp.empty();   // (the start's measurement may release it: before READY)
         if (!use_mtp && ((o.prompt_cache > 0 && o.conversation_cache_mib > 0) || !o.conversation_save.empty())) {
             std::fprintf(stderr, "xestrata serve: without --mtp the conversation cache's parked conversations and "
                                  "--conversation-save are off (a parked conversation carries the draft layer's K/V)\n");
@@ -7060,6 +7280,9 @@ int main(int argc, char** argv) {
             sp.set_cpu_pool(&pool);
         mem_mark("before the prompt path init");
         if (df2_loaded) sp.set_taps(df2.tap_layers(), 0, 2048);   // tap_first set per request (the prompt's length)
+        // a DFlash2 measured at the start: the measurement's short prompts need a small staging; the window's 2048
+        // rows are taken only if it stays
+        else if (df2_deferred) sp.set_taps(df2_shape.taps, 0, kProbeTapRows);
         if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "xestrata serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
@@ -7076,7 +7299,7 @@ int main(int argc, char** argv) {
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
         // neutral path (no upload, no buffer handed to the sampler).
         constexpr int kPenaltyWindowCap = 4096;
-        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
+        const size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) win_rows;
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
@@ -7134,9 +7357,8 @@ int main(int argc, char** argv) {
         }
         if (n_stages > 1) {
             // STRATA_PIPED_MTP: the groups write each slot's token and proposals at hbase = group * rows-per-group, so
-            // the hand-off holds every slot's rows (otherwise kVerifyMaxT, as before)
-            const int hrows = piped_mtp ? std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch)
-                                        : (int) strata::kernels::kVerifyMaxT;
+            // the hand-off holds every slot's rows (otherwise a window's, win_rows: 8, as before, unless it is wide)
+            const int hrows = piped_mtp ? std::max<int>(win_rows, (1 + pm_drafts) * o.batch) : win_rows;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             auto dev_of = [&](int st) { return st == 0 || split_same ? 0 : stages[(size_t) st - 1]->dev; };
             auto hand_alloc = [&](int dev) -> float* {
@@ -7163,7 +7385,7 @@ int main(int argc, char** argv) {
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                         st == 0 ? nullptr : hand_in[(size_t) st - 1],
                                         st + 1 < n_stages ? hand_out[(size_t) st] : nullptr);
-                if (piped_mtp) stage_ver(st).set_handoff_rows(hrows);
+                if (piped_mtp || hrows > (int) strata::kernels::kVerifyNarrowT) stage_ver(st).set_handoff_rows(hrows);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
@@ -7183,12 +7405,12 @@ int main(int argc, char** argv) {
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
-                    // --batch-mtp: every stage runs the first one's windows of two rows a slot (up to kVerifyMaxT rows,
+                    // --batch-mtp: every stage runs the first one's windows of two rows a slot (up to batch_rows rows,
                     // the hand-off's size) and bounds its captured batch layouts like it (upstream 48f2c47d)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     if (adapt_device_table_lags()) gs.ver.set_always_publish(true);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
-                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
+                                       batch_mtp ? batch_rows : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     // the PCIe share's kernels read the missed experts where CUDA0's runtime allocated or registered
@@ -7237,7 +7459,7 @@ int main(int argc, char** argv) {
         // Verifier::pl_finish copies it across.
         float* pl_mtp_R = nullptr;
         if (pipe) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+            const size_t hb = (size_t) strata::kernels::kVerifyNarrowT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             auto hand_alloc = [&](int dev) -> float* {
                 const strata::core::OnDevice on(dev);
@@ -7276,7 +7498,7 @@ int main(int argc, char** argv) {
                                  gs.dev, st + 1, err.c_str());
                     return 1;
                 }
-                if (last && !strata::gpu::alloc_device(&pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT *
+                if (last && !strata::gpu::alloc_device(&pl_mtp_R, (size_t) strata::kernels::kVerifyNarrowT *
                                                                       (size_t) (g.hc * g.n_embd) * sizeof(float))) {
                     std::fprintf(stderr, "xestrata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
                     return 1;
@@ -7295,8 +7517,9 @@ int main(int argc, char** argv) {
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp: slot rotation makes many layouts (LRU)
         if (adapt_device_table_lags()) ver.set_always_publish(true);
         if (df2_loaded) ver.set_taps(df2.tap_layers());   // the DFlash2 drafter's taps (before init allocates them)
+        else if (df2_deferred) ver.set_taps(df2_shape.taps);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      batch_mtp ? batch_rows : std::max(o.spec, o.batch), err) ||
             (use_mtp &&
              !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                        pipe ? pl_mtp_R : ver.final_R_all(), err))) {
@@ -7305,7 +7528,7 @@ int main(int argc, char** argv) {
         }
         if (df2_loaded) {
             // auto: the MTP's gathered draft head is the same bytes (the same vocabulary file): share it
-            if (use_mtp && df2_vocab == o.mtp + "/draft_vocab.bin") {
+            if (use_mtp && same_bytes(df2_vocab, o.mtp + "/draft_vocab.bin")) {
                 const auto sh = mtp.shared_head();
                 if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
             }
@@ -7366,7 +7589,7 @@ int main(int argc, char** argv) {
             }
             // STRATA_PIPED_MTP: the rows a group's commit replays after the verdict, one hand-off row each
             for (int st = 0; slots_ok && piped_mtp && st < n_stages; ++st)
-                if (!stage_ver(st).init_deferred_commit(std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch),
+                if (!stage_ver(st).init_deferred_commit(std::max<int>(win_rows, (1 + pm_drafts) * o.batch),
                                                         err)) {
                     std::fprintf(stderr, "xestrata serve: XESTRATA_PIPED_MTP, stage %d: %s%s\n", st + 1, err.c_str(),
                                  vram_free_note().c_str());
@@ -8038,9 +8261,10 @@ int main(int argc, char** argv) {
         // tokens never.
         static const bool split_mtp_batch =
             strata::program::draft_kv::split_env_on(strata::env_get("SPLIT_MTP_BATCH"));
-        if (df2_loaded) {
+        if (df2_loaded || df2_deferred) {
             sp.on_taps = [&](const float* taps, int64_t rows, int64_t p0, std::string& e) -> bool {
-                return df2.context(taps, rows, p0, e);   // keep the DFlash2 ring current (auto: even when the MTP drafts)
+                // keep the DFlash2 ring current (auto: even when the MTP drafts); not yet loaded: nothing to keep
+                return !df2_loaded || df2.context(taps, rows, p0, e);
             };
         }
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
@@ -8049,7 +8273,7 @@ int main(int argc, char** argv) {
             // E-9: batched through the prompt path when it can (a layer split: not with STRATA_SPLIT_MTP_BATCH=0)
             bool batched = false;
             const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
-                use_mtp, multi_gpu, split_mtp_batch, strata::core::native_embed() != nullptr);
+                use_mtp && mtp.loaded(), multi_gpu, split_mtp_batch, strata::core::native_embed() != nullptr);
             if (dkv.try_batched || dkv.why != nullptr) {
                 strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;   // the drafter's stage
                 const char* why = dkv.why;
@@ -8067,7 +8291,12 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            if (!e.empty() || (use_mtp && mtp.loaded() && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            if (df2_loaded) {
+                std::vector<int32_t> tokens((size_t) T);
+                for (int64_t t = 0; t < T; ++t) tokens[(size_t) t] = (int32_t) cur[(size_t) (p0 + t)];
+                df2.note_rows(tokens.data(), T, p0);
+            }
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             pp_reached = done;
@@ -8805,86 +9034,91 @@ int main(int argc, char** argv) {
                                  stp->dev, (long long) sf_mib, (long long) (later_reserve + 768 - sf_mib));
             }
         }
-        // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
-        {
-            size_t free_b = 0, total_b = 0;
-            strata::gpu::mem_info(&free_b, &total_b);
-            // #11: arena_mib is what the experts take in RAM as they were placed (the server's RAM warning): the whole
-            // arena, or the resident copy of those the GPU does not hold, none when they are read from the files
-            const bool arena = srcp != &src;
-            const uint64_t ram_experts = arena ? strata::kernels::cpu::expert_layout().total : src.resident_bytes();
-            const char* experts_ram = arena ? "arena" : ram_experts > 0 ? "resident" : "none";
-            // Intel's compiler 2.27 to 2.30: the version whose GEP simplification the runtime turned off (the server's
-            // notice), "none" otherwise
-            const std::string igc = strata::core::compiler_workaround();
-            const std::string igc_workaround = igc.empty() ? "none" : igc;
-            strata::program::InfoLine()
-                .add("logit_bias", 1)
-                .add("context", (long long) o.max_context)
-                .add("kv", o.kv)
-                .add("kv_resident", (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
-                                                 ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0))
-                .add("expert_slots", (long long) xcache.slots())
-                .add("expert_cache_mib", (long long) (xcache.bytes() >> 20))
-                .add("spec", o.spec)
-                .add("mtp_max", o.mtp_max_t)
-                .add("lookup", o.suffix_draft)
-                .add("vram_free_mib", (long long) (free_b >> 20))
-                .add("cvec", cvec_summary)
-                .add("arena_mib", (long long) (ram_experts >> 20))
-                .add("pool_workers", pool.workers())
-                .add_f("pcie_frac", o.pcie_frac)
-                .add_f("spec_min_p", o.spec_min_p)
-                .add("spec_window", o.spec_window)
-                .add("conversation_cache_mib", (long long) o.conversation_cache_mib)
-                .add("conversation_cache_slots", o.conversation_cache_slots)
-                .add("conversation_cache_min_free_mib", (long long) o.conversation_cache_min_free_mib)
-                .add("conversation_cache_min_tokens", (long long) o.conversation_cache_min_tokens)
-                .add("tail_role_token", (long long) o.tail_role_token)
-                .add("vram_elastic", xcache.elastic() ? 1 : 0)
-                .add("batch_slots", o.batch)
-                .add("batch_groups", o.batch > 0 ? o.batch_groups : 1)
-                .add("slot_cache", o.batch > 0 && o.prompt_cache > 0 ? 1 : 0)
-                .add("experts_ram", experts_ram)
-                .add("igc_workaround", igc_workaround)
-                .add("grammar", strata::core::grammar_built() && (o.batch == 0 || o.batch_groups <= 1) ? 1 : 0)
-                .add("script_table", o.batch == 0 ? 1 : 0)
-                .add("helper_pci", drive.d.remote_count > 0
-                                       ? strata::core::device_info(drive.d.remote[0]->device()).pci.c_str() : "none")
-                .add("helper_mib", drive.d.remote_count > 0 ? (long long) (drive.d.remote[0]->gib() * 1024.0) : 0LL)
-                .print();
-        }
-        strata::core::start_serve_watchdog();   // the three engines' one (strata/core/watchdog.hpp)
-        strata::core::progress_at("idle");
-        strata::gpu::pin_reserve_release();   // the engine is up: the pinned memory's last reserve goes back
-        strata::platform::settle_before_ready();
-        strata::platform::downgrades_say();   // the start's fallbacks (the server keeps them: /v1/status)
-        if (strata::core::manifest::enabled()) {   // upstream 89f4fa18 (XESTRATA_MANIFEST): the engine choice and budgets
-            auto& M = strata::core::manifest::instance();
-            M.engine("version", STRATA_VERSION);
-            M.engine("engine", stages.empty() ? "native-single-gpu" : "native-layer-split");
-            M.engine("stages", std::to_string(stages.size() + 1));
-            M.engine("kv_format", o.kv);
-            M.engine("spec_window", std::to_string(o.spec));
-            M.engine("prompt_experts", strata::prefill::experts_path());
-            M.budget("context", o.max_context);
-            M.budget("expert_cache_mib", xcache.bytes() >> 20);
-            M.budget("expert_slots", xcache.slots());
-            M.budget("vram_reserve_mib", o.vram_reserve_mib);
-            M.budget("prefill_chunk", o.prefill_chunk);
-            M.budget("pool_workers", pool.workers());
-            M.budget("conversation_cache_mib", o.conversation_cache_mib);
-            M.budget("batch_slots", o.batch);
-            // upstream 445cdf45: an unset XESTRATA_ROUTE_TAIL_SKIP means the engine default applies (tails are skipped
-            // only where the configuration allows), not "off"
-            const int tail = strata::core::tail_skip_rank();
-            M.path("experts", "route_tail_skip", tail > 0,
-                   tail > 0 ? "XESTRATA_ROUTE_TAIL_SKIP=" + std::to_string(tail)
-                            : "XESTRATA_ROUTE_TAIL_SKIP is unset: the engine default applies, tails are skipped only where the configuration allows");
-            M.write("ready");
-        }
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
-        std::fflush(stdout);
+        // the INFO line, the watchdog and READY: at once, or after the start's measurement of the drafters (below),
+        // whose choice they then report
+        int info_spec = o.spec;   // the window the INFO line reports (the start's measurement may keep a smaller one)
+        auto announce = [&]() {
+            // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
+            {
+                size_t free_b = 0, total_b = 0;
+                strata::gpu::mem_info(&free_b, &total_b);
+                // #11: arena_mib is what the experts take in RAM as they were placed (the server's RAM warning): the whole
+                // arena, or the resident copy of those the GPU does not hold, none when they are read from the files
+                const bool arena = srcp != &src;
+                const uint64_t ram_experts = arena ? strata::kernels::cpu::expert_layout().total : src.resident_bytes();
+                const char* experts_ram = arena ? "arena" : ram_experts > 0 ? "resident" : "none";
+                // Intel's compiler 2.27 to 2.30: the version whose GEP simplification the runtime turned off (the server's
+                // notice), "none" otherwise
+                const std::string igc = strata::core::compiler_workaround();
+                const std::string igc_workaround = igc.empty() ? "none" : igc;
+                strata::program::InfoLine()
+                    .add("logit_bias", 1)
+                    .add("context", (long long) o.max_context)
+                    .add("kv", o.kv)
+                    .add("kv_resident", (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+                                                     ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0))
+                    .add("expert_slots", (long long) xcache.slots())
+                    .add("expert_cache_mib", (long long) (xcache.bytes() >> 20))
+                    .add("spec", info_spec)
+                    .add("mtp_max", o.mtp_max_t)
+                    .add("lookup", o.suffix_draft)
+                    .add("vram_free_mib", (long long) (free_b >> 20))
+                    .add("cvec", cvec_summary)
+                    .add("arena_mib", (long long) (ram_experts >> 20))
+                    .add("pool_workers", pool.workers())
+                    .add_f("pcie_frac", o.pcie_frac)
+                    .add_f("spec_min_p", o.spec_min_p)
+                    .add("spec_window", o.spec_window)
+                    .add("conversation_cache_mib", (long long) o.conversation_cache_mib)
+                    .add("conversation_cache_slots", o.conversation_cache_slots)
+                    .add("conversation_cache_min_free_mib", (long long) o.conversation_cache_min_free_mib)
+                    .add("conversation_cache_min_tokens", (long long) o.conversation_cache_min_tokens)
+                    .add("tail_role_token", (long long) o.tail_role_token)
+                    .add("vram_elastic", xcache.elastic() ? 1 : 0)
+                    .add("batch_slots", o.batch)
+                    .add("batch_groups", o.batch > 0 ? o.batch_groups : 1)
+                    .add("slot_cache", o.batch > 0 && o.prompt_cache > 0 ? 1 : 0)
+                    .add("experts_ram", experts_ram)
+                    .add("igc_workaround", igc_workaround)
+                    .add("grammar", strata::core::grammar_built() && (o.batch == 0 || o.batch_groups <= 1) ? 1 : 0)
+                    .add("script_table", o.batch == 0 ? 1 : 0)
+                    .add("helper_pci", drive.d.remote_count > 0
+                                           ? strata::core::device_info(drive.d.remote[0]->device()).pci.c_str() : "none")
+                    .add("helper_mib", drive.d.remote_count > 0 ? (long long) (drive.d.remote[0]->gib() * 1024.0) : 0LL)
+                    .print();
+            }
+            strata::core::start_serve_watchdog();   // the three engines' one (strata/core/watchdog.hpp)
+            strata::core::progress_at("idle");
+            strata::gpu::pin_reserve_release();   // the engine is up: the pinned memory's last reserve goes back
+            strata::platform::settle_before_ready();
+            strata::platform::downgrades_say();   // the start's fallbacks (the server keeps them: /v1/status)
+            if (strata::core::manifest::enabled()) {   // upstream 89f4fa18 (XESTRATA_MANIFEST): the engine choice and budgets
+                auto& M = strata::core::manifest::instance();
+                M.engine("version", STRATA_VERSION);
+                M.engine("engine", stages.empty() ? "native-single-gpu" : "native-layer-split");
+                M.engine("stages", std::to_string(stages.size() + 1));
+                M.engine("kv_format", o.kv);
+                M.engine("spec_window", std::to_string(info_spec));
+                M.engine("prompt_experts", strata::prefill::experts_path());
+                M.budget("context", o.max_context);
+                M.budget("expert_cache_mib", xcache.bytes() >> 20);
+                M.budget("expert_slots", xcache.slots());
+                M.budget("vram_reserve_mib", o.vram_reserve_mib);
+                M.budget("prefill_chunk", o.prefill_chunk);
+                M.budget("pool_workers", pool.workers());
+                M.budget("conversation_cache_mib", o.conversation_cache_mib);
+                M.budget("batch_slots", o.batch);
+                // upstream 445cdf45: an unset XESTRATA_ROUTE_TAIL_SKIP means the engine default applies (tails are skipped
+                // only where the configuration allows), not "off"
+                const int tail = strata::core::tail_skip_rank();
+                M.path("experts", "route_tail_skip", tail > 0,
+                       tail > 0 ? "XESTRATA_ROUTE_TAIL_SKIP=" + std::to_string(tail)
+                                : "XESTRATA_ROUTE_TAIL_SKIP is unset: the engine default applies, tails are skipped only where the configuration allows");
+                M.write("ready");
+            }
+            std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+            std::fflush(stdout);
+        };
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
@@ -8900,6 +9134,217 @@ int main(int argc, char** argv) {
         const double df2_conf = o.draft_conf > 0.0 ? o.draft_conf : df2_default_conf(xcache.slots());
         if (df2_loaded) df2.set_max_drafts(S - 1);
         strata::spec::GuessGate pl_guess(0.2);   // --pipeline-windows 2: which guessed windows start, learned the same way
+        // ---- the start's measurement of the drafters (strata/spec/draft_probe.hpp), before READY: a few short
+        // requests of a fixed text through this loop (probe_lines; draft= and spec= pick the arm, their output goes to
+        // the null device), then the drafters that lost released, and READY.  While they run the adaptive tier, the
+        // switches measured on the first windows and the one-time choices do not move: the first real request finds
+        // the engine as a start without the measurement leaves it.
+        std::deque<std::string> probe_lines;
+        std::vector<strata::spec::ProbeArm> probe_arms;
+        std::vector<strata::spec::ProbeRun> probe_runs;
+        bool probe_running = false;
+        int spec_cap = 0;               // the window the measurement kept (0: S, as configured)
+        bool drafting_off = false;      // the measurement kept no drafter (an unused MTP may stay loaded)
+        const bool df2_for_probe = df2_deferred;   // DFlash2 is loaded below only to be measured
+        std::vector<float> probe_usage;   // the adaptive tier's counts before it
+        int probe_stdout = -1;
+        size_t probe_free0 = 0;
+        Clock::time_point probe_t0;
+        const int mtp_drafts0 = use_mtp ? mtp.max_drafts() : 0;
+        // the VRAM free now, said with the measurement's lines
+        auto free_mib = [&]() -> long long {
+            size_t fb = 0, tb = 0;
+            strata::gpu::mem_info(&fb, &tb);
+            return (long long) (fb >> 20);
+        };
+        auto df2_drop = [&](const char* why) {
+            if (df2_loaded) df2.release();
+            df2_loaded = false;
+            df2_deferred = false;
+            ver.taps_off();
+            sp.taps_off();
+            if (why != nullptr) std::fprintf(stderr, "xestrata serve: DFlash2 released: %s\n", why);
+        };
+        // the arms' choice applied: the losers released, the window kept, the learning of the measurement's requests
+        // forgotten
+        auto probe_finish = [&]() -> bool {
+            std::fflush(stdout);
+            if (probe_stdout >= 0) strata::platform::stdout_restore(probe_stdout);
+            probe_stdout = -1;
+            probe_running = false;
+            strata::core::window_choices_paused() = false;
+            const long long free_during = free_mib();
+            const strata::spec::DraftProbe judge;
+            const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, df2_loaded && use_mtp, S_mtp);
+            std::fprintf(stderr, "xestrata serve: %s (%.1f s)\n", v.line.c_str(),
+                         std::chrono::duration<double>(Clock::now() - probe_t0).count());
+            if (v.measured) {
+                strata::spec::Drafter keep = v.keep;
+                // DFlash2 alone or beside the MTP keeps the VRAM it took from the reserve: only where the reserve the
+                // engine started with is still free beside it (a long prompt's buffers come out of the reserve)
+                if ((keep == strata::spec::Drafter::Df2 || v.keep_both) &&
+                    free_during < (long long) o.vram_reserve_mib) {
+                    std::fprintf(stderr, "xestrata serve: DFlash2 is not kept: with it %lld MiB of VRAM stay free, less "
+                                         "than the %d MiB reserve: the MTP drafts\n", free_during, o.vram_reserve_mib);
+                    keep = use_mtp ? strata::spec::Drafter::Mtp : strata::spec::Drafter::None;
+                }
+                const bool both = v.keep_both && keep != strata::spec::Drafter::None &&
+                                  free_during >= (long long) o.vram_reserve_mib;
+                if (df2_loaded && keep != strata::spec::Drafter::Df2 && !both)
+                    df2_drop(nullptr);
+                // the MTP released where nothing else needs it: a parked or saved conversation carries its K/V
+                const bool conv_needs_mtp = (o.prompt_cache > 0 && o.conversation_cache_mib > 0) ||
+                                            !o.conversation_save.empty();
+                if (use_mtp && keep != strata::spec::Drafter::Mtp && !both) {
+                    if (conv_needs_mtp) {
+                        // a parked or saved conversation carries the draft layer's K/V: that part stays, the rest goes
+                        const long long f0 = free_mib();
+                        mtp.release_weights(df2_loaded && df2.head_shared());
+                        std::fprintf(stderr, "xestrata serve: the MTP layer's weights, head and buffers released (%lld "
+                                             "MiB of VRAM back); its K/V stays (the conversation cache carries it)\n",
+                                     free_mib() - f0);
+                        if (keep == strata::spec::Drafter::Df2) o.draft_rule = "df2";   // every request: DFlash2
+                    } else {
+                        if (df2_loaded && df2.head_shared()) {   // DFlash2's head was the MTP's: its own first
+                            std::string e;
+                            df2.release();
+                            if (!df2.load(o.draft_model, 0, e) || !df2.bind(wt, g, &native_head, df2_vocab, e) ||
+                                !df2.prepare(ver.tap_dev(), e)) {
+                                std::fprintf(stderr, "xestrata serve: DFlash2 could not take its own head (%s): the MTP "
+                                                     "stays\n", e.c_str());
+                                df2_drop(nullptr);
+                                keep = strata::spec::Drafter::Mtp;
+                            }
+                        }
+                        if (keep != strata::spec::Drafter::Mtp) {
+                            mtp.release();
+                            use_mtp = false;
+                        }
+                    }
+                }
+                drafting_off = keep == strata::spec::Drafter::None && !both;
+                if (keep == strata::spec::Drafter::Mtp && v.spec > 0 && v.spec != S_mtp) spec_cap = v.spec;
+                if (df2_loaded) {   // it stays: the prompt path's taps for the whole window
+                    std::string e;
+                    if (!sp.set_tap_rows(2048, e)) {
+                        std::fprintf(stderr, "xestrata serve: %s: DFlash2 released\n", e.c_str());
+                        df2_drop(nullptr);
+                    }
+                }
+            } else if (df2_loaded) {
+                df2_drop("the measurement did not finish");
+            }
+            if (use_mtp) mtp.set_max_drafts(spec_cap > 0 ? std::min(S_mtp, spec_cap) - 1 : mtp_drafts0);
+            if (!probe_usage.empty()) drive.d.usage = probe_usage;
+            policy = strata::spec::DraftPolicy(S);
+            policy_idle = strata::spec::DraftPolicy(S);
+            policy_is_df2 = df2_loaded && !use_mtp;
+            drafter_policy = strata::spec::DrafterPolicy();
+            sfx.reset();
+            std::fprintf(stderr, "xestrata serve: drafting: %s%s%s; VRAM free %lld MiB before the measurement, %lld with "
+                                 "every drafter loaded, %lld now\n",
+                         df2_loaded && use_mtp && o.draft_rule != "df2" ? "the MTP and DFlash2 (picked per request)"
+                         : df2_loaded                                    ? "DFlash2"
+                         : use_mtp && !drafting_off ? "the MTP"
+                                                     : "no drafter",
+                         spec_cap > 0 ? (", window " + std::to_string(spec_cap)).c_str() : "",
+                         drafting_off && use_mtp ? " (the MTP layer's K/V kept for the conversation cache)" : "",
+                         (long long) (probe_free0 >> 20),
+                         free_during, free_mib());
+            o.spec_auto = false;
+            if (drafting_off) info_spec = 1;
+            else if (spec_cap > 0) info_spec = spec_cap;
+            announce();
+            return true;
+        };
+        {
+            const bool want_arms = probe_ok && (o.draft == "auto" || o.spec_auto) && !o.native_head_gguf.empty();
+            if (df2_deferred && want_arms) {
+                // DFlash2 beside everything else, where the VRAM it takes leaves kProbeFreeMib free; its pack must be
+                // this model's
+                size_t fb = 0, tb = 0;
+                strata::gpu::mem_info(&fb, &tb);
+                probe_free0 = fb;
+                const uint64_t bind = native_head.loaded() ? df2.bind_bytes(native_head.row_bytes(), n_vocab, df2_vocab) : 0;
+                const int64_t left = (int64_t) fb - (int64_t) (df2_shape.bytes + bind) - (64ll << 20);
+                const bool fits_model = df2_shape.hidden == g.n_embd && df2_shape.vocab == n_vocab &&
+                                        *std::max_element(df2_shape.taps.begin(), df2_shape.taps.end()) < g.n_layers;
+                std::string e;
+                if (!fits_model) {
+                    df2_drop("its pack is another model's (hidden size, vocabulary or taps)");
+                } else if (left < (kProbeFreeMib << 20)) {
+                    std::fprintf(stderr, "xestrata serve: DFlash2 is not measured: %lld MiB of VRAM free, it takes about "
+                                         "%llu and %lld must stay free: the MTP drafts\n", (long long) (fb >> 20),
+                                 (unsigned long long) ((df2_shape.bytes + bind) >> 20), (long long) kProbeFreeMib);
+                    df2_drop(nullptr);
+                } else {
+                    const strata::core::OnDevice on_df2(0);
+                    if (!df2.load(o.draft_model, 0, e)) {
+                        std::fprintf(stderr, "xestrata serve: DFlash2 not loaded (%s): the MTP drafts\n", e.c_str());
+                        df2_drop(nullptr);
+                    } else {
+                        if (use_mtp && same_bytes(df2_vocab, o.mtp + "/draft_vocab.bin")) {
+                            const auto sh = mtp.shared_head();
+                            if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
+                        }
+                        df2_loaded = true;
+                        if (!df2.bind(wt, g, &native_head, df2_vocab, e) || !df2.prepare(ver.tap_dev(), e)) {
+                            std::fprintf(stderr, "xestrata serve: DFlash2: %s: the MTP drafts\n", e.c_str());
+                            df2_drop(nullptr);
+                        } else if (free_mib() < (long long) kProbeFreeMib) {
+                            df2_drop("less VRAM is left free beside it than the measurement needs");
+                        } else {
+                            df2.set_max_drafts(S - 1);
+                        }
+                    }
+                }
+            } else if (df2_deferred) {
+                df2_drop(nullptr);
+            }
+            if (want_arms)
+                probe_arms = strata::spec::DraftProbe::arms(use_mtp, df2_loaded, o.draft == "auto", S_mtp, o.spec_auto, S);
+            std::vector<int32_t> prompt;
+            if (probe_arms.size() >= 2) {
+                try {
+                    const strata::GgufFile vf(o.native_head_gguf);
+                    prompt = strata::spec::probe_prompt(vf.string_array("tokenizer.ggml.tokens"));
+                } catch (const std::exception& ex) {
+                    std::fprintf(stderr, "xestrata serve: the drafters are not measured (the vocabulary: %s)\n", ex.what());
+                }
+                if (prompt.empty())
+                    std::fprintf(stderr, "xestrata serve: the drafters are not measured: no prompt from the vocabulary\n");
+            }
+            if (!prompt.empty()) {
+                std::string ids;
+                for (size_t i = 0; i < prompt.size(); ++i) ids += (i ? "," : "") + std::to_string(prompt[i]);
+                const std::vector<int> plan = strata::spec::DraftProbe::plan((int) probe_arms.size());
+                for (int k : plan) {
+                    const strata::spec::ProbeArm& a = probe_arms[(size_t) std::max(k, 0)];
+                    probe_lines.push_back("GEN " + std::to_string(strata::spec::probe_tokens()) + " ckpt=0 draft=" +
+                                          (a.drafter == strata::spec::Drafter::None ? std::string("off")
+                                                                                    : strata::spec::drafter_name(a.drafter)) +
+                                          " spec=" + std::to_string(a.spec) + " probe=" + std::to_string(k) + " " + ids);
+                }
+                if (probe_free0 == 0) {
+                    size_t fb = 0, tb = 0;
+                    strata::gpu::mem_info(&fb, &tb);
+                    probe_free0 = fb;
+                }
+                probe_usage = drive.d.usage;
+                probe_running = true;
+                probe_t0 = Clock::now();
+                strata::core::window_choices_paused() = true;
+                std::fprintf(stderr, "xestrata serve: measuring the drafters: %zu runs of %d tokens on a %zu-token text "
+                                     "(%lld MiB of VRAM free with every drafter loaded)\n", plan.size(),
+                             strata::spec::probe_tokens(), prompt.size(), free_mib());
+                std::fflush(stdout);
+                probe_stdout = strata::platform::stdout_mute();
+            } else if (df2_for_probe && df2_loaded) {
+                // it was loaded to be measured and the measurement cannot run: the MTP, as without the pack
+                df2_drop("the drafters could not be measured");
+            }
+        }
+        if (!probe_running) announce();
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -9032,6 +9477,8 @@ int main(int argc, char** argv) {
             // header): a client's next turn renders the history again WITHOUT this reply's thinking, so it matches
             // the slot's tokens only up to there - the slot's K/V up to it plus this state continue from it
             std::vector<ConvCheckpoint> checks;
+            int pen_n = 0;                 ///< its penalty window (0: none), so its rows get their own history
+            int64_t reply0 = 0;            ///< where its reply began in `ids` (the penalty window's start)
             // a prompt read that gave way to a waiting request (BYIELD): `ids` is the part read so far, and the same
             // request continues from it (the read goes on with the same chunks; `from0`: it had started at token 0)
             bool partial = false, partial_from0 = false;
@@ -9201,7 +9648,7 @@ int main(int argc, char** argv) {
             static size_t next_slot = 0;
             int A = 0;
             const int per = batch_mtp ? 2 : 1;
-            for (size_t offset = 0; offset < bs.size() && S + per <= strata::kernels::kVerifyMaxT; ++offset) {
+            for (size_t offset = 0; offset < bs.size() && S + per <= batch_rows; ++offset) {
                 const int b = batch_mtp ? (int) ((next_slot + offset) % bs.size()) : (int) offset;
                 if (!bs[(size_t) b].active) continue;
                 first[A] = S;
@@ -9268,6 +9715,14 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
+            }
+            // each penalised slot's reply tail for its penalty window: the verifier builds its rows from it and the
+            // tokens this window feeds (a slot of two rows is staged once)
+            for (int t = 0; t < S; ++t) {
+                const BSlot& ps = bs[(size_t) rows[t]];
+                if (ps.pen_n <= 0 || (t > 0 && rows[t - 1] == rows[t])) continue;
+                const int64_t from = std::max<int64_t>(ps.reply0, (int64_t) ps.ids.size() - ps.pen_n);
+                ver.set_slot_history(rows[t], ps.ids.data() + from, (int64_t) ps.ids.size() - from);
             }
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
@@ -9528,7 +9983,7 @@ int main(int argc, char** argv) {
         // copies and chains (on its GPU) start then.
         const int pmtp_rows_per_group = GS * (1 + pm_drafts);
         const bool pmtp = piped && piped_mtp && batch_mtp && stage_ver(0).deferred_commit_on() &&
-                          pmtp_rows_per_group <= (int) strata::kernels::kVerifyMaxT;
+                          pmtp_rows_per_group <= batch_rows;
         int64_t pm_checked = 0;   // proposals checked since the last timing line (bt_accepted: kept)
         // a slot whose next proposals are drafting (its chain in flight on the drafter's stream), and per slot the event
         // after the copy of its rows on the last stage's stream, which the chain waits for
@@ -9835,6 +10290,17 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
                 if (pmtp && !pmtp_flush(k)) return false;   // the commits queued for this stage go first
+                if (k == 0) {   // the penalised slots' reply tails for the group's rows (the last stage draws them)
+                    int grows[strata::kernels::kVerifyMaxT] = {};
+                    for (int t = 0; t < G.S && t < (int) strata::kernels::kVerifyMaxT; ++t)
+                        grows[t] = pmtp ? G.rows[t] : (int) (pick * GS + t);
+                    for (int t = 0; t < G.S && t < (int) strata::kernels::kVerifyMaxT; ++t) {
+                        const BSlot& ps = bs[(size_t) grows[t]];
+                        if (ps.pen_n <= 0 || (t > 0 && grows[t - 1] == grows[t])) continue;
+                        const int64_t from = std::max<int64_t>(ps.reply0, (int64_t) ps.ids.size() - ps.pen_n);
+                        stage_ver(k).set_slot_history(grows[t], ps.ids.data() + from, (int64_t) ps.ids.size() - from);
+                    }
+                }
                 if (!(pmtp ? stage_ver(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
                            : stage_ver(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
                     std::printf("ERR %s\n", err.c_str());
@@ -9911,9 +10377,14 @@ int main(int argc, char** argv) {
             return pmtp_settle();
         };
         for (;;) {
+            // the start's measurement: its last request has run (its runs are in probe_runs): the choice, then READY
+            if (probe_running && probe_lines.empty() && !probe_finish()) return 1;
             strata::core::manifest::instance().flush_if_dirty("request");   // XESTRATA_MANIFEST: what the last request added (a no-op when off)
             strata::platform::downgrades_say();   // a request's fallbacks, between whole lines
-            if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
+            if (!probe_lines.empty()) {   // the start's measurement's requests, before any line is read
+                line = std::move(probe_lines.front());
+                probe_lines.pop_front();
+            } else if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
                 if (!in.try_next(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
                     // the stages' threads poll; spinning here slowed them 3x (it starved the runtime's threads)
@@ -10301,6 +10772,7 @@ int main(int argc, char** argv) {
             uint64_t req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
+            int64_t req_pen_from = -1;   // pen_from=N: the request continues one whose reply began at token N
             std::string req_bias_text;
             bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
@@ -10322,8 +10794,11 @@ int main(int argc, char** argv) {
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             bool req_minp_rule = o.spec_window == "min-p";   // the window rule: a request's spec_min_p is the floor
-            std::string req_draft;   // draft=mtp|dflash2|auto: this request's drafter (--draft auto)
+            std::string req_draft;   // draft=mtp|dflash2|auto|off: this request's drafter (--draft auto)
             bool req_df2 = df2_loaded;   // the drafter this request uses (decided once the prompt is parsed)
+            // spec=N: the largest window this request checks (the start's measurement: an arm's window); probe=K: the
+            // measurement's run K (-1 its warm-up), its speed noted and its output not the server's
+            int req_spec_cap = 0, req_probe = -2;
             uint64_t req_kind = 0;   // its kind (the prompt's first tokens), for the drafter policy
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
             // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
@@ -10355,6 +10830,7 @@ int main(int argc, char** argv) {
                 kf.seed = &req_seed;
                 kf.penalty_repeat = &req_penalty_repeat; kf.penalty_freq = &req_penalty_freq;
                 kf.penalty_present = &req_penalty_present; kf.penalty_last_n = &req_penalty_last_n;
+                kf.pen_from = &req_pen_from;
                 kf.ckpt_int = &req_ckpt; kf.prefill = &req_prefill_only; kf.pin = &req_pin; kf.pin_clamp0 = true;
                 kf.logprobs = &req_logprobs; kf.grammar = &req_grammar;
                 kf.logit_bias = &req_bias_text; kf.logit_bias_present = &req_bias_present;
@@ -10364,14 +10840,16 @@ int main(int argc, char** argv) {
                 kf.spec_min_p = &req_spec_min_p; kf.minp_rule = &req_minp_rule; kf.spec_float = true;
                 kf.route_prior = &req_route_prior;
                 kf.draft = &req_draft;
+                kf.spec_cap = &req_spec_cap;
+                if (probe_running) kf.probe = &req_probe;   // (only the start's own lines carry it)
                 kf.allowed = &req_allowed; kf.img_keys = &req_img_keys;
                 strata::program::parse_gen_keys(endp, kf, geni, &emb_path);
             }
             std::vector<float> req_bias;
             std::string bias_error;
-            if (req_bias_present && (o.batch > 0 ||
-                !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error))) {
-                std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
+            if (req_bias_present &&
+                !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error)) {
+                std::printf("ERR logit_bias: %s\n", bias_error.c_str());   // --batch: the slot keeps it as its own
                 continue;
             }
             static strata::core::Grammar grammar;   // the request being read (a --batch slot takes it over at BADM)
@@ -10387,7 +10865,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (!grammar.start(req_grammar, (int) n_vocab, stops, err)) { std::printf("ERR %s\n", err.c_str()); continue; }
-                grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) grammar.words());
+                grammar_rows.resize((size_t) win_rows * (size_t) grammar.words());
             }
             static strata::core::ScriptGuard script;   // one request at a time (not with --batch), as the grammar
             script.stop();
@@ -10398,7 +10876,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 script.apply_bans(req_bias, (int) n_vocab);
-                grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) script.words());
+                grammar_rows.resize((size_t) win_rows * (size_t) script.words());
             }
             std::vector<int64_t> ids;
             std::string pe;
@@ -10409,15 +10887,23 @@ int main(int argc, char** argv) {
             }
             const int64_t n = (int64_t) ids.size();
             // --draft auto: this request's drafter (the draft= key, else --draft-rule, else the learned policy)
+            const bool req_off = req_draft == "off" || drafting_off;   // no drafter (the suffix lookup may propose)
             if (df2_loaded) {
                 req_kind = strata::spec::DrafterPolicy::kind_of(ids.data(), n);
                 const std::string& d = !req_draft.empty() ? req_draft : o.draft_rule;
                 if (d == "mtp") req_df2 = false;
                 else if (d == "dflash2" || d == "df2" || d == "auto") req_df2 = true;
-                else req_df2 = drafter_policy.choose(req_kind, n, true) == strata::spec::DrafterPolicy::Df2;   // learn
-                if (!use_mtp) req_df2 = true;   // DFlash2 is the only drafter loaded
+                else if (d != "off") req_df2 = drafter_policy.choose(req_kind, n, true) == strata::spec::DrafterPolicy::Df2;   // learn
+                if (!use_mtp || !mtp.loaded()) req_df2 = true;   // DFlash2 is the only drafter loaded
+                if (req_off) req_df2 = false;
                 if (req_df2 != policy_is_df2) { std::swap(policy, policy_idle); policy_is_df2 = req_df2; }
             }
+            const bool req_mtp = use_mtp && mtp.loaded() && !req_df2 && !req_off;   // the MTP drafts this request
+            // the windows this request checks: the measurement's arm, else the window the measurement kept
+            const int req_cap = req_spec_cap > 0 ? req_spec_cap : spec_cap;
+            const int S_r = req_cap > 0 ? std::min(S, req_cap) : S, S_mtp_r = std::min(S_mtp, S_r);
+            if (use_mtp && req_mtp)
+                mtp.set_max_drafts(req_cap > 0 ? S_mtp_r - 1 : mtp_drafts0);
             if (grammar.active() && !grammar.take_reply(ids, err)) {   // a request continued in another leg (--batch)
                 std::printf("ERR %s\n", err.c_str());
                 continue;
@@ -11243,8 +11729,12 @@ int main(int argc, char** argv) {
                     }();
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
-                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)))
+                    if (!ver.commit(T, e) || (use_mtp && mtp.loaded() && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)))
                         return false;
+                    if (df2_loaded) {
+                        if (!df2.context(ver.tap_dev(), T, q, e)) return false;
+                        df2.note_rows(win.data(), T, q);
+                    }
                     q += T;
                     pp_reached = q;   // #471
                 }
@@ -11475,7 +11965,7 @@ int main(int argc, char** argv) {
             }
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
-            if (use_mtp) mtp.set_draft_sampling(req_sp);
+            if (use_mtp && mtp.loaded()) mtp.set_draft_sampling(req_sp);
             {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
                 // threads only.  An enabled placement is swept at every request: it catches threads created since.
                 static const bool aux_start = strata::aux_cpus::enabled();
@@ -11703,15 +12193,10 @@ int main(int argc, char** argv) {
                 if (fol_next < fol_sets.size() && !fol_sets[fol_next].empty()) fol = &fol_sets[fol_next];
                 ++fol_next;
             }
-#if defined(STRATA_USE_HIP)
-            // on by default (HIP, where it was measured: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations
-            // fell back to the older checkpoint against 4 of 16 without it, #4677); XESTRATA_SERVE_STOP_BOUND=0 turns
-            // it off
-            static const bool stop_bound = [] {
-                const char* v = strata::env_get("SERVE_STOP_BOUND");
-                return v == nullptr || std::strcmp(v, "0") != 0;
-            }();
-#endif
+            // on by default on every backend (measured on HIP: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16
+            // continuations fell back to the older checkpoint against 4 of 16 without it, #4677; it changes no emitted
+            // token, only which accepted rows the session keeps); XESTRATA_SERVE_STOP_BOUND=0 turns it off
+            static const bool stop_bound = strata::core::serve_stop_bound_on(strata::env_get("SERVE_STOP_BOUND"));
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
@@ -11725,7 +12210,10 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             // #4590: where the penalty window may start in `consumed`: the prompt without its last token, which joins
             // the window as the fed-back head `x`
-            const size_t pen_gen0 = strata::kernels::penalty_window_from(consumed.size(), pen_prompt);
+            size_t pen_gen0 = strata::kernels::penalty_window_from(consumed.size(), pen_prompt);
+            // a request that continues an earlier leg (prompt + what it generated: solo -> batch slot, slot -> solo)
+            // names where its reply began, so the window keeps the earlier reply's tokens
+            if (req_pen_from >= 0 && !pen_prompt) pen_gen0 = std::min<size_t>(pen_gen0, (size_t) req_pen_from);
             int64_t reply_ck = (int64_t) consumed.size();   // --reply-checkpoint-every: where the last one was taken
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
@@ -11777,7 +12265,7 @@ int main(int argc, char** argv) {
                                  pl_serial);
             }
             if (pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new && kvg.on &&
-                !kvg_ensure(std::min<int64_t>(o.max_context, p + max_new + 2 * (int64_t) strata::kernels::kVerifyMaxT + 64),
+                !kvg_ensure(std::min<int64_t>(o.max_context, p + max_new + 2 * (int64_t) strata::kernels::kVerifyNarrowT + 64),
                             adapt_quiesce)) {
                 std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                 return 1;
@@ -12212,14 +12700,12 @@ int main(int argc, char** argv) {
                     chain_kind = 0;
                     int a = 0;
                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
-#if defined(STRATA_USE_HIP)
                     // #4677: commit only the rows this request can emit, so the parked snapshot is what the client
                     // got (a snapshot with more is refused and the older checkpoint is read again)
                     if (stop_bound)
                         a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outp.data(), [&](int32_t y) {
                             return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                         }) - 1;
-#endif
                     for (int i = 0; i < a; ++i)   // the reply ends at its first stop token (as the serial windows')
                         if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end()) {
                             a = i;
@@ -12277,7 +12763,7 @@ int main(int argc, char** argv) {
                         ++pl_on;
                         // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
                         mtp.set_source_R(V1(A).final_R(0));
-                        chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
+                        chain_n = std::min(strata::kernels::kVerifyNarrowT - 1, B.T + S_mtp - 1);
                         if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
                             return die(err);
                         chain_kind = 1;
@@ -12306,7 +12792,7 @@ int main(int argc, char** argv) {
                         B = PW{};
                         if (!last) {
                             mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = strata::kernels::kVerifyMaxT - 1;
+                            chain_n = strata::kernels::kVerifyNarrowT - 1;
                             if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
                                 return die(err);
                             chain_kind = 2;
@@ -12364,7 +12850,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "xestrata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
-            if (!pcie_move_decided && drive.d.pcie_split == pcie_split_ptr)
+            if (!pcie_move_decided && !probe_running && drive.d.pcie_split == pcie_split_ptr)
                 pcie_move_decided = pcie_move_if_pays(drive.d, ver.fetch_branch(), sp.stats(), host_res, o.spec);
             seed_usage_from_prompt(drive.d.usage, sp.stats(), routed_seen, g.n_expert, 4 * (int64_t) o.adapt_every, o.adapt_decay);
             // the window rule, as the chain drafts: another draft after n when the rule would keep it (--spec-window)
@@ -12374,12 +12860,12 @@ int main(int argc, char** argv) {
             policy.set_scale_all(req_minp_rule);
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 policy.set_context(p);         // STRATA_SPEC_COST: the round costs of this context length
-                int T = (use_mtp || req_df2) ? S_mtp : 1;   // no drafter: one token a round unless a lookup fires
-                if (req_df2) T = strata::spec::df2_window(dprob.data(), S, df2_conf);   // DFlash2's confidence cut
-                else if (use_mtp && !req_minp_rule) T = policy.mtp_window(dprob.data(), S_mtp);
-                else if (use_mtp && req_spec_min_p > 0.0) {
+                int T = (req_mtp || req_df2) ? S_mtp_r : 1;   // no drafter: one token a round unless a lookup fires
+                if (req_df2) T = strata::spec::df2_window(dprob.data(), S_r, df2_conf);   // DFlash2's confidence cut
+                else if (req_mtp && !req_minp_rule) T = policy.mtp_window(dprob.data(), S_mtp_r);
+                else if (req_mtp && req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    while (T < S_mtp_r && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -12389,7 +12875,7 @@ int main(int argc, char** argv) {
                 if (o.suffix_draft > 0 && !first_window) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
-                    if (k > 0 && ((!use_mtp && !req_df2) || sbuf[0] == drafts[0])) {
+                    if (k > 0 && ((!req_mtp && !req_df2) || sbuf[0] == drafts[0])) {
                         const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
@@ -12449,7 +12935,7 @@ int main(int argc, char** argv) {
                     const char* e = strata::env_get("RAM_ADAPT");
                     return e != nullptr ? std::max(0, (int) std::strtol(e, nullptr, 10)) : 0;
                 }();
-                if (ram_adapt_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
+                if (ram_adapt_n > 0 && !first_window && !probe_running && !drive.d.usage.empty() && pending.empty() &&
                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu &&
                     drive.d.remote_count == 0 && o.batch == 0) {
                     strata::core::ram_adapt_round(drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, src,
@@ -12520,13 +13006,11 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-#if defined(STRATA_USE_HIP)
                 // #4677: as in the pipelined path: do not cache accepted rows whose outputs this request cannot emit
                 if (stop_bound)
                     a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
                         return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     }) - 1;
-#endif
                 if (fol != nullptr && fol_lp != nullptr) {   // rows 0..a have valid logits (their inputs are accepted)
                     std::vector<int32_t> fol_tg((size_t) a + 1, -1);
                     for (int i = 0; i <= a; ++i) {
@@ -12566,13 +13050,14 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
-                if (adapt_period > 0)
+                // the start's measurement moves no expert and decides nothing once (see probe_lines)
+                if (adapt_period > 0 && !probe_running)
                     for (int st = 0; st < n_stages; ++st) stage_ver(st).add_routing(drive.d.usage.data(), g.n_expert, a + 1);
-                if (adapt_auto && produced_n >= kAdaptDecideAt) {
+                if (adapt_auto && !probe_running && produced_n >= kAdaptDecideAt) {
                     adapt_auto = false;
                     adapt_period = auto_adapt_period(ver, adapt_period, srcp == &src && !src.complement_ready(), "xestrata serve");
                 }
-                if (!drive.d.usage.empty() && !ajob &&
+                if (!drive.d.usage.empty() && !ajob && !probe_running &&
                     (adapt_period > 0 ? (p + a + 1) / adapt_period > p / adapt_period : ((rounds + 1) % o.adapt_every) == 0))
                     adapt_thr = std::thread([&] {
                         strata::platform::name_this_thread("xs-adapt");
@@ -12641,7 +13126,7 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
-                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                if (req_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0),
                                           outv[(size_t) a]);
                 bool drafted = eos || produced_n >= max_new;
@@ -12654,10 +13139,11 @@ int main(int argc, char** argv) {
                         dprob[(size_t) i] = pp[i];
                     }
                     df2.note_rows(outv.data(), a + 1, p);
-                } else if (!drafted && use_mtp) {
+                } else if (!drafted && req_mtp) {
                     drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
-                    // --draft auto: keep the idle DFlash2 ring current with this window's accepted rows
-                    if (drafted && df2_loaded && !req_df2) {
+                    // --draft auto: keep the idle DFlash2 ring current with this window's accepted rows (not in the
+                    // start's measurement: its MTP arm is timed as the MTP alone runs)
+                    if (drafted && df2_loaded && !req_df2 && req_probe == -2) {
                         if (df2.context_async(ver.tap_dev(), a + 1, p, err)) df2.note_rows(outv.data(), a + 1, p);
                     }
                 } else if (!drafted) {
@@ -12729,7 +13215,9 @@ int main(int argc, char** argv) {
                 }
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
-            if (df2_loaded && req_kind != 0)   // --draft auto learn: this request's measured decode speed
+            if (req_probe >= 0)   // the start's measurement: this run's speed
+                probe_runs.push_back({req_probe, produced_n, decode_ms, draft_offered, draft_accepted});
+            if (df2_loaded && req_kind != 0 && req_probe == -2)   // --draft auto learn: this request's measured decode speed
                 drafter_policy.observe(req_kind, n, req_df2 ? strata::spec::DrafterPolicy::Df2
                                                             : strata::spec::DrafterPolicy::Mtp, produced_n, decode_ms);
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
@@ -12903,6 +13391,10 @@ int main(int argc, char** argv) {
                 }
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
+                    if (!ver.set_slot_logit_bias(admit_slot, req_bias, err)) {   // and its own logit bias
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
                     // its grammar has taken the first token: it goes on in the slot's windows (none: the slot's is
                     // cleared)
                     bgram[(size_t) admit_slot] = std::move(grammar);
@@ -12915,6 +13407,17 @@ int main(int argc, char** argv) {
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
+                    {   // its penalty window in the slot's decode: the reply, from the last prompt token (the first
+                        // window feeds it), as the solo loop counts it; a continued leg names where it began
+                        const bool slot_pen = req_sp.penalty_last_n > 0 &&
+                                              (req_sp.penalty_repeat != 1.0f || req_sp.penalty_freq != 0.0f ||
+                                               req_sp.penalty_present != 0.0f);
+                        sl.pen_n = slot_pen ? std::min(req_sp.penalty_last_n, kPenaltyWindowCap) : 0;
+                        sl.reply0 = (int64_t) strata::kernels::penalty_window_from(live.size() > 0 ? live.size() - 1 : 0,
+                                                                                  pen_prompt);
+                        if (req_pen_from >= 0 && !pen_prompt)
+                            sl.reply0 = std::min<int64_t>(sl.reply0, req_pen_from);
+                    }
                     if (batch_mtp) {   // the slot's first proposal, from the prompt's last row
                         // (STRATA_PIPED_MTP: up to pm_drafts proposals, each further one while --spec-min-p allows)
                         int nd = 1;
@@ -13489,7 +13992,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (df2_loaded) {
-            if (use_mtp && df2_vocab == o.mtp + "/draft_vocab.bin") {
+            if (use_mtp && same_bytes(df2_vocab, o.mtp + "/draft_vocab.bin")) {
                 const auto sh = mtp.shared_head();
                 if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
             }

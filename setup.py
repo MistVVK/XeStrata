@@ -465,6 +465,27 @@ def proxy_hint() -> str:
             "terminal first")
 
 
+def net_say():
+    """The network rule's waiting line in setup's own indentation (serve/download.py's open_url): what the transfer
+    waits for, said after 5 s and every 10 s after that, instead of a silent console."""
+    return lambda line: say(f"  {line}")
+
+
+def net_fail(e: "download_core.NetFailure", what=None) -> NoReturn:
+    """setup's stop for a host that did not answer: the plain sentence, the one next step, then the proxy and source
+    hints (serve/download.py's rule, upstream fd40eb0fd)."""
+    fail(e.headline(what), e.next_step() + "".join(h for h in (proxy_hint(), source_hint(str(e))) if h))
+
+
+def disk_fail(e: BaseException, part: Path) -> NoReturn:
+    """setup's stop for a file that cannot be written (full drive, quota, a read-only folder): what happened and the one
+    next step, in plain words instead of the raw errno (upstream 0771e3555)."""
+    words = download_core.disk_words(e)
+    if words is not None:
+        fail(f"cannot write {part.name}: {words[0]}", words[1] + " and run it again")
+    fail(f"cannot write {part.name}: {e}", "free some disk space (or pick another --models-dir) and run it again")
+
+
 def ms_file(url: str):
     """(repo, path) when `url` is a Hugging Face file of a repository setup knows (HF_REVISIONS), else None."""
     m = HF_FILE.match(url)
@@ -482,8 +503,8 @@ def ms_meta(repo: str, path: str):
     if repo not in _ms_files:
         try:
             api = f"{ms_endpoint()}/api/v1/models/{repo}/repo/files?Recursive=true"
-            with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "xestrata-setup"}),
-                                        timeout=60) as r:
+            with download_core.open_url(urllib.request.Request(api, headers={"User-Agent": "xestrata-setup"}),
+                                        say=net_say()) as r:
                 files = json.loads(r.read())["Data"]["Files"]
             _ms_files[repo] = {f["Path"]: (int(f.get("Size") or 0), (f.get("Sha256") or "").lower()) for f in files}
         except (OSError, ValueError, KeyError, TypeError):
@@ -898,6 +919,7 @@ SC117_SWIFT_FILES = {
         (26710079616, "5b91b79a4bbee162761c16b9a47a3434c3f8be0ad6bf34849318d9efcb4b6aa1"),
 }
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
+UMA_DENSE_ROOM_GB = 8          # in the GPU's own pool: the dense weights' buffers beside the file's dense bytes
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
 # --rope-scaling / --rope-scale, and refuses an explicit --rope-scaling none there.
@@ -1164,6 +1186,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                "tag": "qwen36-", "name": "qwen3.6-35b-a3b", "max_context": 262144, "plain": True,
                "profile": "expert-profile-qwen36.bin", "mmproj": _QWEN36_MMPROJ,
                "draft_vocab": True,   # the vocabulary of Qwen3.8's draft head subsets (data/draft_vocab*.bin)
+               "dflash2": "qwen3.6-35b-a3b",   # its DFlash2 drafter (tools/dflash2_fetch.py's key)
                "models": {
                    "UD-Q4_K_XL": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "size": 22853663008,
                                   "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1",
@@ -1298,6 +1321,7 @@ PLAIN_FAMILIES["glm53"] = {
     "about": "320B, 18B active; a large MoE for the PCs whose RAM and VRAM hold 95 GB or more",
     "tag": "glm53-", "name": "glm-5.3-flash", "max_context": 262144, "plain": True,
     "profile": "expert-profile-glm53.bin",
+    "dflash2": "glm-5.3-flash",   # its DFlash2 drafter (tools/dflash2_fetch.py's key)
     "models": {
         "UD-IQ3_XXS": {"repo": _GLM53, "file": _GLM53_IQ3[0]["path"], "parts": _GLM53_IQ3,
                        "size": sum(x["size"] for x in _GLM53_IQ3), "about": "3-bit (Unsloth Dynamic)", "tested": True},
@@ -2008,16 +2032,18 @@ def unused_card_notes(found, used) -> list:
 
 def strix_halo_notes(gpu, ram) -> list:
     """What setup tells a Strix Halo owner (a leading "!" = a warning): nothing is changed or refused."""
-    notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): the CPU and the GPU share one memory ({ram:.0f} GB seen by the "
-             f"OS + a {gpu.get('carve_gb', 0.0):.1f} GB BIOS carve-out); the model's experts live in it."]
+    notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): one memory in all ({ram:.0f} GB seen by the OS + a "
+             f"{gpu.get('carve_gb', 0.0):.1f} GB BIOS carve-out the OS does not see). The engine's device allocations "
+             "come from the carve-out; the model's experts live in the RAM beside it."]
     if gpu.get("shared_gb", 0.0) < 0.75 * ram - 1:
-        notes.append(f"!the GPU reaches {gpu.get('shared_gb', 0.0):.0f} GB of shared memory (the GTT pool; the "
-                     "kernel's default is about half of the RAM). The kernel options ttm.pages_limit and "
-                     "ttm.page_pool_size give it more (docs/DETAILS.md, AMD APUs); setup changes no host setting")
+        notes.append(f"!the GPU reaches {gpu.get('shared_gb', 0.0):.0f} GB of the RAM through the GTT pool (the "
+                     "kernel's default is about half of the RAM; the GTT pool is the RAM itself). The kernel options "
+                     "ttm.pages_limit and ttm.page_pool_size give it more (docs/DETAILS.md, AMD APUs); setup changes "
+                     "no host setting")
     if gpu.get("carve_gb", 0.0) > 16:
         notes.append(f"!the BIOS carve-out is {gpu['carve_gb']:.0f} GB: that memory is taken from the OS, while the "
-                     "GPU reaches the shared memory anyway. A small carve-out (512 MB - 2 GB) leaves the RAM to the "
-                     "model")
+                     "GPU reaches the RAM through the GTT anyway. A small carve-out (512 MB - 2 GB) leaves the RAM "
+                     "to the model")
     if ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB:
         notes.append(f"  Recommended model: {STRIX_HALO_MODEL} (Unsloth); the menus list the others.")
     return notes
@@ -3345,7 +3371,7 @@ class _Source:
             if stale is not None and self.final is not None and self.final != stale:
                 return self.final                        # another connection already got a fresh address
             req = urllib.request.Request(self.url, headers={"User-Agent": "xestrata-setup", "Range": "bytes=0-0"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with download_core.open_url(req, say=net_say()) as r:
                 cr = (r.headers.get("Content-Range") or "").strip()
                 if r.status != 206 or cr != f"bytes 0-0/{self.total}":
                     raise _NoRange(f"HTTP {r.status}, Content-Range {cr!r}")
@@ -3545,7 +3571,7 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
         try:
             url = src.get()
             req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={pos}-{end}"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with download_core.open_url(req, say=net_say()) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
                     if st.stop.is_set():
@@ -3570,7 +3596,7 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
                                         st.flight.pop(i, None)
                             return
             return
-        except (_NoRange, _DiskError, _Changed):
+        except (_NoRange, _DiskError, _Changed, download_core.NetFailure):
             raise
         except urllib.error.HTTPError as e:
             err = e
@@ -3611,7 +3637,7 @@ def _piece_worker(src: _Source, st: _Pieces, todo: list, part: Path):
     except _PieceFailed as e:
         st.errors.append(e)
         st.abort_round.set()
-    except (_NoRange, _DiskError, _Changed) as e:
+    except (_NoRange, _DiskError, _Changed, download_core.NetFailure) as e:
         st.fatal = st.fatal or e
         st.stop.set()
     except OSError as e:                                # the .part itself could not be opened
@@ -3747,10 +3773,12 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
         part.with_name(part.name + ".src").unlink(missing_ok=True)
         fail(f"{name} changed on the server while it was downloading: the part that was there was deleted",
              "run it again (the download starts over with the file that is there now)")
+    if isinstance(st.fatal, download_core.NetFailure):
+        _save_pieces(part, total, st.snapshot())
+        net_fail(st.fatal, name)
     if isinstance(st.fatal, _DiskError):
         _save_pieces(part, total, st.snapshot())
-        fail(f"cannot write {part.name}: {st.fatal}",
-             "free some disk space (or pick another --models-dir) and run it again")
+        disk_fail(st.fatal, part)
     if isinstance(st.fatal, _NoRange):
         _save_pieces(part, total, st.snapshot())
         return False                                    # the server stopped doing ranges: one stream from the start
@@ -3785,7 +3813,7 @@ def _repair_piece(src: _Source, st: _Pieces, f, i: int, stats: dict):
         try:
             url = src.get()
             req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={pos}-{end}"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with download_core.open_url(req, say=net_say()) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
                     if st.stop.is_set():
@@ -3804,7 +3832,7 @@ def _repair_piece(src: _Source, st: _Pieces, f, i: int, stats: dict):
                     pos += len(b)
                     st.add(i, len(b))
             return
-        except (_NoRange, _DiskError, _Changed):
+        except (_NoRange, _DiskError, _Changed, download_core.NetFailure):
             raise
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 410) and url is not None:
@@ -3896,7 +3924,7 @@ def download_single(url: str, part: Path, total: int, label: str):
             break                                      # ask for (a range past the end is a 416, retried 30 times)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={have}-"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with download_core.open_url(req, say=net_say()) as r:
                 try:
                     have = download_core.resumed_at(r, have, total)
                 except OSError:
@@ -3917,8 +3945,13 @@ def download_single(url: str, part: Path, total: int, label: str):
             progress_end()
             if not total or have >= total:
                 break
+        except download_core.NetFailure:
+            progress_end()
+            raise                                      # the rule's window is spent: download_file says it once
         except (OSError, http.client.HTTPException) as e:
             progress_end()
+            if download_core.disk_words(e) is not None:   # a .part that cannot be written: no retry helps
+                disk_fail(e, part)
             if part.exists() and total and part.stat().st_size > total:
                 part.unlink(missing_ok=True)           # more than the file has can only be wrong bytes
             warn(f"download interrupted ({e}); retrying in 10 s ...")
@@ -3930,7 +3963,7 @@ def range_total(url: str) -> int:
     (ModelScope's: #1915); 0 when it does not say.  With the length known the file comes over several connections."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": "bytes=0-0"})
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with download_core.open_url(req, timeout=download_core.FIRST_CONNECT_S) as r:
             m = re.match(r"\s*bytes 0-0/(\d+)\s*$", r.headers.get("Content-Range") or "")
             return int(m.group(1)) if r.status == 206 and m else 0
     except (OSError, http.client.HTTPException):
@@ -3975,7 +4008,14 @@ def download_file(url, dst: Path, what=None):
         src = Path(url[7:] if url.startswith("file://") else url)
         if not src.exists():
             fail(f"not found: {src}")
-        shutil.copyfile(src, dst)
+        try:
+            shutil.copyfile(src, dst)
+        except OSError as e:      # a source that cannot be opened: no waiting, one sentence (upstream 465fcbbc9)
+            words = download_core.disk_words(e)
+            if words is not None and words[0].startswith(("the drive", "the drive's quota")):
+                disk_fail(e, dst)
+            fail(f"cannot copy {src}: {e}", "check that the file is there and readable, and that the "
+                                            "destination can be written, then run it again")
         mark(dst)
         ok(f"{what or dst.name} copied")
         return
@@ -3993,8 +4033,10 @@ def download_file(url, dst: Path, what=None):
     for attempt in range(5):
         try:
             req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "xestrata-setup"})
-            total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
+            total = int(download_core.open_url(req, say=net_say()).headers.get("Content-Length", 0))
             break
+        except download_core.NetFailure as e:   # 12 s then 30 s: about 44 s for a silent host, not 320
+            net_fail(e, what or dst.name)
         except urllib.error.HTTPError as e:
             if e.code == 404 and hf_unpinned(url) != url:  # the pinned revision is gone from the repository
                 if not allow_unpinned():
@@ -4035,7 +4077,10 @@ def download_file(url, dst: Path, what=None):
         return
     if not (total >= DL_MIN_PARALLEL and conns > 1 and parallel_download(url, part, total, label, conns, dst.name)):
         _claim_part(part, url)
-        download_single(url, part, total, label)
+        try:
+            download_single(url, part, total, label)
+        except download_core.NetFailure as e:
+            net_fail(e, what or dst.name)
     if total and part.stat().st_size != total:
         fail(f"could not finish downloading {dst.name}: {part.stat().st_size:,} bytes on disk, "
              f"the server says {total:,}",
@@ -5457,7 +5502,7 @@ def write_ratio_head(QI, models_dir: Path) -> None:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup",
                                                            "Range": f"bytes={start}-{end}"})
-                data = urllib.request.urlopen(req, timeout=120).read()
+                data = download_core.open_url(req, say=net_say()).read()
                 if len(data) == end - start + 1:
                     return data
             except (urllib.error.URLError, OSError):
@@ -5896,7 +5941,7 @@ def kv_streaming_ram_gb(ctx, kv) -> float:
 def kv_streaming_wanted(model, ctx, kv, ram) -> bool:
     """Does setup stream this model's KV cache on this PC (--kv-resident): from 64K up, when the RAM holds the cache
     beside the model's experts (+1 GB).  The merges' and the release's measurements ask it too (tools/bench_core.py)."""
-    return ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_streaming_ram_gb(ctx, kv) + 1
+    return ctx >= 65536 and ram >= MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB + kv_streaming_ram_gb(ctx, kv) + 1
 
 
 #: The draft layer (MTP) takes about 1 GB of graphics memory out of the expert cache (upstream 671f4573d): its files
@@ -7199,8 +7244,8 @@ def saved_ple_io(cfg_path: Path) -> str | None:
 
 
 def ple_io_auto(ple: Path, model: str, ram: float, low_ram: bool) -> bool:
-    """Whether setup keeps the n-gram table in RAM by itself (--ple-io ram), saying why; False: the engine's default
-    reads (direct), which the engine may still lock in RAM itself where the RAM can spare the table."""
+    """Whether setup keeps the n-gram table in RAM by itself (--ple-io ram), saying why; False: the engine chooses
+    (auto: it measures direct against mmap, and locks the table in RAM itself where XESTRATA_PLE_AUTO_RAM asks it)."""
     if str(ROOT / "tools") not in sys.path:
         sys.path.insert(0, str(ROOT / "tools"))
     from gguf_reader import GGUFFile
@@ -8380,6 +8425,36 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         args += ["--expert-profile", str(ROOT / "data" / fam["profile"])]
     if fam.get("draft_vocab"):                         # the MTP layer's drafts over a token subset (--draft-vocab)
         args += ["--draft-vocab", str(ROOT / "data" / DRAFT_VOCABS.get(a.draft_vocab or "cjk", "draft_vocab.bin"))]
+    # the drafter: a model with a DFlash2 drafter (the family's "dflash2", tools/dflash2_fetch.py's key) has it fetched
+    # into dflash2/ beside the model for auto (the default) and dflash2; with auto the engine measures it, the MTP layer
+    # and no drafter at its start and keeps the fastest (the window too, --spec auto)
+    drafting = getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json") or "auto"
+    df2_key = fam.get("dflash2")
+    df2_pack = None
+    if df2_key and drafting in ("auto", "dflash2") and not on_cpu:
+        df2_dir = models_dir / "dflash2"
+        say(f"  The DFlash2 drafter of {fam['title']} (a second way to guess ahead) comes from Inco AI (Apache-2.0);")
+        say("  it is packed on this PC.")
+        run([sys.executable, str(ROOT / "tools" / "dflash2_fetch.py"), "fetch", "--model", df2_key, "--out",
+             str(df2_dir)], env=dict(os.environ), check=False)
+        df2_pack = next((p for p in (df2_dir / f"{df2_key}-dflash2.q4_0-selq4.pack",
+                                     df2_dir / f"{df2_key}-dflash2.q4_0.pack") if p.exists()), None)
+        if df2_pack is None:
+            warn("the DFlash2 drafter is not on this PC (the download did not complete): the MTP layer continues")
+            if drafting == "dflash2":
+                drafting = "mtp"
+    elif drafting == "dflash2":
+        drafting = "auto"   # no drafter for this model: the MTP layer, measured against none
+    if not on_cpu:
+        if drafting == "off":
+            args += ["--draft", "off"]
+        elif drafting == "dflash2" and df2_pack is not None:
+            args += ["--draft", "dflash2", "--draft-model", str(df2_pack)]
+        else:
+            args += ["--draft", drafting, "--spec", "auto"]
+            if drafting == "auto" and df2_pack is not None:
+                args += ["--draft-model", str(df2_pack)]
+        ok(f"drafting: {drafting}")
     if vision != "none":   # the GPU encoder warms up before the engine, which then sizes itself around it
         args += ["--vision"]
     if a.vram_reserve_mib is not None:
@@ -8416,6 +8491,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                            "tokenizer": str(tok_dir / "tokenizer"), "model_name": served_name(family, model),
                            "family": family,
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+    if not on_cpu:
+        cfg["drafting"] = drafting
+        if df2_pack is not None:
+            cfg["draft_model"] = str(df2_pack)
     # for serve/autotune.py's choices (its "parallel": slots taken from the VRAM the experts leave, "replicas",
     # "split_serve"): the model's files and, of them, the experts the cache holds - a dense model has none
     cfg["model_gb"] = round(d["size"] / 1e9, 1)
@@ -8819,13 +8898,12 @@ OPTIONS = [
                      ["fr", "English, code and French"]],
             default=""),
     _option("drafting", "How the model guesses ahead (speculative decoding)",
-            "the drafter: auto = the model's MTP layer, and DFlash2 too only if its pack is already on this PC "
-            "(then the faster is chosen per request by the measured speed and the context depth; default, no "
-            "download), mtp = the MTP layer only, dflash2 = fetch the DFlash2 block drafter (~0.5 GB, "
-            "Qwen3.8-Flash-Next only) and use it, off = no drafter",
-            choices=[["auto", "Auto: the MTP layer, DFlash2 too if its pack is present (recommended, no download)"],
+            "the drafter: auto = the model's MTP layer and, where the model has one, the DFlash2 block drafter "
+            "(fetched, ~0.5-0.8 GB packed); the engine measures them and no drafter at its start and keeps the "
+            "fastest (default), mtp = the MTP layer only, dflash2 = DFlash2 only, off = no drafter",
+            choices=[["auto", "Auto: measured at each start, the fastest kept (recommended)"],
                      ["mtp", "The model's MTP layer only"],
-                     ["dflash2", "DFlash2: fetch the pack (Qwen3.8-Flash-Next only)"],
+                     ["dflash2", "DFlash2 only (Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B)"],
                      ["off", "Off: no speculative decoding"]],
             default="auto", when=["download"], question="How should the model guess ahead?"),
     _option("script-guard", "Other languages' characters in the answers, for every model (the thinking is left as "
@@ -9483,8 +9561,8 @@ def main() -> int:
         mem = "no VRAM of its own (it shares the system RAM)" if gpu.get("integrated") else \
             f"{gpu['vram_gb']:.0f} GB VRAM"
         if "uma_gb" in gpu:
-            mem = (f"unified memory: a {gpu['carve_gb']:.1f} GB BIOS carve-out + {gpu['shared_gb']:.0f} GB shared with "
-                   f"the RAM, {gpu['uma_gb']:.0f} GB usable by the GPU")
+            mem = (f"unified memory: a {gpu['carve_gb']:.1f} GB BIOS carve-out (the GPU's own pool) + "
+                   f"{gpu['shared_gb']:.0f} GB of the RAM reached through the GTT, {gpu['uma_gb']:.0f} GB in all")
         ok(f"GPU: {gpu['name']}, {mem}, PCI {gpu['pci']}, PCIe link " + (gpu["link"] or "not readable"))
         if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
             for line in strix_halo_notes(gpu, ram_gb()):
@@ -9691,7 +9769,20 @@ def main() -> int:
                          "install it anyway", "  Install it anyway?")
             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
         budget = budget_choice(model, ram, a.resident_budget_gib)
-        ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
+        # upstream 86ffdbeb1: on a unified-memory GPU whose own pool holds the experts, the expert cache takes them all
+        # and nothing is pinned.  The GPU's own pool is the BIOS carve-out (the OS does not see it), not `uma_gb`: the
+        # GTT pool is the RAM itself.  The dense weights and the buffers take their part of the carve-out first, so the
+        # experts' room is the carve-out less the file's dense bytes (the download holds experts and dense) and room
+        # beside them.
+        own_gb = (gpu.get("carve_gb") or 0.0) if gpu.get("integrated") else 0.0
+        dense_gb = max(0.0, MODELS[model]["download_gb"] - MODELS[model]["arena_gb"])
+        if (gpu.get("integrated") and a.resident_budget_gib is None
+                and own_gb >= MODELS[model]["arena_gb"] + dense_gb + UMA_DENSE_ROOM_GB):
+            ok(f"{model}'s experts fit the GPU's own memory ({own_gb:.0f} GB BIOS carve-out): the expert cache takes "
+               "them all, no RAM copy is pinned")
+            budget = None
+        else:
+            ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
     elif a.resident_budget_gib is not None:
@@ -10018,14 +10109,14 @@ def main() -> int:
     for line in draft_vocab_note(gpu_expert_vram(gpu), draft_vocab):   # #474: a recommendation, nothing changes
         say("  " + line)
 
-    # the DFlash2 block drafter (--drafting dflash2): a pinned download packed on this PC (tools/dflash2_fetch.py).
-    # Only an explicit dflash2 choice fetches it. auto does NOT download: the engine runs the MTP alone unless a pack
-    # is already on this PC (a previous dflash2 install), and only then loads both and learns which drafter is faster.
-    # DFlash2 measured slower than the MTP on every B70/RTX 4070 depth, so its cost is not paid by everyone.
+    # the DFlash2 block drafter: a pinned download packed on this PC (tools/dflash2_fetch.py), fetched for auto (the
+    # default) and dflash2. With auto the engine measures the MTP, DFlash2 and no drafter at its start and keeps the
+    # fastest, releasing the others (strata/spec/draft_probe.hpp): where the MTP wins (the B70 and the RTX 4070) the
+    # engine is as it is without the pack. A failed download leaves the MTP (auto measures it against no drafter).
     drafting = getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json") or "auto"
     df2_dir = data / "dflash2"
     df2_pack = df2_dir / "qwen3.8-flash-next-dflash2.q4_0-selq4.pack"
-    if drafting == "dflash2":
+    if drafting in ("auto", "dflash2"):
         say("  The DFlash2 drafter (a second way to guess ahead, ~0.5 GB packed) comes from")
         say("  incoai/Qwen3.8-Flash-Next-DFlash2 (Apache-2.0); it is packed on this PC.")
         run([sys.executable, str(ROOT / "tools" / "dflash2_fetch.py"), "fetch", "--out", str(df2_dir)],
@@ -10033,7 +10124,8 @@ def main() -> int:
         have_pack = df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists()
         if not have_pack:   # offline or a failed check: the MTP layer continues (the install goes on)
             warn("the DFlash2 drafter is not on this PC (the download did not complete): the MTP layer continues")
-            drafting = "mtp"
+            if drafting == "dflash2":
+                drafting = "mtp"
     # the draft vocabulary subset beside the pack (when a pack is present), the choice this model's config keeps
     if df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists():
         src_vocab = ROOT / "data" / DRAFT_VOCABS.get(draft_vocab or "cjk", "draft_vocab.bin")
@@ -10050,7 +10142,7 @@ def main() -> int:
         fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
     args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", str(ple),
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
-            "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
+            "--prefill", "auto", "--spec", "auto", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
     df2_use = df2_pack if df2_pack.exists() else df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack"
     if drafting == "off":
@@ -10059,7 +10151,7 @@ def main() -> int:
         args += ["--draft", "dflash2", "--draft-model", str(df2_use), "--spec", "6"]   # the anchor + up to 7 drafts
     elif drafting == "auto":
         args += ["--draft", "auto"]
-        if df2_use.exists():   # a pack is present (a previous dflash2 install): auto may load both and learn
+        if df2_use.exists():   # the engine measures DFlash2 against the MTP at its start and keeps the faster
             args += ["--draft-model", str(df2_use)]
     elif drafting == "mtp":
         args += ["--draft", "mtp"]
@@ -10109,9 +10201,11 @@ def main() -> int:
                    f"so setup leaves {UNSLOTH_RAM_LEFT_GB} GB of the RAM for the OS and the desktop. "
                    "--expert-cache N in the config's args sets it")
             else:
-                warn(f"this GPU shares the RAM, and the {budget:g} GiB RAM budget leaves almost none for the expert "
-                     "cache: it stays on auto, which may take the room the OS needs. A smaller "
-                     "--resident-budget-gib leaves room")
+                # upstream 1d342f083: say where the cache is sized from, not that it may take the OS's room (on a
+                # unified-memory GPU a larger --vram-reserve-mib cannot raise it)
+                carve = gpu.get("carve_gb") or 0.0
+                where = f"the {carve:.0f} GB BIOS carve-out" if carve else "the shared memory"
+                ok(f"expert cache: sized from {where}, not from the RAM (the GTT pool is the RAM)")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     if a.vram_reserve_mib is not None:                 # #493: VRAM left free for other programs (only when given)

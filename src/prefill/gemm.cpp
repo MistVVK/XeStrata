@@ -207,6 +207,12 @@ core::TimedCache<sycl::device, std::tuple<int, int, int64_t, int64_t>, bool> g_o
 // accumulating product, whose output a trial would change; a queue recording a graph, which cannot wait) takes a
 // choice already made for the class and otherwise the library.  XESTRATA_BLAS=1 keeps the library; without one (the
 // trial failed, or XESTRATA_NO_BLAS=1) the products take the own kernels anyway.
+//
+// The choice is made per start, and the library's speed moves between starts: on the RX 9060 XT the same BF16 product
+// (4096 x 320 x 10240) measured 13.1 to 25.5 TFLOPS through rocBLAS while XeStrata's kernels held at 16.8-21.3, and a
+// class near the two paths' speed changed sides from start to start, taking the answer's last bits with it (2026-11-14:
+// the same binary and settings split a 64K greedy answer at token 18).  The library's own fast and slow states gave the
+// same bits.  A run whose answer must be the same every time takes the own kernels throughout: XESTRATA_NO_BLAS=1.
 bool own_first(void* stream, Own k, int64_t T, int64_t N, int64_t K, bool measure, const std::function<void()>& own,
                const std::function<void()>& lib) {
     static const bool library = env_on("BLAS");
@@ -800,20 +806,26 @@ bool w8_fused(void* stream) {
 // Not a shape at a time either: the narrow margins of the small shapes moved the choice from start to start (as
 // recorded; the image DiTs' w8_fused above).  A queue recording a graph,
 // or a timing around this product (core::timing_depth), takes native until the GPU is timed.
-// A MoE model keeps native by default: neither the timing nor the int8 library's load (oneDNN's reservation,
-// about 385 MiB on the B70, shifts the expert cache's placement and the answers with it, 2026-11-12), and its
-// KL against the floor of the same binary's runs passed the task's bar nowhere the form was taken (the RTX 4070's
-// 32K: Qwen3.8-Flash-Next 0.00955 / top-1 100%, Qwen3.6-35B-A3B 0.04622 / 89.06%, the floors 0 / 100%).  A dense
-// model's default is the timed choice (the user's decision 2026-11-12: the RTX 4070's Qwen3.5-9B 32K prompt
-// 3245 -> 5462 tok/s; its KL 0.00411 / 96.88% against the BLAS floor 0.00107 / 100% accepted).
-// XESTRATA_LLM_W8A8=0 fixes the form off (a dense model too), =1 on (a MoE model too, without the timing).
+// A MoE model's dense products (the GDN's and QSA's projections, not its experts) take the same timed choice: on
+// Strix Halo's gfx1151 (2026-11-14) W8A8 measured 2.1x faster on the three shapes, the 8K prompt 552 -> 732 tok/s
+// and the 32K 628 -> 811, and the greedy answers were the same on the 1K/8K/32K prompts.  A KL against the native
+// path is unverified for a MoE model (the RTX 4070's 32K KL had failed: Qwen3.8-Flash-Next 0.00955 / top-1 100%,
+// Qwen3.6-35B-A3B 0.04622 / 89.06%), and on the B70 the int8 library's load (oneDNN's reservation, about 385 MiB)
+// shifts the expert cache's placement and the answers with it (2026-11-12): a device where the timing is under the
+// 10% margin keeps native.  A dense model's default is the tipping choice too (the user's decision 2026-11-12: the
+// RTX 4070's Qwen3.5-9B 32K prompt 3245 -> 5462 tok/s; its KL 0.00411 / 96.88% against the BLAS floor 0.00107 /
+// 100% accepted).
+// XESTRATA_LLM_W8A8=0 fixes the form off everywhere, =1 on without the timing.
 bool Gemm::llm_w8a8(void* stream, bool dense) {
     static const int fixed = [] {
         const char* e = strata::env_get("LLM_W8A8");
         return e == nullptr ? -1 : std::strtol(e, nullptr, 10) != 0 ? 1 : 0;
     }();
     if (fixed >= 0) return fixed == 1 && Gemm::i8_usable(stream);
-    if (!dense) return false;   // a MoE model: no timing, no int8 library (the comment above)
+    // A MoE model's dense products (the GDN's and QSA's projections) choose by the same timing: measured on Strix
+    // Halo's gfx1151 (2026-11-14) W8A8 is 18-28% faster end to end on Qwen3.8-Flash-Next's 8K/32K prompts, and the
+    // greedy answers were the same on 1K/8K/32K (a KL against the native path is unverified there and on the other
+    // GPUs: XESTRATA_LLM_W8A8=0 keeps native everywhere).
     if (!Gemm::i8_usable(stream)) return false;
     sycl::queue& q = core::Runtime::get().stream(stream);
     struct Kept {

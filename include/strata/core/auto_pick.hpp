@@ -34,6 +34,13 @@ inline Pick pick_from_env(const char* name) {
 /// error of the two means: a handful of windows at a long context differ by 10% from one to the next), so a run the two
 /// cannot be told apart in keeps the default.  Blocks run on the windows where the switch can show, only; one that
 /// never sees such a window keeps the default and says so.  Nothing is kept between runs; the decision is one line.
+/// While the serve engines' start measures the drafters (strata/spec/draft_probe.hpp) the switches below are not
+/// measured on its windows: they decide on the first real requests', as a start without the measurement does.
+inline bool& window_choices_paused() {
+    static bool paused = false;
+    return paused;
+}
+
 class WindowChoice {
 public:
     WindowChoice() = default;
@@ -51,7 +58,7 @@ public:
 
     /// The window that just ran under on(): its milliseconds and tokens, and whether it could show the difference.
     void took(double ms, int64_t tokens, bool informative = true) {
-        if (!choosing() || !informative || tokens <= 0) return;
+        if (!choosing() || !informative || tokens <= 0 || window_choices_paused()) return;
         const int f = on_ ? 1 : 0;
         const double per = ms / (double) tokens;
         ++n_[f];

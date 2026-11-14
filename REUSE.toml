@@ -32,7 +32,7 @@ SPDX-License-Identifier = "MIT"
 # XeStrata's own files without a comment of their own: the settings register (tools/settings_register.py writes it),
 # and the expert profiles of the other models
 [[annotations]]
-path = ["data/dflash2/NOTICE.md"]
+path = ["data/dflash2/NOTICE.md", "data/dflash2/NOTICE-GLM-5.3-Flash.md", "data/dflash2/NOTICE-Qwen3.6-35B-A3B.md"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
