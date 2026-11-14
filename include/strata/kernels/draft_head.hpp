@@ -32,6 +32,9 @@ constexpr int kTopKSelectionMax = 512;   ///< the shared selector's limit
 /// The scratch topk needs for `n` values.
 std::size_t topk_scratch_bytes(int64_t n, int k);
 
+/// Measure both paths once per device and shape before graph capture. No disk cache.
+void topk_probe(int64_t n, int k, bool mapped);
+
 /// The indices of the `k` (1..kTopKSelectionMax) largest of the `n` values in `v`, into `ids`. The existing small-k
 /// path keeps its work-item tie rule; the wide path breaks ties by index. Device pointers;
 /// `scratch` holds topk_scratch_bytes(n, k).

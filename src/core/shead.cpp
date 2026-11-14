@@ -81,6 +81,8 @@ bool Shead::load(const std::string& path, int device, int vocab, int hidden, int
     if (!upload(bt_, bt) || !upload(a_, ab) || !upload(as_, scales) || !upload(w_, wb) || !upload(ws_, scales)) {
         err = "shead: file read or device upload failed"; release(); return false;
     }
+    kernels::topk_probe(vocab, 512, false);
+    kernels::topk_probe(512, 16, true);
     vocab_ = vocab; hidden_ = hidden; rank_ = (int) rank; max_rows_ = max_rows;
     return true;
 }

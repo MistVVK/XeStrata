@@ -4,10 +4,16 @@
 #include "strata/kernels/draft_head.hpp"
 
 #include "strata/core/runtime.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -116,12 +122,22 @@ sycl::event topk_stage_small(sycl::queue& q, const float* v, const int32_t* ids_
     });
 }
 
-// A tile holds twice the largest supported k. A larger selection replaces hundreds of sequential reductions with
-// a local sort and a merge of retained lists. The cutoff is structural (k and input size), not a GPU model; speed has
-// not yet been measured. All indices in scratch are input offsets so an ID map works at every merge level.
+// A tile holds twice the largest supported k. All scratch indices are input offsets, including with an ID map.
 constexpr int kWideTile = 1024;
-constexpr int kWideMinK = kTopKMax * 2;
-bool topk_wide_shape(int64_t n, int k) { return k >= kWideMinK && n >= (int64_t) 2 * k; }
+using TopKey = std::tuple<int, int64_t, int, bool>;
+std::mutex top_mutex;
+std::map<TopKey, bool> top_choices;
+thread_local int top_override = -1;
+
+int top_mode() {
+    const char* exact = strata::env_get("EXACT");
+    if (exact && std::strcmp(exact, "1") == 0) return 1;
+    const char* mode = strata::env_get("DRAFT_TOPK");
+    if (!mode || !*mode || std::strcmp(mode, "auto") == 0) return -1;
+    if (std::strcmp(mode, "wide") == 0) return 1;
+    if (std::strcmp(mode, "reduction") == 0) return 0;
+    throw std::invalid_argument("XESTRATA_DRAFT_TOPK must be auto, wide or reduction");
+}
 
 sycl::event topk_wide(sycl::queue& q, const float* v, const int32_t* map, int64_t n, int k, int32_t* ids,
                       float* values, void* scratch, int wg) {
@@ -277,7 +293,7 @@ std::size_t topk_scratch_bytes(int64_t n, int k) {
     // the first stage's candidates at most, twice (the stages go back and forth), values and indices
     const int64_t c = ((n + kTopChunk - 1) / kTopChunk) * k;
     const size_t narrow = (std::size_t) (2 * c) * (sizeof(float) + sizeof(int32_t));
-    const size_t wide = topk_wide_shape(n, k) ? (size_t) 2 * ((n - 1) / kWideTile + 1) * k * sizeof(int32_t) : 0;
+    const size_t wide = (size_t) 2 * ((n - 1) / kWideTile + 1) * k * sizeof(int32_t);
     return std::max(narrow, wide);
 }
 
@@ -292,7 +308,15 @@ void topk_mapped(const float* v, const int32_t* id_map, int64_t n, int k, int32_
     int wg = 1;
     while ((size_t) wg * 2 <= limit && wg < kTopWG) wg *= 2;
     const size_t local = dev.get_info<sycl::info::device::local_mem_size>();
-    if (topk_wide_shape(n, k) && local >= kWideTile * (sizeof(float) + sizeof(int32_t))) {
+    int mode = top_override >= 0 ? top_override : top_mode();
+    if (mode < 0) {
+        std::lock_guard<std::mutex> lock(top_mutex);
+        const auto it = top_choices.find({core::Runtime::get().ordinal(), n, k, id_map != nullptr});
+        mode = it == top_choices.end() ? (n >= k && local >= kWideTile * 8) : (int) it->second;
+    }
+    if (mode && (n < k || local < kWideTile * (sizeof(float) + sizeof(int32_t))))
+        throw std::runtime_error("topk: wide selection needs n >= k and 8192 bytes of local memory");
+    if (mode) {
         const auto e = topk_wide(q, v, id_map, n, k, ids, values, scratch, wg);
         done(stream, e, "topk");
         return;
@@ -322,6 +346,61 @@ void topk_mapped(const float* v, const int32_t* id_map, int64_t n, int k, int32_
     e = q.memcpy(ids, in_i, (size_t) k * sizeof(int32_t));
     if (values) e = q.memcpy(values, in_v, (size_t) k * sizeof(float));
     done(stream, e, "topk");
+}
+
+void topk_probe(int64_t n, int k, bool mapped) {
+    if (top_mode() >= 0) return;
+    if (n < k || k < 1 || k > kTopKSelectionMax || n > INT32_MAX)
+        throw std::invalid_argument("topk_probe: invalid shape");
+    auto& runtime = core::Runtime::get();
+    const TopKey key{runtime.ordinal(), n, k, mapped};
+    {
+        std::lock_guard<std::mutex> lock(top_mutex);
+        if (top_choices.count(key)) return;
+    }
+    auto& q = runtime.compute();
+    if (q.get_device().get_info<sycl::info::device::local_mem_size>() < kWideTile * 8) {
+        std::lock_guard<std::mutex> lock(top_mutex);
+        top_choices[key] = false;
+        return;
+    }
+    float* input = sycl::malloc_device<float>((size_t) n, q);
+    int32_t* map = mapped ? sycl::malloc_device<int32_t>((size_t) n, q) : nullptr;
+    int32_t* ids = sycl::malloc_device<int32_t>((size_t) k, q);
+    void* scratch = sycl::malloc_device(topk_scratch_bytes(n, k), q);
+    auto release = [&] {
+        if (input) sycl::free(input, q);
+        if (map) sycl::free(map, q);
+        if (ids) sycl::free(ids, q);
+        if (scratch) sycl::free(scratch, q);
+    };
+    if (!input || (mapped && !map) || !ids || !scratch) { release(); throw std::bad_alloc(); }
+    try {
+        q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+            input[i] = (float)((i[0] * 7919) % 104729);
+            if (map) map[i] = (int32_t) i[0];
+        }).wait_and_throw();
+        auto run = [&](int mode) {
+            top_override = mode;
+            topk_mapped(input, map, n, k, ids, nullptr, scratch, &q);
+            q.wait_and_throw();
+        };
+        run(0); run(1);  // compile and warm both before timing
+        double elapsed[2] = {};
+        for (int i = 0; i < 4; ++i) {
+            const int mode = i == 0 || i == 3 ? 0 : 1;
+            const auto start = std::chrono::steady_clock::now();
+            run(mode);
+            elapsed[mode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        }
+        top_override = -1;
+        // A difference within 5% is treated as a tie in favour of the wide path; verify on the three GPUs.
+        const bool wide = elapsed[1] <= elapsed[0] * 1.05;
+        { std::lock_guard<std::mutex> lock(top_mutex); top_choices[key] = wide; }
+        std::fprintf(stderr, "topk: n=%lld k=%d mapped=%d reduction=%.3f wide=%.3f ms, %s\n",
+                     (long long) n, k, (int) mapped, elapsed[0] * 500, elapsed[1] * 500, wide ? "wide" : "reduction");
+    } catch (...) { top_override = -1; release(); throw; }
+    release();
 }
 
 void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* stream) {
