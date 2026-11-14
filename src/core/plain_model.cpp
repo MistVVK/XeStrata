@@ -830,22 +830,22 @@ bool PlainModel::load_arch(std::string& err) {
 // --kv not given: the FP16 cache unless it leaves blocks off the GPU (whose CPU forward costs far more than the
 // cache's rounding); then the first of INT8, tcq5 and tcq4 (heads of 256, not PLaMo 3's: kv_tcq.hpp) with which the
 // GPU holds them all, else the smallest.  In this order each rounds the cache a little more than the one before.
-// The trellis forms are only taken within kTcqAutoMaxCells: past that context their kl_median crosses the quality
-// line (kv_tcq.hpp), so the pick keeps INT8 rather than round the cache below the line.  The dense and the MoE pick
+// Past kKvAutoQuantMaxCells every quantized cache's kl_median crosses the quality line (kv_tcq.hpp), so the pick
+// keeps FP16 and lets gpu_layers shrink rather than round the cache below the line.  The dense and the MoE pick
 // share this, so the line is the same rule wherever the cache is chosen automatically; an explicit --kv is untouched.
 template <typename Fits, typename KvRow>
 void PlainModel::auto_kv_format(Fits fits, KvRow kv_row, int64_t nl) {
     if (!(opt_.kv_auto && opt_.kv_tcq == 0 && opt_.kv_q4 == 0 && !opt_.kv_int8)) return;
     const int64_t f16 = fits(kv_row(false, 0, 0), nullptr);
     if (f16 >= nl) return;   // FP16 holds every block: keep it
+    if (opt_.max_cells > k::kKvAutoQuantMaxCells) return;   // keep FP16: a quantized cache is below the quality line
     const ModelSpec& s = spec_;
     const bool tc_ok = s.key_length == 256 && s.arch != ModelArch::Plamo3;
-    const bool tc_line = opt_.max_cells <= k::kTcqAutoMaxCells;
     struct Pick { bool i8; int tcq; const char* name; };
     const Pick picks[] = {{true, 0, "int8"}, {false, 5, "tcq5"}, {false, 4, "tcq4"}};
     const Pick* take = &picks[0];
     for (const Pick& p : picks) {
-        if (p.tcq != 0 && (!tc_ok || !tc_line)) continue;
+        if (p.tcq != 0 && !tc_ok) continue;
         take = &p;
         if (fits(kv_row(p.i8, 0, p.tcq), nullptr) == nl) break;
     }
@@ -1501,7 +1501,7 @@ bool PlainModel::load_qwen(std::string& err) {
                              "(~%.2f GiB of host copy)\n", (long long) kv_resident_cells_,
                      (double) kv_host_bytes() / 1073741824.0);
     // --kv not given, a MoE model: the same auto pick as the dense one (auto_kv_format), the same quality line
-    // (kTcqAutoMaxCells).  The K/V is allocated before the experts' tier (open_experts takes what VRAM is left), so the
+    // (kKvAutoQuantMaxCells).  The K/V is allocated before the experts' tier (open_experts takes what VRAM is left), so the
     // pick sizes the cache against the free VRAM less a reserve and the tier's estimate: the experts it would hold,
     // capped at half the free VRAM so a large expert set (read from RAM) does not push the cache below FP16.
     if (!dense_ && root_ == this && !opt_.encoder && opt_.kv_auto && opt_.kv_tcq == 0 && opt_.kv_q4 == 0 &&

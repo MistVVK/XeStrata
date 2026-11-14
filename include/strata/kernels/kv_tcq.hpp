@@ -40,14 +40,15 @@ inline constexpr int kTcqChain = 64;   ///< values a chain: a row of 256 is four
 inline constexpr int kTcqBlock = 16;   ///< positions coded together (deferred coding)
 inline constexpr int kTcqRing = 64;    ///< the INT8 ring's cells (positions mod kTcqRing)
 
-/// The most context cells the AUTOMATIC --kv pick may take a trellis cache (tcq4/tcq5) at.  Past it the cache's
-/// kl_median crosses YASAKANI's quality line, so the auto pick keeps INT8 instead (an explicit --kv tcq4/tcq5 is not
-/// bound by this).  From the measurement (INT2, 2026-11-14, Qwen3.6-35B-A3B, B70/RX 9060 XT/RTX 4070): tcq5's
-/// kl_median increase over the FP16 floor was within the 0.00052 nat line at 8192 cells (0.00038-0.00046 on the three
-/// makers) but 0.0028-0.0034 at 32768.  8192 is the largest measured context within the line; the next measured point
-/// (32768) is already over, so the boundary is set at 8192 until a finer sweep places it.  The same rule for every
-/// model the auto pick serves (dense and MoE plain alike): the line is the cache's, not the model's.
-inline constexpr int64_t kTcqAutoMaxCells = 8192;
+/// The most context cells the AUTOMATIC --kv pick may take a QUANTIZED cache (int8, k8v4, q4_0, tcq4/tcq5) at.
+/// Past it every quantized cache's kl_median crosses YASAKANI's quality line, so the auto pick keeps FP16 (and lets
+/// gpu_layers shrink) instead; an explicit --kv is not bound by this.  From the measurement (INT2, 2026-11-14,
+/// Qwen3.6-35B-A3B, B70, kl_median of KL(fp16||kv) over 1023 rows): at 8192 cells int8 0.000434, tcq5 0.000378,
+/// k8v4 0.000493 are within the 0.00052 nat line (q4_0 0.000852 already over); at 32768 ALL are over — int8 0.002107,
+/// tcq5 0.002762, k8v4 0.003570.  8192 is the largest measured context within the line for int8/tcq5/k8v4; the next
+/// measured point (32768) is already over, so the boundary is set at 8192 until a finer sweep places it.  The same
+/// rule for every model the auto pick serves (dense and MoE plain alike): the line is the cache's, not the model's.
+inline constexpr int64_t kKvAutoQuantMaxCells = 8192;
 
 /// Bytes per cell and KV head: the code and the scale.  bits 4 or 5.
 inline uint64_t kv_tcq_bytes_per_head(int head_dim, int bits) { return (uint64_t) head_dim * bits / 8 + 4; }
