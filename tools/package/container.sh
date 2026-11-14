@@ -219,6 +219,19 @@ if [ "$license" = contrib ]; then
   runtime="$runtime, \"nvidia_pip\": $(json_list "$nvidia_pip")"
 fi
 runtime="$runtime}"
+# the parts' notices the engine's folder carries (About > Licenses): the ROCm BLAS headers' texts from the
+# distribution's packages, as tools/package/win_rocm.sh takes them.  Before the install below, which takes the file.
+mkdir -p /build/rocm-texts
+case "$distro" in
+  ubuntu*) for p in librocblas-dev libhipblaslt-dev libhipblas-common-dev; do
+             cp "/usr/share/doc/$p/copyright" "/build/rocm-texts/LICENSE-$p.txt"
+           done ;;
+  fedora*) for p in rocblas hipblaslt hipblas-common; do
+             for f in /usr/share/licenses/"$p"*/*; do [ -f "$f" ] && cp "$f" "/build/rocm-texts/LICENSE-$p-$(basename "$f").txt"; done
+           done ;;
+esac
+python3 "$src/tools/package/engine_notices.py" --src "$src" --build /build/engine --rocm /build/rocm-texts \
+  --out /build/engine/package/NOTICES.json
 case "$distro" in
   ubuntu*)
     # the libraries the engine's own files link, from dpkg-shlibdeps; not oneMath's backends and the CUDA and HIP
@@ -242,19 +255,6 @@ case "$distro" in
     ;;
   fedora*) generator=RPM ;;
 esac
-# the parts' notices the engine's folder carries (About > Licenses): the ROCm BLAS headers' texts from the
-# distribution's packages, as tools/package/win_rocm.sh takes them
-mkdir -p /build/rocm-texts
-case "$distro" in
-  ubuntu*) for p in librocblas-dev libhipblaslt-dev libhipblas-common-dev; do
-             cp "/usr/share/doc/$p/copyright" "/build/rocm-texts/LICENSE-$p.txt"
-           done ;;
-  fedora*) for p in rocblas hipblaslt hipblas-common; do
-             for f in /usr/share/licenses/"$p"*/*; do [ -f "$f" ] && cp "$f" "/build/rocm-texts/LICENSE-$p-$(basename "$f").txt"; done
-           done ;;
-esac
-python3 "$src/tools/package/engine_notices.py" --src "$src" --build /build/engine --rocm /build/rocm-texts \
-  --out /build/engine/package/NOTICES.json
 cmake -DSTRATA_PACKAGE_DEPENDS="$depends" -DSTRATA_PACKAGE_RECOMMENDS="$recommends" \
   -DSTRATA_PACKAGE_SUGGESTS="$suggests" -DSTRATA_PACKAGE_RUNTIME="$runtime" /build/engine
 cd /build/engine
