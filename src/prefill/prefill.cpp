@@ -729,6 +729,20 @@ struct Prefill::Impl {
     int32_t* lat_dst_ = nullptr;
     int32_t* lat_tok_ = nullptr;
     int64_t lat_scratch_T_ = 0;              // the chunk the scratch was sized for
+    // the latent mmq fast path's scratch (the int8 matrix-unit products, iq_mmq)
+    uint8_t* lm_xq_ = nullptr;               // D input (q8, T rows of N)
+    float* lm_xl_ = nullptr;                 // D output (T*G rows of ELL)
+    uint8_t* lm_xlq_ = nullptr;              // A gu input (q8, T*K expert-order rows of ELL)
+    float* lm_gu_ = nullptr;                 // A gate/up (a group's rows of 2*I)
+    float* lm_h_ = nullptr;                  // A swiglu (a group's rows of I)
+    uint8_t* lm_hq_ = nullptr;               // A down input (q8, a group's rows of I)
+    float* lm_yl_ = nullptr;                 // A down output (T*K expert-order rows of ELL)
+    uint8_t* lm_ylq_ = nullptr;              // U input (q8, T*K group-order rows of ELL)
+    uint8_t* lm_grp_gu_ = nullptr;           // a group's gathered gate/up weights
+    uint8_t* lm_grp_d_ = nullptr;            // a group's gathered down weights
+    int32_t* lm_ids_ = nullptr;              // the quantize row map (T*K)
+    int32_t* lm_bounds_ = nullptr;           // the grouped products' bounds (n_expert+1 + G+1)
+    int64_t lm_scratch_T_ = 0;
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
