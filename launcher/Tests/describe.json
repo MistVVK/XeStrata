@@ -2228,9 +2228,9 @@
   }
  ],
  "image_default": [
-  "mage-flow-turbo",
-  "qwen-image-turbo",
-  "moss-image"
+  "mage-flow-turbo-uncensored",
+  "qwen-image-turbo-uncensored",
+  "moss-image-uncensored"
  ],
  "web_search": null,
  "custom": null,
