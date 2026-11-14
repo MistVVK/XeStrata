@@ -381,29 +381,13 @@ bool PlainModel::prompt_warm_products(std::string& err) {
 void PlainModel::prompt_yskn(const W& w, const uint16_t* x16, int64_t ldx, float* y, int64_t T, int64_t ldy) {
     const k::YsknDev& d = *w.yk;
     prefill::Gemm& gm = prompt_gemm().gemm;
-    // the rows a part: the scratch's rotated rows of the widest matrix (1,024 rows of 17,408: 35 MB of FP16 and
-    // 71 MB of FP32 for Qwen3.8-27B), the FP16 matrix of the largest one but the head (178 MB)
-    constexpr int64_t kRows = 1024;
-    if (yskn_w16_ == nullptr) {
-        size_t wmax = 0, cmax = 0, rmax = 0;
-        for (const auto& e : yskn_devs_) {
-            if (e.get() != head_.yk) wmax = std::max(wmax, (size_t) e->rows * e->cols);
-            cmax = std::max(cmax, (size_t) e->cols);
-            rmax = std::max(rmax, (size_t) e->rows);
-        }
-        yskn_w16_ = static_cast<uint16_t*>(strata::gpu::alloc_device(wmax * 2));
-        yskn_x16_ = static_cast<uint16_t*>(strata::gpu::alloc_device((size_t) kRows * cmax * 2));
-        yskn_yrot_ = static_cast<float*>(strata::gpu::alloc_device((size_t) kRows * rmax * 4));
-        for (void* p : {(void*) yskn_w16_, (void*) yskn_x16_, (void*) yskn_yrot_})
-            if (p != nullptr) allocs_.push_back(p);
-        if (yskn_w16_ == nullptr || yskn_x16_ == nullptr || yskn_yrot_ == nullptr)
-            throw std::runtime_error("plain prompt: no VRAM for the .yskn products' scratch");
-    }
+    // the scratch taken at the load (yskn_scratch): the FP16 matrix of the largest matrix but the head (178 MB for
+    // Qwen3.8-27B), the rotated rows of the widest / tallest one (1,024 rows of 17,408: 35 MB of FP16, 71 MB of FP32)
     if (w.yk == head_.yk) throw std::runtime_error("plain prompt: the .yskn head takes the decode's product");
     k::yskn_dequant_f16(d, yskn_w16_, cs_);
     const int64_t ld = ldy > 0 ? ldy : w.n_out;
-    for (int64_t t0 = 0; t0 < T; t0 += kRows) {
-        const int64_t n = std::min(kRows, T - t0);
+    for (int64_t t0 = 0; t0 < T; t0 += kYsknPromptRows) {
+        const int64_t n = std::min(kYsknPromptRows, T - t0);
         k::yskn_rotate_in_f16(d, x16 + (size_t) t0 * ldx, ldx, (int) n, yskn_x16_, cs_);
         gm.native(yskn_x16_, /*F16*/ 1, yskn_w16_, yskn_yrot_, n, d.rows, d.cols);
         k::yskn_rotate_out(d, yskn_yrot_, (int) n, y + (size_t) t0 * ld, ld, cs_);

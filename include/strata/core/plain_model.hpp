@@ -71,6 +71,10 @@ struct YsknDev;
 
 namespace strata::core {
 
+/// The prompt's rows a part of a .yskn product (PlainModel::prompt_yskn): the rotated input and output rows of the
+/// scratch are this many of the widest / tallest matrix's
+inline constexpr int64_t kYsknPromptRows = 1024;
+
 class RemoteExperts;
 class PlainCpu;
 
@@ -728,11 +732,12 @@ private:
     /// V-head order (grouped in the file, tiled in the engine) as row or column maps; false: none there (err unset)
     /// or a failure (err set)
     bool upload_yskn(const std::string& name, W& w, std::string& err);
-    /// The scratch the decode's .yskn products share, sized for the largest matrix and max_t rows
+    /// The scratch the .yskn products share, taken at the load (the VRAM estimate counts the same bytes): the decode's
+    /// sized for the largest matrix and max_t rows, the prompt's FP16 matrix and rotated rows (yskn_prompt_sizes)
     bool yskn_scratch(std::string& err);
     /// The prompt's product of a .yskn matrix: x16 [T] (row stride ldx) rotated, the matrix decoded to FP16 rows and
-    /// multiplied by prefill::Gemm, the rows rotated back into y (row stride ldy, 0: n_out), in parts of the scratch's
-    /// rows
+    /// multiplied by prefill::Gemm, the rows rotated back into y (row stride ldy, 0: n_out), in parts of
+    /// kYsknPromptRows rows
     void prompt_yskn(const W& w, const uint16_t* x16, int64_t ldx, float* y, int64_t T, int64_t ldy);
     /// The head's tensor: output.weight, or token_embd.weight where the file ties the two (as llama.cpp reads Qwen3.5's
     /// small models, which have no output.weight)
@@ -1116,7 +1121,8 @@ private:
     std::vector<const strata::yskn::TensorDesc*> yskn_emb_extra_;
     std::vector<int8_t> yskn_emb_signs_;
     void* yskn_scratch_ = nullptr;   ///< the decode's .yskn products' (yskn_scratch)
-    /// the prompt's: the FP16 matrix, the rotated input rows, the rotated output rows (prompt_yskn)
+    /// the prompt's, taken at the load with it: the FP16 matrix, the rotated input rows, the rotated output rows
+    /// (prompt_yskn)
     uint16_t* yskn_w16_ = nullptr;
     uint16_t* yskn_x16_ = nullptr;
     float* yskn_yrot_ = nullptr;

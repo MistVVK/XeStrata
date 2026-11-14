@@ -19,6 +19,7 @@
 // (yskn_rotate_in_f16) and the output rotated back (yskn_rotate_out).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels {

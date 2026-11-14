@@ -190,6 +190,40 @@ bool yskn_name(const std::string& gguf, std::string& out, int& vorder) {
     return false;
 }
 
+// the work-items a row's columns are divided among: enough rows x workers to fill the device (its compute units times
+// 256 lanes; measured on no card yet), a divisor of the 512-groups; XESTRATA_YSKN_WORKERS fixes it.  The load's upload
+// and the VRAM estimate (auto_gpu_layers) ask the same question of the same device
+int yskn_workers(int rows, int cols, int64_t lanes) {
+    const int G = cols / strata::yskn::kGroup;
+    int want = 1;
+    if (const char* e = strata::env_get("YSKN_WORKERS"); e != nullptr && std::atoi(e) > 0) want = std::atoi(e);
+    else want = (int) std::max<int64_t>(1, (lanes + rows - 1) / rows);
+    int nw = 1;
+    for (int c = 1; c <= G; ++c)
+        if (G % c == 0) {
+            nw = c;
+            if (c >= want) break;
+        }
+    return nw;
+}
+
+// the prompt scratch's three buffers (prompt_yskn, yskn_scratch): the FP16 matrix of the largest matrix but the head,
+// the rotated input rows of the widest one, the rotated output rows of the tallest one (kYsknPromptRows rows; the head
+// takes the decode's product).  From the container's header, so the VRAM estimate (auto_gpu_layers, before the upload)
+// and the load's allocation take the same bytes
+void yskn_prompt_sizes(const strata::yskn::Container& c, size_t& w16, size_t& x16, size_t& yrot) {
+    size_t wmax = 0, cmax = 0, rmax = 0;
+    for (const strata::yskn::TensorDesc& t : c.tensors()) {
+        if (t.role == "embedding" || t.name == "lm_head") continue;
+        wmax = std::max(wmax, (size_t) t.physical_rows * t.cols);
+        cmax = std::max(cmax, (size_t) t.cols);
+        rmax = std::max(rmax, (size_t) t.physical_rows);
+    }
+    w16 = wmax * 2;
+    x16 = (size_t) kYsknPromptRows * cmax * 2;
+    yrot = (size_t) kYsknPromptRows * rmax * 4;
+}
+
 }  // namespace
 
 bool PlainModel::open_yskn(std::string& err) {
@@ -300,22 +334,10 @@ bool PlainModel::upload_yskn(const std::string& name, W& w, std::string& err) {
         err = "plain model: " + yn + ": " + e.what();
         return false;
     }
-    // the work-items a row's columns are divided among: enough rows x workers to fill the device (its compute units
-    // times 256 lanes; measured on no card yet), a divisor of the 512-groups; XESTRATA_YSKN_WORKERS fixes it
-    const int G = d.cols / strata::yskn::kGroup;
-    int want = 1;
-    if (const char* e = strata::env_get("YSKN_WORKERS"); e != nullptr && std::atoi(e) > 0) {
-        want = std::atoi(e);
-    } else {
-        const int64_t lanes = (int64_t) Runtime::get().stream(cs_).get_device().get_info<sycl::info::device::max_compute_units>() * 256;
-        want = (int) std::max<int64_t>(1, (lanes + d.rows - 1) / d.rows);
-    }
-    d.n_workers = 1;
-    for (int c = 1; c <= G; ++c)
-        if (G % c == 0) {
-            d.n_workers = c;
-            if (c >= want) break;
-        }
+    // the work-items a row's columns are divided among (yskn_workers): the device's lanes from its compute units
+    const int64_t lanes =
+        (int64_t) Runtime::get().stream(cs_).get_device().get_info<sycl::info::device::max_compute_units>() * 256;
+    d.n_workers = yskn_workers(d.rows, d.cols, lanes);
     w.type = -1;   // no GGUF type: every reader of w checks yk first
     w.data = d.words;
     w.n_in = d.cols;
@@ -329,12 +351,23 @@ bool PlainModel::yskn_scratch(std::string& err) {
     if (yskn_devs_.empty()) return true;
     size_t bytes = 0;
     for (const auto& d : yskn_devs_) bytes = std::max(bytes, k::yskn_scratch_bytes(*d, opt_.max_t));
-    yskn_scratch_ = strata::gpu::alloc_device(bytes);
-    if (yskn_scratch_ == nullptr) {
+    // the prompt's scratch too, taken here (not at the first prompt): the VRAM the load leaves for the K/V pool and
+    // the context's guidance (auto_gpu_layers counts the same bytes) must not hold it
+    size_t w16 = 0, x16 = 0, yrot = 0;
+    yskn_prompt_sizes(*yskn_, w16, x16, yrot);
+    auto take = [&](size_t b) -> void* {
+        void* p = strata::gpu::alloc_device(b);
+        if (p != nullptr) allocs_.push_back(p);
+        return p;
+    };
+    yskn_scratch_ = take(bytes);
+    yskn_w16_ = static_cast<uint16_t*>(take(w16));
+    yskn_x16_ = static_cast<uint16_t*>(take(x16));
+    yskn_yrot_ = static_cast<float*>(take(yrot));
+    if (yskn_scratch_ == nullptr || yskn_w16_ == nullptr || yskn_x16_ == nullptr || yskn_yrot_ == nullptr) {
         err = "plain model: no VRAM for the .yskn products' scratch";
         return false;
     }
-    allocs_.push_back(yskn_scratch_);
     return true;
 }
 
@@ -820,15 +853,35 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
                 head += b;
             }
         }
-    if (yskn_)   // the matrices the skeleton lacks: their codes (the tables and scales are small)
+    uint64_t yskn_scratch_b = 0;
+    if (yskn_) {   // the matrices the skeleton lacks: their codes, tables, scales and signs, and the products' scratch
+        const int64_t lanes = (int64_t) Runtime::get().device().get_info<sycl::info::device::max_compute_units>() * 256;
         for (const strata::yskn::TensorDesc& t : yskn_->tensors()) {
+            if (t.role == "embedding") continue;
+            // the codes in the device order, the int8 and FP16 tables (24 KiB), tau and the scale (6 a row), the
+            // signs, the GDN's V-head order (upload_yskn)
+            uint64_t b = t.stream_bytes + 24576 + (uint64_t) t.physical_rows * 6 + (uint64_t) t.cols +
+                         (t.has_rot_out ? (uint64_t) t.physical_rows : 0);
+            if (t.name.find("linear_attn.out_proj") != std::string::npos) b += (uint64_t) t.cols * 4;
+            else if (t.name.find("linear_attn.in_proj_qkv") != std::string::npos ||
+                     t.name.find("linear_attn.in_proj_z") != std::string::npos)
+                b += (uint64_t) t.rows * 4;
             if (t.name.rfind("layers.", 0) == 0) {
                 const int64_t l = std::strtoll(t.name.c_str() + 7, nullptr, 10);
-                if (l >= 0 && l < nl) block[(size_t) l] += t.stream_bytes;
+                if (l >= 0 && l < nl) block[(size_t) l] += b;
             } else if (t.name == "lm_head") {
-                head += t.stream_bytes;
+                head += b;
             }
+            k::YsknDev d;
+            d.rows = t.physical_rows;
+            d.cols = t.cols;
+            d.n_workers = yskn_workers(d.rows, d.cols, lanes);
+            yskn_scratch_b = std::max<uint64_t>(yskn_scratch_b, k::yskn_scratch_bytes(d, opt_.max_t));
         }
+        size_t w16 = 0, x16 = 0, yrot = 0;
+        yskn_prompt_sizes(*yskn_, w16, x16, yrot);
+        yskn_scratch_b += w16 + x16 + yrot;
+    }
     const int64_t nkv = std::max<int64_t>(1, s.n_head_kv.empty() ? 1 : *std::max_element(s.n_head_kv.begin(), s.n_head_kv.end()));
     const int64_t chunk = std::max<int64_t>(opt_.prompt_chunk, opt_.max_t);
     for (int64_t l = 0; l < nl; ++l) {
@@ -842,13 +895,13 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
     const uint64_t reserve = opt_.reserve_mib >= 0
                                  ? (uint64_t) opt_.reserve_mib << 20
                                  : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
-    uint64_t used = head + reserve;
+    uint64_t used = head + reserve + yskn_scratch_b;
     int64_t fit = 0;
     while (fit < nl && used + block[(size_t) fit] <= free_b) used += block[(size_t) fit++];
     if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
-    opt_.gpu_layers = head + reserve > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
+    opt_.gpu_layers = head + reserve + yskn_scratch_b > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
     std::fprintf(stderr, "xestrata plain: %.2f GiB of VRAM free, the head and a reserve %.2f GiB, the blocks %.2f GiB: %s\n",
-                 free_b / 1073741824.0, (head + reserve) / 1073741824.0,
+                 free_b / 1073741824.0, (head + reserve + yskn_scratch_b) / 1073741824.0,
                  std::accumulate(block.begin(), block.end(), uint64_t{0}) / 1073741824.0,
                  opt_.gpu_layers == 0 ? "the CPU alone" : ("the first " + std::to_string(fit) + " blocks on the GPU").c_str());
     return true;
