@@ -5497,7 +5497,7 @@ def import_anima(path: Path, models_dir: Path) -> str:
     folder.mkdir(parents=True, exist_ok=True)
     dest = folder / path.name
     reserved = {qi.local_path(models_dir, k).name for k in qi.FILES if k.startswith(("anima-", "llm-anima-"))}
-    if dest.name in reserved:
+    if dest.name in reserved or "anima-" + path.stem in {v[0] for v in qi.IMAGE_MODELS.values()}:
         raise ValueError("the name is reserved for an Anima release")
     if dest.resolve() != path:
         with path.open("rb") as src, dest.open("xb") as out:
@@ -5519,7 +5519,8 @@ def ask_images(cfg_path: Path) -> str | None:
         ARGS.image_auto_largest = True
     models_dir = Path(ARGS.models_dir) if ARGS and ARGS.models_dir else data_folder_path(None, load_settings()) / "models"
     by_name = {v[0]: k for k, v in qi.IMAGE_MODELS.items()}
-    by_name.update({"anima-" + k[len(qi.ANIMA_USER):]: k for k in qi.anima_user_dits(models_dir)})
+    for k in qi.anima_user_dits(models_dir):
+        by_name.setdefault("anima-" + k[len(qi.ANIMA_USER):], k)
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
@@ -9213,8 +9214,9 @@ def describe() -> dict:
     QI = _qimage()
     images = image_descriptions(data_folder_path(getattr(ARGS, "data_dir", None), load_settings()) / "models")
     by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
-    by_name.update({"anima-" + m["id"][len(QI.ANIMA_USER):]: m["id"] for m in images
-                    if m["id"].startswith(QI.ANIMA_USER)})
+    for m in images:
+        if m["id"].startswith(QI.ANIMA_USER):
+            by_name.setdefault("anima-" + m["id"][len(QI.ANIMA_USER):], m["id"])
     installed = []
     for c in installed_configs():
         ch = choices_from_config(c)
