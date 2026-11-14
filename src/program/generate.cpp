@@ -55,6 +55,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/core/kv_grow_rules.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
@@ -10470,7 +10471,8 @@ int main(int argc, char** argv) {
     // addresses move, so every captured graph stays valid.  The context is never smaller: --max-context cells always
     // fit, the cache simply holds fewer experts while a long one is live.
     struct KvGrow {
-        bool on = false;
+        bool on = false;                  // the pools are elastic: every request's cells are mapped before it runs
+        bool from_cache = false;          // ... and the expert cache gives them its slots (else new VRAM only)
         int64_t top = 0, lo = 0;          // slots [lo, top) hold no expert; their whole chunks may be with the K/V
         int64_t floor = 128;              // the cache keeps at least these slots
         int64_t step = 8192;              // the K/V grows in whole steps of cells
@@ -10478,13 +10480,21 @@ int main(int argc, char** argv) {
         std::vector<strata::core::VmmChunk> spare;   // out of the cache, not (yet) in the K/V
         int64_t grows = 0, trims = 0, fresh = 0, evicted = 0, refilled = 0;
     } kvg;
+    // Pools made elastic at session init map only their first cells, so they grow whenever the session is elastic: a
+    // cache that cannot give slots (no VMM range, residency table or expert source, or a top at or under the floor)
+    // only means the K/V grows from new VRAM (kv_grow_rules.hpp).  Before, such a start left the pools at their first
+    // cells and a longer prompt wrote past them (an illegal memory access).
     auto kvg_start = [&](int64_t top) {
-        kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
-                 !host_res.empty() && srcp != nullptr && top > kvg.floor;
+        const strata::core::KvGrowStart s = strata::core::kv_grow_start(
+            strata::core::qsa_kv_elastic(), xcache.vmm_range() != nullptr, d_res != nullptr && !host_res.empty(),
+            srcp != nullptr, top, kvg.floor);
+        kvg.on = s.on;
+        kvg.from_cache = s.from_cache;
         if (!kvg.on) return;
         kvg.top = kvg.lo = top;
         kvg.cells = strata::core::qsa_kv_elastic_cells();
         if (const char* v = std::getenv("STRATA_KV_GROW_STEP"); v != nullptr && std::atoll(v) > 0) kvg.step = std::atoll(v);
+        if (!kvg.from_cache) return;
         // tests: the cache keeps this many slots (its size: the K/V grows into new VRAM only)
         if (const char* v = std::getenv("STRATA_KV_GROW_FLOOR"); v != nullptr && std::atoll(v) > 0) kvg.floor = std::atoll(v);
         std::fprintf(stderr, "strata generate: elastic K/V: %lld of %lld cells in VRAM (%.2f of %.2f GiB); the expert "
@@ -10498,85 +10508,89 @@ int main(int argc, char** argv) {
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
     auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
         if (!kvg.on || cells <= kvg.cells) return true;
-        const int64_t target = std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
+        const int64_t target = strata::core::kv_grow_target(cells, kvg.step, o.max_context);
         const int64_t need = strata::core::qsa_kv_elastic_need(target);
         if (need == 0) { kvg.cells = strata::core::qsa_kv_elastic_cells(); return true; }
         quiesce();
-        strata::core::VmmRange& r = *xcache.vmm_range();
-        const uint64_t G = strata::core::vmm_granularity();
-        std::vector<int32_t> owner;   // slot -> residency index
-        // The slots given up are the ones just below the prompt path's loan, and the loan is most of the cache: they
-        // hold experts of middling heat.  So an expert there that is hotter than the coldest one in the loan region
-        // moves into that one's slot (a device copy), and the coldest is given up instead - the cache then holds what
-        // a smaller cache would.  Heat: the adaptive tier's routing counts, then the profile's rank.
-        std::vector<int32_t> rank;
-        std::vector<std::pair<float, int32_t>> cold;   // the loan region's residents, hottest first
-        auto heat = [&](int32_t i) -> float {
-            const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i];
-            return u * 1048576.0f - (float) rank[(size_t) i];
-        };
-        const auto& lay = strata::kernels::cpu::expert_layout();
         int64_t gave = 0, moved = 0;
-        auto freeable = [&]() -> int64_t {   // mapped chunks wholly inside [lo, top): a chunk a live slot shares stays
-            const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
-            const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
-            int64_t k = 0;
-            for (int64_t c = c0; c < c1; ++c) k += r.mapped(c) ? 1 : 0;
-            return k;
-        };
-        while ((int64_t) kvg.spare.size() + freeable() < need && kvg.lo > kvg.floor) {
-            if (owner.empty()) {
-                owner.assign((size_t) xcache.slots(), -1);
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= 0 && host_res[i] < xcache.slots()) owner[(size_t) host_res[i]] = (int32_t) i;
-                rank.assign(host_res.size(), (int32_t) profile.size());
-                for (size_t r = 0; r < profile.size(); ++r)
-                    rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= kvg.top) cold.emplace_back(heat((int32_t) i), (int32_t) i);
-                std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-            }
-            --kvg.lo;
-            ++gave;
-            if (const int32_t oi = owner[(size_t) kvg.lo]; oi >= 0) {
-                const int64_t layer = oi / g.n_expert;
-                int32_t vi = -1;
-                if (!cold.empty() && cold.back().first < heat(oi)) {
-                    vi = cold.back().second;
-                    const int32_t vs = host_res[(size_t) vi];
-                    nib::guard_raw(layer, "the elastic K/V's slot move (kvg_ensure)");
-                    if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < lay.blob_bytes(layer) ||
-                        cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
-                                   (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToDevice) != cudaSuccess)
-                        vi = -1;
-                    else {
-                        cold.pop_back();
-                        host_res[(size_t) oi] = vs;
-                        host_res[(size_t) vi] = strata::core::kNotResident;
-                        ++moved;
-                    }
+        // the expert cache gives the K/V slots only when kvg_start found it able to (kvg.from_cache); otherwise the
+        // K/V grows from new VRAM alone (grow_take below), as it does when the cache is at its floor
+        if (kvg.from_cache) {
+            strata::core::VmmRange& r = *xcache.vmm_range();
+            const uint64_t G = strata::core::vmm_granularity();
+            std::vector<int32_t> owner;   // slot -> residency index
+            // The slots given up are the ones just below the prompt path's loan, and the loan is most of the cache: they
+            // hold experts of middling heat.  So an expert there that is hotter than the coldest one in the loan region
+            // moves into that one's slot (a device copy), and the coldest is given up instead - the cache then holds what
+            // a smaller cache would.  Heat: the adaptive tier's routing counts, then the profile's rank.
+            std::vector<int32_t> rank;
+            std::vector<std::pair<float, int32_t>> cold;   // the loan region's residents, hottest first
+            auto heat = [&](int32_t i) -> float {
+                const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i];
+                return u * 1048576.0f - (float) rank[(size_t) i];
+            };
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            auto freeable = [&]() -> int64_t {   // mapped chunks wholly inside [lo, top): a chunk a live slot shares stays
+                const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
+                const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
+                int64_t k = 0;
+                for (int64_t c = c0; c < c1; ++c) k += r.mapped(c) ? 1 : 0;
+                return k;
+            };
+            while ((int64_t) kvg.spare.size() + freeable() < need && kvg.lo > kvg.floor) {
+                if (owner.empty()) {
+                    owner.assign((size_t) xcache.slots(), -1);
+                    for (size_t i = 0; i < host_res.size(); ++i)
+                        if (host_res[i] >= 0 && host_res[i] < xcache.slots()) owner[(size_t) host_res[i]] = (int32_t) i;
+                    rank.assign(host_res.size(), (int32_t) profile.size());
+                    for (size_t r = 0; r < profile.size(); ++r)
+                        rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
+                    for (size_t i = 0; i < host_res.size(); ++i)
+                        if (host_res[i] >= kvg.top) cold.emplace_back(heat((int32_t) i), (int32_t) i);
+                    std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
                 }
-                if (vi < 0) host_res[(size_t) oi] = strata::core::kNotResident;
-                ++kvg.evicted;
+                --kvg.lo;
+                ++gave;
+                if (const int32_t oi = owner[(size_t) kvg.lo]; oi >= 0) {
+                    const int64_t layer = oi / g.n_expert;
+                    int32_t vi = -1;
+                    if (!cold.empty() && cold.back().first < heat(oi)) {
+                        vi = cold.back().second;
+                        const int32_t vs = host_res[(size_t) vi];
+                        nib::guard_raw(layer, "the elastic K/V's slot move (kvg_ensure)");
+                        if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < lay.blob_bytes(layer) ||
+                            cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
+                                       (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToDevice) != cudaSuccess)
+                            vi = -1;
+                        else {
+                            cold.pop_back();
+                            host_res[(size_t) oi] = vs;
+                            host_res[(size_t) vi] = strata::core::kNotResident;
+                            ++moved;
+                        }
+                    }
+                    if (vi < 0) host_res[(size_t) oi] = strata::core::kNotResident;
+                    ++kvg.evicted;
+                }
             }
-        }
-        // a device-to-device cudaMemcpy does not wait for the copy: the moves still read the slots given up, and a
-        // chunk unmapped under a copy faults it (the error then sticks to whatever runs next)
-        if (gave > 0 && cudaDeviceSynchronize() != cudaSuccess) {
-            std::fprintf(stderr, "strata: moving experts for the K/V failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-            return false;
-        }
-        {
-            const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
-            const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
-            for (int64_t c = c0; c < c1; ++c)
-                if (r.mapped(c))
-                    if (const strata::core::VmmChunk h = r.unmap(c)) kvg.spare.push_back(h);
-        }
-        if (gave > 0 &&
-            cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
-            std::fprintf(stderr, "strata: the residency table upload failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-            return false;
+            // a device-to-device cudaMemcpy does not wait for the copy: the moves still read the slots given up, and a
+            // chunk unmapped under a copy faults it (the error then sticks to whatever runs next)
+            if (gave > 0 && cudaDeviceSynchronize() != cudaSuccess) {
+                std::fprintf(stderr, "strata: moving experts for the K/V failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            {
+                const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
+                const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
+                for (int64_t c = c0; c < c1; ++c)
+                    if (r.mapped(c))
+                        if (const strata::core::VmmChunk h = r.unmap(c)) kvg.spare.push_back(h);
+            }
+            if (gave > 0 &&
+                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata: the residency table upload failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
         }
         int64_t fresh = 0;
         auto grow_take = [&]() -> strata::core::VmmChunk {
@@ -10608,7 +10622,7 @@ int main(int argc, char** argv) {
     // A request that needs far fewer cells than the K/V holds gives the rest back: the slots refill with the
     // profile's hottest experts the GPU does not hold.  Run on a quiet device (as kvg_ensure's `quiesce`).
     auto kvg_trim = [&](int64_t cells, int64_t hold) -> bool {   // `hold`: the cells a parked conversation could need
-        if (!kvg.on) return true;
+        if (!kvg.on || !kvg.from_cache) return true;   // new VRAM only: nothing to hand back to the cache
         // #1128: a parked conversation comes back through kvg_ensure's grow, so a K/V that fell to a short request's
         // size is grown again (its experts shuffled again) after every short request in between: the K/V keeps the
         // longest parked conversation's cells while it is parked
