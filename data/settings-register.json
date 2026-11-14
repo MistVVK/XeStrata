@@ -6602,8 +6602,8 @@
    "first_commit": "a606e3a966",
    "first_date": "2026-10-01",
    "since": "v0.1.40.1",
-   "last_commit": "8544420180",
-   "last_date": "2026-10-27",
+   "last_commit": "7fc188c0b9",
+   "last_date": "2026-11-13",
    "status": "research",
    "owner": "core",
    "note": "[auto] not documented for users; code default not readable from the call",
@@ -9736,13 +9736,13 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2452,
+     "line": 2485,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2532,
+     "line": 2565,
      "backend": "hip",
      "fn": "getenv"
     },
@@ -24452,19 +24452,19 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2723,
+     "line": 2784,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2739,
+     "line": 2800,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2757,
+     "line": 2818,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -24583,7 +24583,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2245,
+     "line": 2271,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24619,7 +24619,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2722,
+     "line": 2783,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24652,7 +24652,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2738,
+     "line": 2799,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -24693,13 +24693,13 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2384,
+     "line": 2417,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2446,
+     "line": 2479,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -24750,7 +24750,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2748,
+     "line": 2809,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -24792,7 +24792,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2249,
+     "line": 2275,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24828,7 +24828,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2369,
+     "line": 2402,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24867,13 +24867,13 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2199,
+     "line": 2209,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2528,
+     "line": 2561,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -24907,13 +24907,13 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2217,
+     "line": 2227,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2569,
+     "line": 2602,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -24947,13 +24947,13 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2205,
+     "line": 2215,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2548,
+     "line": 2581,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -24987,13 +24987,13 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2211,
+     "line": 2221,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2562,
+     "line": 2595,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -25033,13 +25033,13 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2385,
+     "line": 2418,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2834,
+     "line": 2895,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -25084,7 +25084,7 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2353,
+     "line": 2379,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25103,11 +25103,44 @@
    "first_commit": "9512b9c84b",
    "first_date": "2026-10-15",
    "since": "v0.1.45",
-   "last_commit": "289dd66fc2",
+   "last_commit": "7fc188c0b9",
    "last_date": "2026-11-13",
    "status": "opt-in",
    "owner": "prefill",
    "note": "[auto] documented for users (docs/DETAILS.md:1158)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PF_FUSED_SM75_IQ",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2386,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "7fc188c0b9",
+   "first_date": "2026-11-13",
+   "since": null,
+   "last_commit": "7fc188c0b9",
+   "last_date": "2026-11-13",
+   "status": "rollback",
+   "owner": "prefill",
+   "note": "[reviewed] On a Turing card (sm_75) the i-quant gate/up pairs run on the fused kernels when STRATA_PF_FUSED_SM75 is on; 0 here puts them back on the int8 dp4a kernels (Q2_0 / Q2_0 stays fused).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -25119,7 +25152,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2347,
+     "line": 2373,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25153,7 +25186,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2673,
+     "line": 2722,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -25176,8 +25209,8 @@
    "first_commit": "60445b58c0",
    "first_date": "2026-10-02",
    "since": "v0.1.40.1",
-   "last_commit": "9e491df8e7",
-   "last_date": "2026-11-12",
+   "last_commit": "cb5f224140",
+   "last_date": "2026-11-14",
    "status": "research",
    "owner": "prefill",
    "note": "[reviewed] Tile tuning: nothing on sm_86, auto stays. [phaseA-tests/notes-144-pfiq.md:12]",
@@ -25193,7 +25226,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2555,
+     "line": 2588,
      "backend": "hip",
      "fn": "getenv"
     },
@@ -25232,7 +25265,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2253,
+     "line": 2279,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25564,7 +25597,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2934,
+     "line": 3002,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -25604,7 +25637,7 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2277,
+     "line": 2303,
      "backend": "hip",
      "fn": "getenv"
     },
@@ -25649,7 +25682,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2290,
+     "line": 2316,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -26175,7 +26208,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2509,
+     "line": 2542,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -26466,7 +26499,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2684,
+     "line": 2737,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -28044,7 +28077,7 @@
     },
     {
      "file": "src/kernels/verify_batch_parity.cpp",
-     "line": 174,
+     "line": 181,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -28104,7 +28137,7 @@
    "first_commit": "7cf709e5b1",
    "first_date": "2026-09-28",
    "since": "v0.1.40.1",
-   "last_commit": "90731f26f7",
+   "last_commit": "b902973681",
    "last_date": "2026-11-13",
    "status": "default",
    "owner": "core",
