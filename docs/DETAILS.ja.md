@@ -1103,7 +1103,7 @@ print(r.choices[0].message.content)
   ガードを使っても、推測デコードはガードなしと同じように効きます。B70 で同じ質問を 3 回ずつ比べた decode は、Qwen3.8-Flash-Next で 97.9 と 97.7 トークン/秒、Ornith-1.5-35B-A3B で 141.9 と 144 トークン/秒でした（それまでの Ornith は 106.5 トークン/秒で、ガードが推測デコードを止めていました）。
   本文に項目を足せないクライアントは、ヘッダー `X-XeStrata-Script-Guard: ja` で同じ指定ができます（本文の `script_guard` が優先します）。
   指定のない要求には、Web のチャット設定の「他のアプリにも使う」、環境変数 `XESTRATA_SCRIPT_GUARD=ja`、`xestrata-<model>.json` の `"script_guard": "ja"`、全モデル共通の設定（`settings.json`）の `"script_guard"` の順に効きます。設定ファイルの 2 つは Web の Settings でも変えられます。どれもなければオフで、要求の `"script_guard": "off"` でその要求だけ切れます。
-  setup は、対話で動かした最初の 1 回と `--setup` のときに、使うかを尋ねて `settings.json` に書きます（`--script-guard ja|en|ko|zh-cn|zh-tw|off` で尋ねずに決められます）。勧める答えは、システムの言語が日本語なら `ja`、韓国語なら `ko`、中国語なら `zh-cn`（台湾・香港は `zh-tw`）、ベトナム語なら `off`、それ以外は `en` です。
+  setup は、対話で動かした最初の 1 回と `--setup` のときに、使うかを尋ねて `settings.json` に書きます（`--script-guard ja|en|ko|zh-cn|zh-tw|off` で尋ねずに決められます）。勧める答えは `off`（使わない）で、使うときは答えの言語を選びます。
   XeStrata の計測（`xestrata --setup --bench`、`tools/` の計測の道具、リリースと upstream の追従の比べ）は、どの要求にも `"script_guard": "off"` を付けるので、この設定に左右されません。
   Web のチャット設定では、最初は表示言語が日本語なら「日本語」、韓国語なら「韓国語」、中国語なら「中国語（簡体）」、それ以外なら「英語など（CJKV 以外）」が選ばれています。止める字の言語で書かせるときはオフにします。
   logit_bias を受け付けないエンジン（古いエンジン）と、`"parallel"` のバッチの枠（この守りは 1 度に 1 つの要求の分しか持ちません）では効かず、server のウィンドウにそう 1 行出します。
