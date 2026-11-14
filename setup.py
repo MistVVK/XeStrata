@@ -8557,9 +8557,33 @@ DENSE_MARGIN_GB = 1.0
 DENSE_RAM_GB = 8
 
 
-def dense_vram_gb(fam: dict, d: dict, ctx: int) -> float:
-    """The VRAM (GB) a dense model of PLAIN_FAMILIES needs at a context of `ctx`: its weights, its K/V and the margin"""
-    return d["size"] / 1e9 + fam["kv_bytes"] * ctx / 1e9 + DENSE_MARGIN_GB
+def dense_vram_gb(fam: dict, d: dict, ctx: int, streaming: bool = False) -> float:
+    """The VRAM (GB) a dense model of PLAIN_FAMILIES needs at a context of `ctx`: its weights, its K/V and the margin.
+    With KV streaming (--kv-resident) the K/V's VRAM is the resident cells a layer, not the whole context."""
+    kv_cells = PLAIN_KV_RESIDENT if streaming else ctx
+    return d["size"] / 1e9 + fam["kv_bytes"] * kv_cells / 1e9 + DENSE_MARGIN_GB
+
+
+PLAIN_KV_RESIDENT = 32768   # the resident cells a layer --kv-resident auto keeps in VRAM (the engine's resolve_kv_resident)
+
+
+def plain_kv_host_gb(fam: dict, ctx: int, kv: str) -> float:
+    """The RAM a plain model's streamed KV host copy takes at a context of `ctx`: its K/V bytes a token (kv_bytes,
+    FP16 across the attention layers), scaled by the --kv format.  An estimate (the engine's figure is per layer and
+    head, and counts the MTP layer's)."""
+    factor = {"fp16": 1.0, "int8": 0.52, "q4_0": 0.28, "k8v4": 0.40}.get(kv, 1.0)
+    return ctx * fam.get("kv_bytes", 0) * factor / 1e9
+
+
+def plain_kv_streaming_wanted(fam: dict, d: dict, ctx: int, ram: float, kv: str) -> bool:
+    """Does the engine stream this plain model's KV (--kv-resident auto): from 64K up, when the RAM holds the experts
+    (a dense model: none) beside the KV host copy and the engine's headroom.  The engine decides the same at load
+    (resolve_kv_resident, the experts' real bytes); setup uses the model file as the experts' upper bound, for the
+    context guidance."""
+    if ctx < 65536:
+        return False
+    experts = 0.0 if fam.get("dense") else d["size"] / 1e9
+    return ram >= experts + LOW_RAM_HEADROOM_GB + plain_kv_host_gb(fam, ctx, kv) + 1
 
 
 # A dense model on the CPU (--device cpu, the families with "cpu"): its weights repacked as int8 (one byte a weight, a
@@ -8747,12 +8771,17 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         why = "its MLA is nope-only, with no rotation to scale" if nope else "it keeps its trained context"
         warn(f"--rope-scaling / --rope-scale do not apply to {fam['title']}: {why}")
     ok(f"context: {ctx} tokens")
+    kv_fmt = a.kv if (a.kv and a.kv in plain_kv_takes(family)) else "fp16"
+    streaming = not on_cpu and plain_kv_streaming_wanted(fam, d, ctx, ram, kv_fmt)
+    if streaming:
+        ok(f"KV streaming (auto): the last {PLAIN_KV_RESIDENT // 1024}K cells a layer stay in VRAM, the rest in RAM "
+           f"(~{plain_kv_host_gb(fam, ctx, kv_fmt):.1f} GB), so the long context fits and more experts stay on the GPU")
     if on_cpu and ram < cpu_ram_gb(fam, ctx):
         warn(f"{fam['title']} on the CPU keeps its weights as int8 and the KV cache in FP32: "
              f"~{cpu_ram_gb(fam, ctx):.0f} GB at a {ctx // 1024}K context, and this PC has {ram:.0f} GB, so the engine "
              "may not start; a shorter context fits")
-    elif dense and not on_cpu and gpu_gb < dense_vram_gb(fam, d, ctx):
-        warn(f"{fam['title']} {model} keeps every weight in VRAM: ~{dense_vram_gb(fam, d, ctx):.0f} GB at a "
+    elif dense and not on_cpu and gpu_gb < dense_vram_gb(fam, d, ctx, streaming):
+        warn(f"{fam['title']} {model} keeps every weight in VRAM: ~{dense_vram_gb(fam, d, ctx, streaming):.0f} GB at a "
              f"{ctx // 1024}K context, and the GPU has {gpu_gb:.0f} GB, so the engine may not start; a smaller size "
              "or context fits")
     parts = plain_parts(d)

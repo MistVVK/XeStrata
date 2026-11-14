@@ -19,6 +19,7 @@
 // src/models/qwen35.cpp at de7fa0a3) is qwen35moe's with the MoE replaced by a dense SwiGLU, down(silu(gate(h)) * up(h)),
 // in every block and in the MTP layer: no experts, so none of the tiers, the CPU pool or the window protocol.
 #include "strata/core/context_fit.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "strata/core/kv_elastic.hpp"
 #include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/plain_model.hpp"
@@ -58,6 +59,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_tcq.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/yskn.hpp"
@@ -1470,6 +1472,26 @@ bool PlainModel::load_qwen(std::string& err) {
             std::fprintf(stderr, "xestrata plain: the sliding-window layers' K/V in a ring of %lld cells (window %lld)\n",
                          (long long) (ring_pages_ * qs.page_size), (long long) s.swa_window);
     }
+    // --kv-resident: resolve auto/off/N, then plan the streamed layers' ring (the trailing cells in VRAM, the rest in
+    // the host copy). The sliding-window layers keep their own ring; the MTP layer's attention streams too. The ring
+    // holds the resident cells and a window's own (a verify window appends its drafts before it reads, and a rejected
+    // draft's cells must not overwrite the tail the next window reads).
+    if (!resolve_kv_resident(err)) return false;
+    attn_stream_.assign((size_t) n_attn, false);
+    kv_host_.assign((size_t) n_attn, k::KvHostPools{});
+    if (kv_resident_cells_ > 0) {
+        const int64_t slots = (kv_resident_cells_ + opt_.max_t + qs.page_size - 1) / qs.page_size;
+        if (slots < n_pages_) {
+            kv_stream_slots_ = slots;
+            for (size_t a = 0; a < (size_t) n_attn; ++a) attn_stream_[a] = !attn_swa_[a];
+        } else {
+            kv_resident_cells_ = 0;   // the whole context fits the ring: fully resident, as without --kv-resident
+        }
+    }
+    if (kv_stream_slots_ > 0 && first())
+        std::fprintf(stderr, "xestrata plain: KV streaming: the last %lld cells a layer in VRAM, the rest in RAM "
+                             "(~%.2f GiB of host copy)\n", (long long) kv_resident_cells_,
+                     (double) kv_host_bytes() / 1073741824.0);
     // the decode attention's form for this GPU (an fp16 cache), timed before any graph is recorded and before the cache
     // takes its VRAM (an encoder does not decode)
     if (!opt_.kv_int8 && opt_.kv_q4 == 0 && opt_.kv_tcq == 0 && !opt_.encoder) {
@@ -1506,6 +1528,7 @@ bool PlainModel::load_qwen(std::string& err) {
                         : !(first() && last()) ? "a layer split"
                         : opt_.batch_slots > 0 ? "--batch"
                         : opt_.encoder ? "an encoder"
+                        : kv_stream_slots_ > 0 ? "KV streaming keeps the K/V's VRAM fixed (the ring)"
                         : !vmm_available() || !strata::gpu::vmem_supported() ? "no virtual memory on this GPU"
                         : opt_.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
         const bool grow = asked && why == nullptr;
@@ -1529,14 +1552,17 @@ bool PlainModel::load_qwen(std::string& err) {
                    : opt_.kv_q4 == 2 ? codes + scales + q4
                    : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
         };
-        auto kv_bytes_at = [&](int64_t want) -> uint64_t {   // this stage's blocks at `want` cells
+        auto kv_bytes_at = [&](int64_t want) -> uint64_t {   // this stage's blocks at a context of `want` tokens
             uint64_t total = 0;
             for (int64_t i2 = 0; i2 < n_attn; ++i2) {
                 bool mine2 = has_mtp_ && i2 == mtp_.attn;
                 for (int64_t l = lb_; l < le_ && !mine2; ++l) mine2 = blocks_[(size_t) l].attn == i2;
                 if (!mine2 || (opt_.encoder && i2 > 0)) continue;   // an encoder's layers share the first's cells
-                total += kv_block_bytes(ringed((size_t) i2) ? std::min<int64_t>(want, ring_pages_ * qs.page_size)
-                                                            : want);
+                if (kv_streamed((size_t) i2))   // streamed: the ring's VRAM, fixed (the rest is the host copy, in RAM)
+                    total += kv_block_bytes(kv_stream_slots_ * qs.page_size);
+                else
+                    total += kv_block_bytes(ringed((size_t) i2) ? std::min<int64_t>(want, ring_pages_ * qs.page_size)
+                                                                : want);
             }
             return total;
         };
@@ -1564,7 +1590,9 @@ bool PlainModel::load_qwen(std::string& err) {
                 tc_ring_[a] = tc_ring_[0];
                 continue;
             }
-            const bool ok = alloc_kv(p, ringed(a) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : cells, grow);
+            const size_t vram_cells = kv_streamed(a) ? (size_t) (kv_stream_slots_ * qs.n_head_kv * qs.page_size)
+                                    : ringed(a) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : cells;
+            const bool ok = alloc_kv(p, vram_cells, grow && !kv_streamed(a));
             k_pool_[a] = p.k_pool;
             v_pool_[a] = p.v_pool;
             k_scale_[a] = p.k_scale;
@@ -1576,6 +1604,7 @@ bool PlainModel::load_qwen(std::string& err) {
             k_tc_[a] = p.k_tc;
             v_tc_[a] = p.v_tc;
             tc_ring_[a] = p.tc_ring;
+            if (ok && kv_streamed(a) && !alloc_kv_host(a, err)) return false;
             if (!ok) {
                 err = "plain model: no VRAM for the K/V cache (" + std::to_string(opt_.max_cells) + " cells)";
                 if (kv_room_known) {   // #5715: the context that would fit, from this engine's own K/V figure
@@ -1614,6 +1643,15 @@ bool PlainModel::load_qwen(std::string& err) {
                 return false;
             }
             allocs_.push_back(swa_table_);
+        }
+        if (kv_stream_slots_ > 0) {   // the streamed layers' ring: logical page p in page p % kv_stream_slots_
+            for (int64_t i = 0; i < n_pages_; ++i) table[(size_t) i] = (int32_t) (i % kv_stream_slots_);
+            if (!strata::gpu::alloc_device(&kv_stream_table_, table.size() * 4) ||
+                !strata::gpu::copy(kv_stream_table_, table.data(), table.size() * 4)) {
+                err = "plain model: the streamed layers' page table";
+                return false;
+            }
+            allocs_.push_back(kv_stream_table_);
         }
         if (grow) {   // the first cells (STRATA_KV_GROW_INIT, 16384 by default) mapped now
             const char* iv = strata::env_get("KV_GROW_INIT");
@@ -1842,6 +1880,19 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     b.cpu_cap = std::min<int64_t>((int64_t) TK, (int64_t) k::cpu::MAXT * (int64_t) E);
     take(b.cpu, (uint64_t) b.cpu_cap * N * 4); take(b.cpu_row, (uint64_t) b.cpu_cap * 4);
     take(b.gemm_scratch, (uint64_t) b.gemm_elems * 2);
+    if (kv_stream_slots_ > 0) {   // --kv-resident: one attention layer's whole K/V, staged from the host copy per
+        const auto qs = attn_shapes();   // layer and chunk (the identity layout, page_table_ its table)
+        const uint64_t pairs = (uint64_t) n_pages_ * NKV * (uint64_t) qs.page_size;
+        const uint64_t codes = pairs * HD, scales = pairs * (HD / k::KV_Q8_GROUP) * 2,
+                       q4 = pairs * (uint64_t) k::kv_q4_bytes_per_head((int) HD);
+        if (opt_.kv_q4 == 1) { take(b.kv_stage.k_q4, q4); take(b.kv_stage.v_q4, q4); }
+        else if (opt_.kv_q4 == 2) {
+            take(b.kv_stage.k_q, codes); take(b.kv_stage.k_scale, scales); take(b.kv_stage.v_q4, q4);
+        } else if (opt_.kv_int8) {
+            take(b.kv_stage.k_q, codes); take(b.kv_stage.v_q, codes);
+            take(b.kv_stage.k_scale, scales); take(b.kv_stage.v_scale, scales);
+        } else { take(b.kv_stage.k_pool, codes * 2); take(b.kv_stage.v_pool, codes * 2); }
+    }
     if (glm_) {   // plain_prompt_glm5.cpp
         const uint64_t HC = 4, MIX = (2 + HC) * HC, S = (uint64_t) s.kda_head_dim, GC = NH * S;
         const uint64_t QLR = (uint64_t) s.q_lora_rank, KVR = (uint64_t) s.kv_lora_rank;
@@ -2721,6 +2772,10 @@ k::QsaAttnPools PlainModel::kv_pools(size_t a, int slot) const {
     pools.tc_ring_kv = (int) attn_shapes().n_head_kv;
     pools.page_table = table_of(a);   // the identity (a ring's for a sliding-window layer): a slot's pools have the
                                       // live session's shape
+    if (slot < 0 && kv_streamed(a)) {   // the streamed layer: the host copy and the trailing cells the ring holds
+        pools.host = kv_host_[a];
+        pools.resident = (int32_t) kv_resident_cells_;
+    }
     return pools;
 }
 
@@ -2741,6 +2796,112 @@ std::vector<PlainModel::StatePart> PlainModel::kv_planes(size_t a, int slot, siz
     else if (p.v_q4 != nullptr) v = {{p.k_q, codes}, {p.k_scale, scales}, {p.v_q4, q4}};
     else if (p.k_q != nullptr) v = {{p.k_q, codes}, {p.v_q, codes}, {p.k_scale, scales}, {p.v_scale, scales}};
     return v;
+}
+
+std::vector<PlainModel::StatePart> PlainModel::kv_host_planes(size_t a, size_t cells) const {
+    const k::KvHostPools& h = kv_host_[a];
+    const size_t HD = (size_t) attn_shapes().head_dim;
+    const size_t codes = cells * HD, scales = cells * (HD / k::KV_Q8_GROUP) * 2,
+                 q4 = cells * (size_t) k::kv_q4_bytes_per_head((int) HD);
+    std::vector<StatePart> v;
+    if (h.k_pool != nullptr) v = {{h.k_pool, codes * 2, 2}, {h.v_pool, codes * 2, 2}};
+    else if (h.k_q4 != nullptr) v = {{h.k_q4, q4}, {h.v_q4, q4}};
+    else if (h.v_q4 != nullptr) v = {{h.k_q, codes}, {h.k_scale, scales}, {h.v_q4, q4}};
+    else if (h.k_q != nullptr) v = {{h.k_q, codes}, {h.v_q, codes}, {h.k_scale, scales}, {h.v_scale, scales}};
+    return v;
+}
+
+uint64_t PlainModel::kv_host_bytes() const {
+    const k::QsaShapes qs = attn_shapes();
+    const uint64_t HD = (uint64_t) qs.head_dim;
+    const uint64_t pairs = (uint64_t) n_pages_ * qs.n_head_kv * qs.page_size;   // one layer, the whole context
+    const uint64_t codes = pairs * HD, scales = pairs * (HD / k::KV_Q8_GROUP) * 2,
+                   q4 = pairs * (uint64_t) k::kv_q4_bytes_per_head((int) HD);
+    const uint64_t per = opt_.kv_q4 == 1 ? 2 * q4
+                       : opt_.kv_q4 == 2 ? codes + scales + q4
+                       : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
+    uint64_t layers = 0;   // the attention layers that would stream: non-recurrent, non-sliding-window, and the MTP's
+    for (int64_t l = 0; l < spec_.n_layer; ++l)
+        if (!spec_.recurrent[(size_t) l] && !spec_.layer_swa(l)) ++layers;
+    if (has_mtp_) ++layers;
+    return per * layers;
+}
+
+bool PlainModel::resolve_kv_resident(std::string& err) {
+    kv_resident_cells_ = 0;
+    if (glm_ || opt_.cpu || cpu_tail_ != nullptr || opt_.encoder || opt_.batch_slots > 0) {
+        if (opt_.kv_resident > 0 && first())
+            std::fprintf(stderr, "xestrata plain: --kv-resident is off: %s\n",
+                         glm_ ? "GLM-5.3-Flash's DSA caches stream with --kv-ram"
+                              : opt_.encoder ? "an encoder reads no decode context"
+                              : opt_.batch_slots > 0 ? "--batch" : "the CPU's forward");
+        opt_.kv_resident = 0;
+        return true;
+    }
+    if (opt_.kv_tcq != 0) {   // the trellis-coded pools have no host copy (kv_q8.hpp)
+        if (opt_.kv_resident > 0 && first())
+            std::fprintf(stderr, "xestrata plain: --kv-resident is off: the trellis-coded K/V (tcq4/tcq5) has no host copy\n");
+        opt_.kv_resident = 0;
+        return true;
+    }
+    int64_t want = opt_.kv_resident;
+    if (want == 0) return true;
+    if (want < 0) {   // auto: Qwen3.8-Flash-Next's rule (setup's kv_streaming_wanted), from the engine's own figures
+        if (opt_.max_cells < 65536) { opt_.kv_resident = 0; return true; }
+        uint64_t experts = 0;
+        if (!dense_) {
+            if (root_ == this) {   // the layout open_experts reads again (metadata only); the stages inherit it
+                std::vector<int64_t> blocks;
+                for (int64_t l = 0; l < spec_.n_layer; ++l)
+                    if (spec_.layer_routes(l)) blocks.push_back(l);
+                if (model_mtp_) blocks.push_back(spec_.n_layer);
+                if (!expert_layout_from_gguf(opt_.gguf, blocks, spec_.n_expert, spec_.n_embd, spec_.n_ff_exp, err))
+                    return false;
+            }
+            const auto& lay = k::cpu::expert_layout();
+            experts = lay.total + lay.max_blob;
+        }
+        const uint64_t need = experts + (8ull << 30) + kv_host_bytes() + (1ull << 30);   // the arena's 8 GiB beside
+        const auto avail = strata::core::available_host_bytes();
+        if (!avail || *avail < need) {
+            if (first())
+                std::fprintf(stderr, "xestrata plain: KV streaming off: the experts and the KV host copy need %.1f GiB "
+                                     "of RAM, %.1f GiB is available\n", (double) need / 1073741824.0,
+                             avail ? (double) *avail / 1073741824.0 : 0.0);
+            opt_.kv_resident = 0;
+            return true;
+        }
+        want = 32768;   // the resident cells setup's --kv-resident 32768 keeps
+    }
+    want = std::max<int64_t>(want, attn_shapes().page_size);
+    opt_.kv_resident = want;   // resolved: a layer split's stages inherit it
+    kv_resident_cells_ = want;
+    return true;
+}
+
+bool PlainModel::alloc_kv_host(size_t a, std::string& err) {
+    const k::QsaShapes qs = attn_shapes();
+    const size_t HD = (size_t) qs.head_dim;
+    const size_t pairs = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
+    const size_t codes = pairs * HD, scales = pairs * (HD / k::KV_Q8_GROUP) * 2,
+                 q4 = pairs * (size_t) k::kv_q4_bytes_per_head((int) HD);
+    k::KvHostPools h;
+    bool ok = true;
+    auto take = [&](auto*& q, size_t bytes) {
+        if (!ok) return;
+        void* hp = nullptr;
+        void* dp = nullptr;
+        if (!mapped(bytes, &hp, &dp)) { ok = false; return; }
+        allocs_.push_back(hp);   // host USM, freed in the destructor (as --kv-ram's latent)
+        q = (std::remove_reference_t<decltype(q)>) dp;
+    };
+    if (opt_.kv_q4 == 1) { take(h.k_q4, q4); take(h.v_q4, q4); }
+    else if (opt_.kv_q4 == 2) { take(h.k_q, codes); take(h.k_scale, scales); take(h.v_q4, q4); }
+    else if (opt_.kv_int8) { take(h.k_q, codes); take(h.v_q, codes); take(h.k_scale, scales); take(h.v_scale, scales); }
+    else { take(h.k_pool, codes * 2); take(h.v_pool, codes * 2); }
+    if (!ok) { err = "plain model: no RAM for the streamed K/V host copy"; return false; }
+    kv_host_[a] = h;
+    return true;
 }
 
 bool PlainModel::alloc_kv(KvPtrs& p, size_t cells, bool vmm) {
@@ -2867,11 +3028,25 @@ bool PlainModel::kv_trim(int64_t cells, int64_t hold, std::string& err) {
 }
 
 void PlainModel::kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
-                                 strata::gpu::Stream cs) {
+                                 strata::gpu::Stream cs, const k::KvHostPools* stage) {
     const KvPtrs p = kv_ptrs(a, slot);
     const k::QsaShapes qs = attn_shapes();
     const int row = (int) (qs.n_head_kv * qs.head_dim);
-    if (p.k_tc != nullptr) {
+    // --kv-resident: the host copy gets every cell (the identity layout), the VRAM ring its resident pages, and the
+    // prompt's staging pool its copy; the one shared append (kv_q8.hpp), so the cells are bit for bit a fully
+    // resident layer's (the individual kv_append_* are its wrappers).  The trellis-coded pools have no host copy.
+    const bool streamed = slot < 0 && kv_streamed(a);
+    const k::KvHostPools host = streamed ? kv_host_[a] : k::KvHostPools{};
+    auto base = [&]() {
+        k::KvAppend ap;
+        ap.step = steps; ap.step_stride = k::kStepCount; ap.cur_stride = row; ap.n_tok = n;
+        ap.page_table = table_of(a);
+        ap.k_pool = p.k_pool; ap.v_pool = p.v_pool;
+        ap.k_q = p.k_q; ap.v_q = p.v_q; ap.k_scale = p.k_scale; ap.v_scale = p.v_scale;
+        ap.k_q4 = p.k_q4; ap.v_q4 = p.v_q4;
+        return ap;
+    };
+    if (p.k_tc != nullptr) {   // trellis-coded (Y5): no host copy, the ring and the codebook on the device
         k::KvAppend ka;
         ka.step = steps;
         ka.step_stride = k::kStepCount;
@@ -2885,22 +3060,30 @@ void PlainModel::kv_append_cells(size_t a, int slot, const int32_t* steps, int n
         ka.tc_ring = p.tc_ring;
         ka.page_table = table_of(a);
         k::kv_append_cells(ka, qs, cs);
-    } else if (p.k_q4 != nullptr) {
-        k::kv_append_q4_steps(p.k_q4, p.v_q4, table_of(a), steps, k::kStepCount, n, kc, vc, qs, cs);
-    } else if (p.v_q4 != nullptr) {   // K8V4: K's INT8 codes and scales (one plane), V's Q4_0 (one plane)
-        k::kv_append_q8_steps(p.k_q, p.k_q, p.k_scale, p.k_scale, table_of(a), steps, k::kStepCount, kc, kc, row, n, qs,
-                              cs);
-        k::kv_append_q4_steps(p.v_q4, p.v_q4, table_of(a), steps, k::kStepCount, n, vc, vc, qs, cs);
-    } else if (n == 1) {   // a window's row (the one-cell kernels the windows always took)
-        if (p.k_q != nullptr)
-            k::kv_append_q8_step(p.k_q, p.v_q, p.k_scale, p.v_scale, table_of(a), steps, kc, vc, qs, cs);
-        else
-            k::kv_append_step(p.k_pool, p.v_pool, table_of(a), steps, kc, vc, qs, cs);
-    } else if (p.k_q != nullptr) {
-        k::kv_append_q8_steps(p.k_q, p.v_q, p.k_scale, p.v_scale, table_of(a), steps, k::kStepCount, kc, vc, row, n, qs,
-                              cs);
-    } else {
-        k::kv_append_steps(p.k_pool, p.v_pool, table_of(a), steps, k::kStepCount, kc, vc, row, n, qs, cs);
+    } else if (p.k_q4 != nullptr) {   // Q4_0 (rotated)
+        k::KvAppend ap = base();
+        ap.k = kc; ap.v = vc;
+        ap.host = streamed ? &host : nullptr; ap.stage = stage;
+        k::kv_append_cells(ap, qs, cs);
+    } else if (p.v_q4 != nullptr) {   // K8V4: K's INT8 half, V's Q4_0 half (the folded calls, as Qwen3.8's prompt)
+        const k::KvHostPools hk = k::kv_hybrid_k_half(host), hv = k::kv_hybrid_v_half(host);
+        const k::KvHostPools sk = stage ? k::kv_hybrid_k_half(*stage) : k::KvHostPools{};
+        const k::KvHostPools sv = stage ? k::kv_hybrid_v_half(*stage) : k::KvHostPools{};
+        k::KvAppend ak = base();
+        ak.k = kc; ak.v = kc; ak.k_q = p.k_q; ak.v_q = p.k_q; ak.k_scale = p.k_scale; ak.v_scale = p.k_scale;
+        ak.k_q4 = nullptr; ak.v_q4 = nullptr;
+        ak.host = streamed ? &hk : nullptr; ak.stage = stage ? &sk : nullptr;
+        k::kv_append_cells(ak, qs, cs);
+        k::KvAppend av = base();
+        av.k = vc; av.v = vc; av.k_q4 = p.v_q4; av.v_q4 = p.v_q4;
+        av.k_q = nullptr; av.v_q = nullptr; av.k_scale = nullptr; av.v_scale = nullptr;
+        av.host = streamed ? &hv : nullptr; av.stage = stage ? &sv : nullptr;
+        k::kv_append_cells(av, qs, cs);
+    } else {   // FP16 or INT8
+        k::KvAppend ap = base();
+        ap.k = kc; ap.v = vc;
+        ap.host = streamed ? &host : nullptr; ap.stage = stage;
+        k::kv_append_cells(ap, qs, cs);
     }
 }
 
@@ -3389,6 +3572,10 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens, bool 
             continue;
         }
         if (recurrent_only) continue;
+        if (slot < 0 && kv_streamed(a)) {   // the authoritative host copy (the identity layout), not the VRAM ring
+            for (const StatePart& p : kv_host_planes(a, cells)) parts.push_back(p);
+            continue;
+        }
         for (const StatePart& p : kv_planes(a, slot, cells)) parts.push_back(p);
     }
     return parts;
@@ -3649,6 +3836,17 @@ bool PlainModel::restore_parts(const Snapshot& snap, bool recurrent_only, std::s
         // the rings hold the window before the state's tokens, and nothing older
         st->ring_end_ = snap.tokens;
         st->ring_from_ = std::max<int64_t>(0, snap.tokens - spec_.swa_window);
+        if (!recurrent_only && st->kv_stream_slots_ > 0) {   // refill the streamed layers' ring from the host copy
+            const k::QsaShapes qs = st->attn_shapes();
+            const int64_t pages = (snap.tokens + qs.page_size - 1) / qs.page_size;
+            const int64_t b0 = std::max<int64_t>(0, pages - st->kv_stream_slots_);
+            const int fmt = st->opt_.kv_q4 == 1 ? k::kKvQ4 : st->opt_.kv_q4 == 2 ? k::kKvHybrid
+                          : st->opt_.kv_int8 ? k::kKvInt8 : k::kKvF16;
+            for (size_t a = 0; a < st->k_pool_.size(); ++a)
+                if (st->kv_streamed(a))
+                    k::kv_ring_restore(st->kv_pools(a), st->kv_host_[a], fmt, b0, pages, st->kv_stream_slots_, qs,
+                                       st->cs_);
+        }
     }
     return true;
 }
@@ -3672,9 +3870,14 @@ bool PlainModel::reset(std::string& err) {
     // (--kv-grow: the cells mapped)
     const size_t live = kv_cells_ < 0 ? cells
                                       : (size_t) ((kv_cells_ + qs.page_size - 1) / qs.page_size * qs.n_head_kv * qs.page_size);
-    for (size_t i = 0; i < k_pool_.size(); ++i)
-        for (const StatePart& p : kv_planes(i, -1, ringed(i) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : live))
+    for (size_t i = 0; i < k_pool_.size(); ++i) {
+        // a streamed layer's VRAM is the ring (the host copy keeps its cells: a fresh sequence reads only below its
+        // own count, and the appends overwrite them); a sliding-window layer's ring; the rest the mapped cells
+        const size_t n = kv_streamed(i) ? (size_t) (kv_stream_slots_ * qs.n_head_kv * qs.page_size)
+                       : ringed(i) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : live;
+        for (const StatePart& p : kv_planes(i, -1, n))
             ok = ok && strata::gpu::memset(p.dev, 0, p.bytes);
+    }
     ring_end_ = ring_from_ = 0;
     cur_ = -1;
     drafts_.clear();

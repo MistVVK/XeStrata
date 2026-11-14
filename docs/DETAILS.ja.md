@@ -187,6 +187,17 @@ VRAM には、アテンションが読む部分（`--kv-resident 32768`）だけ
 アテンションが読む値は同じで、変わるのは KV の置き場所だけです。
 RAM は文脈 1 トークンあたり約 13.7 KB 使い、128K で約 1.7 GB です。
 
+**plain のモデルの KV ストリーミング**（`--kv-resident N|auto|off`、既定 `auto`、`XESTRATA_KV_RESIDENT`）:
+Ornith・Qwen3.6・Qwen3.5・llm-jp・PLaMo の全注意（GQA）の層も、Qwen3.8 と同じ形で KV を RAM に流します。
+権威ある K/V はページ固定の RAM に置き（identity 配置）、VRAM には末尾 N セルのリングだけを置きます。
+decode は古いセルを RAM から PCIe で読み（共通の attention カーネル）、新しいセルは VRAM から読みます。
+プロンプトは層ごとに 1 層分のセルを借りた VRAM の staging pool に写して attention します。
+`auto` は Qwen3.8 と同じ決まり（64K 以上で、エキスパートと余裕と KV のホスト写しが RAM に収まるとき）で、N の既定は 32768 です。
+int8・q4_0・k8v4 の KV、推測デコードの窓、会話の保存と戻しとともに動きます。
+答えは流さないときとビット一致で、変わるのは KV の置き場所だけです。
+GLM-5.3-Flash の DSA は `--kv-ram`、sliding-window の層は自分のリング、`--batch` と encoder は対象外です。
+流すとき KV の VRAM は固定なので `--kv-grow` は無効になります（エンジンがそう言います）。
+
 **伸びる KV**（`--kv-grow` か `XESTRATA_KV_GROW=1`、upstream 9e3dbfe7）: KV キャッシュを全部 VRAM に置き、要求が届いたセルの分だけ VRAM を取ります。
 残りはエキスパートのキャッシュが使い、文脈が伸びるとスロットを KV に渡し、短い要求のあとに取り戻します。
 KV とキャッシュは仮想メモリ（`sycl_ext_oneapi_virtual_mem`）の上にあり、どちらのアドレスも動かないので、捕まえたグラフはそのまま使えます。
@@ -523,6 +534,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | --- | --- |
 | `--max-context N` | KV キャッシュのトークン数（setup が GPU の VRAM から選びます） |
 | `--kv-ram on\|off` | GLM-5.3-Flash の DSA の層の潜在（1 位置 1 KB）を VRAM でなく RAM に持ち、空いた VRAM をエキスパートに回す（既定 on）。decode の窓は各トークンが選んだ位置だけを VRAM に写して読み、prompt の塊は層ごとにその時点までを写して読む。128K の文脈で B70 の VRAM のエキスパートが 2,150 から 2,322 枠に増え、RTX 4070 は 128K で起動できるようになり、64K で prompt が 3.3 から 7.1 トークン/秒になりました |
+| `--kv-resident N\|auto\|off` | 注意の層の KV を RAM に流す（Qwen3.8 と同じ形）。権威ある K/V はページ固定の RAM、VRAM は末尾 N セルのリングだけで、decode は古いセルを PCIe で読む。`auto`（既定）は 64K 以上でエキスパートと KV のホスト写しが RAM に収まるとき（N の既定 32768）、`off` で全部 VRAM。int8・q4_0・k8v4、推測の窓、会話の保存とともに動き、答えはビット一致。GLM の DSA（`--kv-ram`）・sliding-window の層・`--batch`・encoder は対象外で、流すとき `--kv-grow` は無効（`XESTRATA_KV_RESIDENT`）。`tcq4`・`tcq5` はホスト写しを持たないので対象外（流す形は off） |
 | `--kv fp16\|int8\|q4_0\|k8v4\|tcq4\|tcq5` | 注意の層の KV キャッシュを FP16（既定）か、64 値ごとに FP16 の倍率を持つ int8 で持つ。int8 は VRAM が半分になり、答えが少し変わります。`q4_0` は K と V を Hadamard の回転の後に Q4_0 で（FP16 の約 28%）、`k8v4` は K を int8、V を回転した Q4_0 で持ちます（約 40%）。`tcq5`・`tcq4` は K と V を符号つきの回転の後に、1 値 5 ビット・4 ビットのトレリス符号（YASAKANI の KV5 の方式）で持ちます（約 32%・26%）。RX 9060 XT の Qwen3.5-9B と Qwen3.6-35B-A3B で、FP16 の KV に対する KL は `tcq5` が `k8v4` と、`tcq4` が `q4_0` と同じかそれより小さくなりました。トレリス符号は 16 トークンそろうまで int8 で持ち、そろったところでまとめて符号にします（`XESTRATA_KV_TCQ_DEFER=0` で 1 トークンずつ）。この 4 つはヘッドが 256 のモデル（Ornith、Qwen3.6、Qwen3.5-9B）だけです。`--kv` を渡さない密なモデル（Qwen3.5-9B）は、FP16 では全部の層が GPU に載らないとき、int8・`tcq5`・`tcq4` のうち全部の層が載る最初のものを選びます（RX 9060 XT を 12 GB に絞った 262K で int8、10 GB で `tcq5`）。B70 の Qwen3.5-9B の 32K の prefill は FP16 20.6 秒、`q4_0` 20.4 秒、`k8v4` 19.8 秒でした（GLM-5.3-Flash ではどれも使えません） |
 | `--kv-grow`、`--no-kv-grow` | `--serve` で 1 GPU のとき、KV キャッシュを仮想メモリに置き、要求が届く位置の分だけ VRAM を使う。エキスパートの VRAM の段（`--vram-elastic` の区切り）が長い要求の前にその分を譲り、短い要求の後に取り戻します。既定は Qwen3.8-Flash-Next と同じく、GPU の仮想メモリのページが 2 MiB 以上のとき有効です（RTX 4070 は有効、B70 は無効）。RTX 4070 の Qwen3.6-35B-A3B（128K の文脈）では、起動時の段が 2,870 から 4,182 枠になり、32K の prefill が 32.9 秒から 29.0 秒になりました（並列スロットとは一緒に使えません） |
 | `--control-vector-scaled FILE:SCALE[,...]`、`--control-vector FILE`、`--control-vector-layer-range A B`、`--cvec-mode`、`--cvec-dir` | llama.cpp の形式の制御ベクトルを、各層の FFN の後の残差に足す（Qwen3.8-Flash-Next と同じ意味）。`--serve` では要求ごとに切り替えられ（`experimental_speed_projection`）、切り替えたときは、それまでの会話の状態を読み直します（GLM-5.3-Flash ではまだ使えません） |

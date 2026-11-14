@@ -37,6 +37,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_tcq.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -1400,8 +1401,27 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     } else if (opt_.kv_q4 == 2) {
                         k::fwht256_inplace_cuda(P.vcur, T * NKV, cs);
                     }
-                    kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs);
-                    const k::QsaAttnPools pools = kv_pools((size_t) a);
+                    const bool streamed = kv_streamed((size_t) a);
+                    k::QsaAttnPools pools = kv_pools((size_t) a);
+                    if (streamed) {
+                        // --kv-resident: stage this layer's cells [0, pa) from the host copy into the staging pool
+                        // (the identity layout), then the chunk's cells go to the host copy, the staging pool and the
+                        // VRAM ring; the prompt attention reads the staging pool (Qwen3.8-Flash-Next's prompt path)
+                        const int fmt = opt_.kv_q4 == 1 ? k::kKvQ4 : opt_.kv_q4 == 2 ? k::kKvHybrid
+                                      : opt_.kv_int8 ? k::kKvInt8 : k::kKvF16;
+                        k::QsaAttnPools stage;
+                        stage.k_pool = P.kv_stage.k_pool; stage.v_pool = P.kv_stage.v_pool;
+                        stage.k_q = P.kv_stage.k_q; stage.v_q = P.kv_stage.v_q;
+                        stage.k_scale = P.kv_stage.k_scale; stage.v_scale = P.kv_stage.v_scale;
+                        stage.k_q4 = P.kv_stage.k_q4; stage.v_q4 = P.kv_stage.v_q4;
+                        stage.page_table = page_table_;   // the identity: the staging pool is a fully resident layout
+                        k::kv_stage_from_host(stage, kv_host_[(size_t) a], fmt, (pa + qs.page_size - 1) / qs.page_size,
+                                              qs, cs);
+                        kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs, &P.kv_stage);
+                        pools = stage;
+                    } else {
+                        kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs);
+                    }
                     // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
                     // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
                     // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes

@@ -276,7 +276,20 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
                      const int32_t* step, int64_t max_ids, const QsaShapes& s, float* attn, float* weights,
                      void* stream);
 
-struct KvHostPools;   // kv_stream.hpp
+/// The host copy of one layer's K/V (KV streaming, kv_stream.hpp): device-mapped pointers (host USM, one address)
+/// into pinned memory, identity layout `[block][kv_head][page_size][head_dim]`. All null when the layer is fully
+/// resident. Defined here so the attention pools (qsa_decode_attn.hpp) can carry it by value into the kernel.
+struct KvHostPools {
+    uint16_t* k_pool = nullptr;   ///< fp16 mode
+    uint16_t* v_pool = nullptr;
+    int8_t* k_q = nullptr;        ///< int8 mode: codes
+    int8_t* v_q = nullptr;
+    uint16_t* k_scale = nullptr;  ///< int8 mode: fp16 scale per 64 values
+    uint16_t* v_scale = nullptr;
+    uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
+    uint8_t* v_q4 = nullptr;
+    bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
+};
 
 /// The cell's position comes from `step`, so this is the form a graph may contain. With a host copy (KV streaming)
 /// the cell is written there too, and to VRAM only if its block is resident.
