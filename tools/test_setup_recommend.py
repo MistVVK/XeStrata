@@ -61,7 +61,8 @@ class SizeByQuality(unittest.TestCase):
 
 
 class FirstModel(unittest.TestCase):
-    fams = [f for f in setup.FAMILIES if f != setup.CUSTOM]
+    # edge0, like CUSTOM, is outside the recommendation ladder (--family edge0, setup_edge0; setup's list excludes it)
+    fams = [f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")]
 
     def test_the_first_this_pc_runs_in_the_users_order(self):
         self.assertEqual(setup.recommend_family(self.fams, room(64, 16)), "sc117-swift")
@@ -79,7 +80,7 @@ class FirstModel(unittest.TestCase):
 
 class Levels(unittest.TestCase):
     def test_every_family_has_its_place(self):
-        self.assertEqual(set(setup.TIERS), {f for f in setup.FAMILIES if f != setup.CUSTOM})
+        self.assertEqual(set(setup.TIERS), {f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")})
         self.assertEqual(len(set(setup.TIERS.values())), len(setup.TIERS))
 
     def test_the_levels_name_the_family(self):
