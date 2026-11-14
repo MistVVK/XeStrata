@@ -195,7 +195,7 @@ void yskn_gemv(const YsknDev& w, const int8_t* xq, const float* alpha, int T, in
 
 void yskn_finish(const YsknDev& w, const int64_t* part, const float* alpha, int T, float* y, int64_t ldy, void* stream) {
     check(w, "yskn_finish");
-    if (!part || !alpha || !y || T <= 0 || T > kYsknMaxRows) throw core::DeviceError("yskn_finish: invalid arguments");
+    if (!part || !alpha || !y || T <= 0 || T > kWindowMaxT) throw core::DeviceError("yskn_finish: invalid arguments");
     auto& q = queue_for(stream);
     const int rows = w.rows, G = w.cols / kGroup, nw = w.n_workers;
     const float* tau = w.tau;
@@ -210,24 +210,27 @@ void yskn_finish(const YsknDev& w, const int64_t* part, const float* alpha, int 
 }
 
 size_t yskn_scratch_bytes(const YsknDev& w, int T) {
-    const size_t rows = (size_t) std::min(T, kYsknMaxRows);
+    (void) T;   // sized for the widest window (kYsknMmaRows rows), either form reads it
+    const size_t rows = (size_t) kYsknMmaRows;
     const size_t q = (rows * (size_t) w.cols + 255) / 256 * 256;
     const size_t a = (rows * (size_t) (w.cols / kGroup) * 4 + 255) / 256 * 256;
     return q + a + (size_t) w.n_workers * rows * (size_t) w.rows * 8;
 }
 
 void yskn_proj(const YsknDev& w, const float* x, int64_t ldx, int T, float* y, int64_t ldy, void* scratch, void* stream) {
-    const size_t rows = (size_t) std::min(T, kYsknMaxRows);
-    auto* xq = static_cast<int8_t*>(scratch);
-    const size_t qb = (rows * (size_t) w.cols + 255) / 256 * 256;
-    auto* alpha = reinterpret_cast<float*>(static_cast<uint8_t*>(scratch) + qb);
-    const size_t ab = (rows * (size_t) (w.cols / kGroup) * 4 + 255) / 256 * 256;
-    auto* part = reinterpret_cast<int64_t*>(static_cast<uint8_t*>(scratch) + qb + ab);
+    const YsknScratch s = yskn_scratch_parts(w, scratch);
+    if (yskn_mma_take(T, stream)) {   // the matrix form: the whole window a launch (up to kYsknMmaRows)
+        for (int t0 = 0; t0 < T; t0 += kYsknMmaRows) {
+            const int n = std::min(kYsknMmaRows, T - t0);
+            yskn_mma_proj(w, x + (size_t) t0 * ldx, ldx, n, y + (size_t) t0 * ldy, ldy, scratch, stream);
+        }
+        return;
+    }
     for (int t0 = 0; t0 < T; t0 += kYsknMaxRows) {
         const int n = std::min(kYsknMaxRows, T - t0);
-        yskn_act(w, x + (size_t) t0 * ldx, ldx, n, xq, alpha, stream);
-        yskn_gemv(w, xq, alpha, n, part, stream);
-        yskn_finish(w, part, alpha, n, y + (size_t) t0 * ldy, ldy, stream);
+        yskn_act(w, x + (size_t) t0 * ldx, ldx, n, s.xq, s.alpha, stream);
+        yskn_gemv(w, s.xq, s.alpha, n, s.part, stream);
+        yskn_finish(w, s.part, s.alpha, n, y + (size_t) t0 * ldy, ldy, stream);
     }
 }
 

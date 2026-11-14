@@ -1115,6 +1115,13 @@ bool PlainModel::load_qwen(std::string& err) {
         return false;
     }
     if (!tune_uploaded(err) || !yskn_scratch(err)) return false;
+    if (yskn_ != nullptr && !yskn_devs_.empty()) {
+        // the decode's matrix form: time its row boundary on the largest matrix (once a GPU, before any graph)
+        const k::YsknDev* big = yskn_devs_.front().get();
+        for (const auto& d : yskn_devs_)
+            if ((int64_t) d->rows * d->cols > (int64_t) big->rows * big->cols) big = d.get();
+        k::yskn_mma_tune(*big, yskn_scratch_, cs_);
+    }
     // the BF16 projections' two GEMV forms timed for each shape a window takes, before any graph is recorded; the
     // head is left to the default form (its timing would allocate a second copy of it)
     try {

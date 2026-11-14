@@ -436,7 +436,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/sampler_host.cpp
                                     src/kernels/xe/native_gdn.cpp src/kernels/xe/native_moe.cpp
                                     src/kernels/xe/fused_gdn.cpp src/kernels/xe/native_gdn_preprocess.cpp
-                                    src/kernels/xe/yskn.cpp
+                                    src/kernels/xe/yskn.cpp src/kernels/xe/yskn_mma.cpp
                                     src/kernels/xe/native_ple_postops.cpp src/kernels/xe/native_qsa.cpp
                                     src/kernels/xe/native_qsa_score.cpp src/kernels/xe/native_qsa_indexer.cpp
                                     src/kernels/xe/native_flash_attn.cpp src/kernels/xe/qsa_select.cpp
