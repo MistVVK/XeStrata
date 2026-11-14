@@ -116,6 +116,9 @@
 #include "strata/program/split_walk.hpp"
 #include "strata/program/gpu_report.hpp"
 #include "strata/prefill/loan_rules.hpp"
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+#include "strata/prefill/equal_cut_rule.hpp"
+#endif
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
@@ -10259,6 +10262,25 @@ int main(int argc, char** argv) {
         return loan_by_walk ? strata::prefill::loan_rules::walk_chunk(tokens, chunk, strata::prefill::Prefill::stream_all_min_tokens())
                             : chunk;
     };
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+    // A build without MMQ (prefill.cpp STRATA_PF_OWN_ONLY): ONE GPU reads a segment longer than its chunk in n = ceil(tokens /
+    // max_chunk) chunks of EQUAL size by default, also when today's last chunk would be under the stream floor (a sub-floor
+    // remainder costs close to a full pass where most experts stream: RTX 5070 12 GB, Q2_0, 14,000-32,000 tokens, 0.923-1.001 of
+    // today's time; equal_cut_rule.hpp).  `one_gpu`: no layer split, no peer card, one slot, no head alias.  A layer split keeps
+    // today's cut, or with STRATA_PREFILL_EQUAL=1 the older opt-in rule below (#693); STRATA_PREFILL_EQUAL=0 keeps today's cut
+    // everywhere.  `request_chunk` is unchanged (STRATA_SPLIT_SMALL_OWN uses it too).
+    static const strata::prefill::equal_cut::Cut equal_cut_one = strata::prefill::equal_cut::pick(std::getenv("STRATA_PREFILL_EQUAL"), true);
+    static const strata::prefill::equal_cut::Cut equal_cut_split = strata::prefill::equal_cut::pick(std::getenv("STRATA_PREFILL_EQUAL"), false);
+    auto equal_chunk = [&](int64_t tokens, int64_t max_chunk, bool one_gpu) -> int64_t {
+        return strata::prefill::equal_cut::chunk(one_gpu ? equal_cut_one : equal_cut_split, tokens, max_chunk,
+                                                 strata::prefill::Prefill::stream_all_min_tokens());
+    };
+    // #2824: as below; a prompt with no host plan takes the cut above
+    auto planned_chunk = [&](int64_t tokens, int64_t cap, int64_t plan, bool one_gpu) -> int64_t {
+        if (plan <= 0 || plan >= cap || tokens <= 0) return equal_chunk(tokens, cap, one_gpu);
+        return strata::program::prefill_plan::balanced_chunk(tokens, cap, plan);
+    };
+#else
     // STRATA_PREFILL_EQUAL=1 (opt-in, PR #693): a segment of `tokens` reads in n = ceil(tokens / max_chunk) chunks of EQUAL
     // size (ceil(tokens / n) rounded up to 256) instead of full chunks and a short last one.  A chunk of
     // stream_all_min_tokens() or more streams every expert the GPU does not hold, whatever its length, so a prompt's cost
@@ -10285,6 +10307,7 @@ int main(int argc, char** argv) {
         if (plan <= 0 || plan >= cap || tokens <= 0) return equal_chunk(tokens, cap);
         return strata::program::prefill_plan::balanced_chunk(tokens, cap, plan);
     };
+#endif
     // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits,
     // or with --prefill auto the largest chunk whose buffers take at most kAutoLendPct % of the slots (a
     // lent slot's expert is streamed during the prompt and refilled after it; measured on a 12 GB card, 32K Q2_0
@@ -17987,7 +18010,27 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                // one GPU: equal chunks (equal_cut_rule.hpp), unless their loan would take more slots than today's cut
+                const bool eq_one_gpu = pf_parts.size() == 1 && stages.empty() && !multi_gpu && !peer.valid() &&
+                                        !o.prefill_head_alias && o.batch <= 1;
+                int64_t want_full = loan_chunk(tokens, planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk, eq_one_gpu));
+                if (eq_one_gpu) {
+                    const int64_t want_today = loan_chunk(tokens, planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk, false));
+                    if (want_full != want_today && pf_parts[0].first >= 0) {
+                        const int64_t floor_eq = strata::prefill::Prefill::stream_all_min_tokens();
+                        auto tail_eq = [&](int64_t w) -> int64_t {
+                            return tail_loan_on && strata::prefill::Prefill::tail_matters(w, srcp != nullptr)
+                                       ? strata::prefill::loan_rules::segment_tail(tokens, w, floor_eq) : -1;
+                        };
+                        if (!strata::prefill::equal_cut::loan_ok(part_slots(pf_parts[0], want_full, tail_eq(want_full)),
+                                                                 part_slots(pf_parts[0], want_today, tail_eq(want_today))))
+                            want_full = want_today;
+                    }
+                }
+#else
                 const int64_t want_full = loan_chunk(tokens, planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk));
+#endif
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
                 const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
                                        : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
@@ -21155,12 +21198,28 @@ int main(int argc, char** argv) {
                         int64_t c2 = chunk_in;
                         (void) plan_lend(c2);
                     } else {
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                        chunk = std::min(vram_chunk, planned_chunk(n_batched, vram_chunk, chunk, false));   // equal chunks, no tail
+#else
                         chunk = std::min(vram_chunk, planned_chunk(n_batched, vram_chunk, chunk));   // equal chunks, no tail
+#endif
                     }
                     k = lend_slots(chunk);
                 }
             }
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+            // one GPU: equal chunks (equal_cut_rule.hpp), unless their loan would take more slots than today's cut
+            const bool eq_one_gpu = !multi_gpu && !peer.valid() && !o.prefill_head_alias && o.batch <= 1;
+            int64_t request_sized = loan_chunk(n_batched, equal_chunk(n_batched, chunk, eq_one_gpu));
+            if (eq_one_gpu) {
+                const int64_t request_today = loan_chunk(n_batched, equal_chunk(n_batched, chunk, false));
+                if (request_sized != request_today &&
+                    !strata::prefill::equal_cut::loan_ok(lend_slots(request_sized), lend_slots(request_today)))
+                    request_sized = request_today;
+            }
+#else
             const int64_t request_sized = loan_chunk(n_batched, equal_chunk(n_batched, chunk));
+#endif
             if (k > 0 && request_sized < chunk) {                     // no bigger than this prompt segment needs
                 chunk = request_sized;
                 k = lend_slots(chunk);
