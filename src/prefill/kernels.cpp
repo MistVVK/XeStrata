@@ -891,8 +891,8 @@ struct Gdn {
         launch_norm(y, y16, T);
     }
 
-    // The chunked scan (gdn_chunk.cpp) or the token-by-token kernels, for each device.  XESTRATA_GDN_CHUNKED unset or
-    // auto: the faster one, timed once on copies of the state at the first call of kChunkTimeMin tokens or more (each
+    // The chunked scan (gdn_chunk.cpp) or the token-by-token kernels, for each device.  XESTRATA_GDN_CHUNKED=1: the
+    // scan, timed once on copies of the state at the first call of kChunkTimeMin tokens or more (each
     // with its output norm), at 256 tokens and at the call's first 2048 at most.  A scan form at least 3% faster at
     // the longer length takes the calls from where the two lines (time = a + b tokens) cross: a device where the scan
     // is slower at both lengths never takes it.  Nothing is written down: every start times again.  =0: never; =1:
@@ -911,7 +911,10 @@ struct Gdn {
     static bool chunked(sycl::queue& q, int64_t T, bool with_out, Seq&& seq, Norm&& launch_norm, const float* state,
                         const float* h, const float* gate, const float* beta, const float* z, const float* gamma,
                         float eps, bool silu) {
-        static const int mode = strata::env_auto("GDN_CHUNKED");   // -1 automatic, 0 off, 1 on
+        // Opt-in for now (INT2, 2026-11-14): the FP16-operand scan's state error (~5e-4) is over the contract's 1e-4
+        // floor (gdn_chunk_parity on the B70 and the RX 9060 XT; GDN_CONTRACT.md's tiers keep the floor for the mixed
+        // precision too).  The token-by-token kernels keep the default until GDN settles the state update's precision.
+        static const int mode = [] { const int m = strata::env_auto("GDN_CHUNKED"); return m < 0 ? 0 : m; }();
         if (mode == 0 || T < 64) return false;
         ChunkPick& cp = chunk_pick(q);
         if (!cp.decided && mode == 1) {

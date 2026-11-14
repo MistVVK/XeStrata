@@ -153,6 +153,12 @@ Out run(const Inputs& in, int form) {
 }  // namespace
 
 int main() {
+    // the scan is opt-in (kernels.cpp): the parity runs when it is enabled, else CTest skips it
+    const char* enabled = std::getenv("XESTRATA_GDN_CHUNKED");
+    if (enabled == nullptr || std::atoi(enabled) != 1) {
+        std::printf("the chunked DeltaNet scan is opt-in (XESTRATA_GDN_CHUNKED=1): skipped\n");
+        return 77;
+    }
     // the token-by-token kernels for the comparison: gdn_recurrence must not choose the scan itself
 #if defined(_WIN32)
     _putenv_s("XESTRATA_GDN_CHUNKED", "0");
