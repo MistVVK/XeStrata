@@ -231,6 +231,15 @@ const bool g_own_only_defaults = [] {
 }();
 }  // namespace
 #endif
+namespace {
+// own_only_line.hpp peer_keeps_mmq: this engine has no MMQ, so --peer-device's prompt share is always declined (set_peer) and the walk keeps its own kernels.
+// Here and not in the header: STRATA_PF_OWN_ONLY is defined above, after the header was included.
+#if defined(STRATA_PF_OWN_ONLY)
+constexpr bool kPfOwnOnlyBuild = true;
+#else
+constexpr bool kPfOwnOnlyBuild = false;
+#endif
+}  // namespace
 #ifndef STRATA_PREFILL_WS
 // the weight-stationary experts (moe_ws.hpp) are in the CUDA STRATA_EXPERIMENTAL_SM60 build only
 namespace strata::prefill::ws {
@@ -1998,7 +2007,7 @@ const MmqPlan& mmq_plan() {
         }
 #if defined(STRATA_PF_OWN_ONLY)
         if (layers > 0) {   // The owner approved this wording (11-13).  One line per process (the plan is made once): the layer counts per path, from the rule functions that pick the path.
-            const bool peer_off = strata::core::peer_portable();            // the walk's own condition (no_peer): the fused kernels stay off with a peer device
+            const bool peer_off = strata::prefill::peer_keeps_mmq(strata::core::peer_portable(), kPfOwnOnlyBuild);   // the walk's own condition (no_peer): false in this build
             const bool entry_on = staged_fo_on();                           // the staged group entry for a fused-only layer below the floor (staged_fo_rule.hpp)
             strata::prefill::OwnOnlySplit big, small;                       // at or above the long-prompt floor, below it
             const bool i8_gated = strata::kernels::native_expert_i8_floor_gated();   // P100 class: the int8 default is for chunks under stream_all_min() only, the FP16 path from it up
@@ -5282,9 +5291,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const float* had_sh = had_d ? m.had_sh[(size_t) l] : nullptr;
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-                    // --peer-device: MMQ only, whether or not the peer took the prompt path (set_peer can decline), as
-                    // fused_ring() sized the ring and the buffers for it
-                    const bool no_peer = !core::peer_portable();
+                    // --peer-device with MMQ: MMQ only, whether or not the peer took the prompt path (set_peer can decline), as
+                    // fused_ring() sized the ring and the buffers for it.  Without MMQ the share is always declined: the
+                    // kernels the walk picks without the flag, in MMQ's buffer layout (own_only_line.hpp peer_keeps_mmq)
+                    const bool no_peer = !strata::prefill::peer_keeps_mmq(core::peer_portable(), kPfOwnOnlyBuild);
                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
                     // a Hadamard-folded layer (APR / Gyro) on the fused kernels: only the trellis pairs (CUDA, STRATA_PF_FUSED_TQ=1: native_supported
                     // answers for them only with it), block 128: the gate/up input rotated into m.Xr as the MMQ path does, the down input

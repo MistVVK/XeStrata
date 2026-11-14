@@ -26,6 +26,13 @@ inline void own_only_count_layer(OwnOnlySplit& big, OwnOnlySplit& small, bool fo
     if (fo && entry_on && unfolded) ++small.staged; else if (i8) ++small.i8; else ++small.fp16;
 }
 
+/// --peer-device and the prompt walk's fused experts: whether the flag keeps every layer off the fused kernels (the walk's `no_peer`, prefill.cpp, and the start-up
+/// line's `peer_off`).  `peer_flag`: --peer-device is on (core::peer_portable).  `own_only`: this engine was built without MMQ (STRATA_PF_OWN_ONLY).  With MMQ the
+/// peer can take a share of the prompt path, which runs on MMQ only, so the flag keeps MMQ whether or not the share was taken.  Without MMQ the share is declined
+/// by design (Prefill::set_peer), so the walk keeps the kernels it picks without the flag; they run in MMQ's buffer layout, which fused_ring() keeps for a peer
+/// session (the layout the small-card path's kPfFusedKernelsOnly runs the fused kernels in, pf_fused_override.hpp).
+inline constexpr bool peer_keeps_mmq(bool peer_flag, bool own_only) { return peer_flag && !own_only; }
+
 namespace own_only_detail {
 inline std::string parts(const OwnOnlySplit& s, int64_t layers, bool staged_name, bool with_total) {
     std::vector<std::string> v;
@@ -45,7 +52,7 @@ inline std::string parts(const OwnOnlySplit& s, int64_t layers, bool staged_name
 }  // namespace own_only_detail
 
 /// One plain sentence.  `big` runs at `floor_tokens` tokens or more, `small` below it; equal splits (no staged entry, same counts) say "every chunk".
-/// `peer_off`: --peer-device is on, so the fused kernels are off and the counts are the ones that result.
+/// `peer_off`: --peer-device keeps the fused kernels off (peer_keeps_mmq) and the counts are the ones that result; an engine built without MMQ passes false.
 inline std::string own_only_line(int64_t layers, int64_t floor_tokens, const OwnOnlySplit& big, const OwnOnlySplit& small, bool peer_off) {
     std::string s = "strata: prompt kernels: ";
     const bool equal = small.staged == 0 && big == small;
