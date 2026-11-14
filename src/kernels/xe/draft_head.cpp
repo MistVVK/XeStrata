@@ -46,20 +46,62 @@ sycl::event topk_stage(sycl::queue& q, const float* v, const int32_t* ids_in, in
             int slot = -1;
 #pragma unroll
             for (int i = 0; i < kTopPer; ++i)
-                if (id[i] >= 0 && (slot < 0 || val[i] > best)) { best = val[i]; slot = i; }
+                if (id[i] >= 0 && (slot < 0 || val[i] > best || (val[i] == best && id[i] < id[slot]))) {
+                    best = val[i]; slot = i;
+                }
             const float top = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<float>());
-            // the lowest work-item holding it gives it up, so one value leaves the chunk each turn
-            const int who = sycl::reduce_over_group(it.get_group(), slot >= 0 && best == top ? t : kTopWG,
-                                                    sycl::minimum<int>());
-            if (t == who) {
+            const int winner = sycl::reduce_over_group(it.get_group(), slot >= 0 && best == top ? id[slot] : INT32_MAX,
+                                                       sycl::minimum<int>());
+            if (slot >= 0 && id[slot] == winner) {
                 out_v[g * k + j] = top;
-                out_i[g * k + j] = id[slot];
+                out_i[g * k + j] = winner;
                 id[slot] = -1;
-            } else if (who == kTopWG && t == 0) {   // fewer than k values in the chunk
+            } else if (winner == INT32_MAX && t == 0) {   // fewer than k values in the chunk
                 out_v[g * k + j] = kNone;
                 out_i[g * k + j] = -1;
             }
         }
+    });
+}
+
+// Devices that cannot launch 256 work-items keep the same 4096-value chunks and exact tie rule. The local taken
+// flags replace the fast form's per-thread register list; this path is not yet speed-measured.
+sycl::event topk_stage_small(sycl::queue& q, const float* v, const int32_t* ids_in, int64_t n, int k, float* out_v,
+                             int32_t* out_i, int wg) {
+    const int64_t groups = (n + kTopChunk - 1) / kTopChunk;
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint8_t, 1> taken(kTopChunk, h);
+        h.parallel_for(sycl::nd_range<1>((size_t) groups * wg, (size_t) wg), [=](sycl::nd_item<1> it) {
+            const int64_t g = (int64_t) it.get_group(0), base = g * kTopChunk;
+            const int t = (int) it.get_local_id(0);
+            auto group = it.get_group();
+            for (int i = t; i < kTopChunk; i += wg) {
+                const int64_t at = base + i;
+                taken[i] = at >= n || (ids_in != nullptr && ids_in[at] < 0);
+            }
+            sycl::group_barrier(group);
+            for (int j = 0; j < k; ++j) {
+                float best = -std::numeric_limits<float>::infinity();
+                int id = INT32_MAX;
+                for (int i = t; i < kTopChunk; i += wg) {
+                    if (taken[i]) continue;
+                    const int64_t at = base + i;
+                    const int next = ids_in ? ids_in[at] : (int) at;
+                    const float value = v[at];
+                    if (value > best || (value == best && next < id)) { best = value; id = next; }
+                }
+                const float top = sycl::reduce_over_group(group, best, sycl::maximum<float>());
+                const int winner = sycl::reduce_over_group(group, best == top ? id : INT32_MAX, sycl::minimum<int>());
+                if (t == 0) { out_v[g * k + j] = top; out_i[g * k + j] = winner == INT32_MAX ? -1 : winner; }
+                if (winner != INT32_MAX)
+                    for (int i = t; i < kTopChunk; i += wg) {
+                        if (taken[i]) continue;
+                        const int64_t at = base + i;
+                        if ((ids_in ? ids_in[at] : (int) at) == winner) taken[i] = 1;
+                    }
+                sycl::group_barrier(group);
+            }
+        });
     });
 }
 
@@ -146,21 +188,31 @@ std::size_t topk_scratch_bytes(int64_t n, int k) {
     return (std::size_t) (2 * c) * (sizeof(float) + sizeof(int32_t));
 }
 
-void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* stream) {
-    if (k < 1 || k > kTopKMax || n < 1) throw std::invalid_argument("topk: k is 1 to 64 and n positive");
+void topk_mapped(const float* v, const int32_t* id_map, int64_t n, int k, int32_t* ids, float* values,
+                 void* scratch, void* stream) {
+    if (k < 1 || k > kTopKSelectionMax || n < 1 || n > INT32_MAX)
+        throw std::invalid_argument("topk: invalid k or input length");
     auto& q = Q(stream);
+    const auto dev = q.get_device();
+    const size_t limit = std::min(dev.get_info<sycl::info::device::max_work_group_size>(),
+                                  dev.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]);
+    int wg = 1;
+    while ((size_t) wg * 2 <= limit && wg < kTopWG) wg *= 2;
+    if (wg < kTopWG && dev.get_info<sycl::info::device::local_mem_size>() < kTopChunk)
+        throw std::runtime_error("topk: the device cannot hold the selection flags");
     const int64_t cap = ((n + kTopChunk - 1) / kTopChunk) * k;   // topk_scratch_bytes' room for one side
     auto* fv = static_cast<float*>(scratch);
     auto* fi = reinterpret_cast<int32_t*>(fv + 2 * cap);
     float* bv[2] = {fv, fv + cap};
     int32_t* bi[2] = {fi, fi + cap};
     const float* in_v = v;
-    const int32_t* in_i = nullptr;
+    const int32_t* in_i = id_map;
     int side = 0;
     sycl::event e;
     while (true) {
         const int64_t groups = (n + kTopChunk - 1) / kTopChunk;
-        e = topk_stage(q, in_v, in_i, n, k, bv[side], bi[side]);
+        e = wg == kTopWG ? topk_stage(q, in_v, in_i, n, k, bv[side], bi[side])
+                         : topk_stage_small(q, in_v, in_i, n, k, bv[side], bi[side], wg);
         n = groups * k;
         in_v = bv[side];
         in_i = bi[side];
@@ -168,7 +220,12 @@ void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* s
         if (groups == 1) break;
     }
     e = q.memcpy(ids, in_i, (size_t) k * sizeof(int32_t));
+    if (values) e = q.memcpy(values, in_v, (size_t) k * sizeof(float));
     done(stream, e, "topk");
+}
+
+void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* stream) {
+    topk_mapped(v, nullptr, n, k, ids, nullptr, scratch, stream);
 }
 
 void int2_pad_from(const int32_t* pos, int32_t from, float* y, int64_t n, void* stream) {
