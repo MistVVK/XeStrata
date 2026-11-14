@@ -38,6 +38,14 @@ struct OneSessionFit {
     long long fit = 0;
 };
 
+// Whether the staging pair counts in the floor (OneSessionInput::staging).  place_experts allocates it whenever the streamed prompt path is on
+// (use_pf) and the main layers are hybrid.  The build with MMQ keeps its old rule (MMQ or our int8 kernels on a layer).  The build without MMQ
+// counts it on the streamed path as well: there the fused kernels take the layers, use_mmq is false and n_i8 is 0, and the floor was 0, so a context
+// that cannot fit went on to place_experts' "not enough VRAM left for the hybrid experts' buffers" with no size that fits (RTX 3060 Ti 8 GB, 32K).
+inline bool one_session_staging_counted(bool use_mmq, bool any_i8, bool use_pf, bool mmq_built) {
+    return use_mmq || any_i8 || (!mmq_built && use_pf);
+}
+
 inline OneSessionFit one_session_fit(const OneSessionInput& in) {
     OneSessionFit f;
     const size_t session = in.kv_tok * in.ctx + in.state;
