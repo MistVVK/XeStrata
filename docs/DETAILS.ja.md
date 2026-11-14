@@ -217,7 +217,7 @@ setup（`./setup.sh`、パッケージの `xestrata`、ランチャーの窓）�
 最初に選ばれているモデルは、Qwen3.8-Flash-Next の Swift 1.5 の SC117 版（IQ3_XXS が入るとき）、Gyro-Coder-L（エキスパートが全部 RAM に入るとき）、Gyro-Coder（同じく）、Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B、Qwen3.5-2B の順に見て、この PC で動く最初のものです（GPU のない PC では Qwen3.5-2B）。
 大きさは品質で勧めます。
 
-- ISTA-DASLab の GSQ-RCO のファイル（元のもの、Swift 1.5、Coder、SC117 と huihui-ai の版）は IQ3_XXS です。この PC に入らなければ、入るうちで品質のいちばん高いものです（省 RAM モードで入るものも含みます）。
+- ISTA-DASLab の GSQ-RCO のファイル（元のもの、Swift 1.5、Coder、SC117 と huihui-ai の版）は、入れば IQ3_S、次に IQ3_XXS です。どちらも入らなければ、入るうちで品質のいちばん高いものです（省 RAM モードで入るものも含みます）。
 - RAM の予算で動くファイル（Unsloth、Gyro、AtomicChat の AD）は、エキスパートが全部 RAM に入るうちで品質のいちばん高いものです。実験的な版は勧めません。
 - Qwen3.8-Flash-Next 以外の MoE（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、GLM-5.3-Flash）は、RAM と VRAM の合計に入るうちで品質のいちばん高いものです。
 - Qwen3.5（9B、2B、0.8B）は、VRAM に入るうちで最も大きなものです。GPU のない PC では、2B は UD-Q5_K_XL、0.8B は Q8_0 です。

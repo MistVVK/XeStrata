@@ -238,7 +238,7 @@ On the command line, choose each level with `--base`, `--variant` and `--quantiz
 The model chosen first is the first of Qwen3.8-Flash-Next's Swift 1.5 in SC117's copy (where its IQ3_XXS fits), Gyro-Coder-L (where its experts all fit the RAM), Gyro-Coder (likewise), Ornith-1.5, Qwen3.6-35B-A3B, Qwen3.5-9B and Qwen3.5-2B that this PC runs (Qwen3.5-2B on a PC without a GPU).
 The size is recommended by quality:
 
-- ISTA-DASLab's GSQ-RCO files (the original, Swift 1.5, the Coder, SC117's and huihui-ai's versions): IQ3_XXS; where this PC does not hold it, the best quality it holds (in the low-RAM mode too).
+- ISTA-DASLab's GSQ-RCO files (the original, Swift 1.5, the Coder, SC117's and huihui-ai's versions): IQ3_S where this PC holds it, else IQ3_XXS; where it holds neither, the best quality it holds (in the low-RAM mode too).
 - The files that run on a RAM budget (Unsloth's, Gyro, AtomicChat's AD): the best quality whose experts all fit the RAM; never an experimental one.
 - The MoE models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, GLM-5.3-Flash): the best quality the RAM and VRAM together hold.
 - Qwen3.5 (9B, 2B, 0.8B): the largest the VRAM holds. On a PC without a GPU, UD-Q5_K_XL for the 2B and Q8_0 for the 0.8B.
