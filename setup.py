@@ -5440,7 +5440,8 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     names = QI.file_names(quant, enc, tquant, dit)
     if user:   # its DiT is the user's file, not one to fetch
         names = names[1:]
-    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered, "q8": q8, "names": names}
+    return {"choice": choice, "requested_size": size, "quant": quant, "tquant": tquant, "lowered": lowered,
+            "q8": q8, "names": names}
 
 
 def image_descriptions(models_dir: Path) -> list[dict]:
@@ -5523,8 +5524,9 @@ def ask_images(cfg_path: Path) -> str | None:
     except (OSError, ValueError):
         cfg = {}
     if isinstance(cfg, dict) and isinstance(cfg.get("images"), dict):
-        picks = [by_name[x["model_name"]] for x in [cfg["images"], *(cfg.get("image_models") or [])]
-                 if isinstance(x, dict) and x.get("model_name") in by_name]
+        picks = [x.get("setup_choice") or by_name[x["model_name"]]
+                 for x in [cfg["images"], *(cfg.get("image_models") or [])]
+                 if isinstance(x, dict) and (x.get("setup_choice") or x.get("model_name") in by_name)]
     else:
         picks = [] if cfg else list(qi.SETUP_DEFAULT)
     while True:
@@ -5691,6 +5693,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
                               uma=bool((gpu or {}).get("integrated")), policy=a.image_gpu_policy or "auto",
                               ssd_offload=getattr(a, "image_ssd_offload", None) == "on", text_quant=p["tquant"],
                               dit_q8=p["q8"], dit_keep=getattr(a, "image_dit_keep", None) != "off")
+        cfg["setup_choice"] = p["choice"] + ((":" + p["requested_size"]) if p["requested_size"] else "")
         if p["lowered"]:
             cfg["quant_lowered"] = p["lowered"]
         cfgs.append(cfg)
@@ -9218,8 +9221,8 @@ def describe() -> dict:
         secs = [cfg.get("images"), *(cfg.get("image_models") or [])] if isinstance(cfg.get("images"), dict) else []
         installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
                           "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095,
-                          "images": [by_name[s["model_name"]] for s in secs
-                                     if isinstance(s, dict) and s.get("model_name") in by_name]})
+                          "images": [s.get("setup_choice") or by_name[s["model_name"]] for s in secs
+                                     if isinstance(s, dict) and (s.get("setup_choice") or s.get("model_name") in by_name)]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
             "ram_gb": round(ram_gb(), 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
             "gpu": gpu["index"] if gpu else None,
