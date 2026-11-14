@@ -62,7 +62,8 @@ MoeWindow::~MoeWindow() {
     }
     for (void* p : {(void*) h_x_, (void*) h_ids_, (void*) h_w_, (void*) h_ymiss_, (void*) h_seq_, (void*) h_flag_,
                     (void*) h_flagA_, (void*) h_flagB_, (void*) h_plan_, arena_, (void*) skip_, (void*) slot_off_d_,
-                    (void*) h_latxl_, (void*) h_latact0_, (void*) h_xlseq_, (void*) lat_labels_dev_})
+                    (void*) h_latxl_, (void*) h_latact0_, (void*) h_xlseq_, (void*) lat_labels_dev_,
+                    (void*) h_u_mmq_ids_, (void*) h_u_mmq_bounds_})
         if (p != nullptr) strata::gpu::free(p);
     if (lat_du_owned_) {
         if (lat_d_ != nullptr) strata::gpu::free(lat_d_);
@@ -219,6 +220,13 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         ok = mapped(T * G * ELL * 4, (void**) &h_latxl_, (void**) &m_latxl_) &&
              mapped(T * G * (ELL / 32) * 34, (void**) &h_latact0_, (void**) &m_latact0_) &&
              mapped(64, (void**) &h_xlseq_, (void**) &m_xlseq_);
+        // the U mmq bucketing's host tables: a layer's slice each, so a layer's copy kernel reads its own slice
+        // while the next layer writes another (no sync between the window's layers); across windows the verdict
+        // sync drains the copies before the slices are rewritten
+        if (ok && lat_u_mmu_) {
+            ok = strata::gpu::alloc_host(&h_u_mmq_ids_, (size_t) lay.n_layers * T * K * sizeof(int32_t)) &&
+                 strata::gpu::alloc_host(&h_u_mmq_bounds_, (size_t) lay.n_layers * (G + 1) * sizeof(int32_t));
+        }
     }
     if (!ok) { err = "moe window: mapped staging allocation failed"; return false; }
     {   // a plan for each of the two token groups a window may be cut into
@@ -556,10 +564,13 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
             // the A outputs' image, then U for the GPU's rows (hit_out, now H wide)
             if (lat_u_mmu_) {
                 // the G groups as iq_mmq experts: bucket the routes by label; the product's ids map the group-order
-                // rows back to route order, so hit_out stays in the order the combine adds
+                // rows back to route order, so hit_out stays in the order the combine adds.  The bucketing goes into
+                // this layer's host slice, uploaded by a copy kernel (not a sync copy): the next layer writes another
+                // slice, so the window's layers need no sync between them.
                 const int32_t* hlabels = lat_labels_.data() + (size_t) layer * lay.n_expert;
                 const int32_t* hids = h_ids_ + (size_t) tb * K;
-                std::vector<int32_t> idsU((size_t) cap), ubnd((size_t) G + 1);
+                int32_t* idsU = h_u_mmq_ids_ + (size_t) layer * capx;
+                int32_t* ubnd = h_u_mmq_bounds_ + (size_t) layer * (G + 1);
                 int64_t u = 0, maxr = 0;
                 ubnd[0] = 0;
                 for (int gg = 0; gg < G; ++gg) {
@@ -568,8 +579,8 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                     ubnd[gg + 1] = (int32_t) u;
                     maxr = std::max<int64_t>(maxr, ubnd[gg + 1] - ubnd[gg]);
                 }
-                strata::gpu::copy(lat_u_mmq_ids_, idsU.data(), (size_t) cap * 4);
-                strata::gpu::copy(lat_u_mmq_bounds_, ubnd.data(), (size_t) (G + 1) * 4);
+                copy_i32_from_mapped(lat_u_mmq_ids_, idsU, cap, cs);
+                copy_i32_from_mapped(lat_u_mmq_bounds_, ubnd, G + 1, cs);
                 strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, lat_fmt_, ELL, ELL, cap, cs);
                 strata::prefill::mmq::Product up;
                 up.w = lat_u_ + (size_t) layer * u_bytes; up.type = lat_fmt_; up.w_rows = N; up.w_cols = ELL;
