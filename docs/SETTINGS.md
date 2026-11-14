@@ -10,7 +10,7 @@ debugging and are kept in `data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (272)
+## Switches you can turn on (271)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -120,7 +120,6 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_KVA_SUFFIX` | number | NVIDIA and AMD | [KVA.md](KVA.md) |
 | `STRATA_KV_GROW` | on / off | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
 | `STRATA_KV_GROW_HOLD` | number | NVIDIA and AMD | - |
-| `STRATA_KV_HOST_DMA` | on / off | AMD, Intel Arc | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 | `STRATA_KV_HOST_REGISTER` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_KV_PREFETCH` | number | NVIDIA and AMD, Intel Arc | [KV_PREFETCH.md](KV_PREFETCH.md) |
 | `STRATA_KV_ROT` | on / off | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md), [SPLIT_SERVE.md](SPLIT_SERVE.md) |
@@ -289,7 +288,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WS_FAST` | number | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
 
-## Switches that go back to earlier behaviour (78)
+## Switches that go back to earlier behaviour (80)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -316,6 +315,8 @@ version made it the default.
 | `STRATA_IL_PAD` | number | NVIDIA and AMD | v0.2.10 | - |
 | `STRATA_IQ_MT_MIN` | on / off | NVIDIA and AMD, CPU | v0.1.40.1 | [BATCHING.md](BATCHING.md), [DETAILS.md](DETAILS.md), [OLDER_GPUS.md](OLDER_GPUS.md) |
 | `STRATA_KEEP_MAPPING` | on / off | NVIDIA and AMD | v0.1.41 | - |
+| `STRATA_KV_HOST_DMA` | on / off | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
+| `STRATA_MEM_CREDIT_INACTIVE` | text | NVIDIA and AMD | - | - |
 | `STRATA_METAL_LDB` | on / off | Mac | v0.2.10 | - |
 | `STRATA_METAL_MTP_OVERLAP` | on / off | Mac | v0.2.10 | - |
 | `STRATA_METAL_MTP_Q8` | on / off | Mac | v0.1.44 | [MAC.md](MAC.md) |
