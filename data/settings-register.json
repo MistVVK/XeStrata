@@ -22411,7 +22411,7 @@
    "first_commit": "716ebae14e",
    "first_date": "2026-11-14",
    "since": null,
-   "last_commit": "29147556b9",
+   "last_commit": "7a9f8d2ad0",
    "last_date": "2026-11-14",
    "status": "rollback",
    "owner": "kernels/cpu",
