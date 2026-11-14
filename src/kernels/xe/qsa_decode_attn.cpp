@@ -210,7 +210,7 @@ inline float dotn(const float* k, const float* q) {
 // ROWS: a batch window's rows, each with its own slot's pools.  A template argument, not a test of rows.n in the
 // kernel: the pools picked per work-item cost the B70 8 times the kernel's time (69 -> 532 us at 8192 cells) and the
 // RTX 4070 some, for every caller.
-template <int HD, int G, int KV_MODE, bool LOOP, int NC, bool PERCELL, bool ROWS, bool VB = false>
+template <int HD, int G, int KV_MODE, bool LOOP, int NC, bool PERCELL, bool ROWS>
 sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools pools, const int32_t* ids_all,
                          const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
                          float* part_m_all, float* part_l_all, int n_slots, size_t n_q, int cap,
@@ -222,13 +222,6 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
     constexpr int WARPS = THREADS / WARP;
     constexpr int N = HD / WARP;          // dimensions a lane holds in the score loop
     constexpr int GP = (G + 3) / 4 * 4;   // a cell's weights padded to whole float4s
-    // VB: the value loop reads N dimensions a work-item in one loadn (the score loop's shape) instead of one a
-    // work-item, so the trellis read decodes one 64-bit window for N values, not a window a value.  The first WARP
-    // work-items own the HD dimensions (N each); the rest sit the value loop out.  The per-(head, dimension) sums
-    // still fold the cells in ascending order, so the bits are the one-a-work-item form's.  XESTRATA_QSA_VBATCH
-    // picks the form until the three makers' timing keeps the faster (launch_kv_form).
-    constexpr int VN = VB ? N : 1;        // dimensions a work-item owns in the value loop
-    constexpr int VTHREADS = VB ? WARP : THREADS;   // the work-items the value loop uses
     // ids_all null: every cell, slot c of the chunk is cell c0 + c, and the count is the cache's (step[kStepNKv])
     const bool dense = ids_all == nullptr;
     return queue.submit([&](sycl::handler& hd) {
@@ -290,11 +283,8 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
             };
             // chunks first, first + n_slots, ... in turn, each folded into the running max, sum and values (online
             // softmax); with one chunk a slot (n_slots the chunks) these are the chunk's own, as before
-            float run_m[G], run_l[G], run_acc[G][VN];
-            for (int h = 0; h < G; ++h) {
-                run_m[h] = -FLT_MAX; run_l[h] = 0.0f;
-                for (int e = 0; e < VN; ++e) run_acc[h][e] = 0.0f;
-            }
+            float run_m[G], run_l[G], run_acc[G];
+            for (int h = 0; h < G; ++h) { run_m[h] = -FLT_MAX; run_l[h] = 0.0f; run_acc[h] = 0.0f; }
             for (int chunk = first; chunk * csz < n_ids; chunk += n_slots) {
                 const int c0 = chunk * csz;
                 const int n_here = sycl::min(csz, n_ids - c0);
@@ -423,77 +413,59 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                     if (lane == 0) { sml[h] = m; sml[G + h] = l; }
                 }
                 sycl::group_barrier(grp);
-                // values: work-item t owns VN dimensions (t*VN .. t*VN+VN-1) for all G heads.  VB reads them in one
-                // loadn (the score loop's shape), so the trellis read decodes one window for N values; the first
-                // VTHREADS work-items own the HD dimensions and the rest sit the value loop out.
-                if (t < VTHREADS) {
-                    float acc[GP][VN];
-                    for (int h = 0; h < GP; ++h)
-                        for (int e = 0; e < VN; ++e) acc[h][e] = 0.0f;
-                    // one cell's weights (GP/4 float4 loads from local memory) into the accumulators; the cells are
-                    // folded in ascending order, so the sums are the plain loop's, bit for bit (upstream fd95405).
-                    // The padding slots past G accumulate whatever local memory holds and are never stored.
-                    const auto fold = [&](int c, const float* v) {
-        #pragma unroll
-                        for (int g4 = 0; g4 < GP / 4; ++g4) {
-                            const sycl::float4 w = spt[(size_t) c * (GP / 4) + g4];
-        #pragma unroll
-                            for (int e = 0; e < VN; ++e) {
-                                acc[4 * g4][e] = sycl::fma(w.x(), v[e], acc[4 * g4][e]);
-                                acc[4 * g4 + 1][e] = sycl::fma(w.y(), v[e], acc[4 * g4 + 1][e]);
-                                acc[4 * g4 + 2][e] = sycl::fma(w.z(), v[e], acc[4 * g4 + 2][e]);
-                                acc[4 * g4 + 3][e] = sycl::fma(w.w(), v[e], acc[4 * g4 + 3][e]);
-                            }
-                        }
-                    };
-                    const auto vread = [&](int cc, float* v) {
-                        const int g = ring_of(cc);
-                        const int ring = g >= 0 ? g + v_ring : -1;
-                        if constexpr (VB) loadn<HD, KV_MODE>(shost[cc] ? hp : p, true, srow[cc], t * VN, v, tab, ring);
-                        else v[0] = load_v1<HD, KV_MODE>(shost[cc] ? hp : p, srow[cc], t, tab, ring);
-                    };
-                    int c = 0;
-                    // four cells at a time with their V loads issued together; a group holding a masked cell (page -1,
-                    // rare) leaves this loop and the one below finishes the chunk
-                    for (; c + 4 <= n_here; c += 4) {
-                        const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
-                        if ((r0 | r1 | r2 | r3) < 0) break;
-                        float v0[VN], v1[VN], v2[VN], v3[VN];
-                        vread(c, v0); vread(c + 1, v1); vread(c + 2, v2); vread(c + 3, v3);
-                        fold(c, v0); fold(c + 1, v1); fold(c + 2, v2); fold(c + 3, v3);
+                // values: work-item t owns dimension t for all G heads.
+                float acc[GP];
+                for (int h = 0; h < GP; ++h) acc[h] = 0.0f;
+                // one cell's weights (GP/4 float4 loads from local memory) into the accumulators; the cells are folded
+                // in ascending order, so the sums are the plain loop's, bit for bit (upstream fd95405).  The padding
+                // slots past G accumulate whatever local memory holds and are never stored.
+                const auto fold = [&](int c, float v) {
+    #pragma unroll
+                    for (int g4 = 0; g4 < GP / 4; ++g4) {
+                        const sycl::float4 w = spt[(size_t) c * (GP / 4) + g4];
+                        acc[4 * g4] = sycl::fma(w.x(), v, acc[4 * g4]);
+                        acc[4 * g4 + 1] = sycl::fma(w.y(), v, acc[4 * g4 + 1]);
+                        acc[4 * g4 + 2] = sycl::fma(w.z(), v, acc[4 * g4 + 2]);
+                        acc[4 * g4 + 3] = sycl::fma(w.w(), v, acc[4 * g4 + 3]);
                     }
-                    for (; c < n_here; ++c) {
-                        if (srow[c] < 0) continue;   // masked above, weight 0
-                        float v[VN];
-                        vread(c, v);
-                        fold(c, v);
-                    }
-                    if constexpr (!LOOP) {   // the chunk's own partials
-                        for (int h = 0; h < G; ++h)
-                            for (int e = 0; e < VN; ++e)
-                                part_acc[((size_t) slot * G + h) * HD + t * VN + e] = acc[h][e];
-                    } else {
-                        for (int h = 0; h < G; ++h) {
-                            const float m = sml[h], m2 = sycl::fmax(run_m[h], m);
-                            const float a = sycl::exp(run_m[h] - m2), b = sycl::exp(m - m2);
-                            for (int e = 0; e < VN; ++e) run_acc[h][e] = run_acc[h][e] * a + acc[h][e] * b;
-                            run_l[h] = run_l[h] * a + sml[G + h] * b;
-                            run_m[h] = m2;
-                        }
-                    }
+                };
+                int c = 0;
+                // four cells at a time with their V loads issued together; a group holding a masked cell (page -1,
+                // rare) leaves this loop and the one below finishes the chunk
+                for (; c + 4 <= n_here; c += 4) {
+                    const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
+                    if ((r0 | r1 | r2 | r3) < 0) break;
+                    const auto vr = [&](int k) { const int g = ring_of(c + k); return g >= 0 ? g + v_ring : -1; };
+                    const float v0 = load_v1<HD, KV_MODE>(shost[c] ? hp : p, r0, t, tab, vr(0));
+                    const float v1 = load_v1<HD, KV_MODE>(shost[c + 1] ? hp : p, r1, t, tab, vr(1));
+                    const float v2 = load_v1<HD, KV_MODE>(shost[c + 2] ? hp : p, r2, t, tab, vr(2));
+                    const float v3 = load_v1<HD, KV_MODE>(shost[c + 3] ? hp : p, r3, t, tab, vr(3));
+                    fold(c, v0);
+                    fold(c + 1, v1);
+                    fold(c + 2, v2);
+                    fold(c + 3, v3);
                 }
-                if constexpr (!LOOP) {
+                for (; c < n_here; ++c) {
+                    if (srow[c] < 0) continue;   // masked above, weight 0
+                    const int g = ring_of(c);
+                    fold(c, load_v1<HD, KV_MODE>(shost[c] ? hp : p, srow[c], t, tab, g >= 0 ? g + v_ring : -1));
+                }
+                if constexpr (!LOOP) {   // the chunk's own partials
+                    for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
                     if (t < G) { part_m[slot * G + t] = sml[t]; part_l[slot * G + t] = sml[G + t]; }
                     break;
+                }
+                for (int h = 0; h < G; ++h) {
+                    const float m = sml[h], m2 = sycl::fmax(run_m[h], m);
+                    const float a = sycl::exp(run_m[h] - m2), b = sycl::exp(m - m2);
+                    run_acc[h] = run_acc[h] * a + acc[h] * b;
+                    run_l[h] = run_l[h] * a + sml[G + h] * b;
+                    run_m[h] = m2;
                 }
                 sycl::group_barrier(grp);   // the next chunk writes srow, sp, spt and sml
             }
             if constexpr (LOOP) {
-                if (t < VTHREADS) {
-                    for (int h = 0; h < G; ++h)
-                        for (int e = 0; e < VN; ++e)
-                            part_acc[((size_t) slot * G + h) * HD + t * VN + e] = run_acc[h][e];
-                }
+                for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = run_acc[h];
                 if (t < G) { part_m[slot * G + t] = run_m[t]; part_l[slot * G + t] = run_l[t]; }
             }
         });
@@ -593,12 +565,7 @@ void launch_kv_form(int kv_mode, int nc, sycl::queue& queue, const float* q, con
                int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div,
                int min_chunk, const QsaAttnPoolsRows& rows) {
     constexpr int N8 = PERCELL ? 2 : 8, N4 = PERCELL ? 2 : 4;   // the per-cell form has no cells-a-step forms
-    // the trellis value loop's form: XESTRATA_QSA_VBATCH=1 the N-dimensions-a-work-item read (one window for N
-    // values), unset/0 the one-a-work-item read.  The default stays the old form until the three makers' timing keeps
-    // the faster as the single path (Y25b); both give the same bits (the cells fold in the same order).
-    static const bool vbatch = strata::env_auto("QSA_VBATCH") == 1;
-    if (kv_mode == 4 && vbatch) launch_chunk<HD, G, 4, LOOP, 2, PERCELL, ROWS, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
-    else if (kv_mode == 4) launch_chunk<HD, G, 4, LOOP, 2, PERCELL, ROWS, false>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    if (kv_mode == 4) launch_chunk<HD, G, 4, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
