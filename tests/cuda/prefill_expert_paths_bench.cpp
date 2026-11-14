@@ -42,6 +42,7 @@
 #endif
 
 #include "ggml.h"
+#include "../prefill/bench_blob_layout.hpp"
 
 #include <cuda_runtime.h>
 
@@ -640,7 +641,19 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
     size_t free0 = 0, tot = 0;
     cudaMemGetInfo(&free0, &tot);
 
-    // blobs at the engine's stride (a whole number of blocks of both formats), identical but for one byte (not the scale)
+    // blobs at the engine's stride (a whole number of blocks of both formats), identical but for one quant byte of the gate matrix's first row:
+    // strata::bench_blob::perturb_offset skips every byte that carries scale bits in the gate/up type's block (fixed offsets 4..19 reached block 1's
+    // fp16 scale on Q2_0's 18-byte blocks and gave some experts scales of +-12,992 or NaN)
+    strata::bench_blob::BlockLayout gu_lay;
+    if (!real && !strata::bench_blob::layout_of((int) p.gu, gu_lay)) {
+        std::printf("   %s: no block layout for gate/up type %d in bench_blob_layout.hpp: pair skipped\n", p.name, (int) p.gu);
+        return;
+    }
+    if (!real && (gu_lay.bytes != (int) type_size(p.gu) || gu_lay.values != (int) blck_size(p.gu) || strata::bench_blob::perturb_offset(gu_lay, 15) >= geo.gu_row)) {
+        std::fprintf(stderr, "bench_blob_layout.hpp: type %d has %d bytes / %d values per block there, ggml says %zu / %lld\n", (int) p.gu, gu_lay.bytes,
+                     gu_lay.values, type_size(p.gu), (long long) blck_size(p.gu));
+        std::exit(1);
+    }
     std::mt19937 rng(o.seed + (unsigned) p.gu * 7 + (unsigned) p.d);
     size_t unit = type_size(p.gu);
     while (unit % type_size(p.d) != 0 || unit % 16 != 0) unit += type_size(p.gu);
@@ -651,7 +664,7 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
     auto blob_bytes = [&](int e) -> std::vector<uint8_t> {
         if (real) { std::vector<uint8_t> rb = real->blob[(size_t) e]; rb.resize(geo.bytes, 0); return rb; }   // (an expert no row routes to is not loaded: zeros)
         std::vector<uint8_t> b = base;
-        b[4 + (size_t) (e % 16)] ^= (uint8_t) e;
+        b[strata::bench_blob::perturb_offset(gu_lay, e)] ^= (uint8_t) e;
         return b;
     };
     for (int e = 0; e < E; ++e) {
