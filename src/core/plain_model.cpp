@@ -1387,6 +1387,19 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     b.cpu_cap = std::min<int64_t>((int64_t) TK, (int64_t) k::cpu::MAXT * (int64_t) E);
     take(b.cpu, (uint64_t) b.cpu_cap * N * 4); take(b.cpu_row, (uint64_t) b.cpu_cap * 4);
     take(b.gemm_scratch, (uint64_t) b.gemm_elems * 2);
+    if (kv_stream_slots_ > 0) {   // --kv-resident: one attention layer's whole K/V, staged from the host copy per
+        const auto qs = attn_shapes();   // layer and chunk (the identity layout, page_table_ its table)
+        const uint64_t pairs = (uint64_t) n_pages_ * NKV * (uint64_t) qs.page_size;
+        const uint64_t codes = pairs * HD, scales = pairs * (HD / k::KV_Q8_GROUP) * 2,
+                       q4 = pairs * (uint64_t) k::kv_q4_bytes_per_head((int) HD);
+        if (opt_.kv_q4 == 1) { take(b.kv_stage.k_q4, q4); take(b.kv_stage.v_q4, q4); }
+        else if (opt_.kv_q4 == 2) {
+            take(b.kv_stage.k_q, codes); take(b.kv_stage.k_scale, scales); take(b.kv_stage.v_q4, q4);
+        } else if (opt_.kv_int8) {
+            take(b.kv_stage.k_q, codes); take(b.kv_stage.v_q, codes);
+            take(b.kv_stage.k_scale, scales); take(b.kv_stage.v_scale, scales);
+        } else { take(b.kv_stage.k_pool, codes * 2); take(b.kv_stage.v_pool, codes * 2); }
+    }
     if (glm_) {   // plain_prompt_glm5.cpp
         const uint64_t HC = 4, MIX = (2 + HC) * HC, S = (uint64_t) s.kda_head_dim, GC = NH * S;
         const uint64_t QLR = (uint64_t) s.q_lora_rank, KVR = (uint64_t) s.kv_lora_rank;
