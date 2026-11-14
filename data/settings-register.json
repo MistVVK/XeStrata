@@ -22381,6 +22381,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_NUMA_CARD",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 4179,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "716ebae14e",
+   "first_date": "2026-11-14",
+   "since": null,
+   "last_commit": "29147556b9",
+   "last_date": "2026-11-14",
+   "status": "rollback",
+   "owner": "kernels/cpu",
+   "note": "[reviewed] On by default on Linux hosts with more than one memory node: the engine keeps its threads on the graphics card's node, so the pinned buffers it allocates land there too (only when that node has the CPUs and the free memory for it). =0 (also off / false / no) keeps the earlier placement. On one-node hosts it moves no thread; it does nothing on Windows and macOS. [phaseA-tests/par/RESULTS-NUMA-CARD.md BLOCK 6]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_NUMA_POOL",
    "backends": [
     "cpu"
