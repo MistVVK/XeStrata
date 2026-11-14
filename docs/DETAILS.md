@@ -457,7 +457,7 @@ a GPU ([a PC without a GPU](#a-pc-without-a-gpu)).
   Q6_K and Q8_0, with the tensor types of the same official versions), can be chosen too
   (`--family ornith-uncensored`). It refuses far less, and its safety filtering is reduced, so check what it writes.
 - **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)** (LLM-jp,
-  Apache-2.0): a thinking model of 32B with 3B active per token, in Japanese and English, context up to 256K.
+  Apache-2.0): a thinking model of 32B with 3B active per token, in Japanese and English, with a 64K context.
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)** (Qwen, Apache-2.0): a thinking
   Qwen3.5-family MoE of 35B with 3B active per token, context up to 256K. The GGUFs are Unsloth's UD-Q4_K_XL,
   UD-Q6_K_XL and Q8_0 with the MTP layer.
