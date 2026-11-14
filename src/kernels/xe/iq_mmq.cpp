@@ -314,6 +314,23 @@ template<> struct Dec<8> {   // Q8_0: d
         return r;
     }
 };
+template<> struct Dec<2> {   // Q4_0: d (code - 8), element j in qs[j]'s low nibble, j+16 in its high (the latent D/U)
+    static constexpr int QK = 32, BSZ = (int) sizeof(block_q4_0);
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const block_q4_0* b = reinterpret_cast<const block_q4_0*>(row) + sb;
+        Sub r;
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t w = (uint32_t) get_int_b2(b->qs, j);
+            const uint32_t lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;
+            // each nibble 0..15 -> the signed byte (code - 8): flip the sign bit, then sign-extend it into the byte
+            const uint32_t cl = lo ^ 0x08080808u, ch = hi ^ 0x08080808u;
+            r.v[j] = cl | ((cl & 0x08080808u) * 0x1Eu);
+            r.v[4 + j] = ch | ((ch & 0x08080808u) * 0x1Eu);
+        }
+        r.s0 = r.s1 = (float) b->d;
+        return r;
+    }
+};
 template<> struct Dec<14> {   // Q6_K: d scale (6-bit value - 32), a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q6_K);
     static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
@@ -1564,7 +1581,7 @@ bool iq_mmq_type_sums(int t) { return t == 7 || t == 12 || t == 13; }   // has_m
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
+        case 2: case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
         case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 42: return true;
         default: return false;
     }
@@ -1578,6 +1595,7 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 11: return (size_t) (cols / Dec<11>::QK) * Dec<11>::BSZ;
         case 12: return (size_t) (cols / Dec<12>::QK) * Dec<12>::BSZ;
         case 13: return (size_t) (cols / Dec<13>::QK) * Dec<13>::BSZ;
+        case 2: return (size_t) (cols / Dec<2>::QK) * Dec<2>::BSZ;
         case 8: return (size_t) (cols / Dec<8>::QK) * Dec<8>::BSZ;
         case 14: return (size_t) (cols / Dec<14>::QK) * Dec<14>::BSZ;
         case kNativeQ6KRows: return (size_t) (cols / Dec<kNativeQ6KRows>::QK) * Dec<kNativeQ6KRows>::BSZ;
@@ -1643,6 +1661,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         return by_rows<TY>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, \
                            dst, ld_dst, rows > 0 ? rows : total_rows)
     switch (t) {
+        STRATA_MMQ_CASE(2);
         STRATA_MMQ_CASE(6);
         STRATA_MMQ_CASE(7);
         STRATA_MMQ_CASE(8);
