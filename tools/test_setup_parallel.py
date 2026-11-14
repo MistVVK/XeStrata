@@ -47,7 +47,7 @@ class Parallel(unittest.TestCase):
         # asked above the recommendation where it pays
         lines = S.parallel_note(4, 24, q2, 32768, "int8", False)
         self.assertTrue(any("recommended for this card: 3" in x for x in lines))
-        self.assertTrue(any("at most 8" in x for x in S.parallel_note(12, 48, q2, 32768, "int8", False)))
+        self.assertTrue(any("at most 16" in x for x in S.parallel_note(20, 96, q2, 32768, "int8", False)))
         self.assertEqual(len(S.parallel_note(3, 24, q2, 32768, "int8", False)), 1)   # as recommended: no warning
 
 
