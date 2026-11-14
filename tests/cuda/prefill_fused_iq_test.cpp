@@ -61,7 +61,7 @@ void ck(cudaError_t e, const char* what) {
 struct Dev {
     void* p = nullptr;
     explicit Dev(size_t n) { ck(cudaMalloc(&p, n), "cudaMalloc"); }
-    ~Dev() { cudaFree(p); }
+    ~Dev() { (void)cudaFree(p); }
     Dev(const Dev&) = delete;
     Dev& operator=(const Dev&) = delete;
     template <typename T> T* as() const { return (T*) p; }
@@ -652,7 +652,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     // check of experts_native fails for the launches that hold one, which then take the unstaged kernel (no process exit); the output bits must equal the all-device run's
     struct HostBlobs {
         void* p = nullptr;
-        ~HostBlobs() { if (p) cudaFreeHost(p); }
+        ~HostBlobs() { if (p) (void)cudaFreeHost(p); }
     } host_blobs;
     if (g_host_blobs > 0) {
         const int nh = std::min(g_host_blobs, E);
@@ -905,8 +905,8 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         if (!mq ? (ef.rms > 0.03 || ef.worst > 0.25) : (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst))
             throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's (timing)");
     }
-    cudaEventDestroy(a);
-    cudaEventDestroy(b);
+    (void)cudaEventDestroy(a);
+    (void)cudaEventDestroy(b);
     delete mbp;
     if (g_host_blobs > 0) {
         const int fbk = fused::staged_blob_fallbacks();
@@ -945,7 +945,7 @@ BitsRun bits_run(const Pair& p, int T, int E, bool host, cudaStream_t s) {
     ck(cudaMemset(blobs.p, 0, (size_t) E * stride + 4096), "zero");
     struct HostMem {
         void* p = nullptr;
-        ~HostMem() { if (p) cudaFreeHost(p); }
+        ~HostMem() { if (p) (void)cudaFreeHost(p); }
     } hm;
     if (host) {
         ck(cudaHostAlloc(&hm.p, (size_t) E * stride + 4096, cudaHostAllocMapped), "cudaHostAlloc");
@@ -1025,8 +1025,8 @@ int main(int argc, char** argv) {
         if (turing_only) {
             int cmaj = 0, cmin = 0;
             if (cudaGetDeviceCount(&cmaj) != cudaSuccess || cmaj == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
-            cudaDeviceGetAttribute(&cmaj, cudaDevAttrComputeCapabilityMajor, 0);
-            cudaDeviceGetAttribute(&cmin, cudaDevAttrComputeCapabilityMinor, 0);
+            (void)cudaDeviceGetAttribute(&cmaj, cudaDevAttrComputeCapabilityMajor, 0);
+            (void)cudaDeviceGetAttribute(&cmin, cudaDevAttrComputeCapabilityMinor, 0);
             if (strata::cc_major_of(cmaj) != 7 || strata::cc_minor_of(cmin) != 5) { std::printf("--turing: not a compute capability 7.5 card (and no STRATA_EMULATE_CC=75): skipped\n"); return 77; }
         }
 #ifdef _WIN32
@@ -1070,7 +1070,7 @@ int main(int argc, char** argv) {
         // with STRATA_PF_FUSED unset nothing is set up below sm_80 (Turing's pair is STRATA_PF_FUSED=1 STRATA_PF_FUSED_SM75=1's)
         if (unset_pf) {
             int major = 0;
-            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+            (void)cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
             if (strata::cc_major_of(major) < 8) { std::printf("STRATA_PF_FUSED unset: nothing is set up below sm_80 (skipped)\n"); return 77; }
         }
         // the opt-in kernel sets (STRATA_PF_FUSED_NT=256, _F16=1, _WS=1): a card that cannot set them up (shared memory,
@@ -1167,7 +1167,7 @@ int main(int argc, char** argv) {
                 const bool turing_pair = p.gu == GGML_TYPE_Q2_0 && p.d == GGML_TYPE_Q2_0;
                 const bool q50_pair = p.d == GGML_TYPE_Q5_0;   // (STRATA_PF_FUSED_Q50=1 only: off by default on CUDA and gfx12)
                 int major = 0;
-                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+                (void)cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
                 major = strata::cc_major_of(major);   // (STRATA_EMULATE_CC=75 on a bigger card: the pairs Turing has no kernels for are skipped as on the real card)
                 if ((major < 8 || turing_pair || q50_pair) && (!only || turing_only)) { std::printf("%s: not set up on this device (skipped)\n", p.name); continue; }
                 throw std::runtime_error(std::string(p.name) + ": not covered by the native kernels");

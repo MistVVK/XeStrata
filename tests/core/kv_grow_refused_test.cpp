@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
         CHECK(qsa_kv_elastic_cells() >= cells1);
         CHECK(cudaDeviceSynchronize() == cudaSuccess);
         CHECK(fill_and_check(st, s, cells1, 0x44));
-        for (void* p : hog) cudaFree(p);
+        for (void* p : hog) (void)cudaFree(p);
     }
     // the whole context: every cell of --max-context can be mapped the same way
     CHECK(qsa_kv_elastic_grow(max_cells, [] { return (VmmChunk) 0; }));
