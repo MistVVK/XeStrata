@@ -2636,6 +2636,30 @@
         "reason": "inherited, not yet fixed"
       },
       {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<40, false, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<40, false, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<40, true, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<40, true, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
         "name": "strata::prefill::fused::{anonymous}::native_kernel<42, false, 2, 256, false>",
         "stack": 8,
         "local": 0,
@@ -2808,6 +2832,30 @@
         "stack": 16,
         "local": 0,
         "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<40, false, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<40, false, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<40, true, 2, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
+      },
+      {
+        "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<40, true, 4, 512, false>",
+        "stack": 8,
+        "local": 0,
+        "reason": "NVFP4 instance compiled for sm_75, never set up below sm_80 (dev_info returns first); stack 8, measured on 271262826"
       },
       {
         "name": "strata::prefill::fused_q36::{anonymous}::native_kernel<42, false, 2, 256, false>",
