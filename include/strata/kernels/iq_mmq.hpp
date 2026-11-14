@@ -28,9 +28,6 @@ const char* iq_mmq_path(sycl::queue& q);
 /// activations (iq_mmq_quantize's canon); the same bits as the CPU's canonical rows (canon_expert.hpp) and the decode's
 /// grouped experts, in any tile shape and on every GPU.
 inline constexpr int kIqMmqFx = 1000;
-/// The .yskn products' type (the trellis-coded weights, yskn_sum.hpp's sum rules): the same body, its own decoder
-/// (Dec<kIqMmqYskn>, the table in the context) and sum rules (a 512-group, 2^24/max, ties to even).
-inline constexpr int kIqMmqYskn = 1100;
 /// The type iq_mmq_grouped takes for the fixed-point products of ggml_type (the gate/up's IQ2_XXS, IQ2_XS, IQ3_XXS,
 /// IQ3_S and IQ2_S, the down's IQ4_NL), or 0 where it has none.
 int iq_mmq_fx(int ggml_type);
@@ -71,15 +68,6 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int ggml_type, const void* w, size_t 
                            int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
                            int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst,
                            const uint8_t* const* wtab = nullptr, size_t woff = 0, int64_t rows = 0);
-
-/// The .yskn decode's product of T rows (<= 16) on the shared DP4a body, the YSKN sum rules (yskn_sum.hpp: a 512-group,
-/// 2^24/max, ties to even): w the trellis codes in the row layout (a row's units one after another), xq the int8
-/// activations (yskn_act), xs the per-512 alpha replicated per 32, lut8 the 4,096 int8 pairs, bits the codes' K, tau
-/// the rows' scales, bounds {0, T} and ids the identity (one group), dst the rotated-basis rows (the output rotation
-/// is yskn_rotate_out's, after).  w_rows a multiple of 128, w_cols of 512.  The same bits as the DP4a form in yskn.cpp
-sycl::event iq_mmq_yskn(sycl::queue& q, const void* w, int64_t w_rows, int64_t w_cols, const void* xq, const float* xs,
-                        int64_t T, const int32_t* bounds, const int32_t* ids, float* dst, int64_t ld_dst,
-                        const uint16_t* lut8, int bits, const float* tau);
 
 /// iq_mmq_grouped's product on RDNA3's and RDNA4's WMMA in FP16 (iq_kernels.cpp): each weight block dequantized in
 /// local memory to the values iq_dequant_f16 writes, each activation value its int8 times its block's scale.  The
