@@ -3,12 +3,14 @@
 #include "cpu_kernels.h"
 #include "cpu_team.h"
 #include "vit_cpu.h"
+#include "vit_f16.h"
 
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -280,6 +282,64 @@ static void test_round_choice() {
     check(ok, "rounding default per weight type and its override", "-", 0, 0);
 }
 
+// the GPU reader's F16 kind (vit_f16.h): which BF16 values F16 holds, the error of the others, the activation clamp and STRATA_VIT_BF16_AS_F16
+static float bf16_value(uint16_t b) { const uint32_t u = (uint32_t) b << 16; float f; std::memcpy(&f, &u, 4); return f; }
+static void test_f16_kind() {
+    // named cases: 1.0, -1.0, 2^-14, 2^-17 with all mantissa bits, 2^-18 with the lowest bit (not) and the second lowest (yes), 2^-24, 2^-25,
+    // 65,280 (the largest BF16 value under 65,504), 65,536, 2^20, +-0, inf, -inf, nan, a BF16 subnormal, -(2^-18 + lowest bit)
+    struct Case { uint16_t b; bool exact; };
+    const Case cs[] = {{0x3F80, true}, {0xBF80, true}, {0x3880, true}, {0x377F, true}, {0x3681, false}, {0x3682, true}, {0x3380, true}, {0x3300, false},
+                       {0x477F, true}, {0x4780, false}, {0x4980, false}, {0x0000, true}, {0x8000, true}, {0x7F80, false}, {0xFF80, false}, {0x7FC0, false},
+                       {0x0001, false}, {0xB681, false}};
+    bool ok = true;
+    for (const Case& c : cs) if (bf16_exact_in_f16(c.b) != c.exact) { ok = false; std::printf("  bf16 0x%04x: exact %d, want %d\n", c.b, (int) !c.exact, (int) c.exact); }
+    check(ok, "F16 kind: named BF16 values", "-", 0, 0);
+    // all 65,536 BF16 values against an independent rule in double precision: finite, |v| <= 65504 and a multiple of F16's step at that size
+    // (2^-24 under 2^-14, else 2^(floor(log2 |v|) - 10)); the error of the others in range is the distance to the nearest step multiple (ties to even)
+    int bad = 0, bad_err = 0;
+    double worst_err = 0.0;
+    for (uint32_t b = 0; b < 65536; ++b) {
+        const double v = bf16_value((uint16_t) b), a = std::fabs(v);
+        const bool fin = std::isfinite(v);
+        bool want = false;
+        double want_err = 0.0;
+        if (fin && a <= 65504.0) {
+            int ex = 0;
+            (void) std::frexp(a, &ex);   // a = f * 2^ex, f in [0.5, 1)
+            const double step = a < std::ldexp(1.0, -14) ? std::ldexp(1.0, -24) : std::ldexp(1.0, ex - 1 - 10);
+            const double q = a / step, r = std::nearbyint(q);
+            want = a == 0.0 || q == r;
+            want_err = want ? 0.0 : std::fabs(q - r) * step;
+        }
+        if (bf16_exact_in_f16((uint16_t) b) != want) ++bad;
+        const double got_err = bf16_f16_abs_error((uint16_t) b);
+        if (got_err != want_err) ++bad_err;
+        if (got_err > worst_err) worst_err = got_err;
+    }
+    check(bad == 0, "F16 kind: every BF16 value against the double-precision rule", "-", (double) bad, 0.0);
+    check(bad_err == 0 && worst_err == std::ldexp(1.0, -25), "F16 kind: rounding error of the values under 2^-14 (largest 2^-25)", "-", worst_err, std::ldexp(1.0, -25));
+    // a matrix: counts, and it stays BF16 only for a weight beyond F16's range
+    const uint16_t w1[] = {0x3F80, 0x3681, 0x3300, 0x377F, 0x0001};
+    const uint16_t w2[] = {0x3F80, 0x4780, 0x7FC0, 0x3681};
+    const Bf16F16Count c1 = bf16_count_f16(w1, 5), c2 = bf16_count_f16(w2, 4);
+    check(c1.not_exact == 3 && c1.overflow == 0 && c1.max_abs_error == std::ldexp(1.0, -25) && bf16_matrix_fits_f16(c1.overflow) &&
+          c2.not_exact == 3 && c2.overflow == 2 && !bf16_matrix_fits_f16(c2.overflow), "F16 kind: matrix counts and the BF16 fallback", "-", 0, 0);
+    // the activation clamp: F16's finite range, NaN stays NaN
+    const float big = 70000.0f, inf = std::numeric_limits<float>::infinity();
+    check(f16_clamp(big) == 65504.0f && f16_clamp(-big) == -65504.0f && f16_clamp(inf) == 65504.0f && f16_clamp(-inf) == -65504.0f &&
+          f16_clamp(65504.0f) == 65504.0f && f16_clamp(-1.5f) == -1.5f && f16_clamp(0.0f) == 0.0f && std::isnan(f16_clamp(std::nanf(""))),
+          "F16 kind: activation clamp to +-65,504", "-", 0, 0);
+    // STRATA_VIT_BF16_AS_F16: unset = the card's default; 0 / empty / not a number = as stored; 2 = F16 inputs; any other number = the BF16-rounded kind
+    struct M { const char* env; int dflt; int want; };
+    const M ms[] = {{nullptr, BF16_TO_F16, BF16_TO_F16}, {nullptr, BF16_ROUNDED, BF16_ROUNDED}, {"0", BF16_TO_F16, BF16_STORED}, {"0", BF16_ROUNDED, BF16_STORED},
+                    {"", BF16_TO_F16, BF16_STORED}, {"x", BF16_TO_F16, BF16_STORED}, {"1", BF16_TO_F16, BF16_ROUNDED}, {"1", BF16_ROUNDED, BF16_ROUNDED},
+                    {"2", BF16_ROUNDED, BF16_TO_F16}, {"2", BF16_TO_F16, BF16_TO_F16}, {"3", BF16_TO_F16, BF16_ROUNDED}, {"-1", BF16_TO_F16, BF16_ROUNDED},
+                    {" 2", BF16_STORED, BF16_TO_F16}, {"12", BF16_TO_F16, BF16_ROUNDED}};
+    bool mok = true;
+    for (const M& c : ms) if (vit_gpu_bf16_mode(c.env, c.dflt) != c.want) { mok = false; std::printf("  env '%s' default %d: %d, want %d\n", c.env ? c.env : "(unset)", c.dflt, vit_gpu_bf16_mode(c.env, c.dflt), c.want); }
+    check(mok, "F16 kind: STRATA_VIT_BF16_AS_F16 values", "-", 0, 0);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "team") == 0) {     // only the fork-join team (a loop under ThreadSanitizer)
         const int reps = argc > 2 ? std::atoi(argv[2]) : 1;
@@ -315,6 +375,7 @@ int main(int argc, char** argv) {
     }
     test_team();
     test_round_choice();
+    test_f16_kind();
     std::printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
