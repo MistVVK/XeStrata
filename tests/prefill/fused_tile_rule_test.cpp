@@ -689,5 +689,24 @@ int main() {
             CHECK(!q36_takes_gfx12(q36_start_env(false, env), false, true));
         }
     }
+    // Turing (t75_pick): an i-quant gate/up takes 128 rows from above 56 rows an expert with no upper end; a Q2_0 gate/up keeps the band of pick (the rule as it was for it)
+    {
+        using strata::prefill::fused_tile::t75_pick;
+        const Card none{};
+        CHECK(t75_pick(rows_at(5.0), E, false) == 4 && t75_pick(rows_at(19.5), E, false) == 4 && t75_pick(rows_at(40.0), E, false) == 4);   // 256 / 1,000 / 2,048 tokens: 64 rows
+        CHECK(t75_pick(28672, E, false) == 4 && t75_pick(28673, E, false) == 2);                                                              // 56.0 / 56.002 rows an expert
+        CHECK(t75_pick(40950, E, false) == 2 && t75_pick(57344, E, false) == 2);                                                              // 4,096 tokens; 112.0 (the band's top)
+        CHECK(t75_pick(57345, E, false) == 2 && t75_pick(81910, E, false) == 2 && t75_pick(200000, E, false) == 2 && t75_pick(327670, E, false) == 2);   // above the band: 128 (pick says 64)
+        CHECK(pick(none, 81910, E).ww == 4);
+        CHECK(t75_pick(100, 0, false) == 2 && t75_pick(56, 1, false) == 4);                                                                  // no experts counts as one
+        // a Q2_0 gate/up: exactly pick's band at every size
+        for (int64_t n : {int64_t(0), int64_t(1000), rows_at(5.0), int64_t(28672), int64_t(28673), int64_t(57344), int64_t(57345), int64_t(81910), int64_t(327670)})
+            CHECK(t75_pick(n, E, true) == pick(none, n, E).ww);
+        // the i-quant rule against pick: the same up to 112 rows an expert (the band's lower bound is the rule's), 128 where pick goes back to 64
+        for (int64_t n = 0; n <= 400000; n += 977) {
+            const double avg = (double) n / E;
+            CHECK(t75_pick(n, E, false) == (avg > 112.0 ? 2 : pick(none, n, E).ww));
+        }
+    }
     return failed == 0 ? 0 : 1;
 }

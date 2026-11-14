@@ -9736,13 +9736,13 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2507,
+     "line": 2540,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2588,
+     "line": 2621,
      "backend": "hip",
      "fn": "getenv"
     },
@@ -24452,19 +24452,19 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2780,
+     "line": 2841,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2796,
+     "line": 2857,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2814,
+     "line": 2875,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -24583,7 +24583,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2293,
+     "line": 2319,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24619,7 +24619,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2779,
+     "line": 2840,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24652,7 +24652,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2795,
+     "line": 2856,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -24693,13 +24693,13 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2432,
+     "line": 2465,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2501,
+     "line": 2534,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -24750,7 +24750,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2805,
+     "line": 2866,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -24792,7 +24792,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2297,
+     "line": 2323,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24828,7 +24828,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2417,
+     "line": 2450,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24867,13 +24867,13 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2247,
+     "line": 2257,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2584,
+     "line": 2617,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -24907,13 +24907,13 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2265,
+     "line": 2275,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2625,
+     "line": 2658,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -24947,13 +24947,13 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2253,
+     "line": 2263,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2604,
+     "line": 2637,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -24987,13 +24987,13 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2259,
+     "line": 2269,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2618,
+     "line": 2651,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -25033,13 +25033,13 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2433,
+     "line": 2466,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2900,
+     "line": 2961,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -25084,7 +25084,7 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2401,
+     "line": 2427,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25112,6 +25112,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_FUSED_SM75_IQ",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2434,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "rollback",
+   "owner": "prefill",
+   "note": "[reviewed] On a Turing card (sm_75) the i-quant gate/up pairs run on the fused kernels when STRATA_PF_FUSED_SM75 is on; 0 here puts them back on the int8 dp4a kernels (Q2_0 / Q2_0 stays fused).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_FUSED_SM86",
    "backends": [
     "cuda-hip"
@@ -25119,7 +25152,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2395,
+     "line": 2421,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25153,7 +25186,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2730,
+     "line": 2779,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -25193,7 +25226,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2611,
+     "line": 2644,
      "backend": "hip",
      "fn": "getenv"
     },
@@ -25232,7 +25265,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2301,
+     "line": 2327,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25564,7 +25597,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 3000,
+     "line": 3068,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -25604,7 +25637,7 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2325,
+     "line": 2351,
      "backend": "hip",
      "fn": "getenv"
     },
@@ -25649,7 +25682,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2338,
+     "line": 2364,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -26208,7 +26241,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2565,
+     "line": 2598,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -26499,7 +26532,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2741,
+     "line": 2794,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29764,7 +29797,7 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2858,
+     "line": 2919,
      "backend": "cuda-hip",
      "fn": "getenv"
     },

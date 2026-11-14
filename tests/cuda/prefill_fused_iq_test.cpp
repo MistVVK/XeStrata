@@ -1015,10 +1015,19 @@ int main(int argc, char** argv) {
         // whose Q2_0 / Q2_0 pair the engine takes with the old variable unset or at 1)
         // --no-kq: STRATA_PF_FUSED_KQ left as it is (HIP: the ctest entry for STRATA_PF_FUSED_Q8D=1 on gfx12, which must cover the i-quant / Q8_0
         // pairs without the K-quant switch that also covers them there)
-        bool unset_pf = false, no_kq = false;
+        // --turing: the Turing set only (STRATA_PF_FUSED_SM75=1; the ctest entry prefill_fused_iq_test_sm75): skipped (77) unless the card is a compute capability 7.5 one or emulates it (STRATA_EMULATE_CC=75)
+        bool unset_pf = false, no_kq = false, turing_only = false;
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--unset-pf-fused") == 0) unset_pf = true;
             if (std::strcmp(argv[i], "--no-kq") == 0) no_kq = true;
+            if (std::strcmp(argv[i], "--turing") == 0) turing_only = true;
+        }
+        if (turing_only) {
+            int cmaj = 0, cmin = 0;
+            if (cudaGetDeviceCount(&cmaj) != cudaSuccess || cmaj == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
+            cudaDeviceGetAttribute(&cmaj, cudaDevAttrComputeCapabilityMajor, 0);
+            cudaDeviceGetAttribute(&cmin, cudaDevAttrComputeCapabilityMinor, 0);
+            if (strata::cc_major_of(cmaj) != 7 || strata::cc_minor_of(cmin) != 5) { std::printf("--turing: not a compute capability 7.5 card (and no STRATA_EMULATE_CC=75): skipped\n"); return 77; }
         }
 #ifdef _WIN32
         if (unset_pf) _putenv_s("STRATA_PF_FUSED", ""); else _putenv_s("STRATA_PF_FUSED", "1");   // (an empty value removes it)
@@ -1127,6 +1136,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        int pairs_run = 0;   // (the pairs whose kernels this device has; --turing insists on at least one)
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         bool bits = false;
@@ -1158,9 +1168,11 @@ int main(int argc, char** argv) {
                 const bool q50_pair = p.d == GGML_TYPE_Q5_0;   // (STRATA_PF_FUSED_Q50=1 only: off by default on CUDA and gfx12)
                 int major = 0;
                 cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
-                if ((major < 8 || turing_pair || q50_pair) && !only) { std::printf("%s: not set up on this device (skipped)\n", p.name); continue; }
+                major = strata::cc_major_of(major);   // (STRATA_EMULATE_CC=75 on a bigger card: the pairs Turing has no kernels for are skipped as on the real card)
+                if ((major < 8 || turing_pair || q50_pair) && (!only || turing_only)) { std::printf("%s: not set up on this device (skipped)\n", p.name); continue; }
                 throw std::runtime_error(std::string(p.name) + ": not covered by the native kernels");
             }
+            ++pairs_run;
             if (ref) reference_part(p, s);
             // Q5_0 down (round 0217): tails and boundaries - a handful of tokens, one token, a tile's edge (63, 65 rows an expert is not controlled, the counts follow the routing)
             if (ref && (p.d == GGML_TYPE_Q5_0 || edge)) {
@@ -1171,11 +1183,12 @@ int main(int argc, char** argv) {
                 if (edge) reference_part(p, s, 640, 16, 300);   // five 64-row tiles an expert: the paired-tile (128-row) kernels
             }
         }
+        if (turing_only && pairs_run == 0) throw std::runtime_error("--turing: no pair has kernels on this device (the Turing set was not set up)");
         if (timing) {
             // the IQ2_XS pack's layers (34 of 48 IQ2_S / Q2_0, 11 IQ2_XXS / Q2_0), the IQ3_S pack's most common, IQ3_XXS's
             for (const Pair& p : only ? pairs : std::vector<Pair>{pairs[0], pairs[1], pairs[4], pairs[3]}) {
                 if (only && std::string(p.name).find(only) == std::string::npos) continue;
-                if (!fused::native_supported((int) p.gu, (int) p.d)) continue;   // (Turing: the Q2_0 pair only)
+                if (!fused::native_supported((int) p.gu, (int) p.d)) continue;   // (Turing: the Q2_0 pair and the i-quant pairs the Turing set takes)
                 for (int T : chunks) timing_part(p, T, s);
             }
         }
