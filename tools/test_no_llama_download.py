@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-SCRIPTS = ["packaging/build_cuda_linux.sh", "packaging/build_cuda_linux_aarch64.sh", "packaging/build_hip_linux.sh", "packaging/build_hip_gfx1103.sh",
+SCRIPTS = ["packaging/build_cuda_linux.sh", "packaging/build_cuda_linux_aarch64.sh", "packaging/build_cuda_windows.py", "packaging/build_hip_linux.sh", "packaging/build_hip_gfx1103.sh",
            "packaging/build_sycl_linux.sh", "packaging/build_split_cuda.sh", "packaging/build_split_hip.sh",
            "packaging/build_vision_windows.bat", "packaging/build_vision_mac.sh",
            "packaging/mac/build_engine.sh", "spark/build_engine.sh",

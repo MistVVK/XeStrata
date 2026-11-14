@@ -5,7 +5,7 @@
 
 #include "strata/prefill/moe_fused.hpp"   // kMoeEmbd, kMoeFF: the compiled geometry's widths
 
-#include "ggml.h"   // ggml_blck_size, ggml_type_size (ggml-base, the format definitions)
+#include "strata/quant/types.hpp"   // the block geometry of a type id (Strata's own type table, no ggml)
 
 #include <cuda_runtime.h>
 
@@ -15,15 +15,6 @@
 
 namespace strata::prefill::mmq {
 namespace {
-// (the same as moe_mmq.cu's) the Gyro trellis types (ids 144-146, 147-149) are outside the type table of an upstream ggml: their block
-// geometry is known here (128 weights; 34 / 26 / 30 / 42 / 50 / 58 bytes), everything else asks ggml
-inline bool is_tq(int t) { return t >= 144 && t <= 149; }
-inline int64_t type_blck(int t) { return is_tq(t) ? 128 : (int64_t) ggml_blck_size((ggml_type) t); }
-inline size_t type_bytes(int t) {
-    return t == 144 ? 34 : t == 145 ? 26 : t == 146 ? 30 : t == 147 ? 42 : t == 148 ? 50 : t == 149 ? 58
-                                                                                     : ggml_type_size((ggml_type) t);
-}
-
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill mmq: %s: %s\n", what, cudaGetErrorString(e));
@@ -158,8 +149,13 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 }  // namespace
 
+// The block geometry comes from Strata's type table (src/quant/types.cpp): the GGUF format's ids with ggml's sizes, the trellis types
+// 144-149 included (128 weights; 34 / 26 / 30 / 42 / 50 / 58 bytes); tests/quant/type_geometry_oracle.cpp checks it against ggml's
+// own table.  An id the table does not know has no size here (0): no prompt path reads such a matrix.
 size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
-    return (size_t) rows * (size_t) (cols / type_blck((int) t)) * type_bytes((int) t);
+    const ::strata::quant::TypeInfo* ti = ::strata::quant::type_info(t);
+    if (ti == nullptr) return 0;
+    return (size_t) rows * (size_t) (cols / ti->blck) * ti->bytes;
 }
 
 size_t q8_bytes(int64_t rows, int64_t cols) {
