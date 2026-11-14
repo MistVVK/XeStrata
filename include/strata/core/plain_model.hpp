@@ -462,6 +462,9 @@ public:
 
     /// Drafts a window can check (0: no speculative decoding): spec - 1 when the model has its MTP layer.
     int drafts() const { return tail().has_mtp_ ? tail().n_mtp_ : 0; }
+    /// The resolved rope scaling of the full-attention layers (the file's and the options' meet, load_qwen): the
+    /// startup summary reads it.  A GLM-5.3-Flash (nope MLA) keeps the identity (its rotation is none).
+    const strata::kernels::RopeScaling& rope_full() const { return tail().rope_full_; }
     /// The DFlash2 drafter's taps (the shared mechanism, core/dflash2.hpp): the completed output of these layers,
     /// gathered for every window row into tap_dev() ([max_t][ntap][n_embd]; the plain residual has one stream).
     /// Set before load; empty (the default) allocates nothing and records nothing.

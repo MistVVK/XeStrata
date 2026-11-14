@@ -707,6 +707,10 @@ bool PlainModel::rope_scalings(const ModelSpec& s, const PlainOptions& opt, k::R
     k::RopeScaling rs;
     rs.freq_base = opt.rope_freq_base > 0 ? opt.rope_freq_base : s.rope_base;
     const std::string type = !opt.rope_scaling.empty() ? opt.rope_scaling : s.rope_scaling_type;
+    if (!type.empty() && type != "none" && type != "linear" && type != "yarn") {
+        err = "plain model: rope scaling type '" + type + "' - none, linear or yarn only";
+        return false;
+    }
     rs.type = type == "yarn" ? RST::YaRN : type == "linear" ? RST::Linear : RST::None;
     if (rs.type != RST::None) {
         rs.factor = opt.rope_scale > 0 ? opt.rope_scale : s.rope_scaling_factor > 1.0 ? s.rope_scaling_factor : 1.0;

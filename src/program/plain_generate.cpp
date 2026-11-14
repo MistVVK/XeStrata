@@ -42,6 +42,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/platform/memory.hpp"
@@ -2939,6 +2940,12 @@ int plain_main(int argc, char** argv) {
             std::_Exit(1);
         }
         return 1;
+    }
+    if (const auto& rs = model.rope_full(); rs.type != strata::kernels::RopeScalingType::None) {
+        std::fprintf(stderr, "xestrata (%s): rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), "
+                             "--max-context %lld against a trained context of %.0f\n",
+                     arch.c_str(), rs.type == strata::kernels::RopeScalingType::YaRN ? "yarn" : "linear", rs.factor,
+                     rs.freq_scale(), rs.freq_base, rs.mscale(), (long long) opt.max_cells, rs.orig_ctx);
     }
     {   // --aux-cpus: the threads that are neither pool workers nor the host thread beside the workers
         const std::vector<int> wc = model.pool_worker_cpus();

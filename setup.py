@@ -8233,6 +8233,17 @@ def replicas_config(a, cfg: dict) -> None:
          "check that the RAM holds them")
 
 
+def plain_rope_extend(family: str, fam: dict) -> bool:
+    """Whether a plain family's context can go past its trained length by rope scaling: the Qwen-family rotations
+    (Ornith-1.5, Qwen3.6, Qwen3.5) take it, as Qwen3.8-Flash-Next does.  llm-jp-4.1 keeps its trained 64K (the user's
+    decision), and GLM-5.3-Flash's MLA is nope-only (no rotation to scale).  A model of the user's own files: by its
+    architecture."""
+    if family == "llmjp":
+        return False
+    arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
+    return not (family == "glm53" or arch in ("glm5-next", "glm5next"))
+
+
 def plain_kv_takes(family: str) -> tuple:
     """The KV cache precisions a plain family's engine path takes (--kv), FP16 the default: the Hadamard-rotated Q4_0
     forms for heads of 256; GLM-5.3-Flash's DSA caches in FP16 only.  A model of the user's own files: by its
@@ -8309,13 +8320,15 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if fam.get("mmproj") and not on_cpu:
         ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                          "cpu": "on (encoder on the CPU)"}[vision])
-    # the context: up to the model's, recommended by the smallest card's memory as for Qwen3.8-Flash-Next
-    contexts = [c for c in CONTEXTS if c <= fam["max_context"]]
+    # the context: up to the model's trained length, recommended by the smallest card's memory as for
+    # Qwen3.8-Flash-Next; past it by rope scaling where the model's rotation takes it (the 384K and 512K steps too)
+    rope_extend = plain_rope_extend(family, fam)
+    trained = fam["max_context"]
+    contexts = [c for c in CONTEXTS if c <= trained or rope_extend]
     if a.context:
         ctx = a.context
-        if ctx > fam["max_context"]:
-            fail(f"{fam['title']} takes up to {fam['max_context']} tokens of context",
-                 f"--context {fam['max_context']}")
+        if ctx > trained and not rope_extend:
+            fail(f"{fam['title']} takes up to {trained} tokens of context", f"--context {trained}")
     else:
         say()
         if on_cpu:
@@ -8326,9 +8339,31 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
             say("  experts fit on the GPU:")
         for i, c in enumerate(contexts, 1):
             rec_mark = "   (recommended for your " + ("PC)" if on_cpu else "GPU)")
-            say(f"  {i}) {c // 1024}K tokens" + (rec_mark if c == rec_ctx else ""))
+            say(f"  {i}) {c // 1024}K tokens" + (rec_mark if c == rec_ctx else "") +
+                ("   (experimental: setup adds rope scaling)" if c > trained else ""))
         ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)],
                                str(contexts.index(rec_ctx) + 1), a.yes)) - 1]
+    # the rope scaling for the context actually served, as for Qwen3.8-Flash-Next: past the trained length an omitted
+    # method is yarn (asked when interactive) and the factor final / trained; an explicit --rope-scaling / --rope-scale
+    # wins.  A model whose rotation does not take it (llm-jp-4.1, GLM-5.3-Flash) keeps its trained angles.
+    scaling = rope_scale = None
+    if rope_extend:
+        scaling = a.rope_scaling
+        if ctx > trained and scaling is None and not a.yes:
+            scaling = ask_option("rope-scaling", a.yes)
+        try:
+            scaling, rope_scale = resolve_rope(ctx, scaling, a.rope_scale, trained=trained)
+        except ValueError as e:
+            fail(str(e))
+        if scaling is not None:
+            origin = (f"final context / trained {trained}; override with --rope-scale" if a.rope_scale is None
+                      else "as requested")
+            ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
+    elif a.rope_scaling is not None or a.rope_scale is not None:
+        arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
+        nope = family == "glm53" or arch in ("glm5-next", "glm5next")
+        why = "its MLA is nope-only, with no rotation to scale" if nope else "it keeps its trained context"
+        warn(f"--rope-scaling / --rope-scale do not apply to {fam['title']}: {why}")
     ok(f"context: {ctx} tokens")
     if on_cpu and ram < cpu_ram_gb(fam, ctx):
         warn(f"{fam['title']} on the CPU keeps its weights as int8 and the KV cache in FP32: "
@@ -8417,6 +8452,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # ---- 7. the settings
     step(7, "writing the model's settings" if PACKAGED else "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx)]
+    if scaling is not None:     # the resolved rope configuration: the explicit flags, or yarn and the derived factor
+        args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
     if on_cpu:
         args += ["--device", "cpu"]
     if fam.get("profile"):                             # the experts filled into VRAM at start, most routed first
@@ -9072,7 +9109,7 @@ def describe() -> dict:
                                "experimental": False, "recommended": m == by_quant[size_quantizer(f, m)],
                                "quantizer": size_quantizer(f, m), "context": ctx_f,
                                "vision": bool(fam.get("mmproj")), "budget": not fam.get("dense")})
-            max_ctx = fam["max_context"]
+            max_ctx = CONTEXTS[-1] if plain_rope_extend(f, fam) else fam["max_context"]
         else:
             for m in names:
                 d = MODELS[m]
