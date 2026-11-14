@@ -1,6 +1,6 @@
 # Strata media and video guide
 
-For people and AI tools creating an article, overview or video. Last reviewed: 7 November 2026, for Strata 0.2.13.
+For people and AI tools creating an article, overview or video. Last reviewed: 7 November 2026, for Strata 0.2.14.
 Use [AI_REFERENCE.md](AI_REFERENCE.md) for product facts and [README.md](../README.md) for the public introduction.
 
 ## Short description

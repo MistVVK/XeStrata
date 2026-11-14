@@ -32,23 +32,23 @@ class VersionBump(unittest.TestCase):
         # 0.2.7.1 (DGX Spark): Control and the linux-aarch64 engine packages are 0.1.53 (the CMake project version); the app and the Terminal stay 0.2.7, the Metal engine 0.1.52.
         # 0.2.7: Terminal and app are 0.2.7; Control and every engine package (Qwen, DeepSeek, Metal) are 0.1.52 (the CMake project version; the Qwen and DeepSeek C++ both changed since 0.2.6)
         # 0.2.13.1 (Control-only, Linux x86_64: the app on an Intel Arc card, ARCFIX): the Terminal is 0.2.13.1 and Control 0.1.59.1 (the CMake project version); the app stays 0.2.13 and every engine package 0.1.59 (as 0.2.8.1 and 0.2.3.1 did).
-        self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.13.1")
-        self.assertEqual(strata_cli.version(), "0.1.59.1")              # the CMake project version: Control
-        self.assertEqual(first("CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.59.1")
-        self.assertIn('STRATA_VERSION="0.1.59-metal"', (ROOT / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
+        self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.14")
+        self.assertEqual(strata_cli.version(), "0.1.60")              # the CMake project version: Control
+        self.assertEqual(first("CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.60")
+        self.assertIn('STRATA_VERSION="0.1.60-metal"', (ROOT / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
 
     def test_every_place_the_app_version_lives_says_0_2_3(self):
-        self.assertEqual(first("apps/desktop/src-tauri/Cargo.toml", r'^version = "([^"]+)"'), "0.2.13")
+        self.assertEqual(first("apps/desktop/src-tauri/Cargo.toml", r'^version = "([^"]+)"'), "0.2.14")
         lock = (ROOT / "apps/desktop/src-tauri/Cargo.lock").read_text(encoding="utf-8")
-        self.assertRegex(lock, r'name = "strata-desktop"\r?\nversion = "0.2.13"')
-        self.assertEqual(json.loads((ROOT / "apps/desktop/package.json").read_text(encoding="utf-8"))["version"], "0.2.13")
+        self.assertRegex(lock, r'name = "strata-desktop"\r?\nversion = "0.2.14"')
+        self.assertEqual(json.loads((ROOT / "apps/desktop/package.json").read_text(encoding="utf-8"))["version"], "0.2.14")
         host = json.loads((ROOT / "apps/host/package.json").read_text(encoding="utf-8"))
-        self.assertEqual(host["version"], "0.2.13")
+        self.assertEqual(host["version"], "0.2.14")
         locked = json.loads((ROOT / "apps/host/package-lock.json").read_text(encoding="utf-8"))
-        self.assertEqual((locked["version"], locked["packages"][""]["version"]), ("0.2.13", "0.2.13"))
+        self.assertEqual((locked["version"], locked["packages"][""]["version"]), ("0.2.14", "0.2.14"))
 
     def test_the_documents_that_state_the_current_version_agree(self):
-        self.assertIn("Version 0.2.13, engine 0.1.59.", (ROOT / "AGENTS.md").read_text(encoding="utf-8"))
+        self.assertIn("Version 0.2.14, engine 0.1.60.", (ROOT / "AGENTS.md").read_text(encoding="utf-8"))
         for name in ("README.md", "README.de.md", "README.es.md", "README.fr.md", "README.ja.md", "README.pl.md", "README.pt-BR.md", "README.zh-CN.md"):
             text = (ROOT / name).read_text(encoding="utf-8")
             self.assertRegex(text, r"Strata-0[.]2[.][0-9]+-", name)       # (the restyled READMEs state the app version through the download buttons; their owner moves them to the release)
@@ -57,7 +57,7 @@ class VersionBump(unittest.TestCase):
     def test_version_prints_the_product_and_the_build(self):
         done = subprocess.run([sys.executable, str(ROOT / "strata.py"), "--version"], capture_output=True, text=True, cwd=str(ROOT),
                               env={**os.environ, "STRATA_NO_HANDOVER": "1"})
-        self.assertTrue(done.stdout.startswith("strata 0.2.13.1 (build 0.1.59.1;"), done.stdout)
+        self.assertTrue(done.stdout.startswith("strata 0.2.14 (build 0.1.60;"), done.stdout)
 
 
 class UpdateFromTheLastRelease(test_updater.UpdaterCase):

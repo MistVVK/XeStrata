@@ -1,11 +1,11 @@
 # Set up Strata for a user
 
-Use this guide when a user asks an AI agent to install Strata (version 0.2.13). There are two release routes. Pick
+Use this guide when a user asks an AI agent to install Strata (version 0.2.14). There are two release routes. Pick
 one; do not start from a source checkout.
 
 - **The Terminal and `strata launch`** (below). This is the route for an agent that has a shell.
-- **The desktop app.** One installer per system: `Strata-0.2.13-windows-x64-setup.exe`,
-  `Strata-0.2.13-linux-x86_64.AppImage`, `Strata-0.2.13-macos-arm64.dmg`, from the
+- **The desktop app.** One installer per system: `Strata-0.2.14-windows-x64-setup.exe`,
+  `Strata-0.2.14-linux-x86_64.AppImage`, `Strata-0.2.14-macos-arm64.dmg`, from the
   [latest release](https://github.com/Niko1221/Strata/releases/latest). The Windows and Linux installers carry no
   engine: on first start the app shows the engine for the user's graphics card and downloads it, or installs a file the
   user already has ("I already have the file"). Details: [INSTALL.md](INSTALL.md).

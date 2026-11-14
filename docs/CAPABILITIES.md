@@ -1,12 +1,12 @@
 # Which model runs on which hardware
 
-This page is built by `tools/capability_table.py` from [docs/data/capabilities.json](data/capabilities.json) and the package names of release v0.2.13 ([docs/data/release.json](data/release.json)). Do not edit it by hand.
+This page is built by `tools/capability_table.py` from [docs/data/capabilities.json](data/capabilities.json) and the package names of release v0.2.14 ([docs/data/release.json](data/release.json)). Do not edit it by hand.
 
 - **Packaged**: the engine packages in the release for that hardware. Read from the release's file names.
 - **Supported**: what these docs commit to. *untested* means a package exists and nothing is claimed.
 - **Measured**: where numbers for that combination are published. Empty means none are published; it does not mean the combination fails.
 
-App and Terminal 0.2.13, Control and engines 0.1.59. App, Control and engine versions differ on purpose.
+App and Terminal 0.2.14, Control and engines 0.1.60. App, Control and engine versions differ on purpose.
 
 ## At a glance
 
