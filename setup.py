@@ -5447,26 +5447,30 @@ def image_descriptions(models_dir: Path) -> list[dict]:
         for choice, version in versions:
             own = choice.startswith(qi.ANIMA_USER)
             _, dit, enc = qi.IMAGE_MODELS["anima-base" if own else choice]
-            sizes = []
-            for size in reversed(qi.size_choices(dit)):
-                quant = qi.default_quant(dit) if qi.engine_quantized(dit) else size
-                names = qi.file_names(quant, enc, qi.default_text_quant(dit), dit)
-                download = sum(qi.FILES[n][2] for n in names[1 if own else 0:]) / 1e9
-                ram = qi.ram_need_gb(quant, enc, qi.default_text_quant(dit), dit,
-                                     q8=qi.mage_q8(size))
-                if own:
-                    weight = (models_dir / qi.ANIMA_DIR / (choice[len(qi.ANIMA_USER):] + ".safetensors")).stat().st_size
-                    share = qi.MF_Q8_SHARE if size == "int8" else 1
-                    ram += (weight - qi.FILES["anima-base-bf16"][2]) * share / 1e9
-                sizes.append({"id": size, "download_gb": round(download, 1), "ram_gb": round(ram, 1)})
+            def estimates(encoder: str) -> list[dict]:
+                sizes = []
+                for size in reversed(qi.size_choices(dit)):
+                    quant = qi.default_quant(dit) if qi.engine_quantized(dit) else size
+                    names = qi.file_names(quant, encoder, qi.default_text_quant(dit), dit)
+                    download = sum(qi.FILES[n][2] for n in names[1 if own else 0:]) / 1e9
+                    ram = qi.ram_need_gb(quant, encoder, qi.default_text_quant(dit), dit, q8=qi.mage_q8(size))
+                    if own:
+                        weight = (models_dir / qi.ANIMA_DIR / (choice[len(qi.ANIMA_USER):] + ".safetensors"))
+                        share = qi.MF_Q8_SHARE if size == "int8" else 1
+                        ram += (weight.stat().st_size - qi.FILES["anima-base-bf16"][2]) * share / 1e9
+                    sizes.append({"id": size, "download_gb": round(download, 1), "ram_gb": round(ram, 1)})
+                return sizes
+            sizes = estimates(enc)
+            uncensored = choice + "-uncensored" in qi.IMAGE_MODELS
+            uncensored_sizes = estimates(qi.IMAGE_MODELS[choice + "-uncensored"][2]) if uncensored else sizes
             result.append({"id": choice, "title": choice if own else qi.DITS[dit][0],
                            "family": family, "version": version, "origin": origin,
                            "about": "A DiT made from Anima on this PC" if own else qi.ABOUT.get(choice, ""),
                            "download_gb": sizes[0]["download_gb"], "ram_gb": sizes[0]["ram_gb"],
-                           "sizes": sizes, "quants": [x["id"] for x in sizes],
+                           "sizes": sizes, "uncensored_sizes": uncensored_sizes, "quants": [x["id"] for x in sizes],
                            "edits": dit in qi.MF_EDIT or (qi.is_moss(dit) and dit not in qi.MOSS_FEW_STEP)
                            or not qi.engine_quantized(dit), "license": qi.license_note(dit),
-                           "tools": list(qi.IMAGE_TOOLS), "uncensored": choice + "-uncensored" in qi.IMAGE_MODELS})
+                           "tools": list(qi.IMAGE_TOOLS), "uncensored": uncensored})
     return result
 
 
@@ -5474,7 +5478,7 @@ def import_anima(path: Path, models_dir: Path) -> str:
     """Check an Anima DiT and copy it without overwriting an existing model."""
     qi = _qimage()
     path = path.expanduser().resolve()
-    if path.suffix.lower() != ".safetensors" or any(c in path.stem for c in ",:/\\"):
+    if path.suffix != ".safetensors" or any(c in path.stem for c in ",:/\\"):
         raise ValueError("choose an Anima .safetensors file without commas or colons in its name")
     why = qi.anima_header(path)
     if why:
@@ -5566,7 +5570,7 @@ def ask_images(cfg_path: Path) -> str | None:
         if picks and name in [n for n, _ in qi.parse_choices(",".join(picks))]:
             say("  That model and text encoder are already chosen.")
             continue
-        sizes = model["sizes"]
+        sizes = model["uncensored_sizes"] if name.endswith("-uncensored") else model["sizes"]
         if len(sizes) > 1:
             say("    1) auto (the largest that fits the RAM)")
             for i, size in enumerate(sizes, 2):
@@ -9193,8 +9197,10 @@ def describe() -> dict:
                                      if fam.get("plain") else {}),
                          "contexts": [c for c in CONTEXTS if c <= max_ctx], "models": models})
     QI = _qimage()
-    images = image_descriptions(data_folder_path(None, load_settings()) / "models")
+    images = image_descriptions(data_folder_path(getattr(ARGS, "data_dir", None), load_settings()) / "models")
     by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
+    by_name.update({"anima-" + m["id"][len(QI.ANIMA_USER):]: m["id"] for m in images
+                    if m["id"].startswith(QI.ANIMA_USER)})
     installed = []
     for c in installed_configs():
         ch = choices_from_config(c)
