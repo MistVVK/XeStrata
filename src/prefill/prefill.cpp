@@ -714,6 +714,7 @@ struct Prefill::Impl {
     int lat_G_ = 8, lat_fmt_ = 8;
     const uint8_t* lat_d_ = nullptr;         // the session's D/U pair on the device (latent_share.hpp)
     const uint8_t* lat_u_ = nullptr;
+    int64_t lat_layer0_ = 0;                 // the first layer the pair holds (a layer-split stage's first; 0: all)
     std::vector<int32_t> lat_labels_;
     int32_t* lat_labels_dev_ = nullptr;
     float* lat_xl_ = nullptr;                // scratch (allocated on the first latent layer, freed with the object)
@@ -1475,7 +1476,7 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
     mmq::quantize(m.mixed, nullptr, m.lmmq_xq_, fmt, N, N, T, m.cs);
     {
         mmq::Product d;
-        d.w = m.lat_d_ + (size_t) l * d_bytes; d.type = fmt; d.w_rows = G * ELL; d.w_cols = N;
+        d.w = m.lat_d_ + (size_t) (l - m.lat_layer0_) * d_bytes; d.type = fmt; d.w_rows = G * ELL; d.w_cols = N;
         d.expert_bytes = mmq::matrix_bytes(fmt, G * ELL, N); d.n = 1; d.xq = m.lmmq_xq_;
         d.bounds = m.lmmq_bounds_ + DBND; d.ids = m.ids_identity; d.total_rows = T; d.max_rows = T; d.rows = T;
         d.dst = m.lmmq_xl_; d.ld_dst = G * ELL;
@@ -1526,7 +1527,7 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
         for (int gg = 0; gg < G; ++gg)
             maxr = std::max<int64_t>(maxr, m.lmmq_bnd_h_[(size_t) (UBND + gg + 1)] - m.lmmq_bnd_h_[(size_t) (UBND + gg)]);
         mmq::Product up;
-        up.w = m.lat_u_ + (size_t) l * u_bytes; up.type = fmt; up.w_rows = N; up.w_cols = ELL;
+        up.w = m.lat_u_ + (size_t) (l - m.lat_layer0_) * u_bytes; up.type = fmt; up.w_rows = N; up.w_cols = ELL;
         up.expert_bytes = mmq::matrix_bytes(fmt, N, ELL); up.n = G; up.xq = m.lmmq_ylq_;
         up.bounds = m.lmmq_bounds_ + UBND; up.ids = m.ids_identity; up.total_rows = T * K; up.max_rows = maxr; up.rows = T * K;
         up.dst = m.Dm; up.ld_dst = N;
@@ -1579,7 +1580,7 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
     }
     // D: the chunk's rows through the layer's D, the column scales, the experts' q8_1 image
     quantize_q8_1_rows(m.mixed, T, N, m.lat_xq_, m.cs);
-    iq_mmvq(m.lat_fmt_ == 4 ? 2 : 8, m.lat_d_ + (size_t) l * d_bytes, m.lat_xq_, m.lat_xl_, (int) N, (int) (G * ELL),
+    iq_mmvq(m.lat_fmt_ == 4 ? 2 : 8, m.lat_d_ + (size_t) (l - m.lat_layer0_) * d_bytes, m.lat_xq_, m.lat_xl_, (int) N, (int) (G * ELL),
             (int) T, m.cs);
     latent_colscale_rows(m.lat_xl_, T * G, (int) ELL, latent_colscale_dev((int) l, (int) ELL), m.cs);
     quantize_q8_1_rows(m.lat_xl_, T * G, ELL, m.lat_xlq_, m.cs);
@@ -1641,7 +1642,7 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
     }
     // U: each route's latent output back to the shell's width, then the combine (the rows are in routing order)
     quantize_q8_1_rows(m.lat_yl_, T * K, ELL, m.lat_ylq_, m.cs);
-    latent_u_grouped(m.lat_u_ + (size_t) l * u_bytes, m.lat_ylq_, m.ids, m.lat_labels_dev_ + (size_t) l * E, E, T * K,
+    latent_u_grouped(m.lat_u_ + (size_t) (l - m.lat_layer0_) * u_bytes, m.lat_ylq_, m.ids, m.lat_labels_dev_ + (size_t) l * E, E, T * K,
                      (int) ELL, (int) N, m.Dm, m.cs, m.lat_fmt_);
     for (int64_t i = 0; i < T * K; ++i) m.slot_host[(size_t) i] = (int32_t) i;   // the identity: the rows are in routing order
     m.slot_host.to_device(m.slot_dev, m.cs);
@@ -1837,9 +1838,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (m.latent_) {
             m.lat_ELL_ = lay0.fmt[0].n_embd;
             m.lat_I_ = lay0.fmt[0].n_ff;
-            m.lat_d_ = strata::core::latent_shared_d();
-            m.lat_u_ = strata::core::latent_shared_u();
-            m.lat_fmt_ = strata::core::latent_shared_fmt();
+            const auto& sh = strata::core::latent_shared();   // this device's pair (a layer-split stage: its layers)
+            m.lat_d_ = sh.d;
+            m.lat_u_ = sh.u;
+            m.lat_fmt_ = sh.fmt;
+            m.lat_layer0_ = sh.layer0;
             if (m.lat_d_ == nullptr || m.lat_u_ == nullptr) {
                 err = "prefill: the latent D/U pair is not on the device (the driver uploads it before the prompt path)";
                 return false;

@@ -241,8 +241,9 @@ private:
     const uint8_t* lat_d_shared_ = nullptr;   ///< the session's pair (set_shared_latent), null: own
     const uint8_t* lat_u_shared_ = nullptr;
     int lat_fmt_shared_ = 8;
-    uint8_t* lat_d_ = nullptr;         ///< the pair on the device (shared or own), layer-major
+    uint8_t* lat_d_ = nullptr;         ///< the pair on the device (shared or own), layer-major from lat_layer0_
     uint8_t* lat_u_ = nullptr;
+    int64_t lat_layer0_ = 0;           ///< the first layer the pair holds (a layer-split stage's first; 0: all)
     bool lat_du_owned_ = false;
     std::vector<int32_t> lat_labels_;  ///< [layers * E] group labels, host
     int32_t* lat_labels_dev_ = nullptr;

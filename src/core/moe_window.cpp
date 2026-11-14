@@ -116,10 +116,13 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             lat_d_ = const_cast<uint8_t*>(lat_d_shared_);
             lat_u_ = const_cast<uint8_t*>(lat_u_shared_);
             lat_fmt_ = lat_fmt_shared_;
-        } else if (latent_shared_d() != nullptr) {   // the session's pair (the driver uploaded it once)
-            lat_d_ = const_cast<uint8_t*>(latent_shared_d());
-            lat_u_ = const_cast<uint8_t*>(latent_shared_u());
-            lat_fmt_ = latent_shared_fmt();
+        } else if (const auto& sh = strata::core::latent_shared(); sh.d != nullptr) {
+            // the session's pair on this device (the driver uploaded it once); a layer-split stage holds its own
+            // layers from sh.layer0
+            lat_d_ = const_cast<uint8_t*>(sh.d);
+            lat_u_ = const_cast<uint8_t*>(sh.u);
+            lat_fmt_ = sh.fmt;
+            lat_layer0_ = sh.layer0;
         } else {
             const char* dense = strata::env_get("LATENT_DENSE");
             if (dense == nullptr || dense[0] == '\0') {
@@ -406,7 +409,7 @@ void MoeWindow::latent_d_stage(int64_t layer, int tb, int n, const float* x, str
     // the input's q8_1 rows (the same bytes expert_input writes; the window's first group runs this before the
     // router, so the pool's D rows have the router + plan + doorbell stretch of head start)
     quantize_q8_1_rows(x, n, N, nat_xq(tb), cs);
-    iq_mmvq(lat_fmt_ == 4 ? 2 : 8, lat_d_ + (size_t) layer * d_bytes, nat_xq(tb), lat_xl_ + (size_t) tb * G * ELL,
+    iq_mmvq(lat_fmt_ == 4 ? 2 : 8, lat_d_ + (size_t) (layer - lat_layer0_) * d_bytes, nat_xq(tb), lat_xl_ + (size_t) tb * G * ELL,
             (int) N, (int) (G * ELL), n, cs);
     // the Q3_K pack's shared column scales: the D rows take 1/s once, before every consumer reads them
     latent_colscale_rows(lat_xl_ + (size_t) tb * G * ELL, (int64_t) n * G, (int) ELL,
@@ -565,14 +568,14 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 copy_i32_from_mapped(lat_u_mmq_bounds_, ubnd, G + 1, cs);
                 strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, lat_fmt_, ELL, ELL, cap, cs);
                 strata::prefill::mmq::Product up;
-                up.w = lat_u_ + (size_t) layer * u_bytes; up.type = lat_fmt_; up.w_rows = N; up.w_cols = ELL;
+                up.w = lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes; up.type = lat_fmt_; up.w_rows = N; up.w_cols = ELL;
                 up.expert_bytes = strata::prefill::mmq::matrix_bytes(lat_fmt_, N, ELL); up.n = G;
                 up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
                 up.total_rows = cap; up.max_rows = maxr; up.rows = cap; up.dst = hit_out; up.ld_dst = N;
                 lat_mmq_ctx_->run(up, cs);
             } else {
                 quantize_q8_1_rows(yl, cap, ELL, ylq, cs);
-                latent_u_grouped(lat_u_ + (size_t) layer * u_bytes, ylq, ids, labels, lay.n_expert, cap, (int) ELL, (int) N,
+                latent_u_grouped(lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes, ylq, ids, labels, lay.n_expert, cap, (int) ELL, (int) N,
                                  hit_out, cs, lat_fmt_);
             }
             if (mode.resident || dp) {   // no CPU share: its rows are zeros
@@ -582,7 +585,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 // rows zeroed there, the hit path adds their U product)
                 if (!segmented_) wait_flag_ge(m_flag_, ring, cs);
                 stamp(23);
-                latent_u_matvec(lat_u_ + (size_t) layer * u_bytes, reinterpret_cast<const uint8_t*>(ymiss), ids, labels, p_dst,
+                latent_u_matvec(lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes, reinterpret_cast<const uint8_t*>(ymiss), ids, labels, p_dst,
                                 p_counts + 1, lay.n_expert, cap, (int) ELL, (int) N, (int) G, parts, cs, lat_fmt_);
             } else {
                 if (!segmented_) wait_flag_ge(m_flag_, ring, cs);   // the CPU's H-wide contributions
