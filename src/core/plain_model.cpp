@@ -801,19 +801,7 @@ bool PlainModel::load_qwen(std::string& err) {
         stream_into_ = nullptr;
         if (!ok) return false;
     }
-    // the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last
-    tap_local_.clear();
-    tap_slot_.assign((size_t) s.n_layer, -1);
-    for (int l : tap_req_)
-        if (l >= lb_ && l < le_ && l < s.n_layer - 1) {
-            tap_slot_[(size_t) l] = (int) tap_local_.size();
-            tap_local_.push_back(l);
-        }
-    if (!tap_local_.empty() && tap_dev_ == nullptr &&
-        !strata::gpu::alloc_device(&tap_dev_, (size_t) opt_.max_t * tap_local_.size() * s.n_embd * 4)) {
-        err = "plain model: the DFlash2 tap staging does not fit";
-        return false;
-    }
+    if (!setup_taps(err)) return false;
     // the MTP layer, when the window checks drafts and the file has it (its K/V the last attention block's): the last
     // stage's
     {
@@ -3546,6 +3534,24 @@ uint64_t PlainModel::release_mtp(bool keep_head) {
     dprob_.clear();
     strata::gpu::mem_info(&fb1, &tb);
     return fb1 > fb0 ? (uint64_t) (fb1 - fb0) : 0;
+}
+
+// the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last; every model's load
+bool PlainModel::setup_taps(std::string& err) {
+    const ModelSpec& s = spec_;
+    tap_local_.clear();
+    tap_slot_.assign((size_t) s.n_layer, -1);
+    for (int l : tap_req_)
+        if (l >= lb_ && l < le_ && l < s.n_layer - 1) {
+            tap_slot_[(size_t) l] = (int) tap_local_.size();
+            tap_local_.push_back(l);
+        }
+    if (!tap_local_.empty() && tap_dev_ == nullptr &&
+        !strata::gpu::alloc_device(&tap_dev_, (size_t) opt_.max_t * tap_local_.size() * s.n_embd * 4)) {
+        err = "plain model: the DFlash2 tap staging does not fit";
+        return false;
+    }
+    return true;
 }
 
 PlainModel::HeadView PlainModel::draft_head_view() const {

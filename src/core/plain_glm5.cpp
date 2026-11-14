@@ -217,6 +217,7 @@ bool PlainModel::load_glm5(std::string& err) {
         if (l >= lb_ && l < le_ && !load_gblock(m, l, b, err)) return false;
     }
     if (n_dsa == 0) { err = "plain model: the model has no DSA block"; return false; }
+    if (!setup_taps(err)) return false;   // DFlash2's (GLM-5.3-Flash's drafter reads the four streams' mean)
     if (has_mtp_) {   // a DSA block of its own caches, after the trunk's
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
         mtp_allocs_[0] = allocs_.size();   // the layer's own weights (release_mtp)

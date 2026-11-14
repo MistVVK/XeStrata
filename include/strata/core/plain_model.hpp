@@ -730,6 +730,8 @@ private:
     /// The control vector after block b's FFN write, on T rows of x (kernels/cvec.hpp), where it covers the layer
     void steer(const Block& b, int64_t T, float* x, strata::gpu::Stream cs) const;
     void tap_block(const Block& b, int T, strata::gpu::Stream cs);
+    /// set_taps' layers on this stage and the window's tap staging (both loads: load_qwen's and load_glm5's)
+    bool setup_taps(std::string& err);
     /// A tapped layer's output rows (R: [T][hc][n_embd]) into the window's taps (`window`) or the prompt's staging
     void tap_rows(int64_t l, const float* R, int hc, int64_t T, int64_t p0, bool window, strata::gpu::Stream cs);
     /// The prompt's staging handed on after a chunk or a window of rows from p0 (prompt_taps_)
