@@ -92,14 +92,8 @@ uint64_t cache_credit_for_limit(const CacheCredit& credit, uint64_t limit, std::
 /// MemTotal, a limit at or above it, STRATA_MEM_CREDIT_INACTIVE=1): the caller then uses
 /// detail::cgroup_available_bytes as before.
 struct ArenaCgroupRoom { bool applies = false; uint64_t room = 0; uint64_t credit = 0; };
-/// `exclude_own` (STRATA_ARENA_OWN_MAPPED=1, off by default): the credit also leaves out this process's own evictable
-/// file mappings (`own_mapped`, as for the memory guard; unknown: the `inactive` credit).  Off, the PLE table the engine
-/// mapped before the arena counts as room for the arena, and the two can then hold more than the limit together.
 ArenaCgroupRoom arena_cgroup_room(uint64_t limit, uint64_t current, const std::string& stat_text, std::optional<uint64_t> mem_total,
-                                  bool inactive_only, bool exclude_own = false, std::optional<uint64_t> own_mapped = std::nullopt);
-
-/// STRATA_ARENA_OWN_MAPPED: "1" turns `exclude_own` on.
-bool arena_exclude_own_mapped(const char* env_value);
+                                  bool inactive_only);
 /// The operator's cap in bytes for the container/cgroup this engine runs in (0 = none).  Set once at start.
 void set_memory_limit_bytes(uint64_t bytes);
 uint64_t memory_limit_bytes();

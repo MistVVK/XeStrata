@@ -404,10 +404,10 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
 namespace detail {
 
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
-                           const std::string& cgroup_root, const std::string& self_status) {
+                           const std::string& cgroup_root) {
     m = HostMemory{};
 #if defined(_WIN32)
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root; (void) self_status;
+    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
     if (!GlobalMemoryStatusEx(&status)) return false;
@@ -430,15 +430,6 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     }
     if (bytes == 0) return false;
     const bool inactive_only = strata::core::mem_credit_inactive_only(std::getenv("STRATA_MEM_CREDIT_INACTIVE"));
-    // STRATA_ARENA_OWN_MAPPED=1: the process's own mapped file pages (the PLE table above all) are not room for the arena
-    const bool exclude_own = strata::core::arena_exclude_own_mapped(std::getenv("STRATA_ARENA_OWN_MAPPED"));
-    std::optional<uint64_t> own_mapped;
-    if (exclude_own) {
-        std::ifstream status_file(self_status);
-        std::ostringstream status_text;
-        if (status_file) status_text << status_file.rdbuf();
-        own_mapped = strata::core::own_evictable_mapped_bytes(status_text.str(), strata::core::locked_own_file_bytes());
-    }
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
     std::ifstream groups(self_cgroup);
@@ -481,7 +472,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
                     std::ostringstream stat_text;
                     if (stat_file) stat_text << stat_file.rdbuf();
                     const strata::core::ArenaCgroupRoom room =
-                        strata::core::arena_cgroup_room(cap, current, stat_text.str(), mem_total, inactive_only, exclude_own, own_mapped);
+                        strata::core::arena_cgroup_room(cap, current, stat_text.str(), mem_total, inactive_only);
                     if (room.applies) cgroup_available = room.room;
                     bytes = std::min(bytes, cgroup_available);
                     m.cgroup_limit = std::min(m.cgroup_limit, cap);
@@ -512,7 +503,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     return true;
 #elif defined(__APPLE__)
     // macOS: free + inactive + purgeable pages (what the OS can hand out without swapping), as vm_stat reports them
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root; (void) self_status;
+    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
     vm_statistics64_data_t vs{};
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     vm_size_t page_bytes = 0;
@@ -521,7 +512,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     m.available = ((uint64_t) vs.free_count + vs.inactive_count + vs.purgeable_count) * (uint64_t) page_bytes;
     return m.available > 0;
 #else
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root; (void) self_status;
+    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
     const long pages = sysconf(_SC_AVPHYS_PAGES);
     const long page_bytes = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_bytes <= 0 ||

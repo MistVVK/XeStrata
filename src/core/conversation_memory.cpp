@@ -75,22 +75,16 @@ uint64_t cache_credit_for_limit(const CacheCredit& credit, uint64_t limit, std::
 }
 
 ArenaCgroupRoom arena_cgroup_room(uint64_t limit, uint64_t current, const std::string& stat_text, std::optional<uint64_t> mem_total,
-                                  bool inactive_only, bool exclude_own, std::optional<uint64_t> own_mapped) {
+                                  bool inactive_only) {
     ArenaCgroupRoom r;
     if (inactive_only || !mem_total || limit >= *mem_total) return r;
     r.applies = true;
-    const CacheCredit c = cache_credit_from_stat(stat_text, current, false);
-    uint64_t credit = c.lists;   // <= current
-    if (exclude_own) credit = !own_mapped ? c.inactive : (c.lists > *own_mapped ? c.lists - *own_mapped : 0);
+    uint64_t credit = cache_credit_from_stat(stat_text, current, false).lists;   // <= current
     credit -= std::min(credit / 2, limit / 64);
     r.credit = credit;
     const uint64_t used = current - credit;
     r.room = used < limit ? limit - used : 0;
     return r;
-}
-
-bool arena_exclude_own_mapped(const char* env_value) {
-    return env_value != nullptr && env_value[0] == '1';
 }
 
 namespace {

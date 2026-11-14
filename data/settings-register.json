@@ -944,7 +944,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6112,
+     "line": 6103,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -1057,7 +1057,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 5987,
+     "line": 5978,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -1136,39 +1136,6 @@
    "status": "opt-in",
    "owner": "core",
    "note": "[reviewed] Writes experts.bin for mmap experts; user-facing storage option, off unless set. [gh-sweep-1028/WORKLIST-ENGINE.md:101]",
-   "retire_after": "",
-   "retired_in": ""
-  },
-  {
-   "name": "STRATA_ARENA_OWN_MAPPED",
-   "backends": [
-    "cuda-hip"
-   ],
-   "reads": [
-    {
-     "file": "src/core/expert_source.cpp",
-     "line": 434,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    }
-   ],
-   "parse": "flag",
-   "default_state": null,
-   "code_default": null,
-   "engine_sets": [],
-   "engine_defaults": [],
-   "launch_files": [],
-   "launch_sets": [],
-   "launch_reads": [],
-   "doc_mentions": [],
-   "first_commit": "667533760d",
-   "first_date": "2026-11-14",
-   "since": null,
-   "last_commit": "667533760d",
-   "last_date": "2026-11-14",
-   "status": "research",
-   "owner": "core",
-   "note": "[reviewed] off by default; set to 1, the expert arena's RAM check inside a container leaves the engine's own mapped file pages out of the reclaimable figure. Default to be decided by a container measurement. [src/core/expert_source.cpp:434]",
    "retire_after": "",
    "retired_in": ""
   },
@@ -1282,7 +1249,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6060,
+     "line": 6051,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -1650,7 +1617,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4076,
+     "line": 4016,
      "value": "\"1\""
     }
    ],
@@ -3247,13 +3214,13 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 2283,
+     "line": 2274,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/core/expert_source.cpp",
-     "line": 4981,
+     "line": 4972,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -3696,7 +3663,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4074,
+     "line": 4014,
      "value": "\"1\""
     }
    ],
@@ -4194,7 +4161,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 5229,
+     "line": 5220,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -4281,7 +4248,7 @@
    "launch_reads": [
     {
      "file": "setup.py",
-     "line": 8097
+     "line": 8037
     }
    ],
    "doc_mentions": [
@@ -4320,7 +4287,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6243,
+     "line": 6234,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -6725,7 +6692,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 4324,
+     "line": 4315,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -7380,7 +7347,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4077,
+     "line": 4017,
      "value": "\"1\""
     }
    ],
@@ -7561,7 +7528,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 2449,
+     "line": 2440,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -7642,7 +7609,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 970,
+     "line": 961,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -7678,7 +7645,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 3534,
+     "line": 3525,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -7720,7 +7687,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 956,
+     "line": 947,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -7788,7 +7755,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 986,
+     "line": 977,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -8094,7 +8061,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6801,
+     "line": 6792,
      "backend": "cuda-hip",
      "fn": "env_int"
     }
@@ -8160,7 +8127,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6800,
+     "line": 6791,
      "backend": "cuda-hip",
      "fn": "env_int"
     }
@@ -8193,7 +8160,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6802,
+     "line": 6793,
      "backend": "cuda-hip",
      "fn": "env_int"
     }
@@ -8226,7 +8193,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6790,
+     "line": 6781,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -8276,7 +8243,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6803,
+     "line": 6794,
      "backend": "cuda-hip",
      "fn": "env_int"
     }
@@ -8860,7 +8827,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4073,
+     "line": 4013,
      "value": "\"1\""
     }
    ],
@@ -9003,7 +8970,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4073,
+     "line": 4013,
      "value": "\"1\""
     }
    ],
@@ -9109,7 +9076,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4073,
+     "line": 4013,
      "value": "\"1\""
     }
    ],
@@ -9248,7 +9215,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4073,
+     "line": 4013,
      "value": "\"2\""
     }
    ],
@@ -9414,7 +9381,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4077,
+     "line": 4017,
      "value": "\"1\""
     }
    ],
@@ -13458,7 +13425,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1216,
+     "line": 1207,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13493,7 +13460,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1229,
+     "line": 1220,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13526,7 +13493,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1228,
+     "line": 1219,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13559,7 +13526,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1232,
+     "line": 1223,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13595,7 +13562,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1234,
+     "line": 1225,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13628,7 +13595,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1233,
+     "line": 1224,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13663,7 +13630,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1235,
+     "line": 1226,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13698,7 +13665,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1227,
+     "line": 1218,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13731,7 +13698,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1225,
+     "line": 1216,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13764,7 +13731,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1218,
+     "line": 1209,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -13806,7 +13773,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1230,
+     "line": 1221,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -16130,7 +16097,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4077,
+     "line": 4017,
      "value": "\"1\""
     }
    ],
@@ -16724,7 +16691,7 @@
    "launch_sets": [
     {
      "file": "strata_control/split_engine.py",
-     "line": 505,
+     "line": 500,
      "value": "<file>"
     }
    ],
@@ -16784,7 +16751,7 @@
    "reads": [
     {
      "file": "src/core/conversation_memory.cpp",
-     "line": 363,
+     "line": 357,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -18954,7 +18921,7 @@
     },
     {
      "file": "setup.py",
-     "line": 9336,
+     "line": 9276,
      "value": "\"1\" if stream else \"0\""
     }
    ],
@@ -19420,7 +19387,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4350,
+     "line": 4290,
      "value": "\"1\""
     }
    ],
@@ -19608,7 +19575,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4076,
+     "line": 4016,
      "value": "\"1\""
     }
    ],
@@ -21864,7 +21831,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6128,
+     "line": 6119,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -22636,7 +22603,7 @@
    "launch_reads": [
     {
      "file": "setup.py",
-     "line": 8096
+     "line": 8036
     }
    ],
    "doc_mentions": [
@@ -23253,7 +23220,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 3973,
+     "line": 3964,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -23295,7 +23262,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 3979,
+     "line": 3970,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -23814,7 +23781,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 5062,
+     "line": 5053,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25857,7 +25824,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4074,
+     "line": 4014,
      "value": "\"1\""
     }
    ],
@@ -26885,7 +26852,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 3863,
+     "line": 3854,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -26920,7 +26887,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 3856,
+     "line": 3847,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -28163,7 +28130,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4078,
+     "line": 4018,
      "value": "\"1\""
     }
    ],
@@ -28508,7 +28475,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 4972,
+     "line": 4963,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -32487,7 +32454,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4076,
+     "line": 4016,
      "value": "\"1\""
     }
    ],
@@ -32631,7 +32598,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4076,
+     "line": 4016,
      "value": "\"1\""
     }
    ],
@@ -32787,7 +32754,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4078,
+     "line": 4018,
      "value": "\"1\""
     }
    ],
@@ -33799,7 +33766,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 4534,
+     "line": 4525,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -34228,7 +34195,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 8071,
+     "line": 8011,
      "value": "6"
     }
    ],
@@ -34581,7 +34548,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 5044,
+     "line": 5035,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -34910,7 +34877,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 4933,
+     "line": 4924,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -34961,7 +34928,7 @@
     },
     {
      "file": "setup.py",
-     "line": 4353,
+     "line": 4293,
      "value": "\"0\""
     }
    ],
@@ -36184,7 +36151,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4078,
+     "line": 4018,
      "value": "\"1\""
     },
     {
@@ -38778,7 +38745,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 1916,
+     "line": 1907,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -38916,7 +38883,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 2699,
+     "line": 2690,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -40808,7 +40775,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 2643,
+     "line": 2634,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -41686,7 +41653,7 @@
    "launch_sets": [
     {
      "file": "setup.py",
-     "line": 4077,
+     "line": 4017,
      "value": "\"1\""
     }
    ],
@@ -41902,13 +41869,13 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 940,
+     "line": 931,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/core/expert_source.cpp",
-     "line": 2575,
+     "line": 2566,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -42089,7 +42056,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6355,
+     "line": 6346,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -42210,7 +42177,7 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 4217,
+     "line": 4208,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -42314,13 +42281,13 @@
    "reads": [
     {
      "file": "src/core/expert_source.cpp",
-     "line": 5232,
+     "line": 5223,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/core/expert_source.cpp",
-     "line": 6793,
+     "line": 6784,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
