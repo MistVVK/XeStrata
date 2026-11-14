@@ -60,6 +60,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
+#include "strata/spec/window_hash.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/sampler_host.hpp"
@@ -110,6 +111,7 @@ bool mapped(size_t bytes, void** h, void** d) {
 PlainModel::PlainModel() = default;
 
 PlainModel::~PlainModel() {
+    if (hash_file_ != nullptr) std::fclose(hash_file_);
     if (cpu_ != nullptr) {   // --device cpu: no GPU was opened, nothing of its to give back
         if (route_dump_ != nullptr) std::fclose(route_dump_);
         return;
@@ -4480,6 +4482,28 @@ bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err, bool n
     return pipelined_spec() ? pl_chain(pos + 1, err) : mtp_chain(n_mtp_, pos + 1, err);
 }
 
+bool PlainModel::write_window_hash(int64_t index, int64_t pos, int T, const int32_t* argmax, std::string& err) {
+    if (opt_.window_hashes.empty()) return true;
+    if (hash_file_ == nullptr) {
+        hash_file_ = std::fopen(opt_.window_hashes.c_str(), "w");
+        if (hash_file_ == nullptr) {
+            err = "plain model: --window-hashes: cannot write " + opt_.window_hashes;
+            return false;
+        }
+    }
+    PlainModel& t = tail();
+    const OnDevice on(t.dev_);   // the window's final normed rows (the head's input), after forward's stream sync
+    const size_t n_floats = (size_t) T * (size_t) spec_.n_embd;
+    std::vector<float> rows(n_floats);
+    if (!strata::gpu::copy(rows.data(), t.hn_, n_floats * sizeof(float))) {
+        err = std::string("plain model: --window-hashes: ") + strata::gpu::last_error();
+        return false;
+    }
+    const uint64_t h = strata::spec::window_hash_fnv1a(rows.data(), n_floats * sizeof(float));
+    strata::spec::window_hash_line(hash_file_, index, pos, T, h, argmax, T);
+    return true;
+}
+
 bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
                            std::string& err, const int32_t* follow, const int32_t* ext, int n_ext, int match,
                            bool ext_only) {
@@ -4536,6 +4560,8 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     if (!root_->forward(win, T, cur_pos_, out, logits, err, true)) return false;
     const auto t1 = std::chrono::steady_clock::now();
     spec_ms_check_ += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    // --window-hashes: the window's own picks (before --spec-follow stands in for them), as generate.cpp writes them
+    if (!write_window_hash(spec_windows_, cur_pos_, T, out, err)) return false;
     if (follow != nullptr)   // --spec-follow: the continuation in place of the window's picks
         for (int j = 0; j < T; ++j) out[j] = follow[j];
     // accepted: the drafts the window's own picks agree with, up to the first stop token among the emitted

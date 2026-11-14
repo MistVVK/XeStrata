@@ -93,6 +93,7 @@
 #include "strata/spec/guess_gate.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
+#include "strata/spec/window_hash.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -2291,6 +2292,7 @@ int main(int argc, char** argv) {
     shared.spec_window = &o.spec_window;
     shared.spec_window_given = &o.spec_window_given;
     shared.spec_min_p = &o.spec_min_p;
+    shared.window_hashes = &o.window_hashes;
     shared.mmap_experts = &o.mmap_experts;
     shared.vram_free_mib = &o.vram_free_mib;
     shared.vram_elastic = &o.vram_elastic;
@@ -2466,7 +2468,6 @@ int main(int argc, char** argv) {
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = (int) std::strtol(next("--spec-corrupt"), nullptr, 10);
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
-        else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::strtoll(next("--mtp-window"), nullptr, 10);
         else if (a == "--spec-split") o.spec_split = true;
@@ -14310,19 +14311,15 @@ int main(int argc, char** argv) {
                              drive.d.fail ? drive.d.fail : "(no message)");
                 return 1;
             }
-            if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (a test path: a plain copy)
+            if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (the shared --window-hashes form)
                 const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
                 hash_rows.resize(n_floats);
                 if (!strata::gpu::copy(hash_rows.data(), ver.final_R_all(), n_floats * sizeof(float))) {
                     std::fprintf(stderr, "xestrata generate: --window-hashes: %s\n", strata::gpu::last_error());
                     return 1;
                 }
-                uint64_t h = 1469598103934665603ull;
-                const auto* bytes = reinterpret_cast<const uint8_t*>(hash_rows.data());
-                for (size_t i = 0; i < n_floats * sizeof(float); ++i) h = (h ^ bytes[i]) * 1099511628211ull;
-                std::fprintf(hashes, "%lld %lld %d %016llx", (long long) rounds, (long long) p, T, (unsigned long long) h);
-                for (int i = 0; i < T; ++i) std::fprintf(hashes, " %d", (int) outv[(size_t) i]);
-                std::fprintf(hashes, "\n");
+                const uint64_t h = strata::spec::window_hash_fnv1a(hash_rows.data(), n_floats * sizeof(float));
+                strata::spec::window_hash_line(hashes, rounds, p, T, h, outv.data(), T);
             }
             if (!follow.empty()) {   // the continuation stands in for the argmax
                 const size_t k0 = produced.size();

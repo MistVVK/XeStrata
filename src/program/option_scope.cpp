@@ -30,7 +30,7 @@ const char* const kQwen38Only[] = {
     "--expert-cache-cpu-order",
     "--mtp", "--mtp-max-t", "--mtp-window", "--stream-token", "--check-logits", "--stats", "--stage-timing",
     "--spec-split", "--no-spec-split", "--spec-oracle", "--spec-corrupt", "--gpu-stages", "--gpu-only-full",
-    "--logits-stride", "--window-hashes", "--graph-only", "--no-capture", "--no-token-graph", "--no-pool",
+    "--logits-stride", "--graph-only", "--no-capture", "--no-token-graph", "--no-pool",
     "--no-hit-poke", "--no-publish-kernel", "--no-split-rows", "--sync-every-layer", "--pcie-mode",
     "--batch-cpu-split",
 };
