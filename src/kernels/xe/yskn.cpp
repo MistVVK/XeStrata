@@ -15,12 +15,14 @@
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/trellis.hpp"
 #include "strata/kernels/yskn_sum.hpp"
+#include "strata/platform/env.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_yskn
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -282,7 +284,12 @@ void yskn_proj(const YsknDev& w, const float* x, int64_t ldx, int T, float* y, i
         return;
     }
     const YsknScratch s = yskn_scratch_parts(w, scratch);
-    if (yskn_mma_take(T, stream)) {   // the matrix form: the whole window a launch (up to kYsknMmaRows)
+    // XESTRATA_YSKN_DECODE: mma forces yskn_mma.cpp, dp4a forces yskn.cpp's DP4a; else the timed choice (yskn_mma_take)
+    const char* dm = strata::env_get("YSKN_DECODE");
+    const bool force_dp4a = dm != nullptr && std::strcmp(dm, "dp4a") == 0;
+    const bool force_mma = dm != nullptr && std::strcmp(dm, "mma") == 0;
+    const bool mma = !force_dp4a && (force_mma ? yskn_mma_usable(stream) : yskn_mma_take(T, stream));
+    if (mma) {   // the matrix form: the whole window a launch (up to kYsknMmaRows)
         for (int t0 = 0; t0 < T; t0 += kYsknMmaRows) {
             const int n = std::min(kYsknMmaRows, T - t0);
             yskn_mma_proj(w, x + (size_t) t0 * ldx, ldx, n, y + (size_t) t0 * ldy, ldy, scratch, stream);

@@ -687,6 +687,8 @@ struct Kernel {
     // alpha * 2^-24 and the row's tau.  The per-row state is max alpha (float), the per-output the row's tau (float);
     // the experts' canon fx uses int exponent tops instead
     static constexpr bool YSKN = TY == kIqMmqYskn;
+    // the per-row / per-output state's type: YSKN max alpha / tau (float), the experts' canon fx exponent tops (int)
+    using Top = std::conditional_t<YSKN, float, int>;
     // FX: the blocks of 32 that share one activation scale and one d (8: a 256's, gate/up; 1: IQ4_NL's, Q2_0's)
     static constexpr int FXG = [] {
         if constexpr (FX) return Dec<TY>::group32();
@@ -801,7 +803,6 @@ struct Kernel {
         for (int i = 0; i < RPT; ++i) acc[i] = 0.0f;
         [[maybe_unused]] int32_t isum[FX ? RPT : 1];
         [[maybe_unused]] int64_t acc64[FX ? RPT : 1];
-        using Top = std::conditional_t<YSKN, float, int>;   // YSKN: max alpha / tau; the experts: exponent tops
         [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
         [[maybe_unused]] Top* tw = ta + WM;
         if constexpr (FX) {
@@ -920,15 +921,16 @@ struct Kernel {
         mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
         [[maybe_unused]] int32_t isum[FX ? TPS : 1][IM];
         [[maybe_unused]] int64_t acc64[FX ? TPS : 1][IM];
-        [[maybe_unused]] int* ta = local_as<int>(base + FX_OFF).get();
-        [[maybe_unused]] int* tw = ta + WM;
+        [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
+        [[maybe_unused]] Top* tw = ta + WM;
         if constexpr (FX) {
             for (int t = 0; t < TPS; ++t)
                 for (int i = 0; i < IM; ++i) {
                     isum[t][i] = 0;
                     acc64[t][i] = 0;
                 }
-            fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+            if constexpr (YSKN) yskn_tops(lid, lanes, row0, rows, m0, n0, ta, tw);
+            else fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
         }
 
         const int64_t kb = K / 32;   // activation scales a row
@@ -1001,12 +1003,17 @@ struct Kernel {
                 }
                 if constexpr (FX)
                     if ((k0 / 32 + b) % FXG == FXG - 1) {   // into int64 (lane: column, element i: row)
-                        const float wd = fx_wd(wsl, wml, b, cs + lane);
-                        const int twl = tw[cs + lane];
+                        [[maybe_unused]] const float wd = fx_wd(wsl, wml, b, cs + lane);
+                        [[maybe_unused]] const Top twl = tw[cs + lane];
                         for (int t = 0; t < TPS; ++t)
                             for (int i = 0; i < IM; ++i) {
                                 const int rr = rs + t * IM + i;
-                                acc64[t][i] += (int64_t) fx_a(xsl[b * WM + rr], wd, ta[rr] + twl) * isum[t][i];
+                                if constexpr (YSKN)
+                                    acc64[t][i] += yskn::group_term(isum[t][i],
+                                                                    yskn::fixed_scale(xsl[b * WM + rr],
+                                                                                      yskn::fixed_factor(ta[rr])));
+                                else
+                                    acc64[t][i] += (int64_t) fx_a(xsl[b * WM + rr], wd, ta[rr] + twl) * isum[t][i];
                                 isum[t][i] = 0;
                             }
                     }
@@ -1021,7 +1028,8 @@ struct Kernel {
             for (int i = 0; i < IM; ++i) {
                 const int64_t row = m0 + rs + (int64_t) t * IM + i;
                 float v = acc[t][i];
-                if constexpr (FX) v = fx_out(acc64[t][i], ta[rs + t * IM + i] + tw[cs + lane]);
+                if constexpr (YSKN) v = yskn::finish(acc64[t][i], ta[rs + t * IM + i], tw[cs + lane]);
+                else if constexpr (FX) v = fx_out(acc64[t][i], ta[rs + t * IM + i] + tw[cs + lane]);
                 if (row < rows) out(ks, row0 + row, n0 + cs + lane, v);
             }
 #else
@@ -1070,24 +1078,37 @@ struct Kernel {
         // FX: the lane's output's top and its rows' (row j IN + l in lane l), the sums as in intel_body
         [[maybe_unused]] int32_t isum[FX ? TPS : 1][IM];
         [[maybe_unused]] int64_t acc64[FX ? TPS : 1][IM];
-        [[maybe_unused]] int ta_r[XR];
-        [[maybe_unused]] int twl = canon::kFxNone;
+        [[maybe_unused]] Top ta_r[XR];
+        [[maybe_unused]] Top twl = (Top) canon::kFxNone;
         if constexpr (FX) {
             for (int t = 0; t < TPS; ++t)
                 for (int i = 0; i < IM; ++i) {
                     isum[t][i] = 0;
                     acc64[t][i] = 0;
                 }
-            for (int64_t b = 0; b < K / Dec<TY>::QK; ++b)
-                twl = sycl::max(twl, canon::fx_exp(Dec<TY>::block_d(wx, (int) b)));
-            twl = canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wx, 0)), twl);
-            for (int j = 0; j < XR; ++j) {
-                const int64_t rr = (int64_t) j * IN + lane;
-                ta_r[j] = canon::kFxNone;
-                if (rr < live) {
-                    for (int64_t b = 0; b < kb; b += FXG)
-                        ta_r[j] = sycl::max(ta_r[j], canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
-                    ta_r[j] = canon::fx_row_top(canon::fx_exp(xs[(row0 + m0 + rr) * kb]), ta_r[j]);
+            if constexpr (YSKN) {   // the lane's output's tau, its rows' max alpha (yskn_tops' own, per lane)
+                const auto* c = static_cast<const YsknDecCtx*>(ctx);
+                twl = c->tau[col];
+                for (int j = 0; j < XR; ++j) {
+                    const int64_t rr = (int64_t) j * IN + lane;
+                    float amax = 0.f;
+                    if (rr < live)
+                        for (int64_t g = 0; g < K / 512; ++g)
+                            amax = sycl::fmax(amax, xs[(row0 + m0 + rr) * kb + g * 16]);
+                    ta_r[j] = amax;
+                }
+            } else {
+                for (int64_t b = 0; b < K / Dec<TY>::QK; ++b)
+                    twl = sycl::max(twl, (Top) canon::fx_exp(Dec<TY>::block_d(wx, (int) b)));
+                twl = (Top) canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wx, 0)), twl);
+                for (int j = 0; j < XR; ++j) {
+                    const int64_t rr = (int64_t) j * IN + lane;
+                    ta_r[j] = (Top) canon::kFxNone;
+                    if (rr < live) {
+                        for (int64_t b = 0; b < kb; b += FXG)
+                            ta_r[j] = sycl::max(ta_r[j], (Top) canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
+                        ta_r[j] = (Top) canon::fx_row_top(canon::fx_exp(xs[(row0 + m0 + rr) * kb]), ta_r[j]);
+                    }
                 }
             }
         }
@@ -1163,8 +1184,12 @@ struct Kernel {
                         for (int i = 0; i < IM; ++i) {
                             const int rr = t * IM + i;
                             const float x = sycl::select_from_group(sg, xr[rr / IN], rr % IN);
-                            const int tr = sycl::select_from_group(sg, ta_r[rr / IN], rr % IN);
-                            acc64[t][i] += (int64_t) fx_a(x, FXH ? d.m : d.s1, tr + twl) * isum[t][i];
+                            const Top tr = sycl::select_from_group(sg, ta_r[rr / IN], rr % IN);
+                            if constexpr (YSKN)
+                                acc64[t][i] += yskn::group_term(isum[t][i],
+                                                                yskn::fixed_scale(x, yskn::fixed_factor(tr)));
+                            else
+                                acc64[t][i] += (int64_t) fx_a(x, FXH ? d.m : d.s1, tr + twl) * isum[t][i];
                             isum[t][i] = 0;
                         }
                     }
@@ -1173,7 +1198,10 @@ struct Kernel {
             for (int i = 0; i < IM; ++i) {
                 const int64_t row = m0 + (int64_t) t * IM + i;
                 float v = acc[t][i];
-                if constexpr (FX) {
+                if constexpr (YSKN) {
+                    const int rr = t * IM + i;
+                    v = yskn::finish(acc64[t][i], sycl::select_from_group(sg, ta_r[rr / IN], rr % IN), twl);
+                } else if constexpr (FX) {
                     const int rr = t * IM + i;
                     v = fx_out(acc64[t][i], sycl::select_from_group(sg, ta_r[rr / IN], rr % IN) + twl);
                 }
@@ -1252,8 +1280,8 @@ struct Kernel {
             [[maybe_unused]] mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, TM, TN>
                 fxs[FX ? SGM : 1][FX ? SGN : 1];
             [[maybe_unused]] int64_t acc64[FX ? SGM : 1][FX ? SGN : 1][FX ? FQ : 1];
-            [[maybe_unused]] int* ta = local_as<int>(base + FX_OFF).get();
-            [[maybe_unused]] int* tw = ta + WM;
+            [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
+            [[maybe_unused]] Top* tw = ta + WM;
             [[maybe_unused]] const auto sti = local_as<int32_t>(base + ST_OFF) + static_cast<int>(sgid * TM * TN);
             if constexpr (FX) {
                 for (int i = 0; i < SGM; ++i)
@@ -1261,7 +1289,8 @@ struct Kernel {
                         mx::joint_matrix_fill(sg, fxs[i][j], 0);
                         for (int k = 0; k < FQ; ++k) acc64[i][j][k] = 0;
                     }
-                fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+                if constexpr (YSKN) yskn_tops(lid, lanes, row0, rows, m0, n0, ta, tw);
+                else fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
             }
 
             const int64_t kb = K / 32;   // activation scales a row
@@ -1346,9 +1375,14 @@ struct Kernel {
                                     sycl::group_barrier(sg);
                                     for (int k = 0; k < FQ; ++k) {
                                         const int q = lane + SG * k, rr = ms + i * TM + q / TN;
-                                        const int nn = ns + j * TN + q % TN;
-                                        acc64[i][j][k] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, nn),
-                                                                         ta[rr] + tw[nn]) * sti[q];
+                                        [[maybe_unused]] const int nn = ns + j * TN + q % TN;
+                                        if constexpr (YSKN)
+                                            acc64[i][j][k] += yskn::group_term(sti[q],
+                                                                               yskn::fixed_scale(xsl[b * WM + rr],
+                                                                                                 yskn::fixed_factor(ta[rr])));
+                                        else
+                                            acc64[i][j][k] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, nn),
+                                                                             ta[rr] + tw[nn]) * sti[q];
                                     }
                                     sycl::group_barrier(sg);
                                     mx::joint_matrix_fill(sg, fxs[i][j], 0);
@@ -1373,7 +1407,9 @@ struct Kernel {
                     for (int j = 0; j < SGN; ++j)
                         for (int k = 0; k < FQ; ++k) {
                             const int q = lane + SG * k, rr = ms + i * TM + q / TN, nn = ns + j * TN + q % TN;
-                            const float v = fx_out(acc64[i][j][k], ta[rr] + tw[nn]);
+                            float v;
+                            if constexpr (YSKN) v = yskn::finish(acc64[i][j][k], ta[rr], tw[nn]);
+                            else v = fx_out(acc64[i][j][k], ta[rr] + tw[nn]);
                             if (m0 + rr < rows) out(ks, row0 + m0 + rr, n0 + nn, v);
                         }
                 return;
@@ -1425,8 +1461,8 @@ struct Kernel {
             // FX: as intel_body, by the elements' positions
             [[maybe_unused]] int32_t isum[FX ? SGM : 1][FX ? SGN : 1][8];
             [[maybe_unused]] int64_t acc64[FX ? SGM : 1][FX ? SGN : 1][8];
-            [[maybe_unused]] int* ta = local_as<int>(base + FX_OFF).get();
-            [[maybe_unused]] int* tw = ta + WM;
+            [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
+            [[maybe_unused]] Top* tw = ta + WM;
             if constexpr (FX) {
                 for (int i = 0; i < SGM; ++i)
                     for (int j = 0; j < SGN; ++j)
@@ -1434,7 +1470,8 @@ struct Kernel {
                             isum[i][j][el] = 0;
                             acc64[i][j][el] = 0;
                         }
-                fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+                if constexpr (YSKN) yskn_tops(lid, lanes, row0, rows, m0, n0, ta, tw);
+                else fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
             }
 
             const int64_t kb = K / 32;   // activation scales a row
@@ -1498,26 +1535,38 @@ struct Kernel {
                     }
                     if constexpr (FX)
                         if ((k0 / 32 + b) % FXG == FXG - 1) {   // the group's sums into int64
-                            // fx_scale's parts, a row's and an output's apart: m = ma mw, s = (ea - ta + kFxHead) +
-                            // (ew - tw)
-                            uint32_t am[SGM][8];
-                            int as[SGM][8];
-                            for (int i = 0; i < SGM; ++i)
-                                for (int el = 0; el < 8; ++el) {
-                                    const canon::FxPart p = canon::fx_part(xsr[i][el]);
-                                    am[i][el] = p.m;
-                                    as[i][el] = p.e - ta[ms + i * TM + row_of(el)] + canon::kFxHead;
-                                }
-                            for (int j = 0; j < SGN; ++j) {
-                                const int nn = ns + j * TN + lo;
-                                const canon::FxPart wp = canon::fx_part(fx_wd(wsl, wml, b, nn));
-                                const int ws = wp.e - tw[nn];
+                            if constexpr (YSKN) {   // the 512-group's alpha to its fixed-point integer (yskn_sum.hpp)
+                                for (int j = 0; j < SGN; ++j)
+                                    for (int i = 0; i < SGM; ++i)
+                                        for (int el = 0; el < 8; ++el) {
+                                            const int rr = ms + i * TM + row_of(el);
+                                            acc64[i][j][el] += yskn::group_term(isum[i][j][el],
+                                                                                yskn::fixed_scale(xsr[i][el],
+                                                                                                  yskn::fixed_factor(ta[rr])));
+                                            isum[i][j][el] = 0;
+                                        }
+                            } else {
+                                // fx_scale's parts, a row's and an output's apart: m = ma mw, s = (ea - ta + kFxHead) +
+                                // (ew - tw)
+                                uint32_t am[SGM][8];
+                                int as[SGM][8];
                                 for (int i = 0; i < SGM; ++i)
                                     for (int el = 0; el < 8; ++el) {
-                                        acc64[i][j][el] += (int64_t) canon::fx_shift(am[i][el] * wp.m, as[i][el] + ws,
-                                                                                     wp.neg) * isum[i][j][el];
-                                        isum[i][j][el] = 0;
+                                        const canon::FxPart p = canon::fx_part(xsr[i][el]);
+                                        am[i][el] = p.m;
+                                        as[i][el] = p.e - ta[ms + i * TM + row_of(el)] + canon::kFxHead;
                                     }
+                                for (int j = 0; j < SGN; ++j) {
+                                    const int nn = ns + j * TN + lo;
+                                    const canon::FxPart wp = canon::fx_part(fx_wd(wsl, wml, b, nn));
+                                    const int ws = wp.e - tw[nn];
+                                    for (int i = 0; i < SGM; ++i)
+                                        for (int el = 0; el < 8; ++el) {
+                                            acc64[i][j][el] += (int64_t) canon::fx_shift(am[i][el] * wp.m, as[i][el] + ws,
+                                                                                         wp.neg) * isum[i][j][el];
+                                            isum[i][j][el] = 0;
+                                        }
+                                }
                             }
                         }
                     if constexpr (MIN)
@@ -1536,7 +1585,9 @@ struct Kernel {
                     for (int el = 0; el < 8; ++el) {
                         const int64_t row = m0 + ms + (int64_t) i * TM + row_of(el);
                         float v = acc[i][j][el];
-                        if constexpr (FX)
+                        if constexpr (YSKN)
+                            v = yskn::finish(acc64[i][j][el], ta[ms + i * TM + row_of(el)], tw[ns + j * TN + lo]);
+                        else if constexpr (FX)
                             v = fx_out(acc64[i][j][el], ta[ms + i * TM + row_of(el)] + tw[ns + j * TN + lo]);
                         if (row < rows) out(ks, row0 + row, cb, v);
                     }
@@ -2186,12 +2237,20 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
 sycl::event iq_mmq_yskn(sycl::queue& q, const void* w, int64_t w_rows, int64_t w_cols, const void* xq, const float* xs,
                         int64_t T, const int32_t* bounds, const int32_t* ids, float* dst, int64_t ld_dst,
                         const uint16_t* lut8, int bits, const float* tau) {
-    // the .yskn decode's DP4a product on the shared body (the YSKN sum rules): T rows (<= 16) of int8 activations xq
+    // the .yskn decode's product on the shared body (the YSKN sum rules): T rows (<= 16) of int8 activations xq
     // (yskn_act), xs the per-512 alpha replicated per 32, w the trellis codes in the row layout, dst the rotated-basis
-    // rows (yskn_rotate_out applies the output rotation after).  bounds {0, T}, ids the identity (one group)
+    // rows (yskn_rotate_out applies the output rotation after).  bounds {0, T}, ids the identity (one group).  The
+    // form is the device's (Intel's XMX, the joint_matrix / WMMA tiles, else DP4a), the 16-row tile (T <= 16)
     YsknDecCtx ctx{lut8, bits, (int) w_cols, tau};
-    return launch<kIqMmqYskn, 1, 1, true, false, 0, false>(q, w, nullptr, 0, 0, w_rows, w_cols, 1, xq, T, bounds, T,
-                                                           ids, dst, ld_dst, &ctx, xs);
+#define STRATA_YSKN_LAUNCH(DP4A, IS) \
+    launch<kIqMmqYskn, 1, 1, DP4A, false, IS, false>(q, w, nullptr, 0, 0, w_rows, w_cols, 1, xq, T, bounds, T, ids, \
+                                                     dst, ld_dst, &ctx, xs)
+    const int is = intel_shape_of(q);
+    if (is == 1) return STRATA_YSKN_LAUNCH(false, 1);
+    if (is == 2) return STRATA_YSKN_LAUNCH(false, 2);
+    if (iq_mmq_usable(q)) return STRATA_YSKN_LAUNCH(false, 0);
+    return STRATA_YSKN_LAUNCH(true, 0);
+#undef STRATA_YSKN_LAUNCH
 }
 
 void iq_mmq_choose_forms(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, int n) {
