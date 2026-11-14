@@ -523,27 +523,34 @@ void test_topk(void* s) {
     report("topk", (val == val_ref ? 0 : 1) + (tok == tok_ref ? 0 : 1), 0);
 }
 
-// The shared selector: a mapped tie is resolved by token ID, even across chunks.
+// The draft head selector: equal scores may choose any distinct IDs, including across chunks.
 void test_shared_topk(void* s) {
-    constexpr int n = 8193, count = 512;
+    constexpr int n = 8193;
     std::vector<float> v(n);
-    std::vector<int32_t> map(n), expected(n), got(count);
-    for (int i = 0; i < n; ++i) { v[(size_t) i] = (float) (i % 7); map[(size_t) i] = n - 1 - i; expected[(size_t) i] = i; }
-    std::sort(expected.begin(), expected.end(), [&](int a, int b) {
-        return v[(size_t) a] != v[(size_t) b] ? v[(size_t) a] > v[(size_t) b] : map[(size_t) a] < map[(size_t) b];
-    });
+    for (int i = 0; i < n; ++i) v[(size_t) i] = (float) (i % 257);
+    std::vector<float> expected = v;
+    std::sort(expected.begin(), expected.end(), std::greater<float>());
     parity::Device dev;
     const float* dv = dev.upload(v);
-    const int32_t* dm = dev.upload(map);
-    int32_t* ids = dev.alloc<int32_t>(count);
-    float* vals = dev.alloc<float>(count);
-    auto* scratch = dev.alloc<uint8_t>(k::topk_scratch_bytes(n, count));
-    k::topk_mapped(dv, dm, n, count, ids, vals, scratch, s);
-    parity::sync();
-    parity::copy_out(got.data(), ids, got.size());
-    int64_t bad = 0;
-    for (int i = 0; i < count; ++i) bad += got[(size_t) i] != map[(size_t) expected[(size_t) i]];
-    report("shared topk 512 ties", bad, 0);
+    for (int count : {1, 16, 64}) {
+        auto* ids = dev.alloc<int32_t>(count);
+        auto* scratch = dev.alloc<uint8_t>(k::topk_scratch_bytes(n, count));
+        k::topk(dv, n, count, ids, scratch, s);
+        parity::sync();
+        std::vector<int32_t> got((size_t) count);
+        parity::copy_out(got.data(), ids, got.size());
+        int64_t bad = 0;
+        std::vector<bool> seen(n, false);
+        for (int i = 0; i < count; ++i) {
+            const int id = got[(size_t) i];
+            if (id < 0 || id >= n || seen[(size_t) id]) { ++bad; continue; }
+            seen[(size_t) id] = true;
+            bad += v[(size_t) id] != expected[(size_t) i];
+        }
+        char name[64];
+        std::snprintf(name, sizeof name, "shared topk %d ties", count);
+        report(name, bad, 0);
+    }
 }
 
 void test_select(void* s, bool q4) {

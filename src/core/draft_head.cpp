@@ -164,7 +164,6 @@ bool DraftHeadInt2::build(int type, int64_t n_rows, int n_in, const std::functio
         return false;
     }
     k_ = candidates();
-    k::topk_probe(n_rows, k_, false);
     const size_t scratch = k::topk_scratch_bytes(n_rows, k_);
     scratch_ = gpu::alloc_device(scratch);
     if (scratch_ == nullptr || !gpu::alloc_device(&codes_, host.size()) || !gpu::alloc_device(&cand_, (size_t) k_ * 4) ||
