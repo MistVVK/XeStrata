@@ -200,6 +200,7 @@ def header(out: str, t4: dict, t5: dict) -> None:
             t = f"{v:.6g}"
             return (t if "." in t or "e" in t else t + ".0") + "f"
         return ", ".join(lit(v) for v in m)
+    # REUSE-IgnoreStart
     text = [
         "// SPDX-FileCopyrightText: 2026 the YASAKANI authors",
         "// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors",
@@ -218,6 +219,7 @@ def header(out: str, t4: dict, t5: dict) -> None:
         f"inline constexpr int16_t kCode5[256] = {{\n{emit(t5['code'])}\n}};",
         f"inline constexpr float kMult5[] = {{{mults(t5['mult'])}}};",
     ]
+    # REUSE-IgnoreEnd
     text += ["", "}  // namespace strata::kernels::tcq", ""]
     Path(out).write_text("\n".join(text))
 
