@@ -720,6 +720,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(ple_fp8_parity src/kernels/ple_fp8_parity.cpp)
     target_link_libraries(ple_fp8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
+elseif(STRATA_BUILD_TESTS)
+  # without the native experts (the cpu-check preset) there is no ggml, but the quant layer needs none: its own tests (quant_selftest,
+  # nvfp4_decode_model_test) are built and run here too; the ggml oracle tests (quant_parity and the benches against ggml-cpu) stay native-only
+  set(STRATA_QUANT_NO_GGML ON)
+  strata_quant_layer()
 endif()
 
 if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/hit_cpu_order_parity.cu")
