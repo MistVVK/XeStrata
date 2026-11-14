@@ -3215,7 +3215,7 @@ class Vision:
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
         self.max_tokens = self.token_limit(cfg)
         self.elastic = cfg.get("elastic") is True
-        self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
+        self.elastic_mib = self.elastic_ask_mib(cfg, self.max_tokens)
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         if not lazy and not self.elastic:
             self._start()
@@ -3224,6 +3224,15 @@ class Vision:
     # config without vision.max_tokens left the reader unclamped, and #3690 saw one picture become 93,700 image tokens (I7).  A key that is
     # there is the person's: 0 means no limit, as before.
     DEFAULT_MAX_TOKENS = {"gpu": 1024, "cpu": 300}
+
+    @staticmethod
+    def elastic_ask_mib(cfg: dict, max_tokens: int) -> int:
+        """The VRAM the expert cache keeps free for an elastic reader: the config's elastic_mib when the person set one, else the reader's
+        need at its image limit (strata_control/reader_room.py; 0 = no limit counts as 16,384), never below 2,048.  At the default limit of
+        1,024 tokens that is 2,048; at 16,384 it is 3,674 (a 2,048 ask left the encoder out of memory for one large picture on an RTX A6000)."""
+        if cfg.get("elastic_mib"):
+            return int(cfg["elastic_mib"])
+        return max(2048, math.ceil(reader_room.reader_needs_mib(max_tokens)))
 
     @staticmethod
     def token_limit(cfg: dict) -> int:
