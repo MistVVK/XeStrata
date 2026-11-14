@@ -18177,6 +18177,13 @@ int main(int argc, char** argv) {
                 const bool eq_one_gpu = pf_parts.size() == 1 && stages.empty() && !multi_gpu && !peer.valid() &&
                                         !o.prefill_head_alias && o.batch <= 1;
                 int64_t want_full = loan_chunk(tokens, planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk, eq_one_gpu));
+                // the equal chunk that kEqualMinChunk turned down (equal_cut_rule.hpp declined_equal; 0: none): kept below
+                // when today's cut, handed back for it, cannot be lent but the equal cut can (keep_equal)
+                int64_t pf_declined_eq = 0;
+                if (eq_one_gpu && equal_cut_one == strata::prefill::equal_cut::Cut::equal &&
+                    (pf_plan_chunk <= 0 || pf_plan_chunk >= o.prefill_chunk))
+                    pf_declined_eq = strata::prefill::equal_cut::declined_equal(tokens, o.prefill_chunk,
+                                                                                strata::prefill::Prefill::stream_all_min_tokens());
                 if (eq_one_gpu) {
                     const int64_t want_today = loan_chunk(tokens, planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk, false));
                     if (want_full != want_today && pf_parts[0].first >= 0) {
@@ -18245,6 +18252,23 @@ int main(int argc, char** argv) {
                         };
                         tail_p = tail_for(want_p);
                         int64_t need_p = part_slots(p, want_p, tail_p);
+                        int64_t want_cut = want;   // the chunk this request asked for (the equal one when keep_equal took it)
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                        if (pf_declined_eq > 0 && want == want_full) {
+                            const int64_t eq_w = loan_chunk(tokens, pf_declined_eq);
+                            const int64_t eq_tail = tail_for(eq_w);
+                            const int64_t eq_need = part_slots(p, eq_w, eq_tail);
+                            if (strata::prefill::equal_cut::keep_equal(need_p, eq_need, (int64_t) p.cache->slots() - (int64_t) g_lend_keep)) {
+                                std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: the old cut's "
+                                             "buffers do not fit the slots that can be lent, the equal cut's do\n",
+                                             (long long) want_p, (long long) eq_w);
+                                want_p = eq_w;
+                                want_cut = eq_w;
+                                tail_p = eq_tail;
+                                need_p = eq_need;
+                            }
+                        }
+#endif
                         while ((need_p <= 0 || need_p + g_lend_keep > p.cache->slots()) && want_p > 256) {
                             want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
                             tail_p = tail_for(want_p);
@@ -18254,9 +18278,9 @@ int main(int argc, char** argv) {
                             e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
                             return false;
                         }
-                        if (want_p != want)
+                        if (want_p != want_cut)
                             std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
-                                         "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
+                                         "buffers do not fit the slots that can be lent (#2090)\n", (long long) want_cut,
                                          (long long) want_p);
                         if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
                             std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
@@ -21381,6 +21405,21 @@ int main(int argc, char** argv) {
                 if (request_sized != request_today &&
                     !strata::prefill::equal_cut::loan_ok(lend_slots(request_sized), lend_slots(request_today)))
                     request_sized = request_today;
+                // today's cut handed back for a short equal chunk (equal_cut_rule.hpp declined_equal), but its loan does not
+                // fit while the equal cut's does: keep the equal cut (keep_equal)
+                const int64_t declined = equal_cut_one == strata::prefill::equal_cut::Cut::equal
+                                             ? strata::prefill::equal_cut::declined_equal(n_batched, chunk,
+                                                                                          strata::prefill::Prefill::stream_all_min_tokens())
+                                             : 0;
+                if (declined > 0) {
+                    const int64_t eq_sized = loan_chunk(n_batched, declined);
+                    if (strata::prefill::equal_cut::keep_equal(lend_slots(request_sized), lend_slots(eq_sized),
+                                                               (int64_t) xcache.slots() - (int64_t) g_lend_keep)) {
+                        std::fprintf(stderr, "strata generate: prompt chunk %lld -> %lld tokens: the old cut's buffers do not fit "
+                                     "the slots that can be lent, the equal cut's do\n", (long long) request_sized, (long long) eq_sized);
+                        request_sized = eq_sized;
+                    }
+                }
             }
 #else
             const int64_t request_sized = loan_chunk(n_batched, equal_chunk(n_batched, chunk));

@@ -65,7 +65,8 @@ int main() {
     CHECK(ec::equal_chunk(32000, 10240, F) == 8000 && cut_of(32000, 8000).n == 4 && cut_of(32000, 8000).lo == 8000);
     CHECK(ec::equal_chunk(14000, 10240, F) == 7000 && cut_of(14000, 7000).n == 2);
     CHECK(ec::equal_chunk(20000, 9984, F) == 6667 && cut_of(20000, 6667).n == 3 && cut_of(20000, 6667).last == 6666);
-    CHECK(ec::equal_chunk(10500, 10240, F) == 5250 && cut_of(10500, 5250).n == 2);
+    // 2 x 5,250 is under kEqualMinChunk at a 10,240 chunk: today's 10,240 + 260 (before the kEqualMinChunk rule: 5,250)
+    CHECK(ec::equal_chunk(10500, 10240, F) == 10240 && ec::declined_equal(10500, 10240, F) == 5250);
     CHECK(ec::equal_chunk(20000, 10240, F) == 10000);
     CHECK(ec::equal_chunk(22980, 10240, F) == 7660);
     CHECK(ec::equal_chunk(18932, 10240, F) == 9466);
@@ -76,7 +77,26 @@ int main() {
         CHECK(ec::equal_chunk(t, 10240, F) == ec::today_chunk(t, 10240));
     CHECK(ec::equal_chunk(8000, 10240, F) == 8192);
     CHECK(ec::equal_chunk(10240, 10240, F) == 10240);
-    CHECK(ec::equal_chunk(10241, 10240, F) == 5121);
+    CHECK(ec::equal_chunk(10241, 10240, F) == 10240);      // 2 x 5,121 is short: today's 10,240 + 1 (before: 5,121)
+    // ---- kEqualMinChunk (RTX 4090 24 GB, IQ3_S, chunk 8,192): an equal chunk under 6,144 keeps today's cut
+    CHECK(ec::equal_chunk(8279, 8192, 3072) == 8192 && ec::declined_equal(8279, 8192, 3072) == 4140);    // 8,192 + 87
+    CHECK(ec::equal_chunk(11192, 8192, 3072) == 8192 && ec::declined_equal(11192, 8192, 3072) == 5596);  // 8,192 + 3,000
+    CHECK(ec::equal_chunk(16884, 8192, 3072) == 8192 && ec::declined_equal(16884, 8192, 3072) == 5628);  // 8,192 x 2 + 500
+    CHECK(ec::equal_chunk(20000, 8192, 3072) == 6667 && ec::declined_equal(20000, 8192, 3072) == 0);     // 3 x 6,667 stays
+    CHECK(ec::equal_chunk(32000, 8192, 3072) == 8000 && ec::declined_equal(32000, 8192, 3072) == 0);     // 4 x 8,000 stays
+    CHECK(ec::equal_chunk(12288, 8192, 3072) == 6144 && ec::declined_equal(12288, 8192, 3072) == 0);
+    CHECK(ec::equal_chunk(12287, 8192, 3072) == 6144);     // ceil(12,287 / 2) = 6,144: at the limit, equal
+    CHECK(ec::equal_chunk(12286, 8192, 3072) == 8192);     // 6,143: short, today's 8,192 + 4,094
+    // a configured chunk under 8,192 keeps the rule as before (4,096: 2 x 3,500 stays equal)
+    CHECK(ec::equal_chunk(7000, 4096, 3072) == 3500 && ec::declined_equal(7000, 4096, 3072) == 0);
+    CHECK(!ec::short_equal(3500, 4096) && ec::short_equal(6143, 8192) && !ec::short_equal(6144, 8192));
+    // ---- keep_equal: today's cut was handed back but cannot be lent; the equal cut can (no GPU needed)
+    CHECK(ec::keep_equal(900, 700, 800));                  // today's loan over the room, the equal one under it: keep equal
+    CHECK(ec::keep_equal(0, 700, 800));                    // today's cannot be laid out at all
+    CHECK(!ec::keep_equal(700, 600, 800));                 // today's fits: today's cut
+    CHECK(!ec::keep_equal(900, 850, 800));                 // neither fits: today's cut, halved by the caller (#2090)
+    CHECK(!ec::keep_equal(900, 0, 800));                   // the equal one cannot be laid out
+    CHECK(ec::keep_equal(801, 800, 800) && !ec::keep_equal(800, 800, 800));   // the room is inclusive
     // ---- the cases the change is for: today's cut leaves a short tail under the floor, the equal cut evens it out
     CHECK(ec::today_chunk(20932, 10240) == 10240 && cut_of(20932, 10240).last == 452);   // today: 10,240 x 2 + 452
     CHECK(cut_of(20932, ec::equal_chunk(20932, 10240, F)).n == 3 && cut_of(20932, ec::equal_chunk(20932, 10240, F)).lo >= 6976);
