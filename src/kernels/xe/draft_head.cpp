@@ -4,10 +4,16 @@
 #include "strata/kernels/draft_head.hpp"
 
 #include "strata/core/runtime.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -26,6 +32,7 @@ constexpr int kTopWG = 256, kTopPer = 16, kTopChunk = kTopWG * kTopPer;   // top
 // One stage of topk: each work-group the k largest of its kTopChunk of the `n` values (their indices `ids_in[i]`, or
 // i without), into out_v / out_i at k a group.  Each work-item holds kTopPer of them; the group's reductions pick one
 // a turn, so no local memory and no barrier of its own.
+template <bool Stable>
 sycl::event topk_stage(sycl::queue& q, const float* v, const int32_t* ids_in, int64_t n, int k, float* out_v,
                        int32_t* out_i) {
     const int64_t groups = (n + kTopChunk - 1) / kTopChunk;
@@ -45,21 +52,163 @@ sycl::event topk_stage(sycl::queue& q, const float* v, const int32_t* ids_in, in
             float best = kNone;
             int slot = -1;
 #pragma unroll
-            for (int i = 0; i < kTopPer; ++i)
-                if (id[i] >= 0 && (slot < 0 || val[i] > best)) { best = val[i]; slot = i; }
+            for (int i = 0; i < kTopPer; ++i) {
+                if (id[i] < 0) continue;
+                if (slot < 0 || val[i] > best || (Stable && val[i] == best && id[i] < id[slot])) {
+                    best = val[i]; slot = i;
+                }
+            }
             const float top = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<float>());
-            // the lowest work-item holding it gives it up, so one value leaves the chunk each turn
-            const int who = sycl::reduce_over_group(it.get_group(), slot >= 0 && best == top ? t : kTopWG,
-                                                    sycl::minimum<int>());
-            if (t == who) {
-                out_v[g * k + j] = top;
-                out_i[g * k + j] = id[slot];
-                id[slot] = -1;
-            } else if (who == kTopWG && t == 0) {   // fewer than k values in the chunk
-                out_v[g * k + j] = kNone;
-                out_i[g * k + j] = -1;
+            if constexpr (Stable) {
+                const int winner = sycl::reduce_over_group(it.get_group(), slot >= 0 && best == top ? id[slot] : INT32_MAX,
+                                                           sycl::minimum<int>());
+                if (slot >= 0 && id[slot] == winner) {
+                    out_v[g * k + j] = top; out_i[g * k + j] = winner; id[slot] = -1;
+                } else if (winner == INT32_MAX && t == 0) {
+                    out_v[g * k + j] = kNone; out_i[g * k + j] = -1;
+                }
+            } else {
+                // The original draft-head path: equal values go to the lowest work-item, not the lowest ID.
+                const int who = sycl::reduce_over_group(it.get_group(), slot >= 0 && best == top ? t : kTopWG,
+                                                        sycl::minimum<int>());
+                if (t == who) {
+                    out_v[g * k + j] = top; out_i[g * k + j] = id[slot]; id[slot] = -1;
+                } else if (who == kTopWG && t == 0) {
+                    out_v[g * k + j] = kNone; out_i[g * k + j] = -1;
+                }
             }
         }
+    });
+}
+
+// Devices that cannot launch 256 work-items keep the same 4096-value chunks and exact tie rule. The local taken
+// flags replace the fast form's per-thread register list; this path is not yet speed-measured.
+sycl::event topk_stage_small(sycl::queue& q, const float* v, const int32_t* ids_in, int64_t n, int k, float* out_v,
+                             int32_t* out_i, int wg) {
+    const int64_t groups = (n + kTopChunk - 1) / kTopChunk;
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint8_t, 1> taken(kTopChunk, h);
+        h.parallel_for(sycl::nd_range<1>((size_t) groups * wg, (size_t) wg), [=](sycl::nd_item<1> it) {
+            const int64_t g = (int64_t) it.get_group(0), base = g * kTopChunk;
+            const int t = (int) it.get_local_id(0);
+            auto group = it.get_group();
+            for (int i = t; i < kTopChunk; i += wg) {
+                const int64_t at = base + i;
+                taken[i] = at >= n || (ids_in != nullptr && ids_in[at] < 0);
+            }
+            sycl::group_barrier(group);
+            for (int j = 0; j < k; ++j) {
+                float best = -std::numeric_limits<float>::infinity();
+                int id = INT32_MAX;
+                for (int i = t; i < kTopChunk; i += wg) {
+                    if (taken[i]) continue;
+                    const int64_t at = base + i;
+                    const int next = ids_in ? ids_in[at] : (int) at;
+                    const float value = v[at];
+                    if (value > best || (value == best && next < id)) { best = value; id = next; }
+                }
+                const float top = sycl::reduce_over_group(group, best, sycl::maximum<float>());
+                const int winner = sycl::reduce_over_group(group, best == top ? id : INT32_MAX, sycl::minimum<int>());
+                if (t == 0) { out_v[g * k + j] = top; out_i[g * k + j] = winner == INT32_MAX ? -1 : winner; }
+                if (winner != INT32_MAX)
+                    for (int i = t; i < kTopChunk; i += wg) {
+                        if (taken[i]) continue;
+                        const int64_t at = base + i;
+                        if ((ids_in ? ids_in[at] : (int) at) == winner) taken[i] = 1;
+                    }
+                sycl::group_barrier(group);
+            }
+        });
+    });
+}
+
+// A tile holds twice the largest supported k. All scratch indices are input offsets, including with an ID map.
+constexpr int kWideTile = 1024;
+using TopKey = std::tuple<int, int64_t, int, bool>;
+std::mutex top_mutex;
+std::map<TopKey, bool> top_choices;
+thread_local int top_override = -1;
+
+int top_mode() {
+    const char* exact = strata::env_get("EXACT");
+    if (exact && std::strcmp(exact, "1") == 0) return 1;
+    const char* mode = strata::env_get("DRAFT_TOPK");
+    if (!mode || !*mode || std::strcmp(mode, "auto") == 0) return -1;
+    if (std::strcmp(mode, "wide") == 0) return 1;
+    if (std::strcmp(mode, "reduction") == 0) return 0;
+    throw std::invalid_argument("XESTRATA_DRAFT_TOPK must be auto, wide or reduction");
+}
+
+sycl::event topk_wide(sycl::queue& q, const float* v, const int32_t* map, int64_t n, int k, int32_t* ids,
+                      float* values, void* scratch, int wg) {
+    const int chunks = (int) ((n - 1) / kWideTile + 1);
+    int32_t* src = static_cast<int32_t*>(scratch);
+    int32_t* dst = src + (size_t) chunks * k;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> score(kWideTile, h);
+        sycl::local_accessor<int32_t, 1> index(kWideTile, h);
+        h.parallel_for(sycl::nd_range<1>((size_t) chunks * wg, (size_t) wg), [=](sycl::nd_item<1> it) {
+            const int chunk = (int) it.get_group(0), t = (int) it.get_local_id(0);
+            const auto group = it.get_group();
+            for (int i = t; i < kWideTile; i += wg) {
+                const int64_t at = (int64_t) chunk * kWideTile + i;
+                index[i] = at < n ? (int32_t) at : INT32_MAX;
+                score[i] = at < n ? v[at] : -std::numeric_limits<float>::infinity();
+            }
+            sycl::group_barrier(group);
+            for (int span = 2; span <= kWideTile; span *= 2) {
+                for (int stride = span / 2; stride > 0; stride /= 2) {
+                    for (int i = t; i < kWideTile; i += wg) {
+                        const int j = i ^ stride;
+                        if (j <= i) continue;
+                        const int ii = index[i], jj = index[j];
+                        const int ki = ii == INT32_MAX ? INT32_MAX : map ? map[ii] : ii;
+                        const int kj = jj == INT32_MAX ? INT32_MAX : map ? map[jj] : jj;
+                        const bool j_better = score[j] > score[i] || (score[j] == score[i] && kj < ki);
+                        const bool i_better = score[i] > score[j] || (score[i] == score[j] && ki < kj);
+                        if (((i & span) == 0 && j_better) || ((i & span) != 0 && i_better)) {
+                            const float tmp = score[i]; score[i] = score[j]; score[j] = tmp;
+                            index[i] = jj; index[j] = ii;
+                        }
+                    }
+                    sycl::group_barrier(group);
+                }
+            }
+            for (int i = t; i < k; i += wg) src[(size_t) chunk * k + i] = index[i];
+        });
+    });
+    int lists = chunks;
+    while (lists > 1) {
+        const int next = (lists + 1) / 2;
+        const size_t work = (size_t) next * 2 * k;
+        q.parallel_for(sycl::nd_range<1>(((work + wg - 1) / wg) * wg, (size_t) wg), [=](sycl::nd_item<1> it) {
+            const size_t j = it.get_global_id(0);
+            if (j >= work) return;
+            const int pair = (int) (j / (2 * k)), item = (int) (j % (2 * k));
+            const int side = item / k, row = item % k, left = pair * 2, right = left + 1;
+            int32_t* out = dst + (size_t) pair * k;
+            if (right >= lists) { if (side == 0) out[row] = src[(size_t) left * k + row]; return; }
+            const int ix = src[(size_t) (left + side) * k + row];
+            if (ix == INT32_MAX) return;
+            const float value = v[ix];
+            const int id = map ? map[ix] : ix;
+            const int32_t* other = src + (size_t) (left + 1 - side) * k;
+            int lo = 0, hi = k;
+            while (lo < hi) {
+                const int mid = (lo + hi) / 2, ox = other[mid];
+                const float ov = ox == INT32_MAX ? -std::numeric_limits<float>::infinity() : v[ox];
+                const int oid = ox == INT32_MAX ? INT32_MAX : map ? map[ox] : ox;
+                if (ov > value || (ov == value && oid < id)) lo = mid + 1; else hi = mid;
+            }
+            if (row + lo < k) out[row + lo] = ix;
+        });
+        lists = next;
+        int32_t* swap = src; src = dst; dst = swap;
+    }
+    return q.parallel_for(sycl::range<1>((size_t) k), [=](sycl::id<1> p) {
+        const int ix = src[p[0]];
+        ids[p[0]] = ix == INT32_MAX ? -1 : map ? map[ix] : ix;
+        if (values) values[p[0]] = ix == INT32_MAX ? -std::numeric_limits<float>::infinity() : v[ix];
     });
 }
 
@@ -143,24 +292,51 @@ void int2_gemv(const uint8_t* w, const float* x, float* y, int n_in, int64_t n_o
 std::size_t topk_scratch_bytes(int64_t n, int k) {
     // the first stage's candidates at most, twice (the stages go back and forth), values and indices
     const int64_t c = ((n + kTopChunk - 1) / kTopChunk) * k;
-    return (std::size_t) (2 * c) * (sizeof(float) + sizeof(int32_t));
+    const size_t narrow = (std::size_t) (2 * c) * (sizeof(float) + sizeof(int32_t));
+    const size_t wide = (size_t) 2 * ((n - 1) / kWideTile + 1) * k * sizeof(int32_t);
+    return std::max(narrow, wide);
 }
 
-void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* stream) {
-    if (k < 1 || k > kTopKMax || n < 1) throw std::invalid_argument("topk: k is 1 to 64 and n positive");
+void topk_mapped(const float* v, const int32_t* id_map, int64_t n, int k, int32_t* ids, float* values,
+                 void* scratch, void* stream) {
+    if (k < 1 || k > kTopKSelectionMax || n < 1 || n > INT32_MAX)
+        throw std::invalid_argument("topk: invalid k or input length");
     auto& q = Q(stream);
+    const auto dev = q.get_device();
+    const size_t limit = std::min(dev.get_info<sycl::info::device::max_work_group_size>(),
+                                  dev.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]);
+    int wg = 1;
+    while ((size_t) wg * 2 <= limit && wg < kTopWG) wg *= 2;
+    const size_t local = dev.get_info<sycl::info::device::local_mem_size>();
+    int mode = top_override >= 0 ? top_override : top_mode();
+    if (mode < 0) {
+        std::lock_guard<std::mutex> lock(top_mutex);
+        const auto it = top_choices.find({core::Runtime::get().ordinal(), n, k, id_map != nullptr});
+        mode = it == top_choices.end() ? (n >= k && local >= kWideTile * 8) : (int) it->second;
+    }
+    if (mode && (n < k || local < kWideTile * (sizeof(float) + sizeof(int32_t))))
+        throw std::runtime_error("topk: wide selection needs n >= k and 8192 bytes of local memory");
+    if (mode) {
+        const auto e = topk_wide(q, v, id_map, n, k, ids, values, scratch, wg);
+        done(stream, e, "topk");
+        return;
+    }
+    if (wg < kTopWG && dev.get_info<sycl::info::device::local_mem_size>() < kTopChunk)
+        throw std::runtime_error("topk: the device cannot hold the selection flags");
     const int64_t cap = ((n + kTopChunk - 1) / kTopChunk) * k;   // topk_scratch_bytes' room for one side
     auto* fv = static_cast<float*>(scratch);
     auto* fi = reinterpret_cast<int32_t*>(fv + 2 * cap);
     float* bv[2] = {fv, fv + cap};
     int32_t* bi[2] = {fi, fi + cap};
     const float* in_v = v;
-    const int32_t* in_i = nullptr;
+    const int32_t* in_i = id_map;
     int side = 0;
     sycl::event e;
     while (true) {
         const int64_t groups = (n + kTopChunk - 1) / kTopChunk;
-        e = topk_stage(q, in_v, in_i, n, k, bv[side], bi[side]);
+        e = wg == kTopWG ? (id_map ? topk_stage<true>(q, in_v, in_i, n, k, bv[side], bi[side])
+                                      : topk_stage<false>(q, in_v, in_i, n, k, bv[side], bi[side]))
+                         : topk_stage_small(q, in_v, in_i, n, k, bv[side], bi[side], wg);
         n = groups * k;
         in_v = bv[side];
         in_i = bi[side];
@@ -168,7 +344,67 @@ void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* s
         if (groups == 1) break;
     }
     e = q.memcpy(ids, in_i, (size_t) k * sizeof(int32_t));
+    if (values) e = q.memcpy(values, in_v, (size_t) k * sizeof(float));
     done(stream, e, "topk");
+}
+
+void topk_probe(int64_t n, int k, bool mapped) {
+    if (top_mode() >= 0) return;
+    if (n < k || k < 1 || k > kTopKSelectionMax || n > INT32_MAX)
+        throw std::invalid_argument("topk_probe: invalid shape");
+    auto& runtime = core::Runtime::get();
+    const TopKey key{runtime.ordinal(), n, k, mapped};
+    {
+        std::lock_guard<std::mutex> lock(top_mutex);
+        if (top_choices.count(key)) return;
+    }
+    auto& q = runtime.compute();
+    if (q.get_device().get_info<sycl::info::device::local_mem_size>() < kWideTile * 8) {
+        std::lock_guard<std::mutex> lock(top_mutex);
+        top_choices[key] = false;
+        return;
+    }
+    float* input = sycl::malloc_device<float>((size_t) n, q);
+    int32_t* map = mapped ? sycl::malloc_device<int32_t>((size_t) n, q) : nullptr;
+    int32_t* ids = sycl::malloc_device<int32_t>((size_t) k, q);
+    void* scratch = sycl::malloc_device(topk_scratch_bytes(n, k), q);
+    auto release = [&] {
+        if (input) sycl::free(input, q);
+        if (map) sycl::free(map, q);
+        if (ids) sycl::free(ids, q);
+        if (scratch) sycl::free(scratch, q);
+    };
+    if (!input || (mapped && !map) || !ids || !scratch) { release(); throw std::bad_alloc(); }
+    try {
+        q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+            input[i] = (float)((i[0] * 7919) % 104729);
+            if (map) map[i] = (int32_t) i[0];
+        }).wait_and_throw();
+        auto run = [&](int mode) {
+            top_override = mode;
+            topk_mapped(input, map, n, k, ids, nullptr, scratch, &q);
+            q.wait_and_throw();
+        };
+        run(0); run(1);  // compile and warm both before timing
+        double elapsed[2] = {};
+        for (int i = 0; i < 4; ++i) {
+            const int mode = i == 0 || i == 3 ? 0 : 1;
+            const auto start = std::chrono::steady_clock::now();
+            run(mode);
+            elapsed[mode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        }
+        top_override = -1;
+        // A difference within 5% is treated as a tie in favour of the wide path; verify on the three GPUs.
+        const bool wide = elapsed[1] <= elapsed[0] * 1.05;
+        { std::lock_guard<std::mutex> lock(top_mutex); top_choices[key] = wide; }
+        std::fprintf(stderr, "topk: n=%lld k=%d mapped=%d reduction=%.3f wide=%.3f ms, %s\n",
+                     (long long) n, k, (int) mapped, elapsed[0] * 500, elapsed[1] * 500, wide ? "wide" : "reduction");
+    } catch (...) { top_override = -1; release(); throw; }
+    release();
+}
+
+void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* stream) {
+    topk_mapped(v, nullptr, n, k, ids, nullptr, scratch, stream);
 }
 
 void int2_pad_from(const int32_t* pos, int32_t from, float* y, int64_t n, void* stream) {

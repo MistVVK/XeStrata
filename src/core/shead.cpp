@@ -7,6 +7,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/shead.hpp"
+#include "strata/kernels/draft_head.hpp"
 #include "strata/kernels/window_limits.hpp"
 
 #include <algorithm>
@@ -65,7 +66,7 @@ bool Shead::load(const std::string& path, int device, int vocab, int hidden, int
     };
     if (!alloc(&bt_, bt) || !alloc(&a_, ab) || !alloc(&as_, scales) || !alloc(&w_, wb) || !alloc(&ws_, scales) ||
         !alloc(&q_, r * rank * 4) || !alloc(&score_, r * v * 4) || !alloc(&candidates_, r * 512 * 4) ||
-        !alloc(&exact_, r * 512 * 4) || !alloc(&sort_tmp_, 2 * r * ((v + 1023) / 1024) * 512 * 4)) {
+        !alloc(&exact_, r * 512 * 4) || !alloc(&sort_tmp_, r * kernels::topk_scratch_bytes(vocab, 512))) {
         err = "shead: buffers do not fit"; release(); return false;
     }
     std::vector<char> stage(4u << 20);
@@ -80,6 +81,8 @@ bool Shead::load(const std::string& path, int device, int vocab, int hidden, int
     if (!upload(bt_, bt) || !upload(a_, ab) || !upload(as_, scales) || !upload(w_, wb) || !upload(ws_, scales)) {
         err = "shead: file read or device upload failed"; release(); return false;
     }
+    kernels::topk_probe(vocab, 512, false);
+    kernels::topk_probe(512, 16, true);
     vocab_ = vocab; hidden_ = hidden; rank_ = (int) rank; max_rows_ = max_rows;
     return true;
 }

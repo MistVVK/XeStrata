@@ -109,8 +109,6 @@ Every copyright holder whose work is in this repository, its license and where t
   The YD1S static draft table (include/strata/spec/static_drafter.hpp, src/spec/static_drafter.cpp) is written after
   YASAKANI's specx.cpp. It stays under Apache-2.0; these files as a whole are under the LGPL
   (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt.
-  The adaptive DFlash2 block-width rule (include/strata/spec/df2_block_policy.hpp) is written after that same source.
-  It stays under Apache-2.0; the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0).
   The .yskn models' container reader and reference products (include/strata/artifact/yskn.hpp,
   src/artifact/yskn.cpp), integer sums, the trellis state window the readers share
   (include/strata/kernels/trellis.hpp) and GPU products (include/strata/kernels/yskn.hpp, src/kernels/xe/yskn.cpp,

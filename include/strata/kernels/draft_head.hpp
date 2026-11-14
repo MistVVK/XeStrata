@@ -26,14 +26,23 @@ void int2_pack_rows(const float* rows, int64_t n_rows, int n_in, uint8_t* out);
 void int2_gemv(const uint8_t* w, const float* x, float* y, int n_in, int64_t n_out, void* stream);
 
 /// The largest topk_max values a call can choose.
-constexpr int kTopKMax = 64;
+constexpr int kTopKMax = 64;   ///< the int2 draft head's configured candidate limit
+constexpr int kTopKSelectionMax = 512;   ///< the shared selector's limit
 
 /// The scratch topk needs for `n` values.
 std::size_t topk_scratch_bytes(int64_t n, int k);
 
-/// The indices of the `k` (1..kTopKMax) largest of the `n` values in `v`, in no order, into `ids`.  Device pointers;
+/// Measure both paths once per device and shape before graph capture. No disk cache.
+void topk_probe(int64_t n, int k, bool mapped);
+
+/// The indices of the `k` (1..kTopKSelectionMax) largest of the `n` values in `v`, into `ids`. The existing small-k
+/// path keeps its work-item tie rule; the wide path breaks ties by index. Device pointers;
 /// `scratch` holds topk_scratch_bytes(n, k).
 void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* stream);
+/// The same selection with an optional input ID map and optional output values. IDs must be distinct and nonnegative;
+/// ties go to the lower mapped ID.
+void topk_mapped(const float* v, const int32_t* id_map, int64_t n, int k, int32_t* ids, float* values,
+                 void* scratch, void* stream);
 
 /// y[0..n) = -1.7e38 (a probability of 0) when the device value *pos is `from` or more, else nothing: a decision the
 /// device makes, so a captured graph takes it at every replay.

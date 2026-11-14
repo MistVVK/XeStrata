@@ -52,7 +52,6 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/spec/draft_probe.hpp"
-#include "strata/spec/df2_block_policy.hpp"
 #include "strata/spec/drafter_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/static_drafter.hpp"
@@ -1517,9 +1516,9 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             ? probe_arms[(size_t) std::max(req_probe, 0)].static_table : static_selected);
         const int req_block = probe_running && req_probe >= -1
             ? probe_arms[(size_t) std::max(req_probe, 0)].block : block_selected;
-        strata::spec::Df2BlockPolicy block_policy(req_block == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
-                                                  : req_block == 2 ? strata::spec::Df2BlockPolicy::Mode::Adaptive
-                                                                   : strata::spec::Df2BlockPolicy::Mode::Short);
+        // The same speed learner that chooses a drafter also compares the two DFlash2 block shapes per round.
+        strata::spec::DrafterPolicy block_policy(1, false);
+        Clock::time_point d2_started;
         if (req_spec_cap > 0 && !req_df2 && model.drafts() > 0) model.set_mtp_drafts(req_spec_cap - 1);
         if (req_prefill && (geni || ids.size() < 2 || admit_slot >= 0)) {
             std::printf("ERR prefill=1 needs a text prompt of at least 2 tokens and no batch slot\n");
@@ -2287,10 +2286,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     ok = false;
                     break;
                 }
-                if (d2_have && !static_window && n_ext == d2_width - 1 && n_emit <= n_ext + 1 &&
-                    produced + n_emit < max_new &&
-                    std::find(eos.begin(), eos.end(), out[(size_t) n_emit - 1]) == eos.end())
-                    block_policy.observe(d2_width, n_emit - 1);
+                if (req_block == 2 && d2_have && !static_window && produced + n_emit < max_new &&
+                    std::find(eos.begin(), eos.end(), out[(size_t) n_emit - 1]) == eos.end()) {
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - d2_started).count();
+                    block_policy.observe(0, 0, d2_width == strata::kernels::kWindowMaxT
+                                                ? strata::spec::DrafterPolicy::Df2 : strata::spec::DrafterPolicy::Mtp,
+                                         n_emit, ms);
+                }
                 // the window's committed rows: the pending token and the accepted drafts; the token after them anchors
                 // the next block
                 int32_t rows[strata::core::Dflash2Drafter::kMaxRows + 1];
@@ -2300,8 +2302,11 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 const bool ends = produced + n_emit >= max_new ||
                                   std::find(eos.begin(), eos.end(), out[(size_t) n_emit - 1]) != eos.end();
                 if (!ends) {
-                    d2_width = block_policy.choose(dr.window);
+                    const bool wide = dr.window >= strata::kernels::kWindowMaxT &&
+                        (req_block == 1 || (req_block == 2 && block_policy.choose(0, 0, true) == strata::spec::DrafterPolicy::Df2));
+                    d2_width = wide ? strata::kernels::kWindowMaxT : strata::kernels::kVerifyNarrowT;
                     if (!dr.is_bdraft) dr.df2.set_block_rows(d2_width);
+                    d2_started = Clock::now();
                     if (!dr.draft(model.tap_dev(), n_emit, p0, out[(size_t) n_emit - 1], d2, d2p, err)) {
                         ok = false;
                         break;

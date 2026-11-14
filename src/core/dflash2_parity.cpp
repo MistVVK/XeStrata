@@ -6,6 +6,7 @@
 // summation order; the attention's planar output within one quantization step; the top-k and the selector's picks
 // exactly.  Skipped (77) without a GPU.
 #include "strata/kernels/dflash2.hpp"
+#include "strata/kernels/draft_head.hpp"
 #include "../kernels/parity_device.hpp"
 
 #include <algorithm>
@@ -522,6 +523,29 @@ void test_topk(void* s) {
     report("topk", (val == val_ref ? 0 : 1) + (tok == tok_ref ? 0 : 1), 0);
 }
 
+// The shared selector also supplies SHEAD: a mapped tie is resolved by token ID, even across chunks.
+void test_shared_topk(void* s) {
+    constexpr int n = 8193, count = 512;
+    std::vector<float> v(n);
+    std::vector<int32_t> map(n), expected(n), got(count);
+    for (int i = 0; i < n; ++i) { v[(size_t) i] = (float) (i % 7); map[(size_t) i] = n - 1 - i; expected[(size_t) i] = i; }
+    std::sort(expected.begin(), expected.end(), [&](int a, int b) {
+        return v[(size_t) a] != v[(size_t) b] ? v[(size_t) a] > v[(size_t) b] : map[(size_t) a] < map[(size_t) b];
+    });
+    parity::Device dev;
+    const float* dv = dev.upload(v);
+    const int32_t* dm = dev.upload(map);
+    int32_t* ids = dev.alloc<int32_t>(count);
+    float* vals = dev.alloc<float>(count);
+    auto* scratch = dev.alloc<uint8_t>(k::topk_scratch_bytes(n, count));
+    k::topk_mapped(dv, dm, n, count, ids, vals, scratch, s);
+    parity::sync();
+    parity::copy_out(got.data(), ids, got.size());
+    int64_t bad = 0;
+    for (int i = 0; i < count; ++i) bad += got[(size_t) i] != map[(size_t) expected[(size_t) i]];
+    report("shared topk 512 ties", bad, 0);
+}
+
 void test_select(void* s, bool q4) {
     const int rows = 7, rank = 256, vocab = 4096;
     std::vector<float> hp((size_t) rows * rank), unary((size_t) rows * k::kDf2TopK);
@@ -659,6 +683,7 @@ int main() {
     test_attention(s, k::kDf2Rows);
     test_attention(s, 16);
     test_topk(s);
+    test_shared_topk(s);
     test_select(s, false);
     test_select(s, true);
     test_taps(s);

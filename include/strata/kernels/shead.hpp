@@ -10,7 +10,8 @@ namespace strata::kernels {
 
 // The caller owns the device buffers. bt [rank][hidden] is FP32; a [vocab][rank] and w [vocab][hidden] are signed
 // int8 with the row scales as and ws. h [rows][hidden] is FP32. Work: q [rows][rank], score [rows][vocab],
-// candidates and exact [rows][512], and sort_tmp [2][rows][ceil(vocab / 1024)][512]. Output: top_id and top_value [rows][16], descending with token-id tie breaks.
+// candidates and exact [rows][512]; sort_tmp is rows * topk_scratch_bytes(vocab, 512) bytes. Output: top_id and
+// top_value [rows][16], descending with token-id tie breaks.
 // The model's .shead must match its tokenizer and drafter. Its rows are not interchangeable with a DFlash2 head.
 void shead_top512(const float* h, const float* bt, const int8_t* a, const float* as, const int8_t* w,
                   const float* ws, int rows, int hidden, int rank, int vocab, float* q, float* score,
