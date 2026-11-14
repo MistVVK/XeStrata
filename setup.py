@@ -1112,71 +1112,11 @@ def ram_gb():
     return total
 
 
-def _cgroup_levels(root, group):
-    """The cgroup directories from the mount `root` down to `group` ("/a/b"), cut at the first one that is not there
-    (a container without its own cgroup namespace sees its host path, but only its own subtree under the mount)."""
-    levels = [root]
-    at = root
-    for part in [p for p in group.split("/") if p]:
-        if part in (".", ".."):
-            return []
-        at = os.path.join(at, part)
-        if not os.path.isdir(at):
-            break
-        levels.append(at)
-    return levels if os.path.isdir(root) else []
-
-
-def _cgroup_number(path, v1=False):
-    """A cgroup limit file: its number of bytes, or None for "max", an absent or unreadable file, or v1's "unlimited"."""
-    try:
-        with open(path) as stream:
-            text = stream.read().strip()
-    except OSError:
-        return None
-    if not text.isdigit():
-        return None
-    value = int(text)
-    if v1 and value >= 1 << 62:
-        return None
-    return value
-
-
 def _cgroup_memory_limit(self_cgroup="/proc/self/cgroup", root="/sys/fs/cgroup"):
     """The smallest memory limit (bytes) on this process's cgroup and its ancestors, as the engine's memory guard reads
-    it: cgroup v2 memory.max and memory.high, or cgroup v1 memory.limit_in_bytes when there is no v2 memory controller.
-    None when no level sets a limit or the files cannot be read."""
-    try:
-        with open(self_cgroup) as stream:
-            lines = stream.read().splitlines()
-    except OSError:
-        lines = ["0::/"]
-    v2_group = v1_group = None
-    for line in lines:
-        parts = line.split(":", 2)
-        if len(parts) != 3:
-            continue
-        if parts[0] == "0" and parts[1] == "":
-            v2_group = parts[2]
-        elif "memory" in parts[1].split(","):
-            v1_group = parts[2]
-    limits = []
-    v2_files = False
-    if v2_group is not None:
-        for level in _cgroup_levels(root, v2_group):
-            if not os.path.exists(os.path.join(level, "memory.current")):
-                continue
-            v2_files = True
-            for name in ("memory.max", "memory.high"):
-                value = _cgroup_number(os.path.join(level, name))
-                if value is not None:
-                    limits.append(value)
-    if not v2_files and v1_group is not None:
-        for level in _cgroup_levels(os.path.join(root, "memory"), v1_group):
-            value = _cgroup_number(os.path.join(level, "memory.limit_in_bytes"), v1=True)
-            if value is not None:
-                limits.append(value)
-    return min(limits) if limits else None
+    it (strata_control/cgroup_memory.py). None when no level sets a limit or the files cannot be read."""
+    from strata_control import cgroup_memory
+    return cgroup_memory.memory_limit(self_cgroup, root)
 
 
 _MM_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"

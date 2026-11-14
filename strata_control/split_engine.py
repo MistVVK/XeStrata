@@ -378,16 +378,11 @@ def _named_or_visible(cards: list[Card], indexes: list[int] | None) -> list[Card
 
 
 def ram_gib() -> tuple[float, float]:
-    """(total, available) GiB of this PC's RAM from /proc/meminfo; (0, 0) where there is none."""
-    try:
-        vals = {}
-        for line in open("/proc/meminfo", encoding="ascii"):
-            k, _, v = line.partition(":")
-            if k in ("MemTotal", "MemAvailable"):
-                vals[k] = int(v.split()[0]) / (1 << 20)
-        return vals.get("MemTotal", 0.0), vals.get("MemAvailable", 0.0)
-    except OSError:
-        return 0.0, 0.0
+    """(total, available) GiB of this PC's RAM from /proc/meminfo, inside a container its memory limit
+    (strata_control/cgroup_memory.py); (0, 0) where there is none."""
+    from strata_control import cgroup_memory
+    total, available = cgroup_memory.ram_bytes()
+    return (total or 0) / (1 << 30), (available or 0) / (1 << 30)
 
 
 def _flag(args: list, name: str) -> str | None:
