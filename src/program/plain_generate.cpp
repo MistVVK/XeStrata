@@ -651,7 +651,7 @@ struct PlainDrafters {
                      pack.c_str(), window, (double) df2.vram_bytes() / 1048576.0);
         return true;
     }
-    bool begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold, std::string& err) {
+    bool begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold, std::string&) {
         return df2.begin_request(ids, n, resume, cold);
     }
     bool context(const float* taps, int64_t rows, int64_t pos, std::string& err) {

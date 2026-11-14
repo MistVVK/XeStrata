@@ -9443,10 +9443,10 @@ int main(int argc, char** argv) {
             }
             if (want_arms) {
                 probe_arms = strata::spec::DraftProbe::arms(use_mtp, df2_loaded, o.draft == "auto", S_mtp, o.spec_auto, S,
-                                                             false, 8, static_mode < 0 && static_drafter.loaded(),
+                                                             static_mode < 0 && static_drafter.loaded(),
                                                              S < strata::kernels::kWindowMaxT ? 0 : strata::core::wide_window() == strata::core::WideWindow::On ? 1
                                                                  : strata::core::wide_window() == strata::core::WideWindow::Auto ? 2 : 0,
-                                                             false, static_mode == 1);
+                                                             static_mode == 1);
             }
             std::vector<int32_t> prompt;
             if (probe_arms.size() >= 2) {
