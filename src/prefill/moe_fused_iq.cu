@@ -31,6 +31,7 @@
 #if defined(__HIPCC__)
 #include "moe_f16_common.cuh"
 #include "moe_f16_kq.hpp"
+#include "moe_p1a.hpp"
 #endif
 
 #include <cuda_fp16.h>
@@ -3024,6 +3025,49 @@ static bool g_dm16_want = false, g_dm16_used = false;
 void want_dm_f16(bool on) { g_dm16_want = on; }
 bool dm_f16_used() { return g_dm16_used; }
 
+// STRATA_PF_P1A=1 (gfx1151, HIP; a default on Windows gfx1151, arch_defaults.cpp): the Q4_K gate/up + Q5_1 down layers on moe_p1a.cu's kernels (F16 activations from the
+// layer's FP16 input rows, F16 H, FP16 down rows); STRATA_PF_P1A_L2=1 adds the Q5_K gate/up and Q8_0 down layers.  Taken per call only
+// when the prompt path handed over the FP16 input (p1a_input), the down rows go out as FP16 (want_dm_f16) and H has room for FP16 rows;
+// every other call, and every call with the switch off, runs as before.
+#if defined(__HIPCC__)
+static const void* g_p1a_x16 = nullptr;
+static size_t g_p1a_h_bytes = 0;
+#endif
+static bool g_p1a_used = false;
+bool p1a_wanted() {
+#if defined(__HIPCC__)
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PF_P1A");
+        return v != nullptr && v[0] == '1' && v[1] == '\0' && dev_info().g1151;
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
+[[maybe_unused]] static bool p1a_l2() {
+#if defined(__HIPCC__)
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_P1A_L2"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    return on;
+#else
+    return false;   // (the P1A kernels run on gfx1151 only: p1a_wanted)
+#endif
+}
+void p1a_input(const void* x16, size_t h_bytes) {
+#if defined(__HIPCC__)
+    g_p1a_x16 = p1a_wanted() ? x16 : nullptr;
+    g_p1a_h_bytes = g_p1a_x16 != nullptr ? h_bytes : 0;
+#else
+    (void) x16; (void) h_bytes;   // (g_p1a_x16 / g_p1a_h_bytes are read in the HIP-only P1A launch only)
+#endif
+}
+bool p1a_used() { return g_p1a_used; }
+#if defined(__HIPCC__)
+bool p1a_takes_pair(int gu_type, int d_type) { return p1a_wanted() && p1a::takes(gu_type, d_type, p1a_l2()); }
+#else
+bool p1a_takes_pair(int, int) { return false; }   // (namespace p1a, moe_p1a.hpp, exists in HIP builds only)
+#endif
+
 // (CUDA, STRATA_PF_FUSED_TQ=1) a Hadamard-folded down (set_down_rotation): on, and the down input's sign vector
 static const float* g_rot_signs = nullptr;
 static bool g_rot_on = false;
@@ -3039,6 +3083,7 @@ void hadamard128_rows(float* x, int64_t rows, int64_t cols, const float* signs, 
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream) {
     g_dm16_used = false;
+    g_p1a_used = false;
     if (b.e1 <= b.e0 || n <= 0) return;
     const DevInfo& d = dev_info();
 #if !defined(__HIPCC__)
@@ -3055,6 +3100,16 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 #if defined(__HIPCC__)
     {
         const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
+        // STRATA_PF_P1A=1 (gfx1151; p1a_input set only then): gate/up and down on moe_p1a.cu's kernels, H as FP16 in `ha`, the down rows as FP16 in `dm`
+        if (g_p1a_x16 != nullptr && g_dm16_want && !g_rot_on && d.g1151 && p1a::takes(g.gu_type, g.d_type, p1a_l2()) && tiles <= 65535 &&
+            (size_t) n * kMoeFF * 2 <= g_p1a_h_bytes) {
+            p1a::gate_up(b, g, tb.ts, tb.tiles, tb.off, tiles, g_p1a_x16, src, ha, s);
+            p1a::down(b, g, tb.ts, tb.tiles, tb.off, tiles, ha, dm, s);
+            g_dm16_used = true;
+            g_p1a_used = true;
+            ck(cudaGetLastError(), "experts_native (P1A)");
+            return;
+        }
         // W (X1): LDS alias of the H tile + waves_per_eu(8) (192 VGPRs) + 4 blocks per WGP, only for the types whose
         // kernels do not spill under the cap (measured: gate/up IQ2_*, IQ3_*, IQ4_XS 0-5 regs; down IQ4_NL 11, Q8_0 / Q2_0 0;
         // Q4_K / Q5_K gate/up and Q5_1 down spill 100+ and keep the old launch).

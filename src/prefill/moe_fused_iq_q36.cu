@@ -58,6 +58,12 @@ bool covers_down(int) { return false; }
 void gate_up(const Batch&, const NativeGeom&, const int32_t*, const int2*, const int32_t*, int64_t, int, int64_t, const uint8_t*, const int32_t*, uint8_t*, cudaStream_t) {}
 void down(const Batch&, const NativeGeom&, const int32_t*, const int2*, const int32_t*, int64_t, int, int64_t, const uint8_t*, float*, cudaStream_t, bool) {}
 }  // namespace strata::prefill::fused_q36::f16kq
+// moe_p1a.cu's kernels likewise: the original copy's only (this copy's p1a_input is never called, so its experts_native never reaches these)
+namespace strata::prefill::fused_q36::p1a {
+bool takes(int, int, bool) { return false; }
+void gate_up(const Batch&, const NativeGeom&, const int32_t*, const int2*, const int32_t*, int64_t, const void*, const int32_t*, void*, cudaStream_t) {}
+void down(const Batch&, const NativeGeom&, const int32_t*, const int2*, const int32_t*, int64_t, const void*, void*, cudaStream_t) {}
+}  // namespace strata::prefill::fused_q36::p1a
 #endif
 
 namespace strata::prefill::fused {

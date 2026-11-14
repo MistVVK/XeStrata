@@ -117,6 +117,7 @@ bool ple_batch_enabled() {
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -192,6 +193,10 @@ bool native_wide() { return false; }
 void experts_native(const WideBatch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
 void set_down_rotation(bool, const float*) {}
+bool p1a_wanted() { return false; }
+void p1a_input(const void*, size_t) {}
+bool p1a_used() { return false; }
+bool p1a_takes_pair(int, int) { return false; }
 void hadamard128_rows(float*, int64_t, int64_t, const float*, void*) {}
 }  // namespace strata::prefill::fused
 #endif
@@ -1506,6 +1511,7 @@ struct Prefill::Impl {
     // row map, the group bounds, the group buffers of gathered experts
     void *Xq = nullptr, *Hq = nullptr;
     float* H = nullptr;
+    size_t H_bytes = 0;   // H's size (STRATA_PF_P1A: FP16 H rows must fit)
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     float *Xscale = nullptr, *Hscale = nullptr, *grp_tail = nullptr;   // NVFP4: activation scales, expert tails
@@ -2162,6 +2168,62 @@ bool fused_layout(size_t T, bool src) {
 }
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens.
+// STRATA_PF_P1A=1: once, at the last layer of the first fused prompt chunk, which layers' experts took the P1A kernels (by type pair)
+template <class F>
+void p1a_report(const std::vector<F>& fmt, size_t l, bool took) {
+    static std::vector<int> seen;   // per layer: -1 not on the fused path yet, 0 today's kernels, 1 P1A
+    static bool said = false;
+    if (said || fmt.empty()) return;
+    if (seen.empty()) seen.assign(fmt.size(), -1);
+    if (l < seen.size() && seen[l] < 0) seen[l] = took ? 1 : 0;
+    if (l + 1 != fmt.size()) return;
+    said = true;
+    const auto name = [](int t) -> std::string {
+        switch (t) {
+            case 7: return "Q5_1";
+            case 8: return "Q8_0";
+            case 12: return "Q4_K";
+            case 13: return "Q5_K";
+            default: return "type " + std::to_string(t);
+        }
+    };
+    std::map<std::string, int> on, off;
+    int n_on = 0, n_off = 0, n_unseen = 0;
+    for (size_t i = 0; i < fmt.size(); ++i) {
+        const std::string pair = name(fmt[i].gu_type) + "/" + name(fmt[i].d_type);
+        if (seen[i] == 1) { ++on[pair]; ++n_on; }
+        else if (seen[i] == 0) { ++off[pair]; ++n_off; }
+        else ++n_unseen;
+    }
+    const auto list = [](const std::map<std::string, int>& m) {
+        std::string s;
+        for (const auto& kv : m) s += (s.empty() ? "" : ", ") + kv.first + " " + std::to_string(kv.second);
+        return s.empty() ? std::string("none") : s;
+    };
+    if (n_on == 0) return;   // a pack or chunk with no P1A layer: no line
+    std::fprintf(stderr, "strata: prompt experts P1A (STRATA_PF_P1A=1): gate/up + down on the P1A kernels in %d of %zu layers (%s); "
+                         "today's kernels in %d (%s); %d not on the fused path in this chunk\n",
+                 n_on, fmt.size(), list(on).c_str(), n_off, list(off).c_str(), n_unseen);
+}
+// STRATA_PF_P1A (gfx1151): some layer of the loaded native pack takes the P1A kernels; only then does H grow to FP16 rows, so a
+// pack with no such layer sizes exactly what it did before.  The expert layout is loaded before the first plan (generate.cpp's
+// main: expert_layout_load ahead of every bytes_needed and Prefill::init); debug builds check that every sizing sees one answer.
+// A smaller H than the P1A kernels need is never written past: experts_native takes them only when the FP16 rows fit in the
+// H that Prefill::init carved (H_bytes), and runs today's kernels for that call otherwise.
+bool p1a_pack() {
+    bool any = false;
+    if (fused::p1a_wanted()) {
+        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+        for (size_t l = 0; lay.native && l < lay.fmt.size() && !any; ++l)
+            any = fused::p1a_takes_pair(lay.fmt[l].gu_type, lay.fmt[l].d_type);
+    }
+#ifndef NDEBUG
+    static std::atomic<int> first{-1};   // the first sizing's answer; a later different one = a plan made before the layout was loaded
+    int want = -1;
+    if (!first.compare_exchange_strong(want, (int) any)) assert(want == (int) any);
+#endif
+    return any;
+}
 struct MoeBufs { size_t gu, h, xq, hq; };
 // `tail` (>= 0, fused only): the MMQ rows a chunk below the floor may bring, in tokens (a lent layout sized for its
 // segment's own last chunk, loan_rules.hpp); -1: stream_all_min() - 1, as the start-up layout.
@@ -2173,8 +2235,10 @@ MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused, int64_t tail = -1) {
     if (!fused) return {T * K * kFF2, T * K * kFF, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), kFF)};
     const int64_t tail_tokens = tail >= 0 ? std::min<int64_t>(tail, std::max<int64_t>(stream_all_min() - 1, 0)) : stream_all_min() - 1;
     const size_t ts = (size_t) std::min<int64_t>((int64_t) T, tail_tokens);   // MMQ's last small chunk
+    // STRATA_PF_P1A=1 (gfx1151 only; on by default on Windows gfx1151) and a pack with P1A layers: H holds FP16 rows (n_ff halves a routed row)
+    const size_t h_p1a = p1a_pack() ? (T * K * kFF * 2 + 3) / 4 : 0;
     return {std::max<size_t>(ts * K * kFF2, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
-            std::max<size_t>(ts * K * kFF, (fused::act_bytes((int64_t) (T * K), kFF) + 3) / 4),
+            std::max<size_t>(std::max<size_t>(ts * K * kFF, (fused::act_bytes((int64_t) (T * K), kFF) + 3) / 4), h_p1a),
             std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
             mmq::q8_bytes((int64_t) (ts * K), kFF)};
 }
@@ -2582,6 +2646,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (mp.any) {
             m.Xq = c.take<uint8_t>(mb.xq, ok);
             m.H = c.take<float>(mb.h, ok);
+            m.H_bytes = mb.h * sizeof(float);
             m.Hq = c.take<uint8_t>(mb.hq, ok);
             m.Xscale = c.take<float>(T * K, ok); m.Hscale = c.take<float>(T * K, ok);
             m.grp_tail = c.take<float>(MMQ_GROUP * 4, ok);
@@ -5357,6 +5422,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         else fused::quantize_act(m.mixed, T, N, m.Xq, m.cs);
                         // (a folded trellis down: H rotated inside experts_native; off again after the layer's launches)
                         if (fused_nat && had_d) fused::set_down_rotation(true, had_sh);
+                        // STRATA_PF_P1A=1 (gfx1151): the layer input's FP16 rows for the P1A kernels (p1a_input keeps nullptr otherwise)
+                        if (fused_nat) fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
+                        bool p1a_layer = false;
                         fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
                         // launches over the experts in id order, each at most kMaxBatch experts (STRATA_PF_BATCH: below)
                         // of which at most a third of the ring streamed: the next batch's blobs arrive while one computes.
@@ -5416,6 +5484,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                           m.Dm, m.cs);
                                 }
                                 dm16_used = fused::dm_f16_used();
+                                p1a_layer = p1a_layer || fused::p1a_used();
                             } else {
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
@@ -5429,6 +5498,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                         if (fused_nat && had_d) fused::set_down_rotation(false, nullptr);
+                        if (fused_nat && fused::p1a_wanted()) {
+                            fused::p1a_input(nullptr, 0);
+                            p1a_report(lay.fmt, (size_t) l, p1a_layer);
+                        }
                     } else {
                         // group the (token, k) pairs by expert on the host
                         pt.mark(kPfHostGroup, cs);

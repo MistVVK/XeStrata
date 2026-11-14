@@ -46,6 +46,15 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 /// down runs on an F16 kernel; dm_f16_used() says which form the last call wrote (false on every other path), for moe_combine16.
 void want_dm_f16(bool on);
 bool dm_f16_used();
+/// STRATA_PF_P1A=1 on gfx1151 (HIP; a default on Windows gfx1151, false everywhere else): the K-quant layers may take moe_p1a.cu's kernels.
+bool p1a_wanted();
+/// For the next experts_native calls (when p1a_wanted()): the layer input as FP16 rows [token][n_embd] (nullptr: none) and the
+/// bytes of `ha`.  A call takes the P1A kernels only with an input, want_dm_f16(true) and room for FP16 H; p1a_used() says whether
+/// the last call did (it wrote FP16 down rows then, dm_f16_used() is true).
+void p1a_input(const void* x16, size_t h_bytes);
+bool p1a_used();
+/// p1a_wanted() and a layer of this gate/up + down type pair would take the P1A kernels (the buffers grow only for such a pack).
+bool p1a_takes_pair(int gu_type, int d_type);
 /// (CUDA, STRATA_PF_FUSED_TQ=1) a Hadamard-folded down for the next experts_native calls of a trellis pair: the gate/up writes H as FP32
 /// into the first n_ff floats of each row's own down-output row in `dm` (no other buffer), which is rotated there (y = H_128 (signs * h) /
 /// sqrt(128) per 128 features; signs nullptr = identity, else n_ff values on the device) and quantized into `ha` before the down product

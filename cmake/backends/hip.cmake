@@ -50,6 +50,7 @@ macro(strata_hip_mmq)
       src/prefill/moe_fused_iq.cu
       src/prefill/moe_fused_iq_q36.cu   # the same kernels again for Qwen3.6's expert shape (gfx12: strata-q36's fused prompt experts)
       src/prefill/moe_f16_kq.cu
+      src/prefill/moe_p1a.cu
       src/prefill/moe_helpers.cu)   # the gathers, SwiGLU passes and row table (cut from moe_mmq.cu)
     if(STRATA_MMQ_KQUANTS)
       # the same K-quant instances as the CUDA branch: on HIP they serve the dense GGUF projections
@@ -107,6 +108,7 @@ macro(strata_hip_pf_own)
       src/prefill/moe_fused_iq.cu
       src/prefill/moe_fused_iq_q36.cu
       src/prefill/moe_f16_kq.cu
+      src/prefill/moe_p1a.cu
       src/prefill/moe_helpers.cu)
     set_source_files_properties(${_strata_pf_own_sources} PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_pf_own STATIC ${_strata_pf_own_sources} src/prefill/mmq_absent.cpp)
@@ -233,6 +235,7 @@ if(STRATA_HIP_GFX906)
       list(APPEND _strata_cu ${_strata_tq_hip})
     endif()
     target_sources(strata_pf_own PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu)   # (Strata's own: beside moe_fused_iq.cu)
+    target_sources(strata_pf_own PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_p1a.cu)    # (the same: moe_fused_iq.cu calls it)
   endif()
   set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
 endif()
