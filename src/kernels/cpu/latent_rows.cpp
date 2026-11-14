@@ -183,11 +183,13 @@ void u_row_avx512vnni(const uint8_t* u, int H, int ELL, int fmt, const uint8_t* 
             const __m512i aw = _mm512_inserti64x4(_mm512_castsi256_si512(aw0), aw1, 1);
             const __m512i sq = _mm512_inserti64x4(_mm512_castsi256_si512(sq0), sq1, 1);
             const __m512i si = _mm512_dpbusd_epi32(_mm512_setzero_si512(), aw, sq);
-            const __m512 d = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(h2f(dx0) * h2f(dw0))),
-                                                _mm256_set1_ps(h2f(dx1) * h2f(dw1)), 1);
+            // the two blocks' scales in the two halves (AVX-512 F's 64-bit insert: cpu_avx512_ok does not ask for DQ)
+            const __m512 d = _mm512_castpd_ps(_mm512_insertf64x4(
+                _mm512_castps_pd(_mm512_castps256_ps512(_mm256_set1_ps(h2f(dx0) * h2f(dw0)))),
+                _mm256_castps_pd(_mm256_set1_ps(h2f(dx1) * h2f(dw1))), 1));
             acc = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(si), acc);
         }
-        __m256 acc256 = _mm256_add_ps(_mm512_castps512_ps256(acc), _mm512_extractf32x8_ps(acc, 1));
+        __m256 acc256 = _mm256_add_ps(_mm512_castps512_ps256(acc), _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(acc), 1)));
         for (; b < nb; ++b) {   // an odd tail block
             const uint8_t* wb = w + (size_t) b * bs;
             const uint8_t* xb = hq + (size_t) b * 36;
