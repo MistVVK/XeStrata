@@ -20,6 +20,10 @@ namespace {
 // measurements (the per-stage counts, the 48 layer graphs, the stream-token path, the split verify window, the fetch
 // branch's --pcie-mode, the pool's hit and publish experiments), and its prompt path's grouped products
 // (--prefill-experts): the other models' engine has windows of its own, one graph a window size, one fetch over PCIe
+// --draft-fallback and --draft-mtp-spec rest on generate.cpp running DFlash2 and the MTP layer together (a static
+// primary with the other as fallback, its own window): the plain engine keeps both loaded but picks one per request
+// by its measured speed (--draft auto, strata/spec/drafter_policy.hpp) and sets the MTP's window with --spec, so the
+// static knobs add nothing there.  --spec-min-p and --window-hashes are shared (shared_options.hpp).
 const char* const kQwen38Only[] = {
     "--pack", "--ple-gguf", "--no-ple", "--ple-io", "--ple-row-cache", "--ple-inflight", "--ple-delay-us",
     "--ple-sync-submit", "--embd-gguf", "--native-dense-gguf", "--native-head-gguf", "--native-flash-attn-short",
@@ -28,9 +32,10 @@ const char* const kQwen38Only[] = {
     "--prefill", "--prefill-until", "--no-prefill-borrow", "--prefill-experts",
     "--expert-cache-per-layer", "--kv-resident",
     "--expert-cache-cpu-order",
-    "--mtp", "--mtp-max-t", "--mtp-window", "--stream-token", "--check-logits", "--stats", "--stage-timing",
+    "--mtp", "--mtp-max-t", "--mtp-window", "--draft-fallback", "--draft-mtp-spec",
+    "--stream-token", "--check-logits", "--stats", "--stage-timing",
     "--spec-split", "--no-spec-split", "--spec-oracle", "--spec-corrupt", "--gpu-stages", "--gpu-only-full",
-    "--logits-stride", "--window-hashes", "--graph-only", "--no-capture", "--no-token-graph", "--no-pool",
+    "--logits-stride", "--graph-only", "--no-capture", "--no-token-graph", "--no-pool",
     "--no-hit-poke", "--no-publish-kernel", "--no-split-rows", "--sync-every-layer", "--pcie-mode",
     "--batch-cpu-split",
 };

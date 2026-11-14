@@ -211,6 +211,9 @@ struct PlainOptions {
     /// The routed experts written here, a record a token and MoE layer as generate.cpp's --dump-routing writes them
     /// (int32 layer, int32 k, k int32 ids, k float weights, 0 here): tools/make_profile.py reads them.  Empty: none.
     std::string dump_routing;
+    /// --window-hashes PATH: a line per serial verify window (index, position, size, a hash of its final normed rows,
+    /// its argmaxes), the answer-drift fingerprint generate.cpp writes (strata/spec/window_hash.hpp).  Empty: none.
+    std::string window_hashes;
     double rope_freq_base = 0;      ///< the rotation's base (0: the file's)
     double rope_freq_scale = 0;     ///< ... and its frequency scale, as llama.cpp's --rope-freq-scale (0: none)
     /// The most tokens a prompt chunk takes through the batched products (`prompt`; a shorter prompt, one chunk of its
@@ -480,6 +483,9 @@ public:
 
     /// Drafts a window can check (0: no speculative decoding): spec - 1 when the model has its MTP layer.
     int drafts() const { return tail().has_mtp_ ? tail().n_mtp_ : 0; }
+    /// The resolved rope scaling of the full-attention layers (the file's and the options' meet, load_qwen): the
+    /// startup summary reads it.  A GLM-5.3-Flash (nope MLA) keeps the identity (its rotation is none).
+    const strata::kernels::RopeScaling& rope_full() const { return tail().rope_full_; }
     /// The DFlash2 drafter's taps (the shared mechanism, core/dflash2.hpp): the completed output of these layers,
     /// gathered for every window row into tap_dev() ([max_t][ntap][n_embd]; the plain residual has one stream).
     /// Set before load; empty (the default) allocates nothing and records nothing.
@@ -556,6 +562,9 @@ public:
     bool spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
                    std::string& err, const int32_t* follow = nullptr, const int32_t* ext = nullptr, int n_ext = 0,
                    int match = 0, bool ext_only = false);
+    /// --window-hashes: this window's fingerprint line (strata/spec/window_hash.hpp), from the last stage's final
+    /// normed rows.  Opens the file on the first call; a no-op when --window-hashes was not given.
+    bool write_window_hash(int64_t index, int64_t pos, int T, const int32_t* argmax, std::string& err);
     /// The position of the pending token (spec_start's, then each window's).
     int64_t pending_pos() const { return tail().cur_pos_; }
     /// The windows and the drafts they checked and accepted since the load, for the report.
@@ -1173,6 +1182,7 @@ private:
     std::vector<int64_t> slot_layer_;             ///< per slot, the moe layer it holds experts of
     std::vector<double> heat_;                    ///< [moe layer][expert] routed entries since the load
     std::FILE* route_dump_ = nullptr;             ///< --dump-routing's file, or null
+    std::FILE* hash_file_ = nullptr;              ///< --window-hashes' file, opened on the first window, or null
     /// `n` tokens' `k` routed experts of MoE layer `layer` into --dump-routing's file
     void dump_routes(int64_t layer, const int32_t* ids, int64_t n, int64_t k);
     struct StatePart { void* dev; size_t bytes; int typesize = 0; };   ///< typesize: as Snapshot's

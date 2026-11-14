@@ -111,7 +111,11 @@ then (every 6th request when they are within 4%, every 12th otherwise).
 
 DFlash2's window closes where the product of its selector probabilities falls below `--draft-conf P` (the default comes
 from the expert slots; an explicit `--draft-conf` wins). `--draft dflash2` loads no MTP layer by default (for
-Qwen3.8-Flash-Next `--draft-fallback mtp` loads both). DFlash2 runs on one GPU, one request at a time (a layer split,
+Qwen3.8-Flash-Next `--draft-fallback mtp` loads both). `--draft-fallback` and `--draft-mtp-spec` are Qwen3.8-Flash-Next's
+only: the two run DFlash2 and the MTP layer together and set a static primary with the other as fallback (its window),
+while the plain engine keeps both loaded but picks the faster per request by its measured speed (`--draft auto`, the
+DFlash2 section above) and sets the MTP's window with `--spec`, so the static knobs add nothing there. DFlash2 runs on
+one GPU, one request at a time (a layer split,
 `--batch` and pipeline windows keep the MTP). The plain engine's `--draft dflash2` is for `--serve` only. The greedy
 answer is the same whichever drafter proposes (the verify window emits the target's argmax).
 
@@ -605,7 +609,8 @@ The engine's options (added to the settings' `args`):
 | `--batch N` (`"parallel": N`, `"auto"` by default) | with `--serve`, decode up to N conversations together ([BATCHING](BATCHING.md#the-other-models-the-plain-engine); not GLM-5.3-Flash nor `--vision` yet) |
 | `--prompt-cache N`, `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID`, `--conversation-save-checkpoints N` | with `--serve`, the conversation checkpoints of a model with a recurrent state (Ornith, Qwen3.6, Qwen3.5-9B). A recurrent state cannot go back to an earlier position, so a request that takes a conversation up short of its end (the next turn after a reply rendered otherwise, an edited message, a new chat on the same system prompt) reads all of it again without one. The meanings and defaults are Qwen3.8-Flash-Next's ([the conversation cache](#the-conversation-cache)), and a request's `pin` and `"strata_checkpoint": false` apply. A checkpoint is the recurrent state only (about 60 MB for Qwen3.6); the K/V of the positions below it are the conversation's. `--turn-token` defaults to the vocabulary's `<|im_start|>`, else `<|start|>`. A model of attention layers only (llm-jp, GLM-5.3-Flash) needs none: the K/V up to any position serve |
 | `--tail-role-token ID`, `--prompt-cache-tail`, `--prompt-cache-spread`, `--conversation-cache-min-tokens N`, `--conversation-cache-park-gain N`, `--short-read N`, `--session-save-reclaim` | `--serve`'s policies of the conversation cache and the checkpoints (Qwen3.8-Flash-Next's meanings); `--short-read` defaults to `--max-t` |
-| `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N`, `--yarn-ext-factor F`, `--yarn-attn-factor F`, `--yarn-beta-fast F`, `--yarn-beta-slow F` | context extension (the YaRN knobs as llama.cpp's) |
+| `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N`, `--yarn-ext-factor F`, `--yarn-attn-factor F`, `--yarn-beta-fast F`, `--yarn-beta-slow F` | context extension (the YaRN knobs as llama.cpp's): a context past the trained length (262,144) shrinks the rotation's angles (linear) or extends them with YaRN. It reads the GGUF's `rope.scaling.*` and the rotation's dimensions (all or a part) and applies them per layer. Ornith, Qwen3.6 and Qwen3.5 take it; llm-jp-4.1 keeps its trained 64K, and GLM-5.3-Flash's MLA is nope (no rotation), so neither extends. An unscaled run answers bit for bit as it did before this feature. setup offers the 384K and 512K choices and the RoPE question for these models too ([above](#run-setupsh)) |
+| `--window-hashes PATH` | per verify window, a line with its index, position, size, a 64-bit hash of its final normed rows and its argmaxes (the same form as Qwen3.8-Flash-Next's engine, `strata/spec/window_hash.hpp`). A tool for answer drift: two builds that do the same arithmetic write the same file. Use it with `--spec-follow` and `--adapt-every 0` (the serial verify window; it does not write `--pipeline-windows 2`'s windows) |
 
 #### A PC without a GPU
 

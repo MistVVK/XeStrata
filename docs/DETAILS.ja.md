@@ -107,7 +107,10 @@ plain エンジンは 3 と 2）。既定の形（設定の窓の MTP）を外�
 
 DFlash2 の窓は `--draft-conf P` で、selector 確率の積が P を下回る所で閉じます（既定は expert slots から決めます。
 `--draft-conf` の明示が優先）。`--draft dflash2` は既定で MTP の層を読みません（Qwen3.8-Flash-Next は
-`--draft-fallback mtp` で両方）。DFlash2 は 1 枚の GPU・1 要求ずつです（層分割・`--batch`・pipeline windows は
+`--draft-fallback mtp` で両方）。`--draft-fallback` と `--draft-mtp-spec` は Qwen3.8-Flash-Next だけです: この 2 つは
+DFlash2 と MTP の層を一緒に走らせ、静的な主役と予備（その窓）を決めるものですが、plain エンジンは両方を読んだ上で
+要求ごとに実測の速い方を選び（`--draft auto`、上の DFlash2 の節）、MTP の窓は `--spec` で決めるので、静的なつまみは
+要りません。DFlash2 は 1 枚の GPU・1 要求ずつです（層分割・`--batch`・pipeline windows は
 MTP のまま）。plain エンジンの `--draft dflash2` は `--serve` だけです。greedy の答えは drafter によらず同じです
 （検証の窓が target の argmax を出します）。
 
@@ -557,7 +560,8 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--batch N`（`"parallel": N`、既定は `"auto"`） | `--serve` で最大 N 個の会話をまとめて decode する（[BATCHING](BATCHING.ja.md#ほかのモデルplain-のエンジン)。GLM-5.3-Flash と `--vision` ではまだ使えません） |
 | `--prompt-cache N`、`--prompt-cache-every N`、`--prompt-cache-root N`、`--turn-token ID`、`--conversation-save-checkpoints N` | `--serve` で、再帰の状態を持つモデル（Ornith、Qwen3.6、Qwen3.5-9B）の会話のチェックポイント。再帰の状態は前の位置へ戻せないので、会話の途中から続く要求（描き方の違う返答の次のターン、書き換えた発言、同じシステムプロンプトの新しい会話）は、チェックポイントがなければ全部を読み直します。意味と既定は Qwen3.8-Flash-Next と同じで（[会話のキャッシュ](#会話のキャッシュ)）、要求の `pin` と `"strata_checkpoint": false` も効きます。チェックポイントは再帰の状態だけで（Qwen3.6 で約 60 MB）、その下の位置の K/V は会話のものを使います。`--turn-token` の既定は語彙の `<|im_start|>`、なければ `<|start|>` です。注意の層だけのモデル（llm-jp、GLM-5.3-Flash）は、どの位置までの K/V も使えるので要りません |
 | `--tail-role-token ID`、`--prompt-cache-tail`、`--prompt-cache-spread`、`--conversation-cache-min-tokens N`、`--conversation-cache-park-gain N`、`--short-read N`、`--session-save-reclaim` | `--serve` の会話のキャッシュとチェックポイントの方針（Qwen3.8-Flash-Next と同じ意味）。`--short-read` の既定は `--max-t` です |
-| `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N`、`--yarn-ext-factor F`、`--yarn-attn-factor F`、`--yarn-beta-fast F`、`--yarn-beta-slow F` | 文脈の延長（YaRN の値は llama.cpp と同じ意味） |
+| `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N`、`--yarn-ext-factor F`、`--yarn-attn-factor F`、`--yarn-beta-fast F`、`--yarn-beta-slow F` | 文脈の延長（YaRN の値は llama.cpp と同じ意味）。学習した長さ（262,144）を超える文脈で、回転の角度を縮めて（linear）YaRN で伸ばします。GGUF の `rope.scaling.*` と回転の次元（全部か一部か）を読み、層ごとに効かせます。Ornith・Qwen3.6・Qwen3.5 が使えます。llm-jp-4.1 は学習した 64K のまま、GLM-5.3-Flash は MLA が nope（回転がない）ので伸ばしません。伸ばさない設定の答えは、この機能のない実行とビットで同じです。setup は 384K・512K の選択肢と RoPE の問いをこれらのモデルにも出します（[上](#setupsh-を実行する)） |
+| `--window-hashes PATH` | 検証の窓ごとに、index・位置・大きさ・その窓の最終の正規化された行の 64 ビットハッシュ・argmax を 1 行で書きます（Qwen3.8-Flash-Next のエンジンと同じ形、`strata/spec/window_hash.hpp`）。答えの揺れを調べる道具: 同じ計算をする 2 つの実行物は同じファイルを書きます。`--spec-follow` と `--adapt-every 0` と一緒に使います（直列の検証の窓。`--pipeline-windows 2` の窓は書きません） |
 
 #### GPU のない PC
 

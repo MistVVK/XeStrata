@@ -44,6 +44,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/platform/memory.hpp"
@@ -2544,6 +2545,9 @@ static void plain_usage(const std::string& arch) {
                  "                       of them where they go past the MTP's (also without an MTP layer; default 0 = off)\n"
                  "  --lookup-chain K     --serve: after the MTP's drafts, up to K lookup drafts that continue them\n"
                  "  --lookup-chain-min M  the shortest match --lookup-chain extends on (default 3)\n"
+                 "  --window-hashes PATH per verify window, a line with its index, position, size, a 64-bit hash of\n"
+                 "                       its final normed rows and its argmaxes: two builds that do the same\n"
+                 "                       arithmetic write the same file (use with --spec-follow, --adapt-every 0)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --rope-freq-base F, --rope-freq-scale F   the rotation's base and frequency scale\n"
                  "  --yarn-ext-factor F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F  YaRN's knobs\n"
@@ -2674,6 +2678,7 @@ int plain_main(int argc, char** argv) {
     shared.spec_window = &opt.spec_window;
     shared.spec_window_all = true;
     shared.spec_min_p = &opt.spec_min_p;
+    shared.window_hashes = &opt.window_hashes;
     shared.mmap_experts = &opt.mmap_experts;
     shared.vram_free_mib = &opt.vram_free_mib;
     shared.vram_elastic = &opt.vram_elastic;
@@ -3105,6 +3110,12 @@ int plain_main(int argc, char** argv) {
             std::_Exit(1);
         }
         return 1;
+    }
+    if (const auto& rs = model.rope_full(); rs.type != strata::kernels::RopeScalingType::None) {
+        std::fprintf(stderr, "xestrata (%s): rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), "
+                             "--max-context %lld against a trained context of %.0f\n",
+                     arch.c_str(), rs.type == strata::kernels::RopeScalingType::YaRN ? "yarn" : "linear", rs.factor,
+                     rs.freq_scale(), rs.freq_base, rs.mscale(), (long long) opt.max_cells, rs.orig_ctx);
     }
     {   // --aux-cpus: the threads that are neither pool workers nor the host thread beside the workers
         const std::vector<int> wc = model.pool_worker_cpus();
