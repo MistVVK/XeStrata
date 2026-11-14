@@ -54,6 +54,26 @@ int main() {
         CHECK_LINE(own_only_line(48, 1024, s, s, true),
                    "strata: prompt kernels: every chunk runs 40 of 48 layers on the int8 kernels and 8 on the FP16 path (--peer-device: the fused kernels are off).");
     }
+    // peer_keeps_mmq: only an engine with MMQ keeps the walk on MMQ for --peer-device; without MMQ the share is declined and the walk keeps its own kernels
+    {
+        static_assert(!strata::prefill::peer_keeps_mmq(false, false), "no flag, with MMQ: the walk's own kernels");
+        static_assert(!strata::prefill::peer_keeps_mmq(false, true), "no flag, without MMQ: the walk's own kernels");
+        static_assert(strata::prefill::peer_keeps_mmq(true, false), "--peer-device with MMQ: MMQ only");
+        static_assert(!strata::prefill::peer_keeps_mmq(true, true), "--peer-device without MMQ: the walk's own kernels (the share is declined)");
+        // the start-up line of a build without MMQ with --peer-device on: the counts without the flag and no clause
+        OwnOnlySplit big; big.fused = 48;
+        OwnOnlySplit small; small.staged = 48;
+        CHECK_LINE(own_only_line(48, 1024, big, small, strata::prefill::peer_keeps_mmq(true, true)),
+                   "strata: prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the staged fused entry.");
+#if defined(STRATA_PF_OWN_ONLY)   // the test built as an engine without MMQ is (prefill.cpp kPfOwnOnlyBuild): the same answers from this build's flag
+        constexpr bool own_only_build = true;
+#else
+        constexpr bool own_only_build = false;
+#endif
+        const std::string with_flag = own_only_line(48, 1024, big, small, strata::prefill::peer_keeps_mmq(true, own_only_build));
+        const bool has_clause = with_flag.find("(--peer-device: the fused kernels are off)") != std::string::npos;
+        if (has_clause == own_only_build) { std::fprintf(stderr, "FAIL %s:%d: --peer-device clause %s in this build (own-only %d)\n", __FILE__, __LINE__, has_clause ? "present" : "missing", (int) own_only_build); ++failed; }
+    }
     // the Tesla P100 in a build without MMQ (no fused kernels; the int8 default under the chunk limit, the FP16 path from it): the stream floor is the limit: FP16 from it up
     {
         OwnOnlySplit big; big.fp16 = 48;
