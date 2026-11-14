@@ -119,21 +119,6 @@ def ready(d: Drafter, out: Path):
     return None
 
 
-# The YASAKANI conversion is already in its runtime format, not a DF2P pack. It lives beside the target weights;
-# setup shares the two files between the quality and speed targets. The yskn engine will consume both paths.
-YASAKANI_TARGETS = {"qwen38_27b_quality.yskn", "qwen38_27b_speed.yskn"}
-
-
-def yasakani_draft(target: Path):
-    """Return the block draft and head beside a known target, or None. Refuse an incomplete pair."""
-    if target.name not in YASAKANI_TARGETS:
-        return None
-    draft, head = (target.parent / name for name in ("bdraft2_k8.yskn", "bdraft2_k8.shead"))
-    if draft.is_file() != head.is_file():
-        raise ValueError("the YASAKANI block drafter needs both bdraft2_k8.yskn and bdraft2_k8.shead")
-    return (draft, head) if draft.is_file() else None
-
-
 def plan(d: Drafter, out: Path):
     got = ready(d, out)
     if got:
