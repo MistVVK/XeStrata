@@ -5,7 +5,7 @@
 //   1. the arms of a start (one drafter alone: none to measure);
 //   2. another form replaces the default (the MTP at its window) only 10% ahead and in every run;
 //   3. no drafter wins where a window costs more than its drafts bring, by that bar;
-//   4. a round settles the measurement once no other arm can still win;
+//   4. a round settles the measurement once no other arm can still win; a run's length from the warm-up's speed;
 //   5. the prompt from a vocabulary (the byte-level BPE's and SentencePiece's word marks).
 #include "strata/spec/draft_probe.hpp"
 
@@ -72,6 +72,12 @@ int main() {
     check(DraftProbe::settled(a3, r1), "a round where every other arm is slower: settled");
     std::vector<ProbeRun> r2 = {{0, 48, 480.0, 0, 0}, {1, 48, 400.0, 0, 0}, {2, 48, 960.0, 0, 0}};
     check(!DraftProbe::settled(a3, r2), "an arm faster than the default: another round");
+
+    check(strata::spec::probe_run_tokens(10.0) == 16 && strata::spec::probe_run_tokens(30.0) == 30 &&
+              strata::spec::probe_run_tokens(200.0) == strata::spec::probe_tokens(),
+          "a run's tokens: about a second of decode, 16 .. probe_tokens()");
+    check(strata::spec::probe_line_tokens("GEN 48 ckpt=0 draft=mtp 1,2", 16) == "GEN 16 ckpt=0 draft=mtp 1,2",
+          "a plan line's token count rewritten");
 
     std::vector<std::string> bpe(300), spm(300);
     for (size_t i = 0; i < bpe.size(); ++i) bpe[i] = spm[i] = "<unused" + std::to_string(i) + ">";

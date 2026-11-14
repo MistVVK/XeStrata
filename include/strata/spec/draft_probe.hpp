@@ -80,6 +80,14 @@ bool probe_enabled();
 int probe_tokens();
 /// The warm-up run's tokens (it is not counted: the first requests pay the kernels' first launches)
 constexpr int kProbeWarmTokens = 16;
+/// The tokens a counted run decodes on a model that the warm-up decoded at `warm_tps`: about a second of decode,
+/// 16 at least and probe_tokens() at most (GLM-5.3-Flash at 10 tok/s on the B70: the measurement took 128 s at 48)
+int probe_run_tokens(double warm_tps);
+/// The measurement's time once every arm has run once: past it, no further round starts (XESTRATA_DRAFT_PROBE_S,
+/// default 20 s)
+double probe_budget_s();
+/// The plan's line `line` ("GEN <n> ...") with its token count set to n
+std::string probe_line_tokens(const std::string& line, int n);
 
 /// The probe's prompt from a model's vocabulary (its GGUF tokenizer.ggml.tokens): a fixed English text, each word one
 /// token where the vocabulary has it as one (the byte-level BPE's leading-space mark U+0120 or SentencePiece's

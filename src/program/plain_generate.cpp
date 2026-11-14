@@ -592,6 +592,11 @@ struct PlainDrafters {
             err = "the DFlash2 pack " + pack + " is another model's (its hidden size, vocabulary or taps)";
             return false;
         }
+        if (model.tap_dev() == nullptr || model.n_taps() != (int) shape.taps.size()) {
+            err = "the model's windows hold no DFlash2 taps (its layers " + std::to_string(model.n_taps()) + " of " +
+                  std::to_string(shape.taps.size()) + ")";
+            return false;
+        }
         if (!df2.loaded() && !df2.load(pack, 0, err)) return false;   // (--draft dflash2: before the model's tier)
         const strata::core::PlainModel::HeadView h = model.draft_head_view();
         const strata::core::PlainModel* m = &model;
@@ -1048,19 +1053,23 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         probe_free0 = fb;
         if (dr.deferred && want_arms) {
             const int64_t need = (int64_t) dr.shape.bytes + (256ll << 20);   // the pack, its buffers and logits (about)
+            // measured only where it could stay: the reserve still free beside it (probe_finish's rule); GLM-5.3-Flash on
+            // the B70 left 230 MiB beside it, was measured for 128 s and could not stay
+            const int64_t keep_free = std::max<int64_t>(kProbeFreeMib,
+                                                        opt.reserve_mib >= 0 ? opt.reserve_mib : (int64_t) (tb >> 20) / 32);
             std::string e;
-            if ((int64_t) fb - need < (kProbeFreeMib << 20)) {
+            if ((int64_t) fb - need < (keep_free << 20)) {
                 std::fprintf(stderr, "xestrata (%s): DFlash2 is not measured: %lld MiB of VRAM free, it takes about %lld "
-                                     "and %lld must stay free: the MTP layer drafts\n", arch.c_str(),
-                             (long long) (fb >> 20), (long long) (need >> 20), (long long) kProbeFreeMib);
+                                     "and %lld must stay free (the reserve: it could not stay): the MTP layer drafts\n",
+                             arch.c_str(), (long long) (fb >> 20), (long long) (need >> 20), (long long) keep_free);
                 dr.release(model);
             } else if (!dr.load(model, arch, e)) {
                 std::fprintf(stderr, "xestrata (%s): DFlash2 not loaded (%s): the MTP layer drafts\n", arch.c_str(),
                              e.c_str());
                 dr.release(model);
-            } else if (free_mib() < (long long) kProbeFreeMib) {
-                std::fprintf(stderr, "xestrata (%s): DFlash2 released: less VRAM is left free beside it than the "
-                                     "measurement needs\n", arch.c_str());
+            } else if (free_mib() < (long long) keep_free) {
+                std::fprintf(stderr, "xestrata (%s): DFlash2 released: less VRAM than the reserve is left free beside "
+                                     "it: it could not stay\n", arch.c_str());
                 dr.release(model);
             }
         } else if (dr.deferred) {
@@ -2246,10 +2255,15 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                                      (double) (model.file_read_bytes() - file_bytes0) / 1e6, (int64_t) (n_end - resume),
                                      (int64_t) (model.offloaded() - offload0), ""});
         std::fflush(stdout);
-        if (req_probe >= 0) {   // the start's measurement: this run's speed; a round that settles it ends it
+        if (req_probe == -1 && decode_ms > 0.0) {   // the warm-up: the counted runs about a second of decode each
+            const int nt = strata::spec::probe_run_tokens(1000.0 * (double) produced / decode_ms);
+            for (std::string& pl : probe_lines) pl = strata::spec::probe_line_tokens(pl, nt);
+        } else if (req_probe >= 0) {   // a counted run; a round that settles it, or past the budget, ends it
             probe_runs.push_back({req_probe, (int64_t) produced, decode_ms, (int64_t) (model.spec_drafted() - off0),
                                   (int64_t) (model.spec_accepted() - acc0)});
-            if (probe_runs.size() % probe_arms.size() == 0 && strata::spec::DraftProbe::settled(probe_arms, probe_runs))
+            const bool round = probe_runs.size() % probe_arms.size() == 0;
+            if (round && (strata::spec::DraftProbe::settled(probe_arms, probe_runs) ||
+                          std::chrono::duration<double>(Clock::now() - probe_t0).count() > strata::spec::probe_budget_s()))
                 probe_lines.clear();
         }
         else if (dr.loaded && req_kind != 0 && req_probe == -2 && !req_off)   // both kept: what this request taught

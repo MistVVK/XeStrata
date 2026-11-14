@@ -6,6 +6,9 @@
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -128,8 +131,39 @@ bool probe_enabled() {
 
 int probe_tokens() {
     const char* v = strata::env_get("DRAFT_PROBE_TOKENS");
-    const int n = v != nullptr && v[0] != '\0' ? std::atoi(v) : 48;
-    return std::max(16, n);
+    long n = 48;   // a value that is not a whole number keeps the default
+    if (v != nullptr && v[0] != '\0') {
+        char* end = nullptr;
+        errno = 0;
+        const long r = std::strtol(v, &end, 10);
+        if (*end == '\0' && errno == 0 && r <= INT_MAX) n = r;
+    }
+    return std::max(16, (int) std::max(n, 0L));
+}
+
+int probe_run_tokens(double warm_tps) {
+    const int most = probe_tokens();
+    if (!(warm_tps > 0.0)) return most;
+    return std::clamp((int) std::lround(warm_tps * 1.0), 16, std::max(16, most));
+}
+
+double probe_budget_s() {
+    const char* v = strata::env_get("DRAFT_PROBE_S");
+    double s = 20.0;   // a value that is not a number keeps the default
+    if (v != nullptr && v[0] != '\0') {
+        char* end = nullptr;
+        errno = 0;
+        const double r = std::strtod(v, &end);
+        if (*end == '\0' && errno == 0) s = r;
+    }
+    return s > 0.0 ? s : 20.0;
+}
+
+std::string probe_line_tokens(const std::string& line, int n) {
+    if (line.rfind("GEN ", 0) != 0) return line;
+    const size_t sp = line.find(' ', 4);
+    if (sp == std::string::npos) return line;
+    return "GEN " + std::to_string(n) + line.substr(sp);
 }
 
 std::vector<int32_t> probe_prompt(const std::vector<std::string>& vocab) {
