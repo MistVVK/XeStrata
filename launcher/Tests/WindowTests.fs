@@ -160,7 +160,8 @@ type private Levels = { Model: ComboBox; Version: ComboBox; Quantization: ComboB
 
 let private installPage (w: Window) =
     click w (tr "home.install" "Install a model ...")
-    let sizes = waitFor "the sizes" (fun () -> match all<ListBox> w with [ s ] -> Some s | _ -> None)
+    let sizes = waitFor "the text model sizes" (fun () ->
+        all<ListBox> w |> List.tryFind (fun s -> s.SelectedItem :? Model))
     { Model = fieldOf<ComboBox> w (tr "install.model" "Model")
       Version = fieldOf<ComboBox> w (tr "install.version" "Version: the original, or whose changed copy")
       Quantization = fieldOf<ComboBox> w (tr "install.quantization" "Quantization: whose model files")
@@ -503,8 +504,7 @@ let ``an installed model's image models are set by install.py`` () =
     let setup = FakeSetup(d, none)
     let w = open' setup
     click w "Images ..."
-    let first = all<CheckBox> w |> List.find (fun b -> match b.Content with :? StackPanel -> true | _ -> false)
-    first.IsChecked <- Nullable true
+    click w "Add to selection"
     // the image jobs on the GPU of the list (by its PCI address), and SAM 3.1's license agreed to
     pick w "image-gpu" "same"
     let sam3 = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text.StartsWith "Agree to Meta's SAM License" | _ -> false)
@@ -514,7 +514,7 @@ let ``an installed model's image models are set by install.py`` () =
     let r = setup.Last
     Assert.Equal(Places.imageInstallPy, r.Script)
     for part in
-        [ [ "--config"; d.Installed[0].Config ]; [ "--model"; d.Images[0].Id ]; [ "--yes" ]; [ "--gpu"; "same" ]
+        [ [ "--config"; d.Installed[0].Config ]; [ "--model"; d.Images[0].Id + "-uncensored" ]; [ "--yes" ]; [ "--gpu"; "same" ]
           [ "--sam3-license"; "agree" ] ] do
         Assert.True(contains part r.Args, sprintf "%A not in %A" part r.Args)
 

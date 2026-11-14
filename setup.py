@@ -5373,6 +5373,9 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
     asked = size or a.image_quant or QI.default_quant(dit)
     hunyuan = QI.is_hunyuanimage3(dit)
+    auto_largest = bool(getattr(a, "image_auto_largest", False) and size is None and not a.image_quant)
+    if auto_largest and hunyuan:
+        asked = QI.HUNYUANIMAGE3_QUANTS[-1]
     if hunyuan and asked not in QI.HUNYUANIMAGE3_QUANTS:   # Qwen-Image's --image-quant, given for this model too
         warn(f"--image-quant {asked}: {label} comes as w4a8 or int8 (Tencent's quantizations); w4a8 taken (int8 is "
              "the nearer the model's bf16 weights, and about twice as slow a step)")
@@ -5383,6 +5386,11 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
             warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
                  "(--image-dit-q8 auto|on|off)")
         asked = QI.dit_quants(dit)[-1]
+        if auto_largest and getattr(a, "image_dit_q8", None) in (None, "auto"):
+            q8 = False
+            if text_gb is not None:
+                left = usable_ram_gb(a) - text_gb
+                q8 = not QI.fit_ram(left, enc, asked, QI.default_text_quant(dit), dit, q8=False)[2]
     dit_keep = getattr(a, "image_dit_keep", None) != "off"
     tasked = "" if hunyuan else QI.default_text_quant(dit)   # HunyuanImage 3.0 has no text encoder
     shared = shared_text_quant(QI, dit, enc, chat_gguf)
@@ -5432,60 +5440,164 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     names = QI.file_names(quant, enc, tquant, dit)
     if user:   # its DiT is the user's file, not one to fetch
         names = names[1:]
-    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered, "q8": q8, "names": names}
+    return {"choice": choice, "requested_size": size, "quant": quant, "tquant": tquant, "lowered": lowered,
+            "q8": q8, "names": names}
+
+
+def image_descriptions(models_dir: Path) -> list[dict]:
+    """Image picker levels and size estimates, from the same files and RAM table as installation."""
+    qi = _qimage()
+    result = []
+    for family, origin, versions in qi.IMAGE_FAMILIES:
+        versions = list(versions)
+        if versions[0][0] == "anima-base":
+            versions.extend((name, f"Your own: {name[len(qi.ANIMA_USER):]}")
+                            for name in qi.anima_user_dits(models_dir))
+        for choice, version in versions:
+            own = choice.startswith(qi.ANIMA_USER)
+            _, dit, enc = qi.IMAGE_MODELS["anima-base" if own else choice]
+
+            def estimates(encoder: str) -> list[dict]:
+                sizes = []
+                for size in reversed(qi.size_choices(dit)):
+                    quant = qi.default_quant(dit) if qi.engine_quantized(dit) else size
+                    names = qi.file_names(quant, encoder, qi.default_text_quant(dit), dit)
+                    download = sum(qi.FILES[n][2] for n in names[1 if own else 0:]) / 1e9
+                    ram = qi.ram_need_gb(quant, encoder, qi.default_text_quant(dit), dit, q8=qi.mage_q8(size))
+                    if own:
+                        weight = (models_dir / qi.ANIMA_DIR / (choice[len(qi.ANIMA_USER):] + ".safetensors"))
+                        share = qi.MF_Q8_SHARE if size == "int8" else 1
+                        ram += (weight.stat().st_size - qi.FILES["anima-base-bf16"][2]) * share / 1e9
+                    sizes.append({"id": size, "download_gb": round(download, 1), "ram_gb": round(ram, 1)})
+                return sizes
+            sizes = estimates(enc)
+            uncensored = choice + "-uncensored" in qi.IMAGE_MODELS
+            uncensored_sizes = estimates(qi.IMAGE_MODELS[choice + "-uncensored"][2]) if uncensored else sizes
+            result.append({"id": choice, "title": choice if own else qi.DITS[dit][0],
+                           "family": family, "version": version, "origin": origin,
+                           "origin_key": qi.IMAGE_ORIGIN_KEYS[origin],
+                           "own": own,
+                           "about": "A DiT made from Anima on this PC" if own else qi.ABOUT.get(choice, ""),
+                           "download_gb": sizes[0]["download_gb"], "ram_gb": sizes[0]["ram_gb"],
+                           "sizes": sizes, "uncensored_sizes": uncensored_sizes, "quants": [x["id"] for x in sizes],
+                           "edits": dit in qi.MF_EDIT or (qi.is_moss(dit) and dit not in qi.MOSS_FEW_STEP)
+                           or not qi.engine_quantized(dit), "license": qi.license_note(dit),
+                           "tools": list(qi.IMAGE_TOOLS), "uncensored": uncensored})
+    return result
+
+
+def import_anima(path: Path, models_dir: Path) -> str:
+    """Check an Anima DiT and copy it without overwriting an existing model."""
+    qi = _qimage()
+    path = path.expanduser().resolve()
+    if path.suffix != ".safetensors" or any(c in path.stem for c in ",:/\\"):
+        raise ValueError("choose an Anima .safetensors file without commas or colons in its name")
+    why = qi.anima_header(path)
+    if why:
+        raise ValueError(why)
+    folder = models_dir / qi.ANIMA_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / path.name
+    reserved = {qi.local_path(models_dir, k).name for k in qi.FILES if k.startswith(("anima-", "llm-anima-"))}
+    if dest.name in reserved or "anima-" + path.stem in {v[0] for v in qi.IMAGE_MODELS.values()}:
+        raise ValueError("the name is reserved for an Anima release")
+    if dest.resolve() != path:
+        with path.open("rb") as src, dest.open("xb") as out:
+            try:
+                shutil.copyfileobj(src, out)
+            except BaseException:
+                dest.unlink()
+                raise
+    name = qi.ANIMA_USER + path.stem
+    if name not in qi.anima_user_dits(models_dir):
+        raise ValueError("the name is reserved for an Anima release")
+    return name
 
 
 def ask_images(cfg_path: Path) -> str | None:
-    """Image generation asked on the console: the image models (numbers, comma-separated), the default of several, and
-    their -uncensored text encoder -> an --images value; None to leave the config's as it is (none before, none now).
-    The answers the model's config `cfg_path` was written with are the defaults."""
-    QI = _qimage()
-    plain = [c for c in QI.IMAGE_MODELS if not c.endswith("-uncensored")]
-    by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}
-    now: list[str] = []
+    """Choose image models one at a time; the first is the default."""
+    qi = _qimage()
+    if ARGS is not None:
+        ARGS.image_auto_largest = True
+    models_dir = (Path(ARGS.models_dir) if ARGS and ARGS.models_dir
+                  else data_folder_path(None, load_settings()) / "models")
+    by_name = {v[0]: k for k, v in qi.IMAGE_MODELS.items()}
+    for k in qi.anima_user_dits(models_dir):
+        by_name.setdefault("anima-" + k[len(qi.ANIMA_USER):], k)
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         cfg = {}
     if isinstance(cfg, dict) and isinstance(cfg.get("images"), dict):
-        now = [by_name[s["model_name"]] for s in [cfg["images"], *(cfg.get("image_models") or [])]
-               if isinstance(s, dict) and s.get("model_name") in by_name]
-    had = [c.removesuffix("-uncensored") for c in now]
-    say()
-    say("  Image generation: models that make images besides the text model (POST /v1/images/generations and the")
-    say("  web page's Images tab). One runs on the GPU at a time; with several, the web page and the API's \"model\"")
-    say("  choose, and a request that names none gets the default.")
-    for i, c in enumerate(plain, 1):
-        _, dit, enc = QI.IMAGE_MODELS[c]
-        names = QI.file_names(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit)
-        need = QI.ram_need_gb(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit)
-        say(f"    {i}. {c}: {QI.ABOUT.get(c, '')} (download {sum(QI.FILES[n][2] for n in names) / 1e9:.0f} GB, "
-            f"~{need:.0f} GB of RAM)")
-    # a model set up for the first time: SETUP_DEFAULT; set up again: what it has (none included)
-    default = ",".join(str(plain.index(c) + 1) for c in (had if cfg else QI.SETUP_DEFAULT) if c in plain) or "none"
+        picks = [x.get("setup_choice") or by_name[x["model_name"]]
+                 for x in [cfg["images"], *(cfg.get("image_models") or [])]
+                 if isinstance(x, dict) and (x.get("setup_choice") or x.get("model_name") in by_name)]
+    else:
+        picks = [] if cfg else list(qi.SETUP_DEFAULT)
     while True:
-        got = ask("Which image models? (numbers, comma-separated; none: no image generation)", [], default, False,
-                  free=True)
-        if got.lower() in ("none", "no", "n", ""):
-            return "no" if now else None
-        try:
-            picks = [plain[int(x) - 1] for x in got.replace(" ", "").split(",")]
-            if len(set(picks)) == len(picks) and all(int(x) >= 1 for x in got.replace(" ", "").split(",")):
-                break
-        except (ValueError, IndexError):
-            pass
-        say(f"  please answer numbers from 1 to {len(plain)}, comma-separated, or none")
-    if len(picks) > 1:
-        first = had[0] if had and had[0] in picks else picks[0]
-        say("  " + ", ".join(f"{i}. {c}" for i, c in enumerate(picks, 1)))
-        d = int(ask("Which is the default?", [str(i) for i in range(1, len(picks) + 1)], str(picks.index(first) + 1),
-                    False))
-        picks = [picks[d - 1], *(c for i, c in enumerate(picks, 1) if i != d)]
-    if any(c + "-uncensored" in QI.IMAGE_MODELS for c in picks):
-        unc = ask("Their text encoder with its refusal direction removed (-uncensored)?", ["y", "n"],
-                  "y" if any(c.endswith("-uncensored") for c in now) else "n", False) == "y"
-        picks = [c + "-uncensored" if unc and c + "-uncensored" in QI.IMAGE_MODELS else c for c in picks]
-    return ",".join(picks)
+        say("  Image models chosen (the first is the default):")
+        for i, choice in enumerate(picks, 1):
+            say(f"    {i}. {choice}")
+        say("  a) add one   r) remove one   d) choose the default   k) keep these   n) none")
+        action = ask("What next?", ["a", "r", "d", "k", "n"], "k", False)
+        if action == "k":
+            return ",".join(picks) if picks else "no"
+        if action == "n":
+            return "no"
+        if action in ("r", "d"):
+            if picks:
+                n = int(ask("Which one?", [str(i) for i in range(1, len(picks) + 1)], "1", False)) - 1
+                item = picks.pop(n)
+                if action == "d":
+                    picks.insert(0, item)
+            continue
+        models = image_descriptions(models_dir)
+        families = list(dict.fromkeys(m["family"] for m in models))
+        for i, family in enumerate(families, 1):
+            say(f"    {i}) {family}")
+        index = int(ask("Which model?", [str(i) for i in range(1, len(families) + 1)], "1", False)) - 1
+        family = families[index]
+        versions = [m for m in models if m["family"] == family]
+        own = versions[0]["id"] == "anima-base"
+        if len(versions) > 1 or own:
+            for i, m in enumerate(versions, 1):
+                say(f"    {i}) {m['version']}")
+            if own:
+                say("    f) a file on this PC (an Anima DiT, .safetensors)")
+            choices = [str(i) for i in range(1, len(versions) + 1)] + (["f"] if own else [])
+            selected = ask("Which version?", choices, "1", False)
+            if selected == "f":
+                path = ask("Path to the Anima DiT", [], "", False, free=True)
+                try:
+                    name = import_anima(Path(path), models_dir)
+                    versions = image_descriptions(models_dir)
+                    model = next(m for m in versions if m["id"] == name)
+                except (OSError, ValueError) as e:
+                    say(f"  {e}")
+                    continue
+            else:
+                model = versions[int(selected) - 1]
+        else:
+            model = versions[0]
+        name = model["id"]
+        if model["uncensored"]:
+            say("    1) refusal direction removed (-uncensored)   2) original")
+            if ask("Its text encoder?", ["1", "2"], "1", False) == "1":
+                name += "-uncensored"
+        if picks and name in [n for n, _ in qi.parse_choices(",".join(picks))]:
+            say("  That model and text encoder are already chosen.")
+            continue
+        sizes = model["uncensored_sizes"] if name.endswith("-uncensored") else model["sizes"]
+        if len(sizes) > 1:
+            say("    1) auto (the largest that fits the RAM)")
+            for i, size in enumerate(sizes, 2):
+                say(f"    {i}) {size['id']}: download {size['download_gb']:.1f} GB, "
+                    f"~{size['ram_gb']:.1f} GB of RAM")
+            size = int(ask("Which size?", [str(i) for i in range(1, len(sizes) + 2)], "1", False)) - 1
+            if size:
+                name += ":" + sizes[size - 1]["id"]
+        picks.append(name)
+        say(f"  Added: {name}")
 
 
 def write_ratio_head(QI, models_dir: Path) -> None:
@@ -5553,13 +5665,6 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
     choices = QI.parse_choices(a.images)
-    if any(QI.is_anima(QI.IMAGE_MODELS[c][1]) for c, _ in choices if c in QI.IMAGE_MODELS):
-        # the derivatives the user put in Anima's folder: models of their own beside the ones asked for
-        user = QI.anima_user_dits(models_dir)
-        for name, path in user.items():
-            if all(c != name for c, _ in choices):
-                ok(f"{name}: a derivative of Anima in {path.parent}, set up as an image model of its own")
-                choices.append((name, None))
     for c, _ in choices:
         if c.startswith(QI.ANIMA_USER):
             path = models_dir / QI.ANIMA_DIR / (c[len(QI.ANIMA_USER):] + ".safetensors")
@@ -5593,6 +5698,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
                               uma=bool((gpu or {}).get("integrated")), policy=a.image_gpu_policy or "auto",
                               ssd_offload=getattr(a, "image_ssd_offload", None) == "on", text_quant=p["tquant"],
                               dit_q8=p["q8"], dit_keep=getattr(a, "image_dit_keep", None) != "off")
+        cfg["setup_choice"] = p["choice"] + ((":" + p["requested_size"]) if p["requested_size"] else "")
         if p["lowered"]:
             cfg["quant_lowered"] = p["lowered"]
         cfgs.append(cfg)
@@ -9110,24 +9216,11 @@ def describe() -> dict:
                                      if fam.get("plain") else {}),
                          "contexts": [c for c in CONTEXTS if c <= max_ctx], "models": models})
     QI = _qimage()
-    images = []
-    for choice, (_, dit, enc) in QI.IMAGE_MODELS.items():
-        if choice.endswith("-uncensored"):
-            continue
-        names = QI.file_names(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit)
-        images.append({"id": choice, "title": QI.DITS[dit][0], "about": QI.ABOUT.get(choice, ""),
-                       "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
-                       "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit), 1),
-                       "edits": dit in QI.MF_EDIT or (QI.is_moss(dit) and dit not in QI.MOSS_FEW_STEP)
-                       or not QI.engine_quantized(dit),
-                       "license": QI.license_note(dit), "tools": list(QI.IMAGE_TOOLS),
-                       "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
-                       # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K, magetrail:int8,
-                       # hunyuan-image-3-distil:int8), largest first; Mage-Flow's: 8 bits always (int8) or 16 (bf16),
-                       # not the file's
-                       "quants": list(QI.size_choices(dit)) if QI.engine_quantized(dit)
-                       else list(reversed(QI.size_choices(dit)))})
+    images = image_descriptions(data_folder_path(getattr(ARGS, "data_dir", None), load_settings()) / "models")
     by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
+    for m in images:
+        if m["id"].startswith(QI.ANIMA_USER):
+            by_name.setdefault("anima-" + m["id"][len(QI.ANIMA_USER):], m["id"])
     installed = []
     for c in installed_configs():
         ch = choices_from_config(c)
@@ -9135,8 +9228,9 @@ def describe() -> dict:
         secs = [cfg.get("images"), *(cfg.get("image_models") or [])] if isinstance(cfg.get("images"), dict) else []
         installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
                           "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095,
-                          "images": [by_name[s["model_name"]] for s in secs
-                                     if isinstance(s, dict) and s.get("model_name") in by_name]})
+                          "images": [s.get("setup_choice") or by_name[s["model_name"]] for s in secs
+                                     if isinstance(s, dict)
+                                     and (s.get("setup_choice") or s.get("model_name") in by_name)]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
             "ram_gb": round(ram_gb(), 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
             "gpu": gpu["index"] if gpu else None,
@@ -9251,6 +9345,8 @@ def main() -> int:
     ap.add_argument("--json", action="store_true",
                     help="one JSON object a line for a front end (the Windows launcher): messages, steps, progress and "
                          "questions, whose answers are read as lines on stdin")
+    ap.add_argument("--image-auto-largest", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--import-anima", metavar="PATH", help="add an Anima DiT from this PC")
     ap.add_argument("--describe", action="store_true",
                     help="print this PC, the model families and sizes (with the RAM they need and the recommended "
                          "ones), the data folder and the installed models as one JSON object, and exit (the Windows "
@@ -9385,6 +9481,14 @@ def main() -> int:
         a.custom = custom_info(shards, mid)
         register_custom(a.custom)
         a.family, a.model = CUSTOM, mid
+    if a.import_anima:
+        try:
+            name = import_anima(Path(a.import_anima), data_folder_path(a.data_dir, load_settings()) / "models")
+        except (OSError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        emit({"type": "anima_imported", "name": name})
+        return 0
     if a.describe:
         emit(describe())
         return 0
