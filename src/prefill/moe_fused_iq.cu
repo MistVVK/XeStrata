@@ -3025,7 +3025,7 @@ static bool g_dm16_want = false, g_dm16_used = false;
 void want_dm_f16(bool on) { g_dm16_want = on; }
 bool dm_f16_used() { return g_dm16_used; }
 
-// STRATA_PF_P1A=1 (gfx1151, HIP; off by default): the Q4_K gate/up + Q5_1 down layers on moe_p1a.cu's kernels (F16 activations from the
+// STRATA_PF_P1A=1 (gfx1151, HIP; a default on Windows gfx1151, arch_defaults.cpp): the Q4_K gate/up + Q5_1 down layers on moe_p1a.cu's kernels (F16 activations from the
 // layer's FP16 input rows, F16 H, FP16 down rows); STRATA_PF_P1A_L2=1 adds the Q5_K gate/up and Q8_0 down layers.  Taken per call only
 // when the prompt path handed over the FP16 input (p1a_input), the down rows go out as FP16 (want_dm_f16) and H has room for FP16 rows;
 // every other call, and every call with the switch off, runs as before.
@@ -3052,6 +3052,7 @@ void p1a_input(const void* x16, size_t h_bytes) {
     g_p1a_h_bytes = g_p1a_x16 != nullptr ? h_bytes : 0;
 }
 bool p1a_used() { return g_p1a_used; }
+bool p1a_takes_pair(int gu_type, int d_type) { return p1a_wanted() && p1a::takes(gu_type, d_type, p1a_l2()); }
 
 // (CUDA, STRATA_PF_FUSED_TQ=1) a Hadamard-folded down (set_down_rotation): on, and the down input's sign vector
 static const float* g_rot_signs = nullptr;

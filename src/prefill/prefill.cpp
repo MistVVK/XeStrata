@@ -195,6 +195,7 @@ void set_down_rotation(bool, const float*) {}
 bool p1a_wanted() { return false; }
 void p1a_input(const void*, size_t) {}
 bool p1a_used() { return false; }
+bool p1a_takes_pair(int, int) { return false; }
 void hadamard128_rows(float*, int64_t, int64_t, const float*, void*) {}
 }  // namespace strata::prefill::fused
 #endif
@@ -2189,9 +2190,19 @@ void p1a_report(const std::vector<F>& fmt, size_t l, bool took) {
         for (const auto& kv : m) s += (s.empty() ? "" : ", ") + kv.first + " " + std::to_string(kv.second);
         return s.empty() ? std::string("none") : s;
     };
+    if (n_on == 0) return;   // a pack or chunk with no P1A layer: no line
     std::fprintf(stderr, "strata: prompt experts P1A (STRATA_PF_P1A=1): gate/up + down on the P1A kernels in %d of %zu layers (%s); "
                          "today's kernels in %d (%s); %d not on the fused path in this chunk\n",
                  n_on, fmt.size(), list(on).c_str(), n_off, list(off).c_str(), n_unseen);
+}
+// STRATA_PF_P1A (gfx1151): some layer of the loaded native pack takes the P1A kernels; only then does H grow to FP16 rows, so a
+// pack with no such layer sizes exactly what it did before
+bool p1a_pack() {
+    if (!fused::p1a_wanted()) return false;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l)
+        if (fused::p1a_takes_pair(lay.fmt[l].gu_type, lay.fmt[l].d_type)) return true;
+    return false;
 }
 struct MoeBufs { size_t gu, h, xq, hq; };
 // `tail` (>= 0, fused only): the MMQ rows a chunk below the floor may bring, in tokens (a lent layout sized for its
@@ -2204,8 +2215,8 @@ MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused, int64_t tail = -1) {
     if (!fused) return {T * K * kFF2, T * K * kFF, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), kFF)};
     const int64_t tail_tokens = tail >= 0 ? std::min<int64_t>(tail, std::max<int64_t>(stream_all_min() - 1, 0)) : stream_all_min() - 1;
     const size_t ts = (size_t) std::min<int64_t>((int64_t) T, tail_tokens);   // MMQ's last small chunk
-    // STRATA_PF_P1A=1 (gfx1151 only, off by default): H holds FP16 rows (n_ff halves a routed row)
-    const size_t h_p1a = fused::p1a_wanted() ? (T * K * kFF * 2 + 3) / 4 : 0;
+    // STRATA_PF_P1A=1 (gfx1151 only; on by default on Windows gfx1151) and a pack with P1A layers: H holds FP16 rows (n_ff halves a routed row)
+    const size_t h_p1a = p1a_pack() ? (T * K * kFF * 2 + 3) / 4 : 0;
     return {std::max<size_t>(ts * K * kFF2, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
             std::max<size_t>(std::max<size_t>(ts * K * kFF, (fused::act_bytes((int64_t) (T * K), kFF) + 3) / 4), h_p1a),
             std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),

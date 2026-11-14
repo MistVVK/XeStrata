@@ -205,6 +205,11 @@ std::vector<std::pair<std::string, std::string>> igpu_default_env(const char* gc
             // interleaved 8K pairs, same engine: IQ3_S x1.022 (4 of 4 pairs), UD-IQ4_XS x1.026 (3 of 3), UD-Q4_K_XL x1.012 (3 of 4); the first-token KL
             // is 1e-4 at 8K and 0.02-0.04 on agent transcripts (information).  STRATA_PF_DM16=0 turns it off.
             {"STRATA_PF_DM16", "1"},
+            // The Q4_K gate/up + Q5_1 down layers (43 of 48 in UD-Q4_K_XL) on the F16 WMMA kernels of src/prefill/moe_p1a.cu; other layers
+            // and packs keep the kernels above.  Windows gfx1151, UD-Q4_K_XL, 5 interleaved pairs: prompt x1.046 (4K), x1.043 (8K),
+            // x1.043 (32K), decode unchanged (job strix-20261114-1347-9a28).  KL to the FP16 truth, 24 prompts a size: on 0.0112 / 0.0116
+            // against off 0.0179 / 0.0118 at 4K / 8K (job strix-20261114-1347-238b).  STRATA_PF_P1A=0 turns it off.
+            {"STRATA_PF_P1A", "1"},
         };
     }
     return t;
