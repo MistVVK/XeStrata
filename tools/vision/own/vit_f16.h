@@ -51,6 +51,14 @@ VIT_F16_HD inline bool bf16_exact_in_f16(uint16_t b) {
 // an activation clamped to F16's finite range (NaN stays NaN), before it is written as F16
 VIT_F16_HD inline float f16_clamp(float v) { return v > 65504.0f ? 65504.0f : v < -65504.0f ? -65504.0f : v; }
 
+// true when the BF16 value b lies beyond F16's range (|v| >= 65,536 by its exponent, inf, nan): a matrix with one stays BF16
+VIT_F16_HD inline bool bf16_beyond_f16(uint16_t b) { return ((b >> 7) & 0xff) > 127 + 15; }
+inline long long bf16_count_beyond_f16(const uint16_t* w, long long n) {
+    long long c = 0;
+    for (long long i = 0; i < n; ++i) c += bf16_beyond_f16(w[i]);
+    return c;
+}
+
 // whether a BF16 matrix may be held as F16 in BF16_TO_F16 mode: no weight beyond F16's range.  Weights under 2^-14 that F16 holds only to its
 // 2^-24 step (an error of at most 2^-25 each) are counted for the trace but do not keep the matrix in BF16.
 inline bool bf16_matrix_fits_f16(long long n_overflow) { return n_overflow == 0; }
@@ -59,7 +67,7 @@ inline bool bf16_matrix_fits_f16(long long n_overflow) { return n_overflow == 0;
 // 2^-24 step, so the error is at most 2^-25.  0 for an F16 value or one beyond the range (those are not held as F16).
 inline double bf16_f16_abs_error(uint16_t b) {
     const int e = (b >> 7) & 0xff, m = b & 0x7f;
-    if (bf16_exact_in_f16(b) || e == 0xff || e - 127 > 15) return 0.0;
+    if (bf16_exact_in_f16(b) || bf16_beyond_f16(b)) return 0.0;
     if (e == 0) return std::ldexp((double) m, -133);                       // a BF16 subnormal: F16 holds 0
     const double q = std::ldexp((double) (0x80 | m), e - 127 - 7 + 24);   // the value in units of 2^-24
     return std::ldexp(std::fabs(q - std::nearbyint(q)), -24);
@@ -73,8 +81,7 @@ inline Bf16F16Count bf16_count_f16(const uint16_t* w, long long n) {
     for (long long i = 0; i < n; ++i) {
         if (bf16_exact_in_f16(w[i])) continue;
         ++c.not_exact;
-        const int e = (w[i] >> 7) & 0xff;
-        if (e == 0xff || e - 127 > 15) { ++c.overflow; continue; }
+        if (bf16_beyond_f16(w[i])) { ++c.overflow; continue; }
         const double err = bf16_f16_abs_error(w[i]);
         if (err > c.max_abs_error) c.max_abs_error = err;
     }

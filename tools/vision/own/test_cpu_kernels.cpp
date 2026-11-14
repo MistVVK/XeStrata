@@ -324,6 +324,13 @@ static void test_f16_kind() {
     const Bf16F16Count c1 = bf16_count_f16(w1, 5), c2 = bf16_count_f16(w2, 4);
     check(c1.not_exact == 3 && c1.overflow == 0 && c1.max_abs_error == std::ldexp(1.0, -25) && bf16_matrix_fits_f16(c1.overflow) &&
           c2.not_exact == 3 && c2.overflow == 2 && !bf16_matrix_fits_f16(c2.overflow), "F16 kind: matrix counts and the BF16 fallback", "-", 0, 0);
+    // the overflow count the load uses (no trace) equals the full count's over all 65,536 values: exponents 143-255, both signs
+    std::vector<uint16_t> all(65536);
+    for (uint32_t b = 0; b < 65536; ++b) all[b] = (uint16_t) b;
+    const Bf16F16Count ca = bf16_count_f16(all.data(), 65536);
+    const long long nb = bf16_count_beyond_f16(all.data(), 65536);
+    check(nb == ca.overflow && nb == 113LL * 256 && !bf16_beyond_f16(0x477F) && bf16_beyond_f16(0x4780) && bf16_beyond_f16(0xFFC0),
+          "F16 kind: the overflow count of the load", "-", (double) nb, (double) ca.overflow);
     // the activation clamp: F16's finite range, NaN stays NaN
     const float big = 70000.0f, inf = std::numeric_limits<float>::infinity();
     check(f16_clamp(big) == 65504.0f && f16_clamp(-big) == -65504.0f && f16_clamp(inf) == 65504.0f && f16_clamp(-inf) == -65504.0f &&

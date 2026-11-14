@@ -258,6 +258,12 @@ __global__ void k_round(float* __restrict__ y, size_t n, int kind) {
     }
 }
 
+// BF16 weights to F16 in place (K_HF): exact inside F16's range, F16's round to nearest even under 2^-14 (matrices with a weight beyond the range stay BF16)
+__global__ void k_bf16_to_f16(uint16_t* __restrict__ p, size_t n) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        p[i] = f_to_f16bits(__uint_as_float((uint32_t) p[i] << 16));
+}
+
 // n floats to the 16-bit kind
 __global__ void k_cast(const float* __restrict__ in, size_t n, void* out, int kind) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) store_kind(out, i, in[i], kind);
@@ -693,20 +699,13 @@ struct VitGpuImpl {
         if (t->type == GT_BF16 && bf16_mode == BF16_TO_F16) {    // BF16 -> F16 (K_HF) unless a weight is beyond F16's range
             raw.resize(n * 2);
             if (!gg.read_raw(*t, raw.data(), err)) return false;
-            const Bf16F16Count c = bf16_count_f16((const uint16_t*) raw.data(), (long long) n);
+            // the full count (weights not exact in F16, their largest error) only for the trace; the rule needs the overflow count alone
+            Bf16F16Count c;
+            if (trace) c = bf16_count_f16((const uint16_t*) raw.data(), (long long) n);
+            else c.overflow = bf16_count_beyond_f16((const uint16_t*) raw.data(), (long long) n);
             w.kind = bf16_matrix_fits_f16(c.overflow) ? K_HF : K_BF16;
             f16_notes.push_back({name, w.kind, c, (long long) n});
-            if (w.kind == K_HF) {
-                for (size_t i = 0; i < n; ++i) {
-                    uint16_t b;
-                    std::memcpy(&b, &raw[i * 2], 2);
-                    const uint32_t u = (uint32_t) b << 16;
-                    float f;
-                    std::memcpy(&f, &u, 4);
-                    const uint16_t h = host_f32_to_f16(f);
-                    std::memcpy(&raw[i * 2], &h, 2);
-                }
-            }
+            // uploaded as stored and turned into F16 on the GPU (k_bf16_to_f16): a host loop over the 444 M weights of the Qwen3.8 reader took 0.8 s
         } else if (t->type == GT_BF16 && bf16_mode == BF16_ROUNDED) {   // BF16 -> F16 (K_BH)
             std::vector<float> f(n);
             if (!gg.read_f32(*t, f.data(), err)) return false;
@@ -734,8 +733,14 @@ struct VitGpuImpl {
         uint16_t* dev = nullptr;
         if (!alloc(dev, n, err, true)) return false;
         w.p = dev;
-        return cudaMemcpy(w.p, raw.data(), n * 2, cudaMemcpyHostToDevice) == cudaSuccess || (err = "GPU copy failed", false);
+        if (cudaMemcpy(w.p, raw.data(), n * 2, cudaMemcpyHostToDevice) != cudaSuccess) { err = "GPU copy failed"; return false; }
+        if (w.kind == K_HF) {
+            k_bf16_to_f16<<<blocks_for(n), 256>>>(dev, n);
+            if (cudaGetLastError() != cudaSuccess) { err = "the BF16 to F16 conversion failed on the GPU"; return false; }
+        }
+        return true;
     }
+    bool trace = false;               // STRATA_TRACE: the per-matrix F16 counts
     static cudaDataType_t dtype(Kind k) { return k == K_F32 ? CUDA_R_32F : (k == K_F16 || k == K_BH || k == K_HF) ? CUDA_R_16F : CUDA_R_16BF; }
 
     // y[M][N] (float32) = A[M][K] (kind of w) * w^T
@@ -920,6 +925,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     }
 #endif
     m.bf16_mode = vit_gpu_bf16_mode(std::getenv("STRATA_VIT_BF16_AS_F16"), m.bf16_mode);
+    m.trace = std::getenv("STRATA_TRACE") != nullptr;
     {
         const cudaError_t se = set_device_retrying(device);
         if (se != cudaSuccess) { err = std::string("cannot use GPU ") + std::to_string(device) + ": " + cudaGetErrorString(se); return false; }
@@ -978,7 +984,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
             return false;
     }
     m.n_weight_allocs = m.allocs.size();
-    if (std::getenv("STRATA_TRACE") && !m.f16_notes.empty()) {
+    if (m.trace && !m.f16_notes.empty()) {
         for (const VitGpuImpl::F16Note& f : m.f16_notes)
             std::fprintf(stderr, "vit-f16 trace: %s %s, %lld of %lld weights not exact in F16 (%lld beyond its range), largest error %.3g\n", f.name.c_str(),
                          f.kind == K_HF ? "F16" : "BF16", f.c.not_exact, f.n, f.c.overflow, f.c.max_abs_error);
