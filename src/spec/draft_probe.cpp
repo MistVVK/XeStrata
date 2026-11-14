@@ -22,13 +22,12 @@ const char* drafter_name(Drafter d) {
         case Drafter::None: return "none";
         case Drafter::Mtp: return "mtp";
         case Drafter::Df2: return "dflash2";
-        case Drafter::Bdraft2: return "bdraft2";
     }
     return "?";
 }
 
 std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spec, bool spec_auto, int df2_spec,
-                                       bool bdraft2, int bdraft2_spec, bool static_available, int wide_mode, bool bdraft_shead, bool static_forced) {
+                                       bool static_available, int wide_mode, bool static_forced) {
     std::vector<ProbeArm> a;
     if (mtp) {
         a.push_back({Drafter::Mtp, spec});
@@ -44,11 +43,7 @@ std::vector<ProbeArm> DraftProbe::arms(bool mtp, bool df2, bool none_ok, int spe
             if (static_available || static_forced) a.push_back({Drafter::Df2, cap, true, block});
         }
     }
-    if (bdraft2) {
-        a.push_back({Drafter::Bdraft2, bdraft2_spec});
-        if (bdraft_shead) a.push_back({Drafter::Bdraft2, bdraft2_spec, false, 0, true});
-    }
-    if (none_ok && (mtp || df2 || bdraft2)) a.push_back({Drafter::None, 1});
+    if (none_ok && (mtp || df2)) a.push_back({Drafter::None, 1});
     if (a.size() < 2) a.clear();
     return a;
 }
@@ -92,7 +87,6 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
         v.line += buf;
         if (arms[i].drafter == Drafter::Df2 && arms[i].block == 2) v.line += " adaptive block";
         if (arms[i].static_table) v.line += " + static table";
-        if (arms[i].shead) v.line += " + SHEAD 512";
         if (drafted[i] > 0) {
             std::snprintf(buf, sizeof buf, " (drafts kept %.2f)", (double) accepted[i] / (double) drafted[i]);
             v.line += buf;
@@ -120,17 +114,15 @@ ProbeVerdict DraftProbe::decide(const std::vector<ProbeArm>& arms, const std::ve
     v.keep = arms[pick].drafter;
     v.spec = arms[pick].drafter == Drafter::None ? 1 : arms[pick].spec;
     (void) spec_default;
-    // the kept arm's form (Y6): DFlash2's block mode and static table, the yskn drafter's output head
+    // the kept arm's form (Y6): DFlash2's block mode and static table
     v.df2_static = v.keep == Drafter::Df2 && arms[pick].static_table;
     v.df2_block = v.keep == Drafter::Df2 ? arms[pick].block : 0;
-    v.bdraft_shead = v.keep == Drafter::Bdraft2 && arms[pick].shead;
     v.line += std::string(" - keeps ") + drafter_name(v.keep) +
               (v.keep == Drafter::None ? std::string() : " window " + std::to_string(v.spec));
     if (v.keep == Drafter::Df2) {
         v.line += std::string(" (DFlash2 block ") + (v.df2_block == 0 ? "8" : v.df2_block == 1 ? "16" : "adaptive") +
                   (v.df2_static ? ", static table on)" : ", static table off)");
     }
-    if (v.keep == Drafter::Bdraft2) v.line += v.bdraft_shead ? " (SHEAD 512)" : " (full head)";
     return v;
 }
 
