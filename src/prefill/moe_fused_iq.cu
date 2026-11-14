@@ -3044,8 +3044,12 @@ bool p1a_wanted() {
 #endif
 }
 [[maybe_unused]] static bool p1a_l2() {
+#if defined(__HIPCC__)
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_P1A_L2"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
     return on;
+#else
+    return false;   // (the P1A kernels run on gfx1151 only: p1a_wanted)
+#endif
 }
 void p1a_input(const void* x16, size_t h_bytes) {
     g_p1a_x16 = p1a_wanted() ? x16 : nullptr;

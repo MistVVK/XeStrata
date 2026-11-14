@@ -184,7 +184,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PF_GROUP_SCRATCH` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_HC_REGION` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_I8` | on / off | Intel Arc | [INTEL_INT8_EXPERTS.md](INTEL_INT8_EXPERTS.md) |
-| `STRATA_PF_P1A_L2` | on / off | NVIDIA and AMD | - |
+| `STRATA_PF_P1A_L2` | on / off | AMD | - |
 | `STRATA_PF_PEER_CPU` | number | NVIDIA and AMD | - |
 | `STRATA_PF_SWITCH_MIN_T` | number | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_PF_WMMA` | on / off | NVIDIA and AMD | [NVIDIA_V100.md](NVIDIA_V100.md) |

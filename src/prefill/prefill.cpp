@@ -117,6 +117,7 @@ bool ple_batch_enabled() {
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -2196,13 +2197,23 @@ void p1a_report(const std::vector<F>& fmt, size_t l, bool took) {
                  n_on, fmt.size(), list(on).c_str(), n_off, list(off).c_str(), n_unseen);
 }
 // STRATA_PF_P1A (gfx1151): some layer of the loaded native pack takes the P1A kernels; only then does H grow to FP16 rows, so a
-// pack with no such layer sizes exactly what it did before
+// pack with no such layer sizes exactly what it did before.  The expert layout is loaded before the first plan (generate.cpp's
+// main: expert_layout_load ahead of every bytes_needed and Prefill::init); debug builds check that every sizing sees one answer.
+// A smaller H than the P1A kernels need is never written past: experts_native takes them only when the FP16 rows fit in the
+// H that Prefill::init carved (H_bytes), and runs today's kernels for that call otherwise.
 bool p1a_pack() {
-    if (!fused::p1a_wanted()) return false;
-    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
-    for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l)
-        if (fused::p1a_takes_pair(lay.fmt[l].gu_type, lay.fmt[l].d_type)) return true;
-    return false;
+    bool any = false;
+    if (fused::p1a_wanted()) {
+        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+        for (size_t l = 0; lay.native && l < lay.fmt.size() && !any; ++l)
+            any = fused::p1a_takes_pair(lay.fmt[l].gu_type, lay.fmt[l].d_type);
+    }
+#ifndef NDEBUG
+    static std::atomic<int> first{-1};   // the first sizing's answer; a later different one = a plan made before the layout was loaded
+    int want = -1;
+    if (!first.compare_exchange_strong(want, (int) any)) assert(want == (int) any);
+#endif
+    return any;
 }
 struct MoeBufs { size_t gu, h, xq, hq; };
 // `tail` (>= 0, fused only): the MMQ rows a chunk below the floor may bring, in tokens (a lent layout sized for its
