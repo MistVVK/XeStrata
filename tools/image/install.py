@@ -48,6 +48,7 @@ import setup as S  # noqa: E402
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--quant", choices=["Q4_K_M", "Q6_K", "Q8_0", *QI.HUNYUANIMAGE3_QUANTS])
+    ap.add_argument("--auto-largest", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--models-dir", help="where the model files go (default: the data folder's models)")
     ap.add_argument("--config", help="a run config (xestrata-<model>.json) to write the \"images\" section into")
     ap.add_argument("--gpu-policy", choices=option_values.GPU_POLICIES, default=S.OPTION["image-gpu-policy"]["default"])
@@ -92,7 +93,7 @@ def main(argv=None) -> int:
         data, _ = S.data_folder(None)
         a.models_dir = str(data / "models")
     ns = argparse.Namespace(images=a.model, image_quant=a.quant, image_gpu_policy=a.gpu_policy, yes=a.yes,
-                            image_ssd_offload=a.ssd_offload, image_dit_q8=a.dit_q8,
+                            image_ssd_offload=a.ssd_offload, image_dit_q8=a.dit_q8, image_auto_largest=a.auto_largest,
                             image_dit_keep=a.dit_keep, image_gpu=a.gpu, image_sam3_license=a.sam3_license)
     path = Path(a.config) if a.config else None
     cfg = json.loads(path.read_text(encoding="utf-8-sig")) if path is not None and path.is_file() else {}

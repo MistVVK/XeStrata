@@ -5373,6 +5373,9 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
     asked = size or a.image_quant or QI.default_quant(dit)
     hunyuan = QI.is_hunyuanimage3(dit)
+    auto_largest = bool(getattr(a, "image_auto_largest", False) and size is None and not a.image_quant)
+    if auto_largest and hunyuan:
+        asked = QI.HUNYUANIMAGE3_QUANTS[-1]
     if hunyuan and asked not in QI.HUNYUANIMAGE3_QUANTS:   # Qwen-Image's --image-quant, given for this model too
         warn(f"--image-quant {asked}: {label} comes as w4a8 or int8 (Tencent's quantizations); w4a8 taken (int8 is "
              "the nearer the model's bf16 weights, and about twice as slow a step)")
@@ -5383,6 +5386,11 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
             warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
                  "(--image-dit-q8 auto|on|off)")
         asked = QI.dit_quants(dit)[-1]
+        if auto_largest and getattr(a, "image_dit_q8", None) in (None, "auto"):
+            q8 = False
+            if text_gb is not None:
+                left = usable_ram_gb(a) - text_gb
+                q8 = QI.ram_need_gb(asked, enc, QI.default_text_quant(dit), dit, q8=False) > left
     dit_keep = getattr(a, "image_dit_keep", None) != "off"
     tasked = "" if hunyuan else QI.default_text_quant(dit)   # HunyuanImage 3.0 has no text encoder
     shared = shared_text_quant(QI, dit, enc, chat_gguf)
@@ -5505,6 +5513,8 @@ def import_anima(path: Path, models_dir: Path) -> str:
 def ask_images(cfg_path: Path) -> str | None:
     """Choose image models one at a time; the first is the default."""
     qi = _qimage()
+    if ARGS is not None:
+        ARGS.image_auto_largest = True
     models_dir = Path(ARGS.models_dir) if ARGS and ARGS.models_dir else data_folder_path(None, load_settings()) / "models"
     by_name = {v[0]: k for k, v in qi.IMAGE_MODELS.items()}
     by_name.update({"anima-" + k[len(qi.ANIMA_USER):]: k for k in qi.anima_user_dits(models_dir)})
@@ -9324,6 +9334,7 @@ def main() -> int:
     ap.add_argument("--json", action="store_true",
                     help="one JSON object a line for a front end (the Windows launcher): messages, steps, progress and "
                          "questions, whose answers are read as lines on stdin")
+    ap.add_argument("--image-auto-largest", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--import-anima", metavar="PATH", help="add an Anima DiT from this PC")
     ap.add_argument("--describe", action="store_true",
                     help="print this PC, the model families and sizes (with the RAM they need and the recommended "
