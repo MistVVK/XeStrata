@@ -83,6 +83,17 @@ std::optional<uint64_t> own_evictable_mapped_bytes(const std::string& status_tex
 /// (no MemTotal, a limit at or above it, or STRATA_MEM_CREDIT_INACTIVE=1) `inactive`, as before.
 uint64_t cache_credit_for_limit(const CacheCredit& credit, uint64_t limit, std::optional<uint64_t> mem_total, bool inactive_only,
                                 std::optional<uint64_t> own_mapped);
+
+/// The expert arena's RAM figure (core::detail::host_available_memory: the arena verdict and its wait, the file tier,
+/// the CPU share) under a container's cgroup-v2 limit: the room limit - (current - credit), with the credit taken from
+/// the same memory.stat arithmetic as above (`lists`: shmem and locked pages are never credited; that figure's `file`
+/// counter holds both, and an allocation up to it was OOM-killed with 3 GiB of shmem held) less that figure's own
+/// margin min(half the credit, limit / 64).  `applies` is false where the arena figure keeps its earlier rule (no
+/// MemTotal, a limit at or above it, STRATA_MEM_CREDIT_INACTIVE=1): the caller then uses
+/// detail::cgroup_available_bytes as before.
+struct ArenaCgroupRoom { bool applies = false; uint64_t room = 0; uint64_t credit = 0; };
+ArenaCgroupRoom arena_cgroup_room(uint64_t limit, uint64_t current, const std::string& stat_text, std::optional<uint64_t> mem_total,
+                                  bool inactive_only);
 /// The operator's cap in bytes for the container/cgroup this engine runs in (0 = none).  Set once at start.
 void set_memory_limit_bytes(uint64_t bytes);
 uint64_t memory_limit_bytes();

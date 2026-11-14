@@ -74,6 +74,19 @@ uint64_t cache_credit_for_limit(const CacheCredit& credit, uint64_t limit, std::
     return credit.lists > *own_mapped ? credit.lists - *own_mapped : 0;
 }
 
+ArenaCgroupRoom arena_cgroup_room(uint64_t limit, uint64_t current, const std::string& stat_text, std::optional<uint64_t> mem_total,
+                                  bool inactive_only) {
+    ArenaCgroupRoom r;
+    if (inactive_only || !mem_total || limit >= *mem_total) return r;
+    r.applies = true;
+    uint64_t credit = cache_credit_from_stat(stat_text, current, false).lists;   // <= current
+    credit -= std::min(credit / 2, limit / 64);
+    r.credit = credit;
+    const uint64_t used = current - credit;
+    r.room = used < limit ? limit - used : 0;
+    return r;
+}
+
 namespace {
 std::atomic<uint64_t> g_locked_own_file_bytes{0};
 }

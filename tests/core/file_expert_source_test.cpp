@@ -663,11 +663,26 @@ void test_host_memory() {
     put("fs/box/memory.current", std::to_string(16 * GiB) + "\n");
     put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
     require(probe("0::/box\n") && m.available == 36 * GiB - 48 * GiB / 64 && m.cgroup_limit == 48 * GiB, "v2 limit");
-    // 149: with "file" (active + inactive cache) the active part counts too: 12 GiB of cache, 4 GiB anonymous
-    put("fs/box/memory.stat", "file " + std::to_string(12 * GiB) + "\ninactive_file " + std::to_string(4 * GiB) +
-                              "\nfile_dirty 0\nfile_writeback 0\n");
+    // 149: the active page cache counts too: 12 GiB of cache (8 active, 4 inactive), 4 GiB anonymous
+    put("fs/box/memory.stat", "file " + std::to_string(12 * GiB) + "\nactive_file " + std::to_string(8 * GiB) +
+                              "\ninactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
     require(probe("0::/box\n") && m.available == 44 * GiB - 48 * GiB / 64 && m.cgroup_limit == 48 * GiB,
             "v2 limit, the active page cache credited");
+    // 3 GiB of shmem (a memfd, the KV pool) is in "file" but on the anon lists: it cannot be reclaimed without swap, and an
+    // allocation up to a figure that counted it was OOM-killed in a 24 GiB scope.  Under a container's limit (below
+    // MemTotal) it is not credited; nor are locked pages (the unevictable list)
+    put("fs/box/memory.stat", "file " + std::to_string(15 * GiB) + "\nshmem " + std::to_string(3 * GiB) + "\nactive_file " +
+                              std::to_string(8 * GiB) + "\ninactive_file " + std::to_string(4 * GiB) + "\nunevictable " +
+                              std::to_string(2 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
+    put("fs/box/memory.current", std::to_string(19 * GiB) + "\n");
+    require(probe("0::/box\n") && m.available == 41 * GiB - 48 * GiB / 64, "container: shmem and locked pages are not credited");
+    set_env("STRATA_MEM_CREDIT_INACTIVE", "1");
+    require(probe("0::/box\n") && m.available == 44 * GiB - 48 * GiB / 64, "STRATA_MEM_CREDIT_INACTIVE=1: the earlier file credit");
+    set_env("STRATA_MEM_CREDIT_INACTIVE", nullptr);
+    put("meminfo", "MemTotal: 41943040 kB\nMemAvailable: 104857600 kB\n");   // 40 GiB: the 48 GiB limit is not a container's
+    require(probe("0::/box\n") && m.available == 44 * GiB - 48 * GiB / 64, "a limit above MemTotal: the earlier file credit");
+    put("meminfo", "MemTotal: 134217728 kB\nMemAvailable: 104857600 kB\n");
+    put("fs/box/memory.current", std::to_string(16 * GiB) + "\n");
     put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
     put("fs/box/memory.max", "max\n");
     require(probe("0::/box\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2 max");

@@ -450,6 +450,30 @@ int main() {
         check(f.sample(40 * GiB) && f.sample(40 * GiB)->credit == 1 * GiB && f.sample(40 * GiB)->source == MemorySource::flag,
               "--memory-limit-mib: inactive only");
     }
+    // the expert arena's figure under a container's limit: the same file-list credit (never shmem, never locked pages), its own margin
+    {
+        // the 24 GiB scope with a 3 GiB memfd held (l620, 11-14): the earlier figure credited the shmem in "file" and an
+        // allocation up to it was OOM-killed; this one leaves it charged
+        const std::string memfd = "anon 1048576\nfile " + std::to_string(3 * GiB) + "\nfile_mapped " + std::to_string(3 * GiB) +
+                                  "\nshmem " + std::to_string(3 * GiB) + "\nactive_file 0\ninactive_file 0\nunevictable 0\n"
+                                  "file_dirty 0\nfile_writeback 0\n";
+        const std::optional<uint64_t> host(251 * GiB);
+        ArenaCgroupRoom a = arena_cgroup_room(24 * GiB, 3 * GiB + 20 * MiB, memfd, host, false);
+        check(a.applies && a.credit == 0 && a.room == 21 * GiB - 20 * MiB, "memfd: the shmem stays charged");
+        // active and inactive file pages count, less min(half, limit / 64); locked pages (unevictable) do not
+        const std::string cache = "file " + std::to_string(14 * GiB) + "\nactive_file " + std::to_string(8 * GiB) + "\ninactive_file " +
+                                  std::to_string(4 * GiB) + "\nunevictable " + std::to_string(2 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n";
+        a = arena_cgroup_room(48 * GiB, 16 * GiB, cache, host, false);
+        check(a.applies && a.credit == 12 * GiB - 48 * GiB / 64 && a.room == 44 * GiB - 48 * GiB / 64, "file lists less the margin");
+        a = arena_cgroup_room(48 * GiB, 16 * GiB, cache, std::optional<uint64_t>(48 * GiB), false);
+        check(!a.applies, "a limit at MemTotal: the earlier rule (caller)");
+        check(!arena_cgroup_room(48 * GiB, 16 * GiB, cache, std::nullopt, false).applies, "MemTotal unknown: the earlier rule");
+        check(!arena_cgroup_room(48 * GiB, 16 * GiB, cache, host, true).applies, "STRATA_MEM_CREDIT_INACTIVE=1: the earlier rule");
+        a = arena_cgroup_room(8 * GiB, 9 * GiB, "inactive_file 0\n", host, false);
+        check(a.applies && a.room == 0, "usage over the limit: 0");
+        a = arena_cgroup_room(48 * GiB, 16 * GiB, "", host, false);
+        check(a.applies && a.credit == 0 && a.room == 32 * GiB, "no memory.stat text: no credit");
+    }
     // the limit on a parent level, credited from that level's own memory.stat; memory.high below memory.max
     {
         Fixture f;
