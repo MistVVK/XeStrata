@@ -156,7 +156,7 @@ macro(strata_hip_prompt_tests)
     # one prompt layer of experts timed on every path the engine can take (see tests/cuda/prefill_expert_paths_bench.cpp); any AMD card, a small smoke run here
     add_executable(hip_prefill_expert_paths_bench tests/cuda/prefill_expert_paths_bench.cpp)
     target_include_directories(hip_prefill_expert_paths_bench PRIVATE "${_strata_gg}/include")
-    target_link_libraries(hip_prefill_expert_paths_bench PRIVATE strata_prefill ${_strata_pf_tests_lib} ggml-base strata_hip_runtime)
+    target_link_libraries(hip_prefill_expert_paths_bench PRIVATE strata_prefill ${_strata_pf_tests_lib} $<TARGET_NAME_IF_EXISTS:strata_quant> ggml-base strata_hip_runtime)
     add_test(NAME hip_prefill_expert_paths_bench COMMAND hip_prefill_expert_paths_bench --quick)
     set_tests_properties(hip_prefill_expert_paths_bench PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     list(APPEND _strata_hip_tests hip_prefill_expert_paths_bench)

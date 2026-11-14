@@ -7,8 +7,9 @@
 // 65,504 and the reference does not).  perturb_offset() walks the bytes from offset 4 and skips every byte this table marks: a format whose
 // bytes 4..19 hold no scale bits keeps the blobs of earlier runs.
 //
-// Header-only and free of ggml (tests/prefill/bench_blob_layout_test.cpp checks it on the CPU); the bench checks bytes and values per block
-// against ggml_type_size / ggml_blck_size before it uses an entry.  The layouts are those of third_party/strata-ggml/ggml/src/ggml-common.h.
+// Header-only and free of ggml (tests/prefill/bench_blob_layout_test.cpp checks it on the CPU); the bench and the test check bytes and values
+// per block against the engine's own type table (strata::quant::type_info) before an entry is used.  The layouts are those of
+// third_party/strata-ggml/ggml/src/ggml-common.h.
 #pragma once
 
 #include <cstddef>

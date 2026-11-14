@@ -42,6 +42,7 @@
 #endif
 
 #include "ggml.h"
+#include "strata/quant/types.hpp"
 #include "../prefill/bench_blob_layout.hpp"
 
 #include <cuda_runtime.h>
@@ -649,9 +650,11 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
         std::printf("   %s: no block layout for gate/up type %d in bench_blob_layout.hpp: pair skipped\n", p.name, (int) p.gu);
         return;
     }
-    if (!real && (gu_lay.bytes != (int) type_size(p.gu) || gu_lay.values != (int) blck_size(p.gu) || strata::bench_blob::perturb_offset(gu_lay, 15) >= geo.gu_row)) {
-        std::fprintf(stderr, "bench_blob_layout.hpp: type %d has %d bytes / %d values per block there, ggml says %zu / %lld\n", (int) p.gu, gu_lay.bytes,
-                     gu_lay.values, type_size(p.gu), (long long) blck_size(p.gu));
+    // checked against the engine's own type table (strata::quant::type_info), not ggml's: a build without MMQ links no ggml for this
+    const strata::quant::TypeInfo* gu_ti = real ? nullptr : strata::quant::type_info((int) p.gu);
+    if (!real && (gu_ti == nullptr || gu_lay.bytes != (int) gu_ti->bytes || gu_lay.values != gu_ti->blck || strata::bench_blob::perturb_offset(gu_lay, 15) >= geo.gu_row)) {
+        std::fprintf(stderr, "bench_blob_layout.hpp: type %d has %d bytes / %d values per block there, strata::quant::type_info says %zu / %d\n", (int) p.gu,
+                     gu_lay.bytes, gu_lay.values, gu_ti ? gu_ti->bytes : (size_t) 0, gu_ti ? gu_ti->blck : 0);
         std::exit(1);
     }
     std::mt19937 rng(o.seed + (unsigned) p.gu * 7 + (unsigned) p.d);

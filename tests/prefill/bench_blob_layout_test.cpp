@@ -6,6 +6,9 @@
 #include <vector>
 
 #include "bench_blob_layout.hpp"
+#if defined(BBL_HAVE_QUANT)
+#include "strata/quant/types.hpp"
+#endif
 
 using strata::bench_blob::BlockLayout;
 using strata::bench_blob::is_scale;
@@ -25,6 +28,11 @@ int main() {
         for (int b = 0; b < L.bytes; ++b) data += !is_scale(L, b);
         CHECK(data > 0 && data < L.bytes);   // every format has a scale and quant bytes
         for (const auto& s : L.scale) CHECK(s.begin >= 0 && s.begin < s.end && s.end <= L.bytes);
+#if defined(BBL_HAVE_QUANT)
+        // the geometry equals the engine's own type table (the one the bench checks against at run time)
+        const strata::quant::TypeInfo* ti = strata::quant::type_info(t);
+        CHECK(ti != nullptr && (int) ti->bytes == L.bytes && ti->blck == L.values);
+#endif
 
         // a base blob of 40 blocks (the bench's gate row of 2,560 values is 10 to 80 blocks), every expert of a 512-expert layer
         const size_t n = (size_t) L.bytes * 40;
@@ -81,6 +89,10 @@ int main() {
         std::fprintf(stderr, "bench_blob_layout_test: %d check(s) failed\n", failed);
         return 1;
     }
-    std::printf("bench_blob_layout_test: OK\n");
+#if defined(BBL_HAVE_QUANT)
+    std::printf("bench_blob_layout_test: OK (geometry checked against strata::quant::type_info)\n");
+#else
+    std::printf("bench_blob_layout_test: OK (no strata_quant in this build: geometry not cross-checked)\n");
+#endif
     return 0;
 }
