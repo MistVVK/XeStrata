@@ -272,6 +272,7 @@ int main(int argc, char** argv) try {
     int bad = 0;
     for (const auto& c : {three, one}) {
         bad += check(GGML_TYPE_Q8_0, 128, 160, c);
+        bad += check(GGML_TYPE_Q4_0, 128, 160, c);
         bad += check(GGML_TYPE_IQ3_XXS, 128, 512, c);
         bad += check(GGML_TYPE_IQ2_XS, 128, 512, c);
         bad += check(GGML_TYPE_Q4_K, 128, 512, c);
