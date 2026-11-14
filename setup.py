@@ -1119,7 +1119,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     "ornith": {"title": "Ornith-1.5-35B-A3B", "by": "Ornith AI (MIT)",
                "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Q4_K_M to BF16, and community GSQ-RCO 3 "
                         "and 3.5 bits",
-               "tag": "ornith-", "name": "ornith-1.5-35b-a3b", "max_context": 262144, "plain": True,
+               "tag": "ornith-", "name": "ornith-1.5-35b-a3b", "max_context": 262144, "plain": True, "kv_bytes": 20480,
                "profile": "expert-profile-ornith.bin", "mmproj": _ORNITH_MMPROJ,
                "models": {
                    "Q4_K_M": {"repo": _ORNITH, "file": "Ornith-1.5-35B-Q4_K_M.gguf", "size": 21713463040,
@@ -1155,6 +1155,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
         "about": "Ornith-1.5 with its refusals removed (dealignai's CRACK): far fewer refusals, and its safety "
                  "filtering is reduced, so check what it writes",
         "tag": "ornith-uncensored-", "name": "ornith-1.5-35b-a3b-uncensored", "max_context": 262144, "plain": True,
+               "kv_bytes": 20480,
         "profile": "expert-profile-ornith.bin", "mmproj": _ORNITH_UNC_MMPROJ,
         "models": {
             "Q4_K_M": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q4_K_M"), "size": 21713462848,
@@ -1168,7 +1169,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
         }},
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "by": "LLM-jp (Apache-2.0)",
               "about": "32B, 3B active; Japanese and English, a thinking model", "tag": "llmjp-",
-              "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 65536, "plain": True,
+              "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 65536, "plain": True, "kv_bytes": 67584,
               "profile": "expert-profile-llmjp.bin",
               "models": {
                   "Q4_K_M": {"repo": _LLMJP, "file": "llm-jp-4.1-32b-a3b-thinking-Q4_K_M.gguf", "size": 21522488192,
@@ -1183,7 +1184,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     # experts, Q8_0 dense, F32, and the MTP block's two routers in BF16
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen (Apache-2.0), GGUFs with the MTP layer by Unsloth",
                "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Unsloth's 4-, 6- and 8-bit files",
-               "tag": "qwen36-", "name": "qwen3.6-35b-a3b", "max_context": 262144, "plain": True,
+               "tag": "qwen36-", "name": "qwen3.6-35b-a3b", "max_context": 262144, "plain": True, "kv_bytes": 23244,
                "profile": "expert-profile-qwen36.bin", "mmproj": _QWEN36_MMPROJ,
                "draft_vocab": True,   # the vocabulary of Qwen3.8's draft head subsets (data/draft_vocab*.bin)
                "dflash2": "qwen3.6-35b-a3b",   # its DFlash2 drafter (tools/dflash2_fetch.py's key)
@@ -1208,6 +1209,7 @@ PLAIN_FAMILIES["qwen36-uncensored"] = {
     "about": "Qwen3.6-35B-A3B with its refusals removed (Heretic + MPOA): far fewer refusals, and its safety "
              "filtering is reduced, so check what it writes",
     "tag": "qwen36-uncensored-", "name": "qwen3.6-35b-a3b-uncensored", "max_context": 262144, "plain": True,
+    "kv_bytes": 23244,
     "profile": "expert-profile-qwen36.bin", "draft_vocab": True, "mmproj": _QWEN36_UNC_MMPROJ,
     "models": {
         "APEX-I-Quality": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Quality"), "size": 23514746272,
@@ -8173,6 +8175,10 @@ def prepare_engine(a, gpu: dict) -> tuple[Path, Path, list]:
 # about 1.9 GB, counted from prompt_carve, not measured; the engine halves the chunk until they fit, down to 16 tokens),
 # the products' libraries and the driver's reserve.  The least that lets the engine start.
 DENSE_MARGIN_GB = 1.0
+# A MoE's own weights beside its experts (the dense part, the head, the norms): about 2-3 GB across the plain
+# MoE families, an estimate for the streaming rule's VRAM half (the engine counts the real bytes).  The expert tier
+# is elastic: its partial residency on a small card is normal, not a weight the K/V pushed out.
+MOE_DENSE_GB = 3.0
 # ... and its RAM: the model file's pages pass through the OS cache once while the weights go to the GPU, and the
 # token embedding stays mapped (rows read on the host); an estimate, not measured
 DENSE_RAM_GB = 8
@@ -8185,7 +8191,7 @@ def dense_vram_gb(fam: dict, d: dict, ctx: int, streaming: bool = False) -> floa
     return d["size"] / 1e9 + fam["kv_bytes"] * kv_cells / 1e9 + DENSE_MARGIN_GB
 
 
-PLAIN_KV_RESIDENT = 32768   # the resident cells a layer --kv-resident auto keeps in VRAM (the engine's resolve_kv_resident)
+PLAIN_KV_RESIDENT = 32768   # the resident cells a layer --kv-resident auto keeps in VRAM (resolve_kv_resident)
 
 
 def plain_kv_host_gb(fam: dict, ctx: int, kv: str) -> float:
@@ -8196,15 +8202,24 @@ def plain_kv_host_gb(fam: dict, ctx: int, kv: str) -> float:
     return ctx * fam.get("kv_bytes", 0) * factor / 1e9
 
 
-def plain_kv_streaming_wanted(fam: dict, d: dict, ctx: int, ram: float, kv: str) -> bool:
-    """Does the engine stream this plain model's KV (--kv-resident auto): from 64K up, when the RAM holds the experts
-    (a dense model: none) beside the KV host copy and the engine's headroom.  The engine decides the same at load
-    (resolve_kv_resident, the experts' real bytes); setup uses the model file as the experts' upper bound, for the
-    context guidance."""
+def plain_kv_streaming_wanted(fam: dict, d: dict, ctx: int, ram: float, kv: str, vram: float = 0.0) -> bool:
+    """Does the engine stream this plain model's KV (--kv-resident auto): from 64K up, only where the resident K/V
+    does not fit the GPU beside the model's own weights (the expert tier is elastic: its partial residency on a
+    small card is normal, not a weight pushed out), and the RAM holds the experts (a dense model: none) beside the
+    KV host copy and the engine's headroom.  The engine decides the same at load (resolve_kv_resident /
+    auto_gpu_layers, the real bytes); setup uses the model file as the experts' upper bound, for the context
+    guidance.  Where the resident form fits, streaming measured 45-76% slower decode (B70, RTX 4070, RX 9060 XT,
+    2026-11-15): it is not the default there.  Qwen3.8's rule (kv_streaming_wanted) has no VRAM condition: its QSA
+    reads only the selected cells, so streaming costs it nothing."""
     if ctx < 65536:
         return False
     experts = 0.0 if fam.get("dense") else d["size"] / 1e9
-    return ram >= experts + LOW_RAM_HEADROOM_GB + plain_kv_host_gb(fam, ctx, kv) + 1
+    if ram < experts + LOW_RAM_HEADROOM_GB + plain_kv_host_gb(fam, ctx, kv) + 1:
+        return False
+    if vram <= 0:
+        return True   # the GPU's size unknown: the RAM rule alone
+    weights = d["size"] / 1e9 if fam.get("dense") else MOE_DENSE_GB
+    return weights + fam.get("kv_bytes", 0) * ctx / 1e9 + DENSE_MARGIN_GB > vram
 
 
 # A dense model on the CPU (--device cpu, the families with "cpu"): its weights repacked as int8 (one byte a weight, a
@@ -8355,7 +8370,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                                str(contexts.index(rec_ctx) + 1), a.yes)) - 1]
     ok(f"context: {ctx} tokens")
     kv_fmt = a.kv if (a.kv and a.kv in plain_kv_takes(family)) else "fp16"
-    streaming = not on_cpu and plain_kv_streaming_wanted(fam, d, ctx, ram, kv_fmt)
+    streaming = not on_cpu and plain_kv_streaming_wanted(fam, d, ctx, ram, kv_fmt, gpu_gb)
     if streaming:
         ok(f"KV streaming (auto): the last {PLAIN_KV_RESIDENT // 1024}K cells a layer stay in VRAM, the rest in RAM "
            f"(~{plain_kv_host_gb(fam, ctx, kv_fmt):.1f} GB), so the long context fits and more experts stay on the GPU")

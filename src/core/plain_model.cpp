@@ -643,6 +643,26 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
     uint64_t used = head + reserve;
     int64_t fit = 0;
     while (fit < nl && used + block[(size_t) fit] <= free_b) used += block[(size_t) fit++];
+    // --kv-resident auto: where the resident K/V would push blocks off the GPU, plan the streaming ring instead
+    // (resolve_kv_resident checks the RAM and plans it): streaming reads the whole non-resident context over PCIe
+    // every token, so it is only for the contexts the resident form cannot hold -- where that form fits, streaming
+    // measured 45-76% slower decode (B70, RTX 4070, RX 9060 XT, 2026-11-15).  Qwen3.8's auto (29ad2c249) has no
+    // VRAM condition: its QSA reads only the selected cells, so streaming costs it nothing.
+    if (fit < nl && opt_.kv_resident < 0 && opt_.max_cells >= 65536) {
+        const int64_t ps = attn_shapes().page_size;
+        const int64_t ring = std::min<int64_t>(opt_.max_cells, (32768 + opt_.max_t + ps - 1) / ps * ps);
+        const uint64_t row = (uint64_t) (nkv * s.key_length) * 2 * (opt_.kv_int8 ? 1 : 2);
+        for (int64_t l = 0; l < nl; ++l)
+            if (!s.recurrent[(size_t) l] && !s.layer_swa(l))
+                block[(size_t) l] += (uint64_t) (ring - opt_.max_cells) * row;
+        used = head + reserve;
+        fit = 0;
+        while (fit < nl && used + block[(size_t) fit] <= free_b) used += block[(size_t) fit++];
+        kv_stream_auto_ = true;
+        if (first())
+            std::fprintf(stderr, "xestrata plain: the resident K/V does not fit beside the weights: KV streaming "
+                                 "(auto), the last 32768 cells a layer in VRAM\n");
+    }
     if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
     opt_.gpu_layers = head + reserve > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
     std::fprintf(stderr, "xestrata plain: %.2f GiB of VRAM free, the head and a reserve %.2f GiB, the blocks %.2f GiB: %s\n",
@@ -2298,6 +2318,51 @@ uint64_t PlainModel::kv_host_bytes() const {
     return per * layers;
 }
 
+// Does the whole context's K/V fit the VRAM beside this stage's own weights (the dense part and the head; the
+// expert tier is elastic, its partial residency normal)?  The auto rule's VRAM half (resolve_kv_resident): the
+// weights from the metadata, nothing allocated yet, the same reserve auto_gpu_layers takes.
+bool PlainModel::kv_resident_fits_vram() const {
+    size_t f = 0, t = 0;
+    {
+        const OnDevice on(dev_);
+        if (!strata::gpu::mem_info(&f, &t)) return true;   // unknown: the RAM rule alone decides
+    }
+    const uint64_t free_b = counted_free(f, f, opt_.vram_free_mib);
+    const ModelSpec& s = spec_;
+    const bool last = le_ == s.n_layer;
+    uint64_t weights = 0;
+    for (size_t i = 0; i < model_->size(); ++i)
+        for (const TensorInfo& ti : model_->shard(i).tensors()) {
+            if (ti.name.rfind("blk.", 0) == 0) {
+                if (ti.name.find("_exps.") != std::string::npos) continue;   // the expert tier: elastic
+                const int64_t l = std::strtoll(ti.name.c_str() + 4, nullptr, 10);
+                if ((l >= lb_ && l < le_) || (has_mtp_ && l == s.n_layer)) weights += tensor_payload_bytes(ti);
+            } else if (last && (ti.name == head_name() || ti.name == "output_norm.weight")) {
+                weights += tensor_payload_bytes(ti);
+            }
+        }
+    for (int64_t l = lb_; l < le_; ++l)
+        if (s.recurrent[(size_t) l])
+            weights += (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state +
+                                   (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4;
+    const uint64_t reserve = opt_.reserve_mib >= 0
+                                 ? (uint64_t) opt_.reserve_mib << 20
+                                 : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
+    // the whole context's K/V of this stage's attention blocks (the MTP layer's too), as alloc_kv takes it
+    const k::QsaShapes qs = attn_shapes();
+    const uint64_t cells = (uint64_t) opt_.max_cells * (uint64_t) qs.n_head_kv;
+    const uint64_t codes = cells * (size_t) qs.head_dim, scales = cells * ((size_t) qs.head_dim / k::KV_Q8_GROUP) * 2,
+                   q4 = cells * (uint64_t) k::kv_q4_bytes_per_head((int) qs.head_dim);
+    const uint64_t one = opt_.kv_q4 == 1 ? 2 * q4
+                       : opt_.kv_q4 == 2 ? codes + scales + q4
+                       : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
+    uint64_t kv = 0;
+    for (int64_t l = lb_; l < le_; ++l)
+        if (blocks_[(size_t) l].attn >= 0 && !attn_swa_[(size_t) blocks_[(size_t) l].attn]) kv += one;
+    if (has_mtp_ && !attn_swa_[(size_t) mtp_.attn]) kv += one;
+    return weights + reserve + kv <= free_b;
+}
+
 bool PlainModel::resolve_kv_resident(std::string& err) {
     kv_resident_cells_ = 0;
     if (glm_ || opt_.cpu || cpu_tail_ != nullptr || opt_.encoder || opt_.batch_slots > 0) {
@@ -2311,8 +2376,15 @@ bool PlainModel::resolve_kv_resident(std::string& err) {
     }
     int64_t want = opt_.kv_resident;
     if (want == 0) return true;
-    if (want < 0) {   // auto: Qwen3.8-Flash-Next's rule (setup's kv_streaming_wanted), from the engine's own figures
+    if (want < 0) {   // auto: from 64K up, only where the resident K/V does not fit the GPU, and the RAM holds it
         if (opt_.max_cells < 65536) { opt_.kv_resident = 0; return true; }
+        // the VRAM rule (2026-11-15): stream only where the resident K/V does not fit beside the model's own
+        // weights -- auto_gpu_layers already planned the ring for a dense model (kv_stream_auto_); here, a MoE's
+        // dense part and head (the expert tier is elastic: its partial residency on a small card is normal, not a
+        // block pushed out).  Where the resident form fits, streaming measured 45-76% slower decode (B70, RTX 4070,
+        // RX 9060 XT): it must not be the default there.  Qwen3.8's rule (29ad2c249) has no VRAM condition: its
+        // QSA reads only the selected cells, so streaming costs it nothing.
+        if (!kv_stream_auto_ && kv_resident_fits_vram()) { opt_.kv_resident = 0; return true; }
         uint64_t experts = 0;
         if (!dense_) {
             if (root_ == this) {   // the layout open_experts reads again (metadata only); the stages inherit it
