@@ -111,6 +111,8 @@ struct SharedOptionFields {
     bool batch_clamp0 = false;           ///< plain: max 0; generate as it is
     int* expert_cache_remote = nullptr;  ///< --expert-cache-device1/2/3, an array of 3
     bool expert_cache_remote_clamp0 = false;   ///< plain: max 0
+    bool* split_roles_helper = nullptr;  ///< --split-roles any|helper (helper: true), --layer-split auto's second GPU
+    bool* split_skip_if_fits = nullptr;  ///< --split-skip-if-fits: the first GPU alone when it holds every profiled pair
     int* pool_tasks = nullptr;
     const char* pool_tasks_msg = nullptr;      ///< the engine's own error line
     bool pool_tasks_strict = false;            ///< generate: the whole value an integer
@@ -356,6 +358,11 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
         f.expert_cache_remote) {
         const int v = (int) std::strtol(next(a.c_str()), nullptr, 10);
         f.expert_cache_remote[(size_t) (a.back() - '1')] = f.expert_cache_remote_clamp0 ? std::max(0, v) : v;
+        return 1;
+    }
+    if (a == "--split-skip-if-fits" && f.split_skip_if_fits) { *f.split_skip_if_fits = true; return 1; }
+    if (a == "--split-roles" && f.split_roles_helper) {
+        *f.split_roles_helper = std::string(next(a.c_str())) == "helper";
         return 1;
     }
     if (a == "--pool-tasks" && f.pool_tasks) {

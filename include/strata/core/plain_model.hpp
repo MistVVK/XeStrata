@@ -189,6 +189,10 @@ struct PlainOptions {
     /// (--expert-cache-remote-placement)
     std::array<int, 3> expert_cache_remote{};
     std::string expert_cache_remote_placement = "stripe";
+    /// --split-roles any|helper and --split-skip-if-fits: the second GPU's role in --layer-split auto (a stage of the
+    /// split, a helper expert cache, or none), as Qwen3.8-Flash-Next's (core/split_role.hpp)
+    bool split_roles_helper = false;
+    bool split_skip_if_fits = false;
     bool pcie_split = true;         ///< split the missed experts between the CPU and PCIe by measured times
     /// --pcie-frac F: that share of the missed experts over PCIe in every window, instead of the measured split and the
     /// decode's first windows' choice (< 0: measured)
@@ -652,6 +656,9 @@ private:
     bool load_stage(const PlainOptions& opt, PlainModel* root, int64_t lb, int64_t le, int dev, std::string& err);
     /// The split's points from each GPU's free memory (split_auto)
     bool split_auto_points(std::string& err);
+    /// The second GPU's role in --layer-split auto (split_auto_points): a stage, a helper expert cache, or none
+    /// (core/split_role.hpp, as generate.cpp).  Needs --expert-profile; without one the split by memory stands.
+    bool split_auto_role(std::string& err);
     /// The architecture's part of the load (the blocks of this stage), and after every stage's: the RAM copy of the
     /// experts no GPU holds, each stage's PCIe split, the report
     bool load_arch(std::string& err);

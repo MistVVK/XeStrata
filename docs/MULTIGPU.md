@@ -101,6 +101,13 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   The log shows which one wins (`as a helper expert cache instead: ... -> the helper`).
   With `--pipeline-windows`, `--no-pool` or `--batch` the split stays.
 
+The plain engine (Qwen3.6-35B-A3B, Ornith-1.5 and the others) makes this choice of the second GPU's role (a helper
+cache, a stage, or none) through the same shared part (`core/split_role.hpp`). Its split points come from each GPU's
+share of the free memory (`choose_split_by_room`), not the search above, and the role choice runs only with
+`--expert-profile` (without one the split by memory stands). It takes `--split-roles`, `--split-skip-if-fits` and the
+environment variables above with the same meanings. The prediction prices a decode window only, as here; the prompt
+speed is checked by measurement (whether the choice helps plain is measured in the record's measure-plan).
+
 Environment variables change the model's assumptions:
 
 | Variable | Default | Meaning |

@@ -412,7 +412,8 @@ if(STRATA_ENABLE_XE)
 
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
                                  src/core/weights.cpp src/core/layout.cpp src/core/link_probe.cpp
-                                 src/core/split_predict.cpp src/core/stdin_lines.cpp src/core/watchdog.cpp)
+                                 src/core/split_predict.cpp src/core/split_role.cpp src/core/stdin_lines.cpp
+                                 src/core/watchdog.cpp)
   target_include_directories(strata_core PUBLIC include)
   target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform)
 
@@ -1649,6 +1650,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(auto_pick_test src/core/auto_pick_test.cpp)
   target_include_directories(auto_pick_test PRIVATE include)
   add_test(NAME auto_pick_test COMMAND auto_pick_test)
+  # the second GPU's role in --layer-split auto: the helper window prediction and the choice (header-only, no GPU)
+  add_executable(split_role_test src/core/split_role_test.cpp)
+  target_include_directories(split_role_test PRIVATE include)
+  add_test(NAME split_role_test COMMAND split_role_test)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
