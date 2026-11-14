@@ -18,14 +18,15 @@
 // or more, an equal chunk under kEqualMinChunk keeps today's cut; a smaller configured chunk keeps the rule as before.
 //
 // Two chunks take a lower minimum (kEqualMinChunk2).  Equal cut against today's, prompt ms, by equal chunk:
-//   RTX 4090 24 GB, IQ3_S, chunk 8,192 (pod, 11-14): two chunks 4,140: 1.34, 4,224: 1.25, 4,596: 1.15, 5,596: 1.011,
-//     5,725: 0.938, 5,950: 0.938, 6,125: 0.977; three chunks 5,628: 1.13, 5,717: 1.111, 5,933: 1.084, 6,133: 1.058,
-//     6,667: 0.98; four chunks of 8,000: 0.986.
-//   RTX 5070 12 GB, Q2_0 plain pack, chunk 10,496 (11-14): two chunks 5,250: 1.043, 5,500: 0.862, 5,650: 0.856, 5,750: 0.83,
-//     6,100: 0.86.
-// With two chunks the segment is twice the equal chunk, so the two-chunk minimum is a prompt length: 5,500 = segments of
-// 11,000 tokens or more (the RTX 5070 at 5,250 is a 10,496 + 3 cut; the RTX 4090 at 5,596 is level).  Three or more chunks
-// take the equal cut from 6,144 tokens each.  Both values are measured on these two cards; they are not a model.
+//   RTX 4090 24 GB, IQ3_S, chunk 8,192 (pod, 11-14): two chunks 4,140: 1.34, 4,224: 1.25, 4,596: 1.15, 5,400: 0.985,
+//     5,500: 1.007, 5,596: 1.011, 5,600: 1.021, 5,725: 0.938, 5,950: 0.938, 6,125: 0.977; three chunks 5,628: 1.13,
+//     5,717: 1.111, 5,933: 1.084, 6,133: 1.058, 6,667: 0.98; four chunks of 8,000: 0.986.
+//   RTX 5070 12 GB, Q2_0 plain pack, chunk 10,496 (11-14): two chunks 5,250: 1.043, 5,400: 0.869 (today's 10,496 + 303 took
+//     1.150 of the equal cut's time), 5,500: 0.862, 5,650: 0.856, 5,750: 0.83, 6,100: 0.86.
+// With two chunks the segment is twice the equal chunk, so the two-chunk minimum is a prompt length: 5,400 = segments of
+// 10,799 tokens or more (the RTX 5070 at 5,250 is a 10,496 + 3 cut).  The engine cuts the prompt length minus 1 (the last
+// token is read with the first new one), so a prompt of 10,800 tokens is a segment of 10,799 and takes 2 x 5,400.  Three or
+// more chunks take the equal cut from 6,144 tokens each.  Both values are measured on these two cards; they are not a model.
 //
 // The rule applies where a segment's chunk is chosen (generate.cpp: the serve lend and generate's prompt) and only on
 // one GPU: a layer split keeps today's cut (prefill.cpp pipeline_chunk: evening out a short tail added a full pass
@@ -64,7 +65,7 @@ constexpr int64_t today_chunk(int64_t tokens, int64_t max_chunk) {
 /// The shortest equal chunk taken with a configured chunk of kEqualMinApplies or more (see the top of this file):
 /// kEqualMinChunk2 when the equal cut has exactly two chunks, kEqualMinChunk for three or more.
 inline constexpr int64_t kEqualMinChunk = 6144;
-inline constexpr int64_t kEqualMinChunk2 = 5500;
+inline constexpr int64_t kEqualMinChunk2 = 5400;
 inline constexpr int64_t kEqualMinApplies = 8192;
 constexpr int64_t equal_min_chunk(int64_t n) {
     return n == 2 ? kEqualMinChunk2 : kEqualMinChunk;
