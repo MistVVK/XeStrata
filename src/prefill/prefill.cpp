@@ -574,9 +574,14 @@ inline bool plain_discrete_floor_now() {
 inline int64_t stream_all_min() {
     static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
     if (env >= 0) return env;
+#if defined(STRATA_PF_OWN_ONLY)
     const bool discrete = plain_discrete_floor_now();
     // (default_stream_floor() prints its line once and caches: only asked when its answer can be the result, as before)
     return strata::prefill::floor_with_share(discrete, g_stream_min_share, discrete || g_stream_min_share <= 0 ? default_stream_floor() : 0);
+#else
+    // a build with MMQ keeps the old text of this function (its compiled code stays the same)
+    return g_stream_min_share > 0 ? g_stream_min_share : default_stream_floor();
+#endif
 }
 #if defined(STRATA_PF_OWN_ONLY)
 inline void own_only_line_flush() {
