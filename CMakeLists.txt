@@ -438,6 +438,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(share_own_rule_test PRIVATE include)
   add_test(NAME share_own_rule_test COMMAND share_own_rule_test)
 
+  # the long-prompt floor of the plain pack by card class and share state: 1,536 tokens on a discrete CUDA card in a build without MMQ, the old answer elsewhere (header-only, no GPU)
+  add_executable(plain_floor_rule_test tests/prefill/plain_floor_rule_test.cpp)
+  target_include_directories(plain_floor_rule_test PRIVATE include)
+  add_test(NAME plain_floor_rule_test COMMAND plain_floor_rule_test)
+
   # the start-up sentence of an engine built without llama.cpp's MMQ prompt kernels (layer counts per path; header-only, no GPU)
   add_executable(own_only_line_test tests/prefill/own_only_line_test.cpp)
   target_include_directories(own_only_line_test PRIVATE include)
