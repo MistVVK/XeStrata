@@ -298,27 +298,37 @@ type MainWindow(setup: Setup.Access) as this =
                 chosen <- chosen @ [ v ]
                 refresh ()
             | _ -> ())
+        let columns (cells: Control list) =
+            let grid = Grid(ColumnDefinitions = ColumnDefinitions("80,2*,*,2*,*,*,45"), ColumnSpacing = 6.0)
+            for i, cell in List.indexed cells do
+                Grid.SetColumn(cell, i)
+                grid.Children.Add cell
+            grid
         let drawRows () =
             rows.Children.Clear()
+            rows.Children.Add(columns [ muted (tr "imgpick.default" "Default"); muted (tr "imgpick.modelVersion" "Model / version");
+                                        muted (tr "imgpick.size" "Size"); muted (tr "imgpick.encoder" "Text encoder");
+                                        muted (tr "imgpick.download" "Download"); muted "RAM"; muted "" ])
             let mutable download = 0.0
             for i, choice in List.indexed chosen do
                 match choiceModel choice with
                 | Some m ->
                     let s = sizeFor m choice
                     download <- download + s.DownloadGb
-                    let def = RadioButton(GroupName = "image-default", IsChecked = Nullable(i = 0),
-                                          Content = tr "imgpick.default" "Default")
+                    let def = RadioButton(GroupName = "image-default", IsChecked = Nullable(i = 0))
                     def.IsCheckedChanged.Add(fun _ ->
                         if def.IsChecked = Nullable true && i <> 0 then
                             chosen <- choice :: (chosen |> List.filter ((<>) choice))
                             refresh ())
                     let remove = button "×" (fun () -> chosen <- chosen |> List.filter ((<>) choice); refresh ())
+                    remove.MinWidth <- 0.0
                     let encoderName =
                         if not m.Uncensored then "—"
                         elif choice.Substring(m.Id.Length).StartsWith "-uncensored" then tr "imgpick.removed" "Refusal direction removed (-uncensored)"
                         else tr "imgpick.original" "Original"
-                    rows.Children.Add(row 8.0 [ def; text (m.Title + " · " + (if choiceSize m choice = "" then tr "img.auto" "Auto" else s.Id));
-                                              muted (encoderName + " · " + gb s.DownloadGb + " · RAM " + gb s.RamGb); remove ])
+                    rows.Children.Add(columns [ def; text m.Title;
+                                                text (if choiceSize m choice = "" then tr "img.auto" "Auto" + " (" + s.Id + ")" else s.Id);
+                                                muted encoderName; muted (gb s.DownloadGb); muted (gb s.RamGb); remove ])
                 | None -> rows.Children.Add(muted choice)
             total.Text <- trf "imgpick.total" "Total download: {download}" [ "download", box (gb download) ]
         refresh <- fun () ->
@@ -337,6 +347,7 @@ type MainWindow(setup: Setup.Access) as this =
                     let auto = ss |> Array.tryFind (fun s -> s.RamGb <= ramLeft ()) |> Option.defaultValue (Array.last ss)
                     let labels =
                         [| yield tr "imgpick.auto" "Auto (recommended; largest that fits RAM)" + " — " + auto.Id + " · " + gb auto.DownloadGb + ", RAM " + gb auto.RamGb
+                                 + (if auto.RamGb > ramLeft () then " · " + tr "install.doesNotFitThe" "does not fit the RAM" else "")
                            for s in ss do
                                yield s.Id + " — " + gb s.DownloadGb + ", RAM " + gb s.RamGb
                                      + (if s.RamGb > ramLeft () then " · " + tr "install.doesNotFitThe" "does not fit the RAM" else "") |]
@@ -414,7 +425,7 @@ type MainWindow(setup: Setup.Access) as this =
         let control = stack 8.0 [ field (tr "imgpick.model" "Model") (row 8.0 [ family; ownButton ]); ownBox; versionField; encoderField;
                                   card (stack 4.0 [ info; origin ]); field (tr "imgpick.size" "Size") sizes; license; duplicate; add;
                                   subheading (tr "imgpick.chosen" "Selected image models"); rows; total ]
-        control, value
+        control, value, refresh
 
     // ---------------------------------------------------------------------------------------------- the pages
     let rec home () =
@@ -609,7 +620,7 @@ type MainWindow(setup: Setup.Access) as this =
         let selectedContext (f: Family) = f.Contexts[max 0 contexts.SelectedIndex]
         let mutable imagesChosen = false
         let mutable refreshFields = ignore
-        let images, imagesValue = imagePicker d d.ImageDefault (fun () -> match selectedModel () with Some m -> max 0.0 (d.RamGb - m.RamGb) | None -> d.RamGb) (fun () -> refreshFields ())
+        let images, imagesValue, refreshImages = imagePicker d d.ImageDefault (fun () -> match selectedModel () with Some m -> max 0.0 (d.RamGb - m.RamGb) | None -> d.RamGb) (fun () -> refreshFields ())
         let imagesField = field (tr "install.imageGenerationModelsTo" "Image generation: models to make images with, besides the text model") images
         // what setup's options are shown for: the family, size and context chosen (step 2's questions where setup
         // would ask them)
@@ -685,6 +696,7 @@ type MainWindow(setup: Setup.Access) as this =
                 contexts.SelectedIndex <- max 0 (Array.IndexOf(f.Contexts, m.Context))
                 install.IsEnabled <- true
                 refresh ()
+                refreshImages ()
             | _ -> install.IsEnabled <- false
         baseBox.SelectionChanged.Add(fun _ -> baseChanged ())
         variantBox.SelectionChanged.Add(fun _ -> variantChanged ())
@@ -754,7 +766,7 @@ type MainWindow(setup: Setup.Access) as this =
             d.Families |> Array.tryFind (fun f -> f.Id = m.Family)
             |> Option.bind (fun f -> f.Models |> Array.tryFind (fun x -> x.Id = m.Model))
             |> Option.map (fun x -> x.RamGb) |> Option.defaultValue 0.0
-        let picker, value = imagePicker d m.Images (fun () -> max 0.0 (d.RamGb - textRam)) ignore
+        let picker, value, _ = imagePicker d m.Images (fun () -> max 0.0 (d.RamGb - textRam)) ignore
         let holds w = match w with "images" -> true | "sam3" -> not (isNull (box d.Sam3)) && not d.Sam3.Agreed | _ -> false
         let options = fieldsOf d [ "images" ] holds (fun () -> None) |> List.collect snd
         Fields.watch options (fun () -> Fields.refresh options)
