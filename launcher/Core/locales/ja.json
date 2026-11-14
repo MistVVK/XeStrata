@@ -39,7 +39,6 @@
  "home.thisPc": "この PC",
  "home.tune": "調整",
  "images.apply": "適用",
- "images.checkTheImageModels": "画像を作るのに使う画像のモデルにチェックを入れてください（なし: 画像の生成はオフ）。ファイルをダウンロードし、モデルは次の起動から使います。",
  "images.title": "{model} の画像の生成",
  "img.auto": "自動",
  "img.defaultImageModelThe": "既定の画像のモデル（ほかのモデルは Web のページか API の \"model\" で選びます）",

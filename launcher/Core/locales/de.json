@@ -39,7 +39,6 @@
  "home.thisPc": "Dieser PC",
  "home.tune": "Abstimmen",
  "images.apply": "Anwenden",
- "images.checkTheImageModels": "Wählen Sie die Bildmodelle, mit denen Bilder erzeugt werden (keines: Bilderzeugung aus). Ihre Dateien werden heruntergeladen, und das Modell übernimmt sie beim nächsten Start.",
  "images.title": "Bilderzeugung für {model}",
  "img.auto": "Automatisch",
  "img.defaultImageModelThe": "Standard-Bildmodell (die anderen: auf der Webseite oder über \"model\" der API gewählt)",

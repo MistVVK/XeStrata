@@ -39,7 +39,6 @@
  "home.thisPc": "Este PC",
  "home.tune": "Ajustar",
  "images.apply": "Aplicar",
- "images.checkTheImageModels": "Marca los modelos de imagen con los que crear imágenes (ninguno: generación de imágenes desactivada). Sus archivos se descargan y el modelo los toma en su próximo inicio.",
  "images.title": "Generación de imágenes para {model}",
  "img.auto": "Automático",
  "img.defaultImageModelThe": "Modelo de imagen por defecto (los demás: se eligen en la página web o con \"model\" de la API)",

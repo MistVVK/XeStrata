@@ -39,7 +39,6 @@
  "home.thisPc": "이 PC",
  "home.tune": "조정",
  "images.apply": "적용",
- "images.checkTheImageModels": "이미지를 만들 이미지 모델을 선택하세요(없음: 이미지 생성 끔). 파일을 다운로드하며, 모델은 다음 시작부터 사용합니다.",
  "images.title": "{model}의 이미지 생성",
  "img.auto": "자동",
  "img.defaultImageModelThe": "기본 이미지 모델(나머지는 웹 페이지나 API의 \"model\"로 선택)",

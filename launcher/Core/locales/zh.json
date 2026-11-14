@@ -39,7 +39,6 @@
  "home.thisPc": "这台电脑",
  "home.tune": "调优",
  "images.apply": "应用",
- "images.checkTheImageModels": "勾选用来生成图片的图片模型（都不选：关闭图片生成）。会下载它们的文件，模型在下次启动时使用。",
  "images.title": "{model} 的图片生成",
  "img.auto": "自动",
  "img.defaultImageModelThe": "默认图片模型（其他的在网页上或通过 API 的 \"model\" 选择）",
