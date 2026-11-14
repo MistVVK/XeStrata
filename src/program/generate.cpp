@@ -112,6 +112,7 @@
 #include "strata/prefill/loan_rules.hpp"
 #if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/equal_cut_rule.hpp"
+#include "strata/prefill/fit_out_rule.hpp"
 #endif
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -11218,6 +11219,11 @@ int main(int argc, char** argv) {
         decide_split_ring();
         std::vector<PfPart> pf_parts;
         int64_t pf_plan_chunk = 0;   // #2824: the host-aware plan's chunk for prompts longer than o.prefill_chunk (0: none)
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+        int64_t pf_fit_tail = -1;     // the tail the auto scan counts (fit_out_rule.hpp): -1 today's floor - 1, 0 after a tail-0 scan
+        int64_t pf_fit_small = 0;     // that scan's small_max (0.1.39's chunk): the request path's today's-cut limit after a tail-0 scan
+        bool pf_small_taken = false;  // the small-card prompt path was taken
+#endif
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
@@ -11230,7 +11236,11 @@ int main(int argc, char** argv) {
             // explicit --prefill is the operator's number, and a loan of it only has to fit.  With one participant
             // (no split) this reduces to plan_lend exactly, so the single-GPU loan is unchanged from main.
             auto fits_one = [&](const PfPart& p, int64_t c, bool cap) -> bool {
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                const int64_t k = part_slots(p, c, cap ? pf_fit_tail : -1);   // tail 0 only in the auto scan after fit_out's case
+#else
                 const int64_t k = part_slots(p, c);
+#endif
                 if (k <= 0 || k + g_lend_keep > p.cache->slots()) return false;
                 return !(cap && k * 100 > kAutoLendPct * p.cache->slots());
             };
@@ -11267,7 +11277,16 @@ int main(int argc, char** argv) {
                                                                         kAutoLendPct * p.cache->slots() / 100));
                     const uint64_t avail = part_bytes(p, (int32_t) (p.cache->slots() - budget));
                     const uint64_t nonring = strata::program::split_part_figure(on_part_device, p.dev, [&] {
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                        // after fit_out's case: the chunk's own buffers at tail 0 (the ring's bytes do not depend on the tail)
+                        const uint64_t nr = strata::prefill::Prefill::bytes_needed_no_ring(g, *p.ses, c, srcp != nullptr);
+                        if (pf_fit_tail < 0) return nr;
+                        const uint64_t full = strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr);
+                        const uint64_t at0 = strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr, pf_fit_tail);
+                        return nr - std::min(nr, full - std::min(full, at0));
+#else
                         return strata::prefill::Prefill::bytes_needed_no_ring(g, *p.ses, c, srcp != nullptr);
+#endif
                     });
                     room = std::min(room, (int64_t) ((avail - std::min(avail, nonring)) / (uint64_t) kBlob));
                 }
@@ -11280,6 +11299,12 @@ int main(int argc, char** argv) {
             // 0.1.39's list with its ring: the chunk it would pick, and the size up to which a prompt keeps that ring
             auto old_pick = [&](const PfPart* only) -> int64_t {
                 strata::prefill::Prefill::set_ring_budget(0, 0);
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                // 0.1.39's chunk is always priced with today's tail: it bounds every layout at or below it, a short tail included
+                const int64_t fit_tail_was = pf_fit_tail;
+                pf_fit_tail = -1;
+                struct Back { int64_t& t; int64_t v; ~Back() { t = v; } } back{pf_fit_tail, fit_tail_was};
+#endif
                 static constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
                 for (const int64_t c : kAutoChunks) {
                     if (c > 8192 && (c > o.prefill_auto_max || c > o.max_context)) continue;   // #282, as plan_lend
@@ -11340,6 +11365,9 @@ int main(int argc, char** argv) {
 #endif
                     }
                     chunk = scan(nullptr);
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                    pf_small_taken = chunk > 0;
+#endif
                     if (chunk <= 0) {   // the unfused layout's buffers do not fit anywhere: keep the default path as it was
                         strata::prefill::pf_fused_override().store(-1);
                         if (pp.layer_major) {
@@ -11409,6 +11437,65 @@ int main(int argc, char** argv) {
                 pf_plan_chunk = chunk;
                 chunk = chunk_vram;
             }
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+            // fit_out_rule.hpp: with the equal cut on one GPU and the request-sized tail loan, no layout above 0.1.39's chunk
+            // carries a short tail, so the scan counts what those layouts carve: tail 0.  Today's chunk stays when the
+            // host-aware plan planned a smaller one, when it would plan one for the larger chunk, and when the start-up
+            // layout of the larger chunk (today's tail) would not keep the 128-slot floor.
+            if (chunk > 0 && pf_plan_chunk == 0) {
+                namespace fo = strata::prefill::fit_out;
+                fo::ScanCase sc;
+                sc.auto_chunk = o.prefill_auto && strata::prefill::Prefill::ring_bytes_enabled();
+                sc.one_gpu = pf_parts.size() == 1 && stages.empty() && !multi_gpu && !peer.valid() && !o.prefill_head_alias &&
+                             o.batch <= 1;
+                sc.tail_loan = tail_loan_on;
+                sc.equal_cut = equal_cut_one == strata::prefill::equal_cut::Cut::equal;
+                sc.small_path = pf_small_taken;
+                sc.fused_at_chunk = strata::prefill::Prefill::tail_matters(chunk, srcp != nullptr);
+                if (fo::scan_tail(sc) == 0) {
+                    const int64_t small1 = old_pick(nullptr);   // today's tail (old_pick)
+                    pf_fit_tail = 0;
+                    int64_t c_new = fo::pick(chunk, scan(nullptr), pf_fit_tail);
+                    if (c_new != chunk && !fits(c_new, false, nullptr)) c_new = chunk;   // the start-up layout, today's tail
+                    const int64_t cap1 = strata::prefill::Prefill::ring_cap_for(small1);
+                    const int64_t ring1 = small1 >= c_new ? 0 : ring_room(c_new, nullptr, cap1);
+                    auto restore1 = [&] { strata::prefill::Prefill::set_ring_budget((int) ring1, small1); };
+                    restore1();
+                    if (c_new != chunk) {
+                        uint64_t gc_bytes = 0;
+                        int64_t gc_slots = 0;
+                        for (const PfPart& p : pf_parts) {
+                            gc_bytes += (uint64_t) std::max<int64_t>(0, (int64_t) p.cache->bytes());
+                            gc_slots += p.cache->slots();
+                        }
+                        const int64_t planned = host_plan_chunk(
+                            c_new, gc_bytes, gc_slots, [&](int64_t c) { return fits(c, true, nullptr); },
+                            [&](int64_t c, uint64_t& bytes, int64_t& slots) {
+                                bytes = 0;
+                                slots = 0;
+                                for (const PfPart& p : pf_parts) {
+                                    const int64_t k = part_slots(p, c, pf_fit_tail);
+                                    if (k <= 0) continue;
+                                    slots += k;
+                                    bytes += part_bytes(p, (int32_t) (p.cache->slots() - k));
+                                }
+                            },
+                            [&](int64_t c) { return ring_room(c, nullptr, cap1); }, restore1);
+                        if (planned != c_new) c_new = chunk;
+                    }
+                    if (c_new == chunk) {   // today's count and today's ring
+                        pf_fit_tail = -1;
+                        const int64_t small0 = old_pick(nullptr);
+                        strata::prefill::Prefill::set_ring_budget(
+                            small0 >= chunk ? 0 : (int) ring_room(chunk, nullptr, strata::prefill::Prefill::ring_cap_for(small0)),
+                            small0);
+                    } else {
+                        chunk = c_new;
+                        pf_fit_small = small1;
+                    }
+                }
+            }
+#endif
             if (chunk > 0 && alone > chunk_vram) {
                 for (size_t i = 1; i < pf_parts.size(); ++i) {
                     const PfPart& p = pf_parts[i];
@@ -14893,8 +14980,15 @@ int main(int argc, char** argv) {
             PfPart& p = pf_parts[0];
             const int64_t live = xcache.slots();
             auto fits = [&](int64_t c) {
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                // the cap with the auto scan's tail (fit_out_rule.hpp), the floor with today's (the start-up layout)
+                const int64_t k = part_slots(p, c, o.prefill_auto ? pf_fit_tail : -1);
+                const int64_t k_floor = part_slots(p, c);
+                return k > 0 && k_floor > 0 && k_floor + g_lend_keep <= live && !(o.prefill_auto && k * 100 > kAutoLendPct * live);
+#else
                 const int64_t k = part_slots(p, c);
                 return k > 0 && k + g_lend_keep <= live && !(o.prefill_auto && k * 100 > kAutoLendPct * live);
+#endif
             };
             int64_t c = chunk_full;
             while (c > 256 && !fits(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
@@ -17918,8 +18012,11 @@ int main(int argc, char** argv) {
                             return tail_loan_on && strata::prefill::Prefill::tail_matters(w, srcp != nullptr)
                                        ? strata::prefill::loan_rules::segment_tail(tokens, w, floor_eq) : -1;
                         };
+                        // after a tail-0 scan only at or below 0.1.39's chunk: today's cut above it would carve the short tail the
+                        // scan did not count (fit_out_rule.hpp today_cut_ok)
                         if (!strata::prefill::equal_cut::loan_ok(part_slots(pf_parts[0], want_full, tail_eq(want_full)),
-                                                                 part_slots(pf_parts[0], want_today, tail_eq(want_today))))
+                                                                 part_slots(pf_parts[0], want_today, tail_eq(want_today))) &&
+                            strata::prefill::fit_out::today_cut_ok(pf_fit_tail, want_today, pf_fit_small))
                             want_full = want_today;
                     }
                 }
