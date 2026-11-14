@@ -114,6 +114,15 @@ inline int head_of_lane(int lane) {
     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
 }
 
+// The host copy (KV streaming) as attention pools: the same fields, so the loads below read it with the one code
+// path. Its page table is unused (the host row is the identity layout, computed where the cell is mapped).
+inline QsaAttnPools host_pools(const KvHostPools& h) {
+    QsaAttnPools p;
+    p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q;
+    p.k_scale = h.k_scale; p.v_scale = h.v_scale; p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+    return p;
+}
+
 // One V element of pool row `row`, dimension `d` (the value loop's own work-item), per KV format.
 template <int HD, int KV_MODE>
 inline float load_v1(const QsaAttnPools& p, long long row, int d) {
@@ -200,6 +209,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
         sycl::local_accessor<float, 1> sp(sycl::range<1>((size_t) G * CHUNK), hd);       // scores
         sycl::local_accessor<sycl::float4, 1> spt(sycl::range<1>(CHUNK * GP / 4), hd);  // probabilities, cell-major
         sycl::local_accessor<long long, 1> srow(sycl::range<1>(CHUNK), hd);     // pool row of each cell
+        sycl::local_accessor<int, 1> shost(sycl::range<1>(CHUNK), hd);         // 1: the cell's row is in the host copy
         sycl::local_accessor<float, 1> sml(sycl::range<1>(2 * G), hd);           // a chunk's max and sum per head
         hd.parallel_for(sycl::nd_range<3>({n_q, (size_t) n_kv_heads, (size_t) n_slots * THREADS}, {1, 1, THREADS}),
                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -212,6 +222,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 if constexpr (ROWS) return rows.p[z];
                 else return pools;
             }();
+            const QsaAttnPools hp = host_pools(p.host);   // the host copy as pools (streamed dense attention)
             const float* q = q_all + z * (size_t) (n_kv_heads * G) * HD;
             const int32_t* ids = dense ? nullptr : ids_all + z * (size_t) cap;
             const int32_t* step = step_all + z * kStepCount;
@@ -243,14 +254,22 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 const int n_here = sycl::min(csz, n_ids - c0);
                 if (t < CHUNK) {
                     long long r = -1;
+                    int host = 0;
                     if (t < n_here) {
                         const int cell = dense ? lo + c0 + t : ids[c0 + t];
-                        const long long page = (long long) p.page_table[cell / page_size];
-                        // a block the KV streaming could not make resident keeps page -1; its cells are masked (score
-                        // -FLT_MAX, weight 0) instead of being read from before the pool (upstream f3925cf)
-                        if (page >= 0) r = (page * n_kv_real + kv_real) * page_size + (cell % page_size);
+                        if (dense && p.host.present() && cell < n_all - p.resident) {
+                            // the host copy, identity layout: block cell / page_size, its own KV head's run
+                            r = ((long long) (cell / page_size) * n_kv_real + kv_real) * page_size + (cell % page_size);
+                            host = 1;
+                        } else {
+                            const long long page = (long long) p.page_table[cell / page_size];
+                            // a block the KV streaming could not make resident keeps page -1; its cells are masked
+                            // (score -FLT_MAX, weight 0) instead of being read from before the pool (upstream f3925cf)
+                            if (page >= 0) r = (page * n_kv_real + kv_real) * page_size + (cell % page_size);
+                        }
                     }
                     srow[t] = r;
+                    shost[t] = host;
                 }
                 sycl::group_barrier(grp);
                 if constexpr (PERCELL) {
@@ -261,7 +280,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                         if (t < n_here && srow[t] >= 0) {
                             for (int d = 0; d < HD; d += N) {
                                 float key[N];
-                                loadn<HD, KV_MODE>(p, false, srow[t], d, key);
+                                loadn<HD, KV_MODE>(shost[t] ? hp : p, false, srow[t], d, key);
                                 for (int h = 0; h < G; ++h) sums[h] += dotn<N>(key, &sq[h * HD + d]);
                             }
                         }
@@ -283,7 +302,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                     }
                     if (all_ok) {
                         float kk[NC][N];
-                        for (int j = 0; j < NC; ++j) loadn<HD, KV_MODE>(p, false, srow[cc[j]], lane * N, kk[j]);
+                        for (int j = 0; j < NC; ++j) loadn<HD, KV_MODE>(shost[cc[j]] ? hp : p, false, srow[cc[j]], lane * N, kk[j]);
                         constexpr int HP = G <= 4 ? 4 : 16;   // the heads reduce4 or reduce12 sums
                         float pp[NC][HP];
     #pragma unroll
@@ -313,7 +332,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                                 continue;
                             }
                             float kn[N];
-                            loadn<HD, KV_MODE>(p, false, srow[c], lane * N, kn);
+                            loadn<HD, KV_MODE>(shost[c] ? hp : p, false, srow[c], lane * N, kn);
                             constexpr int HP = G <= 4 ? 4 : 16;
                             float part[HP];
                             for (int h = 0; h < G; ++h) part[h] = dotn<N>(kn, &sq[h * HD + lane * N]);
@@ -376,8 +395,10 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 for (; c + 4 <= n_here; c += 4) {
                     const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
                     if ((r0 | r1 | r2 | r3) < 0) break;
-                    const float v0 = load_v1<HD, KV_MODE>(p, r0, t), v1 = load_v1<HD, KV_MODE>(p, r1, t);
-                    const float v2 = load_v1<HD, KV_MODE>(p, r2, t), v3 = load_v1<HD, KV_MODE>(p, r3, t);
+                    const float v0 = load_v1<HD, KV_MODE>(shost[c] ? hp : p, r0, t),
+                                v1 = load_v1<HD, KV_MODE>(shost[c + 1] ? hp : p, r1, t);
+                    const float v2 = load_v1<HD, KV_MODE>(shost[c + 2] ? hp : p, r2, t),
+                                v3 = load_v1<HD, KV_MODE>(shost[c + 3] ? hp : p, r3, t);
                     fold(c, v0);
                     fold(c + 1, v1);
                     fold(c + 2, v2);
@@ -385,7 +406,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 }
                 for (; c < n_here; ++c) {
                     if (srow[c] < 0) continue;   // masked above, weight 0
-                    fold(c, load_v1<HD, KV_MODE>(p, srow[c], t));
+                    fold(c, load_v1<HD, KV_MODE>(shost[c] ? hp : p, srow[c], t));
                 }
                 if constexpr (!LOOP) {   // the chunk's own partials
                     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
@@ -773,6 +794,10 @@ void run_form(const float* q, const QsaAttnPools& pools, const int32_t* ids, con
               const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window,
               const QsaAttnPoolsRows& rows = {}) {
     const Form f = form_of<HD, G>(queue_for(stream));
+    // streamed dense attention reads the host copy with the SAME form as a resident layer (the split, the cells a
+    // step, the chunk size): the chunk distribution sets the online-softmax folding order, so a different form would
+    // change the answer's bits. A split > 1 reads each host cell once per group (the traffic the form costs); the
+    // long contexts streaming engages usually time split 1.
     const bool ok = with_split<HD>(G / f.split, [&]<int GS>() {
         run_shape<HD, GS>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, f.nc, f.split,
                           f.min_chunk, rows);

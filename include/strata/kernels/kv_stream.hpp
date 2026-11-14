@@ -30,19 +30,8 @@
 
 namespace strata::kernels {
 
-/// The host copy of one layer's K/V: device-mapped pointers (UVA) into pinned memory, identity layout
-/// `[block][kv_head][page_size][head_dim]`. All null when the layer is fully resident.
-struct KvHostPools {
-    uint16_t* k_pool = nullptr;   ///< fp16 mode
-    uint16_t* v_pool = nullptr;
-    int8_t* k_q = nullptr;        ///< int8 mode: codes
-    int8_t* v_q = nullptr;
-    uint16_t* k_scale = nullptr;  ///< int8 mode: fp16 scale per 64 values
-    uint16_t* v_scale = nullptr;
-    uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
-    uint8_t* v_q4 = nullptr;
-    bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
-};
+/// The host copy of one layer's K/V is `KvHostPools` (qsa.hpp): device-mapped pointers (UVA) into pinned memory,
+/// identity layout `[block][kv_head][page_size][head_dim]`. All null when the layer is fully resident.
 
 /// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0, and
 /// K8V4 (`--kv k8v4`: K as int8 codes + scales, V as rotated q4_0 - three runs, `k_q`, `k_scale`, `v_q4`).

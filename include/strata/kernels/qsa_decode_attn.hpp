@@ -33,6 +33,12 @@ struct QsaAttnPools {
     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
     const uint8_t* v_q4 = nullptr;
     const int32_t* page_table = nullptr;
+    /// KV streaming (the plain engine's dense attention, --kv-resident): the authoritative host copy and the number
+    /// of trailing cells the VRAM ring holds. With host.present(), a dense query reads a cell below n_kv - resident
+    /// from the host copy (identity layout) and the rest through page_table (the ring `block % n_slots`); the kernel
+    /// reads each host cell once (no KV-head split). Empty / 0: every cell through page_table, as before.
+    KvHostPools host;
+    int32_t resident = 0;
 };
 
 /// A batch window's queries, each with its own slot's pools (upstream 7a9245b6c): query z reads rows.p[z].
