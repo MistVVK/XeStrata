@@ -9320,7 +9320,7 @@ OPTIONS = [
                      [OV.GUARD_LANGS[3], "Chinese (Simplified): no kana, Hangul or Japanese-only characters"],
                      [OV.GUARD_LANGS[4], "Chinese (Traditional): no kana, Hangul or Japanese-only characters"],
                      [OV.GUARD_OFF, "Off: answers as the model writes them"]],
-            default="en", keep=True, question="Keep other languages' characters out?"),
+            default=OV.GUARD_OFF, keep=True, question="Keep other languages' characters out?"),
     _option("ple-io", "Qwen3.8-Flash-Next's n-gram table",
             "how the engine reads Qwen3.8-Flash-Next's n-gram table, kept for the model: ram = the whole table in RAM "
             "(faster new prompts, ~29 GB more RAM), direct = read from the SSD as needed, auto = setup chooses by the "
@@ -9381,12 +9381,7 @@ def option_default(name: str):
         modes = [v for v, _ in OPTION[name]["choices"]]
         if settings.get("script_guard") in modes:
             return settings["script_guard"]
-        import locale                                   # the environment's on Linux, the system's on Windows
-        lang = (next((os.environ[k] for k in ("LC_ALL", "LC_MESSAGES", "LANG") if os.environ.get(k)), "")
-                or locale.getlocale()[0] or "").lower()
-        return "ja" if lang.startswith(("ja", "japanese")) else "ko" if lang.startswith(("ko", "korean")) else \
-            "zh-tw" if lang.startswith(("zh_tw", "zh_hk", "zh-tw", "zh-hk", "chinese (traditional)")) else \
-            "zh-cn" if lang.startswith(("zh", "chinese")) else "off" if lang.startswith(("vi", "vietnamese")) else "en"
+        return OV.GUARD_OFF          # off until the user chooses a language
     if name == "data-dir":
         return str(data_folder_path(None, settings))
     o = OPTION[name]
