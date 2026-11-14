@@ -1948,14 +1948,16 @@ const MmqPlan& mmq_plan() {
             for (int64_t l = 0; l < layers; ++l) {
                 const bool fo = p.fo[(size_t) l] != 0 && !peer_off;
                 bool i8 = false;                                            // the int8 expert kernels take this layer's formats (the class rule or STRATA_EXPERT_I8, i8_wants_identity's test)
-                bool unfolded = true;                                       // no Hadamard fold and no tail: the staged entry and the int8 kernels read neither (fz_staged / i8_l: !had_gu && !had_d && !tail_off)
+                bool unfolded = true;                                       // no Hadamard fold and no tail: the int8 kernels read neither (i8_l: !had_gu && !had_d && !tail_off)
+                bool staged_ok = true;                                      // the staged entry: no fold; a tail only where the fused kernels take the pair (fz_staged: they apply the tail's scales inside)
                 if (lay.native) {
                     const auto& f = lay.fmt[(size_t) l];
                     unfolded = !f.tail_off && !f.had_gu && !f.had_d;
+                    staged_ok = !f.had_gu && !f.had_d && (!f.tail_off || fo);
                     if (unfolded)
                         i8 = strata::kernels::native_expert_i8_prompt(strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), (int64_t) 1 << 20);
                 }
-                strata::prefill::own_only_count_layer(big, small, fo, i8, i8_gated, entry_on, unfolded);
+                strata::prefill::own_only_count_layer(big, small, fo, i8, i8_gated, entry_on, staged_ok);
             }
             std::fprintf(stderr, "%s\n", strata::prefill::own_only_line(layers, stream_all_min(), big, small, peer_off).c_str());
             std::string sw;
@@ -5735,7 +5737,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // The staging is the resident groups' (STAGE_GRP slots held until the group's launch).  Not (in a build with MMQ) with a layer the CPU share took experts of (share_own_rule.hpp), nor with a peer,
                         // STRATA_MMQ_DIRECT / _WS, the WMMA tiles, STRATA_PF_GROUP_SCRATCH, NVFP4 tails, Hadamard-folded or nibble layers.
                         const bool fz_staged = !stream_all && strata::prefill::staged_entry_layer(use_mmq, fused_only, staged_fo_on()) && lay.native && !fused_l && !wmma_l && !had_gu && !had_d && share_keeps_own_kernels(rows_cpu) &&
-                                               on_peer.empty() && !m.pp && m.group_cap == 0 && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
+                                               on_peer.empty() && !m.pp && m.group_cap == 0 && (!lay.fmt[(size_t) l].tail_off || fused::native_supported(mmq_gt, mmq_dt)) && ws::mode() == 0 &&   // (an NVFP4 tail: only where the fused kernels take the pair - they apply s_gate / s_up / s_down inside, so the entry needs no row_sd)
                                                !(m.cache && mmq_plan().direct[(size_t) l]) && staged_group_gather() && staged_group_entry_on() &&
                                                MMQ_GROUP <= mmq::kGatherGroupMax && MMQ_GROUP <= fused::kMaxBatch &&
 #if STRATA_EXPERT_NIBBLE_BUILT
@@ -6849,7 +6851,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const int64_t r0c = cpu_at;
                         cudaMemcpyAsync(m.Dm + (size_t) r0c * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
                                         cudaMemcpyHostToDevice, m.cs);
-                        if (use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off)
+                        if (use_mmq && !fused_l && !fz_staged_l && lay.native && lay.fmt[(size_t) l].tail_off)
                             cudaMemcpyAsync(m.row_sd + r0c, m.cpu_ones, (size_t) rows_cpu * sizeof(float),
                                             cudaMemcpyHostToDevice, m.cs);
                         stats_.experts_cpu += n_cpu;
@@ -6875,7 +6877,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine16(reinterpret_cast<const uint16_t*>(m.Dm), m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
-                                    use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
+                                    use_mmq && !fused_l && !fz_staged_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);   // (fz_staged_l: the fused kernels applied s_down already)
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);

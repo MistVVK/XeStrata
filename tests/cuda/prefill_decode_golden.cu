@@ -42,7 +42,7 @@ constexpr int kGroup = 256;     // blocks per digest line
 
 // sub-blocks of 32 values per block (load_unit's ib): the 256-value super-blocks 8, Q2_0 2, the trellis types 4, the 32-value formats 1
 __host__ __device__ constexpr int nsub(int t) {
-    return t == T_IQ4_NL || t == T_Q5_0 || t == T_Q5_1 || t == T_Q8_0 ? 1 : t == T_Q2_0 ? 2 : is_tq(t) ? 4 : 8;
+    return t == T_IQ4_NL || t == T_Q5_0 || t == T_Q5_1 || t == T_Q8_0 ? 1 : t == T_Q2_0 || t == T_NVFP4 ? 2 : is_tq(t) ? 4 : 8;
 }
 
 template <int T> __global__ void decode_probe_kernel(const uint8_t* __restrict__ blocks, int nblk, uint32_t* __restrict__ out) {
@@ -61,7 +61,11 @@ template <int T> __global__ void decode_probe_kernel(const uint8_t* __restrict__
 #pragma unroll
         for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
     }
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if constexpr (T == T_NVFP4) {
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_fp4[k] << (8 * (k & 3));
+    }
+    const int i =blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nblk * nsub(T)) return;
     const int b = i / nsub(T), ib = i % nsub(T);
     constexpr int NW = raw_words(T) > 5 ? raw_words(T) : 5;
@@ -91,7 +95,7 @@ const Fmt kFormats[] = {
     {T_IQ3_S, "IQ3_S", true},     {T_IQ4_XS, "IQ4_XS", true}, {T_IQ4_NL, "IQ4_NL", true}, {T_Q2_0, "Q2_0", true},
     {T_Q4_K, "Q4_K", true},       {T_Q5_K, "Q5_K", true},     {T_Q5_0, "Q5_0", true},     {T_Q5_1, "Q5_1", true},
     {T_Q8_0, "Q8_0", true},       {T_Q6_K, "Q6_K", true},     {T_TQ2_T, "TQ2_T", false},  {T_TQK6, "TQK6", false},
-    {T_TQK7, "TQK7", false}};
+    {T_TQK7, "TQK7", false},      {T_NVFP4, "NVFP4", true}};
 
 // the formats whose decode this build compiles: every one (the trellis decode on HIP too since the gfx12 port; the check keeps the list
 // so that a build without one says so instead of failing)
@@ -123,6 +127,7 @@ void run_probe(int t, const uint8_t* blocks, int nblk, uint32_t* out) {
         case T_TQ2_T: launch_probe<T_TQ2_T>(blocks, nblk, out); break;
         case T_TQK6: launch_probe<T_TQK6>(blocks, nblk, out); break;
         case T_TQK7: launch_probe<T_TQK7>(blocks, nblk, out); break;
+        case T_NVFP4: launch_probe<T_NVFP4>(blocks, nblk, out); break;
         default: throw std::runtime_error("no probe for this type in this build");
     }
 }
@@ -158,6 +163,7 @@ uint16_t half_from(uint64_t r) {
 std::vector<int> half_fields(int t) {
     if (t == T_Q4_K || t == T_Q5_K || t == T_Q5_1) return {0, 2};   // d and dmin (Q5_1: d and m)
     if (t == T_Q6_K) return {208};                                   // d at the block's end
+    if (t == T_NVFP4) return {};                                     // four UE4M3 scale bytes (every byte value is a scale, 0x7F the NaN that reads as 0), no fp16 field
     return {0};
 }
 

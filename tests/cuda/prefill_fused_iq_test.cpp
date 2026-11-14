@@ -72,7 +72,9 @@ struct Pair {
     const char* name;
 };
 // MMQ covers this pair (the HIP build has no Q4_K / Q5_K / Q5_1 MMQ: those pairs are checked against the reference only)
-bool mmq_ok(const Pair& p) { return mmq::supported((int) p.gu) && mmq::supported((int) p.d); }
+// (the NVFP4 pair is judged against the reference alone: MMQ's NVFP4 products have no per-expert scales - the engine applies the blob's tail around them - and run_mmq below does not)
+bool nvfp4_pair(const Pair& p) { return p.gu == GGML_TYPE_NVFP4 && p.d == GGML_TYPE_NVFP4; }
+bool mmq_ok(const Pair& p) { return !nvfp4_pair(p) && mmq::supported((int) p.gu) && mmq::supported((int) p.d); }
 
 // The trellis types (Gyro: TQ2_T 144, TQK6 145, TQK7 146; agentionai's ids) are outside the pinned ggml's type table: their sizes and their
 // dequantization here, from the format definition (third_party/ggml/ggml-common-tq.h's header comment), not from the kernels' code.
@@ -165,6 +167,7 @@ struct Geo {
         up_off = gu_row * FF;
         down_off = 2 * up_off;
         bytes = down_off + d_row * N;
+        if (nvfp4_pair(p)) bytes += 16;   // the blob's tail {s_gate, s_up, s_down, 0} (cpu::NativeFmt::tail_off = down_off + d_row n_embd)
     }
     fused::NativeGeom native(const Pair& p) const {
         fused::NativeGeom g;
@@ -194,6 +197,12 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
                    : tq_type(t) ? 0.003f : 0.0008f;
     std::uniform_real_distribution<float> sc(lo, 6.0f * lo);
     for (size_t i = 0; i < nb * bs; ++i) m[i] = (uint8_t) byte(rng);
+    if (t == GGML_TYPE_NVFP4) {   // four UE4M3 scale bytes then 32 bytes of codes: scales 0x28..0x58 (2^-2 .. 2^4 raw, finite, bit 7 clear), the codes as drawn
+        std::uniform_int_distribution<int> ub(0x28, 0x58);
+        for (size_t b = 0; b < nb; ++b)
+            for (int k = 0; k < 4; ++k) m[b * bs + (size_t) k] = (uint8_t) ub(rng);
+        return;
+    }
     for (size_t b = 0; b < nb; ++b) {
         const ggml_fp16_t h = ggml_fp32_to_fp16(sc(rng));
         std::memcpy(m + b * bs + (t == GGML_TYPE_Q6_K ? 208 : 0), &h, 2);   // (Q6_K keeps d at its end; its 16 int8 scales stay random bytes)
@@ -207,6 +216,11 @@ std::vector<uint8_t> make_blob(const Pair& p, const Geo& g, std::mt19937& rng) {
     std::vector<uint8_t> b(g.bytes);
     fill_matrix(b.data(), p.gu, 2 * FF, N, rng);
     fill_matrix(b.data() + g.down_off, p.d, N, FF, rng);
+    if (nvfp4_pair(p)) {   // the per-expert scales, about 1e-4 (a ModelOpt weight_scale_2): three of them, then a zero word
+        std::uniform_real_distribution<float> ss(2e-4f, 2e-3f);
+        const float t[4] = {ss(rng), ss(rng), ss(rng), 0.0f};
+        std::memcpy(b.data() + g.bytes - 16, t, 16);
+    }
     return b;
 }
 
@@ -227,6 +241,13 @@ void dequant(const Pair& p, const Geo& g, const std::vector<uint8_t>& b, std::ve
     const auto* td = ggml_get_type_traits(p.d);
     for (int r = 0; r < 2 * FF; ++r) tg->to_float(b.data() + (size_t) r * g.gu_row, gu.data() + (size_t) r * N, N);
     for (int r = 0; r < N; ++r) td->to_float(b.data() + g.down_off + (size_t) r * g.d_row, dn.data() + (size_t) r * FF, FF);
+    if (nvfp4_pair(p)) {   // NVFP4: each projection times its own per-expert scale (the blob's tail), as llama.cpp applies .scale
+        float t[4];
+        std::memcpy(t, b.data() + g.bytes - 16, 16);
+        for (int r = 0; r < FF; ++r) for (int k = 0; k < N; ++k) gu[(size_t) r * N + k] *= t[0];
+        for (int r = FF; r < 2 * FF; ++r) for (int k = 0; k < N; ++k) gu[(size_t) r * N + k] *= t[1];
+        for (size_t i = 0; i < dn.size(); ++i) dn[i] *= t[2];
+    }
 }
 
 // activations: N(0, 1) with a few large values (the hidden state has outliers); token `zero` all zero
@@ -1079,7 +1100,9 @@ int main(int argc, char** argv) {
             {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K + Q8_0"},
             // Gyro-S (TQK6 gate/up, TQK7 down) and Gyro-M (TQ2_T both): STRATA_PF_FUSED_TQ=1 on CUDA sm_80+ (opt-in); MMQ = the overlay's trellis
             // instances; the ids are agentionai's (the pinned ggml.h has no enumerators for them)
-            {(ggml_type) 145, (ggml_type) 146, "TQK6 + TQK7"},       {(ggml_type) 144, (ggml_type) 144, "TQ2_T + TQ2_T"}};
+            {(ggml_type) 145, (ggml_type) 146, "TQK6 + TQK7"},       {(ggml_type) 144, (ggml_type) 144, "TQ2_T + TQ2_T"},
+            // NVFP4 (ModelOpt packs: gate/up and down NVFP4, the blob's tail = the per-expert scales); STRATA_PF_FUSED=1 as the test sets it; CUDA sm_80+; against the reference alone
+            {GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, "NVFP4 / NVFP4"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
@@ -1127,7 +1150,7 @@ int main(int argc, char** argv) {
             if (only ? std::string(p.name).find(only) == std::string::npos : p.gu == GGML_TYPE_Q4_K || p.gu == GGML_TYPE_Q5_K) continue;
             // the i-quant / Q8_0 and Q8_0 / Q8_0 pairs run only when --only names them (ctest prefill_fused_iq_test_q8d / _q8gu), so every
             // other entry runs what it ran
-            if (!only && ((p.d == GGML_TYPE_Q8_0 && !kq_gu(p)) || tq_type(p.gu))) continue;   // (and the trellis pairs: _tq)
+            if (!only && ((p.d == GGML_TYPE_Q8_0 && !kq_gu(p)) || tq_type(p.gu) || nvfp4_pair(p))) continue;   // (and the trellis pairs: _tq; the NVFP4 pair: _nvfp4)
             if (!fused::native_supported((int) p.gu, (int) p.d)) {
                 // the Q2_0 / Q2_0 pair is the Turing opt-in's (STRATA_PF_FUSED_SM75=1; the only pair set up there) or, on sm_80+,
                 // STRATA_PF_FUSED_Q2N=1's: skip what this device does not take (--only=NAME still insists)
