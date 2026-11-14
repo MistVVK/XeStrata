@@ -86,6 +86,43 @@ int main() {
     CHECK(fo::today_cut_ok(0, 8192, 8192));
     CHECK(!fo::today_cut_ok(0, 10240, 8192));
 
+    // the RAM copy's lend region (--resident-experts, --resident-budget-gib, the automatic RAM fallback) is sized before the serve
+    // scan runs (generate.cpp, the resident block): it holds the start-up loan of the chunk the scan can take, with the equal cut on
+    // and off.  The scan takes the tail-0 chunk only when the copy keeps that whole loan (region_holds); a copy that keeps less
+    // (RAM short: the region's slots are kept from the last slot down while they fit the budget) gets today's chunk, so no start
+    // reads more lent experts from the file than today.  -1: the arena (every expert in RAM, no region).
+    struct Card { int64_t slots, today, tail0, extra; };
+    for (const Card cd : {Card{3851, 9216, 10240, 207}, Card{6960, 23296, 24064, 155}}) {
+        for (const bool eq : {true, false}) {
+            fo::ScanCase c = on;
+            c.equal_cut = eq;
+            const int64_t tail = fo::scan_tail(c);
+            const int64_t today = scan(cd.slots, -1);
+            CHECK(today == cd.today);
+            const int64_t k_today = loan(today, -1);
+            const int64_t c0 = scan(cd.slots, 0);
+            CHECK(c0 == cd.tail0);
+            int64_t k0 = c0 > today ? loan(c0, -1) : 0;
+            if (!fo::loan_fits(k0, cd.slots, 128, 90, false)) k0 = 0;   // the start-up layout keeps the 128-slot floor
+            CHECK(k0 - k_today == cd.extra);   // the region's extra slots (x 1.3175 MiB of RAM: 273 MiB at 12 GB, 204 at 16 GB)
+            const int64_t region = fo::region_slots(k_today, k0, tail);
+            CHECK(region == (eq ? k0 : k_today));
+            for (const int64_t kept : {region, region - 1, k_today, k_today - 1, int64_t(-1)}) {
+                int64_t chunk = fo::pick(today, c0, tail);
+                if (chunk != today && !fo::region_holds(loan(chunk, -1), kept)) chunk = today;   // the scan's guard
+                const int64_t startup = loan(chunk, -1);
+                CHECK(startup <= region);                    // the serve loan never outgrows the region
+                if (kept >= k_today) CHECK(startup <= kept); // every lent expert kept in RAM wherever today's were
+                CHECK(loan(chunk, 0) <= startup);            // a request's relayout at the chunk lends no more than the start-up
+                if (kept < 0 || kept >= region) CHECK(chunk == (eq ? cd.tail0 : cd.today));
+                else CHECK(chunk == cd.today);               // RAM short of the larger region: today's chunk
+            }
+        }
+    }
+    CHECK(fo::region_slots(3417, 0, 0) == 3417);       // no tail-0 chunk above today's: today's region
+    CHECK(fo::region_slots(3417, 3624, -1) == 3417);   // today's count: today's region
+    CHECK(fo::region_holds(3624, -1) && fo::region_holds(3624, 3624) && !fo::region_holds(3624, 3623));
+
     if (failed) { std::fprintf(stderr, "fit_out_rule_test: %d failed\n", failed); return 1; }
     std::printf("fit_out_rule_test: all passed\n");
     return 0;

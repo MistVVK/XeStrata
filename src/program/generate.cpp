@@ -10306,8 +10306,20 @@ int main(int argc, char** argv) {
         }
         return best;
     };
-    auto plan_lend = [&](int64_t& chunk) -> int64_t {
+    // `tail` (>= 0, a build without MMQ): the serve scan's tail-0 count (fit_out_rule.hpp), priced as that scan prices it, for
+    // the RAM copy's lend region; 0.1.39's chunk keeps today's tail.  -1: today's count (every other caller).
+    auto plan_lend = [&](int64_t& chunk, int64_t tail = -1) -> int64_t {
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+        auto slots_for = [&](int64_t c) -> int64_t {
+            return tail < 0 ? lend_slots(c)
+                            : slots_from_bytes(strata::prefill::Prefill::bytes_needed(g, ss, c, srcp != nullptr, tail));
+        };
+        auto old_slots = lend_slots;
+#else
+        (void) tail;
         auto slots_for = lend_slots;
+        auto old_slots = lend_slots;
+#endif
         // 0.1.39's list with its ring (also the size up to which a prompt keeps that ring under #583)
         auto old_rule = [&]() -> int64_t {
             strata::prefill::Prefill::set_ring_budget(0, 0);
@@ -10316,7 +10328,7 @@ int main(int argc, char** argv) {
                 // above 8192: only when asked for, and only when a prompt of the context can use it
                 if (c > 8192 && (c > o.prefill_auto_max || c > o.max_context)) continue;
                 if (o.prefill_auto_cap > 0 && c > o.prefill_auto_cap) continue;   // #1630
-                const int64_t k = slots_for(c);
+                const int64_t k = old_slots(c);
                 if (k + g_lend_keep <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots()) return c;
             }
             return 0;
@@ -10349,7 +10361,16 @@ int main(int argc, char** argv) {
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             const uint64_t avail = bytes_from_slots(budget);
             auto room_of = [&](int64_t t) -> int64_t {
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                uint64_t nonring = strata::prefill::Prefill::bytes_needed_no_ring(g, ss, t, srcp != nullptr);
+                if (tail >= 0) {   // the chunk's own buffers at that tail, as the serve scan's ring_room (the ring's bytes do not depend on it)
+                    const uint64_t full = strata::prefill::Prefill::bytes_needed(g, ss, t, srcp != nullptr);
+                    const uint64_t at = strata::prefill::Prefill::bytes_needed(g, ss, t, srcp != nullptr, tail);
+                    nonring -= std::min(nonring, full - std::min(full, at));
+                }
+#else
                 const uint64_t nonring = strata::prefill::Prefill::bytes_needed_no_ring(g, ss, t, srcp != nullptr);
+#endif
                 return std::min((int64_t) ((avail - std::min(avail, nonring)) / (uint64_t) blob), ring_max);
             };
             // `room_of` is capped at ring_max, so "the ring is full" is exactly room == ring_max, and both that
@@ -10370,7 +10391,7 @@ int main(int argc, char** argv) {
             // a prompt that fits 0.1.39's chunk keeps 0.1.39's ring (one chunk: the smaller ring only slowed it)
             if (small >= c) {   // the scan bought nothing: 0.1.39's choice
                 strata::prefill::Prefill::set_ring_budget(0, 0);
-                if (small > 0) { chunk = small; return slots_for(small); }
+                if (small > 0) { chunk = small; return old_slots(small); }
                 return 0;
             }
             strata::prefill::Prefill::set_ring_budget((int) room_of(c), small);
@@ -10783,11 +10804,45 @@ int main(int argc, char** argv) {
                                  "streamed ring %d slots\n", 100.0 * res_share, ring);
         }
     };
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+    // fit_out_rule.hpp: what the serve scan knows when it picks its chunk, in ONE place: the scan below and the RAM copy's lend
+    // region, which is sized before it, count the same tail
+    auto fit_case = [&](int64_t chunk, bool small_path) -> strata::prefill::fit_out::ScanCase {
+        strata::prefill::fit_out::ScanCase sc;
+        sc.auto_chunk = o.prefill_auto && strata::prefill::Prefill::ring_bytes_enabled();
+        sc.one_gpu = stages.empty() && !multi_gpu && !peer.valid() && !o.prefill_head_alias && o.batch <= 1;
+        sc.tail_loan = tail_loan_on;
+        sc.equal_cut = equal_cut_one == strata::prefill::equal_cut::Cut::equal;
+        sc.small_path = small_path;
+        sc.fused_at_chunk = strata::prefill::Prefill::tail_matters(chunk, srcp != nullptr);
+        return sc;
+    };
+    int64_t region_chunk = 0;   // the chunk the RAM copy's lend region was sized for (the warning below names it)
+    int64_t region_today = 0, region_today_k = 0;   // today's chunk and its start-up loan, which the scan keeps when the RAM holds less
+#endif
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
             int64_t chunk = o.prefill_chunk;
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+            int64_t k = plan_lend(chunk);
+            region_chunk = region_today = chunk;
+            region_today_k = k;
+            // the serve scan may take the tail-0 chunk: the region holds its start-up loan (today's tail, the largest loan any
+            // request takes at that chunk), so the scan's hard guard can take it when the RAM keeps it.  The small-card path is
+            // decided later; its chunk is at most today's, which the region holds either way.
+            if (k > 0 && o.serve && strata::prefill::fit_out::scan_tail(fit_case(chunk, false)) == 0) {
+                int64_t c0 = o.prefill_chunk;
+                int64_t k0 = plan_lend(c0, 0) > 0 && c0 > chunk ? lend_slots(c0) : 0;
+                if (!strata::prefill::fit_out::loan_fits(k0, xcache.slots(), g_lend_keep, kAutoLendPct, false)) k0 = 0;   // the scan's start-up test
+                const int64_t kr = strata::prefill::fit_out::region_slots(k, k0, 0);
+                if (kr != k) { k = kr; region_chunk = c0; }
+                int64_t c1 = o.prefill_chunk;
+                (void) plan_lend(c1);   // the ring state as today's scan left it
+            }
+#else
             const int64_t k = plan_lend(chunk);
+#endif
             if (k > 0) lend_from = xcache.slots() - k;
         }
         // a layer split: the experts every later stage's cache holds are left out of the RAM copy, as CUDA0's are
@@ -10944,13 +10999,21 @@ int main(int argc, char** argv) {
         // Said, never capped: --prefill is the user's, and with the RAM for them it is the faster one (+21-35%).
         // #1683: with a RAM budget the lend region is kept after the ranked experts, as far as the budget reaches, so
         // the advice there is a larger budget, not a smaller chunk (the budget used to keep none of it whatever the chunk)
-        if (resident_ok && lend_from >= 0 && (o.prefill_chunk > 8192 || o.resident_budget > 0) && xcache.slots() > lend_from &&
-            src.resident_lent_slots() < xcache.slots() - lend_from)
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+        // the loan the prompt path will really take: the region's chunk, or today's when the RAM keeps less than the region
+        // of a tail-0 chunk (the serve scan's guard then keeps today's chunk; fit_out_rule.hpp region_holds)
+        int64_t warn_chunk = region_chunk, warn_k = xcache.slots() - lend_from;
+        if (region_chunk != region_today && src.resident_lent_slots() < warn_k) { warn_chunk = region_today; warn_k = region_today_k; }
+#else
+        const int64_t warn_chunk = o.prefill_chunk, warn_k = xcache.slots() - lend_from;
+#endif
+        if (resident_ok && lend_from >= 0 && (o.prefill_chunk > 8192 || o.resident_budget > 0) && warn_k > 0 &&
+            src.resident_lent_slots() < warn_k)
             std::fprintf(stderr, "strata generate: WARNING: a prompt chunk of %lld tokens lends %lld cache slots to the "
                                  "prompt path, but only %lld of their experts fit in RAM: the others are read from the "
                                  "SSD on every chunk, and prompts can read ~3x slower than with --prefill auto (#669). "
                                  "%s keeps them all in RAM\n",
-                         (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from),
+                         (long long) warn_chunk, (long long) warn_k,
                          (long long) src.resident_lent_slots(),
                          o.resident_budget > 0
                              ? (ram_fallback_resident
@@ -11444,19 +11507,18 @@ int main(int argc, char** argv) {
             // layout of the larger chunk (today's tail) would not keep the 128-slot floor.
             if (chunk > 0 && pf_plan_chunk == 0) {
                 namespace fo = strata::prefill::fit_out;
-                fo::ScanCase sc;
-                sc.auto_chunk = o.prefill_auto && strata::prefill::Prefill::ring_bytes_enabled();
-                sc.one_gpu = pf_parts.size() == 1 && stages.empty() && !multi_gpu && !peer.valid() && !o.prefill_head_alias &&
-                             o.batch <= 1;
-                sc.tail_loan = tail_loan_on;
-                sc.equal_cut = equal_cut_one == strata::prefill::equal_cut::Cut::equal;
-                sc.small_path = pf_small_taken;
-                sc.fused_at_chunk = strata::prefill::Prefill::tail_matters(chunk, srcp != nullptr);
+                const fo::ScanCase sc = fit_case(chunk, pf_small_taken);   // pf_parts holds CUDA0 and every stage: one part iff stages.empty()
                 if (fo::scan_tail(sc) == 0) {
                     const int64_t small1 = old_pick(nullptr);   // today's tail (old_pick)
                     pf_fit_tail = 0;
                     int64_t c_new = fo::pick(chunk, scan(nullptr), pf_fit_tail);
                     if (c_new != chunk && !fits(c_new, false, nullptr)) c_new = chunk;   // the start-up layout, today's tail
+                    // the RAM copy (resident modes): the larger chunk only when the copy keeps every slot of its start-up loan,
+                    // the largest loan any request takes at it; otherwise those experts would be read from the model file on
+                    // every chunk (#669).  The arena holds every expert: no region, nothing to hold.
+                    if (c_new != chunk &&
+                        !fo::region_holds(part_slots(pf_parts[0], c_new), src.complement_ready() ? src.resident_lent_slots() : -1))
+                        c_new = chunk;
                     const int64_t cap1 = strata::prefill::Prefill::ring_cap_for(small1);
                     const int64_t ring1 = small1 >= c_new ? 0 : ring_room(c_new, nullptr, cap1);
                     auto restore1 = [&] { strata::prefill::Prefill::set_ring_budget((int) ring1, small1); };

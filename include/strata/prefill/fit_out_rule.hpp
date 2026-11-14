@@ -47,6 +47,20 @@ constexpr bool today_cut_ok(int64_t tail, int64_t today_chunk, int64_t small_max
     return tail < 0 || today_chunk <= small_max;
 }
 
+/// The RAM copy's lend region (--resident-experts, --resident-budget-gib and the automatic RAM fallback): sized before the serve
+/// scan runs, it must hold the slots of every loan the scan can take, or each slot past it is read from the model file during
+/// every chunk.  `today_k`: the start-up loan of today's chunk; `tail0_k`: the start-up loan (today's tail, the largest loan any
+/// request takes at that chunk) of the chunk the tail-0 scan takes; `tail`: scan_tail().  The larger of the two after a tail-0 scan.
+constexpr int64_t region_slots(int64_t today_k, int64_t tail0_k, int64_t tail) {
+    return tail == 0 && tail0_k > today_k ? tail0_k : today_k;
+}
+
+/// The serve scan takes the tail-0 chunk only when its start-up loan fits the RAM copy's lend region; `region_k` < 0: no region
+/// (the arena holds every expert in RAM), nothing to hold.
+constexpr bool region_holds(int64_t loan_k, int64_t region_k) {
+    return region_k < 0 || loan_k <= region_k;
+}
+
 /// The scan's slot test (generate.cpp fits_one): `k` slots lent out of `slots`, `keep` kept, at most `pct` % when `cap`.
 constexpr bool loan_fits(int64_t k, int64_t slots, int64_t keep, int64_t pct, bool cap) {
     return k > 0 && k + keep <= slots && !(cap && k * 100 > pct * slots);
