@@ -8,8 +8,10 @@
 #include "strata/kernels/yskn.hpp"
 
 #include "cuda_intrinsics.hpp"
+#include "hadamard_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/trellis.hpp"
 #include "strata/kernels/yskn_sum.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_yskn
 #include "strata/kernels/device_arch_tag.hpp"
@@ -42,27 +44,16 @@ void check(const YsknDev& w, const char* what) {
         throw core::DeviceError(std::string(what) + ": invalid .yskn matrix");
 }
 
-// the orthonormal Hadamard transform of buf[0..511], 256 work-items each one butterfly a stage (the CPU reference's
-// pairs: (lo, lo + h), lo the k-th index whose bit h is clear)
+// the orthonormal Hadamard transform of buf[0..511]: the shared butterfly (hadamard_device.hpp, the APR experts'
+// hadamard_rows and the CPU's hadamard_rotate), 256 work-items each one pair a stage; the trailing barrier leaves the
+// result ready to read (the caller's barrier after the load is covered by the first stage's own)
 inline void fwht512_local(float* buf, int lane, const sycl::nd_item<1>& it) {
-    for (int h = 1; h < kGroup; h <<= 1) {
-        const int lo = ((lane & ~(h - 1)) << 1) | (lane & (h - 1));
-        const float a = buf[lo], b = buf[lo + h];
-        buf[lo] = a + b;
-        buf[lo + h] = a - b;
-        sycl::group_barrier(it.get_group());
-    }
+    xe::hadamard_block(buf, kGroup, lane, 256, it.get_group());
+    sycl::group_barrier(it.get_group());
 }
 
-// the state of step j: bits [K (j + 1) - 12, K (j + 1)) of the unit's words, zeros below its start
-template<int K> inline uint32_t state_of(const uint32_t* w, int j) {
-    const int e = K * (j + 1);
-    if (e < 12) return (w[0] & ((1u << e) - 1u)) << (12 - e);
-    const int start = e - 12, word = start >> 5, sh = start & 31;
-    uint32_t v = w[word] >> sh;
-    if (sh + 12 > 32) v |= w[word + 1] << (32 - sh);
-    return v & 0xFFFu;
-}
+// the state of step j: the shared trellis window (kernels/trellis.hpp, the reader's unit_state)
+using strata::kernels::trellis::state_of;
 
 template<int K>
 sycl::event gemv_launch(sycl::queue& q, const YsknDev& w, const int8_t* xq, const float* alpha, int T, int64_t* part) {

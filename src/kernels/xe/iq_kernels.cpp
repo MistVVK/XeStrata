@@ -32,6 +32,7 @@
 // SOFTWARE.
 //
 #include "strata/kernels/canon_math.hpp"
+#include "hadamard_device.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/matrix_report.hpp"
@@ -2276,15 +2277,7 @@ sycl::event launch_hadamard_rows(sycl::queue& q, const T* x, T* y, int64_t rows,
                 if (signs) v *= signs[col0 + i];
                 buf[i] = v;
             }
-            for (int len = 1; len < block; len <<= 1) {
-                sycl::group_barrier(it.get_group());
-                for (int p = lid; p < block / 2; p += n) {
-                    const int i = (p / len) * 2 * len + p % len;
-                    const float a = buf[i], c = buf[i + len];
-                    buf[i] = a + c;
-                    buf[i + len] = a - c;
-                }
-            }
+            xe::hadamard_block(&buf[0], block, lid, n, it.get_group());
             sycl::group_barrier(it.get_group());
             for (int i = lid; i < block; i += n) y[base + i] = (T) (buf[i] * scale);
         });

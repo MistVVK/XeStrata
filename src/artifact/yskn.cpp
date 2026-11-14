@@ -4,6 +4,7 @@
 // src/artifact/yskn.cpp - the .yskn reader and the CPU reference of its products (strata/artifact/yskn.hpp).
 #include "strata/artifact/yskn.hpp"
 
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/yskn_sum.hpp"
 
@@ -358,17 +359,9 @@ void row_rotated(const Container& c, const TensorDesc& t, int r, float* out) {
 }
 
 void fwht512(float* x, size_t n) {
-    for (size_t b = 0; b + kGroup <= n; b += kGroup) {
-        float* v = x + b;
-        for (int h = 1; h < kGroup; h <<= 1)
-            for (int i = 0; i < kGroup; i += 2 * h)
-                for (int k = i; k < i + h; ++k) {
-                    const float a = v[k], c = v[k + h];
-                    v[k] = a + c;
-                    v[k + h] = a - c;
-                }
-        for (int i = 0; i < kGroup; ++i) v[i] *= 0.044194173824159216f;   // 1 / sqrt(512)
-    }
+    // the shared CPU rotation (cpu/hadamard.hpp, the APR experts' own): the same Sylvester order and 1 / sqrt(512)
+    // scale (the float this file's literal was), no signs (the caller applies them)
+    strata::kernels::cpu::hadamard_rotate(x, (int) n, kGroup, nullptr);
 }
 
 void embedding_row(const Container& c, const TensorDesc& t, const std::vector<const TensorDesc*>& extra,

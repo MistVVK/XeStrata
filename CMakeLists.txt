@@ -1569,7 +1569,7 @@ if(STRATA_ENABLE_XE)
     # the .yskn products on the GPU (decode, the prompt's FP16 rows and rotations) against the CPU reference, on a
     # synthetic container; the reader compiles in (picojson through strata_xgrammar's include)
     add_executable(yskn_parity src/kernels/yskn_parity.cpp src/artifact/yskn.cpp)
-    target_link_libraries(yskn_parity PRIVATE strata_kernels strata_xgrammar)
+    target_link_libraries(yskn_parity PRIVATE strata_kernels strata_kernels_cpu strata_xgrammar)
     add_test(NAME yskn_parity COMMAND yskn_parity --selftest)
     add_test(NAME device_selftest COMMAND strata-device --selftest)
     set_tests_properties(elementwise_parity device_selftest PROPERTIES TIMEOUT 60)
