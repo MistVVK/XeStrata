@@ -832,6 +832,51 @@ int main(int argc, char** argv) {
         bad += !valid;
     }
 
+    // Mixed request parameters in one launch must match separate sampler calls, including untouched rows.
+    {
+        constexpr int T = 6, V = 257, H = 8;
+        std::vector<float> logits(T * V), bias(T * V, 0.0f);
+        std::vector<int> history(T * H), initial(T, -123), want(T), got(T);
+        std::vector<uint32_t> masks(T * ((V + 31) / 32), ~uint32_t(0));
+        for (int t = 0; t < T; ++t) {
+            for (int v = 0; v < V; ++v) logits[t * V + v] = float((v * 31 + t * 7) % 193) / 31.0f;
+            for (int j = 0; j < H; ++j) history[t * H + j] = (t * 19 + j / 2) % V;
+            bias[t * V + (t * 19) % V] = -100.0f;
+            masks[t * ((V + 31) / 32)] &= ~(1u << t);
+        }
+        auto* dl = static_cast<float*>(strata::parity::alloc_bytes(logits.size() * sizeof(float)));
+        auto* db = static_cast<float*>(strata::parity::alloc_bytes(bias.size() * sizeof(float)));
+        auto* dh = static_cast<int*>(strata::parity::alloc_bytes(history.size() * sizeof(int)));
+        auto* dm = static_cast<uint32_t*>(strata::parity::alloc_bytes(masks.size() * sizeof(uint32_t)));
+        auto* out = static_cast<int*>(strata::parity::alloc_bytes(T * sizeof(int)));
+        auto* dp = static_cast<strata::kernels::SamplerParams*>(strata::parity::alloc_bytes(T * sizeof(strata::kernels::SamplerParams)));
+        strata::parity::copy_bytes_in(dl, logits.data(), logits.size() * sizeof(float));
+        strata::parity::copy_bytes_in(db, bias.data(), bias.size() * sizeof(float));
+        strata::parity::copy_bytes_in(dh, history.data(), history.size() * sizeof(int));
+        strata::parity::copy_bytes_in(dm, masks.data(), masks.size() * sizeof(uint32_t));
+        std::vector<strata::kernels::SamplerParams> params(T);
+        for (int t = 0; t < T; ++t) {
+            auto& p = params[t];
+            p.greedy = t % 2 == 0; p.temperature = p.greedy ? 0.0f : 0.7f;
+            p.top_k = 5 + t; p.top_p = 0.9f; p.min_p = 0.05f;
+            p.seed = 23 + t; p.counter = (uint64_t(1) << 32) + t;
+            p.penalty_last_n = t + 1; p.penalty_repeat = 1.2f; p.penalty_freq = 0.2f; p.penalty_present = 0.3f;
+            p.logit_bias = db + t * V; p.allowed = dm + t * ((V + 31) / 32);
+            p.gumbel = t == 3;
+            strata::kernels::sample_tokens(dl + t * V, 1, V, dh + t * H, H, p, out + t, nullptr);
+        }
+        strata::parity::copy_bytes_out(want.data(), out, T * sizeof(int));
+        params[4].penalty_last_n = -1;
+        want[4] = initial[4];
+        strata::parity::copy_bytes_in(dp, params.data(), T * sizeof(params[0]));
+        strata::parity::copy_bytes_in(out, initial.data(), T * sizeof(int));
+        strata::kernels::sample_token_rows(dl, T, V, dh, H, dp, out, nullptr);
+        strata::parity::copy_bytes_out(got.data(), out, T * sizeof(int));
+        const bool valid = got == want;
+        std::printf("  sampler mixed rows vs individual: %s\n", valid ? "PASS" : "FAIL");
+        bad += !valid;
+    }
+
     // ---- GUMBEL-MAX (STRATA_SPEC_GUMBEL, p.gumbel; upstream 6381df34).  (a) The kernel's pick equals the host
     // reference's, draw for draw, under the chains the server uses (top_k / top_p / min_p / temperature) - on a GPU with
     // FP64 (one without sums and hashes in float).  (b) It is an exact sample: over many counters the picks' frequencies

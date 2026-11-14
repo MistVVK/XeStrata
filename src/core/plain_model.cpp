@@ -4374,18 +4374,31 @@ bool PlainModel::stage_slots(const int32_t* tokens, const int* slot, const int64
                 return false;
             }
         }
+        std::vector<k::SamplerParams> params(sp, sp + T);
         for (int t = 0; t < T; ++t) {
-            k::SamplerParams p = sp[t];
+            auto& p = params[(size_t) t];
             p.counter = (uint64_t) pos[t];
             const int b = slot[t];
             const bool pen = h > 0 && penalised(p);
             const bool bias = b >= 0 && b < (int) slot_bias_on_.size() && slot_bias_on_[(size_t) b] != 0;
             if (bias) p.logit_bias = slot_bias_dev_[(size_t) b];
-            if (!pen) p.penalty_last_n = 0;   // no history handed to this row: nothing for it to count
-            k::sample_tokens(logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
-                             pen ? slot_hist_dev_ + (size_t) t * (size_t) h : nullptr, pen ? h : 0, p, m_out_ + t,
-                             cs_);
+            if (!pen) p.penalty_last_n = 0;
         }
+        if (slot_params_cap_ < (size_t) T) {
+            k::SamplerParams* d = nullptr;
+            if (!strata::gpu::alloc_device(&d, (size_t) T * sizeof(params[0]))) {
+                err = std::string("plain model: the slots' sampler parameters: ") + strata::gpu::last_error();
+                return false;
+            }
+            allocs_.push_back(d);
+            slot_params_dev_ = d;
+            slot_params_cap_ = (size_t) T;
+        }
+        if (!strata::gpu::copy(slot_params_dev_, params.data(), (size_t) T * sizeof(params[0]))) {
+            err = std::string("plain model: the slots' sampler parameters: ") + strata::gpu::last_error();
+            return false;
+        }
+        k::sample_token_rows(logits_, T, (int) n_vocab_, h ? slot_hist_dev_ : nullptr, h, slot_params_dev_, m_out_, cs_);
     }
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("plain model: the batch window: ") + strata::gpu::last_error();

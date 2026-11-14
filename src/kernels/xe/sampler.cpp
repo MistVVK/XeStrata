@@ -252,7 +252,8 @@ namespace {
 // FP64 and float elsewhere (device_caps.hpp)
 template <int THREADS, typename D>
 sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int n_vocab, const int* history,
-                          int history_len, SamplerParams pp, bool greedy, size_t words, int* out) {
+                          int history_len, SamplerParams pp, bool greedy, size_t words, int* out,
+                          const SamplerParams* rows = nullptr, bool gumbel = false) {
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<unsigned, 1> bits(sycl::range<1>(words), h);
         sycl::local_accessor<float, 1> sv(sycl::range<1>(THREADS / WARP), h);
@@ -263,15 +264,19 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int t = (int) it.get_group(0);
             const int tid = (int) it.get_local_id(0);
+            SamplerParams row = rows ? rows[t] : pp;
+            if (rows && row.penalty_last_n < 0) return;
+            row.gumbel = row.gumbel || gumbel;
+            const int draw_row = rows ? 0 : t;
             const float* l = logits + (size_t) t * n_vocab;
             unsigned* b = &bits[0];
-            const Window w = load_window<THREADS>(it, history, history_len, pp.penalty_last_n, n_vocab, t, b);
+            const Window w = load_window<THREADS>(it, history, history_len, row.penalty_last_n, n_vocab, t, b);
 
-            if (greedy) {
+            if (rows ? (row.greedy || row.temperature <= 0.0f) : greedy) {
                 float wv;
                 int wi;
                 block_argmax<THREADS>(it, n_vocab, &sv[0], &si[0], [&](int v, float& s) {
-                    s = apply_penalties(biased(pp, l, v, t, n_vocab), hit_count(w, b, v), pp);
+                    s = apply_penalties(biased(row, l, v, draw_row, n_vocab), hit_count(w, b, v), row);
                     return true;
                 }, wv, wi);
                 // a tie between two -inf candidates leaves wi == n_vocab, and the serial version answered 0
@@ -279,7 +284,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                 return;
             }
 
-            int k = (pp.top_k > 0 && pp.top_k < KMAX) ? pp.top_k : KMAX;
+            int k = (row.top_k > 0 && row.top_k < KMAX) ? row.top_k : KMAX;
             if (k > n_vocab) k = n_vocab;
 
             // top_k: k rounds of a block argmax over the not-yet-taken
@@ -288,14 +293,14 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                 int wi;
                 block_argmax<THREADS>(it, n_vocab, &sv[0], &si[0], [&](int v, float& s) {
                     for (int j = 0; j < i; ++j) if (sel_ids[j] == v) return false;
-                    s = apply_penalties(biased(pp, l, v, t, n_vocab), hit_count(w, b, v), pp);
+                    s = apply_penalties(biased(row, l, v, draw_row, n_vocab), hit_count(w, b, v), row);
                     return true;
                 }, wv, wi);
                 if (tid == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
                 sycl::group_barrier(it.get_group());
             }
 
-            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], k, pp, t, nullptr, nullptr, tid == 0);
+            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], k, row, draw_row, nullptr, nullptr, tid == 0);
             if (tid == 0) out[t] = pick;
         });
     });
@@ -520,8 +525,26 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
             return;
         }
     }
-    const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, pp, greedy, words, out);
+    const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, pp, greedy, words, out, nullptr, false);
     if (!stream) core::Runtime::get().wait(e, "sample_tokens");
+}
+
+
+void sample_token_rows(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                       const SamplerParams* params, int* out, void* stream) {
+    if (n_tokens <= 0 || n_vocab <= 0) return;
+    auto& q = core::Runtime::get().stream(stream);
+    const size_t words = history && history_len > 0 ? (size_t) ((n_vocab + 31) / 32) : 1;
+    const int wg = xe::has_fp64(q) ? xe::work_group_upto_1024<SampleKernelDouble>(q)
+                                   : xe::work_group_upto_1024<SampleKernelFloat>(q);
+    auto launch = xe::has_fp64(q)
+                      ? (wg == 1024 ? sample_launch<1024, double> : wg == 512 ? sample_launch<512, double>
+                                                                       : sample_launch<256, double>)
+                      : (wg == 1024 ? sample_launch<1024, float> : wg == 512 ? sample_launch<512, float>
+                                                                      : sample_launch<256, float>);
+    const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, SamplerParams{}, false, words, out,
+                          params, gumbel_env());
+    if (!stream) core::Runtime::get().wait(e, "sample_token_rows");
 }
 
 

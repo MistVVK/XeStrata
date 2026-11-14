@@ -496,6 +496,8 @@ private:
     std::vector<float*> slot_bias_dev_;              ///< per slot: its logit bias on the device (null: none)
     std::vector<std::vector<int32_t>> slot_tail_;    ///< per slot: its reply tail for the penalty window
     int32_t* slot_hist_d_ = nullptr;                 ///< the current batch window's penalty-history rows (device)
+    strata::kernels::SamplerParams* slot_params_d_ = nullptr;
+    size_t slot_params_cap_ = 0;
     size_t slot_hist_cap_ = 0;                       ///< ... and how many int32 fit (grows to the widest window)
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;

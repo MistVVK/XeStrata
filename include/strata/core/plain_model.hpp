@@ -1306,6 +1306,8 @@ private:
     std::vector<float*> slot_bias_dev_;   ///< per slot: its bias array on the device (kept for the slot's next one)
     std::vector<char> slot_bias_on_;      ///< ... and whether the slot's current request has a bias
     int32_t* slot_hist_dev_ = nullptr;    ///< the batch window's slots' penalty-history rows (device)
+    strata::kernels::SamplerParams* slot_params_dev_ = nullptr;
+    size_t slot_params_cap_ = 0;
     size_t slot_hist_cap_ = 0;            ///< ... how many int32 fit; grows to the widest window
     bool bias_on_ = false, allowed_on_ = false;
     std::function<bool(const int32_t*, int, std::string&)> window_masks_;   ///< set_window_masks
