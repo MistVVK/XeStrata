@@ -10,6 +10,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/latent.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -167,6 +168,13 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         // (5x smaller across PCIe than the H-wide contributions, and the pool's U work moves to the device);
         // off keeps the CPU's U.  The auto choice is to be confirmed on the three GPUs (EDGE/measure-plan.md).
         lat_u_gpu_ = strata::core::pick_from_env("LATENT_U_GPU") != strata::core::Pick::Off;
+        // XESTRATA_LATENT_U_MMU: the U on the matrix units.  on takes it; auto/off the dp4a U until verified
+        // on the three GPUs (measure-plan.md §5).
+        lat_u_mmu_ = strata::env_auto("LATENT_U_MMU") == 1;
+        if (lat_u_mmu_) {
+            lat_mmq_ctx_ = std::make_unique<strata::prefill::mmq::Context>();
+            strata::prefill::mmq::choose_forms(lat_fmt_, shape.n_embd, lat_ELL_, lat_G_, nullptr);
+        }
         // the column scales on the device NOW, in plain stream context: the D stage's first call can otherwise
         // land inside a graph capture, where an allocation is not permitted
         for (int64_t l = 0; l < lay.n_layers; ++l) {
@@ -242,6 +250,9 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             lat_xlq_ = b.take<uint8_t>(T * G * (ELL / 32) * 36);
             lat_ylq_ = b.take<uint8_t>(T * K * (ELL / 32) * 36);
             lat_act0_ = b.take<uint8_t>(T * G * (ELL / 32) * 34);
+            lat_u_mmq_ylq_ = b.take<uint8_t>(strata::prefill::mmq::q8_bytes(T * K, ELL));
+            lat_u_mmq_ids_ = b.take<int32_t>(T * K);
+            lat_u_mmq_bounds_ = b.take<int32_t>(G + 1);
         }
     };
     Bump count;
@@ -541,10 +552,35 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 grouped_lat(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
             }
             stamp(22);
-            // the A outputs' q8_1 image, then U for the GPU's rows (hit_out, now H wide)
-            quantize_q8_1_rows(yl, cap, ELL, ylq, cs);
-            latent_u_grouped(lat_u_ + (size_t) layer * u_bytes, ylq, ids, labels, lay.n_expert, cap, (int) ELL, (int) N,
-                             hit_out, cs, lat_fmt_);
+            // the A outputs' image, then U for the GPU's rows (hit_out, now H wide)
+            if (lat_u_mmu_) {
+                // the G groups as iq_mmq experts: bucket the routes by label; the product's ids map the group-order
+                // rows back to route order, so hit_out stays in the order the combine adds
+                const int32_t* hlabels = lat_labels_.data() + (size_t) layer * lay.n_expert;
+                const int32_t* hids = h_ids_ + (size_t) tb * K;
+                std::vector<int32_t> idsU((size_t) cap), bU((size_t) G + 1);
+                int64_t u = 0, maxr = 0;
+                bU[0] = 0;
+                for (int gg = 0; gg < G; ++gg) {
+                    for (int64_t r = 0; r < cap; ++r)
+                        if (hlabels[hids[r]] == gg) idsU[u++] = (int32_t) r;
+                    bU[gg + 1] = (int32_t) u;
+                    maxr = std::max<int64_t>(maxr, bU[gg + 1] - bU[gg]);
+                }
+                strata::gpu::copy(lat_u_mmq_ids_, idsU.data(), (size_t) cap * 4);
+                strata::gpu::copy(lat_u_mmq_bounds_, bU.data(), (size_t) (G + 1) * 4);
+                strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, lat_fmt_, ELL, ELL, cap, cs);
+                strata::prefill::mmq::Product up;
+                up.w = lat_u_ + (size_t) layer * u_bytes; up.type = lat_fmt_; up.w_rows = N; up.w_cols = ELL;
+                up.expert_bytes = strata::prefill::mmq::matrix_bytes(lat_fmt_, N, ELL); up.n = G;
+                up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
+                up.total_rows = cap; up.max_rows = maxr; up.rows = cap; up.dst = hit_out; up.ld_dst = N;
+                lat_mmq_ctx_->run(up, cs);
+            } else {
+                quantize_q8_1_rows(yl, cap, ELL, ylq, cs);
+                latent_u_grouped(lat_u_ + (size_t) layer * u_bytes, ylq, ids, labels, lay.n_expert, cap, (int) ELL, (int) N,
+                                 hit_out, cs, lat_fmt_);
+            }
             if (mode.resident || dp) {   // no CPU share: its rows are zeros
                 copy_or_zero_from_mapped(parts, ymiss, (long long) n * K * N, skip, ring, cs);
             } else if (lat_u_gpu_) {

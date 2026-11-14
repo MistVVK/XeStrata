@@ -32,7 +32,10 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <memory>
 #include <vector>
+
+namespace strata::prefill::mmq { class Context; }
 
 namespace strata::core {
 
@@ -253,6 +256,12 @@ private:
     uint8_t* m_latact0_ = nullptr;
     uint32_t* h_xlseq_ = nullptr;      ///< mapped: the D stage's doorbell (layer + 1)
     uint32_t* m_xlseq_ = nullptr;
+    // the U product on the int8 matrix units (XESTRATA_LATENT_U_MMU): the G groups as iq_mmq experts
+    bool lat_u_mmu_ = false;           ///< auto: the dp4a U until verified on the three GPUs (measure-plan §5)
+    uint8_t* lat_u_mmq_ylq_ = nullptr; ///< the A outputs quantized for MMQ (group order, T*K rows of ELL)
+    int32_t* lat_u_mmq_ids_ = nullptr; ///< group-order row -> its route (the quantize and the product's dst map)
+    int32_t* lat_u_mmq_bounds_ = nullptr;  ///< the G groups' entry bounds (G + 1)
+    std::unique_ptr<strata::prefill::mmq::Context> lat_mmq_ctx_;
 };
 
 }  // namespace strata::core
