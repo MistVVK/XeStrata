@@ -1072,8 +1072,9 @@ bool PlainModel::load_qwen(std::string& err) {
         size_t kv_room_b = 0, kv_total_b = 0;
         const bool kv_room_known = strata::gpu::mem_info(&kv_room_b, &kv_total_b) && kv_room_b > 0;
         const size_t kv_head_dim = (size_t) qs.head_dim;
-        auto kv_block_bytes = [&](int64_t want) -> uint64_t {   // one attention block's K/V at `want` cells (alloc_kv)
-            const uint64_t cells = (uint64_t) std::max<int64_t>(want, 0);
+        // one attention block's K/V at a context of `want` tokens (alloc_kv): every KV head has its own cells
+        auto kv_block_bytes = [&](int64_t want) -> uint64_t {
+            const uint64_t cells = (uint64_t) std::max<int64_t>(want, 0) * (uint64_t) qs.n_head_kv;
             const uint64_t codes = cells * kv_head_dim, scales = cells * (kv_head_dim / k::KV_Q8_GROUP) * 2,
                            q4 = cells * (uint64_t) k::kv_q4_bytes_per_head((int) kv_head_dim);
             return opt_.kv_tcq != 0 ? 2 * cells * k::kv_tcq_bytes_per_head((int) kv_head_dim, opt_.kv_tcq)
