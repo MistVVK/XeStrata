@@ -168,9 +168,10 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         // (5x smaller across PCIe than the H-wide contributions, and the pool's U work moves to the device);
         // off keeps the CPU's U.  The auto choice is to be confirmed on the three GPUs (EDGE/measure-plan.md).
         lat_u_gpu_ = strata::core::pick_from_env("LATENT_U_GPU") != strata::core::Pick::Off;
-        // XESTRATA_LATENT_U_MMU: the U on the matrix units.  on takes it; auto/off the dp4a U until verified
-        // on the three GPUs (measure-plan.md §5).
-        lat_u_mmu_ = strata::env_auto("LATENT_U_MMU") == 1;
+        // XESTRATA_LATENT_U_MMU: the U on the matrix units.  on takes it; off the dp4a U; auto follows the device
+        // as iq_mmq's other products do (mmq::built): the matrix units where it reports them, else dp4a.
+        const int ummu = strata::env_auto("LATENT_U_MMU");
+        lat_u_mmu_ = ummu == 1 || (ummu < 0 && strata::prefill::mmq::built());
         if (lat_u_mmu_) {
             lat_mmq_ctx_ = std::make_unique<strata::prefill::mmq::Context>();
             strata::prefill::mmq::choose_forms(lat_fmt_, shape.n_embd, lat_ELL_, lat_G_, nullptr);

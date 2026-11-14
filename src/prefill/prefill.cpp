@@ -1578,9 +1578,10 @@ bool Prefill::latent_experts_mmq(int64_t l, int64_t T, int64_t K, Impl& m, std::
 
 bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err) {
     using namespace strata::kernels;
-    // XESTRATA_LATENT_FUSED: the int8 matrix-unit arm (iq_mmq).  on takes it; off the dp4a arm below; auto keeps
-    // the dp4a arm until the mmq arm is verified on the three GPUs (measure-plan.md §5), then switches.
-    if (strata::env_auto("LATENT_FUSED") == 1) return latent_experts_mmq(l, T, K, m, err);
+    // XESTRATA_LATENT_FUSED: the int8 matrix-unit arm (iq_mmq).  on takes it; off the dp4a arm below; auto follows
+    // the device as iq_mmq's other products do (mmq::built): the matrix units where it reports them, else dp4a.
+    const int fused = strata::env_auto("LATENT_FUSED");
+    if (fused == 1 || (fused < 0 && strata::prefill::mmq::built())) return latent_experts_mmq(l, T, K, m, err);
     const int64_t N = m.g->n_embd, ELL = m.lat_ELL_, I = m.lat_I_;
     const int G = m.lat_G_, E = (int) m.g->n_expert;
     const auto& lay = cpu::expert_layout();
