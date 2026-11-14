@@ -246,12 +246,14 @@ type MainWindow(setup: Setup.Access) as this =
         let sizes = ListBox(MinWidth = 420.0)
         sizes.ItemTemplate <-
             itemTemplate (fun (label: string) ->
+                let warning = tr "install.doesNotFitThe" "does not fit the RAM"
+                let suffix = " · " + warning
+                let doesNotFit = label.EndsWith suffix
                 row 8.0 [
-                    yield text label
+                    yield text (if doesNotFit then label.Substring(0, label.Length - suffix.Length) else label)
                     if label.StartsWith(tr "imgpick.auto" "Auto (recommended; largest that fits RAM)") then
                         yield badge okBrush (tr "install.recommended" "recommended")
-                    if label.Contains(tr "install.doesNotFitThe" "does not fit the RAM") then
-                        yield badge failBrush (tr "install.doesNotFitThe" "does not fit the RAM")
+                    if doesNotFit then yield badge failBrush warning
                 ])
         let info = TextBlock(TextWrapping = Media.TextWrapping.Wrap)
         let origin = muted ""
