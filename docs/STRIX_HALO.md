@@ -81,7 +81,8 @@ cmake -S . -B build-halo -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-halo --target strata -j 8        # about 25 minutes the first time
 ```
 
-The build warns that `gfx1151` is "unvalidated". `STRATA_PREFILL_MMQ=ON` builds ggml's MMQ kernels the prompt experts need. To test:
+The build warns that `gfx1151` is "unvalidated". The engine is built without llama.cpp's MMQ kernels: the prompt experts run on
+Strata's own kernels where they cover a layer and on the FP16 path elsewhere. Add `-DSTRATA_MMQ=ON` to build the MMQ kernels too. To test:
 `cmake --build build-halo -j 8` builds the tests and `ctest --test-dir build-halo` runs them. `hip_prefill_hcd_exact_parity` and
 `hip_prefill_hipblaslt_gemm` need the table (next section) and skip without it.
 

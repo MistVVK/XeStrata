@@ -11,8 +11,9 @@ refills, to avoid repeated pageable-source registrations.
 ## Reproduce the configuration
 
 Build instructions are in [AMD_HIP.md](AMD_HIP.md). Use the repository-pinned
-llama.cpp dependency; do not silently substitute another revision. Build with
-`STRATA_PREFILL_MMQ=ON` and use these runtime variables for the measured arm:
+llama.cpp dependency; do not silently substitute another revision. The numbers
+below were measured on a build with llama.cpp's MMQ kernels: build with
+`-DSTRATA_PREFILL_MMQ=ON -DSTRATA_MMQ=ON` and use these runtime variables for the measured arm:
 
 ```sh
 export STRATA_PREFILL_MMQ=1
