@@ -3056,7 +3056,11 @@ void p1a_input(const void* x16, size_t h_bytes) {
     g_p1a_h_bytes = g_p1a_x16 != nullptr ? h_bytes : 0;
 }
 bool p1a_used() { return g_p1a_used; }
+#if defined(__HIPCC__)
 bool p1a_takes_pair(int gu_type, int d_type) { return p1a_wanted() && p1a::takes(gu_type, d_type, p1a_l2()); }
+#else
+bool p1a_takes_pair(int, int) { return false; }   // (namespace p1a, moe_p1a.hpp, exists in HIP builds only)
+#endif
 
 // (CUDA, STRATA_PF_FUSED_TQ=1) a Hadamard-folded down (set_down_rotation): on, and the down input's sign vector
 static const float* g_rot_signs = nullptr;
