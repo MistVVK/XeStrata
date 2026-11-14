@@ -586,6 +586,8 @@ public:
     bool kv_grow_to(int64_t cells, std::string& err);
     bool kv_trim(int64_t cells, int64_t hold, std::string& err);
     bool kv_elastic() const { return kv_cells_ >= 0; }
+    /// --kv-resident: the trailing cells a streamed attention layer keeps in VRAM (0: not streaming)
+    int64_t kv_resident() const { return kv_resident_cells_; }
     /// --control-vector: the loaded vector's tables (kernels/cvec.hpp, cvec_upload) on every stage's GPU too, before
     /// the first window; the blocks then apply it after their FFN (steer)
     bool replicate_cvec(std::string& err);

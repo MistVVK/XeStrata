@@ -970,6 +970,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 .add("logit_bias", 1)
                 .add("context", (long long) ctx)
                 .add("kv", opt.kv_q4 == 1 ? "q4_0" : opt.kv_q4 == 2 ? "k8v4" : opt.kv_int8 ? "int8" : "fp16")
+                .add("kv_resident", (long long) model.kv_resident())
                 .add("expert_slots", (long long) model.slots())
                 .add("expert_cache_mib", (long long) (model.tier_bytes() >> 20))
                 .add("spec", drafting_off ? 1 : dr.loaded && !model.drafts() ? dr.window : model.drafts() + 1)
@@ -2393,6 +2394,10 @@ static void plain_usage(const std::string& arch) {
                  "                       too, the CLI's greedy runs)\n"
                  "  --coupled-draft, --no-coupled-draft  sample the MTP drafts with the request's chain (default: off)\n"
                  "  --kv-ram on|off      GLM-5.3-Flash: the DSA layers' latent cells in RAM, their VRAM to the experts (on)\n"
+                 "  --kv-resident N|auto|off  stream the attention layers' K/V: the last N cells a layer in VRAM, the\n"
+                 "                       rest in RAM (the decode reads it over PCIe). auto (default): from 64K up when\n"
+                 "                       the RAM holds the experts beside the KV; off: every cell in VRAM. Not GLM's DSA\n"
+                 "                       (--kv-ram), the sliding-window layers, --batch or an encoder (XESTRATA_KV_RESIDENT)\n"
                  "  --spec-window all|auto|min-p  how many drafts a window checks: all (default); auto while each is\n"
                  "                       expected to raise the tokens per ms at the measured window costs; or while\n"
                  "                       each is at least --spec-min-p P likely under the MTP layer\n"
@@ -2623,6 +2628,19 @@ int plain_main(int argc, char** argv) {
     shared.session_min_free_mib = &conv_session_min_free;
     shared.memory_limit_mib = &conv_memory_limit;
     shared.ram_reserve_mib = &conv_ram_reserve;
+    shared.kv_resident = &opt.kv_resident;
+    // --kv-resident's default from the environment (XESTRATA_KV_RESIDENT=auto|off|N); the command line overrides it
+    if (const char* v = strata::env_get("KV_RESIDENT")) {
+        if (std::strcmp(v, "auto") == 0) opt.kv_resident = -1;
+        else if (std::strcmp(v, "off") == 0) opt.kv_resident = 0;
+        else {
+            char* end = nullptr;
+            const long long n = std::strtoll(v, &end, 10);
+            if (end != v && *end == '\0' && n >= 0) opt.kv_resident = n;
+            else std::fprintf(stderr, "xestrata (%s): XESTRATA_KV_RESIDENT takes N, auto or off, not \"%s\"\n",
+                              arch.c_str(), v);
+        }
+    }
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {

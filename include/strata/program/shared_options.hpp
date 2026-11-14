@@ -82,6 +82,9 @@ struct SharedOptionFields {
     bool* adapt_async_bool = nullptr;    ///< plain's bool
     bool* coupled_draft = nullptr;
     int* kv_grow = nullptr;
+    /// --kv-resident N|auto|off (the plain engine): -1 auto, 0 off, >0 the resident cells a layer. generate.cpp keeps
+    /// its own parse (N, 0 off; setup decides its auto), so it leaves this null
+    int64_t* kv_resident = nullptr;
     std::string* conversation_save = nullptr;
     std::string* dump_logits = nullptr;
     std::string* dump_routing = nullptr;
@@ -272,6 +275,21 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
     if (a == "--no-coupled-draft" && f.coupled_draft) { *f.coupled_draft = false; return 1; }
     if (a == "--kv-grow" && f.kv_grow) { *f.kv_grow = 1; return 1; }
     if (a == "--no-kv-grow" && f.kv_grow) { *f.kv_grow = 0; return 1; }
+    if (a == "--kv-resident" && f.kv_resident) {
+        const std::string v = next(a.c_str());
+        if (v == "auto") *f.kv_resident = -1;
+        else if (v == "off") *f.kv_resident = 0;
+        else {
+            char* end = nullptr;
+            const long long n = std::strtoll(v.c_str(), &end, 10);
+            if (end == v.c_str() || *end != '\0' || n < 0) {
+                std::fprintf(stderr, "%s: --kv-resident takes N, auto or off, not \"%s\"\n", f.who, v.c_str());
+                return -1;
+            }
+            *f.kv_resident = n;
+        }
+        return 1;
+    }
     if (a == "--conversation-save" && f.conversation_save) { *f.conversation_save = next(a.c_str()); return 1; }
     if (a == "--dump-logits" && f.dump_logits) { *f.dump_logits = next(a.c_str()); return 1; }
     if (a == "--dump-routing" && f.dump_routing) { *f.dump_routing = next(a.c_str()); return 1; }
