@@ -331,6 +331,115 @@ int main() {
         r = g.sample();
         check(r && r->available == 2 * GiB && r->credit == 0, "v1 ignores the non-total inactive_file");
     }
+    // the credit's two forms from one memory.stat text
+    {
+        const std::string v2 = "anon 9\nfile 999\nshmem 500\nfile_mapped 77\nactive_file 30\ninactive_file 20\n"
+                               "file_dirty 3\nfile_writeback 2\nunevictable 400\nactive_anon 1\n";
+        CacheCredit c = cache_credit_from_stat(v2, 1000, false);
+        check(c.inactive == 15 && c.lists == 45, "inactive 20 and lists 50, each less dirty 3 and writeback 2");
+        check(cache_credit_from_stat(v2, 40, false).lists == 35 && cache_credit_from_stat(v2, 40, false).inactive == 15,
+              "the lists figure stops at memory.current too");
+        c = cache_credit_from_stat("inactive_file 20\nfile 999\nshmem 900\nunevictable 900\n", 1000, false);
+        check(c.inactive == 20 && c.lists == 20, "no active_file line: lists = inactive; file, shmem and unevictable never count");
+        c = cache_credit_from_stat("inactive_file 20\nactive_file x\n", 1000, false);
+        check(c.inactive == 20 && c.lists == 20, "a malformed active_file adds nothing and does not cost the inactive credit");
+        c = cache_credit_from_stat("inactive_file 20\nactive_file 5\nactive_file 6\n", 1000, false);
+        check(c.inactive == 20 && c.lists == 20, "a repeated active_file adds nothing");
+        c = cache_credit_from_stat("active_file 30\n", 1000, false);
+        check(c.inactive == 0 && c.lists == 0, "no inactive_file: no credit at all, as before");
+        c = cache_credit_from_stat("inactive_file 18446744073709551615\nactive_file 18446744073709551615\n", 1000, false);
+        check(c.inactive == 1000 && c.lists == 1000, "no overflow in inactive + active");
+        c = cache_credit_from_stat("active_file 30\ninactive_file 20\ntotal_active_file 300\ntotal_inactive_file 200\n"
+                                   "total_dirty 10\ntotal_writeback 0\n", 10000, true);
+        check(c.inactive == 190 && c.lists == 490, "v1 reads the total_ names");
+        check(cache_credit_for_limit({5, 9}, 10, std::optional<uint64_t>(11), false) == 9, "a limit below MemTotal: lists");
+        check(cache_credit_for_limit({5, 9}, 11, std::optional<uint64_t>(11), false) == 5, "a limit at MemTotal: inactive");
+        check(cache_credit_for_limit({5, 9}, 12, std::optional<uint64_t>(11), false) == 5, "a limit above MemTotal: inactive");
+        check(cache_credit_for_limit({5, 9}, 10, std::nullopt, false) == 5, "MemTotal unknown: inactive");
+        check(cache_credit_for_limit({5, 9}, 10, std::optional<uint64_t>(11), true) == 5, "the switch: inactive");
+        check(mem_credit_inactive_only("1") && !mem_credit_inactive_only("0") && !mem_credit_inactive_only(nullptr) &&
+                  !mem_credit_inactive_only(""), "STRATA_MEM_CREDIT_INACTIVE=1 only");
+    }
+    // a container (limit below MemTotal) restarted with its model file's pages still cached: the same figure cold and warm
+    {
+        const auto stat = [](uint64_t active, uint64_t inactive) {
+            return "anon " + std::to_string(5 * GiB) + "\nfile " + std::to_string(active + inactive) + "\nactive_file " +
+                   std::to_string(active) + "\ninactive_file " + std::to_string(inactive) + "\nfile_dirty 0\nfile_writeback 0\n";
+        };
+        const uint64_t limit = 57 * GiB + 760 * MiB, table = 26 * GiB + 820 * MiB;
+        Fixture f;
+        f.meminfo(503 * GiB, 420 * GiB);   // the host's view
+        f.self("0::/");
+        f.put("cgroup/memory.max", limit);
+        // cold: 7 GiB used, 1 GiB of it inactive cache
+        f.put("cgroup/memory.current", 7 * GiB); f.put("cgroup/memory.stat", stat(0, 1 * GiB));
+        const auto cold = f.sample();
+        check(cold && cold->source == MemorySource::cgroup && cold->available == limit - 6 * GiB, "cold start: limit - (current - cache)");
+        // warm, the table's pages on the active list (the pod: credited 1.0 GiB, available 26.7 GiB under the old rule)
+        f.put("cgroup/memory.current", 7 * GiB + table); f.put("cgroup/memory.stat", stat(table, 1 * GiB));
+        const auto warm = f.sample();
+        check(warm && warm->available == cold->available && warm->credit == table + 1 * GiB, "warm, active: the same figure");
+        f.put("cgroup/memory.stat", stat(1 * GiB, table));
+        check(f.sample() && f.sample()->available == cold->available, "warm, inactive: the same figure");
+        // the way back
+#ifdef _WIN32
+        _putenv_s("STRATA_MEM_CREDIT_INACTIVE", "1");
+#else
+        setenv("STRATA_MEM_CREDIT_INACTIVE", "1", 1);
+#endif
+        f.put("cgroup/memory.stat", stat(table, 1 * GiB));
+        const auto old = f.sample();
+        check(old && old->available == limit - (7 * GiB + table - 1 * GiB) && old->credit == 1 * GiB,
+              "STRATA_MEM_CREDIT_INACTIVE=1: active pages are not credited, as before");
+#ifdef _WIN32
+        _putenv_s("STRATA_MEM_CREDIT_INACTIVE", "");
+#else
+        unsetenv("STRATA_MEM_CREDIT_INACTIVE");
+#endif
+        check(f.sample() && f.sample()->available == cold->available, "switch cleared: the lists rule again");
+        // a limit at or above MemTotal (not a container's view): the inactive rule, bit for bit
+        f.meminfo(57 * GiB, 50 * GiB);
+        const auto at = f.sample();
+        check(at && at->credit == 1 * GiB && at->available == limit - (7 * GiB + table - 1 * GiB) && at->source == MemorySource::cgroup,
+              "limit above MemTotal: active pages are not credited, as before");
+        f.meminfo(limit, 50 * GiB);
+        check(f.sample() && f.sample()->credit == 1 * GiB, "limit equal to MemTotal: inactive only");
+        // no limit at all: MemAvailable, untouched by memory.stat
+        f.meminfo(503 * GiB, 420 * GiB);
+        f.put("cgroup/memory.max", "max\n");
+        check(f.sample() && f.sample()->available == 420 * GiB && f.sample()->source == MemorySource::meminfo && f.sample()->credit == 0,
+              "no limit: MemAvailable");
+        // the operator's cap keeps the inactive rule (its usage is the namespace root's)
+        check(f.sample(40 * GiB) && f.sample(40 * GiB)->credit == 1 * GiB && f.sample(40 * GiB)->source == MemorySource::flag,
+              "--memory-limit-mib: inactive only");
+    }
+    // the limit on a parent level, credited from that level's own memory.stat; memory.high below memory.max
+    {
+        Fixture f;
+        f.meminfo(256 * GiB, 200 * GiB);
+        f.self("0::/a/b");
+        f.put("cgroup/a/memory.max", 24 * GiB); f.put("cgroup/a/memory.current", 20 * GiB);
+        f.put("cgroup/a/memory.stat", "active_file " + std::to_string(10 * GiB) + "\ninactive_file " + std::to_string(2 * GiB) + "\n");
+        f.put("cgroup/a/b/memory.max", "max\n"); f.put("cgroup/a/b/memory.current", 19 * GiB);
+        f.put("cgroup/a/b/memory.stat", "active_file 0\ninactive_file 0\n");
+        auto r = f.sample();
+        check(r && r->source == MemorySource::cgroup && r->limit == 24 * GiB && r->credit == 12 * GiB && r->available == 16 * GiB,
+              "parent limit: 24 - (20 - 12)");
+        f.put("cgroup/a/memory.high", 18 * GiB);
+        r = f.sample();
+        check(r && r->limit == 18 * GiB && r->available == 10 * GiB && r->credit == 12 * GiB, "memory.high below max: 18 - (20 - 12)");
+    }
+    // cgroup v1 under a limit below MemTotal: total_active_file counts too
+    {
+        Fixture g;
+        g.meminfo(120 * GiB, 80 * GiB);
+        g.self("4:memory:/m");
+        g.put("cgroup/memory/m/memory.limit_in_bytes", 64 * GiB); g.put("cgroup/memory/m/memory.usage_in_bytes", 62 * GiB);
+        g.put("cgroup/memory/m/memory.stat", "total_active_file " + std::to_string(4 * GiB) + "\ntotal_inactive_file " +
+                                                  std::to_string(3 * GiB) + "\ntotal_dirty " + std::to_string(1 * GiB) + "\n");
+        const auto r = g.sample();
+        check(r && r->credit == 6 * GiB && r->available == 8 * GiB && r->source == MemorySource::cgroup, "v1: 64 - (62 - (7 - 1))");
+    }
     // the process-wide setting and the real files
     {
         check(memory_limit_bytes() == 0, "no cap by default");

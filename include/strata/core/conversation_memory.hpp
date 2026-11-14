@@ -18,11 +18,13 @@ namespace strata::core {
 //     what the container uses now - the top visible cgroup's memory.current, or MemTotal - MemAvailable when the
 //     cgroup files cannot be read.  For a container whose real limit sits on a parent cgroup it cannot see.
 //
-// Usage is memory.current as the kernel reports it, less one reclaimable kind: the clean inactive file cache of the
-// same group (memory.stat inactive_file, v1 total_inactive_file, less dirty and writeback pages, never more than
-// memory.current), which the kernel gives back at memory.high or the limit before it kills anything.  Nothing else is
-// credited: active_file holds mlocked pages, and shmem is the pinned complements and the KV pool.  A memory.stat that
-// is missing or unparsable gives no credit (it does not make the sample unknown).
+// Usage is memory.current as the kernel reports it, less the group's clean file cache, which the kernel gives back at
+// memory.high or the limit before it kills anything (cache_credit_from_stat below).  Under a limit below MemTotal (a
+// container) every clean page on the evictable file lists counts (active_file + inactive_file); otherwise, and with
+// STRATA_MEM_CREDIT_INACTIVE=1, only inactive_file does, as before.  The lists are list state, not page types
+// (cgroup-v2 memory.stat): mlocked pages are on the unevictable list and shmem (the pinned complements, the KV pool)
+// is on the anon lists, so neither is ever credited.  A memory.stat that is missing or unparsable gives no credit (it
+// does not make the sample unknown).
 // Pinned, locked and shared memory stays charged in full: a hard-limit kill is worse than a skipped park.
 //
 // Unknown telemetry is deliberately distinct from a measured zero.  A limit file that exists but cannot be parsed
@@ -51,6 +53,22 @@ struct MemoryProbePaths {
     std::string self_cgroup = "/proc/self/cgroup";
     std::string cgroup_root = "/sys/fs/cgroup";
 };
+
+/// One group's reclaimable file cache from its memory.stat text (v2 names, or v1's total_* names), each less the dirty
+/// and writeback pages and never more than `current`:
+///   inactive  inactive_file (the rule outside containers, and the earlier rule everywhere);
+///   lists     inactive_file + active_file: every clean page the kernel can evict for the group.
+/// No inactive_file line, or a malformed inactive / dirty / writeback value: both 0.  A malformed or missing active_file:
+/// lists = inactive.
+struct CacheCredit { uint64_t inactive = 0; uint64_t lists = 0; };
+CacheCredit cache_credit_from_stat(const std::string& stat, uint64_t current, bool v1);
+
+/// STRATA_MEM_CREDIT_INACTIVE=1: the inactive-only credit everywhere (the way back for testing).
+bool mem_credit_inactive_only(const char* env_value);
+
+/// The credit a cgroup limit gets: `lists` under a limit below MemTotal (a container: /proc/meminfo is the host's),
+/// `inactive` otherwise (no MemTotal, a limit at or above it, or the switch above).
+uint64_t cache_credit_for_limit(const CacheCredit& credit, uint64_t limit, std::optional<uint64_t> mem_total, bool inactive_only);
 
 /// The operator's cap in bytes for the container/cgroup this engine runs in (0 = none).  Set once at start.
 void set_memory_limit_bytes(uint64_t bytes);
