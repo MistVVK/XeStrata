@@ -3,6 +3,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/platform/home_cpus.hpp"
 
 #include <cuda_runtime.h>
 
@@ -124,13 +125,12 @@ inline long test_copy_fail_at() {
 /// First thing a background copy thread does (STRATA_CKPT_ASYNC, STRATA_PARK_ASYNC): a thread the host creates
 /// inherits the host's one CPU (strata/platform/aux_cpus.hpp), where its memcpys would take turns with the decode.
 /// Wide first: the mask the aux placement keeps as this thread's own is the one restore() puts back (a request with
-/// aux_cpus=0), and the host's one CPU must not be it.  No output depends on where a thread runs.
+/// aux_cpus=0), and the host's one CPU must not be it.  Wide means the process's own CPU set from the start-up
+/// (strata/platform/home_cpus.hpp: every CPU unless the engine placed itself on the card's NUMA node).  No output
+/// depends on where a thread runs.
 inline void background_thread_placement() {
 #if defined(__linux__)
-    cpu_set_t all;
-    CPU_ZERO(&all);
-    for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
-    (void) sched_setaffinity(0, sizeof all, &all);   // the kernel keeps the CPUs the process may use
+    strata::platform::widen_to_home();               // the kernel keeps the CPUs the cgroup allows
     strata::aux_cpus::pin_current_thread();          // (a no-op while the feature is off)
 #endif
 }
