@@ -69,7 +69,13 @@ remote_placement(const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t
                  const std::array<int, 3>& caps, bool by_layer, const std::function<bool(int32_t, int32_t)>& held) {
     std::array<std::vector<std::pair<int32_t, int32_t>>, 3> by_device;
     std::vector<uint8_t> assigned((size_t) layers * (size_t) experts, 0);
-    const int devices = 1 + (caps[1] > 0) + (caps[2] > 0);
+    // the helpers actually asked for (caps[r] > 0), in order.  A lone --expert-cache-device2 or -device3 (no -device1)
+    // is one of them: the count is not "1 + the later two", which placed nothing when caps[0] was 0 (the helper then
+    // opened with an empty list, "need ... ranked experts").
+    std::array<int, 3> active{};
+    int devices = 0;
+    for (int r = 0; r < 3; ++r) if (caps[(size_t) r] > 0) active[(size_t) devices++] = r;
+    if (devices == 0) return by_device;
     int next = 0;
     for (const auto& pair : ranked) {
         if (pair.first < 0 || pair.first >= layers || pair.second < 0 || pair.second >= experts ||
@@ -77,23 +83,25 @@ remote_placement(const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t
             continue;
         const size_t index = (size_t) pair.first * (size_t) experts + (size_t) pair.second;
         if (assigned[index]) continue;
-        int target = -1;
+        int target = -1;   // an index into active
         if (by_layer) {
             target = pair.first % devices;
             // other layers' owners may still have room: keep scanning the ranks
-            if (by_device[(size_t) target].size() >= (size_t) caps[(size_t) target]) continue;
+            const int r = active[(size_t) target];
+            if (by_device[(size_t) r].size() >= (size_t) caps[(size_t) r]) continue;
         } else {
             for (int i = 0; i < devices; ++i) {
-                const int r = (next + i) % devices;
+                const int c = (next + i) % devices;
+                const int r = active[(size_t) c];
                 if (by_device[(size_t) r].size() < (size_t) caps[(size_t) r]) {
-                    target = r;
+                    target = c;
                     break;
                 }
             }
             if (target < 0) break;
         }
         assigned[index] = 1;
-        by_device[(size_t) target].push_back(pair);
+        by_device[(size_t) active[(size_t) target]].push_back(pair);
         next = (target + 1) % devices;
     }
     return by_device;
