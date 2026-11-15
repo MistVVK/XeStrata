@@ -732,9 +732,8 @@ struct Prefill::Impl {
     int32_t* lat_ng_[2] = {};
     int32_t* lat_dst_[2] = {};
     int32_t* lat_tok_[2] = {};
-    std::vector<unsigned long long> lat_h_ptrs[2];
-    std::vector<int32_t> lat_h_start[2], lat_h_dst[2], lat_h_tok[2];
-    int32_t lat_h_ng[2] = {};
+    HostVec<int32_t> lat_h_ptrs[2];   // ng*2 int32: the device pointers' bytes (pinned, fast copy kernel)
+    HostVec<int32_t> lat_h_start[2], lat_h_dst[2], lat_h_tok[2], lat_h_ng[2];
     strata::gpu::Event* lat_tbl_ev[2] = {};
     int64_t lat_scratch_T_ = 0;              // the chunk the scratch was sized for
     // the latent mmq fast path's scratch (the int8 matrix-unit products, iq_mmq)
@@ -1675,7 +1674,7 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
         auto& dst = m.lat_h_dst[s];
         auto& tok = m.lat_h_tok[s];
         ptrs.resize((size_t) ng * 2);
-        start.resize((size_t) ng + 1);
+        start.resize((size_t) (ng + 1));
         dst.resize((size_t) (T * K));
         tok.resize((size_t) (T * K));
         m.lat_h_ng[s].resize(1);
@@ -1684,8 +1683,9 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
         for (size_t j = b0; j < b1; ++j) {
             const int32_t e = order[j];
             const int32_t slot = (m.host_res && m.cache) ? m.host_res[(size_t) l * E + e] : -1;
+            unsigned long long p;
             if (slot >= 0) {
-                ptrs[j - b0] = (unsigned long long) m.cache->device_slot(slot);
+                p = (unsigned long long) m.cache->device_slot(slot);
             } else {
                 const uint8_t* b = m.src->blob(l, e);
                 if (b == nullptr) {
@@ -1694,9 +1694,10 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
                 }
                 strata::gpu::stream_wait_event(m.copy, m.used[0]);   // the last batch's kernel has read the buffers
                 strata::gpu::copy_async(m.lat_blobs_ + (j - b0) * blob_bytes, b, blob_bytes, m.copy);
-                ptrs[j - b0] = (unsigned long long) (m.lat_blobs_ + (j - b0) * blob_bytes);
+                p = (unsigned long long) (m.lat_blobs_ + (j - b0) * blob_bytes);
                 dma = true;
             }
+            std::memcpy(&ptrs[2 * (j - b0)], &p, 8);
         }
         if (dma) {
             strata::gpu::event_record(m.copied[0], m.copy);
@@ -1704,27 +1705,30 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
         }
         // the batch's entry tables: the routes in expert order, ent_dst = the route, ent_tok = its xl row
         start[0] = 0;
-        dst.clear(); tok.clear();
+        int64_t nd = 0;
         for (size_t j = b0; j < b1; ++j) {
             const int32_t e = order[j];
             const int32_t g = labels[e];
             for (const int32_t i : routes[(size_t) e]) {
-                dst.push_back(i);
-                tok.push_back((i / (int32_t) K) * G + g);
+                dst[nd] = i;
+                tok[nd] = (i / (int32_t) K) * G + g;
+                ++nd;
             }
-            start[j - b0 + 1] = (int32_t) dst.size();
+            start[j - b0 + 1] = (int32_t) nd;
         }
-        // upload set s on m.cs, ordered with the kernels: batch bi-1's kernel reads set (bi-1)&1 (not this one),
-        // and batch bi+1's upload of this set is ordered after this batch's kernel, so the device tables never
-        // race.  No stream_sync between batches: the host runs ahead, bounded only by the per-set event above.
-        m.lat_h_ng[s] = ng;
-        strata::gpu::copy_async(m.lat_ptrs_[s], ptrs.data(), (size_t) ng * 8, m.cs);
-        strata::gpu::copy_async(m.lat_start_[s], start.data(), (size_t) (ng + 1) * 4, m.cs);
-        strata::gpu::copy_async(m.lat_ng_[s], &m.lat_h_ng[s], 4, m.cs);
-        strata::gpu::copy_async(m.lat_dst_[s], dst.data(), dst.size() * 4, m.cs);
-        strata::gpu::copy_async(m.lat_tok_[s], tok.data(), tok.size() * 4, m.cs);
+        dst.resize((size_t) nd); tok.resize((size_t) nd);
+        // upload set s on m.cs through the pinned copy kernel (fast, not the pageable copy engine), ordered with
+        // the kernels: batch bi-1's kernel reads set (bi-1)&1, and batch bi+1's upload of this set is ordered after
+        // this batch's kernel, so the device tables never race.  No stream_sync between batches: the host runs
+        // ahead, bounded only by the per-set event above.
+        m.lat_h_ng[s][0] = ng;
+        ptrs.to_device((int32_t*) m.lat_ptrs_[s], m.cs);
+        start.to_device(m.lat_start_[s], m.cs);
+        m.lat_h_ng[s].to_device(m.lat_ng_[s], m.cs);
+        dst.to_device(m.lat_dst_[s], m.cs);
+        tok.to_device(m.lat_tok_[s], m.cs);
         strata::gpu::event_record(m.lat_tbl_ev[s], m.cs);
-        native_expert_grouped(L, m.lat_ptrs_[s], m.lat_start_[s], m.lat_ng_[s], m.lat_dst_[s], m.lat_tok_[s], ng, (int64_t) dst.size(),
+        native_expert_grouped(L, m.lat_ptrs_[s], m.lat_start_[s], m.lat_ng_[s], m.lat_dst_[s], m.lat_tok_[s], ng, nd,
                               m.lat_xlq_, m.lat_scratch_, m.lat_yl_, m.cs, ng);
         strata::gpu::event_record(m.used[0], m.cs);   // the batch's blobs read: the next batch may reuse them
     }
