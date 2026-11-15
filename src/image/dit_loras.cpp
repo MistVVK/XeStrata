@@ -242,6 +242,7 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
         if (nk > 0) {
             bake_tmp_ = alloc<float>(*owned_, nk, what_);
             bake_at16_ = alloc<uint16_t>(*owned_, kr, what_);
+            bake_bytes_ = (uint64_t) nk * 4 + (uint64_t) kr * 2;
             baked_any_ = true;
             hooks.reprepare();   // the queued work drained before the prepare changes
         }
@@ -265,6 +266,7 @@ void DitLoras::drop() {
                 release(*owned_, *p);
                 *p = nullptr;
             }
+        bake_bytes_ = 0;
     }
     layers_.clear();
     files_.clear();
@@ -275,7 +277,8 @@ void DitLoras::drop() {
 uint64_t DitLoras::bytes() const {
     uint64_t n = 0;
     for (const std::unique_ptr<LoraLayer>& l : layers_) n += l->bytes();
-    return n + scratch_->glora_bytes();   // a GLoRA's own path's buffers
+    // a GLoRA's own path's buffers, and the bake's (taken before the plan that places the blocks beside them)
+    return n + scratch_->glora_bytes() + bake_bytes_;
 }
 
 bool dit_slot_norms(const DitLoraSlot& slot, const std::vector<float>& norms, std::vector<float>& out,

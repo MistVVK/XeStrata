@@ -87,7 +87,7 @@ public:
 
     const std::string& key() const { return key_; }
     int count() const { return (int) files_.size(); }
-    /// The bound entries' A and B on the GPU (and a GLoRA's buffers).
+    /// The bound entries' A and B on the GPU (and a GLoRA's buffers, and the bake's: bake_tmp and bake_at16).
     uint64_t bytes() const;
     bool baked_any() const { return baked_any_; }
     float* bake_tmp() const { return bake_tmp_; }        // a weight's delta [n][k], while adapters are baked
@@ -105,6 +105,7 @@ private:
     bool baked_any_ = false;
     float* bake_tmp_ = nullptr;
     uint16_t* bake_at16_ = nullptr;
+    uint64_t bake_bytes_ = 0;   // bake_tmp_'s and bake_at16_'s
 };
 
 /// A slot's row norms out of its weight's tensor's (`norms`: the tensor's rows, the slot's from src_row on).
