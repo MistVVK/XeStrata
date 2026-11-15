@@ -187,10 +187,24 @@ KIND_KEY = "ss_xestrata_kind"
 KINDS = ("character", "style", "other")
 
 # A request's block weights by name ("blocks": "character"): the strength's factor each DiT block, one a block of the
-# family's DiT (the engine's LORA:<strength>@<w0>,...: word, LoraUse's blocks), where a character's shape and where
-# a picture's style go in that DiT, read from images made with a block's adapter switched off and on.  "all" is every
-# block at 1 (no factors).  A family with no table here takes the numbers' form only.
-BLOCK_PRESETS: dict[str, dict[str, tuple[float, ...]]] = {}
+# family's DiT (the engine's LORA:<strength>@<w0>,...: word, LoraUse's blocks), where a character's look and where
+# a picture's style go in that DiT.  Read from images of a character LoRA with its blocks switched on a group at a
+# time, the same prompt and seed (2026-11-16, the RX 9060 XT): Qwen-Image-2.1 Turbo's blocks 8-15 alone drew the
+# character (its hair, eyes and hairpin) with the base's light and background, 0-7 alone the LoRA's drawing without
+# the character, the rest little; Anima Turbo's 14-20 alone drew the character in the base's drawing, the others
+# none of it.  "style" is the other blocks.  Mage-Flow's blocks 0-5 carried both, a block or a weight at a time
+# alike, so it has no table (nor MOSS-Image and MageTrail, not looked at yet).  "all" is every block at 1.  A family
+# with no table takes the numbers' form only.
+
+
+def _span(n: int, first: int, last: int, inside: float) -> tuple[float, ...]:
+    return tuple(inside if first <= b <= last else 1.0 - inside for b in range(n))
+
+
+BLOCK_PRESETS: dict[str, dict[str, tuple[float, ...]]] = {
+    "qwen-image": {"character": _span(32, 8, 15, 1.0), "style": _span(32, 8, 15, 0.0)},
+    "anima": {"character": _span(28, 14, 20, 1.0), "style": _span(28, 14, 20, 0.0)},
+}
 
 
 class LoraError(ValueError):
