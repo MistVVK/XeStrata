@@ -27,6 +27,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
+# icpx links SYCL code through temporary objects in /tmp/icpx-*, which it deletes when the link ends. With the linker's own dependency
+# file (CMake 3.27+, Ninja and Makefile generators), those objects become link inputs that never exist again, so every executable relinks on every build.
+# Off, a link depends only on the libraries named here: a library the linker finds on its own (a oneAPI runtime upgrade) needs a clean build.
+set(CMAKE_LINK_DEPENDS_USE_LINKER OFF)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 option(STRATA_SYCL_WORKLOAD_TRACE "Build diagnostic CPU annotations and optional routing audit" OFF)
 if(STRATA_SYCL_WORKLOAD_TRACE)
