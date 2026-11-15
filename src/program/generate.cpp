@@ -1164,11 +1164,17 @@ bool adapt_device_table_lags() { return adapt_nowait() || adapt_lag() > 1; }
 /// lost decode to upstream, which does not cut (RX 9060 XT, 1K, upstream's text: 48.0 tok/s cut against 54.2 uncut
 /// and upstream's 52.9, 2026-10-22).  So a greedy reply of Gyro's can differ from run to run where a swap's timing
 /// moves an expert between the CPU and the GPU inside a window.
+/// A latent pack (Edge0) is not cut either: its experts' two sides round differently (the GPU's q8_1 rows, the CPU's
+/// Q8_K), and cut every 4 tokens its windows never passed 4 though the draft policy chose 6 for its lookups (39 of 54
+/// on a 1K text), and the RTX 4070 lost decode to edge0-strata, which does not cut (32K: 40.3 against 53.5 tok/s,
+/// 2026-11-15).
 bool adapt_cuts_windows() {
     static const bool v = [] {
         const auto p = strata::core::pick_from_env("ADAPT_CUT");
         if (p == strata::core::Pick::Off) return false;
         if (p == strata::core::Pick::On) return true;
+        for (const auto& pair : strata::core::latent_shared_table())
+            if (pair.d != nullptr) return false;
         return !strata::core::adapt_layers_round_alike();
     }();
     return v;
