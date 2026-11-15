@@ -29,7 +29,13 @@ int main() {
     CHECK(parse_switch("0") == 0 && parse_switch("2") == 0 && parse_switch("off") == 0);
 
     // the shipped default for Windows gfx1151
-    CHECK(kG1151DefaultOn == false);
+    CHECK(kG1151DefaultOn == true);
+    // with the shipped default: Windows gfx1151 on when unset; Linux, STRATA_GFX1151_DEFAULTS=0, the switch at 0 and a build without STRATA_PF_FUSED_TQ off
+    CHECK(strata::prefill::fused_tq_hip::device_on(false, true, true, true, -1, false, kG1151DefaultOn));
+    CHECK(!strata::prefill::fused_tq_hip::device_on(false, true, false, true, -1, false, kG1151DefaultOn));
+    CHECK(!strata::prefill::fused_tq_hip::device_on(false, true, true, true, -1, true, kG1151DefaultOn));
+    CHECK(!strata::prefill::fused_tq_hip::device_on(false, true, true, true, 0, false, kG1151DefaultOn));
+    CHECK(!strata::prefill::fused_tq_hip::device_on(false, true, true, false, -1, false, kG1151DefaultOn));
 
     const int sws[] = {-1, 0, 1};
     for (int m = 0; m < 64; ++m) {

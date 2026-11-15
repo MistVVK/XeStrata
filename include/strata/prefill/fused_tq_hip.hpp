@@ -12,8 +12,10 @@
 
 namespace strata::prefill::fused_tq_hip {
 
-// the default for Windows gfx1151 (STRATA_PF_TQ_G1151 unset)
-inline constexpr bool kG1151DefaultOn = false;
+// the default for Windows gfx1151 (STRATA_PF_TQ_G1151 unset): on.  Strix Halo, Gyro-S, the build without MMQ (with the floor 64 / --short-read 64 rule of
+// stream_floor_rule.hpp / staged_fo_rule.hpp): prompts of 128 to 32,000 tokens at 0.60 to 0.89 of 0.2.13's prompt time; 26-64-token prompts on the verify windows as before.
+// STRATA_PF_TQ_G1151=0 (or STRATA_GFX1151_DEFAULTS=0) is the way back.
+inline constexpr bool kG1151DefaultOn = true;
 
 // the value of STRATA_PF_TQ_G1151: -1 unset or empty, 1 when it starts with '1', 0 otherwise
 constexpr int parse_switch(const char* v) { return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0); }
