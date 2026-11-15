@@ -896,6 +896,8 @@ class Runner:
             args += ["--experimental-speed-projection", "off"]
         resolved = self.resolved_drafting(fam)
         mtp_word = s.mtp if resolved != "off" else "off"
+        if mtp_word is None and self.layer_back():
+            mtp_word = "on"                                  # a drafter chosen again after Off: the "mtp": false that Off's "--mtp off" left goes (REAL-USE-1)
         if mtp_word in ("on", "off") and fam in modelstate.HELPER_FAMILIES:
             args += ["--mtp", mtp_word]                      # round 8, N3: "--mtp off" never reached setup, which then fetched the 5.2 GB draft layer
         if resolved == "dflash2" and fam in modelstate.HELPER_FAMILIES and mtp_word != "off":
@@ -965,6 +967,23 @@ class Runner:
             return None, None
         desc = self.catalog.strata.describe_config(path)
         return path, desc
+
+    def layer_back(self, path: Path | None = None) -> bool:
+        """A drafter is named at this launch (Auto, MTP or DFlash2, not Off; no --mtp) while the installed config says "mtp": false: a Drafting Off launch hands
+        setup "--mtp off", and setup keeps that at every later run, so Auto read it as "the draft layer is off" and started without a drafter (0.2.13.1, REAL-USE-1).
+        Then setup runs again with "--mtp on", and the start is the one a first launch with that choice gets.  A model the feed says has no draft layer stays off."""
+        s = self.s
+        if s.mtp is not None or s.drafting is None or s.family not in modelstate.HELPER_FAMILIES or sys.platform == "darwin":
+            return False                                     # (a Mac's setup takes no --mtp word: setup_args)
+        from strata_control import drafting
+        if drafting.normalize(s.drafting) == "off" or self.resolved_drafting(s.family) == "off":
+            return False
+        try:
+            if path is None:
+                path = self.catalog.installed_config(self.catalog.tag_of(s.family, s.model))
+            return path is not None and read_config(path).get("mtp") is False
+        except Exception:                                    # noqa: BLE001 - an unreadable config is setup's to report; nothing changes here
+            return False
 
     def installed_serves_request(self, path: Path) -> bool:
         """C08: the installed copy is what this launch asked for. A --model-path (or the Folder step's own files) and a --data-dir always win:
@@ -1164,7 +1183,7 @@ class Runner:
         if not (s.family and s.model):
             raise LaunchError("No model was chosen.", "Choose a model, or use --model NAME (strata launch --help lists them).", 2)
         path, desc = self.installed_state()
-        if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)):
+        if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)) and not self.layer_back(path):
             if self.installed_serves_request(path):
                 self.emit("model", f"{s.family} {s.model} is already installed with these choices.", 100)
                 return path
