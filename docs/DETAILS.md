@@ -1306,6 +1306,26 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   The prefix cache only reuses a prompt's start, so every new folder and every new day reads ~14K tokens again.
   `"env_to_user": true` in `xestrata-<model>.json` moves that block to the front of the first user message, so the system turn is the same for every session (opt-in, upstream d8a49433).
   Measured by upstream (RTX 5070 Ti Laptop, a new session in a second folder): the first request took 1.1 s instead of 11.9 s, and the model still answered the folder and date correctly.
+- **Pi** (`pi-coding-agent`): add the server to `providers` in `~/.pi/agent/models.json`.
+  Any of the `api` kinds works: `openai-completions` (base URL `http://127.0.0.1:8095/v1`), `openai-responses` (the same), `anthropic-messages` (`http://127.0.0.1:8095`).
+
+  ```json
+  {
+    "providers": {
+      "xestrata": {
+        "baseUrl": "http://127.0.0.1:8095/v1",
+        "api": "openai-completions",
+        "apiKey": "none",
+        "models": [{ "id": "xestrata", "reasoning": true, "contextWindow": 262144, "maxTokens": 32768,
+                     "thinkingLevelMap": { "off": "none" } }]
+      }
+    }
+  }
+  ```
+
+  With `openai-completions`, Pi sends nothing for `--thinking off` unless `thinkingLevelMap` has `"off": "none"`, and the model thinks, as it does by default.
+  With it, Pi sends `reasoning_effort: "none"` and the thinking is off.
+  `openai-responses` and `anthropic-messages` send the off without it.
 - **Claude Code**: set `ANTHROPIC_BASE_URL=http://127.0.0.1:8095` and `ANTHROPIC_MODEL` to a Claude model name it knows.
   Claude Code refuses names it doesn't know; XeStrata ignores the name.
   Add any `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
