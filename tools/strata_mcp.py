@@ -1639,9 +1639,14 @@ def combined_progress(prog: dict, job: dict) -> dict:
         prog["download"] = {"file": "checking files", "done_gb": dl["done_gb"], "total_gb": dl["total_gb"],
                             "remaining_gb": round(max(0.0, dl["total_gb"] - dl["done_gb"]), 3), "percent": int(dl["percent"])}
         return prog
-    if job.get("files") and step.startswith(("5/", "6/", "7/")):   # the install knows its files: count each of them, also after the download
-        # (DL99: from step 6 on the parts were dropped and the app counted the engine's part alone, "99% · 0.7 / 0.7 GB")
+    if job.get("files") and step.startswith("5/"):      # the install knows its files: count each of them
         return files_progress(prog, job, job["files"])
+    if job.get("files") and step.startswith(("6/", "7/")):
+        # after the download: no download figure (setup prepares the files), but the parts stay, all whole, so the app's one bar is complete
+        # (DL99: they were dropped and the app counted the engine's part alone, "99% · 0.7 / 0.7 GB")
+        prog = files_progress(prog, job, job["files"])
+        prog.pop("download", None)
+        return prog
     if not folder or not total or not step.startswith("5/"):
         prog.pop("download", None)
         return prog
