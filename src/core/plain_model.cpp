@@ -615,7 +615,8 @@ void PlainModel::auto_kv_format(Fits fits, KvRow kv_row, int64_t nl) {
     const int64_t f16 = fits(kv_row(false, 0, 0), nullptr);
     if (f16 >= nl) return;   // FP16 holds every block: keep it
     const ModelSpec& s = spec_;
-    const bool tc_ok = s.key_length == 256 && s.arch != ModelArch::Plamo3;
+    // (a streamed cache takes no trellis code: it has no host copy)
+    const bool tc_ok = s.key_length == 256 && s.arch != ModelArch::Plamo3 && kv_stream_slots_ == 0;
     struct Pick { bool i8; int tcq; const char* name; };
     const Pick picks[] = {{true, 0, "int8"}, {false, 5, "tcq5"}, {false, 4, "tcq4"}};
     const Pick* take = &picks[0];
@@ -698,7 +699,30 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
     };
     auto_kv_format(fits, kv_row, nl);
     uint64_t total = 0;
-    const int64_t fit = fits(kv_row(opt_.kv_int8, opt_.kv_q4, opt_.kv_tcq), &total);
+    int64_t fit = fits(kv_row(opt_.kv_int8, opt_.kv_q4, opt_.kv_tcq), &total);
+    // --kv-resident auto: where no K/V format keeps every block on the GPU, plan the streaming ring instead
+    // (resolve_kv_resident checks the RAM and plans it): streaming reads the whole non-resident context over PCIe
+    // every token, so it is only for the contexts the resident form cannot hold -- where that form fits, streaming
+    // measured 45-76% slower decode (B70, RTX 4070, RX 9060 XT, 2026-11-15).  Qwen3.8's auto (29ad2c249) has no
+    // VRAM condition: its QSA reads only the selected cells, so streaming costs it nothing.  The trellis codes have
+    // no host copy (kv_q8.hpp): an auto pick of one goes back to FP16, or int8 where FP16's ring leaves blocks off.
+    if (fit < nl && opt_.kv_resident < 0 && opt_.max_cells >= 65536 && (opt_.kv_tcq == 0 || opt_.kv_auto)) {
+        const int64_t ps = attn_shapes().page_size;
+        const int64_t ring = std::min<int64_t>(opt_.max_cells, (32768 + opt_.max_t + ps - 1) / ps * ps);
+        for (int64_t l = 0; l < nl; ++l)
+            if (!s.recurrent[(size_t) l] && !s.layer_swa(l)) kv_cells[(size_t) l] = (uint64_t) (ring * nkv);
+        if (opt_.kv_tcq != 0) {
+            opt_.kv_tcq = 0;
+            opt_.kv_int8 = fits(kv_row(false, 0, 0), nullptr) < nl;
+            std::fprintf(stderr, "xestrata plain: the K/V cache in %s for KV streaming\n", opt_.kv_int8 ? "int8" : "fp16");
+        }
+        total = 0;
+        fit = fits(kv_row(opt_.kv_int8, opt_.kv_q4, opt_.kv_tcq), &total);
+        kv_stream_auto_ = true;
+        if (first())
+            std::fprintf(stderr, "xestrata plain: the resident K/V does not fit beside the weights: KV streaming "
+                                 "(auto), the last 32768 cells a layer in VRAM\n");
+    }
     if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
     opt_.gpu_layers = head + reserve > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
     std::fprintf(stderr, "xestrata plain: %.2f GiB of VRAM free, the head and a reserve %.2f GiB, the blocks %.2f GiB: %s\n",
@@ -1566,6 +1590,11 @@ int64_t PlainModel::prompt_int8_below() const {
     if (const char* v = strata::env_get("PLAIN_MMQ"); v != nullptr && v[0] != '\0') return INT64_MAX;
     const auto& lay = k::cpu::expert_layout();
     if (dense_ || spec_.n_expert <= 0 || !lay.native || lay.fmt.empty()) return INT64_MAX;
+    // ROCm (RX 9060 XT): the expert products' timing probe, like the prompt attention's, leaves a not-present
+    // mapping that faults/hangs the start when the KV streams a large host copy (llm-jp 128K, 2026-11-15).  Skip
+    // the timing on HIP (both arms, so streaming and resident take the same int8 products and the same answer);
+    // the int8 products run at every size (the untimed default).
+    if (core::Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_hip) return INT64_MAX;
     // as prompt_routed launches them: the experts in VRAM in one int8 launch, kGroup a launch on the FP16 path
     prefill::mmq::ExpertLaunches launches;
     launches.n_expert = spec_.n_expert;
@@ -2641,6 +2670,51 @@ uint64_t PlainModel::kv_host_bytes() const {
     return per * layers;
 }
 
+// Does the whole context's K/V fit the VRAM beside this stage's own weights (the dense part and the head; the
+// expert tier is elastic, its partial residency normal)?  The auto rule's VRAM half (resolve_kv_resident): the
+// weights from the metadata, nothing allocated yet, the same reserve auto_gpu_layers takes.
+bool PlainModel::kv_resident_fits_vram() const {
+    size_t f = 0, t = 0;
+    {
+        const OnDevice on(dev_);
+        if (!strata::gpu::mem_info(&f, &t)) return true;   // unknown: the RAM rule alone decides
+    }
+    const uint64_t free_b = counted_free(f, f, opt_.vram_free_mib);
+    const ModelSpec& s = spec_;
+    const bool last = le_ == s.n_layer;
+    uint64_t weights = 0;
+    for (size_t i = 0; i < model_->size(); ++i)
+        for (const TensorInfo& ti : model_->shard(i).tensors()) {
+            if (ti.name.rfind("blk.", 0) == 0) {
+                if (ti.name.find("_exps.") != std::string::npos) continue;   // the expert tier: elastic
+                const int64_t l = std::strtoll(ti.name.c_str() + 4, nullptr, 10);
+                if ((l >= lb_ && l < le_) || (has_mtp_ && l == s.n_layer)) weights += tensor_payload_bytes(ti);
+            } else if (last && (ti.name == head_name() || ti.name == "output_norm.weight")) {
+                weights += tensor_payload_bytes(ti);
+            }
+        }
+    for (int64_t l = lb_; l < le_; ++l)
+        if (s.recurrent[(size_t) l])
+            weights += (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state +
+                                   (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4;
+    const uint64_t reserve = opt_.reserve_mib >= 0
+                                 ? (uint64_t) opt_.reserve_mib << 20
+                                 : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
+    // the whole context's K/V of this stage's attention blocks (the MTP layer's too), as alloc_kv takes it
+    const k::QsaShapes qs = attn_shapes();
+    const uint64_t cells = (uint64_t) opt_.max_cells * (uint64_t) qs.n_head_kv;
+    const uint64_t codes = cells * (size_t) qs.head_dim, scales = cells * ((size_t) qs.head_dim / k::KV_Q8_GROUP) * 2,
+                   q4 = cells * (uint64_t) k::kv_q4_bytes_per_head((int) qs.head_dim);
+    const uint64_t one = opt_.kv_q4 == 1 ? 2 * q4
+                       : opt_.kv_q4 == 2 ? codes + scales + q4
+                       : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
+    uint64_t kv = 0;
+    for (int64_t l = lb_; l < le_; ++l)
+        if (blocks_[(size_t) l].attn >= 0 && !attn_swa_[(size_t) blocks_[(size_t) l].attn]) kv += one;
+    if (has_mtp_ && !attn_swa_[(size_t) mtp_.attn]) kv += one;
+    return weights + reserve + kv <= free_b;
+}
+
 bool PlainModel::resolve_kv_resident(std::string& err) {
     kv_resident_cells_ = 0;
     if (glm_ || opt_.cpu || cpu_tail_ != nullptr || opt_.encoder || opt_.batch_slots > 0) {
@@ -2660,8 +2734,15 @@ bool PlainModel::resolve_kv_resident(std::string& err) {
     }
     int64_t want = opt_.kv_resident;
     if (want == 0) return true;
-    if (want < 0) {   // auto: Qwen3.8-Flash-Next's rule (setup's kv_streaming_wanted), from the engine's own figures
+    if (want < 0) {   // auto: from 64K up, only where the resident K/V does not fit the GPU, and the RAM holds it
         if (opt_.max_cells < 65536) { opt_.kv_resident = 0; return true; }
+        // the VRAM rule (2026-11-15): stream only where the resident K/V does not fit beside the model's own
+        // weights -- auto_gpu_layers already planned the ring for a dense model (kv_stream_auto_); here, a MoE's
+        // dense part and head (the expert tier is elastic: its partial residency on a small card is normal, not a
+        // block pushed out).  Where the resident form fits, streaming measured 45-76% slower decode (B70, RTX 4070,
+        // RX 9060 XT): it must not be the default there.  Qwen3.8's rule (29ad2c249) has no VRAM condition: its
+        // QSA reads only the selected cells, so streaming costs it nothing.
+        if (!kv_stream_auto_ && kv_resident_fits_vram()) { opt_.kv_resident = 0; return true; }
         uint64_t experts = 0;
         if (!dense_) {
             if (root_ == this) {   // the layout open_experts reads again (metadata only); the stages inherit it
@@ -2699,21 +2780,26 @@ bool PlainModel::alloc_kv_host(size_t a, std::string& err) {
     const size_t pairs = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
     const size_t codes = pairs * HD, scales = pairs * (HD / k::KV_Q8_GROUP) * 2,
                  q4 = pairs * (size_t) k::kv_q4_bytes_per_head((int) HD);
-    k::KvHostPools h;
-    bool ok = true;
-    auto take = [&](auto*& q, size_t bytes) {
-        if (!ok) return;
-        void* hp = nullptr;
-        void* dp = nullptr;
-        if (!mapped(bytes, &hp, &dp)) { ok = false; return; }
-        allocs_.push_back(hp);   // host USM, freed in the destructor (as --kv-ram's latent)
-        q = (std::remove_reference_t<decltype(q)>) dp;
+    // One pinned block a layer, the pools its slices (Qwen3.8-Flash-Next's layer.cpp, the same form).
+    const size_t bytes = (opt_.kv_q4 == 1 ? 2 * q4
+                        : opt_.kv_q4 == 2 ? codes + scales + q4
+                        : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes) + 4 * 256;
+    void* hp = nullptr;
+    void* dp = nullptr;
+    if (!mapped(bytes, &hp, &dp)) { err = "plain model: no RAM for the streamed K/V host copy"; return false; }
+    allocs_.push_back(hp);   // host USM, freed in the destructor (as --kv-ram's latent)
+    uint8_t* cur = (uint8_t*) dp;
+    uint64_t used = 0;
+    auto take = [&](auto*& q, size_t n) {
+        using P = std::remove_reference_t<decltype(q)>;
+        q = (P) (cur + used);
+        used = (used + n * sizeof(std::remove_pointer_t<P>) + 15) & ~(uint64_t) 15;
     };
+    k::KvHostPools h;
     if (opt_.kv_q4 == 1) { take(h.k_q4, q4); take(h.v_q4, q4); }
-    else if (opt_.kv_q4 == 2) { take(h.k_q, codes); take(h.k_scale, scales); take(h.v_q4, q4); }
-    else if (opt_.kv_int8) { take(h.k_q, codes); take(h.v_q, codes); take(h.k_scale, scales); take(h.v_scale, scales); }
-    else { take(h.k_pool, codes * 2); take(h.v_pool, codes * 2); }
-    if (!ok) { err = "plain model: no RAM for the streamed K/V host copy"; return false; }
+    else if (opt_.kv_q4 == 2) { take(h.k_q, codes); take(h.k_scale, scales / 2); take(h.v_q4, q4); }
+    else if (opt_.kv_int8) { take(h.k_q, codes); take(h.v_q, codes); take(h.k_scale, scales / 2); take(h.v_scale, scales / 2); }
+    else { take(h.k_pool, codes); take(h.v_pool, codes); }
     kv_host_[a] = h;
     return true;
 }

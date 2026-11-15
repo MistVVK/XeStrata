@@ -1320,6 +1320,8 @@ private:
     /// resolve --kv-resident (auto/off/N) to the resident cells a layer (0: off), before the K/V is sized; the root
     /// writes the resolved value into opt_.kv_resident so the layer split's stages inherit it
     bool resolve_kv_resident(std::string& err);
+    bool kv_resident_fits_vram() const;   ///< the auto rule's VRAM half: the resident K/V beside the own weights
+    bool kv_stream_auto_ = false;         ///< auto_gpu_layers planned the ring (the resident K/V pushed blocks off)
     /// the host copy's bytes for this stage's streamed attention layers at the whole context (the auto rule's figure)
     uint64_t kv_host_bytes() const;
     /// allocate attention block a's host copy (the identity layout, the whole context); false on a failed allocation

@@ -480,8 +480,14 @@ Runtime& Runtime::at(int ordinal) {
 Runtime* Runtime::owner(const void* pointer) {
     if (!pointer) return nullptr;
     std::lock_guard<std::mutex> lock(g_runtimes_mutex);
-    for (auto& r : runtimes())
-        if (r && sycl::get_pointer_type(pointer, r->context_) != sycl::usm::alloc::unknown) return r.get();
+    for (auto& r : runtimes()) {
+        if (!r) continue;
+        // ROCm (RX 9060 XT) sometimes refuses the query (UR_RESULT_ERROR_UNKNOWN) with a large streamed KV host
+        // copy beside the expert arena; treat that as "not this runtime's" rather than letting it abort the start.
+        try {
+            if (sycl::get_pointer_type(pointer, r->context_) != sycl::usm::alloc::unknown) return r.get();
+        } catch (const std::exception&) { continue; }
+    }
     return nullptr;
 }
 
