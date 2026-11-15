@@ -1832,7 +1832,11 @@ if(STRATA_NATIVE_EXPERTS)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp
                                            src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp
-                                           src/kernels/cpu/tq_avx512.cpp)
+                                           src/kernels/cpu/tq_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
+                                           src/kernels/cpu/nvfp4_avx512.cpp)
+  # NVFP4's CPU rows (Edge0's latent experts): an AVX2 and an AVX-512 VNNI copy, chosen at run time (native_expert.cpp)
+  set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
   # the trellis types' CPU rows (Gyro, tq_cpu.hpp): AVX2 and AVX-512 copies of the scalar kernel, chosen at run time
   set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
