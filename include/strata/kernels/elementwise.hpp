@@ -70,6 +70,9 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 /// Plan v0.3 P3: copy `n` int32 from mapped pinned host memory into device memory with a kernel (the QSA
 /// per-token step and positions), instead of a host-to-device memcpy node in the middle of a layer.
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);
+/// `*flag = value` from the device, behind the stream's earlier work (a copy's landing told through mapped host
+/// memory: `flag` is its device alias), with a system-scope fence before the store.
+void mapped_flag_store(uint32_t* flag, uint32_t value, void* stream);
 /// Up to 8 copies from mapped host memory in one launch: `words` 4-byte words each (16 bytes a load where both ends
 /// are 16-byte aligned and the count a multiple of 4).  Graph-capturable.
 struct MappedCopy {

@@ -213,8 +213,6 @@ private:
     int32_t *h_plan_ = nullptr, *m_plan_ = nullptr;      ///< a plan per token group
     int64_t plan_i32_ = 0;
     GpuPlanSink sink_;
-    struct FlagSet { uint32_t* flag; uint32_t value; };
-    FlagSet flag_sets_[256] = {};   ///< host-function arguments, one per ring in flight (layers x groups)
 
     // the device arena
     void* arena_ = nullptr;

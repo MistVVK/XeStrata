@@ -165,6 +165,13 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
     });
 }
 
+void mapped_flag_store(uint32_t* flag, uint32_t value, void* stream) {
+    queue_for(stream).single_task([=] {
+        sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+        reinterpret_cast<volatile uint32_t*>(flag)[0] = value;
+    });
+}
+
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if (((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {

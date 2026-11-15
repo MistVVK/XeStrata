@@ -432,20 +432,20 @@ void MoeWindow::raise_flag_b_ordered(uint32_t want) {
         raise_flag(h_flagB_, want);
         return;
     }
-    FlagSet& fs = flag_sets_[want % (sizeof flag_sets_ / sizeof flag_sets_[0])];
-    fs.flag = h_flagB_;
-    fs.value = want;
-    FlagSet* set = &fs;
-    if (!strata::gpu::launch_host(copy_, [set] { raise_flag(set->flag, set->value); })) {
+    // in stream order behind the copies, as fetch_dma raises it: once the stream holds copies every raise goes
+    // through it, so the stores land in ring order and flag B only rises
+    try {
+        strata::kernels::mapped_flag_store(m_flagB_, want, copy_);
+    } catch (const std::exception& e) {
         // The flag was not raised: the consumers must not be released to staging that is still being written.
-        std::fprintf(stderr, "xestrata DMA: ordered flag B completion failed: %s\n", strata::gpu::last_error());
+        std::fprintf(stderr, "xestrata DMA: ordered flag B completion failed: %s\n", e.what());
         std::fflush(stderr);
         std::abort();
     }
 }
 
 // The PCIe share by DMA: the copy engine moves the blobs while the CPU computes its share and the GPU its VRAM
-// experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe groups).
+// experts; a kernel behind them raises flag B when they have landed (the graph waits for it before the PCIe groups).
 void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     MoeWindow* w = (MoeWindow*) ctx;
     const uint32_t want = w->cur_ring_;
@@ -453,11 +453,9 @@ void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t by
     uint8_t* stage = (uint8_t*) w->sink_.staging;   // this group's half in a split window
     for (int i = 0; i < n; ++i) strata::gpu::copy_async(stage + (size_t) i * bytes, src[i], bytes, w->copy_);
     w->copy_used_ = true;
-    FlagSet& fs = w->flag_sets_[want % (sizeof w->flag_sets_ / sizeof w->flag_sets_[0])];
-    fs.flag = w->h_flagB_;
-    fs.value = want;
-    FlagSet* set = &fs;
-    strata::gpu::launch_host(w->copy_, [set] { raise_flag(set->flag, set->value); });
+    // flag B by a kernel behind the copies on the same in-order stream: a host function there cost the RTX 4070's
+    // SYCL ~0.2 ms of the pool's time a layer (Edge0-120B-q3k, 32K: 0.23 of 0.73 ms a layer's call, 2026-11-15)
+    strata::kernels::mapped_flag_store(w->m_flagB_, want, w->copy_);
 }
 
 void MoeWindow::publish_plan(void* ctx) {
