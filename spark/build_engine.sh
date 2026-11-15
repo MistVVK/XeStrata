@@ -51,9 +51,12 @@ cd "$repo"
 "$cmake" -G Ninja -S . -B "$build" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
     -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_SKIP_BUILD_RPATH=OFF '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
-    -DSTRATA_MMQ=ON "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake
-# -DSTRATA_MMQ=ON: not measured without MMQ; kept as in 0.2.13 (the engine default is OFF since then)
-# strata_kq (libstrata_kq.so) exists only in a build with llama.cpp's MMQ: STRATA_CMAKE_EXTRA=-DSTRATA_MMQ=OFF builds without it
+    -DSTRATA_MMQ=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake
+# without llama.cpp's MMQ, as the x86 release builds since 0.2.14 (named here: a build folder configured before keeps ON in its cache).
+# Such a build turns Strata's fused prompt kernels on for every layer they cover (src/prefill/prefill.cpp, own_only_switches.hpp), on the
+# GB10 too: IQ3_S, UD-IQ4_XS and UD-Q4_K_XL ran 48 of 48 layers on them on a GB10 (par/RESULTS-SPARK-R1.md, 11-14 / 11-15), the rest
+# takes the FP16 path.  strata_kq (libstrata_kq.so) exists only in a build with MMQ: STRATA_CMAKE_EXTRA=-DSTRATA_MMQ=ON builds the old
+# path (A/B runs)
 . "$repo/packaging/engine_targets.sh"
 targets=$(engine_targets "$cmake" "$build")
 # shellcheck disable=SC2086
