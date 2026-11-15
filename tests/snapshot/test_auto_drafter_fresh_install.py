@@ -124,6 +124,60 @@ class PickedDrafterMissing(unittest.TestCase):
         self.assertEqual(drafter(rec), "off")
 
 
+def net_launch(m, s, extra=(), offline=False, setup_disagrees=False):
+    """A first Auto launch on a fresh install where the start's decision finds no drafter on disk after setup (the start's safety net,
+    runner.fetch_missing_drafter). `setup_disagrees`: setup decides without the start's signals (as a card near a class line can), so it is told DFlash2
+    where the start runs the MTP. `offline`: setup's draft-layer step goes on without the layer, and the DFlash2 drafter cannot be downloaded either."""
+    from contextlib import ExitStack
+    from unittest import mock
+    from strata_cli.launch import runner as R
+    from strata_control import drafting_fetch
+    from tests.snapshot import driver
+    world = fresh_world(m, s)
+    try:
+        with world.patched(), ExitStack() as st:
+            if offline:
+                st.enter_context(mock.patch.object(driver, "setup_fetches_layer", lambda *a, **k: None))
+                st.enter_context(mock.patch.object(drafting_fetch, "online", lambda *a, **k: False))
+            if setup_disagrees == "blocked":
+                from strata_control import drafting
+                st.enter_context(mock.patch.object(drafting, "blocked_by", lambda *a, **k: True))
+            elif setup_disagrees:
+                st.enter_context(mock.patch.object(R, "auto_signals", lambda *a, **k: {}))
+            rec = drive_launch(world, tuple(extra), setup_runs=True, fresh=True)
+        return rec if "failed" in rec else normalize(rec, world)
+    finally:
+        world.close()
+
+
+class StartSafetyNet(unittest.TestCase):
+    maxDiff = None
+    # (1) several requests block DFlash2 at the start (drafting.blocked_by; a `--parallel` launch of the matrix runs DFlash2 one request at a time, so the block is
+    #     set directly): setup was told DFlash2, the start falls back to the MTP layer; (2) setup says DFlash2, the start says the MTP
+    CASES = (("blocked", "nv_resident", "iq3_s", (), "blocked"),
+             ("class line", "nv_12gb_streaming", "iq3_s", (), True))
+
+    def test_online_the_layer_is_fetched_and_the_mtp_runs(self):
+        for name, mkey, skey, extra, disagrees in self.CASES:
+            with self.subTest(case=name):
+                rec = net_launch(get_machine(mkey), get_set(skey), extra, setup_disagrees=disagrees)
+                self.assertNotIn("failed", rec)
+                self.assertIn({"call": "setup_mtp_layer"}, rec["fetches"], "setup ran again and fetched the layer")
+                self.assertEqual(drafter(rec), "mtp", rec["engine"]["argv"])
+
+    def test_offline_the_start_goes_on_without(self):
+        for name, mkey, skey, extra, disagrees in self.CASES:
+            with self.subTest(case=name):
+                rec = net_launch(get_machine(mkey), get_set(skey), extra, offline=True, setup_disagrees=disagrees)
+                self.assertNotIn("failed", rec, "no stop")
+                self.assertEqual(drafter(rec), "off")
+
+    def test_a_chosen_off_is_not_fetched_for(self):
+        rec = net_launch(get_machine("nv_resident"), get_set("iq3_s"), ("--drafting", "off"), setup_disagrees="blocked")
+        self.assertNotIn({"call": "setup_mtp_layer"}, rec["fetches"])
+        self.assertEqual(drafter(rec), "off")
+
+
 class MacSetupFetchesThePickedDrafter(unittest.TestCase):
     # 0.2.14 SMOKE-1 (M5 Max, Q2_0, offline): the plan named DFlash2, setup fetched the MTP layer anyway (setup_args left --drafter out on a Mac) and stopped offline
     def test_metal_sets(self):

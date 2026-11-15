@@ -161,7 +161,8 @@ def run(a) -> int:
     sig = _signals(a, want)
     needed = drafting.needs_pack(**want, **sig) or drafting.needs_tuned(**want, **sig)       # (the tuned drafter is a download of its own, where the set and the card use it)
     tuned_needed = drafting.needs_tuned(**want, **sig)
-    mtp_needed = drafting.needs_mtp(**want, **sig)
+    mtp_needed = drafting.needs_mtp(**want, **sig) or (not needed and want["mtp_here"] is False and drafting.normalize(want["mode"]) != "off"
+                                                       and drafting.decide(**want, **sig).drafter == "off")   # the start's safety net (runner.fetch_missing_drafter): never no drafter unless Off was chosen
     if a.drafting_command == "plan":
         decision = drafting.decide(**want, **sig)
         support = drafting.hardware_support(want["backend"], want["archs"], want["model_name"])

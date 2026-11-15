@@ -923,9 +923,10 @@ class Runner:
             args += ["--kv", s.kv]
         if fam in ("qwen", "coder"):
             args += ["--experimental-speed-projection", "off"]
-        resolved = self.resolved_drafting(fam)
+        layer_fetch = getattr(self, "_layer_fetch", False)  # the start's safety net (fetch_missing_drafter): setup fetches the draft layer
+        resolved = "mtp" if layer_fetch else self.resolved_drafting(fam)
         mtp_word = s.mtp if resolved != "off" else "off"
-        if mtp_word is None and self.layer_back():
+        if mtp_word is None and (layer_fetch or self.layer_back()):
             mtp_word = "on"                                  # a drafter chosen again after Off: the "mtp": false that Off's "--mtp off" left goes (REAL-USE-1)
         if mtp_word in ("on", "off") and fam in modelstate.HELPER_FAMILIES:
             args += ["--mtp", mtp_word]                      # round 8, N3: "--mtp off" never reached setup, which then fetched the 5.2 GB draft layer
@@ -1212,7 +1213,8 @@ class Runner:
         if not (s.family and s.model):
             raise LaunchError("No model was chosen.", "Choose a model, or use --model NAME (strata launch --help lists them).", 2)
         path, desc = self.installed_state()
-        if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)) and not self.layer_back(path):
+        if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)) and not self.layer_back(path) \
+                and not getattr(self, "_layer_fetch", False):
             if self.installed_serves_request(path):
                 self.emit("model", f"{s.family} {s.model} is already installed with these choices.", 100)
                 return path
@@ -2406,6 +2408,31 @@ class Runner:
         except Exception:                                    # noqa: BLE001 - an unreadable table is only the generic plan line
             return False
 
+    def fetch_missing_drafter(self, base_path: Path) -> Path:
+        """The start's safety net: a model never starts without a drafter unless the person chose Off. When the start's decision (drafting.decide on the installed
+        config) is no drafter although Off was not chosen, the drafter it falls back to is the MTP layer and that is not here (DFlash2 blocked by several requests;
+        a card near a class line where setup and the start read the context differently): setup runs again and fetches the layer with its own download
+        lines, then the start decides again. Offline (setup goes on without the layer) or a server that does not answer: the start goes on without, with
+        the start's own line. Never stops the launch."""
+        from strata_control import drafting
+        try:
+            cfg = read_config(base_path)
+            want = self.drafting_inputs(cfg)
+            if not cfg or drafting.normalize(want["mode"]) == "off" or want.get("mtp_here") is not False or self.feed_without_draft_layer() \
+                    or self.s.family not in modelstate.HELPER_FAMILIES or drafting.decide(**want, **self.drafting_signals(cfg, want)).drafter != "off":
+                return base_path
+        except Exception:                                    # noqa: BLE001 - a question asked early is never a reason to stop a launch
+            return base_path
+        self._layer_fetch = True
+        try:
+            return self.ensure_model()
+        except Cancelled:
+            raise
+        except LaunchError:                                  # the layer could not be had: the start goes on without it and says so
+            return base_path
+        finally:
+            self._layer_fetch = False
+
     def keep_saved_off(self) -> None:
         """A launch without a Drafting word keeps the Off this launch ran with last time (its own run config, launch/<name>.json), unless the model's installed
         config holds a Drafting choice of its own (the app's Models screen). Off is only ever the person's choice, and a chosen Off holds: where setup does not run
@@ -2458,6 +2485,7 @@ class Runner:
             base = self.ensure_model()
             self.check_cancel()
             self.ensure_drafter(base)
+            base = self.fetch_missing_drafter(base)
             self.check_cancel()
             self.check_saved_state_readable()
             self.emit("config", "Writing this launch's settings…")
