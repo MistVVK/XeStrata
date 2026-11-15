@@ -26,6 +26,7 @@
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/nvfp4.hpp"
 #include "strata/platform/env.hpp"
 
 #include "ggml.h"
@@ -135,18 +136,24 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
     // llama.cpp's graph does
     std::vector<float> xr(x);
     if (f.had_gu) for (int k = 0; k < NT; ++k) cpu::hadamard_rotate(xr.data() + k * H, (int) H, f.had_block, f.gu_signs);
+    // NVFP4: the expert's s_gate, s_up and s_down from the blob's tail (1 for every other type)
+    const double sg = strata::kernels::nvfp4::tail_scale(blob.data(), f.tail_off, 0);
+    const double su = strata::kernels::nvfp4::tail_scale(blob.data(), f.tail_off, 1);
+    const double sd = strata::kernels::nvfp4::tail_scale(blob.data(), f.tail_off, 2);
     for (int k = 0; k < NT; ++k) {
         std::vector<float> h(FF);
         for (int64_t r = 0; r < FF; ++r) {
             double g = 0, u = 0;
             for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * xr[k * H + i]; u += (double) U[r * H + i] * xr[k * H + i]; }
+            g *= sg;
+            u *= su;
             h[r] = (float) (g / (1.0 + std::exp(-g)) * u);
         }
         if (f.had_d) cpu::hadamard_rotate(h.data(), (int) FF, f.had_block, f.d_signs);
         for (int64_t r = 0; r < H; ++r) {
             double o = 0;
             for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * h[i];
-            ref[k * H + r] = (float) o;
+            ref[k * H + r] = (float) (o * sd);
         }
     }
     // (b) the CPU
@@ -550,6 +557,10 @@ static int check_synthetic(const std::string& arg, void* s, bool had = false) {
     std::vector<float> wd((size_t) H * FF);
     for (auto& v : wd) v = nd(rng);
     q((ggml_type) dt, wd.data(), blob.data() + f.down_off, H, FF);
+    if (f.tail_off) {   // NVFP4: the expert's s_gate, s_up, s_down - not 1, so a kernel that drops one shows
+        const float tail[4] = {1.5f, 0.75f, 1.25f, 0.0f};
+        std::memcpy(blob.data() + f.tail_off, tail, sizeof tail);
+    }
     int failures = check_blob(had ? "hadamard" : "synthetic", 0, blob, f, s);
     // the GPU dequantizers against ggml's to_float, every bit
     namespace par = strata::parity;

@@ -108,6 +108,26 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
 /// SwiGLU (the CPU's canonical rows' and the decode's, bit for bit).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream, bool canon = false);
 
+/// NVFP4 (kernels/nvfp4.hpp): where a group's expert q keeps its {s_gate, s_up, s_down, 0} - right after its down
+/// matrix, which the down Product reads at wtab[q] + woff or w + q * expert_bytes (the gathers copy the tail with the
+/// down rows: `mat_bytes` is that matrix's size, the tail's offset from it).
+struct TailAt {
+    const uint8_t* w = nullptr;
+    const uint8_t* const* wtab = nullptr;
+    size_t woff = 0, expert_bytes = 0, mat_bytes = 0;
+};
+/// The down Product `dn`'s tails (its matrix `mat_bytes` long).
+inline TailAt tails_of(const Product& dn, size_t mat_bytes) {
+    return {static_cast<const uint8_t*>(dn.w), dn.wtab, dn.woff, dn.expert_bytes, mat_bytes};
+}
+/// swiglu() of split GU rows [0, rows) whose expert takes its s_gate and s_up first: row r is the group's row
+/// bounds[0] + r, of expert q where bounds[q] <= it < bounds[q + 1] (n experts, bounds on the device).
+void swiglu_tails(const float* gu, float* h, int64_t rows, int64_t n_ff, const int32_t* bounds, int n, TailAt t,
+                  void* stream);
+/// Rows [0, rows) of `d` (`cols` floats, `ld` apart) times their expert's s_down, the rows found as swiglu_tails'.
+void scale_rows_tails(float* d, int64_t ld, int64_t cols, int64_t rows, const int32_t* bounds, int n, TailAt t,
+                      void* stream);
+
 /// How a prompt's layer launches its experts' products, for int8_rows_below to time them so: the model's experts, how
 /// many the int8 products take a launch, how many the FP16 path dequantizes and multiplies a launch, and whether each
 /// expert's blob is first gathered into a group buffer for the int8 products (Qwen3.8-Flash-Next's prompt).

@@ -9,7 +9,10 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/nvfp4_avx2.hpp"
+#include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/nvfp4.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/tq_cpu.hpp"
@@ -164,6 +167,12 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
+    // NVFP4 in any projection: the expert's {s_gate, s_up, s_down, 0} after its rows (1 for a projection of another
+    // type: a mixed expert's tail has 1 there)
+    if (gu_type == nvfp4::kType || up_type == nvfp4::kType || d_type == nvfp4::kType) {
+        f.tail_off = f.bytes;
+        f.bytes += nvfp4::kTailBytes;
+    }
     f.act_bytes = gu_type == 42 ? sizeof(ActQ) : ggml_row_size(vdt_g, n_embd);
     if (gu_type == 42 && n_embd > H) {
         err = "native experts: a Q2_0 layer wider than the ActQ";
@@ -312,9 +321,25 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         part_rows(f.gu_type, blob, f.gu_row, (int) f.n_embd, act, nt, ff, r0, r1, mt);
         part_rows(f.up_type, blob + f.up_off, f.up_row, (int) f.n_embd, act, nt, up, r0, r1, mt);
         const float lim = expert_swiglu_limit();
+        const float sg = nvfp4::tail_scale(blob, f.tail_off, 0), su = nvfp4::tail_scale(blob, f.tail_off, 1);
         for (int t = 0; t < nt; ++t)
-            for (int r = r0; r < r1; ++r) ff[t][r] = swiglu_host(ff[t][r], up[t][r], lim);
+            for (int r = r0; r < r1; ++r) ff[t][r] = swiglu_host(ff[t][r] * sg, up[t][r] * su, lim);
         return;
+    }
+    // NVFP4 (Edge0's latent experts): rows that decode a block once for every token, ggml's arithmetic, from one token
+    // on (ggml-cpu's own NVFP4 dot is scalar on x86); the expert's s_gate and s_up from the blob's tail
+    const float sg = nvfp4::tail_scale(blob, f.tail_off, 0), su = nvfp4::tail_scale(blob, f.tail_off, 1);
+    if (f.gu_type == nvfp4::kType) {
+        static const bool nv512 = cpu_avx512_ok() && strata::env_get("NO_NVFP4_512") == nullptr;
+        static const bool nv256 = cpu_avx2_ok() && strata::env_get("NO_NVFP4_256") == nullptr;
+        if (nv512 && nvfp4_512_fits((int) f.n_embd)) {
+            nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1, sg, su);
+            return;
+        }
+        if (nv256 && nvfp4_256_fits((int) f.n_embd)) {
+            nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1, sg, su);
+            return;
+        }
     }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
@@ -360,7 +385,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
-            ff[t][r] = swiglu_host(g, u, lim);
+            ff[t][r] = swiglu_host(g * sg, u * su, lim);
         }
     }
 }
@@ -376,6 +401,19 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     if (tq_rows_own(f.d_type)) {   // the trellis types, as in native_gu_rows
         tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
+    }
+    const float sd = nvfp4::tail_scale(blob, f.tail_off, 2);   // NVFP4: the expert's s_down, on the output
+    if (f.d_type == nvfp4::kType) {   // as the gate/up rows
+        static const bool nv512 = cpu_avx512_ok() && strata::env_get("NO_NVFP4_512") == nullptr;
+        static const bool nv256 = cpu_avx2_ok() && strata::env_get("NO_NVFP4_256") == nullptr;
+        if (nv512 && nvfp4_512_fits((int) f.n_ff)) {
+            nvfp4_512_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1, sd);
+            return;
+        }
+        if (nv256 && nvfp4_256_fits((int) f.n_ff)) {
+            nvfp4_256_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1, sd);
+            return;
+        }
     }
     if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
@@ -402,7 +440,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);
-            out[t][r] = s;
+            out[t][r] = s * sd;
         }
     }
 }

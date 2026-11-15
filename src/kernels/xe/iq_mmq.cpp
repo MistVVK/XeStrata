@@ -23,6 +23,7 @@
 //
 // In a source file of its own, so its kernels are in a device image apart from the Intel-only ones.
 #include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/nvfp4.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/q8_act.hpp"
 #include "strata/kernels/matrix_report.hpp"
@@ -499,6 +500,28 @@ template<> struct Dec<11> {   // Q3_K: d (6-bit scale - 32) ((2-bit value | high
         return r;
     }
 };
+// NVFP4 (nvfp4.hpp): 32 values are two 16-value sub-blocks of one block of 64, each with its UE4M3 scale (halved: the
+// table is the E2M1 values doubled).  Sub-block s's ints 2 s and 2 s + 1 hold its values 0-3 | 8-11 and 4-7 | 12-15
+// in their low | high nibbles.
+template<> struct Dec<40> {
+    static constexpr int QK = 64, BSZ = (int) sizeof(block_nvfp4);
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const block_nvfp4* b = reinterpret_cast<const block_nvfp4*>(row) + sb / 2;
+        const int s0 = 2 * (sb % 2);   // the first of the two sub-blocks
+        Sub r;
+        for (int k = 0; k < 2; ++k) {
+            const Int2 a = get_int_from_table_16(get_int_b4(b->qs, 2 * (s0 + k)), kvalues_fp4);
+            const Int2 c = get_int_from_table_16(get_int_b4(b->qs, 2 * (s0 + k) + 1), kvalues_fp4);
+            r.v[4 * k + 0] = (uint32_t) a.x;
+            r.v[4 * k + 1] = (uint32_t) c.x;
+            r.v[4 * k + 2] = (uint32_t) a.y;
+            r.v[4 * k + 3] = (uint32_t) c.y;
+        }
+        r.s0 = nvfp4::ue4m3_half(b->d[s0]);
+        r.s1 = nvfp4::ue4m3_half(b->d[s0 + 1]);
+        return r;
+    }
+};
 // Q2_K: d sc value - dmin m, sc and m a pair per 16 values.  The products have one min a block of 32, so a Q2_K row
 // is read as twice its length: block 2 i is its sub-block i's values (scales d sc), block 2 i + 1 ones scaled by
 // -dmin m, against activations whose blocks come twice each (iq_mmq_quantize's dup).  QK: 256 values per 512 read.
@@ -616,7 +639,7 @@ template<> struct Dec<kIqMmqFx + 42> {
 
 template<int TY>
 constexpr bool half_scales() {
-    return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11 ||
+    return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11 || TY == 40 ||
            TY == kIqMmqFx + 17 || TY == kIqMmqFx + 22;
 }
 template<int TY>
@@ -2014,7 +2037,7 @@ bool iq_mmq_type_sums(int t) { return t == 7 || t == 12 || t == 13; }   // has_m
 bool iq_mmq_type_ok(int t) {
     switch (t) {
         case 2: case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
-        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 42: return true;
+        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 40: case 42: return true;
         case kIqMmqFx + 16: case kIqMmqFx + 17: case kIqMmqFx + 18: case kIqMmqFx + 20: case kIqMmqFx + 21:
         case kIqMmqFx + 22: case kIqMmqFx + 42: return true;
         default: return false;
@@ -2048,6 +2071,7 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 29: return (size_t) (cols / Dec<29>::QK) * Dec<29>::BSZ;
         case 19: return (size_t) (cols / Dec<19>::QK) * Dec<19>::BSZ;
         case 42: case kIqMmqFx + 42: return (size_t) (cols / Dec<42>::QK) * Dec<42>::BSZ;
+        case 40: return (size_t) (cols / Dec<40>::QK) * Dec<40>::BSZ;
         default: return 0;
     }
 }
@@ -2140,6 +2164,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(29);
         STRATA_MMQ_CASE(19);
         STRATA_MMQ_CASE(42);
+        STRATA_MMQ_CASE(40);
         default: return {};
     }
 #undef STRATA_MMQ_CASE

@@ -1082,38 +1082,76 @@ EDGE0_FILES = {
         "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
         "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
     },
+    "Edge0-145B-NVFP4": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (39796, "072de3f320d0702193bf3e20b400ff256bafe416abaa8a15cfd55ce747151053"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (47563800576, "a39b0c127983b85d07326c8bad49260d6b475293b46e4166428c91a765ee593a"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1981808640, "e31e11f36c7e5a23c82550b524fd44fb28cfa821ef59fd688b8d2339137ab287"),
+        "latent_dense_q8.bin": (3743416320, "fbb25caaa0dcf45ef62f1a4945dcf98a53a166934a3b461b166fbafa831d87ca"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1532, "c83979acd68612f3b8171a42f61d8aebf78c28aff1ad4d8e8f92e18deab7f97a"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1437, "84c702bd52f6c800f72590c9c99cf6c24290fee4e59e7e81e5a057999772fcc0"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2536, "adcdea803989c7e76717ec308064d1d20e8bb5b12e6944cb9cbfa499137389b0"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
+    "Edge0-120B-NVFP4": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (40222, "d027f12776819495c3d2e07196631eacb236b7f5bffb6a8911987f61669bd527"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (33974255616, "f342e24b5d6df7ad13a9305563225ab088d139fef095c3411e85b631d1757532"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1415577600, "4824fb68c5dceb94c33bae0fda3801b1f26f65eb8b9ea0dfac0450fc2bfa41b5"),
+        "latent_dense_q8.bin": (2673868800, "fec3adc0b7b3b0798127550951e541823a0c96ca136911332ee050e39c302c91"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1532, "717a3d96977dd66b6950a05913ee2637b0f746d9d894f3b6490f840406bd8b54"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1433, "d5a43a7b930a6c391e67bb5df8bdd75aaf945d306609fc7cf9117b6825adae23"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2536, "2c7adde09899c294712f8da3e4664108ab1b239aecb7490050d55aec6c491aed"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
 }
-EDGE0_SHARED = [
-    "LICENSE",
-    "NOTICE",
-    "dense.bin",
-    "index.txt",
-    "labels.bin",
-    "model-skeleton.gguf",
-    "mtp/dense.bin",
-    "mtp/dense.txt",
-    "mtp/draft_vocab.bin",
-    "mtp/experts.bin",
-    "ple-fp8.gguf",
-    "profile.bin",
-    "start.sh",
-    "third-party/Qwen-LICENSE.txt",
-    "tokenizer/chat_template.jinja",
-    "tokenizer/merges.txt",
-    "tokenizer/token_type.json",
-    "tokenizer/tokenizer.json",
-    "tokenizer/vocab.json",
-]
 
-# Edge0's latent-MoE releases (Edge0-145B-q3k / Edge0-120B-q3k): a pre-built Strata pack (experts.bin + the v6
-# native_experts.txt + dense.bin + the skeleton GGUF + the fp8 n-gram table + the latent D/U files + labels + scales),
-# not a GGUF the packer converts.  The two share 19 files (the n-gram table, the skeleton, dense.bin, the MTP layer,
-# labels, the tokenizer, ...): setup downloads them once and hardlinks the second model's copy.  The weights are
+# Edge0's latent-MoE releases (Edge0-145B / Edge0-120B, Q3_K or NVFP4 experts): a pre-built Strata pack (experts.bin
+# + the v6 native_experts.txt + dense.bin + the skeleton GGUF + the fp8 n-gram table + the latent D/U files + labels,
+# and the Q3_K packs' column scales), not a GGUF the packer converts.  A file of the same size and SHA-256 in another
+# of them (the n-gram table, the skeleton, dense.bin, the MTP layer, labels, the tokenizer, ...) is downloaded once and
+# hardlinked into the next model's folder.  The weights are
 # non-free (Edge0 Community Model License 1.0 + Qwen Community License 1.0): setup fetches them to the user's machine,
 # XeStrata bundles nothing.  Files pinned at the revision (the Hub's LFS SHA-256; the small files' own SHA-256).
 EDGE0_REVISIONS = {
     "Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",
     "Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",
+    "Edge0-145B-NVFP4": "a3778c635f2e97323132ff0b5fe3e093cd48e634",
+    "Edge0-120B-NVFP4": "f2c72e69c8649e3718b17b2b942e364d730a2dcd",
 }
 EDGE0_MODELS: dict[str, dict[str, Any]] = {
     "Edge0-145B-q3k": {"repo": "Edge0/Edge0-145B-q3k", "latent_dim": 1792, "dense_fmt": "8",
@@ -1122,6 +1160,14 @@ EDGE0_MODELS: dict[str, dict[str, Any]] = {
     "Edge0-120B-q3k": {"repo": "Edge0/Edge0-120B-q3k", "latent_dim": 1280, "dense_fmt": "4",
                        "dense_file": "latent_dense_q4.bin", "download_gb": 92.3, "ram_gb": 48,
                        "about": "120B latent MoE (latent width 1280), Q3_K experts; ~86 GB on disk"},
+    # the NVFP4 releases (2026-11-15): the same pack but experts.bin (ggml type 40 with each expert's scales after its
+    # rows) and its manifest, no column scales; their other files are the Q3_K pack's of the same size (linked)
+    "Edge0-145B-NVFP4": {"repo": "Edge0/Edge0-145B-NVFP4", "latent_dim": 1792, "dense_fmt": "8",
+                         "dense_file": "latent_dense_q8.bin", "download_gb": 112.9, "ram_gb": 72,
+                         "about": "145B latent MoE (latent width 1792), NVFP4 experts; ~105 GB on disk"},
+    "Edge0-120B-NVFP4": {"repo": "Edge0/Edge0-120B-NVFP4", "latent_dim": 1280, "dense_fmt": "4",
+                         "dense_file": "latent_dense_q4.bin", "download_gb": 97.6, "ram_gb": 54,
+                         "about": "120B latent MoE (latent width 1280), NVFP4 experts; ~91 GB on disk"},
 }
 EDGE0_LICENSE = ("Edge0 Community Model License 1.0 (personal, research and non-commercial sharing; commercial use "
                  "needs a separate Edge0 license) and Qwen Community License 1.0 (the Qwen3.8-Flash-Next base): "
@@ -1265,7 +1311,8 @@ FAMILIES: dict[str, dict[str, Any]] = {
 # install path (setup_edge0).  Listed for --family edge0; the models are the two sizes in Q3_K and NVFP4, each from
 # its own repository (EDGE0_MODELS' "repo").  No picture reader: the pack has none ("vision" False, no mmproj).
 FAMILIES["edge0"] = {"title": "Edge0 (latent MoE)", "by": "Edge0's latent-MoE distillations of Qwen3.8-Flash-Next",
-                     "about": "145B and 120B latent sparse MoE, Q3_K experts; a pre-built pack, ~99 / ~86 GB on disk",
+                     "about": "145B and 120B latent sparse MoE, Q3_K or NVFP4 experts; a pre-built pack, "
+                              "~86 to ~105 GB on disk",
                      "hf": hf("Edge0/Edge0-145B-q3k"), "file": "", "tag": "edge0-",
                      "name": "edge0", "models": EDGE0_MODELS, "license": EDGE0_LICENSE, "edge0": True,
                      "vision": False, "mmproj_hf": None, "mmproj": None}
@@ -9587,25 +9634,26 @@ def setup_edge0(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     pack = models_dir / model
     rev, repo, files = EDGE0_REVISIONS[model], d["repo"], EDGE0_FILES[model]
     step(5, f"downloading {model}")
-    say(f"  The model files go in {pack} (the two Edge0 models share {len(EDGE0_SHARED)} files: one download,")
-    say("  hardlinked into the other model's folder; a different filesystem downloads its own copy)")
+    say(f"  The model files go in {pack} (a file another Edge0 model here has too is hardlinked from it;")
+    say("  a different filesystem downloads its own copy)")
     for path, (size, sha) in sorted(files.items(), key=lambda kv: (kv[1][0], kv[0])):
         dst = pack / path
         if dst.exists() and done(dst):
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if path in EDGE0_SHARED:
-            src = next((models_dir / o / path for o in EDGE0_MODELS
-                        if o != model and (models_dir / o / path).exists() and done(models_dir / o / path)), None)
-            if src is not None:
-                try:
-                    dst.unlink(missing_ok=True)
-                    os.link(src, dst)
-                    mark(dst, f"hardlink {src}")
-                    ok(f"{path} linked from {src.parent.name}")
-                    continue
-                except OSError:
-                    pass   # a different filesystem: download it
+        # the same file (size and SHA-256) in another Edge0 model's folder
+        src = next((models_dir / o / path for o in EDGE0_MODELS
+                    if o != model and EDGE0_FILES[o].get(path) == (size, sha) and (models_dir / o / path).exists()
+                    and done(models_dir / o / path)), None)
+        if src is not None:
+            try:
+                dst.unlink(missing_ok=True)
+                os.link(src, dst)
+                mark(dst, f"hardlink {src}")
+                ok(f"{path} linked from {src.parent.name}")
+                continue
+            except OSError:
+                pass   # a different filesystem: download it
         download_file(f"{hf_endpoint()}/{repo}/resolve/{rev}/{path}", dst, path)
         verify_sha256(dst, size, sha, own=True)
     ok(f"model files present: {pack}")

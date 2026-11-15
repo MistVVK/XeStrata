@@ -37,6 +37,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/matrix_report.hpp"
+#include "strata/kernels/nvfp4.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/per_device.hpp"
@@ -826,6 +827,39 @@ template<> struct Split<10> {
     }
 };
 template<> struct Split<11> : WholeDot<vec_dot_q3_K_q8_1> {};   // Q3_K
+// NVFP4 (Edge0's latent experts; nvfp4.hpp): a call is 32 values, two 16-value sub-blocks of one scale each, against
+// one q8_1 block (iqs 0 or 4: the block's first or second half; `bq8_1` the block's first q8_1 block).  A sub-block's
+// ints iqs0 and iqs0 + 1 hold its values 0-3 | 8-11 and 4-7 | 12-15 (low | high nibbles), which meet the q8_1
+// block's ints 4 i + {0, 2} and {1, 3}.  ggml-cuda's vec_dot_nvfp4_q8_1 through upstream's Split<40>: the weights
+// decoded once a call, the same sums in the same order.
+template<> struct Split<40> {
+    struct W { Int2 v0[2], v1[2]; float sc[2]; };
+    static W load(const void* vbq, int kbx, int iqs) {
+        const block_nvfp4* bq4 = (const block_nvfp4*) vbq + kbx;
+        W r{};
+        for (int i = 0; i < 2; ++i) {
+            const int iqs0 = iqs + 2 * i;
+            r.v0[i] = get_int_from_table_16(get_int_b4(bq4->qs, iqs0), kvalues_fp4);
+            r.v1[i] = get_int_from_table_16(get_int_b4(bq4->qs, iqs0 + 1), kvalues_fp4);
+            r.sc[i] = nvfp4::ue4m3_half(bq4->d[iqs0 >> 1]);
+        }
+        return r;
+    }
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        const block_q8_1* bq8 = bq8_1 + (iqs >> 2);
+        const float d8 = low_half(bq8->ds);
+        float sum = 0.0f;
+        for (int i = 0; i < 2; ++i) {
+            const int* q8 = (const int*) bq8->qs + (ptrdiff_t) 4 * i;   // the sub-block's 16 activation values
+            int sumi = dp4a(r.v0[i].x, q8[0], 0);
+            sumi = dp4a(r.v0[i].y, q8[2], sumi);
+            sumi = dp4a(r.v1[i].x, q8[1], sumi);
+            sumi = dp4a(r.v1[i].y, q8[3], sumi);
+            sum += r.sc[i] * d8 * (float) sumi;
+        }
+        return sum;
+    }
+};
 
 // ---------------------------------------------------------------- the formats
 // bsz = bytes per block, qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
@@ -965,6 +999,7 @@ template<> struct Fmt<148> : FmtOf<148, (int) sizeof(block_tqp6), 128, 8, 4> {};
 template<> struct Fmt<149> : FmtOf<149, (int) sizeof(block_tqp7), 128, 8, 4> {};
 template<> struct Fmt<10> : FmtOf<10, (int) sizeof(block_q2_K), 256, QI2_K / 2, 2> {};   // two words a call
 template<> struct Fmt<11> : FmtOf<11, (int) sizeof(block_q3_K), 256, QI3_K / VDR_Q3_K, VDR_Q3_K> {};
+template<> struct Fmt<40> : FmtOf<40, (int) sizeof(block_nvfp4), 64, 2, 4> {};   // NVFP4: two calls of 32 values
 
 // A grid format's codebook, for a work-group's copy in local memory (the Volta experts below): its word, its length
 // and the global table.  N = 0: no codebook (IQ4_XS's 16 values stay where they are).
@@ -1303,8 +1338,11 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
                 for (int j = 0; j < NE; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
                 float s[NE];
                 seg_dot_multi<TG, LPR, NE>(sg, wr, xs, n, nb, (int) (L.n_embd / Fmt<TG>::qk), seg_lane, s, fx);
-                if (valid && seg_lane == 0)
-                    for (int j = 0; j < n; ++j) (is_up ? up : gate)[(size_t) (e + j) * L.n_ff + r] = s[j];
+                if (valid && seg_lane == 0) {
+                    const float ts = nvfp4::tail_scale(blob, L.tail_off, is_up ? 1 : 0);   // NVFP4's s_gate / s_up
+                    for (int j = 0; j < n; ++j)
+                        (is_up ? up : gate)[(size_t) (e + j) * L.n_ff + r] = L.tail_off ? s[j] * ts : s[j];
+                }
             }
         }
     });
@@ -1314,9 +1352,9 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
 // GU_LPR / kEntriesPass are candidates, so the choice never regresses).  XESTRATA_LATENT_A_LPR / _A_ENTRIES force.
 // The other forms are built only for the latent A's gate/up types (Q3_K: the Edge0 q3k packs), not for every
 // type: each form is one more kernel a type.
-template<int TG> constexpr bool latent_a_tuned() { return TG == 11; }
+template<int TG> constexpr bool latent_a_tuned() { return TG == 11 || TG == nvfp4::kType; }
 std::vector<std::pair<int, int>> latent_a_forms(int type) {
-    if (type == 11) return {{8, 4}, {8, 8}, {16, 4}, {16, 8}, {32, 4}, {32, 8}};
+    if (type == 11 || type == nvfp4::kType) return {{8, 4}, {8, 8}, {16, 4}, {16, 8}, {32, 4}, {32, 8}};
     return {{GU_LPR, kEntriesPass}};
 }
 template<int TG>
@@ -1358,6 +1396,7 @@ void launch_gu_rows(sycl::queue& q, int ty, size_t cg, const unsigned long long*
         EDGE_GU_TYPE(29); EDGE_GU_TYPE(19); EDGE_GU_TYPE(42); EDGE_GU_TYPE(12); EDGE_GU_TYPE(13); EDGE_GU_TYPE(8);
         EDGE_GU_TYPE(6); EDGE_GU_TYPE(2); EDGE_GU_TYPE(3); EDGE_GU_TYPE(14); EDGE_GU_TYPE(10); EDGE_GU_TYPE(11);
         EDGE_GU_TYPE(144); EDGE_GU_TYPE(145); EDGE_GU_TYPE(146); EDGE_GU_TYPE(147); EDGE_GU_TYPE(148); EDGE_GU_TYPE(149);
+        EDGE_GU_TYPE(40);
         default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(ty));
     }
 #undef EDGE_GU_TYPE
@@ -1389,8 +1428,11 @@ sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned
                 float s[kEntriesPass];
                 seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, wr, xs, n, nb, (int) (L.n_ff / Fmt<TD>::qk),
                                                                   seg_lane, s, fx);
-                if (valid && seg_lane == 0)
-                    for (int j = 0; j < n; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + r] = s[j];
+                if (valid && seg_lane == 0) {
+                    const float ts = nvfp4::tail_scale(blob, L.tail_off, 2);   // NVFP4's s_down
+                    for (int j = 0; j < n; ++j)
+                        out[(size_t) ent_dst[e + j] * L.n_embd + r] = L.tail_off ? s[j] * ts : s[j];
+                }
             }
         }
     });
@@ -1456,8 +1498,10 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
                     if constexpr (NG > 0)
                         seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, nb, seg_lane, s, fx, grid);
                     else seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, nb, seg_lane, s, fx);
-                    if (seg_lane == 0)
-                        for (int j = 0; j < cn; ++j) res[j * kM8Rows + i] = s[j];
+                    if (seg_lane == 0) {
+                        const float ts = nvfp4::tail_scale(blob, L.tail_off, i < 32 ? 0 : 1);   // NVFP4's s_gate / s_up
+                        for (int j = 0; j < cn; ++j) res[j * kM8Rows + i] = L.tail_off ? s[j] * ts : s[j];
+                    }
                 }
                 sycl::group_barrier(it.get_group());
                 if (warp < cn) {   // native_expert_grouped's one-pass SwiGLU + q8_1 on entry c0 + warp's block
@@ -1534,8 +1578,11 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
                                            : blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row;
                     seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, wr, xs, cn, nb, (int) (L.n_ff / Fmt<TD>::qk),
                                                                       seg_lane, s, fx);
-                    if (valid && seg_lane == 0)
-                        for (int j = 0; j < cn; ++j) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
+                    if (valid && seg_lane == 0) {
+                        const float ts = nvfp4::tail_scale(blob, L.tail_off, 2);   // NVFP4's s_down
+                        for (int j = 0; j < cn; ++j)
+                            out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = L.tail_off ? s[j] * ts : s[j];
+                    }
                 }
             }
         });
@@ -1944,6 +1991,19 @@ void dq_q8_0(const void* vx, int64_t ibs, const Out& o, int tid) {
     o.template put<8>(32 * ib + 8 * il, v);
 }
 
+// NVFP4: a piece of 256 values is four blocks of 64; work-item tid takes block tid / 8's sub-block (tid / 2) % 4, its
+// 8 low nibbles (values 0-7) or its 8 high ones (values 8-15), one run of 8
+template<typename Out>
+void dq_nvfp4(const void* vx, int64_t ibs, const Out& o, int tid) {
+    const block_nvfp4* x = (const block_nvfp4*) vx + ibs * 4;
+    const int b = tid / 8, sb = (tid / 2) % 4, hi = tid % 2;
+    const float d = nvfp4::ue4m3_half(x[b].d[sb]);
+    const uint8_t* q = x[b].qs + (ptrdiff_t) 8 * sb;
+    float v[8];
+    for (int j = 0; j < 8; ++j) v[j] = d * (float) kvalues_fp4[hi ? q[j] >> 4 : q[j] & 0x0F];
+    o.template put<8>(64 * b + 16 * sb + 8 * hi, v);
+}
+
 // BF16 (the token embedding as the checkpoint ships it, tools/embd_bf16_pack.py; upstream c627d51): 8 values a
 // work-item, widened exactly
 template<typename Out>
@@ -2003,6 +2063,7 @@ inline void dq_dispatch(int ty, const void* vx, int64_t ibs, const Out& o, int t
         case 11: dq_q3_k(vx, ibs, o, tid); break;
         case 10: dq_q2_k(vx, ibs, o, tid); break;
         case 42: dq_q2_0(vx, ibs, o, tid); break;
+        case 40: dq_nvfp4(vx, ibs, o, tid); break;
         case 30: dq_bf16(vx, ibs, o, tid); break;   // the token embedding only (embed_type_supported)
         case 12: dq_q4_k(vx, ibs, o, tid); break;
         case 13: dq_q5_k(vx, ibs, o, tid); break;
@@ -2379,7 +2440,7 @@ bool in_iq_wmma(int t) {
 }
 bool is_iq(int t) {
     return in_iq_gemm(t) || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 6 || t == 7 || t == 8 || t == 2 ||
-           t == 3;
+           t == 3 || t == nvfp4::kType;
 }
 
 void require(bool ok, const char* what) {
@@ -2405,6 +2466,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
+        case 40: return (size_t) (n / 64) * sizeof(block_nvfp4);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
@@ -2701,13 +2763,16 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
         return gu_type == 30 && d_type == 30 && n_embd > 0 && n_ff > 0 && n_embd % 32 == 0 && n_ff % 32 == 0;
     const bool gu = in_iq_gemm(gu_type) ? gu_type != 20
                                         : gu_type == 12 || gu_type == 13 || gu_type == 14 || gu_type == 8 ||
-                                          gu_type == 6 || gu_type == 2 || gu_type == 3 || gu_type == 10 || gu_type == 11;
+                                          gu_type == 6 || gu_type == 2 || gu_type == 3 || gu_type == 10 || gu_type == 11 ||
+                                          gu_type == nvfp4::kType;
     const bool d = d_type == 20 || d_type == 23 || d_type == 42 || d_type == 6 || d_type == 7 || d_type == 8 ||
+                   d_type == nvfp4::kType ||
                    d_type == 2 || d_type == 3 || d_type == 14 || d_type == 10 || d_type == 11 || d_type == 12 ||
                    d_type == 13 || d_type == 16 || d_type == 17 || d_type == 18 || d_type == 21 || d_type == 22 ||
                    is_tq(d_type);
     const auto qk = [](int t) {
-        return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32 : t == 42 ? 64 : is_tq(t) ? 128 : 256;
+        return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32
+               : t == 42 || t == nvfp4::kType ? 64 : is_tq(t) ? 128 : 256;
     };
     return gu && d && n_embd > 0 && n_ff > 0 && n_embd % qk(gu_type) == 0 && n_ff % qk(d_type) == 0 &&
            n_embd % 256 == 0;   // the dequantizers write whole 256-value pieces of a gate/up row
@@ -2726,6 +2791,10 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.up_off = (size_t) n_ff * L.gu_row;
     L.down_off = L.up_off + (size_t) n_ff * L.up_row;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row;
+    if (gu_type == nvfp4::kType || L.up_type == nvfp4::kType || d_type == nvfp4::kType) {   // as cpu::native_fmt
+        L.tail_off = L.bytes;
+        L.bytes += nvfp4::kTailBytes;
+    }
     return L;
 }
 
@@ -2829,10 +2898,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const size_t grid_bytes = L.gu_type == 22 ? sizeof(iq2s_grid) : L.gu_type == 16 ? sizeof(iq2xxs_grid)
                               : L.gu_type == 18 ? sizeof(iq3xxs_grid) : L.gu_type == 21 ? sizeof(iq3s_grid) : 0;
     const bool fused_gu = m8 && (L.up_type < 0 || L.up_type == L.gu_type) && (L.gu_type == 16 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
-                                 L.gu_type == 23) &&
+                                 L.gu_type == 23 || L.gu_type == nvfp4::kType) &&
                           grid_bytes + xbytes + (size_t) kEntriesPass * kM8Rows * sizeof(float) <= local_mem_bytes(q);
     const size_t hbytes = (size_t) kEntriesPass * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
-    const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42) && hbytes <= local_mem_bytes(q);
+    const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42 || L.d_type == nvfp4::kType) &&
+                          hbytes <= local_mem_bytes(q);
     const bool ws_down = lds_down && down_ws_on(q) && hbytes + (size_t) kM8Rows * L.d_row + 32 <= local_mem_bytes(q);
     if (fused_gu) {
         const size_t cgs = (size_t) cap_groups;
@@ -2841,6 +2911,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             case 18: launch_native_gu_fused<18, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 21: launch_native_gu_fused<21, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 22: launch_native_gu_fused<22, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 40: launch_native_gu_fused<40, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             default: launch_native_gu_fused<23, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         }
     } else {
@@ -2889,8 +2960,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         const size_t cgs = (size_t) cap_groups;
         if (ws_down) {
             if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>(), true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            else if (L.d_type == 40) e = launch_native_down_lds<40, down_lpr<40>(), true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
             else e = launch_native_down_lds<42, down_lpr<42>(), true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         } else if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else if (L.d_type == 40) e = launch_native_down_lds<40, down_lpr<40>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         else e = launch_native_down_lds<42, down_lpr<42>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     } else
     switch (L.d_type) {
@@ -2920,6 +2993,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 147: e = launch_native_down<147, down_lpr<147>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 148: e = launch_native_down<148, down_lpr<148>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 149: e = launch_native_down<149, down_lpr<149>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 40: e = launch_native_down<40, down_lpr<40>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;   // NVFP4
         default: throw core::DeviceError("native_expert_grouped: down type " + std::to_string(L.d_type));
     }
     sync_if_needed(stream, e, "native_expert_grouped");

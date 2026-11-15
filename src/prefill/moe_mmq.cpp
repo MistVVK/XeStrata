@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -166,6 +167,45 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
         float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
         kernels::swiglu_clamp(g, u, lim);
         h[i] = canon ? kernels::canon::silu_mul(g, u) : g / (1.0f + sycl::exp(-g)) * u;
+    });
+}
+
+namespace {
+// expert q of a group's row r (swiglu_tails), and its tail scale k
+inline int tail_expert(const int32_t* bounds, int n, int64_t r) {
+    const int64_t at = bounds[0] + r;
+    int q = 0;
+    while (q + 1 < n && bounds[q + 1] <= at) ++q;
+    return q;
+}
+inline float tail_value(const TailAt& t, int q, int k) {
+    const uint8_t* m = t.wtab != nullptr ? t.wtab[q] + t.woff : t.w + (size_t) q * t.expert_bytes;
+    float v;
+    std::memcpy(&v, m + t.mat_bytes + 4 * (size_t) k, sizeof v);
+    return v;
+}
+}  // namespace
+
+void swiglu_tails(const float* gu, float* h, int64_t rows, int64_t n_ff, const int32_t* bounds, int n, TailAt t,
+                  void* stream) {
+    if (rows <= 0) return;
+    const float lim = kernels::expert_swiglu_limit();
+    Q(stream).parallel_for(sycl::range<1>((size_t) (rows * n_ff)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], r = i / n_ff, k = i % n_ff;
+        const int q = tail_expert(bounds, n, r);
+        const float* row = gu + r * 2 * n_ff;
+        float g = row[k] * tail_value(t, q, 0), u = row[n_ff + k] * tail_value(t, q, 1);
+        kernels::swiglu_clamp(g, u, lim);
+        h[i] = g / (1.0f + sycl::exp(-g)) * u;
+    });
+}
+
+void scale_rows_tails(float* d, int64_t ld, int64_t cols, int64_t rows, const int32_t* bounds, int n, TailAt t,
+                      void* stream) {
+    if (rows <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) (rows * cols)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], r = i / cols, c = i % cols;
+        d[r * ld + c] *= tail_value(t, tail_expert(bounds, n, r), 2);
     });
 }
 
