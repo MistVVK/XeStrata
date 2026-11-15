@@ -31,7 +31,7 @@
 
 #include "moe_f16_common.cuh"
 
-#include "ggml.h"
+#include "strata/quant/types.hpp"   // the type ids (GGUF's numbers, the same as ggml's): Strata's own table, no ggml.h
 
 #include <algorithm>
 
@@ -40,7 +40,7 @@ namespace {
 
 using namespace f16;
 
-constexpr int T_Q4_K = GGML_TYPE_Q4_K, T_Q5_K = GGML_TYPE_Q5_K;
+constexpr int T_Q4_K = (int) strata::quant::Type::Q4_K, T_Q5_K = (int) strata::quant::Type::Q5_K;
 constexpr int GU_NS = kMoeEmbd / 64, D_NS = kMoeFF / 64;   // stages of 64 values (the compiled geometry's: 40 and 10 for Flash-Next)
 constexpr int FEAT = 64;                             // features (gate rows = up rows) per gate/up item
 
@@ -307,7 +307,7 @@ __global__ void __launch_bounds__(THREADS) down_kernel(const Batch b, const Nati
 
 bool covers(int gu_type) { return gu_type == T_Q4_K || gu_type == T_Q5_K; }
 
-bool covers_down(int d_type) { return d_type == GGML_TYPE_Q5_1; }
+bool covers_down(int d_type) { return d_type == (int) strata::quant::Type::Q5_1; }
 
 void gate_up(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* tiles, const int32_t* off, int64_t n,
              int n_expert, int64_t work_bound, const uint8_t* act, const int32_t* src, uint8_t* out, cudaStream_t s) {

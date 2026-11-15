@@ -21,7 +21,6 @@
 #include <mutex>
 #include <type_traits>
 
-#include "ggml.h"
 #include "strata/core/emulate.hpp"
 #include "strata/core/gfx12_platform_defaults.hpp"
 #include "strata/core/sm120_series.hpp"

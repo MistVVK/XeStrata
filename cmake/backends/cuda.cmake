@@ -283,17 +283,18 @@ macro(strata_cuda_mmq)
 endmacro()
 
 # P4-SPLIT, STRATA_MMQ=OFF (the default): Strata's own prompt kernels without llama.cpp's MMQ (strata_pf_own alone, with mmq_absent.cpp for the MMQ half
-# of moe_mmq.hpp); the same sources and options as strata_cuda_mmq gives them, the ggml-base headers only
+# of moe_mmq.hpp); the same sources and options as strata_cuda_mmq gives them.  No ggml: the type ids are Strata's table (strata/quant/types.hpp),
+# the block layouts the quant header in third_party/ggml
 macro(strata_cuda_pf_own)
-    set(_strata_gg ${_strata_ggml_root}/ggml)
+    set(_strata_gg ${_strata_ggml_root}/ggml)   # (the tests' include path)
     add_library(strata_pf_own STATIC src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_helpers.cu
                 src/prefill/moe_fused_iq_q36.cu src/prefill/mmq_absent.cpp)
-    target_include_directories(strata_pf_own PRIVATE ${_strata_gg}/include ${_strata_gg}/src PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(strata_pf_own PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(strata_pf_own PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
     if(MSVC)
       target_compile_options(strata_pf_own PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
-    target_link_libraries(strata_pf_own PUBLIC strata_quant ggml-base ${_strata_gpu_runtime_target})
+    target_link_libraries(strata_pf_own PUBLIC strata_quant ${_strata_gpu_runtime_target})
     if(TARGET CUDA::cuda_driver)
       target_link_libraries(strata_pf_own PUBLIC CUDA::cuda_driver)
     endif()
