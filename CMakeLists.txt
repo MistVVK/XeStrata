@@ -2190,8 +2190,15 @@ if(STRATA_ENABLE_XE)
         continue()
       endif()
       set(out ${CMAKE_BINARY_DIR}/sycl-device/${tgt}${CMAKE_CXX_OUTPUT_EXTENSION})
+      # a shared library's device code is position-independent too: the HIP image's wrapper puts pointers in its
+      # read-only data, which ld refuses in a shared object without it (libxestrata_sdpa_aotriton.so)
+      set(pic "")
+      if(NOT WIN32 AND type MATCHES "^(SHARED|MODULE)_LIBRARY$")
+        set(pic -fPIC)
+      endif()
       add_custom_command(OUTPUT ${out}
-        COMMAND ${CMAKE_CXX_COMPILER} ${_strata_sycl_device_link} -fsycl-link "$<TARGET_OBJECTS:${tgt}>" -o ${out}
+        COMMAND ${CMAKE_CXX_COMPILER} ${_strata_sycl_device_link} ${pic} -fsycl-link "$<TARGET_OBJECTS:${tgt}>"
+                -o ${out}
         DEPENDS "$<TARGET_OBJECTS:${tgt}>"
         COMMENT "SYCL device code of ${tgt}" COMMAND_EXPAND_LISTS VERBATIM)
       add_custom_target(${tgt}_sycl_device DEPENDS ${out} COMMENT "SYCL device code of ${tgt}")
