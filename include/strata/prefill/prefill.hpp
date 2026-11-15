@@ -60,26 +60,18 @@ double cpu_share_setting();
 /// The prompt chunks --prefill auto picks from, the largest first, for both engines (generate.cpp's plan_lend and
 /// PlainModel's): every chunk streams again each expert it routes to, so fewer chunks stream fewer experts.  32768 and
 /// 16384 after upstream ae652b2: on the B70 a 26,292-token IQ3_S prompt read at 1,080 tok/s in 8192-token chunks
-/// (50,356 experts streamed), 1,303 in 16384 and 1,545 in one chunk (17,728), the same logits.  49152 and 40960 (the
-/// RDNA3 fork's 8192 grid) sit above the default ceiling: STRATA_PREFILL_AUTO_MAX raises it to take them, and the loan
-/// and the RAM check still decide (49152 is the last step before the R buffer, ~40 KB a token, passes 2 GiB).
-inline constexpr int64_t kAutoChunks[] = {49152, 40960, 32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
-/// The ceiling of --prefill auto: STRATA_PREFILL_AUTO_MAX, else 32768.  The expert cache sizes its empty slots for it
-/// too (generate.cpp), so a raised ceiling actually lends the bigger chunk.
-inline int64_t auto_max() {
-    static const int64_t m = [] {
+/// (50,356 experts streamed), 1,303 in 16384 and 1,545 in one chunk (17,728), the same logits.
+inline constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+/// The largest of kAutoChunks that `take(chunk)` accepts (0: none), at most STRATA_PREFILL_AUTO_MAX (32768 unset) and,
+/// past 8192, none above `max_context`.
+template <class Take>
+int64_t auto_chunk(int64_t max_context, Take&& take) {
+    static const int64_t auto_max = [] {
         const char* v = strata::env_get("PREFILL_AUTO_MAX");
         return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 32768;
     }();
-    return m;
-}
-/// The largest of kAutoChunks that `take(chunk)` accepts (0: none), at most auto_max() and, past 8192, none above
-/// `max_context`.
-template <class Take>
-int64_t auto_chunk(int64_t max_context, Take&& take) {
-    const int64_t cap = auto_max();
     for (const int64_t c : kAutoChunks) {
-        if (c > cap || (c > 8192 && c > max_context)) continue;
+        if (c > auto_max || (c > 8192 && c > max_context)) continue;
         if (take(c)) return c;
     }
     return 0;

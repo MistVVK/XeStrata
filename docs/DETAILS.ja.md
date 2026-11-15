@@ -2210,9 +2210,6 @@ issue を立てるときは、秘密や個人情報を除いた報告と必要�
   ただし、測った当たり方と費用から、得になるところでだけ使います。
   推測は MTP のものと同じに確かめるので、出力は変わりません。
 - **prefill** は、最大 32,768 トークンの塊で処理し、エキスパートは PCIe で GPU に流します。
-  `XESTRATA_PREFILL_AUTO_MAX` で auto の上限を 8,192 刻みで 49,152 まで上げられます（貸せる枠と空き RAM が引き続き決めます）。
-  `XESTRATA_PREFILL_EQUAL_TAIL_MAX` は、大きな塊 1 つと短い端で読めるプロンプトを、その塊の大きさを超えて均等に分けます
-  （大きな塊がキャッシュの大半を借りてエキスパートをほぼ 2 回流すのを防ぎます。どちらも opt-in）。
   行列積は、Intel の GPU では XMX、AMD の GPU では WMMA（RDNA3 以降）、NVIDIA の GPU では Tensor Core で計算し、
   密な行列積は oneMath 経由で、contrib-llvm のビルドでは oneMKL か cuBLAS に、AMD の GPU では rocBLAS と hipBLASLt に任せます。
 
