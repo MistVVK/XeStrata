@@ -2041,18 +2041,24 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // DFlash2 loaded: its ring from the conversation's log where it can (the part the prompt does not read again),
         // and the prompt's last 2047 rows' taps (its window) handed to it as the prompt is read
         if (dr.loaded) {
-            bool cold = false;
-            dr.df2.begin_request(ids.data(), n, resume, &cold);
             const int64_t cap = dr.deferred ? 256 : 2048;   // the measurement's prompts are short
             if (!model.set_prompt_taps(std::max<int64_t>(0, n - 2047), cap,
                                        [&](const float* taps, int64_t rows, int64_t p0, std::string& e) {
                                            return dr.df2.context(taps, rows, p0, e);
                                        }, err)) {
-                std::printf("ERR %s\n", err.c_str());
-                std::fflush(stdout);
-                continue;
+                // The prompt taps' staging does not fit in the VRAM left (a small card that holds the experts):
+                // answer this request with the MTP layer (or plainly, without one) instead of failing it.  Clear the
+                // taps so the prompt path delivers none; DFlash2's ring is left untouched (begin_request not called).
+                std::fprintf(stderr, "xestrata plain: %s - this request answers without DFlash2\n", err.c_str());
+                std::string e2;
+                model.set_prompt_taps(0, 0, nullptr, e2);
+                req_df2 = false;
+                err.clear();
+            } else {
+                bool cold = false;
+                dr.df2.begin_request(ids.data(), n, resume, &cold);
+                dr.df2.note_rows(ids.data() + resume, n - resume, resume);
             }
-            dr.df2.note_rows(ids.data() + resume, n - resume, resume);
         }
         for (const Cut& c : cuts) {
             if (c.to <= read_to) continue;   // (prefill=1: a cut at the token it leaves out)
