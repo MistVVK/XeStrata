@@ -353,7 +353,10 @@ def config_problems(config: Path, data: Path, install: Path, out: str) -> list[s
     text = " ".join(args)
     if not any(a.endswith(".gguf") or ".gguf" in a for a in args) and "--model" not in args:
         problems.append("the run config names no model file")
-    if "--resident-budget-gib" not in args:               # F5: a feed qwen4exp size is read in place with a RAM budget of its experts
+    if d.get("backend") == "metal":                       # a Mac (setup's mac_control_setup): the Metal engine maps the GGUF in place, its arena is its RAM budget
+        if "--mmap-experts" not in args:
+            problems.append("the Mac run config has no --mmap-experts (the experts read in place from the GGUF)")
+    elif "--resident-budget-gib" not in args:             # F5: a feed qwen4exp size is read in place with a RAM budget of its experts
         problems.append("the run config has no --resident-budget-gib (the RAM budget of the experts)")
     profiles = [a for a in args if "expert-profile" in a]
     if not profiles:
