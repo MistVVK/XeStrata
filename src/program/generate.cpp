@@ -2017,6 +2017,8 @@ struct LatentTab {
     int64_t lat_H = 0, lat_ELL = 0, lat_I = 0, n_layers = 0;
     int lat_G = 8, lat_E = 0, lat_fmt = 8;
     bool latent = false;
+    std::string path;   // the D/U file open now
+    bool q4_fallback = false;   // Q8_0 by default, and the pack's Q4_0 beside it when Q8_0 leaves no working cache
     // detect the latent layout, open the D/U file and read the labels (host side, no device yet)
     bool open(const strata::core::ModelGeometry& g, std::string& err) {
         const auto& lay0 = strata::kernels::cpu::expert_layout();
@@ -2032,7 +2034,20 @@ struct LatentTab {
             err = "the latent layout needs XESTRATA_LATENT_DENSE=<latent_dense_q8.bin>";
             return false;
         }
-        if (!dense.open(f, g.n_layers, lat_G, (int64_t) g.n_embd, lat_ELL, err)) {
+        path = f;
+        // The pack's two D/U files (Edge0 ships latent_dense_q4.bin and latent_dense_q8.bin), whichever of them
+        // XESTRATA_LATENT_DENSE (model.json) names: Q8_0 by default, Q4_0 only where Q8_0 leaves no working expert
+        // cache (to_q4 below; Edge0-145B's Q8_0 pair left an RTX 4070 none) or the user asks for it
+        // (XESTRATA_LATENT_DENSE_FMT=4).  Q4_0 is faster (the B70: Edge0-120B-NVFP4 1K decode 62.2 against 54.1 tok/s,
+        // 32K 58.2 against 51-53; Edge0-145B-NVFP4 32K 53.4 against 37-44) but changes the output past the line an
+        // approximation goes in by default at: its teacher-forced KL against Q8_0 is 0.0078 (120B) and 0.0070 (145B)
+        // on the B70, 21 prompts of 220 tokens, against upstream's 0.0058 (the route tail skip's).
+        const int asked = strata::core::latent_dense_fmt_env(err);
+        if (asked < 0) return false;
+        const std::string pick = strata::core::latent_dense_sibling(path, asked == 0 ? 8 : asked);
+        if (!pick.empty()) path = pick;
+        q4_fallback = asked == 0 && !strata::core::latent_dense_sibling(path, 4).empty();
+        if (!dense.open(path, g.n_layers, lat_G, (int64_t) g.n_embd, lat_ELL, err, asked)) {
             err = "latent dense: " + err;
             return false;
         }
@@ -2058,6 +2073,7 @@ struct LatentTab {
         const uint64_t db = nl * dense.d_bytes(), ub = nl * dense.u_bytes();
         uint8_t *d = nullptr, *u = nullptr;
         if (!strata::gpu::alloc_device((void**) &d, db) || !strata::gpu::alloc_device((void**) &u, ub)) {
+            strata::gpu::free(d);   // (a retry in the other format needs the room back)
             err = "the latent D/U device buffers (" + std::to_string((db + ub) >> 20) + " MiB) do not fit";
             return false;
         }
@@ -2076,6 +2092,26 @@ struct LatentTab {
                      (long long) lat_ELL, (long long) lat_I, lat_G, lat_fmt, (long long) lb, (long long) (le - 1),
                      (double) (db + ub) / 1073741824.0, device);
         return true;
+    }
+    // the fallback: reopen the pack's Q4_0 file and upload it onto `device` in place of the Q8_0 pair (layers [lb, le))
+    bool to_q4(int device, int64_t lb, int64_t le, std::string& err) {
+        auto& t = strata::core::latent_shared_table();
+        if ((size_t) device < t.size()) {
+            const strata::core::OnDevice on(device);
+            strata::gpu::free(t[(size_t) device].d);
+            strata::gpu::free(t[(size_t) device].u);
+            t[(size_t) device] = {};
+        }
+        path = strata::core::latent_dense_sibling(path, 4);
+        q4_fallback = false;
+        if (!dense.open(path, n_layers, lat_G, lat_H, lat_ELL, err, 4)) {
+            err = "latent dense: " + err;
+            return false;
+        }
+        lat_fmt = dense.fmt();
+        std::fprintf(stderr, "xestrata generate: latent D/U: Q4_0 (%s) - Q8_0 leaves this card no working expert cache "
+                             "(XESTRATA_LATENT_DENSE_FMT=8 insists on Q8_0)\n", path.c_str());
+        return upload(device, lb, le, err);
     }
 };
 }  // namespace
@@ -5435,7 +5471,8 @@ int main(int argc, char** argv) {
             // device 0's layers: the first stage's [0, split_at[0]) in a layer split, else every layer.  The later
             // stages' devices get their own layers where their caches are sized (the stages loop below).
             const int64_t le0 = multi_gpu ? split_at[0] : g.n_layers;
-            if (!lat_tab.upload(0, 0, le0, le)) {
+            // a Q8_0 pair that does not fit at all takes the pack's Q4_0 one (the default only)
+            if (!lat_tab.upload(0, 0, le0, le) && !(lat_tab.q4_fallback && lat_tab.to_q4(0, 0, le0, le))) {
                 std::fprintf(stderr, "xestrata generate: %s\n", le.c_str());
                 return 1;
             }
@@ -5493,6 +5530,15 @@ int main(int argc, char** argv) {
         // #496 (below): the slots a working cache needs
         const int64_t min_slots = (o.prefill_chunk > 0 && borrow)
             ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
+        // the latent D/U's default Q8_0 leaves the cache fewer slots than it needs: the pack's Q4_0 (LatentTab)
+        if (lat_tab.latent && lat_tab.q4_fallback && slots < min_slots) {
+            std::string le;
+            if (!lat_tab.to_q4(0, 0, multi_gpu ? split_at[0] : g.n_layers, le)) {
+                std::fprintf(stderr, "xestrata generate: %s\n", le.c_str());
+                return 1;
+            }
+            size_cache();
+        }
         if (slots < min_slots && o.batch > 0) {   // --batch: slots given back until it has them (drop_slots)
             while (slots < min_slots && o.batch > 0) {
                 drop_slots(o.batch - 1, "a working expert cache", false);

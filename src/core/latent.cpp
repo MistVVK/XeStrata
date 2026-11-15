@@ -32,24 +32,37 @@ uint64_t LatentDense::bytes_for(int64_t n_layers, int64_t n_groups, int64_t n_em
     return (uint64_t) n_layers * (db + ub);
 }
 
+int latent_dense_fmt_env(std::string& err) {
+    const char* f = strata::env_get("LATENT_DENSE_FMT");
+    if (f == nullptr || f[0] == '\0' || std::strcmp(f, "auto") == 0) return 0;
+    if (std::strcmp(f, "4") == 0) return 4;
+    if (std::strcmp(f, "8") == 0) return 8;
+    err = "XESTRATA_LATENT_DENSE_FMT must be auto, 4 or 8 (got '" + std::string(f) + "')";
+    return -1;
+}
+
+std::string latent_dense_sibling(const std::string& path, int fmt) {
+    const size_t slash = path.find_last_of("/\\");
+    const std::string dir = slash == std::string::npos ? std::string() : path.substr(0, slash + 1);
+    const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (base != "latent_dense_q4.bin" && base != "latent_dense_q8.bin") return {};
+    const std::string other = dir + (fmt == 4 ? "latent_dense_q4.bin" : "latent_dense_q8.bin");
+    return std::ifstream(other, std::ios::binary).good() ? other : std::string();
+}
+
 bool LatentDense::open(const std::string& path, int64_t n_layers, int64_t n_groups, int64_t n_embd,
-                       int64_t latent_dim, std::string& err) {
+                       int64_t latent_dim, std::string& err, int fmt) {
     close();
     if (n_layers <= 0 || n_groups <= 0 || n_embd <= 0 || latent_dim <= 0 || n_embd % 32 != 0 || latent_dim % 32 != 0) {
         err = path + ": the latent dense geometry is not whole 32-value blocks";
         return false;
     }
     n_layers_ = n_layers; n_groups_ = n_groups; n_embd_ = n_embd; latent_dim_ = latent_dim;
-    fmt_ = 8;
-    if (const char* f = strata::env_get("LATENT_DENSE_FMT"); f != nullptr && f[0] != '\0') {
-        if (f[0] == '4' && f[1] == '\0') fmt_ = 4;
-        else if (f[0] == '8' && f[1] == '\0') fmt_ = 8;
-        else {
-            err = path + ": XESTRATA_LATENT_DENSE_FMT must be 4 or 8 (got '" + std::string(f) + "')";
-            return false;
-        }
+    if (fmt == 0) fmt = latent_dense_fmt_env(err);
+    if (fmt < 0) {
+        err = path + ": " + err;
+        return false;
     }
-    const uint64_t want = (uint64_t) n_layers * (d_bytes() + u_bytes());
     try {
         map_ = std::make_unique<platform::MappedFile>(path);
     } catch (const std::exception& e) {
@@ -57,6 +70,10 @@ bool LatentDense::open(const std::string& path, int64_t n_layers, int64_t n_grou
         return false;
     }
     map_size_ = map_->size();
+    // auto: the format the file's size is (the two formats' sizes differ for every geometry)
+    if (fmt == 0) fmt = map_size_ == bytes_for(n_layers, n_groups, n_embd, latent_dim, 4) ? 4 : 8;
+    fmt_ = fmt;
+    const uint64_t want = (uint64_t) n_layers * (d_bytes() + u_bytes());
     if (map_size_ != want) {
         // strict: the env's format and the file's size disagree.  Name both candidate sizes so the operator
         // sees which format the file actually is (edge0-strata's refusal, no silent fallback).

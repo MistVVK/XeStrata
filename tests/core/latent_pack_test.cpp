@@ -181,7 +181,8 @@ void dense() {
     env_set("XESTRATA_LATENT_DENSE_FMT", nullptr);
     LatentDense du;
     bool ok = du.open((d.path / "du8.bin").string(), L, G, H, ELL, err);
-    check(ok && du.fmt() == 8 && du.bytes() == file.size(), "Q8_0 opens at the default fmt 8" + (ok ? "" : ": " + err));
+    check(ok && du.fmt() == 8 && du.bytes() == file.size(),
+          "the Q8_0 file opens at fmt 8 by default (auto: its size)" + (ok ? "" : ": " + err));
     if (ok) {
         bool same = true;
         for (int64_t l = 0; l < L; ++l) {
@@ -203,10 +204,24 @@ void dense() {
     write_bytes(d.path / "du4.bin", std::vector<uint8_t>((size_t) L * (db4 + ub4), 0x5A));
     ok = du.open((d.path / "du4.bin").string(), L, G, H, ELL, err);
     check(ok && du.fmt() == 4 && du.d_bytes() == db4 && du.u_bytes() == ub4, "Q4_0 opens at fmt 4");
+    env_set("XESTRATA_LATENT_DENSE_FMT", "8");
+    check(!du.open((d.path / "du4.bin").string(), L, G, H, ELL, err) &&
+              err.find("the other fmt wants") != std::string::npos,
+          "fmt 8 against the Q4_0 file refused, both sizes named");
     env_set("XESTRATA_LATENT_DENSE_FMT", "9");
     check(!du.open((d.path / "du4.bin").string(), L, G, H, ELL, err), "fmt 9 refused");
+    // auto (unset, or `auto`): the format the file's size is
+    for (const char* v : {(const char*) nullptr, "auto"}) {
+        env_set("XESTRATA_LATENT_DENSE_FMT", v);
+        const std::string how = v == nullptr ? "by default" : "at auto";
+        ok = du.open((d.path / "du4.bin").string(), L, G, H, ELL, err);
+        check(ok && du.fmt() == 4 && du.d_bytes() == db4, "the Q4_0 file opens at fmt 4 " + how);
+        ok = du.open((d.path / "du8.bin").string(), L, G, H, ELL, err);
+        check(ok && du.fmt() == 8 && du.d_bytes() == db, "the Q8_0 file opens at fmt 8 " + how);
+    }
     env_set("XESTRATA_LATENT_DENSE_FMT", nullptr);
-    check(!du.open((d.path / "du4.bin").string(), L, G, H, ELL, err), "the Q4_0 file at the default fmt 8 refused");
+    write_bytes(d.path / "du_odd.bin", std::vector<uint8_t>((size_t) L * (db4 + ub4) + 1, 0x5A));
+    check(!du.open((d.path / "du_odd.bin").string(), L, G, H, ELL, err), "a file of neither format's size refused");
     check(!du.open((d.path / "du8.bin").string(), L, G, H, 127, err), "a latent width that is not whole blocks refused");
     check(!du.open((d.path / "missing.bin").string(), L, G, H, ELL, err), "a missing file refused");
 }
