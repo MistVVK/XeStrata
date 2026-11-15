@@ -63,13 +63,14 @@ def _label(version: str, backend: str, variant: str = "") -> str:
 # ----------------------------------------------------------------------------------------------- Qwen engine
 
 def _unfit(item: ec.EngineComponent, *, wanted: str | None, target: str, runtime: str | None, cuda_here: list[str], driver_here: str | None,
-           hip_here: list[str]) -> tuple[str, str, list[str]] | None:
+           hip_here: list[str], other_makes: frozenset = frozenset()) -> tuple[str, str, list[str]] | None:
     """Why this computer cannot run the package, as (plain English, a code the app translates, its values), or None. The same checks as
-    engine_component.resolve, one package at a time."""
+    engine_component.resolve, one package at a time. ``other_makes``: the other makes of graphics card this PC also has (a PC with an NVIDIA
+    card and an AMD card); an engine for one of them runs on that card, so it is not "for a different kind of graphics card"."""
     if item.platform != target:
         return ("It was made for a different operating system.", "os", [])
     ok, _why = backend_supported(item.backend, target)
-    if not ok or (wanted and item.backend != wanted):
+    if not ok or (wanted and item.backend != wanted and item.backend not in other_makes):
         return ("It was made for a different kind of graphics card than this computer has.", "gpu_make", [])
     if item.min_runtime and runtime and ec._version_key(runtime) < ec._version_key(item.min_runtime):
         return (f"It needs Strata {item.min_runtime} or newer; this is {runtime}.", "strata", [item.min_runtime, runtime])
@@ -101,9 +102,11 @@ def _qwen_entries(ctx: "updater.Context", root: Path | None = None, component_id
     wanted = ctx.hardware.get("backend")
     runtime = ctx.hardware.get("runtime") or ec.runtime_version()
     target = ctx.hardware.get("platform") or host_platform()
-    cuda_here = ec.cuda_archs_present() if wanted == "cuda" else []
-    driver_here = ec.nvidia_driver_version() if wanted == "cuda" else None
-    hip_here = ec.hip_archs_present() if wanted == "hip" else []
+    other_makes = frozenset(m for m in (ctx.hardware.get("makes") or []) if m in updater.GPU_MAKES and m != wanted)
+    seen = {wanted, *other_makes}
+    cuda_here = ec.cuda_archs_present() if "cuda" in seen else []
+    driver_here = ec.nvidia_driver_version() if "cuda" in seen else None
+    hip_here = ec.hip_archs_present() if "hip" in seen else []
     try:
         active = ec.resolve(root, backend=wanted, full=False, runtime=ctx.hardware.get("runtime"), component_id=component_id).root.name
     except ec.EngineMissing:
@@ -112,17 +115,18 @@ def _qwen_entries(ctx: "updater.Context", root: Path | None = None, component_id
     rows = []
     for item in found:
         why, code, args = _unfit(item, wanted=wanted, target=target, runtime=runtime, cuda_here=cuda_here, driver_here=driver_here,
-                                 hip_here=hip_here) or (None, None, [])
+                                 hip_here=hip_here, other_makes=other_makes) or (None, None, [])
         rows.append({"family": family, "folder": item.root.name, "version": item.version, "backend": item.backend, "platform": item.platform,
                      "variant": item.variant, "bytes": sum(f[2] for f in item.files), "signed": bool(item.signature), "fits": why is None,
-                     "why_not": why, "why_code": code, "why_args": args, "active": item.root.name == active, "build_id": item.build_id, "path": longpath.plain(item.root)})
+                     "why_not": why, "why_code": code, "why_args": args, "active": item.root.name == active, "build_id": item.build_id, "path": longpath.plain(item.root),
+                     "other_card": bool(wanted and item.backend != wanted and item.backend in other_makes)})
     for bad in problems:
         folder = Path(bad["folder"])
         rows.append({"family": family, "folder": folder.name, "version": _version_of(folder.name), "backend": "", "platform": "", "variant": "",
                      "bytes": _walk_bytes(folder), "signed": False, "fits": False, "active": False, "build_id": "", "path": longpath.plain(folder),
                      "why_not": "Its description is missing or damaged, so it cannot be started.", "why_code": "manifest", "why_args": [],
                      "detail": bad["problem"]})
-    fitting = [r for r in rows if r["fits"]]
+    fitting = [r for r in rows if r["fits"] and not r.get("other_card")] or [r for r in rows if r["fits"]]     # "newest" = what updates follow
     newest = max(fitting, key=lambda r: (ec._version_key(r["version"]), r["folder"]), default=None)
     for row in rows:
         row["newest"] = row is newest
@@ -271,6 +275,21 @@ def _use_shape(ctx: "updater.Context", shape: str, folder: str) -> dict:
 
 
 def _use_qwen(ctx: "updater.Context", folder: str) -> dict:
+    found, _ = ec.scan(ctx.components)
+    target = next((item for item in found if item.root.name == folder), None)
+    wanted = ctx.hardware.get("backend")
+    if target is not None and wanted and target.backend != wanted and target.backend in (ctx.hardware.get("makes") or []):
+        # An engine for this PC's other card (an AMD card beside an NVIDIA one): choosing it is choosing that card, the same choice
+        # `strata launch --backend amd` keeps ("now and next time"). Without it a start would go on picking the engine of the first make.
+        before = ec.saved_backend()
+        ec.save_backend(target.backend)
+        ctx.hardware = {**updater.detect_hardware(), "backend_source": "saved choice"}
+        try:
+            out = use_qwen_unlocked(ctx, updater.State(ctx.components), folder)
+        except BaseException:
+            ec.save_backend(before)                     # nothing was switched: the make chosen before stays
+            raise
+        return {**out, "backend_saved": target.backend}
     return use_qwen_unlocked(ctx, updater.State(ctx.components), folder)
 
 

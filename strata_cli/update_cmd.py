@@ -276,6 +276,26 @@ def default_components_dir(ec) -> Path:
     return chosen if found else own
 
 
+def requested_hardware(backend: str, environ=None) -> dict:
+    """What the package choice reads when the person named the engine family (--backend amd | hip | hip-rx6000 | nvidia ...).
+
+    The cards of THAT make are read (their gfx names, driver, archs), the same way a start that was given STRATA_ENGINE_BACKEND reads them. Before,
+    only the family was changed: on a PC with an NVIDIA card and an AMD card the hardware stayed the NVIDIA card's, so `--backend amd` found
+    "no engine for this PC" (the word was not even turned into the hip family) and `--backend hip` could not tell which AMD build the card needs."""
+    from strata_control import engine_component as ec, updater
+    environ = os.environ if environ is None else environ
+    family, variant = ec.split_backend(backend)          # --backend hip-rdna2 = the hip family, the rdna2 package (#4013); amd = hip
+    if family in ec.BACKEND_MATRIX:
+        hardware = updater.detect_hardware({**environ, ec.ENV_BACKEND: family})
+    else:                                                # a word that names no family: the feed is asked for it as it is, and says it has none
+        hardware = updater.detect_hardware(environ)
+        hardware["backend"] = family
+    if variant:
+        hardware["variant_wanted"] = variant
+    hardware["backend_source"] = "requested"             # the person's own decision: the make guard lets it through
+    return hardware
+
+
 def run(a) -> int:
     from strata_control import acquisition, engine_component as ec, feed as feedmod, signing, updater
     machine = a.output in ("json", "jsonl")
@@ -289,12 +309,7 @@ def run(a) -> int:
 
     root = Path(a.components_dir) if a.components_dir else default_components_dir(ec)
     try:
-        hardware = updater.detect_hardware()
-        if a.backend:
-            hardware["backend"], variant = ec.split_backend(a.backend)    # --backend hip-rdna2 = the hip family, the rdna2 package (#4013)
-            if variant:
-                hardware["variant_wanted"] = variant
-            hardware["backend_source"] = "requested"             # the person's own decision: the make guard lets it through
+        hardware = requested_hardware(a.backend) if a.backend else updater.detect_hardware()
         lines: list = []
         cancel = threading.Event()
         ctx = updater.Context(components=root, source="", trusted={}, hardware=hardware, emit=_emit_factory(a, lines), cancel=cancel,
@@ -429,10 +444,19 @@ def _engines_command(a, ctx, machine: bool, fail) -> int:
         out = lib.use_engine(ctx, entry["family"], entry["folder"], entry.get("root"))
         if machine:
             print(json.dumps({"schema_version": 1, "ok": True, **out}, ensure_ascii=False))
-        elif out["status"] == "already":
+        elif out["status"] == "already" and not out.get("backend_saved"):
             print(f"Engine {out['to']} is already in use. Nothing was changed.")
+        elif out["status"] == "already":                 # the engine of the PC's other card: keeping that make's choice is the switch
+            from strata_control import engine_component as ec
+            print(f"Engine {out['to']} is now in use. Models you start from now on run on it.")
+            print(f"The engine for {ec.MAKE_NAMES[out['backend_saved']]} cards is used, now and next time. "
+                  "`strata launch --backend auto` goes back to the PC's own choice.")
         else:
             print(f"Engine {out['to']} is now in use (was {out.get('from') or 'none'}). Models you start from now on run on it.")
+            if out.get("backend_saved"):
+                from strata_control import engine_component as ec
+                print(f"The engine for {ec.MAKE_NAMES[out['backend_saved']]} cards is used, now and next time. "
+                      "`strata launch --backend auto` goes back to the PC's own choice.")
             print("Saved tuning presets are marked for the short re-check; none were deleted." if out.get("presets_marked") else
                   "Saved tuning presets are unchanged.")
             print("`strata update` makes the newest engine the one in use again." if not out.get("automatic") else

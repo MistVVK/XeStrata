@@ -475,10 +475,13 @@ def runtime_version() -> str | None:
 
 def split_backend(value) -> tuple[str, str]:
     """(backend, variant) for a name the person typed: "hip-rdna2" is the hip family and its rdna2 package (the way the feed labels an AMD
-    package, #4013), "hip" is the family alone, any other name is returned as it is with no variant."""
+    package, #4013), "hip" is the family alone, a make's own name is its family ("amd" -> hip, "nvidia" -> cuda, "intel" -> sycl: the words
+    `strata launch --backend` takes, so `strata update --backend amd` means the same), any other name is returned as it is with no variant."""
     name = str(value or "").strip().lower()
     if name not in BACKEND_MATRIX and name.startswith("hip-") and len(name) > 4:
         return "hip", name[4:]
+    if name not in BACKEND_MATRIX and name in BACKEND_ALIASES:
+        return BACKEND_ALIASES[name], ""
     return name, ""
 
 
@@ -1084,7 +1087,7 @@ def resolve(root: Path | None = None, *, backend: str | None = None, target: str
     found, problems = scan(base, component_id)
     if not found and not problems:
         raise EngineMissing("the component folder holds no engine package", base)
-    wanted = backend
+    wanted = split_backend(backend)[0] or None if backend else backend     # "amd" / "hip-rx6000" name the hip family
     how = "requested"
     if wanted is None:
         wanted, how = detect_backend()
@@ -1198,6 +1201,7 @@ def status(root: Path | None = None, *, backend: str | None = None, full: bool =
     """What `strata components engine` and the app's host report. Always answers; never raises for a missing engine."""
     base = root or components_dir()
     found, problems = scan(base)
+    backend = split_backend(backend)[0] or None if backend else backend    # `components engine --backend amd` = the hip family
     try:
         detected, how = detect_backend()
     except ComponentProblem as exc:
