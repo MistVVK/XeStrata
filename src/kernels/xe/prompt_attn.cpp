@@ -490,14 +490,11 @@ int forced_pick() {
 
 }  // namespace
 
-void prompt_attn_tune(const QsaShapes& s, int fmt, int64_t max_cells, void* stream) {
+void prompt_attn_tune(const QsaShapes& s, int fmt, int64_t max_cells, void* stream, bool timed) {
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0 || max_cells <= 0 || fmt < kFmtF16 ||
         fmt > kFmtK8V4)
         return;
     sycl::queue& queue = core::Runtime::get().stream(stream);
-    // ROCm (RX 9060 XT): the timing's probe-buffer cycle leaves a not-present mapping that a later kernel faults on
-    // when the KV streams (llm-jp 64K/128K, 2026-11-15).  Skip the timing: prompt_attn takes the maker's untimed.
-    if (queue.get_device().get_backend() == sycl::backend::ext_oneapi_hip) return;
     picks_for(s, fmt).get(queue.get_device(), [&] {
         Picks p;
         if (env_off("PROMPT_ATTN_MMA")) return p;   // the fixed choice (prompt_attn)
@@ -507,6 +504,16 @@ void prompt_attn_tune(const QsaShapes& s, int fmt, int64_t max_cells, void* stre
         }
         // 8K and up to 64K cells (1 to 2 s on a B70); a cache shorter than the long point takes the short one's choice
         const int64_t a = std::min<int64_t>(max_cells, 8192), b = std::min<int64_t>(max_cells, 65536);
+        if (!timed) {   // the maker's kernel, its scratch taken now for the plan (as prepare_buffers, nothing freed)
+            p.short_pick = p.long_pick = p.short_window = p.long_window = kPickMaker;
+            if (sdpa_maker(queue, stream, SdpaUse::prompt, true, s.head_dim) != SdpaMaker::none)
+                for (const int64_t cells : {b, a}) {
+                    const size_t n = maker_scratch(s, std::min<int64_t>(2048, cells / 2), cells);
+                    if (scratch(queue, 1, n) != nullptr) break;
+                }
+            std::fprintf(stderr, "xestrata: prompt attention: the maker's kernel, untimed\n");
+            return p;
+        }
         prepare_buffers(queue, s, a, b, stream);
         p.short_pick = time_pick(queue, s, fmt, a, stream, &p.short_window);
         p.long_pick = b > a ? time_pick(queue, s, fmt, b, stream, &p.long_window) : p.short_pick;
@@ -528,18 +535,11 @@ bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_
     // (no prompt_attn_tune for this shape): the matrix engines' kernel where there is one
     static const bool no_mma = env_off("PROMPT_ATTN_MMA");
     static const int forced = forced_pick();
-    const bool hip = queue.get_device().get_backend() == sycl::backend::ext_oneapi_hip;   // this GPU's, not the first's
     int pick = kPickUntimed;
     if (no_mma) {
         pick = fmt != kFmtF16 ? kPickNone : kPickFp16;
     } else if (forced != kPickUntimed) {
         pick = forced;
-    } else if (hip) {
-        // ROCm: the tune is skipped (prompt_attn_tune), so the maker's kernel (aotriton) untimed, the one its timing
-        // took on the RX 9060 XT at every length it was run at (llm-jp-4.1's 40/4 heads of 128 over INT8 pools, 6K to
-        // 63K cells: 10.3 / 91.6 ms against the int8 kernel's 36.2 / 321.8, 2026-11-15); where it does not take the
-        // shape, the matrix engines' kernel below
-        pick = kPickMaker;
     } else {
         const Picks& p = picks_for(s, fmt).get(queue.get_device(), [] { return Picks{}; });
         const bool lng = pos0 + T >= p.split;
