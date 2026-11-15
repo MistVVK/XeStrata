@@ -1445,7 +1445,7 @@ bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string
                         take((void**) &m.lmmq_yl_, (size_t) TMM * K * ELL * 4) &&
                         take((void**) &m.lmmq_ylq_, mmq::q8_bytes(TMM * K, ELL)) &&
                         take((void**) &m.lmmq_ids_, (size_t) TMM * K * 4) &&
-                        take((void**) &m.lmmq_bounds_, (size_t) (2 + G + 1) * 4);
+                        take((void**) &m.lmmq_bounds_, (static_cast<size_t>(G) + 3) * 4);
         if (!ok) { err = "prefill: the latent scratch does not fit"; return false; }
         m.lmmq_scratch_T_ = TMM;
         mmq::choose_forms(du_t, G * ELL, N, 1, m.cs);
@@ -1455,7 +1455,7 @@ bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string
     // experts' row order; idsU maps a bucket row to its yl row, and the combine reads a route's U row (slot)
     const int32_t* labels = m.lat_labels_.data() + (size_t) l * E;
     m.lmmq_ids_h_.resize((size_t) (T * K));
-    m.lmmq_bnd_h_.resize((size_t) (2 + G + 1));
+    m.lmmq_bnd_h_.resize(static_cast<size_t>(G) + 3);
     std::vector<int32_t> route_of((size_t) (T * K));
     for (int64_t i = 0; i < T * K; ++i) route_of[(size_t) m.slot_host[(size_t) i]] = (int32_t) i;
     m.lmmq_bnd_h_[0] = 0;
@@ -1471,7 +1471,7 @@ bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string
                 m.slot_host[(size_t) i] = (int32_t) u;
                 ++u;
             }
-            m.lmmq_bnd_h_[(size_t) (2 + gg + 1)] = (int32_t) u;
+            m.lmmq_bnd_h_[static_cast<size_t>(gg) + 3] = (int32_t) u;
         }
     }
     m.lmmq_ids_h_.to_device(m.lmmq_ids_, m.cs);
@@ -1497,7 +1497,7 @@ bool Prefill::latent_mmq_u(int64_t l, int64_t T, int64_t K, Impl& m, std::string
     mmq::quantize(m.lmmq_yl_, m.lmmq_ids_, m.lmmq_ylq_, du_t, ELL, ELL, T * K, m.cs);
     int64_t maxr = 0;
     for (int gg = 0; gg < G; ++gg)
-        maxr = std::max<int64_t>(maxr, m.lmmq_bnd_h_[(size_t) (2 + gg + 1)] - m.lmmq_bnd_h_[(size_t) (2 + gg)]);
+        maxr = std::max<int64_t>(maxr, m.lmmq_bnd_h_[static_cast<size_t>(gg) + 3] - m.lmmq_bnd_h_[static_cast<size_t>(gg) + 2]);
     mmq::Product up;
     up.w = m.lat_u_ + (size_t) (l - m.lat_layer0_) * u_bytes; up.type = du_t; up.w_rows = N; up.w_cols = ELL;
     up.expert_bytes = mmq::matrix_bytes(du_t, N, ELL); up.n = G; up.xq = m.lmmq_ylq_;

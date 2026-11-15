@@ -2549,6 +2549,7 @@ void native_expert_latent_a_tune(const NativeExpertLayout& L, void* stream) {
         q.memcpy(starts, hs.data(), hs.size() * sizeof(int32_t)).wait_and_throw();
         int next = 0;
         std::vector<core::TimedCandidate> tc;
+        tc.reserve(cands.size());
         for (auto [lpr, ne] : cands)
             tc.push_back({[&, lpr, ne] {
                 launch_gu_rows(q, L.gu_type, kGrp, ptr + (size_t) next * kGrp, starts, count, toks, x, L, gate, up, -1, lpr, ne);
@@ -2563,7 +2564,11 @@ void native_expert_latent_a_tune(const NativeExpertLayout& L, void* stream) {
         q.wait_and_throw();
         for (void* p : allocated) sycl::free(p, q);
     } catch (...) {
-        try { q.wait(); } catch (...) {}
+        try {
+            q.wait();
+        } catch (const std::exception& w) {   // the timing's failure is said below; the queue is drained for the frees
+            std::fprintf(stderr, "xestrata: latent A timing: %s\n", w.what());
+        }
         for (void* p : allocated) sycl::free(p, q);
         g_latent_a_choices.put(q.get_device(), key, std::pair<int, int>{GU_LPR, kEntriesPass});
     }
