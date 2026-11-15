@@ -2522,7 +2522,7 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+                           int64_t grid_groups, int mode8_override) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     auto& q = queue_for(stream);   // in order: the launches below follow one another
     const float lim = expert_swiglu_limit();
@@ -2541,7 +2541,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes, not
     // the fused gate/up that writes q8_1 itself)
     const bool had = L.had_block > 0;
-    const bool m8 = !(grid_groups > 0 && grid_groups < cap_groups) && !had && exp_mode8(q);
+    const bool m8 = !(grid_groups > 0 && grid_groups < cap_groups) && !had &&
+                    (mode8_override < 0 ? exp_mode8(q) : mode8_override != 0);
     const size_t xbytes = (size_t) kEntriesPass * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
     const size_t grid_bytes = L.gu_type == 22 ? sizeof(iq2s_grid) : L.gu_type == 16 ? sizeof(iq2xxs_grid)
                               : L.gu_type == 18 ? sizeof(iq3xxs_grid) : L.gu_type == 21 ? sizeof(iq3s_grid) : 0;

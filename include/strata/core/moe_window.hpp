@@ -258,7 +258,8 @@ private:
     uint32_t* h_xlseq_ = nullptr;      ///< mapped: the D stage's doorbell (layer + 1)
     uint32_t* m_xlseq_ = nullptr;
     // the U product on the int8 matrix units (XESTRATA_LATENT_U_MMU): the G groups as iq_mmq experts
-    bool lat_u_mmu_ = false;           ///< auto follows the device (mmq::built): matrix units, else the dp4a U
+    bool lat_u_mmu_ = false;           ///< the U on the matrix units; auto is timed against the dp4a U per device
+    int lat_a_mode8_ = -1;             ///< the A stage's fused/matrix-unit form; -1 the device default, 0 dp4a, 1 mode8
     uint8_t* lat_u_mmq_ylq_ = nullptr; ///< the A outputs quantized for MMQ (group order, T*K rows of ELL)
     int32_t* lat_u_mmq_ids_ = nullptr; ///< group-order row -> its route (the quantize and the product's dst map)
     int32_t* lat_u_mmq_bounds_ = nullptr;  ///< the G groups' entry bounds (G + 1)

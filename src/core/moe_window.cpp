@@ -6,6 +6,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/latent_share.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -269,6 +270,100 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    // The decode's A and U each have a matrix-unit form and a dp4a form; which is faster depends on the device and
+    // the window's few rows, not the GPU's name.  Time both once per device (synthetic rows: the values do not change
+    // the time) and keep the faster.  LATENT_A_MODE8 / LATENT_U_MMU = 0/1 still force a form.  Falls back to the
+    // capability choice if the timing cannot run.
+    if (latent_ && lay.native && !lay.fmt.empty()) {
+        const int a_env = strata::env_auto("LATENT_A_MODE8");
+        const int u_env = strata::env_auto("LATENT_U_MMU");
+        if (a_env < 0 || u_env < 0) {
+            static strata::core::PerDevice<std::pair<int, bool>> picks;
+            auto& pick = picks.get(strata::core::Runtime::get().device(), [&] {
+                std::pair<int, bool> best{-1, strata::prefill::mmq::built()};
+                const auto& f0 = lay.fmt[0];
+                const int64_t ELL = lat_ELL_, G = lat_G_, GN = (int64_t) shape.n_embd;
+                const int64_t cap_t = std::min<int64_t>((int64_t) (T * K), 4 * (int64_t) K);
+                const int64_t n_expert = lay.n_expert;
+                const int du_t = lat_fmt_ == 4 ? 2 : 8;
+                auto& q = strata::core::Runtime::get().compute();
+                const size_t blob_b = (size_t) lay.blob_bytes(0);
+                uint8_t* blob = sycl::malloc_device<uint8_t>(blob_b, q);
+                float* out = sycl::malloc_device<float>((size_t) (cap_t * ELL), q);
+                float* yl = sycl::malloc_device<float>((size_t) (cap_t * ELL), q);
+                int32_t* ids = sycl::malloc_device<int32_t>((size_t) cap_t, q);
+                unsigned long long* gp = sycl::malloc_device<unsigned long long>(1, q);
+                int32_t* gs = sycl::malloc_device<int32_t>(2, q);
+                int32_t* gn = sycl::malloc_device<int32_t>(1, q);
+                int32_t* dst = sycl::malloc_device<int32_t>((size_t) cap_t, q);
+                int32_t* tok = sycl::malloc_device<int32_t>((size_t) cap_t, q);
+                if (blob && out && yl && ids && gp && gs && gn && dst && tok) {
+                    try {
+                        const strata::kernels::NativeExpertLayout L0 = strata::kernels::native_expert_layout(f0.gu_type, f0.d_type, ELL, lat_I_, f0.up_type);
+                        q.memset(blob, 0x11, blob_b);
+                        q.memset(out, 0, (size_t) (cap_t * ELL) * 4);
+                        q.memset(yl, 0, (size_t) (cap_t * ELL) * 4);
+                        const unsigned long long blob_p = (unsigned long long) blob;
+                        q.memcpy(gp, &blob_p, 8);
+                        const int32_t start_h[2] = {0, (int32_t) cap_t};
+                        q.memcpy(gs, start_h, 8);
+                        const int32_t one = 1;
+                        q.memcpy(gn, &one, 4);
+                        q.parallel_for(sycl::range<1>((size_t) cap_t), [=](sycl::id<1> i) {
+                            dst[i[0]] = (int32_t) i[0]; tok[i[0]] = (int32_t) i[0];
+                            ids[i[0]] = (int32_t) (i[0] % (uint64_t) n_expert);
+                        });
+                        q.wait_and_throw();
+                        const int reps = 5;
+                        auto time_a = [&](int m8) {
+                            const auto t0 = std::chrono::steady_clock::now();
+                            for (int r = 0; r < reps; ++r)
+                                strata::kernels::native_expert_grouped(L0, gp, gs, gn, dst, tok, 1, cap_t, lat_xlq_, hit_scratch_, out, nullptr, 1, m8);
+                            q.wait_and_throw();
+                            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        };
+                        if (a_env < 0) {
+                            const double t1 = time_a(1), t0 = time_a(0);
+                            best.first = t0 < t1 ? 0 : 1;
+                        }
+                        auto time_u = [&](bool mmq) {
+                            const auto t0 = std::chrono::steady_clock::now();
+                            for (int r = 0; r < reps; ++r) {
+                                if (mmq) {
+                                    strata::kernels::latent_u_bucket(ids, lat_labels_dev_, lay.n_expert, cap_t, (int) G, lat_u_mmq_ids_, lat_u_mmq_bounds_, nullptr);
+                                    strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, du_t, ELL, ELL, cap_t, nullptr);
+                                    strata::prefill::mmq::Product up;
+                                    up.w = lat_u_; up.type = du_t; up.w_rows = GN; up.w_cols = ELL;
+                                    up.expert_bytes = strata::prefill::mmq::matrix_bytes(du_t, GN, ELL); up.n = (int) G;
+                                    up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
+                                    up.total_rows = cap_t; up.max_rows = cap_t; up.rows = cap_t; up.dst = out; up.ld_dst = GN;
+                                    lat_mmq_ctx_->run(up, nullptr);
+                                } else {
+                                    strata::kernels::quantize_q8_1_rows(yl, cap_t, ELL, lat_ylq_, nullptr);
+                                    strata::kernels::latent_u_grouped(lat_u_, lat_ylq_, ids, lat_labels_dev_, lay.n_expert, cap_t, (int) ELL, (int) GN, out, nullptr, lat_fmt_);
+                                }
+                            }
+                            q.wait_and_throw();
+                            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        };
+                        if (u_env < 0 && strata::prefill::mmq::built()) {
+                            const double tm = time_u(true), td = time_u(false);
+                            best.second = tm < td;
+                        }
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "xestrata: timing the latent decode forms: %s\n", e.what());
+                    }
+                }
+                for (void* p : {(void*) blob, (void*) out, (void*) yl, (void*) ids, (void*) gp, (void*) gs, (void*) gn, (void*) dst, (void*) tok})
+                    if (p != nullptr) sycl::free(p, q);
+                return best;
+            });
+            if (a_env >= 0) lat_a_mode8_ = a_env == 1 ? 1 : 0;
+            else lat_a_mode8_ = pick.first;
+            if (u_env >= 0) lat_u_mmu_ = u_env == 1;
+            else lat_u_mmu_ = pick.second;
+        }
+    }
     set_plan_slot(0, 1);
     // the plan built on the device (resident_plan): its skip flags and the tier's slot offsets there
     if (tier.cache_base != nullptr) {
@@ -530,7 +625,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                          cs);
         const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, ELL, lat_I_, f.up_type);
         auto grouped_lat = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid) {
-            native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, xlq, hit_scratch_, yl, cs, grid);
+            native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, xlq, hit_scratch_, yl, cs, grid, lat_a_mode8_);
         };
         try {
             const bool fb = mode.fetch_side != nullptr && !mode.resident;
