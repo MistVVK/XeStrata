@@ -4,7 +4,9 @@
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/arch_defaults.hpp"   // arena_skip_thp_request
 #include "strata/core/page_cache_drop.hpp"   // drop_range (the drop behind the arena read, Linux)
+#if defined(STRATA_USE_HIP) && defined(__linux__)   // kfd_quiet NOREG scope: Linux HIP only, every other build keeps its old text
 #include "strata/core/kfd_quiet.hpp"   // NOREG: the arena's mode and its lock (integrated gfx11, Linux HIP)
+#endif
 #include <cstddef>
 
 #include <cuda_runtime.h>
@@ -579,9 +581,15 @@ void set_held_address_space(std::vector<uint64_t> bases) {
 }
 
 bool arena_no_register() {
+#if defined(STRATA_USE_HIP) && defined(__linux__)   // kfd_quiet NOREG scope: Linux HIP only, every other build keeps its old text
     // an explicit setting wins over the engine's flag (kfd_quiet.hpp arena_unregistered: the same rule as before, testable)
     return strata::core::kfd_quiet::arena_unregistered(std::getenv("STRATA_ARENA_PIN_GIB"),
                                                        arena_uma_no_register_flag().load(std::memory_order_relaxed));
+#else
+    const char* e = std::getenv("STRATA_ARENA_PIN_GIB");
+    if (e != nullptr && *e != '\0') return std::string(e) == "none";   // an explicit setting wins over the engine's flag
+    return arena_uma_no_register_flag().load(std::memory_order_relaxed);
+#endif
 }
 
 int arena_pin_cap_gib() {
@@ -790,6 +798,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         // 153-igpu (UMA mode): nothing is registered; the whole arena stays resident through the working-set lock instead
         slice_bytes = 1;   // "sliced" with no slice registered: the destructor unlocks from offset registered_bytes (0)
         const char* env = std::getenv("STRATA_ARENA_LOCK");
+#if defined(STRATA_USE_HIP) && defined(__linux__)   // kfd_quiet NOREG scope: Linux HIP only, every other build keeps its old text
         // (kfd_quiet.hpp NOREG, integrated gfx11 under Linux: when the engine chose this mode, no mlock is tried and nothing is said
         // about it; a STRATA_ARENA_LOCK the user set decides as before)
         const bool noreg = strata::core::kfd_quiet::noreg_flag().load(std::memory_order_relaxed);
@@ -802,6 +811,17 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         } else if (!noreg || env != nullptr) {
             note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
         }
+#else
+        if (backing == PageBacking::LargePages) {
+            note = "large pages are resident without a lock; " + note;
+        } else if (env == nullptr || std::string(env) != "0") {
+            const strata::platform::LockResult lr = strata::platform::lock_resident((uint8_t*) base, bytes);
+            locked_bytes = lr.locked_bytes;
+            note = lr.note + "; " + note;
+        } else {
+            note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
+        }
+#endif
         note = "NOT registered with the GPU driver (integrated GPU, UMA mode; STRATA_ARENA_PIN_GIB=0 registers it); " + note;
         return;
     }
@@ -976,8 +996,10 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
     } else if (env != nullptr && std::string(env) == "0") {
         note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
         locked_ranges.clear();
+#if defined(STRATA_USE_HIP) && defined(__linux__)   // kfd_quiet NOREG scope: Linux HIP only, every other build keeps its old text
     } else if (none && !strata::core::kfd_quiet::arena_lock_wanted(strata::core::kfd_quiet::noreg_flag().load(std::memory_order_relaxed), env)) {
         locked_ranges.clear();   // kfd_quiet.hpp NOREG chose the unregistered arena: no mlock tried, nothing said (as in the constructor above)
+#endif
     } else {
         for (const auto& r : locked_ranges) holes.emplace_back((uint8_t*) base + r.first, r.second);
         const strata::platform::LockResult lr = strata::platform::lock_resident_ranges(holes);
