@@ -347,7 +347,7 @@ test('#4783 the composer acts on the choice, the default keeps today\'s behaviou
   assert.match(chat, /if \(plan === 'interrupt'\) \{\s*updateDraft\(''\);\s*clearQuotes\(session\.id\);\s*parkMessage\(session\.id, out\);\s*stopStreaming\(\);\s*return;\s*\}/);
   assert.match(chat, /if \(plan === 'goal'\) \{ clearQuotes\(session\.id\); parkMessage\(session\.id, out\); return; \}/);
   assert.match(chat, /pushToast\('info', tr\('The assistant is still answering'\)/, 'Wait still says so');
-  assert.match(chat, /if \(!session \|\| streaming \|\| !parked\?\.length\)\s*return;\s*const next = takeParked\(session\.id\);/);
+  assert.match(chat, /if \(!session \|\| !parkedReady\(session\.id, activeId, streaming, parked\?\.length \?\? 0\)\)\s*return;\s*const next = takeParked\(session\.id\);/);
   const store = src('lib/store.ts');
   assert.match(store, /whileBusy: validWhileBusy\(parsed\.whileBusy\) \? parsed\.whileBusy : 'wait'/, 'an old or invalid saved value reads as Wait');
   assert.match(store, /\n  whileBusy: 'wait',\n/);

@@ -14,3 +14,11 @@ export type BusyPlan = 'refuse' | 'goal' | 'park' | 'interrupt';
 export function busyPlan(mode: WhileBusy): BusyPlan {
   return mode === 'queue' ? 'goal' : mode === 'interject' ? 'interrupt' : 'refuse';
 }
+
+/**
+ * #5806: may the chat on screen send its parked message now? Only when it is also the store's active chat, which is where sendMessage sends:
+ * a click in the side bar makes the other chat active before the page shows it, and in that moment the message went to the other chat.
+ */
+export function parkedReady(viewed: string | null | undefined, active: string | null | undefined, streaming: boolean, parked: number): boolean {
+  return !!viewed && viewed === active && !streaming && parked > 0;
+}
