@@ -9041,6 +9041,10 @@ def make_handler(svc: Service):
                 print(f"[xestrata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
+                elif path == "/v1/chat/completions" and isinstance(e, ContextOverflow):
+                    # OpenAI's own overflow error: clients that go by the code, not the words, see it as one
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e),
+                                               "param": "messages", "code": "context_length_exceeded"}})
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except ModelBusy as e:                           # the control routes (/v1/load, /v1/vram, ...): 409
