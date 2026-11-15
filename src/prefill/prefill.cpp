@@ -22,6 +22,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/nvfp4.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -1204,7 +1205,9 @@ const MmqPlan& mmq_plan() {
             p.any = true;
             p.canon = p.canon || canon_prefill_layer(lay.fmt[(size_t) l]);
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, ew));
-            p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, ew, 640));
+            // NVFP4: each expert's down slot keeps the blob's tail after its rows (mmq::TailAt)
+            const size_t tail = lay.fmt[(size_t) l].tail_off ? strata::kernels::nvfp4::kTailBytes : 0;
+            p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, ew, 640) + tail);
         }
         // the products' forms timed for each layer's types (Intel's XMX take two), before the int8 and FP16 paths are
         // timed against each other below
@@ -1218,8 +1221,11 @@ const MmqPlan& mmq_plan() {
                     mmq::choose_forms(strata::kernels::iq_mmq_fx(lay.fmt[(size_t) l].d_type), ew, 640, 16, nullptr);
                 }
             }
-        // by the rows a layer's experts average, against this GPU's timing (a latent pack's experts have no FP16 path)
-        if (p.any && mmq_env() < 0 && !lay_latent(lay)) {
+        // by the rows a layer's experts average, against this GPU's timing (a latent pack's experts have no FP16 path,
+        // nor NVFP4's: the FP16 dequantizers do not apply the experts' tail scales)
+        bool tails = false;
+        for (const auto& f : lay.fmt) tails = tails || f.tail_off != 0;
+        if (p.any && mmq_env() < 0 && !lay_latent(lay) && !tails) {
             int64_t first = 0;
             while (!p.layer[(size_t) first]) ++first;
             // as a chunk's layer launches them: MMQ_GROUP experts an int8 launch, each gathered into the group's
@@ -1601,6 +1607,14 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: geometry differs from the artifact's"; return false;
     }
     m.device = strata::core::current_device();
+    {   // NVFP4 experts carry per-expert scales that only the int8 products apply (mmq::swiglu_tails)
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l)
+            if (lay.fmt[l].tail_off != 0 && (l >= mmq_plan().layer.size() || !mmq_plan().layer[l])) {
+                err = "prefill: NVFP4 experts need the int8 products (XESTRATA_PREFILL_MMQ=0, or a GPU without them)";
+                return false;
+            }
+    }
     int64_t tr_last = pf_alloc_trace() ? pf_free_mib() : 0;
     pf_mark("init: start (host sides, then the chunk's buffers)", tr_last);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
@@ -3570,7 +3584,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const int64_t ew = lay.native ? lay.fmt[(size_t) l].n_embd : N;
                         float* const ex_out = m.latent_ ? m.lmmq_yl_ : m.Dm;
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, ew) : 0;
-                        const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, ew, 640) : 0;
+                        // NVFP4: a down slot keeps the expert's tail after its rows (the gathers copy it with them)
+                        const size_t mmq_dmat = use_mmq ? mmq::matrix_bytes(mmq_dt, ew, 640) : 0;
+                        const bool nv_tail = use_mmq && lay.native && lay.fmt[(size_t) l].tail_off != 0;
+                        const size_t mmq_db = mmq_dmat + (nv_tail ? strata::kernels::nvfp4::kTailBytes : 0);
                         host_group_ms += ms_since(t_group);
                         pt.mark(kPfGather, cs);
                         if (use_mmq) {
@@ -3865,10 +3882,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const auto* tabs = reinterpret_cast<const uint8_t* const*>(m.tab_dev);
                                 if (mtab) { gu.wtab = tabs + j0; gu.woff = 0; }
                                 m.mmq_ctx->run(gu, m.cs);
-                                mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs, canon_l);
-                                pt.mark(kPfGemmD, cs);
-                                mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, canon_l ? 32 : 0);
-                                grp_rows_last = nr;
                                 mmq::Product dn;
                                 dn.w = mmq_direct ? ring0 + f.down_off : m.grp_d; dn.type = mmq_dt; dn.w_rows = ew; dn.w_cols = 640;
                                 dn.expert_bytes = mmq_direct ? MMQ_SLOT() : mmq_db;
@@ -3876,7 +3889,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = ex_out + r0 * ew;
                                 dn.ld_dst = ew;
                                 if (mtab) { dn.wtab = tabs + n + j0; dn.woff = 0; }
+                                // NVFP4: the experts' s_gate / s_up into the SwiGLU, s_down on the down rows (after
+                                // each expert's down matrix in every slot form: mmq::TailAt)
+                                const mmq::TailAt tails = mmq::tails_of(dn, mmq_dmat);
+                                if (nv_tail) mmq::swiglu_tails(m.GU, m.H, nr, 640, gu.bounds, ngx, tails, m.cs);
+                                else mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs, canon_l);
+                                pt.mark(kPfGemmD, cs);
+                                mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, canon_l ? 32 : 0);
+                                grp_rows_last = nr;
                                 m.mmq_ctx->run(dn, m.cs);
+                                if (nv_tail) mmq::scale_rows_tails(dn.dst, ew, ew, nr, dn.bounds, ngx, tails, m.cs);
                                 if (mmq_direct) {
                                     const int par = (int) (g % 2);
                                     strata::gpu::event_record(m.mgrp_used[par], m.cs);
@@ -4412,6 +4434,8 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     if (strata::env_get("PREFILL_DUMP_R_ALL")) { why = "a row debug dump (XESTRATA_PREFILL_DUMP_R_ALL)"; return 0; }
     const MmqPlan& mp = mmq_plan();
     if ((int64_t) mp.layer.size() < g.n_layers) { why = "the expert plan has fewer layers than the model"; return 0; }
+    for (const auto& f : strata::kernels::cpu::expert_layout().fmt)   // swiglu_tails is the chunk-major path's
+        if (f.tail_off != 0) { why = "NVFP4 experts (their tail scales)"; return 0; }
     // each layer's experts on the int8 products, or on the FP16 path (a type they lack, or a layer whose experts average
     // more rows than this GPU's int8 products win at: int8_rows_below); the buffers each one needs
     int64_t n_mmq = 0;
