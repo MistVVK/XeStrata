@@ -46,7 +46,8 @@
 // OpenAI's: a PNG whose transparent pixels are where the image changes, the rest kept as the base has it); see
 // img_start.hpp.
 // Adapters (LoRA files, image_lora.hpp: the forms it reads, the plain LoRA's now) are applied at run time,
-// a strength each: the IMG line's LORA:<strength>:<path>, repeated, in the order given.  Their A and B stay on the GPU
+// a strength each (and a factor of it each DiT block, where the word gives them): the IMG line's
+// LORA:<strength>[@<block 0>,<block 1>,...]:<path>, repeated, in the order given.  Their A and B stay on the GPU
 // with the DiT's weights (the budget's fixed part; the IMAGE line says how many, lora_n, and their MiB, lora_mib), and
 // a set that differs from the last request's starts the context again (the prefix's K and V were the other set's).  A
 // model that applies none refuses a request that names one: HunyuanImage 3.0 (it takes no adapters).
@@ -75,9 +76,10 @@
 //                            upscaler's (UPS's) first, then the drawing (its time in ups_s), UPSCOLOR:<m> its color
 //                            correction (UPS's COLOR:); UPS: with CROP: the box enlarged to the drawing's size by that
 //                            upscaler instead of Lanczos (crop_upscale; its time in ups_s);
-//                            LORA:<strength>:<path> an adapter (repeated, in the order given; the strength first, so
-//                            that a path's own colons, as Windows' have, stand; the path's spaces and other separators
-//                            %XX'd, the word's whitespace being the line's);
+//                            LORA:<strength>[@<w0>,<w1>,...]:<path> an adapter (repeated, in the order given; the
+//                            strength first, so that a path's own colons, as Windows' have, stand; the path's spaces
+//                            and other separators %XX'd, the word's whitespace being the line's); @ the strength's
+//                            factor each DiT block (one a block, LoraUse's blocks);
 //                            NEG:<ids, commas> and CFG:<scale> (above 1):
 //                            classifier-free guidance with that negative prompt (its pads as the prompt's); GUID:
 //                            <scale> is HunyuanImage 3.0's guidance token instead (it samples once: no NEG:, no CFG:);
@@ -359,21 +361,41 @@ si::QiRefLayout ref_layout(const std::string& word) {
     throw std::invalid_argument("EDITFMT:<moss|aitk|aitk-nokv|appended>: " + word);
 }
 
-void read_lora(const std::string& word, si::QiRequest& r, Loras& loras) {
-    const std::string rest = word.substr(5);
-    const size_t colon = rest.find(':');
-    const std::string scale = rest.substr(0, colon), path = colon == std::string::npos ? "" : rest.substr(colon + 1);
-    float s = 0.0f;
+// A number that is the whole of `text`, finite: false where it is not.
+bool whole_number(const std::string& text, float& out) {
     size_t used = 0;
     try {
-        s = std::stof(scale, &used);
+        out = std::stof(text, &used);
     } catch (const std::exception&) {
         used = 0;
     }
-    if (scale.empty() || used != scale.size() || !std::isfinite(s))
+    return !text.empty() && used == text.size() && std::isfinite(out);
+}
+
+void read_lora(const std::string& word, si::QiRequest& r, Loras& loras) {
+    const std::string rest = word.substr(5);
+    const size_t colon = rest.find(':');
+    const std::string head = rest.substr(0, colon), path = colon == std::string::npos ? "" : rest.substr(colon + 1);
+    const size_t at = head.find('@');
+    const std::string scale = head.substr(0, at);
+    float s = 0.0f;
+    if (!whole_number(scale, s))
         throw std::invalid_argument("LORA:<strength>:<path>: the strength is not a number: " + word);
+    std::vector<float> blocks;
+    if (at != std::string::npos) {   // @<w0>,<w1>,...: a factor each block, none left out
+        const std::string list = head.substr(at + 1);
+        for (size_t i = 0; i <= list.size();) {
+            const size_t comma = std::min(list.find(',', i), list.size());
+            float b = 0.0f;
+            if (!whole_number(list.substr(i, comma - i), b))
+                throw std::invalid_argument("LORA:<strength>@<w0>,<w1>,...:<path>: a block weight is not a number: " +
+                                            word);
+            blocks.push_back(b);
+            i = comma + 1;
+        }
+    }
     if (path.empty()) throw std::invalid_argument("LORA:<strength>:<path>: no file: " + word);
-    r.loras.push_back({loras.get(decoded_path(path)), s});
+    r.loras.push_back({loras.get(decoded_path(path)), s, std::move(blocks)});
 }
 
 // How a line reads the words it carries: an IMG line's and the command line's take the images themselves, a NEED

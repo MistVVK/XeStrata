@@ -81,6 +81,7 @@ const std::vector<float>& turbo_sigmas() {
 }
 
 QiDit::QiDit() {
+    loras_.block_path = "transformer_blocks.";   // build_lora_targets' blocks (a request's block weights)
     DitLoraHooks& h = loras_.hooks;
     h.drop = [this] { drop_loras(); };
     h.dora_norms = [this](const DitLoraSlot& slot, std::vector<float>& out, std::string& err) {

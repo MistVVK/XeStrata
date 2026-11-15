@@ -65,12 +65,18 @@ public:
     DitLoraHooks hooks;
     /// The blocks' plain LoRAs folded into their weights (the default), else added to each product.
     bool bake = true;
+    /// The path a block's weights' names start with, its number after it ("transformer_blocks.", "layers.",
+    /// "blocks."): what a LoraUse's block factors are read by.
+    std::string block_path;
 
     /// The table: cleared, and a weight's slot added (a weight with no rows, or rows past it, is none).
     void clear_slots() { slots_.clear(); }
     void add(std::string name, DitW& w, int64_t row0, int64_t rows, int64_t src_row = 0, bool biased = false);
     void add(std::string name, DitW& w, bool biased) { add(std::move(name), w, 0, w.n, 0, biased); }
     std::vector<DitLoraTarget> targets() const;
+    /// The block a weight's name is in (block_path's number), -1 outside the blocks; and the blocks the table has.
+    int block_of(const std::string& name) const;
+    int blocks() const;
 
     /// The adapters the next steps apply, each with its strength, bound to the weights' products: a key the DiT does
     /// not take (or a shape that is not its weight's, or a form the engine does not apply) is false with err, and

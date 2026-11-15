@@ -1140,7 +1140,12 @@ std::string lora_key_of(const std::vector<LoraUse>& loras) {
         if (!u.file) continue;
         char num[32];
         std::snprintf(num, sizeof num, "%.7g", (double) u.scale);
-        key += u.file->path() + ":" + num + ";";
+        key += u.file->path() + ":" + num;
+        for (size_t b = 0; b < u.blocks.size(); ++b) {
+            std::snprintf(num, sizeof num, "%.7g", (double) u.blocks[b]);
+            key += (b == 0 ? "@" : ",") + std::string(num);
+        }
+        key += ";";
     }
     return key;
 }
@@ -1166,8 +1171,8 @@ void lora_split(const std::vector<LoraUse>& in, std::vector<LoraUse>& dit, std::
             kept.push_back(k);
             it = kept.end() - 1;
         }
-        if (it->dit) dit.push_back({it->dit, u.scale});
-        if (it->te) te.push_back({it->te, u.scale});
+        if (it->dit) dit.push_back({it->dit, u.scale, u.blocks});
+        if (it->te) te.push_back({it->te, u.scale, {}});   // a text encoder has no DiT blocks
     }
 }
 

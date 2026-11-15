@@ -82,6 +82,7 @@ void q8_0_vec(const uint8_t* w, const float* x, const float* b, float* y, int64_
 using namespace mf_dit_detail;
 
 MfDit::MfDit() {
+    loras_.block_path = "transformer_blocks.";   // build_lora_targets' blocks (a request's block weights)
     DitLoraHooks& h = loras_.hooks;
     h.drop = [this] { drop_loras(); };
     h.dora_norms = [this](const DitLoraSlot& slot, std::vector<float>& out, std::string& err) {
