@@ -22,6 +22,10 @@
 #include "strata/core/reader_room.hpp"
 #include "strata/core/residency_trim.hpp"
 #include "strata/core/kfd_settle.hpp"
+#include "strata/core/kfd_quiet.hpp"
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+#include "strata/kernels/fused_gr.hpp"   // fused_gr_check, called early on an integrated gfx11 (kfd_quiet.hpp, LOAD)
+#endif
 #include "strata/core/page_cache_drop.hpp"
 #include "strata/core/gfx12_chunk.hpp"
 #include "strata/core/nv_chunk.hpp"
@@ -363,6 +367,91 @@ const bool crash_bt_installed = [] {
     return true;
 }();
 }  // namespace
+#endif
+
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+// EXIT (kfd_quiet.hpp), integrated gfx11 under Linux only: SIGTERM / SIGINT / SIGHUP no longer end the process with kernels in flight
+// and the arena registered (the kernel's exit then evicts busy queues: reset 45 on p2006).  The handler only writes the signal's
+// number into a pipe; a thread of its own stops the request, releases the verify windows' GPU waits, waits at most 3 s for the
+// device, drops the arena's registration only when the device finished, and then ends the process by the same signal (the same
+// wait status as before).  Installed only once the card is known to be of that class, only for a signal whose action is still the
+// default (nohup's ignored SIGHUP stays ignored); no signal mask is changed.  A second signal during the stop ends it at once.
+namespace kfdq_exit {
+std::atomic<std::atomic<bool>*> g_stop{nullptr};   // the serve loop's STOP flag while it exists
+int g_pipe[2] = {-1, -1};
+volatile sig_atomic_t g_count = 0;
+int g_dev = 0;
+
+void handler(int sig) {
+    if (strata::core::kfd_quiet::on_signal((int) g_count) == strata::core::kfd_quiet::OnSignal::DefaultAction) {
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
+    g_count = g_count + 1;
+    const unsigned char b = (unsigned char) sig;
+    (void) !write(g_pipe[1], &b, 1);
+}
+
+[[noreturn]] void stop_and_end(int sig) {
+    using clk = std::chrono::steady_clock;
+    const clk::time_point base = clk::now();
+    auto now = [&] { return std::chrono::duration<double>(clk::now() - base).count(); };
+    auto stop = [] { if (std::atomic<bool>* f = g_stop.load()) f->store(true); };
+    auto release = [](int ms) { return strata::core::release_gpu_waits_within(ms); };
+    auto drain = [](int ms) {
+        struct Shared { std::mutex mu; std::condition_variable cv; bool done = false, ok = false; };
+        auto sh = std::make_shared<Shared>();
+        std::thread([sh] {   // may never return on a GPU that hangs: the wait below is bounded, the process ends anyway
+            (void) cudaSetDevice(g_dev);
+            const bool ok = cudaDeviceSynchronize() == cudaSuccess;
+            std::lock_guard<std::mutex> lk(sh->mu);
+            sh->done = true;
+            sh->ok = ok;
+            sh->cv.notify_all();
+        }).detach();
+        std::unique_lock<std::mutex> lk(sh->mu);
+        sh->cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return sh->done; });
+        return sh->done && sh->ok;
+    };
+    int ranges = 0;
+    auto unreg = [&] { ranges = strata::core::unregister_arena_ranges(); };
+    const strata::core::kfd_quiet::TeardownResult r =
+        strata::core::kfd_quiet::teardown(stop, release, drain, unreg, now, strata::core::kfd_quiet::kExitBoundS);
+    if (std::getenv("STRATA_TRACE") != nullptr)
+        std::fprintf(stderr, "strata trace: kfd quiet: signal %d: waits released %s, device drained %s, %d arena ranges unregistered, %.0f ms\n",
+                     sig, r.released ? "yes" : "no", r.drained ? "yes" : "no", ranges, now() * 1000.0);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    signal(sig, SIG_DFL);
+    raise(sig);
+    _exit(128 + sig);
+}
+
+void install(int dev) {
+    g_dev = dev;
+    if (pipe2(g_pipe, O_CLOEXEC) != 0) return;
+    std::thread([] {
+        strata::platform::name_this_thread("strata-stop");
+        unsigned char b = 0;
+        for (;;) {
+            const ssize_t n = read(g_pipe[0], &b, 1);
+            if (n == 1) stop_and_end((int) b);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return;
+        }
+    }).detach();
+    for (int sig : {SIGTERM, SIGINT, SIGHUP}) {
+        struct sigaction old{};
+        if (sigaction(sig, nullptr, &old) != 0 || (old.sa_flags & SA_SIGINFO) || old.sa_handler != SIG_DFL) continue;
+        struct sigaction sa{};
+        sa.sa_handler = handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        (void) sigaction(sig, &sa, nullptr);
+    }
+}
+}  // namespace kfdq_exit
 #endif
 
 
@@ -3499,6 +3588,21 @@ int main(int argc, char** argv) {
     if (std::getenv("STRATA_ARENA_MMAP") && std::getenv("STRATA_ARENA_MMAP")[0] == '1')
         setenv("GPU_PINNED_MIN_XFER_SIZE", "1000000", 0);   // MiB; an explicit setting wins
 #endif
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+    // XFER (kfd_quiet.hpp): on an integrated gfx11 (every GPU node of the KFD topology a gfx1103 / gfx1150 / gfx1151: the class is
+    // read from the topology files, since the device properties need HIP up) the same setting by default, so that no pageable
+    // source of a copy (the check's vectors at load, the lent refill's blobs without a registered arena) becomes a userptr the
+    // kernel can move under a running dispatch.  A value the caller set wins; STRATA_KFD_QUIET(_XFER)=0 sets nothing.
+    {
+        const bool cls = strata::core::kfd_quiet::nodes_in_class(strata::core::kfd_quiet::read_topology("/sys/class/kfd/kfd/topology/nodes"));
+        if (const char* v = strata::core::kfd_quiet::xfer_value(cls, std::getenv("STRATA_KFD_QUIET"), std::getenv("STRATA_KFD_QUIET_XFER"),
+                                                               std::getenv("GPU_PINNED_MIN_XFER_SIZE"))) {
+            setenv("GPU_PINNED_MIN_XFER_SIZE", v, 0);
+            if (std::getenv("STRATA_TRACE") != nullptr)
+                std::fprintf(stderr, "strata trace: kfd quiet: GPU_PINNED_MIN_XFER_SIZE=%s (pageable copies staged by the runtime)\n", v);
+        }
+    }
+#endif
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
@@ -4017,6 +4121,32 @@ int main(int argc, char** argv) {
             // and before READY it waits until its own KFD eviction counter has been quiet for 2 s (kfd_settle.hpp)
             if (strata::core::igpu_kfd_settle_default(ad.gcnArchName, all_igpu, win_host))
                 strata::core::kfd_settle_flag().store(true);
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+            // and the KFD is not provoked while our queues are busy (kfd_quiet.hpp): the same device class, HIP under Linux only
+            if (strata::core::igpu_kfd_settle_default(ad.gcnArchName, all_igpu, win_host)) {
+                strata::core::kfd_quiet::class_flag().store(true);
+                // NOREG: the expert arena takes the unregistered path above (UMA mode) by default on this class, without mlock: with the
+                // arena registered, the first request reset the 780M on its first start (p2006, 11-15, three fixes in); unregistered, 12 of
+                // 12 starts ran clean.  STRATA_ARENA_PIN_GIB set by the user (or STRATA_UMA_REGISTER=1) wins; STRATA_KFD_QUIET_NOREG=0 registers.
+                if (strata::core::kfd_quiet::noreg_default(true, std::getenv("STRATA_KFD_QUIET"), std::getenv("STRATA_KFD_QUIET_NOREG"),
+                                                           std::getenv("STRATA_UMA_REGISTER"))) {
+                    strata::core::arena_uma_no_register_flag().store(true);
+                    strata::core::kfd_quiet::noreg_flag().store(true);
+                    if (std::getenv("STRATA_TRACE") != nullptr)
+                        std::fprintf(stderr, "strata trace: kfd quiet: expert arena not registered with the driver, no mlock (%s)\n",
+                                     strata::core::arena_no_register() ? "in effect" : "STRATA_ARENA_PIN_GIB set: registered as it says");
+                }
+                if (std::getenv("STRATA_TRACE") != nullptr && strata::core::kfd_quiet::on(strata::core::kfd_quiet::Fix::Load))
+                    std::fprintf(stderr, "strata trace: kfd quiet: load order active (check first, settle after the expert cache, first prompt's buffers at init)\n");
+                if (strata::core::kfd_quiet::on(strata::core::kfd_quiet::Fix::Exit)) {
+                    int cur = 0;
+                    if (cudaGetDevice(&cur) != cudaSuccess) { cur = 0; (void) cudaGetLastError(); }
+                    kfdq_exit::install(cur);
+                    if (std::getenv("STRATA_TRACE") != nullptr)
+                        std::fprintf(stderr, "strata trace: kfd quiet: stop on SIGTERM / SIGINT / SIGHUP drains the GPU first (at most 3 s)\n");
+                }
+            }
+#endif
             // and the file cache of the model files is given back while the expert arena is read and after it (page_cache_drop.hpp):
             // the little free memory left beside the arena, the GPU's buffers and that cache is what makes the kernel's proactive compaction run
             if (strata::core::igpu_cache_drop_default(ad.gcnArchName, all_igpu, win_host))
@@ -7829,6 +7959,12 @@ int main(int argc, char** argv) {
         const char* name = named && p.name[0] ? p.name : "(an unnamed GPU)";
 #if defined(STRATA_USE_HIP)
         std::fprintf(stderr, "strata generate: GPU %d: %s (%s)\n", dev, name, named ? p.gcnArchName : "?");
+#if defined(__linux__)
+        // integrated gfx11 (kfd_quiet.hpp, LOAD): the hyper-connection check now, before the expert arena exists and before the warm
+        // thread starts, instead of in Verifier::init after the 7.7 GiB expert cache was allocated (it then finds it done).  Its
+        // result depends on the card and STRATA_HC_SPLIT only (random weights, compared bit for bit), so it is the same here.
+        if (named && strata::core::kfd_quiet::load_moves().hc_check_early) strata::kernels::fused_gr_check();
+#endif
         // the first prompt's one-time hipBLAS library loads (about 2.5 s), done on a thread while the expert arena loads
         if (named) g_warm_thr = std::thread([dev] { strata::prefill::warm_gemm_libraries(dev); });
         // (RDNA4's matrix-core prompt attention is the default since 148-amd: the engine says so once, at its first prompt;
@@ -8718,6 +8854,42 @@ int main(int argc, char** argv) {
         }
 #endif
     }
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+    // LEND (kfd_quiet.hpp), integrated gfx11 under Linux: the prompt path keeps its own buffers instead of lending cache slots, the
+    // rule of the Strix Halo on Windows (0.2.8, above) for this class.  Every lent slot is copied back from the host arena after each
+    // prompt: 1,967 slots (2.53 GiB) on p2006, +1.1-1.4 s on every short prompt with the arena unregistered (11-15).  Decided HERE,
+    // after the cache was sized as with a loan, so the cache keeps the slots it gets today (--expert-cache N or the auto size); the
+    // own buffers then must fit in what the driver reports free beside it (AUTO NO-BORROW's arithmetic), else the loan stays.  The
+    // chunk is the one the loan would have used (no drop to 2,048).  Off by default (kNoLendDefaultOn); STRATA_KFD_QUIET_LEND=1 turns
+    // it on, =0 or STRATA_PREFILL_BORROW=1 keeps the loan.
+    if (pf_borrow && o.prefill_chunk > 0 &&
+        strata::core::kfd_quiet::lend_rule_on(strata::core::kfd_quiet::class_flag().load(std::memory_order_relaxed), std::getenv("STRATA_KFD_QUIET"),
+                                              std::getenv("STRATA_KFD_QUIET_LEND"), std::getenv("STRATA_PREFILL_BORROW"))) {
+        const bool one_gpu = !multi_gpu && stages.empty() && o.peer_device < 1 &&
+                             std::none_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(), [](int n) { return n > 0; });
+        uint64_t cache_b = 0;
+        if (!sized_slots.empty())
+            for (const int64_t sb : sized_slots) cache_b += (uint64_t) strata::core::ExpertCache::slot_stride(sb, slot_guard);
+        else
+            cache_b = (uint64_t) std::max(o.expert_cache, 0) * (uint64_t) nibble_max_slot_bytes();
+        const int64_t own_mib = ((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, o.prefill_chunk, srcp != nullptr) >> 20) + 64;
+        const size_t fb = strata::core::device_free_bytes();
+        const int64_t room_mib = fb > cache_b ? (int64_t) ((fb - cache_b) >> 20) - o.vram_reserve_mib - (int64_t) (pipe_first >> 20) : 0;
+        const strata::core::kfd_quiet::NoLend nl = strata::core::kfd_quiet::no_lend_pick(true, pf_borrow, one_gpu, o.prefill_chunk, room_mib, own_mib);
+        if (std::getenv("STRATA_TRACE") != nullptr)
+            std::fprintf(stderr, "strata trace: kfd quiet: prompt path without a loan: %s (own buffers %lld MiB for a %lld-token chunk, %lld MiB free "
+                                 "beside the %d-slot cache and the %d MiB reserve, %lld kept)\n",
+                         nl.no_lend ? "yes" : !one_gpu ? "no, not one GPU" : !nl.fits ? "no, they do not fit" : "no",
+                         (long long) own_mib, (long long) o.prefill_chunk, (long long) room_mib, o.expert_cache, o.vram_reserve_mib,
+                         (long long) strata::core::kfd_quiet::kNoLendKeepMib);
+        if (nl.no_lend) {
+            o.no_prefill_borrow = true;
+            pf_borrow = false;
+            o.prefill_auto = false;
+            o.prefill_chunk = nl.chunk;
+        }
+    }
+#endif
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL) && !defined(_WIN32)
     // 0.2.10.1 (round0212 item 7): the FP16 weight cache is on when the engine runs batch slots on Linux CUDA.  Bit-exact against the uncached
     // form (gemm_w16_parity, greedy identity 12/12, first-token KL 0); +3.8% (c=1) .. +6.6% (c=8) total tokens/s on l620.  It takes only VRAM beyond
@@ -8883,6 +9055,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
         }
     }
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+    // integrated gfx11 (kfd_quiet.hpp, LOAD): the expert cache's GPU memory was just allocated (7.7 GiB on a 780M) and the kernel moves
+    // pages after such a step; the profile fill, the graph capture and the first GPU work wait until the process's KFD eviction
+    // counter has been quiet for 2 s (at most 10 s; nothing where the counter cannot be read; STRATA_NO_KFD_SETTLE=1 also turns it off)
+    if (strata::core::kfd_quiet::load_moves().settle_after_cache) strata::core::kfd_settle::settle_before_ready();
+#endif
     // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
@@ -14709,6 +14887,9 @@ int main(int argc, char** argv) {
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+        kfdq_exit::g_stop.store(&stop_req);   // EXIT (kfd_quiet.hpp): a signal ends the running request like STOP (nothing without the handler)
+#endif
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
         // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
@@ -14954,6 +15135,25 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+        // integrated gfx11 (kfd_quiet.hpp, LOAD): one staged copy each way on the null stream (the stream of the lent refill and of
+        // the cache's blocking fills), from and into pageable memory, so that the runtime makes its staging buffer and copy path now,
+        // before the settle below, and not inside the first request (p2006: +10-15 MiB of GTT in 3-5 steps there, every mode).  The
+        // device buffer is kept for the run (a free later would be one more driver event); nothing reads it.  Failures are ignored.
+        if (strata::core::kfd_quiet::load_moves().staged_copy_warm) {
+            static void* warm_dev = nullptr;
+            const size_t wn = strata::core::kfd_quiet::kStagedWarmBytes;
+            if (warm_dev == nullptr && cudaMalloc(&warm_dev, wn) != cudaSuccess) warm_dev = nullptr;
+            if (warm_dev != nullptr) {
+                std::vector<unsigned char> wh(wn, 0);
+                if (cudaMemcpy(warm_dev, wh.data(), wn, cudaMemcpyHostToDevice) == cudaSuccess)
+                    (void) cudaMemcpy(wh.data(), warm_dev, wn, cudaMemcpyDeviceToHost);
+            }
+            (void) cudaGetLastError();
+            if (std::getenv("STRATA_TRACE") != nullptr)
+                std::fprintf(stderr, "strata trace: kfd quiet: staged copy before READY %s\n", warm_dev != nullptr ? "done" : "skipped (no device memory)");
+        }
+#endif
         strata::core::kfd_settle::settle_before_ready();   // integrated gfx11 under Linux: until the kernel has stopped moving the registered arena (nothing elsewhere)
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
         // ---- window warm-up (lane DRAFT-COSTS): the first run of a window width builds its graph / pipeline (srv118 CUDA: a capture; Metal: the first execution), so a
@@ -21330,6 +21530,9 @@ int main(int argc, char** argv) {
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+        kfdq_exit::g_stop.store(nullptr);   // the flag goes with this scope
+#endif
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
         // locking that mutex once this scope has destroyed it throws (the engine ended with an abort): end here
