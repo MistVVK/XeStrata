@@ -59,6 +59,11 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME controller_test COMMAND controller_test)
   add_executable(draft_policy_test src/spec/draft_policy_test.cpp)
   target_link_libraries(draft_policy_test PRIVATE strata_spec)
+  if(MSVC)
+    # main keeps about 50 DraftPolicy objects (14.6 KB each) in its blocks, and MSVC gives each block its own stack slots: more
+    # than the 1 MiB stack a Windows program gets by default (stack overflow, 0xC00000FD).  8 MiB, as a Linux main thread has.
+    target_link_options(draft_policy_test PRIVATE /STACK:8388608)
+  endif()
   add_test(NAME draft_policy_test COMMAND draft_policy_test)
   add_executable(window_rule_test src/spec/window_rule_test.cpp)   # which rule picks the window / whose q judges it, by the active draft source
   target_include_directories(window_rule_test PRIVATE include)

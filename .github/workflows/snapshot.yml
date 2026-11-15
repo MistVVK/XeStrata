@@ -48,11 +48,19 @@ jobs:
   snapshot:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-2022]
+        # GitHub's Windows runner runs this suite about 5x slower than a desktop PC (many small files and Node starts): since 0.2.14 (51 tests,
+        # about 1,000 simulated launches) it reached test 43-45 of 51 in tools/check's 900 s (runs 43742804362, 43754922177), while the owner PC
+        # runs all 51 in 3m20s and Linux CI in 4m25s.  Twice the step's time there; Linux keeps 900 s.
+        include:
+          - os: ubuntu-24.04
+            timeout_scale: 1
+          - os: windows-2022
+            timeout_scale: 2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,7 +81,7 @@ jobs:
         working-directory: apps/host
         run: npm ci --no-audit --no-fund
       - name: tools/check snapshot
-        run: python tools/check --only snapshot --keep --scratch "${{ runner.temp }}/check"
+        run: python tools/check --only snapshot --keep --scratch "${{ runner.temp }}/check" --timeout-scale ${{ matrix.timeout_scale }}
       - name: Logs
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4

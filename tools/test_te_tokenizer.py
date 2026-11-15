@@ -37,7 +37,7 @@ class TokenizerMatchesSdcpp(unittest.TestCase):
             raise AssertionError("build failed:\n" + r.stderr[-4000:])
         cls.cases = json.loads((DATA / "te_tok_expected.json").read_text())
         lines = [f"{c['name']} {base64.b64decode(c['prompt_b64']).hex()}" for c in cls.cases]
-        (d / "cases.txt").write_text("\n".join(lines) + "\n")
+        (d / "cases.txt").write_text("\n".join(lines) + "\n", newline="\n")      # read byte for byte: no CR on Windows
         r = subprocess.run([str(cls.exe), "run", str(DATA / "te_tok_merges.txt"), str(d / "cases.txt"), str(d / "out.txt")],
                            capture_output=True, text=True, timeout=600)
         if r.returncode != 0:
