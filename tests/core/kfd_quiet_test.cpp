@@ -113,8 +113,10 @@ void topology() {
         const std::vector<Node> v = read_topology(root);
         CHECK(v.size() == 2);
         CHECK(nodes_in_class(v));
+        CHECK(nodes_in_noreg_class(v));
         put(root + "/2/properties", k7900);
         CHECK(!nodes_in_class(read_topology(root)));
+        CHECK(!nodes_in_noreg_class(read_topology(root)));
         CHECK(read_topology(root + "/none").empty());
         for (const char* p : {"/0/properties", "/1/properties", "/2/properties", "/README"}) std::remove((root + p).c_str());
         for (const char* p : {"/0", "/1", "/2", ""}) rmdir((root + p).c_str());
@@ -202,6 +204,43 @@ void noreg() {
     CHECK(!noreg_default(true, "0", nullptr, nullptr));        // STRATA_KFD_QUIET=0
     CHECK(!noreg_default(true, nullptr, "0", nullptr));        // STRATA_KFD_QUIET_NOREG=0
     CHECK(!noreg_default(true, nullptr, nullptr, "1"));        // STRATA_UMA_REGISTER=1
+    // NOREG's own class: the Radeon 780M class only (gfx1103 = 110003); Strix Point, Strix Halo and discrete cards stay registered
+    auto noreg_cls = [](const std::vector<const char*>& texts) {
+        std::vector<Node> v;
+        for (const char* t : texts) v.push_back(parse_node_properties(t));
+        return nodes_in_noreg_class(v);
+    };
+    auto noreg_on = [&](const std::vector<const char*>& texts) { return noreg_default(noreg_cls(texts), nullptr, nullptr, nullptr); };
+    CHECK(gfx_in_noreg_class(110003));
+    CHECK(!gfx_in_noreg_class(110500));
+    CHECK(!gfx_in_noreg_class(110501));
+    CHECK(!gfx_in_noreg_class(110000));
+    CHECK(!gfx_in_noreg_class(120001));
+    CHECK(noreg_on({kCpuNode, k780M}));             // 110003: unregistered
+    CHECK(!noreg_on({kCpuNode, k890M}));            // 110500: registered
+    CHECK(!noreg_on({kCpuNode, k8060S}));           // 110501: registered
+    CHECK(!noreg_on({kCpuNode, k7900}));            // a discrete card: unchanged (registered)
+    CHECK(!noreg_on({kCpuNode, kR9700}));
+    CHECK(!noreg_on({kCpuNode, k780M, k7900}));     // a 780M beside a discrete card: registered, as before
+    CHECK(!noreg_on({kCpuNode, k780M, k890M}));     // every GPU node must be a gfx1103
+    CHECK(!noreg_on({}));
+    CHECK(!noreg_on({kCpuNode}));
+    // the switches still win on the 780M: STRATA_KFD_QUIET_NOREG=0 / STRATA_KFD_QUIET=0 / STRATA_UMA_REGISTER=1 register
+    CHECK(!noreg_default(noreg_cls({kCpuNode, k780M}), nullptr, "0", nullptr));
+    CHECK(!noreg_default(noreg_cls({kCpuNode, k780M}), "0", nullptr, nullptr));
+    CHECK(!noreg_default(noreg_cls({kCpuNode, k780M}), nullptr, nullptr, "1"));
+    // the user's STRATA_ARENA_PIN_GIB wins over the class default both ways
+    CHECK(arena_unregistered(nullptr, noreg_on({kCpuNode, k780M})));
+    CHECK(!arena_unregistered("0", noreg_on({kCpuNode, k780M})));
+    CHECK(!arena_unregistered(nullptr, noreg_on({kCpuNode, k8060S})));
+    CHECK(arena_unregistered("none", noreg_on({kCpuNode, k8060S})));
+    // LOAD / EXIT / XFER keep the whole integrated gfx11 class
+    auto cls = [](const std::vector<const char*>& texts) {
+        std::vector<Node> v;
+        for (const char* t : texts) v.push_back(parse_node_properties(t));
+        return nodes_in_class(v);
+    };
+    CHECK(cls({kCpuNode, k780M}) && cls({kCpuNode, k890M}) && cls({kCpuNode, k8060S}));
     // the arena's mode: the user's STRATA_ARENA_PIN_GIB wins both ways; unset or empty, the engine's flag
     CHECK(arena_unregistered(nullptr, true));
     CHECK(arena_unregistered("", true));

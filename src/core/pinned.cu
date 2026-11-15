@@ -5,7 +5,7 @@
 #include "strata/core/arch_defaults.hpp"   // arena_skip_thp_request
 #include "strata/core/page_cache_drop.hpp"   // drop_range (the drop behind the arena read, Linux)
 #if defined(STRATA_USE_HIP) && defined(__linux__)   // kfd_quiet NOREG scope: Linux HIP only, every other build keeps its old text
-#include "strata/core/kfd_quiet.hpp"   // NOREG: the arena's mode and its lock (integrated gfx11, Linux HIP)
+#include "strata/core/kfd_quiet.hpp"   // NOREG: the arena's mode and its lock (the Radeon 780M class, Linux HIP)
 #endif
 #include <cstddef>
 
@@ -799,7 +799,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         slice_bytes = 1;   // "sliced" with no slice registered: the destructor unlocks from offset registered_bytes (0)
         const char* env = std::getenv("STRATA_ARENA_LOCK");
 #if defined(STRATA_USE_HIP) && defined(__linux__)   // kfd_quiet NOREG scope: Linux HIP only, every other build keeps its old text
-        // (kfd_quiet.hpp NOREG, integrated gfx11 under Linux: when the engine chose this mode, no mlock is tried and nothing is said
+        // (kfd_quiet.hpp NOREG, the Radeon 780M class under Linux: when the engine chose this mode, no mlock is tried and nothing is said
         // about it; a STRATA_ARENA_LOCK the user set decides as before)
         const bool noreg = strata::core::kfd_quiet::noreg_flag().load(std::memory_order_relaxed);
         if (backing == PageBacking::LargePages) {
