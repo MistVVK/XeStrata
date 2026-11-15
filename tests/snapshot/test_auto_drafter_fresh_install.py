@@ -144,9 +144,34 @@ class SavedOffHolds(unittest.TestCase):
         for m in MACHINES:
             for s in MODEL_SETS:
                 with self.subTest(machine=m.key, set=s.key):
-                    recs = launches(m, s, [("auto", False), ("off", False), (None, False)])
+                    recs = launches(m, s, [("auto", False), ("off", False), (None, False), (None, False)])
                     self.assertEqual(drafter(recs[1]), "off")
-                    self.assertEqual(recs[2]["engine"]["argv"], recs[1]["engine"]["argv"], "the Off of the launch before holds")
+                    for later in recs[2:]:
+                        self.assertEqual(later["engine"]["argv"], recs[1]["engine"]["argv"], "the Off of the launch before holds")
+                        self.assertEqual(later["config_file"].get("drafting"), "off", "the start without a word does not overwrite the saved Off")
+
+    def test_the_plan_after_a_saved_off_says_off(self):
+        # 0.2.14 OWNER-CELL, RTX 5070 IQ3_S: after `--drafting off`, the plan of a launch without a word said "drafting  MTP" and the engine loaded the MTP
+        from tests.snapshot.driver import run_cli
+        from tests.snapshot.test_drafting_round_trip import launches  # noqa: F401
+        from tests.snapshot.world import context_for
+        for mkey, skey in (("nv_12gb_streaming", "iq3_s"), ("strix_halo_win", "ud_q4_k_xl")):
+            with self.subTest(machine=mkey, set=skey):
+                m, s = get_machine(mkey), get_set(skey)
+                world = World(m, s).build()
+                try:
+                    with world.patched():
+                        self.assertNotIn("failed", drive_launch(world, ("--drafting", "off")))
+                        from strata_cli.launch import catalog as C
+                        from unittest import mock
+                        cat = C.Catalog(root=world.install, hardware=world.hardware_report())
+                        with mock.patch.object(C, "Catalog", lambda *a, **k: cat):
+                            code, out, _err = run_cli(["launch", "--model", s.model, "--plan", "--no-tui", "--context", str(context_for(m, s))])
+                    line = next((l for l in out.splitlines() if "rafting" in l), "")
+                    self.assertEqual(code, 0, out[-400:])
+                    self.assertIn("Off", line, out[-600:])
+                finally:
+                    world.close()
 
 
 if __name__ == "__main__":
