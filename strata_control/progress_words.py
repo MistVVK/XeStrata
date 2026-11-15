@@ -100,8 +100,10 @@ def describe(step: int | None, lines: list[str], download: dict | None = None) -
             return Words("draft", "Preparing the draft layer")
         if "mtp_fetch.py" in low or "mtp draft layer:" in low or "of mtp tensors" in low:
             return Words("draft_download", "Downloading the draft layer (about 5 GB; it makes answers about twice as fast)")
-        if "mtp_rt.py" in low or "mtp_pack.py" in low or "[ok] model prepared" in low:
+        if "mtp_rt.py" in low or "mtp_pack.py" in low:
             return Words("draft", "Preparing the draft layer")
+        if "[ok] model prepared" in low:                    # the model is prepared and no draft-layer step ran after it (Off, DFlash2, offline, the layer already here
+            return Words("pack", "Preparing your model for Strata (one time)")     # says "[ok] MTP draft layer" above): the model-preparation words, not the draft layer's
         if "strata_pack.py" in low or "converting the q2_0 experts" in low:
             return Words("pack", "Packing the model's experts for your processor (one time, a few minutes)")
         if "pack_index.py" in low:

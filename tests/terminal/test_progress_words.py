@@ -100,6 +100,14 @@ class StepWords(unittest.TestCase):
         p, label, phase = prog(HEAD + STEP5 + STEP6 + fetch + ["  > python tools/mtp_rt.py --gguf g --out rt"])
         self.assertEqual(phase, "draft")
 
+    def test_step_six_without_a_draft_layer_step_is_not_the_draft_layer(self):
+        # 0.2.14 (l620 offline / Off / Auto, Boston): every launch showed "Preparing the draft layer" after "[ok] model prepared", with no draft layer touched
+        for after in ([], ["  [ok] the draft layer (MTP) is off: its ~5 GB are not downloaded (`--mtp on` fetches it later)"],
+                      ["  [ok] DFlash2 is the drafter: the MTP draft layer's ~5 GB are not downloaded (choosing the MTP later fetches it once)"]):
+            with self.subTest(after=after):
+                p, label, phase = prog(HEAD + STEP5 + STEP6 + ["  [ok] model prepared: y", *after])
+                self.assertEqual((label, phase), ("Preparing your model for Strata (one time)", "pack"))
+
     def test_step_six_with_everything_already_there(self):
         lines = HEAD + STEP5 + STEP6 + ["  [ok] model prepared: y", "  [ok] MTP draft layer: z"]
         self.assertEqual(prog(lines)[2], "draft")
