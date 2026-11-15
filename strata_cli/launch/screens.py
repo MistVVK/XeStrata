@@ -1397,8 +1397,20 @@ class AccessScreen(Base):
         yield Input(id="portfield", classes="field", disabled=True)
 
     def on_mount(self) -> None:
+        # #5812: the key this launch had when the step opened, and the one moving the highlight made (None: none made)
+        self._entry_key, self._cursor_key = self.ctx.settings.api_key, None
         self.build()
         self.paint()
+
+    def drop_cursor_key(self) -> bool:
+        """Back on 'This computer only': a key that only moving the highlight made goes again, so a local launch keeps none (#5812).
+        A key the person made (k, t), gave (--api-key) or had before this step stays."""
+        s = self.ctx.settings
+        made = getattr(self, "_cursor_key", None)
+        if made is None or s.api_key != made:
+            return False
+        s.api_key, self._cursor_key = getattr(self, "_entry_key", None), None
+        return True
 
     def build(self) -> None:
         s = self.ctx.settings
@@ -1448,8 +1460,11 @@ class AccessScreen(Base):
         kind = self.menu().current.key
         s = self.ctx.settings
         s.access = kind
-        if kind != "local" and not s.api_key and not s.no_key:
+        if kind == "local" and self.drop_cursor_key():
+            self.say("")
+        elif kind != "local" and not s.api_key and not s.no_key:
             s.api_key = acc.kept_key() or acc.new_key()
+            self._cursor_key = s.api_key
             self.say("An API key was made for you (recommended beyond this computer). Press t if you want no key.")
         elif kind != "local" and s.no_key:
             self.say(S.NO_KEY_PUBLIC if kind == "cloudflare" else S.NO_KEY_NETWORK, True)
@@ -1497,7 +1512,9 @@ class AccessScreen(Base):
     def commit(self) -> None:
         s = self.ctx.settings
         s.access = self.menu().current.key
-        if s.access != "local" and not s.api_key and not s.no_key:
+        if s.access == "local":
+            self.drop_cursor_key()
+        elif not s.api_key and not s.no_key:
             s.api_key = acc.kept_key() or acc.new_key()
 
     def action_back(self) -> None:
