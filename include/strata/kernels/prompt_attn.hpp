@@ -41,7 +41,8 @@ bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_
 /// qsa_dense_attn_batch) on the stream's GPU, once a GPU, shape and format, over dummy chunks after 8K and up to 64K of
 /// `max_cells` cells, and keeps the fastest of each for prompt_attn, which takes the one nearer a chunk's length; a
 /// line to stderr says what it chose.  It allocates and synchronizes: call it before the cache takes its VRAM.
-/// Untimed, prompt_attn takes the matrix engines' kernel where the GPU has one.
-void prompt_attn_tune(const QsaShapes& s, int pool_format, int64_t max_cells, void* stream);
+/// Untimed, prompt_attn takes the matrix engines' kernel where the GPU has one.  `timed` false: no timing, the maker's
+/// kernel kept (the matrix engines' where it does not take a shape), its buffers taken now as the timing takes them.
+void prompt_attn_tune(const QsaShapes& s, int pool_format, int64_t max_cells, void* stream, bool timed = true);
 
 }  // namespace strata::kernels

@@ -112,6 +112,15 @@ bool mapped(size_t bytes, void** h, void** d) {
     return strata::gpu::device_pointer(d, *h);
 }
 
+// Whether the start's timings (the prompt attention's kernel, the experts' int8 rows) are left out: ROCm with the KV
+// streamed (--kv-resident).  There a timing's buffers, allocated and freed, left a mapping a later kernel faulted on
+// ("Page not present", llm-jp-4.1 int8 64K five starts of five; at 128K the start failed or hung) and without them
+// it started every time (RX 9060 XT, ROCm 7.14, 2026-11-15); why is not known.  Without the stream the timings
+// ran as they always had.  The untimed choices: the maker's attention, the int8 products at every size.
+bool timings_left_out(bool kv_streams) {
+    return kv_streams && Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_hip;
+}
+
 }  // namespace
 
 PlainModel::PlainModel() = default;
@@ -1344,7 +1353,7 @@ bool PlainModel::load_qwen(std::string& err) {
     // as the VRAM is free; GLM-5.3-Flash's prompt takes its own (plain_prompt_glm5.cpp)
     if (opt_.prompt_chunk > 0 && !glm_)
         k::prompt_attn_tune(qs, opt_.kv_tcq != 0 ? 4 : opt_.kv_q4 == 1 ? 2 : opt_.kv_q4 == 2 ? 3 : opt_.kv_int8 ? 1 : 0,
-                            opt_.max_cells, cs_);
+                            opt_.max_cells, cs_, !timings_left_out(kv_stream_slots_ > 0));
     {
         const size_t cells = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
         k_pool_.assign((size_t) n_attn, nullptr);
@@ -1590,11 +1599,7 @@ int64_t PlainModel::prompt_int8_below() const {
     if (const char* v = strata::env_get("PLAIN_MMQ"); v != nullptr && v[0] != '\0') return INT64_MAX;
     const auto& lay = k::cpu::expert_layout();
     if (dense_ || spec_.n_expert <= 0 || !lay.native || lay.fmt.empty()) return INT64_MAX;
-    // ROCm (RX 9060 XT): the expert products' timing probe, like the prompt attention's, leaves a not-present
-    // mapping that faults/hangs the start when the KV streams a large host copy (llm-jp 128K, 2026-11-15).  Skip
-    // the timing on HIP (both arms, so streaming and resident take the same int8 products and the same answer);
-    // the int8 products run at every size (the untimed default).
-    if (core::Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_hip) return INT64_MAX;
+    if (timings_left_out(kv_stream_slots_ > 0)) return INT64_MAX;   // int8 at every size, untimed
     // as prompt_routed launches them: the experts in VRAM in one int8 launch, kGroup a launch on the FP16 path
     prefill::mmq::ExpertLaunches launches;
     launches.n_expert = spec_.n_expert;
