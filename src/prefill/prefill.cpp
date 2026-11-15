@@ -522,6 +522,29 @@ inline bool trellis_cuda_all_fused() {
     return false;
 #endif
 }
+// The gfx12 set on Windows gfx1151 (one card, stream_floor_class_measured()): a build without MMQ (STRATA_PF_OWN_ONLY) loading a native pack whose every layer is a trellis pair that the fused kernels
+// take (layers_all_fused_only()).  On gfx1151 the fused kernels take the trellis pair only where fused_tq_hip.hpp device_on says so (STRATA_PF_TQ_G1151), so with the switch off this is false.  Below the
+// 1,024 floor the staged fused entry does not take Gyro-S's Hadamard-folded layers and every chunk ran on the FP16 path (256 tokens 1,914 ms against 726 ms in 0.2.13): the floor goes to 64
+// (stream_floor_rule.hpp) and --short-read keeps 64 (staged_fo_rule.hpp).  False in a build with MMQ, on Linux, on every other card, and without a loaded layout.
+inline bool trellis_g1151_all_fused() {
+#if defined(STRATA_PF_OWN_ONLY) && defined(STRATA_USE_HIP) && defined(_WIN32)
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return false;
+    for (const auto& f : lay.fmt)
+        if (f.gu_type < (int) strata::quant::Type::TQ2_T || f.gu_type > (int) strata::quant::Type::TQP7) return false;   // not a trellis gate/up
+    return stream_floor_class_measured() && layers_all_fused_only();
+#else
+    return false;
+#endif
+}
+// a layer of the loaded native pack is Hadamard-folded (its gate/up or its down): the staged fused entry (fz_staged) does not take such a layer
+inline bool layers_any_folded() {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native) return false;
+    for (const auto& f : lay.fmt)
+        if (f.had_gu || f.had_d) return true;
+    return false;
+}
 #if defined(STRATA_PF_OWN_ONLY)
 // The two start-up lines of a build without MMQ that name the long-prompt floor ("prompt pieces of N tokens or more read on the fused kernels ..." when the pack's own floor is
 // cached, and "prompt kernels: chunks of N tokens or more ..." when the plan is made) are printed once arm_cpu_share has run (own_only_line.hpp OwnOnlyLineDeferred), with
@@ -540,7 +563,7 @@ inline int64_t default_stream_floor() {
     const bool plain = plain_pack_all_fused();   // a build without MMQ and a non-native pack on the fused kernels: no staged entry or int8 path exists for its layout (stream_floor_rule.hpp)
     if ((!lay.native || lay.fmt.empty()) && !plain) return strata::prefill::kStreamFloorDefault;
     const bool cls = !plain && stream_floor_class_measured();
-    int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on(), plain, trellis_gfx12_all_fused(), trellis_cuda_all_fused());
+    int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on(), plain, trellis_gfx12_all_fused(), trellis_cuda_all_fused(), !plain && trellis_g1151_all_fused());
 #if !defined(STRATA_USE_HIP) && !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     // the card's counts are not known yet (set_card_expert_share has not run) and the rule is not switched off: the default, not cached
     if (v == strata::prefill::kStreamFloorDefault && switch_point_env() != 0 && !switch_point_known()) return v;
@@ -3341,7 +3364,7 @@ int64_t Prefill::short_read_default(int64_t base) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return base;
     const bool cls = stream_floor_class_measured();
-    return strata::prefill::short_read_default(base, cls, cls && layers_all_fused_only(), staged_fo_on());
+    return strata::prefill::short_read_default(base, cls, cls && layers_all_fused_only(), staged_fo_on(), trellis_g1151_all_fused() && layers_any_folded());
 }
 void Prefill::set_card_expert_share(int64_t resident_slots, int64_t total_pairs, double blob_mb, double link_gbps) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)

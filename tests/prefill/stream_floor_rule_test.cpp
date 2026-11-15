@@ -50,6 +50,16 @@ int main() {
     // without the flag (a build with MMQ, another card, another format set) the rows above stand
     CHECK(stream_floor_default(false, false, true, false, false) == kStreamFloorDefault);
     CHECK(stream_floor_default(false, true, true, false, false) == kStreamFloorDefault);
+    // Windows gfx1151, an all-trellis set on the fused kernels (STRATA_PF_TQ_G1151 on, a build without MMQ): the gfx12 floor, with the staged entry on or off
+    CHECK(stream_floor_default(true, true, true, false, false, false, true) == kFusedOnlyFloor);
+    CHECK(stream_floor_default(true, true, false, false, false, false, true) == kFusedOnlyFloor);
+    // the same class and set with the flag false (switch off, Linux, a build with MMQ, another format set): the rows above stand
+    CHECK(stream_floor_default(true, true, true, false, false, false, false) == kStreamFloorDefault);
+    CHECK(stream_floor_default(true, false, false, false, false, false, false) == kStreamFloorDefault);
+    CHECK(stream_floor_default(false, false, false, false, false, false, false) == kStreamFloorDefault);
+    // the gfx12 and CUDA rows are not changed by the new flag's default
+    CHECK(stream_floor_default(false, false, false, false, true, false, false) == kFusedOnlyFloor);
+    CHECK(stream_floor_default(false, false, false, false, false, true, false) == kTrellisCudaFloor);
     if (failed) {
         std::fprintf(stderr, "stream_floor_rule_test: %d check(s) failed\n", failed);
         return 1;

@@ -37,9 +37,14 @@ inline constexpr int64_t kTrellisCudaFloor = 64;   // sweep on an RTX A6000 (sm_
 /// trellis_cuda_all_fused(): layers_all_fused_only() is true only where fused::native_supported takes every layer, which for the trellis pair on CUDA means the sm_86 class with 80 or more SMs by
 /// default, or any sm_80+ card with STRATA_PF_FUSED_TQ=1; every other CUDA card keeps the layers off the fused kernels and this flag is false).  Below the floor such a layer runs each routed expert on
 /// the dequantize + FP16 path (RTX A6000, Gyro-S: 128 / 512 / 1,000 tokens 550 / 1,026 / 1,322 ms against 204 / 456 / 674 ms with MMQ, par/RESULTS-MMQ-TAIL.md); the floor is kTrellisCudaFloor.
+///
+/// `trellis_g1151_fused`: the gfx12 rule on Windows gfx1151 (one card): a build without MMQ loading a native pack whose every layer is a trellis pair that the fused kernels take (prefill.cpp
+/// trellis_g1151_all_fused(): on gfx1151 layers_all_fused_only() holds for such a set only when STRATA_PF_TQ_G1151 lets the fused kernels take the trellis pair, fused_tq_hip.hpp device_on).  The staged
+/// fused entry does not take Gyro-S's Hadamard-folded layers, so with the 1,024 floor every chunk below it ran on the FP16 path (Strix Halo, Gyro-S, 256 tokens 1,914 ms against 726 ms in 0.2.13);
+/// the floor is kFusedOnlyFloor there whatever the staged entry says.  Linux gfx1151, the other gfx11 chips, a build with MMQ and CUDA pass false.
 constexpr int64_t stream_floor_default(bool class_measured, bool all_layers_fused_only, bool staged_entry, bool plain_pack_fused = false, bool trellis_gfx12_fused = false,
-                                       bool trellis_cuda_fused = false) {
-    return (class_measured && all_layers_fused_only && !staged_entry) || plain_pack_fused || trellis_gfx12_fused ? kFusedOnlyFloor
+                                       bool trellis_cuda_fused = false, bool trellis_g1151_fused = false) {
+    return (class_measured && all_layers_fused_only && !staged_entry) || plain_pack_fused || trellis_gfx12_fused || trellis_g1151_fused ? kFusedOnlyFloor
            : trellis_cuda_fused                                                                              ? kTrellisCudaFloor
                                                                                                               : kStreamFloorDefault;
 }

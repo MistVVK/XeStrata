@@ -35,8 +35,11 @@ inline bool staged_fo_decide(const char* env, bool class_default) {
 inline constexpr long long kStagedEntryShortRead = 24;
 
 /// `base`: the engine's own default (64).  `class_measured` / `all_layers_fused_only`: stream_floor_rule.hpp's class; `entry_on`: staged_fo_decide().
-constexpr long long short_read_default(long long base, bool class_measured, bool all_layers_fused_only, bool entry_on) {
-    return class_measured && all_layers_fused_only && entry_on ? kStagedEntryShortRead : base;
+/// `folded_trellis`: that class with an all-trellis set on the fused kernels (prefill.cpp trellis_g1151_all_fused(), Gyro-S with STRATA_PF_TQ_G1151 on) in which a layer is Hadamard-folded.  The
+/// staged entry does not take a folded layer, so a batched piece below the floor ran it on the FP16 path (Strix Halo, Gyro-S, 26 / 31 / 33 / 49 tokens 705 / 766 / 778 / 993 ms against 293 / 391 /
+/// 351 / 486 ms through the windows); such a set keeps `base`.
+constexpr long long short_read_default(long long base, bool class_measured, bool all_layers_fused_only, bool entry_on, bool folded_trellis = false) {
+    return class_measured && all_layers_fused_only && entry_on && !folded_trellis ? kStagedEntryShortRead : base;
 }
 
 /// A layer the staged group entry may take on the layer-side rule: it has an MMQ tile (the entry's earlier rule), or it is fused-only and the entry is on (staged_fo_decide).

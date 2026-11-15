@@ -23,6 +23,7 @@
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/fused_tile_rule.hpp"
 #include "strata/prefill/fused_tq_default.hpp"
+#include "strata/prefill/fused_tq_hip.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -2557,6 +2558,7 @@ bool f16_gu(int t) {
 bool f16_d(int t) { return t == T_Q2_0 || t == T_IQ4_NL || t == T_Q8_0 || t == T_Q5_0; }
 #if defined(__HIPCC__)
 bool tq_hip_requested();   // (STRATA_PF_FUSED_TQ on HIP: below)
+bool tq_hip_device(const DevInfo& d);   // (the trellis instances on this device: gfx12, gfx1151 by its own rule; below)
 bool q8gu_hip_requested();   // (STRATA_PF_FUSED_Q8GU on HIP: below)
 bool q6k_hip_requested();    // (STRATA_PF_FUSED_Q6K on HIP: below)
 #endif
@@ -2573,7 +2575,7 @@ bool gu_covered(int t) {
 #if defined(__HIPCC__)
            || (t == T_Q2_0 && dev_info().w12)   // gfx12: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
            || ((t == T_Q4_K || t == T_Q5_K) && kq_on())   // the gfx11 kernels only
-           || ((t == T_TQK6 || t == T_TQ2_T) && dev_info().w12 && tq_hip_requested())   // STRATA_PF_FUSED_TQ=1 on gfx12
+           || ((t == T_TQK6 || t == T_TQ2_T) && tq_hip_device(dev_info()))   // STRATA_PF_FUSED_TQ=1 on gfx12; gfx1151 by fused_tq_hip.hpp
            || (t == T_Q8_0 && dev_info().w12 && q8gu_hip_requested())   // STRATA_PF_FUSED_Q8GU=1 on gfx12
            || (t == T_Q6_K && dev_info().w12 && q6k_hip_requested())    // STRATA_PF_FUSED_Q6K=1 on gfx12
 #endif
@@ -2640,10 +2642,34 @@ bool q8d_hip_requested() {
 }
 // STRATA_PF_FUSED_TQ on HIP (phase 4, opt-in, gfx12 only): "1" lets Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T / TQ2_T layers take native_w11_kernel's
 // trellis instances instead of MMQ (the decode is CUDA's: 15-bit states, MMQ's int8 codebook tq_lut_i8, one scale a 128-value block; Hadamard-folded
-// downs through the FP32-H epilogue and rot_quant_h_kernel, as on CUDA).  The same switch as CUDA's.  gfx11: not measured, keeps MMQ.
+// downs through the FP32-H epilogue and rot_quant_h_kernel, as on CUDA).  The same switch as CUDA's.  gfx1151: STRATA_PF_TQ_G1151 (below); other gfx11: keeps its path.
 bool tq_hip_requested() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_TQ"); return v != nullptr && v[0] == '1'; }();
     return on;
+}
+// STRATA_PF_TQ_G1151 (internal): gfx1151 (Strix Halo) takes the trellis instances too, with STRATA_PF_FUSED_TQ=1 (a build without MMQ sets it): 1 on, any other value
+// off, unset = fused_tq_hip::kG1151DefaultOn under Windows (STRATA_GFX1151_DEFAULTS=0 off).  The rule: include/strata/prefill/fused_tq_hip.hpp, pinned by
+// tests/prefill/fused_tq_hip_test.cpp.  gfx12 is unchanged (STRATA_PF_FUSED_TQ=1 alone); every other HIP device keeps its path.
+static int tq_g1151_switch() {
+    static const int v = strata::prefill::fused_tq_hip::parse_switch(std::getenv("STRATA_PF_TQ_G1151"));
+    return v;
+}
+static bool tq_g1151_defaults_off() {
+    static const bool off = [] { const char* v = std::getenv("STRATA_GFX1151_DEFAULTS"); return v != nullptr && v[0] == '0'; }();
+    return off;
+}
+#if defined(_WIN32)
+constexpr bool kTqWin = true;
+#else
+constexpr bool kTqWin = false;
+#endif
+bool tq_hip_device(const DevInfo& d) {
+    return strata::prefill::fused_tq_hip::device_on(d.w12, d.g1151, kTqWin, tq_hip_requested(), tq_g1151_switch(), tq_g1151_defaults_off(),
+                                                   strata::prefill::fused_tq_hip::kG1151DefaultOn);
+}
+static bool tq_hip_pair(const DevInfo& d, bool gyro_s, bool gyro_m) {
+    return strata::prefill::fused_tq_hip::pair_on(d.w12, d.g1151, kTqWin, tq_hip_requested(), tq_g1151_switch(), tq_g1151_defaults_off(),
+                                                 strata::prefill::fused_tq_hip::kG1151DefaultOn, gyro_s, gyro_m);
 }
 // STRATA_PF_FUSED_Q8GU on HIP (phase 4, opt-in, gfx12 only): "1" lets a Q8_0 gate/up with a Q8_0 down (the Q8_0 set's 48 layers, UD-Q6_K_XL's one Q8_0
 // layer) take native_w11_kernel's Q8_0 gate/up instance instead of MMQ (32-value blocks, two a stage, like the Q8_0 down; the same decode as CUDA's).  The
@@ -2665,7 +2691,7 @@ bool d_covered_on(int t, const DevInfo& d) {
     if (t == T_Q5_0) return d.w12 ? q50_on(d) : q50_on(d) && f16::requested();   // gfx1151 has no int8 kernel for Q5_0 down (the F16 prompt set must be on); gfx12 has only the int8 one
     if (t == T_Q8_0 && !d.w12 && (f16::requested() || q8d_f16_default(d))) return true;
     if (t == T_Q8_0 && d.w12 && (q8d_hip_requested() || q8gu_hip_requested() || q6k_hip_requested())) return true;   // (behind an i-quant gate/up with Q8D, a Q8_0 one with Q8GU, a Q6_K one with Q6K: native_supported)
-    if (t == T_TQK7 || t == T_TQ2_T) return d.w12 && tq_hip_requested();   // STRATA_PF_FUSED_TQ=1 (behind a trellis gate/up only: native_supported)
+    if (t == T_TQK7 || t == T_TQ2_T) return tq_hip_device(d);   // STRATA_PF_FUSED_TQ=1 on gfx12, gfx1151 by fused_tq_hip.hpp (behind a trellis gate/up only: native_supported)
 #else
     if (t == T_Q5_0) return d.q50;   // STRATA_PF_FUSED_Q50=1 and its kernels set up (dev_info)
     if (t == T_Q5_1) return d.kq;    // STRATA_PF_FUSED_KQ=1 (behind a K-quant gate/up only: native_supported)
@@ -2966,14 +2992,14 @@ bool native_supported(int gu_type, int d_type) {
     if (gu_type == T_Q2_0 && d_type != T_Q2_0) return false;   // the opt-in (STRATA_PF_FUSED=1 as well) takes the Q2_0 / Q2_0 pair only
 #endif
 #if defined(__HIPCC__)
-    // The trellis pairs on gfx12 (opt-in STRATA_PF_FUSED_TQ=1; gu_covered checked it above): Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T / TQ2_T only, with
+    // The trellis pairs on gfx12 (opt-in STRATA_PF_FUSED_TQ=1; gu_covered checked it above) and on gfx1151 (tq_hip_pair): Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T / TQ2_T only, with
     // CUDA's geometry rule (whole 128-value blocks along both K; a folded down's FP32 H row inside the row's own n_embd-float output row).  Any other
     // pairing with a trellis format: MMQ.
     if (is_tq(gu_type) || is_tq(d_type)) {
         constexpr bool geo_ok = D_ROWS_K <= D_ROWS_N && D_ROWS_K % 128 == 0 && GU_ROWS_K % 128 == 0;
         const DevInfo& d = dev_info();
-        const bool pair = (gu_type == T_TQK6 && d_type == T_TQK7) || (gu_type == T_TQ2_T && d_type == T_TQ2_T);
-        return geo_ok && pair && d.ok && d.w12 && tq_hip_requested();
+        // gfx1151 (fused_tq_hip.hpp): Gyro-S's pair by STRATA_PF_TQ_G1151 and its default, Gyro-M's only with STRATA_PF_TQ_G1151=1
+        return geo_ok && d.ok && tq_hip_pair(d, gu_type == T_TQK6 && d_type == T_TQK7, gu_type == T_TQ2_T && d_type == T_TQ2_T);
     }
     // A Q8_0 gate/up on gfx12 (opt-in STRATA_PF_FUSED_Q8GU=1; gu_covered checked it above): with a Q8_0 down only.
     if (gu_type == T_Q8_0) {
