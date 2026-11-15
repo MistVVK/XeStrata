@@ -12,6 +12,7 @@ without a --drafting word after Off stays Off.  Nothing real is used (tests/snap
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -26,16 +27,49 @@ from tests.snapshot.normalize import normalize  # noqa: E402
 from tests.snapshot.world import World  # noqa: E402
 
 
-def launches(machine, mset, steps):
-    """One world, one `strata launch` per (choice, setup_runs) step (choice None: no --drafting word), in order; the normalized records."""
+TUI = "tui"
+
+
+def tui_drafting(world, pick):
+    """The TUI's Drafting step on this world's installed config, in a fresh launch (no choice in the settings yet): (the row it preselects, what its
+    commit leaves in the settings).  `pick` None: the person leaves the preselected row as it is."""
+    from types import SimpleNamespace
+    from strata_cli.launch import settings as S
+    from strata_cli.launch.screens import DraftingScreen
+    base = json.loads(world.config_path.read_text(encoding="utf-8"))
+    s = S.LaunchSettings(family=world.mset.family, model=world.mset.model)
+    menu = SimpleNamespace(columns=None, sel=None, current=None)
+    menu.set_items = lambda items, sel: setattr(menu, "sel", sel)
+    fake = SimpleNamespace(ctx=SimpleNamespace(settings=s, base_config=lambda: base), CHOICES=DraftingScreen.CHOICES,
+                           query_one=lambda _cls: menu, paint=lambda: None, menu=lambda: menu)
+    with world.patched():
+        DraftingScreen.on_mount(fake)
+        shown = DraftingScreen.CHOICES[menu.sel][0]
+        menu.current = SimpleNamespace(key=pick or shown)
+        DraftingScreen.commit(fake)
+    return shown, s.drafting
+
+
+def launches(machine, mset, steps, prepare=None):
+    """One world, one `strata launch` per (choice, setup_runs) step (choice None: no --drafting word; (TUI, pick): the TUI's Drafting step first, then the launch
+    with what it saved), in order; the normalized records (a TUI step's record also has "tui": (shown, saved)).  `prepare(world)` runs before the first step."""
     world = World(machine, mset).build()
     try:
+        if prepare is not None:
+            prepare(world)
         out = []
         for choice, runs in steps:
+            tui = None
+            if isinstance(choice, tuple) and choice[0] == TUI:
+                tui = tui_drafting(world, choice[1])
+                choice = tui[1]
             with world.patched():
                 rec = drive_launch(world, () if choice is None else ("--drafting", choice), setup_runs=runs)
             assert "failed" not in rec, rec.get("failed")
-            out.append(normalize(rec, world))
+            rec = normalize(rec, world)
+            if tui is not None:
+                rec["tui"] = tui
+            out.append(rec)
         return out
     finally:
         world.close()
@@ -90,6 +124,38 @@ class AutoAgainIsAuto(unittest.TestCase):
             with self.subTest(machine=m.key, set=s.key):
                 recs = launches(m, s, [("auto", runs), ("off", runs), (None, runs)])
                 self.assertEqual(argv(recs[2]), argv(recs[1]), "the Off of the launch before is kept (setup's \"mtp\": false)")
+
+    # the TUI (`strata launch` without --no-tui): its Drafting step shows Off where the installed config's draft layer is off and no Drafting choice is saved
+    def test_tui_off_then_auto_is_auto(self):
+        for m, s, runs in self.cells(setup_runs=(True,)):
+            if m.os == "macos":
+                continue
+            with self.subTest(machine=m.key, set=s.key):
+                recs = launches(m, s, [("auto", runs), ("auto", runs), ("off", runs), ((TUI, "auto"), runs)])
+                self.assertEqual(recs[3]["tui"], ("off", "auto"), "the step shows Off, and Auto picked is saved")
+                self.assertEqual(argv(recs[3]), argv(recs[1]), "Auto picked in the TUI after Off starts as Auto did before")
+
+    def test_tui_off_left_as_it_is_stays_off(self):
+        for m, s, runs in self.cells(setup_runs=(True,)):
+            if m.os == "macos":
+                continue
+            with self.subTest(machine=m.key, set=s.key):
+                recs = launches(m, s, [("auto", runs), ("off", runs), ((TUI, None), runs)])
+                self.assertEqual(recs[2]["tui"], ("off", None), "Off is shown, and leaving it writes nothing new")
+                self.assertEqual(argv(recs[2]), argv(recs[1]), "the Off line")
+
+    def test_tui_app_draft_layer_off_left_as_it_is_stays_off(self):
+        def app_turned_the_layer_off(world):                # the app's "Draft layer (MTP)" switch: "mtp": false in the run config, no "drafting" key
+            from strata_control import draft_layer
+            cfg = json.loads(world.config_path.read_text(encoding="utf-8"))
+            cfg["mtp"] = False
+            draft_layer.apply(cfg)
+            world.config_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        for m, s, _runs in self.cells(setup_runs=(True,)):
+            with self.subTest(machine=m.key, set=s.key):
+                recs = launches(m, s, [((TUI, None), "when_needed")], prepare=app_turned_the_layer_off)
+                self.assertEqual(recs[0]["tui"], ("off", None), "Off is shown, and leaving it writes nothing new")
+                self.assertEqual(drafter(recs[0]), "off", "the draft layer stays off")
 
 
 if __name__ == "__main__":
