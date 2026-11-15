@@ -206,7 +206,8 @@ def _parts_of(content):
 # redacted_thinking is allowed only to be dropped without an error: another server's encrypted reasoning, which
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
-ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
+ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking",
+                                               "tool_addition")
 
 
 def _check_parts(content, path: str, kinds):
@@ -645,8 +646,40 @@ def anthropic_tools(req: dict) -> tuple[list[dict] | None, bool]:
     tool is deferred).  A deferred tool is callable although the prompt does not list it.  A client that defers tools
     (Claude Code) holds back more than it declares - it names the rest in the conversation and runs a call for any of
     them - so with one deferred tool a call for an undeclared name is a call too (OutputParser's `deferred`)."""
-    tools = _tool_list(req.get("tools"), None)
+    tools = list(_tool_list(req.get("tools"), None))      # a copy: the request's own list is not changed
+    names = {t["name"] for t in tools}
+    for d in _tool_additions(req):           # #5952: a tool added in the conversation is callable as well
+        if d["name"] not in names:
+            names.add(d["name"])
+            tools.append(d)
     return [_anthropic_tool(t) for t in tools] or None, any(t.get("defer_loading") for t in tools)
+
+
+def _tool_addition(block) -> dict | None:
+    """#5952: a `tool_addition` block's tool definition ({"name", "description", "input_schema"}), or None when the
+    block does not carry one.  Claude Code sends some tools (MCP servers that connect after the session started) this
+    way, in a system message inside `messages`, instead of in the top-level `tools`:
+    {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {"name": ..., "input_schema": ...}}}."""
+    tool = block.get("tool") if isinstance(block, dict) else None
+    d = tool.get("definition") if isinstance(tool, dict) else None
+    if (isinstance(d, dict) and isinstance(d.get("name"), str) and d["name"]
+            and isinstance(d.get("input_schema", {}), dict)):
+        return d
+    return None
+
+
+def _tool_additions(req: dict) -> list[dict]:
+    """#5952: every tool definition the conversation adds with a `tool_addition` block, in order."""
+    out = []
+    messages = req.get("messages")
+    for m in messages if isinstance(messages, list) else []:
+        content = m.get("content") if isinstance(m, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_addition":
+                d = _tool_addition(block)
+                if d is not None:
+                    out.append(d)
+    return out
 
 
 def _tool_references(content, deferred: dict):
@@ -669,6 +702,8 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     declared = _tool_list(req.get("tools"), None)
     # #4663: a `defer_loading` tool stays out of the prompt's tool list until a tool_reference loads it
     deferred = {t["name"]: _anthropic_tool(t) for t in declared if t.get("defer_loading")}
+    # #5952: the names the prompt already shows the model (its tool list); a tool_addition of one of them adds nothing
+    shown = {t["name"] for t in declared if t["name"] not in deferred}
     messages = []
     system = req.get("system")
     if system:
@@ -693,6 +728,18 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 parts.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
+            elif kind == "tool_addition":
+                # #5952: the added tool's definition where the client added it, in the form a tool_reference loads
+                # one (_tool_references): the prompt's start (its tool list) stays the same, and so does its cache
+                d = _tool_addition(block)
+                if d is None:
+                    LOGGER.debug("messages[%d].content[%d]: tool_addition without a tool definition; left out of "
+                                 "the prompt", i, j)
+                elif d["name"] not in shown:
+                    shown.add(d["name"])
+                    added = "<tools>\n" + json.dumps(_anthropic_tool(d), ensure_ascii=False) + "\n</tools>"
+                    text.append(added)
+                    parts.append({"type": "text", "text": added})
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))},
                               "_call_id": block.get("id")})
