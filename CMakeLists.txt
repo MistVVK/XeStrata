@@ -2088,6 +2088,10 @@ endif()
 # Each library's and program's device code, made once from its own objects (see strata_sycl): every target that
 # compiles with strata_sycl, in this directory and below.  A library's code object is linked into the programs
 # that take the library (an archive member nothing refers to would not be), a program's into the program.
+# The tests' programs take a second making, a module for each kernel: the SYCL runtime compiles a module whole the
+# first time one of its kernels runs, and a test that runs a few of a library's kernels compiled all of them
+# (moss_text_parity spent 190 of its 191 s there on the B70).  The programs the packages carry keep one module:
+# made a kernel at a time the engine's code differs (Qwen3.8's greedy text changed, its decode was 4% slower).
 if(STRATA_ENABLE_XE)
   # whether target compiles with strata_sycl, through what it links
   function(strata_uses_sycl target out)
@@ -2130,6 +2134,44 @@ if(STRATA_ENABLE_XE)
   endfunction()
 
   # the device code objects of the targets in dir and below
+  # the programs a test is named after (its name, or its name less a "_<variant>" end): STRATA_SYCL_SPLIT
+  function(strata_sycl_split_tests dir)
+    get_property(tests DIRECTORY ${dir} PROPERTY TESTS)
+    foreach(test IN LISTS tests)
+      set(name ${test})
+      while(name)
+        if(TARGET ${name})
+          set_property(TARGET ${name} PROPERTY STRATA_SYCL_SPLIT ON)
+          break()
+        endif()
+        if(NOT name MATCHES "_[^_]+$")
+          break()
+        endif()
+        string(REGEX REPLACE "_[^_]+$" "" name "${name}")
+      endwhile()
+    endforeach()
+    get_property(subdirs DIRECTORY ${dir} PROPERTY SUBDIRECTORIES)
+    foreach(sub IN LISTS subdirs)
+      strata_sycl_split_tests(${sub})
+    endforeach()
+  endfunction()
+
+  # one device code object of tgt: out, made a module for each kernel if split
+  function(strata_sycl_device_object tgt out split)
+    set(opts "")
+    set(what "")
+    if(split)
+      set(opts -fsycl-device-code-split=per_kernel)
+      set(what ", a module for each kernel")
+    endif()
+    add_custom_command(OUTPUT ${out}
+      COMMAND ${CMAKE_CXX_COMPILER} ${_strata_sycl_device_link} ${opts} -fsycl-link "$<TARGET_OBJECTS:${tgt}>"
+              -o ${out}
+      DEPENDS "$<TARGET_OBJECTS:${tgt}>"
+      COMMENT "SYCL device code of ${tgt}${what}" COMMAND_EXPAND_LISTS VERBATIM)
+  endfunction()
+
+  # the device code objects of the targets in dir and below
   function(strata_sycl_device_links dir)
     get_property(targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
     foreach(tgt IN LISTS targets)
@@ -2143,21 +2185,21 @@ if(STRATA_ENABLE_XE)
         continue()
       endif()
       set(out ${CMAKE_BINARY_DIR}/sycl-device/${tgt}${CMAKE_CXX_OUTPUT_EXTENSION})
-      # a shared library's device code is position-independent too: the HIP image's wrapper puts pointers in its
-      # read-only data, which ld refuses in a shared object without it (libxestrata_sdpa_aotriton.so)
-      set(pic "")
-      if(NOT WIN32 AND type MATCHES "^(SHARED|MODULE)_LIBRARY$")
-        set(pic -fPIC)
-      endif()
-      add_custom_command(OUTPUT ${out}
-        COMMAND ${CMAKE_CXX_COMPILER} ${_strata_sycl_device_link} ${pic} -fsycl-link "$<TARGET_OBJECTS:${tgt}>"
-                -o ${out}
-        DEPENDS "$<TARGET_OBJECTS:${tgt}>"
-        COMMENT "SYCL device code of ${tgt}" COMMAND_EXPAND_LISTS VERBATIM)
-      add_custom_target(${tgt}_sycl_device DEPENDS ${out} COMMENT "SYCL device code of ${tgt}")
+      set(split_out ${CMAKE_BINARY_DIR}/sycl-device/${tgt}-split${CMAKE_CXX_OUTPUT_EXTENSION})
       if(type STREQUAL "STATIC_LIBRARY")
-        target_link_libraries(${tgt} INTERFACE ${out})
+        # both makings; each program takes the one its STRATA_SYCL_SPLIT asks for (a making no program takes is
+        # not built)
+        strata_sycl_device_object(${tgt} ${out} OFF)
+        strata_sycl_device_object(${tgt} ${split_out} ON)
+        add_custom_target(${tgt}_sycl_device DEPENDS ${out} ${split_out} COMMENT "SYCL device code of ${tgt}")
+        target_link_libraries(${tgt} INTERFACE "$<IF:$<BOOL:$<TARGET_PROPERTY:STRATA_SYCL_SPLIT>>,${split_out},${out}>")
       else()
+        get_target_property(split ${tgt} STRATA_SYCL_SPLIT)
+        if(split)
+          set(out ${split_out})
+        endif()
+        strata_sycl_device_object(${tgt} ${out} "${split}")
+        add_custom_target(${tgt}_sycl_device DEPENDS ${out} COMMENT "SYCL device code of ${tgt}")
         target_link_libraries(${tgt} PRIVATE ${out})
       endif()
     endforeach()
@@ -2166,6 +2208,9 @@ if(STRATA_ENABLE_XE)
       strata_sycl_device_links(${sub})
     endforeach()
   endfunction()
+  if(STRATA_BUILD_TESTS)
+    strata_sycl_split_tests(${CMAKE_SOURCE_DIR})
+  endif()
   strata_sycl_device_links(${CMAKE_SOURCE_DIR})
 endif()
 
