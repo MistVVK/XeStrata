@@ -87,6 +87,9 @@ struct NativeExpertLayout {
     size_t up_row = 0;                  // bytes per up row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    // NVFP4 (nvfp4.hpp): the blob ends with the expert's {s_gate, s_up, s_down, 0} at this offset, each on its
+    // projection's FP32 output.  0: no tail (every other type).
+    size_t tail_off = 0;
     // APR (prism.hadamard): the down weights are Hadamard-folded, so native_expert_grouped rotates h before
     // quantizing it (hadamard_rows).  had_block 0 = none; d_signs is a DEVICE vector of n_ff signs or nullptr.
     int had_block = 0;
