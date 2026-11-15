@@ -591,6 +591,7 @@ int main(int argc, char** argv) try {
         bad += check(GGML_TYPE_IQ3_XXS, 128, 512, c);
         bad += check(GGML_TYPE_IQ2_XS, 128, 512, c);
         bad += check(GGML_TYPE_Q4_K, 128, 512, c);
+        bad += check(GGML_TYPE_NVFP4, 128, 512, c);   // Edge0's NVFP4 experts: a scale for each 16 values
         if (strata::kernels::cpu::cpu_avx2_ok()) {   // the CPU's rows are AVX2's
             for (const ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
                                       GGML_TYPE_IQ2_S})
