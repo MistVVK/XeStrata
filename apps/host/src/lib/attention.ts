@@ -51,6 +51,17 @@ export function approvalNotice(tool: string): Notice {
   return { title: tr('Strata needs your answer'), body: tr('The assistant wants to use {0}. Open Strata to approve or deny.', [tool || tr('a tool')]) };
 }
 
+/** #5617: the agent asked the person a question (ask_user_question): the approval notification's own title, with no body (no new sentence). */
+export function questionNotice(): Notice {
+  return { title: tr('Strata needs your answer'), body: '' };
+}
+
+/** The question notification, under the same opt-in as the approval one ("Notify me when Strata needs an answer") and only when Strata is not in front. */
+export function questionAsked(enabled: boolean, focused = windowInFront()): Promise<boolean> {
+  if (!enabled || focused) return Promise.resolve(false);
+  return showNotice(questionNotice());
+}
+
 /** Shows a notification through the desktop shell when there is one, else through the page. Returns whether something was shown. */
 export async function showNotice(notice: Notice, deps: { post?: (body: Notice) => Promise<{ shown?: boolean }>; page?: (notice: Notice) => boolean } = {}): Promise<boolean> {
   const post = deps.post ?? (body => api.post<{ shown?: boolean }>('/api/shell/notify', body));
