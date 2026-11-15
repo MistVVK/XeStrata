@@ -95,6 +95,12 @@ static void dequantize_row_tqp_impl(const uint8_t * x, float * y, int64_t n, int
     }
 }
 
+#ifdef TQP_REF_LIB
+/* the entry points metal/tests/tqp_parity.cpp calls, when this file is linked into it (no main) */
+void ggml_ref_dequantize_row_tqp5(const void * x, float * y, int64_t k) { dequantize_row_tqp_impl((const uint8_t *) x, y, k, 5); }
+void ggml_ref_dequantize_row_tqp6(const void * x, float * y, int64_t k) { dequantize_row_tqp_impl((const uint8_t *) x, y, k, 6); }
+void ggml_ref_dequantize_row_tqp7(const void * x, float * y, int64_t k) { dequantize_row_tqp_impl((const uint8_t *) x, y, k, 7); }
+#else
 int main(int argc, char ** argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <5|6|7> <in.bin> <out.f32>\n", argv[0]);
@@ -122,3 +128,4 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "tqp%d: %ld blocks -> %lld floats\n", k, (long) (size / (long) bsize), (long long) n);
     return 0;
 }
+#endif
