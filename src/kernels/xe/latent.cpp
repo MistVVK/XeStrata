@@ -215,17 +215,29 @@ void latent_publish_d(const float* xl, const uint8_t* act0, int64_t rows, int EL
         ELL % 32 != 0)
         throw core::DeviceError("latent_publish_d: a null pointer or a bad geometry");
     auto& q = queue_for(stream);
-    const int64_t nf = rows * ELL;
+    // both images in one launch of 16-byte stores (a store a float and a byte a block's byte were one PCIe write
+    // each, into the mapped memory): rows x ELL floats and rows x ELL/32 Q8_0 blocks of 34 bytes, 16-byte multiples
+    // at 16-byte aligned rows (a window's group starts at a row of G multiple of 8: 8 x 40 x 34 bytes)
+    using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+    const int64_t nf4 = rows * ELL / 4;
     const int64_t nb = rows * (ELL / 32) * 34;
-    auto e1 = q.parallel_for(sycl::range<1>((size_t) nf), [=](sycl::id<1> i) { xl_out[i[0]] = xl[i[0]]; });
-    auto e2 = q.parallel_for(sycl::range<1>((size_t) nb), [=](sycl::id<1> i) { act0_out[i[0]] = act0[i[0]]; });
+    if ((nb & 15) != 0 || (((uintptr_t) xl | (uintptr_t) xl_out | (uintptr_t) act0 | (uintptr_t) act0_out) & 15) != 0)
+        throw core::DeviceError("latent_publish_d: the images are not 16-byte multiples at 16-byte alignment");
+    const int64_t n16 = nf4 + nb / 16;
+    const size_t groups = (size_t) std::min<int64_t>((n16 + 255) / 256, 256);
+    auto e1 = q.parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t step = (int64_t) it.get_global_range(0);
+        for (int64_t i = (int64_t) it.get_global_id(0); i < n16; i += step) {
+            if (i < nf4) reinterpret_cast<u32x4*>(xl_out)[i] = reinterpret_cast<const u32x4*>(xl)[i];
+            else reinterpret_cast<u32x4*>(act0_out)[i - nf4] = reinterpret_cast<const u32x4*>(act0)[i - nf4];
+        }
+    });
     auto e3 = q.single_task([=] {
         sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
         reinterpret_cast<volatile uint32_t*>(seq)[0] = value;
     });
     if (!stream) {
         core::Runtime::get().wait(e1, "latent_publish_d");
-        core::Runtime::get().wait(e2, "latent_publish_d");
         core::Runtime::get().wait(e3, "latent_publish_d");
     }
 }
