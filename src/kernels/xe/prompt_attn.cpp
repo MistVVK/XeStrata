@@ -477,10 +477,6 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
 int forced_pick() {
     const char* v = strata::env_get("PROMPT_ATTN_PICK");
     if (v == nullptr) {
-        // ROCm (RX 9060 XT): the tune's probe-buffer cycle leaves a not-present mapping that a later kernel (the
-        // experts' int8 product) faults on, probabilistically, when the KV streams (llm-jp 64K, 2026-11-15).  Take
-        // the maker's kernel (aotriton) untimed instead; prompt_attn falls back where it does not take the shape.
-        if (core::Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_hip) return kPickMaker;
         return kPickUntimed;
     }
     const std::string w = v;
@@ -499,6 +495,9 @@ void prompt_attn_tune(const QsaShapes& s, int fmt, int64_t max_cells, void* stre
         fmt > kFmtK8V4)
         return;
     sycl::queue& queue = core::Runtime::get().stream(stream);
+    // ROCm (RX 9060 XT): the timing's probe-buffer cycle leaves a not-present mapping that a later kernel faults on
+    // when the KV streams (llm-jp 64K/128K, 2026-11-15).  Skip the timing; prompt_attn takes the int8 kernel untimed.
+    if (queue.get_device().get_backend() == sycl::backend::ext_oneapi_hip) return;
     picks_for(s, fmt).get(queue.get_device(), [&] {
         Picks p;
         if (env_off("PROMPT_ATTN_MMA")) return p;   // the fixed choice (prompt_attn)
@@ -529,11 +528,16 @@ bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_
     // (no prompt_attn_tune for this shape): the matrix engines' kernel where there is one
     static const bool no_mma = env_off("PROMPT_ATTN_MMA");
     static const int forced = forced_pick();
+    const bool hip = queue.get_device().get_backend() == sycl::backend::ext_oneapi_hip;   // this GPU's, not the first's
     int pick = kPickUntimed;
     if (no_mma) {
         pick = fmt != kFmtF16 ? kPickNone : kPickFp16;
     } else if (forced != kPickUntimed) {
         pick = forced;
+    } else if (hip && fmt != kFmtF16) {
+        // ROCm: the int8 kernel untimed (the tune is skipped).  It reads the streamed staging pool and the resident
+        // pool to the same bits (off==str md5), unlike the maker's and the matrix engines' kernels (2026-11-15).
+        pick = kPickI8;
     } else {
         const Picks& p = picks_for(s, fmt).get(queue.get_device(), [] { return Picks{}; });
         const bool lng = pos0 + T >= p.split;
