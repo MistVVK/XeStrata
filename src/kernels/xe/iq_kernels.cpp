@@ -1138,7 +1138,7 @@ constexpr int kEntriesPass = 4;
 // with no early return, so the segment shuffles see the whole sub-group.
 // `part`: -1 the gate and up rows, 0 the gate rows only, 1 the up rows only (a layer whose gate and up differ in type
 // takes one launch a type)
-template<int TG, int LPR>
+template<int TG, int LPR, int NE = kEntriesPass>
 sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                              const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
                              const block_q8_1* xq, NativeExpertLayout L, float* gate, float* up, int part = -1) {
@@ -1161,17 +1161,30 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
             const uint8_t* blob = (const uint8_t*) grp_ptr[g];
             const uint8_t* wr = blob + (is_up && valid ? L.up_off + (size_t) r * L.up_row : (size_t) r * L.gu_row);
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
-            for (int e = e0; e < e1; e += kEntriesPass) {   // the row's blocks decoded once for kEntriesPass entries
-                const int n = sycl::min(kEntriesPass, e1 - e);
-                const block_q8_1* xs[kEntriesPass];
-                for (int j = 0; j < kEntriesPass; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
-                float s[kEntriesPass];
-                seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, n, nb, (int) (L.n_embd / Fmt<TG>::qk), seg_lane, s);
+            for (int e = e0; e < e1; e += NE) {   // the row's blocks decoded once for NE entries
+                const int n = sycl::min(NE, e1 - e);
+                const block_q8_1* xs[NE];
+                for (int j = 0; j < NE; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
+                float s[NE];
+                seg_dot_multi<TG, LPR, NE>(sg, wr, xs, n, nb, (int) (L.n_embd / Fmt<TG>::qk), seg_lane, s);
                 if (valid && seg_lane == 0)
                     for (int j = 0; j < n; ++j) (is_up ? up : gate)[(size_t) (e + j) * L.n_ff + r] = s[j];
             }
         }
     });
+}
+
+// The latent A's gate/up LPR / entries-a-pass, chosen per device by timing at the window's init (the current
+// GU_LPR / kEntriesPass are candidates, so the choice never regresses).  XESTRATA_LATENT_A_LPR / _A_ENTRIES force.
+template<int TG>
+sycl::event launch_native_gu_tuned(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
+                                   const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
+                                   const block_q8_1* xq, NativeExpertLayout L, float* gate, float* up, int part,
+                                   int lpr, int ne) {
+#define EDGE_GU_CASE(LP, N) if (lpr == (LP) && ne == (N)) return launch_native_gu<TG, LP, N>(q, cap_groups, grp_ptr, grp_start, n_groups, ent_tok, xq, L, gate, up, part)
+    EDGE_GU_CASE(16, 2); EDGE_GU_CASE(16, 4);
+#undef EDGE_GU_CASE
+    return launch_native_gu<TG, GU_LPR, kEntriesPass>(q, cap_groups, grp_ptr, grp_start, n_groups, ent_tok, xq, L, gate, up, part);
 }
 
 // Two gate/up rows share each loaded Q8 activation block.  Each row keeps the same integer butterflies and
@@ -1263,6 +1276,34 @@ bool gu_pair_selected(sycl::queue& q, const NativeExpertLayout& L, int type, int
     return g_gu_pair_choices.get(q.get_device(), gu_pair_key(L, type, part)).value_or(false);
 }
 
+// The latent A's gate/up form: LPR lanes a row and NE entries a pass, timed per device at the window's init.
+// The current GU_LPR / kEntriesPass are candidates, so the choice never regresses.  XESTRATA_LATENT_A_LPR /
+// XESTRATA_LATENT_A_ENTRIES force a value (0/absent: the timed choice).
+using LatentAKey = std::tuple<int, int64_t, int64_t>;
+core::TimedCache<sycl::device, LatentAKey, std::pair<int, int>> g_latent_a_choices;
+int latent_a_lpr_env() { const char* v = strata::env_get("LATENT_A_LPR"); return v && *v ? std::atoi(v) : 0; }
+int latent_a_ne_env() { const char* v = strata::env_get("LATENT_A_ENTRIES"); return v && *v ? std::atoi(v) : 0; }
+std::pair<int, int> latent_a_choice(sycl::queue& q, const NativeExpertLayout& L) {
+    auto c = g_latent_a_choices.get(q.get_device(), LatentAKey{L.gu_type, L.n_embd, L.n_ff})
+                 .value_or(std::pair<int, int>{GU_LPR, kEntriesPass});
+    if (latent_a_lpr_env() > 0) c.first = latent_a_lpr_env();
+    if (latent_a_ne_env() > 0) c.second = latent_a_ne_env();
+    return c;
+}
+namespace {
+void run_gu_candidate(sycl::queue& q, const NativeExpertLayout& L, int type, int lpr, int ne, size_t cg,
+                      const unsigned long long* ptr, const int32_t* starts, const int32_t* count, const int32_t* toks,
+                      const block_q8_1* x, float* gate, float* up) {
+#define EDGE_TUNE_GU(T) case T: launch_native_gu_tuned<T>(q, cg, ptr, starts, count, toks, x, L, gate, up, -1, lpr, ne); break
+    switch (type) {
+        EDGE_TUNE_GU(16); EDGE_TUNE_GU(17); EDGE_TUNE_GU(18); EDGE_TUNE_GU(21); EDGE_TUNE_GU(22);
+        EDGE_TUNE_GU(23); EDGE_TUNE_GU(29); EDGE_TUNE_GU(19); EDGE_TUNE_GU(42); EDGE_TUNE_GU(12);
+        EDGE_TUNE_GU(13); EDGE_TUNE_GU(8); EDGE_TUNE_GU(6); EDGE_TUNE_GU(2); EDGE_TUNE_GU(3);
+        default: launch_native_gu_tuned<23>(q, cg, ptr, starts, count, toks, x, L, gate, up, -1, lpr, ne); break;
+    }
+#undef EDGE_TUNE_GU
+}
+}  // namespace
 template<int TD, int LPR>
 sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
@@ -2455,6 +2496,48 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     return L;
 }
 
+void native_expert_latent_a_tune(const NativeExpertLayout& L, void* stream) {
+    if (latent_a_lpr_env() > 0 && latent_a_ne_env() > 0) return;   // both forced: nothing to time
+    auto& q = queue_for(stream);
+    const LatentAKey key{L.gu_type, L.n_embd, L.n_ff};
+    if (g_latent_a_choices.get(q.get_device(), key)) return;
+    std::vector<void*> allocated;
+    auto alloc = [&](size_t bytes) { void* p = sycl::malloc_device(bytes, q); if (!p) throw core::DeviceError("latent A timing allocation failed"); allocated.push_back(p); return p; };
+    auto release = [&] { q.wait_and_throw(); for (void* p : allocated) sycl::free(p, q); };
+    try {
+        auto* blob = static_cast<uint8_t*>(alloc(L.bytes));
+        auto* ptr = static_cast<unsigned long long*>(alloc(4 * sizeof(unsigned long long)));
+        auto* starts = static_cast<int32_t*>(alloc(5 * sizeof(int32_t)));
+        auto* count = static_cast<int32_t*>(alloc(sizeof(int32_t)));
+        auto* toks = static_cast<int32_t*>(alloc(16 * sizeof(int32_t)));
+        auto* x = static_cast<block_q8_1*>(alloc((size_t) 4 * (L.n_embd / 32) * sizeof(block_q8_1)));
+        auto* gate = static_cast<float*>(alloc((size_t) 16 * L.n_ff * sizeof(float)));
+        auto* up = static_cast<float*>(alloc((size_t) 16 * L.n_ff * sizeof(float)));
+        const unsigned long long hp[4] = {(unsigned long long)(uintptr_t)blob, (unsigned long long)(uintptr_t)blob,
+                                          (unsigned long long)(uintptr_t)blob, (unsigned long long)(uintptr_t)blob};
+        const int32_t hc = 4, ht[16] = {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3};
+        q.memset(blob, 0, L.bytes);
+        q.memset(x, 0, (size_t) 4 * (L.n_embd / 32) * sizeof(block_q8_1));
+        q.memcpy(ptr, hp, sizeof hp); q.memcpy(count, &hc, sizeof hc); q.memcpy(toks, ht, sizeof ht);
+        const int32_t hs[5] = {0, 4, 8, 12, 16};
+        q.memcpy(starts, hs, sizeof hs).wait_and_throw();
+        std::vector<std::pair<int, int>> cands;
+        for (int lpr : {16}) for (int ne : {4}) cands.push_back({lpr, ne});  // NE=2 / LPR=8 misalign on CUDA: only the proven default until those kernels are fixed
+        std::vector<core::TimedCandidate> tc;
+        for (auto [lpr, ne] : cands)
+            tc.push_back({[&, lpr, ne] { for (int i = 0; i < 4; ++i) run_gu_candidate(q, L, L.gu_type, lpr, ne, 4, ptr, starts, count, toks, x, gate, up); return true; }});
+        const auto m = core::timed_choice(tc, [&] { q.wait_and_throw(); }, 5, 1.05, 0.3);
+        const auto best = m.pick >= 0 ? cands[(size_t) m.pick] : std::pair<int, int>{GU_LPR, kEntriesPass};
+        g_latent_a_choices.put(q.get_device(), key, best);
+        std::fprintf(stderr, "xestrata: latent A gate/up type %d width %lld: LPR %d, entries %d\n",
+                     L.gu_type, (long long) L.n_embd, best.first, best.second);
+        release();
+    } catch (...) {
+        for (void* p : allocated) sycl::free(p, q);
+        g_latent_a_choices.put(q.get_device(), key, std::pair<int, int>{GU_LPR, kEntriesPass});
+    }
+}
+
 void native_expert_gu_pair_tune(const NativeExpertLayout& L, int type, int part, void* stream) {
     if (!gu_pair_type(type) || gu_pair_mode() != -1) return;
     auto& q = queue_for(stream);
@@ -2564,6 +2647,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else {
     // the gate and up rows in one launch, or one a type where they differ (native_mixed_gu's layers)
     auto gu_rows = [&](int ty, int part) {
+        const auto a_form = latent_a_choice(q, L); const int a_lpr = a_form.first, a_ne = a_form.second;
         if (gu_pair_selected(q, L, ty, part)) {
             switch (ty) {
                 case 18: launch_native_gu_pair<18>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); return;
@@ -2572,30 +2656,30 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             }
         }
         switch (ty) {
-            case 16: launch_native_gu<16, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 17: launch_native_gu<17, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 18: launch_native_gu<18, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 21: launch_native_gu<21, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 22: launch_native_gu<22, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 23: launch_native_gu<23, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 29: launch_native_gu<29, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 19: launch_native_gu<19, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 42: launch_native_gu<42, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 12: launch_native_gu<12, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 13: launch_native_gu<13, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 8: launch_native_gu<8, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 6: launch_native_gu<6, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 2: launch_native_gu<2, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 3: launch_native_gu<3, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 14: launch_native_gu<14, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 10: launch_native_gu<10, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 11: launch_native_gu<11, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 144: launch_native_gu<144, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 145: launch_native_gu<145, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 146: launch_native_gu<146, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 147: launch_native_gu<147, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 148: launch_native_gu<148, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 149: launch_native_gu<149, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 16: launch_native_gu_tuned<16>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 17: launch_native_gu_tuned<17>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 18: launch_native_gu_tuned<18>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 21: launch_native_gu_tuned<21>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 22: launch_native_gu_tuned<22>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 23: launch_native_gu_tuned<23>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 29: launch_native_gu_tuned<29>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 19: launch_native_gu_tuned<19>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 42: launch_native_gu_tuned<42>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 12: launch_native_gu_tuned<12>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 13: launch_native_gu_tuned<13>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 8: launch_native_gu_tuned<8>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 6: launch_native_gu_tuned<6>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 2: launch_native_gu_tuned<2>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 3: launch_native_gu_tuned<3>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 14: launch_native_gu_tuned<14>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 10: launch_native_gu_tuned<10>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 11: launch_native_gu_tuned<11>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 144: launch_native_gu_tuned<144>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 145: launch_native_gu_tuned<145>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 146: launch_native_gu_tuned<146>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 147: launch_native_gu_tuned<147>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 148: launch_native_gu_tuned<148>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
+            case 149: launch_native_gu_tuned<149>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
             default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(ty));
         }
     };

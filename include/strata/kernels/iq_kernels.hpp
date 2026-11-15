@@ -100,6 +100,10 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
 
 /// Time the two gate/up row layouts for this format and shape before a verify graph records them.
 void native_expert_gu_pair_tune(const NativeExpertLayout& L, int type, int part, void* stream);
+/// Time the latent A gate/up's LPR / entries-a-pass candidates for this layout and keep the faster per device
+/// (the current GU_LPR / kEntriesPass are candidates).  Call at the window's init; XESTRATA_LATENT_A_LPR /
+/// XESTRATA_LATENT_A_ENTRIES force a value.
+void native_expert_latent_a_tune(const NativeExpertLayout& L, void* stream);
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);

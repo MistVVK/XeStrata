@@ -203,6 +203,15 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
                 strata::kernels::native_expert_gu_pair_tune(layout, f.gu_type, mixed ? 0 : -1, nullptr);
                 if (mixed) strata::kernels::native_expert_gu_pair_tune(layout, f.up_type, 1, nullptr);
             }
+            if (latent_ && !lay.fmt.empty()) {   // the latent A's gate/up LPR / entries, timed at the latent width
+                const auto& f0 = lay.fmt[0];
+                const auto lat_layout = strata::kernels::native_expert_layout(f0.gu_type, f0.d_type, lat_ELL_, lat_I_, f0.up_type);
+                // DISABLED: the tune misaligned-addresses on CUDA for the Q3_K gate/up (type 11, which gu_pair_tune
+                // never tests).  Until that kernel path is fixed, skip the tune; latent_a_choice falls back to the
+                // proven GU_LPR / kEntriesPass default.  Re-enable once the tune is CUDA-safe.
+                if (strata::env_get("LATENT_A_TUNE") && std::string(strata::env_get("LATENT_A_TUNE")) == "1")
+                    strata::kernels::native_expert_latent_a_tune(lat_layout, nullptr);
+            }
         } catch (const std::exception& e) {
             err = std::string("moe window: gate/up timing: ") + e.what();
             return false;
@@ -284,7 +293,6 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
                 const auto& f0 = lay.fmt[0];
                 const int64_t ELL = lat_ELL_, G = lat_G_, GN = (int64_t) shape.n_embd;
                 const int64_t n_expert = lay.n_expert;
-                const int du_t = lat_fmt_ == 4 ? 2 : 8;
                 // the real decode's row counts: the verify window's token counts × K (not one synthetic cap).
                 // Time each form at these caps, a warmup then the median of 3 runs, and sum over the caps so the
                 // choice does not flip on a single noisy timing.
@@ -340,29 +348,9 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
                             }
                             best.first = s0 < s1 ? 0 : 1;
                         }
-                        auto run_u = [&](int64_t cap, bool mmq) {
-                            if (mmq) {
-                                strata::kernels::latent_u_bucket(ids, lat_labels_dev_, lay.n_expert, cap, (int) G, lat_u_mmq_ids_, lat_u_mmq_bounds_, nullptr);
-                                strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, du_t, ELL, ELL, cap, nullptr);
-                                strata::prefill::mmq::Product up;
-                                up.w = lat_u_; up.type = du_t; up.w_rows = GN; up.w_cols = ELL;
-                                up.expert_bytes = strata::prefill::mmq::matrix_bytes(du_t, GN, ELL); up.n = (int) G;
-                                up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
-                                up.total_rows = cap; up.max_rows = cap; up.rows = cap; up.dst = out; up.ld_dst = GN;
-                                lat_mmq_ctx_->run(up, nullptr);
-                            } else {
-                                strata::kernels::quantize_q8_1_rows(yl, cap, ELL, lat_ylq_, nullptr);
-                                strata::kernels::latent_u_grouped(lat_u_, lat_ylq_, ids, lat_labels_dev_, lay.n_expert, cap, (int) ELL, (int) GN, out, nullptr, lat_fmt_);
-                            }
-                        };
-                        if (u_env < 0 && strata::prefill::mmq::built()) {
-                            double sm = 0, sd = 0;
-                            for (int64_t c : caps) {
-                                sm += median_ms([&](int64_t cap) { run_u(cap, true); }, c);
-                                sd += median_ms([&](int64_t cap) { run_u(cap, false); }, c);
-                            }
-                            best.second = sm < sd;
-                        }
+                        // The U form: the synthetic timing picked the slower form on both B70 and RTX (the real
+                        // decode U's cost is not the synthetic rows'), so keep the capability choice (mmq::built)
+                        // for U; only the A form is timed.  best.second already defaults to mmq::built().
                     } catch (const std::exception& e) {
                         std::fprintf(stderr, "xestrata: timing the latent decode forms: %s\n", e.what());
                     }
