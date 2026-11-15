@@ -191,6 +191,30 @@ class MacSetupFetchesThePickedDrafter(unittest.TestCase):
                     self.assertEqual("mtp" in first["plan_parts"], want is None, f"plan {first['plan_parts']}")
 
 
+class MacOffFetchesNothing(unittest.TestCase):
+    # DF-REAL on an M5 Max (Q2_0): `--drafting off` on a fresh install fetched the 5.2 GB draft layer (setup_args left --mtp off out on a Mac), the plan said Nothing to download
+    def test_metal_off_on_a_fresh_install(self):
+        from tests.snapshot.matrix import ModelSet
+        q2 = ModelSet("q2_0", "qwen", "Q2_0", "qwen3.8-flash-next-q2_0", ("Qwen3.8-Flash-Next-Q2_0-00001-of-00002.gguf", "Qwen3.8-Flash-Next-Q2_0-00002-of-00002.gguf"))
+        for mkey in ("mac_small", "mac_large"):
+            for s in (get_set("iq3_s"), q2, get_set("ud_q4_k_xl")):
+                with self.subTest(machine=mkey, set=s.key):
+                    world = fresh_world(get_machine(mkey), s)
+                    try:
+                        with world.patched():
+                            rec = drive_launch(world, ("--drafting", "off"), setup_runs=True, fresh=True)
+                        self.assertNotIn("failed", rec)
+                        rec = normalize(rec, world)
+                    finally:
+                        world.close()
+                    a = rec["setup_args"]
+                    self.assertIn("--mtp", a, a)
+                    self.assertEqual(a[a.index("--mtp") + 1], "off", a)
+                    self.assertEqual(rec["fetches"], [], "nothing is fetched")
+                    self.assertNotIn("mtp", rec["plan_parts"])
+                    self.assertEqual(drafter(rec), "off")
+
+
 class SavedOffHolds(unittest.TestCase):
     def test_a_saved_off_survives_a_start_without_a_drafting_word_when_setup_does_not_run(self):
         # 0.2.14 real-use run, Strix T6: the installed copy was reused, the Off was only in the launch's own run config, the next start ran DFlash2

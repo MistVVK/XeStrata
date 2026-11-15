@@ -953,7 +953,8 @@ class Runner:
         if sys.platform == "darwin":
             # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu, speed projection)
             keep = {"--yes", "--no-start", "--family", "--model", "--context", "--vision", "--data-dir", "--gguf-dir", "--move-data",
-                    "--set-default-data-dir", "--feed", "--drafter"}     # --drafter: setup.py's Mac step fetches the draft layer only where the start runs the MTP
+                    "--set-default-data-dir", "--feed", "--drafter", "--mtp"}     # --drafter / --mtp: setup.py's Mac step fetches the draft layer only where the
+                                                                                  # start runs the MTP, and not after a Drafting Off (`--mtp off`)
             flags = ("--yes", "--no-start", "--move-data", "--set-default-data-dir")
             out, i = [], 0
             while i < len(args):
@@ -1003,8 +1004,8 @@ class Runner:
         setup "--mtp off", and setup keeps that at every later run, so Auto read it as "the draft layer is off" and started without a drafter (0.2.13.1, REAL-USE-1).
         Then setup runs again with "--mtp on", and the start is the one a first launch with that choice gets.  A model the feed says has no draft layer stays off."""
         s = self.s
-        if s.mtp is not None or s.drafting is None or s.family not in modelstate.HELPER_FAMILIES or sys.platform == "darwin":
-            return False                                     # (a Mac's setup takes no --mtp word: setup_args)
+        if s.mtp is not None or s.drafting is None or s.family not in modelstate.HELPER_FAMILIES:
+            return False                                     # (a Mac's setup takes the --mtp word too: setup_args)
         from strata_control import drafting
         if drafting.normalize(s.drafting) == "off" or self.resolved_drafting(s.family) == "off":
             return False
