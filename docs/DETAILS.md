@@ -577,7 +577,7 @@ The engine's options (added to the settings' `args`):
 | `--vram-elastic` | with `--serve` on one GPU: the experts' VRAM tier in segments (`--vram-segment-mib`, default 512), given back before an image job and taken again after it (`--image-gpu-policy shrink`) |
 | `--prefill-cpu-share S` | the CPU pool's share of the experts outside VRAM in prefill (0-1; `auto` by default, measured per prompt; 0: every expert on the GPU). The CPU rounds differently from the GPU, so a share that moves between runs moves a greedy answer with it; setup measures it once per PC and model and writes that value into the config. With 0 it is the same each time |
 | `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores, at most 32; in a Linux container with a CPU quota (cgroup), at most one fewer than the quota) |
-| `--pool-cores LIST`, `--aux-cpus SET`, `--pool-tasks N`, `--no-host-worker`, `--memory-limit-mib N` | the CPUs of the expert workers, the CPUs of the threads that are neither workers nor the host (a request's `strata_tune` `aux_cpus` too), the pool's tasks a phase, the host thread kept out of the drain, the RAM the parking and saving of conversations counts (Qwen3.8-Flash-Next's meanings). Without `--pool-cores`, `XESTRATA_POOL_PLACE` (`auto` (the default), `off`, `on`) chooses the workers between every physical core and the fast cores only on a CPU whose cores are not all alike (the P and E cores of a hybrid part), by a start-up measurement of their RAM read bandwidth (the fast cores only when clearly faster; a CPU whose cores are all alike is left untouched) |
+| `--pool-cores LIST`, `--aux-cpus SET`, `--pool-tasks N`, `--no-host-worker`, `--memory-limit-mib N` | the CPUs of the expert workers, the CPUs of the threads that are neither workers nor the host (a request's `strata_tune` `aux_cpus` too), the pool's tasks a phase, the host thread kept out of the drain, the RAM the parking and saving of conversations counts (Qwen3.8-Flash-Next's meanings) |
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096, or a larger chunk the VRAM tier of experts lends, up to 32768, its buffers within 85% of the slots; 0: none at once) |
 | `--max-t N` | the decode window's most tokens (default 8; 16 with `--wide-window on` or a batch of 9 slots or more) |
 | `--wide-window auto\|off\|on` | whether the verify and batch windows go up to 16 rows: `auto` (the default) for a batch of 9 slots or more and a `--spec` of 9 or more, `off` never, `on` wherever they can (the config's `"wide_window"` and `XESTRATA_WIDE_WINDOW` set it too). A window of up to 8 rows runs the same kernels either way |
@@ -956,14 +956,6 @@ The worker count is the list's length; `--pool-workers N` takes its first N entr
 Nothing is refused; the engine warns when two entries are the two threads of one core, when an entry is the host's logical processor, and when one is a processor this process may not use (left out). With nothing usable left the pool keeps its default placement, and a list that cannot be read is said and ignored.
 The host keeps the first core, so leave it out of the list. It moves threads only and does not change the answers.
 Both the Qwen3.8-Flash-Next engine and the plain engine (Ornith, llm-jp, Qwen3.6, GLM-5.3-Flash) take it.
-
-`XESTRATA_POOL_PLACE` (`auto` (the default), `off`, `on`), when `--pool-cores` is not given, chooses the workers between
-every physical core (the default) and the fast cores only on a CPU whose cores are not all alike (the P and E cores of a
-hybrid part). It measures both core sets' RAM read bandwidth at start-up and takes the fast cores only when they are more
-than 5% faster (`auto`); `off` keeps the default, `on` forces the fast cores. The cores' speed is read from the OS's
-`cpuinfo_max_freq`, never from a name. A CPU whose cores are all alike, or that does not report a frequency, is left
-untouched. It moves threads only and does not change the answers. Whether it helps is decided by measurement (on the
-i7-14700 upstream's P-leaning placement was slower, so the default is expected to win; the record's measure-plan).
 
 `--aux-cpus` decides which CPUs run the threads that are neither CPU pool workers nor the host thread (Linux, `off` by
 default, upstream 91f1e85d): the expert cache's refills, the prefill copies, the file reads, the GPU runtime's threads
