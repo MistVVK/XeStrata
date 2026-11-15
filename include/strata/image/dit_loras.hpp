@@ -65,12 +65,18 @@ public:
     DitLoraHooks hooks;
     /// The blocks' plain LoRAs folded into their weights (the default), else added to each product.
     bool bake = true;
+    /// The path a block's weights' names start with, its number after it ("transformer_blocks.", "layers.",
+    /// "blocks."): what a LoraUse's block factors are read by.
+    std::string block_path;
 
     /// The table: cleared, and a weight's slot added (a weight with no rows, or rows past it, is none).
     void clear_slots() { slots_.clear(); }
     void add(std::string name, DitW& w, int64_t row0, int64_t rows, int64_t src_row = 0, bool biased = false);
     void add(std::string name, DitW& w, bool biased) { add(std::move(name), w, 0, w.n, 0, biased); }
     std::vector<DitLoraTarget> targets() const;
+    /// The block a weight's name is in (block_path's number), -1 outside the blocks; and the blocks the table has.
+    int block_of(const std::string& name) const;
+    int blocks() const;
 
     /// The adapters the next steps apply, each with its strength, bound to the weights' products: a key the DiT does
     /// not take (or a shape that is not its weight's, or a form the engine does not apply) is false with err, and
@@ -81,7 +87,7 @@ public:
 
     const std::string& key() const { return key_; }
     int count() const { return (int) files_.size(); }
-    /// The bound entries' A and B on the GPU (and a GLoRA's buffers).
+    /// The bound entries' A and B on the GPU (and a GLoRA's buffers, and the bake's: bake_tmp and bake_at16).
     uint64_t bytes() const;
     bool baked_any() const { return baked_any_; }
     float* bake_tmp() const { return bake_tmp_; }        // a weight's delta [n][k], while adapters are baked
@@ -99,6 +105,7 @@ private:
     bool baked_any_ = false;
     float* bake_tmp_ = nullptr;
     uint16_t* bake_at16_ = nullptr;
+    uint64_t bake_bytes_ = 0;   // bake_tmp_'s and bake_at16_'s
 };
 
 /// A slot's row norms out of its weight's tensor's (`norms`: the tensor's rows, the slot's from src_row on).

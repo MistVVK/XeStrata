@@ -32,8 +32,9 @@ public:
     /// `int8`: a QLoRA, the blocks' products on ai-toolkit's convrot8 base (train::Product::w8) made from the file's
     /// 16-bit weights, as ai-toolkit's default (quantize, qtype convrot8) trains; else the 16-bit weights themselves.
     /// `max_blocks` (0: all of them) keeps the first blocks only: a check that cuts the DiT short.
+    /// `targets`: the products trained (train::Targets; every one by default), the rest without an adapter.
     bool open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err,
-              int64_t max_blocks = 0, bool int8 = false);
+              int64_t max_blocks = 0, bool int8 = false, const train::Targets& targets = {});
 
     /// A caption's text encoder states [n][4096] (host FP32, the system turn already dropped) through the DiT's text
     /// projection, kept on the GPU; returns its id for step().

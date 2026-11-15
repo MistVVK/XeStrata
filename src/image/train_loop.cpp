@@ -212,8 +212,103 @@ std::vector<std::pair<std::string, std::string>> lora_meta(const LoraMeta& m) {
         {"ss_xestrata_revision", STRATA_VERSION},
     };
     if (!m.trigger.empty()) out.emplace_back("modelspec.trigger_phrase", m.trigger);
+    if (!m.kind.empty()) out.emplace_back("ss_xestrata_kind", m.kind);
+    if (!m.targets.empty()) out.emplace_back("ss_xestrata_targets", m.targets);
     out.insert(out.end(), m.extra.begin(), m.extra.end());
     return out;
+}
+
+namespace {
+
+// a value's parts between commas, each trimmed, the empty ones dropped
+std::vector<std::string> comma_parts(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == ',') {
+            const size_t a = cur.find_first_not_of(" \t"), b = cur.find_last_not_of(" \t");
+            if (a != std::string::npos) out.push_back(cur.substr(a, b - a + 1));
+            cur.clear();
+        } else {
+            cur += s[i];
+        }
+    }
+    return out;
+}
+
+// a block's number: digits only
+bool block_number(const std::string& s, int& out) {
+    if (s.empty() || s.size() > 6 || s.find_first_not_of("0123456789") != std::string::npos) return false;
+    out = std::stoi(s);
+    return true;
+}
+
+}  // namespace
+
+bool Targets::take(int block, const std::string& name) const {
+    if (block >= 0) {
+        if (std::find(skip.begin(), skip.end(), block) != skip.end()) return false;
+        if (!blocks.empty() && std::none_of(blocks.begin(), blocks.end(), [&](const std::pair<int, int>& r) {
+                return block >= r.first && block <= r.second;
+            }))
+            return false;
+    }
+    const auto in = [&](const std::string& part) { return name.find(part) != std::string::npos; };
+    if (!only.empty() && std::none_of(only.begin(), only.end(), in)) return false;
+    return std::none_of(ignore.begin(), ignore.end(), in);
+}
+
+std::string Targets::text() const {
+    std::string out;
+    const auto add = [&](const char* what, const std::string& v) {
+        if (v.empty()) return;
+        if (!out.empty()) out += "; ";
+        out += std::string(what) + " " + v;
+    };
+    std::string b;
+    for (const auto& r : blocks)
+        b += (b.empty() ? "" : ",") + std::to_string(r.first) +
+             (r.second != r.first ? "-" + std::to_string(r.second) : std::string());
+    add("blocks", b);
+    std::string k;
+    for (int x : skip) k += (k.empty() ? "" : ",") + std::to_string(x);
+    add("skip", k);
+    std::string o, g;
+    for (const std::string& x : only) o += (o.empty() ? "" : ",") + x;
+    for (const std::string& x : ignore) g += (g.empty() ? "" : ",") + x;
+    add("only_if_contains", o);
+    add("ignore_if_contains", g);
+    return out;
+}
+
+bool parse_targets(const std::string& blocks, const std::string& only, const std::string& ignore, Targets& out,
+                   std::string& err) {
+    out.blocks.clear();
+    if (!blocks.empty() && blocks != "all") {
+        for (const std::string& part : comma_parts(blocks)) {
+            const size_t dash = part.find('-');
+            int a = 0, b = 0;
+            if (dash == std::string::npos ? !block_number(part, a)
+                                          : !block_number(part.substr(0, dash), a) ||
+                                                !block_number(part.substr(dash + 1), b)) {
+                err = "--train-blocks: \"all\", or blocks and ranges with commas (0-5,10), not " + part;
+                return false;
+            }
+            if (dash == std::string::npos) b = a;
+            if (b < a) {
+                err = "--train-blocks: a range from its first block to its last, not " + part;
+                return false;
+            }
+            out.blocks.emplace_back(a, b);
+        }
+        if (out.blocks.empty()) {
+            err = "--train-blocks: no block";
+            return false;
+        }
+    }
+    out.only = comma_parts(only);
+    out.ignore = comma_parts(ignore);
+    return true;
 }
 
 }  // namespace strata::image::train

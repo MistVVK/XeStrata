@@ -28,8 +28,9 @@ public:
     MossTrainer(const MossTrainer&) = delete;
     MossTrainer& operator=(const MossTrainer&) = delete;
 
-    /// The DiT folder's shards (or one safetensors file), a LoRA of `rank` on every block not in `skip`.
-    bool open(const std::string& dit, int64_t rank, bool int8, const std::vector<int>& skip, uint64_t seed,
+    /// The DiT folder's shards (or one safetensors file), a LoRA of `rank` on every product `targets` takes (its
+    /// skip: the blocks left out; a product by its name "layers.N.proj.qkv", lora::kMossBlock's).
+    bool open(const std::string& dit, int64_t rank, bool int8, const train::Targets& targets, uint64_t seed,
               void* stream, std::string& err);
     /// The cached text rows' width (the DiT's hidden size).
     int64_t text_cols() const;

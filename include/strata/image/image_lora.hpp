@@ -192,10 +192,13 @@ private:
 };
 
 /// One adapter a request applies: its file, read once and shared while its request runs, and the strength its delta is
-/// scaled by (the file's own alpha / rank is the entry's).
+/// scaled by (the file's own alpha / rank is the entry's).  `blocks`: the strength's factor a DiT block (block b's
+/// weights take scale * blocks[b]; the weights outside the blocks take scale), as A1111's LoRA Block Weight gives it,
+/// one a block of the DiT; empty: 1 for every block.
 struct LoraUse {
     std::shared_ptr<const LoraFile> file;
     float scale = 1.0f;
+    std::vector<float> blocks;
 };
 
 /// Whether a file's key names this weight: the name as the DiT writes it, or as sd-scripts' `lora_unet_` keys and the
@@ -214,7 +217,8 @@ std::string lora_text_encoder_name(const std::string& key);
 /// none of one part is left out of that list; a file of both, a copy of each share).  The copies are kept for the same
 /// files, so a request's split is the last one's when its files are.
 void lora_split(const std::vector<LoraUse>& in, std::vector<LoraUse>& dit, std::vector<LoraUse>& te);
-/// A set's key: its files' paths and strengths in order ("" for none), what a part compares to know the set changed.
+/// A set's key: its files' paths, strengths and block factors in order ("" for none), what a part compares to know the
+/// set changed.
 std::string lora_key_of(const std::vector<LoraUse>& loras);
 
 /// The bytes the adapters take on the GPU: their entries' tensors (FP16), and the products' scratch of T rows (T times

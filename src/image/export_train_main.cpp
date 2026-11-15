@@ -14,7 +14,10 @@
 //               ai-toolkit's weight of the index), the base unquantized.
 //
 //   train --dit DIT --data EXPORT --out PREFIX [--rank 32] [--steps 3000] [--save-every 250] [--lr 1e-4] [--seed 42]
-//         [--caption-dropout 0.05]   MOSS-Image also [--base int8|bf16] [--skip 22] [--shift 5]
+//         [--caption-dropout 0.05] [--train-blocks 0-5,10] [--only-if-contains PARTS] [--ignore-if-contains PARTS]
+//         [--kind character|style|other]   MOSS-Image also [--base int8|bf16] [--skip 22] [--shift 5]
+//   (the weights trained: train::Targets, every one by default; --skip the blocks left out besides; --kind what the
+//   LoRA adds, in its metadata)
 //   loss  --dit DIT --data EXPORT --stem STEM [--sigma 0.5] [--seed 42]   MOSS-Image also [--base int8|bf16]
 #include "strata/core/runtime.hpp"
 #include "strata/image/anima_trainer.hpp"
@@ -47,12 +50,15 @@ void usage() {
     if (kMoss)
         std::fprintf(stderr, "usage: xestrata-image-moss-train train --dit DIR --data EXPORT --out PREFIX [--rank N] "
                              "[--steps N] [--save-every N] [--lr F] [--seed N] [--caption-dropout F] "
-                             "[--base int8|bf16] [--skip LIST] [--shift F]\n"
+                             "[--train-blocks LIST] [--only-if-contains PARTS] [--ignore-if-contains PARTS] "
+                             "[--kind character|style|other] [--base int8|bf16] [--skip LIST] [--shift F]\n"
                              "       xestrata-image-moss-train loss --dit DIR --data EXPORT --stem STEM [--sigma F] "
                              "[--seed N] [--base int8|bf16]\n");
     else
         std::fprintf(stderr, "usage: xestrata-image-anima-train train --dit FILE --data EXPORT --out PREFIX [--rank N] "
-                             "[--steps N] [--save-every N] [--lr F] [--seed N] [--caption-dropout F]\n"
+                             "[--steps N] [--save-every N] [--lr F] [--seed N] [--caption-dropout F] "
+                             "[--train-blocks LIST] [--only-if-contains PARTS] [--ignore-if-contains PARTS] "
+                             "[--kind character|style|other]\n"
                              "       xestrata-image-anima-train loss --dit FILE --data EXPORT --stem STEM [--sigma F] "
                              "[--seed N]\n");
 }
@@ -92,7 +98,8 @@ std::vector<int> int_list(const std::string& s) {
 // The loop, the same for both models: each epoch the samples in a new order, a caption dropped with its probability,
 // the schedule's index drawn, a posterior draw of the latent and new noise, one step and the clipped AdamW update; the
 // LoRA saved every --save-every steps and at the end (<prefix>_<step>.safetensors).
-template <class T> int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank) {
+template <class T>
+int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const train::Targets& targets) {
     const std::string data = need(f, "data");
     std::mt19937_64 rng(seed ^ 0x9e3779b97f4a7c15ull);   // the loop's own stream, not the LoRA's first values'
     std::normal_distribution<float> gauss(0.f, 1.f);
@@ -117,12 +124,13 @@ template <class T> int run(T& tr, const Flags& f, bool train, uint64_t seed, int
     const double shift = std::stod(opt(f, "shift", "5"));
     const train::Schedule sched = kMoss ? train::schedule_shift(shift) : train::schedule_linear();
     if (kMoss)
-        std::printf("moss-image lora: %zu samples, rank %lld, %lld steps, lr %g, shift %g, base %s, skip %s\n",
+        std::printf("moss-image lora: %zu samples, rank %lld, %lld steps, lr %g, shift %g, base %s, %s\n",
                     stems.size(), (long long) rank, (long long) steps, (double) o.lr, shift,
-                    opt(f, "base", "int8").c_str(), opt(f, "skip", "22").c_str());
+                    opt(f, "base", "int8").c_str(), targets.text().c_str());
     else
-        std::printf("anima lora: %zu samples, rank %lld, %lld steps, lr %g, weighted timesteps\n", stems.size(),
-                    (long long) rank, (long long) steps, (double) o.lr);
+        std::printf("anima lora: %zu samples, rank %lld, %lld steps, lr %g, weighted timesteps%s%s\n", stems.size(),
+                    (long long) rank, (long long) steps, (double) o.lr, targets.text().empty() ? "" : ", ",
+                    targets.text().c_str());
     std::uniform_real_distribution<float> uni(0.f, 1.f);
     std::vector<size_t> order;
     size_t next = 0;
@@ -168,6 +176,8 @@ template <class T> int run(T& tr, const Flags& f, bool train, uint64_t seed, int
             meta.steps = step;
             meta.max_steps = steps;
             meta.seed = seed;
+            meta.kind = opt(f, "kind", "");
+            meta.targets = targets.text();
             tr.save(path, train::lora_meta(meta));
             std::printf("saved %s\n", path.c_str());
         }
@@ -202,17 +212,23 @@ int main(int argc, char** argv) {
         const uint64_t seed = std::stoull(opt(f, "seed", "42"));
         const int64_t rank = train ? std::stoll(opt(f, "rank", "32")) : 0;
         std::string err;
+        namespace tl = strata::image::train;   // `train` is the command's flag here
+        tl::Targets targets;
+        if (!tl::parse_targets(opt(f, "train-blocks", ""), opt(f, "only-if-contains", ""),
+                               opt(f, "ignore-if-contains", ""), targets, err))
+            throw std::invalid_argument(err);
+        if (!tl::lora_kind_ok(opt(f, "kind", ""))) throw std::invalid_argument("--kind is character, style or other");
         if (kMoss) {
             const std::string base = opt(f, "base", "int8");
             if (base != "int8" && base != "bf16") throw std::invalid_argument("--base is int8 or bf16");
             MossTrainer tr;
-            if (!tr.open(need(f, "dit"), rank, base == "int8", int_list(opt(f, "skip", "22")), seed, s, err))
-                throw std::runtime_error(err);
-            return run(tr, f, train, seed, rank);
+            targets.skip = int_list(opt(f, "skip", "22"));
+            if (!tr.open(need(f, "dit"), rank, base == "int8", targets, seed, s, err)) throw std::runtime_error(err);
+            return run(tr, f, train, seed, rank, targets);
         }
         AnimaTrainer tr;
-        if (!tr.open(need(f, "dit"), rank, seed, s, err)) throw std::runtime_error(err);
-        return run(tr, f, train, seed, rank);
+        if (!tr.open(need(f, "dit"), rank, seed, s, err, targets)) throw std::runtime_error(err);
+        return run(tr, f, train, seed, rank, targets);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s: %s\n", kMoss ? "moss-train" : "anima-train", e.what());
         return 1;

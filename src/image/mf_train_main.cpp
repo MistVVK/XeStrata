@@ -32,7 +32,9 @@ void usage() {
                  "       xestrata-image-mf-train train --dit <safetensors> --data <export dir> --out <prefix> "
                  "[--method lora|lokr|dora] [--rank N] [--alpha F] [--steps N] [--lr F] [--seed N] [--accum N] "
                  "[--checkpoint N] [--trigger S] [--title S] [--timesteps linear|logit-normal|shifted] [--sigma-max F] "
-                 "[--caption-dropout F] [--warmup N] [--eps F] [--weight-decay F] [--mod 1|0] [--base int8|bf16]\n");
+                 "[--caption-dropout F] [--warmup N] [--eps F] [--weight-decay F] [--mod 1|0] [--base int8|bf16] "
+                 "[--train-blocks LIST] [--only-if-contains PARTS] [--ignore-if-contains PARTS] "
+                 "[--kind character|style|other]\n");
 }
 
 // sd-scripts' truncated logit-normal (flux_train_utils, sample_truncated_logit_normal_indices): S = sigmoid(-N),
@@ -77,6 +79,7 @@ int main(int argc, char** argv) {
     }
     const std::string cmd = argv[1];
     std::string dit, data, stem, method = "lora", out, trigger, title, revision = "card-5";
+    std::string train_blocks, only_if, ignore_if, kind;   // train::Targets' values, and the metadata's kind
     // ai-toolkit's Mage-Flow defaults (its mageflow model's job): linear timesteps, rank 32 with alpha = rank,
     // AdamW lr 1e-4 eps 1e-6 weight decay 1e-4 at a constant rate, batch 1, 3,000 steps, a save every 250, the
     // caption dropped 5% of the time.  "logit-normal" and "shifted" are the earlier SPEC's draws.
@@ -142,6 +145,14 @@ int main(int argc, char** argv) {
             adam_eps = std::stof(val("eps"));
         else if (a == "--weight-decay")
             wd = std::stof(val("weight-decay"));
+        else if (a == "--train-blocks")
+            train_blocks = val("train-blocks");
+        else if (a == "--only-if-contains")
+            only_if = val("only-if-contains");
+        else if (a == "--ignore-if-contains")
+            ignore_if = val("ignore-if-contains");
+        else if (a == "--kind")
+            kind = val("kind");
         else {
             usage();
             return 2;
@@ -156,6 +167,12 @@ int main(int argc, char** argv) {
     const int64_t open_rank = (cmd == "train") ? rank : 0;
     if (base != "int8" && base != "bf16") {
         usage();
+        return 2;
+    }
+    strata::image::train::Targets targets;   // read before the DiT is opened: a mistyped value is said at once
+    if (!strata::image::train::parse_targets(train_blocks, only_if, ignore_if, targets, err) ||
+        !strata::image::train::lora_kind_ok(kind)) {
+        std::fprintf(stderr, "mf-train: %s\n", err.empty() ? "--kind is character, style or other" : err.c_str());
         return 2;
     }
     if (cmd == "train" && base == "int8" && method == "dora") {
@@ -239,7 +256,7 @@ int main(int argc, char** argv) {
             std::normal_distribution<float> gauss(0.f, 1.f);
             std::uniform_real_distribution<float> drop_uni(0.f, 1.f);
             strata::image::mf_trainer_init_adapters(m.get(), method == "dora" ? 1 : method == "lokr" ? 2 : 0, alpha, seed,
-                                                    mod);
+                                                    mod, targets);
             strata::prefill::Gemm gemm;
             if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
             // one sample's shapes set the device buffers; buckets differ, so re-read per step (cheap host work)
@@ -334,7 +351,7 @@ int main(int argc, char** argv) {
                 acc_loss = 0;
                 if (updates % checkpoint == 0)
                     strata::image::mf_trainer_save(m.get(), out + "." + std::to_string(updates) + ".safetensors",
-                                                   title, trigger, seed, lr, updates, steps);
+                                                   title, trigger, seed, lr, updates, steps, kind);
             }
             if (acc_n > 0) {   // the tail micro-steps' gradients, averaged over what ran
                 strata::image::mf_trainer_adamw(m.get(), lr, 0.9f, 0.999f, adam_eps, wd, acc_n);
@@ -342,7 +359,7 @@ int main(int argc, char** argv) {
             }
             eval_avg("final");
             strata::image::mf_trainer_save(m.get(), out + ".final.safetensors", title, trigger, seed, lr, updates,
-                                           steps);
+                                           steps, kind);
             std::printf("done: saved %s (skipped %d non-finite micro-steps)\n",
                         (out + ".final.safetensors").c_str(), nskip);
         } catch (const std::exception& e) {

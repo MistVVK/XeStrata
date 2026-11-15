@@ -1140,7 +1140,12 @@ std::string lora_key_of(const std::vector<LoraUse>& loras) {
         if (!u.file) continue;
         char num[32];
         std::snprintf(num, sizeof num, "%.7g", (double) u.scale);
-        key += u.file->path() + ":" + num + ";";
+        key += u.file->path() + ":" + num;
+        for (size_t b = 0; b < u.blocks.size(); ++b) {
+            std::snprintf(num, sizeof num, "%.7g", (double) u.blocks[b]);
+            key += (b == 0 ? "@" : ",") + std::string(num);
+        }
+        key += ";";
     }
     return key;
 }
@@ -1166,8 +1171,8 @@ void lora_split(const std::vector<LoraUse>& in, std::vector<LoraUse>& dit, std::
             kept.push_back(k);
             it = kept.end() - 1;
         }
-        if (it->dit) dit.push_back({it->dit, u.scale});
-        if (it->te) te.push_back({it->te, u.scale});
+        if (it->dit) dit.push_back({it->dit, u.scale, u.blocks});
+        if (it->te) te.push_back({it->te, u.scale, {}});   // a text encoder has no DiT blocks
     }
 }
 
@@ -1944,14 +1949,20 @@ int64_t lora_scratch_cols(const LoraEntry& e) {
 }
 
 uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
-    uint64_t bytes = 0;
+    uint64_t bytes = 0, bake = 0;
     int64_t cols = 0, glora_cols = 0, glora_rows = 0;
     for (const LoraUse& u : loras) {
         if (!u.file) continue;
         for (const LoraEntry& e : u.file->entries()) {
-            if (e.kind == LoraKind::lora)
+            if (e.kind == LoraKind::lora) {
                 bytes += 2 * (uint64_t) e.rank * (uint64_t) (e.rows + e.cols);   // A and B, FP16
-            else if (e.kind == LoraKind::glora && e.rows > 0 && e.cols > 0) {
+                // a plain LoRA folded into a block's weight (DitLoras' bake): the weight's delta in FP32 and A^T,
+                // taken once for the largest (a DiT that does not bake it takes none; a fused weight whose parts a
+                // file names apart is larger than its entries - the plan counts what the bind took)
+                if (e.dora.empty() && e.bias.empty())
+                    bake = std::max(bake, (uint64_t) e.rows * (uint64_t) e.cols * 4 +
+                                              (uint64_t) e.cols * (uint64_t) e.rank * 2);
+            } else if (e.kind == LoraKind::glora && e.rows > 0 && e.cols > 0) {
                 bytes += 2 * (uint64_t) e.rank * (uint64_t) (3 * e.cols + e.rows);   // its plain pair and the input's
                                                                                      // two factors, FP16
                 glora_cols = std::max(glora_cols, e.cols);
@@ -1974,7 +1985,7 @@ uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
     if (glora_cols > 0)   // a GLoRA's weight's product of its input: the table of a band's rows, and that input (an
         // int8 one of a W8A8 product's, a packed Q8_0 one's, and the FP16 it is made in)
         bytes += (uint64_t) kLoraGloraRows * ((uint64_t) glora_cols * 6 + (uint64_t) glora_rows * 4);
-    return bytes + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) cols * 6;
+    return bytes + bake + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) cols * 6;
 }
 
 bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n, const std::vector<float>& norms,

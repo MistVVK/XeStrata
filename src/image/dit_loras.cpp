@@ -52,6 +52,21 @@ std::vector<DitLoraTarget> DitLoras::targets() const {
     return out;
 }
 
+int DitLoras::block_of(const std::string& name) const {
+    if (block_path.empty() || name.compare(0, block_path.size(), block_path) != 0) return -1;
+    size_t i = block_path.size();
+    int b = 0;
+    if (i >= name.size() || name[i] < '0' || name[i] > '9') return -1;
+    for (; i < name.size() && name[i] >= '0' && name[i] <= '9'; ++i) b = b * 10 + (name[i] - '0');
+    return i < name.size() && name[i] == '.' ? b : -1;
+}
+
+int DitLoras::blocks() const {
+    int n = 0;
+    for (const DitLoraSlot& s : slots_) n = std::max(n, block_of(s.name) + 1);
+    return n;
+}
+
 bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& changed) {
     changed = false;
     // the set as the same again (its files and strengths): nothing to bind
@@ -66,8 +81,14 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
     };
     void* const s = *s_;
     std::vector<std::string> unknown, text_encoder;
+    const int nblocks = blocks();
     for (const LoraUse& u : loras) {
         if (!u.file) continue;
+        if (!u.blocks.empty() && (int) u.blocks.size() != nblocks) {
+            err = "image engine: " + u.file->path() + ": " + std::to_string(u.blocks.size()) +
+                  " block weights, and the DiT has " + std::to_string(nblocks) + " blocks";
+            return fail();
+        }
         if (hooks.file) hooks.file(*u.file);
         for (const LoraEntry& raw : u.file->entries()) {
             LoraEntry moved;
@@ -128,10 +149,14 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
                         return fail();
                     }
             }
-            const float scale = u.scale * e.scale();
+            // the request's strength, times the factor of the weight's block where the request gives one a block
+            // (the slots of an entry share its name, so its block)
+            const int blk = u.blocks.empty() ? -1 : block_of(slots[0]->name);
+            const float us = blk >= 0 ? u.scale * u.blocks[(size_t) blk] : u.scale;
+            const float scale = us * e.scale();
             // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves the bias's
             // delta and a DoRA's base factors, as a DoRA's decomposition scales the weight with no delta)
-            if (u.scale == 0.0f || (scale == 0.0f && e.bias.empty() && e.dora.empty())) continue;
+            if (us == 0.0f || (scale == 0.0f && e.bias.empty() && e.dora.empty())) continue;
             // a DoRA's: the entry's rows' delta factors (its B's, by the entry's rows), and each part's base factors
             const bool dora = !e.dora.empty();
             std::vector<float> coef((size_t) e.rows, 1.0f);
@@ -142,14 +167,14 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
                 if (dora && !hooks.dora_norms(*slot, norms, err)) return fail();
                 if (dora) {
                     std::vector<float> c;
-                    if (!lora_dora_rows(e, slot->src_row, slot->row0, slot->rows, norms, u.scale, c, bases[i], why)) {
+                    if (!lora_dora_rows(e, slot->src_row, slot->row0, slot->rows, norms, us, c, bases[i], why)) {
                         err.assign(at).append(": ").append(why);
                         return fail();
                     }
                     for (int64_t j = 0; j < slot->rows; ++j) coef[(size_t) (slot->src_row + j)] = c[(size_t) j];
                 }
                 if (e.replaces)   // a set_weight: the weight interpolates to the file's, W + s (S - W)
-                    bases[i].assign((size_t) slot->rows, 1.0f - u.scale);
+                    bases[i].assign((size_t) slot->rows, 1.0f - us);
                 if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, dora, oft, glora,
                                                               e.replaces)) {
                     err = at + ": the weight's rows " + std::to_string(slot->row0) + " .. " +
@@ -172,7 +197,7 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
                 part.n = slot->rows;
                 part.src_row = slot->src_row;
                 part.scale = scale;
-                part.bias_scale = u.scale;   // a diff patch has no alpha: the request's strength only
+                part.bias_scale = us;   // a diff patch has no alpha: the request's strength only
                 part.dora = dora;
                 part.oft = oft;
                 part.glora = glora;
@@ -217,6 +242,7 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
         if (nk > 0) {
             bake_tmp_ = alloc<float>(*owned_, nk, what_);
             bake_at16_ = alloc<uint16_t>(*owned_, kr, what_);
+            bake_bytes_ = (uint64_t) nk * 4 + (uint64_t) kr * 2;
             baked_any_ = true;
             hooks.reprepare();   // the queued work drained before the prepare changes
         }
@@ -240,6 +266,7 @@ void DitLoras::drop() {
                 release(*owned_, *p);
                 *p = nullptr;
             }
+        bake_bytes_ = 0;
     }
     layers_.clear();
     files_.clear();
@@ -250,7 +277,8 @@ void DitLoras::drop() {
 uint64_t DitLoras::bytes() const {
     uint64_t n = 0;
     for (const std::unique_ptr<LoraLayer>& l : layers_) n += l->bytes();
-    return n + scratch_->glora_bytes();   // a GLoRA's own path's buffers
+    // a GLoRA's own path's buffers, and the bake's (taken before the plan that places the blocks beside them)
+    return n + scratch_->glora_bytes() + bake_bytes_;
 }
 
 bool dit_slot_norms(const DitLoraSlot& slot, const std::vector<float>& norms, std::vector<float>& out,

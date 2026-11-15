@@ -68,10 +68,11 @@ enhance has the chat's model write the prompt out first (enhance_prompt).
 Adapters (serve/loras.py): a request's "lora" field - a list of {"name", "scale"}, one such object, a name alone, or
 the same as a form's JSON text - and the prompt's tags, <lora:name:0.8> in A1111's and Forge's form, positive prompt
 and negative; they go to the engine as IMG's and NEED's LORA:<strength>:<path> words (the path's whitespace %XX'd:
-the engine splits the line on it).  A name the model's LoRA folder ("lora_dir") does not offer is refused where the
-field gives it and taken out of the prompt with a warning where a tag does (the response's xestrata.lora_unknown).
-"local_path" is a file inside that folder only.  The response's data[] items carry the adapters applied as "lora":
-[{"name", "scale"}], and xestrata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
+the engine splits the line on it), an adapter's block weights ("blocks") after its strength (@<w0>,<w1>,...).  A
+name the model's LoRA folder ("lora_dir") does not offer is refused where the field gives it and taken out of the
+prompt with a warning where a tag does (the response's xestrata.lora_unknown).  "local_path" is a file inside that
+folder only.  The response's data[] items carry the adapters applied as "lora": [{"name", "scale"}, with "blocks"
+where given], and xestrata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  A config whose "images" section names a card of its own
@@ -656,6 +657,15 @@ def parse_request(req: dict, cfg: dict) -> dict:
     job = {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "partial_images": partial,
            "quality": quality or "auto", "response_format": fmt, "output_format": out_fmt,
            "output_compression": compression, "background": background, "bucket": bucket, **requested, **cfg_fields}
+    bmap = cfg.get("lora_block_map")
+    if loras and bmap:   # Anima-2.9B: block weights in the release's numbering (its adapters'), to the DiT's blocks
+        n = max(int(b) for b in bmap) + 1
+        for use in loras:
+            if use.get("blocks") and len(use["blocks"]) == len(bmap):
+                w = [1.0] * n   # the blocks 2.9B inserted take none of the release's adapter: theirs changes nothing
+                for i, b in enumerate(bmap):
+                    w[int(b)] = use["blocks"][i]
+                use["blocks"] = w
     if loras:
         job["loras"] = loras
     if unknown:
@@ -3086,13 +3096,16 @@ class ImageGen:
 
     @staticmethod
     def _lora_words(job: dict) -> str:
-        """IMG's and NEED's adapters: LORA:<strength>:<path> for each, in the order the request gave them (the strength
-        first, so a Windows path's colons are not read as one; the path's separators %XX'd, as the engine splits the
-        line on whitespace - encode_path); a MOSS-Image edit's adapter (job["edit_lora"]) first, at 1."""
+        """IMG's and NEED's adapters: LORA:<strength>[@<block weights>]:<path> for each, in the order the request gave
+        them (the strength first, so a Windows path's colons are not read as one; the path's separators %XX'd, as the
+        engine splits the line on whitespace - encode_path); a MOSS-Image edit's adapter (job["edit_lora"]) first, at
+        1."""
         edit = f" LORA:1.0:{lora_api.encode_path(job['edit_lora'])}" if job.get("edit_lora") else ""
         if job.get("few_step"):   # the 4-step adapter's LoRA, at 1 (the engine adds it to the products)
             edit = f" LORA:1.0:{lora_api.encode_path(job['few_step']['lora'])}" + edit
-        return edit + "".join(f" LORA:{use['scale']!r}:{lora_api.encode_path(use['path'])}"
+        return edit + "".join(f" LORA:{use['scale']!r}"
+                              + ("@" + ",".join(repr(float(b)) for b in use["blocks"]) if use.get("blocks") else "")
+                              + f":{lora_api.encode_path(use['path'])}"
                               for use in job.get("loras") or ())
 
     @staticmethod
@@ -3665,7 +3678,8 @@ class ImageGen:
     def response(self, images: list[bytes], job: dict, figures: dict, base_url: str) -> dict:
         data = []
         fmt = job.get("output_format") or "png"
-        applied = [{"name": u["name"], "scale": u["scale"]} for u in job.get("loras") or ()]
+        applied = [{"name": u["name"], "scale": u["scale"], **({"blocks": u["blocks"]} if u.get("blocks") else {})}
+                   for u in job.get("loras") or ()]
         backgrounds, flatten_s = [], None
         for i, png in enumerate(images):
             item = {"seed": job["seed"] + i} if job.get("ups_only") else \
@@ -4036,6 +4050,7 @@ EDIT_TOOLS = ("edit_image", "extend_image", "upscale_image", "fix_image", "edit_
 SKILL_ALWAYS = "image-tools"
 SKILL_MODELS = "models"
 SKILL_MODELS_WHEN = "choosing the image model: what each one is made for."
+SKILL_LORA = "lora"   # how the chat's model chooses the LoRAs, their strength and block weights (generate, edit)
 SKILL_COMBINE = "combine-tools"   # its "tool" is "*": offered with two image tools or more
 STYLE_DEFAULT = "natural"         # the prompt style of a model whose skill names none
 # the copy of a made image an image tool's result shows a chat model that reads pictures: its longer side, and how many
@@ -4403,6 +4418,8 @@ class ImageTools:
                             "required": ["label", "caption", "bbox"]}}},
                     "required": ["items"]}}
                 t["parameters"] = params
+            if t["name"] in ("generate_image", "edit_image") and self._lora_lines(gens):   # the models' LoRAs
+                t = self._with_lora(t, gens)
             params = dict(t["parameters"])   # the plan's step and group (combine-tools), every tool's
             params["properties"] = {**params["properties"], **PLAN_ARGS}
             if self.text_gpu == "ask" and t["name"] not in ("upscale_video", "segment_video") and self._can_lend():
@@ -4418,6 +4435,48 @@ class ImageTools:
                 t["parameters"] = params
             out.append(t)
         return out
+
+    @staticmethod
+    def _lora_lines(gens: list) -> list[str]:
+        """The LoRAs the models of `gens` list, one line each: its name, what it was trained to add and its trigger
+        words (serve/loras.py's listing), and its model where several are offered."""
+        lines = []
+        for g in gens:
+            for e in g.loras.listing() if g.loras.takes else ():
+                about = ", ".join(x for x in (e.get("kind"), f"trigger {e['trigger']}" if e.get("trigger") else None)
+                                  if x)
+                lines.append(e["name"] + (f" ({about})" if about else "") + (f" [{g.model}]" if len(gens) > 1 else ""))
+        return lines
+
+    def _with_lora(self, t: dict, gens: list) -> dict:
+        """generate_image's or edit_image's `lora` argument: the models' LoRAs by name, a strength and the block
+        weights (BLOCK_PRESETS' names for the models' families, or a number each block with commas); the lora skill
+        says how to choose them."""
+        # each name with the models whose family has it: a model without the name refuses it (a call wasted on the
+        # first try, 2026-11-16: Mage-Flow's character LoRA asked "character", then again without it)
+        has: dict[str, list[str]] = {}
+        for g in gens:
+            for n in lora_api.BLOCK_PRESETS.get(g.family, {}):
+                has.setdefault(n, []).append(g.model)
+        presets = ["all (every model)"] + [n if len(v) == len(gens) else f"{n} ({', '.join(v)} only)"
+                                           for n, v in has.items()]
+        names = list(dict.fromkeys(e["name"] for g in gens if g.loras.takes for e in g.loras.listing()))
+        params = dict(t["parameters"])
+        params["properties"] = {**params["properties"], "lora": {
+            "type": "array", "description": "LoRAs: " + "; ".join(self._lora_lines(gens)),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": names},
+                    "scale": {"type": "number", "description": "strength, default 1"},
+                    "blocks": {"type": "string",
+                               "description": ("the strength each DiT block: " + "; ".join(presets)
+                                               + "; or a number each block with commas")}},
+                "required": ["name"]}}}
+        t = {**t, "parameters": params}
+        if self.skills == "inline" and (body := self._skills().body(SKILL_LORA)):
+            t["description"] += "\n\nLoRAs:\n" + body
+        return t
 
     def _model_lines(self, gens: list) -> list[str]:
         """Each model's name and what it is made for (the catalog's ABOUT, else _about)."""
@@ -4475,6 +4534,10 @@ class ImageTools:
                 continue
             if want in tools and want not in CORE_TOOLS and not self.all_tools:
                 continue   # its tool's stub carries its line, and its call answers with the skill (_stub_answer)
+            if want == "lora":   # with the LoRA argument only: a model lists LoRAs
+                if {"generate_image", "edit_image"} & set(tools) and self._lora_lines(self._gens()):
+                    out.append((s.name, "tool", s.description))
+                continue
             if (want in tools or want == "*" and len(tools) > 1
                     or want == "guidance" and guided and {"generate_image", "edit_image"} & set(tools)):
                 out.append((s.name, "tool", s.description))
@@ -4914,6 +4977,8 @@ class ImageTools:
                 req["refine"] = args["refine"]
             if name in ("generate_image", "edit_image") and args.get("guidance") not in (None, "", []):
                 req["guidance"] = args["guidance"]
+            if name in ("generate_image", "edit_image") and args.get("lora") not in (None, "", []):
+                req["lora"] = args["lora"]   # serve/loras.py's field: the model's names, strengths, block weights
             if name in ("edit_image", "edit_region", "fix_image") and (args.get("crop_upscale") or args.get("variant")):
                 req["crop_upscale"] = {k: v for k, v in (("method", args.get("crop_upscale")),
                                                          ("variant", args.get("variant"))) if v}

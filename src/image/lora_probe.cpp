@@ -984,7 +984,7 @@ int step(const std::string& dit_path, const std::string& out_path, const std::st
     if (!dit.open(dit_path, s, err)) throw std::runtime_error(err);
     if (!lora_path.empty()) {
         std::vector<si::LoraUse> loras;
-        loras.push_back({si::LoraFile::open(lora_path), scale});
+        loras.push_back({si::LoraFile::open(lora_path), scale, {}});
         if (!dit.set_loras(loras, err)) throw std::runtime_error(err);
     }
     const char* hw_env = std::getenv("QI_STEP_HW");
@@ -1116,7 +1116,7 @@ int moss_step(const std::string& dit_path, const std::string& out_path, const st
     }
     if (!lora_path.empty()) {
         std::vector<si::LoraUse> loras;
-        loras.push_back({si::LoraFile::open(lora_path), scale});
+        loras.push_back({si::LoraFile::open(lora_path), scale, {}});
         if (!dit.set_loras(loras, err)) throw std::runtime_error(err);
     }
     const char* hw_env = std::getenv("MOSS_STEP_HW");
@@ -1246,7 +1246,7 @@ int mf_step(const std::string& dit_path, const std::string& out_path, const std:
     }
     if (!lora_path.empty()) {
         std::vector<si::LoraUse> loras;
-        loras.push_back({si::LoraFile::open(lora_path), scale});
+        loras.push_back({si::LoraFile::open(lora_path), scale, {}});
         if (!dit.set_loras(loras, err)) throw std::runtime_error(err);
     }
     const char* hw_env = std::getenv("MF_STEP_HW");

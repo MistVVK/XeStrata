@@ -194,6 +194,7 @@ using namespace anima_dit_detail;
 bool anima_is_dit(const std::string& path) { return AnimaFile::is_dit(path); }
 
 AnimaDit::AnimaDit() {
+    loras_.block_path = "blocks.";   // build_lora_targets' blocks (a request's block weights)
     DitLoraHooks& h = loras_.hooks;
     h.drop = [this] { drop_loras(); };
     h.dora_norms = [this](const DitLoraSlot& slot, std::vector<float>& out, std::string& err) {

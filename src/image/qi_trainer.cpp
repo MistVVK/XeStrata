@@ -213,7 +213,7 @@ int64_t QiTrainer::blocks() const { return (int64_t) m_->blk.size(); }
 int64_t QiTrainer::width() const { return m_->C; }
 
 bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err,
-                     int64_t max_blocks, bool int8) {
+                     int64_t max_blocks, bool int8, const train::Targets& targets) {
     Impl& m = *m_;
     try {
         m.rank = rank;
@@ -298,13 +298,17 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
             }
             const int layer = m.ws.add(spans);
             for (int i = 0; i < kQiProducts; ++i) blk.off[i] = m.ws.offset(layer, i);
-            for (int i = 0; i < kQiProducts; ++i) blk.l[i] = &m.add_lora(blk.p[i].N, blk.p[i].K, rank, rng);
+            for (int i = 0; i < kQiProducts; ++i)
+                if (targets.take(b, p + kProducts[i])) blk.l[i] = &m.add_lora(blk.p[i].N, blk.p[i].K, rank, rng);
             blk.nq = m.dev_vec(m.g->f32(p + "attn.norm_q.weight"));
             blk.nk = m.dev_vec(m.g->f32(p + "attn.norm_k.weight"));
             m.blk.push_back(blk);
         }
         for (void* x : {(void*) q16, (void*) q8, (void*) qs}) m.release(x);
         if (m.blk.empty()) throw std::runtime_error("image engine (Qwen-Image-2.1 training): the DiT has no blocks");
+        if (rank > 0 && m.loras().empty())
+            throw std::runtime_error("image engine (Qwen-Image-2.1 training): the weights chosen (" + targets.text() +
+                                     ") are none of the blocks' products");
         m.F = m.blk[0].p[kQiGateUp].N / 2;
         m.H = m.C / kHead;
         m.dgrad_scratch(m.blk[0].p, kQiProducts, int8);
@@ -395,7 +399,7 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
         const Impl::Block& B = m.blk[(size_t) b];
         for (int i = 0; i < kQiProducts; ++i) {
             r.p[i] = B.p[i];
-            r.ad[i] = &B.l[i]->ad;
+            r.ad[i] = B.l[i] != nullptr ? &B.l[i]->ad : nullptr;
         }
         r.nq = B.nq;
         r.nk = B.nk;
@@ -407,7 +411,13 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     const bool half = m.ckpt16 != nullptr;
     const int64_t cap = m.cap;
     const int64_t nb = (int64_t) m.blk.size();
-    const int64_t first_kept = nb - m.keep_tapes(nb, R, qi_block_tape_bytes(run_of(0)), 0);
+    // a block's tape at its largest: each product adapted where any block adapts it (a run trains some blocks' or
+    // products' only, train::Targets)
+    QiBlockRun most = run_of(0);
+    for (int i = 0; i < kQiProducts; ++i)
+        for (const Impl::Block& B : m.blk)
+            if (most.ad[i] == nullptr && B.l[i] != nullptr) most.ad[i] = &B.l[i]->ad;
+    const int64_t first_kept = nb - m.keep_tapes(nb, R, qi_block_tape_bytes(most), 0);
     for (int64_t b = 0; b < nb; ++b) {   // the forward, each block's input kept, the last ones' tapes too
         QiBlockRun r = run_of(b);
         // the next block's weights fetched meanwhile; past the last, the backward's second (its first is this one)
@@ -476,6 +486,7 @@ std::vector<train::Tensor> QiTrainer::grads() const {
     std::vector<train::Tensor> out;
     for (size_t b = 0; b < m.blk.size(); ++b)
         for (int i = 0; i < kQiProducts; ++i) {
+            if (m.blk[b].l[i] == nullptr) continue;   // a product the run does not train
             const train::Lora& l = *m.blk[b].l[i];
             const std::string k = "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kProducts[i];
             out.push_back({k + ".lora_A.weight", {m.rank, l.K}, m.read(l.ad.dA, m.rank * l.K)});
@@ -489,6 +500,7 @@ void QiTrainer::save(const std::string& path, const std::vector<std::pair<std::s
     std::vector<train::Tensor> ts;
     for (size_t b = 0; b < m.blk.size(); ++b)
         for (int i = 0; i < kQiProducts; ++i) {
+            if (m.blk[b].l[i] == nullptr) continue;   // a product the run does not train
             const train::Lora& l = *m.blk[b].l[i];
             const std::string k = "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kProducts[i];
             ts.push_back({k + ".lora_A.weight", {m.rank, l.K}, m.read(l.A, m.rank * l.K)});
@@ -504,6 +516,7 @@ void QiTrainer::set_factors(const std::vector<train::Tensor>& ts) {
     gpu::stream_sync(m.s);
     for (size_t b = 0; b < m.blk.size(); ++b)
         for (int i = 0; i < kQiProducts; ++i) {
+            if (m.blk[b].l[i] == nullptr) continue;   // a product the run does not train
             const train::Lora& l = *m.blk[b].l[i];
             const std::string k = "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kProducts[i];
             auto put = [&](const std::string& key, float* d, int64_t n) {

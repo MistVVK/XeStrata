@@ -181,6 +181,7 @@ void ref_values(const uint16_t* v16, const float* from, const float* to, int64_t
 using namespace moss_dit_detail;
 
 MossDit::MossDit() {
+    loras_.block_path = "layers.";   // build_lora_targets' blocks (a request's block weights)
     DitLoraHooks& h = loras_.hooks;
     h.drop = [this] { drop_loras(); };
     h.dora_norms = [this](const DitLoraSlot& slot, std::vector<float>& out, std::string& err) {

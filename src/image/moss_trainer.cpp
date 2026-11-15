@@ -93,7 +93,7 @@ MossTrainer::MossTrainer() : m_(std::make_unique<Impl>()) {}
 MossTrainer::~MossTrainer() = default;
 int64_t MossTrainer::text_cols() const { return m_->C; }
 
-bool MossTrainer::open(const std::string& dit, int64_t rank, bool int8, const std::vector<int>& skip, uint64_t seed,
+bool MossTrainer::open(const std::string& dit, int64_t rank, bool int8, const train::Targets& targets, uint64_t seed,
                        void* stream, std::string& err) {
     Impl& m = *m_;
     try {
@@ -201,11 +201,14 @@ bool MossTrainer::open(const std::string& dit, int64_t rank, bool int8, const st
             blk.n2 = m.dev_vec(f.f32(p + "norm2.weight"));
             blk.nq = m.dev_vec(f.f32(p + "q_norm.weight"));
             blk.nk = m.dev_vec(f.f32(p + "k_norm.weight"));
-            if (rank > 0 && std::find(skip.begin(), skip.end(), b) == skip.end())
-                for (int i = 0; i < kMossProducts; ++i) blk.l[i] = &m.add_lora(blk.p[i].N, blk.p[i].K, rank, rng);
+            for (int i = 0; i < kMossProducts && rank > 0; ++i)
+                if (targets.take(b, p + kProduct[i])) blk.l[i] = &m.add_lora(blk.p[i].N, blk.p[i].K, rank, rng);
             m.blk.push_back(std::move(blk));
         }
         if (m.blk.empty()) throw std::runtime_error("image engine (MOSS-Image training): the DiT has no blocks");
+        if (rank > 0 && m.loras().empty())
+            throw std::runtime_error("image engine (MOSS-Image training): the weights chosen (" + targets.text() +
+                                     ") are none of the blocks' products");
         m.hd = (int64_t) f.f32("layers.0.q_norm.weight").size();
         m.H = m.C / m.hd;
         m.F = m.blk[0].p[kMossUpGate].N / 2;
@@ -261,7 +264,12 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
         z.rows = R;
         for (int i = 0; i < kMossProducts; ++i) {
             z.p[i] = m.blk.back().p[i];
-            z.ad[i] = m.blk.back().l[i] != nullptr ? &m.blk.back().l[i]->ad : nullptr;
+            z.ad[i] = nullptr;   // a block's tape at its largest: the product adapted where any block adapts it
+            for (const Impl::Block& B : m.blk)
+                if (B.l[i] != nullptr) {
+                    z.ad[i] = &B.l[i]->ad;
+                    break;
+                }
         }
         const size_t rc = (size_t) (R * C), tape = moss_block_tape_bytes(z, m.gemm);
         // before a step has shown the arena's size, a block's tape's bytes for its growth
@@ -437,9 +445,9 @@ void MossTrainer::save(const std::string& path, const std::vector<std::pair<std:
     std::vector<train::Tensor> ts;
     for (size_t b = 0; b < m.blk.size(); ++b) {
         const Impl::Block& B = m.blk[b];
-        if (B.l[0] == nullptr) continue;
         const std::string p = "diffusion_model.layers." + std::to_string(b) + ".";
         for (int i = 0; i < kMossProducts; ++i) {
+            if (B.l[i] == nullptr) continue;   // a product the run does not train
             const train::Lora& l = *B.l[i];
             const std::vector<float> A = m.read(l.A, m.rank * l.K), Bv = m.read(l.B, l.N * m.rank);
             if (i == kMossQkv) {   // q, k and v: the fused A each, B's rows split in three

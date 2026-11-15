@@ -4,7 +4,8 @@
 //
 //   strata-image-qi-train train --dit <F16 GGUF> --data <items file> --out <prefix> [--rank 32] [--steps 3000]
 //                               [--lr 1e-4] [--seed 42] [--draw balanced|content|style] [--save-every 250]
-//                               [--caption-dropout 0.05] [--base bf16|int8]
+//                               [--caption-dropout 0.05] [--base bf16|int8] [--train-blocks 0-5,10]
+//                               [--only-if-contains attn] [--ignore-if-contains img_mlp] [--kind character|style|other]
 //   strata-image-qi-train check --dit <F16 GGUF> --dir <dir> [--blocks N] [--base bf16|int8]
 //
 // The caches the trainer reads are ai-toolkit's, made before it trains by tools/image/mf_pre.py --cache qi (the list's
@@ -17,6 +18,9 @@
 //
 // --base int8 is a QLoRA: the blocks' products on ai-toolkit's convrot8 base (W8A8, made from the 16-bit file), as
 // ai-toolkit's default trains.
+//
+// --train-blocks, --only-if-contains and --ignore-if-contains choose the products trained (train::Targets: every one
+// by default); --kind says what the LoRA adds, in its metadata (ss_xestrata_kind), for serve's listing.
 //
 // check is one step on the inputs tools/image/qi_train_step_ref.py writes (states, x0, noise, the LoRA factors), its
 // loss, prediction and gradients written back for the reference to compare.
@@ -47,7 +51,8 @@ void usage() {
     std::fprintf(stderr,
                  "usage: xestrata-image-qi-train train --dit <gguf> --data <items> --out <prefix> [--rank N] "
                  "[--steps N] [--lr F] [--seed N] [--draw balanced|content|style] [--save-every N] "
-                 "[--caption-dropout F] [--base bf16|int8]\n"
+                 "[--caption-dropout F] [--base bf16|int8] [--train-blocks LIST] [--only-if-contains PARTS] "
+                 "[--ignore-if-contains PARTS] [--kind character|style|other]\n"
                  "       xestrata-image-qi-train check --dit <gguf> --dir <dir> [--blocks N] [--base bf16|int8]\n");
 }
 
@@ -101,7 +106,13 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     if (base != "bf16" && base != "int8") throw std::invalid_argument("bad --base (bf16 or int8)");
     QiTrainer tr;
     std::string err;
-    if (!tr.open(need(f, "dit"), rank, seed, s, err, 0, base == "int8")) throw std::runtime_error(err);
+    train::Targets targets;
+    if (!train::parse_targets(opt(f, "train-blocks", ""), opt(f, "only-if-contains", ""),
+                              opt(f, "ignore-if-contains", ""), targets, err))
+        throw std::invalid_argument(err);
+    const std::string kind = opt(f, "kind", "");
+    if (!train::lora_kind_ok(kind)) throw std::invalid_argument("bad --kind (character, style or other)");
+    if (!tr.open(need(f, "dit"), rank, seed, s, err, 0, base == "int8", targets)) throw std::runtime_error(err);
     std::ifstream items(need(f, "data"));
     if (!items) throw std::runtime_error("cannot read the items");
     struct Item {
@@ -180,6 +191,8 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
             meta.steps = step;
             meta.max_steps = steps;
             meta.seed = seed;
+            meta.kind = kind;
+            meta.targets = targets.text();
             meta.extra = {{"ss_content_or_style", opt(f, "draw", "balanced")}};
             tr.save(path, train::lora_meta(meta));
             std::printf("saved %s\n", path.c_str());
