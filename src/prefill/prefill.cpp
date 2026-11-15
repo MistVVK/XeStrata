@@ -1227,6 +1227,11 @@ bool lay_latent(const strata::kernels::cpu::ExpertLayout& lay) {
     return lay.native && !lay.fmt.empty() && lay.fmt[0].n_embd != N;
 }
 
+const MmqPlan& mmq_plan();
+// The latent experts on the standard path's int8 products, where this GPU takes them for every layer
+// (XESTRATA_LATENT_FUSED=0: the dp4a arm, Prefill::latent_experts)
+bool latent_on_standard_path() { return strata::env_auto("LATENT_FUSED") != 0 && mmq_plan().any && !mmq_plan().fallback; }
+
 const MmqPlan& mmq_plan() {
     // per GPU (the current device's): a layer split's stages can differ, and a stage that took the first GPU's plan
     // ran int8 products its own GPU lacks (B70 + RTX 4070: the 4070's prompt chunk stopped at its first layer)
@@ -2713,7 +2718,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        // the latent MoE's dp4a arm (Prefill::latent_experts) copies its own blobs and gives no ring entry back: its
+        // chunks take no stream (one did not finish: the stream waited for slots the arm never released)
+        const bool lat_arm = m.latent_ && !latent_on_standard_path();
+        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr && !lat_arm;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
@@ -3310,8 +3318,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // shell's projections around them.  Where this layer takes the int8 products, its experts are the
                     // standard path's below (latent_mmq_d before them, latent_mmq_u after); else the dp4a arm
                     // (Prefill::latent_experts).  XESTRATA_LATENT_FUSED=0 takes the dp4a arm.
-                    const bool lat_std = m.latent_ && strata::env_auto("LATENT_FUSED") != 0 && mmq_plan().any &&
-                                         mmq_plan().layer[(size_t) l];
+                    const bool lat_std = m.latent_ && latent_on_standard_path() && mmq_plan().layer[(size_t) l];
                     if (m.latent_ && !lat_std) {
                         if (!latent_experts(l, T, K, m, err)) return false;
                     } else {
