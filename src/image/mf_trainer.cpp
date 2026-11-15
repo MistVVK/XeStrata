@@ -461,7 +461,7 @@ static MfBlockRun block_run(Model* m, int64_t b, const MfTrainCond& c, int64_t R
             w->w8[i] = pr.w8;
             w->sw[i] = pr.sw;
             w->b[i] = pr.b;
-            w->ad[i] = blk.adap != nullptr ? &blk.adap->ad[q][i] : nullptr;
+            w->ad[i] = blk.adap != nullptr && !blk.adap->off[q][i] ? &blk.adap->ad[q][i] : nullptr;
         }
         w->nq = blk.nq[q];
         w->nk = blk.nk[q];
@@ -520,7 +520,15 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
         keep != nullptr && m->inputs_half(Rj, (uint64_t) ((m->nblk + 1) * Rj * C) * 4, (uint64_t) (12 * C) * 4);
     if (keep != nullptr) {
         const size_t rc = (size_t) (Rj * C);
-        keep->first_kept = m->nblk - m->keep_tapes(m->nblk, Rj, mf_block_tape_bytes(block_run(m, 0, c, R, Rt), gemm),
+        // a block's tape at its largest: each product adapted where any block adapts it (train::Targets)
+        MfBlockRun most = block_run(m, 0, c, R, Rt);
+        for (int q = 0; q < 2; ++q)
+            for (int i = 0; i < 6; ++i)
+                for (int64_t b = 0; b < m->nblk && (q == 0 ? most.img_w : most.txt_w).ad[i] == nullptr; ++b) {
+                    const MfTrainAdapter* az = m->blk[(size_t) b].adap;
+                    if (az != nullptr && !az->off[q][i]) (q == 0 ? most.img_w : most.txt_w).ad[i] = &az->ad[q][i];
+                }
+        keep->first_kept = m->nblk - m->keep_tapes(m->nblk, Rj, mf_block_tape_bytes(most, gemm),
                                                    half ? (size_t) (m->nblk + 1) * rc * 2 + 4 * rc * 4
                                                         : (size_t) (m->nblk + 1 + 4) * rc * 4);
     }
@@ -643,15 +651,23 @@ void rownorm_f16(const uint16_t* w, int64_t N, int64_t K, float* norms, void* s)
 
 }  // namespace
 
-void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint64_t seed, bool mod_targets) {
+void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint64_t seed, bool mod_targets,
+                              const train::Targets& targets) {
     Model* m = static_cast<Model*>(base);
     void* s = m->stream;
     std::mt19937_64 rng(seed);
+    bool any = false;
     for (int64_t b = 0; b < m->nblk; ++b) {
         MfTrainModel::Block& blk = m->blk[(size_t) b];
         if (blk.adap == nullptr) continue;
         bind(m, b, m->ws.begin((int) b));   // the DoRA norms below read the base's rows
         MfTrainAdapter& tz = *blk.adap;
+        const std::string p = "transformer_blocks." + std::to_string(b) + ".";
+        for (int st = 0; st < 2; ++st)
+            for (int i = 0; i < 6; ++i) {
+                tz.off[st][i] = !targets.take((int) b, p + kTarget[st][i]);
+                any = any || !tz.off[st][i];
+            }
         tz.method = method == 0 ? train::AdapterMethod::lora : method == 1 ? train::AdapterMethod::dora : train::AdapterMethod::lokr;
         tz.alpha = alpha;
         tz.scale = alpha / (float) tz.rank;
@@ -662,6 +678,7 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
                 train::Adapter& az = tz.ad[st][i];
                 az.method = tz.method;
                 az.scale = tz.scale;
+                if (tz.off[st][i]) continue;
                 if (tz.method == train::AdapterMethod::lokr) {
                     // LyCORIS LoKr init: w1 and w2a kaiming-uniform (bound 1/sqrt(fan_in)), w2b zero
                     // (the delta starts at nothing); the f16 views follow the masters
@@ -706,6 +723,7 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
             for (int i = 0; i < 6; ++i) {
                 const int64_t N = blk.prod[st][i].N, K = blk.prod[st][i].K, rk = tz.rank;
                 train::Adapter& az = tz.ad[st][i];
+                if (tz.off[st][i]) continue;
                 if (tz.method == train::AdapterMethod::lokr) {
                     m->add_param(tz.W1[st][i], az.dW1, az.ol * az.im);
                     m->add_param(tz.W2A[st][i], az.dW2a, az.ok * rk);
@@ -719,6 +737,8 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
         if (mod_targets && m->mrank == 0)   // the modulations' plain LoRA: A kaiming-uniform, B zero, as above
                                             // (MageTrail's low-rank form takes none: the engine adds none to it)
             for (int st = 0; st < 2; ++st) {
+                if (!targets.take((int) b, p + lora::kMageMod[st])) continue;
+                any = true;
                 const int64_t C = m->C, rk = tz.rank;
                 tz.modA[st] = m->get<float>(rk * C);
                 tz.modB[st] = m->get<float>(6 * C * rk);
@@ -736,6 +756,10 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
         m->ws.end((int) b);
     }
     gpu::stream_sync(s);
+    m->targets = targets.text();
+    if (!any && !m->blk.empty() && m->blk[0].adap != nullptr)
+        throw std::runtime_error("image engine (Mage-Flow training): the weights chosen (" + targets.text() +
+                                 ") are none of the blocks' products");
 }
 
 void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfTrainCond& c, MfTrainState& s,
@@ -766,7 +790,9 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     float* dnxt_t = tmp.get<float>(Rt * C, st);
     // the modulations' gradients a block (their LoRA's), and its rank scratch
     const MfTrainAdapter* az0 = m->blk.empty() ? nullptr : m->blk[0].adap;
-    const bool mod_on = az0 != nullptr && az0->modA[0] != nullptr;
+    bool mod_on = false;   // any block's modulation trained (train::Targets may leave some out)
+    for (const MfTrainModel::Block& blk : m->blk)
+        mod_on = mod_on || (blk.adap != nullptr && (blk.adap->modA[0] != nullptr || blk.adap->modA[1] != nullptr));
     float* dmod[2] = {mod_on ? tmp.get<float>(6 * C, st) : nullptr, mod_on ? tmp.get<float>(6 * C, st) : nullptr};
     float* mh = mod_on ? tmp.get<float>(az0->rank, st) : nullptr;
     float* mg = mod_on ? tmp.get<float>(az0->rank, st) : nullptr;
@@ -859,6 +885,7 @@ void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, fl
             for (int i = 0; i < 6; ++i) {
                 const int64_t N = m->blk[(size_t) b].prod[q][i].N, K = m->blk[(size_t) b].prod[q][i].K;
                 const train::Adapter& ad = az->ad[q][i];
+                if (az->off[q][i]) continue;
                 if (ad.method == train::AdapterMethod::lokr) {
                     const int64_t rk = az->rank;
                     kernels::f32_to_f16_bulk(az->W1[q][i], ad.w1, ad.ol * ad.im, s);
@@ -874,7 +901,8 @@ void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, fl
 }
 
 void mf_trainer_save(MfTrainModel* base, const std::string& path, const std::string& title,
-                     const std::string& trigger, uint64_t seed, float lr, int64_t steps, int64_t max_steps) {
+                     const std::string& trigger, uint64_t seed, float lr, int64_t steps, int64_t max_steps,
+                     const std::string& kind) {
     Model* m = static_cast<Model*>(base);
     void* s = m->stream;
     gpu::stream_sync(s);
@@ -905,6 +933,7 @@ void mf_trainer_save(MfTrainModel* base, const std::string& path, const std::str
                 const std::string t =
                     "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kTarget[st][i];
                 const train::Adapter& ad = az->ad[st][i];
+                if (az->off[st][i]) continue;   // a product the run does not train
                 // the per-weight alpha (0-dimensional): ai-toolkit's files leave it out at alpha = rank, LyCORIS's
                 // carry it, and the engine reads it where it is
                 ts.push_back(train::Tensor{t + ".alpha", {}, {az->alpha}});
@@ -941,6 +970,8 @@ void mf_trainer_save(MfTrainModel* base, const std::string& path, const std::str
     meta.steps = steps;
     meta.max_steps = max_steps;
     meta.seed = seed;
+    meta.kind = kind;
+    meta.targets = m->targets;
     train::save_safetensors_bf16(path, std::move(ts), train::lora_meta(meta));
 }
 

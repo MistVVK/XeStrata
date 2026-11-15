@@ -11,6 +11,7 @@
 #pragma once
 
 #include "strata/image/mf_train.hpp"
+#include "strata/image/train_loop.hpp"
 #include "strata/image/train_sample.hpp"
 
 #include <cstdint>
@@ -45,6 +46,7 @@ struct MfTrainAdapter {
     // the modulation linears' LoRA (img_mod.1 and txt_mod.1, [6 C][C], ai-toolkit's targets): FP32 masters the
     // one-row product reads as they are and their gradients (null: the modulations not trained)
     float *modA[2] = {}, *modB[2] = {}, *dmodA[2] = {}, *dmodB[2] = {};
+    bool off[2][6] = {};   // a product the run does not train (train::Targets): no adapter bound, none saved
 };
 
 /// The DiT as the trainer reads it: every block's products and head norms, the weights outside the blocks, and one
@@ -66,6 +68,7 @@ struct MfTrainModel {
         MfTrainAdapter* adap = nullptr;   // null: the block runs plain
     };
     std::vector<Block> blk;
+    std::string targets;   // the products trained, as the metadata says them (train::Targets::text; "": all)
 };
 
 /// Open the bf16 DiT (every weight as FP16, as the engine reads it) and an adapter set of the given rank (0: none).
@@ -77,8 +80,10 @@ void mf_trainer_close(MfTrainModel* m);
 /// The adapters' starting point (once, before training): A kaiming-uniform (bound 1/sqrt(fan_in)), B = 0, m = norms
 /// (method 0 plain LoRA, 1 DoRA; alpha free, default candidate rank).  The FP16 working copies sync from the masters
 /// here and after every optimizer step.  mod_targets also trains the modulation linears (img_mod.1, txt_mod.1), as
-/// ai-toolkit's Mage-Flow job does: a plain LoRA there whatever the method.
-void mf_trainer_init_adapters(MfTrainModel* m, int method, float alpha, uint64_t seed, bool mod_targets = false);
+/// ai-toolkit's Mage-Flow job does: a plain LoRA there whatever the method.  `targets`: the products and modulations
+/// trained, by their names ("transformer_blocks.N.attn.to_q", "transformer_blocks.N.img_mod.1"); every one by default.
+void mf_trainer_init_adapters(MfTrainModel* m, int method, float alpha, uint64_t seed, bool mod_targets = false,
+                              const train::Targets& targets = {});
 
 /// The step's constants from its sigma: the time embedding, the modulations of every block and stream, and the
 /// norm_out pair, on the device (the caller keeps them for the backward).  Computed through the products, the same
@@ -122,6 +127,7 @@ void mf_trainer_backward(MfTrainModel* m, const MfTrainSample& s, const MfTrainC
 void mf_trainer_adamw(MfTrainModel* m, float lr, float beta1, float beta2, float eps, float wd, int64_t accum_n);
 /// The safetensors file (SPEC D1): dot keys, per-weight .alpha, the metadata v1 writes.
 void mf_trainer_save(MfTrainModel* m, const std::string& path, const std::string& title,
-                     const std::string& trigger, uint64_t seed, float lr, int64_t steps, int64_t max_steps);
+                     const std::string& trigger, uint64_t seed, float lr, int64_t steps, int64_t max_steps,
+                     const std::string& kind = "");
 
 }  // namespace strata::image

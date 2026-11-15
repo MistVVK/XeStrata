@@ -27,8 +27,11 @@ public:
     AnimaTrainer(const AnimaTrainer&) = delete;
     AnimaTrainer& operator=(const AnimaTrainer&) = delete;
 
-    /// The DiT's safetensors file (its names with or without `net.` or `model.diffusion_model.`), a LoRA of `rank`.
-    bool open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err);
+    /// The DiT's safetensors file (its names with or without `net.` or `model.diffusion_model.`), a LoRA of `rank` on
+    /// every product and modulation row `targets` takes (by its name: "blocks.N.self_attn.q_proj",
+    /// "blocks.N.adaln_modulation_mlp.1").
+    bool open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err,
+              const train::Targets& targets = {});
     /// The cached text rows' width (the context's: the LLM adapter's).
     int64_t text_cols() const;
     /// One micro-step at sigma: x0 the latent tokens [tokens][64] (drawn from the posterior), eps the noise; the

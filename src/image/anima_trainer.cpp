@@ -108,7 +108,8 @@ AnimaTrainer::AnimaTrainer() : m_(std::make_unique<Impl>()) {}
 AnimaTrainer::~AnimaTrainer() = default;
 int64_t AnimaTrainer::text_cols() const { return m_->Cc; }
 
-bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err) {
+bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err,
+                        const train::Targets& targets) {
     Impl& m = *m_;
     try {
         m.rank = rank;
@@ -177,15 +178,21 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
             B.cqn = m.dev_vec(f.f32(p + "cross_attn.q_norm.weight"));
             B.ckn = m.dev_vec(f.f32(p + "cross_attn.k_norm.weight"));
             if (rank > 0) {
-                for (int i = 0; i < kAnProducts; ++i) B.l[i] = &m.add_lora(B.p[i].N, B.p[i].K, rank, rng);
+                for (int i = 0; i < kAnProducts; ++i)
+                    if (targets.take(b, p + kProduct[i])) B.l[i] = &m.add_lora(B.p[i].N, B.p[i].K, rank, rng);
                 for (int k = 0; k < 3; ++k) {
-                    B.m1[k] = &m.add_lora(B.w1[k].N, B.w1[k].K, rank, rng, false);
-                    B.m2[k] = &m.add_lora(B.w2[k].N, B.w2[k].K, rank, rng, false);
+                    if (targets.take(b, p + kMod[k] + ".1"))
+                        B.m1[k] = &m.add_lora(B.w1[k].N, B.w1[k].K, rank, rng, false);
+                    if (targets.take(b, p + kMod[k] + ".2"))
+                        B.m2[k] = &m.add_lora(B.w2[k].N, B.w2[k].K, rank, rng, false);
                 }
             }
             m.blk.push_back(B);
         }
         if (m.blk.empty()) throw std::runtime_error("image engine (Anima training): the DiT has no blocks");
+        if (rank > 0 && m.loras().empty())
+            throw std::runtime_error("image engine (Anima training): the weights chosen (" + targets.text() +
+                                     ") are none of the blocks' products");
         m.F = m.blk[0].p[kAnL1].N;
         m.Cc = m.blk[0].p[kAnCk].K;
         m.dgrad_scratch(m.blk[0].p, kAnProducts, false);
@@ -236,7 +243,12 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
         z.Cc = Cc;
         for (int i = 0; i < kAnProducts; ++i) {
             z.p[i] = m.blk.back().p[i];
-            z.ad[i] = rk > 0 ? &m.blk.back().l[i]->ad : nullptr;
+            z.ad[i] = nullptr;   // a block's tape at its largest: the product adapted where any block adapts it
+            for (const Impl::Block& B : m.blk)
+                if (B.l[i] != nullptr) {
+                    z.ad[i] = &B.l[i]->ad;
+                    break;
+                }
         }
         const size_t rc = (size_t) (HW * C);
         half = m.inputs_half(HW, (uint64_t) (nb + 1 + 3) * rc * 4, (uint64_t) (13 * m.F) * 4);
@@ -285,11 +297,12 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
                 float* mod = mods + (b * 3 + k) * 3 * C;
                 float* x2 = x2s + (b * 3 + k) * M;
                 m.gemm.f16(e16 + C, B.w1[k].w, mh, 1, M, C);
-                if (rk > 0) train::row_lora_fwd(B.m1[k]->A, B.m1[k]->B, x1, 1.f, rk, M, C, mh, hr, s);
+                if (B.m1[k] != nullptr) train::row_lora_fwd(B.m1[k]->A, B.m1[k]->B, x1, 1.f, rk, M, C, mh, hr, s);
                 kernels::f32_to_f16_bulk(mh, m16, M, s);
                 to_f32(m16, M, x2, s);
                 m.gemm.f16(m16, B.w2[k].w, mod, 1, 3 * C, M);
-                if (rk > 0) train::row_lora_fwd(B.m2[k]->A, B.m2[k]->B, x2, 1.f, rk, 3 * C, M, mod, hr, s);
+                if (B.m2[k] != nullptr)
+                    train::row_lora_fwd(B.m2[k]->A, B.m2[k]->B, x2, 1.f, rk, 3 * C, M, mod, hr, s);
                 train::add_into(mod, alora, 3 * C, s);
             }
         }
@@ -335,7 +348,7 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
         r.ckn = B.ckn;
         for (int i = 0; i < kAnProducts; ++i) {
             r.p[i] = B.p[i];
-            r.ad[i] = rk > 0 ? &B.l[i]->ad : nullptr;
+            r.ad[i] = B.l[i] != nullptr ? &B.l[i]->ad : nullptr;
         }
         return r;
     };
@@ -410,10 +423,12 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
             for (int k = 0; k < 3; ++k) {
                 const float* d = dmod + k * 3 * C;
                 const float* x2 = x2s + (b * 3 + k) * M;
-                const train::Lora &l1 = *B.m1[k], &l2 = *B.m2[k];
-                train::row_lora_bwd(l2.A, l2.B, x2, d, 1.f, rk, 3 * C, M, l2.ad.dA, l2.ad.dB, hr, g, s);
-                row_dgrad(B.w2[k].w, d, 3 * C, M, l2.A, g, rk, dx2, s);
-                train::row_lora_bwd(l1.A, l1.B, x1, dx2, 1.f, rk, M, C, l1.ad.dA, l1.ad.dB, hr, g, s);
+                const train::Lora *l1 = B.m1[k], *l2 = B.m2[k];   // either may be untrained (train::Targets)
+                if (l2 != nullptr)
+                    train::row_lora_bwd(l2->A, l2->B, x2, d, 1.f, rk, 3 * C, M, l2->ad.dA, l2->ad.dB, hr, g, s);
+                if (l1 == nullptr) continue;
+                row_dgrad(B.w2[k].w, d, 3 * C, M, l2 != nullptr ? l2->A : nullptr, g, l2 != nullptr ? rk : 0, dx2, s);
+                train::row_lora_bwd(l1->A, l1->B, x1, dx2, 1.f, rk, M, C, l1->ad.dA, l1->ad.dB, hr, g, s);
             }
         std::swap(dcur, dnxt);
     }
@@ -431,13 +446,16 @@ void AnimaTrainer::save(const std::string& path, const std::vector<std::pair<std
         const Impl::Block& B = m.blk[b];
         const std::string p = "diffusion_model.blocks." + std::to_string(b) + ".";
         for (int i = 0; i < kAnProducts; ++i) {
+            if (B.l[i] == nullptr) continue;   // a product the run does not train
             const train::Lora& l = *B.l[i];
             ts.push_back({p + kProduct[i] + ".lora_A.weight", {m.rank, l.K}, m.read(l.A, m.rank * l.K)});
             ts.push_back({p + kProduct[i] + ".lora_B.weight", {l.N, m.rank}, m.read(l.B, l.N * m.rank)});
         }
         for (int k = 0; k < 3; ++k)
             for (int j = 0; j < 2; ++j) {
-                const train::Lora& l = j == 0 ? *B.m1[k] : *B.m2[k];
+                const train::Lora* lp = j == 0 ? B.m1[k] : B.m2[k];
+                if (lp == nullptr) continue;
+                const train::Lora& l = *lp;
                 const std::string n = p + kMod[k] + (j == 0 ? ".1" : ".2");
                 ts.push_back({n + ".lora_A.weight", {m.rank, l.K}, m.read(l.A, m.rank * l.K)});
                 ts.push_back({n + ".lora_B.weight", {l.N, m.rank}, m.read(l.B, l.N * m.rank)});
