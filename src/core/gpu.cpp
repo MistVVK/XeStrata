@@ -352,13 +352,13 @@ bool is_host_usm(const void* p) {
         const core::Runtime* owner = core::Runtime::owner(p);
         return owner && sycl::get_pointer_type(p, owner->context()) == sycl::usm::alloc::host;
     }
-    catch (const std::exception& e) { return fail("is_host_usm", e); }
+    catch (const std::exception&) { return false; }   // a query the runtime refuses: not host USM (the copy path)
 }
 
 bool kernels_read_host(const void* p) {
     if (!p) return false;
     try { return core::Runtime::owner(p) == &rt() && sycl::get_pointer_type(p, rt().context()) == sycl::usm::alloc::host; }
-    catch (const std::exception& e) { return fail("kernels_read_host", e); }
+    catch (const std::exception&) { return false; }
 }
 
 bool kernels_read_registered() { return rt().device().get_backend() != sycl::backend::ext_oneapi_level_zero; }
