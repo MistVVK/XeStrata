@@ -178,7 +178,7 @@ test('one drafter per run: Auto is DFlash2 where the engine has it, the same wor
 
 test('a new install fetches only the drafter it will use; the fit and the slot estimates use the drafter chosen', async () => {
   const source = read('../server/native-control.mjs');
-  assert.match(source, /'gguf_dir','drafter'\]/);
+  assert.match(source, /'gguf_dir','drafter','mtp'\]/);
   assert.match(source, /resolveDrafter\(args\.drafting,args\.family,dflash2Served,dflash2Split\);if\(d==='dflash2'\)args=\{\.\.\.args,drafter:'dflash2'\}/, 'DFlash2: the installer leaves the MTP layer out');
   const { chooseParallel, MTP_VRAM_GB, DFLASH2_VRAM_GB } = await import('../server/native-parallel.mjs');
   assert.deepEqual([MTP_VRAM_GB, DFLASH2_VRAM_GB], [1.08, 0.89]);
