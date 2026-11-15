@@ -104,10 +104,11 @@ class IQ3SOnTheClass(Base):
         for mode, drafter in (("mtp", "mtp"), ("off", "off")):
             self.assertEqual(self.apply(IQ3S, P2003, drafting=mode)[0].drafter, drafter)
 
-    def test_without_the_mtp_layer_auto_is_not_dflash2_either(self):
+    def test_without_the_mtp_layer_auto_starts_the_dflash2_drafter_on_disk(self):
+        # one drafter is picked; when its file is missing the other one stands in where it is on disk (never no drafter unless Off was chosen; 0.2.14)
         (self.data / "mtp" / "rt" / "experts.bin").unlink()
         d, args = self.apply(IQ3S, P2003)
-        self.assertEqual((d.drafter, d.note), ("off", drafting.NONE_HERE))
+        self.assertEqual((d.drafter, d.note), ("dflash2", drafting.NO_MTP))
         self.assertEqual(self.apply(IQ3S, P2003, drafting="dflash2")[0].drafter, "dflash2")
 
     def test_the_fetch(self):
