@@ -6,8 +6,9 @@
       python .claude/skills/upstream-sync/scripts/md5_watch.py OUT GPU [--dry-run]
 
 A cell is one model at one length, or one image model at one size.  An LLM's cell: its fixed prompt
-(<data>/ids/release/<tier>.ids, sync_prompts.py's), the settings that decide its answer (greedy, --adapt-every 0,
---pcie-frac 0, --prefill-cpu-share 0, the context setup writes for that length) and 32 tokens through the engine; the
+(<data>/ids/release/<tier>.ids, sync_prompts.py's; a model of another vocabulary its own, OWN_IDS below), the
+settings that decide its answer (greedy, --adapt-every 0, --pcie-frac 0, --prefill-cpu-share 0, the context setup
+writes for that length) and 32 tokens through the engine; the
 md5 is of the answer's line, and the logits those 32 tokens were chosen from are kept beside it (--dump-logits: the KL
 of a cell that moved).
 An image model's cell: one image from its fixed prompt, IMAGE_SIZE, IMAGE_STEPS and IMAGE_SEED; the md5 is of the PNG.
@@ -101,6 +102,17 @@ def argv_of(name: str) -> list[str]:
     return a
 
 
+# a model whose vocabulary is not Qwen's reads the same tiers in its own ids, <data>/ids/release-<name>/<tier>.ids:
+# Qwen's ids are out of its vocabulary (llm-jp-4.1's 196,608 against Qwen3.8's 248,069 and more) and every cell of it
+# printed no answer.
+OWN_IDS = {"llmjp"}
+
+
+def prompt_ids(name: str, tier: str) -> Path:
+    """The tier's prompt for the model: the release ids, or the model's own for another vocabulary."""
+    return data / "ids" / (f"release-{name}" if name in OWN_IDS else "release") / f"{tier}.ids"
+
+
 def llm_cells(rows: list[dict], meta: dict) -> None:
     engine = B.Engine.from_spec("xe", "xe", B.need("XE"), profile)
     meta["llm"] = {"engine": os.environ["XE"], "common": COMMON, "extra": extra, "profile": profile, "exact": EXACT,
@@ -111,9 +123,10 @@ def llm_cells(rows: list[dict], meta: dict) -> None:
     for name in models:
         argv = [*meta["llm"]["models"][name], *COMMON]
         for tier in tiers:
-            ids = data / "ids" / "release" / f"{tier}.ids"
+            ids = prompt_ids(name, tier)
             if not ids.exists():
-                sys.exit(f"{ids}: the tier's prompt (sync_prompts.py writes it)")
+                sys.exit(f"{ids}: the tier's prompt (sync_prompts.py writes it"
+                         + ("; this model's own vocabulary's ids" if name in OWN_IDS else "") + ")")
             for rnd in range(1, rounds + 1):
                 stem = f"{name}-{tier}-r{rnd}"
                 answer, log = out / "answers" / f"{stem}.out", out / "logs" / f"{stem}.err"
