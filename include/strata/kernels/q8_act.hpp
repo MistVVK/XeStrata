@@ -197,6 +197,19 @@ struct FloatRows {
         return x[(int64_t) (ids != nullptr ? ids[r] : r) * ld + c * kBlock + j];
     }
 };
+/// FloatRows with each column scaled (x * scale[column]) as it is read: the latent pack's shared column scales
+/// folded into the quantization, the same product the separate pass over the rows wrote
+struct ScaledFloatRows {
+    static constexpr bool kRows = true;
+    const float* x;
+    const int32_t* ids;
+    int64_t ld;
+    const float* scale;
+    float operator()(int64_t r, int64_t c, int j) const {
+        const int64_t k = c * kBlock + j;
+        return x[(int64_t) (ids != nullptr ? ids[r] : r) * ld + k] * scale[k];
+    }
+};
 /// FP16 rows of `cols` values
 struct HalfRows {
     static constexpr bool kRows = true;

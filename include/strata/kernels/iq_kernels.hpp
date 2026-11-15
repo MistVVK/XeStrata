@@ -98,6 +98,11 @@ struct NativeExpertLayout {
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1) noexcept;
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1);
 
+/// Time the latent A gate/up's LPR / entries-a-pass candidates for this layout and keep the faster per device
+/// (the current GU_LPR / kEntriesPass are candidates).  Call at the window's init; XESTRATA_LATENT_A_LPR /
+/// XESTRATA_LATENT_A_ENTRIES force a value.
+void native_expert_latent_a_tune(const NativeExpertLayout& L, void* stream);
+
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 
@@ -109,7 +114,7 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups = 0);
+                           int64_t grid_groups = 0, int mode8_override = -1);
 /// APR (prism.hadamard): y = H_block (signs * x) per block of `block` values of each of `rows` rows of `width`
 /// (x and y may be the same rows); `signs` a DEVICE vector of `width` signs or nullptr, the float values those of
 /// hadamard_rotate.  The f16 form rotates FP16 rows in place, computing in float.

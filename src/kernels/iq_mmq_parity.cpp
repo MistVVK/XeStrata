@@ -587,6 +587,7 @@ int main(int argc, char** argv) try {
     int bad = 0;
     for (const auto& c : {three, one}) {
         bad += check(GGML_TYPE_Q8_0, 128, 160, c);
+        bad += check(GGML_TYPE_Q4_0, 128, 160, c);
         bad += check(GGML_TYPE_IQ3_XXS, 128, 512, c);
         bad += check(GGML_TYPE_IQ2_XS, 128, 512, c);
         bad += check(GGML_TYPE_Q4_K, 128, 512, c);
@@ -598,9 +599,13 @@ int main(int argc, char** argv) try {
             for (const ggml_type t : {GGML_TYPE_IQ4_NL, (ggml_type) 42}) bad += check_fx_down(t, 512, 640, c);
         }
     }
+    // the latent D/U shapes (Q4_0): U is [N, ELL] a group, D is [G*ELL, N] — large, unlike the small checks above
+    bad += check(GGML_TYPE_Q4_0, 2560, 1280, one);
+    bad += check(GGML_TYPE_Q4_0, 10240, 2560, one);
     // last: the parts' buffer it reserves stays with the queue
     for (const int32_t rows : {16, 64}) {
         bad += split_parts(GGML_TYPE_Q8_0, 256, 2048, rows);
+        bad += split_parts(GGML_TYPE_Q4_0, 256, 2048, rows);
         bad += split_parts(GGML_TYPE_Q4_K, 256, 2048, rows);
         bad += split_parts(GGML_TYPE_IQ3_XXS, 256, 2048, rows);
     }

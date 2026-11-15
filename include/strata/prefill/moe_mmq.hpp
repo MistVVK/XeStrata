@@ -40,8 +40,9 @@ size_t q8_bytes(int64_t rows, int64_t cols);
 /// int8 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
 /// ids is null); `x` has `ld` floats per row.  `canon` (the fixed-point products, kernels::iq_mmq_fx): the canonical
 /// activations with one scale for each `canon` values (256 a gate/up's, 32 a down's), the CPU's canonical rows'.
+/// `col_scale`: each column multiplied by it as it is read (null: none).
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
-              void* stream, int canon = 0);
+              void* stream, int canon = 0, const float* col_scale = nullptr);
 /// The rows quantize(x, src, ...) writes for tokens x k_used rows in expert order, written token by token: token t's
 /// row of x is quantized once and stored at rows slot[t * k_used + k] (`slot` the inverse of `src`) - the same bytes,
 /// a k_used-th of the quantizations (upstream c675f5b7).  STRATA_QUANT_GATHER=1: quantize() over `src`, as before.

@@ -6,6 +6,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/latent_share.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -62,8 +63,7 @@ MoeWindow::~MoeWindow() {
     }
     for (void* p : {(void*) h_x_, (void*) h_ids_, (void*) h_w_, (void*) h_ymiss_, (void*) h_seq_, (void*) h_flag_,
                     (void*) h_flagA_, (void*) h_flagB_, (void*) h_plan_, arena_, (void*) skip_, (void*) slot_off_d_,
-                    (void*) h_latxl_, (void*) h_latact0_, (void*) h_xlseq_, (void*) lat_labels_dev_,
-                    (void*) h_u_mmq_ids_, (void*) h_u_mmq_bounds_})
+                    (void*) h_latxl_, (void*) h_latact0_, (void*) h_xlseq_, (void*) lat_labels_dev_})
         if (p != nullptr) strata::gpu::free(p);
     if (lat_du_owned_) {
         if (lat_d_ != nullptr) strata::gpu::free(lat_d_);
@@ -178,7 +178,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         lat_u_mmu_ = ummu == 1 || (ummu < 0 && strata::prefill::mmq::built());
         if (lat_u_mmu_) {
             lat_mmq_ctx_ = std::make_unique<strata::prefill::mmq::Context>();
-            strata::prefill::mmq::choose_forms(lat_fmt_, shape.n_embd, lat_ELL_, lat_G_, nullptr);
+            strata::prefill::mmq::choose_forms(lat_fmt_ == 4 ? 2 : 8, shape.n_embd, lat_ELL_, lat_G_, nullptr);
         }
         // the column scales on the device NOW, in plain stream context: the D stage's first call can otherwise
         // land inside a graph capture, where an allocation is not permitted
@@ -191,6 +191,19 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             }
         }
     }
+
+    // The latent A's gate/up form (LPR / entries) is captured in a verify graph: timed beforehand, at the latent width
+    if (lay.native && latent_ && !lay.fmt.empty()) {
+        try {
+            const auto& f0 = lay.fmt[0];
+            const auto lat_layout = strata::kernels::native_expert_layout(f0.gu_type, f0.d_type, lat_ELL_, lat_I_, f0.up_type);
+            strata::kernels::native_expert_latent_a_tune(lat_layout, nullptr);
+        } catch (const std::exception& e) {
+            err = std::string("moe window: gate/up timing: ") + e.what();
+            return false;
+        }
+    }
+
     const uint64_t T = (uint64_t) shape.max_t, N = (uint64_t) shape.n_embd, K = (uint64_t) shape.k;
     bool ok = mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
@@ -205,13 +218,6 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         ok = mapped(T * G * ELL * 4, (void**) &h_latxl_, (void**) &m_latxl_) &&
              mapped(T * G * (ELL / 32) * 34, (void**) &h_latact0_, (void**) &m_latact0_) &&
              mapped(64, (void**) &h_xlseq_, (void**) &m_xlseq_);
-        // the U mmq bucketing's host tables: a layer's slice each, so a layer's copy kernel reads its own slice
-        // while the next layer writes another (no sync between the window's layers); across windows the verdict
-        // sync drains the copies before the slices are rewritten
-        if (ok && lat_u_mmu_) {
-            ok = strata::gpu::alloc_host(&h_u_mmq_ids_, (size_t) lay.n_layers * T * K * sizeof(int32_t)) &&
-                 strata::gpu::alloc_host(&h_u_mmq_bounds_, (size_t) lay.n_layers * (G + 1) * sizeof(int32_t));
-        }
     }
     if (!ok) { err = "moe window: mapped staging allocation failed"; return false; }
     {   // a plan for each of the two token groups a window may be cut into
@@ -259,6 +265,95 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    // The decode's A and U each have a matrix-unit form and a dp4a form; which is faster depends on the device and
+    // the window's few rows, not the GPU's name.  Time both once per device (synthetic rows: the values do not change
+    // the time) and keep the faster.  LATENT_A_MODE8 / LATENT_U_MMU = 0/1 still force a form.  Falls back to the
+    // capability choice if the timing cannot run.
+    if (latent_ && lay.native && !lay.fmt.empty()) {
+        const int a_env = strata::env_auto("LATENT_A_MODE8");
+        const int u_env = strata::env_auto("LATENT_U_MMU");
+        if (a_env < 0 || u_env < 0) {
+            static strata::core::PerDevice<std::pair<int, bool>> picks;
+            auto& pick = picks.get(strata::core::Runtime::get().device(), [&] {
+                std::pair<int, bool> best{-1, strata::prefill::mmq::built()};
+                const auto& f0 = lay.fmt[0];
+                const int64_t ELL = lat_ELL_, GN = (int64_t) shape.n_embd;
+                const int64_t n_expert = lay.n_expert;
+                // the real decode's row counts: the verify window's token counts × K (not one synthetic cap).
+                // Time each form at these caps, a warmup then the median of 3 runs, and sum over the caps so the
+                // choice does not flip on a single noisy timing.
+                const int64_t cap_max = std::min<int64_t>((int64_t) (T * K), 6 * (int64_t) K);
+                std::vector<int64_t> caps;
+                for (int64_t c : {(int64_t) K, 2 * (int64_t) K, 4 * (int64_t) K, 6 * (int64_t) K})
+                    if (c <= cap_max && (caps.empty() || caps.back() != c)) caps.push_back(c);
+                if (caps.empty()) caps.push_back(cap_max);
+                auto& q = strata::core::Runtime::get().compute();
+                const size_t blob_b = (size_t) lay.blob_bytes(0);
+                uint8_t* blob = sycl::malloc_device<uint8_t>(blob_b, q);
+                float* out = sycl::malloc_device<float>((size_t) (cap_max * std::max(ELL, GN)), q);
+                float* yl = sycl::malloc_device<float>((size_t) (cap_max * ELL), q);
+                int32_t* ids = sycl::malloc_device<int32_t>((size_t) cap_max, q);
+                unsigned long long* gp = sycl::malloc_device<unsigned long long>(1, q);
+                int32_t* gs = sycl::malloc_device<int32_t>(2, q);
+                int32_t* gn = sycl::malloc_device<int32_t>(1, q);
+                int32_t* dst = sycl::malloc_device<int32_t>((size_t) cap_max, q);
+                int32_t* tok = sycl::malloc_device<int32_t>((size_t) cap_max, q);
+                if (blob && out && yl && ids && gp && gs && gn && dst && tok) {
+                    try {
+                        const strata::kernels::NativeExpertLayout L0 = strata::kernels::native_expert_layout(f0.gu_type, f0.d_type, ELL, lat_I_, f0.up_type);
+                        q.memset(blob, 0x11, blob_b);
+                        q.memset(out, 0, (size_t) (cap_max * std::max(ELL, GN)) * 4);
+                        q.memset(yl, 0, (size_t) (cap_max * ELL) * 4);
+                        const unsigned long long blob_p = (unsigned long long) blob;
+                        q.memcpy(gp, &blob_p, 8);
+                        const int32_t one = 1;
+                        q.memcpy(gn, &one, 4);
+                        q.parallel_for(sycl::range<1>((size_t) cap_max), [=](sycl::id<1> i) {
+                            dst[i[0]] = (int32_t) i[0]; tok[i[0]] = (int32_t) i[0];
+                            ids[i[0]] = (int32_t) (i[0] % (uint64_t) n_expert);
+                        });
+                        q.wait_and_throw();
+                        auto median_ms = [&](auto run, int64_t cap) {
+                            const int32_t start_h[2] = {0, (int32_t) cap};
+                            q.memcpy(gs, start_h, 8).wait();
+                            run(cap); q.wait_and_throw();   // warmup (JIT / caches)
+                            double ts[3];
+                            for (int r = 0; r < 3; ++r) {
+                                const auto t0 = std::chrono::steady_clock::now();
+                                run(cap); q.wait_and_throw();
+                                ts[r] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                            }
+                            std::sort(ts, ts + 3);
+                            return ts[1];
+                        };
+                        if (a_env < 0) {
+                            double s1 = 0, s0 = 0;
+                            for (int64_t c : caps) {
+                                s1 += median_ms([&](int64_t cap) { strata::kernels::native_expert_grouped(L0, gp, gs, gn, dst, tok, 1, cap, lat_xlq_, hit_scratch_, out, nullptr, 1, 1); }, c);
+                                s0 += median_ms([&](int64_t cap) { strata::kernels::native_expert_grouped(L0, gp, gs, gn, dst, tok, 1, cap, lat_xlq_, hit_scratch_, out, nullptr, 1, 0); }, c);
+                            }
+                            best.first = s0 < s1 ? 0 : 1;
+                        }
+                        // The U form: the synthetic timing picked the slower form on both B70 and RTX (the real
+                        // decode U's cost is not the synthetic rows'), so keep the capability choice (mmq::built)
+                        // for U; only the A form is timed.  best.second already defaults to mmq::built().
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "xestrata: timing the latent decode forms: %s\n", e.what());
+                    }
+                }
+                for (void* p : {(void*) blob, (void*) out, (void*) yl, (void*) ids, (void*) gp, (void*) gs, (void*) gn, (void*) dst, (void*) tok})
+                    if (p != nullptr) sycl::free(p, q);
+                return best;
+            });
+            if (a_env >= 0) lat_a_mode8_ = a_env == 1 ? 1 : 0;
+            else lat_a_mode8_ = pick.first;
+            if (u_env >= 0) lat_u_mmu_ = u_env == 1;
+            else lat_u_mmu_ = pick.second;
+            std::fprintf(stderr, "xestrata: latent decode forms: A %s, U %s\n",
+                         lat_a_mode8_ == 0 ? "dp4a" : lat_a_mode8_ == 1 ? "mode8" : "default",
+                         lat_u_mmu_ ? "mmq" : "dp4a");
+        }
+    }
     set_plan_slot(0, 1);
     // the plan built on the device (resident_plan): its skip flags and the tier's slot offsets there
     if (tier.cache_base != nullptr) {
@@ -327,20 +422,20 @@ void MoeWindow::raise_flag_b_ordered(uint32_t want) {
         raise_flag(h_flagB_, want);
         return;
     }
-    FlagSet& fs = flag_sets_[want % (sizeof flag_sets_ / sizeof flag_sets_[0])];
-    fs.flag = h_flagB_;
-    fs.value = want;
-    FlagSet* set = &fs;
-    if (!strata::gpu::launch_host(copy_, [set] { raise_flag(set->flag, set->value); })) {
+    // in stream order behind the copies, as fetch_dma raises it: once the stream holds copies every raise goes
+    // through it, so the stores land in ring order and flag B only rises
+    try {
+        strata::kernels::mapped_flag_store(m_flagB_, want, copy_);
+    } catch (const std::exception& e) {
         // The flag was not raised: the consumers must not be released to staging that is still being written.
-        std::fprintf(stderr, "xestrata DMA: ordered flag B completion failed: %s\n", strata::gpu::last_error());
+        std::fprintf(stderr, "xestrata DMA: ordered flag B completion failed: %s\n", e.what());
         std::fflush(stderr);
         std::abort();
     }
 }
 
 // The PCIe share by DMA: the copy engine moves the blobs while the CPU computes its share and the GPU its VRAM
-// experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe groups).
+// experts; a kernel behind them raises flag B when they have landed (the graph waits for it before the PCIe groups).
 void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     MoeWindow* w = (MoeWindow*) ctx;
     const uint32_t want = w->cur_ring_;
@@ -348,11 +443,9 @@ void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t by
     uint8_t* stage = (uint8_t*) w->sink_.staging;   // this group's half in a split window
     for (int i = 0; i < n; ++i) strata::gpu::copy_async(stage + (size_t) i * bytes, src[i], bytes, w->copy_);
     w->copy_used_ = true;
-    FlagSet& fs = w->flag_sets_[want % (sizeof w->flag_sets_ / sizeof w->flag_sets_[0])];
-    fs.flag = w->h_flagB_;
-    fs.value = want;
-    FlagSet* set = &fs;
-    strata::gpu::launch_host(w->copy_, [set] { raise_flag(set->flag, set->value); });
+    // flag B by a kernel behind the copies on the same in-order stream: a host function there cost the RTX 4070's
+    // SYCL ~0.2 ms of the pool's time a layer (Edge0-120B-q3k, 32K: 0.23 of 0.73 ms a layer's call, 2026-11-15)
+    strata::kernels::mapped_flag_store(w->m_flagB_, want, w->copy_);
 }
 
 void MoeWindow::publish_plan(void* ctx) {
@@ -520,7 +613,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                          cs);
         const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, ELL, lat_I_, f.up_type);
         auto grouped_lat = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid) {
-            native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, xlq, hit_scratch_, yl, cs, grid);
+            native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, xlq, hit_scratch_, yl, cs, grid, lat_a_mode8_);
         };
         try {
             const bool fb = mode.fetch_side != nullptr && !mode.resident;
@@ -548,30 +641,20 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
             stamp(22);
             // the A outputs' image, then U for the GPU's rows (hit_out, now H wide)
             if (lat_u_mmu_) {
-                // the G groups as iq_mmq experts: bucket the routes by label; the product's ids map the group-order
-                // rows back to route order, so hit_out stays in the order the combine adds.  The bucketing goes into
-                // this layer's host slice, uploaded by a copy kernel (not a sync copy): the next layer writes another
-                // slice, so the window's layers need no sync between them.
-                const int32_t* hlabels = lat_labels_.data() + (size_t) layer * lay.n_expert;
-                const int32_t* hids = h_ids_ + (size_t) tb * K;
-                int32_t* idsU = h_u_mmq_ids_ + (size_t) layer * capx;
-                int32_t* ubnd = h_u_mmq_bounds_ + (size_t) layer * (G + 1);
-                int64_t u = 0, maxr = 0;
-                ubnd[0] = 0;
-                for (int gg = 0; gg < G; ++gg) {
-                    for (int64_t r = 0; r < cap; ++r)
-                        if (hlabels[hids[r]] == gg) idsU[u++] = (int32_t) r;
-                    ubnd[gg + 1] = (int32_t) u;
-                    maxr = std::max<int64_t>(maxr, ubnd[gg + 1] - ubnd[gg]);
-                }
-                copy_i32_from_mapped(lat_u_mmq_ids_, idsU, cap, cs);
-                copy_i32_from_mapped(lat_u_mmq_bounds_, ubnd, G + 1, cs);
-                strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, lat_fmt_, ELL, ELL, cap, cs);
+                // the G groups as iq_mmq experts: bucket the routes by label on the device, so a captured verify
+                // window replays with the doorbell's fresh ids (a host bucketing would bake the capture's).  The
+                // product's ids map the group-order rows back to route order, so hit_out stays in the order the
+                // combine adds.
+                latent_u_bucket(ids, labels, lay.n_expert, cap, (int) G, lat_u_mmq_ids_, lat_u_mmq_bounds_, cs);
+                // the U's ggml type: the latent fmt codes Q4_0 as 4, but ggml's Q4_0 is 2 (Q8_0 is 8)
+                const int du_t = lat_fmt_ == 4 ? 2 : 8;
+                strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, du_t, ELL, ELL, cap, cs);
                 strata::prefill::mmq::Product up;
-                up.w = lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes; up.type = lat_fmt_; up.w_rows = N; up.w_cols = ELL;
-                up.expert_bytes = strata::prefill::mmq::matrix_bytes(lat_fmt_, N, ELL); up.n = G;
+                up.w = lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes; up.type = du_t; up.w_rows = N; up.w_cols = ELL;
+                up.expert_bytes = strata::prefill::mmq::matrix_bytes(du_t, N, ELL); up.n = G;
                 up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
-                up.total_rows = cap; up.max_rows = maxr; up.rows = cap; up.dst = hit_out; up.ld_dst = N;
+                // cap, not the largest group: the captured launch's row shape is fixed, the bounds count the rows
+                up.total_rows = cap; up.max_rows = cap; up.rows = cap; up.dst = hit_out; up.ld_dst = N;
                 lat_mmq_ctx_->run(up, cs);
             } else {
                 quantize_q8_1_rows(yl, cap, ELL, ylq, cs);
@@ -585,8 +668,10 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 // rows zeroed there, the hit path adds their U product)
                 if (!segmented_) wait_flag_ge(m_flag_, ring, cs);
                 stamp(23);
-                latent_u_matvec(lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes, reinterpret_cast<const uint8_t*>(ymiss), ids, labels, p_dst,
-                                p_counts + 1, lay.n_expert, cap, (int) ELL, (int) N, (int) G, parts, cs, lat_fmt_);
+                // ylq (this group's rows) holds the pool's rows on the device: the GPU's U above read it before,
+                // in stream order
+                latent_u_matvec(lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes, reinterpret_cast<const uint8_t*>(ymiss), ylq,
+                                ids, labels, p_dst, p_counts + 1, lay.n_expert, cap, (int) ELL, (int) N, parts, cs, lat_fmt_);
             } else {
                 if (!segmented_) wait_flag_ge(m_flag_, ring, cs);   // the CPU's H-wide contributions
                 stamp(23);
