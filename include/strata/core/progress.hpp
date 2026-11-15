@@ -42,6 +42,14 @@ inline std::atomic<DiagFn>& release_gpu_fn() { static std::atomic<DiagFn> f{null
 inline void release_gpu_waits(std::FILE* f) {
     if (auto fn = release_gpu_fn().load()) fn(f);
 }
+/// The same release with one bound for all live verifiers, silent; true when their streams finished within `ms` (kfd_quiet.hpp,
+/// EXIT).  True when no verifier is live.
+using ReleaseWithinFn = bool (*)(int);
+inline std::atomic<ReleaseWithinFn>& release_gpu_within_fn() { static std::atomic<ReleaseWithinFn> f{nullptr}; return f; }
+inline bool release_gpu_waits_within(int ms) {
+    if (auto fn = release_gpu_within_fn().load()) return fn(ms);
+    return true;
+}
 /// --pipeline-windows: the pipelined loop's windows and the drafter's chain (set while that loop runs)
 inline std::atomic<DiagFn>& diag_pipeline_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
 

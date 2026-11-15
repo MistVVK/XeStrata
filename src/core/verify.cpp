@@ -562,6 +562,17 @@ void release_live_verifiers(std::FILE* f) {
         }
     if (f != nullptr) std::fflush(f);
 }
+// the same, silent, with one bound for all of them (kfd_quiet.hpp, EXIT: an integrated gfx11's stop on a signal)
+bool release_live_verifiers_within(int ms) {
+    const Clock::time_point t0 = Clock::now();
+    bool all = true;
+    for (auto& slot : g_live)
+        if (Verifier* v = slot.load()) {
+            const int64_t left = (int64_t) ms - (int64_t) ms_since(t0);
+            if (!v->release_gpu_waits(left > 0 ? (int) left : 0)) all = false;
+        }
+    return all;
+}
 // #649: the host side of STRATA_VERIFY_TRACE - a ring of the last kTraceN handshake events of every verifier
 struct TraceEv {
     int64_t t_ns;
@@ -885,6 +896,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
     }
     release_gpu_fn().store(&release_live_verifiers);
+    release_gpu_within_fn().store(&release_live_verifiers_within);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there

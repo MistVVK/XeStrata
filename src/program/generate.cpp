@@ -369,6 +369,91 @@ const bool crash_bt_installed = [] {
 }  // namespace
 #endif
 
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+// EXIT (kfd_quiet.hpp), integrated gfx11 under Linux only: SIGTERM / SIGINT / SIGHUP no longer end the process with kernels in flight
+// and the arena registered (the kernel's exit then evicts busy queues: reset 45 on p2006).  The handler only writes the signal's
+// number into a pipe; a thread of its own stops the request, releases the verify windows' GPU waits, waits at most 3 s for the
+// device, drops the arena's registration only when the device finished, and then ends the process by the same signal (the same
+// wait status as before).  Installed only once the card is known to be of that class, only for a signal whose action is still the
+// default (nohup's ignored SIGHUP stays ignored); no signal mask is changed.  A second signal during the stop ends it at once.
+namespace kfdq_exit {
+std::atomic<std::atomic<bool>*> g_stop{nullptr};   // the serve loop's STOP flag while it exists
+int g_pipe[2] = {-1, -1};
+volatile sig_atomic_t g_count = 0;
+int g_dev = 0;
+
+void handler(int sig) {
+    if (strata::core::kfd_quiet::on_signal((int) g_count) == strata::core::kfd_quiet::OnSignal::DefaultAction) {
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
+    g_count = g_count + 1;
+    const unsigned char b = (unsigned char) sig;
+    (void) !write(g_pipe[1], &b, 1);
+}
+
+[[noreturn]] void stop_and_end(int sig) {
+    using clk = std::chrono::steady_clock;
+    const clk::time_point base = clk::now();
+    auto now = [&] { return std::chrono::duration<double>(clk::now() - base).count(); };
+    auto stop = [] { if (std::atomic<bool>* f = g_stop.load()) f->store(true); };
+    auto release = [](int ms) { return strata::core::release_gpu_waits_within(ms); };
+    auto drain = [](int ms) {
+        struct Shared { std::mutex mu; std::condition_variable cv; bool done = false, ok = false; };
+        auto sh = std::make_shared<Shared>();
+        std::thread([sh] {   // may never return on a GPU that hangs: the wait below is bounded, the process ends anyway
+            (void) cudaSetDevice(g_dev);
+            const bool ok = cudaDeviceSynchronize() == cudaSuccess;
+            std::lock_guard<std::mutex> lk(sh->mu);
+            sh->done = true;
+            sh->ok = ok;
+            sh->cv.notify_all();
+        }).detach();
+        std::unique_lock<std::mutex> lk(sh->mu);
+        sh->cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return sh->done; });
+        return sh->done && sh->ok;
+    };
+    int ranges = 0;
+    auto unreg = [&] { ranges = strata::core::unregister_arena_ranges(); };
+    const strata::core::kfd_quiet::TeardownResult r =
+        strata::core::kfd_quiet::teardown(stop, release, drain, unreg, now, strata::core::kfd_quiet::kExitBoundS);
+    if (std::getenv("STRATA_TRACE") != nullptr)
+        std::fprintf(stderr, "strata trace: kfd quiet: signal %d: waits released %s, device drained %s, %d arena ranges unregistered, %.0f ms\n",
+                     sig, r.released ? "yes" : "no", r.drained ? "yes" : "no", ranges, now() * 1000.0);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    signal(sig, SIG_DFL);
+    raise(sig);
+    _exit(128 + sig);
+}
+
+void install(int dev) {
+    g_dev = dev;
+    if (pipe2(g_pipe, O_CLOEXEC) != 0) return;
+    std::thread([] {
+        strata::platform::name_this_thread("strata-stop");
+        unsigned char b = 0;
+        for (;;) {
+            const ssize_t n = read(g_pipe[0], &b, 1);
+            if (n == 1) stop_and_end((int) b);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return;
+        }
+    }).detach();
+    for (int sig : {SIGTERM, SIGINT, SIGHUP}) {
+        struct sigaction old{};
+        if (sigaction(sig, nullptr, &old) != 0 || (old.sa_flags & SA_SIGINFO) || old.sa_handler != SIG_DFL) continue;
+        struct sigaction sa{};
+        sa.sa_handler = handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        (void) sigaction(sig, &sa, nullptr);
+    }
+}
+}  // namespace kfdq_exit
+#endif
+
 
 // STRATA_PIPE_BYIELD_NODRAIN=1 (read once; off by default): with the pipelined groups, a BYIELD that reaches the main
 // loop is dropped without draining the groups first.  A pipelined read never gives way (batch_read_piece), so the
@@ -4027,6 +4112,13 @@ int main(int argc, char** argv) {
                 strata::core::kfd_quiet::class_flag().store(true);
                 if (std::getenv("STRATA_TRACE") != nullptr && strata::core::kfd_quiet::on(strata::core::kfd_quiet::Fix::Load))
                     std::fprintf(stderr, "strata trace: kfd quiet: load order active (check first, settle after the expert cache, first prompt's buffers at init)\n");
+                if (strata::core::kfd_quiet::on(strata::core::kfd_quiet::Fix::Exit)) {
+                    int cur = 0;
+                    if (cudaGetDevice(&cur) != cudaSuccess) { cur = 0; (void) cudaGetLastError(); }
+                    kfdq_exit::install(cur);
+                    if (std::getenv("STRATA_TRACE") != nullptr)
+                        std::fprintf(stderr, "strata trace: kfd quiet: stop on SIGTERM / SIGINT / SIGHUP drains the GPU first (at most 3 s)\n");
+                }
             }
 #endif
             // and the file cache of the model files is given back while the expert arena is read and after it (page_cache_drop.hpp):
@@ -14733,6 +14825,9 @@ int main(int argc, char** argv) {
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+        kfdq_exit::g_stop.store(&stop_req);   // EXIT (kfd_quiet.hpp): a signal ends the running request like STOP (nothing without the handler)
+#endif
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
         // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
@@ -21354,6 +21449,9 @@ int main(int argc, char** argv) {
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+        kfdq_exit::g_stop.store(nullptr);   // the flag goes with this scope
+#endif
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
         // locking that mutex once this scope has destroyed it throws (the engine ended with an abort): end here

@@ -47,11 +47,77 @@ void load_order() {
     CHECK(!class_flag().load());
     CHECK(!on(Fix::Load) && !on(Fix::Exit));
 }
+// a fake GPU layer for the stop: a clock in seconds, a GPU that finishes after `busy_s` once released (never when `hung`)
+struct FakeGpu {
+    double t = 0.0;
+    double busy_s = 0.5;
+    bool hung = false;
+    bool stopped = false, unregistered = false;
+    std::string order;
+    TeardownResult run(double bound) {
+        auto stop = [&] { stopped = true; order += "S"; };
+        auto wait_for = [&](int ms) {   // waits until done or ms passed; true when done
+            const double lim = ms / 1000.0;
+            if (!hung && busy_s <= lim) { t += busy_s; busy_s = 0.0; return true; }
+            t += lim;
+            if (!hung) busy_s -= lim;
+            return false;
+        };
+        auto release = [&](int ms) { order += "R"; return wait_for(ms); };
+        auto drain = [&](int ms) { order += "D"; return wait_for(ms); };
+        auto unreg = [&] { unregistered = true; order += "U"; };
+        return teardown(stop, release, drain, unreg, [&] { return t; }, bound);
+    }
+};
+
+void stop_order() {
+    // a GPU that finishes in 0.5 s: stop, release, drain, unregister; inside the bound
+    {
+        FakeGpu g;
+        const TeardownResult r = g.run(kExitBoundS);
+        CHECK(g.order == "SRDU");
+        CHECK(r.released && r.drained && r.unregistered && g.unregistered);
+        CHECK(g.t <= kExitBoundS + 1e-9);
+    }
+    // a GPU that takes 2.5 s: the release uses most of the bound, the drain the rest; still drained
+    {
+        FakeGpu g;
+        g.busy_s = 2.5;
+        const TeardownResult r = g.run(kExitBoundS);
+        CHECK(r.released && r.drained && r.unregistered);
+        CHECK(g.t <= kExitBoundS + 1e-9);
+    }
+    // a GPU that takes 5 s: not drained within 3 s: the registration stays (unregistering under a running copy is worse), and
+    // the whole stop took no more than the bound
+    {
+        FakeGpu g;
+        g.busy_s = 5.0;
+        const TeardownResult r = g.run(kExitBoundS);
+        CHECK(!r.released && !r.drained && !r.unregistered && !g.unregistered);
+        CHECK(g.order == "SRD");
+        CHECK(g.t <= kExitBoundS + 0.002);
+    }
+    // a hung GPU: the same, bounded
+    {
+        FakeGpu g;
+        g.hung = true;
+        const TeardownResult r = g.run(kExitBoundS);
+        CHECK(!r.drained && !g.unregistered && g.stopped);
+        CHECK(g.t <= kExitBoundS + 0.002);
+    }
+    // the bound stays inside the server's 5 s between SIGTERM and SIGKILL (serve/server.py ENGINE_TERM_WAIT_S)
+    CHECK(kExitBoundS > 0.0 && kExitBoundS < 5.0);
+    // the first signal starts the stop, a second one takes the default action at once
+    CHECK(on_signal(0) == OnSignal::StartTeardown);
+    CHECK(on_signal(1) == OnSignal::DefaultAction);
+    CHECK(on_signal(2) == OnSignal::DefaultAction);
+}
 }  // namespace
 
 int main() {
     switches();
     load_order();
+    stop_order();
     if (failed) {
         std::fprintf(stderr, "kfd_quiet_test: %d check(s) failed\n", failed);
         return 1;

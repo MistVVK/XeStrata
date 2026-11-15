@@ -76,4 +76,42 @@ inline LoadMoves load_moves() {
     return load_moves(class_flag().load(std::memory_order_relaxed), std::getenv("STRATA_KFD_QUIET"), std::getenv(fix_env(Fix::Load)));
 }
 
+// ---- EXIT: the teardown order ---------------------------------------------------------------------------------------------------
+
+/// The bound of the stop, seconds.  The server stops its engine with STOP + QUIT and waits 20 s, then sends SIGTERM and waits 5 s
+/// before SIGKILL (serve/server.py ENGINE_QUIT_WAIT_S / ENGINE_TERM_WAIT_S); the macOS lifeline waits 10 s.  3 s stays inside 5 s.
+constexpr double kExitBoundS = 3.0;
+
+struct TeardownResult {
+    bool released = false;      // the verify windows' GPU waits were released and their streams finished
+    bool drained = false;       // the whole device finished within the bound
+    bool unregistered = false;  // the arena's registration was dropped (only when drained)
+};
+
+/// The order of the stop: `stop()` (the request ends at its next step), `release(ms)` -> bool (raise the spin flags; wait at most ms
+/// for the verify streams), `drain(ms)` -> bool (wait at most ms for the whole device), and only when drained `unregister()`.
+/// `now()` is seconds; the release and the drain share one bound of `bound_s` from the call.
+template <class Stop, class Release, class Drain, class Unregister, class Now>
+TeardownResult teardown(Stop stop, Release release, Drain drain, Unregister unregister, Now now, double bound_s) {
+    TeardownResult r;
+    const double t0 = now();
+    auto left_ms = [&] {
+        const double l = bound_s - (now() - t0);
+        return l > 0.0 ? (int) (l * 1000.0) : 0;
+    };
+    stop();
+    r.released = release(left_ms());
+    r.drained = drain(left_ms());
+    if (r.drained) {
+        unregister();
+        r.unregistered = true;
+    }
+    return r;
+}
+
+/// What a signal does once the handler is in: the first SIGTERM / SIGINT / SIGHUP starts the teardown; a second one while it runs
+/// ends the process at once by its default action (a user pressing Ctrl+C twice).
+enum class OnSignal { StartTeardown, DefaultAction };
+inline OnSignal on_signal(int signals_before) { return signals_before == 0 ? OnSignal::StartTeardown : OnSignal::DefaultAction; }
+
 }  // namespace strata::core::kfd_quiet

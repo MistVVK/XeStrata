@@ -722,8 +722,20 @@ void release_alias_claims(std::vector<void*>& claims) {
 
 // pin_register for the arena's ranges.  Windows HIP: a range whose GPU alias covers memory in use is unregistered again and
 // reported as refused, so the caller's "the driver refused it" path applies to it (#3431).
+#if defined(__linux__)
+// every range start registered here, for unregister_arena_ranges (kfd_quiet.hpp, EXIT); bookkeeping only
+std::mutex g_reg_mu;
+std::vector<void*> g_reg_starts;
+#endif
+
 cudaError_t register_range(PinnedArena& arena, void* p, uint64_t n) {
     const cudaError_t e = pin_register(p, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped);
+#if defined(__linux__)
+    if (e == cudaSuccess) {
+        std::lock_guard<std::mutex> lk(g_reg_mu);
+        g_reg_starts.push_back(p);
+    }
+#endif
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
     std::string why;
     if (e == cudaSuccess && !claim_alias(p, n, arena.alias_claims, why)) {
@@ -739,6 +751,20 @@ cudaError_t register_range(PinnedArena& arena, void* p, uint64_t n) {
     return e;
 }
 }  // namespace
+
+int unregister_arena_ranges() {
+#if defined(__linux__)
+    std::lock_guard<std::mutex> lk(g_reg_mu);
+    int n = 0;
+    for (void* p : g_reg_starts)
+        if (pin_unregister(p) == cudaSuccess) ++n;
+    (void) cudaGetLastError();
+    g_reg_starts.clear();
+    return n;
+#else
+    return 0;
+#endif
+}
 
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size

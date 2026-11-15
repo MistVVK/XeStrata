@@ -116,6 +116,11 @@ struct PinnedArena {
     uint8_t* data() const { return (uint8_t*) base; }
 };
 
+/// Linux: drops the GPU driver's registration of every arena range registered so far, for a process that ends right after
+/// (kfd_quiet.hpp, EXIT: then the kernel's exit has no userptr of ours to evict the queues for).  The arenas stay mapped; their
+/// destructors must not run after it.  Returns the ranges unregistered; 0 elsewhere.
+int unregister_arena_ranges();
+
 struct LoadStats {
     double seconds = 0.0;
     // Loader fix: the two halves of `seconds`, both SUMMED OVER THE READER THREADS rather than wall clock, so
