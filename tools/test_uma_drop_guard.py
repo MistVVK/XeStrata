@@ -47,7 +47,7 @@ class UmaDropGuard(unittest.TestCase):
     def test_line_only_when_pages_were_given_back(self):
         first, last = guarded_span(self.lines)
         block = "\n".join(self.lines[first:last + 1])
-        self.assertRegex(block, r"if \(freed > 0\)\s*\n\s*std::fprintf\(stderr, \"\[DRAFT\] strata serve: this GPU shares")
+        self.assertRegex(block, r"if \(freed > 0\)\s*\n\s*std::fprintf\(stderr, \"strata serve: this GPU shares")
 
 
 if __name__ == "__main__":
