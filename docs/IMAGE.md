@@ -536,7 +536,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 
 **The web page:** the Images tab has a LoRA row (not for a model whose listing is empty). "Add a LoRA…" adds one from the listing, which shows as a chip: its strength can be changed in the chip's number field (-2 to 2, steps of 0.05), a file with `trigger` words has a "Trigger" button that puts them at the end of the prompt (it writes no tag), and × takes it off. 4 at most, and the browser keeps each model's choice and strengths.
 
-**The chat:** the chat's tools (`generate_image`, `edit_image`, and the Responses API's `image_generation`) take the same `lora` as an argument where the model's listing is not empty. The chat's model follows the `lora` skill and chooses only the LoRAs the user names or that fit the character or style asked for. A character LoRA goes at a modest strength, with the style's words in the prompt, so that it does not bring its training pictures' style too. A strength or block weights the user gives are used.
+**The chat:** the chat's tools (`generate_image`, `edit_image`, and the Responses API's `image_generation`) take the same `lora` as an argument where the model's listing is not empty. The chat's model follows the `lora` skill and chooses only the LoRAs the user names or that fit the character or style asked for. A character LoRA goes with the `character` blocks (at strength 1) on a model that has them, else at a modest strength, and the style's words go in the prompt, so that it does not bring its training pictures' style too. A strength or block weights the user gives are used.
 
 **Models that take none:** HunyuanImage 3.0 refuses the `lora` field and a prompt's tag alike (400).
 
