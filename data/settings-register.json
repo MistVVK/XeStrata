@@ -14744,7 +14744,7 @@
    "last_date": "2026-11-15",
    "status": "research",
    "owner": "core",
-   "note": "=0 registers the expert arena with the GPU driver on an integrated gfx11 GPU under Linux (by default it is not registered and not locked with mlock there; STRATA_ARENA_PIN_GIB or STRATA_UMA_REGISTER=1 set by the user wins); automatic on that class, nothing on other devices; for A/B runs only, not for users",
+   "note": "=0 registers the expert arena with the GPU driver on the Radeon 780M class (gfx1103) under Linux (by default it is not registered and not locked with mlock there; STRATA_ARENA_PIN_GIB or STRATA_UMA_REGISTER=1 set by the user wins); automatic on that class, nothing on other devices; for A/B runs only, not for users",
    "retire_after": "",
    "retired_in": ""
   },
