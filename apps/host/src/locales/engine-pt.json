@@ -42,5 +42,6 @@
  "et41": "O motor não foi trocado. Nada foi alterado.",
  "et42": "Escolha um motor da lista.",
  "et43": "Este computador já tem um motor mais novo. Atualizar troca para ele; nada é baixado.",
- "et44": "{0} roda no motor {1} a partir da próxima inicialização. Seus modelos e ajustes continuam como estão. Você pode voltar quando quiser."
+ "et44": "{0} roda no motor {1} a partir da próxima inicialização. Seus modelos e ajustes continuam como estão. Você pode voltar quando quiser.",
+ "et45": "Seu modelo foi baixado, mas o motor para este computador ainda não está pronto. Abra Configurações > Sobre para instalá-lo."
 }

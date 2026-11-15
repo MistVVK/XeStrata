@@ -9,6 +9,11 @@ export function downloadCounter(size:number|undefined,progress:DownloadProgress|
  }
  return running?{value:undefined,label:progress?'Downloading…':'Preparing files…',key:'preparing'}:{value:size,label:'GB to download',key:'size'};
 }
+/** The setup wizard moves on from its download page only when the model is ready. An install that ended with every file in, for a model that is not ready
+ *  because the engine for this PC is missing or can't be used, left the page at its last figure (99%) with no word (DL99): it then says so, with the next step. */
+export function engineNotReadyAfterInstall(installState:string|undefined,modelReady:boolean|undefined,engineUsable:boolean|undefined){
+ return installState==='done'&&modelReady!==true&&engineUsable===false;
+}
 export function onboardingError(message:string){
  if(/(?:not enough.*(?:disk|storage)|disk.*(?:space|full)|ENOSPC)/i.test(message)){
   const needed=message.match(/(?:about\s+)?([\d.]+)\s*GB\s+(?:needed|required)/i)?.[1];

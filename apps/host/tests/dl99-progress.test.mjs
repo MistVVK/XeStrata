@@ -57,3 +57,34 @@ test('DL99: once every file is in, the bar says 100%, not 99% (and never 0.7 / 0
   const almost = lib.installProgress({ parts: [model('downloading', 22.85), reader('done', 0.899)] });
   assert.equal(almost.percent, 99, 'a part still downloading stays below 100');
 });
+
+const NOT_READY = "Your model is downloaded, but the engine for this PC isn't ready yet. Open Settings > About to install it.";
+
+test('DL99: an install that ended with every file in, for a model the missing engine keeps from being ready, says so on the wizard page', async () => {
+  const { readFileSync } = await import('node:fs');
+  // when: the job is done, the model is not ready, the engine for this PC is missing or can't be used
+  assert.equal(lib.engineNotReadyAfterInstall('done', false, false), true);
+  assert.equal(lib.engineNotReadyAfterInstall('done', undefined, false), true, 'a model the list does not show as ready yet');
+  assert.equal(lib.engineNotReadyAfterInstall('done', true, false), false, 'a ready model moves on to the next step');
+  assert.equal(lib.engineNotReadyAfterInstall('done', false, true), false, 'a usable engine: not this case');
+  assert.equal(lib.engineNotReadyAfterInstall('done', false, undefined), false, 'nothing known about the engine yet');
+  assert.equal(lib.engineNotReadyAfterInstall('running', false, false), false, 'not while the job runs');
+  assert.equal(lib.engineNotReadyAfterInstall('error', false, false), false, 'a failed job shows its own error');
+  // the wizard shows the owner's sentence (11-15) for that case, through the translation catalog
+  const page = readFileSync(new URL('../src/components/GuidedSetup.tsx', import.meta.url), 'utf8');
+  assert.ok(page.includes(`engineNotReadyAfterInstall(installJob?.state, installed?.ready, native?.engine?.usable) ? `), 'hooked to the install job, the model and the engine');
+  assert.ok(page.includes(`tr("${NOT_READY}")`));
+  assert.equal(lib.tr(NOT_READY), NOT_READY);
+  // all nine languages have it (scripts/make-engine-locales.py)
+  const en = JSON.parse(readFileSync(new URL('../src/locales/engine-en.json', import.meta.url), 'utf8'));
+  const key = Object.keys(en).find(k => en[k] === NOT_READY);
+  assert.ok(key, 'in the English catalog');
+  for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+    const t = JSON.parse(readFileSync(new URL(`../src/locales/engine-${l}.json`, import.meta.url), 'utf8'))[key];
+    assert.ok(t && t !== NOT_READY && t.includes('>'), `${l}: ${t}`);
+  }
+  await lib.loadCatalog('de');
+  lib.setTranslationLanguage('de');
+  assert.match(lib.tr(NOT_READY), /^Dein Modell ist heruntergeladen/);
+  lib.setTranslationLanguage('en');
+});
