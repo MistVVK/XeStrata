@@ -182,19 +182,39 @@ def _feed_source(feed: str | None = None) -> str:
     return os.environ.get(update_cmd.ENV_FEED) or update_cmd.default_feed()
 
 
+def _accepted_sequence(components: str | Path | None = None) -> tuple[int | None, Path | None]:
+    """(the last feed sequence this computer accepted, the file that remembers it): what `strata update` refuses to go below
+    (updater.open_feed, ``<components>/.updates/state.json``). (None, None) when nothing was accepted yet or the file cannot be read."""
+    try:
+        from strata_cli import update_cmd
+        from strata_control import engine_component as ec, updater
+        root = Path(components) if components else update_cmd.default_components_dir(ec)
+        state = updater.State(root)
+        value = (state.data.get("feed") or {}).get("sequence")
+        return (int(value), state.path) if isinstance(value, int) and not isinstance(value, bool) else (None, None)
+    except Exception:                                     # noqa: BLE001 - a state file that cannot be read accepts nothing, as for the update
+        return None, None
+
+
 def tuned_from_feed(*, feed: str | None = None, backend: str | None = None, size: int | None = None, sha256: str | None = None, name: str | None = None,
-                    variant: str | None = None) -> tuple[str, int, str] | None:
+                    variant: str | None = None, components: str | Path | None = None) -> tuple[str, int, str] | None:
     """(address, size, sha256) of the tuned drafter as the signed feed lists it (member ``drafters``), or None: the feed cannot be read (offline, the host is down: silent), has no
     such entry for this engine family, or lists other bytes than the ones this Strata was measured with (pinned size and SHA-256: then it is another drafter, not ours).
-    A feed that does not verify is DraftingError: a bad signature, an expired feed. A build that trusts no key (a source checkout from before the keys) is silent."""
-    from strata_control import signing
+    A feed that does not verify is DraftingError: a bad signature, an expired feed, or a feed older than the one `strata update` already accepted on this computer
+    (the update's own rule, updater.open_feed: a replayed older feed could name a drafter file the newer one no longer lists). Only the update moves the
+    accepted sequence; this lookup reads it. A build that trusts no key (a source checkout from before the keys) is silent."""
+    from strata_control import signing, updater
     pin = drafting.tuned_pack(variant)
     want_size = pin.size if size is None else size
     want_sha = pin.sha256 if sha256 is None else sha256
     want_name = name or pin.name
     source = _feed_source(feed)
+    last, state_file = _accepted_sequence(components)
     try:
-        loaded = feedmod.fetch(source, signing.load_trusted_keys(), timeout=FEED_TIMEOUT, channel="stable")
+        loaded = feedmod.fetch(source, signing.load_trusted_keys(), timeout=FEED_TIMEOUT, channel="stable", last_sequence=last)
+    except feedmod.FeedDowngrade as exc:
+        words = updater.downgrade_words(exc.sequence, exc.accepted, state_file) if state_file is not None else str(exc)
+        raise DraftingError(f"The update feed could not be trusted: {words}") from None
     except feedmod.FeedError as exc:
         if isinstance(exc, feedmod.FeedUnreachable) or exc.exit_code == 6 or "trusts no update key" in str(exc):
             return None
