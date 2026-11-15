@@ -106,7 +106,14 @@ class StepWords(unittest.TestCase):
                       ["  [ok] DFlash2 is the drafter: the MTP draft layer's ~5 GB are not downloaded (choosing the MTP later fetches it once)"]):
             with self.subTest(after=after):
                 p, label, phase = prog(HEAD + STEP5 + STEP6 + ["  [ok] model prepared: y", *after])
-                self.assertEqual((label, phase), ("Preparing your model for Strata (one time)", "pack"))
+                self.assertEqual((label, phase), ("The model files are on this computer; checking them", "verify"))
+
+    def test_step_six_claims_preparation_only_while_it_runs(self):
+        # 0.2.14.1 check (M5 Max): "Preparing your model for Strata (one time)" on every launch, also a 4-5 s restart with the model prepared
+        self.assertEqual(prog(HEAD + STEP5 + STEP6)[1:], ("The model files are on this computer; checking them", "verify"))
+        self.assertEqual(prog(HEAD + STEP5 + STEP6 + ["  > python tools/iq_pack.py --gguf x --out y"])[1:],
+                         ("Preparing the model data for the engine (one time)", "pack"))
+        self.assertEqual(prog(HEAD + STEP5 + STEP6 + ["  > python tools/strata_pack.py --gguf x --out y"])[2], "pack")
 
     def test_step_six_with_everything_already_there(self):
         lines = HEAD + STEP5 + STEP6 + ["  [ok] model prepared: y", "  [ok] MTP draft layer: z"]
