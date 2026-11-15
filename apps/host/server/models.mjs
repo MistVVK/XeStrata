@@ -84,7 +84,7 @@ export function init(hub) {
   // Files on disk are the source of truth for "current", so a state file that
   // disagrees with the filesystem heals itself.
   const onDisk = VARIANTS.filter((v) => isOnDisk(v.id));
-  if (!patch.current && !s.current && onDisk.length) {
+  if (!REAL && !patch.current && !s.current && onDisk.length) {   // design mode only: in the real mode this made an imported GGUF the remembered model
     patch.current = (onDisk.find((v) => v.tier === 'starter') ?? onDisk[0]).id;
   }
   update(patch);

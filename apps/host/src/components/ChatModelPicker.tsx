@@ -36,7 +36,7 @@ function LegacyChatModelPicker() {
     const trigger = useRef<HTMLButtonElement>(null);
     const running = library?.variants.find(v => v.id === library.loaded);
     const version = library?.variants.find(v => v.id === selected);
-    const groups = library ? pickerGroups(library) : [];
+    const groups = library && library.mode !== 'real' ? pickerGroups(library) : [];   // real engine: its own models (installedNative) only
     const installedNative = pickerNativeModels(native?.installed?.models, native?.instances);
     const status = version ? pickerVersionState(version, library?.loaded ?? null) : null;
     const tooBig = !!version && library?.mode === 'real' && versionFit(version, hardware, contextTokens(engine?.beginner.contextLength ?? '32K')).zone === 'too-big';

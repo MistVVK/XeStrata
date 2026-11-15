@@ -1,21 +1,10 @@
 /**
- * Engine supervisor.
+ * Engine supervisor (what is left of it): the engine status the Monitor and the engine page read, its log ring buffer, the parser of the
+ * engine's Prometheus metrics, and the translation of the tuning configuration into flags for the command preview.
  *
- * Owns the inference process: resolves a binary, translates the tuning
- * configuration into real flags, spawns it, waits for health, keeps a log ring
- * buffer, and polls the engine's own Prometheus metrics so the Monitor shows
- * measured numbers rather than guesses.
- *
- * Supported backends, in preference order:
- *   1. llama.cpp `llama-server` (bundled under $STRATA_HOME/engine, or on PATH)
- *   2. any already-running OpenAI-compatible server on localhost
+ * It starts nothing: the llama.cpp `llama-server` it used to find and start is gone (see start() below). Models run on the Strata engine.
  */
 import { CONTEXT_TOKENS } from './catalog.mjs';
-import { spawn } from 'node:child_process';
-import { existsSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
-import { MODELS_DIR } from './store.mjs';
-import { which } from './util.mjs';
 
 const LOG_LIMIT = 400;
 
@@ -53,57 +42,6 @@ let mcpAt=0,mcpStatus=null,mcpPending=false;
 
 export function init(hub) {
   hubRef = hub;
-}
-
-/* ------------------------------------------------------------------ binary --- */
-
-const BINARY_NAMES = ['llama-server'];
-
-export function findBinary() {
-  const candidates = [];
-
-  if (process.env.STRATA_LLAMA_SERVER) candidates.push({ path: process.env.STRATA_LLAMA_SERVER, source: 'STRATA_LLAMA_SERVER' });
-
-  // A build downloaded into the app's own folder wins over anything on PATH:
-  // it is the version Strata was tested against.
-  try {
-    const engineDir = join(MODELS_DIR, '..', 'engine');
-    if (existsSync(engineDir)) {
-      for (const entry of readdirSync(engineDir)) {
-        const dir = join(engineDir, entry);
-        if (!statSync(dir).isDirectory()) continue;
-        for (const name of BINARY_NAMES) {
-          const full = join(dir, name);
-          if (existsSync(full)) candidates.push({ path: full, source: 'bundled' });
-        }
-      }
-    }
-  } catch {
-    /* ignore unreadable engine dir */
-  }
-
-  for (const name of BINARY_NAMES) {
-    candidates.push({ path: `/opt/homebrew/bin/${name}`, source: 'homebrew' });
-    candidates.push({ path: `/usr/local/bin/${name}`, source: 'homebrew' });
-  }
-
-  return candidates.find((c) => existsSync(c.path)) ?? null;
-}
-
-export async function resolveBinary() {
-  const found = findBinary();
-  if (found) {
-    state.binary = found.path;
-    state.binarySource = found.source;
-    return found;
-  }
-  const onPath = await which('llama-server');
-  if (onPath) {
-    state.binary = onPath;
-    state.binarySource = 'PATH';
-    return { path: onPath, source: 'PATH' };
-  }
-  return null;
 }
 
 /* --------------------------------------------------------------- arguments --- */
@@ -190,102 +128,16 @@ export function logs(limit = 200) {
   return state.logs.slice(-limit);
 }
 
-async function waitForHealth(port, timeoutMs = 90_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
-      const body = await res.json().catch(() => ({}));
-      if (res.ok && body.status === 'ok') return true;
-      if (body.status) log('supervisor', `engine reports: ${body.status}`);
-    } catch {
-      /* not up yet */
-    }
-    if (child?.exitCode !== null && child?.exitCode !== undefined) {
-      throw new Error(`Engine exited early with code ${child.exitCode}`);
-    }
-    await new Promise((r) => setTimeout(r, 700));
-  }
-  throw new Error('Engine did not become healthy in time');
-}
-
-export async function start({ modelId, modelPath, port = 8080, config, hardware, timeoutMs = 120_000 }) {
-  if (state.status === 'running' && state.modelId === modelId && state.port === port) {
-    return status();
-  }
-  if (child) await stop();
-
-  const binary = await resolveBinary();
-  if (!binary) {
-    state.status = 'error';
-    state.error = 'No llama-server binary found. Download the engine from Settings → About.';
-    throw new Error(state.error);
-  }
-  if (!existsSync(modelPath)) {
-    state.status = 'error';
-    state.error = `Model file missing: ${modelPath}`;
-    throw new Error(state.error);
-  }
-
-  state.status = 'starting';
-  state.port = port;
-  state.modelId = modelId;
-  state.modelPath = modelPath;
-  state.error = null;
-  state.logs = [];
-  state.args = buildArgs({ modelPath, config, hardware, port });
-  state.command = describeCommand();
+/**
+ * The app host starts no inference process of its own: models run on the Strata engine (native control). This used to look for a llama.cpp
+ * `llama-server` (STRATA_LLAMA_SERVER, <models>/../engine, /opt/homebrew/bin, /usr/local/bin, PATH) and start it; a packaged app with
+ * STRATA_REAL_ENGINE=1 did so for an imported GGUF, also at start-up (0.2.14). start() now refuses, and nothing in this file spawns a process.
+ */
+export async function start() {
+  state.status = 'error';
+  state.error = 'Strata runs models on its own engine only.';
   hubRef?.send('engine-status', status());
-
-  log('supervisor', `$ ${state.command}`);
-
-  child = spawn(binary.path, state.args, {
-    cwd: join(MODELS_DIR, '..'),
-    env: { ...process.env, LLAMA_CACHE: join(MODELS_DIR, '..', 'cache') },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  state.pid = child.pid;
-  state.startedAt = new Date().toISOString();
-
-  const onData = (stream) => (chunk) => {
-    for (const line of chunk.toString().split('\n')) {
-      if (line.trim()) log(stream, line.replace(/\s+$/, ''));
-    }
-  };
-  child.stdout.on('data', onData('out'));
-  child.stderr.on('data', onData('err'));
-
-  child.on('exit', (code, signal) => {
-    log('supervisor', `engine exited (${signal ?? code})`);
-    child = null;
-    state.pid = null;
-    if (state.status !== 'stopping') {
-      state.status = code === 0 ? 'stopped' : 'error';
-      if (code !== 0 && code !== null) state.error = `Engine exited with code ${code}`;
-    } else {
-      state.status = 'stopped';
-    }
-    stopPolling();
-    hubRef?.send('engine-status', status());
-  });
-
-  try {
-    await waitForHealth(port, timeoutMs);
-  } catch (err) {
-    state.status = 'error';
-    state.error = err.message;
-    hubRef?.send('engine-status', status());
-    await stop();
-    throw err;
-  }
-
-  state.status = 'running';
-  state.startedAt = new Date().toISOString();
-  startPolling();
-  hubRef?.send('engine-status', status());
-  log('supervisor', 'engine ready');
-  return status();
+  throw new Error(state.error);
 }
 
 export async function stop() {
