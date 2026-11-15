@@ -1619,7 +1619,7 @@ size_t iq_mmq_act_bytes(int64_t rows, int64_t cols) { return (size_t) (rows * co
 bool iq_mmq_type_dup(int t) { return t == 10; }
 
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                            int64_t rows, bool sums, bool dup) {
+                            int64_t rows, bool sums, bool dup, const float* col_scale) {
     // dup (Q2_K, Dec<10>): each block written twice, as a row of 2 cols values.  8 values a lane (a block 4 lanes):
     // 8,192 rows of 3,072 took the B70 264 us and the RTX 4070 285 where a block a work-item took 299 and 296, and a
     // block a sub-group (a value a lane) 626 and 394 (2026-11-05)
@@ -1627,13 +1627,16 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
     auto* x8 = static_cast<int8_t*>(xq);
     auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
     float* xu = xs + rows * (oc / 32);
-    const q8act::FloatRows src{x, ids, ld};
-    if (sums) {
-        q8act::Rows<true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
+    auto run = [&](const auto& src) {
+        if (sums) {
+            q8act::Rows<true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
+            return q8act::quantize<8, q8act::Mul>(q, rows * nb, nb, src, out);
+        }
+        q8act::Rows<false> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
         return q8act::quantize<8, q8act::Mul>(q, rows * nb, nb, src, out);
-    }
-    q8act::Rows<false> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
-    return q8act::quantize<8, q8act::Mul>(q, rows * nb, nb, src, out);
+    };
+    if (col_scale != nullptr) return run(q8act::ScaledFloatRows{x, ids, ld, col_scale});
+    return run(q8act::FloatRows{x, ids, ld});
 }
 
 sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_t* slot, void* xq, int64_t cols,

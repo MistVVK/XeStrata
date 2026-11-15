@@ -1484,8 +1484,7 @@ bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string
     d.expert_bytes = mmq::matrix_bytes(du_t, G * ELL, N); d.n = 1; d.xq = m.lmmq_xq_;
     d.bounds = m.lmmq_bounds_; d.ids = m.ids_identity; d.total_rows = T; d.max_rows = T; d.rows = T;
     d.dst = m.lmmq_xl_; d.ld_dst = G * ELL;
-    m.mmq_ctx->run(d, m.cs);
-    latent_colscale_rows(m.lmmq_xl_, T * G, (int) ELL, latent_colscale_dev((int) l, (int) ELL), m.cs);
+    m.mmq_ctx->run(d, m.cs);   // the column scales: in the experts' quantize (run_impl)
     return true;
 }
 
@@ -3618,8 +3617,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         pt.mark(kPfGather, cs);
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
-                            if (m.latent_)   // the D stage's rows, each route's of its expert's group
-                                mmq::quantize(m.lmmq_xl_, m.src_dev, m.Xq, mmq_gt, ew, ew, T * K, m.cs);
+                            if (m.latent_)   // the D stage's rows, each route's of its expert's group, column-scaled
+                                mmq::quantize(m.lmmq_xl_, m.src_dev, m.Xq, mmq_gt, ew, ew, T * K, m.cs,
+                                              strata::kernels::latent_colscale_dev((int) l, (int) ew));
                             else
                                 mmq::quantize_scatter(m.mixed, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
