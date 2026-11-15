@@ -14678,7 +14678,7 @@
    "last_date": "2026-11-15",
    "status": "research",
    "owner": "core",
-   "note": "=0 turns off the engine's KFD-quiet changes on an integrated gfx11 GPU under Linux (gfx1103, gfx1150, gfx1151: the load order, the drain on a stop by signal, the staged pageable copies, the unregistered expert arena; include/strata/core/kfd_quiet.hpp); automatic on that class, nothing on other devices; for A/B runs only, not for users",
+   "note": "=0 turns off the engine's KFD-quiet changes on an integrated gfx11 GPU under Linux (gfx1103, gfx1150, gfx1151: the load order, the drain on a stop by signal, the staged pageable copies; on gfx1103 also the unregistered expert arena; include/strata/core/kfd_quiet.hpp); automatic on that class, nothing on other devices; for A/B runs only, not for users",
    "retire_after": "",
    "retired_in": ""
   },
