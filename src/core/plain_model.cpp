@@ -2286,7 +2286,8 @@ int64_t PlainModel::lend_lowest(int64_t n) const {
 
 // --prompt-chunk not given: the largest of prefill.hpp's kAutoChunks (as Qwen3.8's --prefill auto) whose buffers the
 // tier lends (lend_lowest), or that fit in the `beside` bytes left beside a tier that holds every expert; the pinned
-// host buffers made again for it.  One GPU: a layer split's stages share the rows' buffers of the chunk asked.
+// host buffers made again for it.  At most kAutoSplitMax: the chunk is chosen once here for every prompt, and the
+// bigger ones pay only for a prompt read in one chunk (prefill.hpp).  One GPU: a layer split's stages share the rows' buffers of the chunk asked.
 void PlainModel::auto_prompt_chunk(uint64_t beside) {
     const uint64_t* off = cache_.slot_offsets();
     const int64_t n = n_slots_;
@@ -2296,7 +2297,7 @@ void PlainModel::auto_prompt_chunk(uint64_t beside) {
         prompt_carve(t, pb_, nullptr, nullptr, db, hb);
         if (beside > 0) return db <= beside && db <= max_alloc_bytes();
         return off != nullptr && n >= 2 && off[n] - off[lowest] >= db;
-    });
+    }, std::min(strata::prefill::auto_max(), strata::prefill::kAutoSplitMax));
     // only upward: a chunk below the one asked kept the old way (prompt_borrow halves it until it fits) read faster.
     // The RX 9060 XT, llm-jp-4.1 16K at 8 GiB of VRAM and 20 GiB of RAM (2026-10-26): the chunk chosen here 2048, 310
     // tok/s; 4096 asked (borrowed at prompt time) 352, at either lending share

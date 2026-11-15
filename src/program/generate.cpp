@@ -383,8 +383,8 @@ struct Options {
     int vram_reserve_later_mib = -1;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
-    /// `--prefill auto`: the largest chunk (up to 32768, not past --max-context) whose buffers the expert cache can
-    /// lend.  Every expert a chunk routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per
+    /// `--prefill auto`: the largest chunk (up to prefill::auto_max(); above 32768 only for a prompt read in one chunk,
+    /// not past --max-context) whose buffers the expert cache can lend.  Every expert a chunk routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per
     /// token (the "ubatch" effect).
     bool prefill_auto = false;
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
@@ -754,7 +754,8 @@ void usage() {
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
-                 "                       the largest chunk up to 32768 whose buffers the expert cache can lend\n"
+                 "                       the largest chunk up to 49152 whose buffers the expert cache can lend (above\n"
+                 "                       32768 only for a prompt read in one chunk)\n"
                  "  --prefill-cpu-share S  the CPU pool's share of a short chunk's streamed experts where the default\n"
                  "                       uses the pool (0-1; auto = measured each layer, the default; setup writes\n"
                  "                       the share it measured, so a prompt reads the same way every run)\n"
@@ -5865,7 +5866,7 @@ int main(int argc, char** argv) {
         // (B70 + 4070, IQ2_XS, K=45: the 4070's 3 layers held 1.3 GiB, and 30K-token prompts read in 3072-token
         // chunks took 25.3 s against 14.6 s on the B70 alone in 32768-token ones)
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && sized.size() == st.profile.size()) {
-            const int64_t top = o.prefill_auto ? std::max<int64_t>(8192, std::min<int64_t>(32768, o.max_context))
+            const int64_t top = o.prefill_auto ? std::max<int64_t>(8192, std::min<int64_t>(strata::prefill::auto_max(), o.max_context))
                                                : o.prefill_chunk;
             const int64_t want = (int64_t) strata::prefill::Prefill::bytes_needed(g, st.ss, top) * 100 / 85 +
                                  128 * (int64_t) lay.max_blob;
@@ -7064,6 +7065,7 @@ int main(int argc, char** argv) {
         // 32768 and 16384 (upstream ae652b2; opt-in there, 3e31eea, as other chunks rounded differently on CUDA):
         // prefill.hpp's kAutoChunks.  They take the lend rule below like the others, so a smaller cache picks a
         // smaller chunk, and none goes past --max-context.  STRATA_PREFILL_AUTO_MAX lowers the ceiling (8192: as before).
+        // 49152 and 40960 above them, for a prompt read in one chunk (prefill::one_chunk_cap).
         // #2090 (upstream 1a55fc37, 987548ce): a chunk above 8192 lends the prompt path about twice the slots of 8192
         // (R9700, IQ3_XXS: 3,907 slots / 6.38 GiB at 16384 against 2,068 / 3.37 GiB), and each lent slot's expert is read
         // from the RAM side during the read.  On a 30 GB PC with --resident-experts that was 3.4 GB available, 20 GB in
@@ -11943,7 +11945,8 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
                 if (lend_first < 0) return true;                       // its own buffers: nothing to lend
-                const int64_t want = std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
+                const int64_t want = o.prefill_auto ? strata::prefill::one_chunk_cap(o.prefill_chunk, tokens)
+                                                    : std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
                 if (!lent_now.empty()) {
                     if (want <= lent_chunk) return true;
                     if (!refill(e)) return false;
@@ -13830,6 +13833,9 @@ int main(int argc, char** argv) {
                 chunk = std::max<int64_t>(256, (n_prompt - 1 + 255) / 256 * 256);
                 k = o.prefill_auto ? auto_slots(chunk) : lend_slots(chunk);
                 if (!o.prefill_auto) o.prefill_chunk = chunk;
+            } else if (k > 0 && o.prefill_auto && chunk > strata::prefill::kAutoSplitMax) {   // more than one chunk
+                chunk = strata::prefill::one_chunk_cap(chunk, n_prompt - 1);
+                k = auto_slots(chunk);
             }
             if (o.prefill_auto) {
                 o.prefill_chunk = k > 0 ? chunk : 1024;

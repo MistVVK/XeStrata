@@ -60,18 +60,34 @@ double cpu_share_setting();
 /// The prompt chunks --prefill auto picks from, the largest first, for both engines (generate.cpp's plan_lend and
 /// PlainModel's): every chunk streams again each expert it routes to, so fewer chunks stream fewer experts.  32768 and
 /// 16384 after upstream ae652b2: on the B70 a 26,292-token IQ3_S prompt read at 1,080 tok/s in 8192-token chunks
-/// (50,356 experts streamed), 1,303 in 16384 and 1,545 in one chunk (17,728), the same logits.
-inline constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
-/// The largest of kAutoChunks that `take(chunk)` accepts (0: none), at most STRATA_PREFILL_AUTO_MAX (32768 unset) and,
-/// past 8192, none above `max_context`.
-template <class Take>
-int64_t auto_chunk(int64_t max_context, Take&& take) {
-    static const int64_t auto_max = [] {
+/// (50,356 experts streamed), 1,303 in 16384 and 1,545 in one chunk (17,728), the same logits.  49152 and 40960 (the
+/// RDNA3 fork's 8192 grid) only for a prompt they read in one chunk (one_chunk_cap): on the B70, IQ3_XXS, a 48K prompt
+/// read in 17.7 s in one 48128-token chunk against 18.7 s in 32768 + the rest, the same answer, but a 57K one in 22.2 s
+/// in 49152 + 7848 against 21.8 s in 32768 + 24231 (2026-11-15).  A 16 GB card (RX 9060 XT) cannot lend them at 48K and
+/// keeps 16384; above 49152 the R buffer (~40 KB a token) passes 2 GiB.
+inline constexpr int64_t kAutoChunks[] = {49152, 40960, 32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+/// The largest auto chunk a prompt longer than one chunk is read in (the chunks above it pay only in one chunk).
+inline constexpr int64_t kAutoSplitMax = 32768;
+/// The ceiling of --prefill auto: STRATA_PREFILL_AUTO_MAX, else the largest of kAutoChunks.
+inline int64_t auto_max() {
+    static const int64_t m = [] {
         const char* v = strata::env_get("PREFILL_AUTO_MAX");
-        return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 32768;
+        return v ? (int64_t) std::strtoll(v, nullptr, 10) : kAutoChunks[0];
     }();
+    return m;
+}
+/// The chunk a prompt of `tokens` is read in when the auto chunk is `chunk`: the prompt's own size (rounded up to 256)
+/// when it fits in one, else at most kAutoSplitMax.
+inline int64_t one_chunk_cap(int64_t chunk, int64_t tokens) {
+    const int64_t whole = std::max<int64_t>(256, (tokens + 255) / 256 * 256);
+    return whole <= chunk ? whole : std::min(chunk, kAutoSplitMax);
+}
+/// The largest of kAutoChunks that `take(chunk)` accepts (0: none), at most `cap` and, past 8192, none above
+/// `max_context`.
+template <class Take>
+int64_t auto_chunk(int64_t max_context, Take&& take, int64_t cap = auto_max()) {
     for (const int64_t c : kAutoChunks) {
-        if (c > auto_max || (c > 8192 && c > max_context)) continue;
+        if (c > cap || (c > 8192 && c > max_context)) continue;
         if (take(c)) return c;
     }
     return 0;
