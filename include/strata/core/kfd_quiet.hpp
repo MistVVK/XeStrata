@@ -12,6 +12,8 @@
 //         pinning our pages in place); a value the caller set wins.
 //   NOREG the expert arena is not registered with the driver (the unregistered "UMA" path of pinned.cu), and not mlock'ed; a value
 //         the user set for STRATA_ARENA_PIN_GIB (or STRATA_UMA_REGISTER=1) wins.
+//   LEND  the prompt path keeps its own buffers instead of lending expert cache slots (no refill after every prompt), decided after
+//         the cache is sized and only where the buffers fit; the chunk stays.  Off by default (kNoLendDefaultOn); _LEND=1 turns it on.
 // None changes a kernel or what is computed.  STRATA_KFD_QUIET=0 turns all of them off at run time (A/B with the same binary);
 // STRATA_KFD_QUIET_LOAD / _EXIT / _XFER / _NOREG = 0 turn one off.  STRATA_TRACE prints one line per change that is active.
 //
@@ -107,6 +109,45 @@ inline bool arena_unregistered(const char* pin_gib, bool engine_flag) {
 inline bool arena_lock_wanted(bool noreg, const char* lock_env) {
     if (lock_env != nullptr) return std::string(lock_env) != "0";
     return !noreg;
+}
+
+// ---- LEND: no cache slots lent to the prompt path on the class -------------------------------------------------------------------
+
+/// The default of LEND.  false: written, off until the box test of the no-loan arm decides; true makes it the class default.
+inline constexpr bool kNoLendDefaultOn = false;
+/// What the prompt path's own buffers must leave free beside the cache and the reserve (AUTO NO-BORROW's kNoBorrowKeepMib).
+inline constexpr int64_t kNoLendKeepMib = 3072;
+/// The largest chunk taken without a loan: above it a chunk without a loan meets the Strix Halo launch probe
+/// (generate.cpp uma_refuse_chunk_if_full), which can end the start; such a chunk keeps its loan.
+inline constexpr int64_t kNoLendMaxChunk = 16384;
+
+/// LEND's switch: the class; STRATA_KFD_QUIET=0 or STRATA_KFD_QUIET_LEND=0 off; STRATA_KFD_QUIET_LEND=1 on whatever the default;
+/// STRATA_PREFILL_BORROW=1 (the existing "keep the loan") off; otherwise kNoLendDefaultOn.
+inline bool lend_rule_on(bool cls, const char* all, const char* one, const char* prefill_borrow, bool def = kNoLendDefaultOn) {
+    if (!cls) return false;
+    if (prefill_borrow != nullptr && prefill_borrow[0] == '1') return false;
+    if (all != nullptr && all[0] == '0') return false;
+    if (one != nullptr && one[0] == '0') return false;
+    if (one != nullptr && one[0] == '1') return true;
+    return def;
+}
+
+/// The decision, made AFTER the expert cache is sized as with a loan (so the cache gets the same slots as with lending): the loan
+/// is dropped only where the prompt path would lend (`lends`), on one GPU, with a chunk of 1 .. kNoLendMaxChunk, and when the path's
+/// own buffers for that chunk (`own_mib`) fit in what the driver reports free beside the cache and the reserve (`room_mib`) with
+/// kNoLendKeepMib to spare.  The chunk is never changed here (no drop to the 2,048 of a bare --no-prefill-borrow).
+struct NoLend {
+    bool no_lend = false;
+    bool fits = false;
+    int64_t chunk = 0;
+};
+inline NoLend no_lend_pick(bool rule_on, bool lends, bool one_gpu, int64_t chunk, int64_t room_mib, int64_t own_mib) {
+    NoLend r;
+    r.chunk = chunk;
+    if (!rule_on || !lends || !one_gpu || chunk <= 0 || chunk > kNoLendMaxChunk) return r;
+    r.fits = room_mib >= own_mib + kNoLendKeepMib;
+    r.no_lend = r.fits;
+    return r;
 }
 
 // ---- XFER: the device class from the KFD topology (before HIP starts) ------------------------------------------------------------

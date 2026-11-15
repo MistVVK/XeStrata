@@ -8854,6 +8854,42 @@ int main(int argc, char** argv) {
         }
 #endif
     }
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+    // LEND (kfd_quiet.hpp), integrated gfx11 under Linux: the prompt path keeps its own buffers instead of lending cache slots, the
+    // rule of the Strix Halo on Windows (0.2.8, above) for this class.  Every lent slot is copied back from the host arena after each
+    // prompt: 1,967 slots (2.53 GiB) on p2006, +1.1-1.4 s on every short prompt with the arena unregistered (11-15).  Decided HERE,
+    // after the cache was sized as with a loan, so the cache keeps the slots it gets today (--expert-cache N or the auto size); the
+    // own buffers then must fit in what the driver reports free beside it (AUTO NO-BORROW's arithmetic), else the loan stays.  The
+    // chunk is the one the loan would have used (no drop to 2,048).  Off by default (kNoLendDefaultOn); STRATA_KFD_QUIET_LEND=1 turns
+    // it on, =0 or STRATA_PREFILL_BORROW=1 keeps the loan.
+    if (pf_borrow && o.prefill_chunk > 0 &&
+        strata::core::kfd_quiet::lend_rule_on(strata::core::kfd_quiet::class_flag().load(std::memory_order_relaxed), std::getenv("STRATA_KFD_QUIET"),
+                                              std::getenv("STRATA_KFD_QUIET_LEND"), std::getenv("STRATA_PREFILL_BORROW"))) {
+        const bool one_gpu = !multi_gpu && stages.empty() && o.peer_device < 1 &&
+                             std::none_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(), [](int n) { return n > 0; });
+        uint64_t cache_b = 0;
+        if (!sized_slots.empty())
+            for (const int64_t sb : sized_slots) cache_b += (uint64_t) strata::core::ExpertCache::slot_stride(sb, slot_guard);
+        else
+            cache_b = (uint64_t) std::max(o.expert_cache, 0) * (uint64_t) nibble_max_slot_bytes();
+        const int64_t own_mib = ((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, o.prefill_chunk, srcp != nullptr) >> 20) + 64;
+        const size_t fb = strata::core::device_free_bytes();
+        const int64_t room_mib = fb > cache_b ? (int64_t) ((fb - cache_b) >> 20) - o.vram_reserve_mib - (int64_t) (pipe_first >> 20) : 0;
+        const strata::core::kfd_quiet::NoLend nl = strata::core::kfd_quiet::no_lend_pick(true, pf_borrow, one_gpu, o.prefill_chunk, room_mib, own_mib);
+        if (std::getenv("STRATA_TRACE") != nullptr)
+            std::fprintf(stderr, "strata trace: kfd quiet: prompt path without a loan: %s (own buffers %lld MiB for a %lld-token chunk, %lld MiB free "
+                                 "beside the %d-slot cache and the %d MiB reserve, %lld kept)\n",
+                         nl.no_lend ? "yes" : !one_gpu ? "no, not one GPU" : !nl.fits ? "no, they do not fit" : "no",
+                         (long long) own_mib, (long long) o.prefill_chunk, (long long) room_mib, o.expert_cache, o.vram_reserve_mib,
+                         (long long) strata::core::kfd_quiet::kNoLendKeepMib);
+        if (nl.no_lend) {
+            o.no_prefill_borrow = true;
+            pf_borrow = false;
+            o.prefill_auto = false;
+            o.prefill_chunk = nl.chunk;
+        }
+    }
+#endif
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL) && !defined(_WIN32)
     // 0.2.10.1 (round0212 item 7): the FP16 weight cache is on when the engine runs batch slots on Linux CUDA.  Bit-exact against the uncached
     // form (gemm_w16_parity, greedy identity 12/12, first-token KL 0); +3.8% (c=1) .. +6.6% (c=8) total tokens/s on l620.  It takes only VRAM beyond

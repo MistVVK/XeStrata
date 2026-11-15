@@ -219,11 +219,48 @@ void noreg() {
     CHECK(arena_lock_wanted(false, ""));
     CHECK(!arena_lock_wanted(false, "0"));
 }
+
+void lend() {
+    CHECK(std::string(fix_env(Fix::Lend)) == "STRATA_KFD_QUIET_LEND");
+    // the switch: written off by default; _LEND=1 on, =0 / STRATA_KFD_QUIET=0 / STRATA_PREFILL_BORROW=1 off; never outside the class
+    CHECK(!kNoLendDefaultOn);
+    CHECK(lend_rule_on(true, nullptr, nullptr, nullptr) == kNoLendDefaultOn);
+    CHECK(lend_rule_on(true, nullptr, nullptr, nullptr, true));    // the constant flipped: the class default
+    CHECK(!lend_rule_on(true, nullptr, nullptr, nullptr, false));
+    CHECK(lend_rule_on(true, nullptr, "1", nullptr));
+    CHECK(lend_rule_on(true, "1", "1", nullptr));
+    CHECK(!lend_rule_on(true, nullptr, "0", nullptr, true));
+    CHECK(!lend_rule_on(true, "0", "1", nullptr, true));
+    CHECK(!lend_rule_on(true, nullptr, "1", "1", true));          // STRATA_PREFILL_BORROW=1 keeps the loan
+    CHECK(lend_rule_on(true, nullptr, "1", "0"));
+    CHECK(!lend_rule_on(false, nullptr, "1", nullptr, true));     // not the class
+    // the pick: the chunk always comes back as it went in (8192 stays 8192: no drop to 2048)
+    const int64_t own8k = 2560;   // about the 780M's own buffers at 8192 (2.5 GiB)
+    for (int64_t c : {(int64_t) 512, (int64_t) 2048, (int64_t) 8192, (int64_t) 16384, (int64_t) 32768}) {
+        CHECK(no_lend_pick(true, true, true, c, 100000, own8k).chunk == c);
+        CHECK(no_lend_pick(true, true, true, c, 0, own8k).chunk == c);
+        CHECK(no_lend_pick(false, true, true, c, 100000, own8k).chunk == c);
+    }
+    // the fit check decides: room >= own + kNoLendKeepMib
+    CHECK(no_lend_pick(true, true, true, 8192, own8k + kNoLendKeepMib, own8k).no_lend);
+    CHECK(!no_lend_pick(true, true, true, 8192, own8k + kNoLendKeepMib - 1, own8k).no_lend);
+    CHECK(!no_lend_pick(true, true, true, 8192, own8k + kNoLendKeepMib - 1, own8k).fits);
+    CHECK(no_lend_pick(true, true, true, 8192, 18000, own8k).no_lend);   // p2006: ~18 GiB free beside a 7.72 GiB cache (G)
+    CHECK(!no_lend_pick(true, true, true, 8192, 0, own8k).no_lend);
+    // only where the path would lend, on one GPU, a chunk of 1 .. kNoLendMaxChunk, with the rule on
+    CHECK(!no_lend_pick(false, true, true, 8192, 100000, own8k).no_lend);
+    CHECK(!no_lend_pick(true, false, true, 8192, 100000, own8k).no_lend);
+    CHECK(!no_lend_pick(true, true, false, 8192, 100000, own8k).no_lend);
+    CHECK(!no_lend_pick(true, true, true, 0, 100000, own8k).no_lend);
+    CHECK(no_lend_pick(true, true, true, kNoLendMaxChunk, 100000, own8k).no_lend);
+    CHECK(!no_lend_pick(true, true, true, kNoLendMaxChunk + 1, 100000, own8k).no_lend);
+}
 }  // namespace
 
 int main() {
     switches();
     noreg();
+    lend();
     load_order();
     topology();
     stop_order();
