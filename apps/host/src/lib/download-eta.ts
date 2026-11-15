@@ -77,3 +77,10 @@ export function stageText(stage: InstallStage | undefined): string {
   if (stage.count && stage.index) return tr('Downloading model files · part {0} of {1}', [stage.index, stage.count]);
   return tr('Downloading model files…');
 }
+/** The setup wizard's status line: a server that has not answered yet, else setup's own sentence for what it does now (checking the files,
+ *  preparing the tokenizer, ...; strata_control/progress_words.py, the line the Models page shows), else the part being fetched. Without it the
+ *  wizard said "Downloading the picture reader…" while the model file was checked and "Downloading model files…" after the last file (DL99). */
+export function guidedStatusText(install: { phase?: string; label?: string; parts?: { kind?: string; state?: string; files_done?: number; files_total?: number }[] } | undefined,
+                                 progress: unknown): string {
+  return waitingText(install) ?? install?.label ?? (progress ? stageText(installStage(install)) : 'Preparing your model…');
+}

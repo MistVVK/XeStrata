@@ -1569,7 +1569,8 @@ def files_progress(prog: dict, job: dict, files: list) -> dict:
         except OSError:
             state, have = "waiting", 0
         total = f.get("bytes") or (have if state == "done" else 0)
-        if state == "downloading" and cur_gb and p.name in str(log.get("file", "")):   # the log line names this file
+        named = p.name in str(log.get("file", "")) or (f.get("role") == "vision" and str(log.get("file", "")).startswith("vision encoder"))
+        if state == "downloading" and cur_gb and named:   # the log line names this file (setup calls the picture reader "vision encoder")
             # The .part file is as long as the furthest byte written, which the parallel pieces push to the full size well before the
             # download is done: the pieces setup counts are the truth.
             have = min(have, int(float(log.get("done_gb") or 0) * 1e9)) if have else have

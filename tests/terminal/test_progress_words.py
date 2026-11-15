@@ -167,6 +167,32 @@ class CombinedFigure(unittest.TestCase):
         self.assertEqual(out["download"]["file"], "checking files")
         self.assertEqual(out["download"]["percent"], 20)
 
+    @staticmethod
+    def _qwen36_files(folder: Path, reader_done: bool) -> list:
+        """A Qwen3.6 UD-Q4_K_XL install's files (sizes made sparse, nothing written): the model whole, the picture reader whole or as a .part
+        the parallel pieces have already pushed to its full length."""
+        model = folder / "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+        reader = folder / "mmproj-F16.gguf"
+        for path, size in ((model, 22_853_663_008), (reader if reader_done else reader.with_name(reader.name + ".part"), 899_283_584)):
+            with open(path, "wb") as f:
+                f.truncate(size)
+        return [{"path": str(model), "bytes": 22_853_663_008, "role": "model"},
+                {"path": str(reader), "bytes": 899_283_584, "role": "vision"}]
+
+    def test_the_picture_reader_counts_by_its_own_figure(self):
+        """DL99: setup names the picture reader "vision encoder" in its progress line, not by its file name, so its .part (filled ahead by
+        the parallel pieces) was counted whole: the bar said 99% while 16-48% of it had arrived (Boston, 2026-11-15)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            files = self._qwen36_files(Path(tmp), reader_done=False)
+            prog_ = {"step": "5/7: downloading Qwen3.6-35B-A3B UD-Q4_K_XL",
+                     "download": {"file": "vision encoder", "done_gb": 0.43, "total_gb": 0.9, "percent": 48}}
+            out = strata_mcp.files_progress(prog_, {"total_gb": 22.9}, files)
+            reader = next(p for p in out["parts"] if p["kind"] == "vision")
+            self.assertAlmostEqual(reader["done_gb"], 0.43, places=2)
+            self.assertEqual(reader["state"], "downloading")
+            self.assertLess(out["download"]["percent"], 99)
+
 
 if __name__ == "__main__":
     unittest.main()
