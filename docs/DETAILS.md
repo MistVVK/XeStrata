@@ -198,6 +198,7 @@ Setup counts the carve-out as room for experts (the low-RAM mode) and the carve-
 It tells Strix Halo (gfx1151) apart by name, names the Radeon 8060S / 8050S / 8040S, and recommends UD-IQ4_XS from about 80 GB of memory.
 The kernel's boot options `ttm.pages_limit` and `ttm.page_pool_size` (in 4 KiB pages) give the GPU more of the shared memory.
 Setup changes no host setting.
+On Linux the engine starts at nice +5 when a built-in Radeon draws the desktop (an integrated KFD node), so the compositor keeps its share of the CPU; `XESTRATA_ENGINE_NICE=N` sets another value (0 turns it off, and it is off on any PC without such a chip).
 The engine counts an integrated GPU's free memory as the smaller of what its runtime reports and what Linux can give back (`MemAvailable`) less 6 GiB (upstream 004b15cd; `XESTRATA_UMA_HEADROOM_GIB` changes the 6).
 For the models that keep a RAM budget of their experts (Unsloth's), setup writes the expert cache as a number, not `auto` (upstream #1715).
 The cache and the budget draw on the same RAM, so `auto`, sized from the memory free at start, would count what the budget has not taken yet and leave the OS nothing.
@@ -2321,6 +2322,9 @@ When opening an issue, include the report and necessary log excerpts after remov
   but only where its measured acceptance and cost say it pays.
   The drafts are checked like the MTP's, so the output is the same.
 - **Prefill** runs in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
+  `XESTRATA_PREFILL_AUTO_MAX` raises the auto ceiling to 49,152 on the 8,192 grid (the loan and the free RAM still decide).
+  `XESTRATA_PREFILL_EQUAL_TAIL_MAX` splits a prompt that would read as one big chunk and a short tail evenly past that
+  chunk size, so the big chunk does not loan most of the cache and stream nearly every expert twice (both opt-in).
   The matrix products run on XMX on Intel GPUs, on WMMA on AMD GPUs (RDNA3 or later) and on tensor cores on NVIDIA
   GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib-llvm build, and to
   rocBLAS and hipBLASLt on AMD GPUs.

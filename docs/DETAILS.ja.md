@@ -175,6 +175,7 @@ setup は、BIOS の割り当てをエキスパートの置き場（低 RAM モ�
 Strix Halo（gfx1151）は名前で見分け、Radeon 8060S / 8050S / 8040S を名前に出し、メモリが約 80 GB 以上なら UD-IQ4_XS を勧めます。
 GPU が使える共有のメモリを増やすのは、カーネルの起動の選択肢 `ttm.pages_limit` と `ttm.page_pool_size`（4 KiB のページの数）です。
 setup はホストの設定を変えません。
+Linux では、内蔵の Radeon が画面を描くとき（KFD のノードが統合 GPU のとき）、エンジンは nice +5 で起動し、デスクトップの compositor が CPU の持ち分を保ちます。`XESTRATA_ENGINE_NICE=N` で別の値にします（0 で切り、そのようなチップのない PC では常に 0）。
 エンジンは、内蔵 GPU の空きを、ランタイムが報告する値と、Linux が返せるメモリ（`MemAvailable`）から 6 GiB を引いた値の小さい方として数えます（upstream 004b15cd、`XESTRATA_UMA_HEADROOM_GIB` で 6 を変えられます）。
 エキスパートを RAM の予算で持つモデル（Unsloth の版）では、setup はエキスパートのキャッシュを `auto` でなく数で書きます（upstream #1715）。
 キャッシュと予算は同じ RAM を使うので、起動時の空きから決める `auto` は予算がまだ取っていない分まで数え、OS の分が残らなくなります。
@@ -2239,6 +2240,9 @@ issue を立てるときは、秘密や個人情報を除いた報告と必要�
   ただし、測った当たり方と費用から、得になるところでだけ使います。
   推測は MTP のものと同じに確かめるので、出力は変わりません。
 - **prefill** は、最大 32,768 トークンの塊で処理し、エキスパートは PCIe で GPU に流します。
+  `XESTRATA_PREFILL_AUTO_MAX` で auto の上限を 8,192 刻みで 49,152 まで上げられます（貸せる枠と空き RAM が引き続き決めます）。
+  `XESTRATA_PREFILL_EQUAL_TAIL_MAX` は、大きな塊 1 つと短い端で読めるプロンプトを、その塊の大きさを超えて均等に分けます
+  （大きな塊がキャッシュの大半を借りてエキスパートをほぼ 2 回流すのを防ぎます。どちらも opt-in）。
   行列積は、Intel の GPU では XMX、AMD の GPU では WMMA（RDNA3 以降）、NVIDIA の GPU では Tensor Core で計算し、
   密な行列積は oneMath 経由で、contrib-llvm のビルドでは oneMKL か cuBLAS に、AMD の GPU では rocBLAS と hipBLASLt に任せます。
 
