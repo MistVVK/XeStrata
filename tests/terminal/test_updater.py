@@ -880,5 +880,41 @@ class FailedStartRecords(LazyModel):
         self.assertIn("test-start-0.1.49-failed", left)
 
 
+class GoneVersionPathsInTheTestStart(UpdaterCase):
+    """#5681: a run config that names files in a Control version an update removed (cwd, --expert-profile under components/control/0.1.56)
+    is resolved to the current Control before the test start runs with the stage as its components folder (which has no control folder)."""
+
+    def test_the_test_start_gets_the_current_control_paths(self):
+        from strata_control import profiles, runtime
+        self.install_current()
+        current = self.components / "control" / "0.1.60"
+        (current / "data").mkdir(parents=True)
+        (current / "data" / "expert-profile.bin").write_bytes(b"p")
+        (self.components / "control" / "active.json").write_text(json.dumps({"folder": "0.1.60"}), encoding="utf-8")
+        gone = self.components / "control" / "0.1.56"
+        cfg = json.loads(self.config.read_text())
+        cfg.update({"cwd": str(gone), "args": ["--max-context", "4096", "--expert-profile", str(gone / "data" / "expert-profile.bin")]})
+        self.config.write_text(json.dumps(cfg), encoding="utf-8")
+        folder = fx.build_package(self.root / "lazy", "0.1.46", key=self.key)
+        stage = self.root / "stage"
+        (stage / "engine").mkdir(parents=True)
+        shutil.copytree(folder, stage / "engine" / folder.name)
+        component = ec.read_manifest(stage / "engine" / folder.name)
+        seen = []
+
+        def start(name, **kw):
+            profile, _ = profiles.load(name)
+            seen.append(json.loads(Path(profile["source_config"]).read_text(encoding="utf-8")))
+            return {"ok": True, "state": "ready", "generation_ready": True}
+
+        with mock.patch.object(runtime, "start", side_effect=start), mock.patch.object(runtime, "stop", return_value={}):
+            result = updater.default_test_start(stage, component, self.ctx())
+        self.assertEqual(result["generation_ready"], True)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["cwd"], str(current))
+        self.assertEqual(seen[0]["args"][seen[0]["args"].index("--expert-profile") + 1], str(current / "data" / "expert-profile.bin"))
+        self.assertEqual(json.loads(self.config.read_text())["cwd"], str(gone), "the person's run config is not written by a test start")
+
+
 if __name__ == "__main__":
     unittest.main()
