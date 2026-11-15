@@ -1069,11 +1069,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         strata::spec::Drafter keep = v.measured ? v.keep : model.drafts() > 0 ? strata::spec::Drafter::Mtp
                                                                              : strata::spec::Drafter::Df2;
         // DFlash2 kept only where the VRAM it took from the reserve leaves the reserve the start had (a long prompt's
-        // buffers come out of it)
+        // buffers come out of it).  Not --draft dflash2's: it was loaded before the tier, which was sized around it, so
+        // it took nothing from the reserve; dropped, the run had no drafter at all (RX 9060 XT, 1K and 32K, 2026-11-15)
         size_t fb = 0, tb = 0;
         strata::gpu::mem_info(&fb, &tb);
         const long long reserve = opt.reserve_mib >= 0 ? (long long) opt.reserve_mib : (long long) (tb >> 20) / 32;
-        if ((keep == strata::spec::Drafter::Df2) && free_during < reserve) {
+        if (keep == strata::spec::Drafter::Df2 && dr.deferred && free_during < reserve) {
             std::fprintf(stderr, "xestrata (%s): the drafter is not kept: with it %lld MiB of VRAM stay free, less than the "
                                  "%lld MiB reserve\n", arch.c_str(), free_during, reserve);
             keep = model.drafts() > 0 ? strata::spec::Drafter::Mtp : strata::spec::Drafter::None;
