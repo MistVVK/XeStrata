@@ -446,12 +446,12 @@ struct GdnChunkScan {
 #pragma unroll
                 for (int m = 0; m < MT; ++m) {
                     Ops::zero(sg, d[m]);
-                    typename Ops::A ahi, alo;
+                    typename Ops::A ahi, a_lo;
                     Ops::load(sg, ahi, at(lh, O_ST + (size_t) (m * TM * KTP)), KTP);
-                    Ops::load(sg, alo, at(lh, O_STL + (size_t) (m * TM * KTP)), KTP);
+                    Ops::load(sg, a_lo, at(lh, O_STL + (size_t) (m * TM * KTP)), KTP);
                     Ops::mad(sg, d[m], ahi, bhi);
                     Ops::mad(sg, d[m], ahi, blo);
-                    Ops::mad(sg, d[m], alo, bhi);
+                    Ops::mad(sg, d[m], a_lo, bhi);
                 }
             }
             // (d) D as FP16 (the outputs' P D), e Q S0
@@ -492,12 +492,12 @@ struct GdnChunkScan {
 #pragma unroll
                 for (int j = 0; j < RT; ++j) {
                     each(sg, sacc[j], [&](float& v, int) { v *= el; });
-                    typename Ops::A ahi, alo;
+                    typename Ops::A ahi, a_lo;
                     Ops::load(sg, ahi, at(lh, O_SKT + (size_t) (j * TM * KTP)), KTP);
-                    Ops::load(sg, alo, at(lh, O_SKTL + (size_t) (j * TM * KTP)), KTP);
+                    Ops::load(sg, a_lo, at(lh, O_SKTL + (size_t) (j * TM * KTP)), KTP);
                     Ops::mad(sg, sacc[j], ahi, bhi);
                     Ops::mad(sg, sacc[j], ahi, blo);
-                    Ops::mad(sg, sacc[j], alo, bhi);
+                    Ops::mad(sg, sacc[j], a_lo, bhi);
                 }
             }
             // (h) the outputs
