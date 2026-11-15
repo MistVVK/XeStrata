@@ -241,9 +241,12 @@ static void readers() {
         write(t / "physical_package_id", std::to_string((c / 2) % 2) + "\n");
         write(t / "core_id", std::to_string(c % 2) + "\n");
     }
+#if !defined(_WIN32)
+    // (a PCI address has colons, which no Windows file name may have: create_directories throws there.  The engine reads sysfs on Linux only.)
     write(root / "bus/pci/devices/0000:e1:00.0/numa_node", "1\n");
     write(root / "bus/pci/devices/0000:21:00.0/numa_node", "-1\n");
     write(root / "bus/pci/devices/0000:22:00.0/numa_node", "junk\n");
+#endif
 
 #if defined(__linux__)
     const auto nodes = cpu::card_node_node_cpus(root.string());
@@ -255,10 +258,12 @@ static void readers() {
     expect(desc[1].pkg == 1 && desc[1].core == 1 && desc[3].pkg == -1 && desc[3].core == -1, "describe: package and core, missing CPU -1");
     expect(cpu::card_node_node_cpus((root / "nothing").string()).empty(), "no node folder: no nodes");
 #endif
+#if !defined(_WIN32)
     expect(cpu::card_node_pci_node(root.string(), "0000:e1:00.0") == 1, "pci numa_node 1");
     expect(cpu::card_node_pci_node(root.string(), "0000:21:00.0") == -1, "pci numa_node -1");
     expect(cpu::card_node_pci_node(root.string(), "0000:22:00.0") == -1, "pci numa_node junk: -1");
     expect(cpu::card_node_pci_node(root.string(), "0000:99:00.0") == -1, "pci device missing: -1");
+#endif
     expect(cpu::card_node_free_bytes(root.string(), 1) == 112233ll * 1024, "node 1 MemFree");
     expect(cpu::card_node_free_bytes(root.string(), 0) == -1, "node 0 without MemFree: -1");
     expect(cpu::card_node_free_bytes(root.string(), 5) == -1, "node 5 missing: -1");

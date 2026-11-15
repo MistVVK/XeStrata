@@ -7,10 +7,29 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 
 using namespace strata::core;
 
 namespace {
+// 2 MiB aligned memory from the C library: MSVC's C runtime has no std::aligned_alloc (its free cannot release it), so _aligned_malloc there
+void* aligned_2m(size_t bytes) {
+#ifdef _WIN32
+    return _aligned_malloc(bytes, size_t(2) << 20);
+#else
+    return std::aligned_alloc(size_t(2) << 20, bytes);
+#endif
+}
+void aligned_free(void* p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+
 int checks = 0;
 void check(bool value, const char* description) {
     ++checks;
@@ -19,8 +38,8 @@ void check(bool value, const char* description) {
 constexpr size_t MiB = size_t(1) << 20;
 
 struct FakeOs final : SegmentPoolOs {
-    void* reserve(size_t bytes) override { return std::aligned_alloc(size_t(2) << 20, bytes); }
-    void unreserve(void* base, size_t) override { std::free(base); }
+    void* reserve(size_t bytes) override { return aligned_2m(bytes); }
+    void unreserve(void* base, size_t) override { aligned_free(base); }
     bool commit(void*, size_t) override { return true; }
     bool populate(void*, size_t) override { return true; }
     void release(void* p, size_t n) override { std::memset(p, 0, n); }
