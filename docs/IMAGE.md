@@ -428,7 +428,7 @@ Makes and returns the map a `control` would give the model (the web page's "Prev
 - With MOSS-Image, `generate_image` takes a layout too (`layout`, as the API's), so the chat's model can draft its boxes.
 - `/v1/responses` does the same with OpenAI's built-in `image_generation` tool, and returns the image in an `image_generation_call` item (`result`, the image in base64, with `size`, `quality`, `background`, `output_format` and `revised_prompt`).
   The tool's `size`, `quality`, `output_format`, `output_compression` and `background` are used for the images it makes (`size` `auto`: the size the model asks for).
-  Neither tool has a LoRA field: an image made from the chat applies no adapter.
+  Where the model's LoRA listing is not empty, `generate_image` and `edit_image` take a `lora` argument (names, strengths and block weights), and the chat's model reads the `lora` skill and chooses the LoRAs of the character or style asked for ([LoRA](#lora-adapters)).
 
 ## Video
 
@@ -510,7 +510,7 @@ The models that take one are Qwen-Image-2.1 (Turbo and the base model), MOSS-Ima
 - Setup writes `"lora_dir"` in the config's `"images"` (the data folder's `models/loras`). Every model shares the one folder, and each one's listing is narrowed to what its DiT takes. Create the folder when it is not there.
   The files are `.safetensors` and `.gguf`, and subfolders are read too (a name is its path there, `style/gouache`).
 - The folder is read again at once when it changes, and a listing is kept up to 10 seconds. The server need not be stopped.
-- `/health`'s `image_defaults` and `image_models`, and the image models' `defaults.loras` in `/v1/models`, list the files that model can apply. Each has `name` (without the extension; a subfolder by its path), `path` (from the folder), `rank` (0 for an OFT and a whole difference), `scale` (the strength the file's metadata recommends, else 1), `trigger` (its trigger words), `targets` (the kinds of weight it changes) and `size_mib` (the file's size).
+- `/health`'s `image_defaults` and `image_models`, and the image models' `defaults.loras` in `/v1/models`, list the files that model can apply. Each has `name` (without the extension; a subfolder by its path), `path` (from the folder), `rank` (0 for an OFT and a whole difference), `scale` (the strength the file's metadata recommends, else 1), `trigger` (its trigger words), `kind` (what it was trained to add: `character`, `style` or `other`, which XeStrata's trainers write in the metadata's `ss_xestrata_kind`; else `null`), `targets` (the kinds of weight it changes) and `size_mib` (the file's size).
 - A file with a key that is not this model's weight, or in a form it does not apply, is not listed. Asking for that name is a 400 whose message says why.
 
 ```sh
@@ -531,11 +531,14 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - Up to 4 stack at once. A name given twice is a 400.
 - The prompt's tags `<lora:name:strength>` are read too (in the positive and the negative prompt; the strength may be left out, and is 1.0 then). A tag is taken out of the prompt; when the listing has not the name, that tag is left out of the image and the name is said in the answer's `strata.lora_unknown` and the server's log. A tag's third field (`<lora:name:strength:strength>`) is A1111's text encoder's strength: it is not read (the tag is taken out). A prompt that is only a tag is a 400.
 - The field and the tags together take 4 at most, and a name twice uses the first only (the field, then the positive prompt's tags, then the negative prompt's).
-- Each image of the answer's `data[]` carries `lora` (the `name` and `scale` applied), and `xestrata-engine` has `lora_n` (their count), `lora_mib` (the VRAM they take), `lora_unknown` (the names a tag left out) and `lora_ignored` (the keys of an applied file that name no adapter tensor, so were not applied: its name, how many, and up to six of them).
+- `blocks` scales the strength a DiT block (as A1111's LoRA Block Weight does): a list of numbers, one a block of the DiT (each -2 to 2), or a name (`"all"`: every block at 1). Block b's weights take `scale` times `blocks[b]`, the weights outside the blocks `scale`. A count that is not the DiT's blocks' is a 400 that says the DiT's count. A tag writes them `<lora:name:strength:lbw=0,0,1,...>` or `<lora:name:strength:lbw=name>`.
+- Each image of the answer's `data[]` carries `lora` (the `name` and `scale` applied, and `blocks` where given), and `xestrata-engine` has `lora_n` (their count), `lora_mib` (the VRAM they take), `lora_unknown` (the names a tag left out) and `lora_ignored` (the keys of an applied file that name no adapter tensor, so were not applied: its name, how many, and up to six of them).
 
 **The web page:** the Images tab has a LoRA row (not for a model whose listing is empty). "Add a LoRA…" adds one from the listing, which shows as a chip: its strength can be changed in the chip's number field (-2 to 2, steps of 0.05), a file with `trigger` words has a "Trigger" button that puts them at the end of the prompt (it writes no tag), and × takes it off. 4 at most, and the browser keeps each model's choice and strengths.
 
-**Models that take none:** HunyuanImage 3.0 refuses the `lora` field and a prompt's tag alike (400). The chat's tools (`generate_image`, `edit_image`) and the Responses API's `image_generation` have no LoRA field.
+**The chat:** the chat's tools (`generate_image`, `edit_image`, and the Responses API's `image_generation`) take the same `lora` as an argument where the model's listing is not empty. The chat's model follows the `lora` skill and chooses only the LoRAs the user names or that fit the character or style asked for. A character LoRA goes at a modest strength, with the style's words in the prompt, so that it does not bring its training pictures' style too. A strength or block weights the user gives are used.
+
+**Models that take none:** HunyuanImage 3.0 refuses the `lora` field and a prompt's tag alike (400).
 
 ### The forms applied
 

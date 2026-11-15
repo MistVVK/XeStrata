@@ -428,7 +428,7 @@ BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `
 - MOSS-Image では、`generate_image` に配置（`layout`、API と同じ形）も渡し、チャットのモデルが枠の下書きを書けます。
 - `/v1/responses` では、OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。
   道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。
-  どちらの道具も LoRA の欄を持たず、会話から作る画像にはアダプターを当てません。
+  モデルの LoRA の一覧が空でなければ、`generate_image` と `edit_image` に `lora` の引数（名前・強さ・ブロック重み）が付き、チャットのモデルは `lora` のスキルを読んで、頼まれたキャラクターや画風の LoRA を選びます（[LoRA](#loraアダプター)）。
 
 ## 動画
 
@@ -510,7 +510,7 @@ vLLM-Omni の動画の分割と同じ形です。multipart の `video`（動画�
 - setup は設定の `"images"` に `"lora_dir"` を書きます（データのフォルダーの `models/loras`）。1 つのフォルダーをどのモデルも共有し、一覧はモデルごとに絞ります。フォルダーが無ければ自分で作ります。
   ファイルは `.safetensors` と `.gguf` で、サブフォルダーも読めます（名前は `style/gouache` のように道になります）。
 - フォルダーは 10 秒まで覚え、フォルダーが更新されるとすぐ読み直します。サーバーを止める必要はありません。
-- `/health` の `image_defaults`・`image_models` と、`/v1/models` の画像モデルの項目の `defaults.loras` に、そのモデルが当てられるファイルが並びます。1 本ごとに、`name`（拡張子を除いた名前。サブフォルダーは道）、`path`（フォルダーからの道）、`rank`（OFT と全体差分は 0）、`scale`（ファイルのメタデータが勧める強さ。無ければ 1）、`trigger`（トリガーの語）、`targets`（変える重みの種類）、`size_mib`（ファイルの大きさ）です。
+- `/health` の `image_defaults`・`image_models` と、`/v1/models` の画像モデルの項目の `defaults.loras` に、そのモデルが当てられるファイルが並びます。1 本ごとに、`name`（拡張子を除いた名前。サブフォルダーは道）、`path`（フォルダーからの道）、`rank`（OFT と全体差分は 0）、`scale`（ファイルのメタデータが勧める強さ。無ければ 1）、`trigger`（トリガーの語）、`kind`（学習で足したもの: `character`・`style`・`other`。XeStrata の学習器がメタデータ `ss_xestrata_kind` に書く。無ければ `null`）、`targets`（変える重みの種類）、`size_mib`（ファイルの大きさ）です。
 - そのモデルの重みではないキーを持つファイルや、当てられない形式のファイルは一覧に出ません。その名前で頼むと、理由の付いた 400 が返ります。
 
 ```sh
@@ -531,11 +531,14 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - 1 回に重ねられるのは 4 本までです。同じ名前を 2 回書くと 400 です。
 - プロンプトのタグ `<lora:名前:強さ>` も読みます（肯定と否定の両方。強さは省略でき、省略すると 1.0 です）。タグはプロンプトから取り除き、名前が一覧にないときは、そのタグを外して画像を作り、応答の `strata.lora_unknown` とサーバーのログに名前を出します。`<lora:名前:強さ:強さ>` の 3 つ目は A1111 の文章エンコーダー側の強さで、読みません（タグは取り除きます）。タグだけのプロンプトは 400 です。
 - 欄とタグを合わせて 4 本までで、同じ名前は最初の 1 つだけを使います（欄、肯定のタグ、否定のタグの順）。
-- 応答の `data[]` の各画像に `lora`（当てたものの `name` と `scale`）が付き、`xestrata-engine` に `lora_n`（本数）、`lora_mib`（アダプターが VRAM で使う量）、`lora_unknown`（タグで飛ばした名前）、`lora_ignored`（当てたファイルの鍵で、アダプターの Tensor を名乗らないために当てられなかったもの。ファイル名と本数と名前の先頭 6 個）が入ります。
+- `blocks` で、強さを DiT のブロックごとに掛け分けられます（A1111 の LoRA Block Weight と同じ考え）。DiT のブロックの数だけの数の並び（それぞれ -2〜2）か、名前（`"all"` はすべて 1）です。ブロック b の重みは `scale` × `blocks[b]`、ブロックの外の重みは `scale` のままです。数が DiT のブロックと違うと、DiT のブロックの数を添えた 400 です。タグでは `<lora:名前:強さ:lbw=0,0,1,...>` か `<lora:名前:強さ:lbw=名前>` です。
+- 応答の `data[]` の各画像に `lora`（当てたものの `name` と `scale`、ブロック重みを付けたときは `blocks`）が付き、`xestrata-engine` に `lora_n`（本数）、`lora_mib`（アダプターが VRAM で使う量）、`lora_unknown`（タグで飛ばした名前）、`lora_ignored`（当てたファイルの鍵で、アダプターの Tensor を名乗らないために当てられなかったもの。ファイル名と本数と名前の先頭 6 個）が入ります。
 
 **Web**: Images のタブに LoRA の行が出ます（一覧が空のモデルでは出ません）。「LoRA を追加…」で一覧から選ぶと、選んだもののチップが出ます。チップの数値の欄で強さ（-2〜2、0.05 刻み）を変えられ、`trigger` を持つファイルには「トリガー」のボタンが出て、押すとその語をプロンプトの末尾に足します（タグは書きません）。× で外します。4 本で上限です。選んだものと強さはモデルごとにブラウザーが覚えます。
 
-**当てないモデル**: HunyuanImage 3.0 は `lora` の欄もタグも 400 で断ります。会話の道具（`generate_image`・`edit_image`）と Responses API の `image_generation` は LoRA の欄を持ちません。
+**会話**: 会話の道具（`generate_image`・`edit_image`、Responses API の `image_generation` も）は、モデルの一覧が空でなければ同じ `lora` を引数に持ちます。チャットのモデルは `lora` のスキルに従い、利用者が名前を言ったものか、頼まれたキャラクターや画風に合うものだけを選びます。キャラクターの LoRA は控えめの強さで、画風の言葉をプロンプトに足し、LoRA の学習画像の画風まで持ち込まないようにします。利用者が強さやブロック重みを言えば、それを使います。
+
+**当てないモデル**: HunyuanImage 3.0 は `lora` の欄もタグも 400 で断ります。
 
 ### 当てる形式
 
