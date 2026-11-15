@@ -1689,6 +1689,11 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
             }
             start[j - b0 + 1] = (int32_t) dst.size();
         }
+        // the table buffers are reused every batch: the previous batch's native_expert_grouped (m.cs) is still
+        // reading them while these host copies run on the compute queue, so wait for it first.  Without this the
+        // next batch's dst/tok overwrite the previous batch's mid-kernel (a cross-queue race the matrix-unit arm
+        // does not have: it uploads its tables on m.cs).  Corrupts the A stage's rows on B70/RTX.
+        strata::gpu::stream_sync(m.cs);
         strata::gpu::copy(m.lat_ptrs_, ptrs.data(), (size_t) ng * 8);
         strata::gpu::copy(m.lat_start_, start.data(), (size_t) (ng + 1) * 4);
         strata::gpu::copy(m.lat_ng_, &ng, 4);
