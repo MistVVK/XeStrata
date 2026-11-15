@@ -254,6 +254,9 @@ struct PlainOptions {
     /// --draft dflash2: windows of this many drafts (the recurrent states' copies taken at the load, before the tier
     /// is sized, as the MTP layer's are); 0: the MTP layer's
     int draft_windows = 0;
+    /// --draft dflash2 under --wide-window auto: the 16-row windows' drafts, taken before the tier only where the tier
+    /// cannot give up their room later (not --vram-elastic), so the start can measure them; 0: none
+    int draft_windows_wide = 0;
     std::string draft_rule = "learn";   ///< --draft-rule: a request without a draft= key (--draft auto)
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points

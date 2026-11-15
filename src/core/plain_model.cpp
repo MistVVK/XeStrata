@@ -1938,6 +1938,23 @@ bool PlainModel::open_experts(std::string& err) {
         pool_ = root_->pool_;
     }
 
+    if (opt_.vram_elastic) {   // #533: in segments, as generate.cpp's cache; one GPU only (a split has a tier per GPU)
+        const char* why = !(first() && last()) ? "a layer split has a tier per GPU"
+                        : opt_.vram_segment_mib < 64 ? "--vram-segment-mib is below 64"
+                        : !strata::gpu::vmem_supported() ? "this GPU's runtime has no virtual memory" : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "xestrata plain: --vram-elastic is off: %s\n", why);
+            opt_.vram_elastic = false;
+        }
+    }
+    // --draft dflash2's 16-row windows: a tier that cannot give up their room later (not elastic) leaves it now, so
+    // the start can measure them against the 8-row windows; the drafter gives them back where the 8-row windows are
+    // faster (that VRAM then stays free: the tier is not opened again)
+    if (!opt_.vram_elastic && opt_.draft_windows_wide > n_snap_) {
+        std::string e;
+        if (!set_window_drafts(opt_.draft_windows_wide, e))
+            std::fprintf(stderr, "xestrata plain: %s: DFlash2's windows stay at %d rows\n", e.c_str(), n_snap_ + 1);
+    }
     // the VRAM tier: what the device has left, less the window's arena and a reserve, in slots of each layer's blob,
     // the same number for every layer of this stage
     uint64_t free_b = 0;
@@ -2060,17 +2077,7 @@ bool PlainModel::open_experts(std::string& err) {
     }
     for (auto& f : free_) std::reverse(f.begin(), f.end());   // taken from the back: the lowest slot first
     cache_.set_max_piece(max_alloc_bytes());   // in pieces where the tier passes the device's largest allocation
-    if (opt_.vram_elastic) {   // #533: in segments, as generate.cpp's cache; one GPU only (a split has a tier per GPU)
-        const char* why = !(first() && last()) ? "a layer split has a tier per GPU"
-                        : opt_.vram_segment_mib < 64 ? "--vram-segment-mib is below 64"
-                        : !strata::gpu::vmem_supported() ? "this GPU's runtime has no virtual memory" : nullptr;
-        if (why != nullptr) {
-            std::fprintf(stderr, "xestrata plain: --vram-elastic is off: %s\n", why);
-            opt_.vram_elastic = false;
-        } else {
-            cache_.set_segment_bytes(opt_.vram_segment_mib << 20);
-        }
-    }
+    if (opt_.vram_elastic) cache_.set_segment_bytes(opt_.vram_segment_mib << 20);   // (whether it can: above)
     if (!slot_bytes.empty() && !cache_.open_sized(slot_bytes, L, E, err)) return false;
     n_slots_ = (int64_t) slot_bytes.size();
     tier_whole_ = q == E;

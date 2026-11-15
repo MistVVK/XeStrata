@@ -3149,10 +3149,15 @@ int plain_main(int argc, char** argv) {
         // is left (loaded after it, a 12 GB RTX 4070 had no room for its buffers, the B70 was left 17 MiB free and a
         // 16 GB RX 9060 XT ended before READY at 32K)
         opt.spec = 0;
-        // the 8-row window's copies before the tier; the 16-row window's only where it is asked for (--wide-window on):
-        // under auto the tier gives up their room while they are measured and keeps it only where they are faster
+        // the 8-row window's copies before the tier; the 16-row window's where it is asked for (--wide-window on) or,
+        // under auto, where the tier cannot give up their room while they are measured (not elastic); an elastic tier
+        // gives it up then and keeps it only where they are faster
         opt.draft_windows = strata::core::wide_window() == strata::core::WideWindow::On
                                 ? dr.df2.capacity_rows() - 1 : strata::core::Dflash2Drafter::kDrafts;
+        // (a tier that cannot give their room up later leaves it in the load: PlainOptions::draft_windows_wide)
+        if (strata::core::wide_window() == strata::core::WideWindow::Auto &&
+            dr.df2.capacity_rows() > strata::core::Dflash2Drafter::kRows)
+            opt.draft_windows_wide = dr.df2.capacity_rows() - 1;
         if (!dr.df2.load(dr.pack, 0, err)) {
             size_t fb = 0, tb = 0;
             strata::gpu::mem_info(&fb, &tb);
