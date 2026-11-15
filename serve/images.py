@@ -68,10 +68,11 @@ enhance has the chat's model write the prompt out first (enhance_prompt).
 Adapters (serve/loras.py): a request's "lora" field - a list of {"name", "scale"}, one such object, a name alone, or
 the same as a form's JSON text - and the prompt's tags, <lora:name:0.8> in A1111's and Forge's form, positive prompt
 and negative; they go to the engine as IMG's and NEED's LORA:<strength>:<path> words (the path's whitespace %XX'd:
-the engine splits the line on it).  A name the model's LoRA folder ("lora_dir") does not offer is refused where the
-field gives it and taken out of the prompt with a warning where a tag does (the response's xestrata.lora_unknown).
-"local_path" is a file inside that folder only.  The response's data[] items carry the adapters applied as "lora":
-[{"name", "scale"}], and xestrata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
+the engine splits the line on it), an adapter's block weights ("blocks") after its strength (@<w0>,<w1>,...).  A
+name the model's LoRA folder ("lora_dir") does not offer is refused where the field gives it and taken out of the
+prompt with a warning where a tag does (the response's xestrata.lora_unknown).  "local_path" is a file inside that
+folder only.  The response's data[] items carry the adapters applied as "lora": [{"name", "scale"}, with "blocks"
+where given], and xestrata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  A config whose "images" section names a card of its own
@@ -3086,13 +3087,16 @@ class ImageGen:
 
     @staticmethod
     def _lora_words(job: dict) -> str:
-        """IMG's and NEED's adapters: LORA:<strength>:<path> for each, in the order the request gave them (the strength
-        first, so a Windows path's colons are not read as one; the path's separators %XX'd, as the engine splits the
-        line on whitespace - encode_path); a MOSS-Image edit's adapter (job["edit_lora"]) first, at 1."""
+        """IMG's and NEED's adapters: LORA:<strength>[@<block weights>]:<path> for each, in the order the request gave
+        them (the strength first, so a Windows path's colons are not read as one; the path's separators %XX'd, as the
+        engine splits the line on whitespace - encode_path); a MOSS-Image edit's adapter (job["edit_lora"]) first, at
+        1."""
         edit = f" LORA:1.0:{lora_api.encode_path(job['edit_lora'])}" if job.get("edit_lora") else ""
         if job.get("few_step"):   # the 4-step adapter's LoRA, at 1 (the engine adds it to the products)
             edit = f" LORA:1.0:{lora_api.encode_path(job['few_step']['lora'])}" + edit
-        return edit + "".join(f" LORA:{use['scale']!r}:{lora_api.encode_path(use['path'])}"
+        return edit + "".join(f" LORA:{use['scale']!r}"
+                              + ("@" + ",".join(repr(float(b)) for b in use["blocks"]) if use.get("blocks") else "")
+                              + f":{lora_api.encode_path(use['path'])}"
                               for use in job.get("loras") or ())
 
     @staticmethod
@@ -3665,7 +3669,8 @@ class ImageGen:
     def response(self, images: list[bytes], job: dict, figures: dict, base_url: str) -> dict:
         data = []
         fmt = job.get("output_format") or "png"
-        applied = [{"name": u["name"], "scale": u["scale"]} for u in job.get("loras") or ()]
+        applied = [{"name": u["name"], "scale": u["scale"], **({"blocks": u["blocks"]} if u.get("blocks") else {})}
+                   for u in job.get("loras") or ()]
         backgrounds, flatten_s = [], None
         for i, png in enumerate(images):
             item = {"seed": job["seed"] + i} if job.get("ups_only") else \

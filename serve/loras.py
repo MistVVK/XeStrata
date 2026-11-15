@@ -28,6 +28,7 @@ A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health
   rank      the highest rank of its weights
   scale     the strength its metadata recommends (recommended_strength_model, ...), else 1.0
   trigger   its trigger words (modelspec.trigger_phrase, ss_trigger_words, ...), else None
+  kind      what it was trained to add, "character", "style" or "other" (ss_xestrata_kind), else None
   targets   the kinds of weights it changes ("attn.to_q", "img_mlp.gate_layer", "modulation.1")
   size_mib  the file's size
 
@@ -39,7 +40,9 @@ A file whose metadata says rsLoRA is not listed: its scale is alpha / sqrt(rank)
 
 A request's adapters come from the "lora" field - a list of {"name", "scale"} or one such object (vLLM-Omni's shape), a
 name alone, or one of those as JSON text (a multipart form's field) - and from the prompt's tags, <lora:name:0.8> in
-A1111's and Forge's form, in the positive prompt and the negative one.  "local_path" names a file inside the folder,
+A1111's and Forge's form, in the positive prompt and the negative one.  An adapter's "blocks" (a tag's
+<lora:name:0.8:lbw=...>, LoRA Block Weight's) scales its strength a DiT block: a number each block, or a name
+(BLOCK_PRESETS: "character", "style").  "local_path" names a file inside the folder,
 and no other path is taken (a path is not a capability).  A text encoder's adapter is not applied (the human's
 decision of 2026-10-29): "scale_text" and a tag's third field, A1111's text encoder's weight, are taken as the
 engine's other unknown fields are, ignored.  A name the listing does not have is refused where the field
@@ -179,6 +182,15 @@ ROLES = (
 # carry no strength; civitai's, SimpleTuner's and ai-toolkit's may recommend one).
 STRENGTH_KEYS = ("recommended_strength_model", "recommended_strength", "ss_strength", "modelspec.strength")
 TRIGGER_KEYS = ("modelspec.trigger_phrase", "trigger_phrase", "trigger", "trigger_words", "ss_trigger_words")
+# What an adapter was trained to add (XeStrata's trainers write it: ss_xestrata_kind), the listing's "kind"
+KIND_KEY = "ss_xestrata_kind"
+KINDS = ("character", "style", "other")
+
+# A request's block weights by name ("blocks": "character"): the strength's factor each DiT block, one a block of the
+# family's DiT (the engine's LORA:<strength>@<w0>,...: word, LoraUse's blocks), where a character's shape and where
+# a picture's style go in that DiT, read from images made with a block's adapter switched off and on.  "all" is every
+# block at 1 (no factors).  A family with no table here takes the numbers' form only.
+BLOCK_PRESETS: dict[str, dict[str, tuple[float, ...]]] = {}
 
 
 class LoraError(ValueError):
@@ -772,7 +784,9 @@ class Folder:
                     return f"{key}: dora_scale is neither the weight's rows nor its columns"
                 rank = max(rank, a[0])
             targets.add(kind_of(key))
+        kind = (meta.get(KIND_KEY) or "").strip().lower()
         return {"name": name, "path": rel, "rank": rank, "scale": _recommended(meta), "trigger": _trigger(meta),
+                "kind": kind if kind in KINDS else None,
                 "targets": sorted(targets), "size_mib": round(path.stat().st_size / 1048576, 1),
                 "ignored": sorted(ignored)}
 
@@ -877,8 +891,44 @@ def _items(value) -> list:
     raise LoraError('lora: a list of {"name", "scale"} or one such object')
 
 
+def blocks(value, f: Folder, where: str) -> list[float] | None:
+    """A request's block weights -> the strength's factor each DiT block (None: every block at 1): a list of numbers,
+    one a block (the engine checks their count against the DiT's; as text, with commas), or a name of BLOCK_PRESETS
+    for the model's family ("all": none)."""
+    if value is None or value == "all":
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[-+0-9.eE, ]+", text):   # "0,0,1,..." (a tag's, a tool call's)
+            text = f"[{text}]"
+        if text.startswith("["):
+            try:
+                value = json.loads(text)
+            except ValueError:
+                raise LoraError(f"{where}: a list of numbers, one a block, or a name") from None
+        else:
+            presets = BLOCK_PRESETS.get(f.family, {})
+            if text == "all":
+                return None
+            if text not in presets:
+                names = ", ".join(["all", *presets])
+                raise LoraError(f"{where}: {text!r} is not one of {FAMILY_NAMES.get(f.family, f.family)}'s block "
+                                f"weights ({names}); a list of numbers, one a block, gives them")
+            return list(presets[text])
+    if not isinstance(value, (list, tuple)) or not value:
+        raise LoraError(f"{where}: a list of numbers, one a block, or a name")
+    out = []
+    for v in value:
+        x = _finite(v)
+        if x is None or isinstance(v, bool) or not SCALE_MIN <= x <= SCALE_MAX:
+            raise LoraError(f"{where}: each block's weight a number from {SCALE_MIN:g} to {SCALE_MAX:g}")
+        out.append(x)
+    return out
+
+
 def one(item, f: Folder) -> dict:
-    """One adapter a request names -> {"name", "path", "scale"} ("path": its file, absolute)."""
+    """One adapter a request names -> {"name", "path", "scale"} and "blocks" where it gives them ("path": its file,
+    absolute)."""
     if isinstance(item, str):
         item = {"name": item}
     if not isinstance(item, dict):
@@ -899,6 +949,9 @@ def one(item, f: Folder) -> dict:
         raise LoraError('lora: each adapter needs a "name" (one the model lists) or a "local_path"')
     use = {"name": entry["name"], "path": f.file_of(entry),
            "scale": _strength(item.get("scale"), f"lora: {entry['name']}: scale", 1.0)}
+    weights = blocks(item.get("blocks"), f, f"lora: {entry['name']}: blocks")
+    if weights is not None:
+        use["blocks"] = weights
     return use
 
 
@@ -947,12 +1000,19 @@ def strip_tags(text: str, f: Folder) -> tuple[str, list[dict], list[str]]:
         name = m.group(1).strip()
         entry = f.find(name)
         scale = _strength(m.group(2), f"<lora:{name}:weight>", 1.0)
+        third = (m.group(3) or "").strip()
+        weights = None
+        if third.lower().startswith("lbw="):   # LoRA Block Weight's form: a name, or the numbers with commas
+            weights = blocks(third[4:].strip(), f, f"<lora:{name}:weight:lbw=...>")
         if entry is None:
             unknown.append(name)
             continue
         if any(u["name"] == entry["name"] for u in uses):
             continue
-        uses.append({"name": entry["name"], "path": f.file_of(entry), "scale": scale})
+        use = {"name": entry["name"], "path": f.file_of(entry), "scale": scale}
+        if weights is not None:
+            use["blocks"] = weights
+        uses.append(use)
     return TAG.sub("", text), uses, unknown
 
 
