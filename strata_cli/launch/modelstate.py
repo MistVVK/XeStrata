@@ -110,6 +110,12 @@ def drafting_to_save(key: str, saved: object) -> str | None:
     return "auto" if saved is not None and _d.normalize(saved) != "auto" else None
 
 
+def layer_off_without_choice(base: dict | None) -> bool:
+    """The model's installed config has its draft layer off ("mtp": false: setup's --mtp off from a Drafting Off launch, or the app's Draft layer switch) and holds
+    no Drafting choice: the engine starts without a drafter, so the Drafting step shows Off; a drafter picked there is saved (runner.layer_back)."""
+    return isinstance(base, dict) and base.get("drafting") is None and base.get("mtp") is False
+
+
 def mtp_choice(mtp: str | None, drafting: str | None = None) -> str | None:
     """The draft-layer choice for what to fetch: off when the person said --mtp off, or the drafter is off or DFlash2 (``drafting`` is the resolved drafter,
     resolved_drafting(); nothing then uses the layer, so a new install does not download it), else as chosen."""

@@ -1062,7 +1062,8 @@ class DraftingScreen(Base):
         from strata_cli.launch import modelstate
         now = {"dflash2": "DFlash2", "mtp": "MTP", "off": "Off"}[modelstate.resolved_drafting(None, s.family)]
         items = [Item([label, Cell(now, "") if key == "auto" else Cell("", "")], key=key) for key, label in self.CHOICES]
-        sel = [key for key, _ in self.CHOICES].index(s.drafting) if s.drafting in dict(self.CHOICES) else 0
+        shown = s.drafting if s.drafting in dict(self.CHOICES) else "off" if modelstate.layer_off_without_choice(self.ctx.base_config()) else "auto"
+        sel = [key for key, _ in self.CHOICES].index(shown)
         self.query_one(Menu).columns = [("", 24), ("", 0)]
         self.query_one(Menu).set_items(items, sel)
         self.paint()
@@ -1074,7 +1075,11 @@ class DraftingScreen(Base):
         key = self.menu().current.key
         from strata_cli.launch import modelstate
         # Auto stays "nobody chose" (a saved preset writes nothing) unless the model's file holds another choice the app saved: then Auto is written, so it wins
-        self.ctx.settings.drafting = modelstate.drafting_to_save(key, (self.ctx.base_config() or {}).get("drafting"))
+        base = self.ctx.base_config() or {}
+        layer_off = modelstate.layer_off_without_choice(base)  # the draft layer is off and nothing else is saved: the step showed Off
+        if layer_off and key == "off" and self.ctx.settings.drafting is None:
+            return                                            # Off left as it is: nothing new is written, the draft layer's "mtp": false keeps it
+        self.ctx.settings.drafting = modelstate.drafting_to_save(key, "off" if layer_off else base.get("drafting"))
 
 
 # ------------------------------------------------------------------------------------------------ 6 parallel
@@ -1536,11 +1541,12 @@ class SaveScreen(Base):
 
     def summary_lines(self) -> list[tuple[str, str]]:
         s = self.ctx.settings
+        from strata_cli.launch import modelstate
         r = next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
         lines = [("Model", (r.title if r else (s.model or "?")) + (" (your files)" if s.model_path else "")),
                  ("Context", S.context_label(s.context) + f", memory {s.kv or 'int8'}"),
                  ("Pictures", "on" if s.vision != "off" else "off"),
-                 *([("Drafting", dict(DraftingScreen.CHOICES).get(s.drafting or "auto", "Auto (recommended)"))] if drafting_choice_available(self.ctx) else []),
+                 *([("Drafting", dict(DraftingScreen.CHOICES).get(s.drafting or ("off" if modelstate.layer_off_without_choice(self.ctx.base_config()) else "auto"), "Auto (recommended)"))] if drafting_choice_available(self.ctx) else []),
                  ("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({S.fit_parallel(self.ctx.computer.main_vram_gb)})"),
                  ("Tuning", {"quick": "quick (about 20 min)", "thorough": "thorough (up to 2 h)", "skip": "skipped"}[s.tune]),
                  ("Access", f"{S.ACCESS_WORDS[s.access]}, port {s.port}" + (", API key on" if s.api_key else ", no API key")),

@@ -57,14 +57,36 @@ def engine_start(world: World, cfg: dict) -> dict:
             "notes": [l for l in notes.getvalue().splitlines() if l.strip()]}
 
 
-def drive_launch(world: World) -> dict:
-    """`strata launch --model <set> --yes --no-tui` through the real command, with the engine start, the model download and the tuning replaced."""
+def drive_launch(world: World, extra: tuple[str, ...] = (), setup_runs: bool | str = False) -> dict:
+    """`strata launch --model <set> --yes --no-tui` through the real command, with the engine start, the model download and the tuning replaced.
+    `extra`: more words for the command (`--drafting off`), for the tests that launch several times in one world.  `setup_runs`: setup runs at this launch
+    (as it does at every launch whose --model-path or data folder the installed copy does not match, runner.installed_serves_request) and leaves the
+    draft-layer word in the installed config as strata_control/setup_config.py writes it: the stand-in config afresh, "--mtp off" -> "mtp": false (and no --mtp
+    in the args), "--mtp on" -> true, no word -> the earlier value kept (setup.carry_over).
+    "when_needed": only when ensure_model would not reuse the installed copy (the record then says "setup_ran")."""
     from strata_cli.launch import catalog as C, runner as R
     seen: dict = {}
     cat = C.Catalog(root=world.install, hardware=world.hardware_report())
 
     def ensure_model(self):
-        seen["setup_args"] = self.setup_args()
+        seen["setup_args"] = args = self.setup_args()
+        runs = setup_runs
+        if runs == "when_needed":                            # ensure_model's own test for reusing the installed copy
+            path, desc = self.installed_state()
+            runs = not (path is not None and desc is not None and R.desc_matches(desc, self.s) and not R.files_present(R.read_config(path))
+                        and not self.layer_back(path) and self.installed_serves_request(path))
+        seen["setup_ran"] = bool(runs)
+        if runs:                                             # setup writes the config afresh and carries an earlier "mtp" over unless --mtp is given
+            from strata_control import draft_layer
+            old = json.loads(world.config_path.read_text(encoding="utf-8"))
+            cfg = world.base_config()
+            word = args[args.index("--mtp") + 1] if "--mtp" in args else None
+            if word is not None:
+                cfg["mtp"] = word != "off"
+            elif "mtp" in old:
+                cfg["mtp"] = old["mtp"]
+            draft_layer.apply(cfg)
+            world.config_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         return world.config_path
 
     with mock.patch.object(C, "Catalog", lambda *a, **k: cat), \
@@ -74,7 +96,7 @@ def drive_launch(world: World) -> dict:
             mock.patch.object(R.Runner, "start", lambda self: seen.setdefault("started", True) and None), \
             mock.patch.object(R.Runner, "open_access", lambda self: None), \
             mock.patch.object(R.Runner, "check_serving", lambda self: None):
-        command = ["launch", "--model", world.mset.model, "--yes", "--no-tui", "--context", str(context_for(world.machine, world.mset))]
+        command = ["launch", "--model", world.mset.model, "--yes", "--no-tui", "--context", str(context_for(world.machine, world.mset)), *extra]
         orig_run = R.Runner.run
 
         def run(self, **kw):
@@ -88,7 +110,8 @@ def drive_launch(world: World) -> dict:
         return {"entry": "launch", "command": "strata " + " ".join(command), "failed": {"exit": code, "stderr": err[-400:], "stdout": out[-400:]}}
     cfg = json.loads(Path(runner.config_path).read_text(encoding="utf-8"))
     return {"entry": "launch", "command": "strata " + " ".join(command), "fetches": list(world.fetches),
-            "setup_args": seen.get("setup_args"), "config_file": cfg, "engine": engine_start(world, cfg)}
+            "setup_args": seen.get("setup_args"), "config_file": cfg, "engine": engine_start(world, cfg),
+            **({"setup_ran": seen.get("setup_ran")} if setup_runs else {})}
 
 
 def drive_app(world: World, which: str) -> dict:
