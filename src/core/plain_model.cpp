@@ -910,11 +910,14 @@ bool PlainModel::load_qwen(std::string& err) {
     // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
     // spec - 1 drafts (at most the window kernel's snapshots); every stage's recurrent blocks
     // (--suffix-draft, --lookup-chain: as many as a window's drafts can be, MTP layer or not)
-    const int lookup = opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1 : 0;
-    if (model_mtp_ || lookup > 0) {
+    // (--draft dflash2: DFlash2's windows, window_drafts)
+    const int widest = std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1;
+    const int lookup = opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? widest : 0;
+    const int beside = std::min(opt_.window_drafts, widest);
+    if (model_mtp_ || lookup > 0 || beside > 0) {
         if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kVerifyMaxT + 1});
         n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
-        n_snap_ = std::max(n_mtp_, lookup);
+        n_snap_ = std::max({n_mtp_, lookup, beside});
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
         for (size_t g = 0; g < gdn_state_.size(); ++g)

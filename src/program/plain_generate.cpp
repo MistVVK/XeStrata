@@ -590,6 +590,7 @@ struct PlainDrafters {
     std::string pack;
     bool deferred = false;   ///< auto: loaded at the end of the --serve start, to be measured
     bool loaded = false;
+    bool early = false;      ///< --draft dflash2: the pack and its buffers on the GPU before the model's load (load_early)
     int window = strata::core::Dflash2Drafter::kRows;   ///< the anchor and its drafts, as far as the model's copies allow
 
     /// The pack must be the model's (its hidden size, its vocabulary, its taps inside the layers); then loaded on
@@ -602,7 +603,7 @@ struct PlainDrafters {
             err = "the DFlash2 pack " + pack + " is another model's (its hidden size, vocabulary or taps)";
             return false;
         }
-        if (!df2.load(pack, 0, err)) return false;
+        if (!early && !df2.load(pack, 0, err)) return false;
         const strata::core::PlainModel::HeadView h = model.draft_head_view();
         const strata::core::PlainModel* m = &model;
         auto embed = [m](int32_t tok, float* row) { return m->embed_token(tok, row); };
@@ -631,10 +632,20 @@ struct PlainDrafters {
                      pack.c_str(), window, (double) df2.vram_bytes() / 1048576.0);
         return true;
     }
+    /// --draft dflash2: the pack's weights and the drafter's buffers on the GPU before the model's load sizes the expert
+    /// tier, so the tier is sized around them (Qwen3.8-Flash-Next's order: generate.cpp loads DFlash2 before its expert
+    /// cache).  Loaded after it, they came out of the tier's reserve and did not fit beside a 32K context on a 16 GB
+    /// card (RX 9060 XT, Qwen3.6-35B-A3B: the start ended before READY, 2026-11-15).  The windows' recurrent copies
+    /// the load makes too (PlainOptions::window_drafts); the head's binding and the graphs come out of the reserve.
+    bool load_early(std::string& err) {
+        if (!df2.load(pack, 0, err)) return false;
+        early = true;
+        return true;
+    }
     /// Released from VRAM and RAM, the model's taps off and its windows' extra copies freed (as without the pack)
     void release(strata::core::PlainModel& model) {
         df2.release();
-        loaded = deferred = false;
+        loaded = deferred = early = false;
         model.taps_off();
         std::string e;
         model.set_window_drafts(0, e);
@@ -2935,18 +2946,29 @@ int plain_main(int argc, char** argv) {
     }
     if (opt.draft == "off") opt.spec = 0;   // no drafter (the suffix lookup may still propose)
     if (opt.draft == "dflash2") opt.spec = 0;   // DFlash2 alone: the MTP layer is not loaded
-    if (!model.load(opt, err) || !model.prompt_warm(err)) {
-        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
-        // --serve: said where the server waits for READY, and ended at once: the clean-up of a model half loaded can
-        // wait on a GPU for good (two engines on one pair of GPUs, 2026-11-01); the process's end frees its memory
+    // a start that cannot go on: said where the server waits for READY, and ended at once: the clean-up of a model half
+    // loaded can wait on a GPU for good (two engines on one pair of GPUs, 2026-11-01); the process's end frees its memory
+    auto start_failed = [&](const std::string& what) {
+        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), what.c_str());
         if (serve) {
-            std::printf("ERR %s\n", err.c_str());
+            std::printf("ERR %s\n", what.c_str());
             std::fflush(stdout);
             std::fflush(stderr);
             std::_Exit(1);
         }
         return 1;
+    };
+    // --draft dflash2: the drafter before the expert tier (PlainDrafters::load_early), its windows' copies in the load
+    if (!dr.pack.empty() && !dr.deferred) {
+        opt.window_drafts = strata::core::Dflash2Drafter::kDrafts;
+        if (!dr.load_early(err)) {
+            size_t fb = 0, tb = 0;
+            strata::gpu::mem_info(&fb, &tb);
+            return start_failed(err + " (" + std::to_string(fb >> 20) + " MiB of VRAM free before the model): --draft "
+                                "mtp or auto drafts with the model's MTP layer");
+        }
     }
+    if (!model.load(opt, err) || !model.prompt_warm(err)) return start_failed(err);
     if (const auto& rs = model.rope_full(); rs.type != strata::kernels::RopeScalingType::None) {
         std::fprintf(stderr, "xestrata (%s): rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), "
                              "--max-context %lld against a trained context of %.0f\n",
@@ -3004,10 +3026,7 @@ int plain_main(int argc, char** argv) {
         folder.dir.clear();
     }
     // --draft dflash2: the pack beside the loaded model, its windows' recurrent copies, its head and embedding
-    if (!dr.pack.empty() && !dr.deferred && !dr.load(model, arch, err)) {
-        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
-        return 1;
-    }
+    if (!dr.pack.empty() && !dr.deferred && !dr.load(model, arch, err)) return start_failed(err);
     if (serve)
         return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache,
                            folder, cvecs, dr);

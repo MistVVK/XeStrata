@@ -211,6 +211,9 @@ struct PlainOptions {
     /// window of them where they go past the MTP layer's (models without that layer too); --lookup-chain K: up to K
     /// such tokens after the MTP's drafts.  0: off.  The recurrent states' copies for the longer windows are taken then.
     int suffix_draft = 0, lookup_chain = 0;
+    /// The drafts a window checks for a drafter beside the model (--draft dflash2: DFlash2's): the load makes the
+    /// recurrent states' copies for them before it sizes the expert tier, so the tier leaves their room
+    int window_drafts = 0;
     int lookup_chain_min = 3;   ///< --lookup-chain-min: the shortest match --lookup-chain extends on
     /// --spec-window: how many of the drafts a window checks.  "all": every draft made (the fixed window of spec
     /// tokens); "auto": the drafts kept while the tokens each is expected to add, at its calibrated acceptance, raise
