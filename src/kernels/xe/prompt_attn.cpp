@@ -476,7 +476,13 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
 // kPickUntimed: none
 int forced_pick() {
     const char* v = strata::env_get("PROMPT_ATTN_PICK");
-    if (v == nullptr) return kPickUntimed;
+    if (v == nullptr) {
+        // ROCm (RX 9060 XT): the tune's probe-buffer cycle leaves a not-present mapping that a later kernel (the
+        // experts' int8 product) faults on, probabilistically, when the KV streams (llm-jp 64K, 2026-11-15).  Take
+        // the maker's kernel (aotriton) untimed instead; prompt_attn falls back where it does not take the shape.
+        if (core::Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_hip) return kPickMaker;
+        return kPickUntimed;
+    }
     const std::string w = v;
     return w == "decode" ? kPickNone
            : w == "mma"  ? kPickMma
