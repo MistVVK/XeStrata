@@ -1279,6 +1279,11 @@ int64_t PlainModel::prompt_int8_below() const {
     if (const char* v = strata::env_get("PLAIN_MMQ"); v != nullptr && v[0] != '\0') return INT64_MAX;
     const auto& lay = k::cpu::expert_layout();
     if (dense_ || spec_.n_expert <= 0 || !lay.native || lay.fmt.empty()) return INT64_MAX;
+    // ROCm (RX 9060 XT): the expert products' timing probe, like the prompt attention's, leaves a not-present
+    // mapping that faults/hangs the start when the KV streams a large host copy (llm-jp 128K, 2026-11-15).  Skip
+    // the timing on HIP (both arms, so streaming and resident take the same int8 products and the same answer);
+    // the int8 products run at every size (the untimed default).
+    if (core::Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_hip) return INT64_MAX;
     // as prompt_routed launches them: the experts in VRAM in one int8 launch, kGroup a launch on the FP16 path
     prefill::mmq::ExpertLaunches launches;
     launches.n_expert = spec_.n_expert;
