@@ -1569,7 +1569,8 @@ def files_progress(prog: dict, job: dict, files: list) -> dict:
         except OSError:
             state, have = "waiting", 0
         total = f.get("bytes") or (have if state == "done" else 0)
-        if state == "downloading" and cur_gb and p.name in str(log.get("file", "")):   # the log line names this file
+        named = p.name in str(log.get("file", "")) or (f.get("role") == "vision" and str(log.get("file", "")).startswith("vision encoder"))
+        if state == "downloading" and cur_gb and named:   # the log line names this file (setup calls the picture reader "vision encoder")
             # The .part file is as long as the furthest byte written, which the parallel pieces push to the full size well before the
             # download is done: the pieces setup counts are the truth.
             have = min(have, int(float(log.get("done_gb") or 0) * 1e9)) if have else have
@@ -1597,7 +1598,8 @@ def files_progress(prog: dict, job: dict, files: list) -> dict:
     prog["download"] = {"file": "picture reader" if active and active["kind"] == "vision" else "model files",
                         "done_gb": round(done_gb, 3), "total_gb": round(total_gb, 3),
                         "remaining_gb": round(max(0.0, total_gb - done_gb), 3),
-                        "percent": min(99, int(100 * done_gb / total_gb)) if total_gb else 0}
+                        # 100 only when every file is whole (DL99: the bar stopped at 99% with everything in)
+                        "percent": (100 if all(x["state"] == "done" for x in parts) else min(99, int(100 * done_gb / total_gb))) if total_gb else 0}
     prog["parts"] = parts
     return prog
 
@@ -1639,6 +1641,12 @@ def combined_progress(prog: dict, job: dict) -> dict:
         return prog
     if job.get("files") and step.startswith("5/"):      # the install knows its files: count each of them
         return files_progress(prog, job, job["files"])
+    if job.get("files") and step.startswith(("6/", "7/")):
+        # after the download: no download figure (setup prepares the files), but the parts stay, all whole, so the app's one bar is complete
+        # (DL99: they were dropped and the app counted the engine's part alone, "99% · 0.7 / 0.7 GB")
+        prog = files_progress(prog, job, job["files"])
+        prog.pop("download", None)
+        return prog
     if not folder or not total or not step.startswith("5/"):
         prog.pop("download", None)
         return prog

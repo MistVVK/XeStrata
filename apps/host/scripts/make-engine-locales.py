@@ -223,6 +223,17 @@ def _rest(lang):
 
 
 add(*[_SHAPE_FIRST[l] + ("" if l in ("zh", "ja") else " ") + _rest(l) for l in LANGS])
+# ---- the setup wizard after an install whose files are all in, while the engine for this PC is missing or can't be used (DL99; owner's wording 11-15, with
+# the screen's real name: an engine is installed from Settings > About; Settings > Engine lists the installed ones)
+add("Your model is downloaded, but the engine for this PC isn't ready yet. Open Settings > About to install it.",
+    "模型已下载，但这台电脑的引擎还没有准备好。请打开 设置 > 关于 来安装它。",
+    "モデルはダウンロード済みですが、このPC用のエンジンはまだ準備できていません。設定 > 情報 を開いてインストールしてください。",
+    "Dein Modell ist heruntergeladen, aber die Engine für diesen PC ist noch nicht bereit. Öffne Einstellungen > Über, um sie zu installieren.",
+    "Tu modelo está descargado, pero el motor para este equipo aún no está listo. Abre Ajustes > Acerca de para instalarlo.",
+    "Модель скачана, но движок для этого компьютера ещё не готов. Откройте Настройки > О программе, чтобы установить его.",
+    "Seu modelo foi baixado, mas o motor para este computador ainda não está pronto. Abra Configurações > Sobre para instalá-lo.",
+    "모델은 내려받았지만, 이 PC용 엔진이 아직 준비되지 않았습니다. 설정 > 정보를 열어 설치하세요.",
+    "Votre modèle est téléchargé, mais le moteur pour cet ordinateur n'est pas encore prêt. Ouvrez Réglages > À propos pour l'installer.")
 
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
 NBSP = " "

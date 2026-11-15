@@ -211,6 +211,30 @@ class InstallOwnPath(unittest.TestCase):
         self.assertIn("does not run Qwen3.6-35B-A3B yet", out)
         self.assertEqual([c for c in self.calls if c[0] == "get"], [])
 
+    def test_the_app_with_no_engine_yet_downloads_as_flash_next_does(self):
+        # DL99: the app fetches the engine beside the model on a first run; while it is not there, control_engine_step answers a placeholder
+        # (component "missing") and Flash-Next goes on. Qwen3.6 asked that missing program for its families, got {"qwen4exp"} and stopped
+        # ("this engine (99.0.0) does not run ..."), 4 s into the app's first install.
+        self.families = {"qwen4exp"}                       # what engine_families answers when the program is not there
+
+        def no_engine_yet(a, gpu, hip, amd, cuda_tk, vision):
+            self.calls.append(("engine", vision))
+            return self.root / "llama", self.root / "engine", {"version": "99.0.0", "source": "local", "component": "missing"}, [], gpu, "none"
+        with mock.patch.object(setup, "CONTROL", True), mock.patch.object(setup, "engine_step", no_engine_yet):
+            rc, out = self.install(model="UD-Q4_K_XL")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("does not run Qwen3.6-35B-A3B yet", out)
+        self.assertEqual(len([c for c in self.calls if c[0] == "get"]), 1, "the model is downloaded")
+        self.assertEqual(self.cfg["exe"], "component:strata-engine", "the engine is looked up when the model loads")
+
+    def test_the_app_with_an_engine_that_does_not_run_it_is_still_refused(self):
+        self.families = {"qwen4exp"}
+        with mock.patch.object(setup, "CONTROL", True):
+            rc, out = self.install(model="UD-Q4_K_XL")
+        self.assertEqual(rc, 1)
+        self.assertIn("does not run Qwen3.6-35B-A3B yet", out)
+        self.assertEqual([c for c in self.calls if c[0] == "get"], [])
+
     def test_a_flash_next_size_is_refused(self):
         rc, out = self.install(model="IQ3_XXS")
         self.assertEqual(rc, 1)
