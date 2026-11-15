@@ -4041,6 +4041,7 @@ EDIT_TOOLS = ("edit_image", "extend_image", "upscale_image", "fix_image", "edit_
 SKILL_ALWAYS = "image-tools"
 SKILL_MODELS = "models"
 SKILL_MODELS_WHEN = "choosing the image model: what each one is made for."
+SKILL_LORA = "lora"   # how the chat's model chooses the LoRAs, their strength and block weights (generate, edit)
 SKILL_COMBINE = "combine-tools"   # its "tool" is "*": offered with two image tools or more
 STYLE_DEFAULT = "natural"         # the prompt style of a model whose skill names none
 # the copy of a made image an image tool's result shows a chat model that reads pictures: its longer side, and how many
@@ -4408,6 +4409,8 @@ class ImageTools:
                             "required": ["label", "caption", "bbox"]}}},
                     "required": ["items"]}}
                 t["parameters"] = params
+            if t["name"] in ("generate_image", "edit_image") and self._lora_lines(gens):   # the models' LoRAs
+                t = self._with_lora(t, gens)
             params = dict(t["parameters"])   # the plan's step and group (combine-tools), every tool's
             params["properties"] = {**params["properties"], **PLAN_ARGS}
             if self.text_gpu == "ask" and t["name"] not in ("upscale_video", "segment_video") and self._can_lend():
@@ -4423,6 +4426,48 @@ class ImageTools:
                 t["parameters"] = params
             out.append(t)
         return out
+
+    @staticmethod
+    def _lora_lines(gens: list) -> list[str]:
+        """The LoRAs the models of `gens` list, one line each: its name, what it was trained to add and its trigger
+        words (serve/loras.py's listing), and its model where several are offered."""
+        lines = []
+        for g in gens:
+            for e in g.loras.listing() if g.loras.takes else ():
+                about = ", ".join(x for x in (e.get("kind"), f"trigger {e['trigger']}" if e.get("trigger") else None)
+                                  if x)
+                lines.append(e["name"] + (f" ({about})" if about else "") + (f" [{g.model}]" if len(gens) > 1 else ""))
+        return lines
+
+    def _with_lora(self, t: dict, gens: list) -> dict:
+        """generate_image's or edit_image's `lora` argument: the models' LoRAs by name, a strength and the block
+        weights (BLOCK_PRESETS' names for the models' families, or a number each block with commas); the lora skill
+        says how to choose them."""
+        # each name with the models whose family has it: a model without the name refuses it (a call wasted on the
+        # first try, 2026-11-16: Mage-Flow's character LoRA asked "character", then again without it)
+        has: dict[str, list[str]] = {}
+        for g in gens:
+            for n in lora_api.BLOCK_PRESETS.get(g.family, {}):
+                has.setdefault(n, []).append(g.model)
+        presets = ["all (every model)"] + [n if len(v) == len(gens) else f"{n} ({', '.join(v)} only)"
+                                           for n, v in has.items()]
+        names = list(dict.fromkeys(e["name"] for g in gens if g.loras.takes for e in g.loras.listing()))
+        params = dict(t["parameters"])
+        params["properties"] = {**params["properties"], "lora": {
+            "type": "array", "description": "LoRAs: " + "; ".join(self._lora_lines(gens)),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": names},
+                    "scale": {"type": "number", "description": "strength, default 1"},
+                    "blocks": {"type": "string",
+                               "description": ("the strength each DiT block: " + "; ".join(presets)
+                                               + "; or a number each block with commas")}},
+                "required": ["name"]}}}
+        t = {**t, "parameters": params}
+        if self.skills == "inline" and (body := self._skills().body(SKILL_LORA)):
+            t["description"] += "\n\nLoRAs:\n" + body
+        return t
 
     def _model_lines(self, gens: list) -> list[str]:
         """Each model's name and what it is made for (the catalog's ABOUT, else _about)."""
@@ -4480,6 +4525,10 @@ class ImageTools:
                 continue
             if want in tools and want not in CORE_TOOLS and not self.all_tools:
                 continue   # its tool's stub carries its line, and its call answers with the skill (_stub_answer)
+            if want == "lora":   # with the LoRA argument only: a model lists LoRAs
+                if {"generate_image", "edit_image"} & set(tools) and self._lora_lines(self._gens()):
+                    out.append((s.name, "tool", s.description))
+                continue
             if (want in tools or want == "*" and len(tools) > 1
                     or want == "guidance" and guided and {"generate_image", "edit_image"} & set(tools)):
                 out.append((s.name, "tool", s.description))
@@ -4919,6 +4968,8 @@ class ImageTools:
                 req["refine"] = args["refine"]
             if name in ("generate_image", "edit_image") and args.get("guidance") not in (None, "", []):
                 req["guidance"] = args["guidance"]
+            if name in ("generate_image", "edit_image") and args.get("lora") not in (None, "", []):
+                req["lora"] = args["lora"]   # serve/loras.py's field: the model's names, strengths, block weights
             if name in ("edit_image", "edit_region", "fix_image") and (args.get("crop_upscale") or args.get("variant")):
                 req["crop_upscale"] = {k: v for k, v in (("method", args.get("crop_upscale")),
                                                          ("variant", args.get("variant"))) if v}
