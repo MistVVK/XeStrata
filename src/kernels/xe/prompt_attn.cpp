@@ -496,7 +496,7 @@ void prompt_attn_tune(const QsaShapes& s, int fmt, int64_t max_cells, void* stre
         return;
     sycl::queue& queue = core::Runtime::get().stream(stream);
     // ROCm (RX 9060 XT): the timing's probe-buffer cycle leaves a not-present mapping that a later kernel faults on
-    // when the KV streams (llm-jp 64K/128K, 2026-11-15).  Skip the timing; prompt_attn takes the int8 kernel untimed.
+    // when the KV streams (llm-jp 64K/128K, 2026-11-15).  Skip the timing: prompt_attn takes the maker's untimed.
     if (queue.get_device().get_backend() == sycl::backend::ext_oneapi_hip) return;
     picks_for(s, fmt).get(queue.get_device(), [&] {
         Picks p;
@@ -534,10 +534,12 @@ bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_
         pick = fmt != kFmtF16 ? kPickNone : kPickFp16;
     } else if (forced != kPickUntimed) {
         pick = forced;
-    } else if (hip && fmt != kFmtF16) {
-        // ROCm: the int8 kernel untimed (the tune is skipped).  It reads the streamed staging pool and the resident
-        // pool to the same bits (off==str md5), unlike the maker's and the matrix engines' kernels (2026-11-15).
-        pick = kPickI8;
+    } else if (hip) {
+        // ROCm: the tune is skipped (prompt_attn_tune), so the maker's kernel (aotriton) untimed, the one its timing
+        // took on the RX 9060 XT at every length it was run at (llm-jp-4.1's 40/4 heads of 128 over INT8 pools, 6K to
+        // 63K cells: 10.3 / 91.6 ms against the int8 kernel's 36.2 / 321.8, 2026-11-15); where it does not take the
+        // shape, the matrix engines' kernel below
+        pick = kPickMaker;
     } else {
         const Picks& p = picks_for(s, fmt).get(queue.get_device(), [] { return Picks{}; });
         const bool lng = pos0 + T >= p.split;
