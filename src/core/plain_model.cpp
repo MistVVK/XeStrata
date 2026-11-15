@@ -4118,6 +4118,16 @@ void PlainModel::drop_window_graphs() {
         if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
 }
 
+uint64_t PlainModel::window_drafts_bytes(int drafts) const {
+    if (!next_.empty()) return 0;
+    drafts = std::max(drafts, n_snap_load_ < 0 ? n_snap_ : n_snap_load_);   // set_window_drafts' bounds
+    drafts = std::min(drafts, std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1);
+    if (glm_) drafts = std::min(drafts, k::kGlm5MaxSnaps);
+    if (drafts <= n_snap_) return 0;
+    const int64_t states = std::count_if(gdn_state_.begin(), gdn_state_.end(), [](const float* p) { return p != nullptr; });
+    return (uint64_t) states * (uint64_t) (drafts - n_snap_) * (state_bytes_ + conv_bytes_);
+}
+
 bool PlainModel::set_window_drafts(int drafts, std::string& err) {
     if (!next_.empty()) { err = "plain model: more window drafts on a layer split"; return false; }
     if (n_snap_load_ < 0) n_snap_load_ = n_snap_;

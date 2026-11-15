@@ -63,6 +63,8 @@ public:
     bool load(const std::string& pack_path, int device, std::string& err);
     /// Set before load: reserve the wider buffers only when a caller will measure or use them.
     void set_capacity_rows(int rows);
+    /// The rows its windows are sized for: what set_capacity_rows asked until load, then the load's
+    int capacity_rows() const { return device_ >= 0 ? capacity_rows_ : requested_capacity_rows_; }
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).  The head's
     /// rows over the subset are gathered once (core/draft_head, the MTP drafter's shared part).
     bool bind(const WeightTable& wt, const ModelGeometry& g, const NativeHead* head, const std::string& vocab_file,

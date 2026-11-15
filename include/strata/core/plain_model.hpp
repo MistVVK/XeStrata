@@ -506,6 +506,8 @@ public:
     /// now; fewer than the load made: the extra ones freed).  False with `err`, nothing changed, when they do not fit.
     /// The window graphs are captured again.  One GPU only.
     bool set_window_drafts(int drafts, std::string& err);
+    /// The VRAM set_window_drafts(drafts) would take now (the copies past those there are; 0 where it takes none)
+    uint64_t window_drafts_bytes(int drafts) const;
     /// The window graphs dropped: captured again on their next use (the taps went off, the copies changed).
     void drop_window_graphs();
     /// The prompt's DFlash2 taps (prompt() in chunks and forward_run's windows): the rows at or after `first_pos`,
