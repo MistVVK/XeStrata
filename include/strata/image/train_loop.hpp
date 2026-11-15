@@ -65,17 +65,44 @@ struct Tensor {
 void save_safetensors_bf16(const std::string& path, std::vector<Tensor> ts,
                            const std::vector<std::pair<std::string, std::string>>& meta);
 
+/// The weights a run trains, of those a model adapts (every one by default): ai-toolkit's network_kwargs
+/// only_if_contains and ignore_if_contains (a part of the weight's name, as lora_names.hpp's tables and the saved keys
+/// write it after "diffusion_model.": "attn", "img_mlp", "transformer_blocks.3."), and sd-scripts' block selection
+/// (train_double_block_indices: "0-5,10", "all") with the blocks a model leaves out besides (MOSS-Image's --skip).
+/// One reading for every trainer: --train-blocks, --only-if-contains, --ignore-if-contains.
+struct Targets {
+    std::vector<std::pair<int, int>> blocks;   // the blocks trained, ranges [first, last]; empty: all of them
+    std::vector<int> skip;                     // blocks left out whatever `blocks` says
+    std::vector<std::string> only, ignore;     // parts of a name: one of `only` (where given) and none of `ignore`
+    /// Whether the weight `name` (its block `block`, -1 outside the blocks) is trained.
+    bool take(int block, const std::string& name) const;
+    /// The selection as the saved metadata's ss_xestrata_targets says it ("" for every weight).
+    std::string text() const;
+};
+/// --train-blocks's ("all", or ranges and numbers with commas: "0-5,10"), --only-if-contains's and
+/// --ignore-if-contains's (parts with commas) values into `out`; false with err where one does not read.
+bool parse_targets(const std::string& blocks, const std::string& only, const std::string& ignore, Targets& out,
+                   std::string& err);
+
+/// --kind's values (LoraMeta::kind): "" (not said), "character", "style", "other".
+inline bool lora_kind_ok(const std::string& k) {
+    return k.empty() || k == "character" || k == "style" || k == "other";
+}
+
 /// What a trainer writes into a saved LoRA's metadata, the same keys from every model's (docs/LORA_TRAIN.md, "The
 /// saved file"): ai-toolkit's (name, version, software, format), modelspec.title and modelspec.trigger_phrase (where
 /// there is one), and sd-scripts' (ss_network_module, ss_network_dim, ss_network_alpha, ss_model: the run's name,
 /// ss_base_model_version, ss_steps: the steps so far, ss_max_steps, ss_seed, ss_learning_rate, ss_optimizer_type),
-/// ss_xestrata_revision, then `extra`.
+/// ss_xestrata_revision, ss_xestrata_kind (what it was trained to add: "character", "style", "other"; serve's listing
+/// reads it) and ss_xestrata_targets (Targets::text) where given, then `extra`.
 struct LoraMeta {
     std::string name;                        // the run's (the output's file name without its folder by default)
     std::string base;                        // the base model: "qwen-image-2.1", "moss_image", "anima", "mage-flow"
     std::string module = "networks.lora";    // or networks.lokr
     std::string lr;                          // the learning rate as it was given
     std::string trigger;
+    std::string kind;                        // "character", "style" or "other" ("": not said)
+    std::string targets;                     // Targets::text() of the run's selection
     int64_t rank = 0, steps = 0, max_steps = 0;
     double alpha = 0.0;
     uint64_t seed = 0;
