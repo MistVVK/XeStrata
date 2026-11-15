@@ -283,72 +283,85 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
                 std::pair<int, bool> best{-1, strata::prefill::mmq::built()};
                 const auto& f0 = lay.fmt[0];
                 const int64_t ELL = lat_ELL_, G = lat_G_, GN = (int64_t) shape.n_embd;
-                const int64_t cap_t = std::min<int64_t>((int64_t) (T * K), 4 * (int64_t) K);
                 const int64_t n_expert = lay.n_expert;
                 const int du_t = lat_fmt_ == 4 ? 2 : 8;
+                // the real decode's row counts: the verify window's token counts × K (not one synthetic cap).
+                // Time each form at these caps, a warmup then the median of 3 runs, and sum over the caps so the
+                // choice does not flip on a single noisy timing.
+                const int64_t cap_max = std::min<int64_t>((int64_t) (T * K), 6 * (int64_t) K);
+                std::vector<int64_t> caps;
+                for (int64_t c : {(int64_t) K, 2 * (int64_t) K, 4 * (int64_t) K, 6 * (int64_t) K})
+                    if (c <= cap_max && (caps.empty() || caps.back() != c)) caps.push_back(c);
+                if (caps.empty()) caps.push_back(cap_max);
                 auto& q = strata::core::Runtime::get().compute();
                 const size_t blob_b = (size_t) lay.blob_bytes(0);
                 uint8_t* blob = sycl::malloc_device<uint8_t>(blob_b, q);
-                float* out = sycl::malloc_device<float>((size_t) (cap_t * std::max(ELL, GN)), q);
-                float* yl = sycl::malloc_device<float>((size_t) (cap_t * ELL), q);
-                int32_t* ids = sycl::malloc_device<int32_t>((size_t) cap_t, q);
+                float* out = sycl::malloc_device<float>((size_t) (cap_max * std::max(ELL, GN)), q);
+                float* yl = sycl::malloc_device<float>((size_t) (cap_max * ELL), q);
+                int32_t* ids = sycl::malloc_device<int32_t>((size_t) cap_max, q);
                 unsigned long long* gp = sycl::malloc_device<unsigned long long>(1, q);
                 int32_t* gs = sycl::malloc_device<int32_t>(2, q);
                 int32_t* gn = sycl::malloc_device<int32_t>(1, q);
-                int32_t* dst = sycl::malloc_device<int32_t>((size_t) cap_t, q);
-                int32_t* tok = sycl::malloc_device<int32_t>((size_t) cap_t, q);
+                int32_t* dst = sycl::malloc_device<int32_t>((size_t) cap_max, q);
+                int32_t* tok = sycl::malloc_device<int32_t>((size_t) cap_max, q);
                 if (blob && out && yl && ids && gp && gs && gn && dst && tok) {
                     try {
                         const strata::kernels::NativeExpertLayout L0 = strata::kernels::native_expert_layout(f0.gu_type, f0.d_type, ELL, lat_I_, f0.up_type);
                         q.memset(blob, 0x11, blob_b);
-                        q.memset(out, 0, (size_t) (cap_t * ELL) * 4);
-                        q.memset(yl, 0, (size_t) (cap_t * ELL) * 4);
+                        q.memset(out, 0, (size_t) (cap_max * std::max(ELL, GN)) * 4);
+                        q.memset(yl, 0, (size_t) (cap_max * ELL) * 4);
                         const unsigned long long blob_p = (unsigned long long) blob;
                         q.memcpy(gp, &blob_p, 8);
-                        const int32_t start_h[2] = {0, (int32_t) cap_t};
-                        q.memcpy(gs, start_h, 8);
                         const int32_t one = 1;
                         q.memcpy(gn, &one, 4);
-                        q.parallel_for(sycl::range<1>((size_t) cap_t), [=](sycl::id<1> i) {
+                        q.parallel_for(sycl::range<1>((size_t) cap_max), [=](sycl::id<1> i) {
                             dst[i[0]] = (int32_t) i[0]; tok[i[0]] = (int32_t) i[0];
                             ids[i[0]] = (int32_t) (i[0] % (uint64_t) n_expert);
                         });
                         q.wait_and_throw();
-                        const int reps = 5;
-                        auto time_a = [&](int m8) {
-                            const auto t0 = std::chrono::steady_clock::now();
-                            for (int r = 0; r < reps; ++r)
-                                strata::kernels::native_expert_grouped(L0, gp, gs, gn, dst, tok, 1, cap_t, lat_xlq_, hit_scratch_, out, nullptr, 1, m8);
-                            q.wait_and_throw();
-                            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        auto median_ms = [&](auto run, int64_t cap) {
+                            const int32_t start_h[2] = {0, (int32_t) cap};
+                            q.memcpy(gs, start_h, 8).wait();
+                            run(cap); q.wait_and_throw();   // warmup (JIT / caches)
+                            double ts[3];
+                            for (int r = 0; r < 3; ++r) {
+                                const auto t0 = std::chrono::steady_clock::now();
+                                run(cap); q.wait_and_throw();
+                                ts[r] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                            }
+                            std::sort(ts, ts + 3);
+                            return ts[1];
                         };
                         if (a_env < 0) {
-                            const double t1 = time_a(1), t0 = time_a(0);
-                            best.first = t0 < t1 ? 0 : 1;
-                        }
-                        auto time_u = [&](bool mmq) {
-                            const auto t0 = std::chrono::steady_clock::now();
-                            for (int r = 0; r < reps; ++r) {
-                                if (mmq) {
-                                    strata::kernels::latent_u_bucket(ids, lat_labels_dev_, lay.n_expert, cap_t, (int) G, lat_u_mmq_ids_, lat_u_mmq_bounds_, nullptr);
-                                    strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, du_t, ELL, ELL, cap_t, nullptr);
-                                    strata::prefill::mmq::Product up;
-                                    up.w = lat_u_; up.type = du_t; up.w_rows = GN; up.w_cols = ELL;
-                                    up.expert_bytes = strata::prefill::mmq::matrix_bytes(du_t, GN, ELL); up.n = (int) G;
-                                    up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
-                                    up.total_rows = cap_t; up.max_rows = cap_t; up.rows = cap_t; up.dst = out; up.ld_dst = GN;
-                                    lat_mmq_ctx_->run(up, nullptr);
-                                } else {
-                                    strata::kernels::quantize_q8_1_rows(yl, cap_t, ELL, lat_ylq_, nullptr);
-                                    strata::kernels::latent_u_grouped(lat_u_, lat_ylq_, ids, lat_labels_dev_, lay.n_expert, cap_t, (int) ELL, (int) GN, out, nullptr, lat_fmt_);
-                                }
+                            double s1 = 0, s0 = 0;
+                            for (int64_t c : caps) {
+                                s1 += median_ms([&](int64_t cap) { strata::kernels::native_expert_grouped(L0, gp, gs, gn, dst, tok, 1, cap, lat_xlq_, hit_scratch_, out, nullptr, 1, 1); }, c);
+                                s0 += median_ms([&](int64_t cap) { strata::kernels::native_expert_grouped(L0, gp, gs, gn, dst, tok, 1, cap, lat_xlq_, hit_scratch_, out, nullptr, 1, 0); }, c);
                             }
-                            q.wait_and_throw();
-                            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                            best.first = s0 < s1 ? 0 : 1;
+                        }
+                        auto run_u = [&](int64_t cap, bool mmq) {
+                            if (mmq) {
+                                strata::kernels::latent_u_bucket(ids, lat_labels_dev_, lay.n_expert, cap, (int) G, lat_u_mmq_ids_, lat_u_mmq_bounds_, nullptr);
+                                strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, du_t, ELL, ELL, cap, nullptr);
+                                strata::prefill::mmq::Product up;
+                                up.w = lat_u_; up.type = du_t; up.w_rows = GN; up.w_cols = ELL;
+                                up.expert_bytes = strata::prefill::mmq::matrix_bytes(du_t, GN, ELL); up.n = (int) G;
+                                up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
+                                up.total_rows = cap; up.max_rows = cap; up.rows = cap; up.dst = out; up.ld_dst = GN;
+                                lat_mmq_ctx_->run(up, nullptr);
+                            } else {
+                                strata::kernels::quantize_q8_1_rows(yl, cap, ELL, lat_ylq_, nullptr);
+                                strata::kernels::latent_u_grouped(lat_u_, lat_ylq_, ids, lat_labels_dev_, lay.n_expert, cap, (int) ELL, (int) GN, out, nullptr, lat_fmt_);
+                            }
                         };
                         if (u_env < 0 && strata::prefill::mmq::built()) {
-                            const double tm = time_u(true), td = time_u(false);
-                            best.second = tm < td;
+                            double sm = 0, sd = 0;
+                            for (int64_t c : caps) {
+                                sm += median_ms([&](int64_t cap) { run_u(cap, true); }, c);
+                                sd += median_ms([&](int64_t cap) { run_u(cap, false); }, c);
+                            }
+                            best.second = sm < sd;
                         }
                     } catch (const std::exception& e) {
                         std::fprintf(stderr, "xestrata: timing the latent decode forms: %s\n", e.what());
