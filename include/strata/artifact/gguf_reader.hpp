@@ -220,6 +220,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 1;
         bytes = 1;
         return true;
+    case 40:   // NVFP4: 64 values = 4 UE4M3 scales (one for each 16) + 32 bytes of E2M1 codes (kernels/nvfp4.hpp)
+        elems = 64;
+        bytes = 36;
+        return true;
     case 42:
         elems = 64;
         bytes = 18;
