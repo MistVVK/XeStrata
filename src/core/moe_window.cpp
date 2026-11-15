@@ -680,8 +680,10 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 // rows zeroed there, the hit path adds their U product)
                 if (!segmented_) wait_flag_ge(m_flag_, ring, cs);
                 stamp(23);
-                latent_u_matvec(lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes, reinterpret_cast<const uint8_t*>(ymiss), ids, labels, p_dst,
-                                p_counts + 1, lay.n_expert, cap, (int) ELL, (int) N, (int) G, parts, cs, lat_fmt_);
+                // ylq (this group's rows) holds the pool's rows on the device: the GPU's U above read it before,
+                // in stream order
+                latent_u_matvec(lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes, reinterpret_cast<const uint8_t*>(ymiss), ylq,
+                                ids, labels, p_dst, p_counts + 1, lay.n_expert, cap, (int) ELL, (int) N, parts, cs, lat_fmt_);
             } else {
                 if (!segmented_) wait_flag_ge(m_flag_, ring, cs);   // the CPU's H-wide contributions
                 stamp(23);

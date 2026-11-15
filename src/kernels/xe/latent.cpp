@@ -17,6 +17,7 @@
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_latent
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/rows_cols.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "cuda_intrinsics.hpp"
@@ -181,60 +182,29 @@ void latent_u_bucket(const int32_t* ids, const int32_t* labels, int64_t E, int64
     sync_if_needed(stream, e, "latent_u_bucket");
 }
 
-void latent_u_matvec(const uint8_t* u, const uint8_t* hq, const int32_t* ids, const int32_t* labels,
+void latent_u_matvec(const uint8_t* u, const uint8_t* hq, uint8_t* hq_dev, const int32_t* ids, const int32_t* labels,
                      const int32_t* dst, const int32_t* count, int64_t E, int64_t n_entries, int ELL, int H,
-                     int G, float* parts, void* stream, int fmt) {
-    if (n_entries <= 0 || G <= 0) return;
-    if (u == nullptr || hq == nullptr || ids == nullptr || labels == nullptr || dst == nullptr || count == nullptr ||
-        parts == nullptr || E <= 0 || H <= 0 || ELL <= 0 || ELL % 32 != 0 || (fmt != 4 && fmt != 8))
+                     float* parts, void* stream, int fmt) {
+    if (n_entries <= 0) return;
+    if (u == nullptr || hq == nullptr || hq_dev == nullptr || ids == nullptr || labels == nullptr || dst == nullptr ||
+        count == nullptr || parts == nullptr || E <= 0 || H <= 0 || ELL <= 0 || ELL % 32 != 0 || (fmt != 4 && fmt != 8))
         throw core::DeviceError("latent_u_matvec: a null pointer or a bad geometry");
     auto& q = queue_for(stream);
-    const int nb = ELL / 32;
-    const size_t hq_row = (size_t) nb * 36;
-    const size_t wrow = (size_t) nb * (fmt == 4 ? 18 : 34);
-    const int xgroups = (H + kSubGroups - 1) / kSubGroups;
-    constexpr size_t wg = kSubGroups * kWarp;
-    // one work-group a (group, row tile): the group's entries' hq rows staged in local memory once an entry,
-    // every sub-group of the group reading them there (the mapped rows are across PCIe: one read an entry, not
-    // one a row).  The entries are walked in the same order in every work-group (the barriers are uniform).
-    auto run = [&](auto fmt_tag) {
-        constexpr int FMT = decltype(fmt_tag)::value;
-        return q.submit([&](sycl::handler& h) {
-            sycl::local_accessor<uint8_t, 1> hq_s(sycl::range<1>(hq_row), h);
-            h.parallel_for(sycl::nd_range<2>({(size_t) G, (size_t) xgroups * wg}, {1, wg}),
-                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
-                const int g = (int) it.get_group(0);
-                const int h = (int) it.get_group(1) * kSubGroups + (int) it.get_sub_group().get_group_linear_id();
-                const int lane = (int) it.get_local_linear_id() % kWarp;
-                const int tid = (int) it.get_local_linear_id();
-                const int c = *count;
-                for (int64_t r = 0; r < n_entries; ++r) {
-                    const int32_t e = ids[r];
-                    if (e < 0 || e >= E || labels[e] != g) continue;
-                    bool gpu = false;
-                    for (int i = 0; i < c; ++i) if (dst[i] == r) { gpu = true; break; }
-                    if (gpu) {   // the GPU's own row: parts holds zero for it (the hit path adds its U product)
-                        if (h < H) parts[(size_t) r * (size_t) H + h] = 0.0f;
-                        continue;
-                    }
-                    const uint8_t* x = hq + (size_t) r * hq_row;
-                    for (size_t i = (size_t) tid; i < hq_row; i += wg) hq_s[i] = x[i];
-                    sycl::group_barrier(it.get_group());
-                    if (h < H) {
-                        const uint8_t* w = u + ((size_t) g * (size_t) H + (size_t) h) * wrow;
-                        float acc = 0.0f;
-                        for (int b = lane; b < nb; b += kWarp)
-                            acc += lat_block_dot<FMT>(w + (size_t) b * (FMT == 4 ? 18 : 34),
-                                                      (const block_q8_1*) &hq_s[(size_t) b * 36]);
-                        acc = sycl::reduce_over_group(it.get_sub_group(), acc, sycl::plus<float>());
-                        if (lane == 0) parts[(size_t) r * (size_t) H + h] = acc;
-                    }
-                    sycl::group_barrier(it.get_group());
-                }
-            });
-        });
-    };
-    const auto e = fmt == 4 ? run(std::integral_constant<int, 4>{}) : run(std::integral_constant<int, 8>{});
+    // the pool's rows across PCIe once, in one coalesced pass (each work-group reading them from the mapped memory,
+    // as before, read them once a work-group: 2560 / kSubGroups times over the RTX 4070's x4 link)
+    const size_t bytes = (size_t) n_entries * (size_t) (ELL / 32) * 36;
+    copy_from_mapped(reinterpret_cast<float*>(hq_dev), reinterpret_cast<const float*>(hq), (int64_t) (bytes / 4), stream);
+    // every entry's U row, the group's weights read where they are (latent_u_grouped's kernel)
+    if (fmt == 4) launch_u<4>(q, u, hq_dev, ids, labels, E, n_entries, ELL, H, parts);
+    else launch_u<8>(q, u, hq_dev, ids, labels, E, n_entries, ELL, H, parts);
+    // the GPU's own rows (dst[0..count)) and the routes of no expert hold zero: the hit path adds the former's U
+    const auto e = for_rows_cols(q, n_entries, H, [=](int64_t r, int64_t h) {
+        const int32_t ee = ids[r];
+        bool zero = ee < 0 || ee >= E;
+        const int c = *count;
+        for (int i = 0; i < c && !zero; ++i) zero = dst[i] == (int32_t) r;
+        if (zero) parts[r * (int64_t) H + h] = 0.0f;
+    });
     sync_if_needed(stream, e, "latent_u_matvec");
 }
 
