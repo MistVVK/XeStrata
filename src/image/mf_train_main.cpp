@@ -169,6 +169,12 @@ int main(int argc, char** argv) {
         usage();
         return 2;
     }
+    strata::image::train::Targets targets;   // read before the DiT is opened: a mistyped value is said at once
+    if (!strata::image::train::parse_targets(train_blocks, only_if, ignore_if, targets, err) ||
+        !strata::image::train::lora_kind_ok(kind)) {
+        std::fprintf(stderr, "mf-train: %s\n", err.empty() ? "--kind is character, style or other" : err.c_str());
+        return 2;
+    }
     if (cmd == "train" && base == "int8" && method == "dora") {
         std::fprintf(stderr, "mf-train: DoRA reads the base's row norms: train it on --base bf16\n");
         return 2;
@@ -249,11 +255,6 @@ int main(int argc, char** argv) {
             std::mt19937_64 rng(seed);
             std::normal_distribution<float> gauss(0.f, 1.f);
             std::uniform_real_distribution<float> drop_uni(0.f, 1.f);
-            strata::image::train::Targets targets;
-            if (!strata::image::train::parse_targets(train_blocks, only_if, ignore_if, targets, err))
-                throw std::invalid_argument(err);
-            if (!strata::image::train::lora_kind_ok(kind))
-                throw std::invalid_argument("--kind is character, style or other");
             strata::image::mf_trainer_init_adapters(m.get(), method == "dora" ? 1 : method == "lokr" ? 2 : 0, alpha, seed,
                                                     mod, targets);
             strata::prefill::Gemm gemm;
