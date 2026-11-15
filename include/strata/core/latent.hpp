@@ -25,9 +25,16 @@ class MappedFile;
 
 namespace strata::core {
 
+/// XESTRATA_LATENT_DENSE_FMT: 4 or 8 (the user's choice), 0 for auto (unset, empty or `auto`), -1 with `err` for
+/// another value.
+int latent_dense_fmt_env(std::string& err);
+/// The pack's D/U file of the other format beside `path` (latent_dense_q4.bin / latent_dense_q8.bin, as Edge0 ships
+/// both), or empty when `path` is not one of those names or the file is not there.
+std::string latent_dense_sibling(const std::string& path, int fmt);
+
 /// The D/U dense file: layer l is D [G*ELL, H] then U [G*H, ELL], rows of Q8_0 (fmt 8, 34 B a 32-value block)
-/// or Q4_0 (fmt 4, 18 B).  The format comes from XESTRATA_LATENT_DENSE_FMT (STRATA_LATENT_DENSE_FMT) at open,
-/// default 8, and the file's size must match it.  Mapped read-only; the engine uploads a layer's pair on demand.
+/// or Q4_0 (fmt 4, 18 B).  The format is `fmt` when given, else XESTRATA_LATENT_DENSE_FMT's, else (auto) the one
+/// the file's size is; the size must match it.  Mapped read-only; the engine uploads a layer's pair on demand.
 class LatentDense {
 public:
     LatentDense();
@@ -36,7 +43,7 @@ public:
     LatentDense& operator=(const LatentDense&) = delete;
 
     bool open(const std::string& path, int64_t n_layers, int64_t n_groups, int64_t n_embd, int64_t latent_dim,
-              std::string& err);
+              std::string& err, int fmt = 0);
     void close();
 
     /// The file's size for a geometry and format (what open checks against).
