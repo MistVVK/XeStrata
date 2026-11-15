@@ -34,3 +34,7 @@ third_party/strata-llama/** text eol=lf
 
 # chat templates are read and hashed byte for byte (the served prompt, tools/test_qwen4_intake): LF wherever the repository is cloned
 *.jinja text eol=lf
+
+# the image gate's recorded data (merges with their ranks, expected token ids, table hashes) is read byte for byte by the test programs
+# (tools/test_te_tokenizer.py: a CR at a line end made every merge unknown on a Windows checkout); never convert its line endings
+tools/image/gate/data/** -text
