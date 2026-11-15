@@ -142,13 +142,12 @@ export async function detectBackend({ force = false } = {}) {
     return backend;
   }
 
-  const binary = supervisor.findBinary() ?? (await which('llama-server'));
   backend = {
     kind: 'demo',
-    name: binary ? 'llama.cpp (engine not running)' : 'Strata demo engine',
+    name: 'Strata demo engine',
     baseUrl: null,
     models: [],
-    binary: binary?.path ?? null,
+    binary: null,
     // Every demo frame is labelled for the UI; nothing here may be recorded as a real result.
     simulated: true,
   };

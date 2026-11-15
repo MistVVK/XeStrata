@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { autostartModel } from './autostart.mjs';
 import { engineProgressMark } from './agent/engine-progress.mjs';
 import './system-ca.mjs';        // #3722: the operating system's certificates, before any HTTPS request
 import { createCloudflare } from './cloudflare.mjs';
@@ -258,31 +257,8 @@ function runtimeState(){
   return runtimeModels.state();
 }
 
-/* A remembered DeepSeek model (Strata 0.2.13 and earlier) is not started and is not cleared: server/autostart.mjs logs the refusal and writes nothing. */
-const startupModelId = autostartModel(store.get());
-if (startupModelId) {
-  monitor.setModel(startupModelId);
-  const lastId = startupModelId;
-  setTimeout(() => {
-    const v = variant(lastId);
-    if (!v || !models.isOnDisk(lastId)) return;
-    console.log(`autostart    ·  loading ${v.label}`);
-    void models
-      .load(lastId, {
-        hardware: boot,
-        config: { beginner: store.get().beginner, expert: engine.params(), serving: store.get().serving },
-        onPhase: async (phase, id) => {
-          if (phase === 'loading') await monitor.beginLoading(id);
-          if (phase === 'ready') {
-            await monitor.setModel(id);
-            engine.markRunning(boot.accelerator.backend);
-            hub.send('engine', await engine.config());
-          }
-        },
-      })
-      .catch((err) => console.error('autostart failed:', err.message));
-  }, 700);
-}
+/* No start-up load: the remembered model of the real-engine mode was loaded through a llama.cpp llama-server (0.2.14, also for an imported
+   GGUF nobody had loaded). Models run on the Strata engine, whose own start does not come through here. */
 const backend = await detectBackend({ force: true });
 
 console.log(`strata host  ·  http://${HOST}:${PORT}`);
@@ -1151,11 +1127,10 @@ async function api(req, res, path, method, url) {
     // The plan is only meaningful for a real engine binary, so the panel asks rather than guessing.
     // `available` is false when nothing is installed, which is a state the panel must show honestly
     // instead of offering a plan that cannot be computed.
-    const binary = supervisor.findBinary();
     const status = supervisor.status();
     return json(res, 200, {
-      available: Boolean(binary?.path),
-      path: binary?.path ?? null,
+      available: false,   // the host starts no engine binary of its own (no llama-server)
+      path: null,
       backend: status?.backend ?? null,
       running: Boolean(status?.running),
     });
@@ -1564,22 +1539,8 @@ async function api(req, res, path, method, url) {
         await monitor.setModel(id);engine.markRunning(hw.accelerator.backend);hub.send('engine',await engine.config());
         return json(res,200,runtimeModels.libraryState(models.library()));
       }
-      if(!supervisor.findBinary())return error(res,409,'Install a compatible llama-server engine before switching from native Strata.');const candidate=models.library().variants.find(v=>v.id===id);if(!candidate||!['installed','loaded'].includes(candidate.state))return error(res,409,'Download this model before loading it.');for(const instance of native.state().instances)await native.unload(instance.id);
-      const lib = await models.load(id, {
-        hardware: hw,
-        config: { beginner: store.get().beginner, expert: engine.params(), serving: store.get().serving },
-        onPhase: async (phase, variantId) => {
-          if (phase === 'loading') await monitor.beginLoading(variantId);
-          if (phase === 'ready') {
-            await monitor.setModel(variantId);
-            monitor.idle('Model loaded — waiting for a request');
-            monitor.setContextMax(CONTEXT_TOKENS[store.get().beginner.contextLength] ?? 32768);
-            engine.markRunning(hw.accelerator.backend);
-            hub.send('engine', await engine.config());
-          }
-        },
-      });
-      return json(res, 200, runtimeModels.libraryState(lib));
+      // Strata's own engine only: 0.2.14 started a llama.cpp llama-server here (an imported GGUF, the starter list) in the real-engine mode
+      return error(res,409,'Strata runs models only on its own engine, so this model can\'t load here. Open Models and choose a model there, or use "Use a local GGUF…" for a file you already have.');
     }
   }
 
