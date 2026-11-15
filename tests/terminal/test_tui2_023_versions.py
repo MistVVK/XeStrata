@@ -32,9 +32,10 @@ class VersionBump(unittest.TestCase):
         # 0.2.7.1 (DGX Spark): Control and the linux-aarch64 engine packages are 0.1.53 (the CMake project version); the app and the Terminal stay 0.2.7, the Metal engine 0.1.52.
         # 0.2.7: Terminal and app are 0.2.7; Control and every engine package (Qwen, DeepSeek, Metal) are 0.1.52 (the CMake project version; the Qwen and DeepSeek C++ both changed since 0.2.6)
         # 0.2.13.1 (Control-only, Linux x86_64: the app on an Intel Arc card, ARCFIX): the Terminal is 0.2.13.1 and Control 0.1.59.1 (the CMake project version); the app stays 0.2.13 and every engine package 0.1.59 (as 0.2.8.1 and 0.2.3.1 did).
-        self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.14")
-        self.assertEqual(strata_cli.version(), "0.1.60")              # the CMake project version: Control
-        self.assertEqual(first("CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.60")
+        # 0.2.14.1 (Control-only: the drafter fixes of the Terminal and Control): the Terminal is 0.2.14.1 and Control 0.1.60.1; the app stays 0.2.14 and every engine package 0.1.60.
+        self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.14.1")
+        self.assertEqual(strata_cli.version(), "0.1.60.1")              # the CMake project version: Control
+        self.assertEqual(first("CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.60.1")
         self.assertIn('STRATA_VERSION="0.1.60-metal"', (ROOT / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
 
     def test_every_place_the_app_version_lives_says_0_2_3(self):
@@ -57,7 +58,7 @@ class VersionBump(unittest.TestCase):
     def test_version_prints_the_product_and_the_build(self):
         done = subprocess.run([sys.executable, str(ROOT / "strata.py"), "--version"], capture_output=True, text=True, cwd=str(ROOT),
                               env={**os.environ, "STRATA_NO_HANDOVER": "1"})
-        self.assertTrue(done.stdout.startswith("strata 0.2.14 (build 0.1.60;"), done.stdout)
+        self.assertTrue(done.stdout.startswith("strata 0.2.14.1 (build 0.1.60.1;"), done.stdout)
 
 
 class UpdateFromTheLastRelease(test_updater.UpdaterCase):

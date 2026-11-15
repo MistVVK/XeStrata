@@ -7,7 +7,7 @@ SCHEMA_VERSION = 1
 
 #: The version people are told: the Strata app's own (apps/desktop/src-tauri/Cargo.toml `version`; tests/terminal/test_tuiqa_version.py keeps the
 #: two equal, except for a Terminal-only release such as 0.2.3.1 or 0.2.4, whose app stays 0.2.3). `version()` below is the files' build number, which the engine-compatibility checks compare, so it stays numeric.
-PRODUCT_VERSION = "0.2.14"
+PRODUCT_VERSION = "0.2.14.1"
 
 
 def version() -> str:
