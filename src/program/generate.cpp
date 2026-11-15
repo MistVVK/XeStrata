@@ -22,6 +22,10 @@
 #include "strata/core/reader_room.hpp"
 #include "strata/core/residency_trim.hpp"
 #include "strata/core/kfd_settle.hpp"
+#include "strata/core/kfd_quiet.hpp"
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+#include "strata/kernels/fused_gr.hpp"   // fused_gr_check, called early on an integrated gfx11 (kfd_quiet.hpp, LOAD)
+#endif
 #include "strata/core/page_cache_drop.hpp"
 #include "strata/core/gfx12_chunk.hpp"
 #include "strata/core/nv_chunk.hpp"
@@ -4017,6 +4021,14 @@ int main(int argc, char** argv) {
             // and before READY it waits until its own KFD eviction counter has been quiet for 2 s (kfd_settle.hpp)
             if (strata::core::igpu_kfd_settle_default(ad.gcnArchName, all_igpu, win_host))
                 strata::core::kfd_settle_flag().store(true);
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+            // and the KFD is not provoked while our queues are busy (kfd_quiet.hpp): the same device class, HIP under Linux only
+            if (strata::core::igpu_kfd_settle_default(ad.gcnArchName, all_igpu, win_host)) {
+                strata::core::kfd_quiet::class_flag().store(true);
+                if (std::getenv("STRATA_TRACE") != nullptr && strata::core::kfd_quiet::on(strata::core::kfd_quiet::Fix::Load))
+                    std::fprintf(stderr, "strata trace: kfd quiet: load order active (check first, settle after the expert cache, first prompt's buffers at init)\n");
+            }
+#endif
             // and the file cache of the model files is given back while the expert arena is read and after it (page_cache_drop.hpp):
             // the little free memory left beside the arena, the GPU's buffers and that cache is what makes the kernel's proactive compaction run
             if (strata::core::igpu_cache_drop_default(ad.gcnArchName, all_igpu, win_host))
@@ -7829,6 +7841,12 @@ int main(int argc, char** argv) {
         const char* name = named && p.name[0] ? p.name : "(an unnamed GPU)";
 #if defined(STRATA_USE_HIP)
         std::fprintf(stderr, "strata generate: GPU %d: %s (%s)\n", dev, name, named ? p.gcnArchName : "?");
+#if defined(__linux__)
+        // integrated gfx11 (kfd_quiet.hpp, LOAD): the hyper-connection check now, before the expert arena exists and before the warm
+        // thread starts, instead of in Verifier::init after the 7.7 GiB expert cache was allocated (it then finds it done).  Its
+        // result depends on the card and STRATA_HC_SPLIT only (random weights, compared bit for bit), so it is the same here.
+        if (named && strata::core::kfd_quiet::load_moves().hc_check_early) strata::kernels::fused_gr_check();
+#endif
         // the first prompt's one-time hipBLAS library loads (about 2.5 s), done on a thread while the expert arena loads
         if (named) g_warm_thr = std::thread([dev] { strata::prefill::warm_gemm_libraries(dev); });
         // (RDNA4's matrix-core prompt attention is the default since 148-amd: the engine says so once, at its first prompt;
@@ -8883,6 +8901,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
         }
     }
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+    // integrated gfx11 (kfd_quiet.hpp, LOAD): the expert cache's GPU memory was just allocated (7.7 GiB on a 780M) and the kernel moves
+    // pages after such a step; the profile fill, the graph capture and the first GPU work wait until the process's KFD eviction
+    // counter has been quiet for 2 s (at most 10 s; nothing where the counter cannot be read; STRATA_NO_KFD_SETTLE=1 also turns it off)
+    if (strata::core::kfd_quiet::load_moves().settle_after_cache) strata::core::kfd_settle::settle_before_ready();
+#endif
     // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
