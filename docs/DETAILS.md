@@ -1602,11 +1602,14 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 - **logit_bias**: `"logit_bias"` in `/v1/chat/completions` (`{"<token id>": -100 to 100}`, or a list of `[id, bias]` pairs) is added before the penalties and filters (upstream dcc6f756).
   -100 (`false` in a pair list) keeps the token out. Not with parallel requests (`"parallel"`).
   On the models other than Qwen3.8-Flash-Next too, a request with a logit_bias decodes in speculative windows (the bias is the same for every row).
-- `XESTRATA_SPEC_GUMBEL=1` (opt-in, upstream 6381df34) picks a sampled request's token by Gumbel-max.
-  The noise is drawn per token id instead of along the probability-sorted list, so the tokens follow the same distribution while `--coupled-draft` drafts agree more often with the target's pick.
-  With `--coupled-draft`, temperature 1.0 / top_p 0.95 / top_k 20 and eight 200-token story and code answers, three runs each, the median decode went from 51.05 to 52.05 tokens/s (+2.0%) on an RTX 4070 and from 80.25 to 72.75 tokens/s (-9%) on the B70.
-  The drafts kept on the 4070 rose from 64.1% to 70.8%.
-  The result differs by card: measure on yours before turning it on.
+- `XESTRATA_SPEC_GUMBEL` (auto, 0 or 1) picks a sampled request's token by Gumbel-max.
+  auto (the default) learns per `--serve` request, by the tokens per ms it actually decoded at, whether the Gumbel
+  arm or the inverse-CDF one is faster (`spec/drafter_policy.hpp`'s two-arm learner); either arm samples the same
+  distribution, so the choice changes which tokens are drawn, never the distribution. The Gumbel arm is taken only
+  when it measures at least 1% faster than off. `XESTRATA_EXACT=1` fixes it off.
+  The noise is a hash of (seed, position, token id) for each token, drawn after the list is cut to the 20 most likely
+  (YASAKANI's Q35_SMP_K); a token's noise is the same on the drafter's and the target's side, so `--coupled-draft`
+  drafts agree more often with the target's pick.
 - **logprobs:** `"logprobs": true` with `"top_logprobs": K` (0–20) on `/v1/chat/completions` returns each token's log-probability and the K most likely candidates in `choices[].logprobs` (streamed too; from upstream's Intel port, 4ba35fd).
   The tokens, joined, spell the reply exactly (a character split across two tokens lands in the one that finishes it).
   `"allowed_token_ids": [ids]` keeps only those ids in `top_logprobs`, most likely first, renormalised to sum to 1; the chosen token is one of them when it was named (vLLM's field, but vLLM masks generation with it, while here it filters what is reported, so a token outside the named ids keeps its own `logprob` and an empty list).

@@ -1475,7 +1475,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const int req_block = probe_running && req_probe >= -1
             ? probe_arms[(size_t) std::max(req_probe, 0)].block : block_selected;
         // The same speed learner that chooses a drafter also compares the two DFlash2 block shapes per round.
-        strata::spec::DrafterPolicy block_policy(1, false);
+        strata::spec::DrafterPolicy block_policy(1.01, 1);
         Clock::time_point d2_started;
         if (req_spec_cap > 0 && !req_df2 && model.drafts() > 0) model.set_mtp_drafts(req_spec_cap - 1);
         if (req_prefill && (geni || ids.size() < 2 || admit_slot >= 0)) {

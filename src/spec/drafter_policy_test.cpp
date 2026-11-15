@@ -92,7 +92,7 @@ int main() {
         check(DrafterPolicy::depth_bucket(32768) == 3 && DrafterPolicy::depth_bucket(1000000) == 3, "depth bucket 3: >= 32K");
     }
     {
-        DrafterPolicy p(1, false);
+        DrafterPolicy p(1.01, 1);
         teach(p, ka, 0, DrafterPolicy::Mtp, 2, 4, 10);
         teach(p, ka, 0, DrafterPolicy::Df2, 2, 4, 10);
         check(p.choose(ka, 0, true) == DrafterPolicy::Mtp, "per-window learner: short block wins a tie");
