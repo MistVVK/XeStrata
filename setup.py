@@ -1154,19 +1154,19 @@ EDGE0_REVISIONS = {
     "Edge0-120B-NVFP4": "f2c72e69c8649e3718b17b2b942e364d730a2dcd",
 }
 EDGE0_MODELS: dict[str, dict[str, Any]] = {
-    "Edge0-145B-q3k": {"repo": "Edge0/Edge0-145B-q3k", "latent_dim": 1792, "dense_fmt": "8",
-                       "dense_file": "latent_dense_q8.bin", "download_gb": 105.4, "ram_gb": 64,
+    "Edge0-145B-q3k": {"repo": "Edge0/Edge0-145B-q3k", "latent_dim": 1792,
+                       "download_gb": 105.4, "ram_gb": 64,
                        "about": "145B latent MoE (latent width 1792), Q3_K experts; ~99 GB on disk"},
-    "Edge0-120B-q3k": {"repo": "Edge0/Edge0-120B-q3k", "latent_dim": 1280, "dense_fmt": "4",
-                       "dense_file": "latent_dense_q4.bin", "download_gb": 92.3, "ram_gb": 48,
+    "Edge0-120B-q3k": {"repo": "Edge0/Edge0-120B-q3k", "latent_dim": 1280,
+                       "download_gb": 92.3, "ram_gb": 48,
                        "about": "120B latent MoE (latent width 1280), Q3_K experts; ~86 GB on disk"},
     # the NVFP4 releases (2026-11-15): the same pack but experts.bin (ggml type 40 with each expert's scales after its
     # rows) and its manifest, no column scales; their other files are the Q3_K pack's of the same size (linked)
-    "Edge0-145B-NVFP4": {"repo": "Edge0/Edge0-145B-NVFP4", "latent_dim": 1792, "dense_fmt": "8",
-                         "dense_file": "latent_dense_q8.bin", "download_gb": 112.9, "ram_gb": 72,
+    "Edge0-145B-NVFP4": {"repo": "Edge0/Edge0-145B-NVFP4", "latent_dim": 1792,
+                         "download_gb": 112.9, "ram_gb": 72,
                          "about": "145B latent MoE (latent width 1792), NVFP4 experts; ~105 GB on disk"},
-    "Edge0-120B-NVFP4": {"repo": "Edge0/Edge0-120B-NVFP4", "latent_dim": 1280, "dense_fmt": "4",
-                         "dense_file": "latent_dense_q4.bin", "download_gb": 97.6, "ram_gb": 54,
+    "Edge0-120B-NVFP4": {"repo": "Edge0/Edge0-120B-NVFP4", "latent_dim": 1280,
+                         "download_gb": 97.6, "ram_gb": 54,
                          "about": "120B latent MoE (latent width 1280), NVFP4 experts; ~91 GB on disk"},
 }
 EDGE0_LICENSE = ("Edge0 Community Model License 1.0 (personal, research and non-commercial sharing; commercial use "
@@ -9676,6 +9676,10 @@ def setup_edge0(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     env: dict[str, str] = {}
     for k, v in (mj.get("env") or {}).items():
         name = "XESTRATA_" + k[len("STRATA_"):] if k.startswith("STRATA_") else k
+        # the D/U's format (Q8_0 or Q4_0, both in the pack) is the engine's choice from the card's VRAM (LatentTab in
+        # generate.cpp), not model.json's fixed one; XESTRATA_LATENT_DENSE_FMT=4/8 in the config is the user's
+        if name == "XESTRATA_LATENT_DENSE_FMT":
+            continue
         if name in ("XESTRATA_LATENT_DENSE", "XESTRATA_LATENT_A", "XESTRATA_LATENT_LABELS"):
             v = abs_path(v)
         env[name] = str(v)
