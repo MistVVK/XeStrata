@@ -377,6 +377,19 @@ static int64_t time_int8_rows_below(const kernels::cpu::NativeFmt& f, size_t blo
             strata::gpu::stream_sync(s);
             return std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
         };
+        // the warm-up's row bounds, before the first run16: the FP16 side reads hb on the HOST when the gemm path is
+        // DP4a (no matrix engines, Gemm::f16_groups), so an empty hb there was a null read (the no-XMX startup's
+        // SIGSEGV).  With matrix engines f16_groups returns before touching the bounds, which hid it.  The RS loop
+        // below refills them for each row count.
+        {
+            hb.assign((size_t) GE + 1, 0);
+            for (int64_t e = 0; e <= GE; ++e) hb[(size_t) e] = (int32_t) (e * RS[0]);
+            std::vector<int32_t> rb((size_t) G8 + 1);
+            for (int e = 0; e <= G8; ++e) rb[(size_t) e] = (int32_t) (e * RS[0]);
+            if (!strata::gpu::copy(bounds, hb.data(), hb.size() * 4) ||
+                !strata::gpu::copy(rbounds, rb.data(), rb.size() * 4))
+                return give_up("its row bounds could not be set");
+        }
         // the GPU clocked up before the first timing: both sides at the fewest rows for 50 ms at least
         {
             const auto t0 = Clock::now();

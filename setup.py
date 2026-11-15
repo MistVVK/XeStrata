@@ -4817,8 +4817,6 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, 
     mark(s, f"sha256 {sha}")
 
 
-
-
 def tree_sha256(top: Path) -> str:
     """#32: a folder's files as one SHA-256 - each file's path (relative, with /) and its SHA-256, in path order."""
     items = []
