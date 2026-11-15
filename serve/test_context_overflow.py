@@ -89,8 +89,9 @@ class ContextOverflow(unittest.TestCase):
                             self.assertEqual(error["param"], "input")
                         elif path == "/v1/messages":
                             self.assertEqual(set(error), {"type", "message"})
-                        else:                    # OpenAI's error: param and code are null when there is none
-                            self.assertEqual(error, {**error, "param": None, "code": None})
+                        else:                    # OpenAI's Chat Completions says it with the same code
+                            self.assertEqual(error["code"], "context_length_exceeded")
+                            self.assertEqual(error["param"], "messages")
 
     def test_the_anthropic_route_says_it_the_way_anthropic_does_and_keeps_xestrata_s_sentence(self):
         # #4838: Claude Code decides from the words of a 400: "prompt is too long" makes it compact, "input length and
