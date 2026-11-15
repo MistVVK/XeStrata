@@ -1031,6 +1031,9 @@ bool device_free_memory(const sycl::device& d, uint64_t& free) {
     if (d.has(sycl::aspect::ext_intel_free_memory)) {
         try {
             free = d.get_info<sycl::ext::intel::info::device::free_memory>();
+            // ROCm's figure can come back below zero as an unsigned value: 140 MiB short read as 17592186044276 MiB
+            // free (RX 9060 XT, ROCm 7.14, 2026-11-15).  More than the device has is none left.
+            if (free > d.get_info<sycl::info::device::global_mem_size>()) free = 0;
             return true;
         } catch (const sycl::exception&) {
             return driver_free_memory(d, free);
