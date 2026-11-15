@@ -46,7 +46,8 @@ void load_order() {
         CHECK(m.hc_check_early && m.settle_after_cache && m.first_prompt_buffers);
     }
     // the class, STRATA_KFD_QUIET=0 or STRATA_KFD_QUIET_LOAD=0: the old order (the A/B arm of the same binary)
-    for (const auto& p : {std::pair<const char*, const char*>{"0", nullptr}, {nullptr, "0"}, {"0", "0"}, {"0", "1"}}) {
+    using P = std::pair<const char*, const char*>;
+    for (const P& p : std::vector<P>{P{"0", nullptr}, P{nullptr, "0"}, P{"0", "0"}, P{"0", "1"}}) {
         const LoadMoves m = load_moves(true, p.first, p.second);
         CHECK(!m.hc_check_early && !m.settle_after_cache && !m.first_prompt_buffers);
     }
@@ -117,7 +118,8 @@ void topology() {
         for (const char* p : {"/0/properties", "/1/properties", "/2/properties", "/README"}) std::remove((root + p).c_str());
         for (const char* p : {"/0", "/1", "/2", ""}) rmdir((root + p).c_str());
     } else {
-        CHECK(!"mkdtemp failed");
+        std::fprintf(stderr, "FAIL %s:%d: mkdtemp failed\n", __FILE__, __LINE__);
+        ++failed;
     }
 #endif
 }
