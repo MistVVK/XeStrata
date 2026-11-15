@@ -1187,12 +1187,16 @@ bool PlainModel::load_qwen(std::string& err) {
     // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
     // spec - 1 drafts (at most the window kernel's snapshots); every stage's recurrent blocks
     // (--suffix-draft, --lookup-chain: as many as a window's drafts can be, MTP layer or not)
-    const int lookup = std::max(opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1 : 0,
-                                std::min(opt_.draft_windows, std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1));
-    if (model_mtp_ || lookup > 0) {
+    // (--draft dflash2: DFlash2's windows, draft_windows.  Those past what the MTP layer and the lookup need are the
+    // drafter's, as set_window_drafts' are: set_window_drafts may free them, n_snap_load_ marks where they start)
+    const int widest = std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1;
+    const int lookup = opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? widest : 0;
+    const int beside = std::min(opt_.draft_windows, widest);
+    if (model_mtp_ || lookup > 0 || beside > 0) {
         if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kVerifyMaxT + 1});
         n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
-        n_snap_ = std::max(n_mtp_, lookup);
+        n_snap_load_ = std::max(n_mtp_, lookup);
+        n_snap_ = std::max(n_snap_load_, beside);
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
         for (size_t g = 0; g < gdn_state_.size(); ++g)
@@ -1200,11 +1204,14 @@ bool PlainModel::load_qwen(std::string& err) {
                 float *st = nullptr, *cv = nullptr;
                 if (!strata::gpu::alloc_device(&st, (size_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state) * 4) ||
                     !strata::gpu::alloc_device(&cv, (size_t) (C * (s.ssm_d_conv - 1)) * 4)) {
+                    strata::gpu::free(st);
                     err = "plain model: no VRAM for the recurrent states' copies (--spec)";
                     return false;
                 }
-                allocs_.push_back(st);
-                allocs_.push_back(cv);
+                if (t < n_snap_load_) {
+                    allocs_.push_back(st);
+                    allocs_.push_back(cv);
+                }
                 gdn_snap_[g].push_back(st);
                 conv_snap_[g].push_back(cv);
             }
@@ -4131,7 +4138,7 @@ uint64_t PlainModel::window_drafts_bytes(int drafts) const {
 bool PlainModel::set_window_drafts(int drafts, std::string& err) {
     if (!next_.empty()) { err = "plain model: more window drafts on a layer split"; return false; }
     if (n_snap_load_ < 0) n_snap_load_ = n_snap_;
-    drafts = std::max(drafts, n_snap_load_);   // never fewer than the load's (the MTP layer's windows)
+    drafts = std::max(drafts, n_snap_load_);   // never fewer than the MTP layer's and the lookup's (the load's own)
     drafts = std::min(drafts, std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1);
     if (glm_) drafts = std::min(drafts, k::kGlm5MaxSnaps);
     if (drafts == n_snap_) return true;

@@ -269,6 +269,8 @@ bool PlainModel::load_glm5(std::string& err) {
     if (model_mtp_ || opt_.draft_windows > 0) {   // (--draft dflash2: its windows' copies)
         if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kGlm5MaxSnaps + 1});
         n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
+        // those past the MTP layer's are the drafter's (load_qwen's rule: set_window_drafts may free them)
+        n_snap_load_ = n_mtp_;
         n_snap_ = std::max(n_mtp_, std::min({opt_.draft_windows, opt_.max_t - 1, k::kGlm5MaxSnaps}));
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
@@ -276,11 +278,14 @@ bool PlainModel::load_glm5(std::string& err) {
             for (int t = 0; t < n_snap_ && gdn_state_[g] != nullptr; ++t) {
                 float *st = nullptr, *cv = nullptr;
                 if (!strata::gpu::alloc_device(&st, state_bytes_) || !strata::gpu::alloc_device(&cv, conv_bytes_)) {
+                    strata::gpu::free(st);
                     err = "plain model: no VRAM for the KDA states' copies (--spec)";
                     return false;
                 }
-                allocs_.push_back(st);
-                allocs_.push_back(cv);
+                if (t < n_snap_load_) {
+                    allocs_.push_back(st);
+                    allocs_.push_back(cv);
+                }
                 gdn_snap_[g].push_back(st);
                 conv_snap_[g].push_back(cv);
             }

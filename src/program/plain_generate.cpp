@@ -600,12 +600,13 @@ struct PlainDrafters {
     std::string pack;
     bool deferred = false;   ///< auto: loaded at the end of the --serve start, to be measured
     bool loaded = false;
+    bool borrowed = false;   ///< the expert tier gave up room for the 16-row windows' copies (give_back)
     int window = strata::core::Dflash2Drafter::kRows;   ///< the anchor and its drafts, as far as the model's copies allow
 
     /// The pack must be the model's (its hidden size, its vocabulary, its taps inside the layers); then loaded on
     /// the model's GPU, bound to its embedding (a row at a time on the host) and its head (the drafts' subset, or the
     /// whole head), the windows' recurrent copies grown for its windows, its graphs captured on the window's taps.
-    /// `keep_free`: the VRAM the copies the load did not make must leave free (auto: loaded after the tier).
+    /// `keep_free`: the VRAM the copies the load did not make must leave free (the reserve).
     bool load(strata::core::PlainModel& model, const std::string& arch, std::string& err, uint64_t keep_free = 0) {
         const strata::ModelSpec& s = model.spec();
         if (shape.hidden != s.n_embd || shape.vocab != model.vocab() ||
@@ -633,17 +634,31 @@ struct PlainDrafters {
             df2.release();
             return false;
         }
-        // the windows' recurrent copies for the rows the drafter is sized for (--draft dflash2: the load made them
-        // before the tier); after the tier (auto), only as many as fit beside keep_free: the 16-row window's, else the
-        // 8-row window's, else the MTP layer's.  An allocation the driver refuses is not tried (ROCm says each refusal
-        // as an error: an RX 9060 XT at 32K asked for the 16-row window's after the tier, 2026-11-15)
+        // the windows' recurrent copies for the rows the drafter is sized for, beside keep_free: the 16-row window's
+        // (the expert tier gives up their room where it can: --vram-elastic, the default of --serve; given back when
+        // the 8-row window measures faster, give_back), else the 8-row window's, else the MTP layer's.  An allocation
+        // the driver refuses is not tried (ROCm says each refusal as an error: an RX 9060 XT at 32K asked for the 16-row
+        // window's after the tier, 2026-11-15)
         size_t fb = 0, tb = 0;
         strata::gpu::mem_info(&fb, &tb);
         const auto fits = [&](int d) { return model.window_drafts_bytes(d) + keep_free <= (uint64_t) fb; };
         const int widest = df2.capacity_rows() - 1;
+        std::string e;
+        if (!fits(widest) && model.vram_elastic()) {
+            const int64_t slots0 = model.slots();
+            std::string answer;
+            const int64_t want_mib = (int64_t) ((model.window_drafts_bytes(widest) + keep_free) >> 20) + 1;
+            if (!model.vram(want_mib, answer, e)) {
+                std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), e.c_str());
+            } else {
+                borrowed = true;
+                std::fprintf(stderr, "xestrata (%s): the 16-row windows' copies: the expert tier %lld -> %lld slots\n",
+                             arch.c_str(), (long long) slots0, (long long) model.slots());
+            }
+            strata::gpu::mem_info(&fb, &tb);
+        }
         const int drafts = fits(widest) ? widest : fits(strata::core::Dflash2Drafter::kDrafts)
                                                        ? strata::core::Dflash2Drafter::kDrafts : model.window_drafts();
-        std::string e;
         if (drafts < widest)
             std::fprintf(stderr, "xestrata (%s): DFlash2's windows of %d rows: the recurrent states' copies for %d take "
                                  "%llu MiB, %llu are free\n", arch.c_str(), drafts + 1, widest + 1,
@@ -685,6 +700,15 @@ struct PlainDrafters {
         model.taps_off();
         std::string e;
         model.set_window_drafts(0, e);
+        give_back(model);
+    }
+    /// The expert tier that gave up its room for the 16-row windows' copies grows back (vram: to the reserve it
+    /// started with) once they are freed
+    void give_back(strata::core::PlainModel& model) {
+        if (!borrowed) return;
+        borrowed = false;
+        std::string e, answer;
+        if (!model.vram(-1, answer, e)) std::fprintf(stderr, "xestrata plain: %s\n", e.c_str());
     }
 };
 
@@ -1069,11 +1093,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         strata::spec::Drafter keep = v.measured ? v.keep : model.drafts() > 0 ? strata::spec::Drafter::Mtp
                                                                              : strata::spec::Drafter::Df2;
         // DFlash2 kept only where the VRAM it took from the reserve leaves the reserve the start had (a long prompt's
-        // buffers come out of it)
+        // buffers come out of it).  Not --draft dflash2's: it was loaded before the tier, which was sized around it, so
+        // it took nothing from the reserve; dropped, the run had no drafter at all (RX 9060 XT, 1K and 32K, 2026-11-15)
         size_t fb = 0, tb = 0;
         strata::gpu::mem_info(&fb, &tb);
         const long long reserve = opt.reserve_mib >= 0 ? (long long) opt.reserve_mib : (long long) (tb >> 20) / 32;
-        if ((keep == strata::spec::Drafter::Df2) && free_during < reserve) {
+        if (keep == strata::spec::Drafter::Df2 && dr.deferred && free_during < reserve) {
             std::fprintf(stderr, "xestrata (%s): the drafter is not kept: with it %lld MiB of VRAM stay free, less than the "
                                  "%lld MiB reserve\n", arch.c_str(), free_during, reserve);
             keep = model.drafts() > 0 ? strata::spec::Drafter::Mtp : strata::spec::Drafter::None;
@@ -1090,6 +1115,24 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         if (dr.loaded) {
             dr.deferred = false;
             draft_rule = "df2";
+        }
+        // the 8-row window measured faster: the 16-row window's recurrent copies go back, and the expert tier that
+        // gave up their room grows back into it; no VRAM is kept for windows that are not taken (RX 9060 XT,
+        // Qwen3.6-35B-A3B, 32K: 8 rows 66.6 tok/s, 16 rows 63.8, 2026-11-15)
+        if (dr.loaded && v.measured && block_selected == 0 && dr.window > strata::core::Dflash2Drafter::kRows) {
+            const long long f0 = free_mib();
+            const int64_t slots0 = model.slots();
+            std::string e;
+            if (!model.set_window_drafts(strata::core::Dflash2Drafter::kDrafts, e)) {
+                std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), e.c_str());
+            } else {
+                dr.window = strata::core::Dflash2Drafter::kRows;
+                const long long back = free_mib() - f0;
+                dr.give_back(model);
+                std::fprintf(stderr, "xestrata (%s): DFlash2 drafts in 8-row windows: the 16-row windows' copies given "
+                                     "back (%lld MiB), the expert tier %lld -> %lld slots\n", arch.c_str(), back,
+                             (long long) slots0, (long long) model.slots());
+            }
         }
         drafting_off = keep == strata::spec::Drafter::None;
         if (keep == strata::spec::Drafter::Mtp && v.spec > 0) model.set_mtp_drafts(v.spec - 1);
@@ -3106,7 +3149,10 @@ int plain_main(int argc, char** argv) {
         // is left (loaded after it, a 12 GB RTX 4070 had no room for its buffers, the B70 was left 17 MiB free and a
         // 16 GB RX 9060 XT ended before READY at 32K)
         opt.spec = 0;
-        opt.draft_windows = dr.df2.capacity_rows() - 1;   // the 16-row window's where it may be taken
+        // the 8-row window's copies before the tier; the 16-row window's only where it is asked for (--wide-window on):
+        // under auto the tier gives up their room while they are measured and keeps it only where they are faster
+        opt.draft_windows = strata::core::wide_window() == strata::core::WideWindow::On
+                                ? dr.df2.capacity_rows() - 1 : strata::core::Dflash2Drafter::kDrafts;
         if (!dr.df2.load(dr.pack, 0, err)) {
             size_t fb = 0, tb = 0;
             strata::gpu::mem_info(&fb, &tb);
@@ -3172,7 +3218,12 @@ int plain_main(int argc, char** argv) {
         folder.dir.clear();
     }
     // --draft dflash2: the pack beside the loaded model, its windows' recurrent copies, its head and embedding
-    if (!dr.pack.empty() && !dr.deferred && !dr.load(model, arch, err)) return start_failed(err);
+    if (!dr.pack.empty() && !dr.deferred) {   // the reserve stays free beside the 16-row windows' copies
+        size_t fb = 0, tb = 0;
+        strata::gpu::mem_info(&fb, &tb);
+        const uint64_t reserve = opt.reserve_mib >= 0 ? (uint64_t) opt.reserve_mib << 20 : (uint64_t) tb / 32;
+        if (!dr.load(model, arch, err, reserve)) return start_failed(err);
+    }
     if (serve)
         return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache,
                            folder, cvecs, dr);

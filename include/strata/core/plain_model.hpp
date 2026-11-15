@@ -1246,7 +1246,8 @@ private:
     float* ptap_dev_ = nullptr;        ///< [ptap_cap_][ntap][n_embd] the prompt's taps (set_prompt_taps)
     int64_t ptap_cap_ = 0, ptap_first_ = 0;
     std::function<bool(const float*, int64_t, int64_t, std::string&)> prompt_taps_;
-    int n_snap_load_ = -1;             ///< the copies the load made (set_window_drafts frees only those after them)
+    int n_snap_load_ = -1;             ///< the copies the model itself needs (the MTP layer's, the lookup's); those after
+                                       ///< them are the drafter's, not in allocs_: set_window_drafts may free them
     int n_mtp_load_ = -1;              ///< the MTP layer's drafts the load set (set_mtp_drafts goes no higher)
     size_t mtp_allocs_[2] = {0, 0};    ///< allocs_[0] .. [1]: the MTP layer's own weights (release_mtp)
     bool frozen_ = false;              ///< set_frozen (the root's)
