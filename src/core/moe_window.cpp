@@ -289,7 +289,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
                 auto& q = strata::core::Runtime::get().compute();
                 const size_t blob_b = (size_t) lay.blob_bytes(0);
                 uint8_t* blob = sycl::malloc_device<uint8_t>(blob_b, q);
-                float* out = sycl::malloc_device<float>((size_t) (cap_t * ELL), q);
+                float* out = sycl::malloc_device<float>((size_t) (cap_t * std::max(ELL, GN)), q);
                 float* yl = sycl::malloc_device<float>((size_t) (cap_t * ELL), q);
                 int32_t* ids = sycl::malloc_device<int32_t>((size_t) cap_t, q);
                 unsigned long long* gp = sycl::malloc_device<unsigned long long>(1, q);
@@ -362,6 +362,9 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             else lat_a_mode8_ = pick.first;
             if (u_env >= 0) lat_u_mmu_ = u_env == 1;
             else lat_u_mmu_ = pick.second;
+            std::fprintf(stderr, "xestrata: latent decode forms: A %s, U %s\n",
+                         lat_a_mode8_ == 0 ? "dp4a" : lat_a_mode8_ == 1 ? "mode8" : "default",
+                         lat_u_mmu_ ? "mmq" : "dp4a");
         }
     }
     set_plan_slot(0, 1);
