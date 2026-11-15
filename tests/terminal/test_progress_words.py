@@ -193,6 +193,25 @@ class CombinedFigure(unittest.TestCase):
             self.assertEqual(reader["state"], "downloading")
             self.assertLess(out["download"]["percent"], 99)
 
+    def test_after_the_download_every_file_stays_counted_and_the_figure_is_whole(self):
+        """DL99: from step 6 on the parts were dropped, so the app counted the engine's part alone ("99% · 0.7 / 0.7 GB"). Every file is in:
+        the parts stay, all done, and the figure is 100."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            files = self._qwen36_files(Path(tmp), reader_done=True)
+            job = {"folder": tmp, "total_gb": 22.9, "files": files}
+            for lines in (HEAD + STEP5 + STEP6, HEAD + STEP5 + STEP6 + ["=== Step 7: writing the start script ==="]):
+                out = strata_mcp.combined_progress(strata_mcp.install_progress(lines), job)
+                self.assertEqual([(p["kind"], p["state"]) for p in out.get("parts", [])], [("model", "done"), ("vision", "done")])
+                self.assertEqual(out["download"]["percent"], 100)
+                self.assertAlmostEqual(out["download"]["total_gb"], 23.753, places=2)
+            # while a file is still missing the figure stays below 100
+            Path(files[1]["path"]).rename(files[1]["path"] + ".part")
+            out = strata_mcp.combined_progress(strata_mcp.install_progress(HEAD + STEP5 + [MODEL_PROGRESS]), job)
+            self.assertLessEqual(out["download"]["percent"], 99)
+            # before the download step nothing is counted
+            self.assertNotIn("parts", strata_mcp.combined_progress(strata_mcp.install_progress(HEAD), job))
+
 
 if __name__ == "__main__":
     unittest.main()

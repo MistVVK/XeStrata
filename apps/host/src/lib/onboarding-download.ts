@@ -1,6 +1,7 @@
 export interface DownloadProgress {percent?:number;done_gb?:number;total_gb?:number;remaining_gb?:number;file?:string}
 /** The native installer reports each shard, not whole-model progress. */
 export function downloadCounter(size:number|undefined,progress:DownloadProgress|undefined,running:boolean){
+ if(running&&progress?.file==='checking files')return {value:undefined,label:'Preparing files…',key:'preparing'};   // nothing is downloaded while setup checks the files (DL99)
  if(running&&progress){
   if(Number.isFinite(progress.remaining_gb))return {value:Math.max(0,progress.remaining_gb!),label:'GB left to download',key:'total'};
   if(Number.isFinite(progress.total_gb)&&Number.isFinite(progress.done_gb))return {value:Math.max(0,progress.total_gb!-progress.done_gb!),label:'GB left in this file',key:progress.file??'file'};

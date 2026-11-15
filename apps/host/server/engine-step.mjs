@@ -86,8 +86,9 @@ export function createEngineStep({ control, signal = null, onChange = () => {} }
       { ...part },
     ];
     const merged = { ...install, engine: { ...part }, parts };
-    if (model) {
-      const done = round((modelDone ?? 0) + (part.state === 'pending' || part.state === 'checking' ? 0 : part.done_gb));
+    // setup checking files that are all on disk: its figure is the check's, the engine's bytes are not part of it (DL99)
+    if (model && model.file !== 'checking files') {
+      const done =round((modelDone ?? 0) + (part.state === 'pending' || part.state === 'checking' ? 0 : part.done_gb));
       const remaining = round((modelRemaining ?? 0) + (part.state === 'pending' || part.state === 'checking' ? 0 : engineRemaining));
       const total = done + remaining;
       merged.download = { ...model, done_gb: done, remaining_gb: remaining, percent: total > 0 ? Math.min(100, Math.round(100 * done / total)) : model.percent,

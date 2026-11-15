@@ -1598,7 +1598,8 @@ def files_progress(prog: dict, job: dict, files: list) -> dict:
     prog["download"] = {"file": "picture reader" if active and active["kind"] == "vision" else "model files",
                         "done_gb": round(done_gb, 3), "total_gb": round(total_gb, 3),
                         "remaining_gb": round(max(0.0, total_gb - done_gb), 3),
-                        "percent": min(99, int(100 * done_gb / total_gb)) if total_gb else 0}
+                        # 100 only when every file is whole (DL99: the bar stopped at 99% with everything in)
+                        "percent": (100 if all(x["state"] == "done" for x in parts) else min(99, int(100 * done_gb / total_gb))) if total_gb else 0}
     prog["parts"] = parts
     return prog
 
@@ -1638,7 +1639,8 @@ def combined_progress(prog: dict, job: dict) -> dict:
         prog["download"] = {"file": "checking files", "done_gb": dl["done_gb"], "total_gb": dl["total_gb"],
                             "remaining_gb": round(max(0.0, dl["total_gb"] - dl["done_gb"]), 3), "percent": int(dl["percent"])}
         return prog
-    if job.get("files") and step.startswith("5/"):      # the install knows its files: count each of them
+    if job.get("files") and step.startswith(("5/", "6/", "7/")):   # the install knows its files: count each of them, also after the download
+        # (DL99: from step 6 on the parts were dropped and the app counted the engine's part alone, "99% · 0.7 / 0.7 GB")
         return files_progress(prog, job, job["files"])
     if not folder or not total or not step.startswith("5/"):
         prog.pop("download", None)

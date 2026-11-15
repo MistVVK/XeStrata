@@ -33,3 +33,27 @@ test('DL99: the wizard says what setup is doing (its own sentence), not "Downloa
   const waiting = { running: true, phase: 'waiting', label: 'Waiting for huggingface.co to answer (25 s so far)', parts: [model('downloading', 0)] };
   assert.equal(lib.guidedStatusText(waiting, lib.installProgress(waiting)), 'Waiting for huggingface.co to answer (25 s so far)');
 });
+
+test('DL99: the model check shows its own figure, not a frozen 96%; the counter does not call it "left to download"', () => {
+  const step = createEngineStep({ control: null });
+  const checking = { running: true, step: '5/7: downloading', label: 'Checking…',
+    download: { file: 'checking files', done_gb: 4.13, total_gb: 22.85, remaining_gb: 18.72, percent: 18 },
+    parts: [model('done', 22.854), reader('waiting', 0)] };
+  const p = lib.installProgress(step.merge(checking));
+  assert.equal(p.percent, 18);
+  assert.ok(Math.abs(p.done_gb - 4.13) < 0.01 && Math.abs(p.total_gb - 22.85) < 0.01, JSON.stringify(p));
+  const counter = lib.downloadCounter(23.8, p, true);
+  assert.notEqual(counter.label, 'GB left to download');
+});
+
+test('DL99: once every file is in, the bar says 100%, not 99% (and never 0.7 / 0.7 GB of the engine alone)', () => {
+  const done = { running: true, step: '6/7: preparing the model for Strata', label: 'Preparing the tokenizer',
+    parts: [model('done', 22.854), reader('done', 0.899), engineDone] };
+  const p = lib.installProgress(done);
+  assert.equal(p.percent, 100);
+  assert.ok(p.total_gb > 24, JSON.stringify(p));
+  const still = lib.installProgress({ parts: [model('done', 22.854), reader('downloading', 0.6), engineDone] });
+  assert.ok(still.percent < 100 && still.percent >= 96, JSON.stringify(still));
+  const almost = lib.installProgress({ parts: [model('downloading', 22.85), reader('done', 0.899)] });
+  assert.equal(almost.percent, 99, 'a part still downloading stays below 100');
+});

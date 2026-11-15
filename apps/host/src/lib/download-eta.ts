@@ -43,11 +43,18 @@ export function useDownloadEta(download: { done_gb?: number; remaining_gb?: numb
  *  the job's combined `download` fields ({done_gb, total_gb, remaining_gb, percent}) are used as they are. */
 export interface InstallParts { parts?: { done_gb?: number; total_gb?: number; state?: string }[]; download?: { done_gb?: number; total_gb?: number; remaining_gb?: number; percent?: number; file?: string } }
 export function installProgress(install: InstallParts | undefined): { done_gb: number; total_gb: number; remaining_gb: number; percent: number; file?: string } | undefined {
-  const parts = (install?.parts ?? []).filter(p => Number.isFinite(p.total_gb) && (p.total_gb ?? 0) > 0 && p.state !== 'skipped' && p.state !== 'current');
+  /* setup is checking files that are all on disk (strata_mcp combined_progress: file "checking files"): the check's own figure, not the
+     parts' (which stood at 96% for the whole check, DL99) */
+  const check = install?.download;
+  if (check?.file === 'checking files' && Number.isFinite(check.done_gb) && Number.isFinite(check.total_gb) && (check.total_gb ?? 0) > 0)
+    return { done_gb: check.done_gb!, total_gb: check.total_gb!, remaining_gb: Math.max(0, check.total_gb! - check.done_gb!), percent: Math.min(100, Math.max(0, check.percent ?? Math.floor(100 * check.done_gb! / check.total_gb!))), file: check.file };
+  const parts =(install?.parts ?? []).filter(p => Number.isFinite(p.total_gb) && (p.total_gb ?? 0) > 0 && p.state !== 'skipped' && p.state !== 'current');
   if (parts.length) {
     const total = parts.reduce((n, p) => n + (p.total_gb ?? 0), 0);
     const done = Math.min(total, parts.reduce((n, p) => n + Math.min(p.done_gb ?? 0, p.total_gb ?? 0), 0));
-    return { done_gb: done, total_gb: total, remaining_gb: Math.max(0, total - done), percent: Math.min(99, Math.floor(100 * done / total)), file: install?.download?.file };
+    // 100 once every part is whole (the engine's too); 99 at most while one is still coming
+    const whole = parts.every(p => p.state === 'done');
+    return { done_gb: done, total_gb: total, remaining_gb: Math.max(0, total - done), percent: whole ? 100 : Math.min(99, Math.floor(100 * done / total)), file: install?.download?.file };
   }
   const d = install?.download;
   if (d && Number.isFinite(d.done_gb) && Number.isFinite(d.total_gb)) return { done_gb: d.done_gb!, total_gb: d.total_gb!, remaining_gb: Number.isFinite(d.remaining_gb) ? d.remaining_gb! : Math.max(0, d.total_gb! - d.done_gb!), percent: d.percent ?? 0, file: d.file };
