@@ -114,7 +114,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は intel/llvm v7.2.0 に対して 16 です。v7.1.1 に当てていた 16 のうち、libclc の AMD の対象名の修正は v7.2.0 で libclc の作りが変わっていらなくなり、AMD の FMA の修正は v7.2.0 で直っていました（2026-10-22）。
+  今の修正は intel/llvm v7.2.0 に対して 20 です。v7.1.1 に当てていた 16 のうち、libclc の AMD の対象名の修正は v7.2.0 で libclc の作りが変わっていらなくなり、AMD の FMA の修正は v7.2.0 で直っていました（2026-10-22）。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムが、どの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
@@ -169,8 +169,11 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   AMDGPU の属性推論はその前に走り、この呼び出しを中身の分からない関数と見なしたので、そうしたカーネルはどれも暗黙の引数を全部、hostcall のバッファーも含めて持っていました（XeStrata 0.2.2 の AMD 向けのカーネル 32,556 のうち 14,304。v7.1.1 では 48,084 のうち 0）。
   HIP は、PCIe の atomic 操作が通らない GPU（仮想マシンに渡した GPU、チップセットの先のスロットの GPU）では hostcall のバッファーを持つカーネルを起動しないので、最初のカーネルが `hipErrorIllegalState` で止まっていました（XeStrata の issue #40 と #54）。
   修正後は、属性推論がこの組み込み関数を暗黙の引数を読まないものとして扱います（`amdgpu-global-offset-hostcall`）。
+  20 番目: RDC なし（`-fno-sycl-rdc`）のリンクでは、静的ライブラリのデバイスコードはライブラリの中のオブジェクトごとに `sycl-post-link` を通り、その出力はファイルの表のリストになります。
+  SPIR-V の経路は表ごとにコードの列を取り出してリストと表をまとめますが、NVIDIA と AMD の経路はリストそのものからコードの列を取り出そうとしたので、NVIDIA か AMD の GPU 向けの SYCL のコードを持つ静的ライブラリを使うプログラムは、どれもリンクが「column not found Code」で止まっていました。
+  修正後は、その経路も SPIR-V の経路と同じく取り出してまとめます（`offload-nordc-archive`）。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正と `amdgpu-global-offset-hostcall` は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
-  `offload-bundle-arch` と `l0-static-graph` はどのツールチェーンにも作り直しを求めます。
+  `offload-bundle-arch`・`l0-static-graph`・`offload-nordc-archive` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
 - NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。

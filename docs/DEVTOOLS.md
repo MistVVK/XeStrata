@@ -114,7 +114,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are sixteen fixes now, for intel/llvm v7.2.0. Of the sixteen v7.1.1 took, libclc's AMD target name is no longer needed, libclc being built otherwise since v7.2.0, and the AMD FMA is fixed in v7.2.0 (2026-10-22).
+  There are twenty fixes now, for intel/llvm v7.2.0. Of the sixteen v7.1.1 took, libclc's AMD target name is no longer needed, libclc being built otherwise since v7.2.0, and the AMD FMA is fixed in v7.2.0 (2026-10-22).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -169,8 +169,11 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   The AMDGPU attributor runs before that and took the call as an unknown callee, so every such kernel kept all the implicit inputs, the hostcall buffer among them (14,304 of XeStrata 0.2.2's 32,556 AMD kernels; 0 of 48,084 with v7.1.1).
   HIP launches no kernel with a hostcall buffer on a GPU without PCIe atomics (one passed through to a virtual machine, or in a slot behind a chipset), so the first kernel stopped with `hipErrorIllegalState` (XeStrata's issues #40 and #54).
   Fixed, the attributor takes the builtin as reading no implicit argument (`amdgpu-global-offset-hostcall`).
+  Twentieth, linked without RDC (`-fno-sycl-rdc`), a static library's device code goes through `sycl-post-link` once per object in it, and the output is a list of file tables.
+  The SPIR-V path extracts the code column of each table and merges the lists and the tables; the NVIDIA and AMD path extracted the code column from the list itself, so every link of a program with a static library of SYCL code for an NVIDIA or AMD GPU stopped with "column not found Code".
+  Fixed, that path extracts and merges as the SPIR-V one does (`offload-nordc-archive`).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones and `amdgpu-global-offset-hostcall` only a toolchain with HIP (or one that would have it, ROCm being installed now).
-  `offload-bundle-arch` and `l0-static-graph` ask every toolchain.
+  `offload-bundle-arch`, `l0-static-graph` and `offload-nordc-archive` ask every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).

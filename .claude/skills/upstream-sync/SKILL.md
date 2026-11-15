@@ -215,8 +215,8 @@ The license check needs upstream's tag in the clone (step 1's fetch); without it
 
 As AGENTS.md says, with intel/llvm only, in the free and contrib-llvm modes:
 
-- on the development machine, build and run CTest in `build/free` (without oneAPI's environment) and `build/contrib-llvm`;
-- in the AMD container, its contrib-llvm build with HIP (`STRATA_HIP_ARCHS`), and CTest;
+- on the development machine, build and run CTest in `build/free` (without oneAPI's environment) and `build/contrib-llvm`, all of it, the slow tests too (`ctest -j$(nproc)`);
+- in the AMD container, its contrib-llvm build with HIP (`STRATA_HIP_ARCHS`), and CTest likewise;
 - the Windows cross build (docs/DEVTOOLS.md, Windows cross build), whole and linked: no new warnings;
 - a change NVIDIA's device compile sees is run on the RTX 4070.
 
