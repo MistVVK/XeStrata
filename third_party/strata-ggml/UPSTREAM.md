@@ -59,8 +59,8 @@ folder (an override kept for two releases, then removed).
    (`GGML_COMMON_IMPL_METAL` also opens `iq1s_grid`; line 1134), row `edited` below. `third_party/ggml/ggml-common.h` is now a one-line forwarder to it, kept for two
    releases, so every `#include "ggml-common.h"` is unchanged. The Metal runtime reads this file's TEXT (`metal/src/resource_path.h`: `<exe>/metal/strata-quant-common.h`,
    else the old name beside the executable, else the compiled-in path) and the Mac package ships `metal/strata-quant-common.h` plus a full-text copy as
-   `metal/ggml-common.h` for two releases. `ggml/src/ggml-common.h` of this tree stays llama.cpp's own (ggml-cpu includes it). The dpct-migrated SYCL-mode copy moved the same
-   way (`sycl/third_party/ggml/strata-quant-common.h`, a forwarder under the old name); the SYCL build includes the shared header, not that copy.
+   `metal/ggml-common.h` for two releases. `ggml/src/ggml-common.h` of this tree stays llama.cpp's own (ggml-cpu includes it). The dpct-migrated SYCL-mode copy
+   (`sycl/third_party/ggml`) was deleted in 0.2.15: the SYCL build includes the shared header, and nothing read that copy.
 
 ## Updating
 

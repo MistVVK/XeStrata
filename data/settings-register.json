@@ -24638,8 +24638,7 @@
    "backends": [
     "cuda",
     "cuda-hip",
-    "hip",
-    "sycl"
+    "hip"
    ],
    "reads": [
     {
@@ -24772,18 +24771,6 @@
      "file": "src/qwen35/q36_engine.cu",
      "line": 3965,
      "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused.dp.cpp",
-     "line": 950,
-     "backend": "sycl",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused.dp.cpp",
-     "line": 961,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
@@ -24963,8 +24950,7 @@
    "name": "STRATA_PF_FUSED_KQ",
    "backends": [
     "cuda",
-    "cuda-hip",
-    "sycl"
+    "cuda-hip"
    ],
    "reads": [
     {
@@ -24983,12 +24969,6 @@
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2536,
      "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused_iq.dp.cpp",
-     "line": 1220,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
@@ -25026,20 +25006,13 @@
   {
    "name": "STRATA_PF_FUSED_NATIVE",
    "backends": [
-    "cuda-hip",
-    "sycl"
+    "cuda-hip"
    ],
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2893,
      "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused_iq.dp.cpp",
-     "line": 1365,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
@@ -25462,20 +25435,13 @@
   {
    "name": "STRATA_PF_FUSED_TILE",
    "backends": [
-    "cuda-hip",
-    "sycl"
+    "cuda-hip"
    ],
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2806,
      "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused_iq.dp.cpp",
-     "line": 1352,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
@@ -25907,8 +25873,7 @@
   {
    "name": "STRATA_PF_OCC",
    "backends": [
-    "hip",
-    "sycl"
+    "hip"
    ],
    "reads": [
     {
@@ -25921,18 +25886,6 @@
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2353,
      "backend": "hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused.dp.cpp",
-     "line": 845,
-     "backend": "sycl",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused_iq.dp.cpp",
-     "line": 1163,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
