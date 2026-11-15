@@ -124,8 +124,6 @@
     "cpu",
     "--experimental-speed-projection",
     "off",
-    "--drafter",
-    "dflash2",
     "--data-dir",
     "<ROOT>/data"
    ],

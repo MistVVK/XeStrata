@@ -82,13 +82,15 @@ class ModelState:
 HELPER_FAMILIES = ("qwen", "swift", "coder", "unsloth", "gyro")
 
 
-def resolved_drafting(drafting: str | None, family: str | None) -> str:
+def resolved_drafting(drafting: str | None, family: str | None, *, model_name: str | None = None, args: list | None = None,
+                      vram_mib: float | None = None) -> str:
     """The drafter a choice means for this family on this computer: ``dflash2`` | ``mtp`` | ``off`` (strata_control/drafting.py: Auto is DFlash2 where the engine
-    has it). Never raises; an unknown computer is the MTP."""
+    has it). ``model_name`` / ``args`` / ``vram_mib``: the model's set and the card signals the start's decision reads (runner.auto_signals; the 12 GB card with
+    IQ3_S is the MTP). Never raises; an unknown computer is the MTP."""
     try:
         from strata_control import drafting as _d
         backend, archs = _d.detect_hardware()
-        return _d.choice_of(drafting, family=family, backend=backend, archs=archs)
+        return _d.choice_of(drafting, family=family, backend=backend, archs=archs, model_name=model_name, args=args, vram_mib=vram_mib)
     except Exception:                                        # noqa: BLE001
         return "mtp"
 

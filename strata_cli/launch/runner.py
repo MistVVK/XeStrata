@@ -318,6 +318,37 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
     return cfg
 
 
+def card_signals(cfg: dict, gpus: Any, want: dict) -> dict:
+    """Runner.drafting_signals for a run config and the launch's cards ``gpus``: the arguments with the person's own options over them, and the ONE card's memory."""
+    try:
+        from strata_control import drafting, user_args
+        args = [str(a) for a in cfg.get("args") or []]
+        if cfg.get("user_args"):
+            args = user_args.merge(args, cfg["user_args"])
+        run = {**cfg, "gpu": [int(g) for g in gpus] if gpus else cfg.get("gpu")}
+        return {"args": args, "vram_mib": drafting.card_vram_mib(run, want.get("backend"), want.get("archs"))}
+    except Exception:                                    # noqa: BLE001 - no signal means the tuned pack is not fetched
+        return {"args": [], "vram_mib": None}
+
+
+def auto_signals(catalog, s: S.LaunchSettings, family: str | None) -> dict:
+    """What the start's drafting decision reads besides the choice (drafting_inputs / drafting_signals): the model's set and the card signals of the installed config
+    (or none yet) with this launch's context and cards. With them, what setup is told to fetch and what the plan lists are the drafter the start runs: on the 12 GB
+    card with IQ3_S Auto is the MTP (drafting.CLASS_DEFAULTS); without them setup was told DFlash2, skipped the draft layer, and the start had no drafter (0.2.14
+    real-use run). A Mac's setup decides its draft layer itself (metal/setup_mac.py): nothing. Never raises."""
+    if sys.platform == "darwin":
+        return {}
+    try:
+        from strata_control import drafting
+        path = catalog.installed_config(catalog.tag_of(s.family, s.model))
+        cfg = apply_choices(read_config(path) if path is not None else {}, s)
+        backend, archs = drafting.detect_hardware()
+        return {"model_name": cfg.get("model_name") or catalog.model_name_of(family, s.model),
+                **card_signals(cfg, s.gpus, {"backend": backend, "archs": archs})}
+    except Exception:                                    # noqa: BLE001 - no signal: Auto as before
+        return {}
+
+
 def apply_cards(cfg: dict, gpus: "list[int] | dict | None") -> None:
     """The graphics cards of THIS launch go into its run config, whatever card the model was installed with (no reinstall): one card is a number,
     several are a list with the automatic layer split. None: the installed config's own choice stays.  A dict is the roles of every card
@@ -1476,7 +1507,7 @@ class Runner:
         from strata_control import drafting
         if self.feed_without_draft_layer(family):            # the model list says this model has no draft layer: no drafter is planned or fetched for it (G14, APP-LIN 0.2.14)
             return "off"
-        r = modelstate.resolved_drafting(self.s.drafting, family)
+        r = modelstate.resolved_drafting(self.s.drafting, family, **auto_signals(self.catalog, self.s, family))
         if r == "dflash2" and drafting.normalize(self.s.drafting) == "auto" and self.split_expected():
             return "mtp"
         return r
@@ -1557,15 +1588,7 @@ class Runner:
     def drafting_signals(self, cfg: dict, want: dict) -> dict:
         """The two signals drafting.tuned_applies reads besides the backend and the card: the arguments (--expert-cache and the others the confidence reads, with the person's own
         options over them as the server merges them) and the memory of the ONE card this launch uses (None: several cards, a shared-memory chip, or not readable)."""
-        try:
-            from strata_control import drafting, user_args
-            args = [str(a) for a in cfg.get("args") or []]
-            if cfg.get("user_args"):
-                args = user_args.merge(args, cfg["user_args"])
-            run = {**cfg, "gpu": [int(g) for g in self.s.gpus] if self.s.gpus else cfg.get("gpu")}
-            return {"args": args, "vram_mib": drafting.card_vram_mib(run, want.get("backend"), want.get("archs"))}
-        except Exception:                                    # noqa: BLE001 - no signal means the tuned pack is not fetched
-            return {"args": [], "vram_mib": None}
+        return card_signals(cfg, self.s.gpus, want)
 
     def one_request_for_dflash2(self, config: Path) -> bool:
         """DFlash2 chosen on purpose and the person gave no number of requests: one at a time, said once (drafting.wants_one_request)."""

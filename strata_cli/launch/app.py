@@ -20,7 +20,7 @@ from strata_cli.launch import params as P
 from strata_cli.launch import settings as S
 from strata_cli.launch import store
 from strata_cli.launch.catalog import Catalog
-from strata_cli.launch.runner import Cancelled, Event, LaunchError, Result, Runner, read_config
+from strata_cli.launch.runner import Cancelled, Event, LaunchError, Result, Runner, auto_signals, read_config
 from strata_cli.launch.screens import (AccessScreen, AdvancedScreen, CardsScreen, ConfirmScreen, ContextScreen, DraftingScreen, FolderScreen,
                                        ModelScreen, ParallelScreen, PicturesScreen, RunScreen, SaveScreen, StartScreen,
                                        TuningScreen, flow_for)
@@ -109,7 +109,7 @@ class Ctx:
         s = self.settings
         return modelstate.assess(self.catalog, s.family, s.model, vision=s.vision, model_path=s.model_path,
                                  data_dir=data_dir if data_dir is not None else s.data_dir, rows=self.rows, mtp=s.mtp,
-                                 drafting=modelstate.resolved_drafting(s.drafting, s.family))
+                                 drafting=modelstate.resolved_drafting(s.drafting, s.family, **auto_signals(self.catalog, s, s.family)))
 
     def default_folder(self) -> Path:
         """The folder the Folder step starts with: where the chosen model already is (installed, or the person's own files with their
