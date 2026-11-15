@@ -719,19 +719,21 @@ struct Kernel {
     // loop's first barrier publishes them.
     void fx_tops(int lid, int lanes, int64_t row0, int64_t rows, int64_t m0, int64_t n0, const uint8_t* wx, int* ta,
                  int* tw) const {
-        const int64_t kb = K / 32, nw = K / Dec<TY>::QK;
+        const int64_t kb = K / 32;
         for (int rr = lid; rr < WM; rr += lanes) {
             int t = canon::kFxNone;
             if (m0 + rr < rows)
                 for (int64_t b = 0; b < kb; b += FXG) t = sycl::max(t, canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
             ta[rr] = m0 + rr < rows ? canon::fx_row_top(canon::fx_exp(xs[(row0 + m0 + rr) * kb]), t) : t;
         }
-        for (int nn = lid; nn < WN; nn += lanes) {
-            int t = canon::kFxNone;
-            const uint8_t* wr = wx + (size_t) (n0 + nn) * row_bytes;
-            for (int64_t b = 0; b < nw; ++b) t = sycl::max(t, canon::fx_exp(Dec<TY>::block_d(wr, (int) b)));
-            tw[nn] = canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wr, 0)), t);
-        }
+        if (tw == nullptr) return;
+        for (int nn = lid; nn < WN; nn += lanes) tw[nn] = fx_wtop(wx + (size_t) (n0 + nn) * row_bytes);
+    }
+    // FX: an output's top (of its blocks' d) over the whole of K, its weights' row at wr
+    Top fx_wtop(const uint8_t* wr) const {
+        int t = canon::kFxNone;
+        for (int64_t b = 0; b < K / Dec<TY>::QK; ++b) t = sycl::max(t, canon::fx_exp(Dec<TY>::block_d(wr, (int) b)));
+        return canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wr, 0)), t);
     }
     // FX: a group's integer scale from its activation scale and its d at a row and output's top
     static int32_t fx_a(float xsv, float wd, int top) {
@@ -768,13 +770,19 @@ struct Kernel {
         [[maybe_unused]] int32_t isum[FX ? RPT : 1];
         [[maybe_unused]] int64_t acc64[FX ? RPT : 1];
         [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
-        [[maybe_unused]] Top* tw = ta + WM;
+        // FX: this work-item's output's top in a register, not through local memory: in the B70's DP4a kernel (IGC
+        // 2.41.16) every output's top read there differed from the same computed again from global memory, while
+        // the rows' tops and the scales there were right, and every fixed-point check of iq_mmq_parity failed with
+        // XESTRATA_NO_XMX=1 (2026-11-16; the RTX 4070's and the RX 9060 XT's DP4a and the B70's XMX were right).
+        // Its own column's: K / QK d's
+        [[maybe_unused]] Top twn = (Top) canon::kFxNone;
         if constexpr (FX) {
             for (int i = 0; i < RPT; ++i) {
                 isum[i] = 0;
                 acc64[i] = 0;
             }
-            fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+            fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, nullptr);
+            twn = fx_wtop(wx + (size_t) (n0 + n) * row_bytes);
         }
         const int64_t kb = K / 32;   // activation scales a row
         for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
@@ -819,7 +827,7 @@ struct Kernel {
                     if constexpr (FX) {   // ws0 (ws1 FXH: the second 16's) the integer scale
                         isum[i] += FXH ? (int32_t) ws0 * s0 + (int32_t) ws1 * s1 : (int32_t) ws0 * (s0 + s1);
                         if ((k0 / 32 + b) % FXG == FXG - 1) {
-                            acc64[i] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, n), ta[rr] + tw[n]) *
+                            acc64[i] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, n), ta[rr] + twn) *
                                             isum[i];
                             isum[i] = 0;
                         }
@@ -834,7 +842,7 @@ struct Kernel {
             const int rr = rbase + i * RSTEP;
             const int64_t row = m0 + rr;
             float v = acc[i];
-            if constexpr (FX) v = fx_out(acc64[i], ta[rr] + tw[n]);
+            if constexpr (FX) v = fx_out(acc64[i], ta[rr] + twn);
             if (row < rows) out(ks, row0 + row, n0 + n, v);
         }
     }
