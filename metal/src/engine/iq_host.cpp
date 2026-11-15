@@ -13,7 +13,7 @@
 namespace strata::kernels {
 namespace {
 // agentionai's trellis types (Gyro): TQ2_T (144), TQK6 (145), TQK7 (146); 128 weights a block
-bool is_tq(int t) { return t == 144 || t == 145 || t == 146 || (t >= 147 && t <= 149); }
+bool is_tq(int t) { return t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149; }
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8;   // 14: Q6_K (Unsloth's Q5/Q6 gate/up)
