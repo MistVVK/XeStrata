@@ -87,12 +87,6 @@ std::vector<int> physical_cores(bool skip_first);
 void set_pool_cores(const std::vector<int>& cpus);
 const std::vector<int>& pool_cores_setting();
 
-/// XESTRATA_POOL_PLACE (auto / off / on): on a CPU whose cores are not all alike, choose the pool's workers between
-/// every physical core (the default) and the fast cores only, by a start-up measurement of their RAM read bandwidth
-/// (auto), or force one (off / on).  Returns the workers' cores; empty keeps the default placement.  `line` gets the
-/// choice's reason (empty when the default stands).  Set before the pool is built, as set_pool_cores.
-std::vector<int> auto_pool_cores(std::string& line);
-
 /// Every logical processor this process may run on and the physical core it belongs to (pool_cores.hpp's
 /// LogicalCpuInfo).  Empty when the system does not say.
 std::vector<LogicalCpuInfo> logical_cpu_layout();

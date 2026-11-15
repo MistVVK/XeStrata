@@ -769,13 +769,29 @@ bool PlainModel::split_auto_role(std::string& err) {
     const ModelSpec& s = spec_;
     const int64_t L = s.n_layer, E = s.n_expert, M = s.n_moe_layers();
     if (M < 1 || E < 1 || opt_.profile.empty()) return true;
-    // the profile, its MoE layer indices read as the trunk's blocks (the prediction's layers are the blocks)
+    // The choice prices a single-token decode window and is unreliable for plain's MTP verify window (which pipelines
+    // the stages across the GPUs).  Measured (B70 + RTX 4070, both models MTP): ornith alone decoded 6.7% faster than
+    // the split (the choice right); q36 alone decoded 6% slower at 1K and 18.5% slower at 32K, the prompt 13.5% slower
+    // at 32K (the choice wrong).  The prediction gives the two nearly the same margin, so it cannot tell them apart.
+    // Default off for plain, then: the capacity-led split stands unless XESTRATA_SPLIT_ROLE_AUTO=1 asks for the choice.
+    // XESTRATA_SPLIT_ROLE=split/helper forces a role either way.  generate.cpp keeps its own use of the shared choice.
+    const char* role_auto = strata::env_get("SPLIT_ROLE_AUTO");
+    const char* role_force = strata::env_get("SPLIT_ROLE");
+    const bool choice_on = (role_auto != nullptr && std::string(role_auto) == "1") ||
+                           (role_force != nullptr && role_force[0] != '\0');
+    if (!choice_on) return true;
+    // the profile, its MoE layer indices read as the trunk's blocks (the prediction's layers are the blocks).  A
+    // profile with the MTP layer (the tier's, finish_experts) serves the trunk-only prediction too: its pairs dropped.
     std::vector<std::pair<int32_t, int32_t>> prof;
     int64_t pslots = 0;
     std::string perr;
     if (!read_expert_profile(opt_.profile, M, E, prof, pslots, perr)) {
-        std::fprintf(stderr, "xestrata plain: --layer-split auto: %s; the split by memory stands\n", perr.c_str());
-        return true;
+        std::string perr2;
+        if (!read_expert_profile(opt_.profile, M + 1, E, prof, pslots, perr2)) {
+            std::fprintf(stderr, "xestrata plain: --layer-split auto: %s; the split by memory stands\n", perr.c_str());
+            return true;
+        }
+        prof.erase(std::remove_if(prof.begin(), prof.end(), [&](const auto& p) { return p.first >= M; }), prof.end());
     }
     for (auto& p : prof) p.first = (int32_t) (p.first + s.n_dense_lead);
     // each block's bytes: its experts' (all E) and its dense ones; the head's

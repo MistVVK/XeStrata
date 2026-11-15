@@ -104,8 +104,12 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
 plain のエンジン（Qwen3.6-35B-A3B・Ornith-1.5 など）も、2 枚目の役目のこの選び（補助のキャッシュか分担か単独か）を
 同じ共通の部品（`core/split_role.hpp`）で行います。ただし分割点は上の探索ではなく各 GPU の空いたメモリの割合
 （`choose_split_by_room`）で決め、役目の選びは `--expert-profile` があるときだけ働きます（無いときはメモリの割合の分担のまま）。
-`--split-roles`・`--split-skip-if-fits` と上の環境変数も同じ意味で取ります。見積もりは decode の窓だけのものであることは
-同じで、prompt の速さは実測で確かめます（`--layer-split auto` の選びが plain で効くかは記録の measure-plan で測ります）。
+`--split-roles`・`--split-skip-if-fits` と上の環境変数も同じ意味で取ります。見積もりは 1 トークンの decode の窓だけのもの
+で、plain の MTP の検証の窓（段を GPU 間でパイプラインする）には当てになりません。実測（B70 + RTX 4070、どちらも MTP あり）:
+Ornith-1.5 は 1 枚だけが分担より decode 6.7% 速く（選びは正しい）、Qwen3.6-35B-A3B は 1 枚だけが 1K で 6%・32K で 18.5% 遅く、
+prompt も 32K で 13.5% 遅かった（選びは誤り）。見積もりは両者にほぼ同じ差を出すので、見分けられません。そこで plain では
+既定でこの選びをせず（`XESTRATA_SPLIT_ROLE_AUTO=1` で有効）、メモリの割合の分担のままにします。
+`XESTRATA_SPLIT_ROLE=split|helper` は役目を決めます（明示の指定。この選びの有効・無効にかかわらず）。
 
 見積もりの前提は、環境変数で変えられます。
 

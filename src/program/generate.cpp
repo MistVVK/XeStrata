@@ -3005,13 +3005,6 @@ int main(int argc, char** argv) {
             std::string why;
             if (strata::kernels::cpu::parse_pool_cores(text, cpus, why)) strata::kernels::cpu::set_pool_cores(cpus);
             else std::fprintf(stderr, "xestrata generate: --pool-cores: %s; the pool uses its default placement\n", why.c_str());
-        } else {   // XESTRATA_POOL_PLACE: the fast cores on a CPU whose cores are not all alike, when measured faster
-            std::string why;
-            const std::vector<int> cpus = strata::kernels::cpu::auto_pool_cores(why);
-            if (!cpus.empty()) {
-                strata::kernels::cpu::set_pool_cores(cpus);
-                std::fprintf(stderr, "xestrata generate: %s\n", why.c_str());
-            }
         }
     }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {

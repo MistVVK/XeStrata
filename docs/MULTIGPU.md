@@ -105,8 +105,13 @@ The plain engine (Qwen3.6-35B-A3B, Ornith-1.5 and the others) makes this choice 
 cache, a stage, or none) through the same shared part (`core/split_role.hpp`). Its split points come from each GPU's
 share of the free memory (`choose_split_by_room`), not the search above, and the role choice runs only with
 `--expert-profile` (without one the split by memory stands). It takes `--split-roles`, `--split-skip-if-fits` and the
-environment variables above with the same meanings. The prediction prices a decode window only, as here; the prompt
-speed is checked by measurement (whether the choice helps plain is measured in the record's measure-plan).
+environment variables above with the same meanings. The prediction prices a single-token decode window and is not
+reliable for plain's MTP verify window (which pipelines the stages across the GPUs). Measured (B70 + RTX 4070, both
+models with MTP): Ornith-1.5 alone decoded 6.7% faster than the split (the choice right); Qwen3.6-35B-A3B alone decoded
+6% slower at 1K and 18.5% slower at 32K, the prompt 13.5% slower at 32K (the choice wrong). The prediction gives the two
+nearly the same margin, so it cannot tell them apart. The choice is therefore off by default for plain
+(`XESTRATA_SPLIT_ROLE_AUTO=1` enables it); the split by memory stands. `XESTRATA_SPLIT_ROLE=split|helper` forces a role
+(an explicit ask, whether or not the choice is enabled).
 
 Environment variables change the model's assumptions:
 
