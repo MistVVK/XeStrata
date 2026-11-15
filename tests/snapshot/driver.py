@@ -98,6 +98,7 @@ def drive_launch(world: World, extra: tuple[str, ...] = (), setup_runs: bool | s
             from strata_control import draft_layer
             if fresh:
                 setup_fetches_layer(world, args)
+                self.note_setup_lines(getattr(world, "setup_said", []))     # what setup printed (a test sets it: mtp_fetch's offline line)
             old = json.loads(world.config_path.read_text(encoding="utf-8")) if world.config_path.exists() else {}
             cfg = world.base_config()
             word = args[args.index("--mtp") + 1] if "--mtp" in args else None
@@ -132,7 +133,7 @@ def drive_launch(world: World, extra: tuple[str, ...] = (), setup_runs: bool | s
     return {"entry": "launch", "command": "strata " + " ".join(command), "fetches": list(world.fetches),
             "setup_args": seen.get("setup_args"), "config_file": cfg, "engine": engine_start(world, cfg),
             **({"setup_ran": seen.get("setup_ran")} if setup_runs else {}),
-            **({"plan_parts": seen.get("plan_parts"), "plan_drafting": seen.get("plan_drafting")} if fresh else {})}
+            **({"plan_parts": seen.get("plan_parts"), "plan_drafting": seen.get("plan_drafting"), "notices": list(runner.notices)} if fresh else {})}
 
 
 def drive_app(world: World, which: str) -> dict:

@@ -1424,6 +1424,9 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
 
 
 ONE_REQUEST_NOTE = "DFlash2 answers one request at a time, so Strata set this model to one request at a time."
+#: setup could not fetch the MTP layer because the computer is offline (tools/mtp_fetch.py OFFLINE) and the start has no other drafter (owner, 11-15).
+#: The app shows the same words (apps/host/server/native-control.mjs installMtpLayer).
+MTP_OFFLINE_NOTE = "There is no internet connection, so the draft layer can't be downloaded now. The model starts without a drafter."
 
 
 def wants_one_request(mode: Any, *, klass: str = "other", model_name: str | None = None, family: str | None = None, backend: str | None = None,

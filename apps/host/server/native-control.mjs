@@ -368,7 +368,10 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   const fam=snapshot.catalog?.families?.find(f=>f.sizes.some(s=>s.id===args.model)),size=fam?.sizes.find(s=>s.id===args.model);
   if(!fam||!size)return;
   job.summary='Downloading the MTP drafter…';emit();
-  /* the model's own files folder (the run config's --native): without it the installer, asked for this model by name, would fetch the whole model again next to the layer (an app install adopted from the person's own GGUF folder has its files elsewhere) */const native=(()=>{const a=(config.args??[]).map(String),i=a.indexOf('--native');return i>=0?(a[i+1]??''):'';})();try{await install(job,{family:fam.family,model:size.model,drafter:'mtp',vision:args.vision??(config.vision?'yes':'no'),...(native?{gguf_dir:dirname(native)}:{})});return true;}
+  /* the model's own files folder (the run config's --native): without it the installer, asked for this model by name, would fetch the whole model again next to the layer (an app install adopted from the person's own GGUF folder has its files elsewhere) */const native=(()=>{const a=(config.args??[]).map(String),i=a.indexOf('--native');return i>=0?(a[i+1]??''):'';})();try{await install(job,{family:fam.family,model:size.model,drafter:'mtp',vision:args.vision??(config.vision?'yes':'no'),...(native?{gguf_dir:dirname(native)}:{})});
+   /* offline the installer goes on without the layer (tools/mtp_fetch.py OFFLINE): the same words as the Terminal's (strata_control/drafting.py MTP_OFFLINE_NOTE) */const layer=(()=>{const a=(config.args??[]).map(String),i=a.indexOf('--mtp');return i>=0?(a[i+1]??''):'';})();
+   if(layer&&!existsSync(join(layer,'experts.bin'))&&!existsSync(join(dirname(layer),'mtp-q2_0.gguf'))){if(job.state==='running'){job.drafterNote="There is no internet connection, so the draft layer can't be downloaded now. The model starts without a drafter.";emit();}return false;}
+   return true;}
   catch{if(job.state==='running'){job.drafterNote='The MTP drafter could not be downloaded.';emit();}return false;}/* one short line, not the installer's own text; Drafting below says what runs instead */
  }
  /* The DFlash2 drafter, before a load that uses it: Control says whether the choice needs it (and the file is not here), downloads it pinned and checked, and packs it, with plain progress in the job.

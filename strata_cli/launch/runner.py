@@ -1297,6 +1297,7 @@ class Runner:
             elif prog.get("step"):
                 self.emit("model", f"Setup step {prog['step']}", None, step=prog.get("step"))
         code = p.wait()
+        self.note_setup_lines(lines)
         if code != 0:
             err = ""
             for line in reversed(lines):
@@ -2434,6 +2435,31 @@ class Runner:
         finally:
             self._layer_fetch = False
 
+    def note_setup_lines(self, lines: list[str]) -> None:
+        """Remember that setup could not fetch the draft layer because this computer is offline: tools/mtp_fetch.py's own line (netpolicy "offline"),
+        after which setup goes on without the layer (setup.fetch_mtp, mtp_fetch exit 5)."""
+        from strata_control import netpolicy
+        tail = netpolicy.WORDS["offline"].split("{host}", 1)[1].format(what="the draft layer")
+        if any(tail in str(line) for line in lines or []):
+            self._mtp_offline = True
+
+    def say_mtp_offline(self, base_path: Path) -> None:
+        """Once per launch: the draft layer could not be downloaded offline and the start has no other drafter (drafting.MTP_OFFLINE_NOTE, shown like the
+        DFlash2 drafter's offline line). The start's own "Drafting: off (no drafter is downloaded yet)" stays as it is."""
+        if not getattr(self, "_mtp_offline", False) or getattr(self, "_mtp_offline_said", False):
+            return
+        from strata_control import drafting
+        try:
+            cfg = read_config(base_path)
+            want = self.drafting_inputs(cfg)
+            if drafting.normalize(want["mode"]) == "off" or drafting.decide(**want, **self.drafting_signals(cfg, want)).drafter != "off":
+                return                                       # Off was chosen, or another drafter runs: nothing to say
+        except Exception:                                    # noqa: BLE001 - a note is never a reason to stop a launch
+            return
+        self._mtp_offline_said = True
+        self.notices.append(drafting.MTP_OFFLINE_NOTE)
+        self.emit("model", drafting.MTP_OFFLINE_NOTE, None, level="warn")
+
     def keep_saved_off(self) -> None:
         """A launch without a Drafting word keeps the Off this launch ran with last time (its own run config, launch/<name>.json), unless the model's installed
         config holds a Drafting choice of its own (the app's Models screen). Off is only ever the person's choice, and a chosen Off holds: where setup does not run
@@ -2487,6 +2513,7 @@ class Runner:
             self.check_cancel()
             self.ensure_drafter(base)
             base = self.fetch_missing_drafter(base)
+            self.say_mtp_offline(base)
             self.check_cancel()
             self.check_saved_state_readable()
             self.emit("config", "Writing this launch's settings…")
