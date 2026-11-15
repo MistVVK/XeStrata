@@ -4125,6 +4125,17 @@ int main(int argc, char** argv) {
             // and the KFD is not provoked while our queues are busy (kfd_quiet.hpp): the same device class, HIP under Linux only
             if (strata::core::igpu_kfd_settle_default(ad.gcnArchName, all_igpu, win_host)) {
                 strata::core::kfd_quiet::class_flag().store(true);
+                // NOREG: the expert arena takes the unregistered path above (UMA mode) by default on this class, without mlock: with the
+                // arena registered, the first request reset the 780M on its first start (p2006, 11-15, three fixes in); unregistered, 12 of
+                // 12 starts ran clean.  STRATA_ARENA_PIN_GIB set by the user (or STRATA_UMA_REGISTER=1) wins; STRATA_KFD_QUIET_NOREG=0 registers.
+                if (strata::core::kfd_quiet::noreg_default(true, std::getenv("STRATA_KFD_QUIET"), std::getenv("STRATA_KFD_QUIET_NOREG"),
+                                                           std::getenv("STRATA_UMA_REGISTER"))) {
+                    strata::core::arena_uma_no_register_flag().store(true);
+                    strata::core::kfd_quiet::noreg_flag().store(true);
+                    if (std::getenv("STRATA_TRACE") != nullptr)
+                        std::fprintf(stderr, "strata trace: kfd quiet: expert arena not registered with the driver, no mlock (%s)\n",
+                                     strata::core::arena_no_register() ? "in effect" : "STRATA_ARENA_PIN_GIB set: registered as it says");
+                }
                 if (std::getenv("STRATA_TRACE") != nullptr && strata::core::kfd_quiet::on(strata::core::kfd_quiet::Fix::Load))
                     std::fprintf(stderr, "strata trace: kfd quiet: load order active (check first, settle after the expert cache, first prompt's buffers at init)\n");
                 if (strata::core::kfd_quiet::on(strata::core::kfd_quiet::Fix::Exit)) {

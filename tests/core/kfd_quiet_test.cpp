@@ -189,10 +189,41 @@ void stop_order() {
     CHECK(on_signal(1) == OnSignal::DefaultAction);
     CHECK(on_signal(2) == OnSignal::DefaultAction);
 }
+
+void noreg() {
+    CHECK(std::string(fix_env(Fix::NoReg)) == "STRATA_KFD_QUIET_NOREG");
+    // the class default: unregistered, unless a switch says 0 or STRATA_UMA_REGISTER=1 asks for the registration
+    CHECK(noreg_default(true, nullptr, nullptr, nullptr));
+    CHECK(noreg_default(true, "1", "1", nullptr));
+    CHECK(noreg_default(true, nullptr, nullptr, "0"));
+    CHECK(!noreg_default(false, nullptr, nullptr, nullptr));   // every other card keeps its registered arena
+    CHECK(!noreg_default(false, "1", "1", nullptr));
+    CHECK(!noreg_default(true, "0", nullptr, nullptr));        // STRATA_KFD_QUIET=0
+    CHECK(!noreg_default(true, nullptr, "0", nullptr));        // STRATA_KFD_QUIET_NOREG=0
+    CHECK(!noreg_default(true, nullptr, nullptr, "1"));        // STRATA_UMA_REGISTER=1
+    // the arena's mode: the user's STRATA_ARENA_PIN_GIB wins both ways; unset or empty, the engine's flag
+    CHECK(arena_unregistered(nullptr, true));
+    CHECK(arena_unregistered("", true));
+    CHECK(!arena_unregistered(nullptr, false));
+    CHECK(arena_unregistered("none", false));
+    CHECK(arena_unregistered("none", true));
+    CHECK(!arena_unregistered("0", true));      // the user registers the whole arena
+    CHECK(!arena_unregistered("8", true));      // ... or a capped part of it
+    CHECK(!arena_unregistered("auto", true));
+    // the lock: never tried in the class default; a STRATA_ARENA_LOCK the user set decides; outside NOREG as before (lock unless "0")
+    CHECK(!arena_lock_wanted(true, nullptr));
+    CHECK(arena_lock_wanted(true, "1"));
+    CHECK(!arena_lock_wanted(true, "0"));
+    CHECK(arena_lock_wanted(false, nullptr));
+    CHECK(arena_lock_wanted(false, "1"));
+    CHECK(arena_lock_wanted(false, ""));
+    CHECK(!arena_lock_wanted(false, "0"));
+}
 }  // namespace
 
 int main() {
     switches();
+    noreg();
     load_order();
     topology();
     stop_order();

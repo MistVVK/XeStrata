@@ -10,8 +10,10 @@
 //         only when drained, then end by the same signal as before;
 //   XFER  GPU_PINNED_MIN_XFER_SIZE set before HIP starts (pageable copies go through the runtime's staging buffers instead of
 //         pinning our pages in place); a value the caller set wins.
+//   NOREG the expert arena is not registered with the driver (the unregistered "UMA" path of pinned.cu), and not mlock'ed; a value
+//         the user set for STRATA_ARENA_PIN_GIB (or STRATA_UMA_REGISTER=1) wins.
 // None changes a kernel or what is computed.  STRATA_KFD_QUIET=0 turns all of them off at run time (A/B with the same binary);
-// STRATA_KFD_QUIET_LOAD / _EXIT / _XFER = 0 turn one off.  STRATA_TRACE prints one line per change that is active.
+// STRATA_KFD_QUIET_LOAD / _EXIT / _XFER / _NOREG = 0 turn one off.  STRATA_TRACE prints one line per change that is active.
 //
 // Pure pieces, testable without a GPU (tests/core/kfd_quiet_test.cpp): the switch rule, the topology rule (the device class
 // from the KFD topology files, readable before HIP starts), and the teardown order with the GPU layer passed in.
@@ -30,7 +32,7 @@
 
 namespace strata::core::kfd_quiet {
 
-enum class Fix { Load, Exit, Xfer };
+enum class Fix { Load, Exit, Xfer, NoReg, Lend };
 
 /// The device class, set by the engine once the card is named (the rule of igpu_kfd_settle_default: integrated gfx1103 / gfx1150 /
 /// gfx1151, Linux, every visible card).  Load and Exit do nothing while it is false.
@@ -51,6 +53,8 @@ inline const char* fix_env(Fix f) {
         case Fix::Load: return "STRATA_KFD_QUIET_LOAD";
         case Fix::Exit: return "STRATA_KFD_QUIET_EXIT";
         case Fix::Xfer: return "STRATA_KFD_QUIET_XFER";
+        case Fix::NoReg: return "STRATA_KFD_QUIET_NOREG";
+        case Fix::Lend: return "STRATA_KFD_QUIET_LEND";
     }
     return "STRATA_KFD_QUIET_LOAD";
 }
@@ -74,6 +78,35 @@ inline LoadMoves load_moves(bool cls, const char* all, const char* one) {
 }
 inline LoadMoves load_moves() {
     return load_moves(class_flag().load(std::memory_order_relaxed), std::getenv("STRATA_KFD_QUIET"), std::getenv(fix_env(Fix::Load)));
+}
+
+// ---- NOREG: the expert arena is not registered with the GPU driver on the class ---------------------------------------------------
+
+/// Set by the engine (with arena_uma_no_register_flag, pinned.hpp) when NOREG chose the unregistered arena: the arena is then not
+/// locked with mlock either (it cannot succeed under the default memlock limit of this class and only said "mlock failed").
+inline std::atomic<bool>& noreg_flag() {
+    static std::atomic<bool> f{false};
+    return f;
+}
+
+/// NOREG: the class, the switches, and STRATA_UMA_REGISTER=1 (the existing "register it as before") not set.
+inline bool noreg_default(bool cls, const char* all, const char* one, const char* uma_register) {
+    if (uma_register != nullptr && uma_register[0] == '1') return false;
+    return cls && switch_on(all, one);
+}
+
+/// The arena's mode (pinned.cu arena_no_register): a value the user set for STRATA_ARENA_PIN_GIB wins ("none" = not registered,
+/// anything else = registered as that value says); unset or empty, the engine's flag decides.
+inline bool arena_unregistered(const char* pin_gib, bool engine_flag) {
+    if (pin_gib != nullptr && *pin_gib != '\0') return std::string(pin_gib) == "none";
+    return engine_flag;
+}
+
+/// Whether the unregistered arena is locked with mlock: a STRATA_ARENA_LOCK the user set decides as before ("0" = no lock, anything
+/// else = lock); unset, it is locked unless NOREG chose the mode (`noreg`).
+inline bool arena_lock_wanted(bool noreg, const char* lock_env) {
+    if (lock_env != nullptr) return std::string(lock_env) != "0";
+    return !noreg;
 }
 
 // ---- XFER: the device class from the KFD topology (before HIP starts) ------------------------------------------------------------
