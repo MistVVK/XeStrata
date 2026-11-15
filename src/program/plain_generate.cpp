@@ -3072,28 +3072,32 @@ int plain_main(int argc, char** argv) {
         }
     }
     if (opt.draft == "off") opt.spec = 0;   // no drafter (the suffix lookup may still propose)
-    if (opt.draft == "dflash2" && !dr.pack.empty()) {
-        // DFlash2 alone: no MTP layer; the pack and its windows' recurrent copies before the tier is sized from what
-        // is left (loaded after it, a 12 GB RTX 4070 had no room for its buffers and the B70 was left 17 MiB free)
-        opt.spec = 0;
-        opt.draft_windows = strata::core::Dflash2Drafter::kDrafts;
-        if (!dr.df2.load(dr.pack, 0, err)) {
-            std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
-            return 1;
-        }
-    }
-    if (!model.load(opt, err) || !model.prompt_warm(err)) {
-        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
-        // --serve: said where the server waits for READY, and ended at once: the clean-up of a model half loaded can
-        // wait on a GPU for good (two engines on one pair of GPUs, 2026-11-01); the process's end frees its memory
+    // a start that cannot go on: said where the server waits for READY, and ended at once: the clean-up of a model half
+    // loaded can wait on a GPU for good (two engines on one pair of GPUs, 2026-11-01); the process's end frees its memory
+    auto start_failed = [&](const std::string& what) {
+        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), what.c_str());
         if (serve) {
-            std::printf("ERR %s\n", err.c_str());
+            std::printf("ERR %s\n", what.c_str());
             std::fflush(stdout);
             std::fflush(stderr);
             std::_Exit(1);
         }
         return 1;
+    };
+    if (opt.draft == "dflash2" && !dr.pack.empty()) {
+        // DFlash2 alone: no MTP layer; the pack and its windows' recurrent copies before the tier is sized from what
+        // is left (loaded after it, a 12 GB RTX 4070 had no room for its buffers, the B70 was left 17 MiB free and a
+        // 16 GB RX 9060 XT ended before READY at 32K)
+        opt.spec = 0;
+        opt.draft_windows = strata::core::Dflash2Drafter::kDrafts;
+        if (!dr.df2.load(dr.pack, 0, err)) {
+            size_t fb = 0, tb = 0;
+            strata::gpu::mem_info(&fb, &tb);
+            return start_failed(err + " (" + std::to_string(fb >> 20) + " MiB of VRAM free before the model): --draft "
+                                "mtp or auto drafts with the model's MTP layer");
+        }
     }
+    if (!model.load(opt, err) || !model.prompt_warm(err)) return start_failed(err);
     if (const auto& rs = model.rope_full(); rs.type != strata::kernels::RopeScalingType::None) {
         std::fprintf(stderr, "xestrata (%s): rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), "
                              "--max-context %lld against a trained context of %.0f\n",
@@ -3151,10 +3155,7 @@ int plain_main(int argc, char** argv) {
         folder.dir.clear();
     }
     // --draft dflash2: the pack beside the loaded model, its windows' recurrent copies, its head and embedding
-    if (!dr.pack.empty() && !dr.deferred && !dr.load(model, arch, err)) {
-        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
-        return 1;
-    }
+    if (!dr.pack.empty() && !dr.deferred && !dr.load(model, arch, err)) return start_failed(err);
     if (serve)
         return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache,
                            folder, cvecs, dr);
