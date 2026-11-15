@@ -213,11 +213,16 @@ def _paths(name: str) -> tuple[Path, Path, Path]:
     return directory / f"{name}.json", address, directory / f"{name}.host.log"
 
 
-def _read_state(name: str) -> dict | None:
+def _read_state(name: str, pending_ok: bool = False) -> dict | None:
+    """The owner's state file, or None when there is none. `pending_ok` (a start waiting for the owner it just launched): an empty or half-written
+    file is that owner still writing its state (it creates the file as its lease, then writes it), so it reads as not there yet instead of
+    unreadable (#5601: the test start of an update failed on a 0-byte read that was 191 bytes 100 ms later)."""
     path, socket_path, _ = _paths(_name(name))
     try:
         details = path.lstat()
     except FileNotFoundError:
+        return None
+    if pending_ok and stat.S_ISREG(details.st_mode) and details.st_size == 0:
         return None
     if not stat.S_ISREG(details.st_mode) or not _is_private(details, path) or details.st_size > 16 * 1024:
         raise ProfileError("runtime state file is not private or is invalid", 5)
@@ -226,6 +231,8 @@ def _read_state(name: str) -> dict | None:
     except FileNotFoundError:
         return None                 # the owner left between the look and the read: there is no state any more
     except (OSError, UnicodeError, ValueError):
+        if pending_ok:
+            return None
         raise ProfileError("runtime state file is unreadable", 5) from None
     # POSIX: the address is the one derived from the profile. Windows: the port is chosen when the owner binds, so
     # the state file carries it, and the only address a client may be sent to is a loopback port.
@@ -643,9 +650,9 @@ def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
                                     stderr=subprocess.STDOUT, close_fds=True, **detach)
         _STARTED_HOSTS[name] = proc
         deadline = time.monotonic() + max(5.0, wait)
-        while _read_state(name) is None and proc.poll() is None and time.monotonic() < deadline:
+        while _read_state(name, pending_ok=True) is None and proc.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        if _read_state(name) is None:
+        if _read_state(name, pending_ok=True) is None:
             if proc.poll() is not None:
                 _STARTED_HOSTS.pop(name, None)
             raise ProfileError("runtime host failed to start; inspect " + str(log_path), 6)
