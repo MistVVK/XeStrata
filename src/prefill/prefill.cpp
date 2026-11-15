@@ -2549,6 +2549,29 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 (void) cudaGetLastError();   // the request makes what is missing, and says so if it cannot
         }
     }
+    // and (11-15) the CPU prompt share's pinned buffers, only where the share is armed (STRATA_PREFILL_CPU_SHARE: off by default on
+    // this class): the activations, the rows and their scales at the sizes the first CPU-sharing layer asks for, for the largest chunk
+    // that shares (below cpu_share_max(), the floor of the full stream on an integrated GPU).  The prompt path keeps a buffer that is
+    // large enough and regrows one that is not, as before; a failure here leaves it to the prompt path.
+    if (strata::core::kfd_quiet::load_moves().cpu_share_buffers && T > 0 && cpu_pool_ != nullptr && cpu_share_on()) {
+        const size_t ts = std::min<size_t>(T, (size_t) std::max<int64_t>(cpu_share_max(), 1));
+        const size_t rows = (size_t) std::min<int64_t>((int64_t) ts * K, (int64_t) strata::kernels::cpu::MAXT * g.n_expert);
+        auto pin = [](float*& p, size_t& n, size_t want) {
+            if (p != nullptr) return;
+            if (cudaHostAlloc((void**) &p, want * sizeof(float), cudaHostAllocDefault) == cudaSuccess) {
+                n = want;
+            } else {
+                p = nullptr;
+                n = 0;
+                (void) cudaGetLastError();
+            }
+        };
+        pin(m.cpu_x, m.cpu_x_n, ts * N);
+        pin(m.cpu_rows, m.cpu_rows_n, rows * N);
+        const bool ones_new = m.cpu_ones == nullptr;
+        pin(m.cpu_ones, m.cpu_ones_n, rows);
+        if (ones_new && m.cpu_ones != nullptr) std::fill(m.cpu_ones, m.cpu_ones + rows, 1.0f);
+    }
 #endif
     pf_mark("init: host buffers, PLE rows, identity table", tr_last);
     Alloc o;

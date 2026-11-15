@@ -38,18 +38,19 @@ void load_order() {
     for (const char* all : {(const char*) nullptr, "1", "0"})
         for (const char* one : {(const char*) nullptr, "1", "0"}) {
             const LoadMoves m = load_moves(false, all, one);
-            CHECK(!m.hc_check_early && !m.settle_after_cache && !m.first_prompt_buffers);
+            CHECK(!m.hc_check_early && !m.settle_after_cache && !m.first_prompt_buffers && !m.cpu_share_buffers && !m.staged_copy_warm);
         }
-    // the class, nothing set: all three
+    // the class, nothing set: all of them
     {
         const LoadMoves m = load_moves(true, nullptr, nullptr);
-        CHECK(m.hc_check_early && m.settle_after_cache && m.first_prompt_buffers);
+        CHECK(m.hc_check_early && m.settle_after_cache && m.first_prompt_buffers && m.cpu_share_buffers && m.staged_copy_warm);
     }
+    CHECK(kStagedWarmBytes > (1u << 20));   // above the runtime's own staging threshold
     // the class, STRATA_KFD_QUIET=0 or STRATA_KFD_QUIET_LOAD=0: the old order (the A/B arm of the same binary)
     using P = std::pair<const char*, const char*>;
     for (const P& p : std::vector<P>{P{"0", nullptr}, P{nullptr, "0"}, P{"0", "0"}, P{"0", "1"}}) {
         const LoadMoves m = load_moves(true, p.first, p.second);
-        CHECK(!m.hc_check_early && !m.settle_after_cache && !m.first_prompt_buffers);
+        CHECK(!m.hc_check_early && !m.settle_after_cache && !m.first_prompt_buffers && !m.cpu_share_buffers && !m.staged_copy_warm);
     }
     // the flag as the engine sets it: off until the card is named
     CHECK(!class_flag().load());

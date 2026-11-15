@@ -68,16 +68,25 @@ inline bool on(Fix f) { return class_flag().load(std::memory_order_relaxed) && e
 
 /// LOAD, as one rule for the three call sites (generate.cpp: the check after the card is named, the settle after the expert cache;
 /// prefill.cpp: the first prompt's buffers in Prefill::init).  `cls`: class_flag(); `all` / `one`: the switches.
+/// (and since 11-15: the CPU prompt share's pinned buffers at init where the share is armed; one staged copy each way on the null
+/// stream before the last settle, so the runtime makes its staging buffer and copy path during the load, not in the first request)
 struct LoadMoves {
     bool hc_check_early = false;
     bool settle_after_cache = false;
     bool first_prompt_buffers = false;
+    bool cpu_share_buffers = false;
+    bool staged_copy_warm = false;
 };
 inline LoadMoves load_moves(bool cls, const char* all, const char* one) {
     LoadMoves m;
-    m.hc_check_early = m.settle_after_cache = m.first_prompt_buffers = cls && switch_on(all, one);
+    m.hc_check_early = m.settle_after_cache = m.first_prompt_buffers = m.cpu_share_buffers = m.staged_copy_warm =
+        cls && switch_on(all, one);
     return m;
 }
+
+/// The staged copy before READY: bytes per direction.  More than the 1 MiB below which the runtime always stages a pageable copy,
+/// so the copy takes the path the lent refill's 1.3 MiB blobs take with GPU_PINNED_MIN_XFER_SIZE set (XFER).
+inline constexpr size_t kStagedWarmBytes = 2u << 20;
 inline LoadMoves load_moves() {
     return load_moves(class_flag().load(std::memory_order_relaxed), std::getenv("STRATA_KFD_QUIET"), std::getenv(fix_env(Fix::Load)));
 }

@@ -15135,6 +15135,25 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+        // integrated gfx11 (kfd_quiet.hpp, LOAD): one staged copy each way on the null stream (the stream of the lent refill and of
+        // the cache's blocking fills), from and into pageable memory, so that the runtime makes its staging buffer and copy path now,
+        // before the settle below, and not inside the first request (p2006: +10-15 MiB of GTT in 3-5 steps there, every mode).  The
+        // device buffer is kept for the run (a free later would be one more driver event); nothing reads it.  Failures are ignored.
+        if (strata::core::kfd_quiet::load_moves().staged_copy_warm) {
+            static void* warm_dev = nullptr;
+            const size_t wn = strata::core::kfd_quiet::kStagedWarmBytes;
+            if (warm_dev == nullptr && cudaMalloc(&warm_dev, wn) != cudaSuccess) warm_dev = nullptr;
+            if (warm_dev != nullptr) {
+                std::vector<unsigned char> wh(wn, 0);
+                if (cudaMemcpy(warm_dev, wh.data(), wn, cudaMemcpyHostToDevice) == cudaSuccess)
+                    (void) cudaMemcpy(wh.data(), warm_dev, wn, cudaMemcpyDeviceToHost);
+            }
+            (void) cudaGetLastError();
+            if (std::getenv("STRATA_TRACE") != nullptr)
+                std::fprintf(stderr, "strata trace: kfd quiet: staged copy before READY %s\n", warm_dev != nullptr ? "done" : "skipped (no device memory)");
+        }
+#endif
         strata::core::kfd_settle::settle_before_ready();   // integrated gfx11 under Linux: until the kernel has stopped moving the registered arena (nothing elsewhere)
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
         // ---- window warm-up (lane DRAFT-COSTS): the first run of a window width builds its graph / pipeline (srv118 CUDA: a capture; Metal: the first execution), so a
