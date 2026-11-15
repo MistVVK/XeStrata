@@ -235,7 +235,10 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
      return finalResult;
     }
    }
-  }catch(error){job.engineAbort?.abort();throw error;}
+  }catch(error){/* A failed model install lets the engine download it started run to its end, so a retry finds the engine (DL99: Qwen3.6's setup stopped
+     at step 4 while the engine was still coming, and cancelling it here made every retry fail the same way). Stop still cancels both (cancel()). */
+   if(engineTask&&job.state==='running')await engineTask;else job.engineAbort?.abort();
+   throw error;}
  }
  function terminate(proc,signal='SIGTERM'){if(!proc)return;if(process.platform!=='win32'&&proc.pid){try{process.kill(-proc.pid,signal);return;}catch{}}proc.kill(signal);}
  async function stopProcess(proc){if(!proc||proc.exitCode!=null)return;await new Promise(resolve=>{const timeout=setTimeout(()=>{terminate(proc,'SIGKILL');resolve();},8000);proc.once('exit',()=>{clearTimeout(timeout);resolve();});terminate(proc);});}

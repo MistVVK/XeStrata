@@ -8806,7 +8806,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     elif vision != "none" and not (eng / VEXE).exists():
         warn("this engine has no image encoder: images off (run setup again with --build to compile it)")
         vision = "none"
-    if fam["arch"] not in engine_families(eng):
+    if CONTROL and meta.get("component") == "missing":
+        pass                                           # the app: no engine yet (control_engine_step said so); the run config names the component,
+                                                       # and the engine's families are checked when the model loads
+    elif fam["arch"] not in engine_families(eng):
         if fam.get("feed") and FEED_UNAVAILABLE.get(family, {}).get("allowed"):      # the owner's rule for a feed model (feed_models.UNAVAILABLE_POLICY): warn, go on
             warn(f"{fam['title']} is {FEED_UNAVAILABLE[family]['reason']}")
         else:
