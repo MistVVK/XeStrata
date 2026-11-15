@@ -9246,13 +9246,14 @@ def mac_control_setup(a) -> int:
             prep_lock.unlink(missing_ok=True)
     ok(f"model prepared: {pack}")
     use_mtp = MF.stream_mtp(stream, ram)
-    if use_mtp and MF.MAC_MODELS[model].get("no_mtp"):      # the model list says there is no draft layer: none is fetched (the Flash-Next head is not this model's)
+    no_layer = bool(MF.MAC_MODELS.get(model, {}).get("no_mtp"))
+    if no_layer:                                       # the model list says there is no draft layer: none is fetched (the Flash-Next head is not this model's); said on every Mac, as on Windows and Linux
         say("  The model list says this model has no draft layer (MTP), so none is fetched or used.")
         use_mtp = False
     mtp = (find_in(roots, "mtp/mtp-q2_0.gguf") or data / "mtp" / "mtp-q2_0.gguf").parent
     rt = mtp / "rt"
     if stream and not use_mtp:
-        ok("the experts stream from the SSD: no MTP draft layer (one token per step is faster there)")
+        ok("the experts stream from the SSD" + ("" if no_layer else ": no MTP draft layer (one token per step is faster there)"))
     elif stream:
         ok(f"the experts stream from the SSD; the MTP draft layer stays on, with --spec {MF.STREAM_SPEC}")
     if use_mtp and a.mtp == "off" and not (mtp / "mtp-q2_0.gguf").exists():
