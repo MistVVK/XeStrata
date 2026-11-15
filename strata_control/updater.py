@@ -99,9 +99,12 @@ class TestStartFailed(UpdateError):
                 if what == "Control" else
                 f"The new engine {label} did not start correctly on this computer, so it was not installed. Your current engine is unchanged.")
         low = reason.lower()
+        library = missing_library(reason)
         if what == "Control":
             cause = f"It answered `--version` with: {reason.split('--version said', 1)[1].strip()}" if "--version said" in low else \
                 "It did not answer `--version` in time or at all."
+        elif library:
+            cause = f"The engine needs the system library {library}, and this computer does not have it."
         elif "one-token probe" in low:
             cause = "The engine started but stopped before it answered a test question."
         elif "--version exited" in low or "could not run" in low:
@@ -129,6 +132,58 @@ class TestStartFailed(UpdateError):
         super().__init__(self.plain(label, reason, self.busy, hint), 6)
         self.label = label
         self.reason = reason
+
+
+#: The loader's own words when a program needs a shared library the system does not have (glibc's ld.so).
+_MISSING_LIBRARY = re.compile(r"error while loading shared libraries:\s*([^\s:]+):\s*cannot open shared object file")
+
+#: The package that holds a system library, per Linux family (debian = Debian, Ubuntu, Mint ...; fedora = Fedora, RHEL, Rocky ...; arch = Arch,
+#: Manjaro ...). Only libraries an engine package can need from the system and that a family names differently are listed. Arch: gcc-libs pulls in
+#: libatomic / libgomp / libstdc++ / libgcc both before and after Arch split them into their own packages.
+LIBRARY_PACKAGES = {
+    "libatomic.so.1": {"debian": "libatomic1", "fedora": "libatomic", "arch": "gcc-libs"},
+    "libgomp.so.1": {"debian": "libgomp1", "fedora": "libgomp", "arch": "gcc-libs"},
+    "libstdc++.so.6": {"debian": "libstdc++6", "fedora": "libstdc++", "arch": "gcc-libs"},
+    "libgcc_s.so.1": {"debian": "libgcc-s1", "fedora": "libgcc", "arch": "gcc-libs"},
+    "libnuma.so.1": {"debian": "libnuma1", "fedora": "numactl-libs", "arch": "numactl"},
+    "libz.so.1": {"debian": "zlib1g", "fedora": "zlib", "arch": "zlib"},
+}
+_INSTALL = {"debian": "sudo apt install {}", "fedora": "sudo dnf install {}", "arch": "sudo pacman -S {}"}
+
+
+def missing_library(text: str | None) -> str | None:
+    """The shared library the loader could not find (``libatomic.so.1``), from a program's output; None when it says no such thing."""
+    found = _MISSING_LIBRARY.search(text or "")
+    return found.group(1) if found else None
+
+
+def linux_family(os_release: str = "/etc/os-release") -> str | None:
+    """debian, fedora or arch for this Linux (from /etc/os-release ID and ID_LIKE), or None when it is none of them or cannot be read."""
+    try:
+        text = Path(os_release).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    words = []
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() in ("ID", "ID_LIKE"):
+            words += value.strip().strip("\"'").lower().split()
+    for family, names in (("debian", ("debian", "ubuntu")), ("fedora", ("fedora", "rhel", "centos")), ("arch", ("arch", "archlinux"))):
+        if any(w in names for w in words):
+            return family
+    return None
+
+
+def library_hint(library: str, family: str | None = None) -> str:
+    """The one next step for a missing system library: the command that installs its package on this Linux, or the package names when the
+    family is not known, then run the update again."""
+    packages = LIBRARY_PACKAGES.get(library)
+    if packages and family in packages:
+        return f"Install it with `{_INSTALL[family].format(packages[family])}`, then run `strata update` again."
+    if packages:
+        return (f"Install it with your system's package manager ({packages['debian']} on Debian and Ubuntu, {packages['fedora']} on Fedora, "
+                f"{packages['arch']} on Arch), then run `strata update` again.")
+    return "Install the package that has it with your system's package manager, then run `strata update` again."
 
 
 # ---------------------------------------------------------------------------------------------- state
@@ -794,16 +849,37 @@ def _patched_environ(values: dict):
                 os.environ[key] = value
 
 
-def binary_smoke(component: ec.EngineComponent, timeout: float = 60) -> dict:
+def _keep_text(ctx: "Context | None", component: ec.EngineComponent, text: str) -> Path | None:
+    """What the engine printed at its test start, kept as ``.updates/logs/test-start-<version>.log`` (the file `_keep_log` writes for a full test
+    start), so a failed update can still be read after the downloaded package is gone. None when there is no context or it cannot be written."""
+    if ctx is None:
+        return None
+    try:
+        target = updates_dir(ctx.components) / "logs"
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / f"test-start-{component.version}.log"
+        path.write_bytes(text.encode("utf-8", errors="replace")[-65536:])
+        logs = sorted(target.glob("test-start-*.log"), key=lambda p: p.stat().st_mtime)
+        for old in logs[:-5]:
+            old.unlink(missing_ok=True)
+        return path
+    except OSError:
+        return None
+
+
+def binary_smoke(component: ec.EngineComponent, timeout: float = 60, ctx: "Context | None" = None) -> dict:
     """No model installed yet: the engine must at least load (its libraries resolve, the GPU runtime initialises the loader) and
-    report its version. Weaker than a one-token answer, and reported as such."""
+    report its version. Weaker than a one-token answer, and reported as such. With ``ctx`` a failure keeps the engine's output in
+    ``.updates/logs`` and says where; a missing system library is named, with the package that has it."""
     var = "PATH" if os.name == "nt" else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
     env = dict(os.environ)
     env[var] = os.pathsep.join(ec.package_lib_dirs(component.root)) + os.pathsep + env.get(var, "")
+    command = [str(component.exe), "--version"]
     try:
-        done = subprocess.run([str(component.exe), "--version"], capture_output=True, text=True, errors="replace", timeout=timeout, env=env,
+        done = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=timeout, env=env,
                               cwd=str(component.root), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError) as exc:
+        _keep_text(ctx, component, f"$ {' '.join(command)}\n{type(exc).__name__}: {exc}\n")
         raise TestStartFailed(component.version, f"the engine could not run ({type(exc).__name__}: {exc})") from None
     if done.returncode != 0:
         text = (done.stderr or "") + "\n" + (done.stdout or "")
@@ -813,8 +889,17 @@ def binary_smoke(component: ec.EngineComponent, timeout: float = 60) -> dict:
             # resolved, the GPU runtime started and its argument parser ran. That is what this test is for; say so, do not fail it.
             return {"mode": "binary-only", "detail": "no model is installed yet; this engine does not answer --version, but it loaded and listed its options "
                                                      f"({len(options)} of them), so it runs", "output": ""}
+        kept = _keep_text(ctx, component, f"$ {' '.join(command)}\nexit code {done.returncode}\n--- stderr\n{done.stderr or ''}\n--- stdout\n{done.stdout or ''}\n")
+        library = missing_library(text)
         tail = (done.stderr or done.stdout).strip().splitlines()[-1:] or ["no output"]
-        raise TestStartFailed(component.version, f"--version exited {done.returncode}: {tail[0][:200]}")
+        reason = f"--version exited {done.returncode}: {tail[0][:200]}"
+        if library and library not in reason:
+            reason += f" (error while loading shared libraries: {library}: cannot open shared object file)"
+        where = f" The engine's log from this test is in {kept}." if kept else ""
+        if library:
+            raise TestStartFailed(component.version, reason, busy=False, hint=library_hint(library, linux_family()) + where)
+        hint = f"Run `strata update --force` to try again; if it fails again, report it with the log: {kept}" if kept else None
+        raise TestStartFailed(component.version, reason, hint=hint)
     return {"mode": "binary-only", "detail": "no model is installed yet, so the engine was run with --version only",
             "output": done.stdout.strip()[:200]}
 
@@ -943,6 +1028,14 @@ def _test_start_failure(component: ec.EngineComponent, started: dict, ctx: Conte
                                hint="Nothing was changed. A slow disk or a card that other programs are using can do this: close them and run "
                                     "`strata update` again." + kept)
     reason = f"it did not answer a one-token probe ({error or started.get('state')}){tail}"
+    try:
+        library = missing_library(tail) or missing_library(log.read_text(errors="replace"))
+    except OSError:
+        library = missing_library(tail)
+    if library:                                          # the engine program never ran: the system lacks a library it needs
+        if not missing_library(reason):
+            reason += f" | error while loading shared libraries: {library}: cannot open shared object file"
+        return TestStartFailed(component.version, reason, busy=False, hint=library_hint(library, linux_family()) + f" The engine's log from this test is in {log}.")
     # #4692: "report it with the log" named no log. The engine's words stay out of the sentence, but the person is told where the kept log is.
     hint = (None if TestStartFailed.BUSY.search(reason) else
             f"Run `strata update --force` to try again; if it fails again, report it with the log: {log}")
@@ -987,7 +1080,7 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
     if source is None:
         if not ctx.allow_no_model_smoke:
             raise TestStartFailed(component.version, "no installed model to test with")
-        return binary_smoke(component)
+        return binary_smoke(component, ctx=ctx)
     from strata_control import profiles, runtime
     sandbox = Path(tempfile.mkdtemp(prefix="t-", dir=stage_root))
     try:
