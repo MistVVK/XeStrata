@@ -51,6 +51,13 @@ int main() {
     static_assert(strata::prefill::short_read_default(64, true, true, false) == 64, "entry off (STRATA_PF_STAGED_FO=0): the windows' 64");
     static_assert(strata::prefill::short_read_default(64, false, true, true) == 64, "another class: unchanged");
     static_assert(strata::prefill::short_read_default(64, true, false, true) == 64, "a layer on MMQ or FP16: unchanged");
+    // Windows gfx1151, an all-trellis set on the fused kernels with a Hadamard-folded layer (Gyro-S, STRATA_PF_TQ_G1151 on): the windows' 64
+    static_assert(strata::prefill::short_read_default(64, true, true, true, true) == 64, "folded trellis set: the windows' 64");
+    static_assert(strata::prefill::short_read_default(64, true, true, false, true) == 64, "folded trellis set, entry off: 64");
+    static_assert(strata::prefill::short_read_default(64, true, true, true, false) == strata::prefill::kStagedEntryShortRead, "no folded trellis set: the class default as before");
+    static_assert(strata::prefill::short_read_default(64, false, true, true, false) == 64, "another class: unchanged");
+    CHECK(short_read_default(64, true, true, true, true) == 64);
+    CHECK(short_read_default(64, true, true, true) == strata::prefill::kStagedEntryShortRead);
     // the layer rule: a layer with an MMQ tile is the entry's earlier rule, whatever the decision says
     static_assert(staged_entry_layer(true, false, false), "an MMQ layer keeps the entry");
     static_assert(staged_entry_layer(true, false, true), "an MMQ layer keeps the entry");
