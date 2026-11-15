@@ -287,7 +287,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             auto& pick = picks.get(strata::core::Runtime::get().device(), [&] {
                 std::pair<int, bool> best{-1, strata::prefill::mmq::built()};
                 const auto& f0 = lay.fmt[0];
-                const int64_t ELL = lat_ELL_, G = lat_G_, GN = (int64_t) shape.n_embd;
+                const int64_t ELL = lat_ELL_, GN = (int64_t) shape.n_embd;
                 const int64_t n_expert = lay.n_expert;
                 // the real decode's row counts: the verify window's token counts × K (not one synthetic cap).
                 // Time each form at these caps, a warmup then the median of 3 runs, and sum over the caps so the
