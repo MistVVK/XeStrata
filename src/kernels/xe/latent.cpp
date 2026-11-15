@@ -28,6 +28,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -101,17 +102,18 @@ sycl::event launch_u(sycl::queue& q, const uint8_t* u, const uint8_t* ylq, const
         if (lane == 0) out[(size_t) r * (size_t) H + h] = acc;
     };
     constexpr size_t wg = kSubGroups * kWarp;
-    if (cap_entries <= kMaxFirstDim)
-        return q.parallel_for(sycl::nd_range<2>({(size_t) cap_entries, (size_t) xgroups * wg}, {1, wg}),
-                              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
-            body((int64_t) it.get_group(0), (int) it.get_group(1), it.get_sub_group(), (int) it.get_local_linear_id() % kWarp);
+    // the entries a launch at most: the first dimension's limit, and a global range that an int holds (the kernels'
+    // id queries are ints: a prompt chunk's 35840 entries x 2560 rows x 32 lanes did not)
+    const int64_t step = std::min<int64_t>((int64_t) kMaxFirstDim, (int64_t) INT32_MAX / ((int64_t) xgroups * (int64_t) wg));
+    sycl::event e;
+    for (int64_t r0 = 0; r0 < cap_entries; r0 += step) {   // in order: the launches follow one another
+        const int64_t n = std::min(step, cap_entries - r0);
+        e = q.parallel_for(sycl::nd_range<2>({(size_t) n, (size_t) xgroups * wg}, {1, wg}),
+                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+            body(r0 + (int64_t) it.get_group(0), (int) it.get_group(1), it.get_sub_group(), (int) it.get_local_linear_id() % kWarp);
         });
-    // past the first dimension's limit: one dimension, the entry and the row group out of the group index
-    return q.parallel_for(sycl::nd_range<1>((size_t) cap_entries * (size_t) xgroups * wg, wg),
-                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
-        const int64_t gi = (int64_t) it.get_group_linear_id();
-        body(gi / xgroups, (int) (gi % xgroups), it.get_sub_group(), (int) it.get_local_linear_id() % kWarp);
-    });
+    }
+    return e;
 }
 
 }  // namespace
