@@ -589,6 +589,7 @@ test('packaged: Stop still cancels the engine download of an install', async () 
     assert.equal(job.state, 'cancelled');
     for (let i = 0; i < 100 && seen.aborted === null; i++) await new Promise(r => setTimeout(r, 10));
     assert.equal(seen.aborted, true);
+    await new Promise(r => setTimeout(r, 2000));             // the install loop's 1.5 s wait ends and it returns before the folder goes
   } finally { await f.native.close(); f.cleanup(); }
 });
 

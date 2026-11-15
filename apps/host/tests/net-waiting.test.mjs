@@ -34,8 +34,10 @@ test('the first-run screen takes the waiting line in place of the stage text, on
   assert.equal(eta.waitingText({ phase: 'download', label: 'Getting the model files' }), undefined);
   assert.equal(eta.waitingText(undefined), undefined);
   const src = readFileSync(here('../src/components/GuidedSetup.tsx'), 'utf8');
-  assert.match(src, /<strong className="onboard-download-status">\{tr\(waitingText\(installJob\?\.result\?\.install\) \?\? \(progress \? stageText/,
+  // the wizard's status line is guidedStatusText (DL99): the waiting line first, then setup's own sentence, then the stage text
+  assert.match(src, /<strong className="onboard-download-status">\{tr\(guidedStatusText\(installJob\?\.result\?\.install, progress\)\)\}/,
     'the same element as the stage text: no new element, no new style');
+  assert.equal(eta.guidedStatusText({ phase: 'waiting', label: 'Waiting for github.com to answer (5 s so far)' }, { percent: 3 }), 'Waiting for github.com to answer (5 s so far)');
   void i18n;
 });
 
