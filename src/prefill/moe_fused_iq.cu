@@ -3047,7 +3047,9 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 }
 
 // The down rows as FP16 (opt-in per call: the prompt path asks, STRATA_PF_DM16): dm_f16_used() tells which form the last call wrote.
-static bool g_dm16_want = false, g_dm16_used = false;
+// Per host thread, like g_rot_* below: on a layer split each stage reads its chunks on a thread of its own, at the same time as the
+// others (prefill.cpp run_impl hands the next stage its chunk and goes on), and asks, launches and reads back on that thread.
+static thread_local bool g_dm16_want = false, g_dm16_used = false;
 void want_dm_f16(bool on) { g_dm16_want = on; }
 bool dm_f16_used() { return g_dm16_used; }
 
@@ -3056,10 +3058,10 @@ bool dm_f16_used() { return g_dm16_used; }
 // when the prompt path handed over the FP16 input (p1a_input), the down rows go out as FP16 (want_dm_f16) and H has room for FP16 rows;
 // every other call, and every call with the switch off, runs as before.
 #if defined(__HIPCC__)
-static const void* g_p1a_x16 = nullptr;
-static size_t g_p1a_h_bytes = 0;
+static thread_local const void* g_p1a_x16 = nullptr;   // (per host thread: a stage's own device's FP16 rows, see g_dm16_want)
+static thread_local size_t g_p1a_h_bytes = 0;
 #endif
-static bool g_p1a_used = false;
+static thread_local bool g_p1a_used = false;
 bool p1a_wanted() {
 #if defined(__HIPCC__)
     static const bool on = [] {
@@ -3094,9 +3096,12 @@ bool p1a_takes_pair(int gu_type, int d_type) { return p1a_wanted() && p1a::takes
 bool p1a_takes_pair(int, int) { return false; }   // (namespace p1a, moe_p1a.hpp, exists in HIP builds only)
 #endif
 
-// (CUDA, STRATA_PF_FUSED_TQ=1) a Hadamard-folded down (set_down_rotation): on, and the down input's sign vector
-static const float* g_rot_signs = nullptr;
-static bool g_rot_on = false;
+// (CUDA, STRATA_PF_FUSED_TQ=1) a Hadamard-folded down (set_down_rotation): on, and the down input's sign vector.
+// Per host thread: the sign vector lives on the device of the stage that set it (hadamard_device_signs), and on a layer split the
+// stages' threads set and clear it per layer at the same time; one process-wide copy let CUDA0's kernels read CUDA1's vector
+// (an illegal address without peer access, another layer's signs with it).  prefill.cpp sets, launches and clears on one thread.
+static thread_local const float* g_rot_signs = nullptr;
+static thread_local bool g_rot_on = false;
 void set_down_rotation(bool on, const float* signs) { g_rot_on = on; g_rot_signs = on ? signs : nullptr; }
 void hadamard128_rows(float* x, int64_t rows, int64_t cols, const float* signs, void* stream) {
     if (rows <= 0) return;
