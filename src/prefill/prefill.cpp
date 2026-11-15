@@ -2532,26 +2532,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / (((uint64_t) 3 * strata::kernels::NG_HC_DIM + (uint64_t) N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    // STRATA_PREFILL_EQUAL_TAIL_MAX (the RDNA3 fork's equal-tail, opt-in; unset: no limit, the chunk as chosen): a prompt
-    // read as one big chunk and a short tail streams nearly every expert twice when the big chunk loans most of the
-    // cache (the fork's Q4 1-GPU 57K: 49152 + 8185 read 18.6 s against 15.35 s in two 28672 chunks).  Past the limit,
-    // split such a prompt evenly into chunks of at most m.T (the buffers are sized for m.T, so a smaller step fits).
-    // Every stage computes the same step from the same n, so a layer split stays consistent.  The chunk-major path only;
-    // the layer-major path (STRATA_PREFILL_LAYER_MAJOR) keeps its own super-chunks.
-    const int64_t Tc = [&] {
-        static const int64_t tail_max = [] {
-            const char* v = strata::env_get("PREFILL_EQUAL_TAIL_MAX");
-            return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) INT64_MAX;
-        }();
-        if (m.T <= tail_max || n <= m.T) return m.T;
-        const int64_t tail = n - m.T;                 // the tail after one big chunk
-        if (tail >= stream_all_min()) return m.T;     // a long tail: the usual chunking is fine
-        const int64_t nchunks = n / m.T + (n % m.T != 0);
-        const int64_t per = (n + nchunks - 1) / nchunks;
-        return std::min(m.T, ((per + 255) / 256) * 256);
-    }();
-    auto ple_gather = [&m, &ss, tokens, n, prev0, Tc](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(Tc, n - c0);
+    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = std::min(m.T, n - c0);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -2575,7 +2557,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-    for (int64_t c0 = 0; c0 < n; c0 += Tc) {
+    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (strata::env_get("TRACE")) {   // the stage and the time, one clock for the process (upstream 14d076ee2, 3a2675302)
             static const Clock::time_point t0 = Clock::now();
@@ -2584,7 +2566,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          (long long) n, (long long) stage_lb_, (long long) stage_le_, ms);
             std::fflush(stderr);
         }
-        const int64_t T = std::min(Tc, n - c0), p0 = pos0 + c0;
+        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         // the DFlash2 taps of this chunk: the rows at or after tap_first_ (the ring's window)
         const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
         const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
@@ -2718,9 +2700,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // the pageable fallback (no pinned RAM): waited for, as a pageable source can be read out of order
             // (upstream #1996)
             if (!m.ple_pageable[ple_buf].empty()) strata::gpu::stream_sync(m.cs);
-            if (c0 + Tc < n) {
+            if (c0 + m.T < n) {
                 strata::gpu::event_sync(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + Tc, b = ple_buf ^ 1] {
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
                     strata::aux_cpus::pin_current_thread();
                     return ple_gather(c1, b, ple_next_err);
                 });
@@ -4272,7 +4254,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
             std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long) c, mx);
         };
-        const int64_t last = (n - 1) % Tc;
+        const int64_t last = (n - 1) % m.T;
         std::fprintf(stderr, "xestrata dbg: prompt end: last residual row");
         bad(m.R + last * D, D);
         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }
@@ -4314,7 +4296,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              "in %lld of %lld chunks, mode %s%s%s\n",
                      kva_run ? "on" : "off (capture)", (long long) kva_split, (long long) kva_suffix,
                      (long long) kva_positions, (long long) n, (long long) kva_chunks,
-                     (long long) (n > 0 && Tc > 0 ? (n + Tc - 1) / Tc : 0), mode, only,
+                     (long long) (n > 0 && m.T > 0 ? (n + m.T - 1) / m.T : 0), mode, only,
                      kva.capture ? ", capturing the late layers' inputs" : "");
         if (kva_positions > 0) {
             // What a later turn does with this state (serve): it continues from the live session or a checkpoint of

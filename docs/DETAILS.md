@@ -2349,9 +2349,6 @@ When opening an issue, include the report and necessary log excerpts after remov
   but only where its measured acceptance and cost say it pays.
   The drafts are checked like the MTP's, so the output is the same.
 - **Prefill** runs in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
-  `XESTRATA_PREFILL_AUTO_MAX` raises the auto ceiling to 49,152 on the 8,192 grid (the loan and the free RAM still decide).
-  `XESTRATA_PREFILL_EQUAL_TAIL_MAX` splits a prompt that would read as one big chunk and a short tail evenly past that
-  chunk size, so the big chunk does not loan most of the cache and stream nearly every expert twice (both opt-in).
   The matrix products run on XMX on Intel GPUs, on WMMA on AMD GPUs (RDNA3 or later) and on tensor cores on NVIDIA
   GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib-llvm build, and to
   rocBLAS and hipBLASLt on AMD GPUs.
