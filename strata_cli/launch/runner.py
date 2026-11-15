@@ -335,9 +335,7 @@ def auto_signals(catalog, s: S.LaunchSettings, family: str | None) -> dict:
     """What the start's drafting decision reads besides the choice (drafting_inputs / drafting_signals): the model's set and the card signals of the installed config
     (or none yet) with this launch's context and cards. With them, what setup is told to fetch and what the plan lists are the drafter the start runs: on the 12 GB
     card with IQ3_S Auto is the MTP (drafting.CLASS_DEFAULTS); without them setup was told DFlash2, skipped the draft layer, and the start had no drafter (0.2.14
-    real-use run). A Mac's setup decides its draft layer itself (metal/setup_mac.py): nothing. Never raises."""
-    if sys.platform == "darwin":
-        return {}
+    real-use run); on a Mac the set decides (Metal IQ3_S is the MTP, the other sets DFlash2). Never raises."""
     try:
         from strata_control import drafting
         path = catalog.installed_config(catalog.tag_of(s.family, s.model))
@@ -954,7 +952,7 @@ class Runner:
         if sys.platform == "darwin":
             # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu, speed projection)
             keep = {"--yes", "--no-start", "--family", "--model", "--context", "--vision", "--data-dir", "--gguf-dir", "--move-data",
-                    "--set-default-data-dir", "--feed"}
+                    "--set-default-data-dir", "--feed", "--drafter"}     # --drafter: setup.py's Mac step fetches the draft layer only where the start runs the MTP
             flags = ("--yes", "--no-start", "--move-data", "--set-default-data-dir")
             out, i = [], 0
             while i < len(args):
@@ -2407,6 +2405,25 @@ class Runner:
         except Exception:                                    # noqa: BLE001 - an unreadable table is only the generic plan line
             return False
 
+    def keep_saved_off(self) -> None:
+        """A launch without a Drafting word keeps the Off this launch ran with last time (its own run config, launch/<name>.json), unless the model's installed
+        config holds a Drafting choice of its own (the app's Models screen). Off is only ever the person's choice, and a chosen Off holds: where setup does not run
+        again the Off was only in that file, and the next start ran Auto's drafter (0.2.14 real-use run, Strix T6)."""
+        s = self.s
+        if s.drafting is not None:
+            return
+        try:
+            from strata_control import drafting
+            prev = read_config(launch_dir() / f"{self.name}.json")
+            if not isinstance(prev, dict) or drafting.normalize(prev.get("drafting")) != "off":
+                return
+            path = self.catalog.installed_config(self.catalog.tag_of(s.family, s.model))
+            if path is not None and read_config(path).get("drafting") is not None:
+                return
+            s.drafting = "off"
+        except Exception:                                    # noqa: BLE001 - an unreadable file keeps the launch as it was
+            return
+
     def drafting_plan_line(self) -> str:
         """The drafting line of --plan: what drafts, or why not what was asked for. Nothing is changed or downloaded."""
         from strata_control import drafting
@@ -2428,8 +2445,9 @@ class Runner:
 
     def run(self, *, start: bool = True) -> Result:
         self.restart_after = start
+        self.keep_saved_off()
         try:
-            self.check_own_files()                           # a wrong --model-path is said before the engine is downloaded
+            self.check_own_files()                         # a wrong --model-path is said before the engine is downloaded
             if start:
                 reused = self.check_serving()                # before anything is downloaded or stopped
                 if reused is not None:

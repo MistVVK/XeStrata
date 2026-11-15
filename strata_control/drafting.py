@@ -1400,8 +1400,9 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
         return Decision(asked, "off")
     want = choice_of(asked, model_name=model_name, family=family, backend=backend, archs=archs, args=args, vram_mib=vram_mib)
     have_mtp = mtp_here is not False
-    runnable = can_run_dflash2(model_name, family, backend, archs) and not (asked == "auto" and (auto_mtp_only(backend, archs) or want == "mtp" and class_entry(
-        backend, model_name, archs, args=args, vram_mib=vram_mib) is not None))
+    # DFlash2 stands in for a missing MTP layer wherever it may run on this card: also where Auto picks the MTP for the card class (the 12 GB card with IQ3_S), so a
+    # start never goes without a drafter while one is on disk; not where Auto keeps the MTP because DFlash2 stalls there (AUTO_MTP, gfx1201)
+    runnable = can_run_dflash2(model_name, family, backend, archs) and not (asked == "auto" and auto_mtp_only(backend, archs))
 
     if want == "dflash2":
         reason = NOT_HERE if (blocked or not vocab_here) else NOT_DOWNLOADED if not drafter_ready(data_dir, model_name, backend) else ""

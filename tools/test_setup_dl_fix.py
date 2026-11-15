@@ -50,6 +50,23 @@ class FetchMtp(unittest.TestCase):
         result, calls = self.run_with([4])
         self.assertEqual((result, len(calls)), (1, 1))
 
+    def test_offline_setup_goes_on_without_the_draft_layer(self):
+        # 0.2.14 real-use run, R9700 offline: a first Auto launch stopped with exit 6 at the draft layer; offline is never a stop (the model starts without it)
+        result, calls = self.run_with([5])
+        self.assertEqual((result, len(calls)), ("ok", 1))
+
+    def test_the_fetch_says_offline_with_its_own_exit_code(self):
+        import mtp_fetch
+        from strata_control import netpolicy
+        for kind, code in (("offline", mtp_fetch.OFFLINE), ("no_answer", mtp_fetch.NO_ANSWER)):
+            with self.subTest(kind=kind), mock.patch.object(sys, "argv", ["mtp_fetch.py", "inventory", "--out", "x"]), \
+                    mock.patch.object(mtp_fetch, "exit_with_parent", lambda: None), \
+                    mock.patch.object(mtp_fetch, "resolve_repo", mock.Mock(side_effect=netpolicy.NetFailure("huggingface.co", kind))), \
+                    mock.patch("sys.stderr", new=__import__("io").StringIO()):
+                with self.assertRaises(SystemExit) as got:
+                    mtp_fetch.main()
+                self.assertEqual(got.exception.code, code)
+
     def test_a_stopped_download_is_run_again_and_continues(self):
         result, calls = self.run_with([1, 1, 0])
         self.assertEqual((result, len(calls)), ("ok", 3))

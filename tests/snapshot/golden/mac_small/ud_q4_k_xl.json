@@ -30,6 +30,8 @@
     "32768",
     "--vision",
     "gpu",
+    "--drafter",
+    "dflash2",
     "--data-dir",
     "<ROOT>/data"
    ],

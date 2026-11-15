@@ -928,8 +928,10 @@ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
         r = run(cmd, env=env, check=False)
         rc = 0 if r is None else r.returncode              # (a test double answers None)
         if rc == 0:
-            return
-        if rc == 4:                                        # tools/mtp_fetch.py NO_ANSWER: its [X] lines above name the host and the next step
+            return True
+        if rc == 5:                                        # tools/mtp_fetch.py OFFLINE: its [X] lines above say so; the model is set up and starts without the layer,
+            return False                                   # and the next launch with a connection fetches it (offline users: never a stop)
+        if rc == 4:                                       # tools/mtp_fetch.py NO_ANSWER: its [X] lines above name the host and the next step
             say("\nSetup stopped. Fix the item above and run it again - everything already done is kept and skipped.")
             sys.exit(1)
         if r is not None and on_disk() <= before:          # the network rule: run again only when the last run moved bytes
@@ -9262,9 +9264,11 @@ def mac_control_setup(a) -> int:
         use_mtp = False
     if use_mtp and not (mtp / "mtp-q2_0.gguf").exists():
         say("  The MTP draft layer (speculative decoding) comes from the original Qwen checkpoint: only its ~5 GB of MTP tensors are downloaded.")
-        fetch_mtp(mtp, env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
-             "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
+        if fetch_mtp(mtp, env) is False:                   # offline: the model starts without the layer
+            use_mtp = False
+        else:
+            run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
+                 "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
     if use_mtp:
         rt.mkdir(parents=True, exist_ok=True)          # the Metal engine reads mtp-q2_0.gguf beside it (no rt pack)
         refresh_draft_vocab(rt, a.draft_vocab or "cjk")
@@ -10332,11 +10336,11 @@ def main() -> int:
     elif corrupt or not (rt / "experts.bin").exists():
         say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
         say("  only its ~5 GB of MTP tensors are downloaded.")
-        fetch_mtp(mtp, env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
-             "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
-            env=env)
+        if fetch_mtp(mtp, env) is not False:               # (False: offline, nothing to pack)
+            run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
+                 "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
+            run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
+                env=env)
     # a setup run again without --draft-vocab keeps the subset this model's config chose before (cyrillic, fr, en)
     draft_vocab = a.draft_vocab or saved_draft_vocab(home() / f"strata-{tag.lower()}.json")
     if (rt / "experts.bin").exists():

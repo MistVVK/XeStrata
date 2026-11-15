@@ -51,7 +51,8 @@ if (os.environ.get("STRATA_SOURCE") or "").strip().lower() in ("ms", "modelscope
     REPO = PINNED = MS_ENDPOINT + "/models/Qwen/Qwen3.8-Flash-Next/resolve/master/"
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 BAD = 3                                             # `verify`'s exit code: a tensor is missing or corrupt
-NO_ANSWER = 4                                       # the server did not answer or this computer is offline (the [X] lines say which; setup does not run it again)
+NO_ANSWER = 4                                       # the server did not answer (the [X] lines say so; setup does not run it again)
+OFFLINE = 5                                         # this computer has no connection at all: setup goes on without the draft layer, the model starts (offline users)
 
 # #327: sha256 of every MTP tensor's bytes at PINNED_REVISION (two independent fetches agree, and 29 of them were read
 # again from that revision; the two expert tensors' first and last 16 MiB), so a mirror that ignored the
@@ -507,7 +508,7 @@ def main():
     except netpolicy.NetFailure as e:                # the server did not answer, or no connection: one plain sentence, not a traceback
         print("  [X]  " + e.headline("the draft layer"), file=sys.stderr)
         print("       " + e.next_step(), file=sys.stderr)
-        sys.exit(NO_ANSWER)
+        sys.exit(OFFLINE if e.kind == "offline" else NO_ANSWER)
     if lock:
         lock.close()
 
