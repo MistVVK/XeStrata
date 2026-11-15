@@ -206,11 +206,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             if (latent_ && !lay.fmt.empty()) {   // the latent A's gate/up LPR / entries, timed at the latent width
                 const auto& f0 = lay.fmt[0];
                 const auto lat_layout = strata::kernels::native_expert_layout(f0.gu_type, f0.d_type, lat_ELL_, lat_I_, f0.up_type);
-                // DISABLED: the tune misaligned-addresses on CUDA for the Q3_K gate/up (type 11, which gu_pair_tune
-                // never tests).  Until that kernel path is fixed, skip the tune; latent_a_choice falls back to the
-                // proven GU_LPR / kEntriesPass default.  Re-enable once the tune is CUDA-safe.
-                if (strata::env_get("LATENT_A_TUNE") && std::string(strata::env_get("LATENT_A_TUNE")) == "1")
-                    strata::kernels::native_expert_latent_a_tune(lat_layout, nullptr);
+                strata::kernels::native_expert_latent_a_tune(lat_layout, nullptr);
             }
         } catch (const std::exception& e) {
             err = std::string("moe window: gate/up timing: ") + e.what();

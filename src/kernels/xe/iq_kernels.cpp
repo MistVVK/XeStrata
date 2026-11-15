@@ -1176,6 +1176,13 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
 
 // The latent A's gate/up LPR / entries-a-pass, chosen per device by timing at the window's init (the current
 // GU_LPR / kEntriesPass are candidates, so the choice never regresses).  XESTRATA_LATENT_A_LPR / _A_ENTRIES force.
+// The other forms are built only for the latent A's gate/up types (Q3_K: the Edge0 q3k packs), not for every
+// type: each form is one more kernel a type.
+template<int TG> constexpr bool latent_a_tuned() { return TG == 11; }
+std::vector<std::pair<int, int>> latent_a_forms(int type) {
+    if (type == 11) return {{8, 4}, {8, 8}, {16, 4}, {16, 8}, {32, 4}, {32, 8}};
+    return {{GU_LPR, kEntriesPass}};
+}
 template<int TG>
 sycl::event launch_native_gu_tuned(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
@@ -1183,6 +1190,9 @@ sycl::event launch_native_gu_tuned(sycl::queue& q, size_t cap_groups, const unsi
                                    int lpr, int ne) {
 #define EDGE_GU_CASE(LP, N) if (lpr == (LP) && ne == (N)) return launch_native_gu<TG, LP, N>(q, cap_groups, grp_ptr, grp_start, n_groups, ent_tok, xq, L, gate, up, part)
     EDGE_GU_CASE(16, 2); EDGE_GU_CASE(16, 4);
+    if constexpr (latent_a_tuned<TG>()) {
+        EDGE_GU_CASE(8, 4); EDGE_GU_CASE(8, 8); EDGE_GU_CASE(16, 8); EDGE_GU_CASE(32, 4); EDGE_GU_CASE(32, 8);
+    }
 #undef EDGE_GU_CASE
     return launch_native_gu<TG, GU_LPR, kEntriesPass>(q, cap_groups, grp_ptr, grp_start, n_groups, ent_tok, xq, L, gate, up, part);
 }
@@ -1290,20 +1300,21 @@ std::pair<int, int> latent_a_choice(sycl::queue& q, const NativeExpertLayout& L)
     if (latent_a_ne_env() > 0) c.second = latent_a_ne_env();
     return c;
 }
-namespace {
-void run_gu_candidate(sycl::queue& q, const NativeExpertLayout& L, int type, int lpr, int ne, size_t cg,
-                      const unsigned long long* ptr, const int32_t* starts, const int32_t* count, const int32_t* toks,
-                      const block_q8_1* x, float* gate, float* up) {
-#define EDGE_TUNE_GU(T) case T: launch_native_gu_tuned<T>(q, cg, ptr, starts, count, toks, x, L, gate, up, -1, lpr, ne); break
-    switch (type) {
-        EDGE_TUNE_GU(16); EDGE_TUNE_GU(17); EDGE_TUNE_GU(18); EDGE_TUNE_GU(21); EDGE_TUNE_GU(22);
-        EDGE_TUNE_GU(23); EDGE_TUNE_GU(29); EDGE_TUNE_GU(19); EDGE_TUNE_GU(42); EDGE_TUNE_GU(12);
-        EDGE_TUNE_GU(13); EDGE_TUNE_GU(8); EDGE_TUNE_GU(6); EDGE_TUNE_GU(2); EDGE_TUNE_GU(3);
-        default: launch_native_gu_tuned<23>(q, cg, ptr, starts, count, toks, x, L, gate, up, -1, lpr, ne); break;
+// The gate/up rows of type `ty` in their LPR / entries form: the decode's launch and the timing's take this one
+// dispatch, so the timing runs the kernel the decode runs.
+void launch_gu_rows(sycl::queue& q, int ty, size_t cg, const unsigned long long* ptr, const int32_t* starts,
+                    const int32_t* count, const int32_t* toks, const block_q8_1* x, const NativeExpertLayout& L,
+                    float* gate, float* up, int part, int lpr, int ne) {
+#define EDGE_GU_TYPE(T) case T: launch_native_gu_tuned<T>(q, cg, ptr, starts, count, toks, x, L, gate, up, part, lpr, ne); return
+    switch (ty) {
+        EDGE_GU_TYPE(16); EDGE_GU_TYPE(17); EDGE_GU_TYPE(18); EDGE_GU_TYPE(21); EDGE_GU_TYPE(22); EDGE_GU_TYPE(23);
+        EDGE_GU_TYPE(29); EDGE_GU_TYPE(19); EDGE_GU_TYPE(42); EDGE_GU_TYPE(12); EDGE_GU_TYPE(13); EDGE_GU_TYPE(8);
+        EDGE_GU_TYPE(6); EDGE_GU_TYPE(2); EDGE_GU_TYPE(3); EDGE_GU_TYPE(14); EDGE_GU_TYPE(10); EDGE_GU_TYPE(11);
+        EDGE_GU_TYPE(144); EDGE_GU_TYPE(145); EDGE_GU_TYPE(146); EDGE_GU_TYPE(147); EDGE_GU_TYPE(148); EDGE_GU_TYPE(149);
+        default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(ty));
     }
-#undef EDGE_TUNE_GU
+#undef EDGE_GU_TYPE
 }
-}  // namespace
 template<int TD, int LPR>
 sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
@@ -2501,38 +2512,58 @@ void native_expert_latent_a_tune(const NativeExpertLayout& L, void* stream) {
     auto& q = queue_for(stream);
     const LatentAKey key{L.gu_type, L.n_embd, L.n_ff};
     if (g_latent_a_choices.get(q.get_device(), key)) return;
+    const auto cands = latent_a_forms(L.gu_type);
+    if (cands.size() < 2) {
+        g_latent_a_choices.put(q.get_device(), key, cands[0]);
+        return;
+    }
+    // A decode window's hits: kEnt routes over kGrp experts, each its own blob read from memory.  A run takes the
+    // next set of blobs, and the sets together are twice the device's cache, so no run reads a blob from the cache
+    // a run before left it in (one blob for every group timed the cache, not the decode's memory reads).
+    constexpr int kGrp = 24, kEnt = 32;
+    const size_t cache = q.get_device().get_info<sycl::info::device::global_mem_cache_size>();
+    const size_t set_bytes = (size_t) kGrp * L.bytes;
+    const int sets = (int) std::min<size_t>(64, 2 * cache / set_bytes + 2);
     std::vector<void*> allocated;
     auto alloc = [&](size_t bytes) { void* p = sycl::malloc_device(bytes, q); if (!p) throw core::DeviceError("latent A timing allocation failed"); allocated.push_back(p); return p; };
-    auto release = [&] { q.wait_and_throw(); for (void* p : allocated) sycl::free(p, q); };
     try {
-        auto* blob = static_cast<uint8_t*>(alloc(L.bytes));
-        auto* ptr = static_cast<unsigned long long*>(alloc(4 * sizeof(unsigned long long)));
-        auto* starts = static_cast<int32_t*>(alloc(5 * sizeof(int32_t)));
+        auto* blob = static_cast<uint8_t*>(alloc((size_t) sets * set_bytes));
+        auto* ptr = static_cast<unsigned long long*>(alloc((size_t) sets * kGrp * sizeof(unsigned long long)));
+        auto* starts = static_cast<int32_t*>(alloc((kGrp + 1) * sizeof(int32_t)));
         auto* count = static_cast<int32_t*>(alloc(sizeof(int32_t)));
-        auto* toks = static_cast<int32_t*>(alloc(16 * sizeof(int32_t)));
-        auto* x = static_cast<block_q8_1*>(alloc((size_t) 4 * (L.n_embd / 32) * sizeof(block_q8_1)));
-        auto* gate = static_cast<float*>(alloc((size_t) 16 * L.n_ff * sizeof(float)));
-        auto* up = static_cast<float*>(alloc((size_t) 16 * L.n_ff * sizeof(float)));
-        const unsigned long long hp[4] = {(unsigned long long)(uintptr_t)blob, (unsigned long long)(uintptr_t)blob,
-                                          (unsigned long long)(uintptr_t)blob, (unsigned long long)(uintptr_t)blob};
-        const int32_t hc = 4, ht[16] = {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3};
-        q.memset(blob, 0, L.bytes);
-        q.memset(x, 0, (size_t) 4 * (L.n_embd / 32) * sizeof(block_q8_1));
-        q.memcpy(ptr, hp, sizeof hp); q.memcpy(count, &hc, sizeof hc); q.memcpy(toks, ht, sizeof ht);
-        const int32_t hs[5] = {0, 4, 8, 12, 16};
-        q.memcpy(starts, hs, sizeof hs).wait_and_throw();
-        std::vector<std::pair<int, int>> cands;
-        for (int lpr : {16}) for (int ne : {4}) cands.push_back({lpr, ne});  // NE=2 / LPR=8 misalign on CUDA: only the proven default until those kernels are fixed
+        auto* toks = static_cast<int32_t*>(alloc(kEnt * sizeof(int32_t)));
+        auto* x = static_cast<block_q8_1*>(alloc((size_t) kEnt * (L.n_embd / 32) * sizeof(block_q8_1)));
+        auto* gate = static_cast<float*>(alloc((size_t) kEnt * L.n_ff * sizeof(float)));
+        auto* up = static_cast<float*>(alloc((size_t) kEnt * L.n_ff * sizeof(float)));
+        std::vector<unsigned long long> hp((size_t) sets * kGrp);
+        for (size_t b = 0; b < hp.size(); ++b) hp[b] = (unsigned long long) (uintptr_t) (blob + b * L.bytes);
+        std::vector<int32_t> hs(kGrp + 1), ht(kEnt);
+        for (int g = 0, e = 0; g <= kGrp; ++g) { hs[(size_t) g] = e; if (g < kGrp) e += g < kEnt - kGrp ? 2 : 1; }
+        for (int e = 0; e < kEnt; ++e) ht[(size_t) e] = e;
+        const int32_t hc = kGrp;
+        q.memset(blob, 0, (size_t) sets * set_bytes);
+        q.memset(x, 0, (size_t) kEnt * (L.n_embd / 32) * sizeof(block_q8_1));
+        q.memcpy(ptr, hp.data(), hp.size() * sizeof(unsigned long long));
+        q.memcpy(count, &hc, sizeof hc);
+        q.memcpy(toks, ht.data(), ht.size() * sizeof(int32_t));
+        q.memcpy(starts, hs.data(), hs.size() * sizeof(int32_t)).wait_and_throw();
+        int next = 0;
         std::vector<core::TimedCandidate> tc;
         for (auto [lpr, ne] : cands)
-            tc.push_back({[&, lpr, ne] { for (int i = 0; i < 4; ++i) run_gu_candidate(q, L, L.gu_type, lpr, ne, 4, ptr, starts, count, toks, x, gate, up); return true; }});
+            tc.push_back({[&, lpr, ne] {
+                launch_gu_rows(q, L.gu_type, kGrp, ptr + (size_t) next * kGrp, starts, count, toks, x, L, gate, up, -1, lpr, ne);
+                next = (next + 1) % sets;
+                return true;
+            }});
         const auto m = core::timed_choice(tc, [&] { q.wait_and_throw(); }, 5, 1.05, 0.3);
         const auto best = m.pick >= 0 ? cands[(size_t) m.pick] : std::pair<int, int>{GU_LPR, kEntriesPass};
         g_latent_a_choices.put(q.get_device(), key, best);
         std::fprintf(stderr, "xestrata: latent A gate/up type %d width %lld: LPR %d, entries %d\n",
                      L.gu_type, (long long) L.n_embd, best.first, best.second);
-        release();
+        q.wait_and_throw();
+        for (void* p : allocated) sycl::free(p, q);
     } catch (...) {
+        try { q.wait(); } catch (...) {}
         for (void* p : allocated) sycl::free(p, q);
         g_latent_a_choices.put(q.get_device(), key, std::pair<int, int>{GU_LPR, kEntriesPass});
     }
@@ -2655,33 +2686,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                 case 22: launch_native_gu_pair<22>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); return;
             }
         }
-        switch (ty) {
-            case 16: launch_native_gu_tuned<16>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 17: launch_native_gu_tuned<17>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 18: launch_native_gu_tuned<18>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 21: launch_native_gu_tuned<21>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 22: launch_native_gu_tuned<22>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 23: launch_native_gu_tuned<23>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 29: launch_native_gu_tuned<29>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 19: launch_native_gu_tuned<19>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 42: launch_native_gu_tuned<42>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 12: launch_native_gu_tuned<12>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 13: launch_native_gu_tuned<13>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 8: launch_native_gu_tuned<8>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 6: launch_native_gu_tuned<6>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 2: launch_native_gu_tuned<2>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 3: launch_native_gu_tuned<3>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 14: launch_native_gu_tuned<14>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 10: launch_native_gu_tuned<10>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 11: launch_native_gu_tuned<11>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 144: launch_native_gu_tuned<144>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 145: launch_native_gu_tuned<145>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 146: launch_native_gu_tuned<146>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 147: launch_native_gu_tuned<147>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 148: launch_native_gu_tuned<148>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            case 149: launch_native_gu_tuned<149>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne); break;
-            default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(ty));
-        }
+        launch_gu_rows(q, ty, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne);
     };
     if (L.up_type >= 0 && L.up_type != L.gu_type) {
         gu_rows(L.gu_type, 0);
