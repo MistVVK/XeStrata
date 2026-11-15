@@ -3588,6 +3588,21 @@ int main(int argc, char** argv) {
     if (std::getenv("STRATA_ARENA_MMAP") && std::getenv("STRATA_ARENA_MMAP")[0] == '1')
         setenv("GPU_PINNED_MIN_XFER_SIZE", "1000000", 0);   // MiB; an explicit setting wins
 #endif
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+    // XFER (kfd_quiet.hpp): on an integrated gfx11 (every GPU node of the KFD topology a gfx1103 / gfx1150 / gfx1151: the class is
+    // read from the topology files, since the device properties need HIP up) the same setting by default, so that no pageable
+    // source of a copy (the check's vectors at load, the lent refill's blobs without a registered arena) becomes a userptr the
+    // kernel can move under a running dispatch.  A value the caller set wins; STRATA_KFD_QUIET(_XFER)=0 sets nothing.
+    {
+        const bool cls = strata::core::kfd_quiet::nodes_in_class(strata::core::kfd_quiet::read_topology("/sys/class/kfd/kfd/topology/nodes"));
+        if (const char* v = strata::core::kfd_quiet::xfer_value(cls, std::getenv("STRATA_KFD_QUIET"), std::getenv("STRATA_KFD_QUIET_XFER"),
+                                                               std::getenv("GPU_PINNED_MIN_XFER_SIZE"))) {
+            setenv("GPU_PINNED_MIN_XFER_SIZE", v, 0);
+            if (std::getenv("STRATA_TRACE") != nullptr)
+                std::fprintf(stderr, "strata trace: kfd quiet: GPU_PINNED_MIN_XFER_SIZE=%s (pageable copies staged by the runtime)\n", v);
+        }
+    }
+#endif
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.

@@ -76,6 +76,87 @@ inline LoadMoves load_moves() {
     return load_moves(class_flag().load(std::memory_order_relaxed), std::getenv("STRATA_KFD_QUIET"), std::getenv(fix_env(Fix::Load)));
 }
 
+// ---- XFER: the device class from the KFD topology (before HIP starts) ------------------------------------------------------------
+
+/// One node's properties text: `gfx_target_version` and `simd_count` (0 when absent).  A CPU node has simd_count 0.
+struct Node {
+    int64_t gfx = 0;
+    int64_t simds = 0;
+};
+
+inline Node parse_node_properties(const std::string& text) {
+    Node n;
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t e = text.find('\n', i);
+        if (e == std::string::npos) e = text.size();
+        const std::string line = text.substr(i, e - i);
+        i = e + 1;
+        const size_t sp = line.find(' ');
+        if (sp == std::string::npos) continue;
+        const std::string key = line.substr(0, sp);
+        int64_t* dst = key == "gfx_target_version" ? &n.gfx : key == "simd_count" ? &n.simds : nullptr;
+        if (dst == nullptr) continue;
+        int64_t v = 0;
+        size_t j = sp;
+        while (j < line.size() && line[j] == ' ') ++j;
+        bool any = false;
+        for (; j < line.size() && line[j] >= '0' && line[j] <= '9' && v < (int64_t) 1000000000000000LL; ++j) {
+            v = v * 10 + (line[j] - '0');
+            any = true;
+        }
+        if (any) *dst = v;
+    }
+    return n;
+}
+
+/// gfx1103 = 110003, gfx1150 = 110500, gfx1151 = 110501 (major * 10000 + minor * 100 + stepping).  All three exist only as
+/// integrated GPUs.
+inline bool gfx_in_class(int64_t gfx) { return gfx == 110003 || gfx == 110500 || gfx == 110501; }
+
+/// The class: at least one GPU node, and every GPU node one of the three.  A machine with any other GPU beside them (a discrete
+/// card) is not the class, so its path stays the old one.
+inline bool nodes_in_class(const std::vector<Node>& nodes) {
+    int gpus = 0;
+    for (const Node& n : nodes) {
+        if (n.simds <= 0) continue;
+        ++gpus;
+        if (!gfx_in_class(n.gfx)) return false;
+    }
+    return gpus > 0;
+}
+
+#if defined(__linux__)
+/// The nodes under `topo` (normally /sys/class/kfd/kfd/topology/nodes); empty when the folder is not there.
+inline std::vector<Node> read_topology(const std::string& topo) {
+    std::vector<Node> out;
+    DIR* d = opendir(topo.c_str());
+    if (d == nullptr) return out;
+    while (const dirent* e = readdir(d)) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        const std::string path = topo + "/" + e->d_name + "/properties";
+        std::FILE* f = std::fopen(path.c_str(), "r");
+        if (f == nullptr) continue;
+        std::string text;
+        char buf[4096];
+        size_t got = 0;
+        while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, got);
+        std::fclose(f);
+        out.push_back(parse_node_properties(text));
+    }
+    closedir(d);
+    return out;
+}
+#endif
+
+/// XFER: the value the engine sets, or nullptr when nothing is to be set.  `in_class`: the topology rule; `already`:
+/// GPU_PINNED_MIN_XFER_SIZE as the caller set it (a value the caller set wins).  1000000 is what STRATA_ARENA_MMAP=1 sets already
+/// (generate.cpp): the runtime reads it in MiB, so no pageable copy of ours reaches the pin-in-place path.
+inline const char* xfer_value(bool in_class, const char* all, const char* one, const char* already) {
+    if (!in_class || !switch_on(all, one) || already != nullptr) return nullptr;
+    return "1000000";
+}
+
 // ---- EXIT: the teardown order ---------------------------------------------------------------------------------------------------
 
 /// The bound of the stop, seconds.  The server stops its engine with STOP + QUIT and waits 20 s, then sends SIGTERM and waits 5 s

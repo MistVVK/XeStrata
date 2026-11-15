@@ -5,6 +5,13 @@
 #include <cstdio>
 #include <string>
 #include <utility>
+#include <vector>
+
+#if defined(__linux__)
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cstdlib>
+#endif
 
 using namespace strata::core::kfd_quiet;
 
@@ -47,6 +54,74 @@ void load_order() {
     CHECK(!class_flag().load());
     CHECK(!on(Fix::Load) && !on(Fix::Exit));
 }
+// the class from the topology text, as /sys/class/kfd/kfd/topology/nodes/N/properties reads (shortened)
+const char* kCpuNode = "cpu_cores_count 16\nsimd_count 0\nmem_banks_count 1\ngfx_target_version 0\nvendor_id 0\n";
+const char* k780M = "cpu_cores_count 0\nsimd_count 24\nmem_banks_count 1\ngfx_target_version 110003\nvendor_id 4098\ndevice_id 5567\n";
+const char* k890M = "simd_count 32\ngfx_target_version 110500\n";
+const char* k8060S = "simd_count 80\r\ngfx_target_version 110501\r\n";   // \r tolerated: the number ends at the first non-digit
+const char* k7900 = "simd_count 192\ngfx_target_version 110000\n";        // a discrete RX 7900 XTX
+const char* kR9700 = "simd_count 128\ngfx_target_version 120001\n";
+
+void topology() {
+    {
+        const Node n = parse_node_properties(k780M);
+        CHECK(n.gfx == 110003 && n.simds == 24);
+        const Node c = parse_node_properties(kCpuNode);
+        CHECK(c.gfx == 0 && c.simds == 0);
+        CHECK(parse_node_properties(k8060S).gfx == 110501);
+        CHECK(parse_node_properties("").gfx == 0);
+        CHECK(parse_node_properties("gfx_target_version\nsimd_count x\n").simds == 0);   // no number: not read
+        CHECK(parse_node_properties("xgfx_target_version 110003\n").gfx == 0);            // another key
+    }
+    auto cls = [](std::vector<const char*> nodes) {
+        std::vector<Node> v;
+        for (const char* t : nodes) v.push_back(parse_node_properties(t));
+        return nodes_in_class(v);
+    };
+    CHECK(cls({kCpuNode, k780M}));
+    CHECK(cls({kCpuNode, k890M}));
+    CHECK(cls({kCpuNode, k8060S}));
+    CHECK(!cls({}));                        // no topology (no KFD, another OS, a container without /sys/class/kfd)
+    CHECK(!cls({kCpuNode}));                // no GPU node
+    CHECK(!cls({kCpuNode, k7900}));         // a discrete gfx11
+    CHECK(!cls({kCpuNode, kR9700}));
+    CHECK(!cls({kCpuNode, k780M, k7900}));  // a 780M beside a discrete card: not the class (the card keeps its path)
+    CHECK(!cls({kCpuNode, k890M, kR9700}));
+    // the value: only in the class, only with the switches on, never over the caller's own value
+    CHECK(xfer_value(true, nullptr, nullptr, nullptr) != nullptr && std::string(xfer_value(true, nullptr, nullptr, nullptr)) == "1000000");
+    CHECK(xfer_value(false, nullptr, nullptr, nullptr) == nullptr);
+    CHECK(xfer_value(true, "0", nullptr, nullptr) == nullptr);
+    CHECK(xfer_value(true, nullptr, "0", nullptr) == nullptr);
+    CHECK(xfer_value(true, nullptr, nullptr, "4") == nullptr);
+    CHECK(xfer_value(true, nullptr, nullptr, "") == nullptr);   // set, even empty: the caller's
+#if defined(__linux__)
+    // the folder reader on a temporary tree: two nodes, a stray file, a node without properties
+    char tmpl[] = "/tmp/kfdqXXXXXX";
+    if (mkdtemp(tmpl) != nullptr) {
+        const std::string root = tmpl;
+        auto put = [](const std::string& path, const char* text) {
+            if (std::FILE* f = std::fopen(path.c_str(), "w")) { std::fputs(text, f); std::fclose(f); }
+        };
+        mkdir((root + "/0").c_str(), 0700);
+        mkdir((root + "/1").c_str(), 0700);
+        mkdir((root + "/2").c_str(), 0700);
+        put(root + "/0/properties", kCpuNode);
+        put(root + "/1/properties", k780M);
+        put(root + "/README", "not a node");
+        const std::vector<Node> v = read_topology(root);
+        CHECK(v.size() == 2);
+        CHECK(nodes_in_class(v));
+        put(root + "/2/properties", k7900);
+        CHECK(!nodes_in_class(read_topology(root)));
+        CHECK(read_topology(root + "/none").empty());
+        for (const char* p : {"/0/properties", "/1/properties", "/2/properties", "/README"}) std::remove((root + p).c_str());
+        for (const char* p : {"/0", "/1", "/2", ""}) rmdir((root + p).c_str());
+    } else {
+        CHECK(!"mkdtemp failed");
+    }
+#endif
+}
+
 // a fake GPU layer for the stop: a clock in seconds, a GPU that finishes after `busy_s` once released (never when `hung`)
 struct FakeGpu {
     double t = 0.0;
@@ -117,6 +192,7 @@ void stop_order() {
 int main() {
     switches();
     load_order();
+    topology();
     stop_order();
     if (failed) {
         std::fprintf(stderr, "kfd_quiet_test: %d check(s) failed\n", failed);
