@@ -306,6 +306,32 @@ read both folders:
   them were remade as the data's README says, and only those rows carry the ending "No text, letters, numbers, signs
   or logos anywhere in the image." in their prompt (style 09 and 19; 16 character rows).
 
+### The captioning tool
+
+`tools/image/lora_caption.py` has the chat's model (one that reads images) caption the training images, and puts `NN.txt` (one line, `<trigger word>, <description>`) beside each image.
+The captions follow the skill `serve/skills/lora-caption`, the policy above: a character LoRA's caption leaves out the character's own look (given as `--keep`) and writes the clothes, the pose, the background, the framing and **the picture's style (medium, coloring, line, texture, an artist's style) every time**. A word written is learned with that word, so the style is not learned with the trigger. A style LoRA's is the other way round: the style left out, what the picture shows written.
+They are written as the trained model reads a prompt (`--style booru`: Anima's and MageTrail's Danbooru tags; `natural`: the other models' English sentences; `--model-skill` adds the model's own skill). A `.txt` already there is kept unless `--overwrite`.
+
+```sh
+python tools/image/lora_caption.py --dir DATA --kind character --trigger tsumikaze \
+    --keep "teal bob hair, freckles, hairpin" --style natural --server http://127.0.0.1:8095
+```
+
+## The weights trained and the LoRA's kind
+
+The four trainers choose the weights a LoRA goes on with one part (`train::Targets`, `src/image/train_loop.cpp`). Every one is trained by default, as before.
+
+| Option | Its origin | What it does |
+| --- | --- | --- |
+| `--train-blocks 0-5,10` | sd-scripts' `train_double_block_indices` | the blocks trained (ranges and numbers with commas; `all`) |
+| `--only-if-contains attn,img_mlp` | ai-toolkit's `only_if_contains` | only the weights whose name holds one of them |
+| `--ignore-if-contains mlp` | ai-toolkit's `ignore_if_contains` | the weights whose name holds one of them left out |
+| `--skip 22` (MOSS-Image) | ai-toolkit's UI | the blocks left out (22 by default; with the above too) |
+
+- A name is the saved key without `diffusion_model.` (`transformer_blocks.3.attn.to_q`, `layers.3.proj.qkv`, `blocks.3.self_attn.q_proj`, `blocks.3.adaln_modulation_mlp.1`), matched by a part. The attention alone is `attn` for Qwen-Image-2.1 and Mage-Flow, `proj.qkv,proj.o` for MOSS-Image and `_proj` for Anima (`_attn` is in its modulation rows' names too).
+- A choice that takes no weight is refused before the training starts. The saved metadata's `ss_xestrata_targets` says the choice.
+- `--kind character|style|other` says what the LoRA adds, in the metadata's `ss_xestrata_kind`. serve's listing reads it as `kind`, and the chat's model goes by it when it chooses LoRAs ([IMAGE](IMAGE.md#lora-adapters)).
+
 ## The checks
 
 1. **The listing**: read `serve/loras.py`'s `Folder` for that family. The file must be in `listing`, not in `skipped`. Its `rank`, `trigger` and `targets` must be the real values.

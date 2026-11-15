@@ -278,6 +278,32 @@ DiffSynth-Studio `543bf84`（Qwen-Image-2.1 の副参照）は別作りです。
   `758dcad7` の記録 462）。文字の入っていた 18 枚の作り直しはデータの README のとおりで、作り直した行のプロンプトの
   末尾にだけ「No text, letters, numbers, signs or logos anywhere in the image.」が付いています（画風 09・19、キャラ 16 枚）。
 
+### キャプションを付ける道具
+
+`tools/image/lora_caption.py` が、学習画像のキャプションをチャットのモデル（画像を読めるもの）に書かせ、画像の隣に `NN.txt`（`<トリガー語>, <説明>` の 1 行）を置きます。
+キャプションの書き方はスキル `serve/skills/lora-caption` で、上の方針と同じ考えです: キャラクターの LoRA は、キャラクター自身の見た目（`--keep` で渡す）を書かず、服・ポーズ・背景・構図と**絵の画風（媒体・塗り・線・質感・作者の画風）を必ず書きます**。書いた語はその語に結び付くので、画風がトリガー語に付きません。画風の LoRA は逆に、画風を書かず中身を書きます。
+書き方は学習する模型のプロンプトの形に合わせます（`--style booru` は Anima と MageTrail の Danbooru のタグ、`natural` はほかの模型の英文。`--model-skill` で模型のスキルも足す）。すでにある `.txt` は `--overwrite` が無ければ残します。
+
+```sh
+python tools/image/lora_caption.py --dir DATA --kind character --trigger tsumikaze \
+    --keep "teal bob hair, freckles, hairpin" --style natural --server http://127.0.0.1:8095
+```
+
+## 学習する重みの選びと種類
+
+4 つの学習器は、どの重みに LoRA を付けるかを同じ部品（`train::Targets`、`src/image/train_loop.cpp`）で選びます。既定はこれまでどおり全部です。
+
+| 選択肢 | 元の名前 | 意味 |
+| --- | --- | --- |
+| `--train-blocks 0-5,10` | sd-scripts の `train_double_block_indices` | 学習するブロック（範囲と番号をコンマで。`all` は全部） |
+| `--only-if-contains attn,img_mlp` | ai-toolkit の `only_if_contains` | 名前にどれかを含む重みだけ |
+| `--ignore-if-contains mlp` | ai-toolkit の `ignore_if_contains` | 名前にどれかを含む重みを外す |
+| `--skip 22`（MOSS-Image） | ai-toolkit の UI | 外すブロック（既定 22。上の選びと重なる） |
+
+- 名前は保存の鍵から `diffusion_model.` を外したもの（`transformer_blocks.3.attn.to_q`、`layers.3.proj.qkv`、`blocks.3.self_attn.q_proj`、`blocks.3.adaln_modulation_mlp.1`）で、部分一致です。注意だけなら Qwen-Image-2.1 と Mage-Flow は `attn`、MOSS-Image は `proj.qkv,proj.o`、Anima は `_proj` です（`_attn` は変調の行の名前にも入ります）。
+- 何も選ばれないときは、学習を始めずに断ります。保存のメタデータの `ss_xestrata_targets` に選びを書きます。
+- `--kind character|style|other` は LoRA が足すもので、メタデータの `ss_xestrata_kind` に書きます。serve の一覧の `kind` がこれを読み、チャットのモデルが LoRA を選ぶときの手がかりにします（[IMAGE](IMAGE.ja.md#loraアダプター)）。
+
 ## 確かめの手順
 
 1. **一覧**: その模型の family で `serve/loras.py` の `Folder` を読み、ファイルが `listing` に出ること（`skipped` に出たら不合格）。`rank`・`trigger`・`targets` の値が本物と合うことも見ます。
