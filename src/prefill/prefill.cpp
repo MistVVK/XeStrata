@@ -724,11 +724,18 @@ struct Prefill::Impl {
     uint8_t* lat_ylq_ = nullptr;
     uint8_t* lat_scratch_ = nullptr;
     uint8_t* lat_blobs_ = nullptr;           // a batch of staged expert blobs
-    unsigned long long* lat_ptrs_ = nullptr;
-    int32_t* lat_start_ = nullptr;
-    int32_t* lat_ng_ = nullptr;
-    int32_t* lat_dst_ = nullptr;
-    int32_t* lat_tok_ = nullptr;
+    // the batch tables, double-buffered: batch b uploads set b&1 on m.cs while batch b-1's kernel still reads
+    // set (b-1)&1, so no stream_sync between batches.  The host source is double-buffered too; a per-set event
+    // (recorded after the upload) is waited on before the host rewrites that set two batches later.
+    unsigned long long* lat_ptrs_[2] = {};
+    int32_t* lat_start_[2] = {};
+    int32_t* lat_ng_[2] = {};
+    int32_t* lat_dst_[2] = {};
+    int32_t* lat_tok_[2] = {};
+    std::vector<unsigned long long> lat_h_ptrs[2];
+    std::vector<int32_t> lat_h_start[2], lat_h_dst[2], lat_h_tok[2];
+    int32_t lat_h_ng[2] = {};
+    strata::gpu::Event* lat_tbl_ev[2] = {};
     int64_t lat_scratch_T_ = 0;              // the chunk the scratch was sized for
     // the latent mmq fast path's scratch (the int8 matrix-unit products, iq_mmq)
     uint8_t* lmmq_xq_ = nullptr;               // D input (q8, T rows of N)
@@ -1125,6 +1132,7 @@ void Prefill::release() {
     }
     for (int b = 0; b < 2; ++b) {
         if (impl_->mgrp_used[b]) strata::gpu::event_destroy(impl_->mgrp_used[b]);
+        if (impl_->lat_tbl_ev[b]) strata::gpu::event_destroy(impl_->lat_tbl_ev[b]);
         if (impl_->hand[b]) strata::gpu::free(impl_->hand[b]);
         if (impl_->hand_done[b]) strata::gpu::event_destroy(impl_->hand_done[b]);
         for (strata::gpu::Event* e : impl_->hand_ev[b])
@@ -1627,11 +1635,17 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
                   take((void**) &m.lat_ylq_, (size_t) TM * K * lq_row) &&
                   take((void**) &m.lat_scratch_, native_expert_scratch_bytes(TM * K, I)) &&
                   take((void**) &m.lat_blobs_, (size_t) kLatBatch * blob_bytes) &&
-                  take((void**) &m.lat_ptrs_, (size_t) kLatBatch * 8) &&
-                  take((void**) &m.lat_start_, (size_t) (kLatBatch + 1) * 4) &&
-                  take((void**) &m.lat_ng_, 4) &&
-                  take((void**) &m.lat_dst_, (size_t) TM * K * 4) &&
-                  take((void**) &m.lat_tok_, (size_t) TM * K * 4);
+                  take((void**) &m.lat_ptrs_[0], (size_t) kLatBatch * 8) &&
+                  take((void**) &m.lat_ptrs_[1], (size_t) kLatBatch * 8) &&
+                  take((void**) &m.lat_start_[0], (size_t) (kLatBatch + 1) * 4) &&
+                  take((void**) &m.lat_start_[1], (size_t) (kLatBatch + 1) * 4) &&
+                  take((void**) &m.lat_ng_[0], 4) &&
+                  take((void**) &m.lat_ng_[1], 4) &&
+                  take((void**) &m.lat_dst_[0], (size_t) TM * K * 4) &&
+                  take((void**) &m.lat_dst_[1], (size_t) TM * K * 4) &&
+                  take((void**) &m.lat_tok_[0], (size_t) TM * K * 4) &&
+                  take((void**) &m.lat_tok_[1], (size_t) TM * K * 4);
+        for (int s = 0; s < 2 && ok; ++s) ok = strata::gpu::event_create(&m.lat_tbl_ev[s]);
         if (!ok) { err = "prefill: the latent scratch does not fit"; return false; }
         m.lat_scratch_T_ = TM;
         strata::gpu::event_record(m.used[0], m.cs);   // a valid marker: the first batch's DMA may wait on it
@@ -1648,12 +1662,23 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
     std::vector<int32_t> order;
     for (int32_t e = 0; e < E; ++e) if (!routes[(size_t) e].empty()) order.push_back(e);
     const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, ELL, I, f.up_type);
-    std::vector<unsigned long long> ptrs((size_t) kLatBatch);
-    std::vector<int32_t> start((size_t) (kLatBatch + 1)), dst, tok;
     const int32_t* labels = m.lat_labels_.data() + (size_t) l * E;
-    for (size_t b0 = 0; b0 < order.size(); b0 += kLatBatch) {
+    int bi = 0;
+    for (size_t b0 = 0; b0 < order.size(); b0 += kLatBatch, ++bi) {
         const size_t b1 = std::min(order.size(), b0 + kLatBatch);
         const int ng = (int) (b1 - b0);
+        const int s = bi & 1;
+        // set s's host source was last read by batch bi-2's upload: wait for that copy before rewriting it here
+        if (bi >= 2) strata::gpu::event_sync(m.lat_tbl_ev[s]);
+        auto& ptrs = m.lat_h_ptrs[s];
+        auto& start = m.lat_h_start[s];
+        auto& dst = m.lat_h_dst[s];
+        auto& tok = m.lat_h_tok[s];
+        ptrs.resize((size_t) ng * 2);
+        start.resize((size_t) ng + 1);
+        dst.resize((size_t) (T * K));
+        tok.resize((size_t) (T * K));
+        m.lat_h_ng[s].resize(1);
         // the batch's blobs: a resident expert in its cache slot, the others DMA into the batch's buffers
         bool dma = false;
         for (size_t j = b0; j < b1; ++j) {
@@ -1689,17 +1714,17 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
             }
             start[j - b0 + 1] = (int32_t) dst.size();
         }
-        // the table buffers are reused every batch: the previous batch's native_expert_grouped (m.cs) is still
-        // reading them while these host copies run on the compute queue, so wait for it first.  Without this the
-        // next batch's dst/tok overwrite the previous batch's mid-kernel (a cross-queue race the matrix-unit arm
-        // does not have: it uploads its tables on m.cs).  Corrupts the A stage's rows on B70/RTX.
-        strata::gpu::stream_sync(m.cs);
-        strata::gpu::copy(m.lat_ptrs_, ptrs.data(), (size_t) ng * 8);
-        strata::gpu::copy(m.lat_start_, start.data(), (size_t) (ng + 1) * 4);
-        strata::gpu::copy(m.lat_ng_, &ng, 4);
-        strata::gpu::copy(m.lat_dst_, dst.data(), dst.size() * 4);
-        strata::gpu::copy(m.lat_tok_, tok.data(), tok.size() * 4);
-        native_expert_grouped(L, m.lat_ptrs_, m.lat_start_, m.lat_ng_, m.lat_dst_, m.lat_tok_, ng, (int64_t) dst.size(),
+        // upload set s on m.cs, ordered with the kernels: batch bi-1's kernel reads set (bi-1)&1 (not this one),
+        // and batch bi+1's upload of this set is ordered after this batch's kernel, so the device tables never
+        // race.  No stream_sync between batches: the host runs ahead, bounded only by the per-set event above.
+        m.lat_h_ng[s] = ng;
+        strata::gpu::copy_async(m.lat_ptrs_[s], ptrs.data(), (size_t) ng * 8, m.cs);
+        strata::gpu::copy_async(m.lat_start_[s], start.data(), (size_t) (ng + 1) * 4, m.cs);
+        strata::gpu::copy_async(m.lat_ng_[s], &m.lat_h_ng[s], 4, m.cs);
+        strata::gpu::copy_async(m.lat_dst_[s], dst.data(), dst.size() * 4, m.cs);
+        strata::gpu::copy_async(m.lat_tok_[s], tok.data(), tok.size() * 4, m.cs);
+        strata::gpu::event_record(m.lat_tbl_ev[s], m.cs);
+        native_expert_grouped(L, m.lat_ptrs_[s], m.lat_start_[s], m.lat_ng_[s], m.lat_dst_[s], m.lat_tok_[s], ng, (int64_t) dst.size(),
                               m.lat_xlq_, m.lat_scratch_, m.lat_yl_, m.cs, ng);
         strata::gpu::event_record(m.used[0], m.cs);   // the batch's blobs read: the next batch may reuse them
     }
