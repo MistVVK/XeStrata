@@ -117,4 +117,7 @@ python3 packaging/package_engine.py --src "$STAGE" --backend hip --version "$PKG
   --variant "$V" --build-id "$COMMIT+rocm" --tree $shape_pkg --notes "AMD $V build: engine, CPU picture reader, GPU picture reader${NOTE_EXTRA:-}" > "$OUT/package.log" 2>&1
 chk $? "packaged"
 cat "$OUT/package.log" >> "$S"
+# every library a bundled file needs is in the package or on binary_deps.py's short base-system list (glibc, libgcc_s, libstdc++);
+# collect_libs.py bundles libatomic.so.1 (librocm_sysdeps_numa.so.1 needs it) with its notice in licenses/
+for d in "$OUT/components/engine"/*/; do python3 packaging/binary_deps.py "$d" >> "$S" 2>&1; chk $? "imports covered in $(basename "$d")"; done
 st "BUILD-DONE"

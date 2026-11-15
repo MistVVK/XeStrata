@@ -11,9 +11,12 @@ copied library (their own dependencies), and adds libraries that are loaded with
 (--also, a glob searched in --search). `--data SRC=DEST` copies a data folder (rocBLAS / hipBLASLt kernel libraries)
 to DEST under --out, optionally filtered by --data-glob.
 
-Distribution libraries (libc, libm, libstdc++, libdrm, libnuma, ...) are not copied: they are listed in
+Distribution libraries (libc, libm, libstdc++, ...) are not copied: they are listed in
 `SYSTEM-LIBS.txt` beside the output so a missing one on a target PC can be named. The GPU driver's own libraries
 (libcuda.so.1, libnvidia-*, libze_intel_gpu, libOpenCL ICDs) are never bundled: they belong to the driver.
+A distribution library that is not on every system is copied from the build machine all the same (BUNDLE_FROM_SYSTEM, more
+with --bundle-system): libatomic.so.1, which TheRock's librocm_sysdeps_numa.so.1 needs; a container with no libatomic1 package
+could not start the AMD engine (boxia, 2026-11-15). Its notice goes into licenses/ (packaging/notices/).
 Nothing is downloaded; this only reads files on the build machine.
 """
 
@@ -43,10 +46,60 @@ SYSTEM_DIRS = ("/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/")
 DRIVER_PATTERNS = ("libcuda.so*", "libnvidia-*", "libnvcuvid*", "libze_intel_gpu*", "libigdrcl*", "libOpenCL.so*",
                    "libGLX*", "libEGL*", "libvulkan*", "libdrm_amdgpu*", "libdrm.so*", "libamdgpu*")
 LDD_LINE = re.compile(r"^\s*(\S+)\s+=>\s+(\S+)\s+\(0x")
+#: Distribution libraries that are bundled anyway (by soname glob): not on packaging/binary_deps.py's base list, so a PC without them
+#: could not start the engine. Each one has its notice in packaging/notices/<name>.txt, which is copied to <out>/licenses/.
+BUNDLE_FROM_SYSTEM = ("libatomic.so.1",)
+NOTICES = Path(__file__).resolve().parent / "notices"
 
 
 def is_system(path: str) -> bool:
     return path.startswith(SYSTEM_DIRS)
+
+
+def bundled_anyway(name: str, extra: list[str] | tuple[str, ...] = ()) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in (*BUNDLE_FROM_SYSTEM, *extra))
+
+
+def _owner_package(path: str) -> tuple[str, str] | None:
+    """(package, version) of the distribution package that installed ``path`` (dpkg on Debian / Ubuntu, rpm elsewhere), or None."""
+    for command, parse in ((["dpkg-query", "-S", path], lambda t: t.split(":", 1)[0].strip()),
+                           (["rpm", "-qf", "--qf", "%{NAME}\n", path], lambda t: t.strip())):
+        try:
+            done = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0 and done.stdout.strip():
+            package = parse(done.stdout.splitlines()[0])
+            ask = ["dpkg-query", "-W", "-f", "${Version}", package] if command[0] == "dpkg-query" else ["rpm", "-q", "--qf", "%{VERSION}-%{RELEASE}", package]
+            try:
+                version = subprocess.run(ask, capture_output=True, text=True, timeout=30).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                version = ""
+            return package, version
+    return None
+
+
+def copy_notice(name: str, out: Path, origin: str = "") -> None:
+    """For a distribution library that was bundled: packaging/notices/<soname without .so.N>.txt into <out>/licenses/, followed by where the copy
+    came from (the file and the distribution package with its version), and that package's own copyright file and the GPL-3 text from the build
+    machine when it has them (/usr/share/doc/<package>/copyright, /usr/share/common-licenses/GPL-3)."""
+    stem = name.split(".so", 1)[0]
+    source = NOTICES / f"{stem}.txt"
+    if not source.is_file():
+        print(f"WARNING: {name} is bundled but packaging/notices/{stem}.txt does not exist", file=sys.stderr)
+        return
+    folder = out / "licenses"
+    folder.mkdir(parents=True, exist_ok=True)
+    text = source.read_text(encoding="utf-8")
+    owner = (_owner_package(origin) or _owner_package(str(Path(origin).resolve())) or        # /lib vs /usr/lib on a merged-/usr system
+             _owner_package(origin.replace("/lib/", "/usr/lib/", 1) if origin.startswith("/lib/") else origin)) if origin else None
+    if origin:
+        text += f"\nCopied from {origin}" + (f" (distribution package {owner[0]} {owner[1]})" if owner else "") + " on the build machine.\n"
+    (folder / source.name).write_text(text, encoding="utf-8")
+    if owner and Path(f"/usr/share/doc/{owner[0]}/copyright").is_file():
+        _copy(Path(f"/usr/share/doc/{owner[0]}/copyright"), folder / f"{stem}-copyright.txt")
+    if Path("/usr/share/common-licenses/GPL-3").is_file():
+        _copy(Path("/usr/share/common-licenses/GPL-3"), folder / "GPL-3.txt")
 
 
 def is_driver(name: str) -> bool:
@@ -108,6 +161,8 @@ def main(argv=None) -> int:
     ap.add_argument("--data-glob", action="append", default=[], help="keep only data files matching one of these globs")
     ap.add_argument("--data-arch", default="", help="comma list (gfx1200,gfx1201): of the data files that name a gfx arch keep "
                                                     "only these; files naming none (shared tables) are kept")
+    ap.add_argument("--bundle-system", action="append", default=[], metavar="GLOB",
+                    help="a distribution library (soname glob) to bundle all the same, beside " + ", ".join(BUNDLE_FROM_SYSTEM))
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
     copied: dict[str, str] = {}
@@ -126,14 +181,16 @@ def main(argv=None) -> int:
         for name, path in found.items():
             if is_driver(name):
                 continue
-            if is_system(path):
+            if is_system(path) and not bundled_anyway(name, a.bundle_system):
                 system.add(name)
                 continue
             if name in copied:
                 continue
             real = Path(path).resolve()
-            _copy(real, a.out / name)
+            _copy(real, a.out / name)                    # the real file under its soname (a package holds no symlinks)
             copied[name] = str(real)
+            if is_system(path):
+                copy_notice(name, a.out, path)
             queue.append(a.out / name)
     for pattern in a.also:
         hits = [Path(d) / n for d in a.search if os.path.isdir(d) for n in sorted(os.listdir(d)) if fnmatch.fnmatch(n, pattern)]
@@ -157,11 +214,13 @@ def main(argv=None) -> int:
             for dep, path in found.items():
                 if is_driver(dep) or dep in copied:
                     continue
-                if is_system(path):
+                if is_system(path) and not bundled_anyway(dep, a.bundle_system):
                     system.add(dep)
                 else:
                     _copy(Path(path).resolve(), a.out / dep)
                     copied[dep] = str(Path(path).resolve())
+                    if is_system(path):
+                        copy_notice(dep, a.out, path)
     for spec in a.data:
         src, _, dest = spec.partition("=")
         if not dest:

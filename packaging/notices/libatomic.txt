@@ -1,0 +1,13 @@
+libatomic.so.1: the GNU atomic library, part of the GCC runtime
+
+This engine package carries an unmodified copy of libatomic.so.1 from the build machine. The AMD ROCm library
+librocm_sysdeps_numa.so.1 in this package needs it, and some Linux systems (containers, minimal installs) do not have it.
+
+License: the GNU General Public License, version 3 or later, with the GCC Runtime Library Exception, version 3.1
+(SPDX: GPL-3.0-or-later WITH GCC-exception-3.1).
+  GPL-3.0:                https://www.gnu.org/licenses/gpl-3.0.html (GPL-3.txt in this folder when the build machine had it)
+  GCC Runtime Exception:  https://www.gnu.org/licenses/gcc-exception-3.1.html
+Copyright: Free Software Foundation, Inc.
+
+Source code: libatomic is in the GCC source tree (https://gcc.gnu.org/, directory libatomic). The exact source of this copy is the
+source package of the distribution package named below (for Debian and Ubuntu: `apt-get source` of the gcc package that built it).
