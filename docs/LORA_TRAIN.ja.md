@@ -300,7 +300,7 @@ python tools/image/lora_caption.py --dir DATA --kind character --trigger tsumika
 | `--ignore-if-contains mlp` | ai-toolkit の `ignore_if_contains` | 名前にどれかを含む重みを外す |
 | `--skip 22`（MOSS-Image） | ai-toolkit の UI | 外すブロック（既定 22。上の選びと重なる） |
 
-- 名前は保存の鍵から `diffusion_model.` を外したもの（`transformer_blocks.3.attn.to_q`、`layers.3.proj.qkv`、`blocks.3.self_attn.q_proj`、`blocks.3.adaln_modulation_mlp.1`）で、部分一致です。注意だけなら Qwen-Image-2.1 と Mage-Flow は `attn`、MOSS-Image は `proj.qkv,proj.o`、Anima は `_proj` です（`_attn` は変調の行の名前にも入ります）。
+- 名前は学習器の積の名前（`include/strata/image/lora_names.hpp` の表の名前にブロックの道を付けたもの: `transformer_blocks.3.attn.to_q`、`layers.3.proj.qkv`、`blocks.3.self_attn.q_proj`、`blocks.3.adaln_modulation_mlp.1`）で、部分一致です。MOSS-Image の q・k・v は 1 つの積 `proj.qkv` なので、保存の鍵（`proj.q`・`proj.k`・`proj.v`）の 1 つだけを選んだり外したりはできません。注意だけなら Qwen-Image-2.1 と Mage-Flow は `attn`、MOSS-Image は `proj.qkv,proj.o`、Anima は `_proj` です（`_attn` は変調の行の名前にも入ります）。
 - 何も選ばれないときは、学習を始めずに断ります。保存のメタデータの `ss_xestrata_targets` に選びを書きます。
 - `--kind character|style|other` は LoRA が足すもので、メタデータの `ss_xestrata_kind` に書きます。serve の一覧の `kind` がこれを読み、チャットのモデルが LoRA を選ぶときの手がかりにします（[IMAGE](IMAGE.ja.md#loraアダプター)）。
 

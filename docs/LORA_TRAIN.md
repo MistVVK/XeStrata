@@ -328,7 +328,7 @@ The four trainers choose the weights a LoRA goes on with one part (`train::Targe
 | `--ignore-if-contains mlp` | ai-toolkit's `ignore_if_contains` | the weights whose name holds one of them left out |
 | `--skip 22` (MOSS-Image) | ai-toolkit's UI | the blocks left out (22 by default; with the above too) |
 
-- A name is the saved key without `diffusion_model.` (`transformer_blocks.3.attn.to_q`, `layers.3.proj.qkv`, `blocks.3.self_attn.q_proj`, `blocks.3.adaln_modulation_mlp.1`), matched by a part. The attention alone is `attn` for Qwen-Image-2.1 and Mage-Flow, `proj.qkv,proj.o` for MOSS-Image and `_proj` for Anima (`_attn` is in its modulation rows' names too).
+- A name is the trainer's product's (a name of `include/strata/image/lora_names.hpp`'s tables after its block's path: `transformer_blocks.3.attn.to_q`, `layers.3.proj.qkv`, `blocks.3.self_attn.q_proj`, `blocks.3.adaln_modulation_mlp.1`), matched by a part. MOSS-Image's q, k and v are one product, `proj.qkv`, so one of the saved keys (`proj.q`, `proj.k`, `proj.v`) cannot be chosen or left out alone. The attention alone is `attn` for Qwen-Image-2.1 and Mage-Flow, `proj.qkv,proj.o` for MOSS-Image and `_proj` for Anima (`_attn` is in its modulation rows' names too).
 - A choice that takes no weight is refused before the training starts. The saved metadata's `ss_xestrata_targets` says the choice.
 - `--kind character|style|other` says what the LoRA adds, in the metadata's `ss_xestrata_kind`. serve's listing reads it as `kind`, and the chat's model goes by it when it chooses LoRAs ([IMAGE](IMAGE.md#lora-adapters)).
 
