@@ -11,7 +11,8 @@
 //   XFER  GPU_PINNED_MIN_XFER_SIZE set before HIP starts (pageable copies go through the runtime's staging buffers instead of
 //         pinning our pages in place); a value the caller set wins.
 //   NOREG the expert arena is not registered with the driver (the unregistered "UMA" path of pinned.cu), and not mlock'ed; a value
-//         the user set for STRATA_ARENA_PIN_GIB (or STRATA_UMA_REGISTER=1) wins.
+//         the user set for STRATA_ARENA_PIN_GIB (or STRATA_UMA_REGISTER=1) wins.  Only on the Radeon 780M class (gfx1103, also the
+//         760M / 740M of the same chip family: nodes_in_noreg_class); gfx1150 and gfx1151 keep the registered arena.
 //   LEND  the prompt path keeps its own buffers instead of lending expert cache slots (no refill after every prompt), decided after
 //         the cache is sized and only where the buffers fit; the chunk stays.  Off by default (kNoLendDefaultOn); _LEND=1 turns it on.
 // None changes a kernel or what is computed.  STRATA_KFD_QUIET=0 turns all of them off at run time (A/B with the same binary);
@@ -100,7 +101,8 @@ inline std::atomic<bool>& noreg_flag() {
     return f;
 }
 
-/// NOREG: the class, the switches, and STRATA_UMA_REGISTER=1 (the existing "register it as before") not set.
+/// NOREG: the class, the switches, and STRATA_UMA_REGISTER=1 (the existing "register it as before") not set.  `cls` is NOREG's own
+/// class, nodes_in_noreg_class (the Radeon 780M class only), not class_flag().
 inline bool noreg_default(bool cls, const char* all, const char* one, const char* uma_register) {
     if (uma_register != nullptr && uma_register[0] == '1') return false;
     return cls && switch_on(all, one);
@@ -205,6 +207,20 @@ inline bool nodes_in_class(const std::vector<Node>& nodes) {
         if (n.simds <= 0) continue;
         ++gpus;
         if (!gfx_in_class(n.gfx)) return false;
+    }
+    return gpus > 0;
+}
+
+/// NOREG's class: the Radeon 780M class only, gfx1103 = 110003 (the 780M and the 760M / 740M of the same chip family).  Every GPU
+/// node must be one.  gfx1150 (Strix Point) and gfx1151 (Strix Halo) keep the registered arena as before, and so does a machine with
+/// any other GPU beside it.  LOAD, EXIT and XFER keep the whole class of nodes_in_class.
+inline bool gfx_in_noreg_class(int64_t gfx) { return gfx == 110003; }
+inline bool nodes_in_noreg_class(const std::vector<Node>& nodes) {
+    int gpus = 0;
+    for (const Node& n : nodes) {
+        if (n.simds <= 0) continue;
+        ++gpus;
+        if (!gfx_in_noreg_class(n.gfx)) return false;
     }
     return gpus > 0;
 }
