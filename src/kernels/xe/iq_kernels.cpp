@@ -850,7 +850,7 @@ template<> struct Split<40> {
         const float d8 = low_half(bq8->ds);
         float sum = 0.0f;
         for (int i = 0; i < 2; ++i) {
-            const int* q8 = (const int*) bq8->qs + 4 * i;   // the sub-block's 16 activation values
+            const int* q8 = (const int*) bq8->qs + (ptrdiff_t) 4 * i;   // the sub-block's 16 activation values
             int sumi = dp4a(r.v0[i].x, q8[0], 0);
             sumi = dp4a(r.v0[i].y, q8[2], sumi);
             sumi = dp4a(r.v1[i].x, q8[1], sumi);
@@ -1998,7 +1998,7 @@ void dq_nvfp4(const void* vx, int64_t ibs, const Out& o, int tid) {
     const block_nvfp4* x = (const block_nvfp4*) vx + ibs * 4;
     const int b = tid / 8, sb = (tid / 2) % 4, hi = tid % 2;
     const float d = nvfp4::ue4m3_half(x[b].d[sb]);
-    const uint8_t* q = x[b].qs + 8 * sb;
+    const uint8_t* q = x[b].qs + (ptrdiff_t) 8 * sb;
     float v[8];
     for (int j = 0; j < 8; ++j) v[j] = d * (float) kvalues_fp4[hi ? q[j] >> 4 : q[j] & 0x0F];
     o.template put<8>(64 * b + 16 * sb + 8 * hi, v);

@@ -34,7 +34,7 @@ namespace {
 inline int prefetch_distance() {
     static const int v = [] {
         const char* e = strata::env_get("NVFP4_PREFETCH");
-        return e ? std::atoi(e) : 2048;
+        return e ? (int) std::strtol(e, nullptr, 10) : 2048;
     }();
     return v;
 }
@@ -44,7 +44,7 @@ inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si1
 // The block's 64 codes in element order. Sub-block s keeps its codes in qs[8 s .. 8 s + 7]: byte j holds value j
 // in its low nibble and value j + 8 in its high one, so a sub-block is [low nibbles, high nibbles] of its 8 bytes.
 inline __m512i codes64(const uint8_t* qs) {
-    const __m256i q = _mm256_loadu_si256((const __m256i*) qs);
+    const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs));
     const __m256i m4 = _mm256_set1_epi8(0x0F);
     const __m256i lo = _mm256_and_si256(q, m4);
     const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
@@ -74,7 +74,7 @@ struct Acts {
         for (int t = 0; t < nt; ++t) {
             y[t] = (const block_q8_0*) act[t];
             for (int ib = 0; ib < nb; ++ib) {
-                const block_q8_0* yb = y[t] + 2 * ib;
+                const block_q8_0* yb = y[t] + (ptrdiff_t) 2 * ib;
                 dy[(size_t) t * nb + ib] = _mm512_mask_blend_ps((__mmask16) 0xFF00, _mm512_set1_ps(h2f(yb[0].d)),
                                                                  _mm512_set1_ps(h2f(yb[1].d)));
             }
@@ -92,13 +92,13 @@ inline void row_dot(const uint8_t* row, const Acts& a, float* res) {
     const block_nvfp4* x = (const block_nvfp4*) row;
     const int prefetch_ahead = prefetch_distance();
     for (int ib = 0; ib < a.nb; ++ib) {
-        if (prefetch_ahead > 0) _mm_prefetch((const char*) (x + ib) + prefetch_ahead, _MM_HINT_T0);
+        if (prefetch_ahead > 0) _mm_prefetch(reinterpret_cast<const char*>(x + ib) + prefetch_ahead, _MM_HINT_T0);
         const __m512i codes = codes64(x[ib].qs);
         const __m512i g = _mm512_shuffle_epi8(mag, codes);
         const __mmask64 neg = _mm512_test_epi8_mask(codes, eight);
         const __m512 sw = sub_scales(x[ib].d);
         for (int t = 0; t < NT; ++t) {
-            const block_q8_0* yb = a.y[t] + 2 * ib;
+            const block_q8_0* yb = a.y[t] + (ptrdiff_t) 2 * ib;
             const __m512i yv = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*) yb[0].qs)),
                                                   _mm256_loadu_si256((const __m256i*) yb[1].qs), 1);
             const __m512i ys = _mm512_mask_sub_epi8(yv, neg, zero, yv);

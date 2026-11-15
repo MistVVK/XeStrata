@@ -33,7 +33,7 @@ namespace {
 inline int prefetch_distance() {
     static const int v = [] {
         const char* e = strata::env_get("NVFP4_PREFETCH");
-        return e ? std::atoi(e) : 2048;
+        return e ? (int) std::strtol(e, nullptr, 10) : 2048;
     }();
     return v;
 }
@@ -42,7 +42,7 @@ inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si1
 
 // sub-blocks 2 h and 2 h + 1 (16 bytes of qs) as their 32 signed doubled E2M1 values, in element order
 inline __m256i values32(const uint8_t* qs, const __m128i kv) {
-    const __m128i q = _mm_loadu_si128((const __m128i*) qs);
+    const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
     const __m128i m4 = _mm_set1_epi8(0x0F);
     const __m128i lo = _mm_shuffle_epi8(kv, _mm_and_si128(q, m4));
     const __m128i hi = _mm_shuffle_epi8(kv, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
@@ -83,7 +83,7 @@ inline void row_dot(const uint8_t* row, const Acts& a, float* res) {
     const block_nvfp4* x = (const block_nvfp4*) row;
     const int prefetch_ahead = prefetch_distance();
     for (int ib = 0; ib < a.nb; ++ib) {
-        if (prefetch_ahead > 0) _mm_prefetch((const char*) (x + ib) + prefetch_ahead, _MM_HINT_T0);
+        if (prefetch_ahead > 0) _mm_prefetch(reinterpret_cast<const char*>(x + ib) + prefetch_ahead, _MM_HINT_T0);
         const __m256i v01 = values32(x[ib].qs, kv), v23 = values32(x[ib].qs + 16, kv);
         const __m256i a01 = _mm256_sign_epi8(v01, v01), a23 = _mm256_sign_epi8(v23, v23);
         // lanes 0-3 ue4m3(d[0]), 4-7 d[1] (and d[2], d[3]): times a broadcast d_q8, each lane is ggml's scalar
@@ -92,12 +92,12 @@ inline void row_dot(const uint8_t* row, const Acts& a, float* res) {
         const __m256 u01 = _mm256_set_m128(_mm_set1_ps(hv[x[ib].d[1]]), _mm_set1_ps(hv[x[ib].d[0]]));
         const __m256 u23 = _mm256_set_m128(_mm_set1_ps(hv[x[ib].d[3]]), _mm_set1_ps(hv[x[ib].d[2]]));
         for (int t = 0; t < NT; ++t) {
-            const block_q8_0* yb = a.y[t] + 2 * ib;
+            const block_q8_0* yb = a.y[t] + (ptrdiff_t) 2 * ib;
             const __m256i q01 = _mm256_loadu_si256((const __m256i*) yb[0].qs);
             const __m256i q23 = _mm256_loadu_si256((const __m256i*) yb[1].qs);
             const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(a01, _mm256_sign_epi8(q01, v01)), ones);
             const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(a23, _mm256_sign_epi8(q23, v23)), ones);
-            const float* dy = a.dy + (size_t) t * 2 * a.nb + 2 * ib;
+            const float* dy = a.dy + (size_t) t * 2 * a.nb + (size_t) 2 * ib;
             const __m256 s01 = _mm256_mul_ps(u01, _mm256_broadcast_ss(dy));
             const __m256 s23 = _mm256_mul_ps(u23, _mm256_broadcast_ss(dy + 1));
             acc[t] = _mm256_fmadd_ps(s01, _mm256_cvtepi32_ps(p1), acc[t]);
