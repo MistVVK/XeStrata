@@ -3074,8 +3074,18 @@ int main(int argc, char **argv) try {
     */
     if (const dpct::err0 ce =
             DPCT_CHECK_ERROR(arena = (void *)strata::malloc_device_guarded(
-                                 pool_bytes, dpct::get_in_order_queue()));
-        ce != 0) {
+                                 pool_bytes, dpct::get_in_order_queue(), "weight arena"));
+        ce != 0 || arena == nullptr) {   // #5557: Level Zero answers a too-large allocation with null, not an exception
+        if (const uint64_t max_alloc = strata::device_max_alloc(dpct::get_in_order_queue());
+            arena == nullptr && max_alloc && pool_bytes > max_alloc) {
+            // the arena is one allocation (a segmented arena is not built yet), so this GPU's limit, not its free memory, stops
+            // the start; the guard above has said both sizes (wording approved by the coordinator 11-16; it can reach the app)
+            std::fprintf(stderr, "strata generate: this model's GPU weights (%.2f GiB) must fit in one GPU allocation, and this "
+                                 "GPU allows at most %.2f GiB in one: it cannot run this model yet. Choose a smaller model in "
+                                 "Strata, or use a GPU with more memory.\n",
+                         (double) pool_bytes / 1073741824.0, (double) max_alloc / 1073741824.0);
+            return 1;
+        }
         // #486: the arena is the first large allocation and its size does not depend on the context, so what is
         // missing is held by something else: say how much was free
         /*
@@ -5021,6 +5031,18 @@ int main(int argc, char **argv) try {
             for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
             return b;
         };
+        // #5578: the cache is one allocation (no segmented cache on Level Zero yet), so an auto cache larger than the GPU's
+        // largest single allocation cannot be had: size it to that limit at once and say so, instead of two failed tries
+        // ending at three quarters of three quarters of it ("cudaMalloc(7.06 GiB) failed: no error" on a 16 GB A770)
+        if (auto_cache && !o.vram_elastic) {
+            const uint64_t max_alloc = strata::device_max_alloc(dpct::get_in_order_queue());
+            const int64_t before = cache_bytes();
+            if (max_alloc > (64ull << 20) && before > (int64_t) max_alloc && shrink_to((int64_t) max_alloc - (32ll << 20)))
+                std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB would fit, but this GPU allows at most %.2f GiB "
+                                     "in one allocation: %d slots (%.2f GiB)\n",
+                             (double) before / 1073741824.0, (double) max_alloc / 1073741824.0, o.expert_cache,
+                             (double) cache_bytes() / 1073741824.0);
+        }
         // With `--expert-cache auto` the reserve must still be free once the slots are WRITTEN: under WDDM an
         // allocation is not resident until it is touched, and the free figure read before it can be ~1 GB too
         // high.  A cache sized from it filled the card to 0 MiB, the driver then paged, and a request that needed a
