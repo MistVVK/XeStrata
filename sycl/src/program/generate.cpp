@@ -825,7 +825,7 @@ void usage() {
                  "                       GR MMVF, BF16, head, dense + PLE key, MoE combine, GDN, router, QSA,\n"
                  "                       indexer, RoPE, PLE postops, and the CPU q8_0 contract unless the\n"
                  "                       expert cache is on. Individual --native-* flags stay for A/B.\n"
-                 "  --native-head-gguf PATH  native Q5_K head from model shard 1; requires --stream-token\n"
+                 "  --native-head-gguf PATH  the output head on the native kernels (its GGUF type), from model shard 1; requires --stream-token\n"
                  "  --embd-gguf PATH     the token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py:\n"
                  "                       BF16 as the checkpoint ships it; mapped host memory, no VRAM)\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
@@ -4500,8 +4500,8 @@ int main(int argc, char **argv) try {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes, in %.1f s\n",
-                     (unsigned long long) native_head.weight_bytes(),
+        std::fprintf(stderr, "strata generate: experimental native %s head, %llu bytes, in %.1f s\n",   // (output.weight's GGUF type; it said Q5_K for every head, #6030)
+                     strata::ggml_type_name((uint32_t) native_head.type()), (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
     strata::uc_probe("after-head");

@@ -6413,16 +6413,20 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     const bool b_ok = L.n_embd % 128 == 0 && L.n_ff % 64 == 0;
     const bool tm_set = tm > 0;
     if (tm <= 0) tm = (avg >= 96 && b_ok) ? 8 : (int) std::max<int64_t>(2, std::min<int64_t>(4, (avg + 8) / 16));
-    tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
+    const I8Volta vo = i8_volta();
+    // tile 5: the Volta tensor-core form (i8h_volta.cuh; bit-identical output), on a compute capability 7.0 card for the formats it covers
+    const bool h_ok = vo.on && i8h_type(L.gu_type) && i8h_type(L.d_type) && L.n_ff % 32 == 0 && L.n_embd % 64 == 0;
+    if (tm == 5 && !h_ok) tm = 4;
+    if (tm != 5) tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
     // Volta (i8_expert_rule.hpp, i8_tile_two_blocks): the big-grid formats read their grid from global memory, and the pick is lowered to the largest tile that keeps two blocks
     // per multiprocessor (a tile set by STRATA_I8_TM is kept; STRATA_I8_SM70=0 turns both off)
-    const I8Volta vo = i8_volta();
     const bool gg = vo.on && i8_gg_type(L.gu_type);
     if (vo.on && !tm_set) tm = strata::kernels::i8_tile_two_blocks(tm, i8_smem_bytes(L.gu_type, L.d_type, 2, gg), i8_smem_bytes(L.gu_type, L.d_type, 3, gg),
                                                                   i8_smem_bytes(L.gu_type, L.d_type, 4, gg), vo.smem_sm, vo.reserved);
+    if (vo.on && !tm_set) tm = strata::kernels::i8_tile_volta(tm, avg, h_ok);   // the tensor-core form from kI8hMinAvg entries an expert (i8_expert_rule.hpp)
     const size_t smem_limit = i8_smem_limit();   // a tile that does not fit the device's shared memory per block falls to the next smaller one
-    while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm, gg) > smem_limit) tm = tm == 8 ? 4 : tm - 1;
-    const int bm = tm == 8 ? 128 : 16 * tm;
+    while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm, gg) > smem_limit) tm = tm == 8 || tm == 5 ? 4 : tm - 1;
+    const int bm = tm == 8 ? 128 : tm == 5 ? 64 : 16 * tm;
     i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
     I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
              cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm), gg};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
