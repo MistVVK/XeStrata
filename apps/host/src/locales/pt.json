@@ -3527,5 +3527,8 @@
   "s9035": "Estes arquivos do modelo estão faltando: {0}.",
   "s9036": "Pressione Baixar e carregar de novo para buscá-los. Os arquivos que já estão aí são mantidos. Se os mesmos arquivos aparecerem de novo, abra os Detalhes e compartilhe-os ao pedir ajuda.",
   "s9037": "Esta atualização foi interrompida quando o aplicativo reiniciou. Uma atualização posterior terminou, então não há nada a fazer.",
-  "s9038": "Este sistema não deixa o Strata usar a porta {0}. No Linux e no macOS, as portas abaixo de 1024 precisam de direitos de administrador. Inicie o Strata com outra porta (STRATA_PORT), por exemplo 8801."
+  "s9038": "Este sistema não deixa o Strata usar a porta {0}. No Linux e no macOS, as portas abaixo de 1024 precisam de direitos de administrador. Inicie o Strata com outra porta (STRATA_PORT), por exemplo 8801.",
+  "s9039": "Ferramentas para apps neste computador",
+  "s9040": "Quando isto está ligado, um app neste computador que envie sua chave de API pode deixar este modelo usar as ferramentas dele, como ler e alterar arquivos. Apps em outros dispositivos ou pelo link da internet nunca podem.",
+  "s9041": "Crie uma chave de API primeiro."
 }

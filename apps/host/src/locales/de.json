@@ -3527,5 +3527,8 @@
   "s9035": "Diese Modelldateien fehlen: {0}.",
   "s9036": "Drücken Sie noch einmal auf „Herunterladen und laden“, um sie zu holen. Vorhandene Dateien bleiben erhalten. Werden dieselben Dateien wieder aufgelistet, öffnen Sie die Details und teilen Sie sie mit, wenn Sie um Hilfe bitten.",
   "s9037": "Dieses Update wurde beim Neustart der App unterbrochen. Ein späteres Update ist abgeschlossen, Sie müssen nichts tun.",
-  "s9038": "Dieses System erlaubt Strata nicht, Port {0} zu verwenden. Unter Linux und macOS brauchen Ports unter 1024 Administratorrechte. Starten Sie Strata mit einem anderen Port (STRATA_PORT), zum Beispiel 8801."
+  "s9038": "Dieses System erlaubt Strata nicht, Port {0} zu verwenden. Unter Linux und macOS brauchen Ports unter 1024 Administratorrechte. Starten Sie Strata mit einem anderen Port (STRATA_PORT), zum Beispiel 8801.",
+  "s9039": "Werkzeuge für Apps auf diesem Computer",
+  "s9040": "Wenn dies eingeschaltet ist, kann eine App auf diesem Computer, die Ihren API-Schlüssel sendet, dieses Modell seine Werkzeuge verwenden lassen, etwa um Dateien zu lesen und zu ändern. Apps auf anderen Geräten oder über den Internet-Link können das nie.",
+  "s9041": "Zuerst einen API-Schlüssel erstellen."
 }

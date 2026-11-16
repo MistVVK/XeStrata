@@ -27,6 +27,7 @@ import { noModelNotice } from './no-model';
 import { taskHandoverMessage, taskHandoverTitle, chatHandoverMessage, chatHandoverTitle } from './task-handover';
 import type { Task } from './tasks';
 import { postWithFolderFallback } from './folder-pick';
+import { mcpToolsPatch } from './mcp-tools-switch';
 import { createSessionWriter, exportSessions, readBrowserSessions, HOST_FLAG_KEY, PENDING_KEY, type SaveResult, type StorageLike } from './session-persist';
 import { createHttpTransport, hydrateChats, keepLastMomentCopy, WINDOW_ID } from './chat-sync';
 import { copyText } from './clipboard';
@@ -1181,6 +1182,12 @@ export async function setLocalSharing(enabled: boolean) {
 
 export async function setServingAccess(patch: { otherDevices?: boolean; apiKey?: string | null }) {
   const result = await api.patch<ServingState>('/api/serving', patch);
+  set({ serving: newestServingState(state.serving, result) });
+}
+
+/** #5661: let apps on this computer use this model's MCP tools through the API (off by default). */
+export async function setMcpTools(model: string, on: boolean) {
+  const result = await api.patch<ServingState>('/api/serving', mcpToolsPatch(model, on));
   set({ serving: newestServingState(state.serving, result) });
 }
 
