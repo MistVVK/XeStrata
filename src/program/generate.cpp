@@ -2018,7 +2018,7 @@ struct LatentTab {
     int lat_G = 8, lat_E = 0, lat_fmt = 8;
     bool latent = false;
     std::string path;   // the D/U file open now
-    bool q4_fallback = false;   // Q8_0 by default, and the pack's Q4_0 beside it when Q8_0 leaves no working cache
+    bool q4_fallback = false;   // Q8_0 by default, and the pack's Q4_0 beside it where Q8_0 leaves too small a cache
     // detect the latent layout, open the D/U file and read the labels (host side, no device yet)
     bool open(const strata::core::ModelGeometry& g, std::string& err) {
         const auto& lay0 = strata::kernels::cpu::expert_layout();
@@ -2036,8 +2036,8 @@ struct LatentTab {
         }
         path = f;
         // The pack's two D/U files (Edge0 ships latent_dense_q4.bin and latent_dense_q8.bin), whichever of them
-        // XESTRATA_LATENT_DENSE (model.json) names: Q8_0 by default, Q4_0 only where Q8_0 leaves no working expert
-        // cache (to_q4 below; Edge0-145B's Q8_0 pair left an RTX 4070 none) or the user asks for it
+        // XESTRATA_LATENT_DENSE (model.json) names: Q8_0 by default, Q4_0 where Q8_0 leaves this card too small an
+        // expert cache (to_q4, chosen where the cache is sized) or the user asks for it
         // (XESTRATA_LATENT_DENSE_FMT=4).  Q4_0 is faster (the B70: Edge0-120B-NVFP4 1K decode 62.2 against 54.1 tok/s,
         // 32K 58.2 against 51-53; Edge0-145B-NVFP4 32K 53.4 against 37-44) but changes the output past the line an
         // approximation goes in by default at: its teacher-forced KL against Q8_0 is 0.0078 (120B) and 0.0070 (145B)
@@ -2117,7 +2117,7 @@ struct LatentTab {
             return false;
         }
         lat_fmt = dense.fmt();
-        std::fprintf(stderr, "xestrata generate: latent D/U: Q4_0 (%s) - Q8_0 leaves this card no working expert cache "
+        std::fprintf(stderr, "xestrata generate: latent D/U: Q4_0 (%s) in place of Q8_0 on this card "
                              "(XESTRATA_LATENT_DENSE_FMT=8 insists on Q8_0)\n", path.c_str());
         return upload(device, lb, le, err);
     }
@@ -5621,14 +5621,52 @@ int main(int argc, char** argv) {
                 ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
         };
         int64_t min_slots = min_slots_now();
-        // the latent D/U's default Q8_0 leaves the cache fewer slots than it needs: the pack's Q4_0 (LatentTab)
-        if (lat_tab.latent && lat_tab.q4_fallback && slots < min_slots) {
-            std::string le;
-            if (!lat_tab.to_q4(0, 0, multi_gpu ? split_at[0] : g.n_layers, le)) {
-                std::fprintf(stderr, "xestrata generate: %s\n", le.c_str());
-                return 1;
+        // The latent D/U's default Q8_0 against the pack's Q4_0 (LatentTab), by both formats' sizes on this card.
+        // Q4_0's pair is 18/34 of Q8_0's, so it leaves the cache that many more slots; Q4_0 is taken where Q8_0 leaves
+        // fewer than the cache needs, a smaller prompt chunk than Q4_0 would (--prefill auto: the chunk is the
+        // largest whose buffers the cache can lend, auto_slots' rule below at its lower 85%), or under four fifths of
+        // Q4_0's slots.  Measured (2026-11-16, Q8_0's slots / Q4_0's): the RTX 4070 (12 GB) at 0.30-0.64
+        // lost 5-24% of its decode and up to 75% of its 32K prefill with Q8_0 (Edge0-145B-NVFP4 32K: 381 slots
+        // against 1291, a 1024-token chunk, prefill 642 -> 160 tok/s); the B70 (32 GB) at about 0.92-0.95 keeps
+        // Q8_0, whose output Q4_0's departs from past the default line (KL 0.0070-0.0078 against 0.0058).  The four
+        // fifths lies between the two cards' ratios; a 16 GB card's (the RX 9060 XT's) is not measured yet.
+        if (lat_tab.latent && lat_tab.q4_fallback) {
+            const uint64_t du8 = strata::core::latent_device_bytes(0), du4 = du8 / 34 * 18;
+            const int64_t slots_q4 = slots + (int64_t) ((du8 - du4) / (uint64_t) blob);
+            auto chunk_at = [&](int64_t n) -> int64_t {   // the prompt chunk a cache of n slots would lend
+                if (!(o.prefill_chunk > 0 && borrow && o.prefill_auto)) return 0;
+                int64_t got = 0;
+                strata::prefill::auto_chunk(o.max_context, [&](int64_t c) {
+                    for (const bool cap : {false, true})
+                        for (const int ring : {0, 96}) {
+                            strata::prefill::Prefill::set_group_cap(cap);
+                            strata::prefill::Prefill::set_ring_override(ring);
+                            const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, ss, c);
+                            const int64_t k = (need + blob - 1) / blob;
+                            if (k + 128 <= n && k * 100 <= 85 * n) { got = c; return true; }
+                        }
+                    return false;
+                });
+                strata::prefill::Prefill::set_group_cap(false);
+                strata::prefill::Prefill::set_ring_override(0);
+                return got;
+            };
+            const int64_t c8 = chunk_at(slots), c4 = chunk_at(slots_q4);
+            const char* why = slots < min_slots ? "leaves the expert cache fewer slots than it needs"
+                              : c8 < c4         ? "leaves the prompt a smaller chunk"
+                              : slots * 5 < slots_q4 * 4 ? "leaves the expert cache under four fifths of Q4_0's slots"
+                                                         : nullptr;
+            if (why != nullptr) {
+                std::fprintf(stderr, "xestrata generate: latent D/U: Q8_0 %s (%s, chunk %lld; Q4_0 %s, chunk %lld)\n",
+                             why, slots_text(slots).c_str(), (long long) c8, slots_text(slots_q4).c_str(),
+                             (long long) c4);
+                std::string le;
+                if (!lat_tab.to_q4(0, 0, multi_gpu ? split_at[0] : g.n_layers, le)) {
+                    std::fprintf(stderr, "xestrata generate: %s\n", le.c_str());
+                    return 1;
+                }
+                size_cache();
             }
-            size_cache();
         }
         if (slots < min_slots && o.batch > 0) {   // --batch: slots given back until it has them (drop_slots)
             while (slots < min_slots && o.batch > 0) {
