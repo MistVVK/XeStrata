@@ -503,6 +503,10 @@ fn start_host(app: &tauri::AppHandle) -> Result<u16, String> {
     let port = pick_stable_port()?;
     let token = random_token();
     let mut cmd = host_command(&res, port, &token)?;
+    // This process shows the page in its own window: the host says so at /api/app/mode, and the page then hands a link in an answer to
+    // the host, which opens it in the default browser (#5072, #4721). Without it the mode was null and the click called window.open,
+    // which the app window ignores. The Linux shell sets the same variable in supervisor.rs.
+    cmd.env("STRATA_UI_MODE", "window");
     // The signed app updater (Tauri) is reached by the host through a token-protected loopback bridge.
     let bridge = updater::start(app, random_token());
     updater::apply_env(&mut cmd, app, bridge.as_ref());
