@@ -76,5 +76,5 @@
  "fxpr2": "Celui de Strata (recommandé)",
  "fxpr3": "Celui de llama.cpp",
  "fxpr4": "Le programme qui transforme les images en quelque chose que le modèle peut lire. Celui de Strata est plus rapide sur la plupart des ordinateurs et lit correctement les très grandes images ; sur quelques cartes graphiques où il est encore plus lent, Strata utilise de lui-même celui de llama.cpp. Choisissez celui de llama.cpp si les images sont mal lues.",
-  "fx86": "Résumer les anciens messages pour que la discussion soit plus rapide et retrouve de la place"
+  "fx86": "Résumer les anciens messages pour que la conversation soit plus rapide et retrouve de la place"
 }

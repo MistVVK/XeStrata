@@ -32,7 +32,7 @@ add("Strata could not read these chat files. You can delete them here.",
     "Strata не смогла прочитать эти файлы чатов. Их можно удалить здесь.",
     "O Strata não conseguiu ler estes arquivos de chat. Você pode excluí-los aqui.",
     "Strata가 이 채팅 파일들을 읽지 못했습니다. 여기에서 삭제할 수 있습니다.",
-    "Strata n'a pas pu lire ces fichiers de conversation. Vous pouvez les supprimer ici.")
+    "Strata n’a pas pu lire ces fichiers de conversation. Vous pouvez les supprimer ici.")
 add("Strata could not read this chat file, so its messages are not shown.",
     "Strata 无法读取此聊天文件，因此不显示其消息。",
     "Strataはこのチャットファイルを読み込めなかったため、メッセージは表示されません。",
@@ -41,7 +41,7 @@ add("Strata could not read this chat file, so its messages are not shown.",
     "Strata не смогла прочитать этот файл чата, поэтому его сообщения не показаны.",
     "O Strata não conseguiu ler este arquivo de chat, então as mensagens dele não são exibidas.",
     "Strata가 이 채팅 파일을 읽지 못해 메시지를 표시하지 않습니다.",
-    "Strata n'a pas pu lire ce fichier de conversation ; ses messages ne sont donc pas affichés.")
+    "Strata n’a pas pu lire ce fichier de conversation ; ses messages ne sont donc pas affichés.")
 add("Delete chat file",
     "删除聊天文件",
     "チャットファイルを削除",
@@ -104,7 +104,7 @@ add("The chat file could not be deleted",
     "Не удалось удалить файл чата",
     "Não foi possível excluir o arquivo de chat",
     "채팅 파일을 삭제하지 못했습니다",
-    "Le fichier de conversation n'a pas pu être supprimé")
+    "Le fichier de conversation n’a pas pu être supprimé")
 # dmg11 (coordinator 11-16): a chat file of a newer Strata is not damaged and is never offered for deletion.
 add("This chat was saved by a newer version of Strata. Update Strata to open it.",
     "此聊天由较新版本的 Strata 保存。请先更新 Strata 再打开。",
@@ -114,7 +114,7 @@ add("This chat was saved by a newer version of Strata. Update Strata to open it.
     "Этот чат сохранён более новой версией Strata. Обновите Strata, чтобы открыть его.",
     "Este chat foi salvo por uma versão mais recente do Strata. Atualize o Strata para abri-lo.",
     "이 채팅은 더 새 버전의 Strata에서 저장되었습니다. 열려면 Strata를 업데이트하세요.",
-    "Cette conversation a été enregistrée par une version plus récente de Strata. Mettez Strata à jour pour l'ouvrir.")
+    "Cette conversation a été enregistrée par une version plus récente de Strata. Mettez Strata à jour pour l’ouvrir.")
 
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
 NBSP = " "
