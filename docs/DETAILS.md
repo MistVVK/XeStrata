@@ -1766,8 +1766,10 @@ It goes to the state folder's `debug-chat-log/` (`~/.local/state/xestrata/debug-
 - `img/`: the pictures a request sent and the ones a tool made, one file each, named by their hash. A data URL in a request's body becomes `{"picture": "img/..."}`, naming the file.
 - `chats/<chat id>.json`: the web page's own record of a chat, as the browser keeps it (its pictures, files and the copies of the images made included). While the log is on, the page sends a chat each time it saves it.
 
-When the folder grows past `"debug_chat_log_mib"` (1024 by default), the oldest days' lines and the oldest chats go first, then the pictures nothing names any more.
-A write that fails is said once in the server's log, and the request goes on.
+The days before today's and the chats not saved for a day or more are packed with xz on a thread of their own, when the server starts and at the first request of a new day (`requests-<date>.jsonl.xz`, `chats/<chat id>.json.xz`). A packed file is read back and checked before the plain one is removed. A packed chat that is saved again is written plain, and its old `.xz` removed. The pictures are not packed: their formats are compressed already.
+`xzcat` or `xz -dc` reads a packed file.
+When the folder grows past `"debug_chat_log_mib"` (1024 by default, the packed files counted packed), the oldest days' lines and the oldest chats go first, then the pictures nothing names any more.
+A write or a packing that fails is said once in the server's log, and the request goes on. A file that could not be packed stays plain.
 Set an API key when others can reach the server.
 
 ### Chat Completions and Messages fields
