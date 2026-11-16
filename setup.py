@@ -8993,8 +8993,9 @@ def mac_reader(eng: Path, vision: str):
 
 def prepare_pack_only(a) -> int:
     """setup.py --prepare-pack PACK_DIR --gguf-dir DIR --family F --model M: the pack (index, dense weights, tokenizer) of a model whose GGUF files
-    are in DIR, for a card the built-in downloader does not set up (Intel Arc). llama.cpp's gguf-py is fetched when it is not here (the one
-    download); the model's files are never downloaded or changed."""
+    are in DIR, for a card the built-in downloader does not set up (Intel Arc). The pack tool reads the GGUF files with Strata's own reader
+    (tools/strata_gguf.py; llama.cpp's gguf-py only when the person names one with STRATA_GGUF_PY): nothing is downloaded, and the model's files
+    are never changed."""
     if not a.gguf_dir:
         fail("--prepare-pack needs --gguf-dir, the folder with the model's .gguf files")
     family = a.family or "qwen"
@@ -9011,7 +9012,7 @@ def prepare_pack_only(a) -> int:
     pack = Path(a.prepare_pack)
     step(1, "preparing the model for this graphics card")
     llama = llama_override()
-    ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py)")
+    ok("model file reader ready")
     env = dict(os.environ, **gguf_py_env())
     if not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(files[0]), "--out", str(pack),
