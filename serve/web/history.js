@@ -25,8 +25,41 @@
 
   // pictures and files are kept as their names only: a data URL would fill the browser's storage
   // a picture keeps its small preview (thumb) when it has one; records saved before that still clean to names alone
-  const cleanMessages = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => (i.thumb ? {name: i.name, thumb: i.thumb} : {name: i.name})),
+  // (#5998 review) only a preview this page makes is kept: a JPEG data URL of at most THUMB_MAX_CHARS, so a stored chat stays small
+  const THUMB_SIDE = 480, THUMB_QUALITY = 0.72, THUMB_MAX_CHARS = 200000, THUMB_WAIT_MS = 5000;
+  const validThumb = (t) => typeof t === "string" && t.length <= THUMB_MAX_CHARS && /^data:image\/jpeg;base64,[A-Za-z0-9+/]+=*$/.test(t);
+  const cleanMessages = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => (validThumb(i.thumb) ? {name: i.name, thumb: i.thumb} : {name: i.name})),
                                                     files: (m.files || []).map((f) => ({name: f.name}))}));
+  // The preview of a picture (long side THUMB_SIDE px, JPEG): null when the browser cannot decode or draw it, when the canvas has no
+  // 2D context, when export throws or is blocked, when the result is too big, or after THUMB_WAIT_MS. It never rejects, and nothing
+  // waits for it: the attachment with its original goes in at once and gets the preview when it comes. `deps` are the page's
+  // Image and canvas (makeImage(), makeCanvas()), so the rule runs in Node too.
+  function makeThumb(dataUrl, deps, waitMs = THUMB_WAIT_MS) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
+      const timer = setTimeout(() => done(null), waitMs);
+      try {
+        const im = deps.makeImage();
+        im.onerror = () => done(null);
+        im.onload = () => {
+          try {
+            const w = im.naturalWidth || im.width, h = im.naturalHeight || im.height;
+            if (!(w > 0 && h > 0)) return done(null);
+            const s = Math.min(1, THUMB_SIDE / Math.max(w, h));
+            const c = deps.makeCanvas();
+            c.width = Math.max(1, Math.round(w * s)); c.height = Math.max(1, Math.round(h * s));
+            const ctx = c.getContext("2d");
+            if (!ctx) return done(null);
+            ctx.drawImage(im, 0, 0, c.width, c.height);
+            const out = c.toDataURL("image/jpeg", THUMB_QUALITY);
+            done(validThumb(out) ? out : null);
+          } catch (e) { done(null); }
+        };
+        im.src = dataUrl;
+      } catch (e) { done(null); }
+    });
+  }
   const cleanChat = (c) => ({...c, messages: cleanMessages(c.messages)});
 
   // "today" | "yesterday" | "week" | "month" | "older", by calendar days back from now
@@ -85,7 +118,7 @@
   }
 
   const api = {TITLE_MAX, newChat, chatTitle, cleanMessages, cleanChat, groupKey, filterChats, lostAttachments, draftOf, rewind,
-               regenerate, editAnswer, branch};
+               regenerate, editAnswer, branch, THUMB_MAX_CHARS, validThumb, makeThumb};
   root.StrataHistory = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
