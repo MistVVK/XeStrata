@@ -8037,19 +8037,22 @@ def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: st
     slot = parallel_slot_gb(ctx, kv, streaming)
     pinned = parallel_pinned_gb(ctx, kv) if streaming else 0.0
     ram_bound = rec == 0 and parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming) >= 2
-    why = (f"each request at once pins ~{pinned:.1f} GB of RAM for its K/V at this context, more than this PC can "
-           "spare beside the experts" if ram_bound else PARALLEL_COST_NOTE)
+    ram_words = (f"Each extra request at once would need about {pinned:.1f} GB of RAM at this context length, more than this PC has free "
+                 "next to the model")                  # wording approved by the coordinator 11-16 (#6046)
     if asked is None or asked <= 1:
         if not rec:
-            return [f"Several requests at once: left at one at a time - {why} (docs/BATCHING.md)."]
+            if ram_bound:
+                return [f"Several requests at once: off (one at a time). {ram_words} (see docs/BATCHING.md)."]
+            return [f"Several requests at once: left at one at a time - {PARALLEL_COST_NOTE} (docs/BATCHING.md)."]
         return [f"Several requests at once (opt-in): --parallel {rec} decodes up to {rec} together instead of one "
                 f"after the other (each takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md)."]
     lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
-             f"{asked * slot:.1f} GB in all" + (f"; each also pins ~{pinned:.1f} GB of RAM" if pinned else "") + ")"]
+             f"{asked * slot:.1f} GB in all" + (f"; each also needs ~{pinned:.1f} GB of RAM" if pinned else "") + ")"]
     if asked > PARALLEL_MAX:
         lines.append(f"the engine runs at most {PARALLEL_MAX} at once; it will use {PARALLEL_MAX}")
     if not rec:
-        lines.append(f"recommended for this card: one at a time - {why}; kept as you chose")
+        lines.append(f"recommended for this card: one at a time. {ram_words}; kept as you chose" if ram_bound else
+                     f"recommended for this card: one at a time - {PARALLEL_COST_NOTE}; kept as you chose")
     elif asked > rec:
         lines.append(f"recommended for this card: {rec} - more slots leave fewer experts in VRAM, which can make every "
                      "request slower; kept as you chose")

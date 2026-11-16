@@ -49,11 +49,15 @@ class Parallel(unittest.TestCase):
         self.assertEqual(S.parallel_recommend(48, q2, 1048576, "int8", True), 3)
         self.assertEqual(S.parallel_recommend(48, q2, 1048576, "int8", True, 64), 0)
         note = S.parallel_note(None, 48, q2, 1048576, "int8", True, 64)
-        self.assertIn("pins ~13.3 GB of RAM", note[0])
-        self.assertIn("pins ~13.3 GB of RAM", S.parallel_note(2, 48, q2, 1048576, "int8", True, 64)[0])
+        self.assertEqual(note, ["Several requests at once: off (one at a time). Each extra request at once would need about 13.3 GB of RAM "
+                                "at this context length, more than this PC has free next to the model (see docs/BATCHING.md)."])
+        asked = S.parallel_note(2, 48, q2, 1048576, "int8", True, 64)
+        self.assertIn("; each also needs ~13.3 GB of RAM)", asked[0])
+        self.assertIn("recommended for this card: one at a time. Each extra request at once would need about 13.3 GB of RAM at this "
+                      "context length, more than this PC has free next to the model; kept as you chose", asked)
         # VRAM is the limit and RAM is fine: the note does not blame the pinned RAM
         note = S.parallel_note(None, 12, q2, 32768, "int8", False, 128)
-        self.assertNotIn("pins", note[0])
+        self.assertNotIn("GB of RAM", note[0])
         self.assertIn("10-25% speed", note[0])
 
     def test_notes_recommend_never_force(self):
