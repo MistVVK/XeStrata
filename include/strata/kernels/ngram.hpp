@@ -28,6 +28,8 @@
 #include <string>
 #include <vector>
 
+namespace strata { class GgufFile; }
+
 namespace strata::kernels {
 
 // ---- geometry, every value confirmed against the artifact (docs/gguf-metadata.txt) ----
@@ -79,6 +81,11 @@ const PleFormatInfo& ple_format_info(PleFormat f);
 const PleFormatInfo* ple_format_for_type(const char* gguf_type_name);
 /// "IQ4_NL, Q5_0 or FP8 (I8)": the formats for an error message, built from the list.
 std::string ple_format_list();
+/// A `--ple-gguf` file that holds the PLE table and no model projections (generate.cpp keeps it out of the native
+/// dense shard list, whose split checks refuse a file of another set): a tools/ple_fp8_pack.py table
+/// (general.architecture = strata-ple), or any file whose only tensor is per_layer_token_embd.weight (a published
+/// PLE GGUF, an Unsloth engram table, a set's table-only shard).  PleTable::open checks the table itself.
+bool ple_gguf_table_only(const strata::GgufFile& f);
 
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///
