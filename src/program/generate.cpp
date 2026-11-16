@@ -7945,7 +7945,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     bool prefill_head_alias_bound = false;
-    const void* prefill_head_alias_at = nullptr;   // where the head came back the first time
+    const void* prefill_head_alias_at = nullptr;   // where the head came back the first time (or after the last move, #5188)
+    const void* prefill_head_alias_scratch = nullptr;   // and its scratch
     if (o.prefill_head_alias) {
         const char* why = !o.serve ? "it needs --serve"
                         : multi_gpu || !stages.empty() ? "it supports one GPU only"
@@ -11996,7 +11997,10 @@ int main(int argc, char** argv) {
         } else if (o.prefill_auto && d_res == nullptr) {
             o.prefill_chunk = 1024;       // #85: no expert cache at all (a full 8 GB card): small buffers of its own
         }
-        if (o.prefill_head_alias) {
+        // pf_parts is empty when there is no VRAM expert tier (no --expert-profile, or no VRAM left for it): the alias has
+        // nothing to borrow then, and the verifier below stops the start with its own "--expert-profile" error.  It read
+        // pf_parts[0] before and ended in a SIGSEGV instead (found on p2003 with #5188's gate).
+        if (o.prefill_head_alias && !pf_parts.empty()) {
             for (PfPart& p : pf_parts) {
                 p.first = p.cache->slots() > 1 ? 1 : -1;
                 p.first_now = p.first;
@@ -17580,16 +17584,38 @@ int main(int argc, char** argv) {
                 if (!o.prefill_head_alias || native_head.loaded()) return 0;
                 sp.reset();
                 const auto head_t0 = Clock::now();
-                if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+                // STRATA_HEAD_ALIAS_TEST_MOVE=1 (tests only): a spacer as large as the head is held while it loads, so it lands at
+                // another address than last time (#5188's case on a large card)
+                void* move_spacer = nullptr;
+                static const bool test_move = std::getenv("STRATA_HEAD_ALIAS_TEST_MOVE") != nullptr;
+                if (test_move && cudaMalloc(&move_spacer, (size_t) native_head.weight_bytes()) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    move_spacer = nullptr;
+                }
+                const bool head_ok = native_head.load(o.native_head_shards, g.n_embd, n_vocab, err);
+                if (move_spacer != nullptr) (void) cudaFree(move_spacer);
+                if (!head_ok) {
                     std::printf("ERR restoring the native output head failed: %s\n", err.c_str());
                     return 1;
                 }
-                // the verify windows' captured graphs read the head at the address of their capture
-                if (prefill_head_alias_at == nullptr) prefill_head_alias_at = native_head.weights();
-                if (native_head.weights() != prefill_head_alias_at) {
-                    std::printf("ERR --prefill-head-alias: the output head was reloaded at another address, so the "
-                                "captured verify graphs would read freed memory\n");
-                    return 1;
+                // the verify windows' captured graphs read the head (and its scratch) at the address of their capture.
+                // #5188: on an 8 GB card the head came back elsewhere at every second request and the engine stopped; the
+                // window graphs are dropped instead, and each size captures again at its next window
+                if (prefill_head_alias_at == nullptr) {
+                    prefill_head_alias_at = native_head.weights();
+                    prefill_head_alias_scratch = native_head.scratch();
+                }
+                if (native_head.weights() != prefill_head_alias_at || native_head.scratch() != prefill_head_alias_scratch) {
+                    int dropped = 0;
+                    if (!ver.drop_window_graphs(dropped, err)) {
+                        std::printf("ERR --prefill-head-alias: the output head came back at another address and the "
+                                    "captured verify graphs could not be dropped: %s\n", err.c_str());
+                        return 1;
+                    }
+                    prefill_head_alias_at = native_head.weights();
+                    prefill_head_alias_scratch = native_head.scratch();
+                    std::fprintf(stderr, "strata serve: --prefill-head-alias: the output head came back at another address: "
+                                         "%d window graphs dropped, each is captured again at its next window\n", dropped);
                 }
                 std::fprintf(stderr, "strata serve: --prefill-head-alias: output head restored in %.1f ms before decode\n",
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());

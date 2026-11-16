@@ -11931,6 +11931,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_HEAD_ALIAS_TEST_MOVE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 17353,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "d4c732f6a0",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "d4c732f6a0",
+   "last_date": "2026-11-16",
+   "status": "research",
+   "owner": "program",
+   "note": "tests only (#5188): =1 holds a head-sized spacer while --prefill-head-alias reloads the output head, so the head comes back at another address on a large card; users never set it",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_HEAD_HOST",
    "backends": [
     "cuda-hip"
