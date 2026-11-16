@@ -6,6 +6,8 @@ The ordinary GGUF quantizes some small projections which Strata reads as BF16. `
 
 ## Build and prepare
 
+Strata 0.2.16 builds no MMQ kernels, so the Q5_0 down layers of this file have no GPU prompt kernel yet. To run it, build the v0.2.15 tag with `-DSTRATA_ORCA_Q4KS_MMQ=ON` as below.
+
 Build Strata with CUDA, native experts, `STRATA_ORCA_Q4KS_MMQ=ON` (and `STRATA_BUILD_TESTS=ON` for the two parity programs below). This opt-in compiles the Q5_0 GGML MMQ instance for CUDA or HIP (the Q4_K and Q5_1 instances come with the engine's K-quant MMQ build on CUDA); the usual Q8_0 draft-layer instance remains in both builds. HIP also needs `STRATA_PREFILL_MMQ=ON`. Select your card's compute capability, for example `89` on an L40S. On Windows with Ninja and CUDA 12.6, use the Visual Studio developer environment and `-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared` to keep the CUDA runtime linkage consistent. The default pinned ggml checkout is supported by the project build.
 
 ```sh
