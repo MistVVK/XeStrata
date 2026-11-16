@@ -34,9 +34,20 @@ class ConfigureLine(unittest.TestCase):
     def test_cuda12_is_the_pascal_and_volta_build(self):
         got = B.configure_args(Path("S"), Path("Bd"), "cuda12", CUDA12, [])
         self.assertIn("-DSTRATA_EXPERIMENTAL_SM60=ON", got)
-        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=60-real;61-real;70-real;75-real;80-real;86-real;89-real;89-virtual", got)
+        # #5784: machine code for sm_120 too (a Blackwell card beside a Pascal / Volta one, or on a driver under 580.65, runs this package
+        # and compiled its compute_89 PTX for minutes at every start); the PTX stays compute_89, the one sm_90 and other cards between use
+        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=60-real;61-real;70-real;75-real;80-real;86-real;120-real;89-real;89-virtual", got)
         self.assertEqual(B.VARIANTS["cuda12"][2], "576.02")      # the 0.1.59 cuda12 zip's min_driver
         self.assertEqual(B.VARIANTS["cuda13"][2], "580.65")
+
+    def test_every_cuda12_recipe_names_the_same_archs(self):
+        # the engine (Windows, Linux) and the Windows picture reader: package_engine.py refuses a reader that does not cover the engine
+        want = ";".join(str(a) for a in B.VARIANTS["cuda12"][1])
+        self.assertEqual(want, "60;61;70;75;80;86;120;89")
+        linux = (ROOT / "packaging" / "build_cuda_linux.sh").read_text(encoding="utf-8")
+        self.assertIn("cuda12) archs=${ARCHS:-%s};" % want, linux)
+        bat = (ROOT / "packaging" / "build_vision_windows.bat").read_text(encoding="utf-8")
+        self.assertIn('set "ARCHS=%s"' % want, bat)
 
     def test_extra_arguments_come_last_and_the_override_is_named(self):
         got = B.configure_args(Path("S"), Path("Bd"), "cuda13", CUDA13, ["-DSTRATA_WINDOW_MAX_T=16"], ggml_dir="C:\\ref\\llama.cpp")

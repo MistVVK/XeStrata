@@ -1,7 +1,7 @@
 @echo off
 rem The Windows CUDA picture reader for an engine package: strata-vision.exe built for the SAME architectures as the package's strata.exe.
 rem
-rem   packaging\build_vision_windows.bat cuda12 <stage folder>     CUDA 12.9: 60;61;70;75;80;86;89 (+ 89 PTX)  the Pascal / Volta package
+rem   packaging\build_vision_windows.bat cuda12 <stage folder>     CUDA 12.9: 60;61;70;75;80;86;120;89 (+ 89 PTX)  the Pascal / Volta package
 rem   packaging\build_vision_windows.bat cuda13 <stage folder>     CUDA 13.0: 75;86;89;120 (+ 120 PTX)
 rem
 rem Why: the cuda12 and cuda13 packages used to share one strata-vision.exe, built before the Pascal code existed (unchanged since 0.1.44). On a
@@ -24,7 +24,7 @@ if "%VARIANT%"=="" goto usage
 if "%STAGE%"=="" goto usage
 for %%I in ("%~dp0..") do set "SRC=%%~fI"
 if /i "%VARIANT%"=="cuda12" (
-  set "ARCHS=60;61;70;75;80;86;89"
+  set "ARCHS=60;61;70;75;80;86;120;89"
   if defined CUDA_PATH_V12_9 set "CUDA_PATH=%CUDA_PATH_V12_9%"
 ) else if /i "%VARIANT%"=="cuda13" (
   set "ARCHS=75;86;89;120"
