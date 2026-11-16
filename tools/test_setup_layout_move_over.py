@@ -88,6 +88,31 @@ class MoveOver(unittest.TestCase):
         self.assertTrue((self.clone / "models" / "note.txt").exists(), "an existing terminal/models is not replaced")
         self.assertEqual((self.root / "models" / "mine.txt").read_text(encoding="utf-8"), "keep")
 
+    def test_models_and_packs_move_by_rename_only_and_stay_when_it_fails(self):
+        """Coordinator 11-16: models/ and packs/ (hundreds of GB) are never copied. A rename that fails (another disk, files in use)
+        leaves them where they are, with a warning, and the moved config still names them there."""
+        (self.clone / "packs").mkdir()
+        (self.clone / "packs" / "p.bin").write_bytes(b"pack")
+        real = setup.os.rename
+
+        def rename(src, dst):
+            if Path(src).name in ("models", "packs"):
+                raise OSError(18, "Invalid cross-device link")
+            return real(src, dst)
+        with mock.patch.object(setup.os, "rename", side_effect=rename), \
+                mock.patch.object(setup.shutil, "move", side_effect=AssertionError("moved by copy")), \
+                mock.patch.object(setup.shutil, "copytree", side_effect=AssertionError("copied")), \
+                mock.patch.object(setup.shutil, "copy2", side_effect=AssertionError("copied")):
+            moved, out = self.run_it()
+        for name in ("models", "packs"):
+            self.assertTrue((self.clone / name).is_dir(), name)
+            self.assertFalse((self.root / name).exists(), name)
+            self.assertIn(f"{self.clone / name} could not be moved", out)
+        self.assertTrue((self.root / "strata-q2_0.json").exists(), "the rest still moves")
+        cfg = json.loads((self.root / "strata-q2_0.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["args"][1], str(self.clone / "models" / "q2.gguf"), "the config keeps naming the models where they are")
+        self.assertEqual(cfg["exe"], str(self.root / "engine" / "strata.exe"))
+
     def test_no_move_in_the_old_layout_or_an_installed_terminal(self):
         self.assertEqual(self.run_it(self.clone), ([], ""))
         installed = self.tmp / "share" / "strata" / "terminal"

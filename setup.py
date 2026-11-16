@@ -7735,7 +7735,9 @@ def move_over_old_layout() -> list:
             continue
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
+            # a rename only, never a copy: models/ and packs/ hold hundreds of GB. A rename that fails (another disk, files in use)
+            # leaves the entry where it is, with the warning; the old place keeps working for the files a config names.
+            os.rename(src, dst)
             moved.append((src, dst))
         except OSError as e:
             warn(f"{src} could not be moved to {dst}: {e}")
