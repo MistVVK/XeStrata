@@ -570,6 +570,35 @@ test('packaged: a model install that fails does not cancel the engine download i
   } finally { await f.native.close(); f.cleanup(); }
 });
 
+test('packaged: with no engine on the PC yet, the engine is installed before setup starts (setup takes the picture reader from it; Qwen3.6 came up text-only)', async () => {
+  const report = { engine: { status: 'install', offered: { version: '0.1.60' }, download_bytes: 7e8 } };
+  const seen = { installsWhenEngineDone: null };
+  let f;
+  f = packagedFixture({ engineUsable: false, updater: { report, async update(options) {
+    options.onEvent({ event: 'progress', phase: 'download', percent: 50, done: 3.5e8, total: 7e8 });
+    await new Promise(r => setTimeout(r, 300));
+    seen.installsWhenEngineDone = f.rpc.filter(c => c.name === 'strata_install' && c.arguments.confirm).length;
+    return { ok: true, results: [{ component: 'engine', status: 'updated', installed_after: { version: '0.1.60' } }] };
+  } } });
+  try {
+    await f.native.refresh(true);
+    const job = await finish(f.native, f.native.operation('install', { family: 'qwen', model: 'Q2_0' }).id);
+    assert.equal(job.state, 'done', job.error);
+    assert.equal(seen.installsWhenEngineDone, 0, 'setup was not started before the engine was in');
+    assert.equal(f.rpc.filter(c => c.name === 'strata_install' && c.arguments.confirm).length, 1);
+    assert.deepEqual(f.calls.filter(c => c[0] === 'update'), [['update', true, false]], 'the engine is fetched once');
+    assert.equal(job.result.install.engine.state, 'done');
+  } finally { await f.native.close(); f.cleanup(); }
+  // an engine that is there already: setup starts at once and the engine step runs beside it, as before
+  const g = packagedFixture({ engineUsable: true, updater: { report: { engine: { status: 'current', installed: { version: '0.1.60' } } }, async update() { throw new Error('not called'); } } });
+  try {
+    await g.native.refresh(true);
+    const job = await finish(g.native, g.native.operation('install', { family: 'qwen', model: 'Q2_0' }).id);
+    assert.equal(job.state, 'done', job.error);
+    assert.equal(g.calls.filter(c => c[0] === 'update').length, 0, 'a current engine is not fetched');
+  } finally { await g.native.close(); g.cleanup(); }
+});
+
 test('packaged: Stop still cancels the engine download of an install', async () => {
   const report = { engine: { status: 'install', offered: { version: '0.1.46' }, download_bytes: 5e8 } };
   const seen = { aborted: null };

@@ -209,15 +209,25 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
   for(const id of [...instances.keys()])await unload(id);
   if(job.state!=='running')return;
   args=await controlDrafter(args);if(job.state!=='running')return;
-  let result=await tool('strata_install',installArgs(args,true));
   /* The engine comes with the model: the same job makes sure this PC has a usable engine (none installed, or a newer compatible
      one in the signed feed) through Control's component updater, and shows it in the job's own progress (install.engine, install.parts,
      one combined download total). A failed engine download keeps the model files and ends with a retry message. */
   job.engineAbort=new AbortController();
   const engineStep=packaged&&typeof control.update==='function'?createEngineStep({control,signal:job.engineAbort.signal,onChange:()=>{if(job.rawResult)publish(job.rawResult);else emit();}}):null;
   const publish=r=>{job.rawResult=r;job.summary=r.summary;job.result=engineStep&&r.install?{...r,install:engineStep.merge(r.install)}:r;emit();};
+  /* No usable engine on this PC yet (a first run): the engine comes first, then setup. Setup reads the picture reader and the model families
+     from the engine folder (step 4); while the engine was still coming it set pictures off, and Qwen3.6 came up text-only (0.2.15 release
+     test). An engine that is there already is checked for a newer one beside the download, as before. */
+  let engineTask=null;
+  if(engineStep&&!(await control.engine().then(e=>!!e?.usable).catch(()=>false))){
+   publish({summary:job.summary,install:{running:true,parts:[{kind:'model',name:'Model files',state:'waiting',done_gb:0,total_gb:0}]}});
+   engineTask=engineStep.run();
+   await engineTask;
+   if(job.state!=='running')return;
+  }
+  let result=await tool('strata_install',installArgs(args,true));
   publish(result);
-  const engineTask=engineStep?engineStep.run():null;
+  if(engineStep&&!engineTask)engineTask=engineStep.run();
   try{
    for(;;){
     if(job.state!=='running')return;
