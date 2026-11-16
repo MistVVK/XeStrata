@@ -840,10 +840,51 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                     return at
                 if verdict == "hold":
                     return -2
-            elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after):
+            elif after.startswith(FOLLOWERS) or _follower_form(after):    # #6032 R1: the damaged followers
+                return at
+            elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after) \
+                    or any(t.startswith(after) for t in FOLLOWERS) or _follower_form(after) is None:
                 return at if final else -2
         at = text.find(PARAM_END, at + 1)
     return -1
+
+
+# #6032 R1: what else ends a value after its `</parameter>` (Gyro / Coder-L recordings): the Anthropic XML form's
+# `</invoke>` and `<parameter name=` written in place of the call format's own tags, and a garbled `</<`
+FOLLOWERS = ("</<", "</invoke>", "<parameter name=")
+_DAMAGED_OPENER = re.compile(r"<=[^<>\s]+>")          # `<=NAME>`: a damaged parameter opener
+_STRAY_CLOSER = re.compile(r"</(?!parameter>|function>|tool_call>)[^<>\s=/]+>\s*")
+
+
+def _follower_form(after: str):
+    """#6032 R1: `after` (what follows a `</parameter>`, no leading whitespace) starts with a damaged opener `<=NAME>`,
+    or with a stray closer `</NAME>` standing where `</function>` belongs (then `</tool_call>`): True; None while it
+    may still become one (streaming); False otherwise (a tag of the value itself: the value goes on)."""
+    if _DAMAGED_OPENER.match(after):
+        return True
+    if re.fullmatch(r"<=[^<>\s]*", after):
+        return None
+    m = _STRAY_CLOSER.match(after)
+    if m:
+        rest = after[m.end():]
+        if rest.startswith(CALL_END):
+            return True
+        return None if not rest or CALL_END.startswith(rest) else False
+    return None if re.fullmatch(r"</(?!parameter>|function>|tool_call>)[^<>\s=/]*", after) else False
+
+
+NOT_PARAMS = ("function", "think", "parameter")
+
+
+def param_name(opener: str) -> str | None:
+    """#6032 R1: the parameter a `<parameter=` opener names (`opener`: what follows `=` up to the `>` found): the name
+    cut at its first whitespace, `<` or `>` (the model ran a closer or `</think>` into it, or put a space before the
+    `>`); None - the value is read and dropped - when that leaves nothing, a placeholder (null / none) or one of the
+    call format's own tag names."""
+    name = re.split(r"[\s<>]", opener.lstrip(), 1)[0]
+    if not name or name in NOT_PARAMS or name.lower() in ("null", "none"):
+        return None
+    return name
 
 
 def call_end(text: str, final: bool = False, hold: bool = True) -> int:
@@ -866,7 +907,7 @@ def call_end(text: str, final: bool = False, hold: bool = True) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], final, text[pos:gt].split("=", 1)[1].strip(), hold, allow_reopen=True)
+            end = param_end(text[gt + 1:], final, param_name(text[pos:gt].split("=", 1)[1]), hold, allow_reopen=True)
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -948,7 +989,7 @@ def function_end(text: str) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip(), hold=False, allow_reopen=True)   # a bare or unwrapped call: the old rule
+            end = param_end(text[gt + 1:], name=param_name(text[pos:gt].split("=", 1)[1]), hold=False, allow_reopen=True)   # a bare or unwrapped call: the old rule
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -1182,19 +1223,19 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
-        pname = rest[:rest.index(">")]
+        pname = param_name(rest[:rest.index(">")])         # #6032 R1: None = read the value and drop it
         rest = rest[rest.index(">") + 1:]
-        declared = declared_type(props.get(pname))
+        declared = declared_type(props.get(pname)) if pname else None
         # #5493: a close followed by the same name again is part of a STRING value (#4078); a non-string parameter
         # written twice is two writes of it, and the later one counts
-        end = param_end(rest, final=True, name=pname.strip(), allow_reopen=(declared is None or _declares(declared, "string")))
+        end = param_end(rest, final=True, name=pname, allow_reopen=(declared is None or _declares(declared, "string")))
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        v = coerce_value(value, declared, notes)
+        v = coerce_value(value, declared, notes) if pname else _SKIP
         if v is not _SKIP:
             args[pname] = v
     return ToolCall(name=name, arguments=args)
@@ -1611,11 +1652,11 @@ class OutputParser:
                     b = stripped.find(">")
                     if b < 0:
                         return out
-                    pname = stripped[11:b]
+                    pname = param_name(stripped[11:b])   # #6032 R1: as parse_tool_call names it; None = dropped
                     self.sp += b + 1
                     self.sraw_pname = pname
-                    self.spname = pname.strip()
-                    if self.sdeclared.get(pname) == "string":
+                    self.spname = pname
+                    if pname is not None and self.sdeclared.get(pname) == "string":
                         args(("" if self.sfirst else ",") + json.dumps(pname) + ':"')
                         self.sfirst = False
                         self.ss, self.sval_started = "str", False
@@ -1665,7 +1706,7 @@ class OutputParser:
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
-                v = coerce_value(value, declared)    # the note comes with the final call (parse_tool_call)
+                v = coerce_value(value, declared) if self.sraw_pname is not None else _SKIP   # the note comes with the final call
                 if v is not _SKIP:
                     # #5493: held until the call closes, so a parameter the model writes again (anywhere later in the
                     # call) streams once, with the value the final call has (the later write), not as two JSON keys
@@ -1684,7 +1725,7 @@ class OutputParser:
         tail = ""
         if self.ss == "str":
             tail += '"'
-        elif self.ss == "raw":                  # a value the output ended inside: its text, as before
+        elif self.ss == "raw" and self.sraw_pname is not None:   # a value the output ended inside: its text, as before
             self.sheld.pop(self.sraw_pname, None)
             self.sheld[self.sraw_pname] = self.buf[self.sp:].strip("\n")
         for k, v in self.sheld.items():         # #5493: the non-string parameters, each once, the later write
