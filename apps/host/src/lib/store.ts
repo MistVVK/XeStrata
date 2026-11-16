@@ -5,7 +5,7 @@ import { detectLanguage } from './language-detect';
 import { validWhileBusy, type WhileBusy } from './while-busy';
 import { addToQuotes, type Quote } from './quotes';
 import { readAsk, type AgentAnswer, type AgentAsk } from './agent-ask';
-import { plainFailure, plainFailureText } from './plain-errors';
+import { chatFailure, plainFailureText } from './plain-errors';
 import { showcaseMessages, SHOWCASE_AGENTS } from './chat-showcase';
 import { settleAgents, updateAgent } from './agents';
 import { LOOP_USAGE, parseLoop, type LoopCommand } from './loop';
@@ -2203,8 +2203,11 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
         } else if (type === 'error') {
           clearStatus(sessionId);
           // A sentence the host wrote for the person (it carries its catalog key) is shown in their language as it is; anything else is made plain here.
-          const said = typeof frame.key === 'string' ? tr(frame.key, Array.isArray(frame.values) ? frame.values : undefined) : plainFailure(String(frame.message ?? 'Engine error')).message;
-          patchAssistant((m) => ({ ...m, drafts: undefined, error: said, streaming: false, ...(typeof frame.code === 'string' ? { errorCode: frame.code } : {}), ...(typeof frame.details === 'string' && frame.details ? { errorDetail: frame.details } : {}) }));
+          // An engine's own line (or a stop it restarts from) becomes a plain sentence; the line itself is kept for Details (chatFailure, 11-16 review).
+          const failure = typeof frame.key === 'string' ? null : chatFailure(String(frame.message ?? 'Engine error'));
+          const said = typeof frame.key === 'string' ? tr(frame.key, Array.isArray(frame.values) ? frame.values : undefined) : failure!.message;
+          const detail = typeof frame.details === 'string' && frame.details ? frame.details : failure && failure.kind !== 'plain' && failure.detail && failure.detail !== said ? failure.detail : undefined;
+          patchAssistant((m) => ({ ...m, drafts: undefined, error: said, streaming: false, ...(typeof frame.code === 'string' ? { errorCode: frame.code } : {}), ...(detail ? { errorDetail: detail } : {}) }));
         } else if (type === 'done') {
           clearStatus(sessionId);
           workFinished(state.doneSound, Number(frame.durationMs ?? performance.now() - started));
