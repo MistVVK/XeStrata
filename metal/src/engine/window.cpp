@@ -1468,12 +1468,9 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
             for (int c = 0; c < G_BUD; ++c) qids_.as<int>()[t * G_BUD + c] = c;
         qdirty_ = false;
     }
-    // (a window of an activated batch slot, the slot-by-slot path STRATA_METAL_BATCH_ROWS=0, binds THAT slot's state buffers:
-    // the encoded window is kept per active set, or a slot replayed the windows encoded on another set's buffers and wrote
-    // into that set's state - every slot answered garbage there.  Set 0, the solo window, keeps its keys.)
     const int key = rows_ ? 1000000 + Tn * 2 + (sel ? 1 : 0) + (int) (pend_fold_ * 100)
                           : (((((Tn * 2 + (head ? 1 : 0)) * 2 + hp_) * (MAXT + 1)) + pend_fold_) * 2 + (sel ? 1 : 0)) * 2 +
-                                (mrope_on() ? 1 : 0) + active_ * 2000000;
+                                (mrope_on() ? 1 : 0);
     mrope_sync(pos0, Tn);
     const int fold_n = pend_fold_;
     pend_fold_ = 0;
