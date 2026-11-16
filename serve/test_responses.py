@@ -9,7 +9,10 @@ import contextlib
 import http.client
 import io
 import json
+import socket
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -312,7 +315,7 @@ class Server(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 c.request("POST", path, body=json.dumps(body).encode(),
                           headers={"Content-Type": "application/json", **(headers or {})})
-                r = c.getresponse()
+                r = self.response = c.getresponse()
                 raw = r.read().decode()
             if r.getheader("Content-Type") == "text/event-stream":
                 events = []
@@ -891,6 +894,126 @@ class CodexCompactionOverHttp(Server):
         again, code, r = self.compaction(codex_meta("compaction"), between=fails)
         self.assertEqual(code, 200, r)
         self.assertEqual(again, before)                  # so A's compaction still starts as A's turn
+
+
+class HeldEngine(MockEngine):
+    """Says `tokens` of its script, then holds the answer open until the request is cancelled or released."""
+    tokens = 5
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.holding, self.release = threading.Event(), threading.Event()
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        yield from self.script[:self.tokens]
+        self.holding.set()
+        while not (cancel.is_set() or self.release.is_set()):
+            time.sleep(0.01)
+        if not cancel.is_set():
+            yield from self.script[self.tokens:]
+
+
+class ServerCancel(Server):
+    """A drain deadline (--shutdown-timeout) cancels requests whose clients are still connected: they are told the
+    server is stopping, not that the request was malformed (KeyError 'response'), and a stream ends in response.failed."""
+    script = "</think>\n\nThe file says before."
+    body = {"input": "hi", "reasoning": {"effort": "none"}}
+
+    def setUp(self):
+        super().setUp()
+        self.engine = self.svc.engine = HeldEngine(self.tok, self.script, max_context=16384)
+
+    def stop_during(self, body):
+        """post(body), and when the engine holds it run the shutdown's own steps, as at a drain deadline."""
+        seen = {}
+
+        def stop():
+            self.engine.holding.wait(30)
+            self.svc.begin_drain()
+            seen["pending"] = self.svc.wait_for_drain(0)
+            seen["cancelled"] = self.svc.cancel_owned_requests()
+        t = threading.Thread(target=stop)
+        t.start()
+        try:
+            result = self.post(body)
+        finally:
+            t.join()
+        self.assertEqual(seen, {"pending": 1, "cancelled": 1})
+        return result
+
+    def assert_stopping(self, code, r):
+        self.assertEqual(code, 503, r)
+        self.assertEqual(r["error"]["type"], "server_error")
+        self.assertEqual(r["error"]["code"], "server_draining")
+        self.assertEqual(self.response.getheader("Retry-After"), "1")
+
+    def assert_failed_stream(self, code, events):
+        self.assertEqual(code, 200)
+        self.assertEqual(events[-1]["type"], "response.failed")
+        response = events[-1]["response"]
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["error"]["code"], "server_error")     # OpenAI's ResponseErrorCode is a closed list
+        self.assertIn("draining", response["error"]["message"])
+
+    def test_non_stream_cancelled_mid_answer(self):
+        self.assert_stopping(*self.stop_during(self.body))
+
+    def test_non_stream_cancelled_before_the_first_token(self):
+        self.engine.tokens = 0                           # was a 200 with status "in_progress" and no output
+        self.assert_stopping(*self.stop_during(self.body))
+
+    def test_stream_cancelled_mid_answer(self):
+        code, events = self.stop_during({**self.body, "stream": True})
+        self.assert_failed_stream(code, events)
+        self.assertIn("response.output_text.delta", [e["type"] for e in events])
+
+    def test_stream_cancelled_before_the_first_token(self):
+        self.engine.tokens = 0
+        code, events = self.stop_during({**self.body, "stream": True})
+        self.assert_failed_stream(code, events)
+        self.assertNotIn("response.output_text.delta", [e["type"] for e in events])
+
+    def test_a_request_that_ends_within_the_drain_is_answered(self):
+        def stop():
+            self.engine.holding.wait(30)
+            self.svc.begin_drain()
+            self.engine.release.set()
+        t = threading.Thread(target=stop)
+        t.start()
+        code, r = self.post(self.body)
+        t.join()
+        self.assertEqual((code, r["status"]), (200, "completed"), r)
+
+    def hang_up(self, draining):
+        """A client sends a request and closes its socket while the engine holds it; the watcher cancels it within
+        0.5 s.  -> (what the server logged, the state in the monitor)."""
+        self.svc.api_monitor = True
+        data = json.dumps(self.body).encode()
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=30) as s:
+                s.sendall(b"POST /v1/responses HTTP/1.1\r\nContent-Type: application/json\r\n"
+                          b"Content-Length: %d\r\n\r\n" % len(data) + data)
+                self.assertTrue(self.engine.holding.wait(30))
+                if draining:
+                    self.svc.begin_drain()
+            self.assertEqual(self.svc.wait_for_drain(30), 0)
+            deadline = time.monotonic() + 30             # the record closes just after the call is released
+            while "finished_at" not in self.svc.request_records()[0] and time.monotonic() < deadline:
+                time.sleep(0.01)
+        return log.getvalue(), self.svc.request_records()[0]["state"]
+
+    def test_a_client_that_hangs_up_is_a_disconnect_not_a_malformed_request(self):
+        log, state = self.hang_up(draining=False)
+        self.assertNotIn("malformed", log)
+        self.assertNotIn("Traceback", log)
+        self.assertEqual(state, "disconnected")
+
+    def test_a_client_that_hangs_up_during_a_drain(self):
+        log, state = self.hang_up(draining=True)
+        self.assertNotIn("malformed", log)
+        self.assertNotIn("Traceback", log)
+        self.assertEqual(state, "error")                 # the 503 nobody reads: known, and named in the pull request
 
 
 if __name__ == "__main__":

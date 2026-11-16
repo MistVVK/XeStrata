@@ -455,6 +455,10 @@ class ClientGone(Exception):
     waiting for its turn): nothing is left to answer."""
 
 
+class ServerStopping(RuntimeError):
+    """The drain deadline (--shutdown-timeout) cancelled a request whose client may still be waiting for its answer."""
+
+
 class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
 
@@ -8851,6 +8855,12 @@ def make_handler(svc: Service):
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done, check)
+                elif cancel.is_set() or (done or {}).get("finish") == "cancel":
+                    # no final event exists: collect() must not read the last delta as the answer, a stream must not
+                    # end without response.failed.  Cancelled by cancel_owned_requests, or by a client that left
+                    if svc.draining:
+                        raise ServerStopping("this instance is draining; retry against the next instance")
+                    raise ClientGone()
             items = self._capture(events(), "responses")
             if not req.get("stream"):
                 try:
@@ -8861,6 +8871,9 @@ def make_handler(svc: Service):
                 except QueueWaitExpired as e:
                     return self._json(429, responses_error_body(str(e), "server_error",
                                                                 code="queue_wait_timeout"), retry_after=1)
+                except ServerStopping as e:                  # as a request refused while draining
+                    return self._json(503, responses_error_body(str(e), "server_error", code="server_draining"),
+                                      retry_after=1)
                 except EngineDied as e:
                     return self._json(503, responses_error_body(died_note(e), "server_error",
                                                                 code="server_error"))
@@ -8896,6 +8909,8 @@ def make_handler(svc: Service):
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, died_note(e), "server_error", send)
+            except ServerStopping as e:                      # server_error: ResponseErrorCode is a closed list
+                self._responses_failed(asm, str(e), "server_error", send)
             except QueueWaitExpired as e:
                 self._responses_failed(asm, str(e), "queue_wait_timeout", send)
             except StructuredOutputError as e:
