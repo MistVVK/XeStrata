@@ -402,6 +402,9 @@ VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
 VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
 ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
 
+# A stalled peer must release the request turn; 0 preserves unbounded socket waits.
+PEER_STALL_S = _timeout_env("STRATA_PEER_STALL_S", 120.0)
+
 
 # ------------------------------------------------------------------------------------------------ engines
 class Engine(Protocol):
@@ -7619,6 +7622,7 @@ def anthropic_error_type(code: int, current) -> str:
 
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
+        timeout = PEER_STALL_S
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         record = None                                       # #332: this request's monitor record, if kept
@@ -8666,9 +8670,12 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
             self.end_headers()
-            if STREAM_WRITE_TIMEOUT_S > 0:
+            # (#4271) a stuck write ends as OSError: disconnected.  The connection's own PEER_STALL_S deadline stays the
+            # bound when it is the shorter one: one stall rule for every socket operation.
+            limits = [x for x in (STREAM_WRITE_TIMEOUT_S, self.timeout) if x]     # self.timeout: PEER_STALL_S when the class was made
+            if limits:
                 try:
-                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)     # (#4271) a stuck write ends as OSError: disconnected
+                    self.connection.settimeout(min(limits))
                 except OSError:
                     pass
 
