@@ -267,10 +267,6 @@ public:
     void bind_session(strata::core::SessionState& ss);
     void bind_draft(strata::core::QsaState& st);
     bool mtp_ready() const { return mtp_on_; }
-    // --kv fp16 (opt-in): the K/V live as raw halves with no scales, [cell][kv head][head_dim].  Decided from the
-    // session state's format flags at init; false means the 8-bit codes + a fp16 scale per 64 values.
-    bool kv_f16_ = false;
-    bool kv_f16() const { return kv_f16_; }
     void reset();   // a new sequence (session_zero): the running state zeroed
     // ---- batch slots (--batch N): each slot is another sequence's running state (GDN recurrence and conv history, the PLE
     // history, each QSA layer's K/V, indexer tail and pooled keys).  The live members always hold ONE sequence's state (the
@@ -714,11 +710,6 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
                   int max_t, int64_t max_cells, std::string& err) {
     ss_ = &ss;
     main_ss_ = &ss;
-    // --kv fp16: the session states describe a direct-half cache (kv_int8 false, no q4/hybrid).  Test the FLAGS, not
-    // k_pool: Metal's kv_plan gives a state no pools at all (slots 0), so a k_pool test would never fire.
-    kv_f16_ = ss.qsa_states && ss.qsa_alloc > 0 && !ss.qsa_states[ss.qsa_ord0].kv_int8 &&
-              !ss.qsa_states[ss.qsa_ord0].kv_q4 && !ss.qsa_states[ss.qsa_ord0].kv_hybrid;
-    if (kv_f16_) std::fprintf(stderr, "strata metal: QSA K/V cache in FP16 (no quantization; --kv fp16)\n");
     max_t_ = std::min(max_t, MAXT);
     max_cells_ = max_cells;
     // The 19 fields the CUDA guard compares with the compiled shape (strata::geometry_unsupported, + rms_eps); the two it leaves free are
@@ -810,10 +801,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     bigs_ok_ = g_slot_cap > 0;
     const size_t NSET = 1 + (size_t) std::max(0, g_slot_cap);
     auto R256 = [](size_t b) { return (b + 255) / 256 * 256; };
-    // fp16 stores two bytes per value, so a set's K/V run is twice as long (the scale runs stay allocated and unused:
-    // they are 39 MB beside a 50 GB footprint, and leaving them alone keeps every other view untouched).
-    const size_t kvb = kv_f16_ ? 2 * (size_t) MAXC * G_QKV * G_QD : (size_t) MAXC * G_QKV * G_QD;
-    st_gst_ = R256(GST_B); st_hist_ = R256(HIST_B); st_kq_ = R256(kvb);
+    st_gst_ = R256(GST_B); st_hist_ = R256(HIST_B); st_kq_ = R256((size_t) MAXC * G_QKV * G_QD);
     st_sc_ = R256(2 * (size_t) MAXC * G_QKV * 4); st_tail_ = R256(TAIL_B); st_dead_ = R256(DEAD_B);
     st_pooled_ = R256(4 * (size_t) MB * G_ID); st_ple_ = R256(PLEH_B);
     // the set-0 view of a new buffer of `bytes` per set (or a plain buffer when there are no batch slots)
@@ -871,8 +859,8 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
             ghist_[0].push_back(SV(hbBig_, HIST_B, st_hist_, 2, 0));   // [set][parity]: the two parities side by side
             ghist_[1].push_back(SV(hbBig_, HIST_B, st_hist_, 2, 1));
         } else {
-            kq_.push_back(SV(kqBig_, kvb, st_kq_));
-            vq_.push_back(SV(vqBig_, kvb, st_kq_));
+            kq_.push_back(SV(kqBig_, (size_t) MAXC * G_QKV * G_QD, st_kq_));
+            vq_.push_back(SV(vqBig_, (size_t) MAXC * G_QKV * G_QD, st_kq_));
             ksc_.push_back(SV(kscBig_, 2 * (size_t) MAXC * G_QKV * 4, st_sc_));
             vsc_.push_back(SV(vscBig_, 2 * (size_t) MAXC * G_QKV * 4, st_sc_));
             tail_.push_back(SV(tailBig_, TAIL_B, st_tail_));
@@ -1183,19 +1171,17 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         const mtl::Buffer& TL = rw ? tailBig_[(size_t) qi] : tail_[(size_t) qi];
         const mtl::Buffer& DD = rw ? deadBig_[(size_t) qi] : dead_[(size_t) qi];
         const mtl::Buffer& PL = rw ? pooledBig_[(size_t) qi] : pooled_[(size_t) qi];
-        // (pictures in batch slots: each row reads its own slot's M-RoPE table in mropeBig_; --kv fp16: the direct-half kernel)
-        const char* prep = kv_f16_ ? "qsa_prep_fp16" : "qsa_prep";
+        // (pictures in batch slots: each row reads its own slot's M-RoPE table in mropeBig_)
         const mtl::Constants rcm = mrope_on() ? mtl::Constants().b(30, true).b(24, true) : rc;
-        d.p = rw ? P(lqsa_, prep, rcm, std::string(prep) + (mrope_on() ? "#rows#mrope" : "#rows"))
-                 : P(lqsa_, prep, qsa_c(), kv_f16_ ? std::string(prep) + (mrope_on() ? "#mrope" : "") : qsa_k());
+        d.p = rw ? P(lqsa_, "qsa_prep", rcm, mrope_on() ? "qsa_prep#rows#mrope" : "qsa_prep#rows")
+                 : P(lqsa_, "qsa_prep", qsa_c(), qsa_k());
         d.args = {mtl::Arg::B(qfull_), mtl::Arg::B(kcur_), mtl::Arg::B(vcur_), mtl::Arg::B(iqr_), mtl::Arg::B(ikr_),
                   mtl::Arg::B(W_, T(b + "attn_q_norm.weight").offset), mtl::Arg::B(W_, T(b + "attn_k_norm.weight").offset),
                   mtl::Arg::B(W_, T(b + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, T(b + "indexer.k_norm.weight").offset),
                   mtl::Arg::B(cs_), mtl::Arg::B(qcur_), mtl::Arg::B(qidx_), mtl::Arg::B(KQ),
-                  mtl::Arg::B(VQ)};
-        if (!kv_f16_) d.args.push_back(mtl::Arg::B(KS)), d.args.push_back(mtl::Arg::B(VS));
-        d.args.push_back(mtl::Arg::B(TL)); d.args.push_back(mtl::Arg::B(DD)); d.args.push_back(mtl::Arg::B(PL));
-        d.args.push_back(mtl::Arg::V(a)); d.args.push_back(mtl::Arg::B(rw && mrope_on() ? mropeBig_ : mrope_));
+                  mtl::Arg::B(VQ), mtl::Arg::B(KS), mtl::Arg::B(VS),
+                  mtl::Arg::B(TL), mtl::Arg::B(DD), mtl::Arg::B(PL),
+                  mtl::Arg::V(a), mtl::Arg::B(rw && mrope_on() ? mropeBig_ : mrope_)};
         if (rw) d.args.push_back(mtl::Arg::B(rinfo_));
         d.grid[0] = G_QPREP;
         d.grid[1] = ntok;
@@ -1226,11 +1212,9 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
             if (rec_) rec_->push_back({(int) ds.size() - 1, 0});
         }
         mtl::Dispatch at;
-        at.p = rw ? P(lqsa_, kv_f16_ ? "qsa_attn_fp16" : "qsa_attn", rc, kv_f16_ ? "qsa_attn_fp16#rows" : "qsa_attn#rows")
-                  : P(lqsa_, kv_f16_ ? "qsa_attn_fp16" : "qsa_attn", {}, kv_f16_ ? "qsa_attn_fp16" : "qsa_attn");
-        at.args = {mtl::Arg::B(qcur_), mtl::Arg::B(KQ), mtl::Arg::B(VQ)};
-        if (!kv_f16_) at.args.push_back(mtl::Arg::B(KS)), at.args.push_back(mtl::Arg::B(VS));
-        at.args.push_back(mtl::Arg::B(qids_)); at.args.push_back(mtl::Arg::B(part_)); at.args.push_back(mtl::Arg::V(a));
+        at.p = rw ? P(lqsa_, "qsa_attn", rc, "qsa_attn#rows") : P(lqsa_, "qsa_attn", {}, "qsa_attn");
+        at.args = {mtl::Arg::B(qcur_), mtl::Arg::B(KQ), mtl::Arg::B(VQ), mtl::Arg::B(KS),
+                   mtl::Arg::B(VS), mtl::Arg::B(qids_), mtl::Arg::B(part_), mtl::Arg::V(a)};
         if (rw) at.args.push_back(mtl::Arg::B(rinfo_));
         at.grid[0] = G_QCHUNKS;
         at.grid[1] = G_QKV;
@@ -2148,8 +2132,8 @@ void Window::alloc_set(SeqSet& o, bool real, int idx) {
             o.gh1.push_back(view_of(hbBig_[i], ((size_t) idx * 2 + 1) * st_hist_, HIST_B));
         }
         for (size_t j = 0; j < kq_.size(); ++j) {
-            o.kq.push_back(view_of(kqBig_[j], (size_t) idx * st_kq_, kv_f16_ ? 2 * MAXC * G_QKV * G_QD : MAXC * G_QKV * G_QD));
-            o.vq.push_back(view_of(vqBig_[j], (size_t) idx * st_kq_, kv_f16_ ? 2 * MAXC * G_QKV * G_QD : MAXC * G_QKV * G_QD));
+            o.kq.push_back(view_of(kqBig_[j], (size_t) idx * st_kq_, MAXC * G_QKV * G_QD));
+            o.vq.push_back(view_of(vqBig_[j], (size_t) idx * st_kq_, MAXC * G_QKV * G_QD));
             o.ksc.push_back(view_of(kscBig_[j], (size_t) idx * st_sc_, 2 * MAXC * G_QKV * 4));
             o.vsc.push_back(view_of(vscBig_[j], (size_t) idx * st_sc_, 2 * MAXC * G_QKV * 4));
             o.tail.push_back(view_of(tailBig_[j], (size_t) idx * st_tail_, TAIL_B));
@@ -2167,8 +2151,8 @@ void Window::alloc_set(SeqSet& o, bool real, int idx) {
         o.gh1.push_back(A(HIST_B));
     }
     for (size_t j = 0; j < kq_.size(); ++j) {
-        o.kq.push_back(A(kv_f16_ ? 2 * MAXC * G_QKV * G_QD : MAXC * G_QKV * G_QD));
-        o.vq.push_back(A(kv_f16_ ? 2 * MAXC * G_QKV * G_QD : MAXC * G_QKV * G_QD));
+        o.kq.push_back(A(MAXC * G_QKV * G_QD));
+        o.vq.push_back(A(MAXC * G_QKV * G_QD));
         o.ksc.push_back(A(2 * MAXC * 2 * 4));
         o.vsc.push_back(A(2 * MAXC * 2 * 4));
         o.tail.push_back(A(TAIL_B));
@@ -2269,9 +2253,8 @@ bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::s
     }
     }
     for (size_t j = 0; j < kq_.size(); ++j) {
-        const size_t kv_unit = kv_f16_ ? 2 * (size_t) G_QKV * G_QD : (size_t) G_QKV * G_QD;
-        cp(kq_[j], o.kq[j], cells * kv_unit);
-        cp(vq_[j], o.vq[j], cells * kv_unit);
+        cp(kq_[j], o.kq[j], cells * G_QKV * G_QD);
+        cp(vq_[j], o.vq[j], cells * G_QKV * G_QD);
         cp(ksc_[j], o.ksc[j], cells * G_QKV * 8);
         cp(vsc_[j], o.vsc[j], cells * G_QKV * 8);
         cp(pooled_[j], o.pooled[j], ((cells + 3) / 4 + 2) * G_ID * 4);
@@ -2290,19 +2273,12 @@ namespace { strata::core::QsaState* g_draft_state = nullptr; }   // the drafter'
 
 static void bind_qsa(strata::core::QsaState& st, const mtl::Buffer& kq, const mtl::Buffer& vq, const mtl::Buffer& ksc,
                      const mtl::Buffer& vsc, const mtl::Buffer* pooled, const mtl::Buffer* tail, const mtl::Buffer* dead,
-                     int64_t cells, bool f16 = false) {
+                     int64_t cells) {
     const int64_t page = strata::kernels::qsa_real_shapes().page_size;
-    st.kv_q4 = false; st.kv_hybrid = false; st.kv_rot = false;
-    if (f16) {   // direct-half cache: the generic FP16 layout (kv_int8 false, k_pool/v_pool set, no scales)
-        st.kv_int8 = false;
-        st.k_pool = (uint16_t*) kq.ptr; st.v_pool = (uint16_t*) vq.ptr;
-        st.k_q = nullptr; st.v_q = nullptr; st.k_scale = nullptr; st.v_scale = nullptr;
-    } else {
-        st.kv_int8 = true;
-        st.k_q = (int8_t*) kq.ptr; st.v_q = (int8_t*) vq.ptr;
-        st.k_scale = (uint16_t*) ksc.ptr; st.v_scale = (uint16_t*) vsc.ptr;
-        st.k_pool = nullptr; st.v_pool = nullptr;
-    }
+    st.kv_int8 = true; st.kv_q4 = false; st.kv_hybrid = false; st.kv_rot = false;
+    st.k_q = (int8_t*) kq.ptr; st.v_q = (int8_t*) vq.ptr;
+    st.k_scale = (uint16_t*) ksc.ptr; st.v_scale = (uint16_t*) vsc.ptr;
+    st.k_pool = nullptr; st.v_pool = nullptr;
     st.kv_mode = 0;
     st.n_pages = cells / page; st.n_slots = st.n_pages;
     st.max_cells = std::min<int64_t>(st.max_cells > 0 ? st.max_cells : cells, st.n_pages * page);
@@ -2317,7 +2293,7 @@ void Window::bind_session(strata::core::SessionState& ss) {
     if (n != (int64_t) kq_.size() || o != 0) return;   // a carved session: not this window's whole model
     for (int64_t j = 0; j < n; ++j)
         bind_qsa(ss.qsa_states[(size_t) (o + j)], kq_[(size_t) j], vq_[(size_t) j], ksc_[(size_t) j], vsc_[(size_t) j],
-                 &pooled_[(size_t) j], &tail_[(size_t) j], &dead_[(size_t) j], max_cells_, kv_f16_);
+                 &pooled_[(size_t) j], &tail_[(size_t) j], &dead_[(size_t) j], max_cells_);
 }
 
 void Window::bind_draft(strata::core::QsaState& st) {
@@ -3257,21 +3233,13 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             gemm(p.mixh, p.Wiq, p.iqr, T, 512, N);
             gemm(p.mixh, p.Wik, p.ikr, T, 128, N);
             QsaArgs a{(uint32_t) pos0, 0, (uint32_t) max_cells_, (uint32_t) T, eps_};
-            {   // fp16's prep takes no scale buffers, so its arg list stops at vq and resumes at tail
-                std::vector<mtl::Arg> pa = {mtl::Arg::B(p.qfull), mtl::Arg::B(p.kcur), mtl::Arg::B(p.vcur),
-                                            mtl::Arg::B(p.iqr), mtl::Arg::B(p.ikr),
-                                            mtl::Arg::B(W_, TN(b + "attn_q_norm.weight").offset),
-                                            mtl::Arg::B(W_, TN(b + "attn_k_norm.weight").offset),
-                                            mtl::Arg::B(W_, TN(b + "indexer.q_norm.weight").offset),
-                                            mtl::Arg::B(W_, TN(b + "indexer.k_norm.weight").offset),
-                                            mtl::Arg::B(cs_), mtl::Arg::B(p.qcur), mtl::Arg::B(p.qidx),
-                                            mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi])};
-                if (!kv_f16_) pa.push_back(mtl::Arg::B(ksc_[(size_t) qi])), pa.push_back(mtl::Arg::B(vsc_[(size_t) qi]));
-                pa.push_back(mtl::Arg::B(tail_[(size_t) qi])); pa.push_back(mtl::Arg::B(dead_[(size_t) qi]));
-                pa.push_back(mtl::Arg::B(pooled_[(size_t) qi])); pa.push_back(mtl::Arg::V(a)); pa.push_back(mtl::Arg::B(mrope_));
-                D(PP(p.lqsa, kv_f16_ ? "qsa_prep_fp16" : "qsa_prep", qsa_c(), kv_f16_ ? "qsa_prep_fp16" : qsa_k()),
-                  std::move(pa), G_QPREP, T, 256);
-            }
+            D(PP(p.lqsa, "qsa_prep", qsa_c(), qsa_k()),
+              {mtl::Arg::B(p.qfull), mtl::Arg::B(p.kcur), mtl::Arg::B(p.vcur), mtl::Arg::B(p.iqr), mtl::Arg::B(p.ikr),
+               mtl::Arg::B(W_, TN(b + "attn_q_norm.weight").offset), mtl::Arg::B(W_, TN(b + "attn_k_norm.weight").offset),
+               mtl::Arg::B(W_, TN(b + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, TN(b + "indexer.k_norm.weight").offset),
+               mtl::Arg::B(cs_), mtl::Arg::B(p.qcur), mtl::Arg::B(p.qidx), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]),
+               mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(tail_[(size_t) qi]),
+               mtl::Arg::B(dead_[(size_t) qi]), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)}, G_QPREP, T, 256);
             if (pos0 + T > G_BUD)
                 D(PP(p.lqsa, "qsa_score_mm"), {mtl::Arg::B(p.qidx), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]),
                                                mtl::Arg::B(p.scores), mtl::Arg::V(a)},
@@ -3280,33 +3248,19 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             if (p.flash) {
                 const uint32_t nq = (uint32_t) T * G_QOUT;
                 D(PP(p.lqsa, "qsa_q_f16"), {mtl::Arg::B(p.qcur), mtl::Arg::B(p.qcurh), mtl::Arg::V(nq)}, (nq + 255) / 256, 1, 256);
-                if (kv_f16_) {
-                    D(PP(p.lqsa, "qsa_flash_fp16", mtl::Constants().b(7, p.k4), "qsa_flash_fp16"),
-                      {mtl::Arg::B(p.qcurh), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]),
-                       mtl::Arg::B(p.qids), mtl::Arg::B(p.qfull), mtl::Arg::B(p.xqh), mtl::Arg::V(a)},
-                      2, T, 128);
-                } else {
-                    D(PP(p.lqsa, "qsa_flash", mtl::Constants().b(7, p.k4), "qsa_flash"),
-                      {mtl::Arg::B(p.qcurh), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]),
-                       mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(p.qids), mtl::Arg::B(p.qfull), mtl::Arg::B(p.xqh), mtl::Arg::V(a)},
-                      2, T, 128);
-                }
+                D(PP(p.lqsa, "qsa_flash", mtl::Constants().b(7, p.k4), "qsa_flash"),
+                  {mtl::Arg::B(p.qcurh), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]),
+                   mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(p.qids), mtl::Arg::B(p.qfull), mtl::Arg::B(p.xqh), mtl::Arg::V(a)},
+                  2, T, 128);
             } else {
                 // v1 attention + merge in slices of QS rows (the partials of a slice only)
                 for (int t0 = 0; t0 < T; t0 += p.QS) {
                     const int ns = std::min(p.QS, T - t0);
                     QsaArgs as{(uint32_t) (pos0 + t0), 0, (uint32_t) max_cells_, (uint32_t) ns, eps_};
-                    if (kv_f16_) {
-                        D(PP(p.lqsa, "qsa_attn_fp16"), {mtl::Arg::B(p.qcur, (size_t) t0 * G_QOUT * 4),
-                                                        mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]),
-                                                        mtl::Arg::B(p.qids, (size_t) t0 * G_BUD * 4), mtl::Arg::B(p.part), mtl::Arg::V(as)},
-                          G_QCHUNKS, G_QKV, 256, (uint32_t) ns);
-                    } else {
-                        D(PP(p.lqsa, "qsa_attn"), {mtl::Arg::B(p.qcur, (size_t) t0 * G_QOUT * 4), mtl::Arg::B(kq_[(size_t) qi]),
-                                                   mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]),
-                                                   mtl::Arg::B(p.qids, (size_t) t0 * G_BUD * 4), mtl::Arg::B(p.part), mtl::Arg::V(as)},
-                          G_QCHUNKS, G_QKV, 256, (uint32_t) ns);
-                    }
+                    D(PP(p.lqsa, "qsa_attn"), {mtl::Arg::B(p.qcur, (size_t) t0 * G_QOUT * 4), mtl::Arg::B(kq_[(size_t) qi]),
+                                               mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]),
+                                               mtl::Arg::B(p.qids, (size_t) t0 * G_BUD * 4), mtl::Arg::B(p.part), mtl::Arg::V(as)},
+                      G_QCHUNKS, G_QKV, 256, (uint32_t) ns);
                     D(PP(p.lqsa, "qsa_merge"), {mtl::Arg::B(p.part), mtl::Arg::B(p.qfull, (size_t) t0 * G_QFULL * 4),
                                                 mtl::Arg::B(p.XQ, (size_t) t0 * G_QOUT * 4), mtl::Arg::V(as)}, G_QH, ns, 256);
                 }

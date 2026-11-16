@@ -801,14 +801,7 @@ struct Options {
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once: 64 left the SSD half idle (32K: 303 -> 189 ms)
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
-#if defined(STRATA_GPU_METAL)
-    // Metal's released behaviour is int8 (codes + a scale per 64 values): its fp16 kernels exist now (--kv fp16,
-    // qsa_prep_fp16 / qsa_attn_fp16 / qsa_flash_fp16) but they are OPT-IN, because a half is two bytes where a code
-    // is one, so the default path stays as it was.
-    std::string kv = "int8";           ///< KV storage: int8 (default on Metal) or fp16
-#else
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
-#endif
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
     std::string dump_residual;

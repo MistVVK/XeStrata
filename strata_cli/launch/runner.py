@@ -245,23 +245,12 @@ def read_config(path: Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
-def default_kv(backend: str | None, context: int | None) -> str:
-    """The memory format a launch runs with when the person names none.
-
-    It has to mirror the engine's own default, which differs by backend: Metal keeps 8-bit (`--kv fp16` is opt-in
-    there, because a half is two bytes where a code is one), while the card builds default to fp16 above 8K context
-    and 8-bit below it."""
-    if (backend or "") == "metal":
-        return "int8"
-    return "int8" if (context or 32768) > 8192 else "fp16"
-
-
 def desc_matches(desc: dict, s: S.LaunchSettings) -> bool:
     """Does the installed model's config already carry the context, memory format and picture choice of these settings?
     (The graphics cards are not part of it: they go into each launch's own config, see apply_cards.)"""
     if s.context and desc.get("context") != s.context:
         return False
-    want_kv = s.kv or default_kv(desc.get("backend"), s.context)
+    want_kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
     if desc.get("kv") not in (None, want_kv) and (s.context or 32768) > 8192:
         return False
     images = desc.get("images") or "off"
@@ -317,7 +306,7 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
 
     if s.context:
         put("--max-context", str(int(s.context)))
-    kv = s.kv or default_kv(cfg.get("backend"), s.context)
+    kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
     if "--kv" in args or s.kv:
         put("--kv", kv)
     if s.vision == "off":
