@@ -13041,6 +13041,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_I8_SM70",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6277,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f41d35929e",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "f41d35929e",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "kernels",
+   "note": "The Volta (sm_70) rule of STRATA_EXPERT_I8's prompt kernels: the tile that keeps two blocks per multiprocessor and the big grids read from global memory (#6053). Not set: on on a Volta card, off elsewhere and on HIP. 0: off (the tile rule of the other cards).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_I8_SMEM_LIMIT",
    "backends": [
     "cuda-hip"
