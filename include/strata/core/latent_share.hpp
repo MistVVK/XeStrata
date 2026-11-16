@@ -31,7 +31,7 @@ struct LatentShared {
     // layer's place: >= 0 among the resident layers, -1 - i the i-th streamed one; empty, every layer resident.
     const uint8_t* host = nullptr;
     std::vector<int32_t> at;
-    int ring = 0;   ///< the slots a decode window's ring holds (0: nothing streamed)
+    int ring = 0;   ///< the slots a reader's ring holds (2; 0: nothing streamed)
 
     bool on() const { return d != nullptr || host != nullptr; }
     int32_t place(int64_t layer) const {

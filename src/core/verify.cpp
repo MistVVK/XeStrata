@@ -1379,10 +1379,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // expert work has the router + plan + doorbell stretch of head start (the pool waits on the D doorbell)
         if (win_.latent() && grp == 0) {
             const int n_all = te_[G - 1] - tb_[0];
-            if (!win_.latent_d_stage(l, tb_[0], n_all, mixed_ + (size_t) tb_[0] * N, cs)) {
-                err = "verify layer " + std::to_string(l) + ": the latent D/U copy: " + strata::gpu::last_error();
-                return false;
-            }
+            if (!win_.latent_d_stage(l, tb_[0], n_all, mixed_ + (size_t) tb_[0] * N, cs, err)) return false;
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)

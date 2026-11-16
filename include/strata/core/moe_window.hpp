@@ -93,14 +93,14 @@ public:
     }
     /// Whether this window's pack is a latent one (the experts' width differs from the shell's).
     bool latent() const { return latent_; }
-    /// The layers [lb, le) a window runs, in order (the verifier's): a streamed D/U layer's copy is started ahead
-    /// only for a layer the same window reaches, so every copy branch a capture opens is joined in it.
+    /// The layers [lb, le) a window runs, in order (the verifier's): a streamed D/U layer is landed ahead only for
+    /// a layer the same window reaches, and the ring starts empty at lb.
     void set_layer_range(int64_t lb, int64_t le) { win_lb_ = lb; win_le_ = le; }
     /// The D stage of MoE layer `layer`, tokens [tb, tb + n) of the WHOLE window (call once a layer, at the first
     /// token group, before the router): x's q8_1 rows through D, the column scales, the rows' q8_1 image for the
     /// experts, and the f32 rows + their Q8_0 image to mapped memory with the pool's doorbell (layer + 1).
-    /// A streamed D/U layer lands first (false: its copy failed, last_error() says why).
-    bool latent_d_stage(int64_t layer, int tb, int n, const float* x, strata::gpu::Stream cs);
+    /// A streamed D/U layer lands first (false: its copy failed; the error is in `err`).
+    bool latent_d_stage(int64_t layer, int tb, int n, const float* x, strata::gpu::Stream cs, std::string& err);
     /// The pool's side of the latent window: the mapped D rows, their doorbell and their Q8_0 image (the CPU share
     /// reads them; ExpertDispatch's lat_* fields).
     const float* latent_xl_mapped() const { return h_latxl_; }
@@ -248,25 +248,36 @@ private:
     uint8_t* lat_u_ = nullptr;
     int64_t lat_layer0_ = 0;           ///< the first layer the pair holds (a layer-split stage's first; 0: all)
     bool lat_du_owned_ = false;
-    // streamed D/U layers (LatentShared::stream): this window's ring of lat_sh_.ring layers (D then U each), a copy
-    // branch a slot, and what each slot holds or is landing (-1: nothing)
+    // streamed D/U layers (LatentShared::stream): this window's ring of two layers (D then U each).  A copy kernel
+    // (fetch_blobs, the PCIe share's) lands them in the window's own queue, a piece at each layer before a streamed
+    // one (LatChunk): lat_src_ holds the pinned addresses it reads, each streamed layer's whole and then each layer's
+    // piece, lat_one_ the count 1.  What each slot holds: the layer and how many of its bytes have landed.
+    struct LatChunk {
+        int64_t layer = -1;    ///< the streamed layer a piece of lands at this layer (-1: none)
+        uint64_t off = 0, bytes = 0;
+    };
     LatentShared lat_sh_;
     uint8_t* lat_ring_ = nullptr;
-    strata::gpu::Stream lat_side_[3] = {};
-    int64_t lat_slot_layer_[3] = {-1, -1, -1};
-    bool lat_pending_[3] = {};
+    unsigned long long* lat_src_ = nullptr;
+    int32_t* lat_one_ = nullptr;
+    int64_t lat_nstr_ = 0;                 ///< streamed layers (lat_src_'s whole entries)
+    std::vector<LatChunk> lat_chunk_;      ///< [layer - win_lb_]
+    int64_t lat_slot_layer_[2] = {-1, -1};
+    uint64_t lat_slot_end_[2] = {};
     int64_t win_lb_ = 0, win_le_ = INT64_MAX;
+    int64_t lat_last_ = INT64_MAX;   ///< the layer lat_stream_in saw last
     uint8_t* lat_slot(int64_t layer) const {
-        return lat_ring_ + (size_t) (lat_sh_.stream_index(layer) % lat_sh_.ring) * (lat_sh_.d_bytes + lat_sh_.u_bytes);
+        return lat_ring_ + (size_t) (lat_sh_.stream_index(layer) % 2) * (lat_sh_.d_bytes + lat_sh_.u_bytes);
     }
     /// the layer's D and U on the device: resident, or its ring slot (lat_stream_in made it ready)
     const uint8_t* lat_d_at(int64_t layer, size_t d_bytes) const;
     const uint8_t* lat_u_at(int64_t layer, size_t u_bytes) const;
-    /// a streamed layer's D/U ready on `cs` before its D stage: the branch that copied it joined, or copied now
-    bool lat_stream_in(int64_t layer, strata::gpu::Stream cs);
-    /// after a layer's last U: the streamed layer `ring` places later starts landing in the slot this one freed
-    bool lat_stream_ahead(int64_t layer, strata::gpu::Stream cs);
-    bool lat_fork_copy(int64_t layer, strata::gpu::Stream cs);
+    /// the window's piece schedule and the copy kernel's address table (init)
+    bool lat_stream_init(std::string& err);
+    /// a streamed layer's D/U ready on `cs` before its D stage: landed ahead, or copied now (throws as the kernels do)
+    void lat_stream_in(int64_t layer, strata::gpu::Stream cs);
+    /// before layer `layer` waits for the CPU: its piece of the next streamed layer lands
+    void lat_stream_ahead(int64_t layer, strata::gpu::Stream cs);
     std::vector<int32_t> lat_labels_;  ///< [layers * E] group labels, host
     int32_t* lat_labels_dev_ = nullptr;
     float* lat_xl_ = nullptr;          ///< device: T*G rows of ELL (the D products)

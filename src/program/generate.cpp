@@ -2123,9 +2123,9 @@ struct LatentTab {
     }
     // Streams `n_stream` of the layers [lb, le) on `device` (a single GPU's pair): their D/U go to pinned host memory
     // and the readers copy each into a ring of their own ahead of its use (MoeWindow, Prefill); the rest stay on the
-    // device.  The streamed layers are spread evenly, so each copy has the resident layers between it and the last
-    // one to hide behind; a window's ring holds three layers where two streamed layers are neighbours (the copy of
-    // layer l + 1 starts once layer l - 2's U is done), else two.  0 puts every layer back on the device.
+    // device.  The streamed layers are spread evenly; a reader's ring holds two layers (MoeWindow lands the next
+    // streamed layer while the GPU waits for the CPU's rows of the layer before it).  0 puts every layer back on the
+    // device.
     bool stream(int device, int64_t lb, int64_t le, int64_t n_stream, std::string& err) {
         auto& t = strata::core::latent_shared_table();
         const strata::core::OnDevice on(device);
@@ -2140,10 +2140,8 @@ struct LatentTab {
         n_stream = std::min(n_stream, nl);
         std::vector<int32_t> at((size_t) nl);
         int32_t nres = 0, nstr = 0;
-        bool neighbours = false;
         for (int64_t i = 0; i < nl; ++i) {
             const bool st = (i + 1) * n_stream / nl > i * n_stream / nl;
-            neighbours = neighbours || (st && i > 0 && at[(size_t) i - 1] < 0);
             at[(size_t) i] = st ? -1 - nstr++ : nres++;
         }
         const size_t db = dense.d_bytes(), ub = dense.u_bytes();
@@ -2173,7 +2171,7 @@ struct LatentTab {
         if ((size_t) device >= t.size()) t.resize((size_t) device + 1);
         auto& e = t[(size_t) device];
         e.d = d; e.u = u; e.fmt = lat_fmt; e.layer0 = lb; e.bytes = (uint64_t) nres * (db + ub);
-        e.d_bytes = db; e.u_bytes = ub; e.host = h; e.at = std::move(at); e.ring = neighbours ? 3 : 2;
+        e.d_bytes = db; e.u_bytes = ub; e.host = h; e.at = std::move(at); e.ring = 2;
         std::fprintf(stderr, "xestrata generate: latent D/U: %d of %lld layers streamed from pinned memory "
                              "(%.2f GiB; a window's ring of %d layers, %.0f MiB), %.2f GiB on CUDA%d\n",
                      nstr, (long long) nl, (double) nstr * (double) (db + ub) / 1073741824.0, e.ring,
@@ -5736,11 +5734,10 @@ int main(int argc, char** argv) {
                 (lat_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
                 const auto& lsh = strata::core::latent_shared_on(0);
                 const int64_t L = (int64_t) (lsh.d_bytes + lsh.u_bytes), nl = g.n_layers;
-                // streaming k layers frees k of them, less the windows' rings (3 layers where two streamed layers are
-                // neighbours, k > nl / 2, else 2) and, lent from the cache, the prompt path's ring of 2
+                // streaming k layers frees k of them, less the windows' rings of 2 and, lent from the cache, the
+                // prompt path's ring of 2
                 auto gain = [&](int64_t k) {
-                    const int64_t r = 2 * k > nl ? 3 : 2;
-                    return k * L - (int64_t) lat_windows * r * L - (borrow && o.prefill_chunk > 0 ? 2 * L : 0);
+                    return k * L - (int64_t) lat_windows * 2 * L - (borrow && o.prefill_chunk > 0 ? 2 * L : 0);
                 };
                 int64_t k = nl;
                 if (lat_pick != strata::core::Pick::On) {
