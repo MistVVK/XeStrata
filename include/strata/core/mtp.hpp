@@ -182,6 +182,12 @@ public:
     /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
     bool chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force, int n_out,
                       int n_early, std::string& err);
+    /// More outputs of the last chain, up to `n_out` in all: its next steps queued behind the ones already launched (a
+    /// step is a graph of its own and every step's cell was staged by chain_launch), each with its event.  The chain
+    /// may still be running or have ended; nothing else may have run on the drafter since.  Needs the chain launched
+    /// with n_early == n_out.  The pipelined decode asks for a step only once the outputs before it say it can be
+    /// used: a chain that always ran to its last step spent more of the drafter's card than the windows it fed.
+    bool chain_extend(int n_out, std::string& err);
     /// 1: every output is in chain_tok()/chain_prob(); 0: still running; -1: an error.
     int chain_poll(std::string& err);
     /// How many of the chain's first outputs (up to `n_early`; all of them once the chain is done) have landed in
