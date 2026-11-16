@@ -4,5 +4,13 @@
  "guic03": "Workspace",
  "guic04": "The chat is listed under this workspace. Its next answer works in that workspace’s folder, unless you chose a folder for this chat.",
  "guic05": "Move chat",
- "guic06": "This chat is still working. Stop it or wait for it to finish, then move it."
+ "guic06": "This chat is still working. Stop it or wait for it to finish, then move it.",
+ "guic07": "Your rules",
+ "guic08": "Rules the assistant follows in every chat, for example \"Answer in German\" or \"Keep answers short\". New answers use them right away.",
+ "guic09": "Edit rules",
+ "guic10": "Write one rule per line.",
+ "guic11": "{0} of 64 KB used",
+ "guic12": "Save rules",
+ "guic13": "These rules are too long. Make them shorter than 64 KB, then save again.",
+ "guic14": "The rules were changed in another window. Close this and open them again to see the newest version."
 }

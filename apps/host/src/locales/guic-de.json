@@ -4,5 +4,13 @@
  "guic03": "Arbeitsbereich",
  "guic04": "Der Chat wird unter diesem Arbeitsbereich aufgeführt. Seine nächste Antwort arbeitet im Ordner dieses Arbeitsbereichs, es sei denn, Sie haben für diesen Chat einen Ordner gewählt.",
  "guic05": "Chat verschieben",
- "guic06": "Dieser Chat arbeitet noch. Stoppen Sie ihn oder warten Sie, bis er fertig ist, und verschieben Sie ihn dann."
+ "guic06": "Dieser Chat arbeitet noch. Stoppen Sie ihn oder warten Sie, bis er fertig ist, und verschieben Sie ihn dann.",
+ "guic07": "Ihre Regeln",
+ "guic08": "Regeln, denen der Assistent in jedem Chat folgt, zum Beispiel „Antworte auf Deutsch“ oder „Halte die Antworten kurz“. Neue Antworten verwenden sie sofort.",
+ "guic09": "Regeln bearbeiten",
+ "guic10": "Schreiben Sie eine Regel pro Zeile.",
+ "guic11": "{0} von 64 KB belegt",
+ "guic12": "Regeln speichern",
+ "guic13": "Diese Regeln sind zu lang. Kürzen Sie sie auf unter 64 KB und speichern Sie dann erneut.",
+ "guic14": "Die Regeln wurden in einem anderen Fenster geändert. Schließen Sie dies und öffnen Sie sie erneut, um die neueste Fassung zu sehen."
 }

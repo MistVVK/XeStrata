@@ -4,5 +4,13 @@
  "guic03": "Espace de travail",
  "guic04": "La conversation est rangée dans cet espace de travail. Sa prochaine réponse travaille dans le dossier de cet espace, sauf si vous avez choisi un dossier pour cette conversation.",
  "guic05": "Déplacer la conversation",
- "guic06": "Cette conversation travaille encore. Arrêtez-la ou attendez qu’elle se termine, puis déplacez-la."
+ "guic06": "Cette conversation travaille encore. Arrêtez-la ou attendez qu’elle se termine, puis déplacez-la.",
+ "guic07": "Vos règles",
+ "guic08": "Des règles que l’assistant suit dans chaque conversation, par exemple « Réponds en allemand » ou « Fais des réponses courtes ». Les nouvelles réponses les utilisent tout de suite.",
+ "guic09": "Modifier les règles",
+ "guic10": "Écrivez une règle par ligne.",
+ "guic11": "{0} sur 64 Ko utilisés",
+ "guic12": "Enregistrer les règles",
+ "guic13": "Ces règles sont trop longues. Raccourcissez-les à moins de 64 Ko, puis enregistrez de nouveau.",
+ "guic14": "Les règles ont été modifiées dans une autre fenêtre. Fermez ceci et rouvrez-les pour voir la version la plus récente."
 }

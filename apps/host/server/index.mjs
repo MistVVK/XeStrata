@@ -63,6 +63,7 @@ import { createModelProviders } from './model-providers.mjs';
 import { createForkTimeskip } from './timeskip-fork.mjs';
 import { prepareOversized } from './oversize.mjs';
 import { createChatFolders, chatRootOf, openFile, resolveChatFile, previewFile, rawFile, createAttachments, withAttachments } from './chat-files.mjs';
+import { createUserRules, rulesFile } from './user-rules.mjs';
 import { createLlmProxy, samplingFromExpert } from './agent/llm-shape.mjs';
 import { checkUpdates, checkComponentUpdates, engineFirstRun } from './updates.mjs';
 import { plainNoModel } from './no-model-text.mjs';
@@ -497,6 +498,8 @@ const nativeDrops = createNativeDrops();
 const uploads = createUploads({ dir: join(store.DATA_DIR, 'uploads'), folderOf: chatId => chatRoot(chatId), attachments: chatAttachments });
 try { uploads.sweep(); } catch { /* best effort */ }
 const chatFolders = createChatFolders({ file: join(store.DATA_DIR, 'chat-folders.json') });
+/* The person's own rules for every answer (#5084): the AGENTS.md the Harness reads in agent mode, added to the plain chat paths' prompt too. */
+const userRules = createUserRules({ file: rulesFile(store.DATA_DIR) });
 /** Where a chat's files are: its chosen folder, else the folder its agent worked in, else the default workspace (chat-files.mjs). One source for every file route. */
 const chatRoot = chatId => chatRootOf({ chosen: chatFolders.get(chatId), used: agent.workingFolder?.(chatId), fallback: workspaces[0]?.path ?? WORKSPACE });
 
@@ -570,7 +573,7 @@ async function runRemoteTurn({ selection, message, history, images = [], thinkin
     const appliedSkills = selectSkills(skillState, message, workspaceId);
     entry = serving.open({ client: 'Strata chat', endpoint: connection.protocol === 'anthropic' ? '/messages' : connection.protocol === 'openai-responses' ? '/responses' : '/chat/completions', model: `${connection.name} · ${model.name}`, cancel: () => controller.abort(new DOMException('Cancelled by the user', 'AbortError')) });
     serving.mark(entry.id, { state: 'generating' });
-    const result = await modelProviders.stream({ selection, message, history, images, thinking, signal: requestSignal, systemPrompt: ['You are Strata, a helpful assistant. Answer clearly. Do not claim to have read files or performed actions unless their results are included in the conversation.', skillInstructions(appliedSkills)].filter(Boolean).join('\n\n'), onFrame: frame => {
+    const result = await modelProviders.stream({ selection, message, history, images, thinking, signal: requestSignal, systemPrompt: ['You are Strata, a helpful assistant. Answer clearly. Do not claim to have read files or performed actions unless their results are included in the conversation.', userRules.promptBlock(), skillInstructions(appliedSkills)].filter(Boolean).join('\n\n'), onFrame: frame => {
       if (frame.type === 'start') noteSkillUse(appliedSkills);
       if (frame.type === 'done') serving.mark(entry.id, { tokensIn: frame.tokensIn, tokensOut: frame.tokensOut, usageSource: frame.usageSource });
       onFrame({ ...frame, requestId: entry.id, model: model.name, contextMax: model.contextMax, remoteModel: true, ...(frame.type === 'start' ? { skills: appliedSkills.map(s => s.name) } : {}) });
@@ -637,7 +640,7 @@ async function runTurn({ message, history = [], onFrame, signal, client, workspa
   if(native.hasLive()||nativeModelId){
     let instance;try{instance=native.resolveInstance(nativeModelId??native.state().defaultId);}catch(e){const message=plainNoModel(e.message);onFrame({type:'error',message});return {error:message};}const started=Date.now(),cancel=new AbortController();
     const entry=serving.open({client:client??'Strata chat',endpoint:'/chat/completions',model:instance.apiModelId,instanceId:instance.id,gpuIds:instance.gpus.map(String),cancel:()=>cancel.abort()});
-    try{serving.mark(entry.id,{state:'generating'});const applied=selectSkills(skillState,message,workspaceId);const result=await proxyCompletion({baseUrl:`http://127.0.0.1:${instance.port}/v1`,modelId:instance.apiModelId,authorization:instance.key,message,history,images,extra:{strata_mcp:useTools===true,...(thinkingBudget>0&&String(thinking).toLowerCase()!=='off'?{reasoning_budget_tokens:thinkingBudget}:{}),reasoning_effort:({off:'none',max:'high'}[String(thinking).toLowerCase()]??String(thinking).toLowerCase())},systemPrompt:[SYSTEM_PROMPT,skillInstructions(applied)].filter(Boolean).join('\n\n'),signal:signal?AbortSignal.any([signal,cancel.signal]):cancel.signal,onFrame:frame=>onFrame({...frame,requestId:entry.id,model:instance.label,contextMax:instance.metrics?.engine?.max_context??instance.context,skills:applied.map(s=>s.name)})});serving.mark(entry.id,{...result,usageSource:result.usageSource});serving.finish(entry.id,{tokensOut:result.tokensOut,durationMs:Date.now()-started});return result;}catch(e){serving.finish(entry.id,{durationMs:Date.now()-started,error:e.message});onFrame({type:'error',message:e.message,requestId:entry.id});return {error:e.message};}
+    try{serving.mark(entry.id,{state:'generating'});const applied=selectSkills(skillState,message,workspaceId);const result=await proxyCompletion({baseUrl:`http://127.0.0.1:${instance.port}/v1`,modelId:instance.apiModelId,authorization:instance.key,message,history,images,extra:{strata_mcp:useTools===true,...(thinkingBudget>0&&String(thinking).toLowerCase()!=='off'?{reasoning_budget_tokens:thinkingBudget}:{}),reasoning_effort:({off:'none',max:'high'}[String(thinking).toLowerCase()]??String(thinking).toLowerCase())},systemPrompt:[SYSTEM_PROMPT,userRules.promptBlock(),skillInstructions(applied)].filter(Boolean).join('\n\n'),signal:signal?AbortSignal.any([signal,cancel.signal]):cancel.signal,onFrame:frame=>onFrame({...frame,requestId:entry.id,model:instance.label,contextMax:instance.metrics?.engine?.max_context??instance.context,skills:applied.map(s=>s.name)})});serving.mark(entry.id,{...result,usageSource:result.usageSource});serving.finish(entry.id,{tokensOut:result.tokensOut,durationMs:Date.now()-started});return result;}catch(e){serving.finish(entry.id,{durationMs:Date.now()-started,error:e.message});onFrame({type:'error',message:e.message,requestId:entry.id});return {error:e.message};}
   }
   runtimeState();
   let instance;
@@ -667,7 +670,7 @@ async function runTurn({ message, history = [], onFrame, signal, client, workspa
       // Scope is resolved again at dispatch: a disabled skill never stays active
       // merely because the request waited in the queue.
       const appliedSkills = selectSkills(skillState, message, workspaceId);
-      const systemPrompt = [SYSTEM_PROMPT, skillInstructions(appliedSkills)].filter(Boolean).join('\n\n');
+      const systemPrompt = [SYSTEM_PROMPT, userRules.promptBlock(), skillInstructions(appliedSkills)].filter(Boolean).join('\n\n');
       serving.mark(entry.id, { state: 'generating' });
       const contextMax = instance.memory.context;
       const modelMonitor=models.REAL?monitor:{
@@ -1762,6 +1765,13 @@ async function api(req, res, path, method, url) {
       return json(res, 200, { path: rel, binary: true, sizeKb: st.size / 1024, text: '' });
     }
     return json(res, 200, { path: rel, text, sizeKb: st.size / 1024, updatedAt: st.mtime.toISOString() });
+  }
+
+  // The person's own rules for every answer (#5084). A save names the revision it read; another window's newer save is never overwritten.
+  if (path === '/api/rules' && method === 'GET') return json(res, 200, userRules.read());
+  if (path === '/api/rules' && method === 'PUT') {
+    const body = await readBody(req);
+    try { return json(res, 200, userRules.write(body.text, body.revision)); } catch (e) { return error(res, e.status ?? 400, e.message, e.code ? { code: e.code } : {}); }
   }
 
   // The folder a chat works in, and opening its files by path (notes-split-agent8.md).
