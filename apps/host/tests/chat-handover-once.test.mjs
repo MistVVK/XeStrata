@@ -93,3 +93,17 @@ test('a host that goes away during the move gives the claim back, so the next st
     assert.equal(browser.getItem(HOST_FLAG_KEY), null);
   } finally { h.done(); }
 });
+
+// 11-16: a storage that takes every write and keeps none (getItem gives null) made the claim read back as "another window's"
+// forever, and hydrateChats polled every 250 ms without end (damaged-chats.test.mjs hung host-test on Windows and Linux). Such a
+// storage cannot hold a claim: the move goes on as before, at once.
+test('a storage that keeps no write moves the chats as before and never waits', { timeout: 10_000 }, async () => {
+  const h = host();
+  try {
+    const browser = { length: 0, key: () => null, getItem: () => null, setItem: () => {}, removeItem: () => {} };
+    let waits = 0;
+    const r = await hydrateChats({ transport: h.transport, browser, current: [chat('s_a', 2)], windowId: 'w_one', sleep: async () => { waits++; if (waits > 3) throw new Error('waited on a claim that cannot exist'); } });
+    assert.equal(waits, 0, 'no poll for a claim');
+    assert.equal(r.offline, false);
+  } finally { h.done(); }
+});

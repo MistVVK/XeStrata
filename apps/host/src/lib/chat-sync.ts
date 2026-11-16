@@ -186,7 +186,14 @@ export function claimHandover(browser: StorageLike, owner: string, now: number):
   }
   const mine = `${CLAIM}${owner}:${now}`;
   try { browser.setItem(HOST_FLAG_KEY, mine); } catch { return 'mine'; }
-  return readFlag(browser) === mine ? 'mine' : 'theirs';
+  const back = readFlag(browser);
+  if (back === mine) return 'mine';
+  if (back === '1') return 'done';
+  // Only another window's claim, written between our write and our read, makes this window wait. A write that is not kept at all
+  // (the read gives nothing, or not a claim) is storage that cannot be used: move as before. Waiting on it never ended - the poll
+  // below found no claim to run out, wrote again, and read nothing again, every 250 ms (11-16: a test's storage stub that drops
+  // writes hung host-test on every OS).
+  return back?.startsWith(CLAIM) ? 'theirs' : 'mine';
 }
 
 /** Gives the move back (a refused chat, the host gone) so it is tried again; never clears another window's claim or a finished move. */
