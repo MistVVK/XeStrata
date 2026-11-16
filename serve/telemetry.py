@@ -803,6 +803,25 @@ class _Zes:
             total += st.size
         return (total - free, total) if total else (None, None)
 
+    def integrated(self):
+        """True for a GPU built into the processor, False for a card, None when sysman cannot say: zesDeviceGetProperties'
+        core properties (ze_device_properties_t) carry ZE_DEVICE_PROPERTY_FLAG_INTEGRATED. Read from a raw buffer: stype
+        0x1 at 0, the core's stype 0x3 at 16, its vendorId at 36 (checked to be Intel's, else the layout is not this one)
+        and its flags at 44."""
+        if self.lib is None or self.dev is None:
+            return None
+        buf = ctypes.create_string_buffer(4096)
+        ctypes.c_uint32.from_buffer(buf, 0).value = 0x1           # ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES
+        ctypes.c_uint32.from_buffer(buf, 16).value = 0x3          # ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
+        try:
+            if self.lib.zesDeviceGetProperties(self.dev, buf) != 0:
+                return None
+        except (OSError, AttributeError, TypeError):
+            return None
+        if ctypes.c_uint32.from_buffer(buf, 36).value != 0x8086:
+            return None
+        return bool(ctypes.c_uint32.from_buffer(buf, 44).value & 0x1)
+
     def pci_stats(self):
         """(rx bytes, tx bytes, timestamp in us) of the card's PCIe link, or None (sysman refused or has none)."""
         if self.lib is None or self.dev is None:
@@ -831,8 +850,8 @@ class _Intel:
     def __init__(self, index=0, sysfs=None, stat=None, proc=None, zes=None):
         import glob
         root = sysfs or "/sys"
-        self.proc = proc or "/proc"
-        self.stat_path = stat or self.STAT
+        self._proc = proc or "/proc"            # (attribute names as sycl/serve/xe_telemetry.py had them: tools/test_xe_telemetry.py sets them)
+        self._stat_path = stat                  # None: STAT, read when used, so an instance can point STAT elsewhere
         self.dev = None
         cards = []
         for d in sorted(glob.glob(f"{root}/class/drm/card[0-9]*/device"), key=lambda p: int(re.sub(r"\D", "", p.split("/card")[-1]) or 0)):
@@ -871,7 +890,7 @@ class _Intel:
     def _stat(self):
         try:
             import json
-            with open(self.stat_path) as f:
+            with open(self._stat_path or self.STAT) as f:
                 st = json.load(f)
             return st if time.time() - float(st.get("ts", 0)) < 15 else None
         except (OSError, ValueError, TypeError):
@@ -903,10 +922,13 @@ class _Intel:
     def _busy(self):
         """#5988 (PR #5994): the load of the DRM clients on this card that this user can read in <proc>/<pid>/fdinfo, as a
         percentage between two reads. xe: render + compute cycles (per engine capacity) over the total cycles; i915: render +
-        compute busy nanoseconds over the wall time. None until two reads can be compared."""
+        compute busy nanoseconds over the wall time. Only the card's own driver's clients count (one unit per reading). A client
+        counts when it has an earlier reading and both of its counters moved forward; when no client does (all new, a reset, none),
+        the load is unknown (None), never 0 % (GUI-1116's rules for #5994, 0f6994f52). A client open in several descriptors of
+        one process counts once; an engine class with capacity 0 is left out."""
         import glob
-        now, wall, mem = {}, time.monotonic_ns(), {}
-        for f in glob.glob(f"{self.proc}/[0-9]*/fdinfo/*"):
+        now, wall, mem, drivers = {}, time.monotonic_ns(), {}, {}
+        for f in glob.glob(f"{self._proc}/[0-9]*/fdinfo/*"):
             try:
                 with open(f, encoding="ascii", errors="replace") as fh:
                     text = fh.read()
@@ -918,34 +940,45 @@ class _Intel:
             for line in text.splitlines():
                 k, _, v = line.partition(":")
                 kv.setdefault(k, v.strip())
-            cid = kv.get("drm-client-id")
+            cid, drv = kv.get("drm-client-id"), kv.get("drm-driver")
             try:
-                if kv.get("drm-driver") == "xe":
-                    busy = sum(int(kv.get(f"drm-cycles-{e}", "0")) / int(kv.get(f"drm-engine-capacity-{e}", "1") or 1) for e in ("rcs", "ccs"))
+                if drv == "xe":
+                    busy = 0.0
+                    for e in ("rcs", "ccs"):
+                        cap = int(kv.get(f"drm-engine-capacity-{e}") or 1)
+                        if cap > 0:
+                            busy += int(kv.get(f"drm-cycles-{e}", "0")) / cap
                     total = int(kv.get("drm-total-cycles-ccs") or kv.get("drm-total-cycles-rcs") or 0)
-                elif kv.get("drm-driver") == "i915":
+                elif drv == "i915":
                     busy = sum(int((kv.get(f"drm-engine-{e}") or "0 ns").split()[0]) for e in ("render", "compute"))
                     total = wall
                 else:
                     continue
             except (ValueError, IndexError):
                 continue
-            if cid and total:
-                now[(f.split("/fdinfo/")[0], cid)] = (busy, total)
-            if cid:   # the client's memory on this card (i915: drm-resident-local0, xe: drm-resident-vram0), "N KiB"
-                for k, v in kv.items():
-                    if re.fullmatch(r"drm-resident-(local|vram)\d+", k):
-                        parts = v.split()
-                        if parts and parts[0].isdigit():
-                            unit = {"KiB": 2**10, "MiB": 2**20, "GiB": 2**30}.get(parts[1] if len(parts) > 1 else "", 1)
-                            mem[(f.split("/fdinfo/")[0], cid, k)] = int(parts[0]) * unit
+            if not cid:
+                continue
+            key = (f.split("/fdinfo/")[0], cid)
+            drivers[key] = drv
+            if total:
+                now[key] = (busy, total)
+            for k, v in kv.items():   # the client's memory on this card (i915: drm-resident-local0, xe: drm-resident-vram0), "N KiB"
+                if re.fullmatch(r"drm-resident-(local|vram)\d+", k):
+                    parts = v.split()
+                    if parts and parts[0].isdigit():
+                        unit = {"KiB": 2**10, "MiB": 2**20, "GiB": 2**30}.get(parts[1] if len(parts) > 1 else "", 1)
+                        mem[key + (k,)] = int(parts[0]) * unit
+        # one driver per card; a reader without its card (a test) takes xe's clients when there are any
+        want = self.driver or ("xe" if "xe" in drivers.values() else "i915")
+        now = {c: v for c, v in now.items() if drivers.get(c) == want}
+        mem = {c: v for c, v in mem.items() if drivers.get(c[:2]) == want}
         self._fd_mem = sum(mem.values()) if mem else None
         prev, self._busy_prev = self._busy_prev, now
-        spans = [now[c][1] - prev[c][1] for c in now if c in prev and now[c][1] > prev[c][1]]
-        if not spans:
-            return 0.0 if (now and prev) else None
-        used = sum(max(0, now[c][0] - prev[c][0]) for c in now if c in prev)
-        return max(0.0, min(100.0, 100.0 * used / max(spans)))
+        moved = [c for c in now if c in prev and now[c][1] > prev[c][1] and now[c][0] >= prev[c][0]]
+        if not moved:
+            return None
+        used = sum(now[c][0] - prev[c][0] for c in moved)
+        return max(0.0, min(100.0, 100.0 * used / max(now[c][1] - prev[c][1] for c in moved)))
 
     def read(self):
         out = {"util": None, "mem_used": None, "mem_total": None, "temp": None, "power": None, "power_limit": None}

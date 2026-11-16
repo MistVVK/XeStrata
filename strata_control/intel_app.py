@@ -47,7 +47,7 @@ def supported_here(platform: str | None = None) -> bool:
 
 def arc_cards(root: str = "/sys/class/drm") -> list[dict]:
     """The Intel Arc cards in this Linux computer, as the Terminal lists them (strata_cli/launch/catalog.py intel_arc_cards): vendor "intel", name,
-    vram_gb (the card's own, from its PCI id), usable True."""
+    vram_gb (the card's own memory where it can be read, else the PCI id table's figure), usable True."""
     from strata_cli.launch.catalog import intel_arc_cards
     return intel_arc_cards(root)
 

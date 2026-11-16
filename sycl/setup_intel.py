@@ -57,11 +57,45 @@ INTEL_ARC = {"e223": ("Arc Pro B70", 32.0), "e222": ("Arc Pro B65", 32.0), "e221
 ALCHEMIST_IDS = frozenset({"56a0", "56a1", "56a2", "56a5", "56a6", "5690"})
 
 
-def intel_gpus():
-    """Intel discrete GPUs from sysfs: vendor 0x8086 under the xe or i915 driver, named by PCI device id. VRAM comes
-    from the id table, else from the size of the card's VRAM BAR."""
-    found = []
-    for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+#: Intel's discrete GPU families by PCI device id (Alchemist 0x5690-0x56c1, Battlemage 0xe200-0xe2ff; the Terminal's
+#: strata_cli/launch/catalog.py INTEL_ARC_FAMILIES): the fallback when Level Zero cannot say whether a GPU is integrated.
+DISCRETE_ID_RANGES = ((0x5690, 0x56C1), (0xE200, 0xE2FF))
+#: What setup says when the only Intel GPU is the processor's own, and the next step (wording approved by the coordinator 11-16).
+IGPU_WHAT = ("This PC's Intel graphics ({names}) are built into the processor. Strata's Intel engine doesn't support built-in "
+             "Intel graphics yet.")
+IGPU_NEXT = "Run ./setup.sh to use the processor (CPU) or another graphics card in this PC instead."
+
+
+def level_zero_integrated(pci: str) -> bool | None:
+    """Level Zero's own answer for the GPU at this PCI address (ZE_DEVICE_PROPERTY_FLAG_INTEGRATED, through sysman as the
+    Monitor reads it); None when the runtime is missing or cannot say."""
+    try:
+        from serve.telemetry import _Zes
+        return _Zes(pci).integrated()
+    except Exception:                                   # noqa: BLE001 - no runtime here: the id ranges decide
+        return None
+
+
+def is_integrated(devid: str, pci: str, ask=level_zero_integrated) -> bool:
+    """An Intel GPU built into the processor (Lunar Lake, Arrow Lake, Meteor Lake ... on xe or i915)? A card in INTEL_ARC is
+    discrete without asking; otherwise Level Zero's integrated flag, else the discrete id ranges. Never the PCI slot."""
+    if devid in INTEL_ARC:
+        return False
+    flag = ask(pci) if pci else None
+    if flag is not None:
+        return flag
+    try:
+        value = int(devid, 16)
+    except ValueError:
+        return True
+    return not any(low <= value <= high for low, high in DISCRETE_ID_RANGES)
+
+
+def intel_devices(drm: str | os.PathLike = "/sys/class/drm", ask=level_zero_integrated) -> tuple[list[dict], list[str]]:
+    """(the Intel discrete GPUs, the names of the integrated ones). An integrated GPU is never a card here: its memory is the
+    system RAM, its PCI aperture is not memory, and the container route does not run it."""
+    found, igpus = [], []
+    for card in sorted(Path(drm).glob("card[0-9]*")):
         if "-" in card.name:                            # connectors (card0-DP-1) share the card's device
             continue
         dev = card / "device"
@@ -72,6 +106,10 @@ def intel_gpus():
         except OSError:
             continue
         if vendor != "0x8086" or driver not in ("xe", "i915"):
+            continue
+        pci = os.path.basename(os.path.realpath(dev))
+        if is_integrated(devid, pci, ask):
+            igpus.append(f"PCI id {devid}, {driver}")
             continue
         name, vram = INTEL_ARC.get(devid, (None, 0.0))
         if name is None:
@@ -86,7 +124,13 @@ def intel_gpus():
                 vram = 0.0
         found.append({"index": len(found), "name": f"Intel {name}", "vram_gb": vram, "arch": driver, "driver": driver,
                       "devid": devid})
-    return found
+    return found, igpus
+
+
+def intel_gpus(drm: str | os.PathLike = "/sys/class/drm", ask=level_zero_integrated) -> list[dict]:
+    """Intel discrete GPUs from sysfs: vendor 0x8086 under the xe or i915 driver, named by PCI device id. VRAM comes
+    from the id table, else from the size of the card's VRAM BAR. Integrated GPUs are left out (intel_devices)."""
+    return intel_devices(drm, ask)[0]
 
 
 def real_mem_have(mem_have, real_ram: float, fake_ram: float):
@@ -389,7 +433,9 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
 
 
 def install(argv) -> None:
-    intel = [] if S.WIN else intel_gpus()
+    intel, igpus = ([], []) if S.WIN else intel_devices()
+    if not intel and igpus:
+        S.fail(IGPU_WHAT.format(names="; ".join(igpus)), IGPU_NEXT)
     if not intel:
         S.fail("no Intel Arc found (an xe or i915 card in /sys/class/drm)", "on an NVIDIA or AMD card, run ./setup.sh")
     exe, why = sycl_engine()

@@ -519,6 +519,10 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
   target_link_libraries(prefill_release_test PRIVATE strata_engine strata_prefill strata_spec)
   add_test(NAME prefill_release_test COMMAND prefill_release_test)
   set_tests_properties(prefill_release_test PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(host_memory_zfs_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/host_memory_zfs_test.cpp)   # #5519: the ZFS ARC credit (fixtures)
+  target_link_libraries(host_memory_zfs_test PRIVATE strata_engine strata_prefill strata_spec)
+  add_test(NAME host_memory_zfs_test COMMAND host_memory_zfs_test)
+  set_tests_properties(host_memory_zfs_test PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(dflash2_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/dflash2_bench.cpp)   # DF2-SYCL: the DFlash2 Q4_0 drafter round on an Arc, kernel checks
   target_link_libraries(dflash2_bench PRIVATE strata_kernels)
   add_executable(dense_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/dense_bench.cpp)   # the decode window's dense GEMVs, graph, hash
