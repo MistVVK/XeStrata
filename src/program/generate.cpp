@@ -5613,6 +5613,13 @@ int main(int argc, char** argv) {
             // the output (the 2026-10-02-new-machine record), but rounding to 64 slots cost the RTX 4070 3-4% of its
             // decode.  Runs that must give the same tokens fix the size with --expert-cache N.
             slots = ((int64_t) free_b - over_b - reserve) / blob;
+            // A native pack's cache is sized again below from the free memory less the reserve alone, the matrix
+            // library's VRAM not counted back (sized_slots): it gets no more than that.  The steps for a small card
+            // read the slots it will get: an RX 9060 XT held to 8 GB was sized 376 slots here and got 266, fewer than
+            // the prompt path borrows, whose own buffers then took the room the windows were captured in.
+            if (native_pack && (o.expert_cache_per_layer || !profile.empty()))
+                slots = std::min<int64_t>(slots, ((int64_t) free_b - blas_bytes - over_b -
+                                                  (((int64_t) o.vram_reserve_mib << 20) + pipe_first)) / blob);
             if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         };
         // a slot count for the log: below zero, the MiB the cache is short of its first slot
