@@ -7702,6 +7702,75 @@ def update_pull(argv: list) -> int | None:
     return subprocess.call([sys.executable, str(new), *argv], cwd=str(new.parent), env={**os.environ, PULLED_ENV: "1"})
 
 
+#: what setup writes into the folder it runs in: a clone made before 0.2.16 has these at its root; from 0.2.16 they are in terminal/
+OLD_LAYOUT_FILES = ("strata-*.json", "strata-*.log", "run-*.bat", "run-*.sh", "build-strata*.bat")
+OLD_LAYOUT_DIRS = ("models", "packs", "mtp", ".strata-mcp", "engine-sycl", "engine-cuda12", ".rocm-win")
+#: engine/ of a 0.2.16 clone is the engine's source; anything else in it is the engine an older setup downloaded or compiled there
+ENGINE_SOURCE_ENTRIES = {"src", "include", "cmake", "metal", "sycl", "spark", "third_party", "tests", "bench", "CMakeLists.txt",
+                         "CMakePresets.json"}
+#: the Terminal's own files, which a run config or run script of the old layout names at the clone's root
+TERMINAL_ENTRIES = ("strata.py", "setup.py", "serve", "strata_cli", "strata_control", "tools", "data", "ref", "bin", ".venv")
+
+
+def move_over_old_layout() -> list:
+    """MAP-0215 Q7: the first run of a clone after its pull to the 0.2.16 layout carries setup's state from the clone's root into
+    terminal/, once: the run configs, logs and run scripts, the model and pack folders, the MCP state, and the engine that setup put
+    in engine/ (which is the engine's source folder now; its source entries stay).  The paths inside the moved run configs and run
+    scripts are changed to the new places.  Nothing is moved when terminal/ has a run config of its own, and nothing is replaced.
+    START-HERE.bat / setup.sh move .venv before Python starts.  Returns the (old, new) pairs moved."""
+    old = ROOT.parent
+    if ROOT.name != "terminal" or not (old / "engine" / "CMakeLists.txt").is_file() or any(ROOT.glob("strata-*.json")):
+        return []
+    pairs = []
+    for pat in OLD_LAYOUT_FILES:
+        pairs += [(f, ROOT / f.name) for f in sorted(old.glob(pat)) if f.is_file()]
+    pairs += [(old / d, ROOT / d) for d in OLD_LAYOUT_DIRS if (old / d).is_dir()]
+    eng = old / "engine"
+    if not (ROOT / "engine").exists():
+        pairs += [(e, ROOT / "engine" / e.name) for e in sorted(eng.iterdir())
+                  if e.name not in ENGINE_SOURCE_ENTRIES and not e.name.startswith(("build", "."))]
+    moved = []
+    for src, dst in pairs:
+        if dst.exists():
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            moved.append((src, dst))
+        except OSError as e:
+            warn(f"{src} could not be moved to {dst}: {e}")
+    if not moved:
+        return []
+    swaps = sorted({(str(a), str(b)) for a, b in moved} | {(str(old / n), str(ROOT / n)) for n in TERMINAL_ENTRIES}
+                   | ({(str(eng), str(ROOT / "engine"))} if any(a.parent == eng for a, _ in moved) else set()),
+                   key=lambda ab: -len(ab[0]))
+
+    def rebase(text: str) -> str:
+        for a, b in swaps:
+            for sa, sb in ((a, b), (a.replace("\\", "/"), b.replace("\\", "/"))):
+                text = re.sub(re.escape(sa) + r"(?=$|[\\/\"'\s;,])", lambda _m, sb=sb: sb, text)
+        return text
+
+    def walk(v):
+        return rebase(v) if isinstance(v, str) else [walk(x) for x in v] if isinstance(v, list) else \
+            {k: walk(x) for k, x in v.items()} if isinstance(v, dict) else v
+    for _, dst in moved:
+        if dst.is_file() and dst.name.startswith("strata-") and dst.suffix == ".json":
+            try:
+                data = json.loads(dst.read_text(encoding="utf-8-sig"))
+                dst.write_text(json.dumps(walk(data), indent=2) + "\n", encoding="utf-8")
+            except (OSError, ValueError) as e:
+                warn(f"{dst}: the paths in it could not be updated: {e}")
+        elif dst.is_file() and dst.name.startswith("run-"):
+            try:
+                dst.write_bytes(rebase(dst.read_bytes().decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape"))
+            except OSError as e:
+                warn(f"{dst}: the paths in it could not be updated: {e}")
+    say(f"  Strata's folders were rearranged in this version: your settings and engine moved from {old} into {ROOT}.")
+    return moved
+
+
+
 def update_install(have: list, a) -> int:
     """#475: `setup.py --update` (START-HERE.bat --update, ./setup.sh --update, after update_pull): what a plain START-HERE.bat does to
     an install before it starts the model, without starting it - the Python packages, the ready-made engine when this
@@ -9593,6 +9662,7 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    move_over_old_layout()                             # a clone's first run after its pull to the 0.2.16 layout (Q7)
     if a.update:                                       # Q6: the newest code first (UPDATE.bat / update.sh did the git pull before 0.2.16)
         pulled = update_pull(sys.argv[1:])
         if pulled is not None:
