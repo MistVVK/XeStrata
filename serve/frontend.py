@@ -1179,6 +1179,31 @@ def lenient_json(text: str):
     return v
 
 
+def declared_type(prop, depth: int = 0):
+    """#2371: a parameter's declared JSON type(s) for coerce_value: its "type", or the union of its anyOf / oneOf
+    branches' types (["boolean", "null"] for {"anyOf": [{"type": "boolean"}, {"type": "null"}]}, a nested branch
+    included).  None when a branch names no type (a $ref, an open schema): the value is then read as with no schema.
+    Callers used to read the top-level "type" only, so a boolean declared through anyOf / oneOf stayed the text "True"."""
+    if not isinstance(prop, dict) or depth > 8:
+        return None
+    t = prop.get("type")
+    if t is not None:
+        return t
+    for key in ("anyOf", "oneOf"):
+        branches = prop.get(key)
+        if isinstance(branches, list) and branches:
+            out = []
+            for b in branches:
+                bt = declared_type(b, depth + 1)
+                if bt is None:
+                    return None
+                for x in bt if isinstance(bt, list) else [bt]:
+                    if x not in out:
+                        out.append(x)
+            return out[0] if len(out) == 1 else out
+    return None
+
+
 def coerce_value(value: str, declared, notes: list | None = None):
     """A non-string parameter's text -> its value by the tool's declared type: JSON when it parses; else an array or an
     object read with lenient_json (a note says so in `notes`); else the text itself, as before.  An array or object that
@@ -1230,7 +1255,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = coerce_value(value, (props.get(pname) or {}).get("type"), notes)
+        args[pname] = coerce_value(value, declared_type(props.get(pname)), notes)
     return ToolCall(name=name, arguments=args)
 
 
@@ -1583,7 +1608,7 @@ class OutputParser:
                     return out
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-                self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                self.sdeclared = {k: declared_type(v) for k, v in props.items()}
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
