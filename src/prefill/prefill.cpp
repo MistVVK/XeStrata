@@ -758,6 +758,7 @@ struct Prefill::Impl {
         const int64_t next = lat_sh_.streamed_after(l);
         return next < 0 || land(next);
     }
+    std::vector<int32_t> lat_labels_;
     int32_t* lat_labels_dev_ = nullptr;
     float* lat_xl_ = nullptr;                // the dp4a arm's buffers: in the MoE stage's set (latent_set_sizes, carve)
     uint8_t* lat_xlq_ = nullptr;
