@@ -88,22 +88,22 @@ class Rx6000Detection(KfdDetection):
         fake_sysfs(self.root, [
             (100300, 80, 128, "AMD Radeon RX 6900 XT", 16 << 30),     # gfx1030
             (100301, 40, 129, None, 12 << 30),                        # gfx1031 (RX 6700 XT), no product name
-            (100302, 28, 130, None, 8 << 30),                         # gfx1032 (RX 6600): not in the package
+            (100302, 28, 130, None, 8 << 30),                         # gfx1032 (RX 6600): in the package from 0.2.16 (#5174)
         ])
         g = setup.amd_gpus(str(self.root))
         self.assertEqual([x["arch"] for x in g], ["gfx1030", "gfx1031", "gfx1032"])
         self.assertEqual(g[1]["name"], setup.AMD_NAMES["gfx1031"])
-        self.assertEqual([setup.is_rdna2(x) for x in g], [True, True, False])
+        self.assertEqual([setup.is_rdna2(x) for x in g], [True, True, True])
         self.assertIsNone(setup.amd_problem(g[0]))
         self.assertIsNone(setup.amd_problem(g[1]))
 
     def test_the_note_is_for_gfx103x_only(self):
-        for arch in ("gfx1030", "gfx1031", "gfx1030:sramecc-:xnack-"):
+        for arch in ("gfx1030", "gfx1031", "gfx1032", "gfx1030:sramecc-:xnack-"):
             lines = setup.rdna2_notes({"arch": arch})
             self.assertEqual(len(lines), 1, arch)
             self.assertIn("built, not tested on a real RX 6000 card", lines[0])
             self.assertIn(arch.split(":")[0], lines[0])
-        for arch in ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1151", "gfx1032", "gfx103", "gfx10300", "", None):
+        for arch in ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1151", "gfx1034", "gfx103", "gfx10300", "", None):
             self.assertEqual(setup.rdna2_notes({"arch": arch}), [], arch)
         self.assertEqual(setup.rdna2_notes(None), [])
         self.assertFalse(setup.is_rdna2({"arch": "gfx1030x"}))
@@ -257,7 +257,7 @@ class WindowsDetection(unittest.TestCase):
     REGISTRY = [  # the display class's driver instances: 64-bit VRAM size (as int, or as bytes)
         {"DriverDesc": "NVIDIA GeForce RTX 5070", "MatchingDeviceId": r"PCI\VEN_10DE&DEV_2F04",
          "HardwareInformation.qwMemorySize": 12 << 30},
-        {"DriverDesc": "AMD Radeon RX 6600", "MatchingDeviceId": r"PCI\VEN_1002&DEV_73FF",     # a removed card
+        {"DriverDesc": "AMD Radeon RX 6600", "MatchingDeviceId": r"PCI\VEN_1002&DEV_73FF",     # a removed card (gfx1032 by its id, #5174)
          "HardwareInformation.qwMemorySize": 8 << 30},
         {"DriverDesc": "AMD Radeon RX 9070 XT", "MatchingDeviceId": r"PCI\VEN_1002&DEV_7550&REV_C0",
          "HardwareInformation.qwMemorySize": (16 << 30).to_bytes(8, "little"), "DriverVersion": "32.0.21013.1000"},
@@ -303,14 +303,14 @@ class WindowsDetection(unittest.TestCase):
     def test_registry_alone(self):
         """No WMI answer: the registry's own list (which can hold a removed card)."""
         g = setup.amd_gpus_windows([], self.REGISTRY)
-        self.assertEqual([x["arch"] for x in g if not x["arch"].startswith("unknown")], ["gfx1201", "gfx1101"])
+        self.assertEqual([x["arch"] for x in g if not x["arch"].startswith("unknown")], ["gfx1032", "gfx1201", "gfx1101"])
 
     def test_arch_names(self):
         for name, arch in (("AMD Radeon RX 9070 GRE", "gfx1201"), ("AMD Radeon AI PRO R9700", "gfx1201"),
                            ("AMD Radeon RX 9060 XT", "gfx1200"), ("AMD Radeon RX 7900 GRE", "gfx1100"),
                            ("AMD Radeon PRO W7800", "gfx1100"), ("AMD Radeon RX 7700 XT", "gfx1101"),
                            ("AMD Radeon RX 7600", "gfx1102"), ("AMD Radeon RX 6950 XT", "gfx1030"),
-                           ("AMD Radeon RX 6800M", ""), ("AMD Radeon 780M Graphics", "gfx1103"), ("AMD Radeon RX 7700S", "")):
+                           ("AMD Radeon RX 6800M", ""), ("AMD Radeon RX 6650 XT", "gfx1032"), ("AMD Radeon 780M Graphics", "gfx1103"), ("AMD Radeon RX 7700S", "")):
             self.assertEqual(setup.win_amd_arch(None, name), arch, name)
         self.assertEqual(setup.win_amd_arch(0x744C, "whatever"), "gfx1100")
 
