@@ -281,16 +281,19 @@ class Fallback(unittest.TestCase):
             self.assertEqual(v.reader, reader, line)
             self.assertEqual(log, "", line)                              # nothing said when the chosen reader started
 
-    def test_a_fallback_to_llama_cpps_reader_is_said_once(self):
+    def test_an_older_readers_fallback_word_starts_without_a_line(self):
+        """0.2.16: strata-vision has no llama.cpp reader to fall back on, and the server no longer prints a line for the "fallback" word an older
+        reader (0.2.13-0.2.15) put after READY; the reader still starts."""
         cpu = {"exe": "/e/strata-vision", "gpu": False, "mmproj": "/m/mm.gguf", "model": "/m/t.gguf"}
         v, started, log, err = self.run_start({"strata-vision": "READY 2560 mtmd fallback\n"}, cpu)
         self.assertIsNone(err)
         self.assertEqual((v.reader, len(started)), ("mtmd", 1))           # the same process: no second start
-        self.assertEqual(log.count("[strata] Strata's picture reader did not start; pictures are read with llama.cpp's reader."), 1)
+        self.assertNotIn("llama.cpp", log)
 
-    def test_the_reader_choice_reaches_the_reader_through_the_run_configs_env(self):
-        """The settings write STRATA_VISION_TOWER=mtmd into the model's run config "env" (strata_control/speed_switches.py picture_reader); the server
-        hands that env to the picture reader as to the engine, so no reader argument changes (an older reader ignores the variable)."""
+    def test_an_old_run_configs_reader_entry_still_starts(self):
+        """The removed "Picture reader" setting wrote STRATA_VISION_TOWER=mtmd into a model's run config "env".  A config that still carries it keeps
+        working: the server hands the env to the reader as before (no reader argument changes), and strata-vision 0.2.16 only logs that it no longer
+        reads the name."""
         cfg = {"env": {"STRATA_VISION_TOWER": "mtmd"}, "vision": {"exe": "/e/strata-vision", "mmproj": "/m/mm.gguf", "model": "/m/t.gguf"}}
         env = server.vision_env(cfg, server.child_env(cfg))
         self.assertEqual(env.get("STRATA_VISION_TOWER"), "mtmd")

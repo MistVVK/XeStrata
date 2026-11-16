@@ -66,11 +66,9 @@ targets=$(engine_targets "$cmake" "$build")
 "$cmake" --build "$build" --target $targets -j "$jobs"
 
 if [ "${BUILD_VISION:-1}" = 1 ]; then
-  # strata-vision builds from the vendored third_party/strata-llama; STRATA_GGML_DIR=<llama.cpp checkout> overrides it
-  vision_llama=""; [ -z "$llama" ] || vision_llama="-DLLAMA_DIR=$llama"
-  # shellcheck disable=SC2086
-  "$cmake" -G Ninja -S tools/vision -B "$vision_dir" -DCMAKE_BUILD_TYPE=Release $vision_llama \
-      -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16+i8mm \
+  # strata-vision is Strata's own reader (tools/vision/own): no llama.cpp source, STRATA_GGML_DIR does not reach it
+  "$cmake" -G Ninja -S tools/vision -B "$vision_dir" -DCMAKE_BUILD_TYPE=Release \
+      -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON \
       "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"
   "$cmake" --build "$vision_dir" --target strata-vision -j "$jobs"
 fi

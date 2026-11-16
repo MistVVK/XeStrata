@@ -10,7 +10,7 @@
 #   pkg      stage the files, package_engine.py, --verify, binary_deps.py, `strata --version`
 # It does NOT sign: the package made here is unsigned (packaging/mac/sign-and-notarize.sh --engine signs the folder form; see packaging/ENGINE-COMPONENT.md).
 #
-# Sources of ggml and llama.cpp are the vendored third_party/strata-ggml and third_party/strata-llama: nothing is downloaded. STRATA_GGML_DIR=<llama.cpp checkout>
+# ggml's sources are the vendored third_party/strata-ggml (the reader is Strata's own): nothing is downloaded. STRATA_GGML_DIR=<llama.cpp checkout>
 # builds from that checkout instead (an override, kept for two releases). Needs Xcode Command Line Tools, cmake + ninja (a pip venv is enough) and Apple's
 # metal-cpp (METAL_CPP_DIR, default ~/strata-mac/metal-cpp).
 #

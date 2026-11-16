@@ -37,6 +37,33 @@ class VisionGateRuleTest(unittest.TestCase):
         self.assertTrue(self.g.gate_pass(0.995, 1.0, skip_cpu=True))
         self.assertFalse(self.g.gate_pass(0.985, 1.0, skip_cpu=True))
 
+    def test_without_an_mtmd_reader_rule_one_alone(self):
+        # 0.2.16: strata-vision has no mtmd reader; the mtmd arms need an older program (--mtmd-helper), or none of them (rule 1 alone)
+        self.assertTrue(self.g.gate_pass(0.99920, None))
+        self.assertFalse(self.g.gate_pass(0.99880, None))
+        self.assertIn("--mtmd-helper", GATE.read_text(encoding="utf-8"))
+
+    def test_the_python_cosine_matches_the_definition(self):
+        import array
+        import os
+        import tempfile
+
+        def sve(path, rows):
+            with open(path, "wb") as f:
+                f.write(array.array("i", [0x31455653, len(rows), len(rows), 1, len(rows[0])]).tobytes())
+                f.write(array.array("f", [x for r in rows for x in r]).tobytes())
+
+        with tempfile.TemporaryDirectory() as d:
+            a, b, c = os.path.join(d, "a.sve"), os.path.join(d, "b.sve"), os.path.join(d, "c.sve")
+            sve(a, [[1.0, 0.0], [0.0, 2.0]])
+            sve(b, [[1.0, 0.0], [0.0, 2.0]])
+            sve(c, [[1.0, 1.0], [0.0, 2.0]])
+            same = self.g.cmp("", a, b)
+            self.assertEqual((same["n"], same["global"], same["tokmin"]), ("2", "1.000000", "1.000000"))
+            other = self.g.cmp("", a, c)
+            self.assertEqual(other["tokmin"], "0.707107")                  # token 0: 45 degrees
+            self.assertEqual(other["global"], "%.6f" % (5 / (5 ** 0.5 * 6 ** 0.5)))
+
     def test_mtmd_is_information_only(self):
         src = GATE.read_text(encoding="utf-8")
         self.assertIn('"STRATA_VIT_CPU": "ref"', src)            # the reference reader the gate starts where --ref-dir lacks a picture

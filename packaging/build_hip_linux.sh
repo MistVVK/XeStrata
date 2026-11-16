@@ -7,14 +7,14 @@
 #   VARIANT=rx9070     rx9070 (gfx1200 gfx1201) | rx7900 (gfx1100 gfx1101 gfx1102) | rx6000 (gfx1030 gfx1031) | halo (gfx1151) | igpu (gfx1103 gfx1150) | a name + ARCHS=
 #   ARCHS="gfx1200;gfx1201"          the code objects (default: the variant's)
 #   SRC=<this checkout>              the Strata source (default: the checkout this script is in)
-#   LLAMA=<llama.cpp checkout>       optional override (kept for two releases): ggml (and strata-vision) come from that checkout instead of the vendored third_party/
+#   LLAMA=<llama.cpp checkout>       optional override (kept for two releases): ggml comes from that checkout instead of the vendored third_party/
 #   HP=<ROCm devel root>  CORE=<ROCm core root>  LIBW=<ROCm libraries root>   (TheRock: _rocm_sdk_devel, _rocm_sdk_core, _rocm_sdk_libraries_*)
 #   OUT=<work folder>  PKGVER=0.1.60  COMMIT=<source commit for the build id>  JOBS=16
 #   VISION_ONLY=1                    build only the two readers (no engine, no package)
 #   SPLIT_DIR=<folder>               ship the strata-split-N-amd binaries of that folder (made by packaging/build_split_hip.sh) beside strata
 #   NO_PACKAGE=1                     stop after the stage folder
 #   SHAPE=q4_lite                    the engine of a model shape, its own component (packaging/shape_build.sh)
-#   VISION_HIP_DEFS="-DGGML_CUDA_FA=OFF"   extra cmake definitions for the GPU reader only
+#   VISION_HIP_DEFS="-D..."          extra cmake definitions for the GPU reader only
 #
 # Both readers get RUNPATH $ORIGIN (tools/vision/CMakeLists.txt), and every bundled library is patched to $ORIGIN, so the
 # component folder runs from anywhere with nothing from the environment (packaging/binary_deps.py checks it).
@@ -68,16 +68,15 @@ if [ -z "${VISION_ONLY:-}" ]; then
   chk $? "engine built"
   [ -x "$OUT/b/strata" ] || { st "ABORT no strata"; exit 1; }
 fi
-# strata-vision builds from the vendored third_party/strata-llama; LLAMA=<llama.cpp checkout> overrides it
-VLLAMA=(); [ -z "$LLAMA" ] || VLLAMA=("-DLLAMA_DIR=$LLAMA")
+# strata-vision is Strata's own reader (tools/vision/own): no llama.cpp source, LLAMA does not reach it
 # the CPU reader: portable (AVX2), the fallback that runs on any PC
-cmake -G Ninja -S tools/vision -B "$OUT/bv" -DCMAKE_BUILD_TYPE=Release ${VLLAMA[@]+"${VLLAMA[@]}"} -DSTRATA_VISION_CUDA=OFF \
+cmake -G Ninja -S tools/vision -B "$OUT/bv" -DCMAKE_BUILD_TYPE=Release -DSTRATA_VISION_CUDA=OFF \
   -DSTRATA_PORTABLE=ON > "$OUT/cfg-vision.log" 2>&1
 nice -n 10 cmake --build "$OUT/bv" --target strata-vision -j "$JOBS" > "$OUT/build-vision.log" 2>&1
 chk $? "cpu reader built"
 [ -x "$OUT/bv/bin/strata-vision" ] || { st "ABORT no strata-vision"; exit 1; }
-# the GPU reader: ggml-hip for the same archs; the CPU kernels in it are portable too
-cmake -G Ninja -S tools/vision -B "$OUT/bh" -DCMAKE_BUILD_TYPE=Release ${VLLAMA[@]+"${VLLAMA[@]}"} -DSTRATA_VISION_HIP=ON \
+# the GPU reader: our HIP tower for the same archs; the CPU kernels in it are portable too
+cmake -G Ninja -S tools/vision -B "$OUT/bh" -DCMAKE_BUILD_TYPE=Release -DSTRATA_VISION_HIP=ON \
   "-DSTRATA_VISION_HIP_ARCHS=$ARCHS" -DSTRATA_PORTABLE=ON "${HIPDEFS[@]}" ${VISION_HIP_DEFS:-} > "$OUT/cfg-vision-hip.log" 2>&1
 chk $? "gpu reader configured"
 nice -n 10 cmake --build "$OUT/bh" --target strata-vision -j "$JOBS" > "$OUT/build-vision-hip.log" 2>&1

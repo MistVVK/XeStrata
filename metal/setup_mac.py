@@ -182,7 +182,7 @@ def build_vision(llama: Path) -> Path:
     log = ROOT / "build-vision.log"
     with open(log, "w", encoding="utf-8") as f:
         for cmd in ([tool("cmake"), "-S", str(ROOT / "tools" / "vision"), "-B", str(ROOT / "build-vision"), "-G", "Ninja",
-                     "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}", f"-DLLAMA_DIR={S.vision_llama(llama)}",
+                     "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}",
                      "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_VISION_METAL=ON", "-DSTRATA_PORTABLE=OFF"],
                     [tool("ninja"), "-C", str(ROOT / "build-vision"), "strata-vision"]):
             if subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, env=env) != 0:

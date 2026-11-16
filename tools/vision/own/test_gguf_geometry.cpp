@@ -37,22 +37,10 @@ static uint16_t f32_to_f16(float f) {   // good enough for the values used here 
 }
 
 int main(int argc, char** argv) {
-    // --- 0. the GPU classes where `--tower auto` keeps mtmd (vit_gpu.h) ---
-    for (int mt : {0, 300, 1024}) {      // at or below the default limit: Pascal 6.1 / 6.2 keep mtmd (not measured); cc 6.0 takes ours with F16 and BF16 files
-        CHECK(vit_gpu_slower_nvidia(6, 1, false, mt) && vit_gpu_slower_nvidia(6, 1, true, mt) && vit_gpu_slower_nvidia(6, 2, false, mt) && vit_gpu_slower_nvidia(6, 2, true, mt));
-        CHECK(!vit_gpu_slower_nvidia(6, 0, true, mt) && !vit_gpu_slower_nvidia(6, 0, false, mt));
-        CHECK(!vit_gpu_slower_nvidia(5, 2, false, mt) && !vit_gpu_slower_nvidia(7, 0, false, mt) && !vit_gpu_slower_nvidia(8, 6, true, mt) && !vit_gpu_slower_nvidia(12, 0, false, mt));
-    }
-    for (int mt : {1025, 4096, 16384}) {   // above it: ours on every CUDA class
-        CHECK(!vit_gpu_slower_nvidia(6, 0, false, mt) && !vit_gpu_slower_nvidia(6, 1, false, mt) && !vit_gpu_slower_nvidia(6, 1, true, mt) && !vit_gpu_slower_nvidia(6, 2, true, mt));
-        CHECK(!vit_gpu_slower_nvidia(6, 0, true, mt) && !vit_gpu_slower_nvidia(8, 6, true, mt) && !vit_gpu_slower_nvidia(12, 0, false, mt));
-    }
+    // --- 0. the GPU helpers (vit_gpu.h); no GPU class keeps another reader since 0.2.16 ---
     CHECK(vit_gpu_is_gfx1151("gfx1151") && vit_gpu_is_gfx1151("gfx1151:xnack-"));
     CHECK(!vit_gpu_is_gfx1151("gfx1150") && !vit_gpu_is_gfx1151("gfx1201") && !vit_gpu_is_gfx1151("gfx11510") && !vit_gpu_is_gfx1151("gfx115") && !vit_gpu_is_gfx1151(""));
-    // Windows HIP keeps mtmd under auto except on gfx1151 (Strix, measured with that package; owner 11-11); Linux HIP never
-    CHECK(!vit_gpu_hip_windows_not_measured(true, "gfx1151") && !vit_gpu_hip_windows_not_measured(true, "gfx1151:xnack-"));
-    CHECK(vit_gpu_hip_windows_not_measured(true, "gfx1201") && vit_gpu_hip_windows_not_measured(true, "gfx1100") && vit_gpu_hip_windows_not_measured(true, "gfx1150"));
-    CHECK(!vit_gpu_hip_windows_not_measured(false, "gfx1151") && !vit_gpu_hip_windows_not_measured(false, "gfx1201"));
+    CHECK(kVitGpuMaxHeadDim == 96);      // Qwen3.8 and Qwen3.6 have 72
     {   // the context retry (vit_gpu.h): only "out of memory", only an integrated GPU, only a Linux CUDA build, at most kVitCtxRetries times
         CHECK(kVitCtxRetries == 12 && kVitCtxWaitMs == 1000);
         for (int done = 0; done < kVitCtxRetries; ++done) CHECK(vit_gpu_retry_context(true, true, true, done));
@@ -67,14 +55,7 @@ int main(int argc, char** argv) {
         while (vit_gpu_retry_context(true, true, true, tries)) ++tries;
         CHECK(tries == kVitCtxRetries);
     }
-    {   // the default tower (no --tower): auto, or STRATA_VISION_TOWER's value when it is a known one
-        std::string note;
-        CHECK(vision_tower_default(nullptr, note) == "auto" && note.empty());
-        CHECK(vision_tower_default("", note) == "auto" && note.empty());
-        CHECK(vision_tower_default("mtmd", note) == "mtmd" && vision_tower_default("own", note) == "own" && vision_tower_default("auto", note) == "auto" && note.empty());
-        CHECK(vision_tower_default("llama", note) == "auto" && note.find("STRATA_VISION_TOWER=llama") != std::string::npos);
-    }
-    {   // `--tower auto` on the CPU path by CPU class (owner 11-11: ours below AVX2 too), for both reader files' geometry; the explicit settings are never overruled
+    {   // our CPU tower on every CPU class (owner 11-11: ours below AVX2 too), for both reader files' geometry
         VitGeometry g38;      // the Qwen3.8 tower (projection 2560) and the Qwen3.6 tower (2048): the two public mmproj files' numbers
         g38.projector = "qwen3vl_merger"; g38.layers = 27; g38.width = 1152; g38.heads = 16; g38.head_dim = 72; g38.ffn = 4304; g38.patch = 16; g38.merge = 2;
         g38.image_size = 768; g38.pos_grid = 48; g38.out_dim = 2560; g38.patch_taps = 2; g38.merger_in = 4608; g38.merger_hidden = 4608;
@@ -90,7 +71,7 @@ int main(int argc, char** argv) {
         const Cls classes[] = {{"no SSE4.1", &none_, quant::Isa::Scalar}, {"no AVX", &nehalem, quant::Isa::Sse41}, {"AVX without F16C", &sandy, quant::Isa::Avx},
                                {"AVX with F16C", &ivy, quant::Isa::Avx}, {"AVX2", &haswell, quant::Isa::Avx2}, {"AVX-512", &skylake_x, quant::Isa::Avx512}};
         VitGeometry g_rms = g38;
-        g_rms.norm = NormKind::RMSNorm;      // a tower this code cannot run: `auto` keeps mtmd on every tier
+        g_rms.norm = NormKind::RMSNorm;      // a tower this code cannot run: a start error on every tier
         for (const Cls& k : classes) {
             std::string why;
 #if defined(__x86_64__) || defined(_M_X64)
@@ -99,12 +80,9 @@ int main(int argc, char** argv) {
 #else
             const quant::Isa tier = k.tier;
 #endif
-            for (const VitGeometry* g : {&g38, &g36}) {
-                CHECK(own_cpu_reader_supported(*g, tier, why));          // ours on every tier, both reader files
-                CHECK(vision_tower_resolve("auto", own_cpu_reader_supported(*g, tier, why)) == "own");
-            }
-            CHECK(!own_cpu_reader_supported(g_rms, tier, why) && !why.empty());
-            CHECK(vision_tower_resolve("auto", own_cpu_reader_supported(g_rms, tier, why)) == "mtmd");
+            (void) tier;
+            for (const VitGeometry* g : {&g38, &g36}) CHECK(vit_geometry_supported(*g, why));          // ours on every tier, both reader files
+            CHECK(!vit_geometry_supported(g_rms, why) && !why.empty());
         }
 #if defined(__x86_64__) || defined(_M_X64)
         // the tier mask (STRATA_FORCE_ISA) caps the tier a CPU runs, never raises it
@@ -112,20 +90,11 @@ int main(int argc, char** argv) {
         CHECK(quant::best_isa_for(skylake_x, "scalar") == quant::Isa::Scalar && quant::best_isa_for(sandy, "avx2") == quant::Isa::Avx && quant::best_isa_for(nehalem, "avx512") == quant::Isa::Sse41);
         CHECK(quant::isa_ok_for(ivy, quant::Isa::Avx) && !quant::isa_ok_for(ivy, quant::Isa::Avx2) && !quant::isa_ok_for(nehalem, quant::Isa::Avx) && !quant::isa_ok_for(none_, quant::Isa::Sse41));
 #endif
-        // the explicit settings, both ways, whatever `own_ok` says
-        CHECK(vision_tower_resolve("mtmd", true) == "mtmd" && vision_tower_resolve("mtmd", false) == "mtmd");
-        CHECK(vision_tower_resolve("own", true) == "own" && vision_tower_resolve("own", false) == "own");
-        CHECK(vision_tower_resolve("auto", true) == "own" && vision_tower_resolve("auto", false) == "mtmd");
-        std::string note;
-        CHECK(vision_tower_resolve(vision_tower_default("mtmd", note), true) == "mtmd" && vision_tower_resolve(vision_tower_default("own", note), false) == "own");
-        CHECK(vision_tower_resolve(vision_tower_default(nullptr, note), true) == "own");     // no setting at all: auto
     }
-    {   // a start failure under auto comes back as kOwnStartFailed with its reason (nothing on stdout), so strata-vision can start mtmd's reader
+    {   // a start failure is an "ERR ..." line and a non-zero exit code (the server then starts the CPU reader; there is no other reader to hand over to)
         OwnReaderOptions o;
         o.mmproj = "/nonexistent/strata-own-test-mmproj.gguf";
-        std::string why;
-        o.start_error = &why;
-        CHECK(own_reader_run(o) == kOwnStartFailed && why.find("cannot load the vision encoder") != std::string::npos);
+        CHECK(own_reader_run(o) == 1);
     }
     {   // the test hook names one point at a time
 #ifdef _WIN32

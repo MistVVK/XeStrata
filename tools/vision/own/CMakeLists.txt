@@ -163,8 +163,8 @@ if(_vit_metal)
   target_link_libraries(strata_vit_own PUBLIC "-framework Metal" "-framework Foundation")
 endif()
 
-# the own-tower-only reader, the unit tests, and with a picture list the comparison with mtmd's preparation (oracle_prep.cpp is built in
-# tools/vision's mtmd build) and the embedding comparison
+# the own-tower-only reader, the unit tests, and with a picture list the comparison with mtmd's preparation (oracle_prep.cpp is built by tools/vision
+# with STRATA_VISION_ORACLES=ON, the only build that still compiles llama.cpp's mtmd) and the embedding comparison
 add_executable(strata-vision-own own_main.cpp)
 target_link_libraries(strata-vision-own PRIVATE strata_vit_own)
 add_executable(strata-vision-own-test test_gguf_geometry.cpp)

@@ -302,7 +302,7 @@ of VRAM and on the card from 24 GB. `strata_control/vision_reader.py` is the one
 default with the CPU reader, a B-series card included. An Arc of 24 GB or more also keeps the CPU reader; `--vision gpu` asks for
 the GPU reader.
 
-- **CPU reader:** `strata-vision` (llama.cpp's mtmd). Setup compiles it into `engine-sycl/`, the server runs it on the host, and
+- **CPU reader:** `strata-vision` (Strata's own reader). Setup compiles it into `engine-sycl/`, the server runs it on the host, and
   the engine in the container reads the embeddings from the host's `/dev/shm`, which `strata-sycl.sh` shares
   (`STRATA_SYCL_SHM=0` keeps a private one).
 - **SYCL reader:** `strata-vision-sycl`, the same program on llama.cpp's SYCL backend. `setup --backend sycl --vision gpu`

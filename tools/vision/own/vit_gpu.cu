@@ -865,30 +865,15 @@ bool VitGpu::available(std::string& why) {
     return true;
 }
 
-bool VitGpu::prefer_mtmd(bool bf16_matrices, int max_tokens, std::string& why) {
+std::string VitGpu::arch_name() {
 #if defined(STRATA_VIT_HIP)
     hipDeviceProp_t p;
-    (void) bf16_matrices;
-    (void) max_tokens;
-    if (hipGetDeviceProperties(&p, 0) != hipSuccess) { (void) hipGetLastError(); return false; }
-#ifdef _WIN32
-    const bool windows = true;
-#else
-    const bool windows = false;
-#endif
-    if (vit_gpu_hip_windows_not_measured(windows, p.gcnArchName)) {
-        why = std::string(p.gcnArchName) + " on Windows: the own HIP tower is not measured with the Windows ROCm package yet, mtmd stays";
-        return true;
-    }
-    return false;
+    if (hipGetDeviceProperties(&p, 0) != hipSuccess) { (void) hipGetLastError(); return ""; }
+    return p.gcnArchName;
 #else
     cudaDeviceProp p;
-    if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) { (void) cudaGetLastError(); return false; }
-    if (vit_gpu_slower_nvidia(p.major, p.minor, bf16_matrices, max_tokens)) {
-        why = "compute capability " + std::to_string(p.major) + "." + std::to_string(p.minor) + " (Pascal): the own GPU tower is not measured there, mtmd stays";
-        return true;
-    }
-    return false;
+    if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) { (void) cudaGetLastError(); return ""; }
+    return "sm_" + std::to_string(p.major) + std::to_string(p.minor);
 #endif
 }
 

@@ -1,7 +1,7 @@
 """OWN-1B: nothing downloads llama.cpp to build, package or install Strata.
 
-ggml (third_party/strata-ggml), strata-vision's sources (third_party/strata-llama) and gguf-py (third_party/strata-gguf-py) are vendored at the llama.cpp
-pin. This test reads the release scripts, Docker files, CI workflows and setup.py and fails when one of them fetches llama.cpp again or requires a checkout.
+ggml (third_party/strata-ggml) and gguf-py (third_party/strata-gguf-py) are vendored at the llama.cpp pin; strata-vision is Strata's own reader since
+0.2.16 (third_party/strata-llama only feeds its test oracles). This test reads the release scripts, Docker files, CI workflows and setup.py and fails when one of them fetches llama.cpp again or requires a checkout.
 The overrides (STRATA_GGML_DIR, LLAMA, GG, --llama, STRATA_GGUF_PY) stay for two releases and are allowed: they only POINT at a checkout.
 
     python -m unittest tools.test_no_llama_download -v
@@ -37,12 +37,13 @@ class NoLlamaDownload(unittest.TestCase):
         self.assertFalse(hasattr(setup, "LLAMA_CPP_ZIP"))
         self.assertIsNone(setup.get_llama_cpp() if not setup.os.environ.get("STRATA_GGML_DIR") else None)
         self.assertEqual(setup.VENDORED_LLAMA, ROOT / "third_party" / "strata-llama")
-        self.assertEqual(setup.vision_llama(None), ROOT / "third_party" / "strata-llama")
+        self.assertFalse(hasattr(setup, "vision_llama"))     # 0.2.16: no reader build points at a llama.cpp tree
         self.assertEqual(setup.ggml_defs(None), [])
         for part in ("third_party/strata-ggml",):
             self.assertIn(part, setup.ENGINE_SOURCES)
-        self.assertIn("third_party/strata-llama", setup.VISION_SOURCES)
+        self.assertNotIn("third_party/strata-llama", setup.VISION_SOURCES)
         self.assertIn("tools/vision", setup.VISION_SOURCES)
+        self.assertIn("third_party/stb", setup.VISION_SOURCES)
 
     def test_tools_vision_takes_the_vendored_tree_by_default(self):
         cm = (ROOT / "tools" / "vision" / "CMakeLists.txt").read_text(encoding="utf-8")
