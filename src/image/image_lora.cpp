@@ -1578,13 +1578,16 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
         release();
         return false;
     }
-    // a rank's pair whose A row is far larger than a trained LoRA's, balanced by a power of two (A's row divided, B's
-    // column multiplied, so that B A stays): the product's middle x A^T, which add() rounds to FP16, then stays in its
-    // range.  A file whose A is large and B small (A rows' norms 14 to 28 against B's 0.18, a Mage-Flow LoRA of an
-    // early trainer) made it overflow and the image black at every strength.  Only such rows: an A row's norm was 1.07
-    // at most in ai-toolkit's, XeStrata's and a published LoRA (476 weights), and balancing those too changed their
-    // images (the sampling carries the products' last bits; 2026-11-16, the RX 9060 XT)
-    constexpr double kLargeRow = 4.0 * 4.0;   // an A row's squared norm past which the pair is balanced
+    // a rank's pair whose A row could carry the product's middle x A^T, which add() rounds to FP16, past FP16's range,
+    // balanced by a power of two (A's row divided, B's column multiplied, so that B A stays).  x A_j reaches
+    // |A_j| times the activations' gain, which the upload cannot know (a model's, a block's, a step's); the gain seen:
+    // a Mage-Flow LoRA of an early trainer (A rows' norms 13.4 to 28 against B's 0.18) overflowed at strength 0.15,
+    // so the gain was at least 65504 / (0.15 * 28), about 15600, and a row stays in range at serve's largest strength
+    // (2) below 65504 / (15600 * 2), about 2.1.  Only such rows: an A row's norm was 1.07 at most in ai-toolkit's,
+    // XeStrata's and a published LoRA (476 weights), and balancing those too changed their images (the sampling
+    // carries the products' last bits; 2026-11-16, the RX 9060 XT)
+    constexpr double kFp16Max = 65504.0, kGainSeen = 65504.0 / (0.15 * 28.0), kStrengthMax = 2.0;
+    constexpr double kLargeRow = (kFp16Max / (kGainSeen * kStrengthMax)) * (kFp16Max / (kGainSeen * kStrengthMax));
     std::vector<int> shift((size_t) e.rank, 0);
     bool shifted = false;
     for (int64_t j = 0; j < e.rank; ++j) {
