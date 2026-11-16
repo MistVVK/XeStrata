@@ -330,7 +330,7 @@ class _Adl:
 
     def __init__(self):
         self.lib = None
-        if os.name != "nt":
+        if os.name != "nt" or sys.platform != "win32":      # (sys.platform too: a test that sets os.name to "nt" on Linux must not reach a Windows DLL load)
             return
         try:
             self.lib = ctypes.CDLL("atiadlxx.dll")
@@ -342,7 +342,7 @@ class _Adl:
             self.crt.malloc.restype = ctypes.c_void_p
             self.crt.malloc.argtypes = [ctypes.c_size_t]
             self.ALLOC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)(self._alloc)
-        except (OSError, TypeError, ValueError, AttributeError):
+        except (OSError, TypeError, ValueError, AttributeError, ImportError):
             self.lib = None
 
 
@@ -356,6 +356,8 @@ def _adl_cards(buf, count):
         if not nm or not (buf[i].Present or buf[i].Exist):
             continue
         udid = buf[i].UDID or b""
+        if buf[i].VendorID not in (0x1002, 1002) and b"VEN_1002" not in udid.upper():   # ADL can list another vendor's adapter (an NVIDIA card beside the iGPU)
+            continue
         dev = udid.split(b"DEV_", 1)[1].split(b"&", 1)[0] if b"DEV_" in udid else None
         key = dev or nm
         if key in seen:
@@ -537,13 +539,15 @@ class _AmdWin:
 
 def _pick_card(adl_names, index, hip_names):
     """Which of ADL's card rows is HIP's card `index`: the k-th row named like hip_names[index] (k = how many cards of
-    that name come before it in HIP's order), else row `index`; None when there is no such row."""
-    if 0 <= index < len(hip_names):
+    that name come before it in HIP's order); None when no row has that name (the Monitor then shows what it showed before
+    rather than another card's readings).  Only when the registry lists no AMD card at all: row `index`."""
+    if hip_names:
+        if not 0 <= index < len(hip_names):
+            return None
         want = hip_names[index].strip().lower()
         k = sum(1 for n in hip_names[:index] if n.strip().lower() == want)
         rows = [r for r, n in enumerate(adl_names) if n.strip().lower() == want]
-        if k < len(rows):
-            return rows[k]
+        return rows[k] if k < len(rows) else None
     return index if 0 <= index < len(adl_names) else None
 
 

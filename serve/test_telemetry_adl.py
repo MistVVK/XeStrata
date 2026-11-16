@@ -43,7 +43,7 @@ class OnlyTheMonitor(unittest.TestCase):
         with mock.patch.object(t.os, "name", "posix"), mock.patch.object(t, "_AmdWin") as win:
             self.assertIsInstance(t.monitor_reader(0, amd=True), t._Amd)
             win.assert_not_called()
-        with mock.patch.object(t.os, "name", "nt"), mock.patch.object(t, "_AmdWin") as win:
+        with mock.patch.object(t.os, "name", "nt"), mock.patch.object(t, "_AmdWin") as win, mock.patch.object(t, "_Nvml"), mock.patch.object(t, "_Metal"):
             t.monitor_reader(0, amd=False)                                       # NVIDIA / Metal: never ADL2
             win.assert_not_called()
 
@@ -95,6 +95,7 @@ class Mapping(unittest.TestCase):
         self.assertEqual([t._pick_card(same, i, same) for i in (0, 1)], [0, 1])                               # two of one name
         self.assertEqual(t._pick_card(adl, 1, []), 1)                                                         # no registry list
         self.assertIsNone(t._pick_card(adl, 2, []))
+        self.assertIsNone(t._pick_card(["AMD Radeon(TM) Graphics"], 0, ["AMD Radeon RX 6900 XT"]))           # no ADL row for the HIP card: no reading
 
     def test_cards_skip_the_igpu_beside_a_card_and_keep_an_apu_alone(self):
         A = t._Adl.AdapterInfo
@@ -107,6 +108,9 @@ class Mapping(unittest.TestCase):
         buf = rows((b"AMD Radeon(TM) Graphics", b"164e"), (b"AMD Radeon RX 9070 XT", b"7550"), (b"AMD Radeon RX 9070 XT", b"7550"))
         self.assertEqual(t._adl_cards(buf, 3), [(1, "7550", "AMD Radeon RX 9070 XT", False)])   # one row per card, no iGPU
         apu = rows((b"AMD Radeon(TM) 8060S Graphics", b"1586"), (b"AMD Radeon(TM) 8060S Graphics", b"1586"))
+        nv = rows((b"NVIDIA GeForce RTX 5070", b"2F04"), (b"AMD Radeon(TM) Graphics", b"164E"))
+        nv[0].UDID = b"PCI_VEN_10DE&DEV_2F04"
+        self.assertEqual(t._adl_cards(nv, 2), [(1, "164E", "AMD Radeon(TM) Graphics", True)])            # another vendor's adapter is never a card
         self.assertEqual(t._adl_cards(apu, 2), [(0, "1586", "AMD Radeon(TM) 8060S Graphics", True)])
 
     def test_link_fields(self):
