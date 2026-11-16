@@ -73,7 +73,7 @@ llama.cpp's `ggml` sources are pinned by this repository, and CMake fetches the 
 ```sh
 git clone https://github.com/Niko1221/Strata.git && cd Strata
 cmake -S . -B build-halo -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_PREFILL_MMQ=ON \
+  -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
   -DCMAKE_HIP_ARCHITECTURES=gfx1151 \
   -DCMAKE_HIP_COMPILER=$SDK/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$SDK \
   "-DCMAKE_PREFIX_PATH=$SDK;$SDK/lib/rocm_sysdeps;$SDK/lib/llvm" \
@@ -82,7 +82,7 @@ cmake --build build-halo --target strata -j 8        # about 25 minutes the firs
 ```
 
 The build warns that `gfx1151` is "unvalidated". The engine is built without llama.cpp's MMQ kernels: the prompt experts run on
-Strata's own kernels where they cover a layer and on the FP16 path elsewhere. Add `-DSTRATA_MMQ=ON` to build the MMQ kernels too. To test:
+Strata's own kernels where they cover a layer and on the FP16 path elsewhere. To test:
 `cmake --build build-halo -j 8` builds the tests and `ctest --test-dir build-halo` runs them. `hip_prefill_hcd_exact_parity` and
 `hip_prefill_hipblaslt_gemm` need the table (next section) and skip without it.
 

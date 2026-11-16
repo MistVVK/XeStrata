@@ -102,17 +102,14 @@ class BuildEngineStamp(unittest.TestCase):
         setup.build_engine(GPU, "none", True, Path("llama"), toolkit=13)
         self.assertIn("-DSTRATA_Q6K_EXPERTS=ON", self.defs)
         self.assertNotIn("-DSTRATA_Q6K_EXPERTS=OFF", self.defs)
-        self.assertIn("-DSTRATA_MMQ_KQUANTS=ON", self.defs)  # flipped OFF -> ON in the same commit (465cd61d)
 
-    def test_the_build_without_mmq_is_named_on_the_configure_line(self):
-        """STRATA_MMQ's default became OFF; a build/ folder configured before keeps ON in CMakeCache.txt, so the line names it.
-        ARM64 (DGX Spark) builds without MMQ too since 0.2.15 (spark/build_engine.sh)."""
-        for arm, want in ((False, "-DSTRATA_MMQ=OFF"), (True, "-DSTRATA_MMQ=OFF")):
+    def test_no_mmq_option_is_named_on_the_configure_line(self):
+        """0.2.16: llama.cpp's MMQ build path is gone (no STRATA_MMQ / STRATA_PREFILL_MMQ / STRATA_MMQ_KQUANTS option): x86 and ARM64 name none."""
+        for arm in (False, True):
             with mock.patch.object(setup, "is_arm64", lambda arm=arm: arm):
                 (self.eng / "BUILD.json").write_text(json.dumps(self.old_stamp))
                 setup.build_engine(GPU, "none", True, Path("llama"), toolkit=13)
-            self.assertIn(want, self.defs)
-            self.assertEqual(sum(d.startswith("-DSTRATA_MMQ=") for d in self.defs), 1)
+            self.assertEqual([d for d in self.defs if "MMQ" in d], [])
 
     def test_a_build_that_leaves_the_old_binary_is_not_stamped_or_installed(self):
         self.built = binary("0.1.42")                     # the build "succeeded" without producing the new engine

@@ -61,7 +61,7 @@ cp -r out-spark/engine ./engine
 ```
 
 About 3 minutes for the engine (the first run also fetches llama.cpp at the
-pinned commit). `out-spark/engine/` holds `strata`, `strata-vision`, `libstrata_kq.so`, the CUDA libraries and a `BUILD.json`.
+pinned commit). `out-spark/engine/` holds `strata`, `strata-vision`, the CUDA libraries and a `BUILD.json`.
 `BUILD_VISION=0` leaves the picture reader out. `packaging/build_cuda_linux_aarch64.sh` runs this build and makes the engine package
 for the feed ([packaging/README.md](../packaging/README.md)). A model on a Q2_0 pack cannot run: its CPU kernels need AVX-512.
 

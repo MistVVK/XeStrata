@@ -9,8 +9,8 @@ NVFP4, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and 
 Q4_1, Q5_0, Q5_1 (what the tools and tests use); anything else raises NotImplementedError.
 
 The results are bit-identical to llama.cpp's gguf-py (the pin vendored in third_party/strata-gguf-py): every float32 operation is done in
-the same order, which tools/test_strata_gguf.py proves against it. The block formats are ggml's (third_party/strata-ggml/strata-quant-common.h);
-the grids come from tools/strata_quant_tables.py, generated from that header.
+the same order, which tools/test_strata_gguf.py proves against it. BLOCK below is the block geometry; tools/gen_quant_header.py checks the
+engines' block structs (include/strata/quant/strata-quant-common.h) against it. The grids come from tools/strata_quant_tables.py.
 """
 from __future__ import annotations
 

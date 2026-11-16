@@ -39,7 +39,7 @@ RUN set -e; \
     sm60=OFF; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do if [ "$a" -lt 75 ]; then sm60=ON; fi; done; \
     /venv/bin/cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
         -DSTRATA_EXPERIMENTAL_SM60=$sm60 \
-        -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
+        -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON \
         "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
     . packaging/engine_targets.sh; targets=$(engine_targets /venv/bin/cmake build); \
     /venv/bin/cmake --build build --target $targets -j "$(nproc)"; \

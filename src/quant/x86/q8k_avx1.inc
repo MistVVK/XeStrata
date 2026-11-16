@@ -33,7 +33,7 @@ void quantize_q8_K_avx1(const float* x, void* vy, int64_t k) {
             __m128i v[4];
             for (int q = 0; q < 4; ++q) {
                 __m128 p = _mm_mul_ps(vis, _mm_loadu_ps(x + j + 4 * q));
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__)   // GCC, and Clang / icx when the file is built with -ffp-contract=fast (quant.cmake): both fuse across intrinsics
                 // GCC fuses a multiply and an add into an FMA by default (-ffp-contract=fast); the reference
                 // rounds the product before the add, so the product must stay a separate value (no FMA under
                 // -mavx, but the barrier keeps the contract if the file is ever built with a newer floor)

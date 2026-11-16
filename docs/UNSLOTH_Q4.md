@@ -200,7 +200,6 @@ same top 20 per position.
 | Variable | Effect |
 | --- | --- |
 | `STRATA_LOOKAHEAD=0` | Turns off the routing-aware prefetch (on by default in this mode). While the CPU works on a layer, a thread applies the next layer's router to this layer's input and asks the OS to read the predicted experts' pages. Pages only; the answers are the same. `STRATA_LOOKAHEAD_K` sets the experts per token (default 10). |
-| `STRATA_MMQ_KQ=1` | Multiplies the Q4_K / Q5_K / Q5_1 experts of a prompt with llama.cpp's MMQ kernels instead of dequantizing them to FP16. It rounds differently from the FP16 path, so it is opt-in for this file. On CUDA the kernels are a library next to the engine (`libstrata_kq.so` / `strata_kq.dll`), opened only then, so they take no VRAM from other models ([QUANTS.md](QUANTS.md)). |
 | `STRATA_KQ256=1` | Multi-token AVX2 kernels for the Q4_K / Q5_1 / Q8_0 experts. Bit-exact with ggml's, but measured no faster, so off. |
 | `STRATA_PARTIAL_PIN=1` | Registers the hottest part of the RAM budget (up to `STRATA_PARTIAL_PIN_GIB`, default 24) with the GPU driver, so the GPU computes a share of the misses over PCIe (`--pcie-frac`). Measured no faster, and it changes the numerics of those experts, so off. |
 | `STRATA_FETCH_THREADS=N` | Threads that read the experts from the GGUF while it answers (default 8). The prompt path has its own: `STRATA_STAGER_THREADS` (default 32 here) and `STRATA_STAGER_RING` (128). |
@@ -274,8 +273,7 @@ bartowski's Swift-1.5 Q4_0, whose header shows the same formats.
 - Tests: the packer's synthetic 4-shard and conversion tests
   (`.venv/bin/python -m unittest discover -s tools -p test_iq_pack.py`) and the CTests `gguf_split_test`,
   `expert_layout_test`, `native_expert_parity_*` (the three real expert format pairs against ggml-cpu, the Q5_1 min term,
-  Q8_0 rows, Q4_0/Q4_0 and Q4_0/Q4_1). With `-DSTRATA_MMQ_KQUANTS=ON`, `prefill_mmq_kquant_test` checks the prompt path's
-  MMQ products for Q4_K / Q5_K / Q5_1 / Q8_0 against ggml's dequantized weights.
+  Q8_0 rows, Q4_0/Q4_0 and Q4_0/Q4_1).
 - Not validated: sampled decoding and long conversations. Please report what you see.
 
 ## Credits

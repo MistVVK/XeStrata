@@ -2,7 +2,7 @@
 //
 // The implementation (mtl_rt.mm) is the only Objective-C++ file; every program and test is plain C++ against this
 // header.  Kernels are MSL source files compiled at run time (newLibraryWithSource): the Command Line Tools have no
-// offline `metal` compiler, and the runtime compiler is part of the OS.  ggml-common.h (MIT, third_party/ggml) is
+// offline `metal` compiler, and the runtime compiler is part of the OS.  The quant header (include/strata/quant/strata-quant-common.h) is
 // prepended for the i-quant grids and block structs.
 #pragma once
 

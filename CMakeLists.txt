@@ -17,8 +17,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_geometry.cmake)   # -DSTRATA_GE
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_ggml.cmake)          # which ggml: the vendored third_party/strata-ggml, or -DSTRATA_GGML_DIR
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/backends/cpu.cmake)         # strata_kernels_cpu, the native (ggml-cpu) expert rows, the CPU tests
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/backends/quant.cmake)       # strata_quant: the Strata quant layer (no ggml) and its oracle tests
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/backends/cuda.cmake)        # NVIDIA: toolchain, llama.cpp's MMQ kernels (strata_mmq, strata_kq)
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/backends/hip.cmake)         # AMD: gfx906 compat, MMQ on HIP
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/backends/cuda.cmake)        # NVIDIA: toolchain, Strata's prompt kernels (strata_pf_own)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/backends/hip.cmake)         # AMD: gfx906 compat, Strata's prompt kernels on HIP
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_gpu_engine.cmake)    # the GPU engine both of them build
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
@@ -102,14 +102,8 @@ if(STRATA_HIP_GFX906)
   set(STRATA_ENABLE_CUDA ON CACHE BOOL "" FORCE)
 endif()
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
-option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP (only together with STRATA_MMQ=ON)" OFF)
-# P4-SPLIT: llama.cpp's MMQ prompt kernels (strata_mmq, strata_mmq_w4a4, strata_kq) are built only with -DSTRATA_MMQ=ON: on CUDA, and on HIP
-# together with STRATA_PREFILL_MMQ=ON.  The default (OFF) leaves them out of both.  Strata's own prompt kernels (strata_pf_own: the fused experts
-# and their helpers) are built either way; without MMQ the prompt path takes them where they cover a layer and the FP16 path elsewhere.  A name
-# of its own rather than STRATA_PREFILL_MMQ for CUDA: every CUDA build folder configured before has STRATA_PREFILL_MMQ=OFF in its cache.
-# A build folder configured before the default changed keeps STRATA_MMQ=ON in its cache: setup and the packaging scripts pass the value.
-# -DSTRATA_MMQ=ON builds the old path (for A/B runs).
-option(STRATA_MMQ "Build llama.cpp's MMQ prompt kernels (CUDA; HIP together with STRATA_PREFILL_MMQ)" OFF)
+# llama.cpp's MMQ prompt kernels are no longer in the tree (0.2.16): every CUDA and HIP build compiles Strata's own prompt kernels (strata_pf_own)
+# and the FP16 path.  MMQ comparison builds come from the v0.2.15 tag.
 # The community-made AMD changes (include/strata/core/amd_community.hpp): on by default.  This option is the build half of the one
 # switch STRATA_AMD_COMMUNITY_TUNING: OFF compiles the portable signed-byte dot for gfx1010 again (the SDWA sequence of #4855).
 # The rocBLAS tables are switched at run time (STRATA_AMD_COMMUNITY_TUNING=0).
@@ -142,35 +136,12 @@ if(STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA)
   add_compile_definitions(STRATA_VERIFY_MAX_T=${_strata_window_max_t})
   message(STATUS "Strata: verify / batch windows hold up to ${_strata_window_max_t} rows")
 endif()
-# MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K (Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF
-# projections, STRATA_DENSE_MMQ).  On by default since MODEL-UPDATE Phase 1: on CUDA they are their own library
-# (strata_kq, loaded only for a model with these formats: the engine loads every kernel of its own binary at start,
-# CUDA_MODULE_LOADING=EAGER, and these took ~3.8 MB of VRAM - 3 IQ3_XXS expert slots on a P100 - from every model); on
-# HIP a code object loads on first use, so they cost other models nothing there (R9700: the same slots).  Used at run
-# time when STRATA_MMQ_KQ=1, which the engine sets by itself on NVIDIA cards of compute capability 8.0 and up (include/strata/core/nv_defaults.hpp) and on
-# Linux gfx12 (STRATA_MMQ_KQ=0 turns it off; setup also writes it for UD-Q5_K_XL / UD-Q6_K_XL); other cards keep the FP16 path.  This CMake option only
-# decides whether the kernels are BUILT: on in every release build.
-option(STRATA_MMQ_TQ_OVERLAY "Gyro trellis MMQ prompt kernels: the patched ggml-cuda headers of third_party/strata-ggml/ggml/src/ggml-cuda-tq (with -DSTRATA_GGML_DIR: an overlay of that llama.cpp's headers written at configure time, cmake/strata_ggml_tq_overlay.cmake)" ON)
-option(STRATA_MMQ_KQUANTS "Build the MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K: the experts of Unsloth's K-quant files, and on HIP the dense GGUF projections (STRATA_DENSE_MMQ)" ON)
 # Q6_K gate/up in the grouped expert kernels (Unsloth's UD-Q6_K_XL, and layer 2 of UD-Q5_K_XL; docs/QUANTS.md).  On by
 # default since MODEL-UPDATE Phase 1: one more instance per grouped kernel in iq_kernels.cu, +19 KB of sm_60 code,
 # measured to leave every expert-cache slot count as it was (P100, R9700).  -DSTRATA_Q6K_EXPERTS=OFF drops it.
 option(STRATA_Q6K_EXPERTS "Build the Q6_K gate/up grouped expert kernels (UD-Q6_K_XL, UD-Q5_K_XL)" ON)
 if(STRATA_Q6K_EXPERTS)
   add_compile_definitions(STRATA_Q6K_EXPERTS=1)
-endif()
-option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
-# CUDA: the pointer-table MMQ behind STRATA_MMQ_DIRECT=1 (the prompt path's MMQ reads resident experts in their cache
-# slots through a Strata-side copy of llama.cpp's MMQ scheduler, src/prefill/moe_mmq_tab.cuh).  Off by default, like
-# the K-quant options above: the engine loads every kernel when it starts (CUDA_MODULE_LOADING=EAGER), and these nine
-# instances (+15 MB of binary) take 36-38 MiB of VRAM per GPU on sm_86 - expert slots every model would lose, with
-# STRATA_MMQ_DIRECT unset too.  They also add ~70% of the upstream MMQ instances' compile time per CUDA arch (175 s
-# of CPU for the nine at sm_86 alone).  Off, the build's device code is byte for byte the one without this feature.  CUDA
-# only (not HIP, not gfx906); switched off at configure time when the llama.cpp tree's mmq.cuh is not one the copy
-# was verified against.
-option(STRATA_MMQ_TAB "Build the pointer-table prompt MMQ for STRATA_MMQ_DIRECT=1 (CUDA; ~37 MiB VRAM per GPU)" OFF)
-if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
-  message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
 endif()
 if(STRATA_ENABLE_CUDA AND STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
   message(FATAL_ERROR "STRATA_ENABLE_CUDA and STRATA_ENABLE_HIP are separate backends; enable only one")
@@ -592,17 +563,11 @@ strata_cpu_kernels()
 # third_party/strata-ggml (frozen at the llama.cpp commit in third_party/ggml/VERSION.txt, see its UPSTREAM.md): no download.
 # -DSTRATA_GGML_DIR=<llama.cpp checkout> still builds from that checkout instead (an override kept for two releases).
 strata_ggml_resolve("${CMAKE_CURRENT_SOURCE_DIR}")
-if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
-  message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
-endif()
-if(STRATA_ORCA_Q4KS_MMQ AND NOT STRATA_NATIVE_EXPERTS)
-  message(FATAL_ERROR "STRATA_ORCA_Q4KS_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
-endif()
 if(STRATA_NATIVE_EXPERTS)
   enable_language(C)
-  # ggml-base / ggml-cpu only where something links them: the tests (ggml as the oracle), the ggml-cpu pool (STRATA_OWN_CPU_QUANT=OFF) and an MMQ
-  # build.  A release engine (tests off, Strata's own pool, no MMQ) configures, builds and links no ggml; the ggml tools below exist only with it.
-  if(STRATA_BUILD_TESTS OR NOT STRATA_OWN_CPU_QUANT OR STRATA_MMQ)
+  # ggml-base / ggml-cpu only where something links them: the tests (ggml as the oracle) and the ggml-cpu pool (STRATA_OWN_CPU_QUANT=OFF).
+  # A release engine (tests off, Strata's own pool) configures, builds and links no ggml; the ggml tools below exist only with it.
+  if(STRATA_BUILD_TESTS OR NOT STRATA_OWN_CPU_QUANT)
     strata_ggml_configure_root()
   else()
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)   # (what strata_ggml_configure_root sets for the whole project)
@@ -610,17 +575,8 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   strata_cpu_native_experts()
   strata_quant_layer()
-  strata_ggml_mmq_types()
-  # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
-  if(STRATA_ORCA_Q4KS_MMQ)
-    list(APPEND _strata_mmq_types q5_0)
-  endif()
-  if(STRATA_ENABLE_CUDA AND STRATA_MMQ)
-    strata_cuda_mmq()
-  elseif(STRATA_ENABLE_CUDA)
-    strata_cuda_pf_own()   # P4-SPLIT: no MMQ, Strata's own prompt kernels only
-  elseif(STRATA_PREFILL_MMQ AND STRATA_MMQ)
-    strata_hip_mmq()
+  if(STRATA_ENABLE_CUDA)
+    strata_cuda_pf_own()   # Strata's own prompt kernels
   elseif(STRATA_ENABLE_HIP)
     strata_hip_pf_own()
   endif()
@@ -801,7 +757,7 @@ if(STRATA_BUILD_TESTS)
   endif()
 endif()
 
-# ---- HIP gfx906: every CUDA source of the tree (and the ggml-cuda MMQ sources) is compiled as HIP ----
+# ---- HIP gfx906: every CUDA source of the tree is compiled as HIP ----
 strata_hip_gfx906_sources()
 
 # ---- strata-split: the opt-in engine that splits every layer across 2-4 NVIDIA cards (src/split, from sFNX, MIT, John Fink) ----

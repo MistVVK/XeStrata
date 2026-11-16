@@ -83,7 +83,7 @@ class GGMLQuantizationType(IntEnum):
 
 
 _Q = GGMLQuantizationType
-#: (elements per block, bytes per block): ggml's block structs (third_party/strata-ggml/strata-quant-common.h)
+#: (elements per block, bytes per block): the GGUF block structs (include/strata/quant/strata-quant-common.h)
 GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     _Q.F32: (1, 4), _Q.F16: (1, 2), _Q.Q4_0: (32, 18), _Q.Q4_1: (32, 20), _Q.Q5_0: (32, 22), _Q.Q5_1: (32, 24),
     _Q.Q8_0: (32, 34), _Q.Q8_1: (32, 36), _Q.Q2_K: (256, 84), _Q.Q3_K: (256, 110), _Q.Q4_K: (256, 144),

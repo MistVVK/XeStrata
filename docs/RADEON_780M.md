@@ -32,7 +32,7 @@ By hand, the steps of [STRIX_HALO.md](STRIX_HALO.md) with the architecture and t
 
 ```sh
 cmake -S . -B build-780m -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_PREFILL_MMQ=ON \
+  -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
   -DCMAKE_HIP_ARCHITECTURES=gfx1103 \
   -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
   -DCMAKE_PREFIX_PATH=/opt/rocm \
