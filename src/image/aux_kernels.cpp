@@ -655,8 +655,9 @@ void rope2d_split16(const In* qkv, const float* bias, int64_t N, int64_t heads, 
         const int li = (int) (t % gg);
         const int ti = (li * hf + p) * 2;   // the table: grid^2 x half pairs, far below 2^31
         const float cs = tab[ti], sn = tab[ti + 1];
-        const In* row = qkv + t * 3 * C + h * hd + 2 * p;
-        const int64_t o = t * C + h * hd + (int64_t) 2 * p, c0 = h * hd + (int64_t) 2 * p;
+        const int p2 = 2 * p;   // the pair's first value: 32-bit, as the device counts
+        const In* row = qkv + t * 3 * C + h * hd + p2;
+        const int64_t o = t * C + h * hd + p2, c0 = h * hd + p2;
         auto at = [&](int64_t j) { return value_of(row[j]) + (bias != nullptr ? bias[c0 + j] : 0.f); };
         const float q0 = at(0), q1 = at(1), k0 = at(C), k1 = at(C + 1);
         q16[o] = f16_from_f32(q0 * cs - q1 * sn);
