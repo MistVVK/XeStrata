@@ -57,12 +57,14 @@ async function turn(s, message, body) {
 }
 
 async function play(s, requestId, text) {
-  const bg = /^SCRIPT:bg\b/.test(text);
+  const bg = /^SCRIPT:bg2?\b/.test(text), jobs = /^SCRIPT:bg2\b/.test(text) ? 2 : 1;   // `SCRIPT:bg2`: two background jobs, each finishing with its own turn
   await turn(s, { source: { kind: 'user', rpcId: requestId }, content: [{ type: 'text', text }] }, () => reply(s, bg ? 'Started the job in the background. ' : `Echo: ${text}`));
   if (!bg) return;
-  await sleep(wakeMs);
-  const notice = { source: { kind: 'tool-jobs', form: 'notice', summary: 'job 1 completed' }, content: [{ type: 'text', text: 'Job 1 completed with exit code 0. Output: 42' }] };
-  await turn(s, notice, async () => { await reply(s, 'The background job finished and printed 42. '); await sleep(800); });
+  for (let job = 1; job <= jobs; job++) {
+    await sleep(wakeMs);
+    const notice = { source: { kind: 'tool-jobs', form: 'notice', summary: `job ${job} completed` }, content: [{ type: 'text', text: `Job ${job} completed with exit code 0. Output: ${job === 1 ? 42 : 43}` }] };
+    await turn(s, notice, async () => { await reply(s, job === 1 ? 'The background job finished and printed 42. ' : 'The second job finished and printed 43. '); await sleep(800); });
+  }
 }
 
 function rpc(method, args) {

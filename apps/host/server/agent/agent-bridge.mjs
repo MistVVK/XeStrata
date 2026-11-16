@@ -35,6 +35,8 @@ import { watchForWake } from './wake-watch.mjs';
 
 /** How often one turn asks the agent to carry on after a reply the length limit cut (each time in smaller pieces). */
 export const MAX_CUT_RETRIES = 2;
+/** Replies the agent started by itself (a background command finished) that ended while no page was attached, kept per chat until a page takes them (#6070 review). */
+export const WOKEN_KEPT = 8;
 import { buildAnswer, parseQuestions } from './user-questions.mjs';
 import { BASE_TOKENS, COUNT_ABOVE_CHARS, FIT_TEXT, countTokens, decideFit, fill, grouped } from './context-fit.mjs';
 import { PlanStore, planPrompt, parsePlan, parsePoints, stepObjective, stepLine, firstSentence, stepSummary, planAsPrompt, editedSteps, planView, researchPrompt, researchWritePrompt, RESEARCH_NUDGE, parseSources } from './plan.mjs';
@@ -378,9 +380,10 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     catch (e) { log(`agent · a turn the agent started by itself could not be followed: ${e?.message ?? e}`); }
     finally { c.starting = false; }
   }
-  function armWake(c, runtime, sessionId) {
+  function armWake(c, runtime, sessionId, after) {
     c.wake?.close();
-    c.wake = watchForWake({ gw: runtime.gw, sessionId, onWake: seq => { c.wake = null; void startWakeTurn(c, seq); } });
+    // `after`: the last event our turn saw, so a turn that began before the watch's first snapshot still wakes the chat (#6070 review)
+    c.wake = watchForWake({ gw: runtime.gw, sessionId, after, onWake: seq => { c.wake = null; void startWakeTurn(c, seq); } });
   }
 
   async function runTurnInner(c, { chatId, message, workspacePath, choice = null, mode = null, history = [], onFrame, requestId = `req-${randomUUID()}`, signal, goal = null, thinking = null, thinkingBudget = 0, images = [], planTask = null, planRun = null, researchTopic = null, adopt = null }) {
@@ -572,9 +575,11 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
       c.turn = null;
       // What a page that was away needs to show the end of this turn (attach, below).
       c.last = { wake: !!adopt, taken: attached, requestId, sessionId, mode: appliedMode, model: route.name, contextMax: route.contextWindow, remoteModel: route.kind === 'api', content: hideDeltas ? '' : written.all.slice(0, 4_000_000), reasoning: written.reasoning, cards: [...projector.tools.values()].filter(t => t.card).map(t => t.card), terminal };
+      // every reply the agent started by itself that no page took is kept, not only the last one: two background commands that finish while the app is closed both reach the chat
+      if (c.last.wake && !c.last.taken) c.woken = [...(c.woken ?? []).filter(w => !w.taken), c.last].slice(-WOKEN_KEPT);
       turn.ended.resolve({ reason: projector.ended, failure: failure ?? null });
       notifyIdle();
-      if (!failure && !turn.stopping && !goal && !planTask && !researchTopic && rt === runtime) armWake(c, runtime, sessionId);
+      if (!failure && !turn.stopping && !goal && !planTask && !researchTopic && rt === runtime) armWake(c, runtime, sessionId, turn.lastSeq);
       // A turn that filled the context, or that the guard stopped, leaves a long history behind: summarise the older part now so the next message has room.
       if (noteReason === 'context' || noteReason === 'searches' || noteReason === 'searches-failed' || noteReason === 'rewrites' || /context window|too long|exceeds/i.test(String(projector.ended?.error?.message ?? ''))) void compactSession(runtime, sessionId);
     }
@@ -1458,7 +1463,7 @@ ${note.text}
     return { chatId, sessionId: t.sessionId, requestId: t.requestId, mode: t.mode, stopping: !!t.stopping, wake: t.wake, pending: pendingFor(chatId) };
   }
   /** Chats whose reply to a turn the agent started by itself ended while no page was attached: [{ chatId, requestId }]. */
-  function wokenTurns() { return [...chats.entries()].filter(([, c]) => c.last?.wake && !c.last.taken && !c.turn).map(([chatId, c]) => ({ chatId, requestId: c.last.requestId })); }
+  function wokenTurns() { return [...chats.entries()].filter(([, c]) => !c.turn).flatMap(([chatId, c]) => (c.woken ?? []).filter(w => !w.taken).map(w => ({ chatId, requestId: w.requestId }))); }
   /** Every chat with a turn running. */
   function runningTurns() { return [...chats.keys()].map(turnOf).filter(Boolean); }
   /**
@@ -1473,9 +1478,10 @@ ${note.text}
       turn.reattach({ onFrame, signal });
       return { ended: turn.ended.promise.then(() => undefined), live: true };
     }
-    const last = c?.last;
-    if (!last || !requestId || last.requestId !== requestId) return null;
+    const last = requestId ? [c?.last, ...(c?.woken ?? [])].find(l => l && l.requestId === requestId) : null;
+    if (!last) return null;
     last.taken = true;
+    if (c.woken) c.woken = c.woken.filter(w => !w.taken);
     onFrame({ type: 'start', model: last.model, contextMax: last.contextMax, demo: false, remoteModel: last.remoteModel, agent: true, mode: last.mode, sessionId: last.sessionId, requestId: last.requestId, skills: [], resumed: true });
     onFrame({ type: 'resync', content: last.content, reasoning: last.reasoning });
     for (const card of last.cards) onFrame({ type: 'agent-tool', tool: card });

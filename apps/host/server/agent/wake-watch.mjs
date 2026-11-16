@@ -13,9 +13,12 @@ export const WAKE_EVENTS = new Set(['turn/start', 'user/message', 'step/start'])
  * @param {string} options.sessionId
  * @param {(seq:number) => void} options.onWake      called once, with the sequence number of the event that opened the new turn
  * @param {number} [options.maxMs]                   the watch ends by itself after this long (a chat nobody comes back to)
+ * @param {number} [options.after]                   the last event of the session our own turn saw: a turn that began after it but before this
+ *                                                    watch's first snapshot (a quick background command) is in that snapshot's records and wakes
+ *                                                    the chat. Without it the first snapshot is taken as the past.
  * @returns {{ close: () => void }}
  */
-export function watchForWake({ gw, sessionId, onWake, maxMs = 2 * 60 * 60_000 }) {
+export function watchForWake({ gw, sessionId, onWake, maxMs = 2 * 60 * 60_000, after }) {
   let cursor = -1;
   let done = false;
   let ready = false;
@@ -37,8 +40,14 @@ export function watchForWake({ gw, sessionId, onWake, maxMs = 2 * 60 * 60_000 })
       if (done) return;
       // A re-opened stream (the socket came back) starts with a fresh snapshot: a turn that began while it was away is in its records.
       if (item.type === 'snapshot') {
-        if (!ready) { ready = true; cursor = item.cursor ?? -1; return; }
+        if (!ready) {
+          ready = true;
+          // The gap between the end of our turn and this watch: what the session did after `after` is in the snapshot's records.
+          if (!Number.isInteger(after) || after < 0) { cursor = item.cursor ?? -1; return; }
+          cursor = after;
+        }
         for (const r of item.records ?? []) if (r?.type === 'event') see(r.event);
+        if (!done && Number.isInteger(item.cursor) && item.cursor > cursor) cursor = item.cursor;
         return;
       }
       if (item.type === 'event') see(item.event);

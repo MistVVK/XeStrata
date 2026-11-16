@@ -2367,7 +2367,10 @@ async function takeOverTurns() {
   const live = new Set(running.map(t => t.chatId));
   for (const t of running) if (state.sessions.some(s => s.id === t.chatId) && !liveTurns.has(t.chatId)) void sendMessage('', { reattach: t.chatId, ...(t.wake && t.requestId ? { requestId: t.requestId, wake: true } : {}) });
   // Replies the agent began by itself while no page was open (a background command finished), read whole.
-  for (const w of woken) if (state.sessions.some(s => s.id === w.chatId) && !liveTurns.has(w.chatId) && !live.has(w.chatId)) void sendMessage('', { reattach: w.chatId, requestId: w.requestId, wake: true });
+  // A chat can have several (two background commands finished): each becomes its own reply, in order, one after the other.
+  const wokenByChat = new Map<string, string[]>();
+  for (const w of woken) if (state.sessions.some(s => s.id === w.chatId) && !live.has(w.chatId)) wokenByChat.set(w.chatId, [...(wokenByChat.get(w.chatId) ?? []), w.requestId]);
+  for (const [chatId, requestIds] of wokenByChat) if (!liveTurns.has(chatId)) void requestIds.reduce<Promise<unknown>>((before, requestId) => before.then(() => sendMessage('', { reattach: chatId, requestId, wake: true })), Promise.resolve());
   // Cut-off replies of chats with no turn running: the most recent few, asked once each.
   const cut = state.sessions.filter(s => !live.has(s.id) && !liveTurns.has(s.id)).slice().sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)).slice(0, 12).flatMap(s => {
     const last = s.messages[s.messages.length - 1];
