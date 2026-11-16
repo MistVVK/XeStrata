@@ -15748,6 +15748,16 @@ int main(int argc, char** argv) {
                                      "conversation holds checkpoints the slot does not; it stays)\n", b);
                 return;
             }
+#if defined(STRATA_GPU_METAL)
+            // #5401: a Metal batch slot's running state and K/V live in the decode window (its slot set), not in the slot's
+            // SessionState, whose own device buffers the window never writes (and a streamed start gives back): parking it here
+            // would copy those buffers (the streamed engine aborted on the given-back one).  Parking through the window is a later step.
+            // (the slot is overwritten as after the other skips: each caller resets it, and nothing reaches the cache or its SSD tier;
+            // the wording is the sibling returns', not "skip parking (": serve's #6081 counters read that as a refused park)
+            std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (a Metal batch slot's state "
+                                 "lives in the decode window, not in its sessions; #5401)\n", b);
+            return;
+#endif
             if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu tokens "
                                      "have no per-slot draft K/V without --batch-mtp)\n", b, sl.ids.size());
