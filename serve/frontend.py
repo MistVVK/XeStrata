@@ -1109,6 +1109,9 @@ def coerce_value(value: str, declared, notes: list | None = None):
     arrived as a JSON string of itself is decoded once more."""
     if declared == "string":
         return value
+    boolean = declared == "boolean" or (isinstance(declared, list) and "boolean" in declared and "string" not in declared)
+    if boolean and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"         # #5979: the model's Python spelling (True / False) of a declared boolean is the boolean
     try:
         v = json.loads(value)
     except ValueError:
