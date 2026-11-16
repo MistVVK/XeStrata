@@ -1578,19 +1578,54 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
         release();
         return false;
     }
-    // a DoRA's c folded into B's rows (no copy where there is none, a rank-64 adapter's B being hundreds of MiB)
+    // each rank's pair balanced by a power of two, A's row divided and B's column multiplied: B A is the same to the
+    // bit (a power of two scales FP16 and FP32 exactly), and the product's middle x A^T, which add() rounds to FP16,
+    // stays in its range - a file whose A is large and B small (an A row's norm 28 against B's 0.18, a Mage-Flow LoRA
+    // of an early trainer) made it overflow and the image black at every strength (2026-11-16, the RX 9060 XT).  A
+    // pair whose norms are within a factor of two is left as it is (no copy: most files' pairs)
+    std::vector<int> shift((size_t) e.rank, 0);
+    bool shifted = false;
+    for (int64_t j = 0; j < e.rank; ++j) {
+        double na = 0.0, nb = 0.0;
+        for (int64_t c = 0; c < e.cols; ++c) {
+            const double v = strata::kernels::f32_from_f16(e.a[(size_t) (j * e.cols + c)]);
+            na += v * v;
+        }
+        for (int64_t r = 0; r < e.rows; ++r) {
+            const double v = strata::kernels::f32_from_f16(e.b[(size_t) (r * e.rank + j)]);
+            nb += v * v;
+        }
+        if (na > 0.0 && nb > 0.0) {
+            shift[(size_t) j] = (int) std::lround(std::log2(na / nb) / 4.0);   // log2(sqrt(|A| / |B|)), squared norms
+            shifted = shifted || shift[(size_t) j] != 0;
+        }
+    }
+    std::vector<uint16_t> a_bal;
+    const uint16_t* a = e.a.data();
+    if (shifted) {
+        a_bal = e.a;
+        for (int64_t j = 0; j < e.rank; ++j)
+            for (int64_t c = 0; c < e.cols; ++c) {
+                uint16_t& h = a_bal[(size_t) (j * e.cols + c)];
+                h = strata::kernels::f16_from_f32(std::ldexp(strata::kernels::f32_from_f16(h), -shift[(size_t) j]));
+            }
+        a = a_bal.data();
+    }
+    // a DoRA's c folded into B's rows, and the balance's powers of two into its columns (no copy where there is
+    // neither, a rank-64 adapter's B being hundreds of MiB)
     std::vector<uint16_t> scaled;
     const uint16_t* b = e.b.data();
-    if (row_coef != nullptr) {
+    if (row_coef != nullptr || shifted) {
         scaled = e.b;
         for (int64_t r = 0; r < e.rows; ++r)
             for (int64_t j = 0; j < e.rank; ++j) {
                 uint16_t& h = scaled[(size_t) (r * e.rank + j)];
-                h = strata::kernels::f16_from_f32(strata::kernels::f32_from_f16(h) * row_coef[r]);
+                const float v = std::ldexp(strata::kernels::f32_from_f16(h), shift[(size_t) j]);
+                h = strata::kernels::f16_from_f32(row_coef != nullptr ? v * row_coef[r] : v);
             }
         b = scaled.data();
     }
-    strata::gpu::copy_async(a_, e.a.data(), e.a.size() * 2, stream);
+    strata::gpu::copy_async(a_, a, e.a.size() * 2, stream);
     strata::gpu::copy_async(b_, b, e.b.size() * 2, stream);
     if (!strata::gpu::stream_sync(stream)) {
         err = "the image engine: the adapter " + e.key + " to the GPU: " + strata::gpu::last_error();
