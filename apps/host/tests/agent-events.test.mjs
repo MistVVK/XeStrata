@@ -1,7 +1,7 @@
 /** Pure parts of the agent bridge: profile generation, environment scrubbing, event projection. No Harness needed. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildProfile, outputBudget, routeFor, ASSUMED_API_CONTEXT } from '../server/agent/profile.mjs';
+import { buildProfile, outputBudget, compactionHeadroom, routeFor, ASSUMED_API_CONTEXT } from '../server/agent/profile.mjs';
 import { agentEnvironment, redact } from '../server/agent/harness-runtime.mjs';
 import { TurnProjector, presentTool, toolScope, toolVerb, friendlyFailure, baselineItems } from '../server/agent/events.mjs';
 import { withEarlierConversation } from '../server/agent/agent-bridge.mjs';
@@ -221,4 +221,15 @@ test('an API model\'s route gets a generous answer room, or the connection\'s ow
   const models = Object.values(providers)[0].models;
   const by = Object.fromEntries(models.map(m => [m.id, m.maxTokens]));
   assert.equal(by.unknown, 32768); assert.equal(by.big, 64_000); assert.equal(by.small, 16_384 - 4096);
+});
+
+// #5011: a cloud model whose provider says it may write as much as its window (128K window, 128K maximum output) reserved almost the whole
+// window for every reply, so the conversation was compacted after about 4K tokens of prompt. The reply keeps the larger of 32K and half the window.
+test('a provider maximum as large as the window does not leave the prompt a few thousand tokens before compaction (#5011)', () => {
+  assert.equal(outputBudget(131_072, 131_072), 65_536);
+  const promptRoom = 131_072 - outputBudget(131_072, 131_072) - compactionHeadroom(131_072, outputBudget(131_072, 131_072));
+  assert.ok(promptRoom > 50_000, `prompt room before compaction: ${promptRoom}`);
+  assert.equal(outputBudget(1_000_000, 128_000), 128_000, 'a very large window keeps a large known maximum');
+  assert.equal(outputBudget(200_000, 64_000), 64_000);
+  assert.equal(outputBudget(null, 100_000), 100_000, 'an unknown window: the known maximum as before');
 });

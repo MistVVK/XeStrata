@@ -190,7 +190,10 @@ export const DEFAULT_API_OUTPUT = 32768;
 export function outputBudget(context, maxOutput = null) {
   const c = Number.isFinite(context) && context > 0 ? context : null;
   const window = c === null ? Infinity : Math.max(1024, c - Math.min(4096, Math.floor(c / 4)));
-  if (Number.isFinite(maxOutput) && maxOutput > 0) return Math.max(1024, Math.min(Math.floor(maxOutput), window));
+  // A provider's maximum is what the model can write, not what every reply should reserve (#5011): a 128K model that may write 128K left the
+  // prompt about 4K before compaction. The reply keeps the larger of 32K and half the window; a smaller maximum is still respected.
+  const cap = c === null ? Infinity : Math.max(DEFAULT_API_OUTPUT, Math.floor(c / 2));
+  if (Number.isFinite(maxOutput) && maxOutput > 0) return Math.max(1024, Math.min(Math.floor(maxOutput), window, cap));
   return Math.max(1024, Math.min(DEFAULT_API_OUTPUT, window));
 }
 
