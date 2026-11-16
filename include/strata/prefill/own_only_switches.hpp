@@ -72,4 +72,14 @@ inline bool own_only_user_named(const char* name, const char* value, const std::
 }
 inline bool own_only_user_named(const char* name, const char* value) { return own_only_user_named(name, value, own_only_recorded()); }
 
+/// The fused switches the Qwen3.6 engine's run() sets to "1" when they are unset (src/qwen35/q36_engine.cu), on both of its entries: `strata --model` (where prefill.cpp's
+/// start-up list above has already run) and the standalone strata-q36 (which does not link that list).  Always the K-quant, Q6_K and Q8_0 gate/up instances (this family's
+/// formats); in a build without MMQ also the Turing set-up, STRATA_PF_FUSED_SM75 (TUNE-0216: without it the standalone entry ran every Qwen3.6 layer of a Turing card on the
+/// plain int8 kernels while `strata --model` took the fused ones).  STRATA_PF_FUSED itself follows fused_tile::q36_start_env.  CUDA only: a HIP build reads none of the four.
+inline std::vector<const char*> q36_entry_switches(bool mmq_built) {
+    std::vector<const char*> v = {"STRATA_PF_FUSED_KQ", "STRATA_PF_FUSED_Q6K", "STRATA_PF_FUSED_Q8GU"};
+    if (!mmq_built) v.push_back("STRATA_PF_FUSED_SM75");
+    return v;
+}
+
 }  // namespace strata::prefill
