@@ -201,7 +201,7 @@ def build_vision_sycl_reader(stub: Path, llama) -> bool:
     try:
         os.environ.update(oneapi_environment())
         S.cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision-sycl", "strata-vision",
-                      [f"-DLLAMA_DIR={S.vision_llama(llama)}", "-DSTRATA_VISION_SYCL=ON", "-DSTRATA_PORTABLE=OFF",
+                      ["-DSTRATA_VISION_SYCL=ON", "-DSTRATA_PORTABLE=OFF",
                        f"-DCMAKE_C_COMPILER={compiler[0]}", f"-DCMAKE_CXX_COMPILER={compiler[1]}"], None, "")
         shutil.copy2(ROOT / "build-vision-sycl" / "bin" / "strata-vision-sycl", stub / "strata-vision-sycl")
     except SystemExit:

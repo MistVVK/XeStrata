@@ -52,11 +52,9 @@ cmake --build "$build" --target $targets -j "$(nproc)"
 # a Pascal card the engine ran while the reader died with "device kernel image is invalid"). BUILD_VISION=0 ships a text-only package.
 vision_dir=${BUILD_VISION_DIR:-$repo/build-vision-$variant}
 if [ "${BUILD_VISION:-1}" = 1 ]; then
-  # strata-vision builds from the vendored third_party/strata-llama (llama, mtmd, ggml at the pin); STRATA_GGML_DIR=<llama.cpp checkout> overrides it
-  vision_llama=""; [ -z "${STRATA_GGML_DIR:-}" ] || vision_llama="-DLLAMA_DIR=$STRATA_GGML_DIR"
-  # shellcheck disable=SC2086
-  cmake -G Ninja -S tools/vision -B "$vision_dir" -DCMAKE_BUILD_TYPE=Release $vision_llama \
-      -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"
+  # strata-vision is Strata's own reader (tools/vision/own): no llama.cpp source, STRATA_GGML_DIR does not reach it
+  cmake -G Ninja -S tools/vision -B "$vision_dir" -DCMAKE_BUILD_TYPE=Release \
+      -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"
   cmake --build "$vision_dir" --target strata-vision -j "$(nproc)"
 fi
 

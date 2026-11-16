@@ -3781,7 +3781,8 @@ def check_shards(shards):
 #: gguf-py and llama.cpp's HF converter, vendored at the llama.cpp pin (third_party/strata-gguf-py/UPSTREAM.md): the preparation tools import
 #: them, so no llama.cpp download is needed to pack a model. The Terminal and Control packages carry this folder (packaging/package_terminal.py).
 VENDORED_GGUF_PY = ROOT / "third_party" / "strata-gguf-py"
-#: the llama.cpp sources strata-vision builds (llama, mtmd, the whole ggml), vendored at the same pin (third_party/strata-llama/UPSTREAM.md); phase 3 deletes it
+#: llama.cpp's sources (llama, mtmd, the whole ggml) at the same pin (third_party/strata-llama/UPSTREAM.md): since 0.2.16 only the picture reader's test oracles
+#: build from them (tools/vision, STRATA_VISION_ORACLES=ON); no reader program does
 VENDORED_LLAMA = ROOT / "third_party" / "strata-llama"
 
 
@@ -3812,11 +3813,6 @@ def llama_override():
 def ggml_defs(llama) -> list:
     """The CMake definition that points an engine build at a llama.cpp checkout: only for the override; the vendored tree is the default."""
     return [f"-DSTRATA_GGML_DIR={llama}"] if llama else []
-
-
-def vision_llama(llama) -> Path:
-    """The llama.cpp tree strata-vision builds from: the override (STRATA_GGML_DIR), else the vendored third_party/strata-llama."""
-    return Path(llama) if llama else VENDORED_LLAMA
 
 
 def llama_cpp_if_here():
@@ -5233,7 +5229,7 @@ def build_vision_hip(eng: Path, stamp: Path, meta: dict, llama, vsrc, archs: lis
     say("  Compiling the picture reader for your AMD GPU (a few minutes, once) ...")
     try:
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision-hip", "strata-vision",
-                    [f"-DLLAMA_DIR={vision_llama(llama)}", "-DSTRATA_VISION_HIP=ON", "-DSTRATA_VISION_HIP_ARCHS=" + ";".join(archs),
+                    ["-DSTRATA_VISION_HIP=ON", "-DSTRATA_VISION_HIP_ARCHS=" + ";".join(archs),
                      "-DSTRATA_PORTABLE=OFF", f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
                      f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}", "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                      f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"], None, "")
@@ -5253,7 +5249,7 @@ def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
     if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc):
         say("  Compiling the image encoder (for the CPU) ...")
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
-                    [f"-DLLAMA_DIR={vision_llama(llama)}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"],
+                    ["-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"],
                     find_vcvars() if WIN else None,
                     "build-vision-cpu.bat" if WIN else "")   # #881: MSVC's environment on Windows, as the CUDA path has
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
@@ -6239,7 +6235,7 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
 
 
 ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/ggml", "third_party/strata-ggml")
-VISION_SOURCES = ("tools/vision", "third_party/strata-llama")
+VISION_SOURCES = ("tools/vision", "third_party/stb")     # the reader's own tower and the picture decoder it compiles
 
 
 def source_hash(parts) -> str:
@@ -6376,7 +6372,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
             (eng / KQ_LIB).unlink()
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
-        defs = [f"-DLLAMA_DIR={vision_llama(llama)}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
+        defs = [f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
                 "-DSTRATA_PORTABLE=OFF", *host_compiler_defs(vision == "gpu")]   # native, like the engine
         if vision == "gpu":
             defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",

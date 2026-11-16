@@ -1,32 +1,30 @@
 #!/bin/bash
-# packaging/build_vision_mac.sh - the picture reader for the Mac engine package: strata-vision for macOS arm64, with ggml's Metal
-# backend built in (`--gpu` reads pictures on the Mac's GPU, without it on the CPU). One program for both: Apple Silicon always has
-# the Metal framework, the Metal engine needs it too. It is built from the vendored third_party/strata-llama (llama.cpp at the engine's pin); --llama <checkout> builds from that instead (an override, kept for two releases).
+# packaging/build_vision_mac.sh - the picture reader for the Mac engine package: strata-vision for macOS arm64, Strata's own tower with its
+# Metal kernels (`--gpu` reads pictures on the Mac's GPU, without it on the CPU). One program for both: Apple Silicon always has
+# the Metal framework, the Metal engine needs it too. No llama.cpp source is compiled; --llama is still accepted and ignored.
 #
-#   packaging/build_vision_mac.sh --out <folder> [--llama <llama.cpp checkout>] [--build <build folder>] [--jobs N]
+#   packaging/build_vision_mac.sh --out <folder> [--build <build folder>] [--jobs N]
 #
 # <folder>/strata-vision is the program; copy it beside `strata` in the engine package's --src before packaging/package_engine.py
 # (`strata-vision` is one of the files it takes) and sign it with the rest (packaging/mac/sign-and-notarize.sh signs every Mach-O).
 # Needs cmake and ninja on PATH and the Command Line Tools. The build is portable (no -march: it runs on an M1 as on an M5).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-llama="" out="" build="" jobs=""
+out="" build="" jobs=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --llama) llama="$2"; shift 2 ;;
+    --llama) shift 2 ;;     # (no longer used: the reader holds no llama.cpp code)
     --out) out="$2"; shift 2 ;;
     --build) build="$2"; shift 2 ;;
     --jobs) jobs="$2"; shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
-[ -n "$out" ] || { echo "usage: $0 --out <folder> [--llama <llama.cpp checkout: an override>] [--build <folder>] [--jobs N]" >&2; exit 2; }
+[ -n "$out" ] || { echo "usage: $0 --out <folder> [--build <folder>] [--jobs N]" >&2; exit 2; }
 [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || { echo "this builds on an Apple Silicon Mac" >&2; exit 1; }
 build="${build:-$out/build-vision}"
 mkdir -p "$out"
-vision_llama=""; [ -z "$llama" ] || vision_llama="-DLLAMA_DIR=$llama"     # default: the vendored third_party/strata-llama
-# shellcheck disable=SC2086
-cmake -S "$here/../tools/vision" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release $vision_llama \
+cmake -S "$here/../tools/vision" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_PORTABLE=ON -DSTRATA_VISION_METAL=ON -DSTRATA_VISION_CUDA=OFF
 ninja -C "$build" ${jobs:+-j "$jobs"} strata-vision
 cp "$build/bin/strata-vision" "$out/strata-vision"

@@ -32,7 +32,7 @@ ARG CUDA_ARCHITECTURES="75;80;86;89;120"
 ARG BUILD_VISION=1
 ARG ENGINE_VERSION=
 RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r requirements.txt -r requirements-build.txt
-# ggml comes from the vendored third_party/strata-ggml and strata-vision from third_party/strata-llama (llama, mtmd, ggml at the pin): nothing is downloaded
+# ggml comes from the vendored third_party/strata-ggml; strata-vision is Strata's own reader (tools/vision/own): nothing is downloaded
 RUN set -e; \
     real=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do real="$real;${a}-real"; done; real=${real#;}; \
     last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
@@ -45,7 +45,7 @@ RUN set -e; \
     /venv/bin/cmake --build build --target $targets -j "$(nproc)"; \
     if [ "$BUILD_VISION" = "1" ]; then \
       /venv/bin/cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release \
-          -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
+          -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
       /venv/bin/cmake --build build-vision --target strata-vision -j "$(nproc)"; \
     fi
 RUN set -e; \

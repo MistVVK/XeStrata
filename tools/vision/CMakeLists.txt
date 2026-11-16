@@ -12,7 +12,7 @@
 # Portable (AVX2 baseline) is the default, so a reader built without extra flags runs on any AVX2 PC: the 0.1.32 release's encoder was built native on an
 # AVX-512 machine and stopped with an illegal instruction elsewhere (#411 #412 #419).  setup.py, which builds for the PC it runs on, passes
 # -DSTRATA_PORTABLE=OFF.  The CPU tower picks its kernel tier at run time (tools/vision/own/cpu_caps.h), so the flag only decides the generic code's floor.
-# Build scripts may still pass -DLLAMA_DIR: it is read only with STRATA_VISION_ORACLES=ON.
+# -DLLAMA_DIR is read only with STRATA_VISION_ORACLES=ON (the package scripts and setup pass it no longer).
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
 
