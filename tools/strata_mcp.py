@@ -692,6 +692,17 @@ class Strata:
         except (OSError, ValueError):
             return {}
 
+    @staticmethod
+    def engine_here(reference: str, cfg: dict) -> bool:
+        """A run config's engine named as a component ("component:strata-engine", what every install of the app and `strata launch` writes): is that
+        engine installed? It is not a path on disk, so it was always counted missing, and the app listed "the engine program" beside any file that
+        really was missing. Looked up without the SHA-256 check of a start (strata_control.engine_component.expand, full=False)."""
+        try:
+            from strata_control import engine_component as ec
+            return bool(ec.expand(reference, cfg, full=False))
+        except Exception:                               # noqa: BLE001 - no engine, an unknown component, a damaged folder: missing
+            return False
+
     def describe_config(self, path: Path, usage: dict | None = None) -> dict:
         cfg = self.read_config(path)
         a = cfg.get("args") if isinstance(cfg.get("args"), list) else []
@@ -700,7 +711,7 @@ class Strata:
             return a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None
         tag = path.stem[len("strata-"):]
         missing = [p for p in [cfg.get("exe"), *[x for x in a if isinstance(x, str) and x.endswith(".gguf")]]
-                   if not p or not Path(p).exists()]
+                   if not p or not (self.engine_here(p, cfg) if str(p).startswith("component:") else Path(p).exists())]
         gaps = shard_gaps([x for x in a if isinstance(x, str) and x.endswith(".gguf")])   # a model in parts is whole only with every part
         missing += gaps
         script = self.root / f"run-{tag}.{'bat' if WIN else 'sh'}"

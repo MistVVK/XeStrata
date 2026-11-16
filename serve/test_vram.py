@@ -20,6 +20,7 @@ class VramEngine(ResidentEngine):
     def __init__(self, tok, elastic=True):
         super().__init__(tok)
         self.elastic, self.calls = elastic, []
+        self.info["vram_elastic"] = int(elastic)          # the Strata engine's INFO line says it (0: VRAM is refused with the reason)
 
     def vram(self, reserve_mib, timeout=120.0):
         self.calls.append(reserve_mib)

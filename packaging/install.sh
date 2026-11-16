@@ -96,7 +96,7 @@ main() {
   host=$(printf '%s' "$FEED" | sed -n 's#^[A-Za-z][A-Za-z0-9+.-]*://\([^/:]*\).*#\1#p')
   host=${host:-$FEED}
   fetch "$FEED/install-manifest.txt" "$work/manifest.txt" || die "$host did not answer (or this computer is offline), so the installer could not start. Check that this computer can open https://$host, then run the same line again. Nothing was installed."
-  line=$(awk -v p="$platform" '$1 == p { print; exit }' "$work/manifest.txt")
+  line=$(awk -v p="$platform" '{ sub(/\r$/, "") } $1 == p { print; exit }' "$work/manifest.txt")   # a manifest saved with CRLF line ends reads the same
   [ -n "$line" ] || die "this release has no Terminal for $platform."
   set -- $line
   version=$2; rel=$3; want=$4

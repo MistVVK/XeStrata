@@ -124,6 +124,27 @@ class Elastic(unittest.TestCase):
         self.assertIn("the image encoder stopped after 60 s without a picture", out.getvalue())
         self.assertNotIn("expert cache", out.getvalue())
 
+    def test_the_qwen36_engine_is_not_sent_a_command_it_does_not_have(self):
+        # the Qwen3.6 engine path reports no vram_elastic and has no VRAM command: it answered "VRAM 2048" with its usage text, and the log said
+        # "the expert cache did not make room for the image encoder (expected: GEN <max_new> ...)" at every picture (0.2.15 release test, boston)
+        del self.engine.info["vram_elastic"]
+        usage = "expected: GEN <max_new> [key=value ...] <id,id,...>"
+        self.engine.vram = lambda reserve, timeout=120.0: (self.engine.calls.append(reserve), (_ for _ in ()).throw(ValueError(usage)))[1]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.picture()
+            self.svc.last_image_at = 0
+            self.assertEqual(self.svc._vision_idle_down(), "down")
+            self.picture()
+        self.assertEqual(self.engine.calls, [])             # never asked
+        self.assertEqual(self.vision.starts, 2)             # the encoder starts all the same
+        self.assertNotIn("expected: GEN", out.getvalue())
+        self.assertNotIn("did not make room", out.getvalue())
+        with self.assertRaises(ValueError) as e:            # POST /v1/vram: the server's own sentence, not the engine's usage text
+            self.svc.vram(4000)
+        self.assertEqual(str(e.exception), "this engine cannot resize its VRAM use")
+        self.assertEqual(self.engine.calls, [])
+
     def test_the_load_never_starts_an_elastic_encoder(self):
         self.assertFalse(self.svc._vision_down())
         self.svc.vision = ElasticVision(tempfile.mkdtemp(), elastic=False)
