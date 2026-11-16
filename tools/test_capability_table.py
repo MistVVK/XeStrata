@@ -52,6 +52,10 @@ class CapabilityTable(unittest.TestCase):
                   "assets": ["strata-control-0.1.59.1-linux-x86_64.tar.gz", "strata-engine-0.1.59-linux-x86_64-sycl.tar.gz"]}
         self.assertEqual(ct.versions_line(hotfix), "App and Terminal 0.2.13, Control and engines 0.1.59. "
                          "App, Control and engine versions differ on purpose.")
+        carried = {"product_version": "0.2.15", "control_version": "0.1.61", "engine_version": "0.1.60",
+                   "assets": ["strata-control-0.1.61-linux-x86_64.tar.gz", "strata-engine-0.1.60-linux-x86_64-cuda-cuda13.tar.gz"]}
+        self.assertEqual(ct.versions_line(carried), "App and Terminal 0.2.15, Control 0.1.61, engines 0.1.60. "
+                         "App, Control and engine versions differ on purpose.")
 
     def test_no_page_keeps_the_old_mac_sentence(self):
         for p in ct.PAGES:

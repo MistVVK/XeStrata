@@ -39,8 +39,8 @@ LINES = [
     ("docs/AI_SETUP.md", r"install Strata \(version " + V + r"\)", ["product_version"]),
     ("docs/SOURCE_INSTALL.md", r"use Strata \(version " + V + r"\)", ["product_version"]),
     ("AGENTS.md", r"^Version " + V + r", engine " + V + r"\.", ["product_version", "engine_version"]),
-    ("docs/AI_REFERENCE.md", r"against the " + V + r" release tree \(app and Terminal " + V + r"; Control and engines " + V + r"\)",
-     ["product_version", "product_version", "engine_version"]),
+    ("docs/AI_REFERENCE.md", r"against the " + V + r" release tree \(app and Terminal " + V + r"; Control " + V + r", engines " + V + r"\)",
+     ["product_version", "product_version", "control_version", "engine_version"]),
     ("packaging/UPDATES.md", r"one per OS \(" + V + r"\)", ["product_version"]),
     ("packaging/UPDATES.md", r'"app": \{[^\n]*\n\s*"version": "' + V + '"', ["product_version"]),
     ("packaging/UPDATES.md", r"--target [a-z0-9_-]+ +--version " + V, ["product_version"]),
@@ -50,7 +50,7 @@ LINES = [
     ("packaging/UPDATES.md", r'"version": "' + V + r'", "platform": "linux-x86_64", "backend": "cuda"', ["engine_version"]),
     ("packaging/UPDATES.md", r"engine/strata-engine-" + V + r"-linux-x86_64-cuda-cuda13", ["engine_version"]),
     ("docs/MEDIA_KIT.md", r"for Strata " + V + r"\.", ["product_version"]),
-    ("packaging/README.md", r"\(app and Terminal " + V + r", Control and engines " + V + r"\)", ["product_version", "engine_version"]),
+    ("packaging/README.md", r"\(app and Terminal " + V + r", Control " + V + r", engines " + V + r"\)", ["product_version", "control_version", "engine_version"]),
     ("packaging/ENGINE-COMPONENT.md", r'"name": "strata-engine", "version": "' + V + '"', ["engine_version"]),
     ("packaging/ENGINE-COMPONENT.md", r"package_engine.py --src <build folder> --backend cuda --version " + V, ["engine_version"]),
 ]
@@ -118,6 +118,10 @@ def write(manifest):
     return changed
 
 
+def _vkey(version):
+    return tuple(int(p) for p in str(version).split("."))
+
+
 def check(manifest):
     problems = []
     for key in ("tag", "product_version", "control_version", "engine_version", "assets"):
@@ -132,7 +136,13 @@ def check(manifest):
         if where == "CMakeLists.txt (engine)":
             # the CMake project version is Control's. The engine packages carry it, except after a Control-only hotfix (Control 0.1.59.1,
             # engines still 0.1.59): then Control is the engine version plus one hotfix part.
-            if found != manifest["control_version"] or not (found == want or found.startswith(want + ".")):
+            # A release that builds no engine (0.2.15: Control 0.1.61, the 0.1.60 engines of v0.2.14 carried by absolute url) names the release
+            # it takes them from in "engines_from"; then Control may be ahead of the engines, and the engine packages at engine_version must be
+            # in the asset list (the packages the feed offers).
+            carried = bool(manifest.get("engines_from")) and manifest["engines_from"] != manifest["tag"] \
+                and _vkey(manifest["control_version"]) > _vkey(want) \
+                and any(a.startswith("strata-engine-%s-" % want) for a in manifest["assets"])
+            if found != manifest["control_version"] or not (found == want or found.startswith(want + ".") or carried):
                 problems.append("%s says %s, docs/data/release.json %s is %s (control_version %s)" % (where, found, key, want, manifest["control_version"]))
         elif found != want:
             problems.append("%s says %s, docs/data/release.json %s is %s" % (where, found, key, want))

@@ -66,7 +66,7 @@ body:
     attributes:
       label: Strata version
       description: "In the app: Settings > About. In the Terminal: `strata --version`. From source: the About tab of the web page, or `engine` in `GET /v1/status`, or the git commit."
-      placeholder: "Strata 0.2.14 · engine 0.1.60"
+      placeholder: "Strata 0.2.15 · engine 0.1.60"
     validations:
       required: true
   - type: input

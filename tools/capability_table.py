@@ -99,7 +99,11 @@ def carried(release):
 
 
 def versions_line(release):
-    s = "App and Terminal %s, Control and engines %s" % (release["product_version"], release["engine_version"])
+    c, e = release["control_version"], release["engine_version"]
+    if c == e or c.startswith(e + "."):                     # one version (a Control-only hotfix part counts as the same build)
+        s = "App and Terminal %s, Control and engines %s" % (release["product_version"], e)
+    else:                                                   # 0.2.15: Control 0.1.61 with the 0.1.60 engines of v0.2.14
+        s = "App and Terminal %s, Control %s, engines %s" % (release["product_version"], c, e)
     for ver, kinds in sorted(carried(release).items()):
         s += "; these packages stay at %s: %s" % (ver, "; ".join("%s %s" % (KIND_WORDS[k], ", ".join(sorted(p)))
                                                                 for k, p in sorted(kinds.items())))
