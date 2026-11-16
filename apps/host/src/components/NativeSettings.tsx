@@ -19,7 +19,7 @@ interface SpeedSwitch {
     legacy?: Record<string, string>;
     /** The Expert settings group the row is in (Speed when not given). */
     group?: string;
-    /** The two option names instead of On / Off (the picture reader: Strata's own / llama.cpp's). */
+    /** The two option names instead of On / Off (no row has them since the picture reader row went in 0.2.16). */
     words?: { on: string; off: string };
 }
 const switchGroup = (sw: SpeedSwitch) => sw.group ?? 'Speed';

@@ -23,11 +23,9 @@ ENV = {      # what each switch writes outside its default
     "faster_long_prompts": {"STRATA_KVA": "1"},
     "faster_12gb_nvidia": {"STRATA_ROUTE_PRIOR": "1.5"},
     "faster_radeon_9000": {"STRATA_PCIE_FRAC_DEFAULT": "old"},
-    "picture_reader": {"STRATA_VISION_TOWER": "mtmd"},       # llama.cpp's picture reader instead of Strata's own (owner 11-11)
     "qwen_defaults_026": {"STRATA_DEFAULTS": "026"},         # the Terminal's troubleshooting switch: not in the app
 }
-DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "picture_reader": "on",
-           "qwen_defaults_026": "off"}
+DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "qwen_defaults_026": "off"}
 RTX3060 = {"name": "NVIDIA GeForce RTX 3060", "vendor": "nvidia", "arch": "86", "vram_gb": 12.0}
 RTX4070S = {"name": "NVIDIA GeForce RTX 4070 SUPER", "vendor": "nvidia", "arch": "89", "vram_gb": 12.0}
 RTX4060TI16 = {"name": "NVIDIA GeForce RTX 4060 Ti 16GB", "vendor": "nvidia", "arch": "89", "vram_gb": 16.0}
@@ -217,42 +215,20 @@ class Terminal(unittest.TestCase):
         self.assertIn("on by default; set old to turn off", radeon.description)
 
 
-class PictureReader(unittest.TestCase):
-    """The picture reader (owner 11-11: "Our tower, the other selectable"): Strata's own by default, llama.cpp's chosen in the settings.  The choice is the run
-    config's env entry STRATA_VISION_TOWER=mtmd, which the server hands to strata-vision (an older reader ignores it); a default file carries nothing."""
+class PictureReaderGone(unittest.TestCase):
+    """0.2.16: the "Picture reader" row (STRATA_VISION_TOWER=mtmd for llama.cpp's reader) is gone with llama.cpp's reader: Strata's own reader is the only
+    one.  No switch, app row or Terminal row offers it any more; a run config that still carries the entry is left as it is (strata-vision ignores it)."""
     PICS = {**QWEN, "vision": {"exe": "strata-vision", "mmproj": "mm.gguf", "model": "m.gguf", "gpu": True}}
 
-    def test_it_is_offered_for_every_qwen_model_that_reads_pictures_and_only_there(self):
+    def test_no_switch_names_the_reader(self):
+        self.assertNotIn("picture_reader", W.BY_ID)
+        self.assertNotIn("STRATA_VISION_TOWER", W.env_names())
         for backend, gpus in (("cuda", [RTX]), ("hip", [R9700]), ("hip", [STRIX]), ("sycl", []), ("metal", []), ("cpu", []), (None, [])):
-            self.assertIn("picture_reader", ids({**self.PICS, "backend": backend}, gpus), backend)
-        self.assertIn("picture_reader", ids({**QWEN36, "vision": self.PICS["vision"]}, [RTX]), "Qwen3.6 reads pictures with the same reader")
-        self.assertNotIn("picture_reader", ids(QWEN, [RTX]), "pictures off: no reader to choose")
-        self.assertNotIn("picture_reader", ids({**DEEPSEEK, "vision": self.PICS["vision"]}, [RTX]), "a DeepSeek config gets no switch")
+            self.assertNotIn("picture_reader", ids({**self.PICS, "backend": backend}, gpus), backend)
 
-    def test_the_app_shows_it_in_image_reading_with_two_named_options(self):
-        sw = W.BY_ID["picture_reader"]
-        self.assertEqual((sw.label, sw.group, sw.default, dict(sw.words)), ("Picture reader", "Image reading", "on",
-                                                                            {"on": "Strata's own (recommended)", "off": "llama.cpp's"}))
-        self.assertTrue(all(s.group == "Speed" for s in W.SWITCHES if s.id != "picture_reader"))
-        self.assertLess(len(sw.effect), 300)   # the owner's approved help line (11-11) is 275 characters; the other switches keep 260
-
-    def test_llama_cpps_reader_writes_one_entry_and_the_default_writes_none(self):
-        self.assertEqual(W.set_switch({"PATH": "/bin"}, "picture_reader", False), {"PATH": "/bin", "STRATA_VISION_TOWER": "mtmd"})
-        self.assertEqual(W.set_switch({"PATH": "/bin", "STRATA_VISION_TOWER": "mtmd"}, "picture_reader", True), {"PATH": "/bin"})
-        self.assertTrue(W.is_on({}, "picture_reader"))
-        self.assertFalse(W.is_on({"STRATA_VISION_TOWER": "mtmd"}, "picture_reader"))
-        cfg = derive_config(self.PICS, S.LaunchSettings(extra=S.settings_from_pairs(["STRATA_VISION_TOWER=mtmd"])), bool_flags=frozenset())
-        self.assertEqual(cfg["env"], {**QWEN["env"], "STRATA_VISION_TOWER": "mtmd"})
-        back = derive_config(cfg, S.LaunchSettings(extra=S.settings_from_pairs(["STRATA_VISION_TOWER=off"])), bool_flags=frozenset())
-        self.assertEqual(back["env"], QWEN["env"], "off puts the default back")
-        self.assertEqual(derive_config(self.PICS, S.LaunchSettings(), bool_flags=frozenset())["env"], QWEN["env"], "a default launch carries nothing")
-
-    def test_the_terminal_row_names_both_readers_and_its_default(self):
-        rows = P.build_rows(None, self.PICS["args"], None, self.PICS["env"], None, {}, P.switch_params(W.applicable(self.PICS, [RTX])))
-        row = next(r for r in rows if r.name == "STRATA_VISION_TOWER")
-        self.assertEqual((row.default, row.yours, row.known), ("auto", "", True))
-        self.assertIn("Picture reader (Strata's own by default; set mtmd to use llama.cpp's).", row.description)
-        self.assertIn("Choose llama.cpp's if pictures look misread.", row.description)
+    def test_an_old_entry_stays_in_the_file(self):
+        cfg = {**self.PICS, "env": {**QWEN["env"], "STRATA_VISION_TOWER": "mtmd"}}
+        self.assertEqual(derive_config(cfg, S.LaunchSettings(), bool_flags=frozenset())["env"], cfg["env"])
 
 
 class SameAsTheApp(unittest.TestCase):

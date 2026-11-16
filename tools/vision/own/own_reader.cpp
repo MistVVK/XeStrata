@@ -34,66 +34,23 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 
 }  // namespace
 
-std::string vision_tower_default(const char* env, std::string& note) {
-    const std::string v = env ? env : "";
-    if (v == "mtmd" || v == "own" || v == "auto") return v;
-    if (!v.empty()) note = "STRATA_VISION_TOWER=" + v + " is not mtmd, own or auto; using auto";
-    return "auto";
-}
-
 bool own_reader_inject_failure(const char* point) {
     const char* v = std::getenv("STRATA_VIT_TEST_FAIL");
     return v && point && std::string(v) == point;
 }
 
-bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, std::string& why) {
-    if (gpu) {
-#ifdef STRATA_VIT_GPU
-        (void) max_tokens;      // (the Pascal 6.1 / 6.2 rule that used it is gone: our tower on every GPU)
-        if (!VitGpu::available(why)) return false;
-#else
-        why = "this build has no GPU backend for the own tower";
-        return false;
-#endif
-    }
-    // (an MSVC x86 build kept mtmd here until 11-11; since 54f9cc3c0 it is 0.986 of mtmd-CPU's time at 1,024 tokens, RESULTS-OWN-3V.md D2, so that rule is gone)
-    Gguf gg;
-    VitGeometry g;
-    if (!gg.open(mmproj, why) || !vit_geometry_from_gguf(gg, g, why)) return false;
-    if (!gpu) return own_cpu_reader_supported(g, quant::best_isa(), why);
-    return vit_geometry_supported(g, why);      // a head size above kVitGpuMaxHeadDim is our GPU reader's own start error (own_reader_run), not a reason for mtmd
-}
-
-bool own_cpu_reader_supported(const VitGeometry& g, quant::Isa isa, std::string& why) {
-    // Every CPU tier is allowed (owner 11-11, "make ours the default" below AVX2 too).  Until then an x86 CPU whose best tier was scalar, sse41 or avx kept mtmd under
-    // `auto`; the tiers were gated since (RESULTS-OWN-3V.md PART H: rule 1 on both reader files, byte-identical repeats, no instruction above the CPU's tier outside the
-    // CPU-checked kernels, timed against llama.cpp's reader built for the same CPU class: 0.05 to 0.35 of its time, one cell 1.04).  `isa` stays an argument so a
-    // per-tier rule is one line here and has a test.
-    (void) isa;
-    return vit_geometry_supported(g, why);
-}
-
-std::string vision_tower_resolve(const std::string& tower, bool own_ok) {
-    if (tower == "mtmd" || tower == "own") return tower;      // an explicit choice is never overruled, either way
-    return own_ok ? "own" : "mtmd";                           // auto
-}
-
 int own_reader_run(const OwnReaderOptions& o) {
     using clock = std::chrono::steady_clock;
     const auto load_t0 = clock::now();
-    // every return before READY goes through here: under `auto` the reason goes back to strata-vision, which starts mtmd's reader (nothing on stdout yet)
-    auto fail = [&o](const std::string& msg, int code) {
-        if (o.start_error) {
-            *o.start_error = msg;
-            return kOwnStartFailed;
-        }
+    // every return before READY goes through here: an "ERR ..." line (the server then starts the CPU reader where this was the GPU one)
+    auto fail = [](const std::string& msg, int code) {
         std::printf("ERR %s\n", msg.c_str());
         std::fflush(stdout);
         return code;
     };
     const std::string injected = " (injected for a test: STRATA_VIT_TEST_FAIL)";
 #ifndef STRATA_VIT_GPU
-    if (o.gpu) return fail("this build has no GPU backend for the own tower (use --tower mtmd)", 3);
+    if (o.gpu) return fail("this build has no GPU backend for the own tower", 3);
 #endif
     Gguf gg;
     VitGeometry geo;

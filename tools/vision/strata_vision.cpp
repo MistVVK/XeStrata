@@ -91,13 +91,12 @@ int main(int argc, char** argv) {
     int threads = 0, max_tokens = 0, min_tokens = 0;
     llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
     bool fa_given = false;
-    // --tower mtmd|own|auto: whose picture reader runs (own-stack phase 3).  The default is auto (owner 11-11: our tower the default, mtmd selectable): ours
-    // where it was measured no slower and correct, mtmd's by itself where it was measured slower (own_reader_supported).  Without --tower the environment's
-    // STRATA_VISION_TOWER decides (the model's run config carries STRATA_VISION_TOWER=mtmd when someone picks llama.cpp's reader in the settings; an older
-    // strata-vision ignores it).  An explicit --tower wins.
-    std::string tower_note;
-    std::string tower = strata_vit::vision_tower_default(std::getenv("STRATA_VISION_TOWER"), tower_note);
-    if (!tower_note.empty()) std::fprintf(stderr, "strata-vision: %s\n", tower_note.c_str());
+    // --tower own|auto: our tower (auto is the same since 0.2.16: no card class, no setting and no start failure leads to llama.cpp's reader any more).  The
+    // settings row that wrote STRATA_VISION_TOWER=mtmd into a model's run config is gone; a config that still carries the entry keeps working: the name is
+    // no longer read, one log line says so.  `--tower mtmd` is kept for the test harnesses that compare with llama.cpp's reader, until mtmd leaves the build.
+    std::string tower = "auto";
+    if (const char* env = std::getenv("STRATA_VISION_TOWER"); env && *env && std::strcmp(env, "own") != 0 && std::strcmp(env, "auto") != 0)
+        std::fprintf(stderr, "strata-vision: STRATA_VISION_TOWER=%s is no longer read; Strata's picture reader runs\n", env);
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -134,14 +133,8 @@ int main(int argc, char** argv) {
         }
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
-    // auto: our tower where it can read this file on this backend, else mtmd; when ours then fails before READY, mtmd's reader starts in its place
-    bool own_may_fall_back = false, own_fell_back = false;
-    if (tower == "auto") {
-        std::string why;
-        tower = strata_vit::vision_tower_resolve(tower, !mmproj.empty() && strata_vit::own_reader_supported(mmproj, gpu, max_tokens, why));
-        own_may_fall_back = tower == "own" && !model.empty();   // mtmd needs the text model's header
-        if (tower == "mtmd" && !why.empty()) std::fprintf(stderr, "strata-vision: llama.cpp's reader (%s)\n", why.c_str());
-    }
+    // auto: our tower.  A failure before READY is an "ERR ..." line; the server then starts the CPU reader (serve/server.py, Vision._start), never mtmd's.
+    if (tower == "auto") tower = "own";
     if (mmproj.empty() || (model.empty() && tower != "own")) {   // our tower needs no text model: it never tokenizes
         std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
                              "[--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]\n");
@@ -165,14 +158,7 @@ int main(int argc, char** argv) {
         o.threads = threads;
         o.max_tokens = max_tokens;
         o.min_tokens = min_tokens;
-        std::string start_error;
-        if (own_may_fall_back) o.start_error = &start_error;
-        const int rc = strata_vit::own_reader_run(o);
-        if (rc != strata_vit::kOwnStartFailed) return rc;
-        // nothing was written to stdout yet: the server still waits for READY, which mtmd's reader below gives (with "mtmd" as its third word)
-        std::fprintf(stderr, "strata-vision: Strata's picture reader did not start (%s); reading pictures with llama.cpp's reader\n", start_error.c_str());
-        std::fflush(stderr);
-        own_fell_back = true;
+        return strata_vit::own_reader_run(o);
     }
     llama_log_set(quiet_log, nullptr);
     mtmd_helper_log_set(quiet_log, nullptr);
@@ -316,8 +302,8 @@ int main(int argc, char** argv) {
         mtmd_input_chunks_free(chunks);
         if (bm) mtmd_bitmap_free(bm);
     }
-    // the third word names the reader; a fourth, "fallback", says our tower failed before READY (a server reads only the start: "READY")
-    std::printf("READY %d mtmd%s\n", n_embd, own_fell_back ? " fallback" : "");
+    // the third word names the reader (a server reads only the start: "READY"); only an explicit --tower mtmd gets here
+    std::printf("READY %d mtmd\n", n_embd);
     std::fflush(stdout);
 
     std::string line;
