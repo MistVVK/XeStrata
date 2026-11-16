@@ -25526,6 +25526,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_FUSED_SM75_KQ",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2447,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "042f91a3ff",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "042f91a3ff",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "prefill",
+   "note": "On a Turing card (sm_75) the K-quant and Q8_0 prompt-expert pairs (Q4_K / Q5_K gate/up with a Q5_1 or Q8_0 down, Q6_K or Q8_0 gate/up with a Q8_0 down: the UD-Q4_K_XL / UD-Q6_K_XL sets and Qwen3.6's UD sets) run on the fused kernels by default (#6066). Not set: on. 0: off, those layers go back to the int8 dp4a kernels (a rollback for bug reports; users never set it).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_FUSED_SM86",
    "backends": [
     "cuda-hip"
