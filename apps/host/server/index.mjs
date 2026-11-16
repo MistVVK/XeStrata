@@ -84,7 +84,7 @@ import { proxyCompletion } from './inference.mjs';
 import { apiPath } from './api-paths.mjs';
 import { findFreePort, listenProblem } from './ports.mjs';
 import { validateChatImages } from './chat-images.mjs';
-import { createTimeSkip, measureFolder, timeskipRevisionMessage, imageTypeOf } from './timeskip.mjs';
+import { createTimeSkip, measureFolder, timeskipRevisionMessage, imageTypeOf, forgetTrial } from './timeskip.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -788,10 +788,7 @@ function trialActivity(run) {
  * goes through here, so dropping one of the four can no longer leave the other three behind. */
 function dropTrial(id, timer) {
   if (timer) clearInterval(timer);
-  const trial = trials.get(id);
-  trials.delete(id);
-  if (trial?.chatId) trialByChat.delete(trial.chatId);
-  timeskipChoices.delete(id);
+  forgetTrial({ trials, trialByChat, choices: timeskipChoices }, id);
 }
 /** Tell the page when the job's phase or the assistant's step changed (SSE `timeskip`), at most every 2 s. */
 function watchTrial(id) {
