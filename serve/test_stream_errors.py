@@ -69,7 +69,10 @@ class StreamErrors(unittest.TestCase):
     def chat_error(self, failure):
         got = self.stream(CHAT, failure)
         self.assertEqual(got[-1], "data: [DONE]")
-        return data_of(got[-2])["error"]
+        closing = data_of(got[-2])                       # #5633: a chunk with a finish_reason closes the stream
+        self.assertEqual(closing["choices"], [{"index": 0, "delta": {}, "finish_reason": "error"}])
+        self.assertEqual(closing["id"], data_of(got[0])["id"])
+        return data_of(got[-3])["error"]
 
     def anthropic_error(self, failure):
         got = self.stream(ANTHROPIC, failure)
