@@ -1,5 +1,5 @@
-"""OWN-1B: the quant header's text lives in third_party/strata-ggml/strata-quant-common.h; third_party/ggml/ggml-common.h (and the SYCL-mode copy's old name)
-only forward to it. The Metal runtime reads the text under the new name, the Mac package ships both names (the old one for two releases).
+"""OWN-1B: the quant header's text lives in third_party/strata-ggml/strata-quant-common.h; third_party/ggml/ggml-common.h only forwards to it (the
+dpct-migrated SYCL-mode copy, sycl/third_party/ggml, is gone since 0.2.15: the SYCL build includes the shared header). The Metal runtime reads the text under the new name, the Mac package ships both names (the old one for two releases).
 
     python -m unittest tools.test_quant_header_names -v
 """
@@ -23,10 +23,9 @@ class QuantHeaderNames(unittest.TestCase):
         self.assertGreater(text.count("\n"), 1900)
         old = [ln for ln in OLD.read_text(encoding="utf-8").splitlines() if not ln.startswith("//") and ln.strip()]
         self.assertEqual(old, ['#include "../strata-ggml/strata-quant-common.h"'])
-        sycl = ROOT / "sycl" / "third_party" / "ggml"
-        self.assertEqual([ln for ln in (sycl / "ggml-common.h").read_text(encoding="utf-8").splitlines() if not ln.startswith("//") and ln.strip()],
-                         ['#include "strata-quant-common.h"'])
-        self.assertIn("sycl", (sycl / "strata-quant-common.h").read_text(encoding="utf-8"))
+        # the SYCL build takes the shared header (sycl/CMakeLists.txt: ${STRATA_ROOT}/third_party/ggml), not a migrated copy of its own
+        self.assertFalse((ROOT / "sycl" / "third_party" / "ggml").exists(), "sycl/third_party/ggml is a dpct output copy no build reads")
+        self.assertIn("${STRATA_ROOT}/third_party/ggml", (ROOT / "sycl" / "CMakeLists.txt").read_text(encoding="utf-8"))
 
     def test_the_metal_runtime_reads_the_new_name_and_the_old_one_second(self):
         rp = (ROOT / "metal" / "src" / "resource_path.h").read_text(encoding="utf-8")

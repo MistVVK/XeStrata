@@ -282,9 +282,12 @@ macro(strata_cpu_native_experts)
   elseif(STRATA_ISA_FLOOR STREQUAL "none")
     target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_NONE=1)
   endif()
-  # ggml stays linked (its headers and, for the tests that compare against it, ggml-cpu as the oracle).  With STRATA_OWN_CPU_QUANT the pool itself calls no
-  # ggml-cpu function, so a static link of an engine pulls no ggml-cpu object into the binary (checked with nm in the gates).
-  target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
+  # ggml is linked only where the build has it (CMakeLists.txt: the tests, which compare against ggml-cpu as the oracle, the ggml-cpu pool and an MMQ
+  # build).  With STRATA_OWN_CPU_QUANT the pool itself calls no ggml-cpu function, so even there a static link of an engine pulls no ggml-cpu object
+  # into the binary (checked with nm in the gates); a release build has no ggml at all.
+  if(TARGET ggml-base)
+    target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
+  endif()
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   if(STRATA_OWN_CPU_QUANT)
     target_link_libraries(strata_kernels_cpu PUBLIC strata_quant)
@@ -336,6 +339,7 @@ macro(strata_cpu_native_experts)
     add_test(NAME router_dot_parity COMMAND router_dot_parity)
     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)
   endif()
+  if(TARGET ggml-cpu)   # (the programs below compare against ggml-cpu or read its headers: only in a build that has ggml, CMakeLists.txt)
   # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit against each other at 1..8 tokens and
   # against ggml-cpu's dot, on random blocks; --bench: ms per expert on one thread, the weights streamed from DRAM
   add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
@@ -381,6 +385,7 @@ macro(strata_cpu_native_experts)
     add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
     add_test(NAME q8k_quant_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:q8k_quant_parity>)
   endif()
+  endif()   # TARGET ggml-cpu
   endif()   # STRATA_CPU_X86
 endmacro()
 

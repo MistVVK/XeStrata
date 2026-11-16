@@ -38,7 +38,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "ggml.h"
+#include "strata/quant/types.hpp"   // the type ids (GGUF's numbers, the same as ggml's): Strata's own table, no ggml.h
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
@@ -90,32 +90,32 @@ constexpr int H_ROW_BYTES = D_ROWS_K / 64 * AB;   // bytes of a row of H in the 
 static_assert(GU_ROWS_K % 256 == 0 && D_ROWS_K % 64 == 0, "the native expert kernels: K of gate/up is whole 256-value super-blocks, K of down whole 64-value stages");
 
 // the formats (ggml type ids)
-static_assert(GGML_TYPE_IQ2_XXS == strata::prefill::fused_tile::kTypeIq2Xxs && GGML_TYPE_IQ2_XS == strata::prefill::fused_tile::kTypeIq2Xs &&
-              GGML_TYPE_IQ2_S == strata::prefill::fused_tile::kTypeIq2S && GGML_TYPE_IQ3_XXS == strata::prefill::fused_tile::kTypeIq3Xxs &&
-              GGML_TYPE_IQ3_S == strata::prefill::fused_tile::kTypeIq3S && GGML_TYPE_IQ4_XS == strata::prefill::fused_tile::kTypeIq4Xs,
+static_assert((int) strata::quant::Type::IQ2_XXS == strata::prefill::fused_tile::kTypeIq2Xxs && (int) strata::quant::Type::IQ2_XS == strata::prefill::fused_tile::kTypeIq2Xs &&
+              (int) strata::quant::Type::IQ2_S == strata::prefill::fused_tile::kTypeIq2S && (int) strata::quant::Type::IQ3_XXS == strata::prefill::fused_tile::kTypeIq3Xxs &&
+              (int) strata::quant::Type::IQ3_S == strata::prefill::fused_tile::kTypeIq3S && (int) strata::quant::Type::IQ4_XS == strata::prefill::fused_tile::kTypeIq4Xs,
               "fused_tile_rule.hpp's default_gate_format uses ggml's type ids");
-static_assert(GGML_TYPE_Q5_1 == strata::prefill::fused_tile::kTypeQ5_1 && GGML_TYPE_Q8_0 == strata::prefill::fused_tile::kTypeQ8_0 && GGML_TYPE_Q4_K == strata::prefill::fused_tile::kTypeQ4K &&
-              GGML_TYPE_Q5_K == strata::prefill::fused_tile::kTypeQ5K && GGML_TYPE_Q6_K == strata::prefill::fused_tile::kTypeQ6K,
+static_assert((int) strata::quant::Type::Q5_1 == strata::prefill::fused_tile::kTypeQ5_1 && (int) strata::quant::Type::Q8_0 == strata::prefill::fused_tile::kTypeQ8_0 && (int) strata::quant::Type::Q4_K == strata::prefill::fused_tile::kTypeQ4K &&
+              (int) strata::quant::Type::Q5_K == strata::prefill::fused_tile::kTypeQ5K && (int) strata::quant::Type::Q6_K == strata::prefill::fused_tile::kTypeQ6K,
               "fused_tile_rule.hpp's wide_pair and kq_flash_kind use ggml's type ids");
-constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_S = GGML_TYPE_IQ2_S,
-              T_IQ3_XXS = GGML_TYPE_IQ3_XXS, T_IQ3_S = GGML_TYPE_IQ3_S, T_IQ4_XS = GGML_TYPE_IQ4_XS,
-              T_IQ4_NL = GGML_TYPE_IQ4_NL, T_Q2_0 = GGML_TYPE_Q2_0,
+constexpr int T_IQ2_XXS = (int) strata::quant::Type::IQ2_XXS, T_IQ2_XS = (int) strata::quant::Type::IQ2_XS, T_IQ2_S = (int) strata::quant::Type::IQ2_S,
+              T_IQ3_XXS = (int) strata::quant::Type::IQ3_XXS, T_IQ3_S = (int) strata::quant::Type::IQ3_S, T_IQ4_XS = (int) strata::quant::Type::IQ4_XS,
+              T_IQ4_NL = (int) strata::quant::Type::IQ4_NL, T_Q2_0 = (int) strata::quant::Type::Q2_0,
               // Aurora (opt-in, HIP gfx11 only): Unsloth UD-Q4_K_XL's experts - gate/up Q4_K (one layer Q5_K), down Q5_1
               // (five layers Q8_0).  Their weights are w = d_w q + m_w (a minimum), so a sub-block's dot is
               //   sum w x = d_x (d_w sum q a + m_w sum a):
               // the activation blocks carry sum a per 32 values in their eight spare bytes (quant_act_nat_kernel and
               // the H epilogue write it for every path; no other format reads it)
-              T_Q4_K = GGML_TYPE_Q4_K, T_Q5_K = GGML_TYPE_Q5_K, T_Q5_0 = GGML_TYPE_Q5_0, T_Q5_1 = GGML_TYPE_Q5_1, T_Q8_0 = GGML_TYPE_Q8_0,
+              T_Q4_K = (int) strata::quant::Type::Q4_K, T_Q5_K = (int) strata::quant::Type::Q5_K, T_Q5_0 = (int) strata::quant::Type::Q5_0, T_Q5_1 = (int) strata::quant::Type::Q5_1, T_Q8_0 = (int) strata::quant::Type::Q8_0,
               // CUDA opt-in (STRATA_PF_FUSED_Q6K=1): UD-Q6_K_XL's gate/up (47 layers; UD-Q5_K_XL's one Q6_K layer): w = d sc (q - 32), an
               // int8 scale per 16 values, no minimum
-              T_Q6_K = GGML_TYPE_Q6_K,
+              T_Q6_K = (int) strata::quant::Type::Q6_K,
               // CUDA opt-in (STRATA_PF_FUSED_TQ=1): the Gyro trellis types (agentionai's ids, cmake/strata_ggml_tq_overlay.cmake; the pinned
               // ggml.h has no enumerators for them): 128 weights a block, {fp16 d; qs}; Gyro-M TQ2_T, Gyro-S TQK6 gate/up + TQK7 down
               T_TQ2_T = 144, T_TQK6 = 145, T_TQK7 = 146,
               // NVFP4 (ModelOpt's packs): 64-value blocks {4 UE4M3 scales, 32 bytes of E2M1 codes}, one block a stage.  Its int8 weights are the E2M1 values
               // doubled (kvalues_fp4: 0, 1, 2, 3, 4, 6, 8, 12 with signs), one scale d_ue4m3 / 2 per 16 values (the per-16 path); the per-expert weight_scale_2
               // values (s_gate, s_up, s_down: the blob's 16-byte tail) go on the FP32 products in the epilogues
-              T_NVFP4 = GGML_TYPE_NVFP4;
+              T_NVFP4 = (int) strata::quant::Type::NVFP4;
 // Turing (sm_75, STRATA_PF_FUSED_SM75): the i-quant gate/up formats and the IQ4_NL down that have a set-up instance of native_kernel there, one bit each (DevInfo::t75_set; a down's bits are
 // 8 up).  The kernels are the same source as sm_80+'s (the Turing MMAs are m8n8k16, mma32 / mma16 below); the block gets 64 KB of shared memory there, so a format is set up only if its
 // instance fits (setup_ww), and its 64-row (WW 4) instance only if that fits too (t75_w4).  kT75Formats is the list of formats taken on Turing (a commit adds one format at a time).

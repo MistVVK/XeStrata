@@ -9,7 +9,6 @@ import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { AcquisitionRefused, forbidden, require as requireAcquisition } from '../server/acquisition.mjs';
-import * as engineInstall from '../server/engine-install.mjs';
 import { createConnectorInstaller } from '../server/cloudflared-install.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -26,7 +25,7 @@ test('the host-side switch: STRATA_NO_ACQUIRE or the packaged app forbids acquir
   assert.doesNotThrow(() => requireAcquisition('x', undefined, {}));
 });
 
-test('the llama.cpp and cloudflared fetches refuse before any request is made', async () => {
+test('the cloudflared fetch refuses before any request is made', async () => {
   const previous = process.env.STRATA_NO_ACQUIRE;
   process.env.STRATA_NO_ACQUIRE = '1';
   const realFetch = globalThis.fetch;
@@ -34,8 +33,6 @@ test('the llama.cpp and cloudflared fetches refuse before any request is made', 
   globalThis.fetch = async () => { requests++; throw new Error('network'); };
   const directory = await mkdtemp(join(tmpdir(), 'strata-no-acquire-'));
   try {
-    await assert.rejects(engineInstall.install({ force: true }), err => err instanceof AcquisitionRefused && /llama\.cpp/.test(err.message) && err.status === 409);
-    await assert.rejects(engineInstall.findRelease(), AcquisitionRefused);
     let connectorRequests = 0;
     const installer = createConnectorInstaller({ directory, platform: 'linux', arch: 'x64', env: { STRATA_CLOUDFLARED_SEARCH: 'own' }, fetchImpl: async () => { connectorRequests++; return { ok: false }; } });
     await assert.rejects(installer.ensure(), err => err instanceof AcquisitionRefused && /optional connector component/.test(err.message));
@@ -91,7 +88,7 @@ async function runHost({ env, calls }) {
 
 const probes = async call => ({
   health: await call('/api/health'),
-  binary: await call('/api/engine/binary', 'POST'),
+  binary: await call('/api/engine/binary', 'POST'),   // the llama.cpp download route is gone (0.2.15): no route
   tunnel: await call('/api/serving/tunnel', 'POST', { action: 'prepare' }),
   control: await call('/api/control/status'),
 });
@@ -99,14 +96,15 @@ const probes = async call => ({
 test('the packaged host serves, and every download/install route is refused without one attempt', { timeout: 60000 }, async () => {
   const { results, attempts } = await runHost({ env: { STRATA_PACKAGED: '1', STRATA_NO_ACQUIRE: '1' }, calls: probes });
   assert.equal(results.health.status, 200);
-  assert.equal(results.binary.status, 409);
-  assert.match(results.binary.body.error ?? results.binary.body.message ?? JSON.stringify(results.binary.body), /never downloads/);
+  assert.equal(results.binary.status, 404);
+  assert.match(results.binary.body.error ?? results.binary.body.message ?? JSON.stringify(results.binary.body), /No route/);
   assert.ok(results.tunnel.status >= 400, 'preparing the connector is a refusal');
   assert.equal(results.control.body.acquisition.forbidden, true);
   assert.deepEqual(attempts, [], 'nothing tried to reach the internet or run an installer');
 });
 
 test('the spy is live: without the switch the same routes DO attempt to download (and are blocked)', { timeout: 60000 }, async () => {
-  const { attempts } = await runHost({ env: { STRATA_PACKAGED: '', STRATA_NO_ACQUIRE: '' }, calls: async call => { await call('/api/engine/binary', 'POST'); await call('/api/serving/tunnel', 'POST', { action: 'prepare' }); } });
-  assert.ok(attempts.some(a => a.kind === 'fetch' && /api\.github\.com\/repos\/ggml-org\/llama\.cpp/.test(a.detail)), JSON.stringify(attempts));
+  const { attempts } = await runHost({ env: { STRATA_PACKAGED: '', STRATA_NO_ACQUIRE: '' }, calls: async call => { await call('/api/serving/tunnel', 'POST', { action: 'prepare' }); } });
+  assert.ok(attempts.some(a => a.kind === 'fetch' && /api\.github\.com\/repos\/cloudflare\/cloudflared/.test(a.detail)), JSON.stringify(attempts));
+  assert.ok(!attempts.some(a => /ggml-org\/llama\.cpp/.test(a.detail ?? '')), 'nothing asks for a llama.cpp build');
 });

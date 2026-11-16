@@ -34,7 +34,7 @@
 
 #include <hip/hip_fp16.h>
 
-#include "ggml.h"
+#include "strata/quant/types.hpp"   // the type ids (GGUF's numbers, the same as ggml's): Strata's own table, no ggml.h
 
 #include <algorithm>
 #include <cstdio>
@@ -54,7 +54,7 @@ using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 using v8u = __attribute__((__vector_size__(32))) uint32_t;
 
 constexpr uint32_t kHalfMagic = 0x64646464U;   // the high bytes of 1024.0 as F16
-constexpr int kQ4K = GGML_TYPE_Q4_K, kQ5K = GGML_TYPE_Q5_K, kQ51 = GGML_TYPE_Q5_1, kQ80 = GGML_TYPE_Q8_0;
+constexpr int kQ4K = (int) strata::quant::Type::Q4_K, kQ5K = (int) strata::quant::Type::Q5_K, kQ51 = (int) strata::quant::Type::Q5_1, kQ80 = (int) strata::quant::Type::Q8_0;
 
 
 #if P1A_DEVICE
