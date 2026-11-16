@@ -5234,6 +5234,12 @@ class Service:
         started with, a segment or more below the size it had)."""
         return self.vram_reserve if self.vram_reserve_asked else 0
 
+    def _engine_has_vram_command(self) -> bool:
+        """Does the running engine know the VRAM command?  The Strata engine says so in its INFO line (vram_elastic=0 or 1, every engine
+        since 0.1.39; 0 refuses the command with its reason).  The Qwen3.6 engine path (src/qwen35/q36_engine.cu) reports no such key and
+        has no such command: it answered "VRAM n" with its usage text ("expected: GEN <max_new> ..."), 0.2.15 release test."""
+        return "vram_elastic" in (getattr(self.engine, "info", None) or {})
+
     def _vision_up(self):
         """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
         cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
@@ -5242,6 +5248,8 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
+        if self.loaded() and not self._engine_has_vram_command():
+            self.vision_no_shrink = self.vision_no_shrink_said = True      # the Qwen3.6 engine: no VRAM command (it would answer with its usage text)
         if hasattr(self.engine, "vram") and self.loaded() and not self.vision_no_shrink:
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
@@ -5469,7 +5477,7 @@ class Service:
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
         engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
         An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
-        if not hasattr(self.engine, "vram"):
+        if not hasattr(self.engine, "vram") or (self.loaded() and not self._engine_has_vram_command()):
             raise ValueError("this engine cannot resize its VRAM use")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
