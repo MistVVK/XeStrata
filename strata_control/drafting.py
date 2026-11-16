@@ -1002,7 +1002,9 @@ def pack_slot_mib(args: list[Any]) -> float:
     """MiB of one engine slot for the pack ``--pack`` names. A native-experts pack (Unsloth, i-quant, NVFP4) gives its expert bytes in the first line of
     native_experts.txt, over n_expert per layer and one line per layer: UD-Q4_K_XL is 77,017,907,200 bytes over 512 x 48, 2.99 MiB a slot, as its engine
     logs it ("expert cache 2710 slots, 7.90 GiB" on a 16 GB card). The ISTA-DASLab i-quant packs have the file too: IQ3_S 1.952 MiB (SLOT_MIB, the set the
-    steps were measured on), IQ3_XXS 1.665 MiB. A pack without the file (the canonical Q2_0 pack), or no --pack, is priced at SLOT_MIB."""
+    steps were measured on), IQ3_XXS 1.665 MiB. A pack without the file (the canonical Q2_0 pack), or no --pack, is priced at SLOT_MIB.
+    Only a slot of at least SLOT_MIB is priced at its own size: a smaller one (IQ3_XXS, the 2-bit sets) would raise the estimate and lower the step, and that
+    direction is not measured on those sets yet (coordinator 11-16), so they keep SLOT_MIB, today's pricing."""
     pack = _flag_value(args, "--pack")
     try:
         lines = (Path(pack) / "native_experts.txt").read_text(encoding="utf-8", errors="replace").splitlines() if pack else []
@@ -1012,7 +1014,7 @@ def pack_slot_mib(args: list[Any]) -> float:
     layers = sum(1 for line in lines[1:] if line.strip() and not line.startswith("#"))
     if head is None or not layers or not int(head.group(1)):
         return SLOT_MIB
-    return int(head.group(2)) / (int(head.group(1)) * layers) / 2 ** 20
+    return max(SLOT_MIB, int(head.group(2)) / (int(head.group(1)) * layers) / 2 ** 20)
 
 
 def slots_of(args: list[Any], vram_mib: float | None = None) -> int | None:
