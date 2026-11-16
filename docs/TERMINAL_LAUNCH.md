@@ -132,6 +132,18 @@ The Auto drafter policy rebuilds its options at every start and keeps only layer
 settings? Answers in progress stop." With `--no-tui` the command refuses with one line naming the running model, its port and settings. Add
 `--restart` or run `strata launch --stop` first. A different `--port` runs beside the first server; two big models may not fit in graphics memory together, and the launch says so.
 
+## Defaults for every launch
+
+Settings you want for every model and preset can go in one file, `run-defaults.json`, next to the `launch-presets` folder: `~/.config/strata/run-defaults.json` on Linux and macOS, `%APPDATA%\Strata\run-defaults.json` on Windows. Without the file nothing changes.
+
+It holds one JSON object with server settings only: the keys of the web page's Settings view (`sampling` with `temperature`, `top_p`, `top_k`, `min_p`; `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor`) and `undeclared_tool_calls` (`"text"` or `"call"`). Each value is checked with the Settings view's rules; a key that is not allowed or has a wrong value is skipped and named at the start, the others still apply. Engine options and `mtp` do not go here.
+
+```json
+{ "undeclared_tool_calls": "call", "sampling": { "temperature": 0.6 } }
+```
+
+These are the lowest layer. A setting in the model's own config wins over them, as does a value you change in the Settings view or this launch's own choice (`--set idle-unload=60`). If you edit the file, the next launch uses the new values. `strata launch` says which defaults it used. The app does not read this file.
+
 ## After the start: the monitor
 
 The monitor has seven views. Press `1` to `7` or use the arrow keys.
@@ -148,8 +160,13 @@ app sends them. The list keeps two columns apart. **Vendor tested** is the app v
 
 `q` asks whether to keep serving in the background or stop. Stopping unloads the model and frees graphics memory.
 
-With two or more cards the Overview shows the busiest card's load, all cards' memory, the hottest card and the total power, and a
-"Cards" strip lists up to 4 cards (`5` opens Hardware). The CPU tile shows sockets and cores.
+With two or more cards the Overview shows the busiest card's load, all cards' memory, the hottest card, the total power and the
+slowest card's PCIe link, and a "Cards" strip lists up to 4 cards with the link each one trained (`5` opens Hardware). Each card
+trains its own link, so a card in an x4 slot reads `Gen5 x4` beside a card at `Gen5 x8`. A card that runs narrower than its own
+card could go shows both numbers (`Gen5 x8 of x16`): that is what a card capped to x8 in a x16 slot, or trained down by the board,
+looks like. The Power tile says whose power the number is (`2 cards · limit 360 W`); the Hardware page gives each card its own
+ceiling (`Power 180 W of 300 W`).
+The CPU tile shows sockets and cores.
 
 **Windows console.** In the classic Windows 10 console the monitor switches that window's font to Cascadia Mono when it is installed
 and draws the full look. Otherwise it draws a solid-block look and shows one line suggesting Windows Terminal. Nothing is saved and

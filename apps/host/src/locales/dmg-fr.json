@@ -1,0 +1,13 @@
+{
+ "dmg01": "Conversations illisibles",
+ "dmg02": "Strata n’a pas pu lire ces fichiers de conversation. Vous pouvez les supprimer ici.",
+ "dmg03": "Strata n’a pas pu lire ce fichier de conversation ; ses messages ne sont donc pas affichés.",
+ "dmg04": "Supprimer le fichier de conversation",
+ "dmg05": "Supprimer {0}.json",
+ "dmg06": "Supprimer ce fichier de conversation ?",
+ "dmg07": "Garder le fichier",
+ "dmg08": "Supprimer le fichier",
+ "dmg09": "{0} a été supprimé. Vos autres conversations ne sont pas concernées.",
+ "dmg10": "Le fichier de conversation n’a pas pu être supprimé",
+ "dmg11": "Cette conversation a été enregistrée par une version plus récente de Strata. Mettez Strata à jour pour l’ouvrir."
+}

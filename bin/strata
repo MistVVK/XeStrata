@@ -28,9 +28,23 @@ while [ -L "$self" ]; do
 done
 HERE=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
 
+# Is this a Python this launcher can start?
+#
+# `test -x` alone is not a reliable yes/no. A container runtime's seccomp profile can deny
+# access(X_OK) and make it answer false for a file the shell can still execute. Measured in the
+# official image (0.2.2-cuda13) on Docker 19.03.15 with its default profile: `[ -x .../python3 ]`
+# is false, `[ -e .../python3 ]` is true, and the same path runs `python3 -V` normally. The
+# launcher then skipped the bundled runtime and printed "no usable Python found" with the runtime
+# present. So when the permission test says no, start the interpreter and let it decide.
+is_runnable() {
+  [ -f "$1" ] || return 1        # a directory can be executable too, and it is never a Python
+  [ -x "$1" ] && return 0        # the usual case, and the one a seccomp profile can answer wrongly
+  "$1" -c 'pass' 2>/dev/null     # access(X_OK) denied but the file is there: let the interpreter answer
+}
+
 pick_python() {
   if [ -n "${STRATA_PYTHON:-}" ]; then
-    if [ -x "$STRATA_PYTHON" ]; then printf '%s\n' "$STRATA_PYTHON"; return 0; fi
+    if is_runnable "$STRATA_PYTHON"; then printf '%s\n' "$STRATA_PYTHON"; return 0; fi
     echo "strata: STRATA_PYTHON=$STRATA_PYTHON is not executable" >&2
     return 1
   fi
@@ -45,7 +59,7 @@ pick_python() {
   for candidate in \
       "$HERE/../python/bin/python3" "$HERE/python/bin/python3" \
       "$HERE/../python/bin/python"  "$HERE/python/bin/python"; do
-    if [ -x "$candidate" ]; then printf '%s\n' "$candidate"; return 0; fi
+    if is_runnable "$candidate"; then printf '%s\n' "$candidate"; return 0; fi
   done
 
   # Anything on PATH that is new enough, then the usual places an interpreter lives on macOS
@@ -64,7 +78,7 @@ pick_python() {
       /usr/bin/python3
   do
     [ -n "$candidate" ] || continue
-    [ -x "$candidate" ] || continue
+    is_runnable "$candidate" || continue
     if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)' 2>/dev/null; then
       printf '%s\n' "$candidate"; return 0
     fi

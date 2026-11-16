@@ -812,6 +812,38 @@ def step(n, title):
     say(f"=== Step {n}: {title} ===")
 
 
+def menu_colour(code: str) -> tuple[str, str]:
+    """(start, reset) ANSI codes for a menu name (#5935), or two empty strings: only on a terminal (never in a pipe, a log or the app's
+    installer), never with NO_COLOR set or TERM=dumb, and on Windows only where the console takes escape codes (switched on here once; a
+    console that refuses keeps plain text)."""
+    try:
+        if not sys.stdout.isatty() or os.environ.get("NO_COLOR") is not None or os.environ.get("TERM", "").lower() == "dumb":
+            return "", ""
+    except (AttributeError, ValueError):
+        return "", ""
+    if WIN and not _windows_vt():
+        return "", ""
+    return f"\033[{code}m", "\033[0m"
+
+
+_VT: list = []
+
+
+def _windows_vt() -> bool:
+    """Windows: ENABLE_VIRTUAL_TERMINAL_PROCESSING on this console's output (Windows 10 1511 and later); False when it cannot be had."""
+    if not _VT:
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            handle = k32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            _VT.append(bool(k32.GetConsoleMode(handle, ctypes.byref(mode))) and
+                       (bool(mode.value & 0x0004) or bool(k32.SetConsoleMode(handle, mode.value | 0x0004))))
+        except Exception:                              # noqa: BLE001 - plain text then
+            _VT.append(False)
+    return _VT[0]
+
+
 def ok(msg):
     say(f"  [ok] {msg}")
 
@@ -7978,47 +8010,88 @@ PARALLEL_COST_NOTE = ("parallel N reduces waiting for several users but costs ab
                       "card")
 
 
+PARALLEL_CELL_BYTES = 1850     # VRAM per context cell beyond 32K a session keeps in any KV mode (QSA indexer rows,
+                               # RoPE tables): 0.95 GiB at 262K, 2.27 GiB at 1M per slot with --kv-resident 32768
+PARALLEL_PIN_SHARE = 0.75      # share of the RAM the expert arena plus every session's pinned K/V may take: measured on
+                               # a 125.6 GiB PC, pinning was refused at 99 GiB (79%)
+
+
+def _parallel_kv_tok(kv: str) -> int:
+    # 12 layers: the measured pin (12.38 GiB at 1M int8), not the 13 of kv_streaming_ram_gb
+    return 12 * KV_CELL_BYTES.get(kv, 1056)
+
+
 def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
     """#465: the VRAM one batch slot's session takes: its KV cache (12 QSA layers; with KV streaming only the 32K
-    positions the attention reads stay in VRAM) and the DeltaNet state (~0.17 GB).  Measured: 0.56 GiB at 32K int8."""
-    kv_tok = 12 * (576 if kv == "q4_0" else 1056)
-    return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
+    positions the attention reads stay in VRAM), the DeltaNet state (~0.17 GB) and the per-cell rows every session
+    sizes on the whole context.  Measured: 0.56 GiB at 32K int8; with KV streaming, 0.95 GiB at 262K and 2.27 GiB at
+    1M (RTX 5090, 15/11/2026)."""
+    kv_cells = min(ctx, 32768) if streaming else ctx
+    return (kv_cells * _parallel_kv_tok(kv) + max(0, ctx - 32768) * PARALLEL_CELL_BYTES) / 1e9 + 0.17
 
 
-def parallel_recommend(vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool) -> int:
+def parallel_pinned_gb(ctx: int, kv: str) -> float:
+    """The RAM one session pins with KV streaming: the host copy of its whole K/V (12.38 GiB at 1M int8, measured).
+    The server's own session and every slot each pin one.  Callers apply it only when streaming."""
+    return ctx * _parallel_kv_tok(kv) / 1e9
+
+
+def parallel_ram_fits(n: int, ram_gb: float | None, arena_gb: float, ctx: int, kv: str, streaming: bool) -> bool:
+    """Whether the expert arena plus the pinned K/V of the server's session and n slots stay within PARALLEL_PIN_SHARE
+    of the RAM (ram_gb is in GiB, the arena and the pins in GB).
+    Measured on 125.6 GiB with the 50.3 GB IQ3_S arena at 1M: 8 slots stopped the engine (pinning refused at 99 GiB),
+    4 slots started with 8 GiB free and half the arena unpinned, every request 3-4x slower.  ram_gb None: not known."""
+    if ram_gb is None or not streaming:
+        return True
+    pinned_gib = (arena_gb + (n + 1) * parallel_pinned_gb(ctx, kv)) * 1e9 / 2**30
+    return pinned_gib <= PARALLEL_PIN_SHARE * ram_gb
+
+
+def parallel_recommend(vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool,
+                       ram_gb: float | None = None) -> int:
     """#465: how many requests at once ("parallel") to recommend: 0 = none (one at a time).  Only where the experts
     mostly fit in VRAM - the expert cache (each card's VRAM less ~5 GB, every card of a layer split) still holds
     PARALLEL_HELD of the model's experts beside the slots' sessions, which take at most PARALLEL_SHARE of it, up to 4.
     Where the experts mostly run on the CPU a batch reads about as many experts as the requests one by one and every
     slot's VRAM is expert cache lost: measured on a 12 GB RTX 5070 (Q2_0, 32K), a request alone 11-24% slower with 2-4
-    slots, 4 requests together 63 tok/s against 71 one after the other (docs/BATCHING.md)."""
+    slots, 4 requests together 63 tok/s against 71 one after the other (docs/BATCHING.md).  With KV streaming each
+    slot also pins its whole K/V in RAM, so the count must fit there too (parallel_ram_fits)."""
     if isinstance(vram_gbs, (int, float)):
         vram_gbs = [vram_gbs]
     cache_gb = sum(max(0.0, v - 5) for v in vram_gbs)
     slot = parallel_slot_gb(ctx, kv, streaming)
     best = 0
     for n in (2, 3, 4):
-        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb:
+        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb \
+                and parallel_ram_fits(n, ram_gb, arena_gb, ctx, kv, streaming):
             best = n
     return best
 
 
-def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool) -> list[str]:
+def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool,
+                  ram_gb: float | None = None) -> list[str]:
     """#465: what setup says about "parallel": the recommendation (or, where it would cost speed, why it is left at
     one), or how the asked count compares with it (kept as asked: recommend, never force)."""
-    rec = parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming)
+    rec = parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming, ram_gb)
     slot = parallel_slot_gb(ctx, kv, streaming)
+    pinned = parallel_pinned_gb(ctx, kv) if streaming else 0.0
+    ram_bound = rec == 0 and parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming) >= 2
+    ram_words = (f"Each extra request at once would need about {pinned:.1f} GB of RAM at this context length, more than this PC has free "
+                 "next to the model")                  # wording approved by the coordinator 11-16 (#6046)
     if asked is None or asked <= 1:
         if not rec:
+            if ram_bound:
+                return [f"Several requests at once: off (one at a time). {ram_words} (see docs/BATCHING.md)."]
             return [f"Several requests at once: left at one at a time - {PARALLEL_COST_NOTE} (docs/BATCHING.md)."]
         return [f"Several requests at once (opt-in): --parallel {rec} decodes up to {rec} together instead of one "
                 f"after the other (each takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md)."]
     lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
-             f"{asked * slot:.1f} GB in all)"]
+             f"{asked * slot:.1f} GB in all" + (f"; each also needs ~{pinned:.1f} GB of RAM" if pinned else "") + ")"]
     if asked > PARALLEL_MAX:
         lines.append(f"the engine runs at most {PARALLEL_MAX} at once; it will use {PARALLEL_MAX}")
     if not rec:
-        lines.append(f"recommended for this card: one at a time - {PARALLEL_COST_NOTE}; kept as you chose")
+        lines.append(f"recommended for this card: one at a time. {ram_words}; kept as you chose" if ram_bound else
+                     f"recommended for this card: one at a time - {PARALLEL_COST_NOTE}; kept as you chose")
     elif asked > rec:
         lines.append(f"recommended for this card: {rec} - more slots leave fewer experts in VRAM, which can make every "
                      "request slower; kept as you chose")
@@ -8717,6 +8790,17 @@ def own_path_parallel_note(a_parallel, fam: dict, model: str, vram_gb: float, ct
     return lines
 
 
+def own_path_gguf_in(folder: Path) -> Path | None:
+    """--gguf-dir for a family with an engine path of its own (one GGUF file): the folder's one model file when it is not under the
+    published name (a renamed copy, another maker's build of the same model; #5869). The picture reader (mmproj*) and unfinished
+    downloads (.part) do not count. None when there is not exactly one."""
+    try:
+        found = [p for p in sorted(Path(folder).glob("*.gguf")) if p.is_file() and not p.name.lower().startswith("mmproj")]
+    except OSError:
+        return None
+    return found[0] if len(found) == 1 else None
+
+
 def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted):
     """Steps 2-7 for a family with its own engine path (OWN_PATH_FAMILIES: Qwen3.6-35B-A3B): the size, the context, the
     engine, the GGUF (pinned revision, size and SHA-256), the tokenizer from the GGUF, the config and the start
@@ -8790,8 +8874,11 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} "
              "does not use them")
     folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    gguf = folder / fam["file"].format(q=model)
-    size = fam["sha256"][gguf.name][0]
+    published = fam["file"].format(q=model)           # the published file's name: its pinned size and SHA-256
+    gguf = folder / published
+    if a.gguf_dir and not gguf.exists():
+        gguf = own_path_gguf_in(folder) or gguf        # #5869: the person's own file under another name (the importer checked its types)
+    size = fam["sha256"][published][0]
     part = gguf.with_name(gguf.name + ".part")
     def have(p: Path) -> bool:                         # --gguf-dir: the person's own file has no finish mark; verify_sha256 checks and writes it
         return p.exists() and (done(p) or bool(a.gguf_dir))
@@ -8831,7 +8918,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         if a.gguf_dir:
             fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
         download(fam["hf"] + gguf.name, gguf)
-    verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir))
+    verify_sha256(gguf, *fam["sha256"][published], own=bool(a.gguf_dir))
     ok(f"model file: {gguf}")
     mmproj = folder / fam["mmproj"]
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
@@ -9000,8 +9087,9 @@ def mac_reader(eng: Path, vision: str):
 
 def prepare_pack_only(a) -> int:
     """setup.py --prepare-pack PACK_DIR --gguf-dir DIR --family F --model M: the pack (index, dense weights, tokenizer) of a model whose GGUF files
-    are in DIR, for a card the built-in downloader does not set up (Intel Arc). llama.cpp's gguf-py is fetched when it is not here (the one
-    download); the model's files are never downloaded or changed."""
+    are in DIR, for a card the built-in downloader does not set up (Intel Arc). The pack tool reads the GGUF files with Strata's own reader
+    (tools/strata_gguf.py; llama.cpp's gguf-py only when the person names one with STRATA_GGUF_PY): nothing is downloaded, and the model's files
+    are never changed."""
     if not a.gguf_dir:
         fail("--prepare-pack needs --gguf-dir, the folder with the model's .gguf files")
     family = a.family or "qwen"
@@ -9018,7 +9106,7 @@ def prepare_pack_only(a) -> int:
     pack = Path(a.prepare_pack)
     step(1, "preparing the model for this graphics card")
     llama = llama_override()
-    ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py)")
+    ok("model file reader ready")
     env = dict(os.environ, **gguf_py_env())
     if not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(files[0]), "--out", str(pack),
@@ -9875,17 +9963,18 @@ def main() -> int:
         family = a.family
     else:
         tier = tier_pick(ram, low_ram_vram(gpu))
+        cyan, reset = menu_colour("36")
         rec_fam = STRIX_HALO_FAMILY if strix_halo_recommends(gpu, ram) and STRIX_HALO_FAMILY in fams else             tier[0] if tier and tier[0] in fams else fams[0]
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
-            say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
+            say(f"  {i}) {cyan}{d['title']:20s}{reset} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
                 + family_menu_note(f, hip, gpu, avx2, avx512)
                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
         rest = [*(f for f in OWN_PATH_FAMILIES if not OWN_PATH_FAMILIES[f].get("feed")),
                 *(f for f in OWN_PATH_FAMILIES if OWN_PATH_FAMILIES[f].get("feed")), *feed_late]
         for j, f in enumerate(rest, len(fams) + 1):    # families with an engine path of their own
             d = {**FAMILIES, **OWN_PATH_FAMILIES}[f]
-            say(f"  {j}) {d['title']:20s} {d['by']} - {d['about']}   [new]" + (f"   ({FEED_UNAVAILABLE[f]['reason']})" if f in FEED_UNAVAILABLE else ""))
+            say(f"  {j}) {cyan}{d['title']:20s}{reset} {d['by']} - {d['about']}   [new]" + (f"   ({FEED_UNAVAILABLE[f]['reason']})" if f in FEED_UNAVAILABLE else ""))
         for u in FEED_UNAVAILABLE.values():            # a feed model this engine does not run: said, never offered (unless the owner's rule allows it, above)
             if not u.get("allowed"):
                 say(f"  -) {u['title']:20s} {u['by']} - {u['reason']}")
@@ -9940,7 +10029,9 @@ def main() -> int:
             say(f"  {i}) {m}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, keeps {keeps} of its "
                 f"{d['arena_gb']:.0f} GB of experts in RAM{fit}")
             continue
-        say(f"  {i}) {m:8s}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
+        magenta, reset = menu_colour("35")
+        label = f"{magenta}{m:8s}{reset}"
+        say(f"  {i}) {label}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index(installed or recommended_size(family, names, ram, low_ram_vram(gpu))) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
@@ -10410,7 +10501,7 @@ def main() -> int:
         say(f"  Image generation: POST http://127.0.0.1:{port}/v1/images/generations (OpenAI's images API)")
     if a.parallel is None:                             # #465: the opt-in, said once (nothing changes)
         for line in parallel_note(None, [g.get("vram_gb", 0.0) for g in chosen], MODELS[model]["arena_gb"], ctx, kv,
-                                  "--kv-resident" in cfg["args"]):
+                                  "--kv-resident" in cfg["args"], ram):
             say("  " + line)
     if tuned is False:                                 # #447: a failed tuning is repeated here, not only above
         say("  Tuning:           FAILED (the reason is above): the default settings stay - "

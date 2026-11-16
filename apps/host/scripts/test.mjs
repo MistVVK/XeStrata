@@ -6,11 +6,13 @@ import {resolve} from 'node:path';
 const root=resolve(import.meta.dirname,'..');
 const files=readdirSync(resolve(root,'tests')).filter(name=>name.endsWith('.test.mjs')).sort().map(name=>resolve(root,'tests',name));
 /* Every test file runs against scratch copies of the per-user places the host writes to (the owner's real profile is never touched). */
-import {mkdtempSync} from 'node:fs';
+import {mkdirSync,mkdtempSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 const scratch=mkdtempSync(join(tmpdir(),'strata-host-suite-profile-'));
-const env={...process.env,STRATA_SETTINGS_FILE:join(scratch,'app-settings.json'),STRATA_COMPONENTS_DIR:join(scratch,'components'),LOCALAPPDATA:join(scratch,'Local'),APPDATA:join(scratch,'Roaming'),XDG_DATA_HOME:join(scratch,'xdg-data'),XDG_STATE_HOME:join(scratch,'xdg-state'),XDG_CONFIG_HOME:join(scratch,'xdg-config')};
+// Harness discovers personal skills through the home directory, independently of APPDATA/XDG.
+const home=join(scratch,'home');mkdirSync(home);
+const env={...process.env,HOME:home,USERPROFILE:home,STRATA_HOME:home,STRATA_SETTINGS_FILE:join(scratch,'app-settings.json'),STRATA_COMPONENTS_DIR:join(scratch,'components'),LOCALAPPDATA:join(scratch,'Local'),APPDATA:join(scratch,'Roaming'),XDG_DATA_HOME:join(scratch,'xdg-data'),XDG_STATE_HOME:join(scratch,'xdg-state'),XDG_CONFIG_HOME:join(scratch,'xdg-config')};
 /* Run from PowerShell 7 (GitHub's Windows runners), PSModulePath names PowerShell 7's module folders first and a Windows PowerShell 5.1 child
    that a test starts cannot load Get-Acl / Get-FileHash from them: keep only the folders that are not PowerShell 7's. */
 if(process.platform==='win32'&&env.PSModulePath){const ps7=p=>{const l=p.toLowerCase().replace(/\//g,'\\');return l.includes('\\powershell\\')&&!l.includes('\\windowspowershell\\');};env.PSModulePath=env.PSModulePath.split(';').filter(p=>p&&!ps7(p)).join(';');}

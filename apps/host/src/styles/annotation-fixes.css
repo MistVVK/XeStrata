@@ -782,3 +782,9 @@ html[data-motion='reduced'] .task-tree-row[data-leaving] { opacity: 0; }
 .models-dialog .dialog-body { display:grid; gap:14px; }
 .models-path { font-family:var(--st-font-mono); font-size:12px; font-weight:400; background:var(--st-surface-2); padding:2px 6px; border-radius:6px; overflow-wrap:anywhere; }
 .models-dialog .storage-directory__path { margin:0; }
+/* #5421: the chat files the host cannot read, listed under the workspaces. A damaged row is not clickable (there are no messages to show),
+   so it keeps the chat row's shape without its pointer, and the note above it says why it is there. */
+.nav-damaged { margin-top:10px; }
+.nav-damaged__note { margin:0 0 4px; padding:0 10px; }
+.navsession--damaged { cursor:default; color:var(--st-ink-soft); }
+.navsession--damaged .st-icon { flex:none; opacity:.7; }

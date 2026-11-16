@@ -64,6 +64,8 @@ export function badRequest(res) {
   res.end(payload);
 }
 
+export class InvalidJsonError extends Error {}
+
 export async function readBody(req, limit = 4 * 1024 * 1024) {
   const chunks = [];
   let size = 0;
@@ -77,7 +79,7 @@ export async function readBody(req, limit = 4 * 1024 * 1024) {
   try {
     return JSON.parse(raw);
   } catch {
-    throw new Error('Body must be JSON');
+    throw new InvalidJsonError('Body must be JSON');
   }
 }
 

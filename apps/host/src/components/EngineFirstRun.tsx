@@ -7,6 +7,7 @@ import { useDownloadEta } from '../lib/download-eta';
 import type { NativeJob } from '../lib/native';
 import { megabytes } from '../lib/format';
 import { FirstRunLanguage } from './FirstRunLanguage';
+import { firstRunCard } from '../lib/first-run-card';
 
 /** What the host says about this PC's engine (GET /api/engine/first-run). */
 export interface FirstRunInfo {
@@ -47,8 +48,8 @@ export function useEngineNeeded(): boolean | null {
 }
 
 function gpuLine(info: FirstRunInfo) {
-    // a processor's own tiny graphics (no memory of its own) is not "a card"
-    const first = info.gpus.find(g => (g.vramGb ?? 0) >= 1) ?? info.gpus[0];
+    // the card with the most memory of its own: a processor's graphics listed first is not the card the engine is for (#6015)
+    const first = firstRunCard(info.gpus);
     if (!first) return '';
     const vram = first.vramGb ? `, ${Math.round(first.vramGb)} GB` : '';
     const driver = info.driver ? `, driver ${info.driver}` : '';

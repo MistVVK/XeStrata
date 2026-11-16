@@ -102,6 +102,9 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                    help="which drafter guesses words ahead to make answers faster, one at a time: auto (recommended: DFlash2 for Qwen3.8-Flash-Next where the engine has it, "
                         "else the MTP), mtp, dflash2 (downloads its drafter once, 0.3 to 1.2 GB depending on the model; the size is shown before the download) or off. Auto uses the MTP when several requests run at once; --drafting dflash2 runs with the --parallel count you set. "
                         "If DFlash2 cannot run (on a model it is not for, for example) the MTP is used alone and the start says why")
+    g.add_argument("--draft-vocab", type=_choice("a draft vocabulary", S.DRAFT_VOCAB_MODES), metavar="cjk|en|cyrillic|fr|latin",
+                   help="which tokens the drafter may guess: cjk (the default: with Chinese, Japanese and Korean), en (English and code), "
+                        "cyrillic, fr or latin (each with English and code). Without it Strata picks from this computer's languages")
     g.add_argument("--split-engine", type=_choice("a split-engine setting", S.SPLIT_MODES), metavar="auto|on|off",
                    help="NVIDIA, two or more cards: the engine that splits every layer across the cards (faster answers). auto (the default) uses it by itself "
                         "where it is supported and starts the normal layer split everywhere else; on asks for it and says in one line why it cannot run; "
@@ -125,8 +128,11 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                         "lscpu show). The default is one worker per physical core, which the engine's start line names; "
                         "two entries on one core are kept with a warning")
     a = p.add_argument_group("who can use it")
-    a.add_argument("--access", type=_choice("a way to share Strata", S.ACCESS_KINDS), metavar="local|lan|cloudflare|tailscale",
-                   help="local: this computer only; lan: your network; cloudflare: a quick tunnel; tailscale: your tailnet")
+    a.add_argument("--access", type=_choice("a way to share Strata", S.ACCESS_KINDS), metavar="local|lan|address|cloudflare|tailscale",
+                   help="local: this computer only; lan: your network; address: one address of this computer (see --listen); "
+                        "cloudflare: a quick tunnel; tailscale: your tailnet")
+    a.add_argument("--listen", metavar="ADDRESS",
+                   help="serve on this one address of this computer (a second network card or a VPN) instead of all of them")
     a.add_argument("--port", type=_port, metavar="N", help=f"port (default {S.DEFAULT_PORT})")
     a.add_argument("--api-key", metavar="KEY", help="the key clients must send (made for you when you share beyond this computer)")
     a.add_argument("--api-key-env", metavar="NAME", help="read the key from this environment variable")
@@ -168,6 +174,8 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     c.add_argument("--preset", metavar="NAME", help="take the address, key and model from this saved preset")
     c.add_argument("--check", action="store_true", help="send one prompt and one tool call to the running server the way this app would, and say if each worked")
     c.add_argument("--write", action="store_true", help="write the file(s), after asking; a replaced file is backed up first")
+    c.add_argument("--if-unchanged", action="store_true",
+                   help="with --write: a file that already holds exactly the rendered content is left alone - no write, no backup (reported as unchanged)")
     c.add_argument("--yes", action="store_true", help="do not ask before --write")
     c.add_argument("--show-key", action="store_true", help="print the real key instead of a masked one")
     c.add_argument("--output", choices=("human", "json"), default="human")
@@ -246,6 +254,8 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.mtp = a.mtp
     if a.drafting:
         s.drafting = a.drafting
+    if a.draft_vocab:
+        s.draft_vocab = a.draft_vocab
     if getattr(a, "split_engine", None):
         s.split_engine = a.split_engine
     if a.gpu and getattr(a, "gpu_roles", None):
@@ -266,6 +276,12 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.tune_allow_small = True
     if a.access:
         s.access = a.access
+    if getattr(a, "listen", None):                       # #5917: --listen ADDRESS is the "One address only" way to share
+        s.access, s.listen = "address", a.listen.strip()
+    elif s.access == "address" and not s.listen:
+        from strata_cli.launch import access
+        found = access.local_addresses()
+        s.listen = found[0] if found else None
     if a.port:
         s.port = a.port
     if a.api_key:
@@ -620,6 +636,7 @@ def _tui(run, *args, **kw) -> int:
 
 def running_launches() -> list[dict]:
     """Launch profiles whose server is up now: [{name, profile, url, state}]."""
+    from strata_cli.launch import access
     from strata_control import profiles, runtime
     out = []
     try:
@@ -643,7 +660,7 @@ def running_launches() -> list[dict]:
             prof, ov = {}, {}
         port = ov.get("port", S.DEFAULT_PORT)
         out.append({"name": p["id"][7:], "profile": p["id"], "state": st.get("state"), "port": port,
-                    "url": f"http://127.0.0.1:{port}", "host": ov.get("host", "127.0.0.1"), "config": prof.get("source_config")})
+                    "url": access.host_url(ov.get("host"), port), "host": ov.get("host", "127.0.0.1"), "config": prof.get("source_config")})
     return out
 
 
@@ -800,7 +817,8 @@ def run_launch(a: argparse.Namespace) -> int:
             notices.append(S.Notice("warn", backend_note, ""))
         if not machine:
             _interrupted_move_notice()
-        have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune or a.drafting or getattr(a, "split_engine", None))
+        have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune or a.drafting or a.draft_vocab or
+                            getattr(a, "split_engine", None))
         interactive = sys.stdin.isatty() and sys.stdout.isatty() and not a.no_tui and not machine and not a.plan
         plain_questions = False
         no_screens_package = None
@@ -968,6 +986,38 @@ def run_launch(a: argparse.Namespace) -> int:
 
 # ------------------------------------------------------------------------------------------------ connect
 
+def _connect_write(harness, out, a, machine: bool):
+    """Run the --write block for either output mode. Returns (results, exit_code, message);
+    message is set only when nothing was written or the ask could not happen."""
+    if not out["files"]:
+        return [], 0, "Nothing to write for this app."
+    if not a.yes:
+        if not sys.stdin.isatty():
+            return [], 2, "--write asks first; run it in a terminal or add --yes."
+        ask = "\nWrite these files now? A file that exists is copied to a backup first. [y/N] "
+        if machine:                                   # stdout stays one JSON object
+            print(ask, file=sys.stderr)
+            ans = sys.stdin.readline().strip().lower()
+        else:
+            try:
+                ans = input(ask).strip().lower()
+            except EOFError:                         # the input ended: that is a no
+                ans = ""
+        if ans not in ("y", "yes"):
+            return [], 0, "Nothing was written."
+    # The files are written in order. One that cannot be written ends the write there: it is reported with its error, the ones after it with
+    # "not_written", and the exit code is 1 (before, an OSError ended the command with a traceback and the JSON path said nothing).
+    results: list[dict] = []
+    for n, f in enumerate(out["files"]):
+        try:
+            results.append(harness.write_file(f, if_unchanged=bool(getattr(a, "if_unchanged", False))))
+        except OSError as exc:
+            path = str(harness.expand(f["path"]))
+            results.append({"path": path, "backup": None, "action": "failed", "error": exc.strerror or str(exc)})
+            results += [{"path": str(harness.expand(g["path"])), "backup": None, "action": "not_written"} for g in out["files"][n + 1:]]
+            return results, 1, f"Could not write {path}: {exc.strerror or exc}."
+    return results, 0, None
+
 def run_connect(a: argparse.Namespace) -> int:
     from strata_cli.launch import harness
     machine = a.output == "json"
@@ -1003,26 +1053,39 @@ def run_connect(a: argparse.Namespace) -> int:
                                                        if k != "files"},
                    "files": [{**f, "text": harness.mask(f["text"], key)} for f in out["files"]],
                    "vendor_tested": h.tested or None}
-        if not a.check:
-            print(json.dumps(payload))
-            return 0
-        # --check runs the same two checks as the plain-words output (one prompt, one tool call, the way this app sends them) and the answer
-        # says what they found: "ok" is true only when both worked, and the exit code is 1 when one failed or the server cannot be reached.
-        from strata_cli.launch import check
-        results = check.run_checks(h.id if not h.built_in else "opencode", tgt.url, key, tgt.model)
-        passed = all(r.ok for r in results)
-        payload["checks"] = [{"name": r.name, "ok": r.ok, "detail": r.detail, "seconds": round(r.seconds, 1)} for r in results]
-        payload["checked_server"] = tgt.url
-        payload["ok"] = passed
-        if not passed:
-            reached = any(r.ok for r in results)
-            payload["error"] = {"code": 1, "message": ("The server answered, but the app's prompt or tool call did not work: "
-                                                       + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok))
-                                if reached else
-                                "The server could not be reached or did not answer the check: "
-                                + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok)}
+        # The same order as the plain-words output: --check first, and a failed check writes nothing (exit 1); then --write (#5955).
+        if a.check:
+            # --check runs the same two checks as the plain-words output (one prompt, one tool call, the way this app sends them) and the answer
+            # says what they found: "ok" is true only when both worked, and the exit code is 1 when one failed or the server cannot be reached.
+            from strata_cli.launch import check
+            results = check.run_checks(h.id if not h.built_in else "opencode", tgt.url, key, tgt.model)
+            passed = all(r.ok for r in results)
+            payload["checks"] = [{"name": r.name, "ok": r.ok, "detail": r.detail, "seconds": round(r.seconds, 1)} for r in results]
+            payload["checked_server"] = tgt.url
+            payload["ok"] = passed
+            if not passed:
+                reached = any(r.ok for r in results)
+                payload["error"] = {"code": 1, "message": ("The server answered, but the app's prompt or tool call did not work: "
+                                                           + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok))
+                                    if reached else
+                                    "The server could not be reached or did not answer the check: "
+                                    + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok)}
+                if a.write:
+                    payload["write"] = {"written": []}
+                print(json.dumps(payload))
+                return 1
+        if a.write:                                   # the JSON path writes too, and reports each file
+            written, code, message = _connect_write(harness, out, a, True)
+            payload["write"] = {"written": written}
+            if code:
+                payload["ok"] = False
+                payload["error"] = {"code": code, "message": message}
+                print(json.dumps(payload))
+                return code
+            if message:
+                payload["write"]["note"] = message
         print(json.dumps(payload))
-        return 0 if passed else 1
+        return 0
     _say(f"{h.title}  ({h.speaks}; {h.status})")
     if not info.get("running") and not a.url:
         _say("[!] No running Strata server was found, so this uses the default address. Start one with: strata launch")
@@ -1037,6 +1100,9 @@ def run_connect(a: argparse.Namespace) -> int:
         for k, v in out["env"].items():
             _say((f"  {k}={v}" if os.name != "nt" else f"  set {k}={v}") if shown_key or v == key and not key else
                  (f"  {k}={harness.mask(v, key)}" if os.name != "nt" else f"  set {k}={harness.mask(v, key)}"))
+    if key and not shown_key and (any(key in f["text"] for f in out["files"]) or any(key in str(v) for v in out["env"].values())):
+        _say("")
+        _say("The key is hidden here; add --show-key to print it.")      # #5948: a masked key copied as it is fails with "invalid API key"
     if out["limits"]:
         _say("")
         _say("Good to know:")
@@ -1057,21 +1123,14 @@ def run_connect(a: argparse.Namespace) -> int:
         if not all(r.ok for r in results):
             return 1
     if a.write:
-        if not out["files"]:
-            _say("Nothing to write for this app.")
-            return 0
-        if not a.yes:
-            if not sys.stdin.isatty():
-                print("strata: --write asks first; run it in a terminal or add --yes.", file=sys.stderr)
-                return 2
-            try:
-                ans = input("\nWrite these files now? A file that exists is copied to a backup first. [y/N] ").strip().lower()
-            except EOFError:                                 # the input ended: that is a no
-                ans = ""
-            if ans not in ("y", "yes"):
-                _say("Nothing was written.")
-                return 0
-        for f in out["files"]:
-            r = harness.write_file(f)
-            _say(f"{r['action'].capitalize()} {r['path']}" + (f" (backup: {r['backup']})" if r["backup"] else ""))
+        written, code, message = _connect_write(harness, out, a, False)
+        for r in written:
+            if r["action"] not in ("failed", "not_written"):
+                _say(f"{r['action'].capitalize()} {r['path']}" + (f" (backup: {r['backup']})" if r["backup"] else ""))
+        if message:
+            if code:
+                print(f"strata: {message}", file=sys.stderr)
+            else:
+                _say(message)
+            return code
     return 0

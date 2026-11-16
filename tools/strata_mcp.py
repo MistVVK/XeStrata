@@ -28,6 +28,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import signal
 import subprocess
 import sys
@@ -258,10 +259,26 @@ def proc_terminate(pid, ident) -> bool:
         return False
 
 
+def _writable_retry(func, path) -> bool:
+    """Clear a read-only mark on this one path (Windows refuses to delete a read-only file or an empty read-only folder with
+    WinError 5, #4089) and try once more. Only called for paths inside a model's planned removal. True when it is gone."""
+    try:
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+        func(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def _rmtree_ignore_missing(func, path, exc_info):
-    """shutil.rmtree error hook: a file that vanished while its folder was being removed is already gone."""
+    """shutil.rmtree error hook: a file that vanished while its folder was being removed is already gone; a read-only file or
+    folder gets its mark cleared and one more try (#4089)."""
     exc = exc_info[1] if isinstance(exc_info, tuple) else exc_info
     if isinstance(exc, FileNotFoundError):
+        return
+    if isinstance(exc, PermissionError) and func in (os.unlink, os.remove, os.rmdir) and _writable_retry(func, path):
         return
     raise exc
 
@@ -2134,7 +2151,11 @@ class Tools:
                     if p.is_dir() and not p.is_symlink():
                         shutil.rmtree(p, onerror=_rmtree_ignore_missing)
                     else:
-                        p.unlink(missing_ok=True)
+                        try:
+                            p.unlink(missing_ok=True)
+                        except PermissionError:
+                            if not _writable_retry(os.unlink, p):
+                                raise
                 except FileNotFoundError:
                     pass
                 except OSError as e:

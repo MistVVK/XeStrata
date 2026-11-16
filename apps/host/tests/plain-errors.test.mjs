@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { build } from 'esbuild';
 
 const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
 const catalogs = Object.fromEntries(await Promise.all(languages.map(async l => [l, ({ ...JSON.parse(await readFile(`src/locales/${l}.json`, 'utf8')), ...JSON.parse(await readFile(`src/locales/engine-${l}.json`, 'utf8')), ...JSON.parse(await readFile(`src/locales/gui-${l}.json`, 'utf8')) })])));
 const built = await build({ stdin: { contents: "export * from './src/lib/plain-errors'; export * from './src/lib/i18n';", resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'node', loader: { '.json': 'json' } });
-const { plainFailure, plainFailureText, setTranslationLanguage, loadCatalog } = await import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].text).toString('base64')}`);
+const { plainFailure, plainFailureText, chatFailure, setTranslationLanguage, loadCatalog } = await import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].text).toString('base64')}`);
 for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) await loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
 
 const cases = [
@@ -122,4 +123,75 @@ test('missing model files are named, in every language, with a next step (#3478)
 test('the engine component is named in words, once (#3900)', async () => {
   const { missingNames } = await import('../server/missing-files.mjs');
   assert.deepEqual(missingNames([{ part: 'engine', file: 'component:strata-engine' }], ['component:strata-engine']), ['the engine program']);
+});
+
+// An OpenAI-shaped error body ({"error": {"type", "message"}}, what strata serve and the Responses API answer) showed as raw JSON: the
+// wrapper is peeled the same way as a plain {"error": "..."} (GUI-1116, from the engine-error review).
+test('an error body whose error is an object shows its message, not the JSON', () => {
+  for (const raw of ['HTTP 500: {"error":{"type":"server_error","message":"dequant launch: unspecified launch failure"}}',
+                     '{"error":{"type":"invalid_request_error","message":"messages is required","code":null}}']) {
+    const f = plainFailure(raw);
+    assert.doesNotMatch(f.message, /[{}]|server_error|invalid_request_error/, raw);
+  }
+  assert.equal(plainFailure('{"error":{"type":"server_error","message":"dequant launch: unspecified launch failure"}}').message, 'Dequant launch: unspecified launch failure');
+  assert.equal(plainFailure('{"error":{"type":"x"}}').message, '{"error":{"type":"x"}}', 'no message inside: left as it was');
+});
+
+// The engine's errors in a chat (coordinator's review of 11-16, wording approved). strata serve answers a stop it restarts from with
+// "...; the next request restarts it" (EngineDied, a fatal ERR line) and a non-fatal ERR with the engine's bare line.
+const STOPPED = 'The model stopped while it was answering.', PROBLEM = 'The model ran into a problem while answering.';
+test('an engine that stopped while answering is said so, not as a download, a crash at start or a stop at start', () => {
+  for (const raw of ['Unrecoverable native verification failure: verify: timed out at layer 12; the next request restarts it',
+                     'the engine stopped unexpectedly (exit code 3221225477); the next request restarts it',
+                     'the engine stopped while this request waited; it was not sent; the next request restarts it',
+                     'HTTP 503: {"error":{"type":"server_error","message":"the engine stopped unexpectedly (exit code 3); the next request restarts it"}}']) {
+    const f = plainFailure(raw);
+    assert.equal(f.kind, 'engine-stopped-answering', raw);
+    assert.equal(f.message, STOPPED);
+    assert.match(f.next, /^Send your message again\. Strata starts the model again by itself\./);
+    assert.match(f.detail, /the next request restarts it/, 'the engine line stays under Details');
+  }
+  const again = plainFailure(STOPPED);    // the chat keeps the sentence; ErrorNotice reads it again and finds the next step
+  assert.equal(again.kind, 'engine-stopped-answering');
+  assert.ok(again.next);
+});
+
+test('a real network failure is still a download without internet', () => {
+  for (const raw of ['cannot reach github.com (<urlopen error [Errno 11001] getaddrinfo failed>) - check your internet connection and run it again',
+                     'could not resolve host: huggingface.co', 'connection refused while downloading the model']) {
+    assert.equal(plainFailure(raw).kind, 'network', raw);
+  }
+});
+
+test('in a chat, an engine line no rule knows becomes one plain sentence with the line under Details; a sentence for people stays', () => {
+  for (const [raw, line] of [["prefill: the PLE rows' upload failed: unspecified launch failure", "prefill: the PLE rows' upload failed: unspecified launch failure"],
+                             ['HTTP 500: {"error":{"type":"server_error","message":"dequant launch: unspecified launch failure"}}', 'dequant launch: unspecified launch failure'],
+                             ['500 dequant launch: unspecified launch failure', '500 dequant launch: unspecified launch failure']]) {
+    const f = chatFailure(raw);
+    assert.equal(f.kind, 'engine-error-answering', raw);
+    assert.equal(f.message, PROBLEM);
+    assert.match(f.next, /^Send your message again\. If it keeps happening, open Details/);
+    assert.equal(f.detail, line);
+  }
+  assert.equal(plainFailure(PROBLEM).kind, 'engine-error-answering', 'ErrorNotice finds the next step for the kept sentence');
+  for (const raw of ['Insufficient balance. Top up your account to continue.', 'Invalid API key']) {
+    assert.equal(chatFailure(raw).kind, 'plain', raw);
+    assert.equal(chatFailure(raw).message, raw);
+  }
+  assert.equal(chatFailure('the engine stopped unexpectedly (exit code 3); the next request restarts it').kind, 'engine-stopped-answering', 'rule (a) first');
+  const store = readFileSync(new URL('../src/lib/store.ts', import.meta.url), 'utf8');
+  assert.match(store, /const failure = typeof frame\.key === 'string' \? null : chatFailure\(String\(frame\.message \?\? 'Engine error'\)\);/);
+  assert.match(store, /\.\.\.\(detail \? \{ errorDetail: detail \} : \{\}\)/, 'the engine line is kept for Details');
+});
+
+// GUI-1116 (owner 11-16: every language checked for 0.2.16): the engine-failure sentences of 7bcb5a69c have catalog keys, so the chat shows
+// them in the person's language instead of English. The translations are drafts on the lane's [DRAFT] list for the release review.
+test('the engine-failure sentences and next steps are translated in all nine languages', () => {
+  const sentences = [chatFailure('the model stopped; the next request restarts it'), chatFailure('HTTP 500: weird engine text')].flatMap(f => [f.message, f.next]);
+  assert.equal(sentences.length, 4);
+  for (const text of sentences) {
+    const id = Object.entries(catalogs.en).find(([, v]) => v === text)?.[0];
+    assert.ok(id, `"${text}" has a catalog key`);
+    for (const l of languages) if (l !== 'en') assert.ok(catalogs[l][id] && catalogs[l][id] !== text, `${l}: "${text}" is translated`);
+  }
 });

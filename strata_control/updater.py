@@ -867,13 +867,69 @@ def _keep_text(ctx: "Context | None", component: ec.EngineComponent, text: str) 
         return None
 
 
+def hip_test_cards(component: ec.EngineComponent, env: dict, timeout: float = 60) -> tuple[str | None, list[dict]]:
+    """AMD (#6015): the cards the test start of a HIP package lets the engine see, as HIP_VISIBLE_DEVICES, and the cards the package's own
+    `strata-device --list-devices` found. A card the package has no code for is left out, and so is an integrated chip while a card of its own
+    can run (the start's rule: serve/server.py pick_hip_devices): a Ryzen's integrated Radeon is HIP's device 0 on many PCs, and with it visible
+    the engine's `--version` failed on a PC whose RX 9070 the package is built for, the same test on every retry. (None, cards) when nothing needs
+    hiding, the environment already names the cards, or the probe is missing or fails: then the test runs as before."""
+    if not str(getattr(component, "backend", "") or "").startswith("hip") or env.get("HIP_VISIBLE_DEVICES") or env.get("ROCR_VISIBLE_DEVICES"):
+        return None, []
+    probe = component.root / ("strata-device.exe" if os.name == "nt" else "strata-device")
+    if not probe.is_file():
+        return None, []
+    try:
+        done = subprocess.run([str(probe), "--list-devices"], capture_output=True, text=True, errors="replace", timeout=timeout, env=env,
+                              cwd=str(component.root), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None, []
+    if done.returncode != 0:
+        return None, []
+    from serve.server import parse_hip_devices
+    devices = parse_hip_devices(done.stdout)
+    runnable = [d for d in devices if not d["cannot_run"]]
+    pool = [d for d in runnable if not d["integrated"]] or runnable
+    if not pool or len(pool) == len(devices):
+        return None, devices
+    return ",".join(str(d["index"]) for d in pool), devices
+
+
+def _cards_seen(devices: list[dict], visible: str | None) -> str:
+    """The cards a test start ran with, for its failure reason: "GPU 1 (AMD Radeon RX 9070, gfx1201)"."""
+    shown = [d for d in devices if visible is None or str(d["index"]) in visible.split(",")]
+    return ", ".join(f"GPU {d['index']} ({d['name'] or 'graphics card'}, {d['arch'] or 'unknown'})" for d in shown)
+
+
+def _same_failure_again(ctx: "Context | None", component: ec.EngineComponent, reason: str) -> bool:
+    """Whether the last failed test start of this engine version failed with the same reason (#6015: "Continue" ran the same failing test
+    again and again). Records this failure for the next call. False without a context or when nothing can be read or written."""
+    if ctx is None:
+        return False
+    path = updates_dir(ctx.components) / "logs" / "test-start-last-failure.json"
+    now = {"version": component.version, "reason": reason[:600]}
+    try:
+        before = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        before = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(now), encoding="utf-8")
+    except OSError:
+        pass
+    return isinstance(before, dict) and before.get("version") == now["version"] and before.get("reason") == now["reason"]
+
+
 def binary_smoke(component: ec.EngineComponent, timeout: float = 60, ctx: "Context | None" = None) -> dict:
     """No model installed yet: the engine must at least load (its libraries resolve, the GPU runtime initialises the loader) and
     report its version. Weaker than a one-token answer, and reported as such. With ``ctx`` a failure keeps the engine's output in
-    ``.updates/logs`` and says where; a missing system library is named, with the package that has it."""
+    ``.updates/logs`` and says where; a missing system library is named, with the package that has it. AMD: the engine sees only the cards its
+    package has code for (hip_test_cards), and a failure names the cards it ran with."""
     var = "PATH" if os.name == "nt" else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
     env = dict(os.environ)
     env[var] = os.pathsep.join(ec.package_lib_dirs(component.root)) + os.pathsep + env.get(var, "")
+    visible, devices = hip_test_cards(component, env)
+    if visible is not None:
+        env["HIP_VISIBLE_DEVICES"] = visible
     command = [str(component.exe), "--version"]
     try:
         done = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=timeout, env=env,
@@ -895,9 +951,16 @@ def binary_smoke(component: ec.EngineComponent, timeout: float = 60, ctx: "Conte
         reason = f"--version exited {done.returncode}: {tail[0][:200]}"
         if library and library not in reason:
             reason += f" (error while loading shared libraries: {library}: cannot open shared object file)"
+        if devices:
+            reason += f"; cards the engine saw: {_cards_seen(devices, visible)}"
         where = f" The engine's log from this test is in {kept}." if kept else ""
         if library:
             raise TestStartFailed(component.version, reason, busy=False, hint=library_hint(library, linux_family()) + where)
+        if _same_failure_again(ctx, component, reason):
+            # (#6015) the second identical failure says that trying again does not help, instead of asking for the same retry (coordinator-approved 11-16)
+            hint = ("This is the same problem as last time, so trying again won't fix it. Please report it on GitHub"
+                    + (f" and attach this log: {kept}." if kept else "."))
+            raise TestStartFailed(component.version, reason, busy=False, hint=hint)
         hint = f"Run `strata update --force` to try again; if it fails again, report it with the log: {kept}" if kept else None
         raise TestStartFailed(component.version, reason, hint=hint)
     return {"mode": "binary-only", "detail": "no model is installed yet, so the engine was run with --version only",

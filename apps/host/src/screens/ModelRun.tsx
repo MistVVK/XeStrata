@@ -292,7 +292,7 @@ function LegacyModelRunScreen({ importFirst = false, initialVariant }: {
             if (engine && hardware) {
                 const nextConfig = recommendedConfig(engine, hardware);
                 if (next?.local) {
-                    const k = [4, 8, 16, 32, 64, 128, 256, 512, 1024].filter(k => k * 1024 <= next.contextMax).at(-1) ?? 4;
+                    const k = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024].filter(k => k * 1024 <= next.contextMax).at(-1) ?? 1;
                     const context = Math.min(32, k);
                     nextConfig.beginner.contextLength = `${context}k`;
                     nextConfig.expert['ctx.length'] = `${context}K`;
@@ -440,7 +440,7 @@ function LegacyModelRunScreen({ importFirst = false, initialVariant }: {
           </section>
           <section className="run-card run-context"><div className="run-card__head"><span><Icon name="chat" size={19}/><h2>{tr("Conversation context")}</h2></span><strong>{tr(ctx / 1024)}{tr("K ")}<small>{tr("tokens")}</small></strong></div><p>{tr("How much your model can keep in mind.")}</p>
             <div className="run-context-presets" role="group" aria-label={tr("Context presets")}>{tr([32, 64, 128, 256].map(k => <button key={k} disabled={k > contextMax} aria-pressed={ctx === k * 1024} onClick={() => setContext(k)}><span>{tr(k)}{tr("K")}</span></button>))}</div>
-            <div className="run-context-bottom"><label className="run-context-exact">{tr("Custom ")}<input className="st-input" aria-label={tr("Custom context in K tokens")} type="number" min="4" max={contextMax} step="1" value={Number.isFinite(ctx) ? ctx / 1024 : ''} onChange={e => {
+            <div className="run-context-bottom"><label className="run-context-exact">{tr("Custom ")}<input className="st-input" aria-label={tr("Custom context in K tokens")} type="number" min="1" max={contextMax} step="1" value={Number.isFinite(ctx) ? ctx / 1024 : ''} onChange={e => {
             if (e.target.value)
                 setContext(Number(e.target.value));
         }}/><span>{tr("K")}</span></label></div>

@@ -291,6 +291,7 @@ def create(result: dict[str, Any], *, choices: dict[str, Any], identity: dict[st
         "baseline": {"args": base_args or {}, "decode_tok_s": base.get("decode_tok_s"), "pp4k_tok_s": base.get("pp_tok_s"),
                      "pairs": result.get("pairs"), "noise_aa_decode": (result.get("noise") or {}).get("aa_gap")},
         "measured": {"decode_tok_s": chosen.get("decode_tok_s"), "pp4k_tok_s": chosen.get("pp_tok_s"),
+                     "pp_long_tok_s": chosen.get("pp_long_tok_s"),          # #5324: the long prompt's speed, apart from the 4K one
                      "vram_peak_mib": chosen.get("vram_used_mib"), "rss_peak_mib": chosen.get("rss_peak_mib"),
                      "pairs": result.get("pairs"), "faster_pairs": result.get("faster_pairs"),
                      "gain_pct": result.get("gain_pct"), "gain_decode_pct": result.get("gain_decode_pct"),

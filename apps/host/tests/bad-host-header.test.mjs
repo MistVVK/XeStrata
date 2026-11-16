@@ -110,3 +110,34 @@ test('The share listener also survives a request target that is not a path', asy
   assert.equal(status(bad), 400);
   assert.equal((await fetch(`http://127.0.0.1:${h.port}/api/health`)).status, 200);
 });
+
+test('malformed JSON on inference routes returns 400 without changing route or key checks', async t => {
+  const h = await startHost();
+  t.after(h.done);
+  const host = `http://127.0.0.1:${h.port}`;
+  const json = { 'content-type': 'application/json' };
+  const key = 'test-only-key';
+  const settings = await fetch(host + '/api/serving', { method: 'PATCH', headers: json, body: JSON.stringify({ apiKey: key }) });
+  assert.equal(settings.status, 200);
+  const started = await fetch(host + '/api/serving/share', { method: 'POST', headers: json, body: '{"enabled":true}' });
+  assert.equal(started.status, 200);
+  const share = new URL((await started.json()).sharing.url);
+  share.hostname = '127.0.0.1';
+  const headers = { ...json, authorization: `Bearer ${key}` };
+  const post = (base, path, body, auth = headers) => fetch(base + path, { method: 'POST', headers: auth, body });
+  const invalid = { type: 'invalid_request_error', message: 'Invalid JSON in request body' };
+
+  for (const base of [host, share.origin]) {
+    const chat = await post(base, '/v1/chat/completions', '{');
+    assert.equal(chat.status, 400);
+    assert.deepEqual(await chat.json(), { error: { ...invalid, param: null, code: 'invalid_json' } });
+    const messages = await post(base, '/v1/messages', '{');
+    assert.equal(messages.status, 400);
+    assert.deepEqual(await messages.json(), { type: 'error', error: invalid });
+    assert.equal((await post(base, '/v1/missing', '{')).status, 404);
+    assert.equal((await post(base, '/v1/chat/completions', '{', json)).status, 401);
+    const semantic = await post(base, '/v1/chat/completions', '{}');
+    assert.equal(semantic.status, 400);
+    assert.deepEqual(await semantic.json(), { error: 'No user message found' });
+  }
+});

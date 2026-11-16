@@ -42,6 +42,19 @@ class ClientError(Exception):
         self.http_status = http_status
 
 
+def this_computer(host: str) -> bool:
+    """Loopback, or one of this computer's own addresses: a server started with "One address only" (#5917, strata launch --listen) listens on
+    that address alone, so the monitor reaches it there, over plain HTTP like loopback and never through a proxy."""
+    host = (host or "").strip("[]").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        from strata_cli.launch import access
+        return host in {a.lower() for a in access.local_addresses()}
+    except Exception:                                        # noqa: BLE001 - not known: treated as another computer
+        return False
+
+
 def server_url(raw: str) -> str:
     """Require a server root and prevent credential/path ambiguity."""
     if not isinstance(raw, str):
@@ -56,7 +69,7 @@ def server_url(raw: str) -> str:
     except ValueError as e:
         raise ValueError("invalid server port") from e
     host = u.hostname.lower()
-    local = host in ("localhost", "127.0.0.1", "::1")
+    local = this_computer(host)
     if u.scheme != "https" and not local:
         raise ValueError("remote monitoring requires HTTPS or a local SSH tunnel")
     authority = f"[{host}]" if ":" in host else host
@@ -105,7 +118,8 @@ class Endpoint:
         if self.credential:
             headers["Authorization"] = "Bearer " + self.credential
         req = urllib.request.Request(self.base_url + path, headers=headers)
-        opener = urllib.request.build_opener(_NoRedirect)
+        direct = [urllib.request.ProxyHandler({})] if this_computer(urllib.parse.urlsplit(self.base_url).hostname or "") else []
+        opener = urllib.request.build_opener(_NoRedirect, *direct)
         try:
             with opener.open(req, timeout=self.timeout) as response:
                 content_type = response.headers.get("Content-Type", "")
@@ -179,6 +193,28 @@ def _rows(value: Any, fields: tuple[str, ...], limit: int) -> list[dict]:
         out.append({key: _short(item.get(key)) if key in ("id", "request_id", "state", "name", "finish")
                     else _number(item.get(key)) for key in fields})
     return out
+
+
+def card_link(row: Any, gap: bool = True, show_gen: bool = True) -> str:
+    """One graphics card's own PCIe link as the Terminal words it ("Gen5 x8"); "" when the server does not report it.
+    The generation is the one the card runs at now, or the highest it can reach when it reports no current one (NVML
+    reports a lower link while the card is idle).  A card that runs narrower than it could - capped to x8 in a x16
+    slot, or trained down to x4 by the board - gets both numbers ("Gen5 x8 of x16"), because the narrow one alone
+    reads as a card someone chose; `gap=False` leaves the second number out for a column too narrow for it, and
+    `show_gen=False` leaves only the width ("x8") for a column too narrow even for the link.  An old server, or a
+    card whose link is not readable, gives ""."""
+    if not isinstance(row, dict):
+        return ""
+    gen = _number(row.get("pcie_gen"))
+    if gen is None:
+        gen = _number(row.get("pcie_gen_max"))
+    if gen is None:
+        return ""
+    width, cap = _number(row.get("pcie_width")), _number(row.get("pcie_width_max"))
+    if not show_gen:
+        return f"x{int(width)}" if width else ""
+    return (f"Gen{int(gen)}" + (f" x{int(width)}" if width else "")
+            + (f" of x{int(cap)}" if gap and width and cap and cap > width else ""))
 
 
 def _selected_devices(value: Any) -> list[int]:
@@ -426,7 +462,9 @@ def sanitize_telemetry(raw: dict[str, Any]) -> dict[str, Any]:
                      "replica_devices": replica_devices, "replica_stages": replica_stages,
                      "resolved": placement_resolved,
                      "stages": stages, "source": _short(topology.get("source"), 40)},
-        "devices": _rows(raw.get("devices"), ("index", "name", "mem_used", "mem_total", "util", "temp", "power"), 16),
+        "devices": _rows(raw.get("devices"), ("index", "name", "mem_used", "mem_total", "util", "temp", "power",
+                                              "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width", "pcie_width_max"),
+                         16),
         "ram": {"used": _number(ram.get("used")), "total": _number(ram.get("total"))},
         "recent": _rows(raw.get("recent"), ("id", "time", "duration_s", "finish", "prompt_tokens",
                                            "reused", "output_tokens", "prompt_ms", "decode_ms",
@@ -482,7 +520,14 @@ def normalize_legacy(metrics: dict[str, Any], status: dict[str, Any]) -> dict[st
                                  "mem_used": _number(row.get("mem_used")),
                                  "mem_total": _number(row.get("mem_total")),
                                  "util": _number(row.get("util")), "temp": _number(row.get("temp")),
-                                 "power": _number(row.get("power"))})
+                                 "power": _number(row.get("power")), "power_limit": _number(row.get("power_limit")),
+                                 # each card trains its own PCIe link: dropping these left the detail page with no
+                                 # way to say that one card runs at x8 and the other at x4, or that one of them is
+                                 # capped below the width its own card could reach
+                                 "pcie_gen": _number(row.get("pcie_gen")),
+                                 "pcie_gen_max": _number(row.get("pcie_gen_max")),
+                                 "pcie_width": _number(row.get("pcie_width")),
+                                 "pcie_width_max": _number(row.get("pcie_width_max"))})
     # Old single-GPU servers report only aggregate GPU fields. It is one device only
     # when the static sampler says so; never duplicate an aggregate into four rows.
     if not safe_devices and static.get("gpu_count") == 1 and static.get("gpu_name"):
@@ -490,7 +535,11 @@ def normalize_legacy(metrics: dict[str, Any], status: dict[str, Any]) -> dict[st
                          "mem_used": _number(hardware.get("gpu_mem_used")),
                          "mem_total": _number(hardware.get("gpu_mem_total")),
                          "util": _number(hardware.get("gpu_util")), "temp": _number(hardware.get("gpu_temp")),
-                         "power": _number(hardware.get("gpu_power"))}]
+                         "power": _number(hardware.get("gpu_power")), "power_limit": _number(hardware.get("gpu_power_limit")),
+                         "pcie_gen": _number(hardware.get("gpu_pcie_gen")),
+                         "pcie_gen_max": _number(hardware.get("gpu_pcie_gen_max")),
+                         "pcie_width": _number(hardware.get("gpu_pcie_width")),
+                         "pcie_width_max": _number(hardware.get("gpu_pcie_width_max"))}]
     recent = []
     for row in (metrics.get("requests") if isinstance(metrics.get("requests"), list) else [])[:50]:
         if isinstance(row, dict):

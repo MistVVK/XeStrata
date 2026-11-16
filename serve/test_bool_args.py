@@ -32,5 +32,58 @@ class BooleanArguments(unittest.TestCase):
         self.assertEqual(calls[0].call.arguments["title"], "True")
 
 
+# #2371: the type declared through anyOf / oneOf (what Pydantic and many MCP servers write for Optional[bool], unions)
+UNION = {"name": "set_flags", "parameters": {"type": "object", "properties": {
+    "any_bool": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+    "one_bool": {"oneOf": [{"type": "boolean"}, {"type": "null"}], "description": "Optional[bool]"},
+    "nested": {"anyOf": [{"oneOf": [{"type": "integer"}, {"type": "boolean"}]}, {"type": "null"}]},
+    "text_or_bool": {"anyOf": [{"type": "boolean"}, {"type": "string"}]},
+    "by_ref": {"anyOf": [{"$ref": "#/$defs/Flag"}, {"type": "null"}]},
+    "count": {"oneOf": [{"type": "integer"}, {"type": "null"}]}}}}
+UNION_CALL = ("<function=set_flags>\n<parameter=any_bool>\nTrue\n</parameter>\n<parameter=one_bool>\nfalse\n</parameter>\n"
+              "<parameter=nested>\nTrue\n</parameter>\n<parameter=text_or_bool>\nTrue\n</parameter>\n"
+              "<parameter=by_ref>\nTrue\n</parameter>\n<parameter=count>\n42\n</parameter>\n</function>")
+UNION_WANT = {"any_bool": True, "one_bool": False, "nested": True, "text_or_bool": "True", "by_ref": "True", "count": 42}
+
+
+class UnionTypes(unittest.TestCase):
+    def test_declared_type_reads_the_branches(self):
+        from serve.frontend import declared_type
+        props = UNION["parameters"]["properties"]
+        self.assertEqual(declared_type(props["any_bool"]), ["boolean", "null"])
+        self.assertEqual(declared_type(props["one_bool"]), ["boolean", "null"])
+        self.assertEqual(declared_type(props["nested"]), ["integer", "boolean", "null"])
+        self.assertEqual(declared_type(props["text_or_bool"]), ["boolean", "string"])
+        self.assertIsNone(declared_type(props["by_ref"]), "a $ref branch: unknown, read as with no schema")
+        self.assertEqual(declared_type({"type": "boolean", "anyOf": [{"type": "string"}]}), "boolean", "an explicit type wins")
+        self.assertEqual(declared_type({"anyOf": [{"type": "boolean"}]}), "boolean", "one branch: that type")
+        self.assertIsNone(declared_type({"anyOf": []}))
+        self.assertIsNone(declared_type("boolean"))
+        deep = {"type": "boolean"}
+        for _ in range(20):
+            deep = {"anyOf": [deep]}
+        self.assertIsNone(declared_type(deep), "a schema nested past the bound is read as with no schema")
+
+    def test_a_whole_call_reads_union_booleans(self):
+        self.assertEqual(parse_tool_call(UNION_CALL, UNION).arguments, UNION_WANT)
+
+    def test_the_streamed_parser_reads_union_booleans(self):
+        parser = OutputParser(thinking=False, tools=[UNION], stream_tools=True)
+        events = parser.feed("<tool_call>\n" + UNION_CALL + "\n</tool_call>") + parser.finish()
+        calls = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1, events)
+        self.assertEqual(calls[0].call.arguments, UNION_WANT)
+
+    def test_the_streamed_parser_in_pieces(self):
+        parser = OutputParser(thinking=False, tools=[UNION], stream_tools=True)
+        events = []
+        text = "<tool_call>\n" + UNION_CALL + "\n</tool_call>"
+        for i in range(0, len(text), 7):
+            events += parser.feed(text[i:i + 7])
+        events += parser.finish()
+        calls = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual([c.call.arguments for c in calls], [UNION_WANT])
+
+
 if __name__ == "__main__":
     unittest.main()

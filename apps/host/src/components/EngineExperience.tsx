@@ -2,6 +2,7 @@ import {localeTag} from '../lib/i18n';
 import { tr } from '../lib/i18n';
 import { useEffect, useId, useRef, useState } from 'react';
 import type { PointerEvent } from 'react';
+import { useImeKeys } from '../lib/ime-keys';
 import { closestStop, dialAngle, dialIndex, unwrapAngle } from '../lib/tuning-controls';
 import { Btn, Dialog, Icon, Select } from './ui';
 import { DEFAULT_EXECUTION, FIT_TEXT, OUTPUT_TOKENS, PROFILES, WORKLOADS, RECOMMENDED_CONTEXT_TOKENS, durationText, speedText } from '../lib/experience';
@@ -45,6 +46,7 @@ export function Dial({ label, hint, values, value, saved, recommended, onChange,
     const [dragIndex, setDragIndex] = useState<number | null>(null);
     const [entry, setEntry] = useState(String(value));
     const [entryError, setEntryError] = useState('');
+    const ime = useImeKeys();
     useEffect(() => { setEntry(String(value)); setEntryError(''); }, [value]);
     const shown = dragIndex ?? index;
     function select(i: number) { onChange(values[Math.max(0, Math.min(values.length - 1, Math.round(i)))].value); }
@@ -112,7 +114,9 @@ export function Dial({ label, hint, values, value, saved, recommended, onChange,
       <div className="dial-value"><strong>{tr(dragIndex !== null ? values[Math.round(dragIndex)].label : known ? values[index].label : value.toLocaleString(localeTag()))}</strong><span>{tr(value === recommended ? 'Recommended' : known ? 'Custom' : 'Expert value')}</span></div>
     </div>
     <div className="dial-stops" aria-hidden="true">{tr(values.map(v => <span key={v.value}>{tr(v.label)}</span>))}</div>{tr(gestureHint ? <p className="dial-caption">{tr("Turn the dial \u00B7 or use arrow keys")}</p> : null)}
-    {tr(exactEntry ? <label className="dial-entry"><span>{tr("Exact value")}</span><input className="st-input" aria-label={tr("{0} exact value", [label])} aria-invalid={!!entryError} inputMode="numeric" value={entry} onChange={e => setEntry(e.target.value)} onBlur={commitEntry} onKeyDown={e => {
+    {tr(exactEntry ? <label className="dial-entry"><span>{tr("Exact value")}</span><input className="st-input" aria-label={tr("{0} exact value", [label])} aria-invalid={!!entryError} inputMode="numeric" value={entry} onChange={e => setEntry(e.target.value)} onBlur={commitEntry} {...ime.events} onKeyDown={e => {
+                if (ime.owns(e))
+                    return;
                 if (e.key === 'Enter') {
                     e.preventDefault();
                     commitEntry();

@@ -20,7 +20,17 @@
 import { modelProblem, resolveModel, routeList } from '../model-routes.mjs';
 
 export const name = 'strata-models';
-export const inject = ['tools'];
+export const inject = ['tools', 'systemPrompt'];
+
+/**
+ * #5971: the name of the model a chat runs on, as the person knows it (the model picker's name), for the persona's {{model_name}}. The
+ * Harness's own {{model}} is the route's model id, which for a model on this computer is a file name such as a quantization: asked which
+ * model it is, the assistant had nothing to go on and said "Claude". Found by the agent's provider route and model id; the id when no route fits.
+ */
+export function modelNameOf(routes, options) {
+  const route = (Array.isArray(routes) ? routes : []).find(r => r.provider === options?.provider && r.model === options?.model);
+  return String(route?.name || options?.model || 'an AI model');
+}
 
 /** What the assistant is told in the tool's own text, so every model (a small local one and a hosted one alike) knows when and how. */
 export const SUBAGENT_GUIDANCE = ' Use this tool whenever the person asks you to ask a subagent, a helper or another model ("ask a subagent", "ask DeepSeek", "use the local model", "ask model X"): start it with this tool and do not look for the model yourself with shell commands, in the environment or on this computer. To use a particular model, give `model` as its name or id (for example "DeepSeek V3.2" or "deepseek/deepseek-v3.2", or "local" for the model running on this computer); `provider` is optional. `list_subagent_models` shows what can be used. After starting a helper, do not wait with sleep or commands: end your turn and its answer arrives as a new message.';
@@ -39,6 +49,7 @@ export function subagentArgs(routes, args) {
 
 export function apply(ctx, config = {}) {
   const routes = Array.isArray(config.routes) ? config.routes : [];
+  ctx.systemPrompt.variable('model_name', context => modelNameOf(routes, context?.agent?.options));
 
   const wrapSubagent = def => {
     if (wrapped.has(def)) return;

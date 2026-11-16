@@ -71,5 +71,6 @@
  "fx84": "Die Datei wurde heruntergeladen. „Weiter“ versucht die Installation erneut.",
  "fx85": "Unter „Details“ steht der Grund.",
  "fxec1": "Für diesen Computer gibt es eine neuere Engine. Ihre Modelle und Einstellungen bleiben unverändert.",
- "fxec2": "Beenden Sie zuerst Ihre laufenden Modelle."
+ "fxec2": "Beenden Sie zuerst Ihre laufenden Modelle.",
+  "fx86": "Ältere Nachrichten zusammenfassen, damit der Chat wieder schneller ist und Platz hat"
 }

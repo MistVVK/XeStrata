@@ -365,3 +365,43 @@ test('a streamed answer of 1,500 tokens is a handful of saves to the host, the f
     assert.equal([...memory.keys()].filter((k) => k.startsWith('strata.session')).length, 0, 'nothing is written to the browser storage any more');
   } finally { fake.restore(); h.done(); }
 });
+
+// #5923: a reply streamed into a big chat rewrote the whole chat once a second (about 1 MB/s for a 1 MB chat, growing with the chat).
+// The wait before a scheduled save now grows with the size of the chats that changed; small chats still save within a second, and a
+// turn's end (flush) saves at once.
+const countingTransport = () => { const t = { bytes: 0, puts: 0, rev: 0 }; t.put = async (id, text) => { t.bytes += text.length; t.puts++; t.last = text; return { rev: ++t.rev }; }; t.remove = async () => {}; return t; };
+async function streamFor(t, writer, base, seconds) {
+  let s = base;
+  for (let ms = 0; ms < seconds * 1000; ms += 100) {
+    s = { ...s, messages: [...s.messages.slice(0, -1), { ...s.messages.at(-1), content: s.messages.at(-1).content + 'tok ' }] };
+    writer.schedule([s]);
+    t.mock.timers.tick(100);
+    for (let i = 0; i < 3; i++) await new Promise(r => setImmediate(r));
+  }
+  return s;
+}
+
+test('#5923: a reply streamed for a minute into a 1 MB chat writes about 12 MB (a save at least every 5 s), not 60; a small chat still saves within a second; the turn end saves at once', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const big = chat('big', 20, 50_000);
+  const tr1 = countingTransport();
+  const w1 = createSessionWriter({ transport: tr1 });
+  w1.adopt(big, 1);
+  const last = await streamFor(t, w1, big, 60);
+  const size = serializeSession(big).length;
+  assert.ok(size > 1_000_000, String(size));
+  assert.ok(tr1.bytes <= 13 * size, `a minute of streaming wrote ${(tr1.bytes / 1e6).toFixed(1)} MB for a ${(size / 1e6).toFixed(1)} MB chat (${tr1.puts} saves)`);
+  assert.ok(tr1.puts >= 11, `saved at least every 5 s while the reply streams (${tr1.puts} saves)`);
+  t.diagnostic(`one minute: ${tr1.puts} saves, ${(tr1.bytes / 1e6).toFixed(1)} MB for a ${(size / 1e6).toFixed(2)} MB chat`);
+  const end = { ...last, messages: [...last.messages.slice(0, -1), { ...last.messages.at(-1), content: last.messages.at(-1).content + 'done.' }] };
+  w1.schedule([end]);
+  await w1.flush();
+  assert.equal(JSON.parse(tr1.last).messages.at(-1).content, end.messages.at(-1).content, 'the turn end saves the newest state at once');
+
+  const small = chat('small', 4, 200);
+  const tr2 = countingTransport();
+  const w2 = createSessionWriter({ transport: tr2 });
+  w2.adopt(small, 1);
+  await streamFor(t, w2, small, 3);
+  assert.ok(tr2.puts >= 2, `a small chat saves about once a second (${tr2.puts} saves in 3 s)`);
+});

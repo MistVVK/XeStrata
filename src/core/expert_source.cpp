@@ -4846,7 +4846,11 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         const int64_t e = ids[i];
         if (e < 0 || e >= d.n_expert) {
             d.failed = true;
-            d.fail = "a routed expert id is out of range";
+            static thread_local char oor_buf[160];
+            std::snprintf(oor_buf, sizeof oor_buf,
+                          "a routed expert id is out of range (layer %lld, entry %lld/%lld, id %lld, n_expert %d)",
+                          (long long) d.layers, (long long) i, (long long) k, (long long) e, (int) d.n_expert);
+            d.fail = oor_buf;
             d.fail_layer = d.layers;
             d.fail_expert = e;
             return;
@@ -5299,7 +5303,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (first_pass && kind[i] == -1 && e >= 0 && e < d.n_expert && !take(e, 0)) continue;   // being read: a later batch
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
-                d.fail = "a routed expert id is out of range";
+                static thread_local char oor_buf[160];
+                std::snprintf(oor_buf, sizeof oor_buf,
+                              "a routed expert id is out of range (layer %lld, entry %lld/%lld, id %lld, n_expert %d)",
+                              (long long) d.layers, (long long) i, (long long) (n_tok * k), (long long) e, (int) d.n_expert);
+                d.fail = oor_buf;
                 d.fail_layer = d.layers;
                 d.fail_expert = e;
                 return;

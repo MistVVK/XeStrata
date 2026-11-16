@@ -30,7 +30,7 @@ export function inspectLocalModel(input){
  if(m['general.type']&&m['general.type']!=='model')throw new Error('This is an adapter or auxiliary file. Choose the full model GGUF.');
  if(!m['tokenizer.ggml.model']||!m['tokenizer.ggml.tokens']?.count)throw new Error('This GGUF does not include its tokenizer. Choose the full model, not an adapter. A picture reader (mmproj) goes next to its model, not in its place.');
  const integer=(key,min,max)=>{const value=m[key];if(!Number.isInteger(value)||value<min||value>max)throw new Error(`Missing or invalid ${key} metadata. This model cannot be configured safely.`);return value;};
- const context=integer(`${arch}.context_length`,4096,100_000_000),layers=integer(`${arch}.block_count`,1,4096),embedding=integer(`${arch}.embedding_length`,1,1_000_000),heads=integer(`${arch}.attention.head_count`,1,8192);
+ const context=integer(`${arch}.context_length`,1024,100_000_000),layers=integer(`${arch}.block_count`,1,4096),embedding=integer(`${arch}.embedding_length`,1,1_000_000),heads=integer(`${arch}.attention.head_count`,1,8192);
  const kvHeads=m[`${arch}.attention.head_count_kv`]??heads,keyLength=m[`${arch}.attention.key_length`]??embedding/heads,valueLength=m[`${arch}.attention.value_length`]??keyLength,experts=m[`${arch}.expert_count`]??0;
  if(![kvHeads,keyLength,valueLength].every(n=>Number.isInteger(n)&&n>=1&&n<=1_000_000)||!Number.isInteger(experts)||experts<0||experts>100_000)throw new Error('This model has invalid attention or expert metadata.');
  const count=m['split.count']??1;if(!Number.isInteger(count)||count<1||count>256)throw new Error('This split model has an unsupported number of shards.');

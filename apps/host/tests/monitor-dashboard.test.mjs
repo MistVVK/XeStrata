@@ -62,6 +62,8 @@ test('NVIDIA power and PCIe link readings survive unavailable driver fields',()=
   assert.equal(missing.temperatureC,null);assert.equal(missing.powerW,null);assert.equal(missing.utilizationPct,0);
   const transfer=parsePcieThroughput('# gpu rxpci txpci\n# Idx MB/s MB/s\n0 12.5 8\n1 200 0\n2 - -');
   assert.equal(transfer.get(0),12.5);assert.equal(transfer.get(1),200);assert.equal(transfer.has(2),false);
+  const wrapped=parsePcieThroughput('# Idx MB/s MB/s\n0 59392 0\n1 209673 0\n2 5 209710');
+  assert.equal(wrapped.get(0),59392);assert.equal(wrapped.has(1),false);assert.equal(wrapped.get(2),5);
 });
 test('chart paths reuse the exact original 100×32 geometry',()=>{
   const {paths}=referencePaths([0,5,10]);

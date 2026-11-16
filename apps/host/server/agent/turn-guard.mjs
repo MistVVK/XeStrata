@@ -22,6 +22,9 @@ export const GUARD_LIMITS = Object.freeze({
   contextFraction: 0.93,
   /** A turn that ends with no words at all and a context this full is "out of room", not "nothing to say". */
   contextEmptyFraction: 0.85,
+  /** A goal (#4981): this many tool calls in a row failed, or one call (the same tool with the same arguments) failed this many times. */
+  goalFailedInARow: 12,
+  goalSameFailure: 4,
 });
 
 const SEARCH_TOOLS = new Set(['web_search']);
@@ -34,6 +37,7 @@ const NOTES = {
   rewrites: 'I kept rewriting the plan, so I stopped here with the latest version. Tell me what to change, or approve it.',
   context: 'I ran out of room in this chat, so I stopped. Strata is summarising the older messages to make space. Say “continue” to go on, or start a new chat.',
   empty: 'I stopped without writing an answer. Send your message again, or say “continue”.',
+  'goal-failures': 'This goal kept running into the same errors, so I paused it. Look at the last steps, fix what is in the way, then resume the goal.',
 };
 export const GUARD_NOTES = Object.freeze({ ...NOTES });
 
@@ -102,4 +106,45 @@ export class TurnGuard {
     if (this.contextMax && Number(contextTokens) / this.contextMax >= this.limits.contextEmptyFraction) return 'context';
     return acted ? null : 'empty';                                         // cards of work done are an answer of a kind; no cards and no words is not
   }
+}
+
+/**
+ * #4981: the guard of a goal run. A goal runs for hours across many rounds, so the per-turn limits (searches, plan rewrites) do not apply to it;
+ * what stops it is failing: a goal whose tool calls kept failing ran 5 h 23 min (26 failed calls) before anyone saw it. The goal is paused
+ * (stop() pauses it, Resume picks it up) with one sentence when this many calls in a row failed, or the same call failed this many times.
+ * A call the person denied is their decision, not a failure.
+ */
+export class GoalGuard {
+  /** @param {{limits?: Partial<typeof GUARD_LIMITS>}} [options] */
+  constructor({ limits = {} } = {}) {
+    this.limits = { ...GUARD_LIMITS, ...limits };
+    this.seen = new Set();
+    this.failedInARow = 0; this.failedTotal = 0;
+    this.byCall = new Map();
+    this.reason = null;
+  }
+
+  #fire(reason) { this.reason ??= reason; return this.reason; }
+
+  /** A tool card frame (`agent-tool`), counted once when it has finished. Returns the reason to stop, or null. */
+  card(tool) {
+    if (this.reason || !tool) return this.reason;
+    const done = tool.state === 'done' || tool.state === 'error' || tool.state === 'denied';
+    const id = tool.id ?? tool.callId;
+    if (!done || id === undefined || this.seen.has(id)) return this.reason;
+    this.seen.add(id);
+    if (tool.state === 'denied') return this.reason;
+    if (tool.state !== 'error') { this.failedInARow = 0; return this.reason; }
+    this.failedInARow += 1; this.failedTotal += 1;
+    let key;
+    try { key = `${tool.name}\u0000${JSON.stringify(tool.args ?? null)}`; } catch { key = `${tool.name}\u0000?`; }
+    const same = (this.byCall.get(key) ?? 0) + 1;
+    this.byCall.set(key, same);
+    if (this.failedInARow >= this.limits.goalFailedInARow || same >= this.limits.goalSameFailure) return this.#fire('goal-failures');
+    return this.reason;
+  }
+
+  text() { return this.reason; }
+  context() { return this.reason; }
+  silent() { return this.reason; }
 }

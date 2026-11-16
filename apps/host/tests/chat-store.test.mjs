@@ -1,7 +1,7 @@
 /** Chats as files in the data folder: big chats, restart, a full disk, a refused write, a crash in the middle of a write, two windows. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, statSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, statSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createChatStore, realIo, validChatId, storeFailure } from '../server/chat-store.mjs';
@@ -162,6 +162,76 @@ test('the index is rebuilt from the files when it is lost, damaged or behind; an
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a failed index write after a chat save cannot roll its revision back at restart or lose a stale window conflict', async () => {
+  const dir = scratch();
+  try {
+    let failIndex = false, failures = 0;
+    const store = createChatStore({ dir, io: { ...realIo, async writeFile(path, data) {
+      if (failIndex && path.startsWith(join(dir, 'chats', 'index.json.tmp-'))) {
+        failures++;
+        throw Object.assign(new Error('no room for the index'), { code: 'ENOSPC' });
+      }
+      return realIo.writeFile(path, data);
+    } } });
+    const first = chat('s_index', 2, 10);
+    await store.save(first.id, text(first));
+    failIndex = true;
+    const newer = chat(first.id, 6, 100, { title: 'Saved before the index failed' });
+    assert.equal((await store.save(first.id, text(newer), { baseRev: 1 })).rev, 2);
+    assert.equal(failures, 1, 'only the index write failed');
+    assert.equal(JSON.parse(readFileSync(join(dir, 'chats', 'index.json'), 'utf8')).chats[0].rev, 1, 'the old index is still valid JSON');
+    assert.equal((await readChat(store, first.id)).rev, 2, 'the chat was committed before the index failed');
+
+    const restarted = createChatStore({ dir });
+    const listed = restarted.list().chats[0];
+    assert.equal(restarted.rev(first.id), 2, 'the chat envelope owns its revision');
+    assert.equal(listed.title, newer.title);
+    assert.equal(listed.updatedAt, newer.updatedAt);
+    assert.equal(listed.bytes, statSync(join(dir, 'chats', `${first.id}.json`)).size);
+    assert.deepEqual((await readChat(restarted, first.id)).session, newer);
+    const saved = await restarted.save(first.id, text(first), { baseRev: 1 });
+    assert.equal(saved.rev, 3, 'the revision is never reused after restart');
+    assert.equal(saved.conflict, true, 'the older window still displaces a newer chat');
+    const displaced = JSON.parse(readFileSync(join(dir, 'chats', 'conflicts', `${first.id}.rev2.json`), 'utf8'));
+    assert.deepEqual(displaced.session, newer, 'the newer chat is kept before the older window saves');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an indexed chat that becomes damaged is reported at restart without changing its file', async () => {
+  const dir = scratch();
+  try {
+    const store = createChatStore({ dir });
+    await store.save('s_broken', text(chat('s_broken', 2, 10)));
+    const path = join(dir, 'chats', 's_broken.json'), broken = '{"v":1,"rev":2,"session":';
+    writeFileSync(path, broken);
+    const restarted = createChatStore({ dir });
+    assert.deepEqual(restarted.list().chats, []);
+    assert.deepEqual(restarted.list().damaged, ['s_broken']);
+    assert.equal(readFileSync(path, 'utf8'), broken, 'recovery leaves the damaged chat untouched');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('deleting a damaged chat clears it from the damaged list, so the page can drop the row (#5421)', async () => {
+  const dir = scratch();
+  try {
+    mkdirSync(join(dir, 'chats'));   // the store makes the folder at start; this test hands it a file to read first
+    writeFileSync(join(dir, 'chats', 's_ok.json'), `{"v":1,"rev":1,"savedAt":"2026-11-04T10:00:00.000Z","session":${text(chat('s_ok', 1, 4))}}`);
+    writeFileSync(join(dir, 'chats', 's_bad.json'), '{"v":1,"rev":1,"session":{"id":"s_bad","mess');   // truncated
+    const store = createChatStore({ dir });
+    assert.deepEqual(store.list().damaged, ['s_bad']);
+    const gone = await store.remove('s_bad');
+    assert.equal(gone.removed, false, 'the damaged chat was never in the index');
+    assert.equal(existsSync(join(dir, 'chats', 's_bad.json')), false, 'the file is unlinked');
+    assert.deepEqual(store.list().damaged, [], 'the list forgets the id it just deleted');
+    assert.deepEqual(store.list().chats.map((c) => c.id), ['s_ok'], 'the healthy chat is untouched');
+    assert.equal(JSON.parse(await store.read('s_ok')).session.id, 's_ok');
+    // and the delete is durable: a restart sees one chat and nothing damaged
+    const again = createChatStore({ dir });
+    assert.deepEqual(again.list().damaged, []);
+    assert.deepEqual(again.list().chats.map((c) => c.id), ['s_ok']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('a chat is refused when it does not match its id or is not JSON; delete removes the file and tolerates a chat that is gone', async () => {
   const dir = scratch();
   try {
@@ -187,5 +257,26 @@ test('import: only chats the host does not have are taken, the ones it has are l
     assert.deepEqual(result.skipped, ['s_have']);
     assert.equal(result.failed.length, 2);
     assert.equal((await readChat(store, 's_have')).session.title, 'on the host');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// #5359 review: a start reads only the chats saved since the index was written; an unchanged chat older than the index comes from it.
+test('a chat older than the index with the size it records is taken from the index; a newer or resized one is read', async () => {
+  const dir = scratch();
+  try {
+    const store = createChatStore({ dir });
+    await store.save('s_old', text(chat('s_old', 2, 10)));
+    await store.save('s_size', text(chat('s_size', 2, 10)));
+    const index = join(dir, 'chats', 'index.json'), old = join(dir, 'chats', 's_old.json'), resized = join(dir, 'chats', 's_size.json');
+    const past = new Date(Date.now() - 60_000), now = new Date();
+    // the same size, other bytes, older than the index: a start that read it would report it damaged
+    writeFileSync(old, 'x'.repeat(statSync(old).size)); utimesSync(old, past, past);
+    // older than the index but another size: read, and so reported damaged (nothing is trusted that does not match)
+    writeFileSync(resized, 'y'.repeat(statSync(resized).size + 3)); utimesSync(resized, past, past);
+    utimesSync(index, now, now);
+    const restarted = createChatStore({ dir });
+    assert.deepEqual(restarted.list().chats.map(c => c.id), ['s_old'], 'taken from the index without reading the file');
+    assert.equal(restarted.rev('s_old'), 1);
+    assert.deepEqual(restarted.list().damaged, ['s_size']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

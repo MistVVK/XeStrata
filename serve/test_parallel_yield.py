@@ -3,6 +3,7 @@
 The same fake engine and helpers as serve/test_parallel.py (FakeEngineCase); split out because the whole file took
 about two minutes in one piece."""
 import json
+import queue
 import sys
 import threading
 import time
@@ -16,6 +17,75 @@ from serve import test_parallel as tp
 
 class ParallelServiceYield(tp.FakeEngineCase):
     """Requests that give way to each other, and what happens to a slot when the engine misbehaves."""
+
+    def test_cancelled_slot_keeps_its_next_owners_claim(self):
+        """The BDONE waiter may finish before the cancelled request returns from handing it the slot.
+
+        Adapted from johnfink8/sfnx#16 (MIT, Copyright (c) 2026 John Fink; license terms in LICENSE):
+        finish that wait and let the next owner claim the slot before the previous request's cleanup
+        resumes. No sleeps decide which owner wins.
+        """
+        self.start(2)
+        e = self.engine
+        e.QUARANTINE_S = 1.0                 # a broken fake protocol must not wait the production quarantine
+        with e.slot_cv:
+            e.slot_busy[1] = True
+            e.slot_claims.add(1)
+        request = e.generate_batched(list(b"LONGREPLY please"), 60, {}, threading.Event())
+        received = 0
+        for token in request:
+            received += token is not None
+            if received == 3:
+                break
+        self.assertEqual(e.slot_live[0]["state"], "decoding")
+        claimed = []
+
+        class CompleteThenClaim:
+            def __init__(self, target, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()                         # the real waiter consumes the fake engine's BDONE
+                with e.slot_cv:
+                    claimed.append(not e.slot_busy[0])
+                    e.slot_busy[0] = True
+                    e.slot_claims.add(0)               # the waiting request takes the now-free slot
+
+        with mock.patch.object(tp.server.threading, "Thread", CompleteThenClaim):
+            request.close()
+        self.assertEqual(claimed, [True], "the stopped slot did not reach BDONE and become free")
+        self.assertIn(0, e.slot_claims, "the old request erased the new owner's claim")
+        self.assertTrue(e.slot_busy[0])
+        self.assertNotIn(0, e.slot_releasing)
+
+    def test_a_restart_during_the_release_keeps_the_new_engines_claim(self):
+        """#5657 / #4451: the engine restarts while an old request hands its slot back (between its generation check and
+        the hand-over).  The new engine's request already holds slot 0 in the NEW claim set; the old request's release
+        must not take that claim away, nor mark the new engine's slot as releasing.  No sleeps: the restart is played
+        inside the BSTOP send."""
+        self.start(2)
+        e = self.engine
+        e.QUARANTINE_S = 1.0
+        born = e.gen
+        with e.slot_cv:
+            e.slot_busy[0] = True
+            e.slot_claims.add(0)
+        old = (e.gen, e.slot_q, e.slot_busy, e.slot_held, e.slot_claims, e.slot_releasing)
+        new_claims, new_releasing = {0}, set()
+
+        def bstop_then_restart(line):
+            e.gen = born + 1                                   # restart(): the number first, then the new objects
+            e.slot_q = [queue.Queue(), queue.Queue()]
+            e.slot_busy = [True, False]
+            e.slot_held = [[], []]
+            e.slot_claims, e.slot_releasing = new_claims, new_releasing
+        try:
+            with mock.patch.object(e, "_send", bstop_then_restart):
+                e._release_slot_when_done(0, None, born)
+            self.assertIn(0, new_claims, "the old request's release erased the new engine's claim")
+            self.assertNotIn(0, new_releasing, "the old request's release marked the new engine's slot")
+        finally:
+            e.gen, e.slot_q, e.slot_busy, e.slot_held, e.slot_claims, e.slot_releasing = old
 
     def test_a_long_prompt_gives_way_to_a_short_one(self):
         """#656: a long solo prompt read gives way at a chunk boundary; the short request is answered first, then the

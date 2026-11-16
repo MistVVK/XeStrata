@@ -7080,7 +7080,7 @@ textarea {
 .askcard__details summary { list-style: none; cursor: pointer; padding: 6px 14px; font-size: var(--st-fs-xs); font-weight: 500; color: var(--st-ink-muted); display: flex; align-items: center; gap: 6px; }
 .askcard__details summary::-webkit-details-marker { display: none; }
 .askcard__details[open] summary svg { transform: rotate(180deg); }
-.askcard__details pre { margin: 0 14px 10px; padding: 8px 10px; background: var(--st-code-bg); color: var(--st-code-ink); border-radius: var(--st-r-sm); font: 12px/1.5 var(--st-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.askcard__details pre { margin: 0 14px 10px; padding: 8px 10px; background: var(--st-code-bg); color: var(--st-code-ink); border-radius: var(--st-r-sm); font: 12px/1.5 var(--st-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; }   /* the whole command, scrolled when long (#5856); focusable for the keyboard */
 @media (max-width: 560px) { .askcard__top { flex-wrap: wrap; } .askcard__acts { margin-left: 32px; } }
 
 /* ---- an opened task ---- */

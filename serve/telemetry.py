@@ -23,6 +23,9 @@ import threading
 import time
 
 HISTORY = 60
+# A GP100 (Pascal) reports PCIe traffic of just under 200 GiB/s now and then, even idle: 2^22 KB in NVML's 20 ms window,
+# which reads like the counter stepping back and wrapping.  No link carries it (PCIe 6.0 x16 is under 120 GiB/s).
+PCIE_KB_S_MAX = 150 << 20
 
 
 # ------------------------------------------------------------------------------------------------ NVML
@@ -101,11 +104,18 @@ class _Nvml:
         out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
         out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
         out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
-        rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
-        tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
-        out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
-        out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        # the widest the card itself can go: read beside the negotiated width, so a card capped to x8 in a x16
+        # slot, or trained down to x4 by the board, is visible as the gap instead of looking like an x8 card by choice
+        out["pcie_width_max"] = self._uint("nvmlDeviceGetMaxPcieLinkWidth")
+        out["pcie_rx_mb"] = self._pcie_mb(1)                                             # NVML_PCIE_UTIL_RX_BYTES
+        out["pcie_tx_mb"] = self._pcie_mb(0)
         return out
+
+    def _pcie_mb(self, counter):
+        kb = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(counter))           # KB/s
+        if kb is not None and kb > PCIE_KB_S_MAX:                                        # wrapped: the next read is good
+            kb = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(counter))
+        return kb / 1024.0 if kb is not None and kb <= PCIE_KB_S_MAX else None
 
 
 # ------------------------------------------------------------------------------------------------ AMD (Linux sysfs)
@@ -207,7 +217,8 @@ class _Amd:
         from each hop's `max_link_speed` / `max_link_width` (the capability, so a power-saving downgrade or a Gen3
         slot cannot make it read low).  A card that is Gen4 on its own hop but sits behind a Gen3 root port really
         runs at Gen3, and that is the number a PCIe bandwidth budget needs.
-        `pcie_own_gen` keeps the card's own hop aside: the gap between the two is what a user has to see.
+        `pcie_own_gen` and `pcie_width_max` keep the card's own capability aside: the gap between the two numbers is
+        what a user has to see (a x16 card that only reaches x8).
 
         The bottleneck is only claimed when **every** hop of the path could be read; `pcie_path` reports how many
         of them were ("4/4").  A kernel or a container that hides part of /sys/devices would otherwise drop the
@@ -229,8 +240,14 @@ class _Amd:
         whole = bool(hops) and read == len(hops)
         gen = min(gens) if (whole and gens) else own_gen
         width = min(widths) if (whole and widths) else self._int(os.path.join(own, "current_link_width"))
+        # `pcie_width_max` is the card's own cap (its own hop, kept last by `_hops()`), where `pcie_width` above is
+        # the narrowest hop of the whole path: a card that runs at x8 behind a x8 bridge, or in a slot the board
+        # trained down, reads as the gap instead of looking like an x8 card by choice.  Same split as `pcie_own_gen`.
+        cap = self._int(os.path.join(own, "max_link_width")) if own else None
+        if cap is None and hops:
+            cap = self._int(os.path.join(hops[-1], "max_link_width"))
         return {"pcie_gen": gen, "pcie_gen_max": gen, "pcie_own_gen": own_gen, "pcie_width": width,
-                "pcie_path": "%d/%d" % (read, len(hops))}
+                "pcie_width_max": cap, "pcie_path": "%d/%d" % (read, len(hops))}
 
 
     def read(self):
@@ -532,13 +549,39 @@ class _CpuRamFallback:
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
+# usable bandwidth of one lane per PCIe generation, GB/s (after the line code): only the ORDER matters here
+PCIE_LANE_GBS = {1: 0.25, 2: 0.5, 3: 0.985, 4: 1.969, 5: 3.938, 6: 7.563}
+
+
+def pcie_bottleneck(reads) -> dict | None:
+    """The card whose PCIe link carries the least: lane rate of its generation x its width, all five fields from that ONE card (#5801 #5981),
+    never a link put together from two cards.  The generation is the one the link can reach (pcie_gen_max; the current one when that is
+    not reported), since NVML reports a lower one while a card is idle; the width is the negotiated one.  A card whose generation or
+    width is unknown never wins.  None when no card reports both.  One card: that card."""
+    best = None
+    for index, r in reads:
+        gen = r.get("pcie_gen_max") if r.get("pcie_gen_max") is not None else r.get("pcie_gen")
+        width = r.get("pcie_width")
+        if gen not in PCIE_LANE_GBS or not isinstance(width, (int, float)) or width <= 0:
+            continue
+        rate = PCIE_LANE_GBS[gen] * width
+        if best is None or rate < best[0]:
+            best = (rate, index, r)
+    if best is None:
+        return None
+    _, index, r = best
+    return {"card": index, "gen": r.get("pcie_gen"), "gen_max": r.get("pcie_gen_max"), "width": r.get("pcie_width"),
+            "width_max": r.get("pcie_width_max")}
+
+
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
-        cards, numbered as HIP numbers them, read from sysfs (#301)."""
+        PCIe traffic), mean (load) or hottest (temperature), the PCIe link fields stay card 0's, gpu_pcie_bottleneck names the
+        card with the slowest link (pcie_bottleneck), and "gpus" has each card's own, its link and its power limit included.  `amd`: the
+        AMD backend's cards, numbered as HIP numbers them, read from sysfs (#301)."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
@@ -619,10 +662,18 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
+                # A link is not additive.  The top-level gpu_pcie_* fields stay card 0's reading (their meaning since #112); the card whose
+                # link is the slowest is named apart in gpu_pcie_bottleneck below, and each card's own link is in "gpus".
                 s["gpus"] = [{"index": i, "name": reader.name(), "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
+                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
+                              "power_limit": r.get("power_limit"),
+                              "pcie_gen": r.get("pcie_gen"), "pcie_gen_max": r.get("pcie_gen_max"),
+                              "pcie_width": r.get("pcie_width"), "pcie_width_max": r.get("pcie_width_max"),
+                              "pcie_rx_mb": r.get("pcie_rx_mb"), "pcie_tx_mb": r.get("pcie_tx_mb"),
+                              "pcie_own_gen": r.get("pcie_own_gen"), "pcie_path": r.get("pcie_path")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
+            s["gpu_pcie_bottleneck"] = pcie_bottleneck(reads)
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)
