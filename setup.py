@@ -7693,6 +7693,10 @@ def refresh_draft_vocab(rt: Path, choice: str = "cjk") -> None:
     new, dst = ROOT / "data" / DRAFT_VOCABS.get(choice, "draft_vocab.bin"), rt / "draft_vocab.bin"
     if not new.exists() or not rt.is_dir():
         return
+    # the English subset beside it too: the engine takes it on a card the expert cache leaves short otherwise
+    en, en_dst = ROOT / "data" / DRAFT_VOCABS["en"], rt / "draft_vocab_en.bin"
+    if en.exists() and (not en_dst.exists() or en_dst.read_bytes() != en.read_bytes()):
+        shutil.copyfile(en, en_dst)
     if dst.exists():
         old = hashlib.sha256(dst.read_bytes()).hexdigest()
         shipped = {hashlib.sha256((ROOT / "data" / f).read_bytes()).hexdigest()

@@ -106,7 +106,9 @@ bool copy2d_async(void* dst, size_t dpitch, const void* src, size_t spitch, size
 bool memset(void* dst, int value, size_t bytes);
 bool memset_async(void* dst, int value, size_t bytes, Stream s);
 
-bool mem_info(size_t* free_bytes, size_t* total_bytes);
+/// `short_bytes` (when given): how far the memory in use is past STRATA_VRAM_LIMIT_MIB (0 otherwise), where the free
+/// memory reads 0.
+bool mem_info(size_t* free_bytes, size_t* total_bytes, size_t* short_bytes = nullptr);
 
 /// Virtual memory (sycl_ext_oneapi_virtual_mem; the Level Zero and CUDA adapters, not HIP in intel/llvm 7.1.1): one
 /// address range reserved once and backed by physical segments that can be given back to the driver and taken again,
@@ -178,6 +180,10 @@ bool stream_fork(Stream from, Stream to);
 bool stream_join(Stream into, Stream from);
 bool is_capturing(Stream s);
 bool graph_launch(const Graph* g, Stream s);
+/// Whether a graph with branches may hold a kernel that waits for the host: false where the launch itself submits
+/// the graph's nodes from the host and blocks once its queue is full, so a wait the host serves after the launch
+/// never ends (HIP: the branched graph's nodes go through hip::Graph::RunOneNode, a kernel-argument ring).
+bool graph_branches_may_wait_for_host();
 size_t graph_nodes(const Graph* g);
 /// Destroys a graph after draining the runtime's queues (null is a no-op).
 void graph_destroy(Graph* g);

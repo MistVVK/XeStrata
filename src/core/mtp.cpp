@@ -240,6 +240,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         dense_ = shared->dense_;
         experts_ = shared->experts_;
+        experts_host_ = shared->experts_host_;
         tensors_ = shared->tensors_;
         owns_weights_ = false;
         owns_draft_head_ = false;
@@ -489,13 +490,53 @@ bool int2_allowed(int64_t n_embd) {
 }
 }  // namespace
 
+bool MtpDrafter::experts_to_host(std::string& err) {
+    if (experts_host_) return true;
+    if (!owns_weights_ || experts_ == nullptr || g_ == nullptr) {
+        err = "mtp: no routed experts of its own to move";
+        return false;
+    }
+    const OnDevice on(device_);
+    const uint64_t bytes = (uint64_t) g_->n_expert * strata::kernels::cpu::BLOB;
+    uint8_t* h = nullptr;
+    if (!strata::gpu::alloc_host((void**) &h, bytes)) {
+        err = "mtp: " + std::to_string(bytes >> 20) + " MiB of pinned memory for the routed experts: " +
+              strata::gpu::last_error();
+        return false;
+    }
+    if (!strata::gpu::kernels_read_host(h)) {
+        strata::gpu::free(h);
+        err = "mtp: this GPU's kernels do not read pinned host memory in place";
+        return false;
+    }
+    if (!strata::gpu::copy(h, experts_, bytes)) {
+        strata::gpu::free(h);
+        err = std::string("mtp: the routed experts' copy to pinned memory: ") + strata::gpu::last_error();
+        return false;
+    }
+    strata::gpu::free(experts_);
+    experts_ = h;
+    experts_host_ = true;
+    vram_ -= std::min<uint64_t>(vram_, bytes);
+    return true;
+}
+
+bool MtpDrafter::use_vocab_file(const std::string& name) {
+    if (dhead_ != nullptr || full_head_env()) return false;
+    const int64_t now = DraftSubset::file_tokens(rt_dir_ + "/" + vocab_file_);
+    const int64_t then = DraftSubset::file_tokens(rt_dir_ + "/" + name);
+    if (then <= 0 || (now > 0 && then >= now)) return false;
+    vocab_file_ = name;
+    return true;
+}
+
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
     if (dhead_ == nullptr && owns_draft_head_ && !full_head_env())
-        bytes += (uint64_t) DraftSubset::file_tokens(rt_dir_ + "/draft_vocab.bin") * (head_row_bytes + 4);
+        bytes += (uint64_t) DraftSubset::file_tokens(rt_dir_ + "/" + vocab_file_) * (head_row_bytes + 4);
     // the draft head at 2 bits, an upper bound (it is dropped again where it does not measure faster)
     if (int2_ == nullptr && owns_draft_head_ && !coupled_draft_env() && g_ != nullptr && int2_allowed(g_->n_embd)) {
-        const int64_t sub = full_head_env() ? 0 : DraftSubset::file_tokens(rt_dir_ + "/draft_vocab.bin");
+        const int64_t sub = full_head_env() ? 0 : DraftSubset::file_tokens(rt_dir_ + "/" + vocab_file_);
         const int64_t rows = sub > 0 ? sub : n_vocab;
         constexpr int kMaxCand = strata::kernels::kTopKMax;
         bytes += (uint64_t) rows * strata::kernels::int2_row_bytes((int) g_->n_embd) +
@@ -595,7 +636,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         owns_draft_head_ = false;
     }
     // the draft head's token subset, when tools/draft_vocab.py wrote one (the shared part: core/draft_head)
-    const std::string vocab = rt_dir_ + "/draft_vocab.bin";
+    const std::string vocab = rt_dir_ + "/" + vocab_file_;
     if (dhead_ == nullptr && shared == nullptr && !full_head_env() && DraftSubset::file_tokens(vocab) > 0) {
         auto sub = std::make_shared<DraftSubset>();
         if (!sub->load(vocab, n_vocab_, head->weights(), head->row_bytes(), nullptr, "xestrata mtp", err)) return false;

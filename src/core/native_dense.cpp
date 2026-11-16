@@ -209,11 +209,94 @@ NativeDense::~NativeDense() {
     if (scratch_) strata::gpu::free(scratch_);
     for (void* p : weights_) strata::gpu::free(p);
     for (void* p : hc_q8_) strata::gpu::free(p);
+    if (hc_q8_host_) strata::gpu::free(hc_q8_host_);
+    for (void* p : host_) strata::gpu::free(p);
     if (hc_side_)
         for (void*& p : g_hc_scratch) { strata::gpu::free(p); p = nullptr; }
 }
 
 bool NativeDense::hc_q8_wanted() { return hc_q8_requested(); }
+
+namespace {
+// the layer of a "blk.N." row, -1 for another
+int row_layer(const std::string& name) {
+    if (name.rfind("blk.", 0) != 0) return -1;
+    char* end = nullptr;
+    const long l = std::strtol(name.c_str() + 4, &end, 10);
+    return end != nullptr && *end == '.' ? (int) l : -1;
+}
+}  // namespace
+
+uint64_t NativeDense::layer_device_bytes(const WeightTable& table, int layer) const {
+    uint64_t b = 0;
+    for (const auto& [name, ref] : table.table_) {
+        if (ref.native_data == nullptr || row_layer(name) != layer) continue;
+        for (size_t i = 0; i < weights_.size(); ++i)
+            if (weights_[i] == ref.native_data) b += weight_bytes_[i];
+    }
+    return b;
+}
+
+bool NativeDense::layer_to_host(WeightTable& table, int layer, std::string& err) {
+    for (auto& [name, ref] : table.table_) {
+        if (ref.native_data == nullptr || row_layer(name) != layer) continue;
+        size_t i = 0;
+        while (i < weights_.size() && weights_[i] != ref.native_data) ++i;
+        if (i == weights_.size()) continue;   // not this table's upload (already in pinned memory)
+        void* h = nullptr;
+        if (!strata::gpu::alloc_host(&h, weight_bytes_[i]) || !strata::gpu::kernels_read_host(h) ||
+            !strata::gpu::copy(h, weights_[i], weight_bytes_[i])) {
+            if (h != nullptr) strata::gpu::free(h);
+            err = "layer " + std::to_string(layer) + "'s projections to pinned memory: " + strata::gpu::last_error();
+            return false;
+        }
+        for (auto& kv : table.table_)   // every row that reads these bytes
+            if (kv.second.native_data == weights_[i]) kv.second.native_data = h;
+        strata::gpu::free(weights_[i]);
+        weights_[i] = nullptr;
+        host_.push_back(h);
+        bytes_ -= std::min(bytes_, weight_bytes_[i]);
+    }
+    return true;
+}
+
+bool NativeDense::hc_q8_to_host(std::string& err) {
+    if (hc_q8_host_ != nullptr || hc_q8_.empty()) return true;
+    // each copy at a 256-byte boundary, as its device allocation was
+    auto bytes_of = [](const WeightRef* r) { return (uint64_t) r->ne0 / 32 * 34 * (uint64_t) r->ne1; };
+    uint64_t total = 0;
+    for (const WeightRef* r : hc_q8_refs_) total += (bytes_of(r) + 255) / 256 * 256;
+    uint8_t* h = nullptr;
+    if (!strata::gpu::alloc_host((void**) &h, total)) {
+        err = "the hyper-connection projections: " + std::to_string(total >> 20) + " MiB of pinned memory: " +
+              strata::gpu::last_error();
+        return false;
+    }
+    if (!strata::gpu::kernels_read_host(h)) {
+        strata::gpu::free(h);
+        err = "the hyper-connection projections: this GPU's kernels do not read pinned host memory in place";
+        return false;
+    }
+    std::vector<uint8_t*> at(hc_q8_.size());
+    uint64_t off = 0;
+    for (size_t i = 0; i < hc_q8_.size(); ++i) {
+        at[i] = h + off;
+        if (!strata::gpu::copy(at[i], hc_q8_[i], bytes_of(hc_q8_refs_[i]))) {
+            strata::gpu::free(h);
+            err = std::string("the hyper-connection projections' copy to pinned memory: ") + strata::gpu::last_error();
+            return false;
+        }
+        off += (bytes_of(hc_q8_refs_[i]) + 255) / 256 * 256;
+    }
+    for (size_t i = 0; i < hc_q8_.size(); ++i) {
+        hc_q8_refs_[i]->hc_q8 = at[i];
+        strata::gpu::free(hc_q8_[i]);
+    }
+    hc_q8_.clear();
+    hc_q8_host_ = h;
+    bytes_ -= std::min(bytes_, hc_q8_bytes_);
+    return true;
+}
 
 bool NativeDense::hc_side_names(const std::string& pack_dir, std::set<std::string>& hc, std::set<std::string>& others,
                                 std::string& err) {
@@ -517,12 +600,15 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();
             weights_.push_back(item.data.release());
+            weight_bytes_.push_back(item.bytes);
         }
         scratch_ = scratch.release();
         for (auto& [ref, data] : hc_q8) {
             ref->hc_q8 = data.get();
             hc_q8_.push_back(data.release());
+            hc_q8_refs_.push_back(ref);
         }
+        hc_q8_bytes_ = hc_q8_bytes;
         bytes_ = total + hc_q8_bytes;
         if (strata::core::manifest::enabled()) {   // upstream 89f4fa18: whether the hyper-connection rows were copied, and why
             const char* v = strata::env_get("HC_Q8");
