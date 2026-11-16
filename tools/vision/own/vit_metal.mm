@@ -9,6 +9,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include "vit_f16.h"
 #include "vit_gpu.h"
 #include "vit_metal_src.h"     // generated at build time: kVitMetalSrc, kVitMetalMppSrc
 
@@ -29,7 +30,10 @@ namespace strata_vit {
 
 namespace {
 
-enum Kind { K_F32 = 0, K_F16 = 1, K_BF16 = 2 };
+// K_HF: a BF16 matrix held as F16 with its inputs written as F16 (clamped to +-65,504), the default for BF16 matrices as on CUDA / HIP (vit_gpu.cu, 11-14):
+// BF16's 7-bit mantissa on the inputs left the Qwen3.8 reader at cosine 0.998058 against the float32 reference on code4217.png (M5 Max, 11-16), F16's 10 bits
+// do not.  A matrix with a weight beyond F16's range stays K_BF16.
+enum Kind { K_F32 = 0, K_F16 = 1, K_BF16 = 2, K_HF = 3 };
 
 struct DevW {            // a weight matrix [rows = out][cols = in] on the device
     id<MTLBuffer> b = nil;
@@ -120,6 +124,9 @@ struct VitGpuImpl {
     int align_for(size_t n) const { return q_align ? q_align : n > 16384 ? 64 : 1; }
     size_t padded(size_t n) const { const size_t p = (size_t) pad_for(n); return (n + p - 1) / p * p; }
     bool round_out = false;
+    // BF16 matrices: BF16_TO_F16 (K_HF) by default; STRATA_VIT_BF16_AS_F16=0 (a diagnostic) keeps them BF16 as stored.  The BF16-rounded kind (1) of the
+    // CUDA / HIP tower has no Metal kernel: 1 reads as 0 here.
+    int bf16_mode = BF16_TO_F16;
 
     ~VitGpuImpl() { finish(); }
 
@@ -150,9 +157,18 @@ struct VitGpuImpl {
         w.rows = (int) t->ne[1];
         const size_t n = (size_t) t->nelem();
         std::vector<uint16_t> raw(n);
-        if (t->type == GT_F16 || t->type == GT_BF16) {        // as stored
+        if (t->type == GT_F16 || t->type == GT_BF16) {        // as stored; a BF16 matrix as F16 (K_HF) unless a weight is beyond F16's range
             if (!gg.read_raw(*t, raw.data(), err)) return false;
             w.kind = t->type == GT_F16 ? K_F16 : K_BF16;
+            if (w.kind == K_BF16 && bf16_mode == BF16_TO_F16 && bf16_matrix_fits_f16(bf16_count_beyond_f16(raw.data(), (long long) n))) {
+                w.kind = K_HF;
+                for (size_t i = 0; i < n; ++i) {           // BF16 -> float32 (exact) -> F16, round to nearest even
+                    const uint32_t u = (uint32_t) raw[i] << 16;
+                    float f;
+                    std::memcpy(&f, &u, 4);
+                    raw[i] = host_f32_to_f16(f);
+                }
+            }
         } else {                                                // F32 -> BF16, Q8_0 -> F16
             std::vector<float> f(n);
             if (!gg.read_f32(*t, f.data(), err)) return false;
@@ -236,13 +252,14 @@ struct VitGpuImpl {
     }
     // y[M][w.rows] (float32) = A[M][K] (w's kind) * w^T
     void wgemm(const DevW& w, BO A, int M, BO y) {
-        const char* plain = w.kind == K_F16 ? "vk_gemm_f16" : "vk_gemm_bf16";
+        const bool f16 = w.kind == K_F16 || w.kind == K_HF;     // K_HF: F16 weights and F16 inputs, the F16 products
+        const char* plain = f16 ? "vk_gemm_f16" : "vk_gemm_bf16";
         const char* mpp = nullptr;
-        if (w.kind == K_F16 && mpp_f16) mpp = M >= 128 ? "vm_gemm_f16_128" : "vm_gemm_f16_64";
+        if (f16 && mpp_f16) mpp = M >= 128 ? "vm_gemm_f16_128" : "vm_gemm_f16_64";
         if (w.kind == K_BF16 && mpp_bf16) mpp = M >= 128 ? "vm_gemm_bf16_128" : "vm_gemm_bf16_64";
         gemm(plain, mpp, A, BO(w.b), y, M, w.cols, w.rows, w.cols, w.cols, w.rows, 0, 0, 0, 1, M >= 128 ? 128 : 64);
         if (round_out) {
-            const EltArgs e{(uint64_t) M * w.rows, (int32_t) w.kind, 0};
+            const EltArgs e{(uint64_t) M * w.rows, (int32_t) w.kind, 0};     // (K_HF rounds to BF16 here, as vit_gpu.cu's k_round does)
             go("vk_round", {y}, &e, sizeof e, MTLSizeMake(blocks_for(e.n), 1, 1), 256);
         }
     }
@@ -425,6 +442,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
         m.bytes = m.work_bytes = 0;
         footprint_note("kernels compiled, self-test done");
         // the patch embedding: the two temporal taps summed, kept in float32 (a small matrix)
+        m.bf16_mode = vit_gpu_bf16_mode(std::getenv("STRATA_VIT_BF16_AS_F16"), BF16_TO_F16) == BF16_TO_F16 ? BF16_TO_F16 : BF16_STORED;     // before the matrices are uploaded
         {
             const GgufTensorInfo* t0 = gg.tensor("v.patch_embd.weight");
             if (!t0) { err = "the mmproj file lacks v.patch_embd.weight"; return false; }

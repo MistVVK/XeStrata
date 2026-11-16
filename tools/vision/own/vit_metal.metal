@@ -7,9 +7,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// the 16-bit kinds (vit_metal.mm's Kind): 0 float32, 1 F16, 2 BF16
+// the 16-bit kinds (vit_metal.mm's Kind): 0 float32, 1 F16, 2 BF16, 3 a BF16 matrix held as F16 with its inputs written as F16 (clamped to +-65,504)
 constant int K_F32 = 0;
 constant int K_F16 = 1;
+constant int K_HF = 3;
 
 inline ushort f_to_bf16(float f) {       // round to nearest even; NaN stays NaN
     uint u = as_type<uint>(f);
@@ -24,6 +25,7 @@ inline float f16bits_to_f(ushort h) { return float(as_type<half>(h)); }
 inline void store_kind(device void* out, ulong i, float v, int kind) {
     if (kind == K_F32) ((device float*) out)[i] = v;
     else if (kind == K_F16) ((device ushort*) out)[i] = f_to_f16bits(v);
+    else if (kind == K_HF) ((device ushort*) out)[i] = f_to_f16bits(v > 65504.0f ? 65504.0f : v < -65504.0f ? -65504.0f : v);   // NaN stays NaN (vit_f16.h f16_clamp)
     else ((device ushort*) out)[i] = f_to_bf16(v);
 }
 
