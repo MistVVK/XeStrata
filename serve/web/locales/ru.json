@@ -24,7 +24,7 @@
   "chat.projectionOn": "проекция включена",
   "chat.stopped": "Остановлено",
   "chat.stoppedLower": "остановлено",
-  "chat.tokens": "{n} токенов",
+  "chat.tokens": {"one": "{n} токен", "few": "{n} токена", "many": "{n} токенов", "other": "{n} токена"},
   "chat.toolCalls": {"one": "{n} вызов инструмента", "few": "{n} вызова инструмента", "many": "{n} вызовов инструмента", "other": "{n} вызова инструмента"},
   "chat.toolLimit": "остановлено на пределе в {n} раундов инструментов (mcp.max_rounds)",
   "chat.untitled": "Новый чат",

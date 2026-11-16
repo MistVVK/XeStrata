@@ -24,7 +24,7 @@
   "chat.projectionOn": "프로젝션 켜짐",
   "chat.stopped": "중지됨",
   "chat.stoppedLower": "중지됨",
-  "chat.tokens": "토큰 {n}개",
+  "chat.tokens": {"other": "토큰 {n}개"},
   "chat.toolCalls": {"other": "도구 호출 {n}회"},
   "chat.toolLimit": "도구 라운드 한도 {n}회에서 중지됨 (mcp.max_rounds)",
   "chat.untitled": "새 채팅",

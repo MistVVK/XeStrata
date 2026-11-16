@@ -24,7 +24,7 @@
   "chat.projectionOn": "projeção ativada",
   "chat.stopped": "Parada",
   "chat.stoppedLower": "parada",
-  "chat.tokens": "{n} tokens",
+  "chat.tokens": {"one": "{n} token", "other": "{n} tokens"},
   "chat.toolCalls": {"one": "{n} chamada de ferramenta", "other": "{n} chamadas de ferramenta"},
   "chat.toolLimit": "parada no limite de {n} rodadas de ferramentas (mcp.max_rounds)",
   "chat.untitled": "Novo chat",

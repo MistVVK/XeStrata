@@ -24,7 +24,7 @@
   "chat.projectionOn": "プロジェクションオン",
   "chat.stopped": "停止しました",
   "chat.stoppedLower": "停止",
-  "chat.tokens": "{n} トークン",
+  "chat.tokens": {"other": "{n} トークン"},
   "chat.toolCalls": {"other": "ツール呼び出し {n} 回"},
   "chat.toolLimit": "ツールのラウンド上限 {n} 回で停止 (mcp.max_rounds)",
   "chat.untitled": "新しいチャット",

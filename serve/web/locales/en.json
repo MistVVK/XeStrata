@@ -24,7 +24,10 @@
   "chat.projectionOn": "projection on",
   "chat.stopped": "Stopped",
   "chat.stoppedLower": "stopped",
-  "chat.tokens": "{n} tokens",
+  "chat.tokens": {
+    "one": "{n} token",
+    "other": "{n} tokens"
+  },
   "chat.toolCalls": {
     "one": "{n} tool call",
     "other": "{n} tool calls"

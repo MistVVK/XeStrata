@@ -24,7 +24,7 @@
   "chat.projectionOn": "投影开启",
   "chat.stopped": "已停止",
   "chat.stoppedLower": "已停止",
-  "chat.tokens": "{n} 个 token",
+  "chat.tokens": {"other": "{n} 个 token"},
   "chat.toolCalls": {"other": "{n} 次工具调用"},
   "chat.toolLimit": "已在 {n} 轮工具调用的上限处停止 (mcp.max_rounds)",
   "chat.untitled": "新聊天",
