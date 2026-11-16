@@ -102,7 +102,7 @@ test('a page that comes back asks which chats have a turn running; with none, th
   const home = await mkdtemp(join(tmpdir(), 'strata-chats-active-'));
   const h = await startHost(home);
   try {
-    assert.deepEqual(await (await fetch(`${h.base}/api/chat/active`)).json(), { turns: [] });
+    assert.deepEqual(await (await fetch(`${h.base}/api/chat/active`)).json(), { turns: [], woken: [] });
     const none = await fetch(`${h.base}/api/chat/attach`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 's_nothing', requestId: 'req-1' }) });
     assert.equal(none.status, 404);
     assert.equal((await none.json()).code, 'no-turn');

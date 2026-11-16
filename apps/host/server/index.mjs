@@ -206,6 +206,7 @@ const agent = createAgentBridge({
   engineProgress: instanceId => engineProgressMark(native.readyInstances().find(i => i.id === instanceId)),
   onPlan: (chatId, event, plan) => hub.send('plan', { chatId, event, plan }),
   onQueue: (chatId, queue) => hub.send('queue', { chatId, queue }),
+  onWake: (chatId, requestId) => hub.send('chat-wake', { chatId, requestId }),
   dataDir: store.DATA_DIR,
   componentsDir: componentsDirectory(),
   // The installer ships the Harness next to the host (<install>/host/server -> <install>/harness).
@@ -1992,7 +1993,7 @@ async function api(req, res, path, method, url) {
   /* A page that has just loaded asks which chats have a turn running (a reload does not stop a turn), and takes one over again: the catch-up
      of what was said while no page was there, then the live frames, as on /api/chat/stream. A turn that ended while the page was away
      (the page names it by requestId) is sent once, whole. 404 when there is nothing to take over. */
-  if (path === '/api/chat/active' && method === 'GET') return json(res, 200, { turns: agent.runningTurns() });
+  if (path === '/api/chat/active' && method === 'GET') return json(res, 200, { turns: agent.runningTurns(), woken: agent.wokenTurns() });
   if (path === '/api/chat/attach' && method === 'POST') {
     const b = await readBody(req);
     if (typeof b.sessionId !== 'string' || !b.sessionId) return error(res, 400, 'sessionId is required');

@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildProfile, outputBudget, routeFor, ASSUMED_API_CONTEXT } from '../server/agent/profile.mjs';
 import { agentEnvironment, redact } from '../server/agent/harness-runtime.mjs';
-import { TurnProjector, presentTool, toolScope, toolVerb, friendlyFailure } from '../server/agent/events.mjs';
+import { TurnProjector, presentTool, toolScope, toolVerb, friendlyFailure, baselineItems } from '../server/agent/events.mjs';
 import { withEarlierConversation } from '../server/agent/agent-bridge.mjs';
 
 const local = [{ id: 'inst-1', label: 'Qwen', baseUrl: 'http://127.0.0.1:8095/v1', modelId: 'qwen', context: 32768, key: 'local-secret-key-1' }];
@@ -120,6 +120,52 @@ test('a text the live frames missed is completed from the committed message, onc
   const out = p.consume(ev('assistant/message', { message: { content: [{ type: 'text', text: 'Hello there' }] } }));
   assert.deepEqual(out, [{ type: 'delta', text: 'lo there' }]);
   assert.deepEqual(p.consume(ev('assistant/message', { message: { content: [{ type: 'text', text: 'Hello there' }] } })), []);
+});
+
+test('a turn followed after it began shows a committed reply no live frame carried, once; an ordinary turn does not', () => {
+  const said = { message: { content: [{ type: 'text', text: 'The job finished and printed 42.' }] } };
+  const late = new TurnProjector({ catchUp: true });
+  assert.deepEqual(late.consume(ev('assistant/message', said)), [{ type: 'delta', text: 'The job finished and printed 42.' }]);
+  assert.equal(late.emittedAny, true, 'it counts as written, so the turn guard does not call the turn silent');
+  // The next step is heard live: its committed message adds nothing (the bridge itself drops an event it has seen, by seq).
+  assert.deepEqual(late.consume({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'a:2', chunk: { type: 'text-delta', index: 0, text: ' Done.' } } }), [{ type: 'delta', text: ' Done.' }]);
+  assert.deepEqual(late.consume(ev('assistant/message', { message: { content: [{ type: 'text', text: ' Done.' }] } }, 2)), [], 'and nothing twice');
+  // An ordinary turn hears its reply live from the start: a committed message with no live text is not repeated as new.
+  assert.deepEqual(new TurnProjector().consume(ev('assistant/message', said)), []);
+});
+
+test('the snapshot baseline of a reply in progress becomes the live pieces, and the committed reply adds only the rest', () => {
+  const baseline = { revision: 4, activeAttempt: { attemptId: 'att-9', startedAfterSeq: 12, turn: 2, step: 1, nextIndex: 6, stream: [
+    { type: 'reasoning-chunks', time0: 1, index: 0, dt: [1], texts: ['Reading ', 'the log.'] },
+    { type: 'text-chunks', time0: 3, index: 1, dt: [1], texts: ['The job ', 'finished'] },
+    { type: 'tool-call-chunks', time0: 5, index: 2, dt: [1], id: 'call-1', name: 'write', args: ['{"file_path":', '"out.txt"}'] },
+    { type: 'chunk', time: 7, chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 4 } } },
+  ] } };
+  const items = baselineItems(baseline);
+  assert.ok(items.every(i => i.type === 'assistant-stream' && i.frame.type === 'chunk' && i.frame.attemptId === 'att-9'));
+  assert.deepEqual(items.map(i => i.frame.chunk), [
+    { type: 'reasoning-delta', index: 0, text: 'Reading ' },
+    { type: 'reasoning-delta', index: 0, text: 'the log.' },
+    { type: 'text-delta', index: 1, text: 'The job ' },
+    { type: 'text-delta', index: 1, text: 'finished' },
+    { type: 'tool-call-delta', index: 2, id: 'call-1', name: 'write', argumentsDelta: '{"file_path":' },
+    { type: 'tool-call-delta', index: 2, id: 'call-1', argumentsDelta: '"out.txt"}' },
+    { type: 'usage', usage: { inputTokens: 10, outputTokens: 4 } },
+  ]);
+
+  const p = new TurnProjector({ catchUp: true });
+  const out = items.flatMap(i => p.consume(i));
+  assert.equal(out.filter(f => f.type === 'delta').map(f => f.text).join(''), 'The job finished');
+  assert.equal(out.filter(f => f.type === 'reasoning').map(f => f.text).join(''), 'Reading the log.');
+  // The rest arrives live under the same attempt, then the committed reply: nothing is shown twice.
+  p.consume({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'att-9', chunk: { type: 'text-delta', index: 1, text: ' and printed 42.' } } });
+  assert.deepEqual(p.consume(ev('assistant/message', { message: { content: [{ type: 'text', text: 'The job finished and printed 42.' }] } })), []);
+});
+
+test('a snapshot with no reply in progress, or none at all, gives nothing', () => {
+  assert.deepEqual(baselineItems(undefined), []);
+  assert.deepEqual(baselineItems({ revision: 3 }), []);
+  assert.deepEqual(baselineItems({ revision: 3, activeAttempt: { attemptId: 'a', stream: [] } }), []);
 });
 
 test('tool scopes and previews', () => {
