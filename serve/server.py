@@ -837,6 +837,13 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # #6081: a park the cache refused, by reason (the engine's "skip parking (...)" / "allocation failed" lines; a
+    # "skipped N tokens" line is put()'s refusal).  The first match names the reason; any other text is the size
+    # estimate's own error ("estimate").
+    SKIP = re.compile(r"conversation cache: (?:skip parking \((.*)\)|allocation failed; skip parking)")
+    REASONS = (("gave no memory back", "ram_no_progress"), ("physical RAM admission", "ram_floor"),
+               ("RAM floor after capture", "ram_after_capture"), ("exceeds available budget", "budget"),
+               ("below the", "short"), ("stage CUDA", "estimate"))
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -846,13 +853,21 @@ class ConvCacheLog:
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None, "refused": {}, "refused_total": 0, "last_refused": None}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it.  One poll at a
         time: a second one moved `pos` between the size check and the seek and raised ValueError (negative seek)."""
         with self.lock:
-            return self._poll(path, start)
+            st = self._poll(path, start)
+            st["refused"] = dict(st["refused"])         # a copy: the caller's view does not move with later polls
+            return st
+
+    def _refused(self, reason: str) -> None:
+        st = self.state
+        st["refused"][reason] = st["refused"].get(reason, 0) + 1
+        st["refused_total"] += 1
+        st["last_refused"] = reason
 
     def _poll(self, path, start) -> dict:
         if not path or start is None:
@@ -886,10 +901,20 @@ class ConvCacheLog:
                 if m.group(1) != "skipped":
                     st["parks" if m.group(1) == "parked" else "restores"] += 1
                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
+                else:
+                    self._refused("put")
                 continue
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+                continue
+            m = self.SKIP.search(line)
+            if m:
+                text = m.group(1)
+                if text is None:
+                    self._refused("alloc")
+                else:
+                    self._refused(next((r for k, r in self.REASONS if k in text), "estimate" if text else "other"))
         return dict(self.state)
 
 
@@ -5866,8 +5891,18 @@ class Service:
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
-        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
-                       for name, kind, help_, value in rows)
+        # #6081: the conversation cache from the engine's log: parks, restores, evictions and the refused parks by reason
+        cc = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        rows += [
+            ("strata:conversation_cache_parked", "gauge", "Conversations parked now", cc["parked"]),
+            ("strata:conversation_cache_parks_total", "counter", "Conversations parked", cc["parks"]),
+            ("strata:conversation_cache_restores_total", "counter", "Parked conversations restored", cc["restores"]),
+            ("strata:conversation_cache_evictions_total", "counter", "Parked conversations evicted", cc["evictions"]),
+        ]
+        refused = "strata:conversation_cache_refused_total"
+        return ("".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n" for name, kind, help_, value in rows) +
+                f"# HELP {refused} Conversations the cache did not park, by reason\n# TYPE {refused} counter\n" +
+                "".join(f'{refused}{{reason="{r}"}} {n}\n' for r, n in sorted(cc["refused"].items())))
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
