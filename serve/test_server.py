@@ -6728,7 +6728,9 @@ class OpenAIChunksTerminal(unittest.TestCase):
     def test_a_cancelled_run_that_stops_early_is_not_an_error(self):
         gone = threading.Event()
         gone.set()                                   # the client left: nobody reads the end
-        self.assertEqual(len(self.chunks([], cancel=gone)), 1)
+        # #4758: the role chunk goes out with the first data, and a run that stopped before any has none: no chunk
+        # at all, and no error either
+        self.assertEqual(self.chunks([], cancel=gone), [])
 
 
 
