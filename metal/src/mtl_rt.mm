@@ -297,17 +297,23 @@ void require_fit(const Pipeline& p, uint32_t threads, const char* where) {
 }
 
 Buffer Context::alloc(size_t bytes) {
-    id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    if (!b) {
-        std::fprintf(stderr, "mtl: alloc %zu failed\n", bytes);
-        std::exit(4);
-    }
-    std::memset([b contents], 0, bytes);
-    impl_->track(b);
-    allocated_ += bytes;
+    // Metal returns the new buffer with one more reference parked in the calling thread's autorelease pool.  The engine's host
+    // threads have no pool (only Context::run opens one), so that reference was never given back: every buffer made here lived for
+    // the rest of the process, free() or not (a 16 KB job array per expert matvec, ~90K a request: +1.3 GB and a slower queue every
+    // call, 16 -> 3 tok/s after a few requests on a big Mac).
     Buffer r;
-    r.handle = (__bridge_retained void*)b;
-    r.ptr = [b contents];
+    @autoreleasepool {
+        id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!b) {
+            std::fprintf(stderr, "mtl: alloc %zu failed\n", bytes);
+            std::exit(4);
+        }
+        std::memset([b contents], 0, bytes);
+        impl_->track(b);
+        r.handle = (__bridge_retained void*)b;
+        r.ptr = [b contents];
+    }
+    allocated_ += bytes;
     r.bytes = bytes;
     return r;
 }
@@ -326,14 +332,16 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
     r.stride = maxlen - span;
     for (size_t base = 0; base < bytes; base += r.stride) {
         const size_t len = std::min(maxlen, (bytes - base + pg - 1) / pg * pg);
-        id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(uint8_t*) p + base length:len
-                                                        options:MTLResourceStorageModeShared deallocator:nil];
-        if (!b) {
-            std::fprintf(stderr, "mtl: wrap chunk %zu+%zu failed\n", base, len);
-            std::exit(4);
+        @autoreleasepool {   // as in alloc()
+            id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(uint8_t*) p + base length:len
+                                                            options:MTLResourceStorageModeShared deallocator:nil];
+            if (!b) {
+                std::fprintf(stderr, "mtl: wrap chunk %zu+%zu failed\n", base, len);
+                std::exit(4);
+            }
+            impl_->track(b);
+            r.chunks->push_back((__bridge_retained void*)b);
         }
-        impl_->track(b);
-        r.chunks->push_back((__bridge_retained void*)b);
         if (base + len >= bytes) break;
     }
     allocated_ += bytes;
@@ -351,14 +359,16 @@ Buffer Context::wrap_ranges(void* p, const std::vector<std::pair<size_t, size_t>
     r.starts = std::make_shared<std::vector<size_t>>();
     size_t total = 0;
     for (const auto& rg : ranges) {
-        id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(uint8_t*) p + rg.first length:rg.second - rg.first
-                                                        options:MTLResourceStorageModeShared deallocator:nil];
-        if (!b) {
-            std::fprintf(stderr, "mtl: wrap range %zu+%zu failed\n", rg.first, rg.second - rg.first);
-            std::exit(4);
+        @autoreleasepool {   // as in alloc()
+            id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(uint8_t*) p + rg.first length:rg.second - rg.first
+                                                            options:MTLResourceStorageModeShared deallocator:nil];
+            if (!b) {
+                std::fprintf(stderr, "mtl: wrap range %zu+%zu failed\n", rg.first, rg.second - rg.first);
+                std::exit(4);
+            }
+            impl_->track(b);   // (the #6078 keep-alive names it like every other buffer of the context)
+            r.chunks->push_back((__bridge_retained void*)b);
         }
-        impl_->track(b);   // (the #6078 keep-alive names it like every other buffer of the context)
-        r.chunks->push_back((__bridge_retained void*)b);
         r.starts->push_back(rg.first);
         total += rg.second - rg.first;
     }
@@ -371,15 +381,17 @@ Buffer Context::wrap_ranges(void* p, const std::vector<std::pair<size_t, size_t>
 }
 
 Buffer Context::wrap(void* p, size_t bytes) {
-    id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:p length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-    if (!b) {
-        std::fprintf(stderr, "mtl: wrap %zu failed\n", bytes);
-        std::exit(4);
-    }
-    impl_->track(b);
-    allocated_ += bytes;
     Buffer r;
-    r.handle = (__bridge_retained void*)b;
+    @autoreleasepool {   // (see alloc: the engine's host threads have no pool of their own)
+        id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:p length:bytes options:MTLResourceStorageModeShared deallocator:nil];
+        if (!b) {
+            std::fprintf(stderr, "mtl: wrap %zu failed\n", bytes);
+            std::exit(4);
+        }
+        impl_->track(b);
+        r.handle = (__bridge_retained void*)b;
+    }
+    allocated_ += bytes;
     r.ptr = p;
     r.bytes = bytes;
     return r;
