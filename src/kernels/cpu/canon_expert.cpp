@@ -37,7 +37,6 @@ namespace {
 namespace canon = strata::kernels::canon;
 
 inline float h2f(ggml_half h) { return _cvtsh_ss(h); }
-inline ggml_half f2h(float f) { return _cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT); }
 
 // The CPU's form of a canonical activation of n values with a scale for each `group` (the same values as the GPU's
 // q8_1 blocks, laid out for aligned loads): the scales as floats (the fp16 value), each 32 values' integer sum (Q2_0's
@@ -362,7 +361,7 @@ void canon_quant(const float* x, int64_t n, int group, void* dst, CanonOrder ord
                 amax = a > amax ? a : amax;
             }
             const float d = canon::q8_scale(amax), id = canon::q8_inv(d);
-            ds[g0 / group] = h2f(f2h(d));   // the fp16 value the GPU's blocks hold
+            ds[g0 / group] = canon::f16_value(d);   // the fp16 value the GPU's blocks hold
             for (int i = 0; i < group; ++i) {
                 const int8_t v = canon::q8_value(x[g0 + i], id);
                 q[act_pos(g0 + i, order, n)] = v;
@@ -388,7 +387,7 @@ void canon_quant(const float* x, int64_t n, int group, void* dst, CanonOrder ord
         h = _mm_max_ss(h, _mm_shuffle_ps(h, h, 1));
         const float amax = _mm_cvtss_f32(h);
         const float d = canon::q8_scale(amax), id = canon::q8_inv(d);
-        ds[g0 / group] = h2f(f2h(d));   // the fp16 value the GPU's blocks hold
+        ds[g0 / group] = canon::f16_value(d);   // the fp16 value the GPU's blocks hold
         const __m256 vid = _mm256_set1_ps(id);
         int8_t* out = order == CanonOrder::plain ? q + g0 : tmp;
         for (int i = 0; i < group; i += 32) {

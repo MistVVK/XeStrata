@@ -172,7 +172,7 @@ struct Rows {
             const int64_t row = row_of(r, k);
             for (int e = 0; e < rep; ++e) {
                 const int64_t ob = row * onb + c * rep + e;
-                xs[ob] = HALF_D ? (float) sycl::half(d) : d;
+                xs[ob] = HALF_D ? canon::f16_value(d) : d;
                 if constexpr (SUMS) xu[ob] = d * (float) qsum;
             }
         }
