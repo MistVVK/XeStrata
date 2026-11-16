@@ -36,7 +36,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from serve import image_aux
 from serve import images as img
@@ -327,7 +327,8 @@ def florence_polygons(text: str, W: int, H: int) -> list[list[list[float]]]:
                 continue
         if len(stretch) >= 4:
             if {"poly", "/poly"} <= {m for m, _ in stretch}:
-                parts, part = [], None
+                parts: list[list[tuple[str, int | None]]] = []
+                part: list[tuple[str, int | None]] | None = None
                 for m in stretch:
                     if part is None:
                         part = [] if m[0] == "poly" else None
@@ -340,11 +341,11 @@ def florence_polygons(text: str, W: int, H: int) -> list[list[list[float]]]:
                 parts = [stretch]
             for part in parts:
                 polys, row = [], []
-                for m, b in part + [("sep", None)]:
-                    if m == "loc":
-                        row.append(b)
+                for kind, b in part + [("sep", None)]:
+                    if kind == "loc":
+                        row.append(cast(int, b))   # a <loc_N> piece always has its bin
                         continue
-                    pairs = row[:len(row) // 2 * 2] if m == "sep" else []
+                    pairs = row[:len(row) // 2 * 2] if kind == "sep" else []
                     if pairs:
                         polys.append([_dequant(v, H if k % 2 else W) for k, v in enumerate(pairs)])
                     row = []
@@ -366,10 +367,11 @@ def florence_boxes(text: str, W: int, H: int, grounding: bool = False) -> list[d
     at, after_box = 0, False
     while at < len(pieces):
         words = pieces[at][2] if after_box else pieces[at][3]
-        bins, nxt = [], at + 1
+        bins: list[int] = []
+        nxt = at + 1
         if words:
             while nxt < len(pieces) and pieces[nxt][0] == "loc":
-                bins.append(pieces[nxt][1])
+                bins.append(cast(int, pieces[nxt][1]))   # a <loc_N> piece always has its bin
                 if pieces[nxt][2]:
                     break
                 nxt += 1
