@@ -26,10 +26,10 @@ def tool(name, **props):
     return {"name": name, "parameters": {"type": "object", "properties": props}}
 
 
-S, I, A, O = {"type": "string"}, {"type": "integer"}, {"type": "array"}, {"type": "object"}
-TOOLS = [tool("todo_write", todos=A), tool("run_command", command=S, timeout=I), tool("write_file", path=S, content=S),
-         tool("read", path=S), tool("bash", command=S), tool("edit", path=S, edits=A, options=O)]
-
+S, I, B, A, O = {"type": "string"}, {"type": "integer"}, {"type": "boolean"}, {"type": "array"}, {"type": "object"}
+TOOLS = [tool("todo_write", todos=A), tool("run_command", command=S, timeout=I, dry_run=B),
+         tool("write_file", path=S, content=S), tool("read", path=S), tool("bash", command=S),
+         tool("edit", path=S, edits=A, options=O)]
 
 def qwen(name, **params):
     """The call as Qwen3.8-Flash-Next writes it (the chat template's own form)."""
@@ -130,6 +130,16 @@ add("qwen-one-call", "I will read it.\n\n" + qwen("read", path="a.txt"), [("read
     content="I will read it.", source="the template's own form")
 add("qwen-int-argument", qwen("run_command", command="make -j8", timeout="30"),
     [("run_command", {"command": "make -j8", "timeout": 30})], source="a declared integer")
+add("qwen-python-bool-and-null-skipped",
+    "<tool_call>\n<function=run_command>\n<parameter=command>\nmake\n</parameter>\n"
+    "<parameter=dry_run>\nFalse\n</parameter>\n<parameter=timeout>\nNone\n</parameter>\n</function>\n</tool_call>",
+    [("run_command", {"command": "make", "dry_run": False})],
+    source="Python boolean literal and None placeholder on non-string parameters")
+add("qwen-duplicate-array-parameter",
+    "<tool_call>\n<function=todo_write>\n<parameter=todos>\n[{\"content\": \"draft\"}]\n</parameter>\n"
+    "<parameter=todos>\n[{\"content\": \"final\"}]\n</parameter>\n</function>\n</tool_call>",
+    [("todo_write", {"todos": [{"content": "final"}]})],
+    source="rewritten non-string parameter in the same tool call keeps the last value")
 add("qwen-after-thinking", "Plan: read the file.\n</think>\n\n" + qwen("read", path="a.txt"), [("read", {"path": "a.txt"})],
     thinking=True, reasoning="Plan: read the file.\n", source="the normal agent turn")
 add("qwen-call-in-the-thinking", "Plan: read the file.\n\n" + qwen("read", path="a.txt"), [("read", {"path": "a.txt"})],

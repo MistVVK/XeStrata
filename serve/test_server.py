@@ -6804,3 +6804,121 @@ class PrepareCancelled(unittest.TestCase):
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
 
+
+
+class ToolCallParameterCoercionAndDedup(unittest.TestCase):
+    """Repeated non-string parameters (the model rewrites an array/object parameter in the same call), Python booleans
+    (`True`/`False`), and empty/`null`/`None` non-string parameters produce identical valid JSON in both whole and
+    streamed (`stream_tools=True`) parsing."""
+
+    SCHEMA = [
+        {
+            "name": "fit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "free": {"type": "array"},
+                    "bounds": {"type": "array"},
+                    "dry_run": {"type": "boolean"},
+                    "timeout": {"type": "integer"},
+                    "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "count": {"type": "integer"},
+                },
+            },
+        }
+    ]
+
+    def test_a_rewrite_further_down_the_call_streams_once_with_the_later_value(self):
+        # (our fix-up) the PR's check of a parameter that follows itself covered the adjacent rewrite only: a rewrite
+        # after another parameter streamed both writes (two JSON keys) or the earlier one
+        body = ("<tool_call>\n<function=fit>\n"
+                "<parameter=bounds>\n[1, 2]\n</parameter>\n"
+                "<parameter=path>\ncurve.dat\n</parameter>\n"
+                "<parameter=bounds>\n[10, 20]\n</parameter>\n"
+                "<parameter=timeout>\n5\n</parameter>\n"
+                "<parameter=timeout>\n7\n</parameter>\n"
+                "</function>\n</tool_call>")
+        self.check(body, {"path": "curve.dat", "bounds": [10, 20], "timeout": 7})
+        for step in (1, 7, 10_000):
+            evs = self.events(body, step)
+            streamed = "".join(e.text for e in evs if e.kind == "tool_args")
+            self.assertEqual(streamed.count('"bounds"'), 1, streamed)
+            self.assertEqual(streamed.count('"timeout"'), 1, streamed)
+
+    def test_null_where_the_type_allows_it_and_false_and_zero_kept(self):
+        # (our fix-up) a null placeholder is null when the declared type allows null, not left out; false and 0 stay
+        body = ("<tool_call>\n<function=fit>\n"
+                "<parameter=limit>\nNone\n</parameter>\n"
+                "<parameter=dry_run>\nfalse\n</parameter>\n"
+                "<parameter=count>\n0\n</parameter>\n"
+                "</function>\n</tool_call>")
+        self.check(body, {"limit": None, "dry_run": False, "count": 0})
+
+    def test_without_a_schema_a_none_stays_text(self):
+        from serve.frontend import parse_tool_call
+        call = parse_tool_call("<function=other>\n<parameter=x>\nNone\n</parameter>\n</function>", None)
+        self.assertEqual(call.arguments, {"x": "None"})
+
+    def events(self, body: str, step: int):
+        from serve.frontend import OutputParser
+        text = "</think>\n\n" + body
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=True, recover=True)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        return evs + p.finish()
+
+    def parse(self, body: str, stream_tools: bool, step: int):
+        from serve.frontend import OutputParser
+        text = "</think>\n\n" + body
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools, recover=True)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        evs += p.finish()
+        calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
+        if stream_tools:
+            for c in [e for e in evs if e.kind == "tool_call"]:
+                streamed = "".join(
+                    e.text for e in evs if e.kind == "tool_args" and e.call is not None and e.call.id == c.call.id
+                )
+                self.assertEqual(json.loads(streamed), c.call.arguments)
+        return calls
+
+    def check(self, body: str, expected_args: dict):
+        for stream_tools in (False, True):
+            for step in (1, 5, 19, 10_000):
+                with self.subTest(stream_tools=stream_tools, step=step):
+                    self.assertEqual(self.parse(body, stream_tools, step), [("fit", expected_args)])
+
+    def test_duplicate_array_parameter_uses_last_occurrence(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=path>\ncurve.dat\n</parameter>\n"
+            "<parameter=bounds>\n[{\"min\": 1, \"max\": 2}]\n</parameter>\n"
+            "<parameter=bounds>\n[{\"min\": 10, \"max\": 20}]\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {"path": "curve.dat", "bounds": [{"min": 10, "max": 20}]})
+
+    def test_python_booleans_and_empty_or_null_non_strings(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=path>\ncurve.dat\n</parameter>\n"
+            "<parameter=dry_run>\nTrue\n</parameter>\n"
+            "<parameter=free>\nnull\n</parameter>\n"
+            "<parameter=bounds>\nNone\n</parameter>\n"
+            "<parameter=timeout>\n\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {"path": "curve.dat", "dry_run": True})
+
+    def test_only_skipped_non_string_parameters_yield_empty_object(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=free>\nnull\n</parameter>\n"
+            "<parameter=timeout>\nNone\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {})

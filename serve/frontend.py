@@ -816,12 +816,13 @@ def _close_verdict(after: str, final: bool) -> str:
 
 
 
-def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True) -> int:
+def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True,
+              allow_reopen: bool = False) -> int:
     """Where a parameter value in `text` ends: the first PARAM_END followed (after whitespace) by the next
     PARAM_START or FUNC_END, or by the wrapper's CALL_END when the call's `</function>` was left out (#4427) - the
     same text inside a value (a file that documents the call format, #210) is
     part of the value.  #4078: a close inside a call the value itself quotes (more _QUOTED_OPEN than FUNC_END before
-    it), or one followed by the same parameter `name` again, is part of the value too.  `text` starts at the value.
+    it), or one followed by the same string parameter `name` again, is part of the value too.  `text` starts at the value.
     -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
     at = text.find(PARAM_END)
     while at >= 0:
@@ -831,7 +832,7 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                 gt = after.find(">")
                 if gt < 0:
                     return at if final else -2
-                if name is None or after[len(PARAM_START):gt].strip() != name:
+                if not allow_reopen or name is None or after[len(PARAM_START):gt].strip() != name:
                     return at
             elif after.startswith((FUNC_END, CALL_END)):          # #4427: the model left out its `</function>`
                 verdict = _close_verdict(after, final) if hold else "end"      # hold=False: a call inside the reasoning keeps its old rule
@@ -865,7 +866,7 @@ def call_end(text: str, final: bool = False, hold: bool = True) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], final, text[pos:gt].split("=", 1)[1].strip(), hold)
+            end = param_end(text[gt + 1:], final, text[pos:gt].split("=", 1)[1].strip(), hold, allow_reopen=True)
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -947,7 +948,7 @@ def function_end(text: str) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip(), hold=False)   # a bare or unwrapped call: the old rule
+            end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip(), hold=False, allow_reopen=True)   # a bare or unwrapped call: the old rule
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -1128,19 +1129,30 @@ def declared_type(prop, depth: int = 0):
     return None
 
 
+_SKIP = object()          # #5493: coerce_value's "leave this parameter out"
+
+
+def _declares(declared, kind: str) -> bool:
+    return declared == kind or (isinstance(declared, list) and kind in declared)
+
+
 def coerce_value(value: str, declared, notes: list | None = None):
     """A non-string parameter's text -> its value by the tool's declared type: JSON when it parses; else an array or an
     object read with lenient_json (a note says so in `notes`); else the text itself, as before.  An array or object that
-    arrived as a JSON string of itself is decoded once more."""
+    arrived as a JSON string of itself is decoded once more.  #5493: a declared non-string parameter written empty or as
+    a null placeholder (null / None) is null when its type allows null, else _SKIP (left out, not sent as the text)."""
     if declared == "string":
         return value
     boolean = declared == "boolean" or (isinstance(declared, list) and "boolean" in declared and "string" not in declared)
     if boolean and value.strip().lower() in ("true", "false"):
         return value.strip().lower() == "true"         # #5979: the model's Python spelling (True / False) of a declared boolean is the boolean
+    s = value.strip()
+    if declared is not None and not _declares(declared, "string") and (not s or s.lower() in ("null", "none")):
+        return None if _declares(declared, "null") else _SKIP
     try:
         v = json.loads(value)
     except ValueError:
-        if not value.lstrip().startswith(("[", "{", "`")) or (isinstance(declared, list) and "string" in declared):
+        if not value.lstrip().startswith(("[", "{", "`")) or _declares(declared, "string"):
             return value
         try:
             v = lenient_json(value)
@@ -1149,7 +1161,7 @@ def coerce_value(value: str, declared, notes: list | None = None):
         if notes is not None:
             notes.append("a damaged JSON " + ("array" if isinstance(v, list) else "object") + " argument was read as written")
         return v
-    if isinstance(v, str) and declared in ("array", "object") and v.lstrip().startswith(("[", "{")):
+    if isinstance(v, str) and (_declares(declared, "array") or _declares(declared, "object")) and v.lstrip().startswith(("[", "{")):
         try:
             return json.loads(v)
         except ValueError:
@@ -1172,14 +1184,19 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True, name=pname.strip())
+        declared = declared_type(props.get(pname))
+        # #5493: a close followed by the same name again is part of a STRING value (#4078); a non-string parameter
+        # written twice is two writes of it, and the later one counts
+        end = param_end(rest, final=True, name=pname.strip(), allow_reopen=(declared is None or _declares(declared, "string")))
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = coerce_value(value, declared_type(props.get(pname)), notes)
+        v = coerce_value(value, declared, notes)
+        if v is not _SKIP:
+            args[pname] = v
     return ToolCall(name=name, arguments=args)
 
 
@@ -1494,7 +1511,9 @@ class OutputParser:
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
+        self.sheld: dict = {}        # #5493: the non-string parameters, sent when the call closes (a later write wins)
         self.spname = None
+        self.sraw_pname = ""
         self.svstart = 0
 
     def _wrapped_call_end(self) -> int:
@@ -1545,12 +1564,12 @@ class OutputParser:
                     if b < 0:
                         return out
                     pname = stripped[11:b]
-                    args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
-                    self.sfirst = False
                     self.sp += b + 1
+                    self.sraw_pname = pname
                     self.spname = pname.strip()
                     if self.sdeclared.get(pname) == "string":
-                        args('"')
+                        args(("" if self.sfirst else ",") + json.dumps(pname) + ':"')
+                        self.sfirst = False
                         self.ss, self.sval_started = "str", False
                     else:
                         self.ss = "raw"
@@ -1569,7 +1588,7 @@ class OutputParser:
                     self.sval_started = True
                     self.svstart = self.sp
                 # the walk starts at the value (a quoted call's opener counts); only a close in the new text can end it
-                end = param_end(self.buf[self.svstart:], self._final, name=self.spname) if PARAM_END in rest else -1
+                end = param_end(self.buf[self.svstart:], self._final, name=self.spname, allow_reopen=True) if PARAM_END in rest else -1
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
@@ -1588,7 +1607,9 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, self._final, name=self.spname)
+                declared = self.sdeclared.get(self.sraw_pname)
+                end = param_end(rest, self._final, name=self.spname,         # the rule of parse_tool_call (#5493)
+                                allow_reopen=(declared is None or _declares(declared, "string")))
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -1596,8 +1617,12 @@ class OutputParser:
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
-                v = coerce_value(value, self.sdeclared.get(self.spname))    # the note comes with the final call (parse_tool_call)
-                args(json.dumps(v, ensure_ascii=False))
+                v = coerce_value(value, declared)    # the note comes with the final call (parse_tool_call)
+                if v is not _SKIP:
+                    # #5493: held until the call closes, so a parameter the model writes again (anywhere later in the
+                    # call) streams once, with the value the final call has (the later write), not as two JSON keys
+                    self.sheld.pop(self.sraw_pname, None)
+                    self.sheld[self.sraw_pname] = v
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:
@@ -1611,8 +1636,13 @@ class OutputParser:
         tail = ""
         if self.ss == "str":
             tail += '"'
-        elif self.ss == "raw":
-            tail += json.dumps(self.buf[self.sp:].strip("\n"))
+        elif self.ss == "raw":                  # a value the output ended inside: its text, as before
+            self.sheld.pop(self.sraw_pname, None)
+            self.sheld[self.sraw_pname] = self.buf[self.sp:].strip("\n")
+        for k, v in self.sheld.items():         # #5493: the non-string parameters, each once, the later write
+            tail += ("" if self.sfirst else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
+            self.sfirst = False
+        self.sheld = {}
         tail += "}"
         out.append(Event("tool_args", tail, call=self.scall))
         self.ss = "done"
