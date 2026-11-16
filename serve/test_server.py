@@ -5830,7 +5830,8 @@ class AnswerBeforeTheBody(unittest.TestCase):
                          "HTTP/1.0 403 Forbidden")
 
     def test_a_method_with_no_handler(self):
-        self.assertEqual(self.status("PUT", "/v1/chat/completions"), "HTTP/1.0 501 Unsupported method ('PUT')")
+        self.assertEqual(self.status("PATCH", "/v1/chat/completions"), "HTTP/1.0 501 Unsupported method ('PATCH')")
+        self.assertEqual(self.status("PUT", "/v1/chat/completions"), "HTTP/1.0 404 Not Found")   # PUT: the LoRA captions
 
 
 class PromptProgressBatch(unittest.TestCase):
