@@ -316,7 +316,9 @@ class GuiLayout(unittest.TestCase):
     def test_runner_counts_only_the_missing_helper_and_gives_setup_the_apps_folder(self):
         (self.docs / "mtp" / "rt" / "experts.bin").unlink()
         cat = self.catalog()
-        r = Runner(S.LaunchSettings(family="gyro", model="Gyro-S", context=131072, kv="int8", vision="cpu"), catalog=cat)
+        # The drafter is pinned: with Auto the decision reads this PC's card (drafting.detect_hardware), and on a card where Auto is
+        # DFlash2 the draft layer is not a missing part (owner PC, RTX 5070: 0.0 GB). The test is about the missing helper, not that choice.
+        r = Runner(S.LaunchSettings(family="gyro", model="Gyro-S", context=131072, kv="int8", vision="cpu", drafting="mtp"), catalog=cat)
         self.assertAlmostEqual(r.download_gb(), 5.2)
         argv = r.setup_args()
         self.assertEqual(Path(argv[argv.index("--data-dir") + 1]).resolve(), self.docs.resolve())
