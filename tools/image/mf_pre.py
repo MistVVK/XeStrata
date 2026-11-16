@@ -603,7 +603,8 @@ def main() -> int:
                     help="the cache files' model tag: mf for Mage-Flow (Mage-VAE), mt for MageTrail (the Flux2 VAE), "
                          "ms for MOSS-Image (its VAE, Qwen3.5-9B and its DiT's text embedder: --dit), an for Anima "
                          "(Wan 2.1's VAE, Qwen3-0.6B and its DiT's LLM adapter: --dit, --t5)")
-    ap.add_argument("--dit", help="MOSS-Image's DiT folder or Anima's DiT file (--cache ms, an): the text rows' last part")
+    ap.add_argument("--dit",
+                    help="MOSS-Image's DiT folder or Anima's DiT file (--cache ms, an): the text rows' last part")
     ap.add_argument("--out", help="Qwen-Image-2.1's caches and items.txt (--cache qi)")
     ap.add_argument("--trigger", default="", help="the trigger word --cache qi puts in a caption ([name], [trigger])")
     ap.add_argument("--t5", help="Anima's T5 tokenizer.json (--cache an): the LLM adapter's ids")
