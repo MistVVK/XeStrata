@@ -293,17 +293,14 @@ def expand(path: str) -> Path:
     return Path(os.path.expanduser(path))
 
 
-def write_file(spec: dict, *, backup: bool = True) -> dict:
+def write_file(spec: dict, *, backup: bool = True, if_unchanged: bool = False) -> dict:
     """Write one rendered file. An existing file is copied to `<name>.strata-bak-<time>` first; a JSON file with `merge` keeps the
-    keys it already had (the new ones win on the same key). Returns {path, backup, action}."""
+    keys it already had (the new ones win on the same key). With `if_unchanged`, a file that already holds exactly the text this
+    call would write (after the merge) is left alone: no write, no backup, action `unchanged`. Returns {path, backup, action}."""
     path = expand(spec["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
     existed = path.is_file()
-    bak = None
     text = spec["text"]
-    if existed and backup:
-        bak = path.with_name(path.name + ".strata-bak-" + time.strftime("%Y%m%d-%H%M%S"))
-        shutil.copy2(path, bak)
     if existed and spec.get("merge") and spec["kind"] == "json":
         try:
             old = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -311,8 +308,21 @@ def write_file(spec: dict, *, backup: bool = True) -> dict:
             _keep_output_cap(old, merged)
             text = json.dumps(merged, indent=2)
         except ValueError:
-            pass                                    # an old file that is not JSON is replaced (a backup was made)
-    path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+            pass                                    # an old file that is not JSON is replaced (a backup is made below)
+    final = text if text.endswith("\n") else text + "\n"
+    if existed and if_unchanged:
+        # the comparison is against the FINAL text, after the merge: a merged write that reproduces the file
+        # byte for byte is a no-op, and a backup of it would turn "nothing changed" into a new file each time
+        try:
+            if path.read_text(encoding="utf-8") == final:
+                return {"path": str(path), "backup": None, "action": "unchanged"}
+        except (OSError, UnicodeError):
+            pass                                    # a file we cannot read is not a file we can promise is unchanged
+    bak = None
+    if existed and backup:
+        bak = path.with_name(path.name + ".strata-bak-" + time.strftime("%Y%m%d-%H%M%S"))
+        shutil.copy2(path, bak)
+    path.write_text(final, encoding="utf-8")
     try:
         os.chmod(path, 0o600)                       # it can hold the API key
     except OSError:

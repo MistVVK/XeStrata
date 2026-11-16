@@ -168,6 +168,8 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     c.add_argument("--preset", metavar="NAME", help="take the address, key and model from this saved preset")
     c.add_argument("--check", action="store_true", help="send one prompt and one tool call to the running server the way this app would, and say if each worked")
     c.add_argument("--write", action="store_true", help="write the file(s), after asking; a replaced file is backed up first")
+    c.add_argument("--if-unchanged", action="store_true",
+                   help="with --write: a file that already holds exactly the rendered content is left alone - no write, no backup (reported as unchanged)")
     c.add_argument("--yes", action="store_true", help="do not ask before --write")
     c.add_argument("--show-key", action="store_true", help="print the real key instead of a masked one")
     c.add_argument("--output", choices=("human", "json"), default="human")
@@ -992,7 +994,7 @@ def _connect_write(harness, out, a, machine: bool):
     results: list[dict] = []
     for n, f in enumerate(out["files"]):
         try:
-            results.append(harness.write_file(f))
+            results.append(harness.write_file(f, if_unchanged=bool(getattr(a, "if_unchanged", False))))
         except OSError as exc:
             path = str(harness.expand(f["path"]))
             results.append({"path": path, "backup": None, "action": "failed", "error": exc.strerror or str(exc)})
