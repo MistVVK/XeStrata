@@ -564,6 +564,7 @@ function useSlashCommands(clear: () => void, setDraft: (value: string) => void):
         { id: 'goal', label: '/goal', hint: 'Set a goal and let the assistant keep working until it is done', icon: 'bolt', run: () => setDraft('/goal ') },
         { id: 'plan', label: '/plan', hint: 'Have the assistant write a plan first; nothing runs until you approve it', icon: 'check', run: () => setDraft('/plan ') },
         { id: 'research', label: '/research', hint: 'Search the web, read the pages and answer with sources', icon: 'search', run: () => setDraft('/research ') },
+        { id: 'compact', label: '/compact', hint: 'Summarize the older messages so the chat is faster and has room again', icon: 'layers', run: () => { clear(); void sendMessage('/compact'); } },
         { id: 'loop', label: '/loop', hint: 'Repeat a message every few minutes while this chat is open', icon: 'refresh', run: () => setDraft('/loop 10m ') },
         { id: 'website', label: '/website', hint: 'Open a website in the preview sidebar', icon: 'link', run: () => { clear(); window.dispatchEvent(new Event('strata:open-website')); } },
         { id: 'preview', label: '/preview', hint: 'Open a local file in the preview sidebar', icon: 'file', run: () => { clear(); window.dispatchEvent(new Event('strata:open-preview')); } },
@@ -620,7 +621,9 @@ function Composer({ draft, setDraft, loaded, streaming, onSubmit, onKey, session
     const canChat = loaded || native?.instances.some(i => i.status === 'ready');
     const whileBusy = useStore(s => s.whileBusy), parkedList = useStore(s => (session ? s.parked[session.id] : undefined)) ?? NO_PARKED;
     const quoteList = useStore(s => (session ? s.quotes[session.id] : undefined)) ?? NO_QUOTES;
-    const commands = useSlashCommands(clearDraft, setDraft);
+    // A command that runs at once (/compact, /website) clears only the "/..." the person typed to find it, never a message they were writing
+    // when they opened the menu with its button (PR #5092 review).
+    const commands = useSlashCommands(() => { if (/^\/\S*$/.test(draft)) clearDraft(); }, setDraft);
     const [cursor, setCursor] = useState(0);
     const [fileError, setFileError] = useState('');
     const [slashOpen, setSlashOpen] = useState(false);

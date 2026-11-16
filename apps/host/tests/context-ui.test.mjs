@@ -119,3 +119,20 @@ test('every sentence about the context is in the catalog in all nine languages, 
     }
   }
 });
+
+test('the command menu offers /compact, and picking it summarises the chat at once (it used to say "No command matches")', () => {
+  const chat = read('../src/screens/Chat.tsx');
+  const menu = chat.slice(chat.indexOf('function useSlashCommands'), chat.indexOf('function SlashMenu'));
+  assert.match(menu, /\{ id: 'compact', label: '\/compact', hint: '([^']+)', icon: 'layers', run: \(\) => \{ clear\(\); void sendMessage\('\/compact'\); \} \}/);
+  const hint = /id: 'compact', label: '\/compact', hint: '([^']+)'/.exec(menu)[1];
+  for (const l of ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+    const t = JSON.parse(read(`../src/locales/fix-${l}.json`)).fx86;
+    assert.ok(typeof t === 'string' && t.trim(), `fx86 in ${l}`);
+    if (l === 'en') assert.equal(t, hint); else assert.notEqual(t, hint, `fx86 is translated in ${l}`);
+  }
+});
+
+test('a command that runs at once clears only the "/..." typed to find it, never a message being written (PR #5092 review)', () => {
+  const chat = read('../src/screens/Chat.tsx');
+  assert.ok(chat.includes('const commands = useSlashCommands(() => { if (/^\\/\\S*$/.test(draft)) clearDraft(); }, setDraft);'));
+});

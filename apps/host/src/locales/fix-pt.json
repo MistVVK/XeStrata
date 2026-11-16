@@ -75,5 +75,6 @@
  "fxpr1": "Leitor de imagens",
  "fxpr2": "O do Strata (recomendado)",
  "fxpr3": "O do llama.cpp",
- "fxpr4": "Qual programa transforma as imagens em algo que o modelo consegue ler. O do Strata é mais rápido na maioria dos computadores e lê corretamente imagens muito grandes; em algumas placas de vídeo onde ainda é mais lento, o Strata usa sozinho o do llama.cpp. Escolha o do llama.cpp se as imagens forem lidas de forma errada."
+ "fxpr4": "Qual programa transforma as imagens em algo que o modelo consegue ler. O do Strata é mais rápido na maioria dos computadores e lê corretamente imagens muito grandes; em algumas placas de vídeo onde ainda é mais lento, o Strata usa sozinho o do llama.cpp. Escolha o do llama.cpp se as imagens forem lidas de forma errada.",
+  "fx86": "Resumir as mensagens antigas para o chat ficar mais rápido e voltar a ter espaço"
 }
