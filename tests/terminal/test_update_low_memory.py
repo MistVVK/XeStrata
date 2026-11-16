@@ -12,7 +12,7 @@ from unittest import mock
 
 from strata_control import runtime, updater
 from tests.terminal import update_fixture as fx
-from tests.terminal.test_updater import PLATFORM, UpdaterCase
+from tests.terminal.test_updater import UpdaterCase
 
 SHORT = (20.0, 58.0)
 
@@ -37,7 +37,7 @@ class LowMemoryUpdate(UpdaterCase):
         self.assertIn("Only 20 GB of memory is free right now and fake needs about 58 GB, so the new engine was checked without loading the model. "
                       "It loads your model the next time it starts.", said)
         u = self.engine_state()["unproven"]
-        self.assertEqual((u["version"], u["previous"]), ("0.1.46", f"0.1.45-{PLATFORM}-cuda-cuda13"))
+        self.assertEqual((u["version"], u["previous"]), ("0.1.46", f"0.1.45-{self.platform}-{self.tag}"))
         self.assertEqual(updater.State(self.components).data["history"][-1]["detail"], updater.LOW_MEMORY_MODE)
 
     def test_enough_memory_is_the_full_test_and_nothing_is_unproven(self):

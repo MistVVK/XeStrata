@@ -17,7 +17,8 @@ from tests.terminal.test_updater import PLATFORM, UpdaterCase
 
 
 def folder_of(version):
-    return f"{version}-{PLATFORM}-cuda-cuda13"
+    fam = fx.local_family()                          # (#4138) the family this machine takes: cuda / cuda13, a Mac metal
+    return f"{version}-{PLATFORM}-{fam['backend']}" + (f"-{fam['variant']}" if fam["variant"] else "")
 
 
 class Library(UpdaterCase):

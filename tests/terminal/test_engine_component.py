@@ -21,13 +21,27 @@ from strata_control import acquisition, components, engine_component as ec
 WINDOWS = os.name == "nt"
 HERE = components.host_platform()
 NO_HIP = HERE == "linux-aarch64"      # the DGX Spark: CUDA only
+#: the PC these throwaway packages are written for. A CUDA or HIP package is only ever considered on a PC
+#: that takes that family, and a Mac takes Metal: the resolver drops a package for another platform before
+#: the rule a test is about is reached, so on a Mac the tests speak about a Linux PC instead of this one.
+PC = "linux-x86_64" if HERE == "macos-arm64" else HERE
 EXE = "strata.exe" if WINDOWS else "strata"
 
 
-def make_package(root: Path, *, version="0.1.45", platform=None, backend="cuda", archs=(), min_runtime=None,
+def speak_about_pc(test):
+    """`status()` asks this machine which GPU family it takes; when the packages under test are built for another PC,
+    point that probe at that PC for the one test that asks. Nothing else about this machine changes."""
+    if PC == HERE:
+        return
+    patcher = mock.patch.object(ec, "host_platform", return_value=PC)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
+def make_package(root: Path, *, version="0.1.45", platform=PC, backend="cuda", archs=(), min_runtime=None,
                  extra=None, entry=None) -> Path:
     """A fake engine package the way packaging/package_engine.py lays one out."""
-    platform = platform or HERE
+    platform = platform or PC
     entry = entry or EXE
     folder = root / "engine" / f"{version}-{platform}-{backend}"
     folder.mkdir(parents=True)
@@ -77,6 +91,7 @@ class NoNetwork:
 
 class Resolution(unittest.TestCase):
     def setUp(self):
+        speak_about_pc(self)
         self.dir = tempfile.TemporaryDirectory()
         self.root = Path(self.dir.name)
         self.addCleanup(self.dir.cleanup)
@@ -84,21 +99,21 @@ class Resolution(unittest.TestCase):
     def test_the_package_for_the_backend_is_chosen(self):
         make_package(self.root, backend="cuda")
         make_package(self.root, backend="hip", version="0.1.46")
-        chosen = ec.resolve(self.root, backend="cuda", runtime="0.1.45")
+        chosen = ec.resolve(self.root, backend="cuda", runtime="0.1.45", target=PC)
         self.assertEqual((chosen.backend, chosen.version), ("cuda", "0.1.45"))
-        self.assertEqual(chosen.exe, self.root / "engine" / f"0.1.45-{HERE}-cuda" / EXE)
+        self.assertEqual(chosen.exe, self.root / "engine" / f"0.1.45-{PC}-cuda" / EXE)
         self.assertTrue(chosen.exe.is_file())
 
     def test_the_newest_compatible_version_wins(self):
         make_package(self.root, version="0.1.45")
         make_package(self.root, version="0.1.45.2")
         make_package(self.root, version="0.1.9")                 # 0.1.9 < 0.1.45 numerically, not as text
-        self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1").version, "0.1.45.2")
+        self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1", target=PC).version, "0.1.45.2")
 
     def test_nothing_installed_is_a_notice_that_says_nothing_is_fetched(self):
         with NoNetwork():
             with self.assertRaises(ec.EngineMissing) as caught:
-                ec.resolve(self.root, backend="cuda")
+                ec.resolve(self.root, backend="cuda", target=PC)
         text = str(caught.exception)
         self.assertIn("never downloads an engine", text)
         self.assertIn("strata install", text)
@@ -108,20 +123,20 @@ class Resolution(unittest.TestCase):
 
     def test_a_missing_component_folder_is_the_same_notice(self):
         with self.assertRaises(ec.EngineMissing):
-            ec.resolve(self.root / "does-not-exist", backend="cuda")
+            ec.resolve(self.root / "does-not-exist", backend="cuda", target=PC)
 
     def test_another_platform_is_refused_with_the_reason(self):
-        other = "linux-x86_64" if WINDOWS else "windows-x86_64"
+        other = "windows-x86_64" if PC == "linux-x86_64" else "linux-x86_64"
         make_package(self.root, platform=other)
         with self.assertRaises(ec.EngineMissing) as caught:
-            ec.resolve(self.root, backend="cuda")
+            ec.resolve(self.root, backend="cuda", target=PC)
         self.assertIn(f"is for {other}", str(caught.exception))
 
     @unittest.skipIf(NO_HIP, "there is no HIP engine for arm64 Linux (BACKEND_MATRIX): this test builds one for the host platform")
     def test_another_backend_is_refused_with_the_reason(self):
         make_package(self.root, backend="hip")
         with self.assertRaises(ec.EngineMissing) as caught:
-            ec.resolve(self.root, backend="cuda")
+            ec.resolve(self.root, backend="cuda", target=PC)
         self.assertIn("is a hip engine, this PC needs cuda", str(caught.exception))
 
     def test_an_unqualified_combination_is_not_attempted(self):
@@ -135,24 +150,25 @@ class Resolution(unittest.TestCase):
     def test_runtime_too_old_is_refused(self):
         make_package(self.root, min_runtime="0.2.0")
         with self.assertRaises(ec.EngineMissing) as caught:
-            ec.resolve(self.root, backend="cuda", runtime="0.1.45")
+            ec.resolve(self.root, backend="cuda", runtime="0.1.45", target=PC)
         self.assertIn("needs control 0.2.0", str(caught.exception))
-        self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="0.2.0").version, "0.1.45")
+        self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="0.2.0", target=PC).version, "0.1.45")
 
     def test_cuda_archs_must_cover_the_gpu(self):
         make_package(self.root, archs=("sm_86",))
         with mock.patch.object(ec, "cuda_archs_present", return_value=["sm_120"]):
             with self.assertRaises(ec.EngineMissing) as caught:
-                ec.resolve(self.root, backend="cuda", runtime="1")
+                ec.resolve(self.root, backend="cuda", runtime="1", target=PC)
         self.assertIn("sm_86", str(caught.exception))
         with mock.patch.object(ec, "cuda_archs_present", return_value=["sm_86"]):
-            self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1").version, "0.1.45")
+            self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1", target=PC).version, "0.1.45")
         with mock.patch.object(ec, "cuda_archs_present", return_value=[]):     # cannot tell: not a refusal
-            self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1").version, "0.1.45")
+            self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1", target=PC).version, "0.1.45")
 
 
 class Integrity(unittest.TestCase):
     def setUp(self):
+        speak_about_pc(self)
         self.dir = tempfile.TemporaryDirectory()
         self.root = Path(self.dir.name)
         self.addCleanup(self.dir.cleanup)
@@ -162,25 +178,25 @@ class Integrity(unittest.TestCase):
         lib = next(p for p in self.folder.iterdir() if "cudart" in p.name)
         lib.write_bytes(lib.read_bytes()[:-3])
         with self.assertRaisesRegex(ec.EngineMissing, "bytes, the manifest says"):
-            ec.resolve(self.root, backend="cuda", runtime="1")
+            ec.resolve(self.root, backend="cuda", runtime="1", target=PC)
 
     def test_a_changed_entrypoint_is_refused_at_once(self):
         exe = self.folder / EXE
         exe.write_bytes(b"X" * exe.stat().st_size)               # same size, other bytes
         with self.assertRaisesRegex(ec.EngineMissing, "SHA-256"):
-            ec.resolve(self.root, backend="cuda", runtime="1")
+            ec.resolve(self.root, backend="cuda", runtime="1", target=PC)
 
     def test_a_changed_library_is_found_by_the_full_check_only(self):
         lib = next(p for p in self.folder.iterdir() if "cudart" in p.name)
         lib.write_bytes(b"Y" * lib.stat().st_size)
-        self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1").version, "0.1.45")
+        self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1", target=PC).version, "0.1.45")
         with self.assertRaisesRegex(ec.EngineMissing, "SHA-256"):
-            ec.resolve(self.root, backend="cuda", runtime="1", full=True)
+            ec.resolve(self.root, backend="cuda", runtime="1", full=True, target=PC)
 
     def test_a_missing_file_is_refused(self):
         next(p for p in self.folder.iterdir() if "cudart" in p.name).unlink()
         with self.assertRaisesRegex(ec.EngineMissing, "is missing"):
-            ec.resolve(self.root, backend="cuda", runtime="1")
+            ec.resolve(self.root, backend="cuda", runtime="1", target=PC)
 
     def test_manifest_paths_cannot_leave_the_folder(self):
         data = json.loads((self.folder / ec.MANIFEST).read_text())
@@ -200,7 +216,7 @@ class Integrity(unittest.TestCase):
         broken = self.root / "engine" / "0.9-broken"
         broken.mkdir()
         (broken / ec.MANIFEST).write_text("{not json", encoding="utf-8")
-        chosen = ec.resolve(self.root, backend="cuda", runtime="1")
+        chosen = ec.resolve(self.root, backend="cuda", runtime="1", target=PC)
         self.assertEqual(chosen.version, "0.1.45")
         report = ec.status(self.root, backend="cuda")
         self.assertTrue(report["usable"])
@@ -214,16 +230,19 @@ class Integrity(unittest.TestCase):
         lib.unlink()
         lib.symlink_to(target)
         with self.assertRaisesRegex(ec.EngineMissing, "not a regular file"):
-            ec.resolve(self.root, backend="cuda", runtime="1")
+            ec.resolve(self.root, backend="cuda", runtime="1", target=PC)
 
     @unittest.skipIf(WINDOWS, "NTFS has no execute bit")
     def test_a_non_executable_entrypoint_is_refused(self):
         (self.folder / EXE).chmod(0o644)
         with self.assertRaisesRegex(ec.EngineMissing, "not executable"):
-            ec.resolve(self.root, backend="cuda", runtime="1")
+            ec.resolve(self.root, backend="cuda", runtime="1", target=PC)
 
 
 class Where(unittest.TestCase):
+    def setUp(self):
+        speak_about_pc(self)
+
     def test_environment_wins_then_the_per_user_folder(self):
         self.assertEqual(ec.components_dir({"STRATA_COMPONENTS_DIR": "/x/y"}), Path("/x/y"))
         win = ec.components_dir({"LOCALAPPDATA": "C:\\L"}, windows=True)
@@ -252,6 +271,9 @@ class Where(unittest.TestCase):
 
 class WindowsAmd(unittest.TestCase):
     """Windows PCs with an AMD card and no HIP SDK / nvidia-smi: the display adapters decide the engine."""
+    def setUp(self):
+        speak_about_pc(self)
+
 
     OWNER_PC = [{"vendor": "10de", "device": 0x2F04, "name": "NVIDIA GeForce RTX 5070", "vram_gb": 12.0},
                 {"vendor": "1002", "device": 0x164E, "name": "AMD Radeon(TM) Graphics", "vram_gb": 0.5}]
@@ -310,6 +332,7 @@ class WrongCardFamily(unittest.TestCase):
     """A tester build is for one AMD card family; on another family the person gets one plain line, not a technical list."""
 
     def setUp(self):
+        speak_about_pc(self)
         self.dir = tempfile.TemporaryDirectory()
         self.root = Path(self.dir.name)
         self.addCleanup(self.dir.cleanup)
@@ -318,7 +341,7 @@ class WrongCardFamily(unittest.TestCase):
     def test_an_rx7000_card_with_the_rx9000_build_is_told_to_ask_for_the_other_build(self):
         with mock.patch.object(ec, "hip_archs_present", return_value=["gfx1100"]):
             with self.assertRaises(ec.EngineMissing) as caught:
-                ec.resolve(self.root, backend="hip", runtime="1")
+                ec.resolve(self.root, backend="hip", runtime="1", target=PC)
             note = ec.status(self.root, backend="hip")["notice"]
         self.assertTrue(str(caught.exception).startswith("This build of Strata is for AMD RX 9000 cards."), str(caught.exception))
         self.assertIn("Ask for the RX 7000 build.", note)
@@ -333,7 +356,7 @@ class WrongCardFamily(unittest.TestCase):
 
     def test_the_matching_family_is_not_blocked(self):
         with mock.patch.object(ec, "hip_archs_present", return_value=["gfx1201"]):
-            self.assertEqual(ec.resolve(self.root, backend="hip", runtime="1").backend, "hip")
+            self.assertEqual(ec.resolve(self.root, backend="hip", runtime="1", target=PC).backend, "hip")
 
 
 @unittest.skipIf(NO_HIP, "there is no HIP engine for arm64 Linux (BACKEND_MATRIX): this test builds one for the host platform")
@@ -341,6 +364,7 @@ class Rx6000Package(unittest.TestCase):
     """0.2.2: the RX 6000 package (gfx1030 / gfx1031) is the one an RX 6000 card finds, and no other card family finds it."""
 
     def setUp(self):
+        speak_about_pc(self)
         self.dir = tempfile.TemporaryDirectory()
         self.root = Path(self.dir.name)
         self.addCleanup(self.dir.cleanup)
@@ -359,11 +383,11 @@ class Rx6000Package(unittest.TestCase):
     def test_an_rx6000_card_finds_the_rx6000_package_and_an_rx7000_card_does_not(self):
         make_package(self.root, backend="hip", archs=("gfx1030", "gfx1031"))
         with mock.patch.object(ec, "hip_archs_present", return_value=["gfx1030"]):
-            self.assertEqual(ec.resolve(self.root, backend="hip", runtime="1").hip_archs, ("gfx1030", "gfx1031"))
+            self.assertEqual(ec.resolve(self.root, backend="hip", runtime="1", target=PC).hip_archs, ("gfx1030", "gfx1031"))
             self.assertIsNone(ec.status(self.root, backend="hip")["notice"])
         with mock.patch.object(ec, "hip_archs_present", return_value=["gfx1100"]):
             with self.assertRaises(ec.EngineMissing) as caught:
-                ec.resolve(self.root, backend="hip", runtime="1")
+                ec.resolve(self.root, backend="hip", runtime="1", target=PC)
         self.assertTrue(str(caught.exception).startswith("This build of Strata is for AMD RX 6000 cards."), str(caught.exception))
         self.assertIn("Ask for the RX 7000 build.", str(caught.exception))
 
@@ -371,7 +395,7 @@ class Rx6000Package(unittest.TestCase):
         make_package(self.root, backend="hip", archs=("gfx1200", "gfx1201"))
         with mock.patch.object(ec, "hip_archs_present", return_value=["gfx1030"]):
             with self.assertRaises(ec.EngineMissing) as caught:
-                ec.resolve(self.root, backend="hip", runtime="1")
+                ec.resolve(self.root, backend="hip", runtime="1", target=PC)
         self.assertIn("Ask for the RX 6000 build.", str(caught.exception))
 
 
@@ -379,6 +403,7 @@ class NeverAcquires(unittest.TestCase):
     """The lookup, the status report and the CLI work with the network and process creation unavailable."""
 
     def setUp(self):
+        speak_about_pc(self)
         self.dir = tempfile.TemporaryDirectory()
         self.root = Path(self.dir.name)
         self.addCleanup(self.dir.cleanup)
@@ -416,7 +441,7 @@ class NeverAcquires(unittest.TestCase):
         rewrite(a, min_driver={"nvidia": "580.65"})
         with mock.patch.object(ec, "nvidia_driver_version", return_value="550.120"):
             with self.assertRaises(ec.EngineMissing) as caught:
-                ec.resolve(self.root, backend="cuda", runtime="1")
+                ec.resolve(self.root, backend="cuda", runtime="1", target=PC)
             note = ec.status(self.root, backend="cuda")["notice"]
         self.assertIn("580.65", str(caught.exception), "the technical reason stays for the log")
         self.assertIn("(550.120)", note)
@@ -432,9 +457,9 @@ class NeverAcquires(unittest.TestCase):
         with mock.patch.object(ec, "nvidia_driver_version", return_value="550.120"):
             self.assertIn("driver 575 or newer", ec.status(self.root, backend="cuda")["notice"])
         with mock.patch.object(ec, "nvidia_driver_version", return_value="576.02"):
-            self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1").root.name, "0.1.45-twelve")
+            self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1", target=PC).root.name, "0.1.45-twelve")
         with mock.patch.object(ec, "nvidia_driver_version", return_value="580.178.04"):
-            self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1").root.name, a.name, "the newer-driver build wins")
+            self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1", target=PC).root.name, a.name, "the newer-driver build wins")
 
     def test_the_driver_version_comes_from_the_kernel_module_when_there_is_no_nvidia_smi(self):
         text = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.95.05  Thu Sep 11 2026 GCC version: gcc 15"
@@ -455,7 +480,7 @@ class NeverAcquires(unittest.TestCase):
 
     def test_main_guard_turns_the_notice_into_exit_5(self):
         def start():
-            ec.resolve(self.root, backend="cuda")
+            ec.resolve(self.root, backend="cuda", target=PC)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code = acquisition.main_guard(start)

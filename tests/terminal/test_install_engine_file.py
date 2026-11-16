@@ -2,6 +2,7 @@
 this PC), test-started and switched to, with no feed and no network. The file they chose stays where it is."""
 
 import tarfile
+import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -45,6 +46,7 @@ class InstallEngineFile(UpdaterCase):
             self.install(archive)
         self.assertEqual(self.engine_folders(), [])
 
+    @unittest.skipIf(fx.local_family()["backend"] != "cuda", "a CUDA card's architecture check (#4138: a Mac takes Metal packages)")
     def test_a_package_that_does_not_fit_this_card_says_so(self):
         archive = self.package(archs=("sm_100",))
         with self.assertRaises(updater.UpdateError) as caught:
