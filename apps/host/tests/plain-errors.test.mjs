@@ -123,3 +123,15 @@ test('the engine component is named in words, once (#3900)', async () => {
   const { missingNames } = await import('../server/missing-files.mjs');
   assert.deepEqual(missingNames([{ part: 'engine', file: 'component:strata-engine' }], ['component:strata-engine']), ['the engine program']);
 });
+
+// An OpenAI-shaped error body ({"error": {"type", "message"}}, what strata serve and the Responses API answer) showed as raw JSON: the
+// wrapper is peeled the same way as a plain {"error": "..."} (GUI-1116, from the engine-error review).
+test('an error body whose error is an object shows its message, not the JSON', () => {
+  for (const raw of ['HTTP 500: {"error":{"type":"server_error","message":"dequant launch: unspecified launch failure"}}',
+                     '{"error":{"type":"invalid_request_error","message":"messages is required","code":null}}']) {
+    const f = plainFailure(raw);
+    assert.doesNotMatch(f.message, /[{}]|server_error|invalid_request_error/, raw);
+  }
+  assert.equal(plainFailure('{"error":{"type":"server_error","message":"dequant launch: unspecified launch failure"}}').message, 'Dequant launch: unspecified launch failure');
+  assert.equal(plainFailure('{"error":{"type":"x"}}').message, '{"error":{"type":"x"}}', 'no message inside: left as it was');
+});

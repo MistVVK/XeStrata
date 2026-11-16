@@ -84,7 +84,9 @@ function unwrapErrorPayload(text: string): string {
     // FastAPI and the host both use `detail`/`error`/`message`, and `detail`
     // is itself sometimes an object with a `message`.
     const detail = parsed.detail;
-    const candidate = [parsed.error, parsed.message, typeof detail === 'string' ? detail : (detail as Record<string, unknown> | undefined)?.message]
+    // OpenAI-shaped bodies (strata serve, the Responses API) carry {"error": {"type", "message"}}: the message inside is the sentence.
+    const inner = parsed.error && typeof parsed.error === 'object' ? (parsed.error as Record<string, unknown>).message : undefined;
+    const candidate = [parsed.error, inner, parsed.message, typeof detail === 'string' ? detail : (detail as Record<string, unknown> | undefined)?.message]
       .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
     return candidate ? candidate.trim() : text;
   } catch {
