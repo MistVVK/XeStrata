@@ -28,6 +28,10 @@ size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, i
 void native_expert_i8_quantize(const float*, int64_t, int64_t, void*, void*) {
     strata::metal_engine::missing("strata::kernels::native_expert_i8_quantize");
 }
+bool native_expert_i8_put_record(void*, const void*, size_t, void*) {
+    strata::metal_engine::missing("strata::kernels::native_expert_i8_put_record");
+    return false;
+}
 void native_expert_i8(const NativeExpertLayout&, const unsigned long long*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, int64_t, int64_t,
                       const void*, void*, float*, void*) {
     strata::metal_engine::missing("strata::kernels::native_expert_i8");

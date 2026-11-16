@@ -130,6 +130,10 @@ size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, i
 /// The activation image `native_expert_i8` reads (its `x_q8_1` argument): `n_rows` x `n_cols` floats as blocks of 32 values {float d; int8 q[32]} (36 bytes), MMQ's numbers
 /// (d_inv = 127 / amax, q = round(x * d_inv), d = 1 / d_inv, the scale in FP32).  NOT the q8_1 block of the other kernels (half2 ds); `n_cols` a multiple of 32.
 void native_expert_i8_quantize(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream);
+/// A launch record of at most kI8PutRecordMax bytes (a multiple of 4) written to `dst` (device) on `stream` by a one-block kernel that takes the bytes as its argument:
+/// no host-to-device copy, so the write does not queue behind other copies in the copy engine (the prompt path's streamed experts).  False: too many bytes, or the launch failed.
+constexpr size_t kI8PutRecordMax = 512;
+bool native_expert_i8_put_record(void* dst, const void* src, size_t bytes, void* stream);
 void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                       const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
                       void* scratch, float* out, void* stream);

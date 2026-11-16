@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <utility>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -6339,6 +6340,24 @@ void native_expert_i8_quantize(const float* x, int64_t n_rows, int64_t n_cols, v
     if (n_cols % 32 != 0) { std::fprintf(stderr, "native_expert_i8_quantize: %lld columns\n", (long long) n_cols); std::exit(1); }
     i8_quantize_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
     check("native_expert_i8_quantize");
+}
+
+namespace {
+struct I8RecArg {
+    uint32_t w[kI8PutRecordMax / 4];
+};
+__global__ void i8_put_record_kernel(const I8RecArg a, uint32_t* __restrict__ dst, int nw) {
+    for (int i = threadIdx.x; i < nw; i += blockDim.x) dst[i] = a.w[i];
+}
+}  // namespace
+
+bool native_expert_i8_put_record(void* dst, const void* src, size_t bytes, void* stream) {
+    if (bytes == 0) return true;
+    if (bytes > kI8PutRecordMax || bytes % 4 != 0 || dst == nullptr) return false;
+    I8RecArg a{};
+    std::memcpy(a.w, src, bytes);
+    i8_put_record_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(a, (uint32_t*) dst, (int) (bytes / 4));
+    return cudaGetLastError() == cudaSuccess;
 }
 
 void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
