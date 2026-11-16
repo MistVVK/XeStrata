@@ -51,31 +51,48 @@ export function normalizeBaseUrl(value) {
 const publicConnection = ({ apiKey, ...connection }) => ({ ...connection, apiKeySet: !!apiKey });
 const numeric = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 
-/** The UI replays earlier pictures as OpenAI content blocks. Keep their question
- * and pixels together so another model (or a restarted engine) can read them.
- * Text-only history keeps its original representation and 40-message limit. */
+/**
+ * The history an API model gets. The UI replays earlier pictures as OpenAI content blocks (#4311): their words always go, and to a model
+ * that reads pictures over the OpenAI protocol their pixels go too, so a follow-up question can still be answered after a model change.
+ * An earlier picture never stops the chat: one that is not a PNG, JPEG or WebP data URL (a remote or file address is never sent), or is
+ * over 6 MB, is left out, and when the earlier pictures and this message's together are more than four, the newest are kept.
+ */
+export const HISTORY_PICTURES_MAX = 4;
+function historyPicture(url) {
+  try { return validateChatImages([{ url }])[0].url; } catch { return null; }
+}
 function providerHistory(history, protocol, vision, currentPictures) {
   const picturesAllowed = protocol === 'openai-chat' && vision !== false;
-  const messages = history.filter(m => m && ['user', 'assistant'].includes(m.role)).map(m => {
-    if (typeof m.content === 'string') return { role: m.role, content: m.content };
+  const rows = (Array.isArray(history) ? history : []).filter(m => m && ['user', 'assistant'].includes(m.role)).map(m => {
+    if (typeof m.content === 'string') return { role: m.role, parts: [{ type: 'text', text: m.content }], plain: true };
     if (!Array.isArray(m.content)) return null;
     const parts = [];
     for (const part of m.content) {
       if (!part || typeof part !== 'object' || Array.isArray(part)) continue;
-      if (part.type === 'text' && typeof part.text === 'string') {
-        parts.push({ type: 'text', text: part.text });
-      } else if (part.type === 'image_url' && picturesAllowed && m.role === 'user') {
-        const image = validateChatImages([{ url: part.image_url?.url }])[0];
-        parts.push({ type: 'image_url', image_url: { url: image.url } });
+      if (part.type === 'text' && typeof part.text === 'string') parts.push({ type: 'text', text: part.text });
+      else if (part.type === 'image_url' && picturesAllowed && m.role === 'user') {
+        const url = historyPicture(part.image_url?.url);
+        if (url) parts.push({ type: 'image_url', image_url: { url } });
       }
     }
-    if (!parts.length) return null;
-    const content = parts.some(p => p.type === 'image_url') ? parts : parts.map(p => p.text).join('\n');
-    return { role: m.role, content };
+    return parts.length ? { role: m.role, parts } : null;
   }).filter(Boolean).slice(-40);
-  const pictureCount = messages.reduce((n, m) => n + (Array.isArray(m.content) ? m.content.filter(p => p.type === 'image_url').length : 0), 0);
-  if (pictureCount + currentPictures > 4) fail('Attach up to four pictures per message, including earlier pictures.');
-  return messages;
+  let room = Math.max(0, HISTORY_PICTURES_MAX - currentPictures);
+  for (let r = rows.length - 1; r >= 0; r--) {            // newest first: older pictures give way, their words stay
+    const kept = [];
+    for (let k = rows[r].parts.length - 1; k >= 0; k--) {
+      const part = rows[r].parts[k];
+      if (part.type !== 'image_url') kept.unshift(part);
+      else if (room > 0) { room--; kept.unshift(part); }
+    }
+    rows[r].parts = kept;
+  }
+  return rows.map(({ role, parts, plain }) => {
+    if (plain) return { role, content: parts[0].text };
+    if (parts.some(p => p.type === 'image_url')) return { role, content: parts };
+    const words = parts.map(p => p.text).join('\n');
+    return words ? { role, content: words } : null;
+  }).filter(Boolean);
 }
 
 export function createModelProviders({ directory, changed = () => {}, fetchImpl = fetch, knownThinks = () => null }) {

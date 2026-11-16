@@ -89,18 +89,33 @@ for (const protocol of ['openai-chat', 'openai-responses', 'anthropic']) test(`$
   assert.deepEqual((requests[0].body.messages ?? requests[0].body.input).slice(0, -1), expected);
 });
 
-test('malformed, remote and unsupported historical image URLs fail before a request', async t => {
+// GUI-1116 fix-up: an earlier picture never stops the chat. One that cannot be sent is left out (a remote or file address never goes out)
+// and its words stay; with more than four pictures in all, the newest are kept.
+test('malformed, remote and unsupported historical image URLs are left out; their words stay and the chat goes on', async t => {
   const { send, requests } = setup(t);
-  for (const block of [{ type: 'image_url' }, { type: 'image_url', image_url: null }, image('file:///secret'), image('https://example.com/image.png'), image('data:image/gif;base64,R0lG'), image('data:image/png;base64,%%%')]) {
-    await assert.rejects(send({ history: [{ role: 'user', content: [text('Keep the question'), block] }] }), /Pictures must be attached PNG, JPEG or WebP files/);
+  const blocks = [{ type: 'image_url' }, { type: 'image_url', image_url: null }, image('file:///secret'), image('https://example.com/image.png'), image('data:image/gif;base64,R0lG'), image('data:image/png;base64,%%%')];
+  for (const block of blocks) {
+    await send({ history: [{ role: 'user', content: [text('Keep the question'), block] }, { role: 'assistant', content: 'It was red.' }] });
+    const sent = requests.at(-1).body.messages;
+    assert.deepEqual(sent.slice(0, 2), [{ role: 'user', content: 'Keep the question' }, { role: 'assistant', content: 'It was red.' }], JSON.stringify(block));
+    assert.ok(!JSON.stringify(sent).includes('secret') && !JSON.stringify(sent).includes('example.com'));
   }
-  assert.equal(requests.length, 0);
+  assert.equal(requests.length, blocks.length);
 });
 
-test('historical image size and combined current/history count remain bounded', async t => {
+test('an earlier picture over 6 MB is left out, and with more than four pictures in all the newest are kept', async t => {
   const { send, requests } = setup(t);
   const tooLarge = 'data:image/png;base64,' + Buffer.alloc(6 * 1024 * 1024 + 1).toString('base64');
-  await assert.rejects(send({ history: [{ role: 'user', content: [text('Question'), image(tooLarge)] }] }), /smaller than 6 MB/);
-  await assert.rejects(send({ history: [{ role: 'user', content: [text('Question'), image(PNG), image(PNG)] }], images: [{ url: PNG }, { url: PNG }, { url: PNG }] }), /up to four pictures/);
-  assert.equal(requests.length, 0);
+  await send({ history: [{ role: 'user', content: [text('Question'), image(tooLarge)] }] });
+  assert.deepEqual(requests.at(-1).body.messages[0], { role: 'user', content: 'Question' });
+  const older = 'data:image/png;base64,iVBORw0KGgoA', newer = WEBP;
+  await send({ history: [{ role: 'user', content: [text('First'), image(older), image(older)] }, { role: 'assistant', content: 'ok' }, { role: 'user', content: [text('Second'), image(newer)] }],
+    images: [{ url: PNG }, { url: PNG }, { url: PNG }] });
+  const sent = requests.at(-1).body.messages;
+  const pictures = sent.flatMap(m => Array.isArray(m.content) ? m.content.filter(p => p.type === 'image_url').map(p => p.image_url.url) : []);
+  assert.deepEqual(pictures, [newer, PNG, PNG, PNG], 'four in all: the three of this message and the newest earlier one');
+  assert.deepEqual(sent[0], { role: 'user', content: 'First' }, 'the oldest message keeps its words');
+  await send({ history: [{ role: 'user', content: [text('Q'), image(PNG), image(PNG)] }], images: [{ url: PNG }, { url: PNG }, { url: PNG }, { url: PNG }] });
+  assert.deepEqual(requests.at(-1).body.messages[0], { role: 'user', content: 'Q' }, 'four new pictures leave no room for earlier ones');
+  assert.equal(requests.length, 3);
 });
