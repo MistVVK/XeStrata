@@ -37,22 +37,10 @@ static uint16_t f32_to_f16(float f) {   // good enough for the values used here 
 }
 
 int main(int argc, char** argv) {
-    // --- 0. the GPU classes where `--tower auto` keeps mtmd (vit_gpu.h) ---
-    for (int mt : {0, 300, 1024}) {      // at or below the default limit: Pascal 6.1 / 6.2 keep mtmd (not measured); cc 6.0 takes ours with F16 and BF16 files
-        CHECK(vit_gpu_slower_nvidia(6, 1, false, mt) && vit_gpu_slower_nvidia(6, 1, true, mt) && vit_gpu_slower_nvidia(6, 2, false, mt) && vit_gpu_slower_nvidia(6, 2, true, mt));
-        CHECK(!vit_gpu_slower_nvidia(6, 0, true, mt) && !vit_gpu_slower_nvidia(6, 0, false, mt));
-        CHECK(!vit_gpu_slower_nvidia(5, 2, false, mt) && !vit_gpu_slower_nvidia(7, 0, false, mt) && !vit_gpu_slower_nvidia(8, 6, true, mt) && !vit_gpu_slower_nvidia(12, 0, false, mt));
-    }
-    for (int mt : {1025, 4096, 16384}) {   // above it: ours on every CUDA class
-        CHECK(!vit_gpu_slower_nvidia(6, 0, false, mt) && !vit_gpu_slower_nvidia(6, 1, false, mt) && !vit_gpu_slower_nvidia(6, 1, true, mt) && !vit_gpu_slower_nvidia(6, 2, true, mt));
-        CHECK(!vit_gpu_slower_nvidia(6, 0, true, mt) && !vit_gpu_slower_nvidia(8, 6, true, mt) && !vit_gpu_slower_nvidia(12, 0, false, mt));
-    }
+    // --- 0. the GPU helpers (vit_gpu.h); no GPU class keeps another reader since 0.2.16 ---
     CHECK(vit_gpu_is_gfx1151("gfx1151") && vit_gpu_is_gfx1151("gfx1151:xnack-"));
     CHECK(!vit_gpu_is_gfx1151("gfx1150") && !vit_gpu_is_gfx1151("gfx1201") && !vit_gpu_is_gfx1151("gfx11510") && !vit_gpu_is_gfx1151("gfx115") && !vit_gpu_is_gfx1151(""));
-    // Windows HIP keeps mtmd under auto except on gfx1151 (Strix, measured with that package; owner 11-11); Linux HIP never
-    CHECK(!vit_gpu_hip_windows_not_measured(true, "gfx1151") && !vit_gpu_hip_windows_not_measured(true, "gfx1151:xnack-"));
-    CHECK(vit_gpu_hip_windows_not_measured(true, "gfx1201") && vit_gpu_hip_windows_not_measured(true, "gfx1100") && vit_gpu_hip_windows_not_measured(true, "gfx1150"));
-    CHECK(!vit_gpu_hip_windows_not_measured(false, "gfx1151") && !vit_gpu_hip_windows_not_measured(false, "gfx1201"));
+    CHECK(kVitGpuMaxHeadDim == 96);      // Qwen3.8 and Qwen3.6 have 72
     {   // the context retry (vit_gpu.h): only "out of memory", only an integrated GPU, only a Linux CUDA build, at most kVitCtxRetries times
         CHECK(kVitCtxRetries == 12 && kVitCtxWaitMs == 1000);
         for (int done = 0; done < kVitCtxRetries; ++done) CHECK(vit_gpu_retry_context(true, true, true, done));

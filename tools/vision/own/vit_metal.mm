@@ -356,15 +356,6 @@ bool VitGpu::available(std::string& why) {
     }
 }
 
-bool VitGpu::prefer_mtmd(bool bf16_matrices, int max_tokens, std::string& why) {
-    // the Metal tower passed its gate on the M5 Max (RESULTS-OWN-3V.md D1, D4-D8: rule 1 and 2, 0.47 to 0.79 of mtmd-Metal's time, less memory, the 16,384-token
-    // picture that mtmd-Metal aborts on), so `auto` (the default) takes it on every Mac (owner 11-11: our tower the default, mtmd selectable)
-    (void) bf16_matrices;
-    (void) max_tokens;
-    (void) why;
-    return false;
-}
-
 bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patches, std::string& err) {
     @autoreleasepool {
         VitGpuImpl& m = *impl_;

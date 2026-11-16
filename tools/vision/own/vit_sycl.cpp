@@ -414,13 +414,6 @@ bool VitGpu::available(std::string& why) {
     return pick_gpu(d, why);
 }
 
-bool VitGpu::prefer_mtmd(bool bf16_matrices, int max_tokens, std::string& why) {
-    (void) bf16_matrices;
-    (void) max_tokens;
-    (void) why;
-    return false;
-}
-
 bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patches, std::string& err) {
     VitGpuImpl& m = *impl_;
     (void) device;          // one GPU: the one pick_gpu chooses

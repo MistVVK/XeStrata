@@ -49,14 +49,8 @@ bool own_reader_inject_failure(const char* point) {
 bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, std::string& why) {
     if (gpu) {
 #ifdef STRATA_VIT_GPU
-        bool bf16 = false;      // the layer matrices' type decides on Pascal (vit_gpu.h)
-        {
-            Gguf g0;
-            std::string e0;
-            if (g0.open(mmproj, e0))
-                if (const GgufTensorInfo* t = g0.tensor("v.blk.0.attn_qkv.weight")) bf16 = t->type == GT_BF16;
-        }
-        if (!VitGpu::available(why) || VitGpu::prefer_mtmd(bf16, max_tokens, why)) return false;
+        (void) max_tokens;      // (the Pascal 6.1 / 6.2 rule that used it is gone: our tower on every GPU)
+        if (!VitGpu::available(why)) return false;
 #else
         why = "this build has no GPU backend for the own tower";
         return false;
@@ -67,9 +61,7 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, s
     VitGeometry g;
     if (!gg.open(mmproj, why) || !vit_geometry_from_gguf(gg, g, why)) return false;
     if (!gpu) return own_cpu_reader_supported(g, quant::best_isa(), why);
-    if (!vit_geometry_supported(g, why)) return false;
-    if (g.head_dim > 96) { why = "a head size above 96 is not handled by the GPU attention"; return false; }   // `auto` then reads with mtmd
-    return true;
+    return vit_geometry_supported(g, why);      // a head size above kVitGpuMaxHeadDim is our GPU reader's own start error (own_reader_run), not a reason for mtmd
 }
 
 bool own_cpu_reader_supported(const VitGeometry& g, quant::Isa isa, std::string& why) {
@@ -115,6 +107,9 @@ int own_reader_run(const OwnReaderOptions& o) {
     std::unique_ptr<VitGpu> gpu;
     if (o.gpu) {
         std::string why;
+        if (geo.head_dim > kVitGpuMaxHeadDim)
+            return fail("this picture reader file has attention heads of size " + std::to_string(geo.head_dim) + "; the GPU picture reader handles up to " +
+                            std::to_string(kVitGpuMaxHeadDim) + " (the CPU picture reader reads it)", 1);
         if (own_reader_inject_failure("gpu")) return fail("this picture reader found no GPU" + injected, 3);
         if (!VitGpu::available(why)) return fail("this picture reader found no GPU (" + why + ")", 3);
         gpu.reset(new VitGpu());
