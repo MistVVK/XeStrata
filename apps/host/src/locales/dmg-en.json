@@ -1,0 +1,13 @@
+{
+ "dmg01": "Unreadable chats",
+ "dmg02": "Strata could not read these chat files. You can delete them here.",
+ "dmg03": "Strata could not read this chat file, so its messages are not shown.",
+ "dmg04": "Delete chat file",
+ "dmg05": "Delete {0}.json",
+ "dmg06": "Delete this chat file?",
+ "dmg07": "Keep file",
+ "dmg08": "Delete file",
+ "dmg09": "{0} was deleted. Your other chats are not affected.",
+ "dmg10": "The chat file could not be deleted",
+ "dmg11": "This chat was saved by a newer version of Strata. Update Strata to open it."
+}

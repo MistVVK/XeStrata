@@ -151,6 +151,11 @@ export interface AppState {
    *  The chats stay whole in memory and are tried again at every save; `unsavedSessionsJson()` gives them as text.
    *  A host that does not answer is not this: those saves are simply retried. */
   sessionSave: { failedIds: string[]; reason: 'disk-full' | 'permission' | 'other' } | null;
+  /** The chat files the host has a name for but cannot read (a hand-edited file, a truncated one, a format from a later release) (#5421).
+   *  They are not chats: nothing is in memory for them. The sidebar lists them so the person can delete one. */
+  damagedChats: string[];
+  /** Chats saved by a newer Strata: listed with a note to update Strata, never offered for deletion (#5421 review). */
+  newerChats: string[];
 }
 
 const PREFS_KEY = 'strata.prefs.v2';
@@ -334,6 +339,8 @@ let state: AppState = {
   setupOpen: false,
   sessions: loadSessions(),
   sessionSave: null,
+  damagedChats: [],
+  newerChats: [],
   activeSession: null,
   streaming: false,
   liveChats: 0,
@@ -1334,7 +1341,7 @@ export async function loadChatsFromHost() {
   chatsRead = true;
   const sessions = result.sessions.map(fixSession);
   for (const s of sessions) { const rev = result.revs.get(s.id); if (rev !== undefined && !result.recovered.includes(s.id)) sessionWriter.adopt(s, rev); }
-  set({ sessions });
+  set({ sessions, damagedChats: result.damaged, newerChats: result.newer });
   // Whatever the host does not have yet (a chat it refused during the move, a last-moment copy) is sent now; a refusal raises the notice.
   sessionWriter.schedule(sessions);
   sessionWriter.enable();
@@ -1345,10 +1352,12 @@ export async function loadChatsFromHost() {
 export async function applyChatChange(id: string, rev: number | null, deleted: boolean) {
   const here = state.sessions.find(s => s.id === id);
   if (deleted) {
+    // A damaged file is not a session, so it is dropped from its own list: the other window's delete clears the row here too (#5421).
+    const damaged = state.damagedChats.includes(id) ? state.damagedChats.filter(d => d !== id) : null;
     if (here && !liveTurns.has(id) && !sessionWriter.dirty(here)) {
       sessionWriter.forget(id);
-      set({ sessions: state.sessions.filter(s => s.id !== id), ...(state.activeSession === id ? { activeSession: null } : {}) });
-    }
+      set({ sessions: state.sessions.filter(s => s.id !== id), ...(state.activeSession === id ? { activeSession: null } : {}), ...(damaged ? { damagedChats: damaged } : {}) });
+    } else if (damaged) set({ damagedChats: damaged });
     return;
   }
   if (rev !== null && sessionWriter.rev(id) >= rev) return;
@@ -1369,7 +1378,20 @@ async function syncChatsFromHost() {
   const onHost = new Set(list.chats.map(c => c.id));
   for (const entry of list.chats) await applyChatChange(entry.id, entry.rev, false);
   for (const s of state.sessions) if (!onHost.has(s.id) && sessionWriter.rev(s.id) > 0) await applyChatChange(s.id, null, true);
+  set({ damagedChats: list.damaged ?? [], newerChats: list.newer ?? [] });   // a file deleted in another window leaves the list here (#5421)
   sessionWriter.enable();
+}
+
+/** Delete a chat file the host cannot read. The file goes; nothing else changes (#5421). */
+export async function deleteDamagedChat(id: string) {
+  try {
+    await chatTransport.remove(id);
+    set({ damagedChats: state.damagedChats.filter(d => d !== id) });
+    // dmg09 (coordinator 11-16) says what happened, so it is the toast after the delete, not the question before it
+    pushToast('success', tr('{0} was deleted. Your other chats are not affected.', [`${id}.json`]));
+  } catch (e) {
+    pushToast('error', 'The chat file could not be deleted', e instanceof Error ? e.message : String(e));
+  }
 }
 
 export function newSession(): Session {

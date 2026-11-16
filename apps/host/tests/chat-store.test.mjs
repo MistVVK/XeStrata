@@ -1,7 +1,7 @@
 /** Chats as files in the data folder: big chats, restart, a full disk, a refused write, a crash in the middle of a write, two windows. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, statSync, existsSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, statSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createChatStore, realIo, validChatId, storeFailure } from '../server/chat-store.mjs';
@@ -208,6 +208,27 @@ test('an indexed chat that becomes damaged is reported at restart without changi
     assert.deepEqual(restarted.list().chats, []);
     assert.deepEqual(restarted.list().damaged, ['s_broken']);
     assert.equal(readFileSync(path, 'utf8'), broken, 'recovery leaves the damaged chat untouched');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('deleting a damaged chat clears it from the damaged list, so the page can drop the row (#5421)', async () => {
+  const dir = scratch();
+  try {
+    mkdirSync(join(dir, 'chats'));   // the store makes the folder at start; this test hands it a file to read first
+    writeFileSync(join(dir, 'chats', 's_ok.json'), `{"v":1,"rev":1,"savedAt":"2026-11-04T10:00:00.000Z","session":${text(chat('s_ok', 1, 4))}}`);
+    writeFileSync(join(dir, 'chats', 's_bad.json'), '{"v":1,"rev":1,"session":{"id":"s_bad","mess');   // truncated
+    const store = createChatStore({ dir });
+    assert.deepEqual(store.list().damaged, ['s_bad']);
+    const gone = await store.remove('s_bad');
+    assert.equal(gone.removed, false, 'the damaged chat was never in the index');
+    assert.equal(existsSync(join(dir, 'chats', 's_bad.json')), false, 'the file is unlinked');
+    assert.deepEqual(store.list().damaged, [], 'the list forgets the id it just deleted');
+    assert.deepEqual(store.list().chats.map((c) => c.id), ['s_ok'], 'the healthy chat is untouched');
+    assert.equal(JSON.parse(await store.read('s_ok')).session.id, 's_ok');
+    // and the delete is durable: a restart sees one chat and nothing damaged
+    const again = createChatStore({ dir });
+    assert.deepEqual(again.list().damaged, []);
+    assert.deepEqual(again.list().chats.map((c) => c.id), ['s_ok']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

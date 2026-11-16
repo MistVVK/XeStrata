@@ -25,7 +25,7 @@ export function createHttpTransport(fetchImpl: typeof fetch = (...args) => fetch
     throw new TransportError(message, res.status, code);
   }
   return {
-    async list() { return await (await call('GET', '/api/chats')).json() as { chats: HostChatEntry[]; damaged?: string[] }; },
+    async list() { return await (await call('GET', '/api/chats')).json() as { chats: HostChatEntry[]; damaged?: string[]; newer?: string[] }; },
     async get(id) {
       try {
         const data = await (await call('GET', `/api/chats/${encodeURIComponent(id)}`)).json() as { rev: number; session: Session };
@@ -58,6 +58,11 @@ export interface HydrateResult {
   failed: { id: string; error: string; code?: string }[];
   /** Chats that came back from the last-moment copy because the host's version was older. */
   recovered: string[];
+  /** The chat files the host has a name for but cannot read (a hand-edited file, a truncated one, a format from a later release).
+   *  They have no entries to show, so the page lists the ids and lets the person delete one (#5421). */
+  damaged: string[];
+  /** Chats saved by a newer Strata: shown with a note to update, never offered for deletion (#5421 review). */
+  newer: string[];
 }
 
 /** By name, so it holds across two copies of this module (a bundle per test file). */
@@ -131,9 +136,9 @@ export async function hydrateChats(opts: {
     const onlyHere = opts.current.filter(s => !hostIds.has(s.id));
     const sessions = [...onlyHere, ...merged];
     const recovered = takeLastMomentCopy(browser, sessions, revs);
-    return { sessions: recovered.sessions, revs, offline: false, moved, failed, recovered: recovered.ids };
+    return { sessions: recovered.sessions, revs, offline: false, moved, failed, recovered: recovered.ids, damaged: list.damaged ?? [], newer: list.newer ?? [] };
   } catch (e) {
-    if (isTransportError(e)) return { sessions: opts.current, revs: new Map(), offline: true, moved, failed, recovered: [] };
+    if (isTransportError(e)) return { sessions: opts.current, revs: new Map(), offline: true, moved, failed, recovered: [], damaged: [], newer: [] };
     throw e;
   }
 }

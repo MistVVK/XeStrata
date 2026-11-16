@@ -125,7 +125,7 @@ export interface HostChatEntry { id: string; rev: number; createdAt?: string | n
 
 /** What the page asks of the host about chats (chat-sync.ts makes the real one; a test passes a fake). */
 export interface ChatTransport {
-  list(): Promise<{ chats: HostChatEntry[]; damaged?: string[] }>;
+  list(): Promise<{ chats: HostChatEntry[]; damaged?: string[]; newer?: string[] }>;
   get(id: string): Promise<{ rev: number; session: Session } | null>;
   put(id: string, text: string, baseRev: number | null): Promise<{ rev: number; conflict: boolean }>;
   remove(id: string): Promise<void>;

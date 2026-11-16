@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm, readdir, stat } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
@@ -107,5 +107,36 @@ test('a page that comes back asks which chats have a turn running; with none, th
     assert.equal(none.status, 404);
     assert.equal((await none.json()).code, 'no-turn');
     assert.equal((await fetch(`${h.base}/api/chat/attach`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 400);
+  } finally { await h.stop(); await rm(home, { recursive: true, force: true }).catch(() => {}); }
+});
+
+test('a chat file the host cannot read is listed over HTTP, and its delete clears the list without a restart (#5421)', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'strata-chats-damaged-'));
+  let h = await startHost(home);
+  try {
+    await fetch(`${h.base}/api/chats/s_ok`, { method: 'PUT', headers: named('w1', { 'content-type': 'application/json' }), body: JSON.stringify(chat('s_ok', 2, 10)) });
+    // a hand-edited, truncated file, and one written by a later release: the damaged set is built when the host starts
+    await writeFile(join(home, 'data', 'chats', 's_bad.json'), '{"v":1,"rev":1,"savedAt":"2026-11-04T10:00:00.000Z","session":{"id":"s_bad","mess');
+    await writeFile(join(home, 'data', 'chats', 's_next.json'), '{"v":2,"rev":1,"savedAt":"2026-11-04T10:00:00.000Z","session":{"id":"s_next"}}');
+    await h.stop();
+    h = await startHost(home);
+    const list = await (await fetch(`${h.base}/api/chats`, { headers: named('w1') })).json();
+    assert.deepEqual(list.chats.map(c => c.id), ['s_ok'], 'the healthy chat is listed');
+    // GUI-1116 review (coordinator 11-16): the file from a later release is not damaged; it is named apart and never deleted or overwritten
+    assert.deepEqual(list.damaged, ['s_bad'], 'the truncated file is damaged');
+    assert.deepEqual(list.newer, ['s_next'], 'the file from a later release is named apart');
+    assert.equal((await fetch(`${h.base}/api/chats/s_bad`, { headers: named('w1') })).status, 404, 'a damaged chat has nothing to read');
+    const refused = await fetch(`${h.base}/api/chats/s_next`, { method: 'DELETE', headers: named('w1') });
+    assert.equal(refused.status, 409, 'a chat of a newer Strata is never deleted');
+    const overwrite = await fetch(`${h.base}/api/chats/s_next`, { method: 'PUT', headers: named('w1', { 'content-type': 'application/json' }), body: JSON.stringify(chat('s_next', 2, 10)) });
+    assert.equal(overwrite.status, 409, 'nor overwritten by this older Strata');
+
+    const gone = await (await fetch(`${h.base}/api/chats/s_bad`, { method: 'DELETE', headers: named('w1') })).json();
+    assert.deepEqual(gone, { id: 's_bad', removed: false }, 'the file was on disk, not in the index');
+    const after = await (await fetch(`${h.base}/api/chats`, { headers: named('w1') })).json();
+    assert.deepEqual(after.damaged, [], 'the deleted id is gone from the list at once, with no restart');
+    assert.deepEqual(after.newer, ['s_next']);
+    assert.deepEqual(after.chats.map(c => c.id), ['s_ok'], 'the healthy chat is untouched');
+    assert.deepEqual(await readdir(join(home, 'data', 'chats')), ['index.json', 's_next.json', 's_ok.json'], 'the file is unlinked');
   } finally { await h.stop(); await rm(home, { recursive: true, force: true }).catch(() => {}); }
 });

@@ -56,6 +56,8 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
   let tmpCount = 0;
   let index = new Map();   // id -> entry
   const damaged = new Set();
+  const newer = new Set();   // chats saved by a newer Strata (format above CHAT_FORMAT): listed, never deleted or overwritten (#5421 review)
+  const NEWER_TEXT = 'This chat was saved by a newer version of Strata. Update Strata to open it.';
 
   const fileOf = id => join(root, `${id}.json`);
   const bytesOf = text => Buffer.byteLength(text, 'utf8');
@@ -89,6 +91,8 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
       }
       try {
         const parsed = JSON.parse(readFileSync(fileOf(id), 'utf8'));
+        // A chat saved by a newer Strata (a higher format) is not damaged: it is kept apart, never offered for deletion, never overwritten.
+        if (Number.isInteger(parsed?.v) && parsed.v > CHAT_FORMAT) { newer.add(id); continue; }
         if (parsed?.v !== CHAT_FORMAT || !parsed.session || parsed.session.id !== id) throw new Error('not a chat file');
         map.set(id, entryOf(id, Number(parsed.rev) || 1, parsed.session, statSync(fileOf(id)).size));
       } catch { damaged.add(id); }
@@ -133,7 +137,7 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
     /** The chats, newest first. */
     list() {
       const chats = [...index.values()].sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')) || a.id.localeCompare(b.id));
-      return { v: CHAT_FORMAT, chats, damaged: [...damaged] };
+      return { v: CHAT_FORMAT, chats, damaged: [...damaged], newer: [...newer] };
     },
     has: id => index.has(id),
     rev: id => index.get(id)?.rev ?? 0,
@@ -149,6 +153,7 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
      */
     save(id, sessionText, { baseRev = null } = {}) {
       if (!validChatId(id)) return Promise.reject(new ChatStoreError('That is not a chat id.', 400, 'bad-id'));
+      if (newer.has(id)) return Promise.reject(new ChatStoreError(NEWER_TEXT, 409, 'newer-format'));
       let session;
       try { session = JSON.parse(sessionText); } catch { return Promise.reject(new ChatStoreError('The chat must be JSON.', 400, 'bad-json')); }
       if (!session || typeof session !== 'object' || Array.isArray(session) || session.id !== id) return Promise.reject(new ChatStoreError('The chat does not match its id.', 400, 'bad-chat'));
@@ -170,9 +175,13 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
     /** Delete a chat (the person deleted it). A chat that is not there is already gone. */
     remove(id) {
       if (!validChatId(id)) return Promise.reject(new ChatStoreError('That is not a chat id.', 400, 'bad-id'));
+      if (newer.has(id)) return Promise.reject(new ChatStoreError(NEWER_TEXT, 409, 'newer-format'));
       return queue(async () => {
         try { await io.unlink(fileOf(id)); } catch (e) { if (e?.code !== 'ENOENT') throw storeFailure(e); }
         const had = index.delete(id);
+        // A chat the start-up read could not parse is in `damaged`, never in `index`: its file is now gone,
+        // so the list must forget it too, or the page keeps showing an id with nothing behind it (#5421).
+        damaged.delete(id);
         await writeIndex();
         return { id, removed: had };
       });
