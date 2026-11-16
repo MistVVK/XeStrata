@@ -2027,7 +2027,9 @@ if(STRATA_BUILD_TESTS)
   if(TARGET iq_avx2_parity)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
-      add_test(NAME isa_guard_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_isa_guard.py
+      # the script needs only Python's standard library: the python3 on the PATH when the test runs, so a build
+      # folder run on another machine (the A380 container's checks) does not need the configuring one's venv
+      add_test(NAME isa_guard_check COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_isa_guard.py
                $<TARGET_FILE:strata_kernels_cpu>)
       set_tests_properties(isa_guard_check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
