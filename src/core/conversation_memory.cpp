@@ -18,6 +18,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+#include "strata/platform/commit.hpp"
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -397,7 +399,11 @@ std::optional<HostMemoryReading> sample_host_memory() {
     status.dwLength = sizeof status;
     // #1607: the commit limit (RAM + page file) refuses an allocation while physical RAM is still free
     if (!GlobalMemoryStatusEx(&status)) return {};
-    return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes(), true, std::nullopt);
+    // #5742: the commit with the room the page files may still grow by (a page file set to 8 GB initial and 32 GB
+    // maximum read as 8 GB turned the automatic conversation cache off on a 40 GB machine)
+    const uint64_t commit = strata::platform::commit_available((uint64_t) status.ullAvailPageFile,
+                                                               strata::platform::commit_growth((uint64_t) status.ullTotalPhys));
+    return combine(std::min<uint64_t>(status.ullAvailPhys, commit), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes(), true, std::nullopt);
 #elif defined(__linux__)
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
 #elif defined(__APPLE__)

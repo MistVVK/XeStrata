@@ -558,6 +558,7 @@ int main() {
             for (size_t k = 0; k < parts; ++k) {
                 ConversationCheckpoint p;
                 p.gdn.assign(128, uint8_t(salt + 10 + k));
+                p.dev_tag = uint64_t(salt) * 100 + k + 1;
                 c.stage_parts.push_back(std::move(p));
             }
             return c;
@@ -575,6 +576,8 @@ int main() {
         check(split.stage0[0].stage_parts.empty() && split.parts[1][1].ids == original[2].ids &&
               split.parts[1][1].used == original[2].used && split.parts[0][0].gdn == original[0].stage_parts[0].gdn,
               "split: every stage part carries its checkpoint's ids and LRU stamp");
+        check(split.parts[0][0].dev_tag == 301 && split.parts[1][1].dev_tag == 702,
+              "split: each stage part keeps the tag of its device copy");
         check(split.stage0[0].gdn.data() == gdn0 && split.parts[1][1].gdn.data() == part1,
               "split moves the running state (same buffers, no copy)");
         std::vector<ConversationCheckpoint> back;
@@ -585,7 +588,8 @@ int main() {
                    back[j].tails == original[j].tails && back[j].used == original[j].used &&
                    back[j].stage_parts.size() == original[j].stage_parts.size();
             for (size_t k = 0; same && k < back[j].stage_parts.size(); ++k)
-                same = back[j].stage_parts[k].gdn == original[j].stage_parts[k].gdn;
+                same = back[j].stage_parts[k].gdn == original[j].stage_parts[k].gdn &&
+                       back[j].stage_parts[k].dev_tag == original[j].stage_parts[k].dev_tag;
         }
         check(same, "merge(split(x)) == x, in the original order");
         check(back[0].gdn.data() == gdn0 && back[2].stage_parts[1].gdn.data() == part1, "merge moves them back too");

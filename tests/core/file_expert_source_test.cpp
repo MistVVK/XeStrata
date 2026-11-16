@@ -6,6 +6,7 @@
 #if defined(STRATA_NATIVE_EXPERTS)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/quant/types.hpp"   // the type ids (Strata's table, no ggml.h)
+#include "strata/platform/commit.hpp"   // #5742: commit_available
 #endif
 
 #include <cuda_runtime.h>
@@ -503,6 +504,15 @@ void test_resident_memory_budget() {
     require(clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin - 1, headroom) == 0 &&
                 clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin, headroom) == 0,
             "subtracting the clamping margin underflowed");
+    {
+        // #5742: --resident-budget-gib 24 on 40 GB with a page file at 8 of its 32 GB: 32.25 GiB of RAM and 21.67 GiB of
+        // commit free.  Counting only the commit left cut it to 17.42 GiB; with the page file's 24 GiB of room it stays.
+        const uint64_t phys = 32250ull * GiB / 1000, left = 21670ull * GiB / 1000;
+        require(clamp_resident_budget(24 * GiB, phys, left, headroom) == left - headroom - margin,
+                "the reporter's clamp without the page file's room changed");
+        require(clamp_resident_budget(24 * GiB, phys, strata::platform::commit_available(left, 24 * GiB), headroom) == 24 * GiB,
+                "a budget the page file's room to grow covers was clamped");
+    }
 }
 
 void test_cgroup_memory_budget() {

@@ -169,6 +169,8 @@
 #include <tlhelp32.h>
 #include <dbghelp.h>
 #include <io.h>
+
+#include "strata/platform/commit.hpp"
 #else
 #include <unistd.h>
 #include <cerrno>
@@ -11542,10 +11544,15 @@ int main(int argc, char** argv) {
             if (GlobalMemoryStatusEx(&cs)) {
                 const uint64_t planned = (o.prompt_cache > 0 ? (uint64_t) std::max<int64_t>(o.conversation_cache_mib, 0) << 20 : 0) +
                                          (2ull << 30);   // checkpoints and prompt staging
-                const auto cv = strata::platform::host_limits::commit_verdict((uint64_t) cs.ullAvailPageFile,
-                                                                              (uint64_t) cs.ullTotalPageFile, planned, 4ull << 30);
-                std::fprintf(stderr, "strata serve: Windows commit: %.1f GiB left of a %.1f GiB limit (RAM + page file)\n",
+                // #5742: a page file still below its maximum grows when more is committed: that room counts too
+                const uint64_t grow = strata::platform::commit_growth((uint64_t) cs.ullTotalPhys);
+                const auto cv = strata::platform::host_limits::commit_verdict(
+                    strata::platform::commit_available((uint64_t) cs.ullAvailPageFile, grow),
+                    strata::platform::commit_available((uint64_t) cs.ullTotalPageFile, grow), planned, 4ull << 30);
+                std::fprintf(stderr, "strata serve: Windows commit: %.1f GiB left of a %.1f GiB limit (RAM + page file)",
                              (double) cs.ullAvailPageFile / 1073741824.0, (double) cs.ullTotalPageFile / 1073741824.0);
+                if (grow > 0) std::fprintf(stderr, "; the page files may grow by %.1f GiB more", (double) grow / 1073741824.0);
+                std::fputc('\n', stderr);
                 if (cv.warn) std::fprintf(stderr, "strata serve: %s\n", cv.text.c_str());
             }
         }
@@ -15232,7 +15239,8 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+            // (#5012: experts = every routed (layer, expert) pair, so the Monitor shows "slots / experts" as a share)
+            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld experts=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
@@ -15242,7 +15250,7 @@ int main(int argc, char** argv) {
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
-                        (long long) slots_all, (long long) mib_all,
+                        (long long) slots_all, (long long) (g.n_layers * g.n_expert), (long long) mib_all,
                         (long long) slots_primary, (long long) mib_primary,
                         o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
