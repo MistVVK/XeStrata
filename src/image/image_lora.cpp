@@ -1578,11 +1578,13 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
         release();
         return false;
     }
-    // each rank's pair balanced by a power of two, A's row divided and B's column multiplied: B A is the same to the
-    // bit (a power of two scales FP16 and FP32 exactly), and the product's middle x A^T, which add() rounds to FP16,
-    // stays in its range - a file whose A is large and B small (an A row's norm 28 against B's 0.18, a Mage-Flow LoRA
-    // of an early trainer) made it overflow and the image black at every strength (2026-11-16, the RX 9060 XT).  A
-    // pair whose norms are within a factor of two is left as it is (no copy: most files' pairs)
+    // a rank's pair whose A row is far larger than a trained LoRA's, balanced by a power of two (A's row divided, B's
+    // column multiplied, so that B A stays): the product's middle x A^T, which add() rounds to FP16, then stays in its
+    // range.  A file whose A is large and B small (A rows' norms 14 to 28 against B's 0.18, a Mage-Flow LoRA of an
+    // early trainer) made it overflow and the image black at every strength.  Only such rows: an A row's norm was 1.07
+    // at most in ai-toolkit's, XeStrata's and a published LoRA (476 weights), and balancing those too changed their
+    // images (the sampling carries the products' last bits; 2026-11-16, the RX 9060 XT)
+    constexpr double kLargeRow = 4.0 * 4.0;   // an A row's squared norm past which the pair is balanced
     std::vector<int> shift((size_t) e.rank, 0);
     bool shifted = false;
     for (int64_t j = 0; j < e.rank; ++j) {
@@ -1595,7 +1597,7 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
             const double v = strata::kernels::f32_from_f16(e.b[(size_t) (r * e.rank + j)]);
             nb += v * v;
         }
-        if (na > 0.0 && nb > 0.0) {
+        if (na > kLargeRow && nb > 0.0) {
             shift[(size_t) j] = (int) std::lround(std::log2(na / nb) / 4.0);   // log2(sqrt(|A| / |B|)), squared norms
             shifted = shifted || shift[(size_t) j] != 0;
         }
