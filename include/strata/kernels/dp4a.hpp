@@ -34,7 +34,9 @@ __device__ __forceinline__ int strata_dp4a(const int a, const int b, const int c
         "vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;\n\t"
         "vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;\n\t"
         "vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;"
-        : "+r"(r) : "r"(a), "r"(b));
+        // The first instruction writes r before the remaining instructions
+        // have read a/b. Equal-valued operands must not share its register.
+        : "+&r"(r) : "r"(a), "r"(b));
     return r;
 }
 #define STRATA_DP4A(a, b, c) strata_dp4a((a), (b), (c))
