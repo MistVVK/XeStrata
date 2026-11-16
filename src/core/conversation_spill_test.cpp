@@ -85,6 +85,60 @@ int main() {
     check(fs::exists(root) && !fs::exists(root / "4242-0123456789abcdef"), "both engines ended");
     std::string err;
     check(!SpillNamespace().open(root / "notes.txt" / "sub", err) && !err.empty(), "a root that cannot be a folder is refused with a reason");
+
+    // the entries: written as session files, the oldest go first, matched like the RAM cache, read back exactly
+    {
+        auto img = [](std::vector<int32_t> ids, uint8_t fill, std::vector<int32_t> ckpt = {}) {
+            SavedConversation s;
+            s.live.ids = ids;
+            s.live.gdn.assign(1 << 20, fill);                  // 1 MiB of running state
+            s.cvec = true;
+            if (!ckpt.empty()) { ConversationCheckpoint c; c.ids = ckpt; c.gdn.assign(4096, (uint8_t) (fill + 1)); s.checkpoints.push_back(c); }
+            return s;
+        };
+        const SessionFileIdentity id{11, 22};
+        ConversationSpill sp;
+        // room for two entries of ~2 MiB each (1 MiB payload + the 1 MiB margin per write)
+        check(sp.open(root, (uint64_t(7) << 19), err) && sp.enabled(), "the tier opens");
+        check(sp.put(img({1, 2, 3, 4}, 7, {1, 2}), id, err) && sp.put(img({5, 6, 7}, 9), id, err) && sp.size() == 2, "two entries written");
+        const fs::path first = sp.entry(0).file;
+        check(fs::exists(first) && fs::exists(sp.entry(1).file), "their files exist");
+        check(sp.bytes() == sp.entry(0).bytes + sp.entry(1).bytes && sp.budget().reserved == 0, "the budget counts what is written");
+        check(sp.put(img({8, 9}, 3), id, err) && sp.size() == 2 && !fs::exists(first), "a third pushes out the oldest, its file deleted");
+        auto m = sp.best(std::vector<int32_t>{5, 6, 7, 1}, {}, true);
+        check(m.tokens == 3 && m.live && sp.entry(m.index).live.ids == std::vector<int32_t>({5, 6, 7}), "a prompt finds the entry it continues");
+        check(sp.best(std::vector<int32_t>{1, 2, 3, 4}, {}, true).tokens == 0, "a dropped entry is not found");
+        check(sp.best(std::vector<int32_t>{5, 6, 7, 1}, {}, false).tokens == 0, "other steering: not found");
+        SavedConversation back;
+        const fs::path taken = sp.entry(m.index).file;
+        check(sp.take(m.index, id, {}, back, err) && back.live.ids == std::vector<int32_t>({5, 6, 7}) &&
+              back.live.gdn == std::vector<uint8_t>(1 << 20, 9), "taken back byte for byte");
+        check(sp.size() == 1 && !fs::exists(taken) && sp.bytes() == sp.entry(0).bytes, "a taken entry leaves the tier");
+        // a checkpoint match
+        check(sp.put(img({20, 21, 22, 23}, 5, {20, 21}), id, err), "an entry with a checkpoint");
+        auto mc = sp.best(std::vector<int32_t>{20, 21, 99}, {}, true);
+        check(mc.tokens == 2 && !mc.live, "a prompt that shares only the checkpoint finds it");
+        // another model's identity: refused, the entry goes, out unchanged
+        SavedConversation keep = img({1}, 1);
+        check(!sp.take(mc.index, SessionFileIdentity{11, 23}, {}, keep, err) && keep.live.ids == std::vector<int32_t>({1}), "another identity: refused");
+        check(sp.size() == 1, "the refused entry is gone");
+        // a cut file: refused by the bounded read
+        {
+            const fs::path f = sp.entry(0).file;
+            fs::resize_file(f, fs::file_size(f) / 2, ec);
+            SavedConversation x;
+            check(!ec && !sp.take(0, id, {}, x, err) && sp.size() == 0 && !fs::exists(f), "a cut file is refused and removed");
+        }
+        // larger than the whole tier: refused, nothing written
+        ConversationSpill small;
+        std::string e2;
+        check(small.open(root, 1 << 20, e2) && !small.put(img({1, 2}, 4), id, e2) && !e2.empty(), "an image larger than the tier is refused");
+        size_t files = 0;
+        for (auto& x : fs::directory_iterator(small.dir())) if (x.path().filename() != ".lock") ++files;
+        check(files == 0, "nothing of a refused put is left on the disk");
+        small.close();
+        sp.close();
+    }
     fs::remove_all(root, ec);
     std::printf("conversation_spill_test: %d checks, %d failed\n", checks, failures);
     return failures == 0 ? 0 : 1;

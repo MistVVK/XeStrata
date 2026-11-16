@@ -13,12 +13,16 @@
 // Budget: min(32 GiB, 25% of the free space), never below the free-space floor; a write reserves its estimate first and
 // the reservation counts until the write ends (temporary files included).
 
+#include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_file.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <random>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -165,6 +169,117 @@ public:
 private:
     std::filesystem::path root_, dir_;
     spill_detail::LockHandle lock_ = spill_detail::no_lock();
+};
+
+/// The SSD tier's entries: parked conversations written as session files into this process's namespace, oldest first.
+/// What stays in RAM per entry is only what matching needs: the token ids and picture keys of its live state and of each
+/// checkpoint (no running state, no K/V).  put() deletes the oldest entries when the budget needs the room, and never
+/// leaves a partial file behind; take() reads an entry back under the caller's read limits and removes it either way (a
+/// file that does not read back is not tried again).
+class ConversationSpill {
+public:
+    struct Entry {
+        uint64_t serial = 0;
+        std::filesystem::path file;
+        uint64_t bytes = 0;
+        bool cvec = false;
+        ConversationCheckpoint live;                     // ids and images only
+        std::vector<ConversationCheckpoint> checkpoints;   // ids and images only
+    };
+
+    bool open(const std::filesystem::path& root, uint64_t cap, std::string& error, size_t* cleaned = nullptr) {
+        entries_.clear();
+        budget_ = SpillBudget{cap, 0, 0};
+        return ns_.open(root, error, cleaned);
+    }
+    bool enabled() const { return ns_.is_open() && budget_.cap > 0; }
+    size_t size() const { return entries_.size(); }
+    uint64_t bytes() const { return budget_.used; }
+    const SpillBudget& budget() const { return budget_; }
+    const Entry& entry(size_t i) const { return entries_.at(i); }
+    const std::filesystem::path& dir() const { return ns_.dir(); }
+
+    /// Writes `image` as an entry.  False (with `error`) when the tier is off, the image is larger than the whole tier, or the
+    /// write failed; nothing of this call is then left on the disk.
+    bool put(const SavedConversation& image, const SessionFileIdentity& id, std::string& error) {
+        if (!enabled()) { error = "the SSD tier is off"; return false; }
+        const uint64_t need = (uint64_t) image.bytes() + (uint64_t(1) << 20);   // the payload and the file's own tables
+        if (need > budget_.cap) { error = "larger than the whole SSD tier"; return false; }
+        while (!budget_.reserve(need)) {
+            if (entries_.empty()) { error = "no room in the SSD tier"; return false; }
+            drop(0);
+        }
+        const uint64_t serial = next_serial_++;
+        const std::filesystem::path f = ns_.file_for(serial);
+        size_t written = 0;
+        const bool ok = session_file_write(f.string(), image, id, written, error);
+        budget_.finish(need, ok ? written : 0);
+        if (!ok) {
+            std::error_code ec;
+            std::filesystem::remove(f, ec);
+            return false;
+        }
+        Entry e;
+        e.serial = serial; e.file = f; e.bytes = written; e.cvec = image.cvec;
+        e.live = stub(image.live);
+        for (const auto& c : image.checkpoints) e.checkpoints.push_back(stub(c));
+        entries_.push_back(std::move(e));
+        while (budget_.over() && entries_.size() > 1) drop(0);   // (a file larger than its estimate)
+        return true;
+    }
+
+    /// The entry and the prefix it gives `prompt`, by the RAM cache's rule (ConversationCache::best): its live state or a
+    /// checkpoint, same pictures, same steering; ties prefer the newest.
+    template <class Token>
+    ConversationCache::Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+        ConversationCache::Match m;
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const Entry& e = entries_[i];
+            if (e.cvec != cvec) continue;
+            auto consider = [&](const ConversationCheckpoint& c, bool live) {
+                const int64_t n = conversation_prefix(c, prompt, images);
+                if (n > m.tokens) m = {i, n, live, e.serial};
+            };
+            consider(e.live, true);
+            for (const auto& c : e.checkpoints) consider(c, false);
+        }
+        return m;
+    }
+
+    /// Reads entry `i` back into `out` (bounded by `limits`, the identity checked) and removes the entry.  False: `out` is
+    /// unchanged and the entry is gone.
+    bool take(size_t i, const SessionFileIdentity& id, const SessionReadLimits& limits, SavedConversation& out, std::string& error) {
+        if (i >= entries_.size()) { error = "no such SSD entry"; return false; }
+        SavedConversation image;
+        size_t read = 0;
+        const bool ok = session_file_read(entries_[i].file.string(), id, image, read, error, limits);
+        drop(i);
+        if (ok) out = std::move(image);
+        return ok;
+    }
+
+    void drop(size_t i) {
+        std::error_code ec;
+        std::filesystem::remove(entries_.at(i).file, ec);
+        budget_.drop(entries_[i].bytes);
+        entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+    }
+    void close() {
+        while (!entries_.empty()) drop(entries_.size() - 1);
+        ns_.close();
+    }
+
+private:
+    static ConversationCheckpoint stub(const ConversationCheckpoint& c) {
+        ConversationCheckpoint s;
+        s.ids = c.ids;
+        s.imgs = c.imgs;
+        return s;
+    }
+    SpillNamespace ns_;
+    SpillBudget budget_;
+    std::vector<Entry> entries_;
+    uint64_t next_serial_ = 1;
 };
 
 }  // namespace strata::core
