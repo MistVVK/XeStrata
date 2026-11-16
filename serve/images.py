@@ -2808,7 +2808,7 @@ class ImageGen:
         self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "xestrata-image.log",
                                   self._say)
         self.tok = None
-        self.t5 = None   # Anima's T5 tokenizer (tools/strata_unigram.py), read with the first prompt
+        self.t5: Any = None   # Anima's T5 tokenizer (tools/strata_unigram.py), read with the first prompt
         self._system: str | None = None          # HunyuanImage 3.0's system prompt, read once
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}
         self.yield_turn: Callable[[], None] | None = None   # gpu_turn's, while a job has the turn
