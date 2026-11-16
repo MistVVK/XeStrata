@@ -44,10 +44,18 @@ test('the host shows the speed switches strata_control shows, for every card, en
   }
 });
 
-test('the host and the screen agree with strata_control on which models and families have a Drafting choice', () => {
-  for (const { name, supported } of V.names) assert.equal(S.resolveDrafter('dflash2', name, true, false) === 'dflash2', supported, name);
-  for (const { family, supported } of V.families) {
-    assert.equal(T.resolveDrafter('dflash2', family, true, false) === 'dflash2', supported, `screen: ${family}`);
-    assert.equal(S.resolveDrafter('dflash2', family, true, false) === 'dflash2', supported, `host: ${family}`);
+test('the host and the screen agree with strata_control on which models and families have a Drafting choice', async () => {
+  // a DFlash2 chosen by name runs where strata_control's named rule says (#5240: also the Coder); Auto only where the model was made for it
+  for (const { name, supported, named } of V.names) {
+    assert.equal(S.resolveDrafter('dflash2', name, true, false) === 'dflash2', named, name);
+    assert.equal(S.resolveDrafter('auto', name, true, false) === 'dflash2', supported, `auto: ${name}`);
   }
+  for (const { family, supported, named } of V.families) {
+    assert.equal(T.resolveDrafter('dflash2', family, true, false) === 'dflash2', named, `screen: ${family}`);
+    assert.equal(S.resolveDrafter('dflash2', family, true, false) === 'dflash2', named, `host: ${family}`);
+    assert.equal(T.resolveDrafter('auto', family, true, false) === 'dflash2', supported, `screen auto: ${family}`);
+    assert.equal(S.resolveDrafter('auto', family, true, false) === 'dflash2', supported, `host auto: ${family}`);
+  }
+  const { DFLASH2_NAMED_FAMILIES: generated } = await import('../server/policy-generated.mjs');
+  assert.deepEqual(T.DFLASH2_NAMED_FAMILIES, generated, 'the screen copy of the named-only families is the generated list');
 });

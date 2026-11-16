@@ -278,7 +278,9 @@ class OneRequestAtATime(unittest.TestCase):
                 self.assertTrue(want(mode, model_name=GYRO, backend="cuda", archs=["sm_121"]), mode)
             for mode in ("mtp", "off"):
                 self.assertFalse(want(mode, model_name=GYRO, backend="cuda", archs=["sm_121"]), mode)
-            self.assertFalse(want("dflash2", model_name="qwen3.8-flash-next-coder-iq1_m", backend="cuda", archs=["sm_121"]))
+            self.assertTrue(want("dflash2", model_name="qwen3.8-flash-next-coder-iq1_m", backend="cuda", archs=["sm_121"]), "#5240: the Coder named")
+            self.assertFalse(want("auto", model_name="qwen3.8-flash-next-coder-iq1_m", backend="cuda", archs=["sm_121"]))
+            self.assertFalse(want("dflash2", model_name="qwen3.8-flash-next-swift-iq2_xs", backend="cuda", archs=["sm_121"]))
             self.assertTrue(want("auto", model_name=GYRO, backend="sycl", archs=[]), "Intel runs DFlash2 one request at a time")
             self.assertFalse(want("auto", model_name=GYRO, backend="cpu", archs=[]))
             self.assertTrue(want("auto", model_name=GYRO, backend="metal", archs=[]))

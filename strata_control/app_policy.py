@@ -49,7 +49,10 @@ def render() -> str:
             + "/** The families that have a Drafting choice (strata_control/drafting.py SUPPORTED_FAMILIES). */\n"
             + f"export const DRAFTING_FAMILIES = {json.dumps(list(drafting.SUPPORTED_FAMILIES))};\n"
             + "/** The model names the DFlash2 drafter was made for (strata_control/drafting.py _SUPPORTED_NAME), a case-insensitive pattern. */\n"
-            + f"export const DFLASH2_MODEL_PATTERN = {json.dumps(drafting._SUPPORTED_NAME.pattern)};\n")
+            + f"export const DFLASH2_MODEL_PATTERN = {json.dumps(drafting._SUPPORTED_NAME.pattern)};\n"
+            + "/** #5240: the families and model names DFlash2 runs on only when the person chooses it by name (strata_control/drafting.py NAMED_ONLY_FAMILIES, _NAMED_ONLY_NAME). */\n"
+            + f"export const DFLASH2_NAMED_FAMILIES = {json.dumps(list(drafting.NAMED_ONLY_FAMILIES))};\n"
+            + f"export const DFLASH2_NAMED_PATTERN = {json.dumps(drafting._NAMED_ONLY_NAME.pattern)};\n")
 
 
 #: Cases the host's copies of the RULES (speedSwitchApplies, resolveDrafter) must answer as Python does.  The table above is data and is generated; the rules are code, so the
@@ -80,8 +83,9 @@ def vectors() -> dict:
                 row = {"model": model, "backend": backend, "card": card,
                        "shows": sorted(s.id for s in speed_switches.applicable(cfg, [g], backend) if not s.terminal_only)}
                 switches.append(row)
-    names = [{"name": n, "supported": bool(drafting.supported_model(n, None))} for n in _NAMES]
-    families = [{"family": f, "supported": bool(drafting.supported_model(None, f))} for f in ("qwen", "gyro", "unsloth", "swift", "coder", "nvfp4")]
+    names = [{"name": n, "supported": bool(drafting.supported_model(n, None)), "named": bool(drafting.supported_model(n, None, named=True))} for n in _NAMES]
+    families = [{"family": f, "supported": bool(drafting.supported_model(None, f)), "named": bool(drafting.supported_model(None, f, named=True))}
+                for f in ("qwen", "gyro", "unsloth", "swift", "coder", "nvfp4")]
     return {"cards": _CARDS, "models": _MODELS, "switches": switches, "names": names, "families": families}
 
 
