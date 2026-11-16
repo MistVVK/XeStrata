@@ -12396,9 +12396,10 @@ int main(int argc, char** argv) {
                     while (std::getline(in, line)) {
                         std::vector<int32_t> ids;
                         for (const char* q = line.c_str(); *q != '\0';) {
-                            if (*q >= '0' && *q <= '9') {
-                                ids.push_back((int32_t) std::atoi(q));
-                                while (*q >= '0' && *q <= '9') ++q;
+                            if (*q >= '0' && *q <= '9') {   // a run of digits: a token id
+                                char* end = nullptr;
+                                ids.push_back((int32_t) std::strtol(q, &end, 10));
+                                q = end;
                             } else {
                                 ++q;
                             }
