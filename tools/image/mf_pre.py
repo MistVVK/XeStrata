@@ -418,7 +418,8 @@ def check_dir(d: Path, budgets: int | list[int], step: int) -> int:
             z = np.load(lf)
             a, orig, crop = z["latents"], z["original_size"], z["crop_ltrb"]
             wb, hb, wc, hc, left, t, r, b = want[tag]
-            sd_ok = "latents_sd" not in z or (z["latents_sd"].shape == a.shape and str(z["latents_sd"].dtype) == "float32")
+            sd_ok = "latents_sd" not in z or (z["latents_sd"].shape == a.shape
+                                              and str(z["latents_sd"].dtype) == "float32")
             ok = ok and (str(a.dtype) == "float32" and a.ndim == 3 and sd_ok
                          and a.shape[1:] == (hb // 16, wb // 16) and list(orig) == [ow, oh]
                          and list(crop) == [left, t, r, b]
