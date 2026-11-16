@@ -5566,11 +5566,15 @@ int main(int argc, char** argv) {
         // ends LOW (`reserve_adapted`).  A reserve given on the command line is kept.  No slot at all: the start
         // stops, saying what is short and what makes room.  A card the default reserve leaves that much is sized as
         // before.
+        // The matrix library's VRAM is held already and counted in the reserve (size_cache): the small reserve is
+        // what comes after the cache, on top of it (a 300 MiB reserve under hipBLASLt's 556 left the cache that much
+        // of memory the library holds).
         constexpr int kSmallReserveMib = 300;
-        if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
+        const int small_reserve_mib = kSmallReserveMib + (int) (blas_bytes >> 20);
+        if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > small_reserve_mib) {
             // the largest reserve (in MiB) that still leaves min_slots
             const int64_t fit_mib = ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
-            if (fit_mib >= kSmallReserveMib) {
+            if (fit_mib >= small_reserve_mib) {
                 const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
                 int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib) << 20) + mtp_bind + pipe_first)) / blob;
                 // not below the slots a working cache needs (s2 >= min_slots: r leaves them)
@@ -5587,14 +5591,14 @@ int main(int argc, char** argv) {
         if (o.expert_cache == 0) {
             // what is short, and what makes room: the numbers a small card picks from
             const int64_t at_reserve = o.vram_reserve_given ? o.vram_reserve_mib
-                                                            : std::min(o.vram_reserve_mib, kSmallReserveMib);
+                                                            : std::min(o.vram_reserve_mib, small_reserve_mib);
             const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + pipe_first + min_slots * blob;
             const int64_t short_mib = std::max<int64_t>(1, (need_b - (int64_t) free_b + (1 << 20) - 1) >> 20);
             const int64_t session_mib = (int64_t) (strata::core::session_bytes(g, o.max_context, K) >> 20);
             const std::string reserve_tip =
-                o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib
+                o.vram_reserve_given && o.vram_reserve_mib > small_reserve_mib
                     ? ", a smaller --vram-reserve-mib (" + std::to_string(o.vram_reserve_mib) + " now; " +
-                          std::to_string(kSmallReserveMib) + " is enough on a small card)"
+                          std::to_string(small_reserve_mib) + " is enough on a small card)"
                     : std::string();
             const char* batch_tip = o.batch > 1 ? "fewer simultaneous requests (--batch / parallel), " : "";
             std::fprintf(stderr, "xestrata generate: no VRAM is left for the expert cache: it needs at least %lld slots "
