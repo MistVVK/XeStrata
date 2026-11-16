@@ -9300,6 +9300,9 @@ def mac_control_setup(a) -> int:
         cfg["draft_vocab"] = a.draft_vocab
     if a.browser is not None:
         cfg["open_browser"] = a.browser
+    if no_layer:                                       # the model list says it has no draft layer, and DFlash2 is made for Qwen3.8-Flash-Next only: no drafter exists for it.
+        cfg["mtp"] = False                             # Written as Windows and Linux write it (setup_config, feed_no_drafter), so the plan and the start say
+        cfg["drafting"] = "off"                        # "Drafting: Off" instead of an MTP that has nothing to load (TRIAGE-0215)
     if vision != "none":                               # the Mac's one program reads on the GPU (--gpu) or the CPU (strata_control/vision_reader.py)
         from strata_control import vision_reader as VR
         cfg["args"].append("--vision")

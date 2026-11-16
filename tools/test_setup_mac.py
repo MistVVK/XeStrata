@@ -427,6 +427,27 @@ class ControlMode(unittest.TestCase):
         rc, _ = self.run_setup()                                  # the Flash-Next size itself says nothing of the kind
         self.assertFalse([s for s in self.said if "model list says" in s])
 
+    def test_a_model_without_a_draft_layer_plans_and_starts_no_drafter(self):
+        # the run config of such a model says what Windows and Linux write ("mtp": false, "drafting": "off"), so the plan and the start say
+        # "Drafting: Off"; before, neither key was written and both said "Drafting: MTP" with nothing to load (TRIAGE-0215)
+        from strata_control import drafting, mac_fit
+        for hw in (M4, M5):                                       # a Mac that streams and one that keeps the model in memory
+            with mock.patch.dict(mac_fit.MAC_MODELS["Q2_0"], {"no_mtp": True}):
+                rc, _ = self.run_setup(hw=hw)
+            self.assertEqual(rc, 0)
+            cfg = self.config()
+            self.assertIs(cfg.get("mtp"), False, hw)
+            self.assertEqual(cfg.get("drafting"), "off", hw)
+            self.assertNotIn("--mtp", cfg["args"])
+            for name in (cfg["model_name"], "feedfam-q4_k_m"):    # the feed model's own name as well
+                d = drafting.apply(dict(cfg, model_name=name), data_dir=self.data, backend="metal", archs=[])
+                self.assertEqual((d.drafter, drafting.summary_line(d)), ("off", "Drafting: Off"), (hw, name))
+        (self.home / "strata-q2_0.json").unlink()                 # (a fresh install: nothing carried over from the runs above)
+        rc, _ = self.run_setup(hw=M5)                             # the Flash-Next size keeps its drafter: neither key is written
+        cfg = self.config()
+        self.assertNotIn("drafting", cfg)
+        self.assertNotIn("mtp", cfg)
+
     def test_a_big_mac_keeps_the_pack_in_memory_and_adds_the_draft_layer(self):
         rc, ran = self.run_setup(hw=M5, argv=("--yes", "--no-start", "--model", "IQ3_XXS"))
         self.assertEqual(rc, 0)
