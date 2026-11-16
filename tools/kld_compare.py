@@ -52,7 +52,8 @@ def main() -> int:
     ap.add_argument("--engine", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--chunks", type=int, default=0, help="at most this many chunks (0: all)")
-    ap.add_argument("--bos", type=int, default=1, help="the chunks' first token (-1: the text's own, a model without BOS)")
+    ap.add_argument("--bos", type=int, default=1,
+                    help="the chunks' first token (-1: the text's own, a model without BOS)")
     ap.add_argument("--engine-arg", action="append", default=[])
     ap.add_argument("--json")
     args = ap.parse_args()
@@ -70,7 +71,8 @@ def main() -> int:
             open(pf, "w").write(",".join(map(str, prompt)))
             open(ff, "w").write(",".join(map(str, follow)))
             cmd = [args.engine, "--native", args.model, "--tokens-file", pf, "--spec-follow", ff,
-                   "--max-new", str(len(follow)), "--max-context", str(n_ctx + 64), "--dump-logits", lf] + args.engine_arg
+                   "--max-new", str(len(follow)), "--max-context", str(n_ctx + 64), "--dump-logits", lf]
+            cmd += args.engine_arg
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0:
                 sys.stderr.write(r.stderr[-4000:])

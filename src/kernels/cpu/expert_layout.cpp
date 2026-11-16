@@ -8,6 +8,7 @@
 #include "strata/platform/env.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -372,6 +373,19 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.max_blob = 0;
     int64_t expert_embd = 0, expert_ff = 0;   // v6: the header's own widths (the latent MoE), 0 when absent
     std::string line;
+    // the header's "<key>N": false where the key is there without a whole number after it (atoll read the digits up to
+    // any other character, or 0 for none)
+    auto header_number = [&line](const char* key, int64_t& out) {
+        const size_t at = line.find(key);
+        if (at == std::string::npos) return true;
+        const char* p = line.c_str() + at + std::strlen(key);
+        char* end = nullptr;
+        errno = 0;
+        const long long v = std::strtoll(p, &end, 10);
+        if (end == p || errno != 0 || (*end != '\0' && std::strchr(" \t,)", *end) == nullptr)) return false;
+        out = v;
+        return true;
+    };
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
             if (!line.empty() && line[0] == '#') {
@@ -396,13 +410,15 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // v3 packs record their expert count in the header; a pruned model (GSQ-RCO Coder) ships
                 // fewer experts than the canonical geometry the caller passes, which is a compile-time
                 // default, so the header wins.
-                const size_t at = line.find("(n_expert ");
-                if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                if (!header_number("(n_expert ", L.n_expert)) {
+                    err = "native_experts.txt: the header's n_expert is not a number";
+                    return false;
+                }
                 // v6 (the latent MoE): the experts' widths, the shell's hidden width and FF when absent
-                const size_t eb = line.find("expert_embd ");
-                if (eb != std::string::npos) expert_embd = std::atoll(line.c_str() + eb + 12);
-                const size_t ef = line.find("expert_ff ");
-                if (ef != std::string::npos) expert_ff = std::atoll(line.c_str() + ef + 10);
+                if (!header_number("expert_embd ", expert_embd) || !header_number("expert_ff ", expert_ff)) {
+                    err = "native_experts.txt: the header's expert_embd or expert_ff is not a number";
+                    return false;
+                }
             }
             continue;
         }

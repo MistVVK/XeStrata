@@ -421,7 +421,7 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
         m.ws.end((int) b);
         if (rk > 0)
             for (int k = 0; k < 3; ++k) {
-                const float* d = dmod + k * 3 * C;
+                const float* d = dmod + (int64_t) k * 3 * C;
                 const float* x2 = x2s + (b * 3 + k) * M;
                 const train::Lora *l1 = B.m1[k], *l2 = B.m2[k];   // either may be untrained (train::Targets)
                 if (l2 != nullptr)

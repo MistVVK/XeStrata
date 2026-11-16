@@ -11,6 +11,7 @@ out is learned as the trigger word. So write out everything the LoRA must not le
 Answer with the caption alone, on one line: the trigger word, a comma, then the caption. No notes, no quotes.
 
 A character LoRA (it must learn the character only):
+
 - Leave out the character's own look, the same in every picture: face, eyes, hair (its color, length, style), skin,
   body, a mark or accessory always worn. The user's list of these, where given, is the character's.
 - Write everything else in the picture: the clothes, the pose and expression, what they hold, the background and
@@ -22,6 +23,7 @@ A character LoRA (it must learn the character only):
 - Keep the class word: `a girl`, `a man`, `a cat`.
 
 A style LoRA (it must learn the style only):
+
 - Leave out the style: the medium, the coloring, the line, the texture, the look.
 - Write what the picture shows: the subjects, their clothes and pose, the place, the framing.
 

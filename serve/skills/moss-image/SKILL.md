@@ -5,6 +5,7 @@ metadata:
   kind: model
   for: moss-image
 ---
+
 - Give generate_image a `layout` only when the user says where things or words go; the prompt is then a short
   description of the whole image.
 - One item for each thing or text placed: `character` (a person), `object`, `text` (its exact words in `text`);

@@ -107,7 +107,7 @@ def start_error(room: NoRoom, said) -> str:
                                                           else "") + ")") if room.need_mib else ""
     lines = [x.strip() for x in said if x and x.strip()]
     evidence = (next((x for x in reversed(lines) if "malloc failed" in x.lower()), None)
-                or next((x for x in reversed(lines) if "allocat" in x.lower()), None)
+                or next((x for x in reversed(lines) if "allocat" in x.lower()), None)  # codespell:ignore
                 or (lines[-1] if lines else ""))
     return ("the vision encoder did not start: the graphics card has no room for it" + asked +
             (". From the encoder: " + evidence[:300] if evidence else ""))

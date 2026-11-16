@@ -5,6 +5,7 @@ metadata:
   kind: tool
   tool: upscale_image
 ---
+
 - After the image is as the user wants it. `scale` 2 (the default) for a wallpaper or a print, 1.5 a little larger.
 - Without `redraw`: the same picture larger, its detail restored, nothing drawn anew ("just larger", a photo,
   someone else's picture). `redraw` true draws it again finer; its prompt is what the image shows; `strength` 0.35

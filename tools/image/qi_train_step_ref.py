@@ -40,6 +40,8 @@ def aitk_transformer(root: Path):
     sys.path.insert(0, str(root))
     path = root / "extensions_built_in/diffusion_models/qwen_image_2/src/transformer.py"
     spec = importlib.util.spec_from_file_location("aitk_qwen_image_2_transformer", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"{path} cannot be read")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
@@ -92,7 +94,8 @@ def run(m, sd, dtype, factors, states, xt, x0, noise, t_model, h, w, device="cpu
     t0 = time.time()
     model = build(m, sd, dtype).to(device)
     model.pos_embed = m.QwenImage21Rope(theta=10000, axes_dim=[16, 56, 56])
-    if INT8:   # ai-toolkit's quantize with qtype convrot8 on the blocks' linears (its excluded modules stay as they are)
+    # ai-toolkit's quantize with qtype convrot8 on the blocks' linears (its excluded modules stay as they are)
+    if INT8:
         from toolkit.util.convrot_quant import get_convrot_quantizer
         q = get_convrot_quantizer("convrot8")
         for blk in model.transformer_blocks:

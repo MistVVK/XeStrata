@@ -69,12 +69,12 @@ void rows_scalar_t(const uint8_t* w, size_t row_bytes, int n, const tq_detail::T
             uint32_t st[NS];
             tq_detail::tq_states<TY>(blk + 2, st);
             for (int t = 0; t < nt; ++t) {
-                const int16_t* q = a[t]->q + 128 * i;
+                const int16_t* q = a[t]->q + 128 * (ptrdiff_t) i;
                 for (int k = 0; k < 4; ++k) {
                     int32_t s = 0;
                     for (int j = 0; j < SPK; ++j) {
                         const int16_t* wv = tab + 4 * st[SPK * k + j];   // a TQP step: the row's first two weights
-                        const int16_t* qv = q + 32 * k + WPS * j;
+                        const int16_t* qv = q + 32 * (ptrdiff_t) k + WPS * (ptrdiff_t) j;
                         for (int e = 0; e < WPS; ++e) s += wv[e] * qv[e];
                     }
                     const float sc = dx * a[t]->d[4 * i + k];
@@ -123,7 +123,7 @@ TqIsa tq_isa() {
 
 bool tq_kernels_enabled() {
     static const bool on = [] {
-        if (const char* e = strata::env_get("NO_TQ_KERNELS"); e != nullptr && std::atoi(e) != 0) return false;
+        if (const char* e = strata::env_get("NO_TQ_KERNELS"); e != nullptr && std::strtol(e, nullptr, 10) != 0) return false;
         // Every CPU runs them: the scalar kernel (baseline x86-64) where there is no AVX2.  A ggml built from upstream
         // has no vec_dot for the trellis types to fall back to, so a CPU without AVX2 must not be sent there.
         return true;
@@ -142,7 +142,8 @@ void unpack_act(const void* q8_0, int n, TqAct& a) {
     for (int b = 0; b < n / 32; ++b, p += 34) {   // block_q8_0: fp16 d, 32 x int8
         a.d[b] = tq_half_to_float(tq_ld16(p));
         const int8_t* q = (const int8_t*) (p + 2);
-        for (int j = 0; j < 32; ++j) a.q[32 * b + j] = q[j];
+        for (int j = 0; j < 32; ++j)
+            a.q[32 * b + j] = q[j];  // NOLINT(bugprone-signed-char-misuse): q8_0's values are signed
     }
 }
 

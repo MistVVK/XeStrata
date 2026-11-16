@@ -70,7 +70,7 @@ if [ ${#cpp[@]} -gt 0 ]; then
     cxx=()
     for f in "${cpp[@]}"; do
       [[ $f == *.cpp ]] || continue
-      if printf '%s\n' "${tus[@]}" | grep -qxF "$PWD/$f"; then
+      if grep -qxF "$PWD/$f" <<<"$(printf '%s\n' "${tus[@]}")"; then   # not a pipe: grep -q ends it early
         cxx+=("$f")
       else
         echo "== clang-tidy: $f skipped (not compiled in $BUILD)"
@@ -85,6 +85,12 @@ if [ ${#cpp[@]} -gt 0 ]; then
       for h in "${hpp[@]}"; do
         case "$h" in include/*) inc="[<\"]${h#include/}[>\"]" ;; *) inc="\"([^\"]*/)?${h##*/}\"" ;; esac
         tu=$(grep -l -E "^#include $inc" "${tus[@]}" 2>/dev/null | head -n 1)
+        if [ -z "$tu" ]; then   # a header only another header includes (a shape's in layout.hpp): a source of that one
+          while read -r p; do
+            tu=$(grep -l -E "^#include [<\"]${p#include/}[>\"]" "${tus[@]}" 2>/dev/null | head -n 1)
+            [ -n "$tu" ] && break
+          done < <(grep -rl -E "^#include $inc" include 2>/dev/null)
+        fi
         if [ -n "$tu" ]; then
           run "clang-tidy $h (in ${tu#"$PWD"/})" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$h\"}]" "$tu"
         else

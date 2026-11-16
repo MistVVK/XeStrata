@@ -8,12 +8,27 @@
 #include "strata/platform/env.hpp"
 #include "strata/platform/mapped_file.hpp"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 
 namespace strata::core {
+namespace {
+
+// A manifest's number at p, read whole up to a blank, the end, or the header's ':', ',' or ')': false where atoll and
+// sscanf took the digits up to any other character (or 0 for none).  p moves past it.
+bool manifest_number(const char*& p, int64_t& v) {
+    char* end = nullptr;
+    errno = 0;
+    v = std::strtoll(p, &end, 10);
+    if (end == p || errno != 0 || (*end != '\0' && std::strchr(" \t:,)", *end) == nullptr)) return false;
+    p = end;
+    return true;
+}
+
+}  // namespace
 
 LatentDense::LatentDense() = default;
 LatentDense::~LatentDense() = default;
@@ -143,8 +158,10 @@ bool latent_manifest_read(const std::string& path, LatentManifest& m, std::strin
         if (line.empty()) continue;
         if (line[0] == '#') {
             if (!head) {
-                int v = 0;
-                if (std::sscanf(line.c_str(), "# strata native experts v%d:", &v) != 1) {
+                static constexpr char kHead[] = "# strata native experts v";
+                const char* p = line.c_str() + sizeof kHead - 1;
+                int64_t v = 0;
+                if (line.rfind(kHead, 0) != 0 || !manifest_number(p, v) || *p != ':') {
                     err = path + ": not a strata native experts manifest (XeStrata's xs manifests go to expert_layout_load)";
                     return false;
                 }
@@ -152,25 +169,39 @@ bool latent_manifest_read(const std::string& path, LatentManifest& m, std::strin
                     err = path + ": native experts version " + std::to_string(v) + " is not one this reader knows (3..6)";
                     return false;
                 }
-                m.version = v;
+                m.version = (int) v;
                 head = true;
-                const size_t eb = line.find("expert_embd ");
-                if (eb != std::string::npos) m.expert_embd = std::atoll(line.c_str() + eb + 12);
-                const size_t ef = line.find("expert_ff ");
-                if (ef != std::string::npos) m.expert_ff = std::atoll(line.c_str() + ef + 10);
-                const size_t ne = line.find("(n_expert ");
-                if (ne != std::string::npos) m.n_expert = std::atoll(line.c_str() + ne + 10);
+                // the header's "expert_embd N", "expert_ff N" and "(n_expert N, ..."; a key without its number fails
+                auto key_number = [&line](const char* key, int64_t& out) {
+                    const size_t at = line.find(key);
+                    if (at == std::string::npos) return true;
+                    const char* q = line.c_str() + at + std::strlen(key);
+                    return manifest_number(q, out);
+                };
+                if (!key_number("expert_embd ", m.expert_embd) || !key_number("expert_ff ", m.expert_ff) ||
+                    !key_number("(n_expert ", m.n_expert)) {
+                    err = path + ": the header's expert_embd, expert_ff or n_expert is not a number";
+                    return false;
+                }
             }
             continue;
         }
         if (!head) { err = path + ": a row before the version header"; return false; }
         LatentLayerFmt l;
-        unsigned long long off = 0, blob = 0;
-        int layer = -1;
-        if (std::sscanf(line.c_str(), "%d %d %d %llu %llu", &layer, &l.gu_type, &l.d_type, &off, &blob) != 5) {
-            err = path + ": cannot parse the row '" + line + "'";
+        int64_t row[5] = {};   // layer gu_type d_type offset blob_bytes, then columns this reader does not use
+        const char* p = line.c_str();
+        bool ok = true;
+        for (int64_t& v : row) ok = ok && manifest_number(p, v);
+        if (!ok || row[0] < 0 || row[0] > INT32_MAX || row[1] < INT32_MIN || row[1] > INT32_MAX || row[2] < INT32_MIN ||
+            row[2] > INT32_MAX || row[3] < 0) {
+            err = path + ": cannot parse the row '";
+            err += line + "'";
             return false;
         }
+        const int layer = (int) row[0];
+        l.gu_type = (int) row[1];
+        l.d_type = (int) row[2];
+        const uint64_t off = (uint64_t) row[3], blob = row[4] > 0 ? (uint64_t) row[4] : 0;
         if (layer != (int) m.layers.size()) {
             err = path + ": layer " + std::to_string(layer) + " out of order (expected " +
                   std::to_string(m.layers.size()) + ")";

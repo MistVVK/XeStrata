@@ -5,4 +5,5 @@ metadata:
   kind: model
   for: hunyuan-image-3
 ---
+
 - Write in English or Chinese.

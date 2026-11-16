@@ -5,6 +5,7 @@ metadata:
   kind: tool
   tool: control
 ---
+
 - `type`: `pose` (people's pose, nothing else kept), `depth` (composition), `canny` (every outline), `lineart` (a
   drawing's lines; `lineart_coarse` rough ones), `hed` (soft outlines), `scribble` (a sketch), `mlsd` (a room's
   straight lines), `gray` (shading), `none` (the image is a map already, one control returned).

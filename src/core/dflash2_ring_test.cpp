@@ -15,6 +15,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -90,7 +91,8 @@ int main(int argc, char** argv) {
                 for (int kvsel = 0; kvsel < 2 && !differs; ++kvsel)
                     for (int h = 0; h < 8 && !differs; ++h) {
                         const size_t off = ((size_t) l * 2 + kvsel) * per + ((size_t) h * Dflash2Drafter::kRing + sl) * 128;
-                        if (std::memcmp(&kv[off], &kvA[off], 128 * 4) != 0) differs = true;
+                        for (int i = 0; i < 128 && !differs; ++i)   // the bits: a copy keeps NaNs and -0 as they are
+                            differs = std::bit_cast<uint32_t>(kv[off + i]) != std::bit_cast<uint32_t>(kvA[off + i]);
                     }
             if (differs) ++bad_kv;
         }

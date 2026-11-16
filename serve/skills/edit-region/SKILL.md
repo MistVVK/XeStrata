@@ -5,6 +5,7 @@ metadata:
   kind: tool
   tool: edit_region
 ---
+
 - `region`: the part in short English words, as a label (`hair`, `sky`, `the left cup`); the prompt: what it
   becomes, in the model's prompt style ("long blue hair").
 - Every instance is found; for one, say which: `the man's hair`, `the girl on the left`.
