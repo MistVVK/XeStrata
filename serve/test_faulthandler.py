@@ -96,7 +96,39 @@ class NativeDeath(unittest.TestCase):
                            capture_output=True, text=True, timeout=180)
         self.assertIn("Fatal Python error", p.stderr)
         self.assertIn("Thread 0x", p.stderr)                         # a live worker is in the report
-        self.assertIn("request-worker", p.stderr)                    # and one can be told from the others
+        self.assertIn("in <lambda>", p.stderr)                       # with its own Python frames
+        # (the thread's NAME is not printed by the shipped Python 3.12's faulthandler: frames and ids only)
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal")
+    def test_a_closed_error_output_neither_stops_the_start_nor_changes_the_death(self):
+        """A launcher that started the server with no error output (fd 2 closed): arming answers, the server goes on,
+        and a native death still ends the process by the same signal (nothing is written, nothing hangs)."""
+        crasher = ("import os, signal, sys\n"
+                   "sys.path.insert(0, os.environ['STRATA_ROOT'])\n"
+                   "import serve.server as server\n"
+                   "os.close(2)\n"
+                   "print('armed', server.arm_faulthandler(env={}), flush=True)\n"
+                   "print('still serving', flush=True)\n"
+                   "os.kill(os.getpid(), signal.SIGSEGV)\n")
+        p = subprocess.run([sys.executable, "-c", crasher], cwd=ROOT, env={**os.environ, "STRATA_ROOT": ROOT},
+                           capture_output=True, text=True, timeout=180)
+        self.assertRegex(p.stdout, r"armed (True|False)\nstill serving\n")
+        self.assertEqual(p.returncode, -signal.SIGSEGV)
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal")
+    def test_the_stack_lands_in_a_log_file_the_output_is_redirected_to(self):
+        """The app and the Terminal send the server's output to a log file: the stack must be in that file."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "server.log")
+            with open(log, "w") as f:
+                p = subprocess.run([sys.executable, "-c", CRASHER], cwd=ROOT, env={**os.environ, "STRATA_ROOT": ROOT},
+                                   stdout=f, stderr=subprocess.STDOUT, timeout=180)
+            with open(log, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        self.assertEqual(p.returncode, -signal.SIGSEGV)
+        self.assertIn("Fatal Python error", text)
+        self.assertIn("the_line_that_dies", text)
 
 
 if __name__ == "__main__":
