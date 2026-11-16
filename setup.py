@@ -8783,6 +8783,17 @@ def own_path_parallel_note(a_parallel, fam: dict, model: str, vram_gb: float, ct
     return lines
 
 
+def own_path_gguf_in(folder: Path) -> Path | None:
+    """--gguf-dir for a family with an engine path of its own (one GGUF file): the folder's one model file when it is not under the
+    published name (a renamed copy, another maker's build of the same model; #5869). The picture reader (mmproj*) and unfinished
+    downloads (.part) do not count. None when there is not exactly one."""
+    try:
+        found = [p for p in sorted(Path(folder).glob("*.gguf")) if p.is_file() and not p.name.lower().startswith("mmproj")]
+    except OSError:
+        return None
+    return found[0] if len(found) == 1 else None
+
+
 def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted):
     """Steps 2-7 for a family with its own engine path (OWN_PATH_FAMILIES: Qwen3.6-35B-A3B): the size, the context, the
     engine, the GGUF (pinned revision, size and SHA-256), the tokenizer from the GGUF, the config and the start
@@ -8856,8 +8867,11 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} "
              "does not use them")
     folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    gguf = folder / fam["file"].format(q=model)
-    size = fam["sha256"][gguf.name][0]
+    published = fam["file"].format(q=model)           # the published file's name: its pinned size and SHA-256
+    gguf = folder / published
+    if a.gguf_dir and not gguf.exists():
+        gguf = own_path_gguf_in(folder) or gguf        # #5869: the person's own file under another name (the importer checked its types)
+    size = fam["sha256"][published][0]
     part = gguf.with_name(gguf.name + ".part")
     def have(p: Path) -> bool:                         # --gguf-dir: the person's own file has no finish mark; verify_sha256 checks and writes it
         return p.exists() and (done(p) or bool(a.gguf_dir))
@@ -8897,7 +8911,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         if a.gguf_dir:
             fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
         download(fam["hf"] + gguf.name, gguf)
-    verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir))
+    verify_sha256(gguf, *fam["sha256"][published], own=bool(a.gguf_dir))
     ok(f"model file: {gguf}")
     mmproj = folder / fam["mmproj"]
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked

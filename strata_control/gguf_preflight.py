@@ -102,6 +102,44 @@ def real_model_file(path: Path) -> Path:
     return target
 
 
+def tensor_types(path: Path) -> dict[str, int]:
+    """name -> GGML type of every tensor in one GGUF v3 shard's directory (a link to one is followed), read within the same bounds as
+    inspect_metadata; the metadata values are skipped. For the Qwen3.6 loader check (strata_control/q36_types.py)."""
+    try:
+        path = real_model_file(Path(path))
+        descriptor = os.open(path, os.O_RDONLY)
+        with os.fdopen(descriptor, "rb") as stream:
+            details = os.fstat(stream.fileno())
+            if not stat.S_ISREG(details.st_mode):
+                raise ProfileError("GGUF shard must be a regular file", 5)
+            reader = _Reader(stream, details.st_size)
+            if reader.take(4) != b"GGUF":
+                raise ProfileError("file does not begin with a GGUF header", 5)
+            version, tensors, keys = reader.u32(), reader.u64(), reader.u64()
+            if version != 3:
+                raise ProfileError("Strata metadata preflight requires GGUF v3", 5)
+            if not 0 <= tensors <= MAX_TENSORS or keys > MAX_METADATA_KEYS:
+                raise ProfileError("GGUF tensor or metadata count exceeds the inspection limit", 5)
+            for _ in range(keys):
+                if reader.string() is not None:                # (skipped)
+                    pass
+                reader.value(reader.u32())
+            out: dict[str, int] = {}
+            for _ in range(tensors):
+                name = reader.string(capture=True)
+                if not name or len(name) > 256:
+                    raise ProfileError("GGUF tensor name is invalid or too long", 5)
+                dimensions = reader.u32()
+                if not 1 <= dimensions <= 8:
+                    raise ProfileError("GGUF tensor dimension count is invalid", 5)
+                reader.skip(8 * dimensions)
+                out[name] = reader.u32()
+                reader.skip(8)
+            return out
+    except OSError:
+        raise ProfileError("GGUF metadata could not be read", 5) from None
+
+
 _RESULT_TYPES = {"architecture": (str, type(None)), "projector_type": (str, type(None)), "tokenizer_model": (str, type(None)),
                  "tokenizer_tokens_present": bool, "tokenizer_merges_present": bool, "tensor_count_reported": int,
                  "tensor_count_scanned": int, "tensor_types": dict, "expert_tensor_types": dict, "header_bytes_scanned": int,
