@@ -12,3 +12,12 @@ export function addEnergy(powerW, at) {
 }
 
 export const energyWh = () => meter.wh;
+
+/**
+ * The power the meter adds up (#6012): the sum over the GPUs that report one. A GPU with no power counter (an AMD iGPU
+ * on Windows, a unified-memory GPU) adds nothing instead of making the whole sum unknown; with no reading at all, null.
+ */
+export function reportedPowerW(readings) {
+  const values = (readings ?? []).map(g => g?.powerW).filter(v => typeof v === 'number' && Number.isFinite(v) && v >= 0);
+  return values.length ? values.reduce((n, v) => n + v, 0) : null;
+}
