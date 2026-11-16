@@ -337,7 +337,8 @@ uint64_t zfs_arc_reclaimable_from_text(const std::string& arcstats) {
 }
 
 uint64_t zfs_arc_reclaimable_bytes(const std::string& path) {
-#if defined(__linux__)
+    // the file is read on every system: only Linux has it (no file: 0), and memory_guard_test's fixture gives its own path
+    // on Windows too (a Linux-only read failed that test there)
     std::ifstream in(path);
     if (!in) return 0;
     std::ostringstream text;
@@ -348,10 +349,6 @@ uint64_t zfs_arc_reclaimable_bytes(const std::string& path) {
         std::fprintf(stderr, "[strata] memory: %.1f GiB of the ZFS ARC is counted as available RAM (ZFS gives it back when "
                              "programs need it; #5519)\n", (double) b / (double) (uint64_t(1) << 30));
     return b;
-#else
-    (void) path;
-    return 0;
-#endif
 }
 
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
