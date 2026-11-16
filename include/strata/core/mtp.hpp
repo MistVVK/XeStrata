@@ -82,6 +82,11 @@ public:
     /// drafters that share them follow with share_experts.
     bool experts_to_host(std::string& err);
     bool experts_on_host() const { return experts_host_; }
+    /// The draft head's token subset is read from `name` beside the layer in place of draft_vocab.bin (before bind):
+    /// the English subset setup puts there, a card the expert cache would otherwise leave short.  False (nothing
+    /// changed) where the file is not there or holds no fewer tokens.
+    bool use_vocab_file(const std::string& name);
+    const std::string& vocab_file() const { return vocab_file_; }
     void share_experts(const MtpDrafter& owner) { experts_ = owner.experts_; experts_host_ = owner.experts_host_; }
     /// DF-05: the gathered draft-head rows and vocabulary (this drafter keeps owning them), for the DFlash2 drafter
     /// to share when they are the same bytes (the same head and vocabulary file).  rows null: the whole head.
@@ -263,6 +268,7 @@ private:
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
+    std::string vocab_file_ = "draft_vocab.bin";
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
     float* probs_ = nullptr;

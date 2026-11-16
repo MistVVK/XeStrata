@@ -5764,7 +5764,9 @@ int main(int argc, char** argv) {
             }
             // Still short with every D/U layer streamed (a 6 GB card with Edge0-120B): the hyper-connection
             // projections' Q8_0 copies go to pinned memory, the kernels reading them in place (XESTRATA_HC_HOST: a
-            // window reads them whole over the link).  Not taken where the cache has its slots without it.
+            // window reads them whole over the link), then the drafter's head takes the English subset setup puts
+            // beside the layer (XESTRATA_MTP_VOCAB_EN: Chinese, Japanese and Korean answers draft less).  The last
+            // steps, by their cost: neither is taken where the cache has its slots without them.
             const auto hc_pick = strata::core::pick_from_env("HC_HOST");
             if (native_dense.hc_q8_device_bytes() > 0 && hc_pick != strata::core::Pick::Off &&
                 (hc_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
@@ -5779,6 +5781,18 @@ int main(int argc, char** argv) {
                                          "memory, read in place (XESTRATA_HC_HOST=0 keeps them on the device): the "
                                          "expert cache %s in place of %s\n", (unsigned long long) (hb >> 20),
                                  slots_text(slots).c_str(), slots_text(before).c_str());
+                }
+            }
+            const auto en_pick = strata::core::pick_from_env("MTP_VOCAB_EN");
+            if (mtp.loaded() && en_pick != strata::core::Pick::Off &&
+                (en_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
+                const int64_t before = slots;
+                if (mtp.use_vocab_file("draft_vocab_en.bin")) {
+                    size_cache();
+                    std::fprintf(stderr, "xestrata generate: the drafter's head on the English subset "
+                                         "(draft_vocab_en.bin; XESTRATA_MTP_VOCAB_EN=0 keeps %s): the expert cache %s in "
+                                         "place of %s\n", "draft_vocab.bin", slots_text(slots).c_str(),
+                                 slots_text(before).c_str());
                 }
             }
         }
@@ -7900,7 +7914,7 @@ int main(int argc, char** argv) {
         }
         if (df2_loaded) {
             // auto: the MTP's gathered draft head is the same bytes (the same vocabulary file): share it
-            if (use_mtp && same_bytes(df2_vocab, o.mtp + "/draft_vocab.bin")) {
+            if (use_mtp && same_bytes(df2_vocab, o.mtp + "/" + mtp.vocab_file())) {
                 const auto sh = mtp.shared_head();
                 if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
             }
@@ -9671,7 +9685,7 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "xestrata serve: DFlash2 not loaded (%s): the MTP drafts\n", e.c_str());
                         df2_drop(nullptr);
                     } else {
-                        if (use_mtp && same_bytes(df2_vocab, o.mtp + "/draft_vocab.bin")) {
+                        if (use_mtp && same_bytes(df2_vocab, o.mtp + "/" + mtp.vocab_file())) {
                             const auto sh = mtp.shared_head();
                             if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
                         }
@@ -14465,7 +14479,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (df2_loaded) {
-            if (use_mtp && same_bytes(df2_vocab, o.mtp + "/draft_vocab.bin")) {
+            if (use_mtp && same_bytes(df2_vocab, o.mtp + "/" + mtp.vocab_file())) {
                 const auto sh = mtp.shared_head();
                 if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
             }
