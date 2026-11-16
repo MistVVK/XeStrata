@@ -1057,6 +1057,12 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0, named: b
 
     ``slot_drafts``: Auto on the class whose slot drafts are the default (slot_drafts_by_default says so; the caller asks it): the same as ``named`` for the request slots."""
     items = [str(a) for a in args or []]
+    if str(backend or "").lower().split(":")[0] == "sycl":
+        # #5747: the Intel engine runs DFlash2 for one card and one request at a time only (sycl/src/program/generate.cpp refuses a
+        # layer split, --batch slots and --pipeline-windows at start, "--draft dflash2 is for one card and one request at a time"), so
+        # nothing it refuses is planned there, also not by name: a planned start the engine refuses cost a failed boot per restart
+        return bool(split or slots > 1 or any(a in items for a in ("--batch", "--slots", "--parallel", "--pipeline-windows",
+                                                                     "--layer-split", "--split-device")))
     if (named or slot_drafts) and str(backend or "").lower() != "metal":
         return "--pipeline-windows" in items
     return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel")))
