@@ -4726,7 +4726,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fprintf(stderr, "strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)\n",
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
+        // STOP between two layers (STRATA_STOP_LAYERS=0: only between chunks, as before).  A cancelled batched read keeps none
+        // of its session, only the checkpoints saved before it (generate.cpp: pp_exact), so the chunk is given up where it is:
+        // the expert copies end, then this card finishes what was queued, so the next request starts on a quiet card.
+        static const bool stop_in_chunk = [] {
+            const char* v = std::getenv("STRATA_STOP_LAYERS");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
         for (int64_t l = LB; l < LE; ++l) {
+            if (l > LB && stop_in_chunk && should_stop && should_stop()) {
+                a_stop.store(true, std::memory_order_release);
+                if (issuer.joinable()) issuer.join();
+                if (stream_all) m.stager->finish();
+                if (m.pp != nullptr && m.pp->s != nullptr) {
+                    const core::OnDevice od(m.pp->dev);
+                    (void) cudaStreamSynchronize(m.pp->s);
+                    if (m.pp->s_out != nullptr) (void) cudaStreamSynchronize(m.pp->s_out);
+                }
+                (void) cudaDeviceSynchronize();
+                std::fprintf(stderr, "strata prefill: stopped in the chunk from token %lld before layer %lld (STOP)\n",
+                             (long long) p0, (long long) l);
+                err = "cancelled";
+                return false;
+            }
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk

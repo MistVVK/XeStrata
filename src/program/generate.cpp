@@ -15084,6 +15084,12 @@ int main(int argc, char** argv) {
 #if defined(STRATA_USE_HIP) && defined(__linux__)
         kfdq_exit::g_stop.store(&stop_req);   // EXIT (kfd_quiet.hpp): a signal ends the running request like STOP (nothing without the handler)
 #endif
+        // A layer split: the later stages look at STOP too.  They read each chunk the first stage hands on, so a cancelled prompt
+        // waited for the last stage to finish its chunk (2x P100, 8192-token chunks: ~12 s of a 24 s stop).  The set of
+        // checkpoint parts at a position is kept only when every stage made its part, so a stage that stops early leaves none.
+        // STRATA_STOP_STAGES=0: only the first stage looks (as before).
+        if (const char* v = std::getenv("STRATA_STOP_STAGES"); v == nullptr || std::atoi(v) != 0)
+            for (auto& st : stages) st->sp.should_stop = sp.should_stop;
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
         // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
