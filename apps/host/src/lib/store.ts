@@ -2295,7 +2295,10 @@ function answerAgentTool(sessionId: string, messageId: string, tool: ToolCall, a
   }));
   setState(approved ? 'running' : 'denied');
   api.post('/api/chat/approval', { sessionId, toolId: tool.id, decision: approved ? 'approve' : 'deny' }).catch(error => {
-    setState('proposed');
+    // #5308: 409 is the host saying nothing is waiting for this answer any more (the turn ended, the assistant restarted): it can never be
+    // delivered, so the card ends with the host's sentence instead of asking again; any other failure puts the question back to try again.
+    if (error instanceof ApiError && error.status === 409) setState('error', error.message);
+    else setState('proposed');
     pushToast('error', 'That answer was not delivered', error instanceof Error ? error.message : undefined);
   });
 }
@@ -2309,7 +2312,7 @@ export function resolveTool(messageId: string, toolId: string, approved: boolean
   const sessionId = state.activeSession;
   if (!sessionId) return;
   const tool = state.sessions.find(s => s.id === sessionId)?.messages.find(m => m.id === messageId)?.tools?.find(t => t.id === toolId);
-  if (tool?.live) { answerAgentTool(sessionId, messageId, tool, approved); return; }
+  if (tool?.live) { if (tool.state === 'proposed') answerAgentTool(sessionId, messageId, tool, approved); return; }   // an ended card (#5308) is not answered again
 
   patchSession(sessionId, (s) => ({
     ...s,
