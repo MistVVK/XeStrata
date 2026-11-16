@@ -519,20 +519,111 @@ def take_server_options(a_changes: dict) -> dict:
     return out
 
 
+#: #5858: run-defaults.json, user-wide server settings for every `strata launch` (beside launch-presets/: ~/.config/strata or %APPDATA%\\Strata).
+#: The Settings view's server keys (serve/runconfig.EDITABLE, checked with its rules) and undeclared_tool_calls; not "mtp", "open_browser" or
+#: engine options. Lowest precedence: the model's installed config, the Settings view's saved values and this launch's own choices come first.
+USER_DEFAULTS_FILE = "run-defaults.json"
+USER_DEFAULTS_KEY = "user_defaults"            # in the launch config: {key: value} the defaults file supplied (sampling keys dotted)
+_DEFAULTS_NOT = ("mtp", "open_browser", "vram_reserve_mib")
+
+
+def user_defaults_path() -> Path:
+    from strata_control import profiles
+    return profiles.profile_dir().parent / USER_DEFAULTS_FILE
+
+
+def read_user_defaults(path: Path | None = None) -> tuple[dict, list[str]]:
+    """({key: checked value}, the lines to say) from the user's run-defaults.json. No file: ({}, []), today's behaviour."""
+    from serve import runconfig
+    path = Path(path) if path is not None else user_defaults_path()
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {}, []
+    except OSError as exc:
+        return {}, [f"{path} is skipped: {exc.strerror or exc}."]
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return {}, [f"{path} is skipped: it is not valid JSON ({exc})."]
+    if not isinstance(data, dict):
+        return {}, [f"{path} is skipped: it must hold one JSON object of settings."]
+    out, notes = {}, []
+    for key, value in data.items():
+        flat = {f"sampling.{k}": v for k, v in value.items()} if key == "sampling" and isinstance(value, dict) else {key: value}
+        for name, v in flat.items():
+            try:
+                if name == "undeclared_tool_calls":
+                    if v not in ("text", "call"):
+                        raise ValueError('expected "text" or "call"')
+                    checked = v
+                elif name in runconfig.SPEC and name not in _DEFAULTS_NOT:
+                    checked = runconfig.check(name, v, {})
+                else:
+                    raise ValueError("not a setting this file can hold")
+            except ValueError as exc:
+                notes.append(f"{path}: {name} is skipped ({exc}).")
+                continue
+            if checked is not None:
+                out[name] = checked
+    return out, notes
+
+
+def _has_setting(cfg: dict, key: str) -> bool:
+    if key.startswith("sampling."):
+        return isinstance(cfg.get("sampling"), dict) and key.split(".", 1)[1] in cfg["sampling"]
+    return key in cfg
+
+
+def _setting_of(cfg: dict, key: str):
+    if key.startswith("sampling."):
+        return (cfg.get("sampling") or {}).get(key.split(".", 1)[1]) if isinstance(cfg.get("sampling"), dict) else None
+    return cfg.get(key)
+
+
+def apply_user_defaults(cfg: dict, base: dict, defaults: dict) -> dict:
+    """The defaults the model's installed config does not set itself, put into `cfg`; returns what was applied (remembered in the
+    launch config under USER_DEFAULTS_KEY, so carry_settings tells them from a value the Settings view saved)."""
+    applied = {}
+    for key, value in (defaults or {}).items():
+        if _has_setting(base, key):
+            continue                                         # the model's own setting comes first
+        if key.startswith("sampling."):
+            merged = dict(cfg["sampling"]) if isinstance(cfg.get("sampling"), dict) else {}
+            merged[key.split(".", 1)[1]] = value
+            cfg["sampling"] = merged
+        elif key == "lazy_load" and value and cfg.get("vision"):
+            continue                                         # lazy loading is text-only
+        else:
+            cfg[key] = value
+        applied[key] = value
+    if applied:
+        cfg[USER_DEFAULTS_KEY] = applied
+    else:
+        cfg.pop(USER_DEFAULTS_KEY, None)
+    return applied
+
+
 def carry_settings(cfg: dict, prev: dict | None) -> None:
     """The Settings-view values a person saved in this launch's config since its last start (the web page writes into
-    the very file `strata launch` wrote): their standing choices, kept in the rebuilt config like a hand-edit."""
+    the very file `strata launch` wrote): their standing choices, kept in the rebuilt config like a hand-edit. A value the user
+    defaults file put there last time (and nobody changed since) is not carried: the defaults file as it is now decides it (#5858)."""
     if not prev:
         return
+    from_defaults = prev.get(USER_DEFAULTS_KEY) if isinstance(prev.get(USER_DEFAULTS_KEY), dict) else {}
+
+    def untouched_default(key: str) -> bool:
+        return key in from_defaults and _setting_of(prev, key) == from_defaults[key]
+
     for key in WEB_SETTINGS_KEYS:
-        if key not in prev:
+        if key not in prev or untouched_default(key):
             continue
         if key == "lazy_load" and prev[key] and cfg.get("vision"):
             continue                                         # lazy loading is text-only; the page itself refuses it for a picture model
         cfg[key] = prev[key]
     sampling = prev.get("sampling")
     if isinstance(sampling, dict):
-        keep = {k: v for k, v in sampling.items() if k in WEB_SAMPLING_KEYS}
+        keep = {k: v for k, v in sampling.items() if k in WEB_SAMPLING_KEYS and not untouched_default(f"sampling.{k}")}
         if keep:
             merged = dict(cfg["sampling"]) if isinstance(cfg.get("sampling"), dict) else {}
             merged.update(keep)
@@ -540,7 +631,7 @@ def carry_settings(cfg: dict, prev: dict | None) -> None:
 
 
 def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None,
-                  prev: dict | None = None) -> dict:
+                  prev: dict | None = None, defaults: dict | None = None) -> dict:
     """The private run config of this launch: the installed one plus the choices that are not setup's (host, port, key, cards, advanced).
     `prev` is the config this launch wrote last time: its calibrated values, hand edits and the values the Settings view
     saved (serve/runconfig.py, carry_settings) are kept (strata_control/arg_layers.py: explicit launch values, then
@@ -586,6 +677,7 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         cfg["env"] = tune_knobs.apply_to_env(dict(cfg.get("env") or {}), e_changes)
     from strata_control import draft_layer
     draft_layer.apply(cfg)                                   # "mtp": false (from the installed config too) never sits beside --mtp in the saved args (B10)
+    apply_user_defaults(cfg, base, defaults or {})            # #5858: the user's run-defaults.json, below everything else
     carry_settings(cfg, prev)                                # what the Settings view saved since the last start survives this launch
     for key, value in server_set.items():                    # an explicit value from this command line beats what an earlier start saved
         if value is None:
@@ -1780,9 +1872,16 @@ class Runner:
             previous = None
         if not isinstance(previous, dict):
             previous = None
+        defaults, notes = read_user_defaults()
+        for note in notes:
+            self.emit("config", note, None, level="warn")
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
                             log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base),
-                            prev=previous)
+                            prev=previous, defaults=defaults)
+        used = {k: _setting_of(cfg, k) for k in (cfg.get(USER_DEFAULTS_KEY) or {}) if _setting_of(cfg, k) == cfg[USER_DEFAULTS_KEY][k]}
+        if used:
+            self.emit("config", f"Using your defaults from {user_defaults_path()}: " + ", ".join(f"{k}={v if isinstance(v, str) else json.dumps(v)}" for k, v in used.items()) +
+                      " (a model's own settings and this launch's choices take priority).", None)
         self.say_remembered_cards(base)
         self.apply_four_card(cfg)
         self.apply_split_engine(cfg)
