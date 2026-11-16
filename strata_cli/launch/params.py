@@ -226,8 +226,8 @@ def flag_list(engine: str | Path | None) -> list[str] | None:
     if not engine:
         return None
     try:
-        from strata_control import tuning
-        return tuning.engine_flag_inventory(Path(engine))
+        from strata_control import tune_knobs, tuning
+        return tuning.engine_flag_inventory(Path(engine), wanted=tuning.dimension_flags() | tune_knobs.arm_flags())
     except Exception:                                        # noqa: BLE001
         return None
 

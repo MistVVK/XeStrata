@@ -412,6 +412,7 @@ class Context:
     feed_timeout: float = 30.0                    # seconds a read of the feed may wait (the quiet daily check uses 5)
     automatic: bool = False                       # a read of the feed nobody asked for by name (netpolicy rule 4b: the refusal note)
     gate: object | None = None                    # strata_control.engine_update.ModelGate: what to do when a model is loaded (None: refuse before anything is downloaded)
+    memory_check: Callable | None = None          # (run config) -> (free GB, needed GB) when memory is short for a test load, else None (#5400; tests)
 
     def say(self, phase: str, message: str, **extra) -> None:
         self.emit({"event": "phase", "phase": phase, "message": message, **extra})
@@ -694,6 +695,12 @@ def _choose_engine(feed: feedmod.Feed, ctx: Context, state: State) -> tuple[dict
     if report["status"] == "available" and local:
         report["installed_locally"] = local
         report["download_bytes"] = 0
+        if offered.version in (section.get("failed_unproven") or {}) and not ctx.force:
+            # #5400: this engine was used without a test load (memory was short) and could not start the model; switching to it again by itself
+            # would repeat that. The person can ask for it by name.
+            report["status"] = "failed-before"
+            report["note"] = (f"{offered.version} could not start your model after the last update, so the previous engine is in use; "
+                              "run `strata update --force` to use it again")
         return report, offered
     bad = (section.get("failed") or {}).get(offered.version)
     if bad and _failed_mark_is_old(bad, ctx):
@@ -1107,6 +1114,11 @@ def _test_start_failure(component: ec.EngineComponent, started: dict, ctx: Conte
 
 TEST_CONTEXT = 4096
 _TEST_DROP_WITH_VALUE = ("--kv-resident", "--vision-tokens")
+#: (#5400) "--ple-io ram" locks the n-gram (PLE) table in RAM (28.8 GB for IQ3_S, measured on l620): the test reads its rows from the file
+#: ("direct"), which is all a one-token test needs. The engine also picks "ram" by itself when the RAM is free (its residency policy): the test
+#: start's environment turns that off (TEST_ENV).
+_TEST_PLE_IO = "direct"
+TEST_ENV = {"STRATA_PLE_AUTO_RAM": "0"}
 _TEST_DROP_FLAGS = ("--vision",)
 
 
@@ -1127,12 +1139,119 @@ def light_test_args(args: list) -> list:
             i += 2
         elif item in _TEST_DROP_WITH_VALUE and nxt is not None:
             i += 2
+        elif item == "--ple-io" and nxt == "ram":
+            out += [item, _TEST_PLE_IO]
+            i += 2
         elif item in _TEST_DROP_FLAGS:
             i += 2 if nxt is not None and not nxt.startswith("--") else 1
         else:
             out.append(item)
             i += 1
     return out
+
+
+#: #5400: the result mode of a test start that did not load the model because memory was short (the engine's binary check only), and the
+#: share of a model's RAM figure (setup's MODELS[size]["ram_gb"], which counts the whole PC) that is the operating system's.
+LOW_MEMORY_MODE = "binary-low-memory"
+TABLE_OS_SHARE_GB = 4.0
+_SETUP_MODELS: list = []
+
+
+def _setup_models() -> dict:
+    """setup.py's model table (MODELS), read once, quietly; {} when it cannot be read."""
+    if not _SETUP_MODELS:
+        table: dict = {}
+        try:
+            import importlib.util
+            path = Path(__file__).resolve().parents[1] / "setup.py"
+            spec = importlib.util.spec_from_file_location("strata_setup_for_update", path)
+            mod = importlib.util.module_from_spec(spec)
+            real = sys.stdout
+            sys.stdout = sys.stderr
+            try:
+                spec.loader.exec_module(mod)
+            finally:
+                sys.stdout = real
+            table = dict(getattr(mod, "MODELS", {}) or {})
+        except (Exception, SystemExit):                  # noqa: BLE001 - no table: the files' sizes decide
+            table = {}
+        _SETUP_MODELS.append(table)
+    return _SETUP_MODELS[0]
+
+
+#: RAM the test start keeps free beside what it plans (#5400; the resident mode's own STRATA_RESIDENT_HEADROOM_GIB is the same 4 GB), and the
+#: engine's own memory beside the expert arena and the PLE table: 84.4 GB peak (VmHWM) on l620 for IQ3_S = 50.3 arena + 28.8 PLE + 5.3
+TEST_HEADROOM_GB = 4.0
+ENGINE_BASE_GB = 5.3
+_LOW_RAM_FLAGS = ("--mmap-experts", "--resident-experts")
+
+
+def _flag_number(args: list[str], flag: str) -> float | None:
+    if flag in args[:-1]:
+        try:
+            return float(args[args.index(flag) + 1])
+        except ValueError:
+            return None
+    return None
+
+
+def test_ram_need_gb(cfg: dict) -> float | None:
+    """The RAM the update's test start (light_test_args) needs for this run config, in GB, from the engine's own plan of where the experts go
+    (docs/DETAILS.md "Low-RAM modes"), plus TEST_HEADROOM_GB:
+    - the normal mode copies every expert into RAM: the model's expert arena (setup's MODELS[size]["arena_gb"]);
+    - --resident-budget-gib N: N GiB of experts in RAM;
+    - --mmap-experts / --resident-experts: the experts are mapped, or copied only when they fit beside the headroom the engine keeps itself: nothing
+      beyond the headroom;
+    the light arguments leave no KV cache in RAM and no picture reader. Without the arena figure: setup's whole-PC figure less the system's share,
+    else the size of the model files. None when nothing is known (then the full test runs, as before)."""
+    args = [str(a) for a in cfg.get("args") or []]
+    extra = ENGINE_BASE_GB + TEST_HEADROOM_GB
+    if "--ple-io" in args[:-1] and args[args.index("--ple-io") + 1] == "ram" and "--ple-gguf" in args[:-1]:
+        try:
+            extra += Path(args[args.index("--ple-gguf") + 1]).stat().st_size / 1e9        # the PLE table locked in RAM (not after light_test_args)
+        except OSError:
+            pass
+    budget = _flag_number(args, "--resident-budget-gib")
+    if budget is not None:
+        return budget * 1.073741824 + extra
+    if any(f in args for f in _LOW_RAM_FLAGS):
+        return extra
+    name = str(cfg.get("model_name") or "").lower()
+    best = None
+    for size, entry in _setup_models().items():
+        if name.endswith("-" + str(size).lower()) and isinstance(entry, dict) and (entry.get("arena_gb") or entry.get("ram_gb")):
+            if best is None or len(str(size)) > len(best[0]):
+                best = (str(size), entry)
+    if best is not None:
+        entry = best[1]
+        if entry.get("arena_gb"):
+            return float(entry["arena_gb"]) + extra
+        return max(0.0, float(entry["ram_gb"]) - TABLE_OS_SHARE_GB)
+    total = 0
+    for flag in ("--native", "--ple-gguf"):
+        if flag in args[:-1]:
+            try:
+                total += Path(args[args.index(flag) + 1]).stat().st_size
+            except OSError:
+                pass
+    return total / 1e9 + extra if total else None
+
+
+def free_ram_gb() -> float | None:
+    try:
+        from strata_control import tune_machine
+        mib = tune_machine.memory().get("available_mib")
+        return None if mib is None else mib * 1048576 / 1e9
+    except Exception:                                    # noqa: BLE001 - unknown: the full test
+        return None
+
+
+def low_memory(cfg: dict) -> tuple[float, float] | None:
+    """(free GB, needed GB) when the memory free now is less than a test load of this model needs; None when there is room or either is unknown."""
+    need, free = test_ram_need_gb(cfg), free_ram_gb()
+    if need is None or free is None or free >= need:
+        return None
+    return free, need
 
 
 def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Context) -> dict:
@@ -1161,6 +1280,22 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
         cfg.pop("lib_dirs", None)
         if isinstance(cfg.get("args"), list):
             cfg["args"] = light_test_args(cfg["args"])
+        cfg["env"] = {**(cfg.get("env") if isinstance(cfg.get("env"), dict) else {}), **TEST_ENV}
+        short = (ctx.memory_check or low_memory)(cfg)
+        if short:
+            # #5400: loading the model now would push this PC out of memory (other programs hold it). The engine gets the check an install with no
+            # model gets; it becomes "unproven" (_finish_engine_install), and if its first real start fails the previous engine is used again by itself.
+            free, need = short
+            model = cfg.get("model_name") or source.stem
+            if component.version in (State(ctx.components).section("engine").get("failed_unproven") or {}):
+                raise TestStartFailed(component.version, f"it could not be tested with your model: only {free:.0f} GB of memory is free right now and {model} needs "
+                                                         f"about {need:.0f} GB, and the last time this engine was used without that test it could not start your model",
+                                      busy=True)
+            ctx.say("test", f"Only {free:.0f} GB of memory is free right now and {model} needs about {need:.0f} GB, so the new engine was checked without "
+                            "loading the model. It loads your model the next time it starts.", component="engine")
+            out = binary_smoke(component, ctx=ctx)
+            return {**out, "mode": LOW_MEMORY_MODE, "model": model, "free_gb": round(free, 1), "need_gb": round(need, 1),
+                    "detail": f"checked without the model: not enough free memory for a test load ({free:.0f} of {need:.0f} GB)"}
         cfg["host"] = "127.0.0.1"
         cfg["port"] = _free_port()
         cfg["log"] = str(sandbox / "engine.log")
@@ -1293,6 +1428,11 @@ def _switch_to_installed(ctx: Context, state: State, folder: str, result: dict) 
     ctx.say("switch", "This engine is already on this computer; switching to it", component="engine")
     out = engine_library.use_qwen_unlocked(ctx, state, folder)
     chosen, _ = installed_engine(ctx.components, ctx.hardware)
+    section = state.section("engine")
+    if chosen is not None and chosen.version in (section.get("failed_unproven") or {}) and section.get("previous"):
+        # (#5400) asked for again with --force after it could not start the model: still not proven, so a failed first start goes back once more
+        section["unproven"] = {"version": chosen.version, "folder": chosen.root.name, "previous": section["previous"],
+                               "at": (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat()}
     result.update({"changed": out.get("changed", False), "status": "updated" if out.get("changed") else "current", "installed_after": _engine_view(chosen),
                    "previous": state.section("engine").get("previous"), "removed": [], "presets_marked": bool(out.get("presets_marked")), "from_disk": True})
     state.history({"at": (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat(), "action": "update-engine", "from": (result.get("installed_before") or {}).get("version"),
@@ -1368,6 +1508,13 @@ def _finish_engine_install(ctx: Context, state: State, pkg: feedmod.EnginePackag
         section["previous"] = previous
         section["active"] = final.name
         section.get("failed", {}).pop(pkg.version, None)
+        if smoke.get("mode") == LOW_MEMORY_MODE and previous:
+            section["unproven"] = {"version": pkg.version, "folder": final.name, "previous": previous,
+                                   "at": (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat()}       # #5400: proven by its first real start
+        else:
+            section.pop("unproven", None)
+            if smoke.get("mode") == "full":
+                (section.get("failed_unproven") or {}).pop(pkg.version, None)
         skipped = [v for v in section.get("skipped", []) if v != pkg.version]
         section["skipped"] = skipped
         after_identity = preset_marks.identity_of(chosen, pkg.manifest_sha256)
@@ -1465,6 +1612,7 @@ def switch_engine(ctx: Context, state: State, name: str, target: ec.EngineCompon
     when the package is what a start picks anyway (the newest one), so the engine follows updates again. One writer of the pin and of the
     previous / skipped bookkeeping: `strata components rollback` and `use_engine` (Settings > Engine, `strata components use`) both come here."""
     section = state.section("engine")
+    section.pop("unproven", None)                     # (#5400) an engine the person chose, or went back to, is never switched away from by itself
     current, _ = installed_engine(ctx.components, ctx.hardware)
     leaving = current.root.name if current else None
     before_identity = preset_marks.identity_of(current, _manifest_sha(current.root)) if current else None
@@ -1533,6 +1681,66 @@ def rollback_engine(ctx: Context) -> dict:
             raise UpdateError(f"the engine is already the previous one ({current.version}); there is nothing older to return to. "
                               "Run `strata update --force` to try the newer version again.", 2)
         return switch_engine(ctx, state, previous, target, what="previous engine")
+
+
+#: #5400: what a start says after it went back to the previous engine by itself.
+FALLBACK_NOTE = ("The new engine {new} could not start your model, so Strata went back to engine {old}. Your settings are unchanged; "
+                 "the update will be offered again.")
+
+
+def unproven_in_use(root: Path | None = None, hardware: dict | None = None) -> dict | None:
+    """The "unproven" record (#5400) when the engine a start uses now is the one the update switched to without a test load; else None."""
+    root = Path(root) if root else ec.components_dir()
+    try:
+        u = State(root).section("engine").get("unproven")
+        if not isinstance(u, dict) or not u.get("folder"):
+            return None
+        current, _ = installed_engine(root, hardware if hardware is not None else detect_hardware())
+        return u if current is not None and current.root.name == u["folder"] else None
+    except Exception:                                    # noqa: BLE001 - a start never fails on this bookkeeping
+        return None
+
+
+def mark_proven(root: Path | None = None, hardware: dict | None = None) -> bool:
+    """A start reached ready with the unproven engine: it is proven, the record goes. True when there was one."""
+    root = Path(root) if root else ec.components_dir()
+    if unproven_in_use(root, hardware) is None:
+        return False
+    try:
+        with update_lock(root):
+            state = State(root)
+            state.section("engine").pop("unproven", None)
+            state.save()
+        return True
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def fall_back_from_unproven(root: Path | None = None, *, hardware: dict | None = None, emit: Callable[[dict], None] = lambda event: None,
+                            serving: Callable[[], list[dict]] = serving_now) -> dict | None:
+    """The first real start with an unproven engine failed (#5400): go back to the previous engine (rollback_engine: nothing downloaded), once.
+    The version is remembered (failed_unproven) so the next offer of it needs the full test, and it is not hidden from the update (not "skipped").
+    None when there is nothing to do or the switch is not possible now (another model serving, the previous engine gone)."""
+    root = Path(root) if root else ec.components_dir()
+    hardware = hardware if hardware is not None else detect_hardware()
+    u = unproven_in_use(root, hardware)
+    if u is None:
+        return None
+    ctx = Context(components=root, source="", trusted={}, hardware=hardware, emit=emit, serving=serving)
+    try:
+        out = rollback_engine(ctx)
+    except (UpdateError, Busy, OSError):
+        return None
+    with update_lock(root):
+        state = State(root)
+        section = state.section("engine")
+        section.pop("unproven", None)
+        section.setdefault("failed_unproven", {})[u["version"]] = (dt.datetime.now(dt.timezone.utc)).isoformat()
+        section["skipped"] = [v for v in section.get("skipped", []) if v != u["version"]]
+        state.history({"at": dt.datetime.now(dt.timezone.utc).isoformat(), "action": "fallback-engine", "from": u["version"], "to": out.get("to"),
+                       "ok": True, "detail": "the first start with an engine switched to without a test load failed"})
+        state.save()
+    return {"from": u["version"], "to": out.get("to"), "message": FALLBACK_NOTE.format(new=u["version"], old=out.get("to"))}
 
 
 # ---------------------------------------------------------------------------------------------- control

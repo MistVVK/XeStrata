@@ -49,7 +49,7 @@ class PendingState(unittest.TestCase):
             self.fail("a complete state file of the wrong shape must not read as waiting")
 
     def test_the_start_waits_with_pending_ok(self):
-        src = inspect.getsource(runtime.start)
+        src = inspect.getsource(runtime._start_once)                   # (#5400: start wraps _start_once, the one start)
         self.assertIn("while _read_state(name, pending_ok=True) is None and proc.poll() is None", src)
         self.assertIn("if _read_state(name, pending_ok=True) is None:", src)
 

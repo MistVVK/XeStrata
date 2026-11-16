@@ -103,6 +103,8 @@ _SLOWER = {("cuda", "sm_86")}
 
 
 _HARDWARE: list = []
+_HARDWARE_MISS: list = []          # (#5427) when the last lookup found no card; asked again after HARDWARE_MISS_S
+HARDWARE_MISS_S = 5.0
 
 # --- Intel: the SYCL path gives no architecture, so the card is told by its name (Windows display adapters) or its PCI id (Linux sysfs).
 #   arc_a        Arc A-series, Alchemist: A3xx / A5xx / A7xx (the A750 was measured: RESULTS-DF2SYCL.md), PCI ids 0x56A0..0x56AF and the mobile 0x5690..0x5692
@@ -154,21 +156,29 @@ def sycl_archs_present() -> list[str]:
 
 
 def detect_hardware() -> tuple[str | None, list[str]]:
-    """(engine family, card architectures) of this computer, looked up once: ``("cuda", ["sm_120"])``, ``("hip", ["gfx1151"])``, ``("metal", [])``;
-    ``(None, [])`` when nothing answers. Read-only probes of tools that are already installed; never raises, never downloads."""
-    if not _HARDWARE:
-        backend: str | None = None
-        archs: list[str] = []
-        try:
-            from strata_control import engine_component
-            backend = engine_component.detect_backend()[0]
-            archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
-            if backend == "sycl" and not archs:
-                archs = sycl_archs_present()
-        except Exception:                                    # noqa: BLE001 - an unknown computer is "no DFlash2", never an error
-            pass
+    """(engine family, card architectures) of this computer: ``("cuda", ["sm_120"])``, ``("hip", ["gfx1151"])``, ``("metal", [])``; ``(None, [])`` when
+    nothing answers. A card that was found is looked up once. ``(None, [])`` is asked again at the next call: a service started at boot can look before
+    the graphics driver answers. Read-only probes of tools that are already installed; never raises, never downloads."""
+    if _HARDWARE:
+        return _HARDWARE[0]
+    if _HARDWARE_MISS and time.monotonic() - _HARDWARE_MISS[0] < HARDWARE_MISS_S:
+        return None, []                                  # a miss a moment ago: the callers of one start do not each run the probes again
+    backend: str | None = None
+    archs: list[str] = []
+    try:
+        from strata_control import engine_component
+        backend = engine_component.detect_backend()[0]
+        archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
+        if backend == "sycl" and not archs:
+            archs = sycl_archs_present()
+    except Exception:                                    # noqa: BLE001 - an unknown computer is "no DFlash2", never an error
+        pass
+    if backend is not None:
         _HARDWARE.append((backend, archs))
-    return _HARDWARE[0]
+        _HARDWARE_MISS.clear()
+    else:
+        _HARDWARE_MISS[:] = [time.monotonic()]
+    return backend, archs
 
 
 def hardware_support(backend: str | None, archs: Any = None, model_name: str | None = None) -> Support:
@@ -471,11 +481,18 @@ SUPPORTED_FAMILIES = ("qwen", "gyro", "unsloth")
 _SUPPORTED_NAME = re.compile(r"^qwen3\.8-flash-next(-gyro-[a-z0-9._-]+|-unsloth-[a-z0-9._-]+|-(q|iq|tq)\d[a-z0-9_.]*)?$", re.IGNORECASE)
 
 
-def supported_model(model_name: str | None = None, family: str | None = None) -> bool:
-    """DFlash2 is for Qwen3.8-Flash-Next only: by family when it is known (the Terminal), else by the run config's model name."""
+#: #5240: models DFlash2 runs on only when the person chooses it by name (Auto keeps the MTP): the Coder (ISTA-DASLab's coding version of the same weights,
+#: 256 of the 512 experts). Reporter's numbers (RTX 4090, stock pack): the same 45/45 agent tasks, 414 against 274 tasks an hour, decode +21-37%.
+NAMED_ONLY_FAMILIES = ("coder",)
+_NAMED_ONLY_NAME = re.compile(r"^qwen3\.8-flash-next-coder-[a-z0-9._-]+$", re.IGNORECASE)
+
+
+def supported_model(model_name: str | None = None, family: str | None = None, *, named: bool = False) -> bool:
+    """DFlash2 is for Qwen3.8-Flash-Next only: by family when it is known (the Terminal), else by the run config's model name. ``named``: DFlash2 is the
+    person's own choice, which also takes the Coder (NAMED_ONLY_FAMILIES, #5240)."""
     if family is not None:
-        return family.lower() in SUPPORTED_FAMILIES
-    return bool(model_name and _SUPPORTED_NAME.match(str(model_name)))
+        return family.lower() in SUPPORTED_FAMILIES or (named and family.lower() in NAMED_ONLY_FAMILIES)
+    return bool(model_name and (_SUPPORTED_NAME.match(str(model_name)) or (named and _NAMED_ONLY_NAME.match(str(model_name)))))
 
 
 # --------------------------------------------------------------------------------------------------- the model file itself
@@ -1378,9 +1395,10 @@ def vocab_path(args: list[Any], data_dir: str | Path | None = None) -> Path | No
     return shipped if shipped.is_file() else None
 
 
-def can_run_dflash2(model_name: str | None, family: str | None, backend: str | None, archs: Any = None) -> bool:
-    """Is this model one the drafter was made for, and does this computer's engine have the DFlash2 code? (The disk and the mode of the start are not looked at.)"""
-    return bool(supported_model(model_name, family) and ENGINE_SERVES_DFLASH2 and backend is not None and hardware_support(backend, archs).can_run)
+def can_run_dflash2(model_name: str | None, family: str | None, backend: str | None, archs: Any = None, *, named: bool = False) -> bool:
+    """Is this model one the drafter was made for (``named``: or one it runs on when chosen by name, the Coder), and does this computer's engine have the DFlash2 code?
+    (The disk and the mode of the start are not looked at.)"""
+    return bool(supported_model(model_name, family, named=named) and ENGINE_SERVES_DFLASH2 and backend is not None and hardware_support(backend, archs).can_run)
 
 
 def choice_of(mode: Any, *, model_name: str | None = None, family: str | None = None, backend: str | None = None, archs: Any = None,
@@ -1401,7 +1419,7 @@ def choice_of(mode: Any, *, model_name: str | None = None, family: str | None = 
     klass = class_entry(backend, model_name, archs, args=args, vram_mib=vram_mib)
     if asked == "auto" and klass is not None and klass.drafter == "mtp":
         return "mtp"                                          # this set on this class of card (CLASS_DEFAULTS)
-    return "dflash2" if can_run_dflash2(model_name, family, backend, archs) else "mtp"
+    return "dflash2" if can_run_dflash2(model_name, family, backend, archs, named=asked == "dflash2") else "mtp"
 
 
 def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None,
@@ -1421,7 +1439,7 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
     # start never goes without a drafter while one is on disk; not where Auto keeps the MTP because DFlash2 stalls there (AUTO_MTP, gfx1201)
     # (and never as the stand-in for a chosen MTP either: owner 11-15, a chosen drafter stays chosen and its fallback must be safe on the card; DFlash2 named by
     # itself is the person's own choice and is not looked at here)
-    runnable = can_run_dflash2(model_name, family, backend, archs) and not (asked != "dflash2" and auto_mtp_only(backend, archs))
+    runnable = can_run_dflash2(model_name, family, backend, archs, named=asked == "dflash2") and not (asked != "dflash2" and auto_mtp_only(backend, archs))
 
     if want == "dflash2":
         ready = _here(Path(pack)) if pack is not None else drafter_ready(data_dir, model_name, backend)
@@ -1435,7 +1453,7 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
     if have_mtp:
         why = ""
         if asked == "dflash2":                      # named, and it cannot run on this model or this computer
-            why = NOT_SUPPORTED if not supported_model(model_name, family) else NOT_SERVED if not ENGINE_SERVES_DFLASH2 else NOT_THIS_CARD
+            why = NOT_SUPPORTED if not supported_model(model_name, family, named=True) else NOT_SERVED if not ENGINE_SERVES_DFLASH2 else NOT_THIS_CARD
         return Decision(asked, "mtp", why)
     # the layer is not on this computer: DFlash2 instead when it can run and its pack is here (said), else none (said)
     if runnable and not blocked and vocab_here and (_here(Path(pack)) if pack is not None else drafter_ready(data_dir, model_name, backend)):
@@ -1567,7 +1585,7 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
         fit = file_fit(args, data_dir) if family is None and not _EXCLUDED_NAME.search(str(name or "")) else ""
         if fit == "fits":
             name = known_name_of_file(args) or FILE_FITS_AS        # a file that is exactly a known set gets that set's table entry; any other the general defaults
-    if not supported_model(name, family):                     # another model: its drafting is not this choice's business (Swift, Coder, NVFP4, Qwen3.6...)
+    if not supported_model(name, family, named=normalize(cfg.get("drafting")) == "dflash2"):     # another model: its drafting is not this choice's business (Swift, NVFP4, Qwen3.6, the Coder under Auto...)
         asked = normalize(cfg.get("drafting"))
         if asked == "off" or cfg.get("mtp") is False:            # no drafter for this model (its draft layer is off, or a feed model whose entry says drafter: none): say so, start none
             # "mtp": false: the server's own draft-layer step takes the layer out (and says so); "drafting": "off" alone: taken out here

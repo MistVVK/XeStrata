@@ -588,10 +588,51 @@ STOP_REAP_WAIT = 10.0       # seconds it then waits for the killed tree to be go
 MAX_START_WAIT = 1800     # seconds a start may wait for the model: a 250 GB set on a slow disk needs more than 10 minutes (#3949)
 
 
+#: #5400: words in a failed start that say the model did not fit (a refusal of this PC, not a broken engine): no fallback to the previous engine.
+_NO_ROOM = re.compile(r"out of memory|not enough (?:free |graphics |gpu |video )?memory|cudaErrorMemoryAllocation|CUDA_ERROR_OUT_OF_MEMORY|"
+                      r"hipErrorOutOfMemory|cannot allocate memory|MemoryError|address already in use|port .* (?:in use|busy)", re.I)
+
+
 def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
           expected_profile_revision: str | None = None,
           expected_source_sha256: str | None = None,
           die_with_pid: int | None = None, on_status=None) -> dict:
+    """Start the saved profile under a new owner host (see _start_once). #5400: an engine the last update switched to without loading the model
+    (memory was short then) is proven by this start: ready clears that; a failure of the engine itself goes back to the previous engine and starts
+    once more, within the same wait. Never a loop: one switch back, and only for that engine."""
+    began = time.monotonic()
+    kw = dict(shutdown_timeout=shutdown_timeout, expected_profile_revision=expected_profile_revision,
+              expected_source_sha256=expected_source_sha256, die_with_pid=die_with_pid, on_status=on_status)
+    result = _start_once(name, wait=wait, **kw)
+    try:
+        from strata_control import updater
+    except Exception:                                   # noqa: BLE001
+        return result
+    if result.get("state") == "ready":
+        updater.mark_proven()
+        return result
+    if result.get("state") != "failed" or wait == 0 or _NO_ROOM.search(f"{result.get('error', '')}\n{result.get('log_tail', '')}"):
+        return result
+    if updater.unproven_in_use() is None:
+        return result
+    try:
+        stop(name, timeout=60)                          # the failed start's host, so nothing serves while the engine is switched
+    except Exception:                                   # noqa: BLE001 - a host that already left
+        pass
+    back = updater.fall_back_from_unproven()
+    if back is None:
+        return result
+    left = max(30.0, wait - (time.monotonic() - began))
+    again = _start_once(name, wait=min(left, MAX_START_WAIT), **kw)
+    again["engine_fallback"] = back
+    again["note"] = back["message"]
+    return again
+
+
+def _start_once(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
+                expected_profile_revision: str | None = None,
+                expected_source_sha256: str | None = None,
+                die_with_pid: int | None = None, on_status=None) -> dict:
     """Start the saved profile under a new owner host.
 
     ``on_status`` (optional) is called with each status answer while the start waits (about every 0.2 s; the caller throttles), so a

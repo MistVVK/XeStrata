@@ -2316,6 +2316,8 @@ class Runner:
             self.end_failed_start()
             raise LaunchError(f"The server could not start: {box['e']}", _log_hint(self.config_path, box["e"]), 6)
         r = box["r"]
+        if r.get("engine_fallback"):                        # #5400: the new engine could not start the model; the previous one was used again
+            self.emit("start", str(r.get("note") or ""), None, level="warn")
         if not r.get("ok"):
             text, nxt = explain_engine_exit(r, self.config_path, marks=self._marks, server_log=self.server_log_path(),
                                             shared_memory=self.shares_memory())

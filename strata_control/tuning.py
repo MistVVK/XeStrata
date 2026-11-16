@@ -57,7 +57,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from strata_control import atomic
 
@@ -150,6 +150,23 @@ def _why_excluded(dim: Dimension, backend: str) -> str | None:
     return f"not a {backend} setting"
 
 
+def dimension_flags() -> set[str]:
+    """Every engine flag any searchable dimension can use (the counterparts of `tune_knobs.arm_flags`)."""
+    out: set[str] = set()
+    for dim in DIMENSIONS:
+        out.update(dim.flags)
+    return out
+
+
+def _arm_flags() -> set[str]:
+    """The arms' flags, imported late: `tune_knobs` is a sibling module, not a dependency of this one."""
+    try:
+        from strata_control.tune_knobs import arm_flags
+    except ImportError:                                      # a partial install: dimensions still work
+        return set()
+    return arm_flags()
+
+
 def validate_dimensions(backend: str,
                         engine_flags: Sequence[str] | None = None) -> tuple[list[Dimension], list[dict[str, str]]]:
     """Return the dimensions this backend may search, and why the rest were excluded.
@@ -204,7 +221,7 @@ def engine_env(engine: Path | str) -> dict[str, str] | None:
     return env
 
 
-def engine_flag_inventory(engine: Path) -> list[str] | None:
+def engine_flag_inventory(engine: Path, wanted: Iterable[str] | None = None) -> list[str] | None:
     """Read the flags an engine binary documents, or None when it cannot be run here.
 
     Both output streams are read. The Strata engine writes its usage to **stderr**, which is easy to
@@ -212,6 +229,11 @@ def engine_flag_inventory(engine: Path) -> list[str] | None:
     dimension is then excluded the sweep silently searches nothing. That failure is safe but
     useless, so the parser reads stderr too and only reports None when the binary could not be run
     at all.
+
+    `wanted` are the flags the caller actually needs. Any of them the help text does not list is
+    asked of the binary directly (#adapt-decay was in engine 0.1.52 but missing from its `--help`),
+    because a documented-flag list is not the same thing as the set of flags the parser accepts. The
+    probe costs one short process per flag, so only the wanted ones are probed.
     """
     try:
         proc = subprocess.run([*engine_command(engine), "--help"], capture_output=True, text=True, errors="replace", timeout=20,
@@ -223,7 +245,30 @@ def engine_flag_inventory(engine: Path) -> list[str] | None:
     flags = sorted(set(re.findall(r"^\s+(--[a-z0-9-]+)", text, re.MULTILINE)))
     # `--help` on this engine exits 0 but writes to stderr; exit codes are not a reliable signal, so
     # the presence of a usable flag list is.
-    return flags or None
+    if not flags:
+        return None
+    known = set(flags)
+    for flag in sorted(set(wanted or ()) - known):
+        if engine_accepts_flag(engine, flag):
+            known.add(flag)
+    return sorted(known)
+
+
+def engine_accepts_flag(engine: Path, flag: str, timeout: float = 15.0) -> bool:
+    """Whether the engine's own parser takes `flag`; False when it could not be asked.
+
+    Run the flag bare and read the answer. A flag the parser knows either asks for its value
+    ("--adapt-decay needs a value") or runs on; an unknown one is named back ("unknown argument:
+    --adapt-decay"). The flag alone is passed, never a dummy value: a bare flag would turn that
+    value into an unknown *positional* argument and produce the same "unknown argument" line.
+    """
+    try:
+        proc = subprocess.run([*engine_command(engine), flag], capture_output=True, text=True,
+                              timeout=timeout, env=engine_env(engine))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    answer = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    return f"unknown argument: {flag}" not in answer
 
 
 # --------------------------------------------------------------------------- the job
@@ -733,7 +778,7 @@ def plan_tuning(engine: Path, backend: str, model: str, objective: str,
     The default ``max_trials`` is the specification's short sweep. ``total_time_s`` is a displayed
     bound: a sweep stops starting new trials when it is reached, and the report says how many ran.
     """
-    flags = engine_flag_inventory(engine)
+    flags = engine_flag_inventory(engine, wanted=dimension_flags() | _arm_flags())
     offered, excluded = validate_dimensions(backend, flags)
     held = set(hold)
     dimensions = [{"id": d.id, "values": list(d.values), "flags": list(d.flags), "help": d.help,

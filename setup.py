@@ -803,6 +803,42 @@ KQ_LIB = "strata_kq.dll" if WIN else "libstrata_kq.so"
 
 
 # ------------------------------------------------------------------------------------------------ output
+#: #4941: --output jsonl. The JSON lines go to the real stdout (kept here); stdout itself is pointed at stderr, so every human line and every program setup
+#: runs (pip, the downloads' helpers, the packer) writes there and the JSON stream stays clean. Events: step, ok, warning, progress, error, done.
+_JSONL: list = []
+_RUN_CONFIGS: list = []                                # the run configs this setup wrote (write_config), the last one is the "done" event's
+
+
+def jsonl_start() -> None:
+    if _JSONL:
+        return
+    sys.stdout.flush()
+    keep = os.dup(1)
+    _JSONL.append(os.fdopen(keep, "w", encoding="utf-8", buffering=1, newline="\n"))
+    os.dup2(2, 1)
+
+
+def event(_name: str, **fields) -> None:
+    """One JSON line of --output jsonl (nothing without it). The name is positional: an error event has a field called "kind"."""
+    if _JSONL:
+        _JSONL[0].write(json.dumps({"schema_version": 1, "event": _name, **fields}, ensure_ascii=False) + "\n")
+        _JSONL[0].flush()
+
+
+_PROGRESS_SENT: dict = {}
+
+
+def progress_event(label: str, done: float, total: float) -> None:
+    """A download's bytes (--output jsonl): at most one line a second per label, and always the last one."""
+    if not _JSONL:
+        return
+    now = time.time()
+    if done < total and now - _PROGRESS_SENT.get(label, 0.0) < 1.0:
+        return
+    _PROGRESS_SENT[label] = now
+    event("progress", label=label, done_bytes=int(done), total_bytes=int(total))
+
+
 def say(msg=""):
     print(msg, flush=True)
 
@@ -810,6 +846,7 @@ def say(msg=""):
 def step(n, title):
     say()
     say(f"=== Step {n}: {title} ===")
+    event("step", n=n, title=title)
 
 
 def menu_colour(code: str) -> tuple[str, str]:
@@ -846,17 +883,21 @@ def _windows_vt() -> bool:
 
 def ok(msg):
     say(f"  [ok] {msg}")
+    event("ok", message=str(msg))
 
 
 def warn(msg):
     say(f"  [!]  {msg}")
+    event("warning", message=str(msg))
 
 
-def fail(msg, hint=None):
+def fail(msg, hint=None, **detail):
+    """Stop setup with exit code 1. ``detail``: machine fields of the --output jsonl error event (kind="no_space" with free_bytes / needed_bytes)."""
     say(f"\n  [X]  {msg}")
     if hint:
         say(f"       {hint}")
     say("\nSetup stopped. Fix the item above and run it again - everything already done is kept and skipped.")
+    event("error", message=str(msg), hint=hint, exit_code=1, **detail)
     sys.exit(1)
 
 
@@ -2960,6 +3001,7 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
             last_print = now
             have = st.have()
             print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="", flush=True)
+            progress_event(label, have, total)
             note = stall.check(have, total, now)
             if note:
                 print()
@@ -3134,6 +3176,7 @@ def repair_download(url: str, path: Path, total: int, label: str, conns: int):
                 last = time.time()
                 have = st.have()
                 print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="", flush=True)
+                progress_event(label, have, total)
     except BaseException:
         st.stop.set()
         raise
@@ -6971,6 +7014,7 @@ def write_config(path: Path, cfg: dict):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     atomic.replace(tmp, path)
+    _RUN_CONFIGS.append(Path(path))
 
 
 # #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the user's - a
@@ -9506,6 +9550,9 @@ def main() -> int:
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
+    ap.add_argument("--output", choices=("human", "jsonl"), default="human",
+                    help="jsonl: one JSON object per line on stdout (step, ok, warning, progress, error, done) for a program that installs "
+                         "a model; the usual text goes to stderr. Use it with --yes --no-start")
     ap.add_argument("--update", action="store_true",
                     help="update the installed engine, Python packages and model settings as a start would, without "
                          "starting the model (UPDATE.bat / update.sh run it after a git pull)")
@@ -9580,6 +9627,8 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.output == "jsonl":
+        jsonl_start()
     if getattr(a, "gguf_dir", None):                   # the person's own files: their finish marks go to Strata's marks/, never beside them
         own_files_in(a.gguf_dir)
     if getattr(a, "dsv41_package", None):              # DeepSeek's engine package: no longer offered (strata_control/retired.py)
@@ -10285,7 +10334,7 @@ def main() -> int:
     problem = disk_room_problem(models_dir, pack_now, real - copy_gb, copy_gb,
                                 (f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1 and not have_model else ""))
     if problem:
-        fail(*problem)
+        fail(*problem, kind="no_space", path=str(models_dir), free_bytes=int(free_now * 1e9), needed_bytes=int(need * 1e9))
     if free_now < need:
         warn(f"little free disk space in {models_dir}: {free_now:.0f} GB free for about {real:.0f} GB of files. "
              "Setup goes on and should fit; free up space if it stops")
@@ -10503,11 +10552,17 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        code = main()
+        if code:
+            event("error", message=f"setup ended with exit code {code}", exit_code=int(code))
+        event("done", exit_code=int(code or 0), run_config=str(_RUN_CONFIGS[-1]) if _RUN_CONFIGS else None)
+        sys.exit(code)
     except acquisition.AcquisitionRefused as e:         # a start that would have installed something: said, not done
         say(f"\n  [X]  {e}")
+        event("error", message=str(e), exit_code=e.exit_code, kind="refused")
         sys.exit(e.exit_code)
     except KeyboardInterrupt:
         say("\nstopped.")
+        event("error", message="stopped", exit_code=1, kind="interrupted")
         sys.exit(1)
 

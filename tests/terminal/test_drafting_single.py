@@ -107,6 +107,8 @@ class EveryChoiceOnEveryBackend(Base):
     def test_other_families_never_get_dflash2_whatever_is_saved(self):
         for family in ("coder", "nvfp4", "swift"):
             for mode in (None, "auto", "mtp", "dflash2"):
+                if family == "coder" and mode == "dflash2":
+                    continue                                    # #5240: the Coder named runs DFlash2 (test_drafting_coder_named.py)
                 cfg = self.cfg(family, **({} if mode is None else {"drafting": mode}))
                 d, args = self.apply(cfg, family, "cuda", ("sm_120",))
                 self.assertNotIn("--draft", args, (family, mode))

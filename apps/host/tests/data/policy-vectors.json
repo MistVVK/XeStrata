@@ -1616,73 +1616,90 @@
  "names": [
   {
    "name": "qwen3.8-flash-next",
-   "supported": true
+   "supported": true,
+   "named": true
   },
   {
    "name": "qwen3.8-flash-next-iq3_s",
-   "supported": true
+   "supported": true,
+   "named": true
   },
   {
    "name": "qwen3.8-flash-next-Q2_0",
-   "supported": true
+   "supported": true,
+   "named": true
   },
   {
    "name": "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
-   "supported": true
+   "supported": true,
+   "named": true
   },
   {
    "name": "qwen3.8-flash-next-unsloth-ud-iq4_xs-v31",
-   "supported": true
+   "supported": true,
+   "named": true
   },
   {
    "name": "qwen3.8-flash-next-gyro-iq4",
-   "supported": true
+   "supported": true,
+   "named": true
   },
   {
    "name": "qwen3.8-flash-next-coder-iq1_m",
-   "supported": false
+   "supported": false,
+   "named": true
   },
   {
    "name": "qwen3.8-flash-next-swift-iq3_s",
-   "supported": false
+   "supported": false,
+   "named": false
   },
   {
    "name": "swift-1.5-iq3_s",
-   "supported": false
+   "supported": false,
+   "named": false
   },
   {
    "name": "qwen3.6-35b-a3b-ud-q4_k_xl",
-   "supported": false
+   "supported": false,
+   "named": false
   },
   {
    "name": "",
-   "supported": false
+   "supported": false,
+   "named": false
   }
  ],
  "families": [
   {
    "family": "qwen",
-   "supported": true
+   "supported": true,
+   "named": true
   },
   {
    "family": "gyro",
-   "supported": true
+   "supported": true,
+   "named": true
   },
   {
    "family": "unsloth",
-   "supported": true
+   "supported": true,
+   "named": true
   },
   {
    "family": "swift",
-   "supported": false
+   "supported": false,
+   "named": false
   },
   {
    "family": "coder",
-   "supported": false
+   "supported": false,
+   "named": true
   },
   {
    "family": "nvfp4",
-   "supported": false
+   "supported": false,
+   "named": false
   }
  ]
 }

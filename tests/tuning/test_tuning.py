@@ -106,6 +106,48 @@ class TestDimensionValidation(TuningCase):
         fake.write_text("print('  --vram-reserve-mib MIB')\n")
         self.assertIn("--vram-reserve-mib", tuning.engine_flag_inventory(fake))
 
+    def test_a_supported_flag_missing_from_help_is_probed_and_kept(self):
+        """Engine 0.1.52 parsed --adapt-decay but did not list it in --help.
+
+        The tuner read only the help text, so `adapt_tier_fast` and `adapt_decay_09` were skipped on
+        every PC with "this engine does not accept --adapt-decay". A flag the parser takes must
+        count as accepted even when the usage text forgot it; the arm is then measured like any
+        other, which is the only way its value on a PC can ever be known.
+        """
+        fake = self.tmp / "fake-engine-unlisted.py"
+        fake.write_text(
+            "import sys\n"
+            "args = sys.argv[1:]\n"
+            "if not args or args == ['--help']:\n"
+            "    print('  --kv KV')\n"                       # only --kv is documented
+            "elif args == ['--adapt-decay']:\n"
+            "    print('--adapt-decay needs a value')\n"     # but the parser takes it
+            "else:\n"
+            "    print('unknown argument: ' + args[0])\n")
+        flags = tuning.engine_flag_inventory(fake, wanted={'--kv', '--adapt-decay', '--nope'})
+        self.assertIn('--kv', flags)
+        self.assertIn('--adapt-decay', flags, 'a supported but undocumented flag must not be dropped')
+        self.assertNotIn('--nope', flags, 'a flag the parser refuses must stay out')
+
+    def test_probing_never_asks_with_a_value(self):
+        """A bare flag plus a dummy value makes the engine reject the *value* as an unknown
+        positional argument, which reads exactly like an unknown flag. Only the flag is passed."""
+        fake = self.tmp / "fake-engine-argv.py"
+        fake.write_text(
+            "import sys\n"
+            "args = sys.argv[1:]\n"
+            "print('argv:', len(args), ' '.join(args))\n")
+        self.assertTrue(tuning.engine_accepts_flag(fake, '--kv-grow'))
+        import subprocess
+        p = subprocess.run([sys.executable, str(fake), '--kv-grow'], capture_output=True, text=True)
+        self.assertEqual(p.stdout.strip(), 'argv: 1 --kv-grow', 'probe must pass the flag alone')
+
+    def test_flag_inventory_still_reports_none_without_help(self):
+        fake = self.tmp / "fake-engine-silent.py"
+        fake.write_text("pass\n")
+        self.assertIsNone(tuning.engine_flag_inventory(fake, wanted={'--kv'}),
+                          'no usable flag list stays None, even with wanted flags')
+
     def test_a_backend_with_dimensions_that_all_need_missing_flags_searches_nothing(self):
         """The safe outcome, asserted so it cannot silently become an unsafe one.
 

@@ -823,11 +823,19 @@ def slug(text: str, limit: int = 40) -> str:
     return re.sub(r"[^a-z0-9]+", "-", cleaned.lower()).strip("-")[:limit].strip("-") or "unknown"
 
 
+def no_server_text(address: str, profile: str | None = None) -> str:
+    """#5369: the address that did not answer, and for a profile the way to the one that serves (a launch's own profile, or its port)."""
+    if not profile:
+        return f"No Strata server answers at {address}."
+    return (f"No Strata server answers at {address} (this profile's address). If you started the model with strata launch, use its profile "
+            f"launch-<preset> (see strata profile list), or set the port: strata profile set {profile} port=N.")
+
+
 def run(target: Target, out: Path | None, *, out_root: Path | None = None, optional_concurrency: bool = False,
         corpus: Corpus | None = None, declared: dict | None = None, plan: dict | None = None,
         engine_log: Path | None = None, engine_run_log: tuple[Path | None, int] | None = None, command: str = "strata bench run --suite standard-v1",
         log=lambda message: None, timeout_s: float = REQUEST_TIMEOUT_S, started_engine: bool = False,
-        hash_model: bool = True) -> tuple[dict, Path]:
+        hash_model: bool = True, profile: str | None = None) -> tuple[dict, Path]:
     """Run the protocol against `target` and write the report into the new directory `out` (or a new folder named
     <date>-standard-<gpu>-<run id> under `out_root`). -> (the result, the folder)."""
     declared = {"track": "custom", "track_notes": "no notes given by the operator", **(declared or {})}
@@ -840,7 +848,7 @@ def run(target: Target, out: Path | None, *, out_root: Path | None = None, optio
         raise ProfileError("benchmark needs an output directory", 2)
     health = target.get("/health", timeout=10)
     if not health or health.get("service") != "strata":
-        raise ProfileError("no Strata server answers at that address", 5)
+        raise ProfileError(no_server_text(target.root, profile), 5)
     if health.get("loaded") is not True:
         raise ProfileError("the server has no model loaded; the benchmark needs a loaded model", 5)
     props = target.get("/props", timeout=15)
