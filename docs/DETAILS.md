@@ -994,7 +994,7 @@ them. The app, `strata launch` and setup use one rule for the reader:
 | Mac | The GPU (Metal) | Whatever its memory. |
 
 Switch pictures off with `--vision no` (or "No" in the app and `strata launch`), or pick the reader with `--vision gpu` or
-`--vision cpu`. Setup downloads the encoder and puts a small helper (`strata-vision`, from llama.cpp's `mtmd` library) beside
+`--vision cpu`. Setup downloads the encoder and puts a small helper (`strata-vision`, Strata's own picture reader) beside
 the engine. Where no reader exists, pictures stay off and the screen says so (the Intel Arc engine has none yet). On AMD the
 card's reader is `strata-vision-hip`; if it cannot start, the server starts the CPU reader and prints one line ([AMD_HIP.md](AMD_HIP.md)).
 
@@ -1399,8 +1399,7 @@ Strata itself: [MIT](../LICENSE). The model files are not part of it; their lice
   [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
   Their licenses apply to the weights.
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT): the i-quant formats, the GPU dot products and dequantizers
-  transcribed in `src/kernels/cuda/iq_kernels.cu`, the CPU backend linked for the i-quant experts, the `mtmd` library behind the
-  image encoder (`tools/vision/`), and `gguf-py` used by the tools. See `third_party/ggml/LICENSE`.
+  transcribed in `src/kernels/cuda/iq_kernels.cu`, the CPU backend linked for the i-quant experts, and `gguf-py` used by the tools. See `third_party/ggml/LICENSE`.
 - Ideas from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen); references in the paper.
 - The DFlash2 drafter's Q4_0 selector (174 MiB less graphics memory, same drafts and same text) is nazeshinjite's idea:

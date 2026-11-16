@@ -27,7 +27,7 @@ strata launch --family qwen36 --model ud-q4_k_xl --vision on --parallel 2
 
 The vision encoder is Unsloth's `mmproj-F16.gguf` (0.9 GB, pinned revision, SHA-256 checked by setup): a 27-layer ViT
 with a 2x2 merger, the same projector family as the Flash-Next models' (`qwen3vl_merger`; only its output width
-differs: 2048 here, 2560 there). Strata runs it with the same helper (`strata-vision`, llama.cpp's `mtmd`), so the
+differs: 2048 here, 2560 there). Strata runs it with the same helper (`strata-vision`), so the
 encoder choices are the Flash-Next ones ([Images](DETAILS.md#images-vision)).
 
 Pictures are on by default, by the same rule as for every model on NVIDIA and AMD cards:
