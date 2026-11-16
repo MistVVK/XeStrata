@@ -325,6 +325,10 @@ public:
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
+    /// #5188 (--prefill-head-alias): every captured window graph is destroyed, so the next window of each size captures
+    /// again and reads the buffers where they are now (the output head came back at another address).  Refuses (false)
+    /// while a prelaunched window is pending.  `dropped`: how many graphs were destroyed.
+    bool drop_window_graphs(int& dropped, std::string& err);
 
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
     // stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window as `run`, driven
@@ -525,10 +529,6 @@ private:
                               std::string& err, int keep_t = -1, unsigned long long flags = 0);
     /// Free the graph of the largest window size other than `keep_t` (and the prelaunched one); `evicted`: there was one.
     bool evict_window_graph(int keep_t, bool& evicted, std::string& err);
-    /// #5188 (--prefill-head-alias): every captured window graph is destroyed, so the next window of each size captures
-    /// again and reads the buffers where they are now (the output head came back at another address).  Refuses (false)
-    /// while a prelaunched window is pending.  `dropped`: how many graphs were destroyed.
-    bool drop_window_graphs(int& dropped, std::string& err);
     bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another
     // STRATA_GRAPH_PRIO (record_window / capture): the captured tails of the priority streams at their joins and the
     // main stream's tails at their forks, so that a capture that dropped the stream priorities can be repaired per
