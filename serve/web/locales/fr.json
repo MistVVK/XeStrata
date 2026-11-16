@@ -265,7 +265,7 @@
   "sidebar.import": "Récupérer une conversation enregistrée",
   "sidebar.imported": "Conversation récupérée",
   "sidebar.importFailed": "Rien à récupérer",
-  "sidebar.importFailedText": "Ce fichier ne contient aucun échange de conversation. Choisissez un fichier enregistré avec « Enregistrer cette conversation en Markdown ».",
+  "sidebar.importFailedText": "Ce fichier ne contient aucun échange de conversation. Choisissez un fichier enregistré avec « Enregistrer cette conversation en Markdown ».",
   "chat.finishFromThinking": "Répondre à partir de cette réflexion",
   "chat.finishFromThinkingTitle": "Rédige une réponse à partir de ce que le modèle avait trouvé avant que vous ne l’arrêtiez. Il ne réfléchit pas davantage.",
   "chat.fromStoppedThinking": "réponse tirée de la réflexion arrêtée"
