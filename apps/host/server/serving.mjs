@@ -61,6 +61,7 @@ export function state() {
     requests: [...requests].reverse(),
     pauseServing: !!s.serving?.pauseServing,
     mcpTools: Array.isArray(s.serving?.mcpTools) ? [...s.serving.mcpTools] : [],
+    trustedOrigins: Array.isArray(s.serving?.trustedOrigins) ? [...s.serving.trustedOrigins] : [],
   };
 }
 
@@ -78,6 +79,9 @@ export function patch(body) {
   else if (typeof body.apiKey === 'string' && body.apiKey.trim()) serving.apiKey = body.apiKey.trim();
   else if (body.generateKey) serving.apiKey = `sk-strata-${randomBytes(12).toString('hex')}`;
   if (typeof body.pauseServing === 'boolean') serving.pauseServing = body.pauseServing;
+  // The origins of pages that may use /v1 without an API key besides this app's own (as strata serve's trusted_origins): exact
+  // http(s) origins, at most 32. No UI; set through PATCH /api/serving.
+  if (Array.isArray(body.trustedOrigins)) serving.trustedOrigins = [...new Set(body.trustedOrigins.map(trustedOrigin).filter(Boolean))].slice(0, 32);
   // #5661: the models whose MCP tools an API client of this computer may use (default: none).
   const choice = body.mcpTools;
   if (choice && typeof choice.model === 'string' && choice.model.trim() && choice.model.length <= 256 && typeof choice.on === 'boolean') {
@@ -123,6 +127,31 @@ export function mcpToolsRefusal(req, via, model) {
   return null;
 }
 export const mcpToolsAllowed = (req, via, model) => mcpToolsRefusal(req, via, model) === null;
+
+/**
+ * The /v1 foreign-Origin rule (owner 11-16), the same contract as strata serve's /v1: while NO API key is set, a request whose Origin
+ * names a page of another site is refused, because any site can make a visitor's browser POST to this computer. A request without
+ * an Origin header (curl, the SDKs, editors, server-side apps) passes; so does this app's own page (a loopback name, or - on the app's
+ * own listener only, `via` 'app' - the request's own Host; LAN sharing and the tunnel serve no page), a page whose origin is in
+ * serving.trustedOrigins, and an origin of another scheme (a browser extension: no web site can send one). "null", an empty Origin and
+ * one that cannot be read count as another site. With a key set the key is the check.
+ */
+const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+export function trustedOrigin(value) {
+  try { const u = new URL(String(value ?? '').trim()); return /^https?:$/.test(u.protocol) && u.host ? `${u.protocol}//${u.host}` : null; } catch { return null; }
+}
+export function v1OriginRefused(req, via = 'app') {
+  if (getStore().serving?.apiKey) return false;
+  const origin = req?.headers?.origin;
+  if (origin === undefined) return false;
+  let url;
+  try { url = new URL(String(origin).trim()); } catch { return true; }            // "null", "", garbage
+  if (!/^https?:$/.test(url.protocol)) return false;                              // chrome-extension:// and the like
+  if (LOOPBACK_NAMES.has(url.hostname) || url.hostname.endsWith('.localhost')) return false;
+  if (via === 'app' && url.host && url.host === String(req?.headers?.host ?? '').toLowerCase()) return false;
+  const trusted = getStore().serving?.trustedOrigins;
+  return !(Array.isArray(trusted) && trusted.includes(`${url.protocol}//${url.host}`));
+}
 
 export function open({ client, endpoint, tokensIn = null, model, instanceId, gpuIds, cancel }) {
   const entry = {

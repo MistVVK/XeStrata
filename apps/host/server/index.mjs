@@ -2115,9 +2115,13 @@ async function api(req, res, path, method, url) {
 
 /* -------------------------------------------------- OpenAI-compatible API --- */
 
+/** The /v1 refusal of a page of another site while no API key is set (wording approved by the coordinator 11-16). */
+const V1_FOREIGN_PAGE = 'Other websites can\'t use this API while no API key is set. Set an API key in Serving to allow it.';
 /** `via`: the listener the request came in on: 'app' (this app's own port), 'share' (LAN sharing) or 'tunnel' (#5661: MCP tools only on 'app'). */
 async function openai(req, res, path, method, via) {
   if (!serving.authorized(req)) return error(res, 401, 'Invalid API key');
+  // Without an API key, a web page of another site may not use the model (serving.mjs v1OriginRefused; strata serve has the same rule).
+  if (serving.v1OriginRefused(req, via)) return error(res, 403, V1_FOREIGN_PAGE);
   try {
     return await routeInference(req, res, path, method, via);
   } catch (err) {
