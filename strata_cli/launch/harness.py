@@ -311,12 +311,17 @@ def write_file(spec: dict, *, backup: bool = True, if_unchanged: bool = False) -
             pass                                    # an old file that is not JSON is replaced (a backup is made below)
     final = text if text.endswith("\n") else text + "\n"
     if existed and if_unchanged:
-        # the comparison is against the FINAL text, after the merge: a merged write that reproduces the file
-        # byte for byte is a no-op, and a backup of it would turn "nothing changed" into a new file each time
+        # the comparison is against the FINAL bytes, after the merge: a merged write that reproduces the file byte for byte is a no-op, and a
+        # backup of it would turn "nothing changed" into a new file each time. Bytes, not text: the write below is a text-mode write (the
+        # platform's line ends, UTF-8 without a BOM), so a file with other line ends or a BOM is written again in that form (#5957)
         try:
-            if path.read_text(encoding="utf-8") == final:
+            if path.read_bytes() == final.replace("\n", os.linesep).encode("utf-8"):
+                try:
+                    os.chmod(path, 0o600)           # left as it is, but private like a written one: it can hold the API key
+                except OSError:
+                    pass
                 return {"path": str(path), "backup": None, "action": "unchanged"}
-        except (OSError, UnicodeError):
+        except OSError:
             pass                                    # a file we cannot read is not a file we can promise is unchanged
     bak = None
     if existed and backup:
