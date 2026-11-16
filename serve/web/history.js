@@ -117,8 +117,93 @@
     return {...newChat(now, rnd), title, parent: {id: chat.id, title: chatTitle(chat)}, messages: copy};
   }
 
+  // Bring a saved chat back (the other half of the composer's "Save this chat as Markdown"): the export's
+  // `## You` / `## <model>` headings become messages (app.js, the export button - one heading per turn).
+  //
+  // Two things in a saved file look like a turn and are not:
+  //   - a heading inside a fenced block is code (C's `##` token paste, a quoted outline in a sample);
+  //   - a heading the text itself carries, like the `## Summary` most answers start a section with, is a section of
+  //     that turn. So the answer's heading is the name the file repeats (the model name, written on every answer and
+  //     on nothing else); a `## ` line that is neither `You` nor that name stays in the text.
+  // If the name ties with headings inside a question (a one-question file), the careful reading finds no answer at all;
+  // then the file is read the simple way, every `## ` line a turn, which is no worse than before. Residual shape,
+  // stated plainly: a question that itself starts a line with `## You` is still read as a new turn - the export
+  // writes no marker that tells the two apart.
+  //
+  // Thinking and tool calls were exported as <details> blocks, which carry nothing the store keeps (it keeps
+  // attachments' names only), so they are dropped - but only the export's own two kinds, named in their <summary>.
+  // A message may hold a <details> of its own (an HTML sample in a fence, an answer explaining the tag) and that is
+  // content, not a trace. No timestamps in the file: the whole chat takes the time it came back. Returns the chat, or
+  // null when the file holds no turns.
+  const headingOf = (line) => { const h = line.match(/^## (.+)$/); return h ? h[1].trim() : null; };
+  // the two blocks the export writes for itself (app.js, "Save this chat as Markdown")
+  const EXPORTED_BLOCK = /^<details>\s*<summary>(?:Thinking|Tool\b[^<]*)<\/summary>/;
+  // drop those blocks and keep every other line; `open` counts the block's own <details> still open, so a block that
+  // holds a nested one is dropped whole and a line that merely mentions the tag does not close it early
+  function dropExportedBlocks(text) {
+    const kept = [];
+    let open = 0;
+    for (const line of String(text || "").split("\n")) {
+      const t = line.trim();
+      if (open) {
+        if (t.startsWith("<details")) open += 1;
+        if (t.startsWith("</details>") && --open <= 0) open = 0;
+        continue;
+      }
+      if (EXPORTED_BLOCK.test(t)) { open = t.includes("</details>") ? 0 : 1; continue; }
+      kept.push(line);
+    }
+    return kept.join("\n");
+  }
+  const fenceOf = (line) => { const f = line.match(/^ {0,3}(`{3,}|~{3,})/); return f ? f[1] : null; };
+  const closesFence = (line, open) => {
+    const m = line.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+    return !!m && m[1][0] === open[0] && m[1].length >= open.length;
+  };
+  function parseChatMarkdown(text, now = Date.now(), rnd = Math.random()) {
+    const lines = String(text || "").split("\n");
+    // the name on the answers: the heading the file repeats most (a tie keeps the one that comes first)
+    const counts = new Map();
+    let open = null;
+    for (const line of lines) {
+      const f = fenceOf(line);
+      if (open) { if (f && closesFence(line, open)) open = null; continue; }
+      if (f) { open = f; continue; }
+      const name = headingOf(line);
+      if (name && name !== "You") counts.set(name, (counts.get(name) || 0) + 1);
+    }
+    let model = null, most = 0;
+    for (const [name, n] of counts) if (n > most) { model = name; most = n; }
+
+    const read = (isTurnHeading) => {
+      const messages = [];
+      let role = null, body = [], fence = null;
+      const flush = () => {
+        const t = dropExportedBlocks(body.join("\n")).trim();
+        if (role && t) messages.push({role, text: t, time: now});
+        body = [];
+      };
+      for (const line of lines) {
+        const f = fenceOf(line);
+        if (fence) { body.push(line); if (f && closesFence(line, fence)) fence = null; continue; }
+        if (f) { fence = f; body.push(line); continue; }
+        const name = headingOf(line);
+        if (name && isTurnHeading(name)) { flush(); role = name === "You" ? "user" : "assistant"; continue; }
+        body.push(line);
+      }
+      flush();
+      return messages;
+    };
+
+    const named = read((name) => name === "You" || (model !== null && name === model));
+    const whole = named.some((m) => m.role === "assistant") && named.some((m) => m.role === "user");
+    const messages = whole ? named : read(() => true);
+    if (!messages.length) return null;
+    return {...newChat(now, rnd), messages};
+  }
+
   const api = {TITLE_MAX, newChat, chatTitle, cleanMessages, cleanChat, groupKey, filterChats, lostAttachments, draftOf, rewind,
-               regenerate, editAnswer, branch, THUMB_MAX_CHARS, validThumb, makeThumb};
+               regenerate, editAnswer, branch, THUMB_MAX_CHARS, validThumb, makeThumb, parseChatMarkdown};
   root.StrataHistory = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

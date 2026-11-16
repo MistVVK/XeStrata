@@ -55,6 +55,65 @@ const cases = {
     assert.ok(!JSON.stringify(clean).includes("data:image/png"), "the full data URL is still dropped");
     assert.deepEqual(H.cleanMessages(convo())[0].images, [{name: "a.png"}], "a record saved before thumbnails still cleans to the name alone");
   },
+  import_parses_a_saved_export_back() {
+    // the shape the composer's "Save this chat as Markdown" writes (app.js): `## You` then `## <model>`,
+    // thinking and tool calls as <details> blocks
+    const md = "## You\n\nwhat is two plus two?\n\n## Qwen-Flash-Next\n\n" +
+      "<details><summary>Thinking</summary>\n\nsecret thoughts\n\n</details>\n\n" +
+      "<details><summary>Tool fs / read (error)</summary>\n\n```json\n{}\n```\n\n```\nboom\n```\n\n</details>\n\nIt is 4.\n";
+    const c = H.parseChatMarkdown(md, 5000, 0.5);
+    assert.equal(c.messages.length, 2);
+    assert.equal(c.messages[0].role, "user"); assert.equal(c.messages[0].text, "what is two plus two?");
+    assert.equal(c.messages[1].role, "assistant"); assert.equal(c.messages[1].text, "It is 4.");
+    assert.ok(!JSON.stringify(c.messages).includes("secret thoughts"), "thinking is dropped, as the store would");
+    assert.equal(c.time, 5000, "no timestamps in the file: the time it came back");
+    assert.ok(c.id && typeof c.id === "string", "a real chat record");
+  },
+  import_is_faithful_and_picky() {
+    assert.equal(H.parseChatMarkdown(""), null, "empty");
+    assert.equal(H.parseChatMarkdown("just some text, no turns"), null);
+    assert.equal(H.parseChatMarkdown(null), null);
+    // any '## ' line starts a turn (stated limitation): a question with its own '## ' line is read as a turn of its own
+    const quoted = H.parseChatMarkdown("## You\n\nmy notes:\n\n## heading inside the question\n\nmore text\n");
+    assert.deepEqual(quoted.messages.map((m) => m.role), ["user", "assistant"], "a '## ' line starts a turn");
+    // a '## You' in an answer's text is read as a new turn: known shape, the export never writes it there
+    const two = H.parseChatMarkdown("## You\n\nq\n\n## Model\n\npartial\n\n## You\n\na\n");
+    assert.deepEqual(two.messages.map((m) => m.role), ["user", "assistant", "user"]);
+    // blank turns are skipped
+    const blank = H.parseChatMarkdown("## You\n\n\n\n## Model\n\nanswer\n");
+    assert.deepEqual(blank.messages.map((m) => m.role), ["assistant"]);
+  },
+  import_keeps_code_and_sections_inside_a_turn() {
+    // a fenced block is code: C's '##' token paste and a quoted outline are not turns
+    const fenced = H.parseChatMarkdown("## You\n\nsee this:\n\n```c\n#define PASTE(a, b) a ## b\n```\n\n## Model\n\n```md\n## Summary\n```\n\ndone\n");
+    assert.deepEqual(fenced.messages.map((m) => m.role), ["user", "assistant"]);
+    assert.ok(fenced.messages[0].text.includes("a ## b"), "the fence stays in the question");
+    assert.deepEqual(fenced.messages[1].text.split("\n")[0], "```md", "the answer's fenced heading stays in the answer");
+    assert.ok(fenced.messages[1].text.endsWith("done"));
+    // an outline in the answer is the answer's text, not turns: the answer heading is the name the file repeats
+    const md = "## You\n\nq1\n\n## Model\n\n## Summary\n\nfast\n\n## Risks\n\nnone\n\n## You\n\nq2\n\n## Model\n\nok\n";
+    const c = H.parseChatMarkdown(md, 7, 0.5);
+    assert.deepEqual(c.messages.map((m) => m.role), ["user", "assistant", "user", "assistant"]);
+    assert.equal(c.messages[1].text, "## Summary\n\nfast\n\n## Risks\n\nnone", "sections stay whole");
+    // one question whose own headings tie with the model's name (read the first), the text is still all there
+    const tie = H.parseChatMarkdown("## You\n\ncompare:\n## A\nfast\n## B\nsafe\n\n## Model\n\nA is faster.\n");
+    const all = tie.messages.map((m) => m.text).join("\n");
+    for (const part of ["compare:", "fast", "safe", "A is faster."]) assert.ok(all.includes(part), `kept: ${part}`);
+  },
+  import_keeps_details_that_are_not_the_export() {
+    // the export writes thinking and tool calls as <details> blocks; those are dropped because the store keeps none of
+    // it. A <details> a message wrote itself is content: an HTML sample in a fenced block, an answer explaining the tag.
+    const sample = "## You\n\nhow do I fold this?\n\n## Model\n\nLike this:\n\n```html\n<details><summary>More</summary>\n\nhidden\n\n</details>\n```\n\nDone.\n";
+    const a = H.parseChatMarkdown(sample, 1, 0.5);
+    assert.ok(a.messages[1].text.includes("<details><summary>More</summary>"), "the answer's own HTML sample stays");
+    const own = "## You\n\nq\n\n## Model\n\n<details><summary>Notes</summary>\n\nkeep me\n\n</details>\n\ndone\n";
+    const b = H.parseChatMarkdown(own, 1, 0.5);
+    assert.ok(b.messages[1].text.includes("keep me"), "an answer's own details block stays");
+    // and the export's own blocks are still dropped, even with thinking that mentions the tag
+    const exportrd = "## You\n\nq\n\n## Model\n\n<details><summary>Thinking</summary>\n\nuse <details> here\n\n</details>\n\nanswer\n";
+    const c = H.parseChatMarkdown(exportrd, 1, 0.5);
+    assert.equal(c.messages[1].text, "answer", "thinking is still dropped");
+  },
   rewind_a_question() {
     const m = convo();
     const plan = H.rewind(m, 2);

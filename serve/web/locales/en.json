@@ -226,6 +226,10 @@
     "one": "{n} chat · kept in this browser",
     "other": "{n} chats · kept in this browser"
   },
+  "sidebar.import": "Bring back a saved chat",
+  "sidebar.importFailed": "Nothing to bring back",
+  "sidebar.importFailedText": "This file has no chat turns in it. Choose a file saved with “Save this chat as Markdown”.",
+  "sidebar.imported": "Chat brought back",
   "sidebar.nameFor": "Name for this chat",
   "sidebar.noMatch": "No chat matches",
   "sidebar.none": "No chats yet",

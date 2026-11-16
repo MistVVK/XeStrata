@@ -261,5 +261,9 @@
   "tool.running": "En cours",
   "tool.skipped": "Non exécuté",
   "tool.writing": "Écriture",
-  "undo": "Annuler"
+  "undo": "Annuler",
+  "sidebar.import": "Récupérer une conversation enregistrée",
+  "sidebar.imported": "Conversation récupérée",
+  "sidebar.importFailed": "Rien à récupérer",
+  "sidebar.importFailedText": "Ce fichier ne contient aucun échange de conversation. Choisissez un fichier enregistré avec « Enregistrer cette conversation en Markdown »."
 }

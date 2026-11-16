@@ -49,6 +49,9 @@
         <span class="card-title sidebar-title" data-i18n="sidebar.title">Chats</span>
         <button class="st-btn st-btn--icon" id="sidebar-new" type="button" title="New chat" aria-label="New chat" data-i18n-title="chat.new" data-i18n-label="chat.new">
           <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
+        <button class="st-btn st-btn--icon" id="sidebar-import" type="button" title="Bring back a saved chat" aria-label="Bring back a saved chat" data-i18n-title="sidebar.import" data-i18n-label="sidebar.import">
+          <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
+        <input type="file" id="sidebar-import-file" accept=".md,.markdown,.txt" multiple hidden>
       </div>
       <input class="st-input sidebar-search" id="sidebar-search" type="search" placeholder="Search chats"
              autocomplete="off" aria-label="Search chats" data-i18n-placeholder="sidebar.search" data-i18n-label="sidebar.search">

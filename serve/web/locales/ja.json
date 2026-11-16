@@ -246,5 +246,9 @@
   "tool.running": "実行中",
   "tool.skipped": "未実行",
   "tool.writing": "書き込み中",
-  "undo": "元に戻す"
+  "undo": "元に戻す",
+  "sidebar.import": "保存したチャットを戻す",
+  "sidebar.imported": "チャットを戻しました",
+  "sidebar.importFailed": "戻せるものがありません",
+  "sidebar.importFailedText": "このファイルにはチャットのやり取りがありません。「このチャットを Markdown で保存」で保存したファイルを選んでください。"
 }

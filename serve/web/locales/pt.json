@@ -246,5 +246,9 @@
   "tool.running": "Em execução",
   "tool.skipped": "Não executada",
   "tool.writing": "Escrevendo",
-  "undo": "Desfazer"
+  "undo": "Desfazer",
+  "sidebar.import": "Recuperar uma conversa salva",
+  "sidebar.imported": "Conversa recuperada",
+  "sidebar.importFailed": "Nada a recuperar",
+  "sidebar.importFailedText": "Este arquivo não tem mensagens de chat. Escolha um arquivo salvo com “Salvar este chat como Markdown”."
 }

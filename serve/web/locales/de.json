@@ -246,5 +246,9 @@
   "tool.running": "Läuft",
   "tool.skipped": "Nicht ausgeführt",
   "tool.writing": "Schreibt",
-  "undo": "Rückgängig"
+  "undo": "Rückgängig",
+  "sidebar.import": "Gespeicherten Chat zurückholen",
+  "sidebar.imported": "Chat zurückgeholt",
+  "sidebar.importFailed": "Nichts zurückzuholen",
+  "sidebar.importFailedText": "Diese Datei enthält keine Chat-Beiträge. Wählen Sie eine Datei, die mit „Diesen Chat als Markdown speichern“ gespeichert wurde."
 }

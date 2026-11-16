@@ -246,5 +246,9 @@
   "tool.running": "실행 중",
   "tool.skipped": "실행 안 됨",
   "tool.writing": "작성 중",
-  "undo": "실행 취소"
+  "undo": "실행 취소",
+  "sidebar.import": "저장한 채팅 가져오기",
+  "sidebar.imported": "채팅을 가져왔습니다",
+  "sidebar.importFailed": "가져올 내용이 없습니다",
+  "sidebar.importFailedText": "이 파일에는 채팅 내용이 없습니다. '이 채팅을 Markdown으로 저장'으로 저장한 파일을 고르세요."
 }
