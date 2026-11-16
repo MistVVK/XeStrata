@@ -460,6 +460,8 @@ Trainer::HostInputs::~HostInputs() {
 }
 
 bool Trainer::HostInputs::open(int64_t slots, int64_t bytes, void* compute) {
+    // the same form again (the next step): the pinned memory stays (pinning it every step costs more than a copy)
+    if (h_ != nullptr && slot_bytes_ == bytes && (int64_t) done_.size() == slots && s_ == compute) return true;
     close();
     if (slots <= 0 || bytes <= 0) return false;
     // the pinned budget's headroom as the streamed layers' homes take it (qi_stream.cpp take_home): the RAM

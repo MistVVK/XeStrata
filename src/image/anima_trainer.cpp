@@ -278,6 +278,7 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
                                                     : (size_t) (nb + 1 + 3) * rc * 4);
     }
     m.set_inputs_mode(hostm ? "host" : half ? "bf16" : "fp32");
+    if (!hostm) m.host.close();
     const bool all32 = backward && !half && !hostm;
     float* bounds = pool.f((all32 ? nb + 1 : 2) * HW * C);
     uint16_t* bounds16 = half && !hostm ? pool.u((nb + 1) * HW * C) : nullptr;
@@ -476,7 +477,6 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
         std::swap(dcur, dnxt);
     }
     gpu::stream_sync(s);
-    m.host.close();
     m.stepped_rows(HW, (uint64_t) HW * C * 4);
     return loss;
 }

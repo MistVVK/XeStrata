@@ -581,6 +581,7 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
     // the host form first (the inputs as FP32, byte for byte): the pinned memory had, else BF16
     const bool hostm = short32 && m->host_inputs(m->nblk + 1, Rj * C * 4);
     const bool half = short32 && !hostm;
+    if (!hostm) m->host.close();
     m->set_inputs_mode(hostm ? "host" : half ? "bf16" : "fp32");
     if (keep != nullptr) {
         const size_t rc = (size_t) (Rj * C);
@@ -689,7 +690,6 @@ float mf_trainer_forward_keep(MfTrainModel* base, const MfTrainSample& s, const 
 
 void mf_trainer_free_state(MfTrainModel* base, MfTrainState& s) {
     Model* m = static_cast<Model*>(base);
-    m->host.close();
     auto drop = [&](float* q) { m->release(q); };
     drop(s.x0);
     drop(s.xe);

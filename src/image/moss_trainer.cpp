@@ -309,6 +309,7 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
                                                     : (size_t) (nb + 1 + 3) * rc * 4);
     }
     m.set_inputs_mode(hostm ? "host" : half ? "bf16" : "fp32");
+    if (!hostm) m.host.close();
     // FP32: every block's input in bounds (two of them passed between, the forward alone); BF16: bounds the two
     // passed between, the inputs in bounds16; host: bounds the two passed between, the inputs on the host (FP32)
     const bool all32 = backward && !half && !hostm;
@@ -470,7 +471,6 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
         std::swap(dcur, dnxt);
     }
     gpu::stream_sync(s);
-    m.host.close();
     m.stepped_rows(R, (uint64_t) R * C * 4);
     tm.mark("blocks backward", s);
     static int64_t n = 0;
