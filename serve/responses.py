@@ -608,7 +608,7 @@ class Assembler:
             out += self.close("completed")
         return out
 
-    def _release(self, text: str) -> list[dict]:
+    def _release(self, text: str, status=None) -> list[dict]:
         """A held structured answer (or the words written beside a tool call) as one message item."""
         if not text.strip():
             return []
@@ -617,7 +617,7 @@ class Assembler:
         self.item["content"][0]["text"] = text
         out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
                               content_index=0, delta=text, logprobs=[]))
-        return out + self.close()
+        return out + self.close(status)
 
     def _call_started(self) -> list[dict]:
         """The first tool call of a JSON-format turn: this turn is not the final answer, so what the model wrote
@@ -654,6 +654,8 @@ class Assembler:
             self.json_text = []
             if self.called:
                 out += self._release(text)           # beside a tool call: as written (#782)
+            elif length:
+                out += self._release(text, "incomplete")   # cut short: the check takes only finish stop, so ended as plain text is
             else:
                 out += self._release(validate(text, done.get("finish")))
         n = done.get("completion_tokens", 0)
