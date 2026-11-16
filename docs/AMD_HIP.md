@@ -516,6 +516,24 @@ kernels for FP16-in / FP16-out GEMMs only; the prompt path's FP16-in / FP32-out 
 | `STRATA_HC_PERSIST=1` | The verifier's hyper-connection read as one persistent kernel (HIP, wave32). Measured on 2x RX 6900 XT: -2.8% to -4.2% ms per verify window. Not offered on gfx11 and gfx12. Opt-in for measurement on gfx103x. [Data](../bench/results/2026-10-12-hc-persist-gfx1030/README.md). |
 | `STRATA_FILE_CACHE_OLD_RULE` | gfx906 keeps the old file-tier cache rule; `=1` forces it on any Linux build, `=0` the current one |
 
+**Decode: the miss split follows the CPU pool (PcieAuto) by default (#4007).** The start-up share only looks at the link
+(0.35-0.39 on a x8 PCIe 4 card, 0.55 on x16), which is too high when the CPU pool is fast. On a discrete gfx103x card the
+share is now refined in the first decode windows from the pool's time per missed expert, as on gfx12 and CUDA. Engine 0.1.59
+(release 0.2.13), unset against `STRATA_PCIE_FRAC_DEFAULT=auto`, ten interleaved pairs each, prompt speed unchanged in every run:
+
+| Machine | Share | 4K decode | 32K decode |
+| --- | --- | ---: | ---: |
+| RX 6900 XT, Windows 11, i9-10900K, PCIe 4.0 x8 probe 12.6 GB/s | 0.35 -> 0.20 (one start 0.25) | 38.0 -> 43.8 (**+15.1%**, 10/10) | 39.0 -> 44.1 (**+13.3%**, 10/10) |
+| RX 6900 XT, Linux, Ryzen 5 5600X, PCIe 4.0 x8 probe 14.1 GB/s | 0.39 -> 0.25 | 45.0 -> 47.1 (**+4.9%**, 10/10) | 47.7 -> 48.1 (**+1.0%**, 10/10) |
+| RX 6700 XT (gfx1031), Linux, Ryzen 7 5800X, x16 probe 28.1 GB/s ([#4007](https://github.com/Niko1221/Strata/issues/4007#issuecomment-6879926995)) | 0.55 -> 0.35 | 41.6 -> 44.0 (**+4.9%**, 9/10) | 42.7 -> 44.0 (**+3.4%**, 10/10) |
+| RX 6700 XT (gfx1031), Linux, probe 2.8 GB/s (maintainers, engine 0.1.61, 3 pairs, [details](../bench/results/2026-11-14-rdna2-pcie-auto/README.md#maintainers-check-on-an-rx-6700-xt-2026-11-16)) | 0.08, no change | 19.44 -> 19.41 (-0.2%, 1/3) | not run |
+
+Windows gains the most because each GPU submission costs more there, so moving missed experts to the CPU pool pays more.
+`STRATA_PCIE_FRAC_DEFAULT=old` keeps the start-up share, an explicit `--pcie-frac` always wins, and integrated gfx103x
+(gfx1035 / gfx1036) and `STRATA_DEFAULTS=026` keep the old behaviour. Like on gfx12, the CPU lane rounds a missing expert's
+rows differently from the GPU lane, so output changes in the last bits. Data:
+[2026-11-14-rdna2-pcie-auto](../bench/results/2026-11-14-rdna2-pcie-auto/README.md).
+
 On a 16 GB card keep the defaults for `--pcie-frac` and `--adapt-every`; the 7900 XTX values in
 [AMD_HIP_PERFORMANCE.md](AMD_HIP_PERFORMANCE.md) cost 8.6 and 13.6 tok/s on an RX 6900 XT.
 
