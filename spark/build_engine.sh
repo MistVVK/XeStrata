@@ -55,7 +55,10 @@ cd "$repo"
 # without llama.cpp's MMQ, as the x86 release builds since 0.2.14 (named here: a build folder configured before keeps ON in its cache).
 # Such a build turns Strata's fused prompt kernels on for every layer they cover (src/prefill/prefill.cpp, own_only_switches.hpp), on the
 # GB10 too: IQ3_S, UD-IQ4_XS and UD-Q4_K_XL ran 48 of 48 layers on them on a GB10 (par/RESULTS-SPARK-R1.md, 11-14 / 11-15), the rest
-# takes the FP16 path.  strata_kq (libstrata_kq.so) exists only in a build with MMQ: STRATA_CMAKE_EXTRA=-DSTRATA_MMQ=ON builds the old
+# takes the FP16 path.  On a GB10 (11-16, users' launch lines) this build gave the same tokens as the same source built with MMQ (IQ3_S and
+# UD-Q4_K_XL, 125 of 125 requests each) and the same forced-token KL against the FP16 prompt path at 8,192 tokens (IQ3_S, bit-identical);
+# against the released 0.1.59 engine its prompt time was 0.66 / 1.01 / 0.99 / 0.98 (IQ3_S) and 0.58 / 0.80 / 0.86 / 0.89 (UD-Q4_K_XL)
+# at 256 / 2,048 / 8,192 / 32,000 tokens (medians of 5 interleaved pairs).  strata_kq (libstrata_kq.so) exists only in a build with MMQ: STRATA_CMAKE_EXTRA=-DSTRATA_MMQ=ON builds the old
 # path (A/B runs)
 . "$repo/packaging/engine_targets.sh"
 targets=$(engine_targets "$cmake" "$build")
