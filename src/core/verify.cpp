@@ -749,7 +749,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const char* v = strata::env_get("DF_BRANCH");
         for (int i = 0; i < 2; ++i)
             if (!df_side_[i]) df_side_[i] = strata::gpu::stream_create();
-        if (!df_side_[0] || !df_side_[1]) df_branch_ = false;
+        // the window waits for the CPU inside its graph: no branch where that wait would hold up the launch itself
+        const bool no_branch = !strata::gpu::graph_branches_may_wait_for_host();
+        if (!df_side_[0] || !df_side_[1] || no_branch) df_branch_ = false;
         else if (v != nullptr) df_branch_ = std::strtol(v, nullptr, 10) != 0;
         else {
             try {
@@ -763,7 +765,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // branches pay (df_branch_) unless STRATA_FETCH_BRANCH=0|1 fixes it.
         if (!fetch_side_) fetch_side_ = strata::gpu::stream_create();
         const char* fv = strata::env_get("FETCH_BRANCH");
-        fetch_branch_ = fetch_side_ != nullptr && (fv != nullptr ? std::strtol(fv, nullptr, 10) != 0 : df_branch_);
+        fetch_branch_ = fetch_side_ != nullptr && !no_branch &&
+                        (fv != nullptr ? std::strtol(fv, nullptr, 10) != 0 : df_branch_);
+        if (no_branch && (v != nullptr || fv != nullptr))
+            std::fprintf(stderr, "xestrata verify: no graph branches in the windows on this device: its graph launch "
+                                 "would wait behind the window's wait for the CPU (STRATA_DF_BRANCH and "
+                                 "STRATA_FETCH_BRANCH ignored)\n");
     }
     if (!strata::gpu::event_create(&commit_done_)) {
         err = "verify: event create failed";

@@ -180,6 +180,10 @@ bool stream_fork(Stream from, Stream to);
 bool stream_join(Stream into, Stream from);
 bool is_capturing(Stream s);
 bool graph_launch(const Graph* g, Stream s);
+/// Whether a graph with branches may hold a kernel that waits for the host: false where the launch itself submits
+/// the graph's nodes from the host and blocks once its queue is full, so a wait the host serves after the launch
+/// never ends (HIP: the branched graph's nodes go through hip::Graph::RunOneNode, a kernel-argument ring).
+bool graph_branches_may_wait_for_host();
 size_t graph_nodes(const Graph* g);
 /// Destroys a graph after draining the runtime's queues (null is a no-op).
 void graph_destroy(Graph* g);

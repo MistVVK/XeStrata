@@ -683,6 +683,13 @@ bool graph_launch(const Graph* g, Stream s) {
     catch (const std::exception& e) { return fail("graph_launch", e); }
 }
 
+bool graph_branches_may_wait_for_host() {
+    // HIP launches a graph without branches as one batch of packets, one with branches a node at a time from the
+    // launching thread: a verify window with the mixer's side branches hung there on an RX 9060 XT, its launch
+    // waiting for the kernel-argument ring behind the window's first wait for the CPU's rows (2026-11-16)
+    return rt().device().get_backend() != sycl::backend::ext_oneapi_hip;
+}
+
 size_t graph_nodes(const Graph* g) { return g ? g->nodes : 0; }
 
 void graph_destroy(Graph* g) {
