@@ -38,6 +38,8 @@ export interface ToolsState {
   /** Skip the once-per-chat question before the first web search or page in Manual mode. Off unless the person turned it on. */
   webWithoutAsking: boolean;
   browser: { enabled: boolean; found: boolean; name: string | null; missing?: 'component' };
+  /** #5968: Run as administrator, Windows only (`available`). Off unless the person turned it on. */
+  runAsAdmin?: { enabled: boolean; available: boolean };
   custom: CustomTool[];
 }
 
@@ -155,6 +157,15 @@ export function SettingsTools({ preview }: { preview?: ToolsState }) {
         </Field>
       </div>
     </section>
+
+    {state.runAsAdmin?.available ? <section className="settings-section">
+      <h2 className="h4" style={{ marginBottom: 10 }}>{tr('Run as administrator')}</h2>
+      <div className="st-card st-card--flush">
+        <Field label={tr('Run as administrator')} hint={tr('Lets the assistant run one command with administrator rights. Windows asks you each time; nothing runs if you choose No.')}>
+          <button className="st-toggle" role="switch" aria-checked={state.runAsAdmin.enabled} aria-label={tr('Run as administrator')} disabled={busy} onClick={() => void save({ runAsAdmin: { enabled: !state.runAsAdmin?.enabled } })} />
+        </Field>
+      </div>
+    </section> : null}
 
     <section className="settings-section">
       <h2 className="h4" style={{ marginBottom: 10 }}>{tr('Your own tools')}</h2>

@@ -1694,7 +1694,7 @@
   "s1676": "Compétence activée",
   "s1677": "Portée de la compétence dans l’espace de travail",
   "s1678": "Compétences",
-  "s1679": "Ignorer les demandes d’autorisation",
+  "s1679": "Ignorer les demandes d’autorisation. Ne donne pas les droits d’administrateur.",
   "s1680": "Commandes slash",
   "s1681": "Plus lent · mémoire système",
   "s1682": "Petits écrans",
@@ -3541,5 +3541,8 @@
   "s9049": "Cette question n’attend plus de réponse.",
   "s9050": "Cette réponse n’a pas été transmise",
   "s9051": "ctx.length: saisissez une taille de contexte entière de 1K à 1024K.",
-  "s9101": "Part du temps pendant laquelle le GPU avait du travail. Cela n’indique pas quelle part de sa puissance de calcul est utilisée."
+  "s9101": "Part du temps pendant laquelle le GPU avait du travail. Cela n’indique pas quelle part de sa puissance de calcul est utilisée.",
+  "s9110": "Exécuter en tant qu’administrateur",
+  "s9111": "Permet à l’assistant d’exécuter une commande avec les droits d’administrateur. Windows vous le demande à chaque fois ; si vous choisissez Non, rien ne s’exécute.",
+  "s9112": "Les droits d’administrateur ont été refusés à l’invite de Windows."
 }

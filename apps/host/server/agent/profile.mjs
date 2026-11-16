@@ -62,12 +62,14 @@ export const MODELS_PLUGIN = fileURLToPath(new URL('./plugins/strata-models.mjs'
 export const SEARCH_PLUGIN = fileURLToPath(new URL('./plugins/strata-search.mjs', import.meta.url));
 /** The app's own tool server for the tools a person writes (instructions, commands). */
 export const CUSTOM_TOOLS_SCRIPT = fileURLToPath(new URL('./custom-tools-mcp.mjs', import.meta.url));
+/** Run as administrator (#5968): the app's one-tool server that asks Windows for the rights, one command at a time. */
+export const ADMIN_TOOL_SCRIPT = fileURLToPath(new URL('./admin-tool-mcp.mjs', import.meta.url));
 
 /** The search service as the person knows it, for the question that comes before the first web search in a chat. */
 const SEARCH_NAMES = Object.freeze({ builtin: 'DuckDuckGo, or Bing when DuckDuckGo is busy', exa: 'Exa', perplexity: 'Perplexity', deepseek: 'DeepSeek' });
 
 /** What Settings -> Tools says when nothing was chosen. */
-const NO_TOOLS_SETTINGS = Object.freeze({ off: new Set(), search: { provider: 'builtin', key: '' }, webWithoutAsking: false, browserEnabled: false, browserPath: null, browserCli: null, servers: {}, hasInstructionTools: false, hasCommandTools: false, toolFile: null });
+const NO_TOOLS_SETTINGS = Object.freeze({ off: new Set(), search: { provider: 'builtin', key: '' }, webWithoutAsking: false, browserEnabled: false, browserPath: null, browserCli: null, servers: {}, hasInstructionTools: false, hasCommandTools: false, runAsAdminEnabled: false, toolFile: null });
 
 /**
  * The tool servers (MCP) set up for the model in Settings, as Harness client rows. Their tools appear to the agent as
@@ -329,7 +331,9 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
   // The browser: Playwright's tool server on the person's own Chrome or Edge, in a separate empty profile (what the Harness's own browser provider does). Every action asks in Manual.
   const browserRows = tools.browserEnabled && tools.browserPath && tools.browserCli
     ? [{ id: 'mcp-browser', name: '@deepseek-ai/dsh-mcp-client', config: { serverName: 'browser', transport: 'stdio', command: process.execPath, args: [tools.browserCli, '--browser', 'chromium', '--isolated', ...(process.env.STRATA_BROWSER_HEADLESS === '1' ? ['--headless'] : []), '--executable-path', tools.browserPath] } }] : [];
-  const ownRows = [...own('instructions', tools.hasInstructionTools), ...own('commands', tools.hasCommandTools), ...browserRows];
+  // Run as administrator (#5968): only when the person turned it on, on Windows. Manual asks first; Windows asks for every call.
+  const adminRows = tools.runAsAdminEnabled ? [{ id: 'mcp-strata-admin', name: '@deepseek-ai/dsh-mcp-client', config: { serverName: 'strata-admin', transport: 'stdio', command: process.execPath, args: [ADMIN_TOOL_SCRIPT] } }] : [];
+  const ownRows = [...own('instructions', tools.hasInstructionTools), ...own('commands', tools.hasCommandTools), ...browserRows, ...adminRows];
   // Web search: DuckDuckGo with no key unless the person chose a keyed service AND saved its key (then that one; never a half-set-up one).
   const searchOn = !tools.off.has('search');
   const keyed = ['exa', 'perplexity', 'deepseek'].includes(tools.search.provider) && tools.search.key ? tools.search.provider : null;

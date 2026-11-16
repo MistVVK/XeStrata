@@ -1694,7 +1694,7 @@
   "s1676": "Skill aktiviert",
   "s1677": "Arbeitsbereichszuordnung des Skills",
   "s1678": "Skills",
-  "s1679": "Berechtigungsabfragen überspringen",
+  "s1679": "Berechtigungsabfragen überspringen. Gibt keine Administratorrechte.",
   "s1680": "Slash-Befehle",
   "s1681": "Langsamer · Systemspeicher",
   "s1682": "Kleine Bildschirme",
@@ -3541,5 +3541,8 @@
   "s9049": "Diese Frage wartet nicht mehr auf eine Antwort.",
   "s9050": "Diese Antwort wurde nicht übermittelt",
   "s9051": "ctx.length: Geben Sie eine ganzzahlige Kontextgröße von 1K bis 1024K ein.",
-  "s9101": "Anteil der Zeit, in der die GPU etwas zu tun hatte. Er sagt nicht aus, wie viel ihrer Rechenleistung genutzt wird."
+  "s9101": "Anteil der Zeit, in der die GPU etwas zu tun hatte. Er sagt nicht aus, wie viel ihrer Rechenleistung genutzt wird.",
+  "s9110": "Als Administrator ausführen",
+  "s9111": "Erlaubt dem Assistenten, einen Befehl mit Administratorrechten auszuführen. Windows fragt Sie jedes Mal; wenn Sie Nein wählen, wird nichts ausgeführt.",
+  "s9112": "Die Administratorrechte wurden in der Windows-Abfrage abgelehnt."
 }

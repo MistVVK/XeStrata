@@ -1694,7 +1694,7 @@
   "s1676": "Habilidad activada",
   "s1677": "Ámbito de trabajo de la habilidad",
   "s1678": "Habilidades",
-  "s1679": "Omitir solicitudes de permiso",
+  "s1679": "Omitir solicitudes de permiso. No da derechos de administrador.",
   "s1680": "Comandos con barra",
   "s1681": "Más lento · memoria del sistema",
   "s1682": "Pantallas pequeñas",
@@ -3541,5 +3541,8 @@
   "s9049": "Esa pregunta ya no espera respuesta.",
   "s9050": "Esa respuesta no se entregó",
   "s9051": "ctx.length: escribe un tamaño de contexto entero de 1K a 1024K.",
-  "s9101": "Parte del tiempo en que la GPU tenía trabajo. No indica cuánta de su capacidad de cálculo se está usando."
+  "s9101": "Parte del tiempo en que la GPU tenía trabajo. No indica cuánta de su capacidad de cálculo se está usando.",
+  "s9110": "Ejecutar como administrador",
+  "s9111": "Permite que el asistente ejecute un comando con derechos de administrador. Windows te lo pregunta cada vez; si eliges No, no se ejecuta nada.",
+  "s9112": "Se rechazaron los derechos de administrador en el aviso de Windows."
 }

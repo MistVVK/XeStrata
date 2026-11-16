@@ -32,6 +32,8 @@ export const PLAN_PRESET = 'strata-plan';
 const LOOK_ONLY_SERVER = 'mcp__strata-instructions__';
 /** The tools a person wrote as commands (Settings -> Tools): the card says which one runs and with what text. */
 const COMMANDS_SERVER = 'mcp__strata-commands__';
+/** Run as administrator (#5968, admin-tool-mcp.mjs): Manual asks first, and Windows asks again for every call; Plan refuses it. */
+const ADMIN_TOOL = 'mcp__strata-admin__run_as_administrator';
 /** The browser tool server's name in the agent (Settings -> Tools). Looking at the page does not ask; acting on it does. */
 const BROWSER_SERVER = 'mcp__browser__';
 const BROWSER_LOOKING = new Set(['browser_snapshot', 'browser_take_screenshot', 'browser_console_messages', 'browser_network_requests', 'browser_wait_for']);
@@ -344,6 +346,7 @@ export function manualDecision(exec, options = {}) {
   if (tool === 'job_kill') return { kind: 'ask', reason: 'Stop a background task' };
   if (tool.startsWith(LOOK_ONLY_SERVER)) return null;
   if (tool.startsWith(BROWSER_SERVER)) return browserDecision(tool.slice(BROWSER_SERVER.length), args);
+  if (tool === ADMIN_TOOL) return { kind: 'ask', reason: `Run as administrator (Windows will ask too): ${clip(args.command, 160)}${args.reason ? ` (${clip(args.reason, 120)})` : ''}` };
   if (tool.startsWith(COMMANDS_SERVER)) return { kind: 'ask', reason: `Run your tool “${tool.slice(COMMANDS_SERVER.length).replace(/_/g, ' ')}”${args.input ? ` with: ${clip(args.input, 120)}` : ''}` };
   if (tool.startsWith('mcp__')) return { kind: 'ask', reason: `Use the connected tool ${tool.split('__').slice(1).join(' / ')}` };
   return { kind: 'ask', reason: `Use the tool ${tool}` };

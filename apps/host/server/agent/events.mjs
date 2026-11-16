@@ -12,6 +12,7 @@ import { askFor } from './ask.mjs';
 import { FIT_TEXT, fill } from './context-fit.mjs';
 import { isContextOverflow } from './context-budget.mjs';
 import { ToolDraft, cutCalls } from './reply-cut.mjs';
+import { REFUSED as ADMIN_REFUSED } from './admin-tool-mcp.mjs';
 
 const SHELL = new Set(['pwsh', 'bash', 'job_kill', 'job_output', 'job_list']);
 const WRITE = new Set(['write', 'edit']);
@@ -44,7 +45,11 @@ export function parseArguments(raw) {
  * One plain sentence and one short detail per tool, so a card never shows raw JSON or an internal tool name as its
  * explanation. Unknown tools (a connected MCP server's) fall back to a generic sentence with their arguments.
  */
+/** #5968: Run as administrator (admin-tool-mcp.mjs) and the line the reply gets when the person chose No at the Windows prompt. */
+const ADMIN_TOOL_NAME = 'mcp__strata-admin__run_as_administrator';
+const ADMIN_REFUSED_LINE = 'Administrator rights were refused at the Windows prompt.';
 const WORDS = {
+  'mcp__strata-admin__run_as_administrator': a => ['Runs a command as administrator. Windows asks you first.', a.command],
   read: a => ['Reads a file.', a.file_path ?? a.path],
   glob: a => ['Looks for files by name.', a.pattern],
   grep: a => ['Searches inside files.', a.pattern ?? a.query],
@@ -387,6 +392,10 @@ export class TurnProjector {
           durationMs: Math.max(0, (e.time ?? 0) - entry.calledAt),
         });
         if (frame) out.push(frame);
+        // #5968: the person chose No at the Windows administrator prompt: one plain line in the reply, in their language
+        if (!denied && entry.card.name === ADMIN_TOOL_NAME && resultText(d.message).startsWith(ADMIN_REFUSED)) {
+          out.push({ type: 'delta', own: true, text: `\n\n${ADMIN_REFUSED_LINE}`, key: ADMIN_REFUSED_LINE, values: [], noteReason: 'admin-refused' });
+        }
         break;
       }
       case 'compaction/start':
