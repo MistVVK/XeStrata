@@ -3988,9 +3988,9 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     # has it, on one card and on a layer split over several cards. A choice that cannot be applied (no drafter file yet, several requests at once) starts the other one if it is on this computer,
     # else none, and says why in the engine's /metrics ("drafting_note"). The start never downloads.
     shaped = {**cfg, "args": args}
-    backend, archs = drafting.detect_hardware()
+    backend, archs = drafting.hardware_for(cfg.get("backend"))   # #5109: the config's engine family, not an idle card of another vendor
     parallel_n = cfg.get("parallel")
-    decision = drafting.apply(shaped, klass=drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
+    decision = drafting.apply(shaped, klass=drafting.card_class(archs) if archs else drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
                               vram_mib=drafting_vram_mib(cfg, backend, archs),
                               slots=parallel_n if isinstance(parallel_n, int) and not isinstance(parallel_n, bool) else 0, engine=exe)
     args = shaped["args"]

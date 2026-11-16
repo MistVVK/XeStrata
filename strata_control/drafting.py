@@ -171,6 +171,23 @@ def detect_hardware() -> tuple[str | None, list[str]]:
     return _HARDWARE[0]
 
 
+#: the card architectures of each engine family, by name (detect_hardware lists every vendor's cards a computer has)
+_FAMILY_ARCH_PREFIX = {"cuda": "sm_", "hip": "gfx"}
+
+
+def hardware_for(engine_backend: str | None) -> tuple[str | None, list[str]]:
+    """#5109: detect_hardware() for a start whose config names its engine family (cfg["backend"]).  On a computer with an NVIDIA card beside the AMD
+    card the engine serves from, detect_hardware() answers "cuda" with the NVIDIA card first, so the drafter's support line, card class and
+    confidence were the idle NVIDIA card's.  The config's family wins, and only its own cards' architectures are kept (in detect_hardware's order).
+    Without a known family (or for one whose cards are not named here): detect_hardware() unchanged."""
+    backend, archs = detect_hardware()
+    want = str(engine_backend or "").strip().lower()
+    prefix = _FAMILY_ARCH_PREFIX.get(want)
+    if not prefix:
+        return backend, archs
+    return want, [a for a in archs if str(a).lower().startswith(prefix)]
+
+
 def hardware_support(backend: str | None, archs: Any = None, model_name: str | None = None) -> Support:
     """Can the engine for this backend and card run DFlash2, and what was measured on it. ``backend`` is the engine family (cuda | hip | sycl | metal);
     ``archs`` the cards' architectures (``sm_120``, ``gfx1151``...), the first one counts like card_class does. ``model_name``: on Metal the answer is
