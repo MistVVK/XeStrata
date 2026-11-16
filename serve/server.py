@@ -986,6 +986,17 @@ def visible_device_order(env: dict | None, backend: str | None) -> list[int]:
     return devices if all(0 <= device <= 65535 for device in devices) and len(set(devices)) == len(devices) else []
 
 
+def monitored_gpu(cards: list[int], env: dict | None, backend: str | None) -> int:
+    """The card the Monitor reads, numbered as the GPU readers number them (serve/telemetry.py: AMD in KFD order, NVIDIA by PCI bus).
+    The config's own cards when it names any. Otherwise the card the engine's environment shows it first: an "Automatic" AMD start
+    (hip_auto_devices) or the person's own HIP_VISIBLE_DEVICES runs the engine on card N while the Monitor used to read card 0, an idle
+    card next to it (#4640). 0 when the environment does not say, or says it ambiguously (visible_device_order)."""
+    if cards:
+        return cards[0]
+    order = visible_device_order(env, backend)
+    return order[0] if order else 0
+
+
 def configure_batch_telemetry_env(env: dict, cfg: dict, override: bool | None) -> None:
     """Only an explicit setting changes the inherited opt-in engine environment."""
     choice = override if override is not None else cfg.get("batch_telemetry")
@@ -10432,7 +10443,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
-    svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
+    svc.gpu_index = monitored_gpu(gpu_list(cfg), env if a.engine == "strata" else None, cfg.get("backend"))   # the card the engine runs on (#51, #4640)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.engine == "strata" and groups:                 # replicas: every card of every group
         svc.gpu_indices = [c for g in groups for c in g]
