@@ -911,7 +911,7 @@ struct Gdn {
     static bool chunked(sycl::queue& q, int64_t T, bool with_out, Seq&& seq, Norm&& launch_norm, const float* state,
                         const float* h, const float* gate, const float* beta, const float* z, const float* gamma,
                         float eps, bool silu) {
-        // Opt-in for now (INT2, 2026-11-14): the FP16-operand scan's state error (~5e-4) is over the contract's 1e-4
+        // Opt-in for now (2026-11-14): the FP16-operand scan's state error (~5e-4) is over the contract's 1e-4
         // floor (gdn_chunk_parity on the B70 and the RX 9060 XT; GDN_CONTRACT.md's tiers keep the floor for the mixed
         // precision too).  The token-by-token kernels keep the default until GDN settles the state update's precision.
         static const int mode = [] { const int m = strata::env_auto("GDN_CHUNKED"); return m < 0 ? 0 : m; }();

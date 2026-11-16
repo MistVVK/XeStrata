@@ -791,7 +791,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     res_graph_ = !always_publish_ && hits.h_res != nullptr && hits.d_res != nullptr && MoeWindow::resident_graph_on();
     if (!win_.device_plans()) { device_plan_ = false; res_graph_ = false; }
     // a latent pack keeps the host plan: the plan's activation-row rewrite reads the doorbell's mapped ids, which
-    // the resident / device-plan graphs do not write (EDGE design §4.4; their speed is a later measurement)
+    // the resident / device-plan graphs do not write (their speed is a later measurement)
     if (win_.latent()) { device_plan_ = false; res_graph_ = false; }
     std::fprintf(stderr, "xestrata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);

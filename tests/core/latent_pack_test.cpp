@@ -67,7 +67,7 @@ void env_set(const char* name, const char* value) {
 // ---- 1. the manifest
 void manifest() {
     // the published Edge0 manifests' header lines, verbatim (their rows are layer gu_type d_type offset blob_bytes,
-    // the offset layer * 512 * blob; the real files are records/2026-11-13-upstream-02131/EDGE/hf/<model>/)
+    // the offset layer * 512 * blob; the real files are the published Edge0 HF manifests)
     struct Want { const char* head; int64_t embd, blob; };
     const Want wants[] = {
         {"# strata native experts v6: latent A-only, Q3_K gu + shared colscale (expert_embd 1792, expert_ff 640)",

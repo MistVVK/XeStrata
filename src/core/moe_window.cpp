@@ -175,7 +175,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         }
         // XESTRATA_LATENT_U_GPU: auto (the default) computes the CPU share's U on the GPU from its q8_1 rows of h
         // (5x smaller across PCIe than the H-wide contributions, and the pool's U work moves to the device);
-        // off keeps the CPU's U.  The auto choice is to be confirmed on the three GPUs (EDGE/measure-plan.md).
+        // off keeps the CPU's U.  The auto choice is to be confirmed on the three GPUs.
         lat_u_gpu_ = strata::core::pick_from_env("LATENT_U_GPU") != strata::core::Pick::Off;
         // XESTRATA_LATENT_U_MMU: the U on the matrix units.  on takes it; off the dp4a U; auto follows the device
         // as iq_mmq's other products do (mmq::built): the matrix units where it reports them, else dp4a.

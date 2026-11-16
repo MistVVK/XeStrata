@@ -37,7 +37,7 @@
 // FP16 hi/lo pairs: X = K S0 with the state split (two products, K single: its error feeds the state through
 // Y = beta (v - e X)), and three products each (hi.hi + hi.lo + lo.hi; lo.lo ~ 2^-22 dropped) for D = T Y with T and Y
 // split and S = e_L S + K^T (f D) with K and f D split.  Single FP16 everywhere left the state ~ 5e-4 from the FP64
-// recurrence, over GDN_CONTRACT.md's 1e-4 floor (INT2's CTest, the B70 and the RX 9060 XT); the pairs leave k's own
+// recurrence, over GDN_CONTRACT.md's 1e-4 floor (CTest on the B70 and the RX 9060 XT); the pairs leave k's own
 // rounding in X, of order 1e-5.  Not the bits of kernels.cpp's recurrence kernels.
 #include "gdn_chunk.hpp"
 
