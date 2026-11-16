@@ -4204,10 +4204,12 @@ class SharingTheGpu(unittest.TestCase):
 
     def test_before_load_refusal_carries_the_commands_own_reason(self):
         """#5987: a scheduler's launcher refuses with its own line; the 503 says that line, at once, with no start."""
+        # its stdout is written AFTER the stderr line (as a buffered stdout is on Windows, flushed at exit): the reason is
+        # stderr's line wherever the streams' order lands
         status, headers, body = self._strict_hook(
-            "import sys; print('checking'); "
-            "print('no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB', file=sys.stderr); "
-            "sys.exit(75)")
+            "import sys; print('checking', flush=True); "
+            "print('no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB', file=sys.stderr, flush=True); "
+            "print('done checking', flush=True); sys.exit(75)")
         self.assertEqual(status, 503)
         self.assertEqual(body["error"]["message"], "no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB")
         self.assertTrue(int(headers["Retry-After"]) > 0)
@@ -4220,19 +4222,27 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(self.engine.starts, 0)
 
     def test_before_load_reason_is_made_safe(self):
+        # UTF-8 bytes on stdout's buffer: the console code page of the machine (cp1250 on the owner PC) cannot fail the child
         status, _, body = self._strict_hook(
-            "import sys; sys.stdout.write('first line\\n\\x1b[31mred \\x07alert\\ttab\\u200b\\x00 ' + 'x' * 400 + '\\n  \\n'); sys.exit(1)")
+            "import sys; sys.stdout.buffer.write(('first line\\r\\n\\x1b[31mred \\x07alert\\ttab\\u200b\\x00 ' + 'x' * 400 + "
+            "'\\r\\n  \\r\\n').encode('utf-8')); sys.exit(1)")
         msg = body["error"]["message"]
         self.assertEqual(status, 503)
         self.assertLessEqual(len(msg), 300)
         self.assertTrue(msg.startswith("[31mred alert tab ") and msg.endswith("..."), msg[:60])
         self.assertFalse(any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c == "​" for c in msg), repr(msg[:60]))
-        from serve.server import hook_reason
+        from serve.server import hook_reason, hook_text
         self.assertEqual(hook_reason(b"a\r\nb \x1b\x00 c\n"), "b c")
         self.assertEqual(hook_reason(""), "")
         self.assertEqual(hook_reason(None), "")
         self.assertEqual(hook_reason("x" * 300), "x" * 300)
         self.assertEqual(len(hook_reason("y" * 301)), 300)
+        # the streams apart: stderr's last line wins, stdout's when stderr is empty or blank
+        self.assertEqual(hook_reason(b"progress\nlater progress\n", stderr=b"no room for 76G of RAM\n"), "no room for 76G of RAM")
+        self.assertEqual(hook_reason(b"busy: try later\n", stderr=b"  \n"), "busy: try later")
+        # not UTF-8 (a Windows console tool's code page): decoded, never an error
+        t = hook_text(b"caf\xe9 full")
+        self.assertTrue(t.startswith("caf") and t.endswith(" full") and len(t) == 9, repr(t))
 
     def test_before_load_that_allows_loads_and_its_output_reaches_the_log(self):
         status, _, _ = self._strict_hook("print('room reserved: 76.0 GB')")

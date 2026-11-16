@@ -513,25 +513,40 @@ class EngineStuck(RuntimeError):
 HOOK_REASON_MAX = 300   # #5987: the most of a before_load command's own refusal line that goes into a 503
 
 
-def hook_reason(output, limit: int = HOOK_REASON_MAX) -> str:
-    """#5987: the last non-empty line a before_load command wrote (stdout and stderr together), made safe for an API
-    message: control and format characters become spaces, runs of whitespace one space, at most `limit` characters
-    ("..." marks a cut).  "" when it wrote nothing."""
-    if isinstance(output, bytes):
-        output = output.decode("utf-8", "replace")
-    for line in reversed((output or "").splitlines()):
-        s = " ".join("".join(" " if unicodedata.category(c)[0] == "C" else c for c in line).split())
-        if s:
-            return s if len(s) <= limit else s[:limit - 3].rstrip() + "..."
+def hook_text(output) -> str:
+    """A before_load command's output as text: UTF-8, else the system's own encoding (a Windows console tool writes its
+    code page), never an error."""
+    if not isinstance(output, bytes):
+        return output or ""
+    try:
+        return output.decode("utf-8")
+    except UnicodeDecodeError:
+        import locale
+        return output.decode(locale.getpreferredencoding(False) or "utf-8", "replace")
+
+
+def hook_reason(output, limit: int = HOOK_REASON_MAX, stderr=None) -> str:
+    """#5987: the last non-empty line a before_load command wrote, made safe for an API message: control and format
+    characters become spaces, runs of whitespace one space, at most `limit` characters ("..." marks a cut).  The two
+    streams are read apart: the reason is stderr's last line, else stdout's - merged, their order depends on the
+    command's buffering (a Python launcher's stdout to a pipe is flushed at its exit, after its stderr line).  "" when it
+    wrote nothing."""
+    for text in (stderr, output):
+        for line in reversed(hook_text(text).splitlines()):
+            s = " ".join("".join(" " if unicodedata.category(c)[0] == "C" else c for c in line).split())
+            if s:
+                return s if len(s) <= limit else s[:limit - 3].rstrip() + "..."
     return ""
 
 
-def hook_echo(output) -> None:
-    """The before_load command's output, passed on to this server's own output (where it went before #5987 read it)."""
+def hook_echo(output, stream=None) -> None:
+    """The before_load command's output, passed on to this server's own stdout (or `stream`: its stderr for the command's
+    stderr), where it went before #5987 read it."""
     if not output:
         return
-    text = output.decode("utf-8", "replace") if isinstance(output, bytes) else output
-    print(text, end="" if text.endswith("\n") else "\n", flush=True)
+    lines = hook_text(output).splitlines()   # (a Windows command's \r\n would come out doubled through a text stream)
+    if lines:
+        print("\n".join(lines), file=stream or sys.stdout, flush=True)
 
 
 class GpuBusy(RuntimeError):
@@ -5474,13 +5489,15 @@ class Service:
                 # #5987: its output is read (and passed on to this server's own output, as before) so that a refusal can
                 # carry the command's own reason
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 hook_echo(r.stdout)
+                hook_echo(r.stderr, sys.stderr)
                 if r.returncode != 0:
                     why = f"it exited with code {r.returncode}"
-                    reason = hook_reason(r.stdout)
+                    reason = hook_reason(r.stdout, stderr=r.stderr)
             except subprocess.TimeoutExpired as e:
                 hook_echo(e.output)
+                hook_echo(e.stderr, sys.stderr)
                 why = f"it did not finish in {self.before_load_timeout_s:g} s (before_load_timeout_s)"
             except (OSError, subprocess.SubprocessError) as e:
                 why = f"it could not run ({e})"
