@@ -5425,8 +5425,9 @@ int main(int argc, char** argv) {
         const int64_t base_reserve =
             later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
         const int64_t reserve = ((base_reserve + (later ? kWindowMib : kPipeSnapMib) + kPipeWindowMib) << 20) + pf + bind;
-        // the stage's latent D/U pair is uploaded before its cache is sized (the stages loop): leave room for it
-        return std::max<int64_t>((int64_t) fb - reserve - (int64_t) strata::core::latent_device_bytes(dev), 0);
+        // (the stage's latent D/U pair is uploaded before its cache is sized, the stages loop: the free memory read
+        // here is without it already)
+        return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     for (size_t i = 0; i < split_at.size(); ++i)
         if (split_at[i] >= g.n_layers) {
@@ -5502,10 +5503,9 @@ int main(int argc, char** argv) {
         auto size_cache = [&] {
             strata::gpu::mem_info(&free_b, &total_b);
             free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
-            if (lat_tab.latent) {   // device 0's D/U pair is already on the device (LatentTab::upload)
-                const size_t du = (size_t) strata::core::latent_device_bytes(0);
-                free_b -= du < free_b ? du : free_b;
-            }
+            // (device 0's latent D/U pair is on the device already, LatentTab::upload: the free memory read here is
+            // without it.  Taken off once more, it left Edge0-120B's 1.32 GiB of Q4_0 D/U free beside the cache - 1.4
+            // GiB free while the windows were captured on an RX 9060 XT held to 10 GB - and refused 8 and 9 GB.)
             // --vram-free-mib: what was free at the start beyond it is not counted, so a start with a few MiB more
             // free gets the same cache
             free_b = (size_t) strata::core::counted_free(free_b, start_free_b, o.vram_free_mib);
