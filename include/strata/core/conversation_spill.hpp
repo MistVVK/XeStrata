@@ -16,7 +16,14 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
 
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <utility>
 #include <cstdio>
 #include <filesystem>
 #include <random>
@@ -34,6 +41,10 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace strata::core {
@@ -94,6 +105,19 @@ inline LockHandle try_lock(const std::filesystem::path& p) {
 inline void unlock(LockHandle fd) { if (fd >= 0) ::close(fd); }
 inline unsigned long own_pid() { return (unsigned long) ::getpid(); }
 #endif
+/// The calling thread gives way (the SSD tier's background writer, P2 step 2c): on Linux nice +10 and the lowest best-effort I/O
+/// level (not the idle class, which a steady stream of expert reads could starve - and a starved writer would hold the serve loop
+/// at its next push); on Windows a below-normal thread priority; elsewhere nothing.  Best effort: a refusal changes nothing.
+inline void lower_thread_priority() {
+#if defined(_WIN32)
+    (void) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__linux__)
+    const long tid = ::syscall(SYS_gettid);
+    (void) ::setpriority(PRIO_PROCESS, (id_t) tid, 10);
+    constexpr int kWhoProcess = 1, kClassBestEffort = 2, kLowest = 7, kClassShift = 13;
+    (void) ::syscall(SYS_ioprio_set, kWhoProcess, (int) tid, (kClassBestEffort << kClassShift) | kLowest);
+#endif
+}
 }  // namespace spill_detail
 
 /// Whether a conversation is worth writing to the SSD tier: reading it back (and writing it first) must cost less than reading its
@@ -199,6 +223,9 @@ private:
 /// checkpoint (no running state, no K/V).  put() deletes the oldest entries when the budget needs the room, and never
 /// leaves a partial file behind; take() reads an entry back under the caller's read limits and removes it either way (a
 /// file that does not read back is not tried again).
+/// Thread-safe (P2 step 2c: a background writer puts while the serve loop matches and takes): the entry list and the budget are
+/// under one lock, a file is written and read outside it, and an entry is reached by its serial (an index can shift when the
+/// writer drops the oldest).  An entry is listed only once its file is complete.
 class ConversationSpill {
 public:
     struct Entry {
@@ -211,50 +238,68 @@ public:
     };
 
     bool open(const std::filesystem::path& root, uint64_t cap, std::string& error, size_t* cleaned = nullptr) {
+        std::lock_guard<std::mutex> lk(mu_);
         entries_.clear();
         budget_ = SpillBudget{cap, 0, 0};
         return ns_.open(root, error, cleaned);
     }
-    bool enabled() const { return ns_.is_open() && budget_.cap > 0; }
-    size_t size() const { return entries_.size(); }
-    uint64_t bytes() const { return budget_.used; }
-    const SpillBudget& budget() const { return budget_; }
-    const Entry& entry(size_t i) const { return entries_.at(i); }
-    const std::filesystem::path& dir() const { return ns_.dir(); }
+    bool enabled() const { std::lock_guard<std::mutex> lk(mu_); return enabled_locked(); }
+    size_t size() const { std::lock_guard<std::mutex> lk(mu_); return entries_.size(); }
+    uint64_t bytes() const { std::lock_guard<std::mutex> lk(mu_); return budget_.used; }
+    SpillBudget budget() const { std::lock_guard<std::mutex> lk(mu_); return budget_; }
+    Entry entry(size_t i) const { std::lock_guard<std::mutex> lk(mu_); return entries_.at(i); }
+    /// the entry `serial` (a copy), if it is still listed
+    std::optional<Entry> find(uint64_t serial) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const size_t i = index_locked(serial);
+        return i == SIZE_MAX ? std::nullopt : std::optional<Entry>(entries_[i]);
+    }
+    std::filesystem::path dir() const { std::lock_guard<std::mutex> lk(mu_); return ns_.dir(); }
 
-    /// Writes `image` as an entry.  False (with `error`) when the tier is off, the image is larger than the whole tier, or the
-    /// write failed; nothing of this call is then left on the disk.
-    bool put(const SavedConversation& image, const SessionFileIdentity& id, std::string& error) {
-        if (!enabled()) { error = "the SSD tier is off"; return false; }
+    /// Writes `image` as an entry (its serial in `*serial_out`).  False (with `error`) when the tier is off, the image is larger
+    /// than the whole tier, or the write failed; nothing of this call is then left on the disk.  The file is written outside the
+    /// lock, under a budget reserved for it.
+    bool put(const SavedConversation& image, const SessionFileIdentity& id, std::string& error, uint64_t* serial_out = nullptr) {
         const uint64_t need = (uint64_t) image.bytes() + (uint64_t(1) << 20);   // the payload and the file's own tables
-        if (need > budget_.cap) { error = "larger than the whole SSD tier"; return false; }
-        while (!budget_.reserve(need)) {
-            if (entries_.empty()) { error = "no room in the SSD tier"; return false; }
-            drop(0);
+        uint64_t serial = 0;
+        std::filesystem::path f;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!enabled_locked()) { error = "the SSD tier is off"; return false; }
+            if (need > budget_.cap) { error = "larger than the whole SSD tier"; return false; }
+            while (!budget_.reserve(need)) {
+                if (entries_.empty()) { error = "no room in the SSD tier"; return false; }
+                drop_locked(0);
+            }
+            serial = next_serial_++;
+            f = ns_.file_for(serial);
         }
-        const uint64_t serial = next_serial_++;
-        const std::filesystem::path f = ns_.file_for(serial);
         size_t written = 0;
         const bool ok = session_file_write(f.string(), image, id, written, error);
-        budget_.finish(need, ok ? written : 0);
         if (!ok) {
             std::error_code ec;
             std::filesystem::remove(f, ec);
-            return false;
         }
         Entry e;
-        e.serial = serial; e.file = f; e.bytes = written; e.cvec = image.cvec;
-        e.live = stub(image.live);
-        for (const auto& c : image.checkpoints) e.checkpoints.push_back(stub(c));
+        if (ok) {
+            e.serial = serial; e.file = f; e.bytes = written; e.cvec = image.cvec;
+            e.live = stub(image.live);
+            for (const auto& c : image.checkpoints) e.checkpoints.push_back(stub(c));
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        budget_.finish(need, ok ? written : 0);
+        if (!ok) return false;
         entries_.push_back(std::move(e));
-        while (budget_.over() && entries_.size() > 1) drop(0);   // (a file larger than its estimate)
+        while (budget_.over() && entries_.size() > 1) drop_locked(0);   // (a file larger than its estimate)
+        if (serial_out) *serial_out = serial;
         return true;
     }
 
     /// The entry and the prefix it gives `prompt`, by the RAM cache's rule (ConversationCache::best): its live state or a
-    /// checkpoint, same pictures, same steering; ties prefer the newest.
+    /// checkpoint, same pictures, same steering; ties prefer the newest.  Reach it by `serial` (find / take_serial).
     template <class Token>
     ConversationCache::Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+        std::lock_guard<std::mutex> lk(mu_);
         ConversationCache::Match m;
         for (size_t i = entries_.size(); i-- > 0;) {
             const Entry& e = entries_[i];
@@ -269,46 +314,195 @@ public:
         return m;
     }
 
-    /// Reads entry `i` back into `out` (bounded by `limits`, the identity checked) and removes the entry.  False: `out` is
-    /// unchanged and the entry is gone.
-    bool take(size_t i, const SessionFileIdentity& id, const SessionReadLimits& limits, SavedConversation& out, std::string& error) {
-        if (i >= entries_.size()) { error = "no such SSD entry"; return false; }
+    /// Reads entry `serial` back into `out` (bounded by `limits`, the identity checked) and removes the entry.  False: `out` is
+    /// unchanged and the entry is gone (or was not there).  The file is read outside the lock: the entry leaves the list first.
+    bool take_serial(uint64_t serial, const SessionFileIdentity& id, const SessionReadLimits& limits, SavedConversation& out,
+                     std::string& error) {
+        std::filesystem::path f;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            const size_t i = index_locked(serial);
+            if (i == SIZE_MAX) { error = "no such SSD entry"; return false; }
+            f = entries_[i].file;
+            budget_.drop(entries_[i].bytes);
+            entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+        }
         SavedConversation image;
         size_t read = 0;
-        const bool ok = session_file_read(entries_[i].file.string(), id, image, read, error, limits);
-        drop(i);
+        const bool ok = session_file_read(f.string(), id, image, read, error, limits);
+        std::error_code ec;
+        std::filesystem::remove(f, ec);
         if (ok) out = std::move(image);
         return ok;
     }
+    bool take(size_t i, const SessionFileIdentity& id, const SessionReadLimits& limits, SavedConversation& out, std::string& error) {
+        uint64_t serial = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (i >= entries_.size()) { error = "no such SSD entry"; return false; }
+            serial = entries_[i].serial;
+        }
+        return take_serial(serial, id, limits, out, error);
+    }
 
-    void drop(size_t i) {
+    void drop(size_t i) { std::lock_guard<std::mutex> lk(mu_); drop_locked(i); }
+    /// Drops entry `serial` and its file; false when it was not listed.
+    bool drop_serial(uint64_t serial) {
+        std::lock_guard<std::mutex> lk(mu_);
+        const size_t i = index_locked(serial);
+        if (i == SIZE_MAX) return false;
+        drop_locked(i);
+        return true;
+    }
+    /// Drops every entry and keeps the tier open (#879: after non-finite logits no parked conversation is kept).  Returns how many.
+    size_t clear() {
+        std::lock_guard<std::mutex> lk(mu_);
+        const size_t n = entries_.size();
+        while (!entries_.empty()) drop_locked(entries_.size() - 1);
+        return n;
+    }
+    void close() {
+        std::lock_guard<std::mutex> lk(mu_);
+        while (!entries_.empty()) drop_locked(entries_.size() - 1);
+        ns_.close();
+    }
+
+private:
+    bool enabled_locked() const { return ns_.is_open() && budget_.cap > 0; }
+    size_t index_locked(uint64_t serial) const {
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (entries_[i].serial == serial) return i;
+        return SIZE_MAX;
+    }
+    void drop_locked(size_t i) {
         std::error_code ec;
         std::filesystem::remove(entries_.at(i).file, ec);
         budget_.drop(entries_[i].bytes);
         entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
     }
-    /// Drops every entry and keeps the tier open (#879: after non-finite logits no parked conversation is kept).  Returns how many.
-    size_t clear() {
-        const size_t n = entries_.size();
-        while (!entries_.empty()) drop(entries_.size() - 1);
-        return n;
-    }
-    void close() {
-        clear();
-        ns_.close();
-    }
-
-private:
     static ConversationCheckpoint stub(const ConversationCheckpoint& c) {
         ConversationCheckpoint s;
         s.ids = c.ids;
         s.imgs = c.imgs;
         return s;
     }
+    mutable std::mutex mu_;
     SpillNamespace ns_;
     SpillBudget budget_;
     std::vector<Entry> entries_;
     uint64_t next_serial_ = 1;
+};
+
+/// The best prefix a parked image gives `prompt`, by the RAM cache's rule (its live state or a checkpoint, same pictures, same
+/// steering): for the images the background writer still holds in RAM.  {tokens, live}; tokens 0 = none.
+template <class Token>
+std::pair<int64_t, bool> conversation_image_prefix(const SavedConversation& s, const std::vector<Token>& prompt,
+                                                   const std::vector<ConversationImageKey>& images, bool cvec) {
+    std::pair<int64_t, bool> m{0, false};
+    if (s.cvec != cvec) return m;
+    const int64_t l = conversation_prefix(s.live, prompt, images);
+    if (l > m.first) m = {l, true};
+    for (const auto& c : s.checkpoints) {
+        const int64_t n = conversation_prefix(c, prompt, images);
+        if (n > m.first) m = {n, false};
+    }
+    return m;
+}
+
+/// P2 step 2c: writes parked conversations to the SSD tier on its own thread, so a request's park does not wait for the disk.
+/// At most one image is written at a time and one waits behind it (push() blocks past that): what the writer holds in RAM is at
+/// most two images over the RAM tier's budget, and the physical-RAM gate sees it (it is still allocated).  A written image is not
+/// freed on the writer thread: it is handed back (take_done) to be freed - or reused, it is still in RAM - on the caller's
+/// thread, the one that owns the cache's allocators.  `write` runs on the writer thread and returns the SSD serial (0: failed).
+template <class Item>
+class BackgroundWriter {
+public:
+    struct Done {
+        Item item;
+        uint64_t serial = 0;   // its SSD entry; 0: the write failed (the image is all there is)
+    };
+    /// `on_start`: runs first on the writer thread (the serve loop lowers its priority there: spill_detail::lower_thread_priority)
+    explicit BackgroundWriter(std::function<uint64_t(const Item&)> write, std::function<void()> on_start = {})
+        : write_(std::move(write)), on_start_(std::move(on_start)), th_([this] { if (on_start_) on_start_(); run(); }) {}
+    BackgroundWriter(const BackgroundWriter&) = delete;
+    BackgroundWriter& operator=(const BackgroundWriter&) = delete;
+    /// what is queued is not written (the namespace goes with the process); a write in flight finishes first
+    ~BackgroundWriter() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+            queue_.clear();
+        }
+        cv_.notify_all();
+        th_.join();
+    }
+    void push(Item&& it) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return queue_.empty() || stop_; });
+        if (stop_) return;
+        queue_.push_back(std::move(it));
+        cv_.notify_all();
+    }
+    void wait_idle() {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return (queue_.empty() && !busy_) || stop_; });
+    }
+    bool idle() const { std::lock_guard<std::mutex> lk(mu_); return queue_.empty() && !busy_; }
+    /// the written ones, to free or reuse on this thread
+    std::vector<Done> take_done() {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<Done> out;
+        out.swap(done_);
+        return out;
+    }
+    /// the queued ones (not the one in flight) back, unwritten - #879 clears them with the cache
+    std::vector<Item> take_queued() {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<Item> out;
+        for (auto& q : queue_) out.push_back(std::move(q));
+        queue_.clear();
+        cv_.notify_all();
+        return out;
+    }
+    /// f(const Item&) over every image not yet handed back - queued, in flight, written - under the lock (the writer only
+    /// reads an image in flight, so reading it here as well is safe)
+    template <class F>
+    void for_each_held(F f) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto& q : queue_) f(q);
+        if (inflight_) f(*inflight_);
+        for (const auto& d : done_) f(d.item);
+    }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lk(mu_);
+        for (;;) {
+            cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
+            if (stop_) return;
+            inflight_.emplace(std::move(queue_.front()));
+            queue_.pop_front();
+            busy_ = true;
+            cv_.notify_all();   // (a push waiting for room)
+            lk.unlock();
+            uint64_t serial = 0;
+            try { serial = write_(*inflight_); } catch (...) { serial = 0; }
+            lk.lock();
+            done_.push_back(Done{std::move(*inflight_), serial});
+            inflight_.reset();
+            busy_ = false;
+            cv_.notify_all();
+        }
+    }
+    std::function<uint64_t(const Item&)> write_;
+    std::function<void()> on_start_;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<Item> queue_;
+    std::optional<Item> inflight_;
+    std::vector<Done> done_;
+    bool busy_ = false, stop_ = false;
+    std::thread th_;   // (last: it starts once the rest exists)
 };
 
 }  // namespace strata::core
