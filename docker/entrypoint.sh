@@ -27,7 +27,20 @@ set -u
 
 APP=/opt/strata
 STRATA="$APP/terminal/bin/strata"
-PYBIN="$APP/terminal/python/bin/python3"; [ -x "$PYBIN" ] || PYBIN=$(command -v python3 || echo python3)
+
+# Is this a Python this container can start? `test -x` alone is not a reliable yes/no: a container
+# runtime's seccomp profile can deny access(X_OK) and make it answer false for a file the shell can
+# still execute. Measured in this image on Docker 19.03.15's default profile: `[ -x .../python3 ]` is
+# false, `[ -e .../python3 ]` is true, and the same path runs `python3 -V` normally. The launcher in
+# bin/strata carries the same helper for the same reason (issue #4309).
+python_usable() {
+  [ -f "$1" ] || return 1        # a directory can be executable too, and it is never a Python
+  [ -x "$1" ] && return 0        # the usual case, and the one a seccomp profile can answer wrongly
+  "$1" -c 'pass' 2>/dev/null     # access(X_OK) denied but the file is there: let the interpreter answer
+}
+
+PYBIN="$APP/terminal/python/bin/python3"
+python_usable "$PYBIN" || PYBIN=$(command -v python3 || echo python3)
 STATE_DIR="${XDG_STATE_HOME:-/data/state}/strata"
 KEY_FILE="${STRATA_KEY_FILE:-/data/state/api-key}"
 PHASE_FILE=/run/strata-phase
