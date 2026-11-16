@@ -96,6 +96,29 @@ inline unsigned long own_pid() { return (unsigned long) ::getpid(); }
 #endif
 }  // namespace spill_detail
 
+/// Whether a conversation is worth writing to the SSD tier: reading it back (and writing it first) must cost less than reading its
+/// prompt again.  A parked image has a fixed-size running state (about 236 MB on Qwen3.8-Flash-Next) whatever its length, so a short
+/// conversation is cheaper to re-read than to round-trip through the disk, and a long one is not (l620, RTX PRO 5000: a 51-token
+/// conversation re-read in about 220 ms against 120 ms written + 220 ms read back; an 8K one 1.6 s against about 0.5 s).  The speeds
+/// are this engine's own, measured as it runs (moving averages; defaults until the first measurement: 2 tokens per ms - a mid-range
+/// card's prompt speed - and 1 GB/s each way).  The prompt speed is learned only from passes of at least kMinTokens fresh tokens, so
+/// a request's fixed costs do not make re-reading look slow.
+struct SpillCost {
+    static constexpr int64_t kMinTokens = 512;
+    static constexpr double kAlpha = 0.3, kMargin = 1.25;
+    double reread_tokens_per_ms = 2.0;
+    double write_bytes_per_ms = 1.0e6, read_bytes_per_ms = 1.0e6;
+    static void blend(double& avg, double sample) {
+        if (sample > 0.0 && sample < 1e300) avg = avg * (1.0 - kAlpha) + sample * kAlpha;
+    }
+    void saw_prompt(int64_t tokens, double ms) { if (tokens >= kMinTokens && ms > 0.0) blend(reread_tokens_per_ms, (double) tokens / ms); }
+    void saw_write(uint64_t bytes, double ms) { if (bytes > 0 && ms > 0.0) blend(write_bytes_per_ms, (double) bytes / ms); }
+    void saw_read(uint64_t bytes, double ms) { if (bytes > 0 && ms > 0.0) blend(read_bytes_per_ms, (double) bytes / ms); }
+    double reread_ms(int64_t tokens) const { return tokens > 0 ? (double) tokens / reread_tokens_per_ms : 0.0; }
+    double round_trip_ms(uint64_t bytes) const { return (double) bytes / write_bytes_per_ms + (double) bytes / read_bytes_per_ms; }
+    bool worth(int64_t tokens, uint64_t bytes) const { return reread_ms(tokens) > kMargin * round_trip_ms(bytes); }
+};
+
 /// This process's spill folder.  open() makes `<root>`, cleans the dead folders and takes its own; the destructor gives the
 /// lock back and removes its own folder (an orderly end; after a crash the next start's clean_dead does it).
 class SpillNamespace {
@@ -264,8 +287,14 @@ public:
         budget_.drop(entries_[i].bytes);
         entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
     }
-    void close() {
+    /// Drops every entry and keeps the tier open (#879: after non-finite logits no parked conversation is kept).  Returns how many.
+    size_t clear() {
+        const size_t n = entries_.size();
         while (!entries_.empty()) drop(entries_.size() - 1);
+        return n;
+    }
+    void close() {
+        clear();
         ns_.close();
     }
 
