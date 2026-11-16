@@ -13,12 +13,13 @@ from unittest import mock
 
 from strata_control import engine_component as ec, engine_library as lib, preset_marks, retired, updater
 from tests.terminal import update_fixture as fx
+from strata_control.targets import host_platform
 from tests.terminal.test_updater import PLATFORM, UpdaterCase
 
 
 def folder_of(version):
     fam = fx.local_family()                          # (#4138) the family this machine takes: cuda / cuda13, a Mac metal
-    return f"{version}-{PLATFORM}-{fam['backend']}" + (f"-{fam['variant']}" if fam["variant"] else "")
+    return f"{version}-{host_platform()}-{fam['backend']}" + (f"-{fam['variant']}" if fam["variant"] else "")
 
 
 class Library(UpdaterCase):
@@ -60,7 +61,7 @@ class Library(UpdaterCase):
         # a fresh read of the folder (what a restart sees)
         self.assertEqual(self.qwen()["0.1.45"]["active"], True)
         self.assertEqual(self.qwen()["0.1.46"]["active"], False)
-        self.assertEqual(ec.status(self.components, backend="cuda")["engine"]["version"], "0.1.45")
+        self.assertEqual(ec.status(self.components, backend=self.family["backend"])["engine"]["version"], "0.1.45")
         # both are still installed: nothing was removed by a switch
         self.assertEqual(self.engine_folders(), [folder_of("0.1.45"), folder_of("0.1.46")])
         back = lib.use_engine(self.ctx(), "qwen", folder_of("0.1.46"))
@@ -128,6 +129,7 @@ class Library(UpdaterCase):
         out = lib.delete_engine(self.ctx(serving=busy), "qwen", folder_of("0.1.45"))
         self.assertEqual(out["status"], "deleted")
 
+    @unittest.skipIf(fx.local_family()["backend"] != "cuda", "an NVIDIA driver floor: a CUDA package's rule (#4138: a Mac takes Metal packages)")
     def test_a_package_this_computer_cannot_run_is_listed_with_its_reason_and_cannot_be_switched_to(self):
         other = self.components / "engine" / folder_of("0.1.99")
         shutil.copytree(self.components / "engine" / folder_of("0.1.46"), other)

@@ -18,7 +18,8 @@ from unittest import mock
 
 from strata_cli import update_cmd
 from strata_control import engine_component as ec, engine_library as lib, feed as feedmod, updater
-from tests.terminal.test_updater import PLATFORM, UpdaterCase
+from tests.terminal import update_fixture as fx
+from tests.terminal.test_updater import UpdaterCase
 
 
 def _detect_backend(environ=None):
@@ -95,10 +96,12 @@ class MixedPcEngines(UpdaterCase):
     """The installed engines on the two-card PC: the CUDA engine the PC picked first, and the hip-rx6000 one installed with --backend amd."""
 
     def setUp(self):
+        if fx.local_family()["backend"] != "cuda":
+            fx.cuda_pc(self)                                # (#4138) these cases are about CUDA (and AMD) packages: on a Mac they speak about a Linux PC
         super().setUp()
         cuda = self.install_current("0.1.60")
         # the hip-rx6000 package: the stub CUDA package with an AMD manifest (the packager wants a real AMD stage, its hipBLASLt version)
-        self.amd = cuda.parent / f"0.1.60-{PLATFORM}-hip-rx6000"
+        self.amd = cuda.parent / f"0.1.60-{self.platform}-hip-rx6000"
         shutil.copytree(cuda, self.amd)
         manifest = json.loads((self.amd / ec.MANIFEST).read_text())
         manifest.update(backend="hip", variant="rx6000", archs=["gfx1030", "gfx1031", "gfx1032"], min_driver={})
