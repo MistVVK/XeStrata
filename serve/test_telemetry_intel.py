@@ -210,6 +210,63 @@ class RootlessLoadAndVram(unittest.TestCase):
             out = telemetry._Intel(0, sysfs=str(root), stat=str(stat), proc=str(root / "proc"), zes=FakeZes()).read()
             self.assertEqual((out["util"], out["mem_used"]), (37, 1024 * 2**20))
 
+    def test_a_load_that_cannot_be_measured_is_unknown_not_idle(self):
+        """GUI-1116's rules for #5994 (0f6994f52): new clients only, or a counter that went back, say nothing; never 0 %."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            b70_tree(root)
+            def client(pid, cid, busy, total, cap=""):
+                fdinfo(root, pid, 5, f"drm-driver:\txe\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t{cid}\ndrm-cycles-rcs:\t0\n"
+                                     f"drm-cycles-ccs:\t{busy}\ndrm-total-cycles-ccs:\t{total}\n{cap}")
+            r = telemetry._Intel(0, sysfs=str(root), stat=str(root / "none.json"), proc=str(root / "proc"), zes=NoZes())
+            client(111, 1, 0, 1000)
+            self.assertIsNone(r.read()["util"])
+            (root / "proc" / "111" / "fdinfo" / "5").unlink()
+            client(112, 2, 900, 1000)                                 # the first client ended, a new one began
+            self.assertIsNone(r.read()["util"], "a client seen for the first time says nothing yet")
+            client(112, 2, 10, 100)                                   # its counters went back (a reset)
+            self.assertIsNone(r.read()["util"], "a reset is not a negative or zero load")
+            client(112, 2, 60, 200)
+            self.assertAlmostEqual(r.read()["util"], 50.0, places=3)
+
+    def test_an_engine_class_with_capacity_0_adds_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            b70_tree(root)
+            def client(rcs, ccs, total):
+                fdinfo(root, 111, 5, f"drm-driver:\txe\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t1\ndrm-cycles-rcs:\t{rcs}\n"
+                                     f"drm-cycles-ccs:\t{ccs}\ndrm-total-cycles-ccs:\t{total}\ndrm-engine-capacity-ccs:\t0\n")
+            client(0, 0, 1000)
+            r = telemetry._Intel(0, sysfs=str(root), stat=str(root / "none.json"), proc=str(root / "proc"), zes=NoZes())
+            r.read()
+            client(200, 900, 2000)
+            self.assertAlmostEqual(r.read()["util"], 20.0, places=3)
+
+    def test_only_the_cards_own_driver_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            b70_tree(root)                                            # an xe card
+            def both(xe_busy, xe_total, i915_ns):
+                fdinfo(root, 111, 5, f"drm-driver:\txe\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t1\n"
+                                     f"drm-cycles-ccs:\t{xe_busy}\ndrm-total-cycles-ccs:\t{xe_total}\n")
+                fdinfo(root, 113, 1, f"drm-driver:\ti915\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t8\n"
+                                     f"drm-engine-compute:\t{i915_ns} ns\ndrm-resident-local0:\t1048576 KiB\n")
+            both(0, 1000, 0)
+            r = telemetry._Intel(0, sysfs=str(root), stat=str(root / "none.json"), proc=str(root / "proc"), zes=NoZes())
+            r.read()
+            both(100, 2000, 10**12)
+            self.assertAlmostEqual(r.read()["util"], 10.0, places=3, msg="nanoseconds of another driver never mix with xe's cycles")
+            self.assertIsNone(r._fd_mem, "nor its memory")
+
+    def test_the_sampler_file_can_be_pointed_elsewhere_on_the_instance(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            b70_tree(root)
+            r = telemetry._Intel(0, sysfs=str(root), proc=str(root / "proc"), zes=NoZes())
+            r.STAT = str(root / "gpustat.json")
+            Path(r.STAT).write_text(json.dumps({"ts": time.time(), "busy_pct": 12, "vram_used_mb": 512, "vram_total_mb": 32768}))
+            self.assertEqual(r.read()["util"], 12)
+
     def test_a_missing_level_zero_is_no_reading_not_an_error(self):
         z = telemetry._Zes("0000:03:00.0", lib=mock.Mock(zesInit=mock.Mock(return_value=0x78000001)))
         self.assertEqual(z.read(), (None, None))
