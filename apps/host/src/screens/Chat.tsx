@@ -37,7 +37,7 @@ import { useLiveStatus } from '../lib/live-status';
 import { ApprovalDock, SCOPE } from '../components/ApprovalCard';
 import { artifactFromUrl, type PreviewArtifact } from '../lib/artifacts';
 import { openExternal } from '../lib/open-external';
-import { busyPlan } from '../lib/while-busy';
+import { busyPlan, parkedReady } from '../lib/while-busy';
 import { composeQuoted, parseQuoted, type Quote } from '../lib/quotes';
 /** Chat — talk to the one loaded model. */
 import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -100,14 +100,15 @@ export function ChatScreen() {
         document.addEventListener('selectionchange', read);
         return () => document.removeEventListener('selectionchange', read);
     }, [session?.id]);
-    // Messages parked while an answer was written (Send after, Interrupt) go one by one, each when the chat is quiet again.
+    // Messages parked while an answer was written (Send after, Interrupt) go one by one, each when the chat is quiet again,
+    // and only from the chat that is also the active one: sendMessage sends to that one (#5806, parkedReady).
     useEffect(() => {
-        if (!session || streaming || !parked?.length)
+        if (!session || !parkedReady(session.id, activeId, streaming, parked?.length ?? 0))
             return;
         const next = takeParked(session.id);
         if (next !== undefined)
             void sendMessage(next);
-    }, [streaming, parked?.length, session?.id]);
+    }, [streaming, parked?.length, session?.id, activeId]);
     const [draft, setDraft] = useState('');
     const draftKey = `strata.chat-draft.${session?.id ?? 'new'}`;
     useEffect(() => {
