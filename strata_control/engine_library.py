@@ -119,7 +119,7 @@ def _qwen_entries(ctx: "updater.Context", root: Path | None = None, component_id
         rows.append({"family": family, "folder": item.root.name, "version": item.version, "backend": item.backend, "platform": item.platform,
                      "variant": item.variant, "bytes": sum(f[2] for f in item.files), "signed": bool(item.signature), "fits": why is None,
                      "why_not": why, "why_code": code, "why_args": args, "active": item.root.name == active, "build_id": item.build_id, "path": longpath.plain(item.root),
-                     "other_card": bool(wanted and item.backend != wanted and item.backend in other_makes)})
+                     "other_card": bool(wanted and item.backend != wanted and item.backend in other_makes), "local": item.local})
     for bad in problems:
         folder = Path(bad["folder"])
         rows.append({"family": family, "folder": folder.name, "version": _version_of(folder.name), "backend": "", "platform": "", "variant": "",
