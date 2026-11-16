@@ -252,7 +252,7 @@ The default is batch 1, gradients accumulated 4, 1500 update steps (the same for
 sd-scripts' examples use AdamW8bit, `lr_scheduler=constant` and `network_dim=16`, so the optimizer's type and the warmup are the only differences.
 Mage-Flow trains resident in bf16 (16 GiB, about 14.5 GiB at peak). The tape is about 2.1 GiB per block, cut to 13 boundaries of 0.65 GiB by recomputing from the boundary (+1 forward).
 Plain LoRA measures 8.9 s/micro, 35 s/update and 14514 MiB (records `2026-11-03-mf-trainer` §3, `2026-11-04-lora-maje-e2e` training.txt).
-`XESTRATA_VRAM_LIMIT_MIB=8192` caps only the engine's apparent budget, not the trainer's allocations.
+`XESTRATA_VRAM_LIMIT_MIB=8192` caps only the engine's apparent budget, not the trainer's allocations. The training's VRAM is decided by the form in "The VRAM budget and the yielding" below.
 
 ## What ai-toolkit and SimpleTuner do differently (D2)
 
@@ -331,6 +331,73 @@ The four trainers choose the weights a LoRA goes on with one part (`train::Targe
 - A name is the trainer's product's (a name of `include/strata/image/lora_names.hpp`'s tables after its block's path: `transformer_blocks.3.attn.to_q`, `layers.3.proj.qkv`, `blocks.3.self_attn.q_proj`, `blocks.3.adaln_modulation_mlp.1`), matched by a part. MOSS-Image's q, k and v are one product, `proj.qkv`, so one of the saved keys (`proj.q`, `proj.k`, `proj.v`) cannot be chosen or left out alone. The attention alone is `attn` for Qwen-Image-2.1 and Mage-Flow, `proj.qkv,proj.o` for MOSS-Image and `_proj` for Anima (`_attn` is in its modulation rows' names too).
 - A choice that takes no weight is refused before the training starts. The saved metadata's `ss_xestrata_targets` says the choice.
 - `--kind character|style|other` says what the LoRA adds, in the metadata's `ss_xestrata_kind`. serve's listing reads it as `kind`, and the chat's model goes by it when it chooses LoRAs ([IMAGE](IMAGE.md#lora-adapters)).
+
+## The VRAM budget and the yielding (elastic training)
+
+The training takes a VRAM budget (MiB), decides its placement from it, and **shrinks, grows and pauses at a step's
+boundary**. One implementation in the four trainers' shared parts (`train::Trainer`, `train::Control`); the entries
+(`xestrata-image-qi-train`, `-mf-train`, `-moss-train`, `-anima-train`) take the same arguments. The loss, the
+gradients and the optimizer's computation do not change (only the placement).
+
+### The low-VRAM form (when the budget is short, in the order it helps)
+
+1. **The backward's working memory in bands of rows**: the MLP's forward and backward run a band of rows at a time
+   (qi: 1024; implemented. On the B70 the working memory at 4035 rows went 4.5 → 2.5 GB).
+1. **The copies not needed left out**: where the GPU's products read a transposed operand (`Gemm::f16_batch_ex_ok`),
+   the transposed copies (at, bt, the dgrad scratch) are not allocated (implemented).
+1. **The blocks' inputs to the host**: where they do not fit in VRAM as FP32, they go to pinned host memory **as
+   FP32** and are read back one block ahead of the backward (`HostInputs`, on a copy queue beside the compute).
+   Nothing is rounded, so the loss and the gradients **match the all-GPU FP32 form byte for byte**. Where the host
+   RAM is short too, they stay on the GPU in BF16 (the last resort, which rounds; the earlier form).
+1. **The weights streamed from the host**: the blocks' weights are a resident prefix within the budget plus two
+   streaming slots (LayerStream; the prefetch covers the backward's turn too). The copy's source (the file's pages,
+   a pinned home, the relay) is measured at the start. An int8 base streams as int8.
+
+The test fixtures: `XESTRATA_TRAIN_WEIGHTS_MIB` (the resident weights' budget), `XESTRATA_TRAIN_TAPES` (the tapes
+kept), `XESTRATA_TRAIN_INPUTS16` (0: FP32 forced, 1: BF16 forced), `XESTRATA_TRAIN_INPUTS_HOST` (0: the host form
+forbidden). The SSD tier comes later (not in v1).
+
+### The budget's hand-over (one form with serve's training job)
+
+A control file and stdout lines (serve/lora_train.py's TrainPlace writes and reads them; the policy lives in
+`serve/train_budget.py`):
+
+```text
+arguments --vram-budget <MiB>     the first budget (0: pause before the first step; the open still needs its room)
+          --vram-control <path>   the control file. Without it the CLI as it was (the budget from the free VRAM)
+          --state <path>          where the state is written (default <out>.state.bin)
+          --resume <path>         continue from a state file (the step count, the rng, the data's order, LoRA, AdamW)
+the control file (serve writes it atomically, tmp + rename; the trainer reads its mtime and size at a step's boundary):
+          {"budget_mib": <int>, "save_state": <bool>}
+          budget_mib 0 = pause at the step's boundary (the VRAM given back; the state kept on the host, resumed alike)
+          save_state true = write the state at the next optimizer update's boundary, then pause (a move, a full stop)
+stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib=]
+          state saved <path>
+```
+
+- The `vram` line comes at a step's boundary when its fields changed. The first four fields are what serve reads
+  (the key=value extras are for the log and the tests). `used` is the trainer's own accounting; `free_mib` is the
+  device's report (what the runtime still holds after a pause shows there). `min` is the least form (no resident
+  block, no tape, the inputs on the host); `peak_est` the next step's estimated peak.
+- The only stopping points are the micro-step's and the update's boundaries (nothing changes mid-step). A shrink
+  or a grow re-plans the resident weights, the tapes and the inputs' form. A pause copies every allocation to the
+  host as it is and frees it (the streamed layers' pinned homes stay); the resume takes the same values back.
+  `--resume` restores the rng's whole state, so the loss column matches a run that never stopped.
+- A budget below `min` pauses. The state is written only where the gradients are zero (after an update).
+- What a pause gives back may not show in the device's report on every backend (the Level Zero runtime's
+  carry-over). serve checks `free_mib` and, where an image job needs more, empties the card fully with
+  `save_state` and the process's end.
+
+### The sharing with serve
+
+The policy lives in one place (`serve/train_budget.py`). The candidate cards reuse the image pick's foundation
+(`setup.image_gpu`'s rule); above it is the training's policy: **the training is the lowest priority**. When chat
+or an image job comes it shrinks, or pauses where even the least form does not fit (**an image job is never made
+to wait for the training to end**). When they leave it grows or resumes. The helper card is not held closed for
+hours (the training uses it closed only while the chat is idle, or shares the budget with the helper cache). A
+move to another card happens only where measured values (the state's and the weights' reload time, the chat's
+remaining time) show it cheaper (with no measurements it does not move). The bandwidth and compute measurements
+are `xestrata-device --bench` (one card at a time, cached per device).
 
 ## The checks
 

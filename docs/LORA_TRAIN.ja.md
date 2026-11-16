@@ -228,7 +228,7 @@ v1 は AdamW（F32 の状態）だけ。`betas = (0.9, 0.999)`、`eps = 1e-8`、
 sd-scripts の例は AdamW8bit・`lr_scheduler=constant`・`network_dim=16` なので、optimizer の型と warmup だけが相違です。
 Mage-Flow の学習は bf16 常駐で組む（16 GiB、ピーク約 14.5 GiB）。tape は block あたり約 2.1 GiB を 13 境界 0.65 GiB に境目再計算で落とす（+1 forward 分）。
 素 LoRA の実測は 8.9 s/micro・35 s/update・14514 MiB（records `2026-11-03-mf-trainer` §3、`2026-11-04-lora-maje-e2e` training.txt）。
-8 GiB の `XESTRATA_VRAM_LIMIT_MIB` は engine の見かけ予算だけで学習の確保は見ない。
+8 GiB の `XESTRATA_VRAM_LIMIT_MIB` は engine の見かけ予算だけで学習の確保は見ない。学習の VRAM は「VRAM の予算と譲り合い」の節の形で決める。
 
 ## ai-toolkit と SimpleTuner と突き合わせた相違（D2）
 
@@ -303,6 +303,64 @@ python tools/image/lora_caption.py --dir DATA --kind character --trigger tsumika
 - 名前は学習器の積の名前（`include/strata/image/lora_names.hpp` の表の名前にブロックの道を付けたもの: `transformer_blocks.3.attn.to_q`、`layers.3.proj.qkv`、`blocks.3.self_attn.q_proj`、`blocks.3.adaln_modulation_mlp.1`）で、部分一致です。MOSS-Image の q・k・v は 1 つの積 `proj.qkv` なので、保存の鍵（`proj.q`・`proj.k`・`proj.v`）の 1 つだけを選んだり外したりはできません。注意だけなら Qwen-Image-2.1 と Mage-Flow は `attn`、MOSS-Image は `proj.qkv,proj.o`、Anima は `_proj` です（`_attn` は変調の行の名前にも入ります）。
 - 何も選ばれないときは、学習を始めずに断ります。保存のメタデータの `ss_xestrata_targets` に選びを書きます。
 - `--kind character|style|other` は LoRA が足すもので、メタデータの `ss_xestrata_kind` に書きます。serve の一覧の `kind` がこれを読み、チャットのモデルが LoRA を選ぶときの手がかりにします（[IMAGE](IMAGE.ja.md#loraアダプター)）。
+
+## VRAM の予算と譲り合い（伸び縮みする学習）
+
+学習は VRAM の予算（MiB）を受けて置き場所を決め、**step の境で縮む・広がる・一時停止する**。4 模型の学習器の
+共通部（`train::Trainer`・`train::Control`）に 1 つあり、入口（`xestrata-image-qi-train`・`-mf-train`・`-moss-train`・
+`-anima-train`）は同じ引数を受ける。損失・勾配・optimizer の計算は変えない（置き場所だけ）。
+
+### 低い VRAM の形（予算が足りないとき、効く順）
+
+1. **逆方向の作業用を行の塊で**: MLP の順方向・逆方向を行の帯（qi は 1024 行）で回す（実装済み。B70 で 4035 行の
+   作業用 4.5→2.5 GB）。
+1. **要らない写しを外す**: GPU が転置つきの積を扱えるとき（`Gemm::f16_batch_ex_ok`）は転置の写し（at・bt・dgrad の一時）を
+   確保しない（実装済み）。
+1. **ブロックの入力をホストへ**: FP32 で VRAM に置けなければ、**FP32 のまま**ピン留めのホストへ退避し、逆方向で
+   1 ブロック先まで読み戻す（`HostInputs`。コピー用のキューで計算と重ねる）。値を丸めないので損失・勾配は全部 GPU の
+   FP32 の形と**バイト一致**。ホストの RAM も足りなければ BF16 で GPU に持つ（値が丸まる最後の逃げ。従来の形）。
+1. **重みをホストから流す**: ブロックの重みは予算内の常駐＋2 枠の流れ込み（LayerStream。先読みは逆方向の折り返しにも
+   対応）。写し元（ファイルの頁・ピン留めの home・リレー）は起動時に測って選ぶ。int8 の土台は int8 のまま流す。
+
+試験用の固定: `XESTRATA_TRAIN_WEIGHTS_MIB`（常駐の重みの予算）・`XESTRATA_TRAIN_TAPES`（tape の本数）・
+`XESTRATA_TRAIN_INPUTS16`（0: FP32 強制・1: BF16 強制）・`XESTRATA_TRAIN_INPUTS_HOST`（0: ホスト退避を禁止）。
+SSD の段は後（v1 に入れない）。
+
+### 予算の受け渡し（serve の学習の仕事と 1 つの形）
+
+制御ファイルと stdout の行（`serve/lora_train.py` の TrainPlace が書き・読む。決め手は `serve/train_budget.py`）:
+
+```text
+引数      --vram-budget <MiB>     最初の予算（0 = 最初の step の前に一時停止。open の分の空きは要る）
+          --vram-control <path>   制御ファイル。無ければ従来の CLI（予算は空き VRAM から自動）
+          --state <path>          状態の保存先（既定 <out>.state.bin）
+          --resume <path>         状態から続ける（step 数・乱数・データの順・LoRA・AdamW を戻す）
+制御ファイル（serve が tmp+rename で原子書き込み。学習器は step の境で mtime と大きさを見て読む）:
+          {"budget_mib": <int>, "save_state": <bool>}
+          budget_mib 0 = step の境で一時停止（VRAM を空ける。状態はホストに保ち、同じ所から再開）
+          save_state true = 次の optimizer 更新の境で状態を書いてから一時停止（カードを移る・完全に止まる準備）
+stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib=]
+          state saved <path>
+```
+
+- `vram` 行は step の境で、欄が変わったら出す。先頭 4 欄が serve の読む形（後ろの key=value はログと試験用）。
+  `used` は学習器の確保の帳簿、`free_mib` は装置の報告（一時停止の後もランタイムが持つ分が見える）。
+  `min` は常駐 0・tape 0・入力ホスト退避の形の最小、`peak_est` は次の step のピークの見積もり。
+- 止め点はマイクロステップと更新の境だけ（step の途中では変えない）。縮む・広がるときは常駐の重み・tape・
+  入力の形を組み直す。一時停止は全確保をホストへバイトのまま写して返し（重みの流れ込みの home の RAM は残す）、
+  再開で同じ値を取り直す。`--resume` は乱数の全状態を戻すので、損失の列が止めなかった回と一致する。
+- 予算が `min` 未満なら一時停止する。状態の保存は勾配 0 の点（更新の境）だけで行う。
+- 一時停止で返した量は装置によって報告に出ないことがある（Level Zero のランタイムの持ち越し）。serve は
+  `free_mib` で確かめ、画像の仕事に足りなければ `save_state`→プロセス終了で完全に空ける。
+
+### serve との分け方
+
+決め手は 1 か所（`serve/train_budget.py`）。候補のカードは画像の選びの土台（`setup.image_gpu` の規則）を再利用し、
+その上は学習の方針: **学習は一番低い優先度**。チャット・画像の仕事が来たら縮む・足りなければ止まる
+（**画像の仕事を学習の終わりまで待たせない**）。空いたら広がる・再開する。helper のカードを何時間も閉じたままに
+しない（チャットが空いている間だけ閉じて使うか、helper と予算で分け合う）。カードを移るのは、測った値
+（状態の読み直しと重みの読み直しの時間・チャットの残り）が移る方を安いと示すときだけ（測った値が無い間は移らない）。
+帯域と計算の測りは `xestrata-device --bench`（1 枚ずつ。装置ごとのキャッシュに置く）。
 
 ## 確かめの手順
 
