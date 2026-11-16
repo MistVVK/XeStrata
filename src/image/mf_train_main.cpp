@@ -422,6 +422,8 @@ int main(int argc, char** argv) {
         for (float& v : eps) v = gauss(rng);
         strata::prefill::Gemm gemm;
         if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
+        if (vram_budget > 0)
+            strata::image::mf_trainer_base(m.get()).set_vram_budget((uint64_t) vram_budget << 20);
         strata::image::MfTrainCond c = strata::image::mf_trainer_cond(m.get(), sigma, smp.h, smp.w, gemm);
         std::vector<float> vp((size_t) smp.tokens * 128);
         void* dv = nullptr;

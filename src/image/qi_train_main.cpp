@@ -238,6 +238,8 @@ int check(const std::map<std::string, std::string>& f, void* s) {
     std::string err;
     if (!tr.open(need(f, "dit"), rank, 1, s, err, std::stoll(opt(f, "blocks", "0")), opt(f, "base", "bf16") == "int8"))
         throw std::runtime_error(err);
+    if (const std::string b = opt(f, "vram-budget", "0"); b != "0")
+        tr.base().set_vram_budget((uint64_t) std::stoll(b) << 20);   // the test's fixed form (byte-match)
     const int text = tr.add_text(read_all<float>(dir + "/states.bin"), n);
     // the factors in grads()' order: per block, per product, A then B
     std::vector<train::Tensor> ts = tr.grads();

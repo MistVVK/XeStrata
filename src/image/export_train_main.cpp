@@ -105,6 +105,8 @@ std::vector<int> int_list(const std::string& s) {
 template <class T>
 int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const train::Targets& targets) {
     const std::string data = need(f, "data");
+    if (const std::string b = opt(f, "vram-budget", "0"); b != "0")
+        tr.base().set_vram_budget((uint64_t) std::stoll(b) << 20);   // the test's fixed form (loss included)
     std::mt19937_64 rng(seed ^ 0x9e3779b97f4a7c15ull);   // the loop's own stream, not the LoRA's first values'
     std::normal_distribution<float> gauss(0.f, 1.f);
     std::vector<float> x0, eps;

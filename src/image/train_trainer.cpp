@@ -13,6 +13,7 @@
 #include <istream>
 #include <ostream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace strata::image::train {

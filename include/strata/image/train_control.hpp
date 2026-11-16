@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <ios>
 #include <iosfwd>
 #include <string>
 
