@@ -27,6 +27,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/runtime_files.hpp"
 #include "strata/uc_probe.hpp"
 #include "strata/pipeline_auto.hpp"
 #include "strata/sycl_doorbell.hpp"
@@ -4600,6 +4601,13 @@ int main(int argc, char **argv) try {
                 ? " (STRATA_EMULATE_CC: a test mode, the card is emulated)"
                 : "");
 // (the CUDA runtime/headers mismatch warning, #542, lives in src/program/generate.cpp; a SYCL port has no CUDA runtime to mismatch; sycl/tools/fixups.py keeps this block out)
+        {   // #5914: which Level Zero loader, Unified Runtime adapter and SYCL runtime files this process uses (the device
+            // query above loaded them), and the adapter switch, so a report shows the combination that ran
+            const std::string files = strata::intel_runtime_files_line();
+            const char* v2 = std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2");
+            std::fprintf(stderr, "strata generate: Intel runtime files: %s; SYCL_UR_USE_LEVEL_ZERO_V2=%s\n",
+                         files.empty() ? "(none found)" : files.c_str(), v2 != nullptr ? v2 : "(unset)");
+        }
 #endif
         const std::string e = strata::core::device_code_error();
         if (!e.empty()) {
