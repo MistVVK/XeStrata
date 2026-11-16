@@ -153,6 +153,11 @@ def parser() -> argparse.ArgumentParser:
     models_inspect.add_argument("model_id")
     models_inspect.add_argument("--install-dir", help="absolute path to a Strata installation")
     models_inspect.add_argument("--output", choices=("human", "json"), default="human")
+    models_explain = models_sp.add_parser("explain", help="show where strata launch looks for a model's files and what it finds (changes nothing)")
+    models_explain.add_argument("name", metavar="NAME", help="a model size (IQ3_S, iq3_s) or family/size (qwen/IQ3_S)")
+    models_explain.add_argument("--family", help="the model family, when the size alone is not enough")
+    models_explain.add_argument("--data-dir", help="look in this data folder instead of the one strata launch uses")
+    models_explain.add_argument("--output", choices=("human", "json"), default="human")
     models_import = models_sp.add_parser("import", help="preview an existing GGUF file set without adopting it")
     models_import.add_argument("path", metavar="PATH")
     models_import.add_argument("--plan", action="store_true", required=True,
@@ -550,6 +555,13 @@ def _source(ref: str) -> tuple[Path, dict | None, str | None, dict]:
 
 def _models(a: argparse.Namespace) -> int:
     from strata_control import models
+    if a.models_command == "explain":
+        from strata_cli import models_explain
+        try:
+            result = models_explain.explain(a.name, family=a.family, data_dir=a.data_dir)
+        except ValueError as exc:
+            return _error(str(exc), 2, a.output == "json")
+        return _success(result, machine=a.output == "json", human=models_explain.words(result))
     if a.models_command == "import":
         result = models.plan_import(a.path)
         if result["issues"]:
