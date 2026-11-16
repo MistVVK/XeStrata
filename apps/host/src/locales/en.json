@@ -3527,5 +3527,18 @@
   "s9035": "These model files are missing: {0}.",
   "s9036": "Press Download & load again to fetch them. Files that are already there are kept. If the same files are listed again, open Details and share them when you ask for help.",
   "s9037": "This update was cut short when the app restarted. A later update finished, so nothing needs doing.",
-  "s9038": "This system does not let Strata use port {0}. On Linux and macOS, ports below 1024 need administrator rights. Start Strata with another port (STRATA_PORT), for example 8801."
+  "s9038": "This system does not let Strata use port {0}. On Linux and macOS, ports below 1024 need administrator rights. Start Strata with another port (STRATA_PORT), for example 8801.",
+  "s9039": "Tools for apps on this computer",
+  "s9040": "When this is on, an app on this computer that sends your API key can let this model use its tools, such as reading and changing files. Apps on other devices or through the internet link never can.",
+  "s9041": "Create an API key first.",
+  "s9042": "{0}{1} tok/s",
+  "s9043": "{0}{1} tok/s · last reply",
+  "s9044": "This goal kept running into the same errors, so I paused it. Look at the last steps, fix what is in the way, then resume the goal.",
+  "s9045": "The model stopped while it was answering.",
+  "s9046": "Send your message again. Strata starts the model again by itself. If it keeps happening, open Details and share them when you ask for help.",
+  "s9047": "The model ran into a problem while answering.",
+  "s9048": "Send your message again. If it keeps happening, open Details and share them when you ask for help.",
+  "s9049": "That question is no longer waiting for an answer.",
+  "s9050": "That answer was not delivered",
+  "s9051": "ctx.length: enter a whole context size from 1K to 1024K."
 }

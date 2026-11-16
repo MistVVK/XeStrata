@@ -3527,5 +3527,18 @@
   "s9035": "Faltan estos archivos del modelo: {0}.",
   "s9036": "Pulse de nuevo «Descargar y cargar» para obtenerlos. Los archivos que ya están se conservan. Si vuelven a aparecer los mismos archivos, abra los detalles y compártalos cuando pida ayuda.",
   "s9037": "Esta actualización se interrumpió cuando la aplicación se reinició. Una actualización posterior terminó, así que no hay nada que hacer.",
-  "s9038": "Este sistema no deja que Strata use el puerto {0}. En Linux y macOS, los puertos por debajo de 1024 necesitan derechos de administrador. Inicia Strata con otro puerto (STRATA_PORT), por ejemplo 8801."
+  "s9038": "Este sistema no deja que Strata use el puerto {0}. En Linux y macOS, los puertos por debajo de 1024 necesitan derechos de administrador. Inicia Strata con otro puerto (STRATA_PORT), por ejemplo 8801.",
+  "s9039": "Herramientas para las aplicaciones de este equipo",
+  "s9040": "Cuando está activado, una aplicación de este equipo que envíe tu clave de API puede dejar que este modelo use sus herramientas, como leer y cambiar archivos. Las aplicaciones de otros dispositivos o a través del enlace de internet nunca pueden.",
+  "s9041": "Crea una clave de API primero.",
+  "s9042": "{0}{1} tok/s",
+  "s9043": "{0}{1} tok/s · última respuesta",
+  "s9044": "Este objetivo se topaba una y otra vez con los mismos errores, así que lo pausé. Revisa los últimos pasos, corrige lo que lo bloquea y luego reanuda el objetivo.",
+  "s9045": "El modelo se detuvo mientras respondía.",
+  "s9046": "Vuelve a enviar tu mensaje. Strata reinicia el modelo por sí solo. Si sigue ocurriendo, abre Detalles y compártelos cuando pidas ayuda.",
+  "s9047": "El modelo tuvo un problema mientras respondía.",
+  "s9048": "Vuelve a enviar tu mensaje. Si sigue ocurriendo, abre Detalles y compártelos cuando pidas ayuda.",
+  "s9049": "Esa pregunta ya no está esperando respuesta.",
+  "s9050": "Esa respuesta no se entregó",
+  "s9051": "ctx.length: introduce un tamaño de contexto entero de 1K a 1024K."
 }

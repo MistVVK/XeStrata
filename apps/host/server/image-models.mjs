@@ -42,7 +42,7 @@ export function createImageModels({ dataDir, modelsDir, real = false, changed = 
       variants: catalog.variants.map(v => ({ ...v, downloadGb: v.bytes / 1e9,
         state: runtime.get(v.id)?.state ?? (installed(v) ? 'installed' : 'available'),
         progress: runtime.get(v.id)?.progress, error: runtime.get(v.id)?.error,
-        downloadUrl: `https://huggingface.co/${catalog.repo}/resolve/${catalog.revision}/${v.file}` })),
+        downloadUrl: `${(process.env.HF_ENDPOINT || '').trim().replace(/\/+$/, '') || 'https://huggingface.co'}/${catalog.repo}/resolve/${catalog.revision}/${v.file}` })),
     };
   }
   const emit = () => changed(library());

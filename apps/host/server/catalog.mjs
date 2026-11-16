@@ -116,4 +116,4 @@ export function expertParams(cores = null) {
   ];
 }
 
-export const CONTEXT_TOKENS = { recommended: 131072, ...Object.fromEntries(Array.from({length:1021}, (_, i) => [`${i+4}k`, (i+4)*1024])) };
+export const CONTEXT_TOKENS = { recommended: 131072, ...Object.fromEntries(Array.from({length:1024}, (_, i) => [`${i+1}k`, (i+1)*1024])) };

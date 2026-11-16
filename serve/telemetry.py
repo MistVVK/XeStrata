@@ -23,6 +23,9 @@ import threading
 import time
 
 HISTORY = 60
+# A GP100 (Pascal) reports PCIe traffic of just under 200 GiB/s now and then, even idle: 2^22 KB in NVML's 20 ms window,
+# which reads like the counter stepping back and wrapping.  No link carries it (PCIe 6.0 x16 is under 120 GiB/s).
+PCIE_KB_S_MAX = 150 << 20
 
 
 # ------------------------------------------------------------------------------------------------ NVML
@@ -104,11 +107,15 @@ class _Nvml:
         # the widest the card itself can go: read beside the negotiated width, so a card capped to x8 in a x16
         # slot, or trained down to x4 by the board, is visible as the gap instead of looking like an x8 card by choice
         out["pcie_width_max"] = self._uint("nvmlDeviceGetMaxPcieLinkWidth")
-        rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
-        tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
-        out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
-        out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        out["pcie_rx_mb"] = self._pcie_mb(1)                                             # NVML_PCIE_UTIL_RX_BYTES
+        out["pcie_tx_mb"] = self._pcie_mb(0)
         return out
+
+    def _pcie_mb(self, counter):
+        kb = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(counter))           # KB/s
+        if kb is not None and kb > PCIE_KB_S_MAX:                                        # wrapped: the next read is good
+            kb = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(counter))
+        return kb / 1024.0 if kb is not None and kb <= PCIE_KB_S_MAX else None
 
 
 # ------------------------------------------------------------------------------------------------ AMD (Linux sysfs)

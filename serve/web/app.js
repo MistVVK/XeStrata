@@ -413,6 +413,16 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
+/* The machine's PCIe link for the PCIe card: with several cards the one with the slowest link (gpu_pcie_bottleneck, which the server names
+   from ONE card: its generation, width and the generation it can reach), else the top-level fields (one card, or a server from before it).
+   gen is the generation the link can reach (NVML reports a lower one while a card is idle), cur the one it runs at now. */
+function pcieLink(hw) {
+  const b = hw && hw.gpu_pcie_bottleneck;
+  if (b && (b.gen || b.gen_max) && b.width) return { gen: b.gen_max || b.gen, cur: b.gen || null, width: b.width, card: b.card };
+  if (!hw) return { gen: null, cur: null, width: null, card: null };
+  return { gen: hw.gpu_pcie_gen_max || hw.gpu_pcie_gen || null, cur: hw.gpu_pcie_gen || null, width: hw.gpu_pcie_width || null, card: null };
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // model state
   // A local turn keeps metrics on "unloaded" for the whole engine start.
@@ -847,7 +857,8 @@ function msgEl(m, i) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
       for (const im of m.images) {
-        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || tr("chat.image", "image"); wrap.appendChild(img); }
+        const shownSrc = im.url || (StrataHistory.validThumb(im.thumb) ? im.thumb : "");   // a stored preview only when it is one this page makes
+        if (shownSrc) { const img = document.createElement("img"); img.src = shownSrc; img.alt = im.name || tr("chat.image", "image"); wrap.appendChild(img); }  // the session keeps the original, a reloaded chat shows the small preview
         else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || tr("chat.image", "image")); wrap.appendChild(c); }
       }
       el.appendChild(wrap);
@@ -1331,8 +1342,10 @@ async function generateReply() {
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
 $("stop-btn").onclick = () => { if (busy) busy.controller.abort(); };
+const composerIme = StrataIme.watch($("input"));    // the Enter that commits an IME conversion does not send (#5071; Safari)
 $("input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  if (composerIme(e)) return;
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
 $("input").addEventListener("input", autosize);
@@ -1375,13 +1388,24 @@ function isTextFile(f) {
   return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
 }
+// a small preview kept next to the name: the full data URL would fill the browser's store, the thumbnail does not. The rule is in
+// history.js (StrataHistory.makeThumb, #5998 review): it never rejects and nothing waits for it, so a picture the browser cannot draw keeps its original.
+const thumbDeps = {makeImage: () => new Image(), makeCanvas: () => document.createElement("canvas")};
+
 function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
       if (!health.images) { toast("warn", tr("file.picturesOff", "Pictures are off"), tr("file.picturesOffText", "This model was set up for text only.")); continue; }
       if (f.size > 20e6) { toast("warn", tr("file.pictureBig", "Picture too large"), tr("file.pictureBigText", "{name} is over 20 MB.", {name: f.name})); continue; }
       const r = new FileReader();
-      r.onload = () => { attachments.push({kind: "image", name: f.name || tr("file.pasted", "pasted image"), url: r.result}); renderAttachments(); };
+      r.onload = () => {
+        const url = r.result;
+        // the original goes in at once; the preview is added to the same entry when it is ready (a message sent before that keeps none)
+        const entry = {kind: "image", name: f.name || tr("file.pasted", "pasted image"), url};
+        attachments.push(entry);
+        renderAttachments();
+        StrataHistory.makeThumb(url, thumbDeps).then((thumb) => { if (thumb) entry.thumb = thumb; });
+      };
       r.readAsDataURL(f);
       continue;
     }

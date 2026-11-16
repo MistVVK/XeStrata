@@ -25,6 +25,14 @@ const CANDIDATES = [
   { name: 'LM Studio', url: 'http://127.0.0.1:1234/v1' },
 ];
 
+/** Model ids an OpenAI-style server lists that are not chat models (embeddings, rerankers, speech): never picked for a chat. */
+const NOT_CHAT = /embed|rerank|(^|[\/:_-])bge-|(^|[\/:_-])e5-|whisper|(^|[\/:_-])tts/i;
+/** The model a chat on an adopted server asks for (#5574): the first listed chat model, else the first listed model; null when it lists none. */
+export function chatModelId(ids) {
+  const list = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && id);
+  return list.find((id) => !NOT_CHAT.test(id)) ?? list[0] ?? null;
+}
+
 let backend = null;
 let checkedAt = 0;
 
@@ -114,11 +122,13 @@ export async function detectBackend({ force = false } = {}) {
       const res = await fetch(`${c.url}/models`, { signal: AbortSignal.timeout(700) });
       if (res.ok) {
         const data = await res.json().catch(() => ({}));
+        const models = (data?.data ?? []).map((m) => m?.id).filter((id) => typeof id === 'string' && id);
+        if (!chatModelId(models)) continue;   // a server that lists no model has nothing to answer with: not adopted (#5574)
         backend = {
           kind: 'openai-compatible',
           name: c.name,
           baseUrl: c.url,
-          models: (data?.data ?? []).map((m) => m.id),
+          models,
         };
         checkedAt = Date.now();
         return backend;
@@ -222,6 +232,8 @@ export async function streamChat({ message, history = [], systemPrompt = '', mod
       signal,
       supervised: be.kind === 'engine',
       engine,
+      // an adopted server (Ollama, LM Studio, llama.cpp) is asked for a model it listed, not the placeholder "local" (#5574)
+      ...(be.kind === 'openai-compatible' ? { modelId: chatModelId(be.models) } : {}),
     });
   }
 

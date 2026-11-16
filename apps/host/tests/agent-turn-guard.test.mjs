@@ -82,7 +82,7 @@ test('every message is a plain sentence with a next step, carries its interface 
     const frame = guardNote(reason);
     assert.equal(frame.type, 'delta'); assert.equal(frame.key, text); assert.equal(frame.own, true);
     assert.ok(text.length < 220, reason);
-    assert.match(text, /(Try again|Tell me|Say|Send|approve)/i, `${reason} gives a next step`);
+    assert.match(text, /(Try again|Tell me|Say|Send|approve|resume)/i, `${reason} gives a next step`);
     const id = idOf(text);
     assert.ok(id, `${reason} is in the English catalog`);
     for (const l of langs) assert.ok(catalogs[l][id]?.trim(), `${reason} in ${l}`);

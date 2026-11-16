@@ -22,7 +22,7 @@ test('bounded reader gets real metadata and rejects fake extensions, partial ten
  ggufFixture(file,{extra:[['general.name',8,'duplicate']]});assert.throws(()=>readGGUF(file),/duplicate/);
  ggufFixture(file,{arch:'clip'});assert.throws(()=>inspectLocalModel(file),/architecture.*not supported/);
  ggufFixture(file,{tensorCount:0});assert.throws(()=>inspectLocalModel(file),/missing tensors/);
- ggufFixture(file,{context:1024});assert.throws(()=>inspectLocalModel(file),/context_length/);
+ ggufFixture(file,{context:512});assert.throws(()=>inspectLocalModel(file),/context_length/);
  const oversized=Buffer.alloc(24);oversized.write('GGUF');oversized.writeUInt32LE(3,4);oversized.writeBigUInt64LE(2n**63n,8);writeFileSync(file,oversized);assert.throws(()=>readGGUF(file),/unsupported integer/);
 });
 

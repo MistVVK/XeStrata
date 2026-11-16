@@ -9,3 +9,13 @@ export function pendingApprovals(session: { messages: { id: string; tools?: Tool
                 out.push({ messageId: m.id, tool });
     return out;
 }
+
+/**
+ * What the approval card's Details shows: every byte the agent asks to run (#5856). The card's preview is a short summary (cut at 600
+ * characters, whitespace as given); for a command the full command comes from the call's own arguments, so ten long steps can all be
+ * read before Approve. Anything else keeps the preview.
+ */
+export function approvalDetail(t: Pick<ToolCall, 'scope' | 'args' | 'preview'>): string {
+    const command = t.scope === 'shell' ? t.args?.command : undefined;
+    return typeof command === 'string' && command.length > 0 ? command : t.preview;
+}

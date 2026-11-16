@@ -3527,5 +3527,18 @@
   "s9035": "Diese Modelldateien fehlen: {0}.",
   "s9036": "Drücken Sie noch einmal auf „Herunterladen und laden“, um sie zu holen. Vorhandene Dateien bleiben erhalten. Werden dieselben Dateien wieder aufgelistet, öffnen Sie die Details und teilen Sie sie mit, wenn Sie um Hilfe bitten.",
   "s9037": "Dieses Update wurde beim Neustart der App unterbrochen. Ein späteres Update ist abgeschlossen, Sie müssen nichts tun.",
-  "s9038": "Dieses System erlaubt Strata nicht, Port {0} zu verwenden. Unter Linux und macOS brauchen Ports unter 1024 Administratorrechte. Starten Sie Strata mit einem anderen Port (STRATA_PORT), zum Beispiel 8801."
+  "s9038": "Dieses System erlaubt Strata nicht, Port {0} zu verwenden. Unter Linux und macOS brauchen Ports unter 1024 Administratorrechte. Starten Sie Strata mit einem anderen Port (STRATA_PORT), zum Beispiel 8801.",
+  "s9039": "Werkzeuge für Apps auf diesem Computer",
+  "s9040": "Wenn dies eingeschaltet ist, kann eine App auf diesem Computer, die Ihren API-Schlüssel sendet, dieses Modell seine Werkzeuge verwenden lassen, etwa um Dateien zu lesen und zu ändern. Apps auf anderen Geräten oder über den Internet-Link können das nie.",
+  "s9041": "Zuerst einen API-Schlüssel erstellen.",
+  "s9042": "{0}{1} tok/s",
+  "s9043": "{0}{1} tok/s · letzte Antwort",
+  "s9044": "Dieses Ziel ist immer wieder auf dieselben Fehler gestoßen, deshalb habe ich es pausiert. Sehen Sie sich die letzten Schritte an, beheben Sie, was im Weg ist, und setzen Sie das Ziel dann fort.",
+  "s9045": "Das Modell hat beim Antworten angehalten.",
+  "s9046": "Senden Sie Ihre Nachricht erneut. Strata startet das Modell von selbst neu. Wenn es immer wieder passiert, öffnen Sie „Details“ und teilen Sie sie, wenn Sie um Hilfe bitten.",
+  "s9047": "Beim Antworten ist im Modell ein Problem aufgetreten.",
+  "s9048": "Senden Sie Ihre Nachricht erneut. Wenn es immer wieder passiert, öffnen Sie „Details“ und teilen Sie sie, wenn Sie um Hilfe bitten.",
+  "s9049": "Diese Frage wartet nicht mehr auf eine Antwort.",
+  "s9050": "Diese Antwort wurde nicht übermittelt",
+  "s9051": "ctx.length: Geben Sie eine ganze Kontextgröße von 1K bis 1024K ein."
 }

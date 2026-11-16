@@ -62,6 +62,21 @@ test('real downloads verify exact bytes, GGUF header and hash at a pinned URL', 
   assert.equal(restarted.library().variants[0].state, 'installed');
   assert.equal(restarted.library().applied, 'off');
 });
+test('real downloads honour HF_ENDPOINT at call time and keep the source page canonical', async t => {
+  const previous = process.env.HF_ENDPOINT;
+  t.after(() => { if (previous === undefined) delete process.env.HF_ENDPOINT; else process.env.HF_ENDPOINT = previous; });
+  for (const endpoint of ['https://hf-mirror.example/', '  https://hf-mirror.example///  ', undefined, '  ', '///']) {
+    delete process.env.HF_ENDPOINT;
+    let fetched;
+    const { service } = fixture(t, { real: true, catalog: smallCatalog, fetcher: async url => { fetched = url; return new Response(data); } });
+    if (endpoint !== undefined) process.env.HF_ENDPOINT = endpoint;
+    service.install('q4'); await service.whenIdle();
+    const base = endpoint?.includes('hf-mirror') ? 'https://hf-mirror.example' : 'https://huggingface.co';
+    assert.equal(fetched, `${base}/${smallCatalog.repo}/resolve/${smallCatalog.revision}/${smallCatalog.variants[0].file}`);
+    assert.equal(service.library().variants[0].state, 'installed');
+    assert.equal(service.library().sourceUrl, `https://huggingface.co/${smallCatalog.repo}`);
+  }
+});
 test('failed verification and failed fetch do not leave installed or partial files', async t => {
   for (const body of [Buffer.from('bad!test-image-weights'), data.subarray(0, 7)]) {
     const { service, modelsDir } = fixture(t, { real: true, catalog: smallCatalog, fetcher: async () => new Response(body) });

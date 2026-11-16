@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { currencyChoices, currencyLabel } from '../lib/currency';
 import { tr } from '../lib/i18n';
+import { useImeKeys } from '../lib/ime-keys';
 import { useMoney } from '../lib/money';
 import { setElectricity, useStore } from '../lib/store';
 import { Btn, Select } from './ui';
@@ -11,14 +12,14 @@ import { Btn, Select } from './ui';
  */
 export function ElectricityPrice() {
     const price = useStore(s => s.electricityPrice), override = useStore(s => s.electricityCurrency);
-    const money = useMoney();
+    const money = useMoney(), ime = useImeKeys();
     const [text, setText] = useState(price > 0 ? String(price) : ''), [picking, setPicking] = useState(false);
     useEffect(() => { setText(price > 0 ? String(price) : ''); }, [price]);
     const commit = () => setElectricity(Number(text.replace(',', '.')), override);
     const choices = useMemo(() => currencyChoices(money.locale), [money.locale]);
     return <span className="stack">
         <span className="row">
-            <input className="st-input" inputMode="decimal" size={7} aria-label={tr("Price per kWh")} placeholder="0.30" value={text} onChange={e => setText(e.target.value)} onBlur={commit} onKeyDown={e => { if (e.key === 'Enter') commit(); }}/>
+            <input className="st-input" inputMode="decimal" size={7} aria-label={tr("Price per kWh")} placeholder="0.30" value={text} onChange={e => setText(e.target.value)} onBlur={commit} {...ime.events} onKeyDown={e => { if (ime.owns(e)) return; if (e.key === 'Enter') commit(); }}/>
             <span className="small muted">{money.currency ? tr("per kWh, in {0}", [currencyLabel(money.currency, money.locale)]) : tr("per kWh")}</span>
             <Btn size="sm" onClick={() => setPicking(v => !v)}>{tr("Change currency")}</Btn>
         </span>

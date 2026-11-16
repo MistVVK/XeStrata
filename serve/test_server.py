@@ -5360,6 +5360,35 @@ class ModelAliases(unittest.TestCase):
             httpd.server_close()
 
 
+class NvmlPcieTraffic(unittest.TestCase):
+    """A GP100 hands back 200 GiB/s now and then, idle: it reaches neither the tile nor a card's total."""
+    WRAPPED = 209_708_000                                                            # 7 MB/s under 2^22 KB / 20 ms
+
+    def reads(self, *kb_s):
+        """What one reading gives from these driver answers, and how many answers were left unread."""
+        from serve import telemetry
+
+        class Lib:
+            left = list(kb_s)
+
+            def nvmlDeviceGetPcieThroughput(self, dev, counter, out):
+                out._obj.value = self.left.pop(0)
+                return 0
+
+        g = telemetry._Nvml.__new__(telemetry._Nvml)
+        g.dev, g.lib = None, Lib()
+        return g._pcie_mb(1), len(g.lib.left)
+
+    def test_a_real_reading_is_kept(self):
+        self.assertEqual(self.reads(58 << 20, 0), (59392.0, 1))                      # about PCIe 5.0 x16's top
+
+    def test_a_wrapped_reading_is_read_again(self):
+        self.assertEqual(self.reads(self.WRAPPED, 2048), (2.0, 0))
+
+    def test_it_is_read_again_once(self):
+        self.assertEqual(self.reads(self.WRAPPED, self.WRAPPED, 2048), (None, 1))
+
+
 class AmdTelemetry(unittest.TestCase):
     """#301: the AMD backend's readings from a fake amdgpu sysfs tree: KFD node -> render node, as setup numbers the
     cards (the CPU node skipped), and free_vram_mib on HIP."""
@@ -5520,6 +5549,25 @@ class AmdTelemetry(unittest.TestCase):
                                   s["gpu_pcie_bottleneck"]["width_max"]), (1, 4, 16))          # x4 that could do x16
                 self.assertEqual([c["power_limit"] for c in s["gpus"]], [300.0, 300.0])      # each card's own ceiling
                 self.assertEqual(s["gpu_power_limit"], 600.0)                                # the run's limit
+
+    def test_each_card_has_its_own_link_in_gpus(self):
+        """The app reads each GPU tile from that card's record: "gpus" had no PCIe keys, so every PCIe tile in the Monitor was empty on
+        a two-card PC (f5c07ddfd). Additive contract (11-16): the top-level gpu_pcie_* fields stay card 0's reading, and the narrower
+        card (a Gen3 x8 beside a Gen4 x16) is named in gpu_pcie_bottleneck."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, speed, width in (("129", "16.0 GT/s PCIe", "16"), ("128", "8.0 GT/s PCIe", "8")):
+                dev = Path(d) / f"class/drm/renderD{minor}/device"
+                (dev / "current_link_speed").write_text(speed + "\n")
+                (dev / "current_link_width").write_text(width + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+            self.assertEqual([(g["index"], g["pcie_gen"], g["pcie_gen_max"], g["pcie_width"]) for g in s["gpus"]],
+                             [(0, 4, 4, 16), (1, 3, 3, 8)])
+            self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_gen_max"], s["gpu_pcie_width"]), (4, 4, 16))   # card 0's
+            b = s["gpu_pcie_bottleneck"]
+            self.assertEqual((b["card"], b["gen"], b["width"]), (1, 3, 8))
 
     def test_free_vram_on_hip(self):
         from serve import telemetry

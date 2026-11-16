@@ -1,6 +1,7 @@
 /** Saved API connections. Secrets never leave the host's private credentials file. */
 import { modelReadsPictures, modelSupportsReasoning } from './vision-probe.mjs';
 import { isOpenRouter, OPENROUTER_EFFORTS } from './agent/profile.mjs';
+import { validateChatImages } from './chat-images.mjs';
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -49,6 +50,50 @@ export function normalizeBaseUrl(value) {
 }
 const publicConnection = ({ apiKey, ...connection }) => ({ ...connection, apiKeySet: !!apiKey });
 const numeric = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+
+/**
+ * The history an API model gets. The UI replays earlier pictures as OpenAI content blocks (#4311): their words always go, and to a model
+ * that reads pictures over the OpenAI protocol their pixels go too, so a follow-up question can still be answered after a model change.
+ * An earlier picture never stops the chat: one that is not a PNG, JPEG or WebP data URL (a remote or file address is never sent), or is
+ * over 6 MB, is left out, and when the earlier pictures and this message's together are more than four, the newest are kept.
+ */
+export const HISTORY_PICTURES_MAX = 4;
+function historyPicture(url) {
+  try { return validateChatImages([{ url }])[0].url; } catch { return null; }
+}
+function providerHistory(history, protocol, vision, currentPictures) {
+  const picturesAllowed = protocol === 'openai-chat' && vision !== false;
+  const rows = (Array.isArray(history) ? history : []).filter(m => m && ['user', 'assistant'].includes(m.role)).map(m => {
+    if (typeof m.content === 'string') return { role: m.role, parts: [{ type: 'text', text: m.content }], plain: true };
+    if (!Array.isArray(m.content)) return null;
+    const parts = [];
+    for (const part of m.content) {
+      if (!part || typeof part !== 'object' || Array.isArray(part)) continue;
+      if (part.type === 'text' && typeof part.text === 'string') parts.push({ type: 'text', text: part.text });
+      else if (part.type === 'image_url' && picturesAllowed && m.role === 'user') {
+        const url = historyPicture(part.image_url?.url);
+        if (url) parts.push({ type: 'image_url', image_url: { url } });
+      }
+    }
+    return parts.length ? { role: m.role, parts } : null;
+  }).filter(Boolean).slice(-40);
+  let room = Math.max(0, HISTORY_PICTURES_MAX - currentPictures);
+  for (let r = rows.length - 1; r >= 0; r--) {            // newest first: older pictures give way, their words stay
+    const kept = [];
+    for (let k = rows[r].parts.length - 1; k >= 0; k--) {
+      const part = rows[r].parts[k];
+      if (part.type !== 'image_url') kept.unshift(part);
+      else if (room > 0) { room--; kept.unshift(part); }
+    }
+    rows[r].parts = kept;
+  }
+  return rows.map(({ role, parts, plain }) => {
+    if (plain) return { role, content: parts[0].text };
+    if (parts.some(p => p.type === 'image_url')) return { role, content: parts };
+    const words = parts.map(p => p.text).join('\n');
+    return words ? { role, content: words } : null;
+  }).filter(Boolean);
+}
 
 export function createModelProviders({ directory, changed = () => {}, fetchImpl = fetch, knownThinks = () => null }) {
   mkdirSync(directory, { recursive: true });
@@ -146,9 +191,9 @@ export function createModelProviders({ directory, changed = () => {}, fetchImpl 
   async function stream({ selection, message, history = [], systemPrompt = '', images = [], thinking, signal, onFrame }) {
     const { connection, model } = resolve(selection);
     const started = Date.now();
-    const messages = history.filter(m => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string').slice(-40).map(m => ({ role: m.role, content: m.content }));
     // Pictures only go to OpenAI-style servers (the one protocol every local server shares); other protocols keep the text.
     const pics = connection.protocol === 'openai-chat' ? images : [];
+    const messages = providerHistory(history, connection.protocol, model.vision, pics.length);
     messages.push({ role: 'user', content: pics.length ? [{ type: 'text', text: message }, ...pics.map(i => ({ type: 'image_url', image_url: { url: i.url } }))] : message });
     const protocol = connection.protocol;
     const payload = protocol === 'anthropic'

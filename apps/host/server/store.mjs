@@ -98,7 +98,7 @@ export function nativeDataDirectory(input) {
   mkdirSync(data,{recursive:true});
   // Unlike a fresh default, a retained library must not fall back to an empty folder if linking fails.
   if(!existsSync(nativeModels))symlinkSync(process.platform==='win32'?root:relative(data,root),nativeModels,process.platform==='win32'?'junction':'dir');
-  const a=statSync(nativeModels),b=statSync(root);
+  const a=statSync(nativeModels,{bigint:true}),b=statSync(root,{bigint:true});
   if(realpathSync(nativeModels)!==root&&!(a.ino&&a.ino===b.ino&&a.dev===b.dev))throw new Error('The model folder conflicts with another library. Choose a different folder.');
   return data;
  }
