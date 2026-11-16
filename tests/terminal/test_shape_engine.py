@@ -80,6 +80,8 @@ def model_entry(**kw) -> dict:
 
 class Base(unittest.TestCase):
     def setUp(self):
+        if host_platform().startswith("macos"):
+            fx.cuda_pc(self)                                # (#4138) these cases are about CUDA packages: on a Mac they speak about a Linux PC with an NVIDIA card
         self.tmp = tempfile.TemporaryDirectory(prefix="strata-shape-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -196,6 +198,7 @@ class Packaging(Base):
         with self.assertRaises(SystemExit):
             build(self.root / "p4", "0.1.59", None, shape="engine")
 
+    @unittest.skipIf(sys.platform == "darwin", "the packager runs in a child process, which sees the Mac and asks for its picture reader (#3697)")
     def test_the_command_line_makes_and_verifies_one(self):
         src = stub_source(self.root / "cli", "0.1.59")
         out = self.root / "cli-out"
