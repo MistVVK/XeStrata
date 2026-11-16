@@ -100,9 +100,10 @@ macro(strata_hip_mmq)
 endmacro()
 
 # P4-SPLIT, HIP without llama.cpp's MMQ (STRATA_MMQ=OFF, the default, or STRATA_PREFILL_MMQ off): Strata's own prompt kernels alone (strata_pf_own, with
-# mmq_absent.cpp for the MMQ half of moe_mmq.hpp), compiled as strata_hip_mmq compiles them, with the ggml-base headers only
+# mmq_absent.cpp for the MMQ half of moe_mmq.hpp), compiled as strata_hip_mmq compiles them.  No ggml: the type ids are Strata's table
+# (strata/quant/types.hpp), the block layouts the quant header in third_party/ggml
 macro(strata_hip_pf_own)
-    set(_strata_gg "${_strata_ggml_root}/ggml")
+    set(_strata_gg "${_strata_ggml_root}/ggml")   # (the tests' include path)
     set(_strata_pf_own_sources
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
@@ -112,9 +113,9 @@ macro(strata_hip_pf_own)
       src/prefill/moe_helpers.cu)
     set_source_files_properties(${_strata_pf_own_sources} PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_pf_own STATIC ${_strata_pf_own_sources} src/prefill/mmq_absent.cpp)
-    target_include_directories(strata_pf_own PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(strata_pf_own PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml" PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(strata_pf_own PRIVATE GGML_USE_HIP=1)
-    target_link_libraries(strata_pf_own PUBLIC strata_quant ggml-base hip::host roc::hipblas)
+    target_link_libraries(strata_pf_own PUBLIC strata_quant hip::host roc::hipblas)
     target_link_libraries(strata_prefill PUBLIC strata_pf_own)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_FUSED=1)
     set(_strata_pf_tests_lib strata_pf_own)
@@ -125,6 +126,7 @@ endmacro()
 macro(strata_hip_prompt_tests)
     if(NOT TARGET strata_mmq)
       # P4-SPLIT: the engine and Strata's prompt library hold none of llama.cpp's MMQ (names in the bytes, nm; tools/check_no_mmq.py)
+      # No tool is named here: an nm found on PATH is used, and when it does not run the line says NOT RUN without failing (no exit 3)
       find_package(Python3 QUIET COMPONENTS Interpreter)
       if(Python3_Interpreter_FOUND)
         add_test(NAME no_mmq_symbols COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_mmq.py $<TARGET_FILE:strata> $<TARGET_FILE:strata_pf_own>)

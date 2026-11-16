@@ -9,6 +9,15 @@
 
 namespace sq = strata::quant;
 
+// the names: every id of Strata's table that ggml has is ggml's enumerator of the same name (the prompt kernels moe_fused_iq.cu, moe_f16_kq.cu
+// and moe_p1a.cu take their type ids from this table, not from ggml.h)
+#define SAME_ID(n) static_assert((int) sq::Type::n == (int) GGML_TYPE_##n, "Strata's type id " #n " is not ggml's")
+SAME_ID(F32); SAME_ID(F16); SAME_ID(Q4_0); SAME_ID(Q4_1); SAME_ID(Q5_0); SAME_ID(Q5_1); SAME_ID(Q8_0); SAME_ID(Q8_1);
+SAME_ID(Q2_K); SAME_ID(Q3_K); SAME_ID(Q4_K); SAME_ID(Q5_K); SAME_ID(Q6_K); SAME_ID(Q8_K);
+SAME_ID(IQ2_XXS); SAME_ID(IQ2_XS); SAME_ID(IQ3_XXS); SAME_ID(IQ1_S); SAME_ID(IQ4_NL); SAME_ID(IQ3_S); SAME_ID(IQ2_S); SAME_ID(IQ4_XS);
+SAME_ID(IQ1_M); SAME_ID(BF16); SAME_ID(MXFP4); SAME_ID(NVFP4); SAME_ID(Q1_0); SAME_ID(Q2_0);
+#undef SAME_ID
+
 static int g_fail = 0;
 #define CHECK(c, ...)                                  \
     do {                                               \

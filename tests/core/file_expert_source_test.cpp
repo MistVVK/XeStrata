@@ -5,7 +5,7 @@
 
 #if defined(STRATA_NATIVE_EXPERTS)
 #include "strata/kernels/cpu/native_expert.hpp"
-#include "ggml.h"
+#include "strata/quant/types.hpp"   // the type ids (Strata's table, no ggml.h)
 #endif
 
 #include <cuda_runtime.h>
@@ -200,10 +200,10 @@ void test_native_variable_layout() {
 
     NativeFmt first_fmt, second_fmt;
     std::string err;
-    const bool first_ok = native_fmt(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, embedding, feed_forward, first_fmt, err);
+    const bool first_ok = native_fmt((int) strata::quant::Type::IQ3_XXS, (int) strata::quant::Type::IQ4_NL, embedding, feed_forward, first_fmt, err);
     require(first_ok, "IQ3_XXS/IQ4_NL synthetic format is unavailable: " + err);
     err.clear();
-    const bool second_ok = native_fmt(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, embedding, feed_forward, second_fmt, err);
+    const bool second_ok = native_fmt((int) strata::quant::Type::IQ2_XS, (int) strata::quant::Type::IQ4_NL, embedding, feed_forward, second_fmt, err);
     require(second_ok, "IQ2_XS/IQ4_NL synthetic format is unavailable: " + err);
     require(first_fmt.bytes != second_fmt.bytes, "chosen native formats do not exercise variable layer sizes");
 
@@ -212,8 +212,8 @@ void test_native_variable_layout() {
     {
         std::ofstream metadata(dir.path / "native_experts.txt");
         require((bool) metadata, "could not create synthetic native_experts.txt");
-        metadata << "0 " << GGML_TYPE_IQ3_XXS << ' ' << GGML_TYPE_IQ4_NL << " 0 " << first_fmt.bytes << '\n';
-        metadata << "1 " << GGML_TYPE_IQ2_XS << ' ' << GGML_TYPE_IQ4_NL << ' ' << layer0_bytes << ' '
+        metadata << "0 " << (int) strata::quant::Type::IQ3_XXS << ' ' << (int) strata::quant::Type::IQ4_NL << " 0 " << first_fmt.bytes << '\n';
+        metadata << "1 " << (int) strata::quant::Type::IQ2_XS << ' ' << (int) strata::quant::Type::IQ4_NL << ' ' << layer0_bytes << ' '
                  << second_fmt.bytes << '\n';
         require((bool) metadata, "could not write synthetic native_experts.txt");
     }

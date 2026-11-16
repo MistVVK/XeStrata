@@ -1392,14 +1392,14 @@ class Runner:
 
     def prepare_pack(self, model_dir: Path, pack: Path, shards: list) -> None:
         """Build the pack an Intel Arc run needs from the GGUF files (the step setup.py runs for NVIDIA and AMD cards): setup.py --prepare-pack
-        fetches llama.cpp's gguf-py by itself and runs tools/iq_pack.py. Takes seconds to a few minutes; the draft layer is not built."""
+        runs tools/iq_pack.py on Strata's own GGUF reader (tools/strata_gguf.py), so nothing is downloaded. Takes seconds to a few minutes; the draft layer is not built."""
         cat = self.catalog
         fam, model = self.s.family, self.s.model
         try:
             fam, model = cat.resolve(str(model), None if fam is None else str(fam))      # setup's own spelling (IQ2_XS, not iq2_xs)
         except Exception:                                    # noqa: BLE001
             pass
-        self.emit("model", "Preparing the model files for this graphics card (once, a few minutes; nothing is downloaded except a small helper)…", 0)
+        self.emit("model", "Preparing the model files for this graphics card (once, a few minutes; nothing is downloaded)…", 0)
         argv = [self.python, str(cat.src / "setup.py"), "--prepare-pack", str(pack), "--gguf-dir", str(model_dir),
                 "--family", str(fam), "--model", str(model)]
         env = self._env()
@@ -1423,7 +1423,7 @@ class Runner:
             err = next((ln.strip()[3:].strip() for ln in reversed(lines) if ln.strip().startswith("[X]")), "")
             raise LaunchError("Strata could not prepare the model files for this graphics card" + (f": {err}" if err else "."),
                               "The last lines of the preparation are in " + (self.keep_setup_output(lines) or "the launch log")
-                              + ". If it says the helper could not be downloaded, check the internet connection (proxy: set HTTPS_PROXY) and try again.", 5)
+                              + ".", 5)
 
     def adopt_prepared_files(self, setup_error: str, chosen: bool = False) -> Path | None:
         """The installer cannot set this graphics card up (Intel Arc, for one): if the model's files and prepared pack are already on disk,
@@ -2351,8 +2351,7 @@ class Runner:
         elif not engine:
             text += " The engine for your graphics card is downloaded first (from the update source; its size is shown when it starts)."
         if intel:
-            text += (" For the Intel card Strata builds the model's pack from your files itself (once, a few minutes); the first time it fetches "
-                     "a small helper (llama.cpp's gguf-py) from GitHub. No draft layer or picture reader is used on Intel cards yet.")
+            text += " For the Intel card Strata builds the model's pack from your files itself, once; it takes a few minutes and downloads nothing."
         return {"gb": gb, "parts": parts, "engine_missing": not engine and not here, "engine_usable": engine, "own_files": st.own_files, "text": text}
 
     def ready_pack_gap(self) -> dict | None:

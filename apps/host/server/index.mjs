@@ -49,7 +49,6 @@ import * as store from './store.mjs';
 import { createChatStore, storeFailure } from './chat-store.mjs';
 import { makePrivateDir } from './private-file.mjs';
 import * as supervisor from './supervisor.mjs';
-import * as engineInstall from './engine-install.mjs';
 import { detectBackend, currentBackend, streamChat, inferenceLine } from './inference.mjs';
 import { CONTEXT_TOKENS, VARIANTS, localModels, variant } from './catalog.mjs';
 import { browseLocalModels, inspectLocalModel } from './local-models.mjs';
@@ -243,7 +242,6 @@ hub.send = (event, payload) => {
 const boot = await hardware.detect({ force: true });
 models.init(hub);
 engine.init(hub);
-engineInstall.init(hub);
 monitor.init(hub, boot);
 monitor.setLiveProbe(() => native.hasLive());
 serving.init(hub, { port: PORT, host: HOST });
@@ -1590,15 +1588,6 @@ async function api(req, res, path, method, url) {
     hub.send('engine', await engine.config());
     hub.send('models', models.library());
     return json(res, 200, status);
-  }
-  if (path === '/api/engine/binary' && method === 'GET') return json(res, 200, engineInstall.status());
-  if (path === '/api/engine/binary' && method === 'POST') {
-    try {
-      const result = await engineInstall.install({ force: url.searchParams.get('force') === '1' });
-      return json(res, 200, result);
-    } catch (err) {
-      return error(res, err.status ?? 500, err.message, { ...engineInstall.status(), error: err.message });
-    }
   }
   if (path === '/api/engine/export' && method === 'GET') return json(res, 200, await engine.exportConfig());
 

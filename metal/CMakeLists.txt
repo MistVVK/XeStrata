@@ -77,16 +77,22 @@ if(NOT STRATA_METAL_ENGINE)
 endif()
 include(${STRATA_ROOT}/cmake/strata_ggml.cmake)        # -DSTRATA_GGML_DIR, or the vendored third_party/strata-ggml
 include(${STRATA_ROOT}/cmake/backends/metal.cmake)
-strata_ggml_resolve("${STRATA_ROOT}")
-if(NOT EXISTS "${_strata_ggml_root}/ggml/CMakeLists.txt")
-  message(FATAL_ERROR "ggml sources not found in '${_strata_ggml_root}' (third_party/strata-ggml, or the -DSTRATA_GGML_DIR checkout)")
-endif()
-strata_metal_ggml()
 # OWN-2N: the CPU expert rows and the --mtp-q4 requantizer on the Strata quant layer (src/quant, its Arm NEON tier, no ggml-cpu
-# call from the pool) instead of ggml-cpu's type traits.  OFF by default on Metal until the layer's oracle (tests/quant/run_oracle.sh, Apple Clang) and unit tests
-# have passed on the Mac; -DSTRATA_OWN_CPU_QUANT=ON builds the engine on the layer.
-option(STRATA_OWN_CPU_QUANT "CPU expert pool and --mtp-q4 on the Strata quant layer instead of ggml-cpu's type traits" OFF)
+# call from the pool) instead of ggml-cpu's type traits.  ON by default since 0.2.16 (bit-exact against ggml-cpu's NEON dots under Apple Clang,
+# tests/quant/run_oracle.sh, OWN-2N); -DSTRATA_OWN_CPU_QUANT=OFF builds the ggml-cpu pool (kept selectable for two releases).
+option(STRATA_OWN_CPU_QUANT "CPU expert pool and --mtp-q4 on the Strata quant layer instead of ggml-cpu's type traits" ON)
 option(STRATA_BUILD_TESTS "Build the quant layer's self-test and ggml oracle test (needs STRATA_OWN_CPU_QUANT)" OFF)
+# ggml-base / ggml-cpu only where something links them: the ggml-cpu pool and the tests (ggml as the oracle).  The default engine has no ggml.
+if(NOT STRATA_OWN_CPU_QUANT OR STRATA_BUILD_TESTS)
+  strata_ggml_resolve("${STRATA_ROOT}")
+  if(NOT EXISTS "${_strata_ggml_root}/ggml/CMakeLists.txt")
+    message(FATAL_ERROR "ggml sources not found in '${_strata_ggml_root}' (third_party/strata-ggml, or the -DSTRATA_GGML_DIR checkout)")
+  endif()
+  strata_metal_ggml()
+else()
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)   # (what strata_metal_ggml sets for the whole project)
+  message(STATUS "Strata Metal: no ggml in this build (own CPU pool, tests off)")
+endif()
 if(STRATA_OWN_CPU_QUANT)
   set(STRATA_QUANT_ROOT ${STRATA_ROOT})
   set(STRATA_CPU_X86 OFF)
@@ -114,11 +120,14 @@ set_source_files_properties(${S}/core/device.cu ${S}/core/pinned.cu
 file(GLOB STRATA_METAL_ENGINE_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/*.cpp)
 
 add_library(strata_metal_host STATIC ${STRATA_METAL_HOST_SOURCES})
-target_include_directories(strata_metal_host PUBLIC ${STRATA_ROOT}/include ${S}/core ${STRATA_ROOT}/third_party/ggml
-                           ${_strata_ggml_root}/ggml/include ${_strata_ggml_root}/ggml/src ${_strata_ggml_root}/ggml/src/ggml-cpu)
+target_include_directories(strata_metal_host PUBLIC ${STRATA_ROOT}/include ${S}/core ${STRATA_ROOT}/third_party/ggml)
 target_compile_definitions(strata_metal_host PUBLIC STRATA_NATIVE_EXPERTS=1 STRATA_HAVE_DFLASH2=1 STRATA_VERSION="0.1.60-metal")
 target_compile_options(strata_metal_host PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations)
-target_link_libraries(strata_metal_host PUBLIC strata_gpu_metal ggml-cpu ggml-base)
+target_link_libraries(strata_metal_host PUBLIC strata_gpu_metal)
+if(TARGET ggml-base)   # the ggml-cpu pool (STRATA_OWN_CPU_QUANT=OFF) or a test build: ggml's headers and libraries, as before
+  target_include_directories(strata_metal_host PUBLIC ${_strata_ggml_root}/ggml/include ${_strata_ggml_root}/ggml/src ${_strata_ggml_root}/ggml/src/ggml-cpu)
+  target_link_libraries(strata_metal_host PUBLIC ggml-cpu ggml-base)
+endif()
 if(STRATA_OWN_CPU_QUANT)
   target_link_libraries(strata_metal_host PUBLIC strata_quant)
   target_compile_definitions(strata_metal_host PUBLIC STRATA_OWN_CPU_QUANT=1)

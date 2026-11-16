@@ -223,7 +223,7 @@ async function main() {
   const refused = await waitJob((await call('/api/native/operations', 'POST', { kind: 'install', args: { family: 'qwen', model: 'IQ2_XS' } })).body.id);
   record('installing from the app is refused (Terminal only)', refused.job.state === 'error' && /Terminal/.test(refused.job.error), refused.job.error);
   const binary = await call('/api/engine/binary', 'POST');
-  record('the llama.cpp download route is refused', binary.status === 409 && /never downloads/.test(binary.body?.error ?? ''), `${binary.status} ${binary.body?.error}`);
+  record('the llama.cpp download route is gone', binary.status === 404, `${binary.status} ${binary.body?.error}`);
 
   // ---- clean shutdown (what the Tauri shell does on exit)
   renameSync(hidden, join(dirs.components, 'engine'));

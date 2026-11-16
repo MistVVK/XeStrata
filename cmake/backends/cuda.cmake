@@ -283,17 +283,18 @@ macro(strata_cuda_mmq)
 endmacro()
 
 # P4-SPLIT, STRATA_MMQ=OFF (the default): Strata's own prompt kernels without llama.cpp's MMQ (strata_pf_own alone, with mmq_absent.cpp for the MMQ half
-# of moe_mmq.hpp); the same sources and options as strata_cuda_mmq gives them, the ggml-base headers only
+# of moe_mmq.hpp); the same sources and options as strata_cuda_mmq gives them.  No ggml: the type ids are Strata's table (strata/quant/types.hpp),
+# the block layouts the quant header in third_party/ggml
 macro(strata_cuda_pf_own)
-    set(_strata_gg ${_strata_ggml_root}/ggml)
+    set(_strata_gg ${_strata_ggml_root}/ggml)   # (the tests' include path)
     add_library(strata_pf_own STATIC src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_helpers.cu
                 src/prefill/moe_fused_iq_q36.cu src/prefill/mmq_absent.cpp)
-    target_include_directories(strata_pf_own PRIVATE ${_strata_gg}/include ${_strata_gg}/src PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(strata_pf_own PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(strata_pf_own PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
     if(MSVC)
       target_compile_options(strata_pf_own PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
-    target_link_libraries(strata_pf_own PUBLIC strata_quant ggml-base ${_strata_gpu_runtime_target})
+    target_link_libraries(strata_pf_own PUBLIC strata_quant ${_strata_gpu_runtime_target})
     if(TARGET CUDA::cuda_driver)
       target_link_libraries(strata_pf_own PUBLIC CUDA::cuda_driver)
     endif()
@@ -312,11 +313,13 @@ endmacro()
 macro(strata_cuda_prompt_tests)
     if(STRATA_BUILD_TESTS AND NOT STRATA_MMQ)
       # P4-SPLIT: the engine and Strata's prompt library hold none of llama.cpp's MMQ (names in the bytes, nm, cuobjdump; tools/check_no_mmq.py)
+      # The cuobjdump look is named, so a device look that did not run fails the test (exit 3, "NOT RUN (<why>)" in its output).  Each tool
+      # gets 600 s (--tool-timeout), under the test's own limit: a slow cuobjdump ends as a named NOT RUN, not as a test killed with no line.
       find_package(Python3 QUIET COMPONENTS Interpreter)
       if(Python3_Interpreter_FOUND)
-        add_test(NAME no_mmq_symbols COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_mmq.py
+        add_test(NAME no_mmq_symbols COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_mmq.py --tool-timeout 600
                  --cuobjdump ${CUDAToolkit_BIN_DIR}/cuobjdump${CMAKE_EXECUTABLE_SUFFIX} $<TARGET_FILE:strata> $<TARGET_FILE:strata_pf_own>)
-        set_tests_properties(no_mmq_symbols PROPERTIES TIMEOUT 900)
+        set_tests_properties(no_mmq_symbols PROPERTIES TIMEOUT 2700)
       endif()
     endif()
     if(STRATA_BUILD_TESTS)
