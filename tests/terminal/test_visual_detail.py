@@ -43,7 +43,11 @@ def snapshot():
                                 for i in range(2)]},
         "devices": [{"index": i, "name": f"GPU-{i}", "util": 70 + i,
                      "mem_used": (10 + i) * 2**30, "mem_total": 24 * 2**30,
-                     "temp": 60 + i, "power": 180 + i} for i in range(2)],
+                     "temp": 60 + i, "power": 180 + i, "power_limit": (300, 220)[i],
+                     # each card trains its own link, and the first one runs narrower than its own card could go:
+                     # a page that printed one card's link, or the run's added-together ceiling, cannot pass
+                     "pcie_gen": 5, "pcie_gen_max": 5, "pcie_width": (8, 4)[i], "pcie_width_max": (16, 4)[i]}
+                     for i in range(2)],
         "ram": {"used": 20 * 2**30, "total": 64 * 2**30},
         "recent": [{"id": "done-0", "finish": "stop", "prompt_tokens": 100,
                     "reused": 20, "output_tokens": 40, "duration_s": 3.2,
@@ -82,6 +86,16 @@ class VisualDetailTests(unittest.TestCase):
         self.assertIn("GPU 0", self.render(sample, "hardware"))
         self.assertIn("HOST SPAN", self.render(sample, "engine"))
         self.assertIn("req-0", self.render(sample, "logs"))
+
+    def test_the_hardware_page_names_the_link_of_the_card_you_selected(self):
+        """Two cards trained to different widths: the page says which card runs at which width, instead of one
+        card's link for the whole run.  The card you selected gets its own power ceiling too - the tile above the
+        cards adds the two ceilings together."""
+        for selected, (link, watts) in ((0, ("Link Gen5 x8 of x16", "Power 180W of 300W")),
+                                        (1, ("Link Gen5 x4", "Power 181W of 220W"))):
+            shown = self.render(snapshot(), "hardware", selected=selected)
+            self.assertIn(link, shown, link)
+            self.assertIn(watts, shown, watts)
 
     def test_selection_detail_and_stale_readings(self):
         sample = snapshot()

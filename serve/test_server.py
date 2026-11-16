@@ -5283,7 +5283,8 @@ class AmdTelemetry(unittest.TestCase):
 
     def test_pcie_link_is_the_narrowest_slowest_hop(self):
         """#1733: the link is the slowest/narrowest hop between the root port and the card; the bottleneck is only
-        claimed when every hop could be read (pcie_path says how many were)."""
+        claimed when every hop could be read (pcie_path says how many were).  The card's own width is kept beside it
+        (`pcie_width_max`), because a x16 card behind a x8 bridge has to read as the gap, not as an x8 card."""
         from serve import telemetry
         with tempfile.TemporaryDirectory() as d:
             hops = []
@@ -5299,10 +5300,12 @@ class AmdTelemetry(unittest.TestCase):
             a.dev = hops[-1]
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops):
                 self.assertEqual(a.link(), {"pcie_gen": 3, "pcie_gen_max": 3, "pcie_own_gen": 4, "pcie_width": 8,
+                                            "pcie_width_max": 16,       # the bridge narrows it to x8, the card could do x16
                                             "pcie_path": "3/3"})
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops[:2] + [str(Path(d) / "hidden")]):
                 got = a.link()             # an unreadable hop: fall back to the card's own negotiated link
-                self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_path"]), (4, 16, "2/3"))
+                self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_width_max"], got["pcie_path"]),
+                                 (4, 16, 16, "2/3"))
             self.assertEqual(telemetry._Amd._gen("32.0 GT/s PCIe"), 5)
             self.assertIsNone(telemetry._Amd._gen("unknown"))
             self.assertTrue(telemetry._Amd._bdf("0000:03:00.0"))
@@ -5322,6 +5325,7 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
                                             "power": 85.0, "power_limit": 300.0, "pcie_gen": None,
                                             "pcie_gen_max": None, "pcie_own_gen": None, "pcie_width": None,
+                                            "pcie_width_max": None,
                                             "pcie_path": "0/0"})    # #1733: no PCIe files in this fake tree
                 r = telemetry.gpu_reader(1, amd=True).read()
                 self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
@@ -5336,6 +5340,55 @@ class AmdTelemetry(unittest.TestCase):
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
+
+    def test_two_cards_keep_their_own_pcie_links(self):
+        """Two cards trained to different widths: each row carries its own link, and the aggregate is the weakest
+        card's.  Card 0's reading used to be the only one anyone could see, so an x4 card hid behind x8."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, width in (("renderD129", "8"), ("renderD128", "4")):
+                dev = Path(d) / "class/drm" / minor / "device"
+                (dev / "current_link_speed").write_text("16.0 GT/s PCIe\n")      # both cards at Gen4
+                (dev / "current_link_width").write_text(width + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(4, 8), (4, 4)])
+                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (4, 4))   # the weakest card, not card 0's x8
+
+    def test_a_card_with_no_link_reading_stays_missing(self):
+        """A card whose sysfs hides its link (the fake tree has no PCIe files) reports nothing: no 0, no invented
+        width, and the aggregate is the other card's link rather than a made-up one."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            dev = Path(d) / "class/drm/renderD128/device"
+            (dev / "current_link_speed").write_text("8.0 GT/s PCIe\n")
+            (dev / "current_link_width").write_text("16\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(None, None), (3, 16)])
+                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (3, 16))
+
+    def test_a_card_narrower_than_it_could_be_shows_the_gap(self):
+        """A card the board trained down to x4 in a slot the card could do x16, beside a card that is x8 by nature:
+        the gap is one card's, so the aggregate's cap comes from the card that gave the narrowest width (the smallest
+        cap in the run would blame the other card).  Each row also carries its own power ceiling, which the summary
+        adds up - without it the Overview loses "of N W limit" on a split run."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, (cur, cap) in (("renderD129", ("8", "8")), ("renderD128", ("4", "16"))):
+                dev = Path(d) / "class/drm" / minor / "device"
+                (dev / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+                (dev / "current_link_width").write_text(cur + "\n")
+                (dev / "max_link_width").write_text(cap + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_width"], c["pcie_width_max"]) for c in s["gpus"]], [(8, 8), (4, 16)])
+                self.assertEqual((s["gpu_pcie_width"], s["gpu_pcie_width_max"]), (4, 16))    # x4 that could do x16
+                self.assertEqual([c["power_limit"] for c in s["gpus"]], [300.0, 300.0])      # each card's own ceiling
+                self.assertEqual(s["gpu_power_limit"], 600.0)                                # the run's limit
 
     def test_free_vram_on_hip(self):
         from serve import telemetry

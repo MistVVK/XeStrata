@@ -144,9 +144,38 @@ class SeveralCards(unittest.TestCase):
         self.assertEqual(g["vram_total"], 72.0)                                                    # all cards
         self.assertEqual((g["power"], g["power_limit"]), (625.0, 1050.0))
         text = draw(m)
-        for want in ("busiest of 3 cards", "all 3 cards", "hottest card", "64.3 / 72 GB", "625 W", "of 1,050 W limit", "61 °C"):
+        for want in ("busiest of 3 cards", "all 3 cards", "hottest card", "64.3 / 72 GB", "625 W", "all 3 cards of 1,050 W", "61 °C"):
             self.assertIn(want, text, want)
         self.assertNotIn("+2", text)                                                              # no more "RTX 3090 +2"
+
+    def power_sub(self, model, width=110) -> str:
+        """The Power tile's small line: the one that says where the big number comes from."""
+        lines = draw(overview.build(model), width=width).splitlines()
+        top = next(i for i, ln in enumerate(lines) if "─ Power ─" in ln)
+        return lines[top + 2].split("│")[1].strip()
+
+    def test_the_power_tile_says_which_cards_it_added(self):
+        """A bare "625 W" over three cards reads as one card's, because the other tiles all say which card they come
+        from and this one said nothing.  The small line names the cards and keeps the added-together ceiling beside it
+        while both fit; a narrow terminal keeps the label and drops the ceiling whole, since a line the box crops
+        mid-sentence is worse than one less number (each card's own ceiling is on the Hardware page)."""
+        self.assertEqual(self.power_sub(three_cards()), "all 3 cards of 1,050 W")                 # width 110: room
+        self.assertEqual(self.power_sub(three_cards(), 90), "all 3 cards")                         # no room: whole
+        text = draw(overview.build(three_cards()), width=90)
+        self.assertNotIn("of 1,050", text)
+        self.assertNotIn("W limit", text)                                                         # never "…of 1,0"
+        two = three_cards()
+        two["hardware"]["gpus"] = two["hardware"]["gpus"][:2]
+        two["hardware_static"]["gpu_count"] = 2
+        self.assertEqual(self.power_sub(two, 100), "all 2 cards of 700 W")                        # the pair, not the pair's biggest card
+        no_limit = three_cards()
+        for c in no_limit["hardware"]["gpus"]:
+            c["power_limit"] = None
+        self.assertEqual(self.power_sub(no_limit), "all 3 cards")                                 # no ceiling reported: still says whose power
+        one = metrics("generating")
+        one["hardware"]["gpus"] = [{"index": 0, "name": "NVIDIA GeForce RTX 5070", "util": 88, "mem_used": 11.2 * GIB,
+                                    "mem_total": 12 * GIB, "temp": 54, "power": 114, "power_limit": 250}]
+        self.assertEqual(self.power_sub(one), "of 250 W limit")                                   # one card: the old line, unchanged
 
     def test_the_cards_strip_one_line_per_card(self):
         text = draw(overview.build(three_cards()))
@@ -159,6 +188,33 @@ class SeveralCards(unittest.TestCase):
         self.assertIn("61 °C", lines[0])
         self.assertIn("236 W", lines[0])
         self.assertIn("RTX 3090", lines[0])
+
+    def test_each_card_shows_its_own_pcie_link(self):
+        """Every card trains its own link, so the strip names the three different ones and the tile shows the
+        weakest card's: an x4 card used to hide behind card 0's number."""
+        m = three_cards()
+        for c, (gen, width) in zip(m["hardware"]["gpus"], ((5, 8), (5, 4), (5, 16))):
+            c["pcie_gen"] = gen
+            c["pcie_gen_max"] = gen
+            c["pcie_width"] = width
+        g = overview.build(m)["gpu"]
+        self.assertEqual((g["pcie_gen"], g["pcie_width"]), (5.0, 4.0))                                # the weakest card
+        text = draw(overview.build(m))
+        self.assertIn("weakest of 3 cards", text)
+        lines = [ln for ln in text.splitlines() if ln.startswith("GPU ")]
+        for want, line in zip(("Gen5 x8", "Gen5 x4", "Gen5 x16"), lines):
+            self.assertIn(want, line, want)
+
+    def test_a_card_that_reports_no_link_falls_back_to_its_max_and_then_to_the_old_layout(self):
+        m = three_cards()
+        m["hardware"]["gpus"][0].update({"pcie_gen": None, "pcie_gen_max": 5, "pcie_width": 8})   # NVML reports no
+        m["hardware"]["gpus"][1].update({"pcie_gen": 3, "pcie_gen_max": 3, "pcie_width": 16})      # link when idle
+        g = overview.build(m)["gpu"]
+        self.assertEqual((g["pcie_gen"], g["pcie_width"]), (3.0, 8.0))                             # min of what came in
+        lines = [ln for ln in draw(overview.build(m)).splitlines() if ln.startswith("GPU ")]
+        self.assertIn("Gen5 x8", lines[0])
+        self.assertIn("Gen3 x16", lines[1])
+        self.assertNotIn("Gen", lines[2])                                                         # nothing reported: as before
 
     def test_up_to_four_cards_then_a_pointer_to_view_5(self):
         m = three_cards()
@@ -173,6 +229,65 @@ class SeveralCards(unittest.TestCase):
         self.assertIn("64 cores · 128 threads", one)
         self.assertNotIn("CPUs", one)
         self.assertIn("6 cores · 12 threads", draw(overview.build(metrics("generating"))))     # no socket count reported: as before
+
+    def test_a_card_narrower_than_it_could_be_says_both_numbers(self):
+        """A card capped to x8 in a x16 slot, or trained down by the board: the narrow number alone reads as a card
+        someone chose, so that card gets both.  The tile's pair comes from the card that gave the narrowest width,
+        never from the widest cap in the run (that would put one card's gap on another card's link)."""
+        m = three_cards()
+        for c, (width, cap) in zip(m["hardware"]["gpus"], ((8, 16), (4, 4), (16, 16))):
+            c.update({"pcie_gen": 5, "pcie_gen_max": 5, "pcie_width": width, "pcie_width_max": cap})
+        lines = [ln for ln in draw(overview.build(m)).splitlines() if ln.startswith("GPU ")]
+        self.assertIn("Gen5 x8 of x16", lines[0])                             # capped in the slot: the gap is the point
+        self.assertIn("Gen5 x4", lines[1])                                    # at its own cap: one number, as before
+        self.assertIn("Gen5 x16", lines[2])
+        g = overview.build(m)["gpu"]
+        self.assertEqual((g["pcie_width"], g["pcie_width_max"]), (4.0, 4.0))  # the x4 card's own pair, not x16
+        self.assertNotIn("x4 of x16", draw(overview.build(m)))
+        m["hardware"]["gpus"][1]["pcie_width_max"] = 16                       # the weakest card could do x16
+        self.assertEqual(overview.build(m)["gpu"]["pcie_width_max"], 16.0)
+        self.assertIn("Gen5 x4 of x16", draw(overview.build(m)))              # the tile says the gap too
+
+    def test_the_cards_strip_link_shrinks_whole_as_the_terminal_narrows(self):
+        """The strip's line is cropped, not wrapped, so a long link gets cut mid-word ("Gen5 x8 o" on an 80-column
+        terminal).  The column steps down a number at a time - the ceiling, then the generation, then nothing - so
+        whatever is left fits whole.  The widths are what this machine's Monitor gives: 110, and 78 for an 80-column
+        terminal less the shell's padding; the same card reads x8 in a x16 slot."""
+        m = three_cards()
+        for c in m["hardware"]["gpus"]:
+            c.update({"pcie_gen": 5, "pcie_gen_max": 5, "pcie_width": 8, "pcie_width_max": 16})
+
+        def strip(width):
+            return [ln for ln in draw(overview.build(m), width=width).splitlines() if ln.startswith("GPU ")]
+
+        self.assertIn("Gen5 x8 of x16", strip(110)[0])                              # room: both numbers
+        at80 = strip(80)
+        self.assertIn("Gen5 x8", at80[0])
+        self.assertNotIn("of x16", at80[0])                                         # the ceiling goes first, whole
+        self.assertNotIn("x8 o", at80[0])                                           # never mid-word
+        at76 = strip(76)
+        self.assertIn(" x8", at76[0])
+        self.assertNotIn("Gen", at76[0])                                            # then the generation
+        at70 = strip(70)
+        self.assertNotIn("x8", at70[0])
+        self.assertNotIn("Gen", at70[0])                                            # then no column: the old line
+        for width in (110, 80, 76, 70):
+            for line in strip(width):
+                self.assertLessEqual(len(line), width + 2)                          # nothing past the terminal here
+
+    def test_a_card_with_no_cap_reported_stays_one_number(self):
+        """An old server, or a driver that answers only the negotiated width: the strip and the tile say exactly what
+        they said before, with no invented cap."""
+        m = three_cards()
+        for c, width in zip(m["hardware"]["gpus"], (8, 4, 16)):
+            c.update({"pcie_gen": 5, "pcie_gen_max": 5, "pcie_width": width})
+        g = overview.build(m)["gpu"]
+        self.assertIsNone(g["pcie_width_max"])
+        text = draw(overview.build(m))
+        self.assertNotIn(" of x", text)
+        lines = [ln for ln in text.splitlines() if ln.startswith("GPU ")]
+        for want, line in zip(("Gen5 x8", "Gen5 x4", "Gen5 x16"), lines):
+            self.assertIn(want, line, want)
 
     def test_a_missing_reading_stays_missing(self):
         m = three_cards()
@@ -226,6 +341,12 @@ class FooterAndViews(unittest.TestCase):
         line = _device(row, 100)
         self.assertIn("RTX 3090", line)
         self.assertNotIn("NVIDIA", line)
+        row.update({"pcie_gen": 5, "pcie_gen_max": 5, "pcie_width": 8, "pcie_width_max": 16})    # capped to x8 in a x16 slot
+        self.assertIn("Gen5 x8 of x16", _device(row, 100))
+        narrow = _device(row, 80)                    # no room for the second number: dropped whole, not cut mid-word
+        self.assertIn("Gen5 x8", narrow)
+        self.assertNotIn("of x16", narrow)
+        self.assertLessEqual(len(narrow), 80)
 
 
 if __name__ == "__main__":

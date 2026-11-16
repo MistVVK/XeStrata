@@ -491,12 +491,28 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
             multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
   spark("sp-temp", h.gpu_temp, 90);
-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
+  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W",
+            multi ? per((g) => (g.power == null ? "–" : `${fmt(g.power)} W` +
+                                             (g.power_limit ? ` of ${fmt(g.power_limit)} W ceiling` : "")))
+                  : hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
+  // each card trains its own link: with several cards the big number is the weakest card's and the line under it
+  // names every card, because one card's "Gen5 x8" said nothing about a second card trained down to x4
+  // (the per-card words follow the big number's rule: the link the card trained, not the lower one it idles at)
+  // a card that runs narrower than it could - capped to x8 in a x16 slot, or trained down by the board - says both,
+  // because the narrow number alone reads as a link someone chose
+  const link = (g) => { const v = g.pcie_gen_max || g.pcie_gen;
+                        return v ? `Gen${v}${g.pcie_width ? ` x${g.pcie_width}` +
+                               (g.pcie_width_max > g.pcie_width ? ` of x${g.pcie_width_max}` : "") : ""}` : "–"; };
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
-  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
+  const width = hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` +
+                (hw.gpu_pcie_width_max > hw.gpu_pcie_width ? ` of x${hw.gpu_pcie_width_max}` : "") : "";
+  const rx = hw.gpu_pcie_rx_mb == null ? ""
+           : `${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s`;
+  setMetric("pcie", gen ? `Gen${gen}` : null, width,
+            multi ? `${per(link)}${rx ? ` · ${rx} total` : ""}`
+                  : rx === "" ? "" : `to GPU ${rx}` +
+                  (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);

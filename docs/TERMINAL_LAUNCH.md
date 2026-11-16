@@ -148,8 +148,13 @@ app sends them. The list keeps two columns apart. **Vendor tested** is the app v
 
 `q` asks whether to keep serving in the background or stop. Stopping unloads the model and frees graphics memory.
 
-With two or more cards the Overview shows the busiest card's load, all cards' memory, the hottest card and the total power, and a
-"Cards" strip lists up to 4 cards (`5` opens Hardware). The CPU tile shows sockets and cores.
+With two or more cards the Overview shows the busiest card's load, all cards' memory, the hottest card, the total power and the
+weakest card's PCIe link, and a "Cards" strip lists up to 4 cards with the link each one trained (`5` opens Hardware). Each card
+trains its own link, so a card in an x4 slot reads `Gen5 x4` beside a card at `Gen5 x8`. A card that runs narrower than its own
+card could go shows both numbers (`Gen5 x8 of x16`): that is what a card capped to x8 in a x16 slot, or trained down by the board,
+looks like. The Power tile says whose power the number is (`all 2 cards of 360 W`); the Hardware page gives each card its own
+ceiling (`Power 180 W of 300 W`).
+The CPU tile shows sockets and cores.
 
 **Windows console.** In the classic Windows 10 console the monitor switches that window's font to Cascadia Mono when it is installed
 and draws the full look. Otherwise it draws a solid-block look and shows one line suggesting Windows Terminal. Nothing is saved and

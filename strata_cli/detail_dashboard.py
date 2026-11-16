@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from strata_cli import nav
-from strata_cli.client import complete_slots
+from strata_cli.client import card_link, complete_slots
 from strata_cli.dashboard import (set_ascii_boxes, _rounded, _age, _current_batch_value, _current_sample,
                                   _device_role, _gib, _meter, _rate_spark, _spark,
                                   _state, _visual_pair, _visual_panel, MonitorHistory)
@@ -108,7 +108,14 @@ def _detail_lines(kind: str, row: dict, snapshot: dict, width: int,
                  f"VRAM {_gib(row.get('mem_used') if live else None)}/"
                  f"{_gib(row.get('mem_total') if live else None)} GiB",
                  f"Temp {number(row.get('temp') if live else None, 'C')}  "
-                 f"Power {number(row.get('power') if live else None, 'W')}",
+                 f"Power {number(row.get('power') if live else None, 'W')}"
+                 # the card's own ceiling (NVML's enforced limit, sysfs power1_cap); the tile adds the cards together,
+                 # so the card you selected needs its own
+                 + (f" of {number(row.get('power_limit') if live else None, 'W')}"
+                    if live and row.get("power_limit") is not None else "")
+                 # the link this card trained, not one card's link for the whole run (an x4 card was hidden behind
+                 # an x8 card's "Gen5 x8"); "" when the server reports no link for this card
+                 + (f"  Link {card_link(row)}" if card_link(row) else ""),
                  _device_stage(topology, row.get("index"), width)]
     elif kind == "slot":
         lines = _slot_detail(row if live else {**row, "tok_s": None}, width)[1:]

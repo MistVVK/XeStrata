@@ -101,6 +101,9 @@ class _Nvml:
         out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
         out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
         out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
+        # the widest the card itself can go: read beside the negotiated width, so a card capped to x8 in a x16
+        # slot, or trained down to x4 by the board, is visible as the gap instead of looking like an x8 card by choice
+        out["pcie_width_max"] = self._uint("nvmlDeviceGetMaxPcieLinkWidth")
         rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
         tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
@@ -207,7 +210,8 @@ class _Amd:
         from each hop's `max_link_speed` / `max_link_width` (the capability, so a power-saving downgrade or a Gen3
         slot cannot make it read low).  A card that is Gen4 on its own hop but sits behind a Gen3 root port really
         runs at Gen3, and that is the number a PCIe bandwidth budget needs.
-        `pcie_own_gen` keeps the card's own hop aside: the gap between the two is what a user has to see.
+        `pcie_own_gen` and `pcie_width_max` keep the card's own capability aside: the gap between the two numbers is
+        what a user has to see (a x16 card that only reaches x8).
 
         The bottleneck is only claimed when **every** hop of the path could be read; `pcie_path` reports how many
         of them were ("4/4").  A kernel or a container that hides part of /sys/devices would otherwise drop the
@@ -229,8 +233,14 @@ class _Amd:
         whole = bool(hops) and read == len(hops)
         gen = min(gens) if (whole and gens) else own_gen
         width = min(widths) if (whole and widths) else self._int(os.path.join(own, "current_link_width"))
+        # `pcie_width_max` is the card's own cap (its own hop, kept last by `_hops()`), where `pcie_width` above is
+        # the narrowest hop of the whole path: a card that runs at x8 behind a x8 bridge, or in a slot the board
+        # trained down, reads as the gap instead of looking like an x8 card by choice.  Same split as `pcie_own_gen`.
+        cap = self._int(os.path.join(own, "max_link_width")) if own else None
+        if cap is None and hops:
+            cap = self._int(os.path.join(hops[-1], "max_link_width"))
         return {"pcie_gen": gen, "pcie_gen_max": gen, "pcie_own_gen": own_gen, "pcie_width": width,
-                "pcie_path": "%d/%d" % (read, len(hops))}
+                "pcie_width_max": cap, "pcie_path": "%d/%d" % (read, len(hops))}
 
 
     def read(self):
@@ -537,8 +547,9 @@ class Telemetry:
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
-        cards, numbered as HIP numbers them, read from sysfs (#301)."""
+        PCIe traffic), mean (load), hottest (temperature) or weakest (the PCIe link, so a card trained to x4 is not
+        hidden behind an x8 card), and "gpus" has each card's own, its link and its power limit included.  `amd`: the
+        AMD backend's cards, numbered as HIP numbers them, read from sysfs (#301)."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
@@ -619,8 +630,30 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
+                # A link is not additive.  These four used to stay card 0's reading, so a card the board had trained
+                # down to x4 hid behind the other card's "Gen5 x8" while the traffic under the tile was already the
+                # two cards' total.  The tile shows the slowest generation and the narrowest width among the cards,
+                # each field on its own: the rule `_Amd.link()` already uses for the hops of one card's path, and the
+                # worst link a token has to cross when the layers sit on both cards.  Each card's own link goes in
+                # "gpus" below, which is what the Monitor and the Terminal name card by card.
+                for k in ("pcie_gen", "pcie_gen_max", "pcie_width"):
+                    v = vals(k)
+                    g[k] = min(v) if v else None
+                # "runs at x8, could do x16" is one card's gap, so the cap goes with the card that gave the width
+                # above, not with the smallest cap in the run (that can be a different card).  Each card's own pair
+                # is in "gpus" below.
+                narrow = [(r.get("pcie_width"), p) for p, (_, r) in enumerate(reads) if r.get("pcie_width") is not None]
+                if narrow:
+                    g["pcie_width_max"] = reads[min(narrow)[1]][1].get("pcie_width_max")
+                else:
+                    g["pcie_width_max"] = None
                 s["gpus"] = [{"index": i, "name": reader.name(), "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
+                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
+                              "power_limit": r.get("power_limit"),
+                              "pcie_gen": r.get("pcie_gen"), "pcie_gen_max": r.get("pcie_gen_max"),
+                              "pcie_width": r.get("pcie_width"), "pcie_width_max": r.get("pcie_width_max"),
+                              "pcie_rx_mb": r.get("pcie_rx_mb"), "pcie_tx_mb": r.get("pcie_tx_mb"),
+                              "pcie_own_gen": r.get("pcie_own_gen"), "pcie_path": r.get("pcie_path")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:
