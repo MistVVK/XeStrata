@@ -3378,6 +3378,68 @@ class ConfigReasoningEffort(unittest.TestCase):
         self.assertEqual(cfg, {"args": ["--ctx", "4096"]})
 
 
+class LoadSharedSettings(unittest.TestCase):
+    """#4933: one unknown key in `.shared-settings.json` used to clear EVERY shared setting, silently.
+
+    The strict reader stays for POST /settings, where a client can be told which key is wrong.  At start-up the file
+    is read key by key instead: the keys the server understands keep applying and each one it does not is named and
+    skipped.  A file that cannot be parsed, or is not an object, is still ignored as a whole."""
+
+    def load(self, text):
+        from serve.server import load_shared_settings
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "x.shared-settings.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        said = []
+        got = load_shared_settings(path, warn=said.append)
+        return got, said
+
+    def test_two_known_keys_are_both_kept(self):
+        got, said = self.load('{"reasoning_effort": "medium", "top_p": 0.9}')
+        self.assertEqual(got, {"reasoning_effort": "medium", "top_p": 0.9})
+        self.assertEqual(said, [])
+
+    def test_an_unknown_key_no_longer_clears_the_known_ones(self):
+        # A made-up key, and not `preserve_thinking`: #4932 teaches the server that name, so on a tree carrying both
+        # changes this example would be a KNOWN key and the test would pass without exercising anything.
+        got, said = self.load('{"reasoning_effort": "medium", "preserve_thoughts": false}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertEqual(len(said), 1)
+        self.assertIn("preserve_thoughts", said[0])
+        self.assertIn("skipped", said[0])
+
+    def test_a_known_key_with_a_bad_value_is_named_and_skipped(self):
+        got, said = self.load('{"reasoning_effort": "medium", "top_p": 5}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertIn("top_p", said[0])
+
+    def test_several_bad_keys_are_each_named(self):
+        got, said = self.load('{"reasoning_effort": "medium", "nope": 1, "top_k": 900}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertEqual(len(said), 2)
+
+    def test_an_unreadable_file_is_ignored_whole_and_says_so(self):
+        got, said = self.load('{not json')
+        self.assertEqual(got, {})
+        self.assertEqual(len(said), 1)
+        self.assertIn("ignored", said[0])
+
+    def test_a_non_object_is_ignored_whole_and_says_so(self):
+        got, said = self.load('["reasoning_effort"]')
+        self.assertEqual(got, {})
+        self.assertEqual(len(said), 1)
+        self.assertIn("ignored", said[0])
+
+    def test_a_missing_file_is_quiet(self):
+        from serve.server import load_shared_settings
+        said = []
+        self.assertEqual(load_shared_settings(os.path.join(tempfile.gettempdir(), "no-such-file-4933.json"),
+                                              warn=said.append), {})
+        self.assertEqual(said, [])              # no file is the normal case: nothing to report
+
+
 class JoinedEngineArgs(unittest.TestCase):
     """#2267: "--ple-io mmap" written as one element of the config's args reached the engine as one argument."""
 
@@ -5326,7 +5388,8 @@ class AmdTelemetry(unittest.TestCase):
 
     def test_pcie_link_is_the_narrowest_slowest_hop(self):
         """#1733: the link is the slowest/narrowest hop between the root port and the card; the bottleneck is only
-        claimed when every hop could be read (pcie_path says how many were)."""
+        claimed when every hop could be read (pcie_path says how many were).  The card's own width is kept beside it
+        (`pcie_width_max`), because a x16 card behind a x8 bridge has to read as the gap, not as an x8 card."""
         from serve import telemetry
         with tempfile.TemporaryDirectory() as d:
             hops = []
@@ -5342,10 +5405,12 @@ class AmdTelemetry(unittest.TestCase):
             a.dev = hops[-1]
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops):
                 self.assertEqual(a.link(), {"pcie_gen": 3, "pcie_gen_max": 3, "pcie_own_gen": 4, "pcie_width": 8,
+                                            "pcie_width_max": 16,       # the bridge narrows it to x8, the card could do x16
                                             "pcie_path": "3/3"})
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops[:2] + [str(Path(d) / "hidden")]):
                 got = a.link()             # an unreadable hop: fall back to the card's own negotiated link
-                self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_path"]), (4, 16, "2/3"))
+                self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_width_max"], got["pcie_path"]),
+                                 (4, 16, 16, "2/3"))
             self.assertEqual(telemetry._Amd._gen("32.0 GT/s PCIe"), 5)
             self.assertIsNone(telemetry._Amd._gen("unknown"))
             self.assertTrue(telemetry._Amd._bdf("0000:03:00.0"))
@@ -5365,6 +5430,7 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
                                             "power": 85.0, "power_limit": 300.0, "pcie_gen": None,
                                             "pcie_gen_max": None, "pcie_own_gen": None, "pcie_width": None,
+                                            "pcie_width_max": None,
                                             "pcie_path": "0/0"})    # #1733: no PCIe files in this fake tree
                 r = telemetry.gpu_reader(1, amd=True).read()
                 self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
@@ -5379,6 +5445,81 @@ class AmdTelemetry(unittest.TestCase):
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
+
+    def test_two_cards_keep_their_own_pcie_links(self):
+        """Two cards trained to different widths: each row carries its own link, the top-level fields stay card 0's (additive
+        contract), and gpu_pcie_bottleneck names the x4 card, which used to hide behind card 0's x8."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, width in (("renderD129", "8"), ("renderD128", "4")):
+                dev = Path(d) / "class/drm" / minor / "device"
+                (dev / "current_link_speed").write_text("16.0 GT/s PCIe\n")      # both cards at Gen4
+                (dev / "current_link_width").write_text(width + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(4, 8), (4, 4)])
+                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (4, 8))   # card 0's, as before
+                self.assertEqual(s["gpu_pcie_bottleneck"], {"card": 1, "gen": 4, "gen_max": 4, "width": 4, "width_max": None})
+
+    def test_the_bottleneck_is_one_real_card_never_a_mix(self):
+        """Gen3 x16 beside Gen5 x4: separate minima would make up "Gen3 x4", a link neither card has.  The bottleneck is the card
+        with the lower lane rate x width (Gen5 x4, 15.75 GB/s, against Gen3 x16, 15.76 GB/s), all its fields from that card."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, (speed, width) in (("renderD129", ("8.0 GT/s PCIe", "16")), ("renderD128", ("32.0 GT/s PCIe", "4"))):
+                dev = Path(d) / "class/drm" / minor / "device"
+                (dev / "current_link_speed").write_text(speed + "\n")
+                (dev / "current_link_width").write_text(width + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(3, 16), (5, 4)])
+                b = s["gpu_pcie_bottleneck"]
+                self.assertEqual((b["card"], b["gen"], b["width"]), (1, 5, 4))
+
+    def test_one_card_its_bottleneck_is_that_card_and_none_without_a_reading(self):
+        from serve import telemetry
+        self.assertEqual(telemetry.pcie_bottleneck([(0, {"pcie_gen": 4, "pcie_gen_max": 4, "pcie_width": 16, "pcie_width_max": 16})]),
+                         {"card": 0, "gen": 4, "gen_max": 4, "width": 16, "width_max": 16})
+        self.assertIsNone(telemetry.pcie_bottleneck([(0, {"pcie_gen": None, "pcie_width": 16}), (1, {"pcie_gen": 4, "pcie_width": None})]))
+
+    def test_a_card_with_no_link_reading_stays_missing(self):
+        """A card whose sysfs hides its link (the fake tree has no PCIe files) reports nothing: no 0, no invented
+        width; the top-level fields stay card 0's (unknown) and the bottleneck is the card that has a reading."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            dev = Path(d) / "class/drm/renderD128/device"
+            (dev / "current_link_speed").write_text("8.0 GT/s PCIe\n")
+            (dev / "current_link_width").write_text("16\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(None, None), (3, 16)])
+                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (None, None))
+                self.assertEqual(s["gpu_pcie_bottleneck"], {"card": 1, "gen": 3, "gen_max": 3, "width": 16, "width_max": None})
+
+    def test_a_card_narrower_than_it_could_be_shows_the_gap(self):
+        """A card the board trained down to x4 in a slot the card could do x16, beside a card that is x8 by nature:
+        the gap is one card's, so the bottleneck's cap comes from that same card (the smallest cap in the run would blame
+        the other card).  Each row also carries its own power ceiling, which the summary adds up - without it the Overview
+        loses "of N W limit" on a split run."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, (cur, cap) in (("renderD129", ("8", "8")), ("renderD128", ("4", "16"))):
+                dev = Path(d) / "class/drm" / minor / "device"
+                (dev / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+                (dev / "current_link_width").write_text(cur + "\n")
+                (dev / "max_link_width").write_text(cap + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_width"], c["pcie_width_max"]) for c in s["gpus"]], [(8, 8), (4, 16)])
+                self.assertEqual((s["gpu_pcie_width"], s["gpu_pcie_width_max"]), (8, 8))      # card 0's, as before
+                self.assertEqual((s["gpu_pcie_bottleneck"]["card"], s["gpu_pcie_bottleneck"]["width"],
+                                  s["gpu_pcie_bottleneck"]["width_max"]), (1, 4, 16))          # x4 that could do x16
+                self.assertEqual([c["power_limit"] for c in s["gpus"]], [300.0, 300.0])      # each card's own ceiling
+                self.assertEqual(s["gpu_power_limit"], 600.0)                                # the run's limit
 
     def test_free_vram_on_hip(self):
         from serve import telemetry

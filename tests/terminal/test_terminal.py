@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from strata_cli.cli import main
-from strata_cli.client import (ClientError, Endpoint, normalize_legacy, normalize_status_only,
+from strata_cli.client import (ClientError, Endpoint, card_link, normalize_legacy, normalize_status_only,
                                sanitize_telemetry, server_url)
 from strata_cli.render import display_width, field, render_view, safe
 from serve.server import (configure_batch_telemetry_env, parse_batch_window_sample,
@@ -513,6 +513,45 @@ class ContractTests(unittest.TestCase):
         self.assertIn("Stage/layer mapping unavailable", device)
         self.assertIn("Request request-7", slot)
         self.assertIn("not a GPU assignment", slot)
+
+    def test_each_card_keeps_its_own_pcie_link_into_the_snapshot(self):
+        """The detail page names the link of the card you selected, so a row's own link has to survive both ways in:
+        it used to be dropped, so an x4 card could only ever read as one card's number."""
+        links = ((5, 8), (5, 4), (None, None), (None, None))
+        sample = four_gpu_snapshot()
+        for row, (gen, width) in zip(sample["devices"], links):
+            row["pcie_gen"] = row["pcie_gen_max"] = gen
+            row["pcie_width"] = width
+        self.assertEqual([card_link(row) for row in sanitize_telemetry(sample)["devices"]],
+                         ["Gen5 x8", "Gen5 x4", "", ""])
+        raw = {"hardware": {"gpus": [{"index": i, "name": f"GPU-{i}", "pcie_gen": g, "pcie_gen_max": g,
+                                      "pcie_width": w} for i, (g, w) in enumerate(links)]}}
+        self.assertEqual([card_link(row) for row in normalize_legacy(raw, {})["devices"]],
+                         ["Gen5 x8", "Gen5 x4", "", ""])
+
+    def test_a_capped_card_and_its_own_power_ceiling_survive_the_snapshot(self):
+        """A card running at x8 under one at x16 needs its own pair, and the card you selected needs its own power
+        ceiling: the tile above the cards adds the two ceilings together, so a row that loses `power_limit` leaves the
+        detail page with no number to compare the card's watts against."""
+        capped = ((5, 8, 16, 180.0), (5, 4, 4, 170.0), (None, None, None, None), (None, None, None, None))
+        sample = four_gpu_snapshot()
+        for row, (gen, width, cap, limit) in zip(sample["devices"], capped):
+            row["pcie_gen"] = row["pcie_gen_max"] = gen
+            row["pcie_width"], row["pcie_width_max"], row["power_limit"] = width, cap, limit
+        rows = sanitize_telemetry(sample)["devices"]
+        self.assertEqual([card_link(r) for r in rows], ["Gen5 x8 of x16", "Gen5 x4", "", ""])
+        self.assertEqual([r["power_limit"] for r in rows], [180.0, 170.0, None, None])
+        raw = {"hardware": {"gpus": [{"index": i, "name": f"GPU-{i}", "pcie_gen": g, "pcie_width": w,
+                                      "pcie_width_max": c, "power_limit": p}
+                                     for i, (g, w, c, p) in enumerate(capped[:2])]}}
+        rows = normalize_legacy(raw, {})["devices"]
+        self.assertEqual([card_link(r) for r in rows], ["Gen5 x8 of x16", "Gen5 x4"])
+        self.assertEqual([r["power_limit"] for r in rows], [180.0, 170.0])
+        old = normalize_legacy({"hardware_static": {"gpu_count": 1, "gpu_name": "NVIDIA GeForce RTX 5060 Ti"},
+                                "hardware": {"gpu_pcie_gen": 5, "gpu_pcie_width": 8, "gpu_pcie_width_max": 16,
+                                             "gpu_power_limit": 180.0}}, {})
+        self.assertEqual(card_link(old["devices"][0]), "Gen5 x8 of x16")      # an old server: one row, both numbers
+        self.assertEqual(old["devices"][0]["power_limit"], 180.0)
 
     def test_wide_serving_scrolls_to_selected_device(self):
         s = four_gpu_snapshot()

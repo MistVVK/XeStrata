@@ -22,6 +22,7 @@ from rich.table import Table
 from rich.text import Text
 
 from strata_cli import nav
+from strata_cli.client import card_link
 
 GIB = 2 ** 30
 BLUE = "#5aa9ff"
@@ -77,7 +78,12 @@ def _cards(hw: dict, static: dict) -> list[dict]:
     raw = hw.get("gpus") if isinstance(hw.get("gpus"), list) else []
     cards = [{"index": c.get("index"), "name": c.get("name"), "util": _num(c.get("util")), "mem_used": _gib(c.get("mem_used")),
               "mem_total": _gib(c.get("mem_total")), "temp": _num(c.get("temp")), "power": _num(c.get("power")),
-              "power_limit": _num(c.get("power_limit"))} for c in raw[:16] if isinstance(c, dict)]
+              "power_limit": _num(c.get("power_limit")),
+              # each card trains its own PCIe link, and can be capped below what the card itself can do: the tile shows
+              # the weakest one, the strip names them all
+              "pcie_gen": _num(c.get("pcie_gen")), "pcie_gen_max": _num(c.get("pcie_gen_max")),
+              "pcie_width": _num(c.get("pcie_width")), "pcie_width_max": _num(c.get("pcie_width_max"))}
+             for c in raw[:16] if isinstance(c, dict)]
     return cards if len(cards) >= 2 else []
 
 
@@ -142,6 +148,7 @@ def build(metrics: dict | None) -> dict | None:
     slots, total_slots = _num(engine.get("expert_slots")), _num(engine.get("experts"))
     cache_mib = _num(engine.get("expert_cache_mib"))
     gen, genmax, width = _num(hw.get("gpu_pcie_gen")), _num(hw.get("gpu_pcie_gen_max")), _num(hw.get("gpu_pcie_width"))
+    width_cap = _num(hw.get("gpu_pcie_width_max"))     # how wide this card could go: x8 under x16 means the slot or the board capped it
     model = {
         "model": engine.get("model"), "max_context": max_ctx, "state": state, "state_raw": state_raw, "queued": int(queued),
         "progress": (done, total), "phase_text": {"Idle": "Waiting for a request", "Reading": "Reading prompt", "Generating": "Generating a reply",
@@ -156,7 +163,8 @@ def build(metrics: dict | None) -> dict | None:
                 "vram_hist": _series(history, "gpu_mem_used", GIB), "temp": _num(hw.get("gpu_temp")), "temp_hist": _series(history, "gpu_temp"),
                 "power": _num(hw.get("gpu_power")), "power_limit": _num(hw.get("gpu_power_limit")), "power_hist": _series(history, "gpu_power"),
                 "pcie_rx": _num(hw.get("gpu_pcie_rx_mb")), "pcie_hist": _series(history, "gpu_pcie_rx_mb"),
-                "pcie_gen": gen if gen is not None else genmax, "pcie_width": width, "count": _num(static.get("gpu_count"))},
+                "pcie_gen": gen if gen is not None else genmax, "pcie_width": width, "pcie_width_max": width_cap,
+                "count": _num(static.get("gpu_count"))},
         "cpu": {"load": _num(hw.get("cpu_pct") if hw.get("cpu_pct") is not None else hw.get("cpu")), "hist": _series(history, "cpu"),
                 "cores": _num(static.get("cores")), "threads": _num(static.get("threads")), "sockets": _num(static.get("sockets")),
                 "numa": _num(static.get("numa_nodes"))},
@@ -181,6 +189,14 @@ def build(metrics: dict | None) -> dict | None:
         g["power"] = _total([c["power"] for c in cards])
         g["power_limit"] = _total([c["power_limit"] for c in cards])
         g["count"] = float(len(cards))
+        # A link is not a total.  The tile shows the link of the ONE card whose link carries the least (the server's own rule,
+        # serve/telemetry.py pcie_bottleneck: lane rate x width, every field from that card, never a link made of two cards' numbers;
+        # a card with no reading never wins); the Cards strip under it names every card's own.
+        from serve.telemetry import pcie_bottleneck
+        slow = pcie_bottleneck([(c["index"], c) for c in cards])
+        if slow is not None:
+            g["pcie_gen"] = slow["gen"] if slow["gen"] is not None else slow["gen_max"]
+            g["pcie_width"], g["pcie_width_max"] = slow["width"], slow["width_max"]
     return model
 
 
@@ -292,21 +308,36 @@ def _tile(title: str, big: str, sub: str, series: str, width: int, *, accent: st
                  border_style="dim")
 
 
-def _cards_strip(cards: list[dict], glyphs: str, accent: str, ascii_mode: bool) -> Text:
-    """One line per card (up to 4): a small load bar, load %, memory, temperature and power; "+ N more cards" beyond that."""
+def _cards_strip(cards: list[dict], glyphs: str, accent: str, ascii_mode: bool, width: int = 110) -> Text:
+    """One line per card (up to 4): a small load bar, load %, memory, temperature, power and that card's own PCIe link
+    (the server reports it per card; the tile above shows only the weakest); "+ N more cards" beyond that."""
     t = Text(no_wrap=True, overflow="crop")
     t.append("Cards" + chr(10), style=f"bold {accent}")
     shown = cards[:4]
     names = [short_gpu(c.get("name")) for c in shown]
     pad = min(16, max(len(n) for n in names))
-    for c, name in zip(shown, names):
-        util = c["util"]
-        used, total = c["mem_used"], c["mem_total"]
-        t.append(f"GPU {c['index'] if c['index'] is not None else '?'}  {name[:pad]:<{pad}}  ")
-        t.append_text(bar((util / 100.0) if util is not None else None, 10, glyphs, accent))
+    heads, tails = [], []
+    for c, name in zip(shown, names):                          # the line's two text runs, the bar goes between them
+        util, used, total = c["util"], c["mem_used"], c["mem_total"]
+        heads.append(f"GPU {c['index'] if c['index'] is not None else '?'}  {name[:pad]:<{pad}}  ")
         mem = f"{fmt(used, 1)} / {fmt(total, 0)} GB" if used is not None and total is not None else "-- GB"
         temp = f"{fmt(c['temp'])} {'C' if ascii_mode else '°C'}"
-        t.append(f"  {fmt(util):>3} %   {mem:<14}  {temp:>6}   {fmt(c['power']):>4} W" + chr(10))
+        tails.append(f"  {fmt(util):>3} %   {mem:<14}  {temp:>6}   {fmt(c['power']):>4} W")
+    links = [card_link(c) for c in shown]          # "" for a card whose link the server does not report
+    col = max((len(x) for x in links), default=0)  # no column at all when no server reports one: the line stays as it was
+    # the strip's line is cropped, never wrapped, so a link too long for the terminal gets cut mid-word ("Gen5 x8 o"):
+    # the column steps down a number at a time - the ceiling, then the generation, then nothing - so whatever is left
+    # fits whole.  Read on this machine at 110, at 78 (an 80-column terminal less the shell's padding) and narrower.
+    room = width - max(len(h) + 10 + len(x) for h, x in zip(heads, tails)) - 2              # 10: the load bar
+    for form in ({"gap": False}, {"gap": False, "show_gen": False}, None):
+        if not col or col <= room:
+            break
+        links = [card_link(c, **form) if form is not None else "" for c in shown]
+        col = max((len(x) for x in links), default=0)
+    for c, name, head, tail, link in zip(shown, names, heads, tails, links):
+        t.append(head)
+        t.append_text(bar((c["util"] / 100.0) if c["util"] is not None else None, 10, glyphs, accent))
+        t.append(tail + (f"  {link:>{col}}" if col else "") + chr(10))
     if len(cards) > 4:
         t.append(f"+ {len(cards) - 4} more cards: press 5" + chr(10), style="dim")
     return t
@@ -393,14 +424,27 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     c, d = model["cpu"], model["disk"]
     gen = f"Gen{int(g['pcie_gen'])}" if g["pcie_gen"] else "PCIe"
     link = f"{gen} x{int(g['pcie_width'])}" if g["pcie_width"] else gen
+    # a card that runs narrower than it could - capped to x8 in a x16 slot, or trained down by the board - shows both
+    # numbers, because the narrow one alone reads as a link someone chose; with several cards it is the pair of the card
+    # with the slowest link (the Cards strip names each card's own)
+    if g["pcie_width"] and g.get("pcie_width_max") and g["pcie_width_max"] > g["pcie_width"]:
+        link += f" of x{int(g['pcie_width_max'])}"
     cpu_sub = (f"{int(c['sockets'])} CPUs {dot} {int(c['cores'])} cores" if c.get("sockets") and c["sockets"] > 1 and c["cores"] else
                f"{int(c['cores'])} cores {dot} {int(c['threads'])} threads" if c["cores"] and c["threads"] else
                f"{int(c['threads'])} threads" if c["threads"] else "")
+    # the Power tile is a sum over the cards, and so is its ceiling, so with two or more cards the tile says whose
+    # power it is, like every other tile says which card its number comes from: a bare "15 W" reads as one card's.
+    # A narrow terminal has no room for the label and the ceiling together; the label wins and the tile stays whole
+    # (the box crops, so a too-long line would lose its end), and each card's own ceiling is on the Hardware page.
+    alone = f"of {fmt(g['power_limit'])} W limit" if g["power_limit"] else ""      # one card: exactly as before
+    together = f"{ncards} cards {dot} limit {fmt(g['power_limit'])} W" if g["power_limit"] else f"{ncards} cards"
+    power_sub = alone if not ncards else (together if len(together) <= inner else f"{ncards} cards")
     tiles2 = [
-        _tile("Power", f"{fmt(g['power'])} W", f"of {fmt(g['power_limit'])} W limit" if g["power_limit"] else "", spark(g["power_hist"], inner, glyphs, lo=0),
+        _tile("Power", f"{fmt(g['power'])} W", power_sub, spark(g["power_hist"], inner, glyphs, lo=0),
               tile_w, accent=accent, box_style=box_style),
-        _tile("PCIe", link, f"to GPU {fmt(g['pcie_rx'])} MB/s" if g["pcie_rx"] is not None else "to GPU --", spark(g["pcie_hist"], inner, glyphs, lo=0), tile_w,
-              accent=accent, box_style=box_style),
+        _tile("PCIe", link, f"slowest of {ncards} cards" if ncards else
+              (f"to GPU {fmt(g['pcie_rx'])} MB/s" if g["pcie_rx"] is not None else "to GPU --"),
+              spark(g["pcie_hist"], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style),
         _tile("CPU", f"{fmt(c['load'])} %", cpu_sub, spark(c["hist"], inner, glyphs, lo=0, hi=100), tile_w, accent=accent, box_style=box_style),
         _tile("Disk read", f"{fmt(d['read'], 1)} MB/s", f"write {fmt(d['write'], 1)} MB/s" if d["write"] is not None else "write --",
               spark(d["hist"], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style),
@@ -455,6 +499,6 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     hint = Text(f"{nav.keys(connect)} views" + "   / filter   Space freeze   r refresh   t theme   b open in browser   ? help   q quit", style="dim")
     parts: list[Any] = [head, tabs, rule, st, state_bar, Text(""), row(tiles1), row(tiles2)]
     if ncards:
-        parts += [Text(""), _cards_strip(cards, glyphs, accent, ascii_mode)]
+        parts += [Text(""), _cards_strip(cards, glyphs, accent, ascii_mode, width)]
     parts += [bottom, Text(""), hint]
     return Group(*parts)

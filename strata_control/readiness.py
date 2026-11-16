@@ -52,6 +52,18 @@ def _credential(source_bytes: bytes) -> str | None:
     return keys[0] if keys else None
 
 
+def _telemetry_credential(cfg: dict, key: str | None) -> str | None:
+    """The key for /v1/telemetry: the inference key, which the server accepts there too, else the read-only telemetry
+    key the server takes from the same places (STRATA_TELEMETRY_KEY, then the config's telemetry_read_key).  Without it
+    a server that has a telemetry key and no inference key answers the probe 401."""
+    if key is not None:
+        return key
+    from serve.server import api_key_of, key_list
+
+    keys = key_list(api_key_of(os.environ.get("STRATA_TELEMETRY_KEY") or cfg.get("telemetry_read_key", "")))
+    return keys[0] if keys else None
+
+
 def _request(host: str, port: int, method: str, path: str, key: str | None,
              timeout: float, body: dict | None = None) -> dict:
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
@@ -93,12 +105,13 @@ def verify(ready: dict, source_bytes: bytes, *, expected_host: str,
     try:
         cfg = json.loads(source_bytes.decode("utf-8-sig"))
         key = _credential(source_bytes)
+        telemetry_key = _telemetry_credential(cfg, key) if isinstance(cfg, dict) else key
     except (UnicodeError, ValueError, TypeError):
         raise ReadinessError("probe_credential_invalid") from None
     if not isinstance(cfg, dict) or not isinstance(ready.get("model_id"), str) or \
             (cfg.get("model_name") is not None and ready["model_id"] != cfg["model_name"]):
         raise ReadinessError("probe_model_mismatch")
-    telemetry = _request(host, port, "GET", "/v1/telemetry", key,
+    telemetry = _request(host, port, "GET", "/v1/telemetry", telemetry_key,
                          max(0.1, deadline - time.monotonic()))
     instance = telemetry.get("instance")
     model = telemetry.get("model")

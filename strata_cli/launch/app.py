@@ -53,6 +53,8 @@ class Ctx:
     engine_flags: list[str] | None = None
     _adv: list | None = None
     _help: str | None = None
+    _help_exe: str | None = None             # the engine whose --help _help is: read once per engine, not again on every edit (#5940)
+    _cmd: tuple | None = None                # (the choices and base config it was worked out for, the engine command): see command_text
 
     # ---- names and warnings
     def default_name(self) -> str:
@@ -148,7 +150,12 @@ class Ctx:
             except Exception:                                # noqa: BLE001
                 pass
         exe = self.engine_exe()
-        text = P.engine_help_text(exe) if exe else None
+        if exe and exe == self._help_exe:
+            text = self._help
+        else:
+            text = P.engine_help_text(exe) if exe else None
+            if text:
+                self._help_exe, self._help = exe, text
         if exe and text:
             self.engine_flags = sorted({p.name for p in P.parse_help(text)})
             self.engine_note = ""
@@ -166,12 +173,32 @@ class Ctx:
         return self._adv
 
     def command_text(self) -> str:
+        """The engine command these choices run. Worked out once per set of choices and base config: it asks for the cards, the engine's
+        backend and the GPU's free memory (child processes such as nvidia-smi), and the Advanced step paints it on every cursor move (#5940)."""
         s = self.settings
-        name = "launch-" + S.slug(s.name or self.default_name())
         cfg = self.base_config()
-        line = f"strata runtime start --profile {name}"
         if cfg is None:
-            return line + "   (the engine command is shown once the model is installed)"
+            return self._runtime_line() + "   (the engine command is shown once the model is installed)"
+        try:
+            import dataclasses
+            import json
+            key = json.dumps([dataclasses.asdict(s), cfg], sort_keys=True, default=str)
+        except Exception:                                    # noqa: BLE001 - not cacheable: work it out every time, as before
+            key = None
+        if key is not None and self._cmd is not None and self._cmd[0] == key:
+            command = self._cmd[1]
+        else:
+            command = self._engine_command(cfg)
+            if key is not None:
+                self._cmd = (key, command)
+        return command if command is not None else self._runtime_line()
+
+    def _runtime_line(self) -> str:
+        s = self.settings
+        return f"strata runtime start --profile {'launch-' + S.slug(s.name or self.default_name())}"
+
+    def _engine_command(self, cfg: dict) -> str | None:
+        s = self.settings
         try:
             from strata_control import tune_knobs
             from strata_cli.launch.runner import apply_choices, cards_for_launch, derive_config
@@ -186,7 +213,7 @@ class Ctx:
             argv = ["***" if (i and argv[i - 1] in ("--api-key",)) else a for i, a in enumerate(argv)]
             return f"{Path(str(d.get('exe', 'engine'))).name} {' '.join(str(a) for a in argv)}"
         except Exception:                                    # noqa: BLE001
-            return line
+            return None
 
 
 class LaunchApp(App):
@@ -421,7 +448,8 @@ def run_monitor(info: dict, *, keep_default: bool = True, color: str = "auto") -
     """Open the monitor for a running launch. q asks whether to keep serving or stop."""
     from strata_cli.client import Endpoint
     from strata_cli.launch.monitor_ext import LaunchMonitor
-    local = next((u for u in info.get("urls", []) if "127.0.0.1" in u), None) or f"http://127.0.0.1:{info.get('port', S.DEFAULT_PORT)}"
+    local = next((u for u in info.get("urls", []) if "127.0.0.1" in u), None) or \
+        (info.get("urls") or [None])[0] or f"http://127.0.0.1:{info.get('port', S.DEFAULT_PORT)}"    # (One address only: its own URL, #5917)
     endpoint = Endpoint(local, info.get("key"), 3.0, "")
     app = LaunchMonitor(endpoint, None, info={**info, "daily_check": True}, color=color)     # (the quiet once-a-day check for a newer engine: this monitor only)
     app.run()

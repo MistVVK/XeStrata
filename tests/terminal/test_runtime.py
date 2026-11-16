@@ -37,9 +37,10 @@ class RuntimeTests(unittest.TestCase):
                                        "STRATA_RUNTIME_DIR": str(self.root / "runtime")})
         env.start()
         self.addCleanup(env.stop)
-        previous_key = os.environ.pop("STRATA_API_KEY", None)
-        self.addCleanup(lambda: os.environ.__setitem__("STRATA_API_KEY", previous_key)
-                        if previous_key is not None else os.environ.pop("STRATA_API_KEY", None))
+        for name in ("STRATA_API_KEY", "STRATA_TELEMETRY_KEY"):   # a developer's own keys stay out of the tests
+            previous = os.environ.pop(name, None)
+            self.addCleanup(lambda name=name, previous=previous: os.environ.__setitem__(name, previous)
+                            if previous is not None else os.environ.pop(name, None))
         engine = self.root / "engine.py"
         engine.write_text("#!" + sys.executable + "\nimport sys\nfrom pathlib import Path\n"
                           "if '--batch' in sys.argv: print('INFO batch_slots=2', flush=True)\n"
@@ -887,6 +888,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.status("local")["model_state"], "ready")
         self.assertTrue(runtime.verify("local", timeout=10)["generation_ready"])
 
+    def test_a_telemetry_key_in_the_environment_does_not_fail_readiness(self):
+        # STRATA_TELEMETRY_KEY (the monitor's read key, set once for `strata monitor`) makes the server want a key on
+        # /v1/telemetry; a profile with no API key must still pass the readiness probe, which reads that endpoint
+        with mock.patch.dict(os.environ, {"STRATA_TELEMETRY_KEY": "stk-test-read-key"}):
+            result = runtime.start("local", wait=10, shutdown_timeout=2)
+            self.assertTrue(result["ok"], result.get("error"))
+            self.assertTrue(result["api_identity_verified"])
+            self.assertTrue(result["generation_ready"])
+            self.assertTrue(runtime.verify("local", timeout=10)["generation_ready"])
+
     def test_failed_generation_probe_does_not_report_ready(self):
         engine = self.root / "engine.py"
         engine.write_text(engine.read_text().replace("        print('T 97', flush=True)",
@@ -1246,6 +1257,13 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(profiles.ProfileError, "unverified"):
             runtime._recover_stale("local", wait=0)
         self.assertTrue(state_path.exists())
+
+    def test_a_no_child_marker_that_cannot_be_written_never_publishes_host_state(self):         # #4250 (zapabob's third case)
+        host = runtime.Host("local", shutdown_timeout=2)
+        with mock.patch.object(host, "_mark_child", side_effect=OSError("marker unavailable")):
+            with self.assertRaisesRegex(OSError, "marker unavailable"):
+                host.serve()
+        self.assertFalse(host.state_path.exists())
 
     # ---- owner transport, attach and identity (POSIX socket and Windows loopback alike)
 
