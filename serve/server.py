@@ -924,9 +924,11 @@ EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default -
 
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
-# finished, #267): the process may stay alive and even print DONE, but it must not take another request.
+# finished, #267; a GPU wait on the host ran out and the window was discarded, #5160 - the Intel engine ends after it):
+# the process may stay alive and even print DONE, but it must not take another request.
 FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
-                  "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
+                  "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished",
+                  "ERR verify: the GPU stopped waiting")
 
 
 def parse_engine_stage_line(line: str) -> list[dict] | None:
