@@ -4833,8 +4833,8 @@ class Service:
                     print(f"[xestrata] images: the expert cache cannot make room ({e}) and only {free} MiB of VRAM is "
                           f"free (the image encoder needs about {need}): this picture is read on the CPU", flush=True)
                 else:
-                    print(f"[xestrata] images: the expert cache did not make room for the image encoder ({e}); starting "
-                          "it anyway", flush=True)
+                    print(f"[xestrata] images: the expert cache did not make room for the image encoder ({e}); "
+                          "starting it anyway", flush=True)
         if self.vision_held:
             time.sleep(0.2)          # the driver's free-VRAM counter shows the cache's release a moment later
         free0, t0 = self.free_vram_mib(), time.time()
