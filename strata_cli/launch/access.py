@@ -59,6 +59,21 @@ def url_host(address: str) -> str:
     return f"[{address}]" if ":" in address and not address.startswith("[") else address
 
 
+def local_url(s: LaunchSettings) -> str:
+    """Where a program on this computer reads the launched server: 127.0.0.1, or its one address when it listens there only (#5917)."""
+    if s.access == "address" and s.listen:
+        return f"http://{url_host(s.listen)}:{s.port}"
+    return f"http://127.0.0.1:{s.port}"
+
+
+def host_url(host: str | None, port) -> str:
+    """The same for a saved profile's host: an address of its own when the server is bound to one, else 127.0.0.1."""
+    h = str(host or "").strip()
+    if not h or h in ("0.0.0.0", "::", "127.0.0.1", "localhost", "::1"):
+        return f"http://127.0.0.1:{port}"
+    return f"http://{url_host(h)}:{port}"
+
+
 def listen_problem(address: str | None) -> str | None:
     """None when `address` is one of this computer's addresses now; else the plain line that stops the launch (#5917: never a silent
     fallback to every address)."""

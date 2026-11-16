@@ -72,6 +72,16 @@ class MonitorReachesTheAddress(unittest.TestCase):
             self.assertEqual(client.server_url("http://127.0.0.1:8080"), "http://127.0.0.1:8080")
 
 
+class LocalReaders(unittest.TestCase):
+    def test_programs_on_this_computer_read_the_one_address(self):
+        s = S.LaunchSettings(access="address", listen="192.168.2.100", port=8081)
+        self.assertEqual(acc.local_url(s), "http://192.168.2.100:8081")
+        self.assertEqual(acc.local_url(s.copy(access="lan")), "http://127.0.0.1:8081")
+        self.assertEqual(acc.host_url("192.168.2.100", 8081), "http://192.168.2.100:8081")
+        self.assertEqual(acc.host_url("0.0.0.0", 8081), "http://127.0.0.1:8081")
+        self.assertEqual(acc.host_url("2001:db8::5", 8081), "http://[2001:db8::5]:8081")
+
+
 class ListenFlag(unittest.TestCase):
     def parse(self, *argv):
         from strata_cli.launch import cmd

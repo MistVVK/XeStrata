@@ -631,6 +631,7 @@ def _tui(run, *args, **kw) -> int:
 
 def running_launches() -> list[dict]:
     """Launch profiles whose server is up now: [{name, profile, url, state}]."""
+    from strata_cli.launch import access
     from strata_control import profiles, runtime
     out = []
     try:
@@ -654,7 +655,7 @@ def running_launches() -> list[dict]:
             prof, ov = {}, {}
         port = ov.get("port", S.DEFAULT_PORT)
         out.append({"name": p["id"][7:], "profile": p["id"], "state": st.get("state"), "port": port,
-                    "url": f"http://127.0.0.1:{port}", "host": ov.get("host", "127.0.0.1"), "config": prof.get("source_config")})
+                    "url": access.host_url(ov.get("host"), port), "host": ov.get("host", "127.0.0.1"), "config": prof.get("source_config")})
     return out
 
 

@@ -448,7 +448,8 @@ def run_monitor(info: dict, *, keep_default: bool = True, color: str = "auto") -
     """Open the monitor for a running launch. q asks whether to keep serving or stop."""
     from strata_cli.client import Endpoint
     from strata_cli.launch.monitor_ext import LaunchMonitor
-    local = next((u for u in info.get("urls", []) if "127.0.0.1" in u), None) or f"http://127.0.0.1:{info.get('port', S.DEFAULT_PORT)}"
+    local = next((u for u in info.get("urls", []) if "127.0.0.1" in u), None) or \
+        (info.get("urls") or [None])[0] or f"http://127.0.0.1:{info.get('port', S.DEFAULT_PORT)}"    # (One address only: its own URL, #5917)
     endpoint = Endpoint(local, info.get("key"), 3.0, "")
     app = LaunchMonitor(endpoint, None, info={**info, "daily_check": True}, color=color)     # (the quiet once-a-day check for a newer engine: this monitor only)
     app.run()

@@ -2248,7 +2248,7 @@ class Runner:
         import socket
         port = int(self.s.port)
         busy = False
-        for host in ("127.0.0.1",):
+        for host in (("127.0.0.1",) if not (self.s.access == "address" and self.s.listen) else (self.s.listen,)):
             try:
                 with socket.create_connection((host, port), timeout=1.0):
                     busy = True
@@ -2276,7 +2276,7 @@ class Runner:
         try:
             import urllib.request
             headers = {"Authorization": f"Bearer {self.s.api_key}"} if self.s.api_key else {}
-            with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{int(self.s.port)}/metrics", headers=headers), timeout=4) as resp:
+            with urllib.request.urlopen(urllib.request.Request(acc.local_url(self.s) + "/metrics", headers=headers), timeout=4) as resp:
                 info = (json.loads(resp.read().decode("utf-8", "replace")).get("engine") or {})
         except Exception:                                    # noqa: BLE001 - the line is a convenience
             return
