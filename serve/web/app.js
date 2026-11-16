@@ -73,10 +73,13 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 });
 
 let tab = "chat";
+const bootHash = location.hash;                       // the tab asked for in the address, kept for a tab that shows later (Experts)
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "monitor", "experts", "about"].includes(name) ? name : "chat";
+  if (tab === "experts" && $("tab-btn-experts").hidden) tab = "chat";          // only when the model saves its expert profile (#5723)
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "experts", "about"]) $(`view-${v}`).hidden = v !== tab;
+  if (tab === "experts") StrataExperts.start($("view-experts")); else StrataExperts.stop();
   if (tab === "images") $("img-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
@@ -120,6 +123,8 @@ async function loadHealth() {
     renderEmptyChat();
     $("tab-btn-images").hidden = !health.image_generation;
     if (location.hash === "#images" && health.image_generation) showTab("images");
+    StrataExperts.init({headers, timeStr});
+    StrataExperts.probe().then((on) => { $("tab-btn-experts").hidden = !on; if (on && bootHash === "#experts" && tab === "chat") showTab("experts"); fitHeader(); });
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }

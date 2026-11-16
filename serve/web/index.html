@@ -27,6 +27,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-experts" aria-controls="view-experts" aria-selected="false" data-tab="experts" hidden>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-experts"/></svg><span>Experts</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span data-i18n="tab.about">About</span></button>
   </nav>
@@ -193,6 +195,20 @@
     </div>
   </section>
 
+  <!-- ============================ Experts (#5723; English only, like Monitor) ============================ -->
+  <section class="view view--experts" id="view-experts" role="tabpanel" aria-labelledby="tab-btn-experts" hidden>
+    <div class="experts">
+      <div class="st-card experts-card">
+        <span class="card-title">Experts</span>
+        <p class="muted small" id="experts-saved"></p>
+        <p class="small" id="experts-error"></p>
+        <div class="experts-grid-wrap"><canvas id="experts-grid" hidden></canvas></div>
+        <p class="muted small">Darker means the model used that expert more.</p>
+        <p class="small experts-tip" id="experts-tip" aria-live="polite"></p>
+      </div>
+    </div>
+  </section>
+
   <!-- ============================ About ============================ -->
   <section class="view view--about" id="view-about" role="tabpanel" aria-labelledby="tab-btn-about" hidden>
     <div class="about">
@@ -319,6 +335,7 @@
 <script src="web/history.js"></script>
 <script src="web/chatstore.js"></script>
 <script src="web/ime.js"></script>
+<script src="web/experts.js"></script>
 <script src="web/chats-ui.js"></script>
 <script src="web/app.js"></script>
 </body>
