@@ -796,6 +796,10 @@ template <> struct W8<T_IQ1_M> {
         b = iq1m_w4(row, k + 16);
     }
 };
+// (mm_gu3's per-element branch, the layout without COOP_K4, reads four values at k: the same decoder)
+template <> struct W4<T_IQ1_M> {
+    static inline half4 run(device const uchar* row, int k, threadgroup const uint* tab) { (void) tab; return iq1m_w4(row, k); }
+};
 
 // IQ1_S (Unsloth's UD-IQ1_S / UD-IQ1_M experts), ggml's dequantize_row_iq1_s: f16 d, qs[32], qh[8] u16; a 32-value sub-block has
 // one scale dl = d (2 s + 1) (qh bits 12-14), a +-0.125 delta (qh bit 15) and four 8-value groups whose grid index is
@@ -1096,6 +1100,7 @@ kernel void mm_down3(device const uchar* W [[buffer(0)]], device const half* HS 
     MMDN3(F, 16, 32, 16, 2) MMDN3(F, 32, 32, 32, 2) MMDN3(F, 16, 64, 32, 1) MMDN3(F, 16, 64, 32, 4)     MMDN3(F, 16, 64, 16, 2) MMDN3(F, 16, 32, 16, 4) MMDN3(F, 16, 64, 32, 5) MMDN3(F, 16, 64, 16, 4)
 MM3_GU(T_Q4_K) MM3_GU(T_Q5_K) MM3_GU(T_Q6_K) MM3_GU(T_Q8_0) MM3_GU(T_IQ4_XS) MM3_GU(T_Q2_0) MM3_GU(T_IQ3_XXS) MM3_GU(T_IQ2_XXS) MM3_GU(T_IQ2_XS) MM3_GU(T_IQ2_S) MM3_GU(T_IQ3_S)
 MM3_GU(T_TQP5) MM3_GU(T_TQP6) MM3_GU(T_TQP7)   // the pair trellis on the register-operand chain (COOP_K4)
+MM3_GU(T_IQ1_M)   // the GSQ IQ2_XS pack's IQ1_M expert gate/up on the register-operand chain (W8<T_IQ1_M> above; #4886 added mm_gu and mm_gu2 only)
 MM3_DN(T_Q2_0) MM3_DN(T_IQ4_NL) MM3_DN(T_Q5_1) MM3_DN(T_Q5_0) MM3_DN(T_Q8_0)
 #ifdef STRATA_KQ_DOWN
 MM3_DN(T_Q4_K) MM3_DN(T_Q5_K) MM3_DN(T_Q6_K) MM3_DN(T_Q3_K) MM3_DN(T_IQ4_XS) MM3_DN(T_IQ3_S)
