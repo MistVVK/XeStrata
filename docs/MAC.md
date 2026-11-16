@@ -210,6 +210,9 @@ from each other: top-1 agreement 95.4% against 95.8%, mean KL 0.0207 against 0.0
 
 ## Limits (this version)
 
+The first request after a model loads also waits once while the engine builds its prompt kernels. On one M2 Ultra (a user's report,
+#5369) the first word came after about 20 seconds, 9.2 s of it for the kernels; later requests started in under a second.
+
 - **Images (vision):** on by default. The app and the Terminal use the `strata-vision` that sits beside `strata` in the engine
   package; `./setup.sh` builds it and asks "Should the model also read images?" (default yes). With `--gpu` it reads on the Mac's
   GPU (ggml's Metal backend), without it on the CPU. A Mac always gets the GPU reader, whatever its memory. The footprint is about
