@@ -12250,6 +12250,7 @@ def _main() -> int:
         print(f"[xestrata] debug chat log on: every chat request's prompt, tool rounds, answer and pictures, and the "
               f"web page's chats, are written to {svc.debug_log.folder} (at most {mib or 1024:g} MiB)" +
               ("" if svc.api_key else "; set an API key if others can reach this server"), flush=True)
+        svc.debug_log.pack_soon()                       # the days before today's and the idle chats, with xz
     searcher = None
     try:                                                # web search: the engine and its address (search.py)
         searcher = runconfig.check("search_engine", runconfig.effective(cfg, user_settings, "search_engine"),
