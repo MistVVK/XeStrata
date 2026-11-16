@@ -2940,9 +2940,17 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     struct Fault { long long every = 0; float bias = 0.0f; };
     static const Fault fault = [] {
         Fault f;
-        if (const char* v = strata::env_get("FORCE_FAULT");
-            v != nullptr && std::sscanf(v, "%lld:%f", &f.every, &f.bias) != 2)
-            f.every = 0;
+        if (const char* v = strata::env_get("FORCE_FAULT"); v != nullptr) {
+            char* end = nullptr;
+            const long long e = std::strtol(v, &end, 10);
+            bool ok = false;
+            if (end != v && *end == ':') {
+                char* bend = nullptr;
+                const float b = std::strtof(end + 1, &bend);
+                if (bend != end + 1) { f.bias = b; ok = true; }
+            }
+            f.every = ok ? e : 0;
+        }
         if (f.every < 0) f.every = 0;
         return f;
     }();

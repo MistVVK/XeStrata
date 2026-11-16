@@ -150,7 +150,7 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
+                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported((int) tensor.type) &&
                     tensor.shape.size() == 2)
                     out.insert(tensor.name);
         }
