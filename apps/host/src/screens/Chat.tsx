@@ -45,7 +45,7 @@ import { Markdown } from '../components/Markdown';
 import { Btn, Icon, IconBtn, ErrorNotice, type IconName } from '../components/ui';
 import { composerCap, scrollBehavior } from '../lib/responsive';
 import { relTime, cx, duration, tokens, tps } from '../lib/format';
-import { addQuote, clearQuotes, removeQuote, createSubagentExample, parkMessage, takeParked, pushToast, setPreviewTabClosed, branchFrom, continueLast, markRead, retryLast, selectSession, rewindTo, sendMessage, stopStreaming, useStore, } from '../lib/store';
+import { addQuote, clearQuotes, removeQuote, createSubagentExample, parkMessage, takeParked, pushToast, setPreviewTabClosed, setPreviewPanelClosed, branchFrom, continueLast, markRead, retryLast, selectSession, rewindTo, sendMessage, stopStreaming, useStore, } from '../lib/store';
 import { CopyBtn, CopyMenuItem, MenuCloseContext } from '../components/CopyBtn';
 import { KEYS_UP, PILL_DISTANCE, distanceFromBottom, followAfterScroll, wheelLeavesBottom } from '../lib/follow-scroll';
 import { getSlashCommands } from '../lib/commands';
@@ -225,6 +225,8 @@ export function ChatScreen() {
             requestAnimationFrame(() => textarea.current?.focus());
         }
     }
+    /** #5548: the panel was closed: the chat stops remembering an open preview, so the next start does not open it again. */
+    function closePreviewPanel() { setPreviewPanelClosed(session?.id); }
     function selectPreview(id: string) {
         endPreviewDeferral();
         setSelectedPreview(id);
@@ -484,7 +486,7 @@ export function ChatScreen() {
     function onComposerKey(_e: React.KeyboardEvent) { }
     if (!session) {
         return (<>
-        <ChatToolbar previewWidth={paneWidth} extraTabs={extraTabs} session={session} items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); }} inline={inlinePreview} expanded={expanded} onExpand={() => setExpanded(v => !v)}/>
+        <ChatToolbar previewWidth={paneWidth} extraTabs={extraTabs} session={session} items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); closePreviewPanel(); }} inline={inlinePreview} expanded={expanded} onExpand={() => setExpanded(v => !v)}/>
         <div className="chatsplit" style={splitStyle} data-timeskip={!!selectedRun || undefined} ref={splitRef} data-preview={!!selectedPreview && inlinePreview || undefined} data-expanded={expanded && !!selectedPreview && inlinePreview || undefined}>
          <DropZone className="chatcol">
           <div className="main__body chat" ref={scroller}>
@@ -496,14 +498,14 @@ export function ChatScreen() {
           </div>
           <Composer draft={draft} setDraft={updateDraft} loaded={!!loaded} streaming={streaming} onSubmit={submit} onKey={onComposerKey} session={session} onPreview={openPreview} textareaRef={textarea}/>
          </DropZone>
-        <ArtifactPanel items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => setSelectedPreview(null)} inline={inlinePreview}/>
+        <ArtifactPanel items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); closePreviewPanel(); }} inline={inlinePreview}/>
          {tr(resizeHandle)}
         </div>
       </>);
     }
     return (<>
       {tr(selection && session ? <button type="button" className="quote-selection" style={{ left: selection.x, top: selection.y }} onMouseDown={e => e.preventDefault()} onClick={() => { addQuote(session.id, selection.text, selection.messageId, selection.role); window.getSelection()?.removeAllRanges(); setSelection(null); }}>{tr("Quote")}</button> : null)}
-      <ChatToolbar previewWidth={paneWidth} extraTabs={extraTabs} session={session} items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); }} inline={inlinePreview} expanded={expanded} onExpand={() => setExpanded(v => !v)}/>
+      <ChatToolbar previewWidth={paneWidth} extraTabs={extraTabs} session={session} items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); closePreviewPanel(); }} inline={inlinePreview} expanded={expanded} onExpand={() => setExpanded(v => !v)}/>
 
       {/* The composer belongs to the conversation column, not the window: with
                 the context panel open, a full-width composer sat underneath the panel
@@ -541,9 +543,9 @@ export function ChatScreen() {
                 <Icon name="chevron" size={18}/></button>) : null)}</div>
           <Composer draft={draft} setDraft={updateDraft} loaded={!!loaded} streaming={streaming} onSubmit={submit} onKey={onComposerKey} session={session} onPreview={openPreview} textareaRef={textarea}/>
         </DropZone>
-        {tr(!setupVisible && selectedRun && session ? <Suspense fallback={null}><TimeSkipPanel key={selectedRun.id} run={selectedRun} sessionId={session.id} inline={inlinePreview} expanded={expanded} onCompare={setExpanded} onPreview={openPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); }}/></Suspense> : null)}
+        {tr(!setupVisible && selectedRun && session ? <Suspense fallback={null}><TimeSkipPanel key={selectedRun.id} run={selectedRun} sessionId={session.id} inline={inlinePreview} expanded={expanded} onCompare={setExpanded} onPreview={openPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); closePreviewPanel(); }}/></Suspense> : null)}
         {tr(!setupVisible && planShown ? <PlanPanel chatId={session?.id}/> : null)}
-        <ArtifactPanel items={previews} onCloseTab={closeTab} selected={setupVisible || planShown ? null : selectedPreview} onSelect={selectPreview} onClose={() => setSelectedPreview(null)} inline={inlinePreview}/>
+        <ArtifactPanel items={previews} onCloseTab={closeTab} selected={setupVisible || planShown ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); closePreviewPanel(); }} inline={inlinePreview}/>
         {tr(resizeHandle)}
       </div>
     </>);

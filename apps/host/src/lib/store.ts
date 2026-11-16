@@ -1401,6 +1401,12 @@ export function setPreviewTabClosed(sessionId:string|undefined, artifactId:strin
   if(!sessionId)return;
   patchSession(sessionId,s=>({...s,closedPreviews:closed?[...new Set([...(s.closedPreviews??[]),artifactId])]:(s.closedPreviews??[]).filter(id=>id!==artifactId),previewOpen:selected??undefined}));
 }
+/** #5548: the preview panel was closed. The chat forgets which preview was open, so the next start does not open the panel again; the tabs
+ * stay, and picking one opens and remembers it as before. */
+export function setPreviewPanelClosed(sessionId: string | undefined) {
+  if (!sessionId) return;
+  patchSession(sessionId, s => s.previewOpen === undefined ? s : { ...s, previewOpen: undefined });
+}
 export function createChatShowcase() {
   const session=newSession();const at=new Date().toISOString();
   patchSession(session.id,s=>({...s,title:'Chat showcase · code, tools & media',showcase:true,statsAvailable:true,tokensIn:28000000,tokensOut:4000000,messages:showcaseMessages(at),agents:SHOWCASE_AGENTS,showcaseAgentStates:true}));
