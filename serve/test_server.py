@@ -4196,6 +4196,49 @@ class SharingTheGpu(unittest.TestCase):
         self.assertTrue(int(headers["Retry-After"]) > 0)
         self.assertEqual(self.engine.starts, 0)
 
+    def _strict_hook(self, code: str):
+        self.svc.before_load = [sys.executable, "-c", code]
+        self.svc.before_load_strict = True
+        self.svc.unload()
+        return self._raw_chat()
+
+    def test_before_load_refusal_carries_the_commands_own_reason(self):
+        """#5987: a scheduler's launcher refuses with its own line; the 503 says that line, at once, with no start."""
+        status, headers, body = self._strict_hook(
+            "import sys; print('checking'); "
+            "print('no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB', file=sys.stderr); "
+            "sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["message"], "no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB")
+        self.assertTrue(int(headers["Retry-After"]) > 0)
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_refusal_without_output_keeps_the_generic_sentence(self):
+        status, _, body = self._strict_hook("import sys; sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertIn("the before_load command failed (it exited with code 75)", body["error"]["message"])
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_reason_is_made_safe(self):
+        status, _, body = self._strict_hook(
+            "import sys; sys.stdout.write('first line\\n\\x1b[31mred \\x07alert\\ttab\\u200b\\x00 ' + 'x' * 400 + '\\n  \\n'); sys.exit(1)")
+        msg = body["error"]["message"]
+        self.assertEqual(status, 503)
+        self.assertLessEqual(len(msg), 300)
+        self.assertTrue(msg.startswith("[31mred alert tab ") and msg.endswith("..."), msg[:60])
+        self.assertFalse(any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c == "​" for c in msg), repr(msg[:60]))
+        from serve.server import hook_reason
+        self.assertEqual(hook_reason(b"a\r\nb \x1b\x00 c\n"), "b c")
+        self.assertEqual(hook_reason(""), "")
+        self.assertEqual(hook_reason(None), "")
+        self.assertEqual(hook_reason("x" * 300), "x" * 300)
+        self.assertEqual(len(hook_reason("y" * 301)), 300)
+
+    def test_before_load_that_allows_loads_and_its_output_reaches_the_log(self):
+        status, _, _ = self._strict_hook("print('room reserved: 76.0 GB')")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.engine.starts, 1)
+
     def test_failing_before_load_without_a_vram_limit_loads(self):
         self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
         self.svc.unload()

@@ -50,6 +50,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.request
 import uuid
 from http.client import HTTPException
@@ -507,6 +508,30 @@ class SessionRefused(ValueError):
 class EngineStuck(RuntimeError):
     """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
     reporting its GPU and RAM as given back."""
+
+
+HOOK_REASON_MAX = 300   # #5987: the most of a before_load command's own refusal line that goes into a 503
+
+
+def hook_reason(output, limit: int = HOOK_REASON_MAX) -> str:
+    """#5987: the last non-empty line a before_load command wrote (stdout and stderr together), made safe for an API
+    message: control and format characters become spaces, runs of whitespace one space, at most `limit` characters
+    ("..." marks a cut).  "" when it wrote nothing."""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    for line in reversed((output or "").splitlines()):
+        s = " ".join("".join(" " if unicodedata.category(c)[0] == "C" else c for c in line).split())
+        if s:
+            return s if len(s) <= limit else s[:limit - 3].rstrip() + "..."
+    return ""
+
+
+def hook_echo(output) -> None:
+    """The before_load command's output, passed on to this server's own output (where it went before #5987 read it)."""
+    if not output:
+        return
+    text = output.decode("utf-8", "replace") if isinstance(output, bytes) else output
+    print(text, end="" if text.endswith("\n") else "\n", flush=True)
 
 
 class GpuBusy(RuntimeError):
@@ -5444,13 +5469,18 @@ class Service:
         if self.before_load:
             cmd = self.before_load
             print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
-            why = None
+            why, reason = None, ""
             try:
+                # #5987: its output is read (and passed on to this server's own output, as before) so that a refusal can
+                # carry the command's own reason
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
-                                   stdin=subprocess.DEVNULL)
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                hook_echo(r.stdout)
                 if r.returncode != 0:
                     why = f"it exited with code {r.returncode}"
-            except subprocess.TimeoutExpired:
+                    reason = hook_reason(r.stdout)
+            except subprocess.TimeoutExpired as e:
+                hook_echo(e.output)
                 why = f"it did not finish in {self.before_load_timeout_s:g} s (before_load_timeout_s)"
             except (OSError, subprocess.SubprocessError) as e:
                 why = f"it could not run ({e})"
@@ -5462,8 +5492,10 @@ class Service:
                 if self.before_load_strict and not self.before_load_ignore_failure:
                     print(f"[strata] the before_load command failed ({why}); the model stays unloaded and this "
                           "request is answered 503 - try again (before_load_strict)", flush=True)
-                    raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
-                                  "model was not loaded; try again in a moment", retry_after=15)
+                    # #5987: a command that refused with a line of its own (a scheduler's "no room ... for 76G of RAM")
+                    # is answered with that line, made safe for the API; without one, the generic sentence
+                    raise GpuBusy(reason or f"the before_load command failed ({why}): the GPU was not given back, so the "
+                                            "model was not loaded; try again in a moment", retry_after=15)
                 hook_failed = why
                 if self.before_load_ignore_failure or not self.min_free_vram_mib:
                     print(f"[strata] the before_load command failed ({why}); loading anyway"
