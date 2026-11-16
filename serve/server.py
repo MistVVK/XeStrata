@@ -7565,6 +7565,14 @@ class BadBody(Exception):
         self.status = status
 
 
+def anthropic_error_type(code: int, current) -> str:
+    """error.type on /v1/messages, by the status rows of platform.claude.com/docs/en/api/errors.  502 and 503 have no
+    row and keep their type: a 503 must not read as overloaded_error, which Claude Code treats as an overload."""
+    known = {401: "authentication_error", 403: "permission_error", 404: "not_found_error", 409: "conflict_error",
+             413: "request_too_large", 429: "rate_limit_error", 500: "api_error"}.get(code)
+    return known or ("invalid_request_error" if code < 500 else current or "api_error")
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -7797,6 +7805,14 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None, retry_after=None):
+            path = self.path.split("?")[0].rstrip("/")
+            if code >= 400 and isinstance(obj.get("error"), dict) and \
+                    V1_V1_ALIASES.get(path, path) in ("/v1/messages", "/v1/messages/count_tokens"):
+                # Anthropic's error shape: @ai-sdk/anthropic drops the message of a body without the top-level type
+                request_id = "req_" + (self.record["id"] if self.record is not None else uuid.uuid4().hex[:12])
+                error = {**obj["error"], "type": anthropic_error_type(code, obj["error"].get("type"))}
+                obj = {"type": "error", **obj, "error": error, "request_id": request_id}
+                headers = {**(headers or {}), "request-id": request_id}
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
