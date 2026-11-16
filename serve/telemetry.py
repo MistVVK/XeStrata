@@ -3,7 +3,8 @@
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
   pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
-  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.  On macOS (Metal backend): IOKit's
+  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power; on Windows, for the Monitor, the driver's AMD Display
+  Library (ADL2 PMLog, #4884).  On macOS (Metal backend): IOKit's
   IOAccelerator registry - load and VRAM; the temperature and power sensors need root (`powermetrics`), and an Apple
   Silicon GPU sits on the die, so there is no PCIe link.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
@@ -251,9 +252,10 @@ class _Amd:
 
 
     def read(self):
-        out = {"util": self._int(os.path.join(self.dev, "gpu_busy_percent")),
-               "mem_used": self._int(os.path.join(self.dev, "mem_info_vram_used")),
-               "mem_total": self._int(os.path.join(self.dev, "mem_info_vram_total"))}
+        own = self.dev or ""      # (#4884) a box with no amdgpu sysfs device (Windows): None readings, never a TypeError
+        out = {"util": self._int(os.path.join(own, "gpu_busy_percent")),
+               "mem_used": self._int(os.path.join(own, "mem_info_vram_used")),
+               "mem_total": self._int(os.path.join(own, "mem_info_vram_total"))}
         if self.hwmon:
             t = self._int(os.path.join(self.hwmon, "temp1_input"))
             out["temp"] = t / 1000.0 if t is not None else None
@@ -265,6 +267,352 @@ class _Amd:
             out["power_limit"] = cap / 1e6 if cap is not None else None
         out.update(self.link())
         return out
+
+
+# ------------------------------------------------------------------------------------------------ AMD (Windows ADL2)
+# #4884 (Lip Wee Yeo, ported from #2704's telemetry part): an AMD card's readings on Windows come from the driver's own AMD Display
+# Library (atiadlxx.dll), the interface HWInfo and LibreHardwareMonitor use, so no ROCm or pip package is needed.  ADL2's PMLog
+# (Overdrive 8) gives load, temperature and power; DedicatedVRAMUsage + MemoryInfoX4 give VRAM; Device Manager's Plug-and-Play
+# record the PCIe link.  ctypes only; every call is guarded (the ABI varies by Adrenalin version); anything that cannot be read is
+# None and nothing here can stop the server.  The Monitor only: monitor_reader() hands it out, gpu_reader() does not, so the VRAM checks the
+# server and Control decide with (free_vram_mib, gpu_vram_mib, the drafter's sizing) keep their Windows AMD behaviour.
+
+class _AdlSensor(ctypes.Structure):
+    """One PMLog sensor reading: whether the card reports it, and its raw value."""
+    _fields_ = [("supported", ctypes.c_int), ("value", ctypes.c_int)]
+
+
+class _Adl:
+    """The ADL2 ctypes bindings; `lib` is None when atiadlxx.dll is absent (and off Windows)."""
+
+    class AdapterInfo(ctypes.Structure):
+        _fields_ = [("Size", ctypes.c_int), ("AdapterIndex", ctypes.c_int),
+                    ("UDID", ctypes.c_char * 256), ("BusNumber", ctypes.c_int),
+                    ("DeviceNumber", ctypes.c_int), ("FunctionNumber", ctypes.c_int),
+                    ("VendorID", ctypes.c_int), ("AdapterName", ctypes.c_char * 256),
+                    ("DisplayName", ctypes.c_char * 256), ("Present", ctypes.c_int),
+                    ("Exist", ctypes.c_int), ("DriverPath", ctypes.c_char * 256),
+                    ("DriverPathExt", ctypes.c_char * 256), ("PNPString", ctypes.c_char * 256),
+                    ("OSDisplayIndex", ctypes.c_int)]
+
+    class MemInfoX4(ctypes.Structure):
+        _fields_ = [("iMemorySize", ctypes.c_longlong), ("strMemoryType", ctypes.c_char * 256),
+                    ("iMemoryBandwidth", ctypes.c_longlong), ("iHyperMemorySize", ctypes.c_longlong),
+                    ("iInvisibleMemorySize", ctypes.c_longlong), ("iVisibleMemorySize", ctypes.c_longlong),
+                    ("iVramVendorRevId", ctypes.c_longlong), ("iMemoryBandwidthX2", ctypes.c_longlong),
+                    ("iMemoryBitRateX2", ctypes.c_longlong)]
+
+    class PmLogSupport(ctypes.Structure):
+        _fields_ = [("usSensors", ctypes.c_ushort * 256), ("iReserved", ctypes.c_int * 16)]
+
+    class PmLogStartInput(ctypes.Structure):
+        _fields_ = [("usSensors", ctypes.c_ushort * 256), ("ulSampleRate", ctypes.c_uint),
+                    ("iReserved", ctypes.c_int * 15)]
+
+    class PmLogStartOutput(ctypes.Structure):
+        _fields_ = [("pLoggingAddress", ctypes.c_void_p)]
+
+    class PmLogDataOutput(ctypes.Structure):
+        _fields_ = [("size", ctypes.c_int), ("sensors", _AdlSensor * 256)]
+
+    # PMLog sensor ids (LibreHardwareMonitor's ADLPMLogSensors enum)
+    S_EDGE, S_MEM, S_ASIC_POWER, S_ACTIVITY_GFX, S_ACTIVITY_MEM = 8, 9, 23, 19, 20
+    S_GFX_POWER, S_BUS_SPEED, S_BUS_LANES, S_TOTAL_POWERLIMIT = 30, 40, 41, 47
+    S_BOARD_POWER = 73
+
+    def _alloc(self, size):
+        # a raw heap pointer ADL can free(): ADL2_Main_Control_Create allocates through this callback and frees on Destroy
+        p = self.crt.malloc(size) if size else None
+        return ctypes.cast(p, ctypes.c_void_p).value if p else None
+
+    def __init__(self):
+        self.lib = None
+        if os.name != "nt":
+            return
+        try:
+            self.lib = ctypes.CDLL("atiadlxx.dll")
+            # atiadlxx links ucrtbase.dll, so malloc from ucrtbase shares the heap ADL frees with; else the process's C runtime
+            try:
+                self.crt = ctypes.CDLL("ucrtbase.dll")
+            except OSError:
+                self.crt = ctypes.CDLL(None)
+            self.crt.malloc.restype = ctypes.c_void_p
+            self.crt.malloc.argtypes = [ctypes.c_size_t]
+            self.ALLOC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)(self._alloc)
+        except (OSError, TypeError, ValueError, AttributeError):
+            self.lib = None
+
+
+def _adl_cards(buf, count):
+    """The ADL adapter rows that are cards, one per card (ADL lists a card once per display; deduped by its DEV_xxxx code):
+    every present discrete card, or, when there is none, the integrated Radeon (an APU alone, Strix Halo) - the same rule
+    as windows_amd_cards().  [(adapter row, DEV code or None, name, integrated)]."""
+    disc, integ, seen = [], [], set()
+    for i in range(count):
+        nm = buf[i].AdapterName
+        if not nm or not (buf[i].Present or buf[i].Exist):
+            continue
+        udid = buf[i].UDID or b""
+        dev = udid.split(b"DEV_", 1)[1].split(b"&", 1)[0] if b"DEV_" in udid else None
+        key = dev or nm
+        if key in seen:
+            continue
+        seen.add(key)
+        row = (i, dev.decode(errors="replace").upper() if dev else None, nm.decode(errors="replace").strip())
+        (integ if b"Graphics" in nm else disc).append(row)
+    return [r + (False,) for r in disc] or [r + (True,) for r in integ]
+
+
+class _AmdWin:
+    """An AMD card's readings on Windows through ADL2's PMLog, with _Nvml's interface: util, mem_used, mem_total, temp,
+    power, power_limit, and the PCIe link: pcie_gen / pcie_gen_max / pcie_width_max from Device Manager's record of the card,
+    pcie_width from PMLog's BUS_LANES (the lanes the card runs at).  `index` is HIP's number of the card: matched to ADL's
+    rows by name in windows_amd_cards() order (the order the rest of the server takes as HIP's), else by position."""
+
+    STALL_LIMIT = 60   # consecutive 1 s samples with identical util+power before the stream is restarted
+
+    def __init__(self, index=0):
+        self.adl = _Adl()
+        self.lib = self.adl.lib
+        self.ctx = None
+        self.adapter = None
+        self.card_count = 0
+        self.dev_code = None
+        self.display_name = None
+        self.integrated = False
+        self.device = ctypes.c_uint(0)
+        self.data = None
+        self._stall = 0
+        self._sig = None
+        if self.lib is not None:
+            try:
+                self._setup(index)
+            except Exception:  # noqa: BLE001 - a driver that answers oddly leaves the reader off, never the server down
+                self.adapter = None
+
+    def _call(self, fn_name, *args):
+        try:
+            return getattr(self.lib, fn_name)(*args)
+        except (AttributeError, OSError, ctypes.ArgumentError):
+            return None
+
+    def _setup(self, index):
+        ctx = ctypes.c_void_p()
+        if self._call("ADL2_Main_Control_Create", self.adl.ALLOC, 1, ctypes.byref(ctx)) != 0:
+            return
+        self.ctx = ctx
+        n = ctypes.c_int(0)
+        if self._call("ADL2_Adapter_NumberOfAdapters_Get", ctx, ctypes.byref(n)) != 0:
+            return
+        count = max(1, min(n.value, 40))
+        buf = (self.adl.AdapterInfo * count)()
+        if self._call("ADL2_Adapter_AdapterInfo_Get", ctx, ctypes.cast(buf, ctypes.c_void_p), ctypes.sizeof(buf)) != 0:
+            return
+        cards = _adl_cards(buf, count)
+        self.card_count = len(cards)
+        pick = _pick_card([c[2] for c in cards], index, [c["name"] for c in windows_amd_cards()])
+        if pick is None:
+            return
+        self.adapter, self.dev_code, self.display_name, self.integrated = cards[pick]
+        # start the PMLog stream here: without it the driver answers QueryPMLogData_Get with its last-known buffer (sensors
+        # frozen at idle; measured on an R9700 by the PR's author)
+        self._start_pmlog()
+
+    def ok(self):
+        return self.lib is not None and self.adapter is not None
+
+    def name(self):
+        return (self.display_name or "AMD Radeon") if self.ok() else "AMD Radeon"
+
+    def _read_pmlog(self):
+        if self.data is None:
+            self.data = self.adl.PmLogDataOutput()
+        if self._call("ADL2_New_QueryPMLogData_Get", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(self.data)) != 0:
+            return None
+        return self.data
+
+    def _start_pmlog(self):
+        if not self.ok() or self.device.value:
+            return
+        if self._call("ADL2_Device_PMLog_Device_Create", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(self.device)) != 0:
+            return
+        sup = self.adl.PmLogSupport()
+        if self._call("ADL2_Adapter_PMLog_Support_Get", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(sup)) != 0:
+            self._destroy_device()
+            return
+        inp = self.adl.PmLogStartInput()
+        for k in range(256):
+            inp.usSensors[k] = sup.usSensors[k]
+        inp.ulSampleRate = 1000
+        out = self.adl.PmLogStartOutput()
+        if self._call("ADL2_Adapter_PMLog_Start", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(inp), ctypes.byref(out),
+                      self.device) != 0:
+            self._destroy_device()
+
+    def _destroy_device(self):
+        if self.device.value and self.ctx is not None and self.adapter is not None:
+            self._call("ADL2_Device_PMLog_Device_Destroy", self.ctx, ctypes.c_int(self.adapter), self.device)
+        self.device = ctypes.c_uint(0)
+
+    def _restart_pmlog(self):
+        """Stop and re-create the stream: in deep idle the driver tears sampling down while QueryPMLogData_Get keeps
+        answering with the frozen buffer, which only a stall check notices."""
+        if self.device.value and self.adapter is not None:
+            self._call("ADL2_Adapter_PMLog_Stop", self.ctx, ctypes.c_int(self.adapter), self.device)
+        self._destroy_device()
+        self._start_pmlog()
+
+    def _watch_stall(self, out):
+        """util+power identical STALL_LIMIT samples in a row (1 s each): the stream died; restart it once."""
+        sig = (out.get("util"), out.get("power"))
+        if sig == self._sig and sig != (None, None):
+            self._stall += 1
+        else:
+            self._stall = 1
+        self._sig = sig
+        if self._stall >= self.STALL_LIMIT:
+            self._restart_pmlog()
+            self._stall = 0
+
+    def close(self):
+        """Give back the PMLog device handle and the ADL context (#1434: +2 handles a reader that is never closed).  Safe twice."""
+        if self.ctx is not None:
+            self._destroy_device()
+            self._call("ADL2_Main_Control_Destroy", self.ctx)
+            self.ctx = None
+        self.adapter = None
+        self.card_count = 0
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - interpreter shutdown can leave the driver DLL unloaded already
+            pass
+
+    def read(self):
+        out = {}
+        if not self.ok():
+            return out
+        d = self._read_pmlog()
+        if d is None:
+            self._start_pmlog()
+            d = self._read_pmlog()
+        lanes = None
+        if d is not None:
+            def val(sid):
+                s = d.sensors[sid]
+                return s.value if s.supported else None
+            u = [x for x in (val(self.adl.S_ACTIVITY_GFX), val(self.adl.S_ACTIVITY_MEM)) if x is not None]
+            out["util"] = max(u) if u else None
+            t = val(self.adl.S_EDGE)
+            if t is None:
+                t = val(self.adl.S_MEM)
+            out["temp"] = float(t) if t is not None else None
+            # RDNA3+ report power as BOARD_POWER (73); older cards ASIC_POWER (23) or GFX_POWER (30); watts (factor 1.0)
+            p = val(self.adl.S_BOARD_POWER)
+            if p is None:
+                p = val(self.adl.S_ASIC_POWER)
+            if p is None:
+                p = val(self.adl.S_GFX_POWER)
+            out["power"] = float(p) if p else None
+            lim = val(self.adl.S_TOTAL_POWERLIMIT)
+            out["power_limit"] = float(lim) if lim else None
+            lanes = val(self.adl.S_BUS_LANES)
+        used = ctypes.c_int(0)
+        if self._call("ADL2_Adapter_DedicatedVRAMUsage_Get", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(used)) == 0 \
+                and used.value > 0:
+            out["mem_used"] = used.value * 1024 * 1024
+        mi = self.adl.MemInfoX4()
+        if self._call("ADL2_Adapter_MemoryInfoX4_Get", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(mi)) == 0 \
+                and mi.iMemorySize > 0:
+            out["mem_total"] = int(mi.iMemorySize)
+        # an integrated Radeon has no PCIe slot: Device Manager still records an internal x16 link for it (Strix Halo: Gen4 x16), which
+        # is not a link the Monitor should show
+        if not self.integrated:
+            out.update(_adl_link(_dm_link_map().get(self.dev_code or ""), lanes))
+        self._watch_stall(out)
+        return out
+
+
+def _pick_card(adl_names, index, hip_names):
+    """Which of ADL's card rows is HIP's card `index`: the k-th row named like hip_names[index] (k = how many cards of
+    that name come before it in HIP's order), else row `index`; None when there is no such row."""
+    if 0 <= index < len(hip_names):
+        want = hip_names[index].strip().lower()
+        k = sum(1 for n in hip_names[:index] if n.strip().lower() == want)
+        rows = [r for r, n in enumerate(adl_names) if n.strip().lower() == want]
+        if k < len(rows):
+            return rows[k]
+    return index if 0 <= index < len(adl_names) else None
+
+
+def _adl_link(dm, lanes):
+    """The link fields from Device Manager's (current speed, current width, max speed, max width) of the card and PMLog's
+    BUS_LANES.  PMLog's BUS_SPEED is the GPU's internal bus (power-saved to Gen4 at idle), so the generation is Device
+    Manager's; Device Manager's CurrentLinkWidth reports the slot's capability, so the width is BUS_LANES.  None for a
+    field that cannot be read (an APU's on-die GPU has no PCIe link)."""
+    out = {}
+    if dm:
+        cur_speed, _cur_width, max_speed, max_width = dm
+        out["pcie_gen"] = cur_speed or None
+        out["pcie_gen_max"] = max_speed or None
+        out["pcie_width_max"] = max_width or None
+    out["pcie_width"] = lanes or None
+    return out
+
+
+_DM_LINK = None        # {DEV code: (current speed, current width, max speed, max width)} from Device Manager, once read
+_DM_LINK_RETRY = 0.0   # a failed query is retried after this monotonic time, not on every 1-second sample
+_DM_LINK_STARTED = False
+_DM_LINK_LOCK = threading.Lock()
+
+
+def _dm_link_map():
+    """Every present display device's PCIe link from Device Manager's Plug-and-Play records, keyed by its DEV_xxxx code.  The
+    first call starts the (seconds-long) query in a background thread and returns {}; a failed query is retried at most every
+    60 s; {} off Windows or when unavailable."""
+    global _DM_LINK, _DM_LINK_STARTED
+    if _DM_LINK is not None:
+        return _DM_LINK
+    if os.name != "nt":
+        _DM_LINK = {}
+        return _DM_LINK
+    if time.monotonic() >= _DM_LINK_RETRY:
+        with _DM_LINK_LOCK:
+            if _DM_LINK is None and not _DM_LINK_STARTED:
+                _DM_LINK_STARTED = True
+                threading.Thread(target=_dm_link_query, daemon=True, name="dm-link").start()
+    return _DM_LINK if _DM_LINK is not None else {}
+
+
+def _dm_link_query():
+    """The Device Manager query behind _dm_link_map, in its own thread, with no console window (CREATE_NO_WINDOW)."""
+    global _DM_LINK, _DM_LINK_RETRY, _DM_LINK_STARTED
+    ps = ("Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Not Connected' } | "
+          "ForEach-Object { $id = $_.InstanceId; if ($id -match 'DEV_([0-9A-Fa-f]{4})') { $dev = $matches[1] } else { return }; "
+          "$v = foreach ($k in 'CurrentLinkSpeed','CurrentLinkWidth','MaxLinkSpeed','MaxLinkWidth') { "
+          "(Get-PnpDeviceProperty -InstanceId $id -KeyName ('DEVPKEY_PciDevice_' + $k) -ErrorAction SilentlyContinue).Data }; "
+          "Write-Output ('DEV_' + $dev + ' ' + ($v -join ' ')) }")
+    try:
+        done = subprocess.run(["powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                              text=True, timeout=20, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        _DM_LINK_RETRY = time.monotonic() + 60
+        _DM_LINK_STARTED = False
+        return
+    m = {}
+    for line in (done.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 5 and parts[0].startswith("DEV_"):
+            try:
+                m[parts[0][4:].upper()] = tuple(int(x) for x in parts[1:])
+            except ValueError:
+                continue
+    if not m and done.returncode != 0:
+        _DM_LINK_RETRY = time.monotonic() + 60
+        _DM_LINK_STARTED = False
+        return
+    _DM_LINK = m
 
 
 def metal_working_set():
@@ -369,6 +717,16 @@ def gpu_reader(index=0, amd=False):
     if amd:
         return _Amd(index)
     return _Metal(index) if sys.platform == "darwin" else _Nvml(index)
+
+
+def monitor_reader(index=0, amd=False):
+    """The Monitor's reader (Telemetry): gpu_reader's, except that with the AMD backend on Windows, where the amdgpu sysfs reader
+    has nothing to read, the driver's ADL2 (#4884).  Every other caller (the server's VRAM checks, the drafter's sizing) keeps
+    gpu_reader, so their decisions on Windows AMD are unchanged."""
+    g = gpu_reader(index, amd)
+    if amd and os.name == "nt" and not g.ok():
+        return _AmdWin(index)
+    return g
 
 
 _DISPLAY_CLASS = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
@@ -587,7 +945,7 @@ class Telemetry:
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
-        self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
+        self.gpus = [(i, monitor_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
         try:
