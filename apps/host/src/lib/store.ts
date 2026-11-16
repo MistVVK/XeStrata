@@ -11,7 +11,7 @@ import { settleAgents, updateAgent } from './agents';
 import { LOOP_USAGE, parseLoop, type LoopCommand } from './loop';
 import { LoopScheduler } from './loop-runner';
 import { applyStatusFrame, clearStatus } from './live-status';
-import { approvalNeeded, workFinished } from './attention';
+import { approvalNeeded, questionAsked, workFinished } from './attention';
 import { applyGoalFrame } from './goal';
 import { tidyAnswer } from './answer-text';
 import { appendText, mergeDeliverable, readDeliverable, readGroup, readSkills, upsertGroup } from './deliverables';
@@ -679,7 +679,11 @@ export function addAgentAsk(sessionId: string, frame: { callId?: unknown; questi
   const ask = readAsk(frame);
   // A /loop runs without anyone there: the question is skipped at once, so the loop never waits for an answer.
   if (ask && loopScheduler.isRunning(sessionId)) { void answerAgentAsk(sessionId, ask.callId, null).catch(() => {}); return; }
-  if (ask) setAsks(sessionId, [...(state.agentAsks[sessionId] ?? []).filter(a => a.callId !== ask.callId), ask]);
+  if (!ask) return;
+  const known = (state.agentAsks[sessionId] ?? []).some(a => a.callId === ask.callId);
+  setAsks(sessionId, [...(state.agentAsks[sessionId] ?? []).filter(a => a.callId !== ask.callId), ask]);
+  // #5617: a question waits for the person like an approval does: the same opt-in notification, once per question
+  if (!known) void questionAsked(state.approvalNotify);
 }
 export function removeAgentAsk(sessionId: string, callId?: string) {
   const rest = callId === undefined ? [] : (state.agentAsks[sessionId] ?? []).filter(a => a.callId !== callId);
