@@ -313,11 +313,13 @@ endmacro()
 macro(strata_cuda_prompt_tests)
     if(STRATA_BUILD_TESTS AND NOT STRATA_MMQ)
       # P4-SPLIT: the engine and Strata's prompt library hold none of llama.cpp's MMQ (names in the bytes, nm, cuobjdump; tools/check_no_mmq.py)
+      # The cuobjdump look is named, so a device look that did not run fails the test (exit 3, "NOT RUN (<why>)" in its output).  Each tool
+      # gets 600 s (--tool-timeout), under the test's own limit: a slow cuobjdump ends as a named NOT RUN, not as a test killed with no line.
       find_package(Python3 QUIET COMPONENTS Interpreter)
       if(Python3_Interpreter_FOUND)
-        add_test(NAME no_mmq_symbols COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_mmq.py
+        add_test(NAME no_mmq_symbols COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_mmq.py --tool-timeout 600
                  --cuobjdump ${CUDAToolkit_BIN_DIR}/cuobjdump${CMAKE_EXECUTABLE_SUFFIX} $<TARGET_FILE:strata> $<TARGET_FILE:strata_pf_own>)
-        set_tests_properties(no_mmq_symbols PROPERTIES TIMEOUT 900)
+        set_tests_properties(no_mmq_symbols PROPERTIES TIMEOUT 2700)
       endif()
     endif()
     if(STRATA_BUILD_TESTS)
