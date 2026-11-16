@@ -332,6 +332,8 @@ public:
     void* take(size_t bytes);
     /// The device memory it holds (its buffer, and what the last call took past it).
     size_t held() const { return cap_ > used_ ? cap_ : used_; }
+    /// Everything it holds given back (a pause: the next call takes its buffers again).
+    void release(void* stream);
     /// Takes from `cap` bytes at `base` (memory of the caller's, not freed here) from now on, instead of its own.
     void attach(void* base, size_t cap);
 

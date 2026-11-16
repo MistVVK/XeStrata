@@ -15,9 +15,11 @@
 
 #include <cstdint>
 #include <deque>
+#include <iosfwd>
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace strata::image::train {
@@ -107,6 +109,79 @@ public:
     /// A step of `rows` ran: its kernels compiled and the arena grown to it.
     void stepped_rows(int64_t rows);
 
+    // ---- the VRAM budget: an explicit cap, the step-boundary shrink/grow, pause and resume
+    /// The VRAM (bytes) this trainer may hold on its GPU, everything of its own counted (0: the automatic form,
+    /// the free memory less the reserves).  Taken at the next step's planning; a change asks the step's buffers
+    /// to be planned again (replan_due).
+    void set_vram_budget(uint64_t bytes);
+    uint64_t vram_budget() const { return budget_; }
+    /// Whether a budget change asks the cached step buffers to be taken again (qi's ensure).
+    bool replan_due() const { return replan_; }
+    /// What the trainer holds now: its own allocations, the arena, the tapes and the weights in VRAM.
+    uint64_t held() const;
+    /// The least VRAM a step of `rows` can run in (no resident block, no tape, the inputs off the GPU): the fixed
+    /// allocations, two stream slots, two FP32 row buffers (`row_bytes` each), the arena's growth and the transients.
+    uint64_t min_bytes(int64_t rows, uint64_t row_bytes, uint64_t guess_row) const;
+    /// The peak a step of `rows` is estimated to take: what is held, the arena's growth and the transients' reserve.
+    uint64_t est_bytes(int64_t rows, uint64_t guess_row) const;
+    /// Pause at a step's boundary: every allocation of the trainer's copied to the host as it is (the values kept
+    /// byte for byte) and freed, the weights' regions, the tapes and the arena given back (the streamed layers'
+    /// pinned homes stay: the resume is a copy, not a read of the file).  The model's own pointers are fixed in its
+    /// remap() through moved().  resume() takes the same values back; nothing of the computation changes.
+    void pause();
+    void resume();
+    bool paused() const { return paused_; }
+    /// The new address of an allocation pause() took (the model's remap hook).  A pointer that was the trainer's
+    /// and is not in the map is a missed remap: it throws, not a dangling read.  A pointer it never owned comes
+    /// back as it was (a weights region's, bound again at the next step).
+    void* moved(void* old) const;
+    /// The inputs' form this step (the VRAM report's): "fp32", "host" or "bf16".
+    void set_inputs_mode(const char* m) { inputs_mode_ = m; }
+    const char* inputs_mode() const { return inputs_mode_; }
+    /// The host form taken (the pinned memory for `slots` rows of `row_bytes`): false where
+    /// XESTRATA_TRAIN_INPUTS16=1 forces BF16, XESTRATA_TRAIN_INPUTS_HOST=0 forbids the host, or the pinned
+    /// memory is not had (the caller falls back to BF16).
+    bool host_inputs(int64_t slots, int64_t row_bytes);
+    int64_t tapes_kept() const { return tapes_kept_; }
+    /// The trained tensors as the state file holds them (train::Control writes the header and the loop's state
+    /// around this): every parameter's FP32 master, moments m and v, in the order add_param took them.  The
+    /// gradients are zero where the state is written (after an optimizer update), so they are not in it.
+    void save_state(std::ostream& os) const;
+    void load_state(std::istream& is);
+
+    /// The blocks' inputs kept on the host as FP32 (the low-VRAM form that keeps the values byte for byte):
+    /// (slots) rows of `bytes` in pinned memory, copied out as the forward writes them and read back before the
+    /// backward's block, one block ahead (HostInputs).  open() false where the pinned memory is not had: the
+    /// caller falls back to BF16 (inputs_half).
+    class HostInputs {
+    public:
+        ~HostInputs();
+        bool open(int64_t slots, int64_t bytes, void* compute);
+        void close();
+        bool ok() const { return h_ != nullptr; }
+        /// The forward's write of `src` copied to slot `slot` (the copy waits for the compute stream's write).
+        void keep(int64_t slot, const float* src, int64_t bytes);
+        /// The compute stream waits for slot `slot`'s keep copy: the buffer it read may be written again.
+        void kept_wait(int64_t slot);
+        /// Slot `slot` read into `dst` ahead of its use: the copy waits for `used_parity`'s last reader of dst
+        /// (-1: none), the compute stream waits for the copy at wait(slot).
+        void fetch(int64_t slot, float* dst, int64_t bytes, int used_parity);
+        void wait(int64_t slot);
+        /// The compute stream is past the reads of the buffer parity `p` (it may be a fetch's destination again).
+        void used(int p);
+
+    private:
+        uint8_t* h_ = nullptr;
+        int64_t slot_bytes_ = 0;
+        void* s_ = nullptr;
+        void* cs_ = nullptr;
+        gpu::Event* wr_ = nullptr;
+        gpu::Event* used_[2] = {};
+        std::vector<gpu::Event*> done_;
+        std::vector<gpu::Event*> kept_;
+    };
+    HostInputs host;
+
     void* s = nullptr;
     prefill::Gemm gemm;
     LayerStream ws;                              // the blocks' weights
@@ -118,6 +193,8 @@ public:
 
 protected:
     const std::string& what() const { return what_; }
+    /// The model fixes its own persistent pointers after resume(), through moved() (the trainer's own are fixed).
+    virtual void remap() {}
 
 private:
     void* take(size_t bytes);
@@ -127,7 +204,8 @@ private:
         int64_t n;
     };
     std::string what_;
-    std::vector<void*> owned_;
+    std::vector<std::pair<void*, size_t>> owned_;
+    uint64_t owned_bytes_ = 0;
     std::deque<Lora> loras_;
     std::vector<uint16_t*> dgrad_tmp_;   // dgrad_weights' [N][K] or [K][N] FP16 a product
     uint16_t* w8tmp_ = nullptr;          // an int8 base's rows before their transpose
@@ -137,6 +215,19 @@ private:
     std::vector<std::unique_ptr<Arena>> tapes_;
     void* tape_buf_ = nullptr;
     size_t tape_cap_ = 0;
+    int64_t tapes_kept_ = 0;
+    uint64_t budget_ = 0;                // the explicit VRAM cap (0: automatic)
+    bool replan_ = false;                // a budget change asks the step's planning again
+    bool paused_ = false;
+    const char* inputs_mode_ = "fp32";
+    struct Hosted {
+        void* old;
+        size_t bytes;
+        std::vector<uint8_t> data;
+    };
+    std::vector<Hosted> host_;           // pause()'s copies (freed at resume; the addresses kept for moved())
+    std::vector<void*> old_owned_;
+    std::unordered_map<void*, void*> moved_;
 };
 
 }  // namespace strata::image::train

@@ -505,6 +505,19 @@ void Arena::rewind() {
     next_ = 0;
 }
 
+void Arena::release(void* stream) {
+    gpu::stream_sync(stream);
+    for (void* p : spill_) gpu::free(p);
+    spill_.clear();
+    if (base_ != nullptr && owned_) gpu::free(base_);
+    base_ = nullptr;
+    owned_ = true;
+    cap_ = used_ = need_ = 0;
+    taken_.clear();
+    replay_ = false;
+    next_ = 0;
+}
+
 void* Arena::take(size_t bytes) {
     bytes = (bytes + 255) / 256 * 256;
     if (replay_) {
