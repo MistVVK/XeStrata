@@ -287,7 +287,7 @@ void fx_act(const float* dx, int nb, FxAct& a) {
         a.e[b] = p.e;
         a.top = std::max(a.top, p.e);
     }
-    if (nb > 0) a.top = canon::fx_row_top(a.e[0], a.top);   // the activation's part of the top, as the weights'
+    a.top = canon::fx_row_top(a.e[0], a.top);   // the activation's part of the top, as the weights'
 }
 
 // ---- the AVX2 forms of the down rows (the gate/up rows: iq_avx2's iq256_canon_rows)

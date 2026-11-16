@@ -233,9 +233,10 @@ template <int NT> STRATA_ROWS_FN void q20_rows_nt(const uint8_t* row, int n, con
         const Fx8 wp = fx_parts8(_mm256_castps_si256(dw));
         for (int t = 0; t < NT; ++t) {
             const __m256i T = q20_step_sums(c, x[t] + 64 * (ptrdiff_t) k0, qs32[t] + 2 * (ptrdiff_t) k0);
-            // calls 2 k0 .. 2 k0 + 7
-            const __m256i am = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(fa[t].m + 2 * (ptrdiff_t) k0));
-            const __m256i ae = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(fa[t].e + 2 * (ptrdiff_t) k0));
+            // calls 2 k0 .. 2 k0 + 7 (int, not ptrdiff_t: the wider product changed these rows' code)
+            const int c0 = 2 * k0;
+            const __m256i am = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(fa[t].m + c0));
+            const __m256i ae = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(fa[t].e + c0));
             acc[t] = fx_mac8(acc[t], fx_scale8(am, ae, wp, shift0[t]), T);
         }
     }
