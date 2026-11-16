@@ -568,7 +568,9 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 - Sampling defaults, in order of precedence: the request, the web page's shared Chat settings, the config's `sampling` block,
   then the model card. Without a block, thinking requests get temperature 1.0, top_p 0.95, top_k 20, and non-thinking
   requests get 0.7, 0.8, 20 with presence_penalty 1.5 (Qwen3.6-35B-A3B uses presence_penalty 1.5 in both). Greedy is only for
-  whoever asks: `temperature: 0` in the request or `"sampling": {"temperature": 0}` in the config. With the default adaptive
+  whoever asks: `temperature: 0` in the request or `"sampling": {"temperature": 0}` in the config. A greedy request is sent
+  without the model card's penalties: a penalty makes the engine sample from its logits, so the answer would not be the
+  greedy one, and the MTP drafts (which run only for greedy requests) would not run (#2940). With the default adaptive
   tier a sampled result is not reproducible from run to run. For seed-reproducible output add `--adapt-every 100000`.
 - Sampled drafting is opt-in and not faster in a way that holds up. `STRATA_SPEC_COUPLED=1` (or `--coupled-draft`) and
   `STRATA_SPEC_GUMBEL=1` raise the accepted-draft rate on some machines; `STRATA_SPEC_PROB=1` is speculative rejection
