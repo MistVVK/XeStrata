@@ -9,6 +9,8 @@
 
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/core/window_wait.hpp"
+#include "strata/sycl_doorbell.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1233,6 +1235,11 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
         err = "session_capture_token: the parts staging is not mapped pinned memory";
         return false;
     }
+    if (tg.wrec == nullptr) {
+        tg.wrec = (uint32_t*) strata::host_malloc_polled(64, dpct::get_in_order_queue());
+        if (tg.wrec == nullptr) { err = "session_capture_token: the wait record could not be allocated"; return false; }
+        wait_record_arm(tg.wrec, 0);
+    }
     dpct::queue_ptr cs = &dpct::get_in_order_queue();
     if (DPCT_CHECK_ERROR(cs = dpct::get_current_device().create_queue(true)) !=
         0) {
@@ -1262,7 +1269,7 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
                                                     hits->blob, hits->x_q8, hits->scratch, hits->hit_out, (void*) cs,
                                                     hits->x_scale);
         }
-        strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
+        strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs, tg.wrec);
         // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).
         strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
         if (hits != nullptr)
@@ -1336,6 +1343,7 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
     ++tg.calls;
     stage_token(g, pos, pos_base, s);
     doorbell_reset(*s.db);
+    wait_record_arm(tg.wrec, ++tg.wepoch);   // #5160: the previous token has completed (synced below)
     const dpct::err0 le = DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*tg.exec));
     /*
     DPCT1009: SYCL reports errors using exceptions and does not use error
@@ -1363,6 +1371,7 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
     volatile uint32_t* const seq = s.db->h_seq;
     volatile uint32_t* const flag = s.db->h_flag;
     using Clock = std::chrono::steady_clock;
+    double tg_pool_max = 0;   // the slowest CPU step of this token (ms), for the message
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const uint32_t want = (uint32_t) (l + 1);
         const auto t0 = Clock::now();
@@ -1404,7 +1413,11 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
         }
         const auto t1 = Clock::now();
         progress_at("token: the CPU experts of layer", l);
-        if (pool != nullptr) pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, y_miss_host);
+        // #5160: once a wait of this token has run out the GPU no longer waits for this payload, so the host stops
+        // computing and only answers the doorbell (the graph then finishes at once); the check after the sync fails it
+        if (pool != nullptr && !wait_record_read(tg.wrec).expired())
+            pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, y_miss_host);
+        tg_pool_max = std::max(tg_pool_max, std::chrono::duration<double, std::milli>(Clock::now() - t1).count());
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
         *flag = want;
@@ -1431,6 +1444,17 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
               dpct::get_error_string_dummy(se);
         return false;
     }
+    if (const WaitExpiry x = wait_record_read(tg.wrec); x.expired()) {   // #5160: the token was computed without the CPU's rows
+        ++tg.waits_expired;
+        char buf[400];
+        std::snprintf(buf, sizeof buf,
+                      "session_run_token: the GPU stopped waiting for %s of layer %u (token at position %lld): the CPU took %.0f ms, "
+                      "longer than the GPU's wait of %u reads; the token was discarded",
+                      wait_site_name(x.site), x.step > 0 ? x.step - 1 : 0u, (long long) pos, tg_pool_max,
+                      (unsigned) strata::spin_max(*cs));
+        err = buf;
+        return false;
+    }
     progress_at("decode");
     progress_beat();
     return true;
@@ -1443,6 +1467,7 @@ catch (sycl::exception const &exc) {
 
 void token_graph_free(TokenGraph& tg) {
     if (tg.exec) delete (tg.exec);
+    if (tg.wrec) strata::host_free_polled(tg.wrec, dpct::get_in_order_queue());
     tg = TokenGraph{};
 }
 

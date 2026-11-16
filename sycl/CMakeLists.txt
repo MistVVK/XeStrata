@@ -56,6 +56,12 @@ endif()
 # time (20,000 reads on a B-series card, 1,000,000 when the CPU serves experts and the host is waited for, 2,000,000
 # elsewhere; STRATA_SPIN_MAX overrides). STRATA_SYCL_SPIN_MAX fixes one bound for every device in this build.
 set(STRATA_SYCL_SPIN_MAX "" CACHE STRING "fixed bound of the device's spins on host flags, in reads (empty: chosen per device at run time)")
+# A test build only: STRATA_TEST_POOL_DELAY=W:K:MS delays one CPU step of one verify window (verify.cpp, test_pool_delay),
+# for the fault-injection check of #5160. Released engines are built without it and have no such switch.
+option(STRATA_SYCL_TEST_HOOKS "compile the fault-injection test hooks (never in a release build)" OFF)
+if(STRATA_SYCL_TEST_HOOKS)
+  add_compile_definitions(STRATA_SYCL_TEST_HOOKS=1)
+endif()
 if(STRATA_SYCL_SPIN_MAX)
   add_compile_definitions(STRATA_SYCL_SPIN_MAX=${STRATA_SYCL_SPIN_MAX}u)
 endif()
@@ -320,6 +326,15 @@ if(STRATA_SYCL_PARITY)
   add_test(NAME window_jobs_test COMMAND window_jobs_test)
   add_test(NAME window_jobs_test_legacy COMMAND window_jobs_test --legacy)   # the 756242554 loop: must fail
   set_tests_properties(window_jobs_test_legacy PROPERTIES WILL_FAIL TRUE)
+  # Host-only: a GPU wait on the host that runs out fails its window (window_wait.hpp; #5160). --legacy replays the old
+  # protocol (a wait that runs out just returns) and must fail.
+  find_package(Threads REQUIRED)
+  add_executable(window_wait_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/window_wait_test.cpp)
+  target_include_directories(window_wait_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(window_wait_test PRIVATE Threads::Threads)
+  add_test(NAME window_wait_test COMMAND window_wait_test)
+  add_test(NAME window_wait_test_legacy COMMAND window_wait_test --legacy)
+  set_tests_properties(window_wait_test_legacy PROPERTIES WILL_FAIL TRUE)
   add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
   target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
   add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)

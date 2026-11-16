@@ -277,6 +277,7 @@ public:
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
+    int64_t waits_expired = 0;   ///< windows discarded because a GPU wait on the host ran out (#5160)
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
@@ -369,6 +370,17 @@ private:
     bool ar_on() const { return all_resident_ && !ar_off_; }
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
+    /// #5160 / #6016: this verifier's wait record (strata/core/window_wait.hpp), 4 words of mapped host memory.  Its window
+    /// kernels write it when a wait on the host runs out; stage_inputs() arms it with the window's epoch; wait_failed() reads it.
+    uint32_t* h_wrec_ = nullptr; uint32_t* m_wrec_ = nullptr;
+    uint32_t wepoch_ = 0;
+    double wpool_ms_ = 0;   ///< the slowest CPU step of the current window (ms), for the message
+    /// A wait of this window ran out: say so in `err` (which wait, which layer, how long the CPU took) and return true.  With
+    /// `drain` the window's flags are raised and its queues drained first (the window is given up; the verifier stays usable
+    /// when they finish within 5 s, otherwise it refuses every later window as release_gpu_waits does).
+    bool wait_failed(int64_t pos0, int T, int G, bool drain, std::string& err);
+    /// The window's flags to UINT32_MAX and its queues drained (bounded); unlike release_gpu_waits it does not retire the verifier.
+    bool drain_failed_window(int timeout_ms);
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
