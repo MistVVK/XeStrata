@@ -921,9 +921,12 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                 return at
             elif names and opener_at(after, names, final) not in (None, "pending"):
                 return at                       # #6032 R2: `<NAME>` / `</NAME>` of a declared parameter not set yet
+            elif names is not None and _stub_follows(after):
+                return at                       # #6032 R5 (recover): the model's empty stub, or a repeated closer
             elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after) \
                     or any(t.startswith(after) for t in FOLLOWERS) or _follower_form(after) is None \
-                    or (names and opener_at(after, names, final) == "pending"):
+                    or (names and opener_at(after, names, final) == "pending") \
+                    or (names is not None and _stub_follows(after) is None):
                 return at if final else -2
         at = nxt(at + 1)
     return -1
@@ -956,6 +959,26 @@ def _follower_form(after: str):
             return True
         return None if not rest or CALL_END.startswith(rest) else False
     return None if re.fullmatch(r"</(?!parameter>|function>|tool_call>)[^<>\s=/]*", after) else False
+
+
+# #6032 R5: the model's empty stub after a value (Gyro / Coder-L recordings): a lone `<` or `</` line, a line of one tag
+# (`</head_after>`), either closed by a `</parameter>` or followed by the next opener; and a closer written again
+_STUB = re.compile(r"(?:</?[ \t]*\n|<[/=]?[^<>\s=/]+>[ \t]*\n)\s*")
+_STUB_NEXT = (PARAM_END, "<parameter=", "</function>", "</tool_call>") + ("</<", "</invoke>", "<parameter name=")
+
+
+def _stub_follows(after: str):
+    """#6032 R5: `after` (what follows a value's `</parameter>`, no leading whitespace) is a closer written again, or
+    an empty stub line followed by a closer or an opener: True; None while it may still become one; False otherwise."""
+    if after.startswith(PARAM_END):
+        return True
+    m = _STUB.match(after)
+    if m:
+        rest = after[m.end():]
+        if rest.startswith(_STUB_NEXT):
+            return True
+        return None if not rest or any(t.startswith(rest) for t in _STUB_NEXT) else False
+    return None if re.fullmatch(r"</?[ \t]*|<[/=]?[^<>\s=/]*>?[ \t]*", after) else False
 
 
 NOT_PARAMS = ("function", "think", "parameter")
@@ -1036,8 +1059,7 @@ def opener_at(s: str, names=None, final: bool = False):
                 return "pending"
             gt = s.find(">")
             return (param_name(s[len(PARAM_START):gt]), gt + 1, None) if gt >= 0 else None
-        gt = s.find(">")
-        return (param_name(s[len(PARAM_START):gt]), gt + 1, None) if gt >= 0 else None
+        return None, len(line), None        # #6032 R5: an opener cut before its `>` (its line ends first): dropped
     if names:
         m = _BARE_OPENER.match(s)
         if m:
@@ -1066,10 +1088,15 @@ def call_end(text: str, final: bool = False, hold: bool = True, names=None) -> i
         rest = text[pos:]
         s = rest.lstrip()
         pos += len(rest) - len(s)
-        got = opener_at(s, set(names) - seen, final) if names and not s.startswith(("<parameter=", FUNC_END)) else None
+        # #6032 R2-R5 (recover, the tool's names known): every opener as parse_tool_call reads it - a damaged one, an
+        # element, the colon form, one cut before its `>` - so the walk never runs one call's end into the next call
+        got = opener_at(s, set(names) - seen, final) if names and not s.startswith(FUNC_END) else None
         if got == "pending":
             return -1
-        if s.startswith("<parameter="):
+        if got is not None and got[2] is not None:            # the colon form: its value and closer are read
+            seen.add(got[0])
+            pos += got[1]
+        elif s.startswith("<parameter=") and got is None:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
@@ -1080,9 +1107,9 @@ def call_end(text: str, final: bool = False, hold: bool = True, names=None) -> i
                 return -1
             seen.add(pname)
             pos = gt + 1 + end + len(PARAM_END)
-        elif got is not None and got[2] is None:              # #6032 R2 / R4: a damaged opener or an element
+        elif got is not None:                                 # #6032 R2 / R4 / R5: any opener, an element too
             pname, length, _ = got
-            closer = "</%s>" % pname if s.startswith("<%s>" % pname) else None
+            closer = "</%s>" % pname if pname and s.startswith("<%s>" % pname) else None
             end = param_end(text[pos + length:], final, pname, hold, allow_reopen=True,
                             names=set(names) - seen - {pname}, closer=closer)
             if end < 0:
@@ -1410,6 +1437,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
             raise ValueError("malformed tool call: " + body[:80])
         args.update(got[0])
         rest = rest.lstrip()[got[1]:]
+    openers = dropped = 0
     while True:
         # #6032 R2 (recover): where a parameter may begin, a damaged opener of a declared parameter not set yet
         # counts (opener_at); anything else is skipped to the next `<parameter=`, as before
@@ -1426,6 +1454,8 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
                 got = (param_name(rest[len(PARAM_START):rest.index(">")]), rest.index(">") + 1, None)
             s = rest
         pname, length, inline = got
+        openers += 1
+        dropped += pname is None
         closer = "</%s>" % pname if recover and pname and s.startswith("<%s>" % pname) else None   # #6032 R4: an element
         rest = s[length:]
         declared = declared_type(props.get(pname)) if pname else None
@@ -1445,6 +1475,10 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         v = coerce_value(value, declared, notes) if pname else _SKIP
         if v is not _SKIP:
             args[pname] = v
+    if recover and openers and dropped == openers and not args:
+        # #6032 R5: every parameter the model began was unreadable (an opener cut before its `>`, a stub): the call is
+        # not run with no arguments at all - it goes back as the text it is
+        raise ValueError("malformed tool call: no readable parameter: " + body[:80])
     return ToolCall(name=name, arguments=args)
 
 
@@ -2295,6 +2329,12 @@ class OutputParser:
                     continue
                 if kind == "wait":
                     after = ""
+                cut = re.match(r"<function=([^<>\s]+)[ \t]*\n", after) if self.recover else None
+                if cut and self.aliases.get(cut.group(1), cut.group(1)) in self.schemas:
+                    # #6032 R6 (recover): `<function=NAME` + line break - the `>` left out - of a declared tool
+                    at = len(self.buf) - len(after)
+                    self.buf = self.buf[:at] + FUNC_START + cut.group(1) + ">\n" + after[cut.end():]
+                    continue
                 is_call = re.match(r"<function=(\s*[^<>\s]+\s*)>", after)
                 if is_call:
                     raw_name = is_call.group(1)
@@ -2445,9 +2485,11 @@ class OutputParser:
                 try:            # the final event carries the call's arguments, as the one _finish_call sends does
                     call = parse_tool_call(self.buf, self.schemas.get(call.name), self.notes, recover=self.recover)
                     call.name, call.id = self.scall.name, self.scall.id
-                except ValueError:
-                    pass
-                out.append(Event("tool_call", call=call))
+                except ValueError as e:
+                    if "no readable parameter" in str(e):
+                        call = None             # #6032 R5: never run with no arguments (it stays announced, unfinished)
+                if call is not None:
+                    out.append(Event("tool_call", call=call))
             elif self.ss == "function_done":
                 out.append(Event("content", self._track(CALL_START + self.buf)))
             self.buf = ""

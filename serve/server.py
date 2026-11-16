@@ -9201,6 +9201,14 @@ def make_handler(svc: Service):
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
+            # #4621 / #1917: what the client's own tool_search returned in THIS request's input is declared in the
+            # conversation where the search answered; after the prompt is made (so its start, and the conversation
+            # cache, stay as they were) the parser and the response accept exactly those names as declared - never a
+            # guessed one.  tool_choice "none" (tools None) hides the found tools too.
+            found, found_names = responses_api.client_found_tools(req)
+            if tools is not None and found:
+                tools = tools + [t for t in found if t["name"] not in names]
+                names = {**found_names, **names}
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
