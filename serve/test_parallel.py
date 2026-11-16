@@ -717,6 +717,28 @@ class ParallelService(FakeEngineCase):
         self.assertEqual(self.chat("fine again")["choices"][0]["message"]["content"], "ok, done.")
         self.assertEqual(self.get("/metrics")["totals"]["requests"], 2, "a later admitted request counts")
 
+    def test_bgen_refused_for_good_counts_in_no_latency_or_prometheus_total(self):
+        """#3336 (PR's checks on top of #3040): the refused admission keeps its Retry-After, adds no latency
+        observation and no Prometheus success / prompt-token count; a later admitted request still counts."""
+        self.start(2)
+        self.engine.SLOT_PARK_S = 0.05
+        out = self._two_at_once("BUSYALL hello")
+        self.assertEqual(out["b"][:2], ("http", 503), out["b"])
+        self.assertEqual(out["b"][3].get("Retry-After"), "5", out["b"])
+        completed = next(row for row in self.svc.history if row["output_tokens"] > 0)
+        self.assertEqual(self.svc.totals["prompt_tokens"], completed["prompt_tokens"])
+        self.assertEqual(self.svc.latencies.snapshot()["e2e"][2], 1)
+        req = urllib.request.Request(self.base + "/metrics", headers={"Accept": "text/plain"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            samples = {line.split("{", 1)[0]: float(line.rsplit(" ", 1)[1])
+                       for line in r.read().decode().splitlines() if line and not line.startswith("#")}
+        self.assertEqual(samples["vllm:request_success_total"], 1)
+        self.assertEqual(samples["vllm:prompt_tokens_total"], completed["prompt_tokens"])
+        self.assertEqual(samples["vllm:e2e_request_latency_seconds_count"], 1)
+        time.sleep(0.5)
+        self.assertEqual(self.chat("fine again")["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(self.svc.latencies.snapshot()["e2e"][2], 2)
+
     def test_bgen_refused_for_good_in_a_stream_is_each_apis_error_frame(self):
         """The same refusal once the 200 is sent: the API's own last frame, not a second HTTP response in the body."""
         self.start(2)
