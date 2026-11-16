@@ -434,7 +434,7 @@ bool memset_async(void* dst, int value, size_t bytes, Stream s) {
     catch (const std::exception& e) { return fail("memset_async", e); }
 }
 
-bool mem_info(size_t* free_bytes, size_t* total_bytes) {
+bool mem_info(size_t* free_bytes, size_t* total_bytes, size_t* short_bytes) {
     try {
         const auto& d = rt().device();
         uint64_t free = 0;
@@ -462,8 +462,10 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
         // elsewhere: the B70 reports its total 1.7 GiB under its 32 GiB and its free memory from the 32 GiB, which
         // the cache has used
         if (margin > 0) free = std::min<uint64_t>(free, total > held + margin ? total - held - margin : 0);
-        core::apply_vram_limit(free, total, held);
+        uint64_t short_b = 0;
+        core::apply_vram_limit(free, total, held, &short_b);
         if (free_bytes) *free_bytes = (size_t) free;
+        if (short_bytes) *short_bytes = (size_t) short_b;
         if (total_bytes) *total_bytes = (size_t) total;
         return true;
     } catch (const std::exception& e) { return fail("mem_info", e); }

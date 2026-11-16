@@ -5500,8 +5500,13 @@ int main(int argc, char** argv) {
                 : 0;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t mtp_bind = 0, reserve = 0, slots = 0;
+        // past XESTRATA_VRAM_LIMIT_MIB: how far, where the free memory reads 0 (an 8 GB limit on the B70: the D/U's
+        // and the drafter's steps changed nothing the sizing saw, and the shortfall was understated)
+        int64_t over_b = 0;
         auto size_cache = [&] {
-            strata::gpu::mem_info(&free_b, &total_b);
+            size_t short_b = 0;
+            strata::gpu::mem_info(&free_b, &total_b, &short_b);
+            over_b = (int64_t) short_b;
             free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
             // (device 0's latent D/U pair is on the device already, LatentTab::upload: the free memory read here is
             // without it.  Taken off once more, it left Edge0-120B's 1.32 GiB of Q4_0 D/U free beside the cache - 1.4
@@ -5523,8 +5528,13 @@ int main(int argc, char** argv) {
             // Not rounded: free VRAM moves the cache by a slot or two between starts, and with it the last bits of
             // the output (the 2026-10-02-new-machine record), but rounding to 64 slots cost the RTX 4070 3-4% of its
             // decode.  Runs that must give the same tokens fix the size with --expert-cache N.
-            slots = ((int64_t) free_b - reserve) / blob;
+            slots = ((int64_t) free_b - over_b - reserve) / blob;
             if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
+        };
+        // a slot count for the log: below zero, the MiB the cache is short of its first slot
+        auto slots_text = [&](int64_t s) {
+            return s >= 0 ? std::to_string(s) + " slots"
+                          : "no slots (" + std::to_string((-s * blob) >> 20) + " MiB short)";
         };
         size_cache();
         // #496 (below): the slots a working cache needs
@@ -5538,6 +5548,12 @@ int main(int argc, char** argv) {
                 return 1;
             }
             size_cache();
+            std::fprintf(stderr, "xestrata generate: latent D/U auto: Q4_0 (%s), the expert cache %s in place of %s "
+                                 "with Q8_0 (XESTRATA_LATENT_DENSE_FMT=8 keeps Q8_0)\n", lat_tab.path.c_str(),
+                         slots_text(slots).c_str(), slots_text(slots_q8).c_str());
+        } else if (lat_tab.latent && lat_tab.auto_fmt) {
+            std::fprintf(stderr, "xestrata generate: latent D/U auto: Q8_0, the expert cache %s "
+                                 "(XESTRATA_LATENT_DENSE_FMT=4 takes Q4_0)\n", slots_text(slots).c_str());
         }
         if (slots < min_slots && o.batch > 0) {   // --batch: slots given back until it has them (drop_slots)
             while (slots < min_slots && o.batch > 0) {
@@ -5575,11 +5591,11 @@ int main(int argc, char** argv) {
             if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > small_reserve_mib) {
                 // the largest reserve (in MiB) that still leaves min_slots
                 const int64_t fit_mib =
-                    ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
+                    ((int64_t) free_b - over_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
                 if (fit_mib >= small_reserve_mib) {
                     const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
                     const int64_t taken = (((int64_t) r + prefill_mib) << 20) + mtp_bind + pipe_first;
-                    int64_t s2 = ((int64_t) free_b - taken) / blob;
+                    int64_t s2 = ((int64_t) free_b - over_b - taken) / blob;
                     // not below the slots a working cache needs (s2 >= min_slots: r leaves them)
                     s2 = std::max<int64_t>(min_slots, s2);
                     if (!profile.empty()) s2 = std::min<int64_t>(s2, (int64_t) profile.size());
@@ -5612,7 +5628,8 @@ int main(int argc, char** argv) {
                     size_cache();
                     std::fprintf(stderr, "xestrata generate: the drafter's routed experts in pinned memory, read in "
                                          "place (XESTRATA_MTP_EXPERTS_HOST=0 keeps them on the device): the expert "
-                                         "cache %lld slots in place of %lld\n", (long long) slots, (long long) before);
+                                         "cache %s in place of %s\n", slots_text(slots).c_str(),
+                                 slots_text(before).c_str());
                 }
             }
         }
@@ -5625,7 +5642,8 @@ int main(int argc, char** argv) {
             const int64_t at_reserve = o.vram_reserve_given ? o.vram_reserve_mib
                                                             : std::min(o.vram_reserve_mib, small_reserve_mib);
             const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + pipe_first + min_slots * blob;
-            const int64_t short_mib = std::max<int64_t>(1, (need_b - (int64_t) free_b + (1 << 20) - 1) >> 20);
+            const int64_t short_mib =
+                std::max<int64_t>(1, (need_b - (int64_t) free_b + over_b + (1 << 20) - 1) >> 20);
             const int64_t session_mib = (int64_t) (strata::core::session_bytes(g, o.max_context, K) >> 20);
             const std::string reserve_tip =
                 o.vram_reserve_given && o.vram_reserve_mib > small_reserve_mib

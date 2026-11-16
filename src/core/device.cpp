@@ -1090,12 +1090,14 @@ void apply_uma_limit(uint64_t& free, uint64_t total) {
 // The used memory is the larger of the report's and what the process holds: the B70 reports its global_mem_size
 // (31023 MiB) less than its 32 GiB and its free memory as the smaller of that and what is free, so the first 1.4 GiB a
 // process takes do not show (2026-10-19); llm-jp-4.1 Q4_K_M under 6144 MiB took 7.3 GiB.
-void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held) {
+void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held, uint64_t* short_b) {
+    if (short_b) *short_b = 0;
     const uint64_t lim = vram_limit_bytes();
     if (lim == 0 || lim >= total) return;
     const uint64_t used = std::max(total > free ? total - free : 0, held);
     total = lim;
     free = lim > used ? lim - used : 0;
+    if (short_b) *short_b = used > lim ? used - lim : 0;
 }
 
 // The room no plan counts, of any device's memory: see the declaration.  A caller that cannot read the device's
