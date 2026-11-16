@@ -7,11 +7,16 @@
 // selects one GPU by what it reports (STRATA_GPU_PCI, else a discrete card with the most memory) and refuses one without
 // what the kernels need.
 #include "strata/core/device.hpp"
+#include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
+#include <sycl/sycl.hpp>
+
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 // A string as a JSON string literal.
@@ -43,6 +48,84 @@ static int list_devices() {
     return 0;
 }
 
+// --bench: the measured values the training placement reads (serve/train_budget.py): the pinned host <-> device
+// copy bandwidth and a compute probe, one JSON line.  Run once per card (STRATA_GPU_PCI selects it).  The copy
+// numbers depend on the PCIe generation and width and the pinned memory (64 MiB each way, 8 passes after 2 warm-up
+// passes, the whole batch timed after one sync); the compute probe is a synthetic FP32 FMA chain (8 independent
+// accumulators, 256 rounds, 1M work-items, 4 launches) - a ranking proxy for the card's arithmetic, not a model
+// kernel's time.  Where the pinned memory or the queue cannot be had it exits non-zero: the caller falls back to
+// the PCIe report and decides conservatively (no fast path assumed).
+static int bench() {
+    namespace gpu = strata::gpu;
+    strata::core::Runtime& rt = strata::core::Runtime::get();
+    void* s = rt.create_stream();
+    size_t fb = 0, tb = 0;
+    const bool known = gpu::mem_info(&fb, &tb);
+    const size_t mb = 64ull << 20;
+    void* h = gpu::alloc_host(mb);
+    void* d = gpu::alloc_device(mb);
+    if (h == nullptr || d == nullptr) {
+        std::fprintf(stderr, "bench: the pinned or device memory was not had: %s\n", gpu::last_error());
+        return 1;
+    }
+    std::memset(h, 0x5a, mb);
+    auto gbs = [&](bool h2d) {
+        for (int i = 0; i < 2; ++i) {
+            if (!gpu::copy_async(h2d ? d : h, h2d ? h : d, mb, s)) throw std::runtime_error(gpu::last_error());
+            gpu::stream_sync(s);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 8; ++i)
+            if (!gpu::copy_async(h2d ? d : h, h2d ? h : d, mb, s)) throw std::runtime_error(gpu::last_error());
+        gpu::stream_sync(s);
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return 8.0 * (double) mb / 1e9 / sec;
+    };
+    const double h2d = gbs(true), d2h = gbs(false);
+    gpu::free(d);
+    gpu::free(h);
+    // the compute probe: buf[i] through 8 dependent FMA chains, the sum written back (nothing optimized away)
+    const int n = 1 << 20;
+    float* buf = static_cast<float*>(gpu::alloc_device((size_t) n * 4));
+    if (buf == nullptr) {
+        std::fprintf(stderr, "bench: the probe's memory was not had: %s\n", gpu::last_error());
+        return 1;
+    }
+    gpu::memset(buf, 0, (size_t) n * 4);
+    sycl::queue& q = rt.compute();
+    auto launch = [&] {
+        q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+            float a0 = buf[id[0]], a1 = a0 + 1.f, a2 = a0 + 2.f, a3 = a0 + 3.f;
+            float a4 = a0 + 4.f, a5 = a0 + 5.f, a6 = a0 + 6.f, a7 = a0 + 7.f;
+            for (int k = 0; k < 256; ++k) {
+                a0 = a0 * 1.0000001f + 0.1f;
+                a1 = a1 * 1.0000001f + 0.1f;
+                a2 = a2 * 1.0000001f + 0.1f;
+                a3 = a3 * 1.0000001f + 0.1f;
+                a4 = a4 * 1.0000001f + 0.1f;
+                a5 = a5 * 1.0000001f + 0.1f;
+                a6 = a6 * 1.0000001f + 0.1f;
+                a7 = a7 * 1.0000001f + 0.1f;
+            }
+            buf[id[0]] = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
+        });
+    };
+    launch();
+    q.wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 4; ++i) launch();
+    q.wait();
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double gflops = 4.0 * (double) n * 256 * 8 * 2 / 1e9 / sec;
+    gpu::free(buf);
+    const strata::core::DeviceInfo di = strata::core::device_info(0);
+    std::printf("{\"pci\": %s, \"h2d_gbs\": %.2f, \"d2h_gbs\": %.2f, \"fp32_gflops\": %.0f, \"free_mib\": %llu, "
+                "\"total_mib\": %llu}\n",
+                json_text(di.pci).c_str(), h2d, d2h, gflops, (unsigned long long) (known ? fb >> 20 : 0),
+                (unsigned long long) (known ? tb >> 20 : 0));
+    return 0;
+}
+
 // --cpu: the CPU's name and the engine's own tests for its kernels (cpu_avx2_ok, cpu_avx512_ok), as one JSON object;
 // no GPU is touched.  setup reads it where it has no /proc/cpuinfo (Windows).
 static int cpu_report() {
@@ -60,16 +143,17 @@ static std::string human(uint64_t b) {
 }
 
 int main(int argc, char** argv) {
-    bool selftest = false, list = false;
+    bool selftest = false, list = false, do_bench = false;
     const char* version = "XeStrata " STRATA_VERSION " (backend " STRATA_BACKEND
         ", upstream Strata " STRATA_UPSTREAM_VERSION ", " STRATA_UPSTREAM_COMMIT ")";
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list = true;
+        else if (std::strcmp(argv[i], "--bench") == 0) do_bench = true;
         else if (std::strcmp(argv[i], "--cpu") == 0) return cpu_report();
         else if (std::strcmp(argv[i], "--version") == 0) { std::puts(version); return 0; }
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: xestrata-device [--selftest] [--list-devices] [--cpu] [--version]\n");
+            std::printf("usage: xestrata-device [--selftest] [--list-devices] [--bench] [--cpu] [--version]\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -79,6 +163,7 @@ int main(int argc, char** argv) {
 
     try {
         if (list) return list_devices();
+        if (do_bench) return bench();
         const strata::core::DeviceInfo d = strata::core::device_info(0);
         std::puts(version);
         std::printf("device %d: %s (%04x:%04x, %s)\n", d.ordinal, d.name.c_str(), d.vendor_id, d.device_id,
