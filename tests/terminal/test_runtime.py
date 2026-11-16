@@ -1258,6 +1258,13 @@ class RuntimeTests(unittest.TestCase):
             runtime._recover_stale("local", wait=0)
         self.assertTrue(state_path.exists())
 
+    def test_a_no_child_marker_that_cannot_be_written_never_publishes_host_state(self):         # #4250 (zapabob's third case)
+        host = runtime.Host("local", shutdown_timeout=2)
+        with mock.patch.object(host, "_mark_child", side_effect=OSError("marker unavailable")):
+            with self.assertRaisesRegex(OSError, "marker unavailable"):
+                host.serve()
+        self.assertFalse(host.state_path.exists())
+
     # ---- owner transport, attach and identity (POSIX socket and Windows loopback alike)
 
     def _stale_host(self, child_pid, *, started=None, token="a" * 64):
