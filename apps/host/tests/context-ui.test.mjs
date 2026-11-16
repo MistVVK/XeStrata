@@ -70,7 +70,9 @@ test('the store keeps the code and the engine\'s text of an error, shows a sente
   const store = read('../src/lib/store.ts');
   assert.match(store, /typeof frame\.key === 'string' \? tr\(frame\.key,/);
   assert.match(store, /errorCode: frame\.code/);
-  assert.match(store, /errorDetail: frame\.details/);
+  // the engine's own details come first; else the engine line chatFailure kept (7bcb5a69c)
+  assert.match(store, /const detail = typeof frame\.details === 'string' && frame\.details \? frame\.details : failure && failure\.kind !== 'plain'/);
+  assert.match(store, /\.\.\.\(detail \? \{ errorDetail: detail \} : \{\}\)/);
   assert.match(store, /type === 'context'/);
   const summarize = store.slice(store.indexOf('export async function summarizeAndContinue'), store.indexOf('export async function sendOversized'));
   assert.ok(summarize.indexOf("sendMessage('/compact')") > 0 && summarize.indexOf("sendMessage('Please answer my last message now.')") > summarize.indexOf("sendMessage('/compact')"), 'summarise first, then ask for the answer');
