@@ -209,11 +209,50 @@ NativeDense::~NativeDense() {
     if (scratch_) strata::gpu::free(scratch_);
     for (void* p : weights_) strata::gpu::free(p);
     for (void* p : hc_q8_) strata::gpu::free(p);
+    if (hc_q8_host_) strata::gpu::free(hc_q8_host_);
     if (hc_side_)
         for (void*& p : g_hc_scratch) { strata::gpu::free(p); p = nullptr; }
 }
 
 bool NativeDense::hc_q8_wanted() { return hc_q8_requested(); }
+
+bool NativeDense::hc_q8_to_host(std::string& err) {
+    if (hc_q8_host_ != nullptr || hc_q8_.empty()) return true;
+    // each copy at a 256-byte boundary, as its device allocation was
+    auto bytes_of = [](const WeightRef* r) { return (uint64_t) r->ne0 / 32 * 34 * (uint64_t) r->ne1; };
+    uint64_t total = 0;
+    for (const WeightRef* r : hc_q8_refs_) total += (bytes_of(r) + 255) / 256 * 256;
+    uint8_t* h = nullptr;
+    if (!strata::gpu::alloc_host((void**) &h, total)) {
+        err = "the hyper-connection projections: " + std::to_string(total >> 20) + " MiB of pinned memory: " +
+              strata::gpu::last_error();
+        return false;
+    }
+    if (!strata::gpu::kernels_read_host(h)) {
+        strata::gpu::free(h);
+        err = "the hyper-connection projections: this GPU's kernels do not read pinned host memory in place";
+        return false;
+    }
+    std::vector<uint8_t*> at(hc_q8_.size());
+    uint64_t off = 0;
+    for (size_t i = 0; i < hc_q8_.size(); ++i) {
+        at[i] = h + off;
+        if (!strata::gpu::copy(at[i], hc_q8_[i], bytes_of(hc_q8_refs_[i]))) {
+            strata::gpu::free(h);
+            err = std::string("the hyper-connection projections' copy to pinned memory: ") + strata::gpu::last_error();
+            return false;
+        }
+        off += (bytes_of(hc_q8_refs_[i]) + 255) / 256 * 256;
+    }
+    for (size_t i = 0; i < hc_q8_.size(); ++i) {
+        hc_q8_refs_[i]->hc_q8 = at[i];
+        strata::gpu::free(hc_q8_[i]);
+    }
+    hc_q8_.clear();
+    hc_q8_host_ = h;
+    bytes_ -= std::min(bytes_, hc_q8_bytes_);
+    return true;
+}
 
 bool NativeDense::hc_side_names(const std::string& pack_dir, std::set<std::string>& hc, std::set<std::string>& others,
                                 std::string& err) {
@@ -522,7 +561,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         for (auto& [ref, data] : hc_q8) {
             ref->hc_q8 = data.get();
             hc_q8_.push_back(data.release());
+            hc_q8_refs_.push_back(ref);
         }
+        hc_q8_bytes_ = hc_q8_bytes;
         bytes_ = total + hc_q8_bytes;
         if (strata::core::manifest::enabled()) {   // upstream 89f4fa18: whether the hyper-connection rows were copied, and why
             const char* v = strata::env_get("HC_Q8");

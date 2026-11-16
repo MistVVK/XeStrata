@@ -58,7 +58,12 @@ public:
     /// `drop_hc_bf16`): no VRAM-share rule for the choice, since the Q8_0 copies then take less than they free.
     void set_hc_side(bool on) { hc_side_ = on; }
     /// After `load`: the Q8_0 read was chosen.
-    bool hc_q8_chosen() const { return !hc_q8_.empty(); }
+    bool hc_q8_chosen() const { return !hc_q8_.empty() || hc_q8_host_ != nullptr; }
+    /// The Q8_0 hyper-connection projections' VRAM (0 once they are in pinned memory).
+    uint64_t hc_q8_device_bytes() const { return hc_q8_host_ != nullptr ? 0 : hc_q8_bytes_; }
+    /// Moves the Q8_0 hyper-connection projections to pinned host memory, the kernels reading them there in place
+    /// (a card the expert cache would leave short otherwise).  Before any graph captures them.
+    bool hc_q8_to_host(std::string& err);
     /// The layers' BF16 down / up rows that have Q8_0 copies become non-resident (data null) and the dequantization
     /// scratch hc_bf16_view uses is allocated here, at load, not on first use (a graph may capture the first use).
     bool drop_hc_bf16(WeightTable& table, std::string& err);
@@ -68,6 +73,9 @@ public:
 private:
     std::vector<void*> weights_;
     std::vector<void*> hc_q8_;   ///< STRATA_HC_Q8=1: the hyper-connection projections' Q8_0 copies
+    std::vector<WeightRef*> hc_q8_refs_;   ///< the rows each copy serves (hc_q8_'s order)
+    uint64_t hc_q8_bytes_ = 0;
+    uint8_t* hc_q8_host_ = nullptr;        ///< hc_q8_to_host: every copy, one after another
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
     bool hc_side_ = false;

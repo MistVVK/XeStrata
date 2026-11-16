@@ -5762,6 +5762,25 @@ int main(int argc, char** argv) {
                                  (long long) before, (long long) min_slots);
                 }
             }
+            // Still short with every D/U layer streamed (a 6 GB card with Edge0-120B): the hyper-connection
+            // projections' Q8_0 copies go to pinned memory, the kernels reading them in place (XESTRATA_HC_HOST: a
+            // window reads them whole over the link).  Not taken where the cache has its slots without it.
+            const auto hc_pick = strata::core::pick_from_env("HC_HOST");
+            if (native_dense.hc_q8_device_bytes() > 0 && hc_pick != strata::core::Pick::Off &&
+                (hc_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
+                std::string he;
+                const int64_t before = slots;
+                const uint64_t hb = native_dense.hc_q8_device_bytes();
+                if (!native_dense.hc_q8_to_host(he)) {
+                    std::fprintf(stderr, "xestrata generate: %s: they stay on the device\n", he.c_str());
+                } else {
+                    size_cache();
+                    std::fprintf(stderr, "xestrata generate: the hyper-connection projections (%llu MiB) in pinned "
+                                         "memory, read in place (XESTRATA_HC_HOST=0 keeps them on the device): the "
+                                         "expert cache %s in place of %s\n", (unsigned long long) (hb >> 20),
+                                 slots_text(slots).c_str(), slots_text(before).c_str());
+                }
+            }
         }
         if (slots > o.expert_cache) {   // the steps above made room
             o.expert_cache = (int) slots;
