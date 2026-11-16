@@ -987,7 +987,18 @@ def _connect_write(harness, out, a, machine: bool):
                 ans = ""
         if ans not in ("y", "yes"):
             return [], 0, "Nothing was written."
-    return [harness.write_file(f) for f in out["files"]], 0, None
+    # The files are written in order. One that cannot be written ends the write there: it is reported with its error, the ones after it with
+    # "not_written", and the exit code is 1 (before, an OSError ended the command with a traceback and the JSON path said nothing).
+    results: list[dict] = []
+    for n, f in enumerate(out["files"]):
+        try:
+            results.append(harness.write_file(f))
+        except OSError as exc:
+            path = str(harness.expand(f["path"]))
+            results.append({"path": path, "backup": None, "action": "failed", "error": exc.strerror or str(exc)})
+            results += [{"path": str(harness.expand(g["path"])), "backup": None, "action": "not_written"} for g in out["files"][n + 1:]]
+            return results, 1, f"Could not write {path}: {exc.strerror or exc}."
+    return results, 0, None
 
 def run_connect(a: argparse.Namespace) -> int:
     from strata_cli.launch import harness
@@ -1024,36 +1035,39 @@ def run_connect(a: argparse.Namespace) -> int:
                                                        if k != "files"},
                    "files": [{**f, "text": harness.mask(f["text"], key)} for f in out["files"]],
                    "vendor_tested": h.tested or None}
+        # The same order as the plain-words output: --check first, and a failed check writes nothing (exit 1); then --write (#5955).
+        if a.check:
+            # --check runs the same two checks as the plain-words output (one prompt, one tool call, the way this app sends them) and the answer
+            # says what they found: "ok" is true only when both worked, and the exit code is 1 when one failed or the server cannot be reached.
+            from strata_cli.launch import check
+            results = check.run_checks(h.id if not h.built_in else "opencode", tgt.url, key, tgt.model)
+            passed = all(r.ok for r in results)
+            payload["checks"] = [{"name": r.name, "ok": r.ok, "detail": r.detail, "seconds": round(r.seconds, 1)} for r in results]
+            payload["checked_server"] = tgt.url
+            payload["ok"] = passed
+            if not passed:
+                reached = any(r.ok for r in results)
+                payload["error"] = {"code": 1, "message": ("The server answered, but the app's prompt or tool call did not work: "
+                                                           + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok))
+                                    if reached else
+                                    "The server could not be reached or did not answer the check: "
+                                    + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok)}
+                if a.write:
+                    payload["write"] = {"written": []}
+                print(json.dumps(payload))
+                return 1
         if a.write:                                   # the JSON path writes too, and reports each file
             written, code, message = _connect_write(harness, out, a, True)
+            payload["write"] = {"written": written}
             if code:
                 payload["ok"] = False
                 payload["error"] = {"code": code, "message": message}
                 print(json.dumps(payload))
                 return code
-            payload["write"] = {"written": written}
             if message:
                 payload["write"]["note"] = message
-        if not a.check:
-            print(json.dumps(payload))
-            return 0
-        # --check runs the same two checks as the plain-words output (one prompt, one tool call, the way this app sends them) and the answer
-        # says what they found: "ok" is true only when both worked, and the exit code is 1 when one failed or the server cannot be reached.
-        from strata_cli.launch import check
-        results = check.run_checks(h.id if not h.built_in else "opencode", tgt.url, key, tgt.model)
-        passed = all(r.ok for r in results)
-        payload["checks"] = [{"name": r.name, "ok": r.ok, "detail": r.detail, "seconds": round(r.seconds, 1)} for r in results]
-        payload["checked_server"] = tgt.url
-        payload["ok"] = passed
-        if not passed:
-            reached = any(r.ok for r in results)
-            payload["error"] = {"code": 1, "message": ("The server answered, but the app's prompt or tool call did not work: "
-                                                       + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok))
-                                if reached else
-                                "The server could not be reached or did not answer the check: "
-                                + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok)}
         print(json.dumps(payload))
-        return 0 if passed else 1
+        return 0
     _say(f"{h.title}  ({h.speaks}; {h.status})")
     if not info.get("running") and not a.url:
         _say("[!] No running Strata server was found, so this uses the default address. Start one with: strata launch")
@@ -1089,12 +1103,13 @@ def run_connect(a: argparse.Namespace) -> int:
             return 1
     if a.write:
         written, code, message = _connect_write(harness, out, a, False)
+        for r in written:
+            if r["action"] not in ("failed", "not_written"):
+                _say(f"{r['action'].capitalize()} {r['path']}" + (f" (backup: {r['backup']})" if r["backup"] else ""))
         if message:
-            if code == 2:
+            if code:
                 print(f"strata: {message}", file=sys.stderr)
             else:
                 _say(message)
             return code
-        for r in written:
-            _say(f"{r['action'].capitalize()} {r['path']}" + (f" (backup: {r['backup']})" if r["backup"] else ""))
     return 0
