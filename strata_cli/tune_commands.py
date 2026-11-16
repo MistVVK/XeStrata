@@ -221,7 +221,7 @@ def _hw_hash(identity: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- tune auto
 
 def auto(a: argparse.Namespace) -> int:
-    from strata_control import autotune, engine_component, presets, tuning
+    from strata_control import autotune, engine_component, presets, tune_knobs, tuning
     from strata_control.tune_session import WorkerSession
 
     machine = a.output == "json"
@@ -239,7 +239,7 @@ def auto(a: argparse.Namespace) -> int:
         return _fail(f"no engine was found at {exe}", 5, machine)
     identity = presets.current_identity(cfg, exe=exe)
     backend = (identity.get("engine") or {}).get("backend") or engine_component.detect_backend()[0] or "cpu"
-    flags = tuning.engine_flag_inventory(Path(exe))
+    flags = tuning.engine_flag_inventory(Path(exe), wanted=tuning.dimension_flags() | tune_knobs.arm_flags())
     opts = autotune.Options(mode=a.mode, goal=goal, reserve_mib=reserve, ram_wish_pct=a.leave_ram, use=a.use,
                             allow_placement=a.allow_small_differences, allow_nonrepeatable=a.allow_not_repeatable,
                             budget_s=(a.minutes * 60.0 if a.minutes else None), check_busy=not a.no_quiet_check)
@@ -483,7 +483,7 @@ def _status(a: argparse.Namespace, machine: bool) -> int:
 
 
 def _recheck(a: argparse.Namespace, machine: bool) -> int:
-    from strata_control import autotune, presets, tuning
+    from strata_control import autotune, presets, tune_knobs, tuning
     from strata_control.tune_session import WorkerSession
     preset = presets.find(a.preset)
     _path, cfg = _load_target(a.target)
@@ -496,7 +496,8 @@ def _recheck(a: argparse.Namespace, machine: bool) -> int:
         int((ident.get("engine") or {}).get("tuning_epoch") or 0)
     opts = autotune.Options(use=(preset.get("choices") or {}).get("use", "chat"))
     ctx = autotune.context_from_config(cfg, engine_backend=(ident.get("engine") or {}).get("backend"), opts=opts,
-                                       engine_flags=tuning.engine_flag_inventory(Path(exe)))
+                                       engine_flags=tuning.engine_flag_inventory(
+                                           Path(exe), wanted=tuning.dimension_flags() | tune_knobs.arm_flags()))
     say = (lambda s: None) if machine else (lambda s: print(s, file=sys.stderr, flush=True))
     workdir = Path(a.work_dir) if a.work_dir else Path(tempfile.mkdtemp(prefix="strata-recheck-"))
     if not a.work_dir:
