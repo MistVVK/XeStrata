@@ -1,7 +1,12 @@
 // The conversation cache's SSD tier: its folder per engine process and its budget (conversation_spill.hpp).  No GPU, no model.
 #include "strata/core/conversation_spill.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -168,6 +173,99 @@ int main() {
         for (int i = 0; i < 40; ++i) { slow.saw_prompt(2000, 2000.0); slow.saw_write(264000000, 130.0); slow.saw_read(264000000, 250.0); }
         check(slow.worth(2000, 264000000), "on a slower card a 2K conversation is worth the disk");
         check(!c.worth(0, 1) && !slow.worth(0, 1), "an empty conversation never is");
+    }
+    {   // 2c: the background writer
+        using namespace std::chrono_literals;
+        struct Gate {   // holds the writer inside a write until opened
+            std::mutex mu; std::condition_variable cv; bool open = false; int entered = 0;
+            void enter() { std::unique_lock<std::mutex> lk(mu); ++entered; cv.notify_all(); cv.wait(lk, [&] { return open; }); }
+            void release() { { std::lock_guard<std::mutex> lk(mu); open = true; } cv.notify_all(); }
+            void wait_entered(int n) { std::unique_lock<std::mutex> lk(mu); cv.wait_for(lk, 5s, [&] { return entered >= n; }); }
+        };
+        Gate gate;
+        std::vector<int> order;
+        std::mutex order_mu;
+        {
+            BackgroundWriter<int> w([&](const int& v) -> uint64_t {
+                gate.enter();
+                std::lock_guard<std::mutex> lk(order_mu);
+                order.push_back(v);
+                return v == 3 ? 0 : (uint64_t) v * 10;   // item 3: a failed write
+            });
+            w.push(1);
+            gate.wait_entered(1);
+            w.push(2);   // one waits behind the one in flight
+            std::atomic<bool> third_in{false};
+            std::thread t([&] { w.push(3); third_in = true; });
+            std::this_thread::sleep_for(150ms);
+            check(!third_in.load(), "a third push waits while one is in flight and one is queued");
+            int held = 0;
+            w.for_each_held([&](const int&) { ++held; });
+            check(held == 2 && !w.idle(), "the queued one and the one in flight are held");
+            gate.release();
+            t.join();
+            w.wait_idle();
+            check(third_in.load() && w.idle(), "the queue drains");
+            auto done = w.take_done();
+            check(done.size() == 3 && done[0].item == 1 && done[0].serial == 10 && done[1].item == 2 && done[1].serial == 20 &&
+                  done[2].item == 3 && done[2].serial == 0, "written in order, each handed back with its serial (0: failed)");
+            check(order == std::vector<int>({1, 2, 3}) && w.take_done().empty(), "handed back once");
+        }
+        Gate g2;
+        std::vector<int> written;
+        {
+            BackgroundWriter<int> w([&](const int& v) -> uint64_t { g2.enter(); written.push_back(v); return 1; });
+            w.push(7);
+            g2.wait_entered(1);
+            w.push(8);
+            auto queued = w.take_queued();
+            check(queued.size() == 1 && queued[0] == 8, "take_queued gives the queued one back unwritten");
+            w.push(9);   // and the writer takes more after it
+            g2.release();
+        }   // the destructor: 7 finishes, 9 is not written (queued at the end)
+        check(written == std::vector<int>({7}) || written == std::vector<int>({7, 9}),
+              "the destructor finishes the write in flight and does not hang");
+        // a SavedConversation through the real SSD tier, while the serve thread matches and takes by serial
+        auto img = [](std::vector<int32_t> ids, uint8_t fill) {
+            SavedConversation s;
+            s.live.ids = ids;
+            s.live.gdn.assign(1 << 18, fill);
+            s.cvec = true;
+            return s;
+        };
+        const SessionFileIdentity id{31, 41};
+        ConversationSpill sp;
+        std::string err;
+        check(sp.open(root, uint64_t(64) << 20, err), "a tier for the writer");
+        {
+            BackgroundWriter<SavedConversation> w([&](const SavedConversation& s) -> uint64_t {
+                uint64_t serial = 0;
+                std::string e;
+                return sp.put(s, id, e, &serial) ? serial : 0;
+            });
+            for (int k = 0; k < 6; ++k) w.push(img({k, k + 1, k + 2}, (uint8_t) k));
+            for (int k = 0; k < 200; ++k) {   // the serve thread matching while the writer puts
+                const auto m = sp.best(std::vector<int32_t>{2, 3, 4, 9}, {}, true);
+                if (m.tokens > 0) (void) sp.find(m.serial);   // (may be gone or not yet listed: it must only not crash or race)
+            }
+            w.wait_idle();
+            auto done = w.take_done();
+            check(done.size() == 6 && sp.size() == 6, "six written, six listed");
+            const auto m = sp.best(std::vector<int32_t>{2, 3, 4, 9}, {}, true);
+            check(m.tokens == 3, "the entry a prompt continues is found");
+            const auto e = sp.find(m.serial);
+            check(e && e->live.ids == std::vector<int32_t>({2, 3, 4}), "found by its serial");
+            SavedConversation back;
+            check(sp.take_serial(m.serial, id, {}, back, err) && back.live.gdn == std::vector<uint8_t>(1 << 18, 2) &&
+                  !sp.find(m.serial) && sp.size() == 5, "taken by its serial, byte for byte; it leaves the list");
+            check(!sp.take_serial(m.serial, id, {}, back, err) && !sp.drop_serial(m.serial), "a gone serial: nothing");
+            check(sp.drop_serial(done[0].serial) && sp.size() == 4, "dropped by its serial");
+            // a written image still in RAM: the prefix it gives, by the RAM cache's rule
+            const auto p = conversation_image_prefix(done[5].item, std::vector<int32_t>{5, 6, 7, 1}, {}, true);
+            check(p.first == 3 && p.second, "a held image's live prefix");
+            check(conversation_image_prefix(done[5].item, std::vector<int32_t>{5, 6, 7}, {}, false).first == 0, "other steering: none");
+        }
+        sp.close();
     }
     fs::remove_all(root, ec);
     std::printf("conversation_spill_test: %d checks, %d failed\n", checks, failures);
