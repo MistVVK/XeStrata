@@ -421,6 +421,11 @@ if(STRATA_SYCL_PARITY)
     list(APPEND _ple_args --gguf "${STRATA_PLE_GGUF}")
   endif()
   add_test(NAME ple_parity COMMAND ple_parity ${_ple_args} WORKING_DIRECTORY ${STRATA_ROOT})
+  # #6026 / #6013: the PLE reader's selftest (CPU and disk only), as the CUDA/HIP build registers it; it covers which
+  # --ple-gguf files are a table and not a model shard (ple_gguf_table_only), shared with generate.cpp here
+  add_executable(ple_reader_test ${STRATA_ROOT}/src/ngram/ple_reader_test.cpp)
+  target_link_libraries(ple_reader_test PRIVATE strata_kernels)
+  add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
   # 0.1.31: the IQ kernels that decode a weight part once for every column/entry, bitwise vs the per-column ones
   # (no --selftest flag: it runs its checks by default), and the rewritten per-hit/grouped expert kernels vs the
   # previous ones, bitwise
