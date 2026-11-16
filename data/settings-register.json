@@ -41092,6 +41092,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_TEST_POOL_DELAY",
+   "backends": [
+    "sycl"
+   ],
+   "reads": [
+    {
+     "file": "sycl/src/core/verify.cpp",
+     "line": 410,
+     "backend": "sycl",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "bba1a0e92a",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "bba1a0e92a",
+   "last_date": "2026-11-16",
+   "status": "research",
+   "owner": "core",
+   "note": "[reviewed] Test hook, compiled only into a -DSTRATA_SYCL_TEST_HOOKS=ON build (released engines have no such switch): W:K:MS delays the CPU step K of verify window W by MS ms, for the #5160 fault-injection check.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_TEST_SLOW_COPY_US",
    "backends": [
     "cuda-hip"
