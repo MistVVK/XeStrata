@@ -137,7 +137,37 @@ int main() {
         for (auto& x : fs::directory_iterator(small.dir())) if (x.path().filename() != ".lock") ++files;
         check(files == 0, "nothing of a refused put is left on the disk");
         small.close();
+        // #879: clear() drops every entry and its file, the tier stays open
+        check(sp.put(img({30, 31}, 2), id, err) && sp.put(img({40, 41}, 2), id, err) && sp.size() == 2, "two more entries");
+        const fs::path c0 = sp.entry(0).file, c1 = sp.entry(1).file;
+        check(sp.clear() == 2 && sp.size() == 0 && sp.bytes() == 0 && !fs::exists(c0) && !fs::exists(c1), "clear() drops them and their files");
+        check(sp.enabled() && fs::is_directory(sp.dir()) && sp.put(img({50}, 1), id, err) && sp.size() == 1, "the tier stays open after clear()");
         sp.close();
+    }
+    {   // the cost rule, with l620's measured speeds (a 236 MB image written in 120 ms, read back in 220 ms; 5 prompt tokens per ms)
+        SpillCost c;
+        check(c.reread_tokens_per_ms == 2.0 && c.round_trip_ms(2000000) == 4.0, "the defaults: 2 tokens per ms, 1 GB/s each way");
+        for (int i = 0; i < 40; ++i) {
+            c.saw_prompt(8000, 1600.0);
+            c.saw_write(236000000, 120.0);
+            c.saw_read(236000000, 220.0);
+        }
+        check(c.reread_tokens_per_ms > 4.99 && c.reread_tokens_per_ms < 5.01, "the prompt speed converges to the measured one");
+        check(c.round_trip_ms(236000000) > 339.0 && c.round_trip_ms(236000000) < 341.0, "the round trip converges to 120 + 220 ms");
+        check(!c.worth(51, 236000000), "a 51-token conversation is not worth the disk (re-read about 10 ms of tokens)");
+        check(!c.worth(2000, 264000000), "a 2K one is not either here (400 ms against about 1.25 x 380 ms)");
+        check(c.worth(8000, 350000000), "an 8K one is (1600 ms against about 1.25 x 504 ms)");
+        const SpillCost before = c;
+        c.saw_prompt(100, 1.0);       // fewer than kMinTokens: a request's fixed costs, not the prompt speed
+        c.saw_prompt(4000, 0.0);      // no time: ignored
+        c.saw_write(0, 5.0);          // nothing written: ignored
+        c.saw_read(1000, -1.0);       // a clock that went back: ignored
+        check(c.reread_tokens_per_ms == before.reread_tokens_per_ms && c.write_bytes_per_ms == before.write_bytes_per_ms &&
+              c.read_bytes_per_ms == before.read_bytes_per_ms, "samples that say nothing about the speeds are ignored");
+        SpillCost slow;   // a card that reads prompts at 1 token per ms: the same 2K conversation is worth spilling
+        for (int i = 0; i < 40; ++i) { slow.saw_prompt(2000, 2000.0); slow.saw_write(264000000, 130.0); slow.saw_read(264000000, 250.0); }
+        check(slow.worth(2000, 264000000), "on a slower card a 2K conversation is worth the disk");
+        check(!c.worth(0, 1) && !slow.worth(0, 1), "an empty conversation never is");
     }
     fs::remove_all(root, ec);
     std::printf("conversation_spill_test: %d checks, %d failed\n", checks, failures);

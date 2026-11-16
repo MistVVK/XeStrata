@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -277,6 +278,10 @@ public:
     /// an eviction, a refused park or a failed RAM check that the cache would not have had without it.  Not owned; the
     /// pool outlives the cache.  bytes() stays the images' (what the logs and every caller have always meant).
     void set_pool(SegmentPoolBudget* pool) { pool_ = pool; }
+    /// The SSD tier (P2 of the cache admission design): a conversation the budget or the RAM gate evicts is handed to `sink`
+    /// instead of being destroyed (its RAM is freed when the sink returns).  Not for the copies drop_superseded() drops (the
+    /// outgoing chain holds them) or for clear() (#879: after non-finite logits nothing is kept).  Empty: as before.
+    void set_evict_sink(std::function<void(SavedConversation&&)> sink) { sink_ = std::move(sink); }
     size_t pool_idle_bytes() const { return pool_ != nullptr ? pool_->idle_bytes() : 0; }
     /// What the cache holds in RAM: its images, the retained K/V and the pool's idle bytes
     size_t resident_bytes() const { return bytes() + pool_idle_bytes(); }
@@ -579,8 +584,10 @@ private:
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
             bytes_ -= entries_[i].bytes();
+            SavedConversation victim = sink_ ? std::move(entries_[i]) : SavedConversation{};
             erase(i);
             ++evictions_;
+            if (sink_) sink_(std::move(victim));   // (its RAM is freed when the sink is done with it)
             return true;
         }
         return false;
@@ -597,6 +604,7 @@ private:
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
     SegmentPoolBudget* pool_ = nullptr;   // STRATA_PARK_SEGPOOL_MIB (not owned)
+    std::function<void(SavedConversation&&)> sink_;   // P2: where an evicted conversation goes (set_evict_sink)
 };
 
 } // namespace strata::core

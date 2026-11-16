@@ -744,6 +744,28 @@ int main() {
         check(slots.put(std::move(p4)) && !slots.make_room(one) && slots.size() == 1 && slots.evictions() == 0,
               "one slot, held by a pin: refused, nothing evicted");
     }
+    {   // P2: an evicted conversation goes to the sink (the SSD tier), whole; superseded copies and clear() do not
+        const size_t one = image({1,2,3}).bytes();
+        ConversationCache c(one * 2, 4);
+        std::vector<SavedConversation> sunk;
+        c.set_evict_sink([&](SavedConversation&& s) { sunk.push_back(std::move(s)); });
+        check(c.put(image({1,2,3})) && c.put(image({4,5,6})), "two parked");
+        check(c.put(image({7,8,9})) && sunk.size() == 1 && sunk[0].live.ids == std::vector<int32_t>({1,2,3}) &&
+              sunk[0].live.gdn == std::vector<uint8_t>(64, 7), "the budget's eviction hands the oldest over whole");
+        check(c.evict_oldest() && sunk.size() == 2 && sunk[1].live.ids == std::vector<int32_t>({4,5,6}),
+              "the RAM gate's eviction too");
+        check(c.size() == 1 && c.evictions() == 2, "the cache keeps its own count as before");
+        auto chained = image({7,8,9,10});
+        chained.checkpoints.push_back(ConversationCheckpoint{});
+        chained.checkpoints.back().ids = {7,8,9};
+        check(c.drop_superseded(chained.live.ids, chained.live.imgs, chained.checkpoints, true) == 0 && sunk.size() == 2,
+              "(a parked entry with no checkpoint is never superseded)");
+        c.put(image({11,12,13}));
+        const size_t before = sunk.size();
+        check(c.clear() > 0 && sunk.size() == before, "#879's clear() hands nothing over");
+        ConversationCache plain(one, 4);
+        check(plain.put(image({1,2,3})) && plain.put(image({4,5,6})) && plain.size() == 1, "without a sink: evicted as before");
+    }
     {
         // #4420: a batch slot's chain holds one checkpoint (its admission's): parking it must not drop (#342) the main session's copy of the
         // same conversation that also holds the root a sibling borrows from (an agent's system prompt and tools) - supersedes_richer()
