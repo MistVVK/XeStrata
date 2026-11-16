@@ -128,7 +128,9 @@ async function loadHealth() {
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
   {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
-  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
+  // #5484: what the load is (NVML, amdgpu and the Mac report time busy, not compute in use)
+  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100,
+   hint: "Share of the time the GPU had work to do. It does not say how much of its compute is in use."},
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
@@ -138,7 +140,7 @@ const METRICS = [
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
-    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
+    <span class="st-metric__label"${m.hint ? ` title="${esc(m.hint)}"` : ""}>${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     ${m.key === "speed" ? `<div class="speed-values">
       <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
       <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
@@ -162,9 +164,11 @@ function spark(id, values, max) {
   svg.querySelector(".line").setAttribute("d", line);
   svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
 }
-function setMetric(key, value, unit, sub) {
+function setMetric(key, value, unit, sub, why) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
   $(`ms-${key}`).textContent = sub || "";
+  // why a card has no reading (the server's gpu_note), on its line and as its tooltip (#5457)
+  $(`ms-${key}`).title = why || "";
 }
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
@@ -498,13 +502,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
                   : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
+  // #5457: a card the server cannot read (a Mac has no temperature or power without root and no PCIe link; a Windows AMD card)
+  // says so, with the server's own reason, whether or not the GPU has a name
+  const unread = (v) => v == null && !multi && !!st.gpu_note;
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
-            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
+            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : unread(hw.gpu_temp) ? "not available" : "",
+            unread(hw.gpu_temp) ? st.gpu_note : "");
   spark("sp-temp", h.gpu_temp, 90);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W",
             multi ? per((g) => (g.power == null ? "–" : `${fmt(g.power)} W` +
                                              (g.power_limit ? ` of ${fmt(g.power_limit)} W limit` : "")))
-                  : hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
+                  : hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : unread(hw.gpu_power) ? "not available" : "",
+            unread(hw.gpu_power) ? st.gpu_note : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   // each card trains its own link: with several cards the big number is the weakest card's and the line under it
   // names every card, because one card's "Gen5 x8" said nothing about a second card trained down to x4
@@ -524,8 +533,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
            : `${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s`;
   setMetric("pcie", gen ? `Gen${gen}` : null, width,
             multi ? `${per(link)}${rx ? ` · ${rx} total` : ""}`
-                  : rx === "" ? "" : `to GPU ${rx}` +
-                  (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
+                  : rx === "" ? (unread(gen || null) ? "not available" : "") : `to GPU ${rx}` +
+                  (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""),
+            unread(gen || null) ? st.gpu_note : "");
   spark("sp-pcie", h.gpu_pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
@@ -560,8 +570,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
 
   // recent requests
   const body = $("req-body");
+  // #5484: the VRAM hit rate column only when a request has one (a Mac and a model wholly in VRAM have no expert cache to hit)
+  const anyHit = requests.some((r) => r.hit_rate != null);
+  $("req-hit").hidden = !anyHit;
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="${anyHit ? 9 : 8}" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"],
@@ -578,7 +591,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+        ${anyHit ? `<td class="num">${hit}</td>` : ""}<td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }
   const all = $("req-all");
@@ -616,7 +629,8 @@ function renderAbout(eng, hw, st) {
     ["Experimental speed projection", projectionText(eng.cvec)],
   ]);
   facts($("facts-hw"), [
-    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
+    // #5457: the server's reason for the readings it lacks is shown beside a named GPU too (a Mac always has a name)
+    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}${st.gpu_note ? ` · ${st.gpu_note}` : ""}` : (st.gpu_note || "not readable (NVML)")],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);

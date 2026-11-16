@@ -112,6 +112,7 @@
   "group.today": "Today",
   "group.week": "Previous 7 days",
   "group.yesterday": "Yesterday",
+  "header.github": "Strata on GitHub",
   "hist.editAnswer": "Edit answer",
   "hist.editAnswerTitle": "Correct the answer's text. No request is sent.",
   "hist.editLabel": "Edit the answer",

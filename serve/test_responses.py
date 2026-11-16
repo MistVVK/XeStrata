@@ -20,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import responses  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.responses import (ENCRYPTED_PREFIX, ResponsesError, collect, input_messages, prompt_made,  # noqa: E402
-                             prompt_tools, request_tools, template_kwargs, text_format, thread_title_events)
+                             prompt_tools, request_tools, client_found_tools, template_kwargs, text_format,
+                             thread_title_events)
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,15 @@ CALL = ("Let me look.\n</think>\n\nChecking.\n\n<tool_call>\n<function=exec_comm
 ANSWER = "Read it.\n</think>\n\nThe file says before."
 TOOLS = [{"type": "function", "name": "exec_command", "description": "Runs a command.", "strict": False,
           "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}]
+# #1917: Codex's client-side tool discovery as it declares it (no name), and an answer to one of its searches
+SEARCH_TOOL = {"type": "tool_search", "execution": "client", "description": "Searches deferred tools.",
+               "parameters": {"type": "object",
+                              "properties": {"query": {"type": "string"}, "limit": {"type": "number"}},
+                              "required": ["query"], "additionalProperties": False}}
+FOUND = {"type": "tool_search_output", "call_id": "s1", "execution": "client", "status": "completed",
+         "tools": [{"type": "namespace", "name": "mcp__fs", "description": "Files.", "tools": [
+             {"type": "function", "name": "read", "defer_loading": True,
+              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]}]}
 
 
 # ------------------------------------------------------------------------------------------------ parsing
@@ -129,6 +139,68 @@ class Parsing(unittest.TestCase):
         tools, names, _ = request_tools(req)
         self.assertEqual([t["name"] for t in tools], ["exec_command", "later_tool"])
         self.assertIn("later_tool", names)
+
+    def test_a_client_tool_search_is_a_function_and_a_hosted_one_is_left_out(self):
+        """#1917: the client runs its own search, so the model gets an ordinary function to call (declared once)."""
+        tools, names, skipped = request_tools({"tools": [*TOOLS, SEARCH_TOOL, dict(SEARCH_TOOL)]})
+        self.assertEqual([t["name"] for t in tools], ["exec_command", "tool_search"])
+        self.assertEqual(tools[1]["parameters"], SEARCH_TOOL["parameters"])
+        self.assertEqual((names["tool_search"], skipped), ((None, "tool_search", "tool_search"), []))
+        for hosted in ({"type": "tool_search"}, {"type": "tool_search", "execution": "server"}):
+            tools, _, skipped = request_tools({"tools": [*TOOLS, hosted]})
+            self.assertEqual(([t["name"] for t in tools], skipped), (["exec_command"], ["tool_search"]))
+
+    def test_a_tool_search_declares_its_finds_where_it_answered(self):
+        call = {"type": "tool_search_call", "call_id": "s1", "execution": "client", "status": "completed",
+                "arguments": {"query": "read a file"}}
+        req = {"tools": [*TOOLS, SEARCH_TOOL], "input": [{"role": "user", "content": "read a.txt"}, call, FOUND]}
+        _, turn, result = input_messages(req)
+        self.assertEqual(turn["tool_calls"], [{"function": {"name": "tool_search",
+                                                            "arguments": {"query": "read a file"}}}])
+        self.assertEqual(result["role"], "tool")
+        self.assertEqual(result["content"], 'These functions can be called from now on:\n\nmcp__fs: Files.\n<tools>\n'
+                         '{"name": "mcp__fs.read", "description": "", "parameters": {"type": "object", '
+                         '"properties": {"path": {"type": "string"}}}}\n</tools>')
+        # the tool list is the request's own; the parser and the response get the finds
+        self.assertEqual([t["name"] for t in request_tools(req)[0]], ["exec_command", "tool_search"])
+        found, names = client_found_tools({"input": [*req["input"], {**FOUND, "call_id": "s2"}]})
+        self.assertEqual(([t["name"] for t in found], names), (["mcp__fs.read"], {"mcp__fs.read": ("mcp__fs", "read",
+                                                                                                  "function")}))
+        empty = input_messages({"input": [{**FOUND, "tools": []}]})
+        self.assertEqual(empty[0]["content"], "No tools matched this search.")
+
+    def test_a_namespace_is_described_once_and_a_tool_found_again_is_only_named(self):
+        """Two searches of one turn find the same namespace: its description is said once, before its tools, and the
+        search the model reads second only names the tools the first one declared (results arrive in any order)."""
+        both = {**FOUND, "tools": [{**FOUND["tools"][0], "tools": [
+            *FOUND["tools"][0]["tools"], {"type": "function", "name": "write", "parameters": {"type": "object"}}]}]}
+        again = {**FOUND, "call_id": "s2"}
+        calls = [{"type": "tool_search_call", "call_id": c, "execution": "client", "arguments": {"query": "files"}}
+                 for c in ("s1", "s2")]
+        first, second = input_messages({"input": [{"role": "user", "content": "go"}, *calls, again, both]})[-2:]
+        self.assertEqual(first["content"].count("Files."), 1)
+        self.assertIn('{"name": "mcp__fs.write", "description": ""', first["content"])
+        self.assertEqual(second["content"], "Already available: mcp__fs.read")
+        # a later search with a new tool of a namespace already described: the tool, not the description again
+        more = {**FOUND, "call_id": "s3", "tools": [{**FOUND["tools"][0], "tools": [
+            {"type": "function", "name": "list", "parameters": {"type": "object"}}]}]}
+        third = input_messages({"input": [{"role": "user", "content": "go"}, *calls, again, both,
+                                          {**calls[0], "call_id": "s3"}, more]})[-1]
+        self.assertNotIn("Files.", third["content"])
+        self.assertIn('"name": "mcp__fs.list"', third["content"])
+
+    def test_found_tools_keep_the_prompt_start(self):
+        """Declared after the search, the finds leave the prompt before it (the tool list included) as it was, so the
+        conversation cache holds; in the tool list, every search would change the prompt's start."""
+        before = {"tools": [*TOOLS, SEARCH_TOOL], "input": [{"role": "user", "content": "read a.txt"}]}
+        after = {**before, "input": [*before["input"], {"type": "tool_search_call", "call_id": "s1",
+                                                        "execution": "client", "arguments": {"query": "read"}}, FOUND]}
+
+        def render(req, **kwargs):
+            return TEMPLATE.render(input_messages(req), tools=request_tools(req)[0], **kwargs)
+
+        self.assertTrue(render(after).startswith(render(before, add_generation_prompt=False)))
+        self.assertNotIn("mcp__fs.read", render(after).split("<|im_end|>")[0])
 
     def test_effort_and_text_format(self):
         self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}, {}), {"enable_thinking": False})
@@ -721,6 +793,35 @@ class ToolRoundTrip(Server):
                                           "output": "2"}]})
         self.assertEqual([c["function"]["name"] for c in msgs[1]["tool_calls"]],
                          ["multi_agent_v1.spawn_agent", "apply_patch"])
+
+    def test_tool_search_then_a_found_tool(self):
+        """#1917 end to end: the model searches, the client answers with what it found, the model calls a found tool.
+        The second prompt continues the first one exactly (the cache holds), and the finds stay out of the tool list."""
+        search = ("Let me search.\n</think>\n\nSearching.\n\n<tool_call>\n<function=tool_search>\n<parameter=query>\n"
+                  "read a file\n</parameter>\n</function>\n</tool_call>")
+        read = ("Found it.\n</think>\n\nReading.\n\n<tool_call>\n<function=mcp__fs.read>\n<parameter=path>\na.txt\n"
+                "</parameter>\n</function>\n</tool_call>")
+        self.engine.scripts = [self.tok.encode(s + "<|im_end|>", parse_special=True) for s in (search, read)]
+        self.engine.script = self.engine.scripts[0]
+        user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read a.txt"}]}
+        base = {"model": "m", "instructions": "You are a coding agent.", "tools": [*TOOLS, SEARCH_TOOL],
+                "store": False, "include": ["reasoning.encrypted_content"]}
+        code, events = self.post({**base, "input": [user], "stream": True})
+        self.assertEqual(code, 200)
+        first_prompt = self.tok.decode(self.engine.last_prompt)
+        self.assertNotIn("response.function_call_arguments.delta", [e["type"] for e in events])
+        output = events[-1]["response"]["output"]
+        call = output[-1]
+        self.assertEqual((call["type"], call["execution"], call["arguments"], call["status"]),
+                         ("tool_search_call", "client", {"query": "read a file"}, "completed"))
+        self.assertNotIn("name", call)
+        code, r = self.post({**base, "input": [user, *output, {**FOUND, "call_id": call["call_id"]}]})
+        self.assertEqual(code, 200, r)
+        second_prompt = self.tok.decode(self.engine.last_prompt)
+        self.assertTrue(second_prompt.startswith(first_prompt + search + "<|im_end|>"), second_prompt[-800:])
+        self.assertNotIn("mcp__fs.read", first_prompt)
+        # That the parser and the response accept the found tool (mcp__fs.read comes back as a function_call) is the
+        # request-scoped eligibility change, ENG-SERVE's part: it reads responses.client_found_tools(req).
 
 
 class JsonFormatWithTools(Server):

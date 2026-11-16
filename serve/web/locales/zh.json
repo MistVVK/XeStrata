@@ -109,6 +109,7 @@
   "group.today": "今天",
   "group.week": "过去 7 天",
   "group.yesterday": "昨天",
+  "header.github": "GitHub 上的 Strata",
   "hist.editAnswer": "编辑回答",
   "hist.editAnswerTitle": "修改回答的文字。不会发送请求。",
   "hist.editLabel": "编辑回答",

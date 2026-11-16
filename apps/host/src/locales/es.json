@@ -3540,5 +3540,6 @@
   "s9048": "Vuelve a enviar tu mensaje. Si sigue ocurriendo, abre «Detalles» y compártelos cuando pidas ayuda.",
   "s9049": "Esa pregunta ya no espera respuesta.",
   "s9050": "Esa respuesta no se entregó",
-  "s9051": "ctx.length: escribe un tamaño de contexto entero de 1K a 1024K."
+  "s9051": "ctx.length: escribe un tamaño de contexto entero de 1K a 1024K.",
+  "s9101": "Parte del tiempo en que la GPU tenía trabajo. No indica cuánta de su capacidad de cálculo se está usando."
 }

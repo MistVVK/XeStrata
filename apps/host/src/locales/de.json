@@ -3540,5 +3540,6 @@
   "s9048": "Senden Sie Ihre Nachricht erneut. Tritt das Problem weiterhin auf, öffnen Sie „Details“ und geben Sie diese bei einer Supportanfrage an.",
   "s9049": "Diese Frage wartet nicht mehr auf eine Antwort.",
   "s9050": "Diese Antwort wurde nicht übermittelt",
-  "s9051": "ctx.length: Geben Sie eine ganzzahlige Kontextgröße von 1K bis 1024K ein."
+  "s9051": "ctx.length: Geben Sie eine ganzzahlige Kontextgröße von 1K bis 1024K ein.",
+  "s9101": "Anteil der Zeit, in der die GPU etwas zu tun hatte. Er sagt nicht aus, wie viel ihrer Rechenleistung genutzt wird."
 }

@@ -1,6 +1,6 @@
 # MCP raster images in the web chat
 
-Enable this optional feature with `"mcp": {"image_results": true}` in the run configuration (alongside existing MCP settings). The value must be a JSON boolean (`true` or `false`); strings and numbers are rejected. It is disabled by default; text-only tool output and stream event fields remain unchanged when disabled.
+This is on by default when the loaded model can read pictures, and off when it cannot. To turn it off, add `"mcp": {"image_results": false}` to the run configuration (beside the other MCP settings); `true` turns it on. The value must be a JSON boolean (`true` or `false`); strings and numbers are rejected. When it is off, the model gets the tool's text only, and the stream events are the same as before.
 
 MCP image results are cached by SHA-256 next to the run configuration, in `<config-stem>.tool-media/`. The web chat receives small same-origin references instead of embedding base64 in chat history. PNG, JPEG and WebP are supported; SVG and arbitrary file/resource URIs are not rendered. Each call displays at most four images, each with at most 24 million base64 characters (about 18 MB decoded). If the cache cannot be written, the chat retains the text result and logs the cache error.
 

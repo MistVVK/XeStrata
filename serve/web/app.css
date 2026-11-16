@@ -186,6 +186,9 @@ main { flex: 1; min-height: 0; display: flex; }
 @media (max-width: 900px) {
   .monitor-row { grid-template-columns: minmax(0, 1fr); }
 }
+/* The name in the header is a link to the project (#5510); it keeps the look of the name. Focus uses the global ring. */
+a.st-header__brand { color: inherit; text-decoration: none; }
+a.st-header__brand:hover { color: var(--st-accent-text); text-decoration: none; }
 /* The tab strip keeps a width it can scroll. The pill's text hides only when the header row overflows (fitHeader in app.js).
    Load / Unload (PR #3550) sits in the row: 9rem of tabs plus its 7.75rem fit from 458px; below that the tighter floors keep
    it and the theme button in the viewport. */

@@ -3540,5 +3540,6 @@
   "s9048": "Renvoyez votre message. Si le problème persiste, ouvrez Détails et partagez-les quand vous demandez de l’aide.",
   "s9049": "Cette question n’attend plus de réponse.",
   "s9050": "Cette réponse n’a pas été transmise",
-  "s9051": "ctx.length: saisissez une taille de contexte entière de 1K à 1024K."
+  "s9051": "ctx.length: saisissez une taille de contexte entière de 1K à 1024K.",
+  "s9101": "Part du temps pendant laquelle le GPU avait du travail. Cela n’indique pas quelle part de sa puissance de calcul est utilisée."
 }

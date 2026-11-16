@@ -109,6 +109,7 @@
   "group.today": "오늘",
   "group.week": "지난 7일",
   "group.yesterday": "어제",
+  "header.github": "GitHub의 Strata",
   "hist.editAnswer": "답변 편집",
   "hist.editAnswerTitle": "답변의 텍스트를 고칩니다. 요청은 전송되지 않습니다.",
   "hist.editLabel": "답변 편집",
