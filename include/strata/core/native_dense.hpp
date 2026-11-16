@@ -64,6 +64,12 @@ public:
     /// Moves the Q8_0 hyper-connection projections to pinned host memory, the kernels reading them there in place
     /// (a card the expert cache would leave short otherwise).  Before any graph captures them.
     bool hc_q8_to_host(std::string& err);
+    /// Layer `layer`'s projections' VRAM (0 once they are in pinned memory, or for a layer it holds none of).
+    uint64_t layer_device_bytes(const WeightTable& table, int layer) const;
+    /// Moves layer `layer`'s projections to pinned host memory, the kernels reading them there in place (the last
+    /// step for a card the expert cache would leave short: a window reads them whole over the link).  Before any graph
+    /// captures them.
+    bool layer_to_host(WeightTable& table, int layer, std::string& err);
     /// The layers' BF16 down / up rows that have Q8_0 copies become non-resident (data null) and the dequantization
     /// scratch hc_bf16_view uses is allocated here, at load, not on first use (a graph may capture the first use).
     bool drop_hc_bf16(WeightTable& table, std::string& err);
@@ -72,6 +78,8 @@ public:
 
 private:
     std::vector<void*> weights_;
+    std::vector<uint64_t> weight_bytes_;   ///< weights_'s sizes
+    std::vector<void*> host_;              ///< layer_to_host's pinned copies
     std::vector<void*> hc_q8_;   ///< STRATA_HC_Q8=1: the hyper-connection projections' Q8_0 copies
     std::vector<WeightRef*> hc_q8_refs_;   ///< the rows each copy serves (hc_q8_'s order)
     uint64_t hc_q8_bytes_ = 0;

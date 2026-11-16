@@ -5795,6 +5795,43 @@ int main(int argc, char** argv) {
                                  slots_text(before).c_str());
                 }
             }
+            // And then the fewest layers' projections (the shell's, read every token) that give the cache its slots
+            // go to pinned memory, spread evenly, the kernels reading them in place (XESTRATA_DENSE_HOST; "on": every
+            // layer's, to measure it): a window reads each such layer's whole over the link.  The slowest step, the
+            // last: it lets a card under 8 GB run Edge0-120B at all.
+            const auto dh_pick = strata::core::pick_from_env("DENSE_HOST");
+            if (!o.native_dense_gguf.empty() && dh_pick != strata::core::Pick::Off &&
+                (dh_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
+                const int64_t nl = g.n_layers, before = slots;
+                std::vector<uint64_t> lb((size_t) nl);
+                for (int64_t l = 0; l < nl; ++l) lb[(size_t) l] = native_dense.layer_device_bytes(wt, (int) l);
+                const int64_t want = (min_slots - slots) * blob + blob;
+                auto pick = [&](int64_t k, int64_t l) { return (l + 1) * k / nl > l * k / nl; };
+                int64_t k = nl;
+                if (dh_pick != strata::core::Pick::On)
+                    for (k = 1; k < nl; ++k) {
+                        uint64_t sum = 0;
+                        for (int64_t l = 0; l < nl; ++l) sum += pick(k, l) ? lb[(size_t) l] : 0;
+                        if ((int64_t) sum >= want) break;
+                    }
+                uint64_t moved = 0;
+                std::string de;
+                for (int64_t l = 0; l < nl; ++l) {
+                    if (!pick(k, l) || lb[(size_t) l] == 0) continue;
+                    if (!native_dense.layer_to_host(wt, (int) l, de)) {
+                        std::fprintf(stderr, "xestrata generate: %s\n", de.c_str());
+                        return 1;
+                    }
+                    moved += lb[(size_t) l];
+                }
+                if (moved > 0) {
+                    size_cache();
+                    std::fprintf(stderr, "xestrata generate: %lld layers' projections (%llu MiB) in pinned memory, read "
+                                         "in place (XESTRATA_DENSE_HOST=0 keeps them on the device): the expert cache %s "
+                                         "in place of %s\n", (long long) k, (unsigned long long) (moved >> 20),
+                                 slots_text(slots).c_str(), slots_text(before).c_str());
+                }
+            }
         }
         if (slots > o.expert_cache) {   // the steps above made room
             o.expert_cache = (int) slots;
