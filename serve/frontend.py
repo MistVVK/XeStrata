@@ -2253,6 +2253,12 @@ class OutputParser:
                     continue
                 if kind == "wait":
                     after = ""
+                cut = re.match(r"<function=([^<>\s]+)[ \t]*\n", after) if self.recover else None
+                if cut and self.aliases.get(cut.group(1), cut.group(1)) in self.schemas:
+                    # #6032 R6 (recover): `<function=NAME` + line break - the `>` left out - of a declared tool
+                    at = len(self.buf) - len(after)
+                    self.buf = self.buf[:at] + FUNC_START + cut.group(1) + ">\n" + after[cut.end():]
+                    continue
                 is_call = re.match(r"<function=(\s*[^<>\s]+\s*)>", after)
                 if is_call:
                     raw_name = is_call.group(1)
