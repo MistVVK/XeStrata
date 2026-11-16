@@ -440,6 +440,13 @@ class EngineDied(RuntimeError):
     restarts = True        # the engine is gone, so the next request starts it again; False for an error raised while the engine is left running (#3961)
 
 
+class EngineClosing(EngineDied):
+    """#6055: the server stopped (or unloaded) the engine under a request it had already accepted, and the engine ended
+    that request on the close's STOP before it finished.  The request failed; it did not end by itself: never a
+    successful reply with no tokens and finish "length".  Nothing restarts the engine for it."""
+    restarts = False
+
+
 def died_note(e: Exception) -> str:
     """What an API error says about an EngineDied: the cause, and that the next request restarts the engine - only where it really is ended."""
     return f"{e}; the next request restarts it" if getattr(e, "restarts", True) else str(e)
@@ -1277,6 +1284,7 @@ class StrataEngine:
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
+        self.closing = False                            # #6055: close() is ending this engine (set before its STOP)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own); first, so
         #                                                 a request that sees the new number sees the new queues (#4451)
@@ -1677,7 +1685,10 @@ class StrataEngine:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
+        except (OSError, AttributeError, ValueError):    # the pipe is gone (or a restart's close() took the process;
+            # #6055: close() closed stdin - a write then raises ValueError, which reached the client as a 400 "malformed")
+            if getattr(self, "closing", False):
+                raise EngineClosing("this instance is draining; retry against the next instance") from None
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
     def _send_for(self, born: int, text: str):
@@ -1810,6 +1821,13 @@ class StrataEngine:
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
+
+    def _raise_if_closed_under(self, finish: str | None, cancel: threading.Event) -> None:
+        """#6055: a request the engine ended with "cancel" although the request itself was not cancelled, while close()
+        is ending the engine: close()'s STOP cut it off.  It failed (EngineClosing, a 503 the client can retry), where
+        it used to end as a successful reply with the tokens so far (none, while its prompt was read) and "length"."""
+        if finish == "cancel" and getattr(self, "closing", False) and not cancel.is_set():
+            raise EngineClosing("this instance is draining; retry against the next instance")
 
     def _done_finish(self) -> str | None:
         """The finish field of the DONE line the control lines read last (None: none since it was cleared)."""
@@ -2425,6 +2443,8 @@ class StrataEngine:
                         yield t
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    if not cont:
+                        self._raise_if_closed_under(self._done_finish(), cancel)   # #6055
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         yielded_legs.append(self.last)
                         continue                            # gave way: again once the shorter request is in
@@ -2475,6 +2495,7 @@ class StrataEngine:
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        self._raise_if_closed_under(f[3] if len(f) > 3 else None, cancel)   # #6055
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -2699,10 +2720,13 @@ class StrataEngine:
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             head = "GEN 0 prefill=1"
+        line = f"{head} {','.join(str(int(t)) for t in ids)}\n"   # (a bad id stays the request's own ValueError)
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+            self.proc.stdin.write(line)
             self.proc.stdin.flush()
-        except (OSError, EngineDied):                    # the pipe is gone: the engine died (not the client)
+        except (OSError, ValueError, AttributeError, EngineDied):   # the pipe is gone: the engine died (not the client)
+            if getattr(self, "closing", False):         # #6055: or close() closed it (a write then raises ValueError)
+                raise EngineClosing("this instance is draining; retry against the next instance") from None
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
@@ -2788,6 +2812,7 @@ class StrataEngine:
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    self._raise_if_closed_under(self.last.get("finish"), cancel)
                     return
                 elif line.startswith("ERR"):
                     done = True
@@ -3023,7 +3048,9 @@ class StrataEngine:
             if self.proc.poll() is None:
                 try:
                     # STOP first: a request still running ends at its next step instead of being waited for (the
-                    # engine reads stdin on its own thread; QUIT behind a long answer would sit in its queue)
+                    # engine reads stdin on its own thread; QUIT behind a long answer would sit in its queue).
+                    # #6055: marked first, so that request fails (EngineClosing) instead of ending as a reply
+                    self.closing = True
                     self.proc.stdin.write("STOP\nQUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
