@@ -9,12 +9,12 @@ import json
 import re
 from pathlib import Path
 
-LANGS = ["en", "zh", "ja", "de", "es", "ru", "pt", "ko", "fr"]
+LANGS = ["en", "zh", "ja", "de", "es", "ru", "pt", "ko", "fr", "he"]
 S = []
 
 
-def add(en, zh, ja, de, es, ru, pt, ko, fr):
-    S.append(dict(en=en, zh=zh, ja=ja, de=de, es=es, ru=ru, pt=pt, ko=ko, fr=fr))
+def add(en, zh, ja, de, es, ru, pt, ko, fr, he):
+    S.append(dict(en=en, zh=zh, ja=ja, de=de, es=es, ru=ru, pt=pt, ko=ko, fr=fr, he=he))
 
 
 add("MTP is the default. DFlash2 is another way to guess the next words ahead, for Qwen3.8-Flash-Next only. On an RTX PRO 5000 it was 7.8% faster than MTP "
@@ -34,7 +34,8 @@ add("MTP is the default. DFlash2 is another way to guess the next words ahead, f
     "기본값은 MTP입니다. DFlash2는 다음 단어를 미리 추측하는 또 다른 방식이며 Qwen3.8-Flash-Next 전용입니다. RTX PRO 5000에서 짧은 프롬프트 19개에서는 MTP보다 7.8% 빨랐고, "
     "긴 사고 과정에서는 1.1% 빨랐으며, 23개 중 21개 프롬프트에서 더 빨랐습니다. 짧은 프롬프트에서는 답변이 동일했습니다.",
     "MTP est le réglage par défaut. DFlash2 est une autre façon de deviner à l'avance les mots suivants, uniquement pour Qwen3.8-Flash-Next. Sur une RTX PRO 5000, il a été 7,8 % "
-    "plus rapide que MTP sur 19 prompts courts et 1,1 % plus rapide en réflexion longue, et plus rapide sur 21 prompts sur 23. Sur les prompts courts, les réponses étaient identiques.")
+    "plus rapide que MTP sur 19 prompts courts et 1,1 % plus rapide en réflexion longue, et plus rapide sur 21 prompts sur 23. Sur les prompts courts, les réponses étaient identiques.",
+    he="MTP הוא ברירת המחדל. DFlash2 היא דרך נוספת לנחש מראש את המילים הבאות, ל-Qwen3.8-Flash-Next בלבד. ב-RTX PRO 5000 הוא היה מהיר ב-7.8% מ-MTP ב-19 הנחיות קצרות ומהיר ב-1.1% בחשיבה ארוכה, ומהיר יותר ב-21 מתוך 23 הנחיות. בהנחיות הקצרות התשובות היו זהות.")
 add("It downloads about 1.2 GB once, works with one graphics card and one request at a time, and uses MTP otherwise.",
     "它会一次性下载约 1.2 GB，仅在使用一张显卡且一次处理一个请求时有效，其他情况下使用 MTP。",
     "約 1.2 GB を一度だけダウンロードします。グラフィックスカード 1 枚で一度に 1 件のリクエストを処理するときに動作し、それ以外では MTP を使います。",
@@ -43,7 +44,8 @@ add("It downloads about 1.2 GB once, works with one graphics card and one reques
     "Один раз скачивает около 1,2 ГБ, работает с одной видеокартой и одним запросом за раз, в остальных случаях используется MTP.",
     "Baixa cerca de 1,2 GB uma única vez, funciona com uma placa de vídeo e um pedido de cada vez, e nos outros casos usa o MTP.",
     "약 1.2 GB를 한 번만 내려받으며, 그래픽 카드 한 장과 한 번에 하나의 요청에서 작동하고, 그 외에는 MTP를 사용합니다.",
-    "Il télécharge environ 1,2 Go une seule fois, fonctionne avec une carte graphique et une requête à la fois, et utilise MTP sinon.")
+    "Il télécharge environ 1,2 Go une seule fois, fonctionne avec une carte graphique et une requête à la fois, et utilise MTP sinon.",
+    he="הוא מוריד כ-1.2 GB פעם אחת, עובד עם כרטיס מסך אחד ובקשה אחת בכל פעם, ובמקרים אחרים משתמש ב-MTP.")
 add("On graphics cards like yours, DFlash2 was faster than MTP on some kinds of text and slower on others in our tests.",
     "在与您类似的显卡上，我们的测试中 DFlash2 在某些类型的文本上比 MTP 快，在另一些上更慢。",
     "お使いのようなグラフィックスカードでは、私たちのテストで DFlash2 は MTP より速い種類の文章と遅い種類の文章がありました。",
@@ -52,7 +54,8 @@ add("On graphics cards like yours, DFlash2 was faster than MTP on some kinds of 
     "На видеокартах, подобных вашей, в наших тестах DFlash2 был быстрее MTP на одних видах текста и медленнее на других.",
     "Em placas de vídeo como a sua, nos nossos testes o DFlash2 foi mais rápido que o MTP em alguns tipos de texto e mais lento em outros.",
     "고객님과 비슷한 그래픽 카드에서 저희 테스트 결과 DFlash2는 일부 유형의 글에서는 MTP보다 빨랐고 다른 유형에서는 더 느렸습니다.",
-    "Sur des cartes graphiques comme la vôtre, DFlash2 a été plus rapide que MTP sur certains types de texte et plus lent sur d'autres lors de nos tests.")
+    "Sur des cartes graphiques comme la vôtre, DFlash2 a été plus rapide que MTP sur certains types de texte et plus lent sur d'autres lors de nos tests.",
+    he="בבדיקות שלנו, בכרטיסי מסך כמו שלכם, DFlash2 היה מהיר יותר מ-MTP בסוגי טקסט מסוימים ואיטי יותר באחרים.")
 add("On graphics cards like yours, DFlash2 was slower than MTP in our tests.",
     "在与您类似的显卡上，我们的测试中 DFlash2 比 MTP 更慢。",
     "お使いのようなグラフィックスカードでは、私たちのテストで DFlash2 は MTP より遅くなりました。",
@@ -61,7 +64,8 @@ add("On graphics cards like yours, DFlash2 was slower than MTP in our tests.",
     "На видеокартах, подобных вашей, в наших тестах DFlash2 был медленнее MTP.",
     "Em placas de vídeo como a sua, nos nossos testes o DFlash2 foi mais lento que o MTP.",
     "고객님과 비슷한 그래픽 카드에서 저희 테스트 결과 DFlash2는 MTP보다 느렸습니다.",
-    "Sur des cartes graphiques comme la vôtre, DFlash2 a été plus lent que MTP lors de nos tests.")
+    "Sur des cartes graphiques comme la vôtre, DFlash2 a été plus lent que MTP lors de nos tests.",
+    he="בבדיקות שלנו, בכרטיסי מסך כמו שלכם, DFlash2 היה איטי יותר מ-MTP.")
 add("DFlash2 has not been tested on your graphics card yet.",
     "DFlash2 尚未在您的显卡上测试过。",
     "DFlash2 はまだお使いのグラフィックスカードでテストされていません。",
@@ -70,7 +74,8 @@ add("DFlash2 has not been tested on your graphics card yet.",
     "DFlash2 ещё не проверялся на вашей видеокарте.",
     "O DFlash2 ainda não foi testado na sua placa de vídeo.",
     "DFlash2는 아직 고객님의 그래픽 카드에서 테스트되지 않았습니다.",
-    "DFlash2 n'a pas encore été testé sur votre carte graphique.")
+    "DFlash2 n'a pas encore été testé sur votre carte graphique.",
+    he="DFlash2 עדיין לא נבדק על כרטיס המסך שלכם.")
 add("Drafting: MTP (DFlash2 isn't available on this graphics card)",
     "预测方式：MTP（DFlash2 不适用于这张显卡）",
     "先読み：MTP（DFlash2 はこのグラフィックスカードでは使えません）",
@@ -79,7 +84,8 @@ add("Drafting: MTP (DFlash2 isn't available on this graphics card)",
     "Упреждающая генерация: MTP (DFlash2 недоступен на этой видеокарте)",
     "Previsão: MTP (o DFlash2 não está disponível nesta placa de vídeo)",
     "미리 추측: MTP (이 그래픽 카드에서는 DFlash2를 사용할 수 없습니다)",
-    "Anticipation : MTP (DFlash2 n'est pas disponible sur cette carte graphique)")
+    "Anticipation : MTP (DFlash2 n'est pas disponible sur cette carte graphique)",
+    he="טיוטה: MTP (DFlash2 אינו זמין בכרטיס המסך הזה)")
 add("There is no internet connection, so the DFlash2 drafter can't be downloaded now.",
     "没有网络连接，因此现在无法下载 DFlash2 草稿模型。",
     "インターネットに接続されていないため、今は DFlash2 のドラフターをダウンロードできません。",
@@ -88,9 +94,11 @@ add("There is no internet connection, so the DFlash2 drafter can't be downloaded
     "Нет подключения к интернету, поэтому сейчас нельзя скачать черновую модель DFlash2.",
     "Não há ligação à internet, por isso não é possível transferir agora o rascunhador do DFlash2.",
     "인터넷에 연결되어 있지 않아 지금은 DFlash2 드래프터를 내려받을 수 없습니다.",
-    "Il n'y a pas de connexion internet, le drafter DFlash2 ne peut donc pas être téléchargé pour le moment.")
+    "Il n'y a pas de connexion internet, le drafter DFlash2 ne peut donc pas être téléchargé pour le moment.",
+    he="אין חיבור לאינטרנט, ולכן אי אפשר להוריד עכשיו את מנוע הטיוטה של DFlash2.")
 add("SSD: not needed",
-    "SSD：不需要", "SSD：不要", "SSD: nicht nötig", "SSD: no hace falta", "SSD: не нужен", "SSD: não é necessário", "SSD: 필요 없음", "SSD : pas nécessaire")
+    "SSD：不需要", "SSD：不要", "SSD: nicht nötig", "SSD: no hace falta", "SSD: не нужен", "SSD: não é necessário", "SSD: 필요 없음", "SSD : pas nécessaire",
+    he="SSD: לא נדרש")
 
 add("DFlash2 answers one request at a time, so Strata set this model to one request at a time.",
     "DFlash2 一次只处理一个请求，因此 Strata 将此模型设置为一次一个请求。",
@@ -100,7 +108,8 @@ add("DFlash2 answers one request at a time, so Strata set this model to one requ
     "DFlash2 отвечает на один запрос за раз, поэтому Strata настроила эту модель на один запрос за раз.",
     "O DFlash2 responde a um pedido de cada vez, por isso o Strata configurou este modelo para um pedido de cada vez.",
     "DFlash2는 한 번에 하나의 요청만 처리하므로 Strata가 이 모델을 한 번에 하나의 요청으로 설정했습니다.",
-    "DFlash2 répond à une requête à la fois, Strata a donc réglé ce modèle sur une requête à la fois.")
+    "DFlash2 répond à une requête à la fois, Strata a donc réglé ce modèle sur une requête à la fois.",
+    he="DFlash2 עונה לבקשה אחת בכל פעם, ולכן Strata הגדירה את המודל הזה לבקשה אחת בכל פעם.")
 
 add("Drafting: off (no drafter is downloaded yet)",
     "预测草稿：关闭（尚未下载任何草稿模型）",
@@ -110,7 +119,8 @@ add("Drafting: off (no drafter is downloaded yet)",
     "Предсказание: выключено (черновая модель ещё не скачана)",
     "Previsão: desativada (nenhum preditor foi baixado ainda)",
     "초안 예측: 꺼짐(초안 모델이 아직 내려받아지지 않았습니다)",
-    "Anticipation : désactivée (aucun module d'anticipation n'est encore téléchargé)")
+    "Anticipation : désactivée (aucun module d'anticipation n'est encore téléchargé)",
+    he="טיוטה: כבויה (עדיין לא הורד מנוע טיוטה)")
 add("Drafting: DFlash2 (the MTP drafter isn't downloaded yet)",
     "预测草稿：DFlash2（MTP 草稿模型尚未下载）",
     "先読み：DFlash2（MTP のドラフトモデルはまだダウンロードされていません）",
@@ -119,7 +129,8 @@ add("Drafting: DFlash2 (the MTP drafter isn't downloaded yet)",
     "Предсказание: DFlash2 (черновая модель MTP ещё не скачана)",
     "Previsão: DFlash2 (o preditor do MTP ainda não foi baixado)",
     "초안 예측: DFlash2(MTP 초안 모델이 아직 내려받아지지 않았습니다)",
-    "Anticipation : DFlash2 (le module d'anticipation MTP n'est pas encore téléchargé)")
+    "Anticipation : DFlash2 (le module d'anticipation MTP n'est pas encore téléchargé)",
+    he="טיוטה: DFlash2 (מנוע הטיוטה של MTP עדיין לא הורד)")
 add("Choosing DFlash2 downloads its drafter: about {0} GB, once.",
     "选择 DFlash2 会下载它的草稿模型：约 {0} GB，只下载一次。",
     "DFlash2 を選ぶと、そのドラフトモデルを一度だけダウンロードします（約 {0} GB）。",
@@ -128,7 +139,8 @@ add("Choosing DFlash2 downloads its drafter: about {0} GB, once.",
     "Если выбрать DFlash2, будет скачана его черновая модель: около {0} ГБ, один раз.",
     "Escolher o DFlash2 baixa o preditor dele: cerca de {0} GB, uma vez.",
     "DFlash2를 고르면 그 초안 모델을 한 번 내려받습니다(약 {0}GB).",
-    "Choisir DFlash2 télécharge son module d'anticipation : environ {0} Go, une seule fois.")
+    "Choisir DFlash2 télécharge son module d'anticipation : environ {0} Go, une seule fois.",
+    he="בחירה ב-DFlash2 מורידה את מנוע הטיוטה שלו: כ-{0} GB, פעם אחת.")
 add("Choosing MTP downloads its drafter: about {0} GB, once.",
     "选择 MTP 会下载它的草稿模型：约 {0} GB，只下载一次。",
     "MTP を選ぶと、そのドラフトモデルを一度だけダウンロードします（約 {0} GB）。",
@@ -137,7 +149,8 @@ add("Choosing MTP downloads its drafter: about {0} GB, once.",
     "Если выбрать MTP, будет скачана его черновая модель: около {0} ГБ, один раз.",
     "Escolher o MTP baixa o preditor dele: cerca de {0} GB, uma vez.",
     "MTP를 고르면 그 초안 모델을 한 번 내려받습니다(약 {0}GB).",
-    "Choisir MTP télécharge son module d'anticipation : environ {0} Go, une seule fois.")
+    "Choisir MTP télécharge son module d'anticipation : environ {0} Go, une seule fois.",
+    he="בחירה ב-MTP מורידה את מנוע הטיוטה שלו: כ-{0} GB, פעם אחת.")
 add("The DFlash2 drafter could not be downloaded, so the model starts without a drafter. Loading the model…",
     "无法下载 DFlash2 草稿模型，因此模型将不使用草稿模型启动。正在加载模型…",
     "DFlash2 のドラフトモデルをダウンロードできなかったため、ドラフトモデルなしで起動します。モデルを読み込んでいます…",
@@ -146,7 +159,8 @@ add("The DFlash2 drafter could not be downloaded, so the model starts without a 
     "Не удалось скачать черновую модель DFlash2, поэтому модель запускается без черновой модели. Загружается модель…",
     "Não foi possível baixar o preditor do DFlash2, então o modelo inicia sem preditor. Carregando o modelo…",
     "DFlash2 초안 모델을 내려받지 못해 초안 모델 없이 시작합니다. 모델을 불러오는 중…",
-    "Le module d'anticipation DFlash2 n'a pas pu être téléchargé, le modèle démarre donc sans module d'anticipation. Chargement du modèle…")
+    "Le module d'anticipation DFlash2 n'a pas pu être téléchargé, le modèle démarre donc sans module d'anticipation. Chargement du modèle…",
+    he="לא ניתן היה להוריד את מנוע הטיוטה של DFlash2, ולכן המודל מופעל בלי מנוע טיוטה. טוען את המודל…")
 add("Downloading the MTP drafter…",
     "正在下载 MTP 草稿模型…",
     "MTP のドラフトモデルをダウンロードしています…",
@@ -155,7 +169,8 @@ add("Downloading the MTP drafter…",
     "Скачивается черновая модель MTP…",
     "Baixando o preditor do MTP…",
     "MTP 초안 모델을 내려받는 중…",
-    "Téléchargement du module d'anticipation MTP…")
+    "Téléchargement du module d'anticipation MTP…",
+    he="מוריד את מנוע הטיוטה של MTP…")
 
 add("The MTP drafter could not be downloaded.",
     "无法下载 MTP 草稿模型。",
@@ -165,7 +180,8 @@ add("The MTP drafter could not be downloaded.",
     "Не удалось скачать черновую модель MTP.",
     "Não foi possível baixar o preditor do MTP.",
     "MTP 초안 모델을 내려받지 못했습니다.",
-    "Le module d'anticipation MTP n'a pas pu être téléchargé.")
+    "Le module d'anticipation MTP n'a pas pu être téléchargé.",
+    he="לא ניתן היה להוריד את מנוע הטיוטה של MTP.")
 add("Drafting: MTP (DFlash2 didn't start)",
     "预测草稿：MTP（DFlash2 未能启动）",
     "先読み：MTP（DFlash2 は起動しませんでした）",
@@ -174,7 +190,8 @@ add("Drafting: MTP (DFlash2 didn't start)",
     "Предсказание: MTP (DFlash2 не запустился)",
     "Previsão: MTP (o DFlash2 não iniciou)",
     "초안 예측: MTP(DFlash2가 시작되지 않았습니다)",
-    "Anticipation : MTP (DFlash2 n'a pas démarré)")
+    "Anticipation : MTP (DFlash2 n'a pas démarré)",
+    he="טיוטה: MTP (DFlash2 לא הופעל)")
 add("Auto uses the all-cards split engine with the MTP draft layer: about {0} GB to download, once.",
     "自动模式使用全部显卡的拆分引擎和 MTP 草稿层：约 {0} GB，只下载一次。",
     "自動では、全カードのスプリットエンジンと MTP ドラフト層を使います。約 {0} GB を一度だけダウンロードします。",
@@ -183,7 +200,8 @@ add("Auto uses the all-cards split engine with the MTP draft layer: about {0} GB
     "Авто использует движок с разделением по всем картам и черновой слой MTP: около {0} ГБ, скачивается один раз.",
     "O automático usa o motor de divisão entre todas as placas com a camada de rascunho MTP: cerca de {0} GB, uma vez.",
     "자동은 모든 카드를 쓰는 분할 엔진과 MTP 초안 층을 사용합니다(약 {0}GB, 한 번만 내려받음).",
-    "Auto utilise le moteur réparti sur toutes les cartes avec la couche de brouillon MTP : environ {0} Go à télécharger, une seule fois.")
+    "Auto utilise le moteur réparti sur toutes les cartes avec la couche de brouillon MTP : environ {0} Go à télécharger, une seule fois.",
+    he="במצב אוטומטי נעשה שימוש במנוע הפיצול על כל הכרטיסים, עם שכבת הטיוטה של MTP: כ-{0} GB להורדה, פעם אחת.")
 add("The all-cards split engine could not start, so the normal layer split runs.",
     "全显卡拆分引擎未能启动，因此改用常规的分层拆分。",
     "全カードのスプリットエンジンを起動できなかったため、通常のレイヤー分割で動作しています。",
@@ -192,7 +210,8 @@ add("The all-cards split engine could not start, so the normal layer split runs.
     "Движок с разделением по всем картам не запустился, поэтому работает обычное послойное разделение.",
     "O motor de divisão entre todas as placas não conseguiu iniciar, então a divisão normal por camadas está em uso.",
     "모든 카드를 쓰는 분할 엔진을 시작하지 못해 일반 레이어 분할로 실행합니다.",
-    "Le moteur réparti sur toutes les cartes n'a pas pu démarrer, la répartition normale par couches est donc utilisée.")
+    "Le moteur réparti sur toutes les cartes n'a pas pu démarrer, la répartition normale par couches est donc utilisée.",
+    he="לא ניתן היה להפעיל את מנוע הפיצול על כל הכרטיסים, ולכן פועל פיצול השכבות הרגיל.")
 add("Drafting: off (the cards were short of memory)",
     "预测草稿：关闭（显卡内存不足）",
     "先読み：オフ（グラフィックスカードのメモリが不足していました）",
@@ -201,7 +220,8 @@ add("Drafting: off (the cards were short of memory)",
     "Предсказание: выключено (на картах не хватило памяти)",
     "Previsão: desligada (faltou memória nas placas)",
     "초안 예측: 꺼짐(카드 메모리가 부족했습니다)",
-    "Anticipation : désactivée (les cartes manquaient de mémoire)")
+    "Anticipation : désactivée (les cartes manquaient de mémoire)",
+    he="טיוטה: כבויה (לא היה מספיק זיכרון בכרטיסים)")
 add("On your Mac, DFlash2 was faster than MTP on this model in our tests.",
     "在您的 Mac 上，我们的测试中 DFlash2 在此模型上比 MTP 更快。",
     "お使いの Mac では、私たちのテストでこのモデルにおいて DFlash2 は MTP より速くなりました。",
@@ -210,7 +230,8 @@ add("On your Mac, DFlash2 was faster than MTP on this model in our tests.",
     "На вашем Mac в наших тестах DFlash2 с этой моделью был быстрее MTP.",
     "No seu Mac, nos nossos testes o DFlash2 foi mais rápido que o MTP com este modelo.",
     "고객님의 Mac에서 저희 테스트 결과 이 모델에서는 DFlash2가 MTP보다 빨랐습니다.",
-    "Sur votre Mac, DFlash2 a été plus rapide que MTP avec ce modèle lors de nos tests.")
+    "Sur votre Mac, DFlash2 a été plus rapide que MTP avec ce modèle lors de nos tests.",
+    he="בבדיקות שלנו, ב-Mac שלכם DFlash2 היה מהיר יותר מ-MTP במודל הזה.")
 add("DFlash2 is off by default on this graphics card for now; choose it in Drafting to use it.",
     "目前在这张显卡上 DFlash2 默认关闭；如需使用，请在“预测草稿”中选择它。",
     "現在、このグラフィックスカードでは DFlash2 は既定でオフです。使うには「先読み」で選んでください。",
@@ -219,7 +240,8 @@ add("DFlash2 is off by default on this graphics card for now; choose it in Draft
     "На этой видеокарте DFlash2 пока выключен по умолчанию; чтобы использовать его, выберите его в разделе «Предсказание».",
     "O DFlash2 está desligado por predefinição nesta placa de vídeo por agora; escolha-o em Previsão para o usar.",
     "현재 이 그래픽 카드에서는 DFlash2가 기본적으로 꺼져 있습니다. 사용하려면 ‘초안 예측’에서 선택하세요.",
-    "DFlash2 est désactivé par défaut sur cette carte graphique pour le moment ; choisissez-le dans Anticipation pour l'utiliser.")
+    "DFlash2 est désactivé par défaut sur cette carte graphique pour le moment ; choisissez-le dans Anticipation pour l'utiliser.",
+    he="DFlash2 כבוי כברירת מחדל בכרטיס המסך הזה בינתיים; כדי להשתמש בו יש לבחור בו בהגדרת הטיוטה.")
 # strata_control/drafting.py NONE_IN_SLOTS after "Drafting: ": request slots with no --batch-mtp draft nothing (the line is printed whole, not inside "MTP (...)")
 add("Drafting: none in parallel slots (one token per request and step); a single request still drafts",
     "预测草稿：并行槽位中没有（每个请求每一步一个词元）；单个请求仍会预测草稿",
@@ -229,7 +251,8 @@ add("Drafting: none in parallel slots (one token per request and step); a single
     "Предсказание: нет в параллельных слотах (один токен на запрос за шаг); один запрос по-прежнему предсказывает",
     "Previsão: nenhuma em vagas paralelas (um token por pedido e por passo); um único pedido ainda faz previsão",
     "초안 예측: 병렬 슬롯에서는 없음(요청당 한 단계에 토큰 하나); 요청이 하나뿐이면 초안 예측을 합니다",
-    "Anticipation : aucune dans les emplacements parallèles (un token par requête et par étape) ; une requête unique anticipe toujours")
+    "Anticipation : aucune dans les emplacements parallèles (un token par requête et par étape) ; une requête unique anticipe toujours",
+    he="טיוטה: לא בחריצים מקבילים (טוקן אחד לכל בקשה ולכל צעד); בקשה יחידה עדיין משתמשת בטיוטה")
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
 NBSP = " "
 

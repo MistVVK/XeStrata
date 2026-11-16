@@ -23,7 +23,7 @@ const BODY = "Strata's chat storage is full, so the newest changes to {0} chat(s
 const BUTTON = 'Copy unsaved chats';
 
 test('the notice exists in all nine languages, with the placeholder kept', () => {
-  for (const lang of ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const lang of ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     const file = JSON.parse(readFileSync(here(`../src/locales/sav-${lang}.json`), 'utf8'));
     assert.deepEqual(Object.keys(file), ['sav01', 'sav02', 'sav03'], lang);
     assert.ok(/\{0\}/.test(file.sav02), `${lang} keeps {0}`);

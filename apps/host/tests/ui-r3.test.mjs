@@ -157,7 +157,7 @@ test('10 (visual): the reply stays still while it streams, one live cue per step
 test('the new words are in all nine languages with the same slots', () => {
   const en = JSON.parse(read('src/locales/r3-en.json'));
   assert.ok(Object.keys(en).length >= 5);
-  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     const cat = JSON.parse(read(`src/locales/r3-${lang}.json`));
     assert.deepEqual(Object.keys(cat), Object.keys(en), lang);
     for (const [id, text] of Object.entries(en)) {

@@ -18,7 +18,7 @@ async function bundle(entry) {
 const LINE = 'Waiting for {0} to answer ({1} s so far)';
 
 test('the waiting line exists in all nine languages with both placeholders', () => {
-  for (const lang of ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const lang of ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     const file = JSON.parse(readFileSync(here(`../src/locales/net-${lang}.json`), 'utf8'));
     assert.deepEqual(Object.keys(file), ['net01'], lang);
     assert.ok(/\{0\}/.test(file.net01) && /\{1\}/.test(file.net01), `${lang} keeps {0} and {1}`);

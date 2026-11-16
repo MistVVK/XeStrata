@@ -18,7 +18,7 @@ test('the paragraph is translated as a whole in all 9 languages', () => {
   const en = JSON.parse(readFileSync(resolve(root, 'src/locales/en.json'), 'utf8'));
   const id = Object.keys(en).find(k => en[k] === joined);
   assert.ok(id, 'the English catalog has the whole paragraph');
-  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     const cat = JSON.parse(readFileSync(resolve(root, `src/locales/${lang}.json`), 'utf8'));
     assert.ok(cat[id] && cat[id] !== joined && cat[id].length > 80, `${lang} has its own translation of the paragraph`);
   }

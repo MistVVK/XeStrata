@@ -102,7 +102,7 @@ test('the context meter follows the turn that is running: a tool step does not r
 });
 
 test('every sentence about the context is in the catalog in all nine languages, with the same slots', () => {
-  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
   const catalogs = Object.fromEntries(langs.map(l => [l, JSON.parse(read(`../src/locales/${l}.json`))]));
   const idOf = text => Object.entries(catalogs.en).find(([, v]) => v === text)?.[0];
   const sentences = [...Object.values(FIT_TEXT), 'Attach as a file', 'Send a shortened preview', 'Summarize and continue', 'Start a new chat',
@@ -125,7 +125,7 @@ test('the command menu offers /compact, and picking it summarises the chat at on
   const menu = chat.slice(chat.indexOf('function useSlashCommands'), chat.indexOf('function SlashMenu'));
   assert.match(menu, /\{ id: 'compact', label: '\/compact', hint: '([^']+)', icon: 'layers', run: \(\) => \{ clear\(\); void sendMessage\('\/compact'\); \} \}/);
   const hint = /id: 'compact', label: '\/compact', hint: '([^']+)'/.exec(menu)[1];
-  for (const l of ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const l of ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     const t = JSON.parse(read(`../src/locales/fix-${l}.json`)).fx86;
     assert.ok(typeof t === 'string' && t.trim(), `fx86 in ${l}`);
     if (l === 'en') assert.equal(t, hint); else assert.notEqual(t, hint, `fx86 is translated in ${l}`);

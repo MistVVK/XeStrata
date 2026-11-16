@@ -7,12 +7,12 @@ import json
 import re
 from pathlib import Path
 
-LANGS = ["en", "zh", "ja", "de", "es", "ru", "pt", "ko", "fr"]
+LANGS = ["en", "zh", "ja", "de", "es", "ru", "pt", "ko", "fr", "he"]
 S = []
 
 
-def add(en, zh, ja, de, es, ru, pt, ko, fr):
-    S.append(dict(en=en, zh=zh, ja=ja, de=de, es=es, ru=ru, pt=pt, ko=ko, fr=fr))
+def add(en, zh, ja, de, es, ru, pt, ko, fr, he):
+    S.append(dict(en=en, zh=zh, ja=ja, de=de, es=es, ru=ru, pt=pt, ko=ko, fr=fr, he=he))
 
 
 add("Waiting for {0} to answer ({1} s so far)",
@@ -23,7 +23,8 @@ add("Waiting for {0} to answer ({1} s so far)",
     "Ожидание ответа от {0} (прошло {1} с)",
     "A aguardar a resposta de {0} ({1} s até agora)",
     "{0}의 응답을 기다리는 중 ({1}초 경과)",
-    "En attente de la réponse de {0} ({1} s jusqu'ici)")
+    "En attente de la réponse de {0} ({1} s jusqu'ici)",
+    he="ממתין לתשובה מ-{0} (עברו {1} שניות)")
 
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
 NBSP = " "

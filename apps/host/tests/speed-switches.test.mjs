@@ -227,7 +227,7 @@ test('the Expert settings show the rows in the existing row layout with an On / 
   assert.match(screen, /<label className="native-setting-row" key=\{sw\.id\}><span><strong>\{tr\(sw\.label\)\}<\/strong><small>\{tr\(sw\.hint\)\}<\/small><\/span><Select /, 'the same row, the same Select');
   assert.match(screen, /\[\{ value: 'on', label: 'On \(recommended\)' \}, \{ value: 'off', label: 'Off' \}\] : \[\{ value: 'off', label: 'Off \(recommended\)' \}, \{ value: 'on', label: 'On' \}\]/);
   assert.match(screen, /if \(write\) env\[name\] = value; else delete env\[name\];/, 'the default removes the entries');
-  const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+  const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
   const catalog = lang => JSON.parse(read(`../src/locales/fix-${lang}.json`));
   const words = [...SPEED_SWITCHES.flatMap(s => [s.label, s.hint, ...Object.values(s.words ?? {})]), 'On (recommended)', 'Off (recommended)'];
   const english = Object.values(catalog('en'));

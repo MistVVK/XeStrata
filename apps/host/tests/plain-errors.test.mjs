@@ -4,11 +4,11 @@ import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { build } from 'esbuild';
 
-const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
 const catalogs = Object.fromEntries(await Promise.all(languages.map(async l => [l, ({ ...JSON.parse(await readFile(`src/locales/${l}.json`, 'utf8')), ...JSON.parse(await readFile(`src/locales/engine-${l}.json`, 'utf8')), ...JSON.parse(await readFile(`src/locales/gui-${l}.json`, 'utf8')) })])));
 const built = await build({ stdin: { contents: "export * from './src/lib/plain-errors'; export * from './src/lib/i18n';", resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'node', loader: { '.json': 'json' } });
 const { plainFailure, plainFailureText, chatFailure, setTranslationLanguage, loadCatalog } = await import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].text).toString('base64')}`);
-for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) await loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
+for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) await loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
 
 const cases = [
   ['Strata’s tunnel for this address is already running (PID 31), so Strata did not start a second one. Stop it first (or use it as it is), then connect again here.', 'tunnel-own-running', /tunnel for this address is already running/],

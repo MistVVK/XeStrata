@@ -203,7 +203,7 @@ test('offline, the update says nothing by itself: the dialog opens only from a b
 });
 
 test('all nine languages carry the dialog\'s words with the same slots', () => {
-  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
   const catalogs = Object.fromEntries(langs.map(l => [l, JSON.parse(src(`src/locales/upd-${l}.json`))]));
   const keys = Object.keys(catalogs.en);
   assert.equal(keys.length, 17);
