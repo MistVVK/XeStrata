@@ -22,7 +22,8 @@ class ScriptPolicies(unittest.TestCase):
             policy = re.search(r"cmake_policy\(\s*SET\s+CMP0057\s+NEW\s*\)", code) or re.search(r"cmake_minimum_required\(\s*VERSION\s+3\.(1[0-9]|[2-9]\d)", code)
             self.assertTrue(policy, f"{path.name} uses IN_LIST without CMP0057 NEW")
             self.assertLess(policy.start(), code.index("IN_LIST"), f"{path.name} sets the policy after its first IN_LIST")
-        self.assertGreaterEqual(found, 1)
+        # (0.2.16: ggml_tq_overlay_test.cmake, the one script that used IN_LIST, went with the MMQ build path; the check stays for new ones)
+        self.assertGreaterEqual(found, 0)
 
 
 if __name__ == "__main__":
