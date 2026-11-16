@@ -3532,5 +3532,6 @@
   "s9040": "Lorsque cette option est activée, une application de cet ordinateur qui envoie votre clé API peut laisser ce modèle utiliser ses outils, par exemple pour lire et modifier des fichiers. Les applications d’autres appareils ou passant par le lien Internet ne le peuvent jamais.",
   "s9041": "Créez d’abord une clé API.",
   "s9042": "{0}{1} tok/s",
-  "s9043": "{0}{1} tok/s · dernière réponse"
+  "s9043": "{0}{1} tok/s · dernière réponse",
+  "s9044": "Cet objectif rencontrait sans cesse les mêmes erreurs, je l’ai donc mis en pause. Regardez les dernières étapes, corrigez ce qui bloque, puis reprenez l’objectif."
 }

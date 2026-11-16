@@ -3532,5 +3532,6 @@
   "s9040": "Wenn dies eingeschaltet ist, kann eine App auf diesem Computer, die Ihren API-Schlüssel sendet, dieses Modell seine Werkzeuge verwenden lassen, etwa um Dateien zu lesen und zu ändern. Apps auf anderen Geräten oder über den Internet-Link können das nie.",
   "s9041": "Zuerst einen API-Schlüssel erstellen.",
   "s9042": "{0}{1} tok/s",
-  "s9043": "{0}{1} tok/s · letzte Antwort"
+  "s9043": "{0}{1} tok/s · letzte Antwort",
+  "s9044": "Dieses Ziel ist immer wieder auf dieselben Fehler gestoßen, deshalb habe ich es pausiert. Sieh dir die letzten Schritte an, behebe, was im Weg ist, und setze das Ziel dann fort."
 }

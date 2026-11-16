@@ -3532,5 +3532,6 @@
   "s9040": "When this is on, an app on this computer that sends your API key can let this model use its tools, such as reading and changing files. Apps on other devices or through the internet link never can.",
   "s9041": "Create an API key first.",
   "s9042": "{0}{1} tok/s",
-  "s9043": "{0}{1} tok/s · last reply"
+  "s9043": "{0}{1} tok/s · last reply",
+  "s9044": "This goal kept running into the same errors, so I paused it. Look at the last steps, fix what is in the way, then resume the goal."
 }

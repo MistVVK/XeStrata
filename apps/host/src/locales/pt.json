@@ -3532,5 +3532,6 @@
   "s9040": "Quando isto está ligado, um app neste computador que envie sua chave de API pode deixar este modelo usar as ferramentas dele, como ler e alterar arquivos. Apps em outros dispositivos ou pelo link da internet nunca podem.",
   "s9041": "Crie uma chave de API primeiro.",
   "s9042": "{0}{1} tok/s",
-  "s9043": "{0}{1} tok/s · última resposta"
+  "s9043": "{0}{1} tok/s · última resposta",
+  "s9044": "Este objetivo continuava esbarrando nos mesmos erros, então eu o pausei. Veja os últimos passos, corrija o que está atrapalhando e depois retome o objetivo."
 }

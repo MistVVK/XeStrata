@@ -29,7 +29,7 @@ import { nearestBudget } from './llm-shape.mjs';
 import { DeliverableTracker, ActivityGroups, FolderClaims } from './deliverables.mjs';
 import { SkillsUsed, skillInfoFrom } from './skills-used.mjs';
 import { turnEngineSpeed } from './engine-speed.mjs';
-import { TurnGuard, guardNote, GUARD_NOTES } from './turn-guard.mjs';
+import { TurnGuard, GoalGuard, guardNote, GUARD_NOTES } from './turn-guard.mjs';
 import { cutNotice, cutNudge } from './reply-cut.mjs';
 import { watchForWake } from './wake-watch.mjs';
 
@@ -493,7 +493,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     }
 
     const projector = new TurnProjector({ policy: MODE_PRESETS[appliedMode].approval, window: route.contextWindow, catchUp: !!adopt });
-    if (!goal) guard = new TurnGuard({ plan: !!planTask, contextMax: route.kind === 'local' ? route.contextWindow : 0 });   // a saved connection's window is often only assumed: never judged by a guess
+    // #4981: a goal gets its own guard (failing calls pause it); the per-turn search and rewrite limits would stop a long goal
+    guard = goal ? new GoalGuard() : new TurnGuard({ plan: !!planTask, contextMax: route.kind === 'local' ? route.contextWindow : 0 });   // a saved connection's window is often only assumed: never judged by a guess
     projector.onStatus = update => { if (!turn?.parentOpen && turn?.children.size && [...turn.children.values()].some(h => !h.done) && update.phase === 'waiting') return; reporter.set(update); };
     const turn = {
       sessionId, projector, route, requestId, live: !!adopt, lastSeq: adopt ? adopt.seq - 1 : -1,
