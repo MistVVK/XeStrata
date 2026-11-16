@@ -260,7 +260,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
     const size_t gx = size_t((reach + SCORE_WARPS - 1) / SCORE_WARPS);
     const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<2>({size_t(nq), gx * SCORE_WARPS * WARP}, {1, SCORE_WARPS * WARP}),
+        sycl::nd_range<2>({size_t(nq), gx * SCORE_WARPS * WARP}, {1, (size_t) SCORE_WARPS * WARP}),
         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int64_t qi = int64_t(it.get_group(0));
@@ -270,11 +270,13 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             if (b > n_bid || b >= max_blocks) return;   // uniform over the sub-group
             const int lane = int(sg.get_local_linear_id());
             const float* key = (b == n_bid) ? dead : pooled + b * IDX_DIM;
-            const float* kp = key + lane * 4;
-            const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
+            const int lane4 = lane * 4;   // a lane's 4 of the 128 dims: 32-bit, as the device counts
+            const float* kp = key + lane4;
+            const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane4;
             float score = 0.0f;
             for (int h = 0; h < IDX_HEADS; ++h) {
-                const float* q4 = q + h * IDX_DIM;
+                const int ho = h * IDX_DIM;
+                const float* q4 = q + ho;
                 float d = kp[0] * q4[0] + kp[1] * q4[1] + kp[2] * q4[2] + kp[3] * q4[3];
                 for (int o = 16; o > 0; o >>= 1) d += sycl::permute_group_by_xor(sg, d, o);
                 score += d > 0.0f ? d : 0.0f;
