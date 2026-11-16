@@ -4428,6 +4428,29 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
     return true;
 }
 
+bool Verifier::drop_window_graphs(int& dropped, std::string& err) {
+    dropped = 0;
+    if (prelaunched_ != 0) {
+        err = "verify: a prelaunched window is pending; its graph cannot be dropped";
+        return false;
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: synchronizing before dropping the window graphs failed";
+        return false;
+    }
+    for (int s = 0; s < 2; ++s)
+        for (int t = 0; t <= strata::kernels::kVerifyLongT; ++t) {
+            for (cudaGraphExec_t* e : {&exec_[s][t], &exec_nr_[s][t]})
+                if (*e != nullptr) {
+                    cudaGraphExecDestroy(*e);
+                    *e = nullptr;
+                    ++dropped;
+                }
+            launched_[s][t] = launched_nr_[s][t] = false;   // the next graph of that size is a cold first launch again
+        }
+    return true;
+}
+
 bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
     evicted = false;
     if (no_window_eviction_ || keep_t < 1) return true;
