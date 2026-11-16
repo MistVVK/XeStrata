@@ -85,6 +85,13 @@ const STARTING_UP = /waiting for (shell|subprocess|ptcRuntime|workflowEngine|san
  * instead of failing the first chat. Any other error is thrown at once; a start that never finishes is a plain AGENT_NOT_READY error
  * with the Harness's text kept for Details. Returns null when `cancelled()` turns true while waiting.
  */
+/** A call to the agent's gateway that never got an answer (no connection, refused, dropped, timed out), as opposed to an answer that said no. */
+export function agentUnreachable(e) {
+  const code = e?.cause?.code ?? e?.code;
+  return (e instanceof TypeError && /fetch failed/i.test(String(e.message))) || e?.name === 'AbortError' || e?.name === 'TimeoutError'
+    || ['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'gateway/not-connected'].includes(code);
+}
+
 export async function createSessionWhenReady(create, { readyMs = 60_000, retryMs = 1_500, onWait = () => {}, cancelled = () => false, now = Date.now } = {}) {
   const until = now() + readyMs;
   for (;;) {
@@ -340,6 +347,13 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
         if (now !== want) throw new Error(`the session reports "${now}" instead of "${want}"`);
       }
     } catch (e) {
+      // #5070: the agent did not answer at all ("fetch failed", a refused or dropped connection): that is not a mode the agent refused, and the
+      // cause goes to the host log, which had nothing about it.
+      if (agentUnreachable(e)) {
+        const why = [e?.message, e?.cause?.code ?? e?.code].filter(Boolean).join(' / ');
+        log(`agent · session ${sessionId}: the agent did not answer while the chat's mode was set (${why}); nothing ran`);
+        throw new AgentUnavailable('The assistant could not start. Try again in a moment.', 'agent-unreachable', why);
+      }
       throw new AgentUnavailable(`Strata could not set this chat to ${MODE_PRESETS[mode].name} mode, so nothing ran. Try again.`, 'mode-unavailable', e.message);
     }
     // Manual leaves the sandbox open and relies on the Strata gate to ask first. Without the gate it must not start.
