@@ -12357,7 +12357,7 @@
    "last_date": "2026-11-12",
    "status": "default",
    "owner": "prefill",
-   "note": "[auto] on by default for a Radeon 780M (gfx1103, integrated, Linux) only (include/strata/core/arch_defaults.hpp:82 prompt_f16_resolve, used by prompt_f16() in src/prefill/gemm.cu); opt-in elsewhere (=1); =0 turns it off. [docs/AMD_HIP.md:512]",
+   "note": "on by default for a Radeon 780M (gfx1103, integrated, Linux) and for the discrete RX 6000 cards (gfx1030 / gfx1031 / gfx1032, #5151) (include/strata/core/arch_defaults.hpp prompt_f16_resolve, used by prompt_f16() in src/prefill/gemm.cu); opt-in elsewhere (=1); =0 turns it off (the way back). [docs/AMD_HIP.md:512]",
    "retire_after": "",
    "retired_in": ""
   },
