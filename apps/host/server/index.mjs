@@ -53,7 +53,7 @@ import { detectBackend, currentBackend, streamChat, inferenceLine } from './infe
 import { CONTEXT_TOKENS, VARIANTS, localModels, variant } from './catalog.mjs';
 import { browseLocalModels, inspectLocalModel } from './local-models.mjs';
 import { keepStreamAlive } from './stream-beat.mjs';
-import { EventHub, badRequest, error, json, readBody, readRaw, requestUrl, sameSecret, uid } from './util.mjs';
+import { EventHub, InvalidJsonError, badRequest, error, json, readBody, readRaw, requestUrl, sameSecret, uid } from './util.mjs';
 import { createUploads } from './chat-uploads.mjs';
 import { createNativeDrops } from './native-drop.mjs';
 import { createVisionProbe, effectiveVision, readsPicturesByDefault } from './vision-probe.mjs';
@@ -2093,6 +2093,19 @@ async function api(req, res, path, method, url) {
 
 async function openai(req, res, path, method) {
   if (!serving.authorized(req)) return error(res, 401, 'Invalid API key');
+  try {
+    return await routeInference(req, res, path, method);
+  } catch (err) {
+    if (!(err instanceof InvalidJsonError)) throw err;
+    if (res.headersSent) return res.end();
+    const message = 'Invalid JSON in request body';
+    const detail = { type: 'invalid_request_error', message };
+    if (path === '/v1/messages') return json(res, 400, { type: 'error', error: detail });
+    return json(res, 400, { error: { ...detail, param: null, code: 'invalid_json' } });
+  }
+}
+
+async function routeInference(req, res, path, method) {
   if(native.state().instances.length){
     if(path==='/v1/models'&&method==='GET')return json(res,200,{object:'list',data:native.state().instances.filter(i=>i.status==='ready').map(i=>({id:i.apiModelId,object:'model',owned_by:'strata',meta:{instanceId:i.id,gpus:i.gpus,label:i.label,aliases:i.aliases}}))});
     if(method==='POST'&&['/v1/chat/completions','/v1/messages','/v1/responses'].includes(path)){if(store.get().serving?.pauseServing)return error(res,503,'New API requests are paused.');if(path==='/v1/responses'&&!native.state().capabilities.responses)return error(res,501,'Update the native Strata installation to use the Responses API.');return nativeGateway({req,res,path,body:await readBody(req,12*1024*1024),control:native,serving});}
