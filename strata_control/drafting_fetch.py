@@ -346,7 +346,7 @@ def ensure(data_dir: str | Path, *, progress: Progress | None = None, cancel: th
     src = folder / "src"
     spec = tuple(files if files is not None else drafting.FILES)
     have = _present([src, *(_hub_snapshots() if files is None else [])], spec)       # already here and checked: used where it is, never fetched again
-    if len(have) < len(spec) and not online(base_url or drafting.BASE_URL):
+    if len(have) < len(spec) and not online(base_url or drafting.base_url()):
         raise OfflineError("There is no internet connection, so the DFlash2 drafter can't be downloaded now.")
     src.mkdir(parents=True, exist_ok=True)
     total = sum(size for _n, size, _h in spec)
@@ -356,7 +356,7 @@ def ensure(data_dir: str | Path, *, progress: Progress | None = None, cancel: th
             base = done_before
             partial = src / (name + ".part")
             try:
-                transfer.download((base_url or drafting.BASE_URL) + name, partial, size=size, sha256=sha, cancel=cancel, what="the DFlash2 drafter",
+                transfer.download((base_url or drafting.base_url()) + name, partial, size=size, sha256=sha, cancel=cancel, what="the DFlash2 drafter",
                                   progress=lambda d, _s, base=base: report("Downloading the DFlash2 drafter…", base + d, total))
             except transfer.Unreachable as exc:
                 raise DraftingError(str(exc)) from None  # the network rule's sentence: the host, what to check, what still works

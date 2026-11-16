@@ -398,6 +398,19 @@ class PlannedArm:
     env: dict[str, str | None]
 
 
+def arm_flags() -> set[str]:
+    """Every flag any arm can put on the engine's command line.
+
+    `tuning.engine_flag_inventory` probes the ones the engine's `--help` does not list, and it
+    needs to know which those could be. The arms know, so they say: a flag that is supported but
+    undocumented must not turn into a silently skipped arm.
+    """
+    out: set[str] = set()
+    for arm in ARMS:
+        out.update(arm.requires_flags())
+    return out
+
+
 def plan_arms(ctx: Context, *, mode: str = "quick", history_bad: set[str] | None = None) -> tuple[list[PlannedArm], list[dict[str, str]]]:
     """The candidates for this machine in the order they are tried, and the ones left out with the reason.
 

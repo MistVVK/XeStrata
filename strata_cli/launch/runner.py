@@ -318,10 +318,22 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
     return cfg
 
 
+def as_started(cfg: dict) -> dict:
+    """A copy of the run config as the server starts it where that changes what the drafter decision reads: serve.server.apply_vision_defaults (the
+    picture reader on demand, and on a card that keeps room for it a larger --vram-reserve-mib). #5810: the fetch had read the config before that
+    step and the start after it, on either side of the tuned pack's slot line, so setup fetched one pack and the start asked for the other."""
+    try:
+        from serve import server as _server
+        return _server.apply_vision_defaults(json.loads(json.dumps(cfg)))
+    except Exception:                                    # noqa: BLE001 - the config as it is
+        return cfg
+
+
 def card_signals(cfg: dict, gpus: Any, want: dict) -> dict:
     """Runner.drafting_signals for a run config and the launch's cards ``gpus``: the arguments with the person's own options over them, and the ONE card's memory."""
     try:
         from strata_control import drafting, user_args
+        cfg = as_started(cfg)
         args = [str(a) for a in cfg.get("args") or []]
         if cfg.get("user_args"):
             args = user_args.merge(args, cfg["user_args"])
@@ -340,8 +352,8 @@ def auto_signals(catalog, s: S.LaunchSettings, family: str | None) -> dict:
         from strata_control import drafting
         path = catalog.installed_config(catalog.tag_of(s.family, s.model))
         cfg = apply_choices(read_config(path) if path is not None else {}, s)
-        backend, archs = drafting.detect_hardware()
-        return {"model_name": cfg.get("model_name") or catalog.model_name_of(family, s.model),
+        backend, archs = drafting.hardware_for(cfg.get("backend"))   # #5109: the config's card family on a mixed NVIDIA + AMD computer
+        return {"model_name": cfg.get("model_name") or catalog.model_name_of(family, s.model), "engine_backend": cfg.get("backend"),
                 **card_signals(cfg, s.gpus, {"backend": backend, "archs": archs})}
     except Exception:                                    # noqa: BLE001 - no signal: Auto as before
         return {}
@@ -393,6 +405,23 @@ def installed_cards(base: dict | None, usable: list[dict] | None = None) -> list
     except ValueError:
         return None
     return cards or None
+
+
+def fit_parallel_for(catalog, s: S.LaunchSettings, vram_gb: float | None) -> int:
+    """"Fit to your card": the VRAM table (S.fit_parallel), except for a model with an engine path of its own (Qwen3.6-35B-A3B), whose
+    engine refuses to start when the slots' sessions do not fit (#5239: 3 slots planned at 128K on a 24 GB card, 5.56 GiB each, the start
+    failed after the download): there setup's own rule for that model and context decides (own_path_parallel_recommend; 0 = one at a time),
+    never more than the table's number."""
+    table = S.fit_parallel(vram_gb)
+    try:
+        setup = catalog.strata.setup_module()
+        fam = (getattr(setup, "OWN_PATH_FAMILIES", None) or {}).get(s.family) if setup is not None else None
+        if fam is None or not s.model:
+            return table
+        rec = setup.own_path_parallel_recommend(fam, str(s.model), float(vram_gb or 0.0), int(s.context or 32768))
+    except Exception:                                        # noqa: BLE001 - the table as before when the rule cannot be asked
+        return table
+    return max(1, min(table, rec or 1))
 
 
 def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, base: dict | None = None) -> "list[int] | dict | None":
@@ -465,14 +494,163 @@ def own_log_path(base: dict) -> str | None:
     return None if _SETUP_LOG_NAME.match(Path(value.replace("\\", "/")).name) else value
 
 
+#: The keys of the Settings view (serve/runconfig.py, the web page's About > Settings) that a start saved into this
+#: launch's config. They are not launch choices, and derive_config rebuilds the config from the installed one, so a
+#: value set on the page would quietly revert at the next start unless the earlier start's config carries it — the
+#: same way strata_control/arg_layers.py keeps hand-edited engine options. Not here: "mtp" and drafting (the
+#: launcher decides those with --mtp and --drafting), "open_browser" (strata launch sets it itself), and
+#: "vram_reserve_mib" (an engine option that already survives as a flag in "args" with its "user_args" copy).
+WEB_SETTINGS_KEYS = ("reasoning_budget_tokens", "fit_max_tokens", "anthropic_thinking", "effort_position",
+                     "aliases", "idle_unload_s", "lazy_load", "engine_silence_s", "api_monitor")
+WEB_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p")     # the editable keys of the "sampling" block
+
+#: Advanced-table options (--set, a preset's extra table) that the server reads from the run config, not from the
+#: engine's command line (serve/server.py). Written into the engine args they stop the engine: it knows no
+#: "--idle-unload" and exits with "unknown argument: --idle-unload", restart and exit again.
+SERVER_CONFIG_OPTIONS = {"--idle-unload": "idle_unload_s"}
+
+
+def take_server_options(a_changes: dict) -> dict:
+    """The command-line choices that are server behavior, not engine options: taken out of the engine changes here,
+    written as config keys after the carried values (what this command line says beats what an earlier start saved).
+    Values arrive as words; they become numbers, and one that cannot be is refused in plain words."""
+    out: dict[str, float | None] = {}
+    for flag, key in SERVER_CONFIG_OPTIONS.items():
+        if flag not in a_changes:
+            continue
+        value = a_changes.pop(flag)
+        if value is None:
+            out[key] = None                                   # "--idle-unload off": remove the key (the server never unloads)
+            continue
+        try:
+            number = float(str(value))
+        except ValueError:
+            raise LaunchError(f"idle-unload={value} is not a number of seconds.",
+                              "Use 0 or 'off' to never unload, or a number of seconds such as 300.")
+        out[key] = int(number) if number.is_integer() else number
+    return out
+
+
+#: #5858: run-defaults.json, user-wide server settings for every `strata launch` (beside launch-presets/: ~/.config/strata or %APPDATA%\\Strata).
+#: The Settings view's server keys (serve/runconfig.EDITABLE, checked with its rules) and undeclared_tool_calls; not "mtp", "open_browser" or
+#: engine options. Lowest precedence: the model's installed config, the Settings view's saved values and this launch's own choices come first.
+USER_DEFAULTS_FILE = "run-defaults.json"
+USER_DEFAULTS_KEY = "user_defaults"            # in the launch config: {key: value} the defaults file supplied (sampling keys dotted)
+_DEFAULTS_NOT = ("mtp", "open_browser", "vram_reserve_mib")
+
+
+def user_defaults_path() -> Path:
+    from strata_control import profiles
+    return profiles.profile_dir().parent / USER_DEFAULTS_FILE
+
+
+def read_user_defaults(path: Path | None = None) -> tuple[dict, list[str]]:
+    """({key: checked value}, the lines to say) from the user's run-defaults.json. No file: ({}, []), today's behaviour."""
+    from serve import runconfig
+    path = Path(path) if path is not None else user_defaults_path()
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {}, []
+    except OSError as exc:
+        return {}, [f"{path} is skipped: {exc.strerror or exc}."]
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return {}, [f"{path} is skipped: it is not valid JSON ({exc})."]
+    if not isinstance(data, dict):
+        return {}, [f"{path} is skipped: it must hold one JSON object of settings."]
+    out, notes = {}, []
+    for key, value in data.items():
+        flat = {f"sampling.{k}": v for k, v in value.items()} if key == "sampling" and isinstance(value, dict) else {key: value}
+        for name, v in flat.items():
+            try:
+                if name == "undeclared_tool_calls":
+                    if v not in ("text", "call"):
+                        raise ValueError('expected "text" or "call"')
+                    checked = v
+                elif name in runconfig.SPEC and name not in _DEFAULTS_NOT:
+                    checked = runconfig.check(name, v, {})
+                else:
+                    raise ValueError("not a setting this file can hold")
+            except ValueError as exc:
+                notes.append(f"{path}: {name} is skipped ({exc}).")
+                continue
+            if checked is not None:
+                out[name] = checked
+    return out, notes
+
+
+def _has_setting(cfg: dict, key: str) -> bool:
+    if key.startswith("sampling."):
+        return isinstance(cfg.get("sampling"), dict) and key.split(".", 1)[1] in cfg["sampling"]
+    return key in cfg
+
+
+def _setting_of(cfg: dict, key: str):
+    if key.startswith("sampling."):
+        return (cfg.get("sampling") or {}).get(key.split(".", 1)[1]) if isinstance(cfg.get("sampling"), dict) else None
+    return cfg.get(key)
+
+
+def apply_user_defaults(cfg: dict, base: dict, defaults: dict) -> dict:
+    """The defaults the model's installed config does not set itself, put into `cfg`; returns what was applied (remembered in the
+    launch config under USER_DEFAULTS_KEY, so carry_settings tells them from a value the Settings view saved)."""
+    applied = {}
+    for key, value in (defaults or {}).items():
+        if _has_setting(base, key):
+            continue                                         # the model's own setting comes first
+        if key.startswith("sampling."):
+            merged = dict(cfg["sampling"]) if isinstance(cfg.get("sampling"), dict) else {}
+            merged[key.split(".", 1)[1]] = value
+            cfg["sampling"] = merged
+        elif key == "lazy_load" and value and cfg.get("vision"):
+            continue                                         # lazy loading is text-only
+        else:
+            cfg[key] = value
+        applied[key] = value
+    if applied:
+        cfg[USER_DEFAULTS_KEY] = applied
+    else:
+        cfg.pop(USER_DEFAULTS_KEY, None)
+    return applied
+
+
+def carry_settings(cfg: dict, prev: dict | None) -> None:
+    """The Settings-view values a person saved in this launch's config since its last start (the web page writes into
+    the very file `strata launch` wrote): their standing choices, kept in the rebuilt config like a hand-edit. A value the user
+    defaults file put there last time (and nobody changed since) is not carried: the defaults file as it is now decides it (#5858)."""
+    if not prev:
+        return
+    from_defaults = prev.get(USER_DEFAULTS_KEY) if isinstance(prev.get(USER_DEFAULTS_KEY), dict) else {}
+
+    def untouched_default(key: str) -> bool:
+        return key in from_defaults and _setting_of(prev, key) == from_defaults[key]
+
+    for key in WEB_SETTINGS_KEYS:
+        if key not in prev or untouched_default(key):
+            continue
+        if key == "lazy_load" and prev[key] and cfg.get("vision"):
+            continue                                         # lazy loading is text-only; the page itself refuses it for a picture model
+        cfg[key] = prev[key]
+    sampling = prev.get("sampling")
+    if isinstance(sampling, dict):
+        keep = {k: v for k, v in sampling.items() if k in WEB_SAMPLING_KEYS and not untouched_default(f"sampling.{k}")}
+        if keep:
+            merged = dict(cfg["sampling"]) if isinstance(cfg.get("sampling"), dict) else {}
+            merged.update(keep)
+            cfg["sampling"] = merged
+
+
 def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None,
-                  prev: dict | None = None) -> dict:
+                  prev: dict | None = None, defaults: dict | None = None) -> dict:
     """The private run config of this launch: the installed one plus the choices that are not setup's (host, port, key, cards, advanced).
-    `prev` is the config this launch wrote last time: its calibrated values and hand edits are kept (strata_control/arg_layers.py: explicit
-    launch values, then persisted overrides, then calibrated values, then Auto)."""
+    `prev` is the config this launch wrote last time: its calibrated values, hand edits and the values the Settings view
+    saved (serve/runconfig.py, carry_settings) are kept (strata_control/arg_layers.py: explicit launch values, then
+    persisted overrides, then calibrated values, then Auto)."""
     from strata_control import arg_layers, tune_knobs
     cfg = json.loads(json.dumps(base))
-    cfg["host"] = acc.host_for(s.access)
+    cfg["host"] = acc.host_for(s.access, s.listen)
     cfg["port"] = int(s.port)
     if s.api_key:
         cfg["api_key"] = s.api_key
@@ -505,11 +683,19 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         intel_spec.apply_for_launch(cfg)
     word_flags = S.WORD_VALUE_FLAGS
     a_changes, e_changes = S.as_argv_changes(s.extra, bool_flags, word_flags) if s.extra else ({}, {})
+    server_set = take_server_options(a_changes)              # a server setting (--set idle-unload=...) never rides to the engine
     arg_layers.layer(cfg, a_changes, prev, bool_flags)       # the one place that decides which value an option has
     if e_changes:
         cfg["env"] = tune_knobs.apply_to_env(dict(cfg.get("env") or {}), e_changes)
     from strata_control import draft_layer
     draft_layer.apply(cfg)                                   # "mtp": false (from the installed config too) never sits beside --mtp in the saved args (B10)
+    apply_user_defaults(cfg, base, defaults or {})            # #5858: the user's run-defaults.json, below everything else
+    carry_settings(cfg, prev)                                # what the Settings view saved since the last start survives this launch
+    for key, value in server_set.items():                    # an explicit value from this command line beats what an earlier start saved
+        if value is None:
+            cfg.pop(key, None)
+        else:
+            cfg[key] = value
     return cfg
 
 
@@ -941,6 +1127,8 @@ class Runner:
             args += ["--kv", s.kv]
         if fam in ("qwen", "coder"):
             args += ["--experimental-speed-projection", "off"]
+        if s.draft_vocab and fam in modelstate.HELPER_FAMILIES:
+            args += ["--draft-vocab", s.draft_vocab]
         layer_fetch = getattr(self, "_layer_fetch", False)  # the start's safety net (fetch_missing_drafter): setup fetches the draft layer
         resolved = "mtp" if layer_fetch else self.resolved_drafting(fam)
         mtp_word = s.mtp if resolved != "off" else "off"
@@ -971,7 +1159,7 @@ class Runner:
         if sys.platform == "darwin":
             # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu, speed projection)
             keep = {"--yes", "--no-start", "--family", "--model", "--context", "--vision", "--data-dir", "--gguf-dir", "--move-data",
-                    "--set-default-data-dir", "--feed", "--drafter", "--mtp"}     # --drafter / --mtp: setup.py's Mac step fetches the draft layer only where the
+                    "--set-default-data-dir", "--feed", "--drafter", "--mtp", "--draft-vocab"}     # --drafter / --mtp: setup.py's Mac step fetches the draft layer only where the
                                                                                   # start runs the MTP, and not after a Drafting Off (`--mtp off`)
             flags = ("--yes", "--no-start", "--move-data", "--set-default-data-dir")
             out, i = [], 0
@@ -1581,7 +1769,7 @@ class Runner:
     def drafting_inputs(self, cfg: dict) -> dict:
         """What strata_control/drafting.py needs to decide for this launch: the choice, the card class, the model and the data folder."""
         from strata_control import drafting
-        backend, archs = drafting.detect_hardware()
+        backend, archs = drafting.hardware_for(cfg.get("backend"))   # #5109: the config's card family on a mixed NVIDIA + AMD computer
         mode = self.s.drafting if self.s.drafting is not None else cfg.get("drafting")
         args = cfg.get("args") or []
         if cfg.get("mtp") is False and drafting.normalize(mode) == "auto":
@@ -1698,9 +1886,16 @@ class Runner:
             previous = None
         if not isinstance(previous, dict):
             previous = None
+        defaults, notes = read_user_defaults()
+        for note in notes:
+            self.emit("config", note, None, level="warn")
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
                             log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base),
-                            prev=previous)
+                            prev=previous, defaults=defaults)
+        used = {k: _setting_of(cfg, k) for k in (cfg.get(USER_DEFAULTS_KEY) or {}) if _setting_of(cfg, k) == cfg[USER_DEFAULTS_KEY][k]}
+        if used:
+            self.emit("config", f"Using your defaults from {user_defaults_path()}: " + ", ".join(f"{k}={v if isinstance(v, str) else json.dumps(v)}" for k, v in used.items()) +
+                      " (a model's own settings and this launch's choices take priority).", None)
         self.say_remembered_cards(base)
         self.apply_four_card(cfg)
         self.apply_split_engine(cfg)
@@ -1802,7 +1997,7 @@ class Runner:
             parallel = None                                  # the slots Strata fills in by itself would keep the MTP: DFlash2 answers one request at a time
         if parallel and self.run_config_owns_slots(config):
             parallel = None                                  # the all-cards split engine's run config carries its lanes (--batch N, from --parallel N or its default): a profile override would only collide with them
-        sets = [f"host={acc.host_for(self.s.access)}", f"port={int(self.s.port)}"] + ([f"parallel={parallel}"] if parallel else [])
+        sets = [f"host={acc.host_for(self.s.access, self.s.listen)}", f"port={int(self.s.port)}"] + ([f"parallel={parallel}"] if parallel else [])
         try:
             current, _rev = profiles.load(name)
         except profiles.ProfileError:
@@ -1837,7 +2032,7 @@ class Runner:
     def catalog_parallel(self) -> int | None:
         try:
             comp = self.catalog.computer()
-            return S.fit_parallel(comp.main_vram_gb) if comp.usable_gpus else None
+            return fit_parallel_for(self.catalog, self.s, comp.main_vram_gb) if comp.usable_gpus else None
         except Exception:                                    # noqa: BLE001
             return None
 
@@ -2121,6 +2316,8 @@ class Runner:
             self.end_failed_start()
             raise LaunchError(f"The server could not start: {box['e']}", _log_hint(self.config_path, box["e"]), 6)
         r = box["r"]
+        if r.get("engine_fallback"):                        # #5400: the new engine could not start the model; the previous one was used again
+            self.emit("start", str(r.get("note") or ""), None, level="warn")
         if not r.get("ok"):
             text, nxt = explain_engine_exit(r, self.config_path, marks=self._marks, server_log=self.server_log_path(),
                                             shared_memory=self.shares_memory())
@@ -2166,7 +2363,7 @@ class Runner:
         import socket
         port = int(self.s.port)
         busy = False
-        for host in ("127.0.0.1",):
+        for host in (("127.0.0.1",) if not (self.s.access == "address" and self.s.listen) else (self.s.listen,)):
             try:
                 with socket.create_connection((host, port), timeout=1.0):
                     busy = True
@@ -2194,7 +2391,7 @@ class Runner:
         try:
             import urllib.request
             headers = {"Authorization": f"Bearer {self.s.api_key}"} if self.s.api_key else {}
-            with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{int(self.s.port)}/metrics", headers=headers), timeout=4) as resp:
+            with urllib.request.urlopen(urllib.request.Request(acc.local_url(self.s) + "/metrics", headers=headers), timeout=4) as resp:
                 info = (json.loads(resp.read().decode("utf-8", "replace")).get("engine") or {})
         except Exception:                                    # noqa: BLE001 - the line is a convenience
             return
@@ -2545,6 +2742,10 @@ class Runner:
         self.keep_saved_word()                               # a restart with no word keeps the saved one (it was written as null before)
         try:
             self.check_own_files()                         # a wrong --model-path is said before the engine is downloaded
+            if start and self.s.access == "address":       # #5917: an address that left this computer stops here, never a silent 0.0.0.0
+                problem = acc.listen_problem(self.s.listen)
+                if problem:
+                    raise LaunchError(problem, "", 2)
             if start:
                 reused = self.check_serving()                # before anything is downloaded or stopped
                 if reused is not None:

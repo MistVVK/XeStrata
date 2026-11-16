@@ -20,8 +20,8 @@ SCHEMA = "strata.launch/1"
 #: setup.py's CONTEXTS (kept here only as the fallback when the installer files are not next to this terminal).
 FALLBACK_CONTEXTS = (8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288)
 
-ACCESS_KINDS = ("local", "lan", "cloudflare", "tailscale")
-ACCESS_WORDS = {"local": "This computer only", "lan": "My local network", "cloudflare": "Cloudflare tunnel",
+ACCESS_KINDS = ("local", "lan", "address", "cloudflare", "tailscale")
+ACCESS_WORDS = {"local": "This computer only", "lan": "My local network", "address": "One address only", "cloudflare": "Cloudflare tunnel",
                 "tailscale": "Tailscale"}
 TUNE_MODES = ("quick", "thorough", "skip")
 VISION_MODES = ("off", "on", "gpu", "cpu")
@@ -30,6 +30,8 @@ MTP_MODES = ("on", "off")
 SPLIT_MODES = ("auto", "on", "off")
 #: strata_control/drafting.py MODES (tests/terminal/test_drafting.py keeps the two the same)
 DRAFTING_MODES = ("auto", "mtp", "dflash2", "off")
+#: setup.py DRAFT_VOCABS (tests/terminal/test_launch_draft_vocab.py keeps the two the same)
+DRAFT_VOCAB_MODES = ("cjk", "en", "cyrillic", "fr", "latin")
 KV_MODES = ("int8", "q4_0", "k8v4", "fp16")
 DEFAULT_PORT = 8080
 
@@ -94,11 +96,13 @@ class LaunchSettings:
     vision: str | None = None                  # None = the default (on when the model can read pictures and the engine has the reader), off | on | gpu | cpu
     parallel: int | None = None                # None = fit to the card
     drafting: str | None = None                # None = Auto (recommended): the table in strata_control/drafting.py; mtp | dflash2 | off choose one. Saved in the launch config
+    draft_vocab: str | None = None              # setup's token subset for the MTP/DFlash2 draft head
     split_engine: str | None = None            # None = auto (the all-cards split engine runs by itself where it is supported); on | off. Saved in the preset and the launch config
     mtp: str | None = None                     # None = as installed (draft layer on); "off" starts without it (less graphics memory and RAM, slower); "on" overrides an installed "off"
     tune: str = "skip"                         # quick | thorough | skip
     tune_allow_small: bool = False             # the "answer-changing" tick, off by default, as in the app
     access: str = "local"
+    listen: str | None = None                  # access "address" (#5917): the one address of this computer the server listens on
     port: int = DEFAULT_PORT
     api_key: str | None = None                 # never shown whole; stored only in the private preset file
     no_key: bool = False                       # served beyond this computer without a key, on purpose (--no-api-key); a warning, never a refusal
@@ -308,12 +312,14 @@ def flags_text(s: LaunchSettings, *, preset: str | None = None) -> str:
             parts.append(f"--mtp {s.mtp}")
         if s.drafting:
             parts.append(f"--drafting {s.drafting}")
+        if s.draft_vocab:
+            parts.append(f"--draft-vocab {s.draft_vocab}")
         if s.split_engine:
             parts.append(f"--split-engine {s.split_engine}")
         parts.append(f"--tune {s.tune}")
         if s.tune_allow_small:
             parts.append("--tune-allow-small")
-        parts.append(f"--access {s.access}")
+        parts.append(f"--listen {s.listen}" if s.access == "address" and s.listen else f"--access {s.access}")
         parts.append(f"--port {s.port}")
         if s.gpu_roles:
             parts.append("--gpu-roles " + ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0]))))

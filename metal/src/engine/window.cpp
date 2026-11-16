@@ -16,6 +16,7 @@
 #include "resource_path.h"
 #include "ref_quant.h"
 #include "arena_budget.h"
+#include "ple_conv_kw.h"
 #include "stream.h"
 #include "geo.h"
 #include "msl_libs.h"
@@ -249,6 +250,10 @@ public:
     bool sample_slot_row(int row, const strata::kernels::SamplerParams& sp, const int32_t* hist, int hist_len, int32_t* tok, std::string& err);   // one slot's row of a batch window, its own params
     bool sample_run(int row0, int n, const strata::kernels::SamplerParams& sp, const int32_t* hist, int hl, std::string& err);   // after run(): replaces out[0..Tn) (and tokout_) by the sampled tokens
     bool copy_logits(int t, float* host) const;
+    // row t of the last window's head logits, in place; null past the window's rows (#879 host-side scan)
+    const float* logits_row(int t) const {
+        return t >= 0 && t < head_rows_ ? lm_.as<float>() + (size_t) t * (size_t) n_vocab_ : nullptr;
+    }
     int64_t vocab() const { return n_vocab_; }
     bool ready() const { return cx_ != nullptr; }
     bool streaming() const { return stream_; }
@@ -442,6 +447,10 @@ private:
     std::vector<mtl::Buffer> gstBig_, hbBig_, kqBig_, vqBig_, kscBig_, vscBig_, tailBig_, deadBig_, pooledBig_;
     mtl::Buffer pleBig_, rinfo_;
     size_t st_gst_ = 0, st_hist_ = 0, st_kq_ = 0, st_sc_ = 0, st_tail_ = 0, st_dead_ = 0, st_pooled_ = 0, st_ple_ = 0;   // bytes between sets
+    // --vision: the slots' own M-RoPE tables side by side (set idx at idx * st_mrope_), so a batch row rotates by its own
+    // slot's table (rinfo_ row word 3: its offset in ints); allocated with the slots, only when the table is set
+    mtl::Buffer mropeBig_;
+    size_t st_mrope_ = 0;
     bool rows_ = false;       // the window being built / run holds one token of each of rows_n_ DIFFERENT sequences (batch slots)
     int rows_n_ = 0;
     strata::core::SessionState* rows_ss_[MAXT] = {};
@@ -458,6 +467,9 @@ private:
     struct SeqSet {
         std::vector<mtl::Buffer> gst, gh0, gh1, kq, vq, ksc, vsc, tail, dead, pooled;
         mtl::Buffer pleHist;
+        // --vision: this slot's own M-RoPE table (int32 [cells][3]), set by slot_copy into the slot from the request that
+        // admitted it: the process's table is rebuilt by every request, the slot's is not.  Not swapped by activate.
+        mtl::Buffer mrope;
         std::vector<float> ple_hist;
         std::vector<float> last_norm;
         int hp = 0, pend_fold = 0, last_T = 0;
@@ -545,6 +557,7 @@ private:
     std::vector<float> ple_hist_;    // NG_HIST x hc_dim normalized rows, row-fastest
     bool ple_on_ = false;
     int last_T_ = 0;
+    int head_rows_ = 0;              // rows of lm_ the last window's head wrote (logits_row)
     double last_gpu_ms_ = 0;
     int last_n_disp_ = 0;
     int32_t last_tokens_[MAXT] = {};
@@ -639,7 +652,10 @@ private:
     void mrope_sync(int64_t c0, int64_t n) {
         if (!mrope_on()) return;
         const int64_t a = std::max<int64_t>(0, c0 & ~(int64_t) 3), b = std::min<int64_t>(max_cells_, c0 + n);
-        if (b > a) std::memcpy(mrope_.as<int32_t>() + a * 3, g_mrope_host + a * 3, (size_t) (b - a) * 12);
+        // a batch slot's own window (activate, the slot-by-slot path): the slot's table, not the process's
+        const SeqSet* live = active_ != 0 && (size_t) active_ < sets_.size() ? sets_[(size_t) active_].get() : nullptr;
+        const int32_t* src = live != nullptr && live->mrope.bytes > 0 ? live->mrope.as<int32_t>() : g_mrope_host;
+        if (b > a) std::memcpy(mrope_.as<int32_t>() + a * 3, src + a * 3, (size_t) (b - a) * 12);
     }
     mtl::Constants qsa_c() const { return mrope_on() ? mtl::Constants().b(24, true) : mtl::Constants(); }
     std::string qsa_k() const { return mrope_on() ? "qsa_prep#mrope" : "qsa_prep"; }
@@ -796,6 +812,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     };
     if (bigs_ok_) { pleBig_ = A(st_ple_ * NSET); pleHist_ = view_of(pleBig_, 0, PLEH_B); } else pleHist_ = A(PLEH_B);
     rinfo_ = A(4 * (8 + 4 * MAXT));
+    st_mrope_ = R256(12 * (size_t) (MAXC + 16));
     auto act = [&](int n) {
         Act a;
         a.n = n;
@@ -921,14 +938,24 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         }
     }
     ple_on_ = ss.ple.ready() && f_.find("blk.1.ple_key.weight") != nullptr;
-    if (ple_on_ && T("blk.1.ple_conv1d.weight").type == ref::F32) {
+    // ple_conv_add reads F16.  F32 (Unsloth's UD-IQ3_XXS and up, Q8_0) and BF16 (Unsloth's UD-IQ1_S / IQ1_M / Q2_0 /
+    // IQ2_XS / Q2_K_XL and their BF16 file) are narrowed here, as tools/iq_pack.py does for the host's pack; a BF16 tensor
+    // read as F16 gave garbage from the first token on Metal only (the CUDA / HIP / SYCL engines read the pack's copy).
+    // The rule is ple_conv_kw.h (tested without a GPU: metal/tests/ple_conv_kw_test.cpp).
+    if (ple_on_) {
         const gguf::Tensor& k = T("blk.1.ple_conv1d.weight");
-        const size_t ne = k.bytes / 4;
-        plekw_ = cx_->alloc((ne * 2 + 4095) / 4096 * 4096);
-        const float* src = (const float*) ((const uint8_t*) W_.ptr + k.offset);
-        uint16_t* dst = plekw_.as<uint16_t>();
-        for (size_t i = 0; i < ne; ++i) dst[i] = ref::f32_to_f16(src[i]);
-        plekw_own_ = true;
+        const PleConvKw kp = ple_conv_kw_plan(k.type);
+        if (kp == PleConvKw::unsupported) {
+            err = "metal window: blk.1.ple_conv1d.weight is type " + std::to_string(k.type) +
+                  ": the Metal PLE conv reads F16 (F32 and BF16 are converted at load)";
+            return false;
+        }
+        if (kp != PleConvKw::file_f16) {
+            const size_t ne = ple_conv_kw_elems(k.type, k.bytes);
+            plekw_ = cx_->alloc((ne * 2 + 4095) / 4096 * 4096);
+            ple_conv_kw_narrow(k.type, (const uint8_t*) W_.ptr + k.offset, ne, plekw_.as<uint16_t>());
+            plekw_own_ = true;
+        }
     }
     ple_hist_.assign((size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM, 0.0f);
     last_norm_.assign((size_t) MAXT * strata::kernels::NG_HC_DIM, 0.0f);
@@ -1144,14 +1171,17 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         const mtl::Buffer& TL = rw ? tailBig_[(size_t) qi] : tail_[(size_t) qi];
         const mtl::Buffer& DD = rw ? deadBig_[(size_t) qi] : dead_[(size_t) qi];
         const mtl::Buffer& PL = rw ? pooledBig_[(size_t) qi] : pooled_[(size_t) qi];
-        d.p = rw ? P(lqsa_, "qsa_prep", rc, "qsa_prep#rows") : P(lqsa_, "qsa_prep", qsa_c(), qsa_k());
+        // (pictures in batch slots: each row reads its own slot's M-RoPE table in mropeBig_)
+        const mtl::Constants rcm = mrope_on() ? mtl::Constants().b(30, true).b(24, true) : rc;
+        d.p = rw ? P(lqsa_, "qsa_prep", rcm, mrope_on() ? "qsa_prep#rows#mrope" : "qsa_prep#rows")
+                 : P(lqsa_, "qsa_prep", qsa_c(), qsa_k());
         d.args = {mtl::Arg::B(qfull_), mtl::Arg::B(kcur_), mtl::Arg::B(vcur_), mtl::Arg::B(iqr_), mtl::Arg::B(ikr_),
                   mtl::Arg::B(W_, T(b + "attn_q_norm.weight").offset), mtl::Arg::B(W_, T(b + "attn_k_norm.weight").offset),
                   mtl::Arg::B(W_, T(b + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, T(b + "indexer.k_norm.weight").offset),
                   mtl::Arg::B(cs_), mtl::Arg::B(qcur_), mtl::Arg::B(qidx_), mtl::Arg::B(KQ),
                   mtl::Arg::B(VQ), mtl::Arg::B(KS), mtl::Arg::B(VS),
                   mtl::Arg::B(TL), mtl::Arg::B(DD), mtl::Arg::B(PL),
-                  mtl::Arg::V(a), mtl::Arg::B(mrope_)};
+                  mtl::Arg::V(a), mtl::Arg::B(rw && mrope_on() ? mropeBig_ : mrope_)};
         if (rw) d.args.push_back(mtl::Arg::B(rinfo_));
         d.grid[0] = G_QPREP;
         d.grid[1] = ntok;
@@ -1561,6 +1591,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
 
 bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err) {
     if (S < 1 || S > MAXT || S > max_t_) { err = "metal window: batch window size out of range"; return false; }
+    if (mrope_on() && mropeBig_.bytes == 0) { err = "metal window: batch rows without the slots' M-RoPE tables"; return false; }
     if (active_ != 0) activate(0);
     uint32_t* ri = rinfo_.as<uint32_t>() + 8;
     int64_t maxpos = 0;
@@ -1574,7 +1605,7 @@ bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64
         ri[4 * t] = (uint32_t) set;
         ri[4 * t + 1] = (uint32_t) pos[t];
         ri[4 * t + 2] = (uint32_t) sets_[(size_t) set]->hp;
-        ri[4 * t + 3] = 0;
+        ri[4 * t + 3] = mrope_on() ? (uint32_t) ((size_t) set * st_mrope_ / 4) : 0;   // its own M-RoPE table, in ints
         maxpos = std::max<int64_t>(maxpos, pos[t]);
     }
     rows_ = true;
@@ -1591,6 +1622,7 @@ bool Window::finish_rows(int Tn, const int32_t* tokens, int32_t* out, double t0)
     win_ms_[Tn] += now_ms() - t0;
     win_gpu_[Tn] += last_gpu_ms_;
     for (int t = 0; t < Tn; ++t) out[t] = tokout_.as<int32_t>()[t];
+    head_rows_ = Tn;   // the batch window's head wrote Tn logits rows (the #879 scan reads them)
     for (int t = 0; t < Tn; ++t) {
         SeqSet& s = *sets_[(size_t) rows_set_[t]];
         s.hp = 1 - s.hp;
@@ -2022,6 +2054,7 @@ bool Window::finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int3
     last_head_ = head;
     for (int t = 0; t < Tn; ++t) out[t] = head ? tokout_.as<int32_t>()[t] : -1;
     last_T_ = Tn;
+    head_rows_ = head ? Tn : 0;
     for (int t = 0; t < Tn; ++t) last_tokens_[t] = tokens[t];
     static const bool trace = std::getenv("STRATA_METAL_TRACE") != nullptr;
     if (trace && head) {
@@ -2056,8 +2089,12 @@ void Window::fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp) {
                   mtl::Arg::B(ydump_), mtl::Arg::V(a), mtl::Arg::B(ghist_[1 - hp][(size_t) gi])};
         d.grid[0] = G_HV;
         d.tg[0] = 512;
-        nb_ = true;   // the layers' folds are independent of each other
         push(ds, d);
+        // The first fold must barrier against whatever the caller last wrote into qkvL_/alL_/beL_/zL_ (the window's
+        // own projections): setting nb_ before the push cleared the caller's `nb_ = false` and let the fold read the
+        // previous chunk's projections, committing them into the recurrent state.  Folds after the first are
+        // independent of each other, so they keep the barrier off.
+        nb_ = true;
     }
     nb_ = false;   // what follows reads the folded state: a barrier
 }
@@ -2079,6 +2116,12 @@ void Window::swap_state(SeqSet& o) {
 // the buffers of one sequence's running state, shaped like the live ones (real: allocated and zero; else empty placeholders)
 void Window::alloc_set(SeqSet& o, bool real, int idx) {
     const size_t MAXC = (size_t) max_cells_, MB = MAXC / 4 + 2;
+    if (real && mrope_on()) {   // the identity until a request is copied in (slot_copy)
+        o.mrope = mropeBig_.bytes > 0 && idx <= g_slot_cap ? view_of(mropeBig_, (size_t) idx * st_mrope_, 12 * (MAXC + 16))
+                                                         : cx_->alloc(12 * (MAXC + 16));
+        int32_t* m = o.mrope.as<int32_t>();
+        for (size_t c = 0; c < MAXC + 16; ++c) m[c * 3] = m[c * 3 + 1] = m[c * 3 + 2] = (int32_t) c;
+    }
     if (real && bigs_ok_) {   // set idx's part of the big buffers
         for (size_t i = 0; i < gst_.size(); ++i) {
             o.gst.push_back(view_of(gstBig_[i], (size_t) idx * st_gst_, GST_B));
@@ -2120,6 +2163,7 @@ void Window::alloc_set(SeqSet& o, bool real, int idx) {
 bool Window::slots_init(const std::vector<strata::core::SessionState*>& slots, std::string& err) {
     if (!sets_.empty()) return true;   // (asked once)
     if (cx_ == nullptr) { err = "metal window: slots before the window is up"; return false; }
+    if (mrope_on() && bigs_ok_) mropeBig_ = cx_->alloc(st_mrope_ * (1 + (size_t) std::max(0, g_slot_cap)));
     std::vector<std::unique_ptr<SeqSet>> v;
     v.push_back(std::make_unique<SeqSet>());
     alloc_set(*v[0], false);
@@ -2180,6 +2224,18 @@ bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::s
     activate(0);
     SeqSet& o = *sets_[(size_t) b + 1];
     if (pend_fold_ > 0 || o.pend_fold > 0) { err = "metal window: a slot copy with a fold pending"; return false; }
+    if (into_slot && mrope_on() && o.mrope.bytes > 0) {
+        // the slot's positions from the request's table: its cells [0, upto) as they are (the K/V rows hold them rotated
+        // already), then the text after them, one position a cell on from the last one (a prompt never ends in an image,
+        // so its t, h and w are one position)
+        const int64_t n = std::min<int64_t>(upto, max_cells_);
+        if (n < 1) { err = "metal window: a slot copy of an empty conversation with the M-RoPE table set"; return false; }
+        const int32_t* last = g_mrope_host + (n - 1) * 3;
+        if (last[0] != last[1] || last[0] != last[2]) { err = "metal window: a slot copy that ends in an image"; return false; }
+        int32_t* m = o.mrope.as<int32_t>();
+        std::memcpy(m, g_mrope_host, (size_t) n * 12);
+        for (int64_t c = n; c < max_cells_ + 16; ++c) m[c * 3] = m[c * 3 + 1] = m[c * 3 + 2] = (int32_t) (last[0] + (c - n + 1));
+    }
     const size_t cells = (size_t) std::max<int64_t>(0, std::min<int64_t>(upto, max_cells_));
     auto cp = [&](const mtl::Buffer& live, const mtl::Buffer& stash, size_t n) {
         n = std::min({n, live.bytes, stash.bytes});
@@ -2258,10 +2314,21 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
     // has to survive a checkpoint: rows 0..2 are the whole state (the means are identical, qsa.metal qsa_prep).
     const size_t gs = GST_B, hs = HIST_B, ts = 3 * 4 * G_ID, dsz = DEAD_B;
     c.gdn.resize(gst_.size() * (gs + hs));
+    size_t sbad = 0;
     for (size_t i = 0; i < gst_.size(); ++i) {
-        std::memcpy(c.gdn.data() + i * (gs + hs), gst_[i].ptr, gs);
-        std::memcpy(c.gdn.data() + i * (gs + hs) + gs, ghist_[hp_][i].ptr, hs);
+        uint8_t* d8 = c.gdn.data() + i * (gs + hs);
+        std::memcpy(d8, gst_[i].ptr, gs);
+        std::memcpy(d8 + gs, ghist_[hp_][i].ptr, hs);
+        // Never persist a non-finite word.  The record is restored wholesale - by this session's recovery path and
+        // by the next session's cold start - so one saved NaN re-poisons every later run from a state that looks
+        // clean.  Zero is the neutral value for both the scan state and the conv history.
+        uint32_t* w = (uint32_t*) d8;
+        for (size_t k = 0; k < (gs + hs) / 4; ++k)
+            if ((w[k] & 0x7F800000u) == 0x7F800000u) { w[k] = 0u; ++sbad; }
     }
+    if (sbad)
+        std::fprintf(stderr, "strata metal: #879 save, %zu tokens: dropped %zu non-finite words instead of persisting them\n",
+                     c.ids.size(), sbad);
     c.ple.assign((const uint8_t*) pleHist_.ptr, (const uint8_t*) pleHist_.ptr + PLEH_B);
     c.tails.resize(tail_.size() * ts);
     c.dead.resize(dead_.size() * dsz);
@@ -2302,10 +2369,31 @@ bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, s
     }
     pend_fold_ = 0;   // the restored state replaces whatever was pending
     last_T_ = 0;
+    // The blob being restored is UNTRUSTED.  A layer of NaN cannot come out of the contractive GDN scan (every
+    // ssm_a is negative, so the decay is <= 1 and the delta rule is bounded), so if it is already in the record it
+    // arrived through the checkpoint - and the #879 recovery restores this very buffer, which is what made one bad
+    // value permanent: it was saved, restored, and re-propagated on every retry.  Zero is the neutral value for both
+    // parts (the state is a memory of v, the conv history is three boundary tokens), so clearing them costs a
+    // three-token warm-up in the affected layer and nothing else.  inf is cleared with NaN: both poison the
+    // recurrence and neither is reachable from a healthy state.  Restore only, so it is off the hot path.
+    const size_t sw = gs / 4, hwc = hs / 4;
+    size_t bad = 0, badl = 0;
     for (size_t i = 0; i < gst_.size(); ++i) {
-        std::memcpy(gst_[i].ptr, c.gdn.data() + i * (gs + hs), gs);
-        std::memcpy(ghist_[hp_][i].ptr, c.gdn.data() + i * (gs + hs) + gs, hs);
+        const uint8_t* s8 = c.gdn.data() + i * (gs + hs);
+        std::memcpy(gst_[i].ptr, s8, gs);
+        std::memcpy(ghist_[hp_][i].ptr, s8 + gs, hs);
+        uint32_t* st = (uint32_t*) gst_[i].ptr;
+        uint32_t* hw = (uint32_t*) ghist_[hp_][i].ptr;
+        size_t here = 0;
+        for (size_t k = 0; k < sw; ++k)
+            if ((((const uint32_t*) s8)[k] & 0x7F800000u) == 0x7F800000u) { st[k] = 0u; ++here; }
+        for (size_t k = 0; k < hwc; ++k)
+            if ((((const uint32_t*) (s8 + gs))[k] & 0x7F800000u) == 0x7F800000u) { hw[k] = 0u; ++here; }
+        if (here) { bad += here; ++badl; }
     }
+    if (bad)
+        std::fprintf(stderr, "strata metal: #879 restore, %zu tokens: cleared %zu non-finite words from the state and "
+                             "conv history of %zu layer(s) - the checkpoint was already poisoned\n", c.ids.size(), bad, badl);
     std::memcpy(pleHist_.ptr, c.ple.data(), c.ple.size());
     const size_t cts = c.tails.size() / std::max<size_t>(tail_.size(), 1);   // 3 rows (the shared contract) or 4 (an older image)
     for (size_t j = 0; j < tail_.size(); ++j) {
@@ -3309,6 +3397,25 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         D(P(lib_, "gr_norm", {}, "gr_norm"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
                                               mtl::Arg::B(p.YE), mtl::Arg::V(a)}, HC, T, 256);
     }
+    // No non-finite value may cross a chunk boundary.  The scan state and the conv history are the only two carriers
+    // that outlive a chunk (and, through the conversation cache and the checkpoint, outlive the request), so this pass
+    // makes a poisoned state self-healing instead of permanent.  It is unconditional on purpose: containment has to
+    // hold in production, not only while diagnosing.  Zero is the neutral value for both - the state is a memory of v
+    // and the history is three boundary tokens - so a bad word costs one layer a three-token warm-up instead of
+    // poisoning every later chunk.  ~19 MB of host reads against ~14 s of prefill: 0.005%.
+    {
+        size_t sbad = 0;
+        for (size_t i = 0; i < gst_.size(); ++i) {
+            uint32_t* st = (uint32_t*) gst_[i].ptr;
+            for (size_t k = 0; k < GST_B / 4; ++k)
+                if ((st[k] & 0x7F800000u) == 0x7F800000u) { st[k] = 0u; ++sbad; }
+            uint32_t* hw = (uint32_t*) ghist_[hp_][i].ptr;
+            for (size_t k = 0; k < HIST_B / 4; ++k)
+                if ((hw[k] & 0x7F800000u) == 0x7F800000u) { hw[k] = 0u; ++sbad; }
+        }
+        if (sbad)
+            std::fprintf(stderr, "strata metal: #879 chunk start: cleared %zu non-finite words from the running GDN state\n", sbad);
+    }
     const double t0 = now_ms();
     if (stream_) {
         seg_T_ = T;
@@ -3552,6 +3659,7 @@ bool window_commit(void* w, int n_keep, std::string& err) {
     return ok;
 }
 bool window_copy_logits(void* w, int t, float* host) { return ((Window*) w)->copy_logits(t, host); }
+const float* window_logits(void* w, int t) { return ((Window*) w)->logits_row(t); }
 
 // the MTP hook (src/core/mtp.cpp under STRATA_GPU_METAL): the drafter lives beside the decode window it reads
 namespace {

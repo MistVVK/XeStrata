@@ -9,8 +9,8 @@
  *   in the middle leaves the older file whole. Temporary files left by a crash are removed at the next start.
  * - `rev` counts the saves of a chat. A save that names a `baseRev` older than the stored one (a second window saved first) is still
  *   written, but the version it displaces is kept in conflicts/ first, so nothing is lost.
- * - The index is a list for fast start. If it is missing or does not match the files it is rebuilt from the files; a file that cannot
- *   be read is reported and left exactly as it is.
+ * - The index is a derived list. At start it is rebuilt from the chat files, which own their revisions even if the last index write
+ *   failed; a file that cannot be read is reported and left exactly as it is.
  * - Nothing is cut: the chat is stored byte for byte as received (a text splice, no re-serialising).
  * - Owner-only: the folder is created private (POSIX 0700 and files 0600; on Windows the folder gets a protected ACL that its files
  *   inherit), the same level as the rest of the profile.
@@ -56,6 +56,8 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
   let tmpCount = 0;
   let index = new Map();   // id -> entry
   const damaged = new Set();
+  const newer = new Set();   // chats saved by a newer Strata (format above CHAT_FORMAT): listed, never deleted or overwritten (#5421 review)
+  const NEWER_TEXT = 'This chat was saved by a newer version of Strata. Update Strata to open it.';
 
   const fileOf = id => join(root, `${id}.json`);
   const bytesOf = text => Buffer.byteLength(text, 'utf8');
@@ -71,15 +73,26 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
     try { names = readdirSync(root); } catch { /* empty */ }
     for (const name of names) if (/\.tmp-\d+-\d+$/.test(name)) { try { unlinkSync(join(root, name)); } catch { /* left */ } }
     const files = names.filter(n => n.endsWith('.json') && n !== 'index.json' && !/\.tmp-/.test(n)).map(n => n.slice(0, -5)).filter(validChatId);
-    let saved = null;
-    try { const parsed = JSON.parse(readFileSync(join(root, 'index.json'), 'utf8')); if (parsed?.v === CHAT_FORMAT && Array.isArray(parsed.chats)) saved = parsed.chats; } catch { /* rebuilt below */ }
     const map = new Map();
-    if (saved) for (const e of saved) if (e && validChatId(e.id) && files.includes(e.id)) map.set(e.id, e);
-    // Files the index does not know (a crash before the index was written, an index lost): read from the files.
+    // A chat rename can succeed before its index write fails or the host exits. Even a valid index can be behind for an existing id:
+    // recover from the chat envelope so the next save cannot reuse a revision or miss an older window's conflict. Such a chat file is
+    // never older than the index (the index is written after the chat), so an index entry is still used for a file that is older than
+    // the index and has the size the index recorded: a start reads only the chats saved since (#5359 review: no full read of a large history).
+    let saved = null, indexMs = -1;
+    try {
+      const path = join(root, 'index.json');
+      const parsed = JSON.parse(readFileSync(path, 'utf8'));
+      if (parsed?.v === CHAT_FORMAT && Array.isArray(parsed.chats)) { saved = new Map(parsed.chats.filter(e => e && validChatId(e.id)).map(e => [e.id, e])); indexMs = statSync(path).mtimeMs; }
+    } catch { /* every chat is read below */ }
     for (const id of files) {
-      if (map.has(id)) continue;
+      const known = saved?.get(id);
+      if (known && Number.isFinite(known.rev)) {
+        try { const st = statSync(fileOf(id)); if (st.mtimeMs < indexMs && st.size === known.bytes) { map.set(id, known); continue; } } catch { /* read below */ }
+      }
       try {
         const parsed = JSON.parse(readFileSync(fileOf(id), 'utf8'));
+        // A chat saved by a newer Strata (a higher format) is not damaged: it is kept apart, never offered for deletion, never overwritten.
+        if (Number.isInteger(parsed?.v) && parsed.v > CHAT_FORMAT) { newer.add(id); continue; }
         if (parsed?.v !== CHAT_FORMAT || !parsed.session || parsed.session.id !== id) throw new Error('not a chat file');
         map.set(id, entryOf(id, Number(parsed.rev) || 1, parsed.session, statSync(fileOf(id)).size));
       } catch { damaged.add(id); }
@@ -124,7 +137,7 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
     /** The chats, newest first. */
     list() {
       const chats = [...index.values()].sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')) || a.id.localeCompare(b.id));
-      return { v: CHAT_FORMAT, chats, damaged: [...damaged] };
+      return { v: CHAT_FORMAT, chats, damaged: [...damaged], newer: [...newer] };
     },
     has: id => index.has(id),
     rev: id => index.get(id)?.rev ?? 0,
@@ -140,6 +153,7 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
      */
     save(id, sessionText, { baseRev = null } = {}) {
       if (!validChatId(id)) return Promise.reject(new ChatStoreError('That is not a chat id.', 400, 'bad-id'));
+      if (newer.has(id)) return Promise.reject(new ChatStoreError(NEWER_TEXT, 409, 'newer-format'));
       let session;
       try { session = JSON.parse(sessionText); } catch { return Promise.reject(new ChatStoreError('The chat must be JSON.', 400, 'bad-json')); }
       if (!session || typeof session !== 'object' || Array.isArray(session) || session.id !== id) return Promise.reject(new ChatStoreError('The chat does not match its id.', 400, 'bad-chat'));
@@ -161,9 +175,13 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
     /** Delete a chat (the person deleted it). A chat that is not there is already gone. */
     remove(id) {
       if (!validChatId(id)) return Promise.reject(new ChatStoreError('That is not a chat id.', 400, 'bad-id'));
+      if (newer.has(id)) return Promise.reject(new ChatStoreError(NEWER_TEXT, 409, 'newer-format'));
       return queue(async () => {
         try { await io.unlink(fileOf(id)); } catch (e) { if (e?.code !== 'ENOENT') throw storeFailure(e); }
         const had = index.delete(id);
+        // A chat the start-up read could not parse is in `damaged`, never in `index`: its file is now gone,
+        // so the list must forget it too, or the page keeps showing an id with nothing behind it (#5421).
+        damaged.delete(id);
         await writeIndex();
         return { id, removed: had };
       });

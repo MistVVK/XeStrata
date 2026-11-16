@@ -103,6 +103,8 @@ _SLOWER = {("cuda", "sm_86")}
 
 
 _HARDWARE: list = []
+_HARDWARE_MISS: list = []          # (#5427) when the last lookup found no card; asked again after HARDWARE_MISS_S
+HARDWARE_MISS_S = 5.0
 
 # --- Intel: the SYCL path gives no architecture, so the card is told by its name (Windows display adapters) or its PCI id (Linux sysfs).
 #   arc_a        Arc A-series, Alchemist: A3xx / A5xx / A7xx (the A750 was measured: RESULTS-DF2SYCL.md), PCI ids 0x56A0..0x56AF and the mobile 0x5690..0x5692
@@ -154,21 +156,46 @@ def sycl_archs_present() -> list[str]:
 
 
 def detect_hardware() -> tuple[str | None, list[str]]:
-    """(engine family, card architectures) of this computer, looked up once: ``("cuda", ["sm_120"])``, ``("hip", ["gfx1151"])``, ``("metal", [])``;
-    ``(None, [])`` when nothing answers. Read-only probes of tools that are already installed; never raises, never downloads."""
-    if not _HARDWARE:
-        backend: str | None = None
-        archs: list[str] = []
-        try:
-            from strata_control import engine_component
-            backend = engine_component.detect_backend()[0]
-            archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
-            if backend == "sycl" and not archs:
-                archs = sycl_archs_present()
-        except Exception:                                    # noqa: BLE001 - an unknown computer is "no DFlash2", never an error
-            pass
+    """(engine family, card architectures) of this computer: ``("cuda", ["sm_120"])``, ``("hip", ["gfx1151"])``, ``("metal", [])``; ``(None, [])`` when
+    nothing answers. A card that was found is looked up once. ``(None, [])`` is asked again at the next call: a service started at boot can look before
+    the graphics driver answers. Read-only probes of tools that are already installed; never raises, never downloads."""
+    if _HARDWARE:
+        return _HARDWARE[0]
+    if _HARDWARE_MISS and time.monotonic() - _HARDWARE_MISS[0] < HARDWARE_MISS_S:
+        return None, []                                  # a miss a moment ago: the callers of one start do not each run the probes again
+    backend: str | None = None
+    archs: list[str] = []
+    try:
+        from strata_control import engine_component
+        backend = engine_component.detect_backend()[0]
+        archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
+        if backend == "sycl" and not archs:
+            archs = sycl_archs_present()
+    except Exception:                                    # noqa: BLE001 - an unknown computer is "no DFlash2", never an error
+        pass
+    if backend is not None:
         _HARDWARE.append((backend, archs))
-    return _HARDWARE[0]
+        _HARDWARE_MISS.clear()
+    else:
+        _HARDWARE_MISS[:] = [time.monotonic()]
+    return backend, archs
+
+
+#: the card architectures of each engine family, by name (detect_hardware lists every vendor's cards a computer has)
+_FAMILY_ARCH_PREFIX = {"cuda": "sm_", "hip": "gfx"}
+
+
+def hardware_for(engine_backend: str | None) -> tuple[str | None, list[str]]:
+    """#5109: detect_hardware() for a start whose config names its engine family (cfg["backend"]).  On a computer with an NVIDIA card beside the AMD
+    card the engine serves from, detect_hardware() answers "cuda" with the NVIDIA card first, so the drafter's support line, card class and
+    confidence were the idle NVIDIA card's.  The config's family wins, and only its own cards' architectures are kept (in detect_hardware's order).
+    Without a known family (or for one whose cards are not named here): detect_hardware() unchanged."""
+    backend, archs = detect_hardware()
+    want = str(engine_backend or "").strip().lower()
+    prefix = _FAMILY_ARCH_PREFIX.get(want)
+    if not prefix:
+        return backend, archs
+    return want, [a for a in archs if str(a).lower().startswith(prefix)]
 
 
 def hardware_support(backend: str | None, archs: Any = None, model_name: str | None = None) -> Support:
@@ -207,6 +234,17 @@ REPO = "incoai/Qwen3.8-Flash-Next-DFlash2"
 REVISION = "a22a1744e85c17364dcc54a6a420af7135d4c7f6"
 LICENSE = "Apache-2.0"
 BASE_URL = f"https://huggingface.co/{REPO}/resolve/{REVISION}/"
+
+
+HF_DEFAULT = "https://huggingface.co"
+
+
+def base_url(endpoint: str | None = None) -> str:
+    """BASE_URL on the host the Hugging Face endpoint variable names, read at each fetch as setup and huggingface_hub read it (#5083: a
+    mirror where the default host cannot be reached; the same rule as strata_control/pictures.py). The pinned revision and every file's
+    SHA-256 are the same whichever host serves them."""
+    base = (endpoint if endpoint is not None else (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or HF_DEFAULT)
+    return f"{base}/{REPO}/resolve/{REVISION}/"
 FILES = (
     ("config.json", 1236, "2409575986f9ea24d455343eb469c0e6940def5edab1d1be503bb8eb4cc3b1b9"),
     ("model.safetensors", 1206140008, "d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f"),
@@ -460,11 +498,18 @@ SUPPORTED_FAMILIES = ("qwen", "gyro", "unsloth")
 _SUPPORTED_NAME = re.compile(r"^qwen3\.8-flash-next(-gyro-[a-z0-9._-]+|-unsloth-[a-z0-9._-]+|-(q|iq|tq)\d[a-z0-9_.]*)?$", re.IGNORECASE)
 
 
-def supported_model(model_name: str | None = None, family: str | None = None) -> bool:
-    """DFlash2 is for Qwen3.8-Flash-Next only: by family when it is known (the Terminal), else by the run config's model name."""
+#: #5240: models DFlash2 runs on only when the person chooses it by name (Auto keeps the MTP): the Coder (ISTA-DASLab's coding version of the same weights,
+#: 256 of the 512 experts). Reporter's numbers (RTX 4090, stock pack): the same 45/45 agent tasks, 414 against 274 tasks an hour, decode +21-37%.
+NAMED_ONLY_FAMILIES = ("coder",)
+_NAMED_ONLY_NAME = re.compile(r"^qwen3\.8-flash-next-coder-[a-z0-9._-]+$", re.IGNORECASE)
+
+
+def supported_model(model_name: str | None = None, family: str | None = None, *, named: bool = False) -> bool:
+    """DFlash2 is for Qwen3.8-Flash-Next only: by family when it is known (the Terminal), else by the run config's model name. ``named``: DFlash2 is the
+    person's own choice, which also takes the Coder (NAMED_ONLY_FAMILIES, #5240)."""
     if family is not None:
-        return family.lower() in SUPPORTED_FAMILIES
-    return bool(model_name and _SUPPORTED_NAME.match(str(model_name)))
+        return family.lower() in SUPPORTED_FAMILIES or (named and family.lower() in NAMED_ONLY_FAMILIES)
+    return bool(model_name and (_SUPPORTED_NAME.match(str(model_name)) or (named and _NAMED_ONLY_NAME.match(str(model_name)))))
 
 
 # --------------------------------------------------------------------------------------------------- the model file itself
@@ -728,12 +773,12 @@ def vram_gb(data_dir: str | Path | None = None, engine: str | os.PathLike[str] |
     return DRAFTER_GB["dflash2_selq4" if uses_selector_q4(data_dir, engine) else "dflash2"]
 
 
-def installed_engine_exe() -> Path | None:
+def installed_engine_exe(backend: str | None = None) -> Path | None:
     """The engine program of the newest installed engine component for this computer's backend (None: not found). A quick folder scan, nothing is hashed or started."""
     try:
         from strata_control import engine_component as ec
         found, _ = ec.scan(None)
-        backend = (detect_hardware()[0] or "").lower()
+        backend = (backend or detect_hardware()[0] or "").lower()   # #5109: a caller that knows the config's family passes it
         best = [c for c in found if not backend or str(c.backend).split(":")[0].lower() == backend] or list(found)
         best.sort(key=lambda c: ec._version_key(c.version), reverse=True)
         return best[0].exe if best and best[0].exe.is_file() else None
@@ -978,7 +1023,8 @@ def conf_for_slots(slots: int | float | None) -> float:
 def expected_slots(vram_mib: float, args: list[Any]) -> int:
     """The ENGINE slots a card of ``vram_mib`` MiB is expected to hold with the drafter on, the same arithmetic as strata_control/vram_fit.py (the card, the
     runtime's gap, the dense weights, the KV session of ``--max-context`` / ``--kv``, the prompt buffers, the reserve; the draft layer's allowance in the base
-    is the DFlash2's own now, it is the only drafter), over one slot. An estimate good to about 10% (two engine starts); the steps of CONF_STEPS are wider."""
+    is the DFlash2's own now, it is the only drafter), over one slot of the pack (pack_slot_mib). An estimate good to about 10% (two engine starts); the steps
+    of CONF_STEPS are wider."""
     from strata_control import vram_fit
     ctx = _flag_value(args, "--max-context")
     ctx = int(ctx) if ctx and ctx.isdigit() else DEFAULT_CONTEXT
@@ -991,7 +1037,29 @@ def expected_slots(vram_mib: float, args: list[Any]) -> int:
     # 0.89 GiB (measured: "drafter 799 MiB" + its head's staging, 890 MiB beside the engine without one; 192 MiB less than the MTP layer): nothing more is taken off.
     free = (float(vram_mib) - vram_fit.GAP_OTHER_MIB - SLOT_BASE_MIB - vram_fit.session_mib(ctx, kv) - vram_fit.HEAD_MIB - reserve
             - (vram_fit.PROMPT_BASE_MIB + vram_fit.PROMPT_PER_TOKEN_MIB * chunk))
-    return max(0, min(MAX_SLOTS, int(free / SLOT_MIB)))
+    return max(0, min(MAX_SLOTS, int(free / pack_slot_mib(args))))
+
+
+_NATIVE_TOTAL = re.compile(r"\bn_expert (\d+), total (\d+)")
+
+
+def pack_slot_mib(args: list[Any]) -> float:
+    """MiB of one engine slot for the pack ``--pack`` names. A native-experts pack (Unsloth, i-quant, NVFP4) gives its expert bytes in the first line of
+    native_experts.txt, over n_expert per layer and one line per layer: UD-Q4_K_XL is 77,017,907,200 bytes over 512 x 48, 2.99 MiB a slot, as its engine
+    logs it ("expert cache 2710 slots, 7.90 GiB" on a 16 GB card). The ISTA-DASLab i-quant packs have the file too: IQ3_S 1.952 MiB (SLOT_MIB, the set the
+    steps were measured on), IQ3_XXS 1.665 MiB. A pack without the file (the canonical Q2_0 pack), or no --pack, is priced at SLOT_MIB.
+    Only a slot of at least SLOT_MIB is priced at its own size: a smaller one (IQ3_XXS, the 2-bit sets) would raise the estimate and lower the step, and that
+    direction is not measured on those sets yet (coordinator 11-16), so they keep SLOT_MIB, today's pricing."""
+    pack = _flag_value(args, "--pack")
+    try:
+        lines = (Path(pack) / "native_experts.txt").read_text(encoding="utf-8", errors="replace").splitlines() if pack else []
+    except OSError:
+        lines = []
+    head = _NATIVE_TOTAL.search(lines[0]) if lines else None
+    layers = sum(1 for line in lines[1:] if line.strip() and not line.startswith("#"))
+    if head is None or not layers or not int(head.group(1)):
+        return SLOT_MIB
+    return max(SLOT_MIB, int(head.group(2)) / (int(head.group(1)) * layers) / 2 ** 20)
 
 
 def slots_of(args: list[Any], vram_mib: float | None = None) -> int | None:
@@ -1057,6 +1125,12 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0, named: b
 
     ``slot_drafts``: Auto on the class whose slot drafts are the default (slot_drafts_by_default says so; the caller asks it): the same as ``named`` for the request slots."""
     items = [str(a) for a in args or []]
+    if str(backend or "").lower().split(":")[0] == "sycl":
+        # #5747: the Intel engine runs DFlash2 for one card and one request at a time only (sycl/src/program/generate.cpp refuses a
+        # layer split, --batch slots and --pipeline-windows at start, "--draft dflash2 is for one card and one request at a time"), so
+        # nothing it refuses is planned there, also not by name: a planned start the engine refuses cost a failed boot per restart
+        return bool(split or slots > 1 or any(a in items for a in ("--batch", "--slots", "--parallel", "--pipeline-windows",
+                                                                     "--layer-split", "--split-device")))
     if (named or slot_drafts) and str(backend or "").lower() != "metal":
         return "--pipeline-windows" in items
     return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel")))
@@ -1361,9 +1435,10 @@ def vocab_path(args: list[Any], data_dir: str | Path | None = None) -> Path | No
     return shipped if shipped.is_file() else None
 
 
-def can_run_dflash2(model_name: str | None, family: str | None, backend: str | None, archs: Any = None) -> bool:
-    """Is this model one the drafter was made for, and does this computer's engine have the DFlash2 code? (The disk and the mode of the start are not looked at.)"""
-    return bool(supported_model(model_name, family) and ENGINE_SERVES_DFLASH2 and backend is not None and hardware_support(backend, archs).can_run)
+def can_run_dflash2(model_name: str | None, family: str | None, backend: str | None, archs: Any = None, *, named: bool = False) -> bool:
+    """Is this model one the drafter was made for (``named``: or one it runs on when chosen by name, the Coder), and does this computer's engine have the DFlash2 code?
+    (The disk and the mode of the start are not looked at.)"""
+    return bool(supported_model(model_name, family, named=named) and ENGINE_SERVES_DFLASH2 and backend is not None and hardware_support(backend, archs).can_run)
 
 
 def choice_of(mode: Any, *, model_name: str | None = None, family: str | None = None, backend: str | None = None, archs: Any = None,
@@ -1384,17 +1459,17 @@ def choice_of(mode: Any, *, model_name: str | None = None, family: str | None = 
     klass = class_entry(backend, model_name, archs, args=args, vram_mib=vram_mib)
     if asked == "auto" and klass is not None and klass.drafter == "mtp":
         return "mtp"                                          # this set on this class of card (CLASS_DEFAULTS)
-    return "dflash2" if can_run_dflash2(model_name, family, backend, archs) else "mtp"
+    return "dflash2" if can_run_dflash2(model_name, family, backend, archs, named=asked == "dflash2") else "mtp"
 
 
 def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None,
            backend: str | None = None, archs: Any = None, mtp_here: bool | None = None, blocked: bool = False, vocab_here: bool = True,
-           args: list[Any] | None = None, vram_mib: float | None = None, slots_none: bool = False) -> Decision:
+           args: list[Any] | None = None, vram_mib: float | None = None, slots_none: bool = False, pack: str | Path | None = None) -> Decision:
     """The drafter a start uses. Never raises. ``slots_none`` (slots_draft_nothing of the start's arguments and request count; False when the caller cannot know it): the reason for a
     DFlash2 that is not available here is NONE_IN_SLOTS instead of NOT_HERE, so the plan says what the server says. One drafter, never two. A choice that cannot be applied becomes the other drafter when that one is on this computer,
     else none, with a note in plain words. ``mtp_here`` says whether the MTP layer is on disk (None: not known, taken as there), ``blocked`` that this start is a layer
     split or has several requests at once (see blocked_by), ``vocab_here`` that the draft vocabulary DFlash2 needs is there. ``klass`` is not used any more (Auto
-    does not depend on the kind of card) and stays only so the callers keep working."""
+    does not depend on the kind of card) and stays only so the callers keep working. ``pack`` pins the person's own runtime file instead of the automatic selection."""
     asked = normalize(mode)
     if asked == "off":
         return Decision(asked, "off")
@@ -1404,24 +1479,25 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
     # start never goes without a drafter while one is on disk; not where Auto keeps the MTP because DFlash2 stalls there (AUTO_MTP, gfx1201)
     # (and never as the stand-in for a chosen MTP either: owner 11-15, a chosen drafter stays chosen and its fallback must be safe on the card; DFlash2 named by
     # itself is the person's own choice and is not looked at here)
-    runnable = can_run_dflash2(model_name, family, backend, archs) and not (asked != "dflash2" and auto_mtp_only(backend, archs))
+    runnable = can_run_dflash2(model_name, family, backend, archs, named=asked == "dflash2") and not (asked != "dflash2" and auto_mtp_only(backend, archs))
 
     if want == "dflash2":
-        reason = NOT_HERE if (blocked or not vocab_here) else NOT_DOWNLOADED if not drafter_ready(data_dir, model_name, backend) else ""
+        ready = _here(Path(pack)) if pack is not None else drafter_ready(data_dir, model_name, backend)
+        reason = NOT_HERE if (blocked or not vocab_here) else NOT_DOWNLOADED if not ready else ""
         if reason == NOT_HERE and slots_none:
             reason = NONE_IN_SLOTS
         if not reason:
-            return Decision(asked, "dflash2", flags=engine_flags(pack_path(data_dir)))
+            return Decision(asked, "dflash2", flags=engine_flags(pack if pack is not None else pack_path(data_dir)))
         return Decision(asked, "mtp", reason) if have_mtp else Decision(asked, "off", NONE_HERE)
     # the MTP: asked for, or all there is where DFlash2 cannot run
     if have_mtp:
         why = ""
         if asked == "dflash2":                      # named, and it cannot run on this model or this computer
-            why = NOT_SUPPORTED if not supported_model(model_name, family) else NOT_SERVED if not ENGINE_SERVES_DFLASH2 else NOT_THIS_CARD
+            why = NOT_SUPPORTED if not supported_model(model_name, family, named=True) else NOT_SERVED if not ENGINE_SERVES_DFLASH2 else NOT_THIS_CARD
         return Decision(asked, "mtp", why)
     # the layer is not on this computer: DFlash2 instead when it can run and its pack is here (said), else none (said)
-    if runnable and not blocked and vocab_here and drafter_ready(data_dir, model_name, backend):
-        return Decision(asked, "dflash2", NO_MTP, engine_flags(pack_path(data_dir)))
+    if runnable and not blocked and vocab_here and (_here(Path(pack)) if pack is not None else drafter_ready(data_dir, model_name, backend)):
+        return Decision(asked, "dflash2", NO_MTP, engine_flags(pack if pack is not None else pack_path(data_dir)))
     return Decision(asked, "off", NONE_HERE)
 
 
@@ -1531,7 +1607,7 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
           engine: str | os.PathLike[str] | None = None) -> Decision:
     """Put the config's ``"drafting"`` choice on its engine arguments (in place): ONE drafter's options and none of the other's. DFlash2: no ``--mtp``, no MTP option,
     ``--draft dflash2 --draft-model <pack> --draft-fallback none --mtp-draft-vocab <file> --spec W --draft-conf C`` (W = window_for: 8 on Strix Halo and on cc 12.0 with >= 48 GB, else 6); the person's own ``--spec`` or ``--draft-conf``
-    in ``user_args`` stays. C is 0.35 where the card holds most experts and higher where fewer slots fit (conf_for_slots): from the person's own ``--expert-cache N``,
+    in ``user_args`` stays, as does an explicit ``--draft-model`` path. C is 0.35 where the card holds most experts and higher where fewer slots fit (conf_for_slots): from the person's own ``--expert-cache N``,
     else from ``vram_mib``, the memory of the one card (None: several cards, a shared-memory chip, unknown: 0.35). MTP: the arguments without any DFlash2 option.
     ``off``: neither (the draft layer's own switch, ``"mtp": false``). ``slots`` says that this start serves several requests at
     once: with Auto that is the MTP, said in one line (except the one class of slot_drafts_by_default: 2 requests on one large Blackwell card holding every expert, where it is
@@ -1549,7 +1625,7 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
         fit = file_fit(args, data_dir) if family is None and not _EXCLUDED_NAME.search(str(name or "")) else ""
         if fit == "fits":
             name = known_name_of_file(args) or FILE_FITS_AS        # a file that is exactly a known set gets that set's table entry; any other the general defaults
-    if not supported_model(name, family):                     # another model: its drafting is not this choice's business (Swift, Coder, NVFP4, Qwen3.6...)
+    if not supported_model(name, family, named=normalize(cfg.get("drafting")) == "dflash2"):     # another model: its drafting is not this choice's business (Swift, NVFP4, Qwen3.6, the Coder under Auto...)
         asked = normalize(cfg.get("drafting"))
         if asked == "off" or cfg.get("mtp") is False:            # no drafter for this model (its draft layer is off, or a feed model whose entry says drafter: none): say so, start none
             # "mtp": false: the server's own draft-layer step takes the layer out (and says so); "drafting": "off" alone: taken out here
@@ -1570,18 +1646,26 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     mode = cfg.get("drafting")
     if cfg.get("mtp") is False and normalize(mode) == "auto":
         mode = "off"                                          # "Draft layer (MTP)" turned off by the person, and no drafter chosen since: no drafter
+    mine = cfg.get("user_args") or []
+    pinned_pack = _flag_value(mine, "--draft-model")
     slot_drafts = slot_drafts_by_default(mode, backend=backend, archs=archs, vram_mib=vram_mib, args=args, slots=slots, split=split,
-                                         drafter_here=vocab is not None and form != FORM_NONE and drafter_ready(data_dir, name, backend))
+                                         drafter_here=vocab is not None and form != FORM_NONE and (_here(Path(pinned_pack)) if pinned_pack is not None else drafter_ready(data_dir, name, backend)))
     decision = decide(mode, model_name=name, family=family, data_dir=data_dir, backend=backend, archs=archs,
                       mtp_here=mtp_here, blocked=blocked_by(strip_draft_flags(args), split=split, slots=slots, named=normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts) or form == FORM_NONE,
                       vocab_here=vocab is not None, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib,
-                      slots_none=slots_draft_nothing(args, slots))     # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
-    mine = cfg.get("user_args") or []
+                      slots_none=slots_draft_nothing(args, slots), pack=pinned_pack)     # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
     pack = None
+    fallback_tuned = False                                    # the tuned pack stands in for a missing stock pack (#5810): the stock pack's conf, not the tuned pack's measured one
     if decision.drafter == "dflash2":
         qualifies = tuned_applies(backend, name, archs, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
-        pack = pack_path(data_dir, engine, model_name=name, backend=backend, tuned=qualifies)
-        if Path(pack) != tuned_path(data_dir, tuned_variant(backend, name)) and not pack_ready(data_dir):         # (only the tuned pack is here and this engine cannot read it: no drafter file for it)
+        pack = pinned_pack if pinned_pack is not None else pack_path(data_dir, engine, model_name=name, backend=backend, tuned=qualifies)
+        if pinned_pack is None and not qualifies and Path(pack) != tuned_path(data_dir, tuned_variant(backend, name)) and not pack_ready(data_dir):
+            # #5810: the stock pack is the one for this start and it is not here, but the set's tuned pack is (setup fetched it for a start that held more
+            # experts): the other DFlash2 pack of the set, before the MTP or no drafter (owner: the drafter stays on)
+            other = pack_path(data_dir, engine, model_name=name, backend=backend, tuned=True)
+            if Path(other) == tuned_path(data_dir, tuned_variant(backend, name)):
+                pack, fallback_tuned = other, True
+        if pinned_pack is None and Path(pack) != tuned_path(data_dir, tuned_variant(backend, name)) and not pack_ready(data_dir):         # (only the tuned pack is here and this engine cannot read it: no drafter file for it)
             decision = Decision(decision.asked, "mtp", NOT_DOWNLOADED) if mtp_here is not False else Decision(decision.asked, "off", NONE_HERE)
     if decision.drafter == "off":
         cfg["args"] = strip_mtp_flags(strip_draft_flags(args))
@@ -1596,9 +1680,9 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
         decision.vocab = vocab_line
         flags = list(engine_flags(pack, vocab, form))
         kept_conf = _flag_value(mine, "--draft-conf")
-        tuned_conf = tuned_conf_for(backend, name) if Path(pack) == tuned_path(data_dir, tuned_variant(backend, name)) else None     # Metal: the conf the tuned pack was measured with; CUDA / HIP: None, the backend's own conf stays
+        tuned_conf = tuned_conf_for(backend, name) if Path(pack) == tuned_path(data_dir, tuned_variant(backend, name)) and not fallback_tuned else None     # Metal: the conf the tuned pack was measured with; CUDA / HIP: None, the backend's own conf stays
         held = slots_of(base, vram_mib)
-        tuned_here = Path(pack) == tuned_path(data_dir, tuned_variant(backend, name))
+        tuned_here = Path(pack) == tuned_path(data_dir, tuned_variant(backend, name)) and not fallback_tuned
         card_conf = big_blackwell_conf_for(backend, name, archs, vram_mib, held) if tuned_here else None      # large-VRAM Blackwell, IQ3_S, tuned pack: the measured 0.55; Strix keeps 0.35 and only widens the window
         flags[flags.index("--draft-conf") + 1] = kept_conf if kept_conf is not None else f"{tuned_conf if tuned_conf is not None else card_conf if card_conf is not None else conf_for(backend, held):g}"
         flags[flags.index("--spec") + 1] = str(window_for(backend, archs, vram_mib, held))

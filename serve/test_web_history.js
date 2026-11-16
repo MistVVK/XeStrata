@@ -47,6 +47,14 @@ const cases = {
     assert.equal(clean[1].text, "a1", "the text stays");
     assert.deepEqual(convo()[0].files, [{kind: "file", name: "n.txt", text: "notes"}], "a copy: the screen keeps its contents");
   },
+  clean_keeps_a_thumbnail_next_to_the_name() {
+    const withThumb = convo();
+    withThumb[0].images[0].thumb = "data:image/jpeg;base64,Kw==";
+    const clean = H.cleanMessages(withThumb);
+    assert.deepEqual(clean[0].images, [{name: "a.png", thumb: "data:image/jpeg;base64,Kw=="}], "the preview rides along, not the original");
+    assert.ok(!JSON.stringify(clean).includes("data:image/png"), "the full data URL is still dropped");
+    assert.deepEqual(H.cleanMessages(convo())[0].images, [{name: "a.png"}], "a record saved before thumbnails still cleans to the name alone");
+  },
   rewind_a_question() {
     const m = convo();
     const plan = H.rewind(m, 2);
@@ -211,6 +219,65 @@ Object.assign(cases, {
     const a = mk({abort: "DataError"}, {c0: chat("c0")});
     await a.store.start();
     assert.deepEqual(await a.store.all(), [], "no hang, no records");
+  },
+});
+
+// #5998 review: the preview never holds the picture back and never breaks the attachment; a stored preview is checked.
+const JPEG = "data:image/jpeg;base64,/9j/AAAA";
+/** A fake page Image and canvas: `img` says how the picture decodes, `canvas` how drawing and export go. */
+function thumbDeps({img = "load", w = 4000, h = 3000, ctx = "ok", out = JPEG} = {}) {
+  const made = {canvas: null};
+  return {
+    made,
+    makeImage: () => {
+      const im = {naturalWidth: w, naturalHeight: h, onload: null, onerror: null};
+      Object.defineProperty(im, "src", {set() { if (img === "load") setTimeout(() => im.onload(), 1); else if (img === "error") setTimeout(() => im.onerror(), 1); else if (img === "throw") throw new Error("bad src"); }});
+      return im;
+    },
+    makeCanvas: () => {
+      const c = {width: 0, height: 0,
+        getContext: () => { if (ctx === "throw") throw new Error("no 2d"); return ctx === "null" ? null : {drawImage() { if (ctx === "drawthrow") throw new Error("tainted"); }}; },
+        toDataURL: () => { if (out === "throw") throw new Error("SecurityError"); return out; }};
+      made.canvas = c;
+      return c;
+    },
+  };
+}
+Object.assign(cases, {
+  async thumb_is_made_small_and_as_jpeg() {
+    const d = thumbDeps();
+    assert.equal(await H.makeThumb("data:image/png;base64,AAA", d), JPEG);
+    assert.deepEqual([d.made.canvas.width, d.made.canvas.height], [480, 360], "long side 480");
+    const small = thumbDeps({w: 100, h: 50});
+    await H.makeThumb("x", small);
+    assert.deepEqual([small.made.canvas.width, small.made.canvas.height], [100, 50], "never enlarged");
+  },
+  async thumb_failures_give_no_preview_and_never_reject() {
+    for (const [what, opts] of [["decode error", {img: "error"}], ["src throws", {img: "throw"}], ["no 2D context", {ctx: "null"}],
+                                ["getContext throws", {ctx: "throw"}], ["draw throws", {ctx: "drawthrow"}], ["export throws", {out: "throw"}],
+                                ["export is not a JPEG", {out: "data:image/png;base64,AAAA"}], ["export too big", {out: "data:image/jpeg;base64," + "A".repeat(H.THUMB_MAX_CHARS)}],
+                                ["no size", {w: 0, h: 0}]]) {
+      assert.equal(await H.makeThumb("data:image/png;base64,AAA", thumbDeps(opts)), null, what);
+    }
+    const t0 = Date.now();
+    assert.equal(await H.makeThumb("x", thumbDeps({img: "never"}), 50), null, "a picture that never loads gives up");
+    assert.ok(Date.now() - t0 < 2000);
+  },
+  stored_previews_are_checked() {
+    const m = (thumb) => [user("q", {images: [{name: "a.png", url: "data:image/png;base64,AAA", thumb}]})];
+    assert.deepEqual(H.cleanMessages(m(JPEG))[0].images, [{name: "a.png", thumb: JPEG}]);
+    for (const bad of ["javascript:alert(1)", "data:image/png;base64,AAAA", "data:image/svg+xml;base64,PHN2Zz4=", "data:image/jpeg;base64,<b>", 42, null,
+                       "data:image/jpeg;base64," + "A".repeat(H.THUMB_MAX_CHARS)]) {
+      assert.deepEqual(H.cleanMessages(m(bad))[0].images, [{name: "a.png"}], String(bad).slice(0, 40));
+    }
+  },
+  the_composer_attaches_first_and_adds_the_preview_later() {
+    const app = require("node:fs").readFileSync(path.join(__dirname, "web", "app.js"), "utf8");
+    const onload = app.slice(app.indexOf("r.onload = () => {\n        const url = r.result;"), app.indexOf("r.readAsDataURL(f);"));
+    assert.ok(onload.length > 0, "the picture reader's onload");
+    assert.ok(onload.indexOf("attachments.push(entry)") < onload.indexOf("StrataHistory.makeThumb(url, thumbDeps)"), "attached before the preview");
+    assert.doesNotMatch(onload, /await/, "nothing waits for the preview");
+    assert.match(app, /const shownSrc = im\.url \|\| \(StrataHistory\.validThumb\(im\.thumb\) \? im\.thumb : ""\);/);
   },
 });
 

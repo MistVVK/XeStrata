@@ -803,6 +803,42 @@ KQ_LIB = "strata_kq.dll" if WIN else "libstrata_kq.so"
 
 
 # ------------------------------------------------------------------------------------------------ output
+#: #4941: --output jsonl. The JSON lines go to the real stdout (kept here); stdout itself is pointed at stderr, so every human line and every program setup
+#: runs (pip, the downloads' helpers, the packer) writes there and the JSON stream stays clean. Events: step, ok, warning, progress, error, done.
+_JSONL: list = []
+_RUN_CONFIGS: list = []                                # the run configs this setup wrote (write_config), the last one is the "done" event's
+
+
+def jsonl_start() -> None:
+    if _JSONL:
+        return
+    sys.stdout.flush()
+    keep = os.dup(1)
+    _JSONL.append(os.fdopen(keep, "w", encoding="utf-8", buffering=1, newline="\n"))
+    os.dup2(2, 1)
+
+
+def event(_name: str, **fields) -> None:
+    """One JSON line of --output jsonl (nothing without it). The name is positional: an error event has a field called "kind"."""
+    if _JSONL:
+        _JSONL[0].write(json.dumps({"schema_version": 1, "event": _name, **fields}, ensure_ascii=False) + "\n")
+        _JSONL[0].flush()
+
+
+_PROGRESS_SENT: dict = {}
+
+
+def progress_event(label: str, done: float, total: float) -> None:
+    """A download's bytes (--output jsonl): at most one line a second per label, and always the last one."""
+    if not _JSONL:
+        return
+    now = time.time()
+    if done < total and now - _PROGRESS_SENT.get(label, 0.0) < 1.0:
+        return
+    _PROGRESS_SENT[label] = now
+    event("progress", label=label, done_bytes=int(done), total_bytes=int(total))
+
+
 def say(msg=""):
     print(msg, flush=True)
 
@@ -810,21 +846,58 @@ def say(msg=""):
 def step(n, title):
     say()
     say(f"=== Step {n}: {title} ===")
+    event("step", n=n, title=title)
+
+
+def menu_colour(code: str) -> tuple[str, str]:
+    """(start, reset) ANSI codes for a menu name (#5935), or two empty strings: only on a terminal (never in a pipe, a log or the app's
+    installer), never with NO_COLOR set or TERM=dumb, and on Windows only where the console takes escape codes (switched on here once; a
+    console that refuses keeps plain text)."""
+    try:
+        if not sys.stdout.isatty() or os.environ.get("NO_COLOR") is not None or os.environ.get("TERM", "").lower() == "dumb":
+            return "", ""
+    except (AttributeError, ValueError):
+        return "", ""
+    if WIN and not _windows_vt():
+        return "", ""
+    return f"\033[{code}m", "\033[0m"
+
+
+_VT: list = []
+
+
+def _windows_vt() -> bool:
+    """Windows: ENABLE_VIRTUAL_TERMINAL_PROCESSING on this console's output (Windows 10 1511 and later); False when it cannot be had."""
+    if not _VT:
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            handle = k32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            _VT.append(bool(k32.GetConsoleMode(handle, ctypes.byref(mode))) and
+                       (bool(mode.value & 0x0004) or bool(k32.SetConsoleMode(handle, mode.value | 0x0004))))
+        except Exception:                              # noqa: BLE001 - plain text then
+            _VT.append(False)
+    return _VT[0]
 
 
 def ok(msg):
     say(f"  [ok] {msg}")
+    event("ok", message=str(msg))
 
 
 def warn(msg):
     say(f"  [!]  {msg}")
+    event("warning", message=str(msg))
 
 
-def fail(msg, hint=None):
+def fail(msg, hint=None, **detail):
+    """Stop setup with exit code 1. ``detail``: machine fields of the --output jsonl error event (kind="no_space" with free_bytes / needed_bytes)."""
     say(f"\n  [X]  {msg}")
     if hint:
         say(f"       {hint}")
     say("\nSetup stopped. Fix the item above and run it again - everything already done is kept and skipped.")
+    event("error", message=str(msg), hint=hint, exit_code=1, **detail)
     sys.exit(1)
 
 
@@ -2928,6 +3001,7 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
             last_print = now
             have = st.have()
             print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="", flush=True)
+            progress_event(label, have, total)
             note = stall.check(have, total, now)
             if note:
                 print()
@@ -3102,6 +3176,7 @@ def repair_download(url: str, path: Path, total: int, label: str, conns: int):
                 last = time.time()
                 have = st.have()
                 print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="", flush=True)
+                progress_event(label, have, total)
     except BaseException:
         st.stop.set()
         raise
@@ -3962,7 +4037,8 @@ def cuda_lib_dirs(toolkit=13):
 # ------------------------------------------------------------------------------------------------ AMD
 # The RX 7900 XT / XTX (gfx1100) and the RX 9070 series / Radeon AI PRO R9700 (gfx1201) on Linux, through the HIP
 # backend (docs/AMD_HIP.md); the RX 7800 XT / 7700 XT (gfx1101, #254) and the RX 9060 XT (gfx1200, #256) were run by
-# their owners; the RX 6800 / 6900 series (gfx1030, #311) and the RX 6700 XT (gfx1031, #524) run but are unvalidated.  There is no ready-made AMD engine: ROCm comes from AMD's TheRock Python wheels into .venv (no sudo;
+# their owners; the RX 6800 / 6900 series (gfx1030, #311), the RX 6700 XT (gfx1031, #524) and the RX 6600 / 6650 XT
+# (gfx1032, #1375) run but are unvalidated.  There is no ready-made AMD engine: ROCm comes from AMD's TheRock Python wheels into .venv (no sudo;
 # a system ROCm 7 in /opt/rocm is used when it has hipcc and hipBLAS) and the engine is compiled here for the cards.
 # No images yet.
 ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   # TheRock's wheels per GPU family
@@ -3972,6 +4048,7 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
                 "gfx1201": "https://rocm.nightlies.amd.com/v2/gfx120X-all/",
                 "gfx1030": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
+                "gfx1032": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",   # RX 6600 / 6650 XT (same RDNA2 family)
                 "gfx1151": "https://rocm.nightlies.amd.com/v2/gfx1151/",       # Strix Halo (docs/STRIX_HALO.md)
                 "gfx1150": "https://rocm.nightlies.amd.com/v2/gfx1150/",       # Strix Point: only with STRATA_EXPERIMENTAL_GFX1150=1
                 "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/"}   # Radeon 780M: only with STRATA_EXPERIMENTAL_GFX1103=1
@@ -3997,7 +4074,7 @@ GFX1103_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"
 # build one with `STRATA_HIP_ARCHS=gfx1150 tools\hip\build_windows.bat` and start setup with `--prebuilt dist\`.
 # Unset: unchanged.
 GFX1150_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1150") == "1"
-AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151") \
+AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1032", "gfx1151") \
             + (("gfx1103",) if GFX1103_OPT_IN else ()) + (("gfx1150",) if GFX1150_OPT_IN else ())
 # The exact (bit-identical) speed switches the engine turns on by default on gfx1151 (src/core/arch_defaults.cpp), less
 # STRATA_HCD_EXACT: that one copies the gfx1151 hipBLASLt table's solutions 1176 / 1177, and the gfx1103 table
@@ -4027,6 +4104,7 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              "gfx1201": "AMD Radeon RX 9070 series / AI PRO R9700 (gfx1201)",
              "gfx1030": "AMD Radeon RX 6800 / 6900 series (gfx1030)",
              "gfx1031": "AMD Radeon RX 6700 XT series (gfx1031)",
+             "gfx1032": "AMD Radeon RX 6600 / 6600 XT / 6650 XT (gfx1032)",
              "gfx1151": "AMD Radeon 8060S / 8050S / 8040S (Ryzen AI Max, Strix Halo, gfx1151)",
              # integrated Radeons of other Ryzen families: named so they are not taken for Strix Halo (not supported)
              "gfx1150": "AMD Radeon 890M / 880M (Ryzen AI 300, Strix Point, gfx1150)",
@@ -4034,7 +4112,8 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              "gfx1103": "AMD Radeon 780M / 760M / 740M (Ryzen 7040 / 8040, Phoenix / Hawk Point, gfx1103)"}
 AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT (gfx1200) and "
              "RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030) and RX 6700 XT "
-             "(gfx1031, #524), and the RX 7600 / 7600 XT (gfx1102, one run reported, #942), all unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
+             "(gfx1031, #524), and the RX 7600 / 7600 XT (gfx1102, one run reported, #942), and the RX 6600 / 6600 XT / 6650 XT "
+             "(gfx1032), all unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
              "gfx1151: experimental, docs/STRIX_HALO.md)")
 
 
@@ -4125,11 +4204,11 @@ def is_strix_halo(g) -> bool:
     return isinstance(g, dict) and gfx_arch_is(g.get("arch"), STRIX_HALO_ARCH)
 
 
-RDNA2_ARCHS = ("gfx1030", "gfx1031")        # RX 6800 / 6900 / 6950 series and RX 6700 XT: the cards of the ready-made RX 6000 engine package
+RDNA2_ARCHS = ("gfx1030", "gfx1031", "gfx1032")   # RX 6800 / 6900 / 6950 series, RX 6700 XT, RX 6600 / 6650 XT: the cards of the ready-made RX 6000 engine package
 
 
 def is_rdna2(g) -> bool:
-    """A discrete RX 6000 card the ready-made RX 6000 engine package covers (gfx1030 / gfx1031); never an RX 7000 / 9000 or an APU."""
+    """A discrete RX 6000 card the ready-made RX 6000 engine package covers (gfx1030 / gfx1031 / gfx1032); never an RX 7000 / 9000 or an APU."""
     return isinstance(g, dict) and any(gfx_arch_is(g.get("arch"), a) for a in RDNA2_ARCHS)
 
 
@@ -4140,7 +4219,7 @@ RDNA2_PACKAGE_NOTE = ("RX 6000 series (RDNA2, {arch}): Strata has a ready-made e
 
 
 def rdna2_notes(gpu) -> list[str]:
-    """What setup tells the owner of an RX 6000 card (gfx1030 / gfx1031); nothing for any other card."""
+    """What setup tells the owner of an RX 6000 card (gfx1030 / gfx1031 / gfx1032); nothing for any other card."""
     if not is_rdna2(gpu):
         return []
     return ["  " + RDNA2_PACKAGE_NOTE.format(arch=str(gpu.get("arch")).split(":")[0])]
@@ -4600,6 +4679,7 @@ _WIN_AMD_DID = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100",        
                 0x7550: "gfx1201", 0x7551: "gfx1201",                               # RX 9070 / 9070 XT, AI PRO R9700
                 0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030",            # RX 6800 / 6800 XT / 6900 XT / 6950 XT
                 0x73DF: "gfx1031",                                                  # RX 6700 XT / 6750 XT / 6800M (#881)
+                0x73FF: "gfx1032", 0x73EF: "gfx1032", 0x73E3: "gfx1032",            # RX 6600 / 6600 XT / 6650 XT, PRO W6600 (Navi 23)
                 **AMD_IGPU_PCI}                                                     # Ryzen APUs: 0x1586 = Strix Halo (gfx1151)
 _WIN_AMD_NAME = ((re.compile(r"\b80[456]0S\b", re.I), "gfx1151"),                   # Radeon 8060S / 8050S / 8040S
                  (re.compile(r"\b8[89]0M\b", re.I), "gfx1150"),                     # Radeon 890M / 880M
@@ -4610,7 +4690,8 @@ _WIN_AMD_NAME = ((re.compile(r"\b80[456]0S\b", re.I), "gfx1151"),               
                  (re.compile(r"RX\s*7900|W7900|W7800", re.I), "gfx1100"),
                  (re.compile(r"RX\s*7800|RX\s*7700(?!\s*S)|W7700", re.I), "gfx1101"),
                  (re.compile(r"RX\s*7600|W7600|W7500", re.I), "gfx1102"),
-                 (re.compile(r"RX\s*6800(?!\s*[MS])|RX\s*6900|RX\s*6950|W6800", re.I), "gfx1030"))
+                 (re.compile(r"RX\s*6800(?!\s*[MS])|RX\s*6900|RX\s*6950|W6800", re.I), "gfx1030"),
+                 (re.compile(r"RX\s*6600|RX\s*6650|W6600", re.I), "gfx1032"))
 _DISPLAY_CLASS = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 
 
@@ -5021,6 +5102,15 @@ def rocm_dev_missing(sysroot: Path) -> list:
     return [name for name, paths in need.items() if not any(p.is_file() for p in paths)]
 
 
+def rocm_clang(root: Path) -> Path:
+    """#6071: ROCm's HIP compiler.  ROCm 7 and TheRock's wheels have <root>/llvm/bin/clang++; rocm-core 10.1 (Arch Linux)
+    has only <root>/lib/llvm/bin/clang++.  The first that exists; when neither does, the old place (callers name it)."""
+    for d in (root / "llvm" / "bin", root / "lib" / "llvm" / "bin"):
+        if (d / "clang++").exists():
+            return d / "clang++"
+    return root / "llvm" / "bin" / "clang++"
+
+
 def rocm_root(archs):
     """ROCm for compiling and running the HIP engine for `archs` (one arch or a list: the cards of a layer split):
     (root, library folders).  A system ROCm 7 with hipcc, hipBLAS and the HIP development files (#446), else AMD's
@@ -5062,7 +5152,7 @@ def rocm_root(archs):
         stamp.write_text(json.dumps({"version": wheel, "index": index}))
     sdk = Path(sys.executable).parent / "rocm-sdk"
     root = Path(out([str(sdk), "path", "--root"]).strip())
-    if not (root / "llvm" / "bin" / "clang++").exists():
+    if not rocm_clang(root).exists():
         fail(f"ROCm was installed but its compiler is missing ({root})",
              f"remove {stamp} and run this again; or install ROCm 7 system-wide")
     # the card family's libraries only (gfx120X-all -> _rocm_sdk_libraries_gfx120X_all): another family's
@@ -5147,7 +5237,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr", "ROCM_PATH": str(root),
                        "HIP_PATH": str(root)})
     os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
-    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(rocm_clang(root).parent), os.environ.get("PATH", "")])
     say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
         if meta.get("backend") == "hip" and (eng / EXE).exists() and has_archs
         else f"  Compiling the Strata engine for your AMD GPU{'s' if len(archs) > 1 else ''} ({', '.join(archs)}; "
@@ -5155,7 +5245,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     cmake_build(ROOT, ROOT / "build-hip", "strata",
                 ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
                  "-DSTRATA_Q6K_EXPERTS=ON", "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
-                 f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+                 f"-DCMAKE_HIP_COMPILER={rocm_clang(root)}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
                  *ggml_defs(llama), *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
@@ -5216,7 +5306,7 @@ def build_vision_hip(eng: Path, stamp: Path, meta: dict, llama, vsrc, archs: lis
         os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr", "ROCM_PATH": str(root),
                            "HIP_PATH": str(root)})
         os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
-        os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+        os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(rocm_clang(root).parent), os.environ.get("PATH", "")])
     build_vision_cpu(eng, stamp, meta, llama, vsrc)
     meta = json.loads(stamp.read_text(encoding="utf-8"))
     if vision != "gpu":
@@ -5229,7 +5319,7 @@ def build_vision_hip(eng: Path, stamp: Path, meta: dict, llama, vsrc, archs: lis
     try:
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision-hip", "strata-vision",
                     ["-DSTRATA_VISION_HIP=ON", "-DSTRATA_VISION_HIP_ARCHS=" + ";".join(archs),
-                     "-DSTRATA_PORTABLE=OFF", f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
+                     "-DSTRATA_PORTABLE=OFF", f"-DCMAKE_HIP_COMPILER={rocm_clang(root)}",
                      f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}", "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                      f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"], None, "")
         shutil.copy2(ROOT / "build-vision-hip" / "bin" / HVEXE, eng / HVEXE)
@@ -6939,6 +7029,7 @@ def write_config(path: Path, cfg: dict):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     atomic.replace(tmp, path)
+    _RUN_CONFIGS.append(Path(path))
 
 
 # #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the user's - a
@@ -7438,6 +7529,22 @@ def engine_version(exe: Path) -> tuple:
     return tuple(int(x) for x in v.split(".")[:4] if x.isdigit())
 
 
+def config_engine_version(cfg: dict) -> tuple:
+    """#4544: the version of the engine a run config starts.  On an Intel (SYCL) install the config's exe is the launcher script
+    sycl/serve/strata-sycl.sh, which carries no version (engine_version read it as 0.1.12 and every --update ended with "the engine
+    was NOT updated"): the folder setup_intel.py stamps (engine-sycl/BUILD.json) says it, else the binary the launcher runs
+    (STRATA_SYCL_BIN from the config's env or this environment, default build-sycl-aot/strata).  Nothing readable: () = unknown."""
+    exe = Path(str(cfg.get("exe") or ""))
+    if cfg.get("backend") != "sycl" and exe.name != "strata-sycl.sh":
+        return engine_version(exe)
+    stamped = engine_version_of(ROOT / "engine-sycl")
+    if stamped != "?":
+        return tuple(int(x) for x in stamped.split(".")[:4] if x.isdigit())
+    rel = (cfg.get("env") or {}).get("STRATA_SYCL_BIN") or os.environ.get("STRATA_SYCL_BIN") or "build-sycl-aot/strata"
+    binary = ROOT / rel
+    return engine_version(binary) if binary.is_file() else ()
+
+
 def is_wsl() -> bool:
     return sys.platform.startswith("linux") and "microsoft" in platform.uname().release.lower()
 
@@ -7624,7 +7731,7 @@ def update_install(have: list, a) -> int:
         if cfg.get("backend") == "hip" and WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461
         ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
-    ver = engine_version(Path(json.loads(have[0].read_text(encoding="utf-8-sig"))["exe"]))
+    ver = config_engine_version(json.loads(have[0].read_text(encoding="utf-8-sig")))
     say()
     start = "START-HERE.bat" if WIN else "./setup.sh"
     if any(ver) and tuple(ver) < MIN_ENGINE:             # #3653: the engine step failed above; "updated" would be untrue
@@ -7963,47 +8070,88 @@ PARALLEL_COST_NOTE = ("parallel N reduces waiting for several users but costs ab
                       "card")
 
 
+PARALLEL_CELL_BYTES = 1850     # VRAM per context cell beyond 32K a session keeps in any KV mode (QSA indexer rows,
+                               # RoPE tables): 0.95 GiB at 262K, 2.27 GiB at 1M per slot with --kv-resident 32768
+PARALLEL_PIN_SHARE = 0.75      # share of the RAM the expert arena plus every session's pinned K/V may take: measured on
+                               # a 125.6 GiB PC, pinning was refused at 99 GiB (79%)
+
+
+def _parallel_kv_tok(kv: str) -> int:
+    # 12 layers: the measured pin (12.38 GiB at 1M int8), not the 13 of kv_streaming_ram_gb
+    return 12 * KV_CELL_BYTES.get(kv, 1056)
+
+
 def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
     """#465: the VRAM one batch slot's session takes: its KV cache (12 QSA layers; with KV streaming only the 32K
-    positions the attention reads stay in VRAM) and the DeltaNet state (~0.17 GB).  Measured: 0.56 GiB at 32K int8."""
-    kv_tok = 12 * (576 if kv == "q4_0" else 1056)
-    return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
+    positions the attention reads stay in VRAM), the DeltaNet state (~0.17 GB) and the per-cell rows every session
+    sizes on the whole context.  Measured: 0.56 GiB at 32K int8; with KV streaming, 0.95 GiB at 262K and 2.27 GiB at
+    1M (RTX 5090, 15/11/2026)."""
+    kv_cells = min(ctx, 32768) if streaming else ctx
+    return (kv_cells * _parallel_kv_tok(kv) + max(0, ctx - 32768) * PARALLEL_CELL_BYTES) / 1e9 + 0.17
 
 
-def parallel_recommend(vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool) -> int:
+def parallel_pinned_gb(ctx: int, kv: str) -> float:
+    """The RAM one session pins with KV streaming: the host copy of its whole K/V (12.38 GiB at 1M int8, measured).
+    The server's own session and every slot each pin one.  Callers apply it only when streaming."""
+    return ctx * _parallel_kv_tok(kv) / 1e9
+
+
+def parallel_ram_fits(n: int, ram_gb: float | None, arena_gb: float, ctx: int, kv: str, streaming: bool) -> bool:
+    """Whether the expert arena plus the pinned K/V of the server's session and n slots stay within PARALLEL_PIN_SHARE
+    of the RAM (ram_gb is in GiB, the arena and the pins in GB).
+    Measured on 125.6 GiB with the 50.3 GB IQ3_S arena at 1M: 8 slots stopped the engine (pinning refused at 99 GiB),
+    4 slots started with 8 GiB free and half the arena unpinned, every request 3-4x slower.  ram_gb None: not known."""
+    if ram_gb is None or not streaming:
+        return True
+    pinned_gib = (arena_gb + (n + 1) * parallel_pinned_gb(ctx, kv)) * 1e9 / 2**30
+    return pinned_gib <= PARALLEL_PIN_SHARE * ram_gb
+
+
+def parallel_recommend(vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool,
+                       ram_gb: float | None = None) -> int:
     """#465: how many requests at once ("parallel") to recommend: 0 = none (one at a time).  Only where the experts
     mostly fit in VRAM - the expert cache (each card's VRAM less ~5 GB, every card of a layer split) still holds
     PARALLEL_HELD of the model's experts beside the slots' sessions, which take at most PARALLEL_SHARE of it, up to 4.
     Where the experts mostly run on the CPU a batch reads about as many experts as the requests one by one and every
     slot's VRAM is expert cache lost: measured on a 12 GB RTX 5070 (Q2_0, 32K), a request alone 11-24% slower with 2-4
-    slots, 4 requests together 63 tok/s against 71 one after the other (docs/BATCHING.md)."""
+    slots, 4 requests together 63 tok/s against 71 one after the other (docs/BATCHING.md).  With KV streaming each
+    slot also pins its whole K/V in RAM, so the count must fit there too (parallel_ram_fits)."""
     if isinstance(vram_gbs, (int, float)):
         vram_gbs = [vram_gbs]
     cache_gb = sum(max(0.0, v - 5) for v in vram_gbs)
     slot = parallel_slot_gb(ctx, kv, streaming)
     best = 0
     for n in (2, 3, 4):
-        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb:
+        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb \
+                and parallel_ram_fits(n, ram_gb, arena_gb, ctx, kv, streaming):
             best = n
     return best
 
 
-def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool) -> list[str]:
+def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool,
+                  ram_gb: float | None = None) -> list[str]:
     """#465: what setup says about "parallel": the recommendation (or, where it would cost speed, why it is left at
     one), or how the asked count compares with it (kept as asked: recommend, never force)."""
-    rec = parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming)
+    rec = parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming, ram_gb)
     slot = parallel_slot_gb(ctx, kv, streaming)
+    pinned = parallel_pinned_gb(ctx, kv) if streaming else 0.0
+    ram_bound = rec == 0 and parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming) >= 2
+    ram_words = (f"Each extra request at once would need about {pinned:.1f} GB of RAM at this context length, more than this PC has free "
+                 "next to the model")                  # wording approved by the coordinator 11-16 (#6046)
     if asked is None or asked <= 1:
         if not rec:
+            if ram_bound:
+                return [f"Several requests at once: off (one at a time). {ram_words} (see docs/BATCHING.md)."]
             return [f"Several requests at once: left at one at a time - {PARALLEL_COST_NOTE} (docs/BATCHING.md)."]
         return [f"Several requests at once (opt-in): --parallel {rec} decodes up to {rec} together instead of one "
                 f"after the other (each takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md)."]
     lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
-             f"{asked * slot:.1f} GB in all)"]
+             f"{asked * slot:.1f} GB in all" + (f"; each also needs ~{pinned:.1f} GB of RAM" if pinned else "") + ")"]
     if asked > PARALLEL_MAX:
         lines.append(f"the engine runs at most {PARALLEL_MAX} at once; it will use {PARALLEL_MAX}")
     if not rec:
-        lines.append(f"recommended for this card: one at a time - {PARALLEL_COST_NOTE}; kept as you chose")
+        lines.append(f"recommended for this card: one at a time. {ram_words}; kept as you chose" if ram_bound else
+                     f"recommended for this card: one at a time - {PARALLEL_COST_NOTE}; kept as you chose")
     elif asked > rec:
         lines.append(f"recommended for this card: {rec} - more slots leave fewer experts in VRAM, which can make every "
                      "request slower; kept as you chose")
@@ -8702,6 +8850,17 @@ def own_path_parallel_note(a_parallel, fam: dict, model: str, vram_gb: float, ct
     return lines
 
 
+def own_path_gguf_in(folder: Path) -> Path | None:
+    """--gguf-dir for a family with an engine path of its own (one GGUF file): the folder's one model file when it is not under the
+    published name (a renamed copy, another maker's build of the same model; #5869). The picture reader (mmproj*) and unfinished
+    downloads (.part) do not count. None when there is not exactly one."""
+    try:
+        found = [p for p in sorted(Path(folder).glob("*.gguf")) if p.is_file() and not p.name.lower().startswith("mmproj")]
+    except OSError:
+        return None
+    return found[0] if len(found) == 1 else None
+
+
 def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted):
     """Steps 2-7 for a family with its own engine path (OWN_PATH_FAMILIES: Qwen3.6-35B-A3B): the size, the context, the
     engine, the GGUF (pinned revision, size and SHA-256), the tokenizer from the GGUF, the config and the start
@@ -8775,8 +8934,11 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} "
              "does not use them")
     folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    gguf = folder / fam["file"].format(q=model)
-    size = fam["sha256"][gguf.name][0]
+    published = fam["file"].format(q=model)           # the published file's name: its pinned size and SHA-256
+    gguf = folder / published
+    if a.gguf_dir and not gguf.exists():
+        gguf = own_path_gguf_in(folder) or gguf        # #5869: the person's own file under another name (the importer checked its types)
+    size = fam["sha256"][published][0]
     part = gguf.with_name(gguf.name + ".part")
     def have(p: Path) -> bool:                         # --gguf-dir: the person's own file has no finish mark; verify_sha256 checks and writes it
         return p.exists() and (done(p) or bool(a.gguf_dir))
@@ -8816,7 +8978,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         if a.gguf_dir:
             fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
         download(fam["hf"] + gguf.name, gguf)
-    verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir))
+    verify_sha256(gguf, *fam["sha256"][published], own=bool(a.gguf_dir))
     ok(f"model file: {gguf}")
     mmproj = folder / fam["mmproj"]
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
@@ -8985,8 +9147,9 @@ def mac_reader(eng: Path, vision: str):
 
 def prepare_pack_only(a) -> int:
     """setup.py --prepare-pack PACK_DIR --gguf-dir DIR --family F --model M: the pack (index, dense weights, tokenizer) of a model whose GGUF files
-    are in DIR, for a card the built-in downloader does not set up (Intel Arc). llama.cpp's gguf-py is fetched when it is not here (the one
-    download); the model's files are never downloaded or changed."""
+    are in DIR, for a card the built-in downloader does not set up (Intel Arc). The pack tool reads the GGUF files with Strata's own reader
+    (tools/strata_gguf.py; llama.cpp's gguf-py only when the person names one with STRATA_GGUF_PY): nothing is downloaded, and the model's files
+    are never changed."""
     if not a.gguf_dir:
         fail("--prepare-pack needs --gguf-dir, the folder with the model's .gguf files")
     family = a.family or "qwen"
@@ -9003,7 +9166,7 @@ def prepare_pack_only(a) -> int:
     pack = Path(a.prepare_pack)
     step(1, "preparing the model for this graphics card")
     llama = llama_override()
-    ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py)")
+    ok("model file reader ready")
     env = dict(os.environ, **gguf_py_env())
     if not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(files[0]), "--out", str(pack),
@@ -9418,6 +9581,9 @@ def main() -> int:
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
+    ap.add_argument("--output", choices=("human", "jsonl"), default="human",
+                    help="jsonl: one JSON object per line on stdout (step, ok, warning, progress, error, done) for a program that installs "
+                         "a model; the usual text goes to stderr. Use it with --yes --no-start")
     ap.add_argument("--update", action="store_true",
                     help="update the installed engine, Python packages and model settings as a start would, without "
                          "starting the model (UPDATE.bat / update.sh run it after a git pull)")
@@ -9492,6 +9658,8 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.output == "jsonl":
+        jsonl_start()
     if getattr(a, "gguf_dir", None):                   # the person's own files: their finish marks go to Strata's marks/, never beside them
         own_files_in(a.gguf_dir)
     if getattr(a, "dsv41_package", None):              # DeepSeek's engine package: no longer offered (strata_control/retired.py)
@@ -9860,17 +10028,18 @@ def main() -> int:
         family = a.family
     else:
         tier = tier_pick(ram, low_ram_vram(gpu))
+        cyan, reset = menu_colour("36")
         rec_fam = STRIX_HALO_FAMILY if strix_halo_recommends(gpu, ram) and STRIX_HALO_FAMILY in fams else             tier[0] if tier and tier[0] in fams else fams[0]
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
-            say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
+            say(f"  {i}) {cyan}{d['title']:20s}{reset} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
                 + family_menu_note(f, hip, gpu, avx2, avx512)
                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
         rest = [*(f for f in OWN_PATH_FAMILIES if not OWN_PATH_FAMILIES[f].get("feed")),
                 *(f for f in OWN_PATH_FAMILIES if OWN_PATH_FAMILIES[f].get("feed")), *feed_late]
         for j, f in enumerate(rest, len(fams) + 1):    # families with an engine path of their own
             d = {**FAMILIES, **OWN_PATH_FAMILIES}[f]
-            say(f"  {j}) {d['title']:20s} {d['by']} - {d['about']}   [new]" + (f"   ({FEED_UNAVAILABLE[f]['reason']})" if f in FEED_UNAVAILABLE else ""))
+            say(f"  {j}) {cyan}{d['title']:20s}{reset} {d['by']} - {d['about']}   [new]" + (f"   ({FEED_UNAVAILABLE[f]['reason']})" if f in FEED_UNAVAILABLE else ""))
         for u in FEED_UNAVAILABLE.values():            # a feed model this engine does not run: said, never offered (unless the owner's rule allows it, above)
             if not u.get("allowed"):
                 say(f"  -) {u['title']:20s} {u['by']} - {u['reason']}")
@@ -9925,7 +10094,9 @@ def main() -> int:
             say(f"  {i}) {m}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, keeps {keeps} of its "
                 f"{d['arena_gb']:.0f} GB of experts in RAM{fit}")
             continue
-        say(f"  {i}) {m:8s}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
+        magenta, reset = menu_colour("35")
+        label = f"{magenta}{m:8s}{reset}"
+        say(f"  {i}) {label}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index(installed or recommended_size(family, names, ram, low_ram_vram(gpu))) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
@@ -10194,7 +10365,7 @@ def main() -> int:
     problem = disk_room_problem(models_dir, pack_now, real - copy_gb, copy_gb,
                                 (f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1 and not have_model else ""))
     if problem:
-        fail(*problem)
+        fail(*problem, kind="no_space", path=str(models_dir), free_bytes=int(free_now * 1e9), needed_bytes=int(need * 1e9))
     if free_now < need:
         warn(f"little free disk space in {models_dir}: {free_now:.0f} GB free for about {real:.0f} GB of files. "
              "Setup goes on and should fit; free up space if it stops")
@@ -10395,7 +10566,7 @@ def main() -> int:
         say(f"  Image generation: POST http://127.0.0.1:{port}/v1/images/generations (OpenAI's images API)")
     if a.parallel is None:                             # #465: the opt-in, said once (nothing changes)
         for line in parallel_note(None, [g.get("vram_gb", 0.0) for g in chosen], MODELS[model]["arena_gb"], ctx, kv,
-                                  "--kv-resident" in cfg["args"]):
+                                  "--kv-resident" in cfg["args"], ram):
             say("  " + line)
     if tuned is False:                                 # #447: a failed tuning is repeated here, not only above
         say("  Tuning:           FAILED (the reason is above): the default settings stay - "
@@ -10412,11 +10583,17 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        code = main()
+        if code:
+            event("error", message=f"setup ended with exit code {code}", exit_code=int(code))
+        event("done", exit_code=int(code or 0), run_config=str(_RUN_CONFIGS[-1]) if _RUN_CONFIGS else None)
+        sys.exit(code)
     except acquisition.AcquisitionRefused as e:         # a start that would have installed something: said, not done
         say(f"\n  [X]  {e}")
+        event("error", message=str(e), exit_code=e.exit_code, kind="refused")
         sys.exit(e.exit_code)
     except KeyboardInterrupt:
         say("\nstopped.")
+        event("error", message="stopped", exit_code=1, kind="interrupted")
         sys.exit(1)
 

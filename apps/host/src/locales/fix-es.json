@@ -71,5 +71,6 @@
  "fx84": "El archivo se descargó. «Continuar» vuelve a intentar la instalación.",
  "fx85": "Abre «Detalles» para ver el motivo.",
  "fxec1": "Hay un motor más nuevo para este ordenador. Sus modelos y ajustes se conservan.",
- "fxec2": "Descargue primero los modelos en ejecución."
+ "fxec2": "Descargue primero los modelos en ejecución.",
+  "fx86": "Resume los mensajes anteriores para que la conversación vaya más rápido y vuelva a tener espacio"
 }

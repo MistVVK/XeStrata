@@ -63,7 +63,8 @@ class AutoAndTheBackends(unittest.TestCase):
         self.assertEqual(drafting.choice_of("dflash2", family="qwen", backend="cuda"), "dflash2")
         self.assertEqual(drafting.choice_of("dflash2", family="qwen", backend="sycl"), "dflash2")
         self.assertEqual(drafting.choice_of("dflash2", family="qwen", backend="cpu"), "mtp", "named, but the engine has none")
-        self.assertEqual(drafting.choice_of("dflash2", family="coder", backend="cuda"), "mtp")
+        self.assertEqual(drafting.choice_of("dflash2", family="coder", backend="cuda"), "dflash2", "#5240: the Coder runs DFlash2 when it is chosen by name")
+        self.assertEqual(drafting.choice_of("dflash2", family="swift", backend="cuda"), "mtp")
 
     def test_the_two_drafters_have_their_own_memory_figure(self):
         self.assertEqual((drafting.DRAFTER_GB["dflash2"], drafting.DRAFTER_GB["mtp"], drafting.DRAFTER_GB["off"]), (0.89, 1.08, 0.0))
@@ -154,7 +155,7 @@ class Decisions(unittest.TestCase):
 
     def test_dflash2_is_for_qwen38_flash_next_only(self):
         self.ready()
-        for name in ("qwen3.6-35b-a3b-q4", "qwen3.8-flash-next-coder-iq3_xxs", "qwen3.8-flash-next-swift-iq2_xs", None):
+        for name in ("qwen3.6-35b-a3b-q4", "qwen3.8-flash-next-swift-iq2_xs", None):
             d = drafting.decide("dflash2", model_name=name, data_dir=self.data, backend="cuda")
             self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_SUPPORTED), name)
             self.assertFalse(drafting.needs_pack("dflash2", model_name=name, data_dir=self.data, backend="cuda"))
@@ -163,6 +164,9 @@ class Decisions(unittest.TestCase):
             self.assertEqual(drafting.decide("dflash2", model_name=name, data_dir=self.data, backend="cuda").drafter, "dflash2", name)
         self.assertTrue(drafting.supported_model(family="qwen") and drafting.supported_model(family="gyro"))
         self.assertFalse(drafting.supported_model(family="coder") or drafting.supported_model(family="swift") or drafting.supported_model(family="nvfp4"))
+        coder = "qwen3.8-flash-next-coder-iq3_xxs"                 # #5240: the Coder runs DFlash2 when it is chosen by name; Auto keeps the MTP
+        self.assertEqual(drafting.decide("dflash2", model_name=coder, data_dir=self.data, backend="cuda").drafter, "dflash2")
+        self.assertEqual(drafting.decide("auto", model_name=coder, data_dir=self.data, backend="cuda").drafter, "mtp")
 
     def test_the_engine_of_this_branch_serves_dflash2(self):
         self.assertTrue(drafting.ENGINE_SERVES_DFLASH2, "src/program/generate.cpp: --draft dflash2 runs with --serve (one card, one request at a time)")
@@ -339,7 +343,7 @@ class EngineArguments(unittest.TestCase):
         c = self.cfg(model_name="qwen3.8-flash-next-coder-iq3_xxs")
         d = self.apply(c)
         self.assertEqual((d.drafter, d.note, c["args"]), ("mtp", "", self.args))
-        c = self.cfg(model_name="qwen3.8-flash-next-coder-iq3_xxs", drafting="dflash2", args=[*self.args, "--draft", "dflash2", "--draft-model", "/p"])
+        c = self.cfg(model_name="qwen3.8-flash-next-swift-iq2_xs", drafting="dflash2", args=[*self.args, "--draft", "dflash2", "--draft-model", "/p"])   # (the Coder named: test_drafting_coder_named.py)
         d = self.apply(c)
         self.assertEqual((d.drafter, d.note, c["args"]), ("mtp", drafting.NOT_SUPPORTED, self.args))
 
@@ -417,6 +421,28 @@ class EngineArguments(unittest.TestCase):
             drafting.take_note()
             engine_args(self.cfg(drafting="dflash2"))
             self.assertEqual(drafting.take_note(), drafting.NOT_SERVED)
+
+    def test_the_intel_launcher_script_reaches_the_check_as_its_binary(self):
+        """#5138 Bug 1: on an Intel install `exe` is sycl/serve/strata-sycl.sh. Reading that shell script for the
+        engine's option strings finds nothing (FORM_NONE) and Auto lost DFlash2 on every such start. The drafting
+        check must follow the launcher to the binary it runs (serve.server.engine_binary), as effort_position does."""
+        from serve.server import engine_args
+        self.pack()
+        self.layer()
+        script = self.data / "sycl" / "serve" / "strata-sycl.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\nexec \"$STRATA_SYCL_BIN\" \"$@\"\n", encoding="utf-8")
+        binary = self.data / "build-sycl" / "strata"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"MZ\x00\x00 strata generate: --draft dflash2 drafts without the MTP layer and needs "
+                           b"--draft-model PACK, --spec 2 or more and --mtp-draft-vocab FILE (or --mtp DIR) "
+                           b"\x00--draft-fallback\x00")
+        self.assertEqual(drafting.engine_form(script), drafting.FORM_NONE, "the script itself carries no option strings")
+        c = self.cfg(env={"STRATA_SYCL_BIN": "build-sycl/strata"})
+        with mock.patch("serve.server.drafting_vram_mib", return_value=None), mock.patch.object(drafting, "data_dir_of", return_value=self.data):
+            args = engine_args(c, exe=str(script))
+        self.assertIn("--draft", args, "Auto on an Intel launcher still gets a drafter decision")
+        self.assertEqual(args[args.index("--draft") + 1], "dflash2", "the check read the binary, not the launcher script")
 
     def test_data_folder_of_an_argument_list(self):
         self.assertEqual(drafting.data_dir_of(["--pack", "/d/packs/x"]), Path("/d"))
@@ -500,6 +526,8 @@ class UnslothAndTheOtherFlashNextFiles(unittest.TestCase):
         for backend, archs in self.HARDWARE:
             for name in ("qwen3.8-flash-next-coder-iq1_m", "qwen3.8-flash-next-nvfp4-nvfp4", "swift-1.5-iq2_xs"):
                 for mode in (None, "auto", "dflash2"):
+                    if mode == "dflash2" and "-coder-" in name:
+                        continue                                    # #5240: the Coder named DFlash2 runs it (test_drafting_coder_named.py)
                     with tempfile.TemporaryDirectory() as tmp:
                         cfg, data, mtp = self.run_config(name, tmp, mode)
                         original = list(cfg["args"])
@@ -996,14 +1024,14 @@ class TheAppAsksControl(unittest.TestCase):
             self.assertTrue(plan["needed"])
             self.assertEqual(plan["gb"], 1.2)
             self.assertEqual(Path(plan["pack"]), drafting.pack_path(self.data), "the data folder comes from the run config's own arguments")
-            self.cfg.write_text(json.dumps({"model_name": "qwen3.8-flash-next-coder-iq3_xxs", "drafting": "dflash2", "args": ["--pack", str(self.data / "packs" / "c")]}))
+            self.cfg.write_text(json.dumps({"model_name": "qwen3.8-flash-next-swift-iq2_xs", "drafting": "dflash2", "args": ["--pack", str(self.data / "packs" / "c")]}))
             other = self.plan()
             self.assertFalse(other["needed"])
             self.assertEqual(other["note"], drafting.NOT_SUPPORTED)
 
     def test_a_model_that_is_not_installed_yet_is_asked_about_by_its_family(self):
         with serving_dflash2():
-            for family, needed in (("gyro", True), ("qwen", True), ("coder", False), ("swift", False)):
+            for family, needed in (("gyro", True), ("qwen", True), ("coder", True), ("swift", False)):       # (#5240: the Coder named)
                 code, out, err = run_cli(["drafting", "plan", "--family", family, "--mode", "dflash2", "--data-dir", str(self.data), "--output", "json"])
                 self.assertEqual(code, 0, err)
                 self.assertEqual(json.loads(out)["needed"], needed, family)
@@ -1044,8 +1072,8 @@ class TheDownloadPlanListsIt(unittest.TestCase):
                 self.assertNotIn("dflash2", kinds)
                 self.assertIn("mtp", kinds, "the MTP is chosen: its layer is the download, DFlash2's is not")
                 self.assertNotIn("mtp", [p["kind"] for p in auto.download_plan()["parts"]], "one drafter per run: a new install fetches only the one it will use")
-                other = Runner(S.LaunchSettings(family="coder", model="IQ3_XXS", context=32768, vision="off", drafting="dflash2"), catalog=catalog(HW_12))
-                self.assertNotIn("dflash2", [p["kind"] for p in other.download_plan()["parts"]], "not for this model: hidden, not offered")
+                other = Runner(S.LaunchSettings(family="coder", model="IQ1_M", context=32768, vision="off"), catalog=catalog(HW_12))
+                self.assertNotIn("dflash2", [p["kind"] for p in other.download_plan()["parts"]], "Auto on the Coder is the MTP: not offered")
 
 
 if __name__ == "__main__":

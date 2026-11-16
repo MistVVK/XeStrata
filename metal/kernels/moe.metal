@@ -596,3 +596,6 @@ DN16(T_Q2_0R, 8, 1, 4) DN16(T_Q2_0R, 8, 2, 4) DN16(T_Q2_0R, 8, 4, 4) DN16(T_Q2_0
 DN16(T_Q2_0R, 4, 4, 4) DN16(T_Q2_0R, 8, 1, 8) DN16(T_Q2_0R, 8, 2, 8) DN16(T_Q2_0R, 16, 1, 4) DN16(T_Q2_0R, 16, 2, 4)
 DN16(T_Q2_0R, 32, 1, 4) DN16(T_Q2_0R, 2, 2, 4)
 #endif   // STRATA_METAL_F16
+// Gyro-Coder-L: the pair-trellis experts (TQP5 / TQP6 / TQP7), any of the three in a gate/up or down position
+GU_SET(T_TQP5) GU_SET(T_TQP6) GU_SET(T_TQP7)
+DN_SET(T_TQP5) DN_SET(T_TQP6) DN_SET(T_TQP7)

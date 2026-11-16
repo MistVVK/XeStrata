@@ -161,12 +161,27 @@ def load(name: str) -> tuple[dict, str]:
             raise ProfileError("profile is larger than 1 MiB", 5)
         value = json.loads(data.decode("utf-8-sig"))
     except FileNotFoundError:
+        preset = _launch_preset_of(name)
+        if preset:                                       # #5369: `strata bench run --profile <preset>` - a launch preset is its own profile
+            raise ProfileError(f"profile {name!r} is not saved. A `strata launch` preset is the profile {preset}; "
+                               "or make one with strata profile create.", 5) from None
         raise ProfileError(f"profile {name!r} is not saved; use strata profile create", 5) from None
     except (OSError, ValueError, UnicodeError) as exc:
         if isinstance(exc, ProfileError):
             raise
         raise ProfileError(f"cannot read profile ({type(exc).__name__})", 5) from None
     return validate_profile(value, expected_name=name), _revision(data)
+
+
+def _launch_preset_of(name: str) -> str | None:
+    """The saved profile of the `strata launch` preset called ``name`` (launch-<name>), when there is one; else None."""
+    if name.startswith("launch-"):
+        return None
+    try:
+        candidate = f"launch-{name}"
+        return candidate if _path(candidate).is_file() else None
+    except (ProfileError, OSError, ValueError):
+        return None
 
 
 def list_profiles() -> list[dict]:

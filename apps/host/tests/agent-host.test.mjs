@@ -40,7 +40,8 @@ async function startHost(t, { home, ws, harness = HARNESS } = {}) {
   t.after(stop);
   const base = `http://127.0.0.1:${port}`;
   for (let i = 0; i < 100; i++) {
-    try { if ((await fetch(`${base}/api/agent/status`)).ok) break; } catch { /* not up yet */ }
+    // #5577: each attempt ends within 2 s, so a host that accepts the connection but never answers fails with its log instead of hanging
+    try { if ((await fetch(`${base}/api/agent/status`, { signal: AbortSignal.timeout(2000) })).ok) break; } catch { /* not up yet, or no answer in time */ }
     if (child.exitCode !== null) throw new Error(`the host exited: ${log.slice(-500)}`);
     await sleep(200);
   }

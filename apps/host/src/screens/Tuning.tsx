@@ -163,9 +163,10 @@ export function TuningScreen() {
     const predicted = preview ?? engine.predicted;
     const cfg = execution(doc?.expert, contextTokens(doc?.beginner.contextLength ?? engine.beginner.contextLength));
     const savedCfg = execution(saved.expert, contextTokens(saved.beginner.contextLength));
-    const contextMax = Math.max(4, Math.floor((current?.contextMax ?? 32768) / 1024));
+    const contextMax = Math.max(1, Math.floor((current?.contextMax ?? 32768) / 1024));
+    const contextMin = Math.min(4, contextMax);
     const recommendedContext = RECOMMENDED_CONTEXT_TOKENS / 1024;
-    const recommendedPosition = contextMax === 4 ? 0 : Math.min(100, (recommendedContext - 4) / (contextMax - 4) * 100);
+    const recommendedPosition = contextMax === contextMin ? 0 : Math.min(100, (recommendedContext - contextMin) / (contextMax - contextMin) * 100);
     const experience = estimate(current, hardware, cfg, workload, library?.mode === 'simulated');
     const savedExperience = estimate(current, hardware, savedCfg, workload, library?.mode === 'simulated');
     const showPreview = <PerformancePreview experience={experience} saved={savedExperience} workload={workload} onWorkload={setWorkload} updating={updating}/>;
@@ -178,8 +179,8 @@ export function TuningScreen() {
       {tr(mode === 'beginner' && doc ? <div className="instrument-layout">
         <section className="instrument-controls simple-engine"><div className="auto-tune-card"><Icon name="gauge" size={28}/><h2 className="h3">{tr("Make the most of this computer")}</h2><p className="small muted">{tr("Find a starting point for your hardware, then review before saving.")}</p><Btn variant="primary" disabled={!hardware || !current} onClick={() => setTuneOpen(true)}>{tr("Auto-tune for my PC")}</Btn>
           <label className="input-field"><span>{tr("Conversation context \u00B7 ")}{tr(cfg.context / 1024)}{tr("K")}</span>
-            <div className="context-slider"><input type="range" className="st-slider" aria-label={tr("Conversation context")} aria-valuetext={`${cfg.context / 1024}K tokens`} aria-describedby="context-recommendation context-help" min={4} max={contextMax} step={1} value={cfg.context / 1024} onChange={e => changeParam('ctx.length', `${e.target.value}K`)}/><span className="context-recommendation-mark" aria-hidden="true" style={{ left: `calc(${recommendedPosition}% + ${8 - recommendedPosition * .16}px)` }}/></div>
-            <div className="context-guidance"><div className="context-scale" aria-hidden="true"><span>{tr("4K")}</span><span>{tr(contextMax)}{tr("K")}</span></div><p className="context-recommendation" id="context-recommendation"><span aria-hidden="true"/>{tr("Recommended: ")}{tr(recommendedContext)}{tr("K")}</p><p className="xs muted" id="context-help">{tr("More conversation history uses more memory.")}</p></div>
+            <div className="context-slider"><input type="range" className="st-slider" aria-label={tr("Conversation context")} aria-valuetext={`${cfg.context / 1024}K tokens`} aria-describedby="context-recommendation context-help" min={contextMin} max={contextMax} step={1} value={cfg.context / 1024} onChange={e => changeParam('ctx.length', `${e.target.value}K`)}/><span className="context-recommendation-mark" aria-hidden="true" style={{ left: `calc(${recommendedPosition}% + ${8 - recommendedPosition * .16}px)` }}/></div>
+            <div className="context-guidance"><div className="context-scale" aria-hidden="true"><span>{tr(`${contextMin}K`)}</span><span>{tr(contextMax)}{tr("K")}</span></div><p className="context-recommendation" id="context-recommendation"><span aria-hidden="true"/>{tr("Recommended: ")}{tr(recommendedContext)}{tr("K")}</p><p className="xs muted" id="context-help">{tr("More conversation history uses more memory.")}</p></div>
           </label></div>
           <section><h2 className="h4">{tr("Resources")}</h2><div className="workload-cards">{tr([{ id: 'shared', title: 'Leave room for other apps', detail: 'Keep this computer responsive' }, { id: 'full', title: 'Full speed', detail: 'Give the engine more CPU threads' }].map(h => <button key={h.id} aria-pressed={(doc.headroom ?? 'shared') === h.id} onClick={() => update({ ...doc, headroom: h.id, expert: { ...doc.expert, 'perf.threads': Math.max(1, (hardware?.cpu.cores ?? 4) - (h.id === 'shared' ? 2 : 0)) } })}><strong>{tr(h.title)}</strong><span>{tr(h.detail)}</span></button>))}</div></section>
         </section>{tr(showPreview)}

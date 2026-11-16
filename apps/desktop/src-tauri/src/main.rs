@@ -44,6 +44,8 @@ mod shell;
 // Plain std, built on every platform so its decisions are tested everywhere; only the Linux window process uses it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod fontguard;
+// The same for the DMA-BUF renderer choice (#5417).
+mod renderer_choice;
 #[cfg(target_os = "linux")]
 mod supervisor;
 
@@ -503,6 +505,10 @@ fn start_host(app: &tauri::AppHandle) -> Result<u16, String> {
     let port = pick_stable_port()?;
     let token = random_token();
     let mut cmd = host_command(&res, port, &token)?;
+    // This process shows the page in its own window: the host says so at /api/app/mode, and the page then hands a link in an answer to
+    // the host, which opens it in the default browser (#5072, #4721). Without it the mode was null and the click called window.open,
+    // which the app window ignores. The Linux shell sets the same variable in supervisor.rs.
+    cmd.env("STRATA_UI_MODE", "window");
     // The signed app updater (Tauri) is reached by the host through a token-protected loopback bridge.
     let bridge = updater::start(app, random_token());
     updater::apply_env(&mut cmd, app, bridge.as_ref());
@@ -856,8 +862,9 @@ fn main() {
     #[cfg(target_os = "linux")]
     {
         // WebKitGTK's DMA-BUF renderer shows a blank window on several NVIDIA + Wayland desktops (and some virtual GPUs); the plain
-        // renderer is slower to start by a hair and always works. Anyone who set the variable themselves keeps their choice.
-        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        // renderer always works but paints on the CPU, which made typing and scrolling crawl on a 4K Radeon desktop (#5417). It
+        // is chosen only where it is needed (renderer_choice.rs). Anyone who set the variable themselves keeps their choice.
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() && renderer_choice::disable_dmabuf_here(std::path::Path::new("/sys")) {
             std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
         }
     }

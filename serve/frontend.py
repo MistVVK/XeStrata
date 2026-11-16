@@ -206,7 +206,8 @@ def _parts_of(content):
 # redacted_thinking is allowed only to be dropped without an error: another server's encrypted reasoning, which
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
-ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
+ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking",
+                                               "tool_addition")
 
 
 def _check_parts(content, path: str, kinds):
@@ -645,8 +646,58 @@ def anthropic_tools(req: dict) -> tuple[list[dict] | None, bool]:
     tool is deferred).  A deferred tool is callable although the prompt does not list it.  A client that defers tools
     (Claude Code) holds back more than it declares - it names the rest in the conversation and runs a call for any of
     them - so with one deferred tool a call for an undeclared name is a call too (OutputParser's `deferred`)."""
-    tools = _tool_list(req.get("tools"), None)
+    tools = _anthropic_callables(req)
     return [_anthropic_tool(t) for t in tools] or None, any(t.get("defer_loading") for t in tools)
+
+
+def _anthropic_callables(req: dict) -> list[dict]:
+    """#5952: the request's callable tools, each name once where it comes from a tool_addition: the top-level `tools`
+    first (as declared, `defer_loading` ones included), then each name a system message's tool_addition adds, its
+    FIRST definition.  A name the top level declares keeps the top-level definition (a later addition of it adds
+    nothing).  The prompt shows an added tool with this same definition (anthropic_to_messages), so what the model
+    reads and what the parser takes a call against are one schema."""
+    tools = list(_tool_list(req.get("tools"), None))      # a copy: the request's own list is not changed
+    names = {t["name"] for t in tools}
+    for d in _tool_additions(req):
+        if d["name"] not in names:
+            names.add(d["name"])
+            tools.append(d)
+    return tools
+
+
+def _tool_addition(block) -> dict | None:
+    """#5952: a `tool_addition` block's tool definition ({"name", "description", "input_schema"}), or None when the
+    block does not carry one in that shape.  Claude Code sends some tools (MCP servers that connect after the session
+    started) this way, in a system message inside `messages`, instead of in the top-level `tools`:
+    {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {"name": ..., "input_schema": ...}}}.
+    The outer `tool` must say "tool_definition"; the name a non-empty string; a description, when there, a string; a
+    schema, when there, an object."""
+    tool = block.get("tool") if isinstance(block, dict) else None
+    if not isinstance(tool, dict) or tool.get("type") != "tool_definition":
+        return None
+    d = tool.get("definition")
+    if (isinstance(d, dict) and isinstance(d.get("name"), str) and d["name"]
+            and isinstance(d.get("input_schema", {}), dict) and isinstance(d.get("description", ""), str)):
+        return d
+    return None
+
+
+def _tool_additions(req: dict) -> list[dict]:
+    """#5952: every tool definition a SYSTEM message of the conversation adds with a `tool_addition` block, in order.
+    The block is the client's (Claude Code puts it in a system message); one in a user or assistant turn - text a
+    user pasted, a tool's output echoed back - adds no tool."""
+    out = []
+    messages = req.get("messages")
+    for m in messages if isinstance(messages, list) else []:
+        if not isinstance(m, dict) or m.get("role") != "system":
+            continue
+        content = m.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_addition":
+                d = _tool_addition(block)
+                if d is not None:
+                    out.append(d)
+    return out
 
 
 def _tool_references(content, deferred: dict):
@@ -669,6 +720,13 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     declared = _tool_list(req.get("tools"), None)
     # #4663: a `defer_loading` tool stays out of the prompt's tool list until a tool_reference loads it
     deferred = {t["name"]: _anthropic_tool(t) for t in declared if t.get("defer_loading")}
+    # #5952: the names the prompt already shows the model (its tool list); a tool_addition of one of them adds nothing.
+    # An added name is shown with its one callable definition (_anthropic_callables: a deferred top-level tool's own,
+    # else the first addition's), where the first addition of it stands.
+    shown = {t["name"] for t in declared if t["name"] not in deferred}
+    callable_defs = {}
+    for t in _anthropic_callables(req):
+        callable_defs.setdefault(t["name"], t)
     messages = []
     system = req.get("system")
     if system:
@@ -693,6 +751,19 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 parts.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
+            elif kind == "tool_addition":
+                # #5952: the added tool's definition where the client added it, in the form a tool_reference loads
+                # one (_tool_references): the prompt's start (its tool list) stays the same, and so does its cache
+                d = _tool_addition(block)
+                if d is None or m.get("role") != "system":
+                    LOGGER.debug("messages[%d].content[%d]: tool_addition %s; left out of the prompt", i, j,
+                                 "without a tool definition" if d is None else f"in a {m.get('role')} message")
+                elif d["name"] not in shown:
+                    shown.add(d["name"])
+                    added = ("<tools>\n" + json.dumps(_anthropic_tool(callable_defs[d["name"]]), ensure_ascii=False) +
+                             "\n</tools>")
+                    text.append(added)
+                    parts.append({"type": "text", "text": added})
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))},
                               "_call_id": block.get("id")})
@@ -1099,14 +1170,19 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
     return "unknown", None
 
 
-def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
+def forced_call(tool_choice, tools: list[dict] | None, callable_tools: list[dict] | None = None) -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
     "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
     unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
-    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
+    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools).
+    `callable_tools` (Anthropic: the tools added in the conversation and the deferred ones as well, #5952): a name
+    among them may be named too; "required" still picks from the prompt's own list."""
     kind, name = tool_choice_of(tool_choice)
     names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    if kind == "named" and name not in names and any(
+            isinstance(t, dict) and t.get("name") == name for t in callable_tools or []):
+        return CALL_START + f"\n<function={name}>\n"
     if kind in ("auto", "none"):
         return None
     if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another

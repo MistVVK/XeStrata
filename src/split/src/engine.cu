@@ -5,6 +5,7 @@
 #include "engine_parts.hpp"
 #include "env.hpp"
 #include "peer_probe.hpp"
+#include "pf_pick.hpp"
 
 #include <cuda_runtime.h>
 #include <unistd.h>
@@ -84,28 +85,27 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
 #if !FNX_HIP
         rows = 8192;
         if (!std::getenv("FNX_PF_ROWS") && !std::getenv("FNX_PF_PASS")) {
-            size_t free_min = SIZE_MAX, kv_max = 0;
+            size_t free_min = SIZE_MAX, kv_max = 0, arena_max = 0;
             for (int c = 0; c < NCARD; ++c) {
                 ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
                 size_t fr = 0, tot = 0;
                 ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
-                free_min = std::min(free_min, fr);
+                // #5496: FNX_ARENA's pool is allocated after this pick (arena_fill); without the arena nothing is taken off (pf_pick.hpp)
+                const size_t arena_c = pf_arena_unallocated(m.cards[c].ec, m.arena);
+                free_min = std::min(free_min, pf_free_after_arena(fr, arena_c));
+                arena_max = std::max(arena_max, arena_c);
                 kv_max = std::max(kv_max, (size_t) n_pages * kvp_page(c) * sizeof(uint16_t));
             }
             const size_t margin = kv_max + (PF_MARGIN_MIB << 20);
-            struct Cfg { int rows, pass; size_t mib; };
-            const Cfg cfgs[] = {{8192, 4, 4148}, {8192, 2, 3028}, {4096, 4, 1673}, {4096, 2, 1112}};
-            Cfg pick = cfgs[3];
-            for (const Cfg& cf : cfgs)
-                if ((cf.mib << 20) + margin <= free_min) {
-                    pick = cf;
-                    break;
-                }
+            const PfPick pick = pf_pick(free_min, margin);
             rows = pick.rows;
             pf_pass_pick_ = pick.pass;
-            if (pick.rows != 8192 || pick.pass != 4)
+            if ((pick.rows != 8192 || pick.pass != 4) && arena_max == 0)
                 std::fprintf(stderr, "fnx: prompt path: %d rows, %d chunks a pass (the cards hold %zu MiB free after the weights, the K/V pool %zu MiB)\n", pick.rows, pick.pass,
                              free_min >> 20, kv_max >> 20);
+            else if (pick.rows != 8192 || pick.pass != 4)
+                std::fprintf(stderr, "fnx: prompt path: %d rows, %d chunks a pass (the cards hold %zu MiB free after the weights and the arena's slots, the K/V pool %zu MiB, the arena's slots up to %zu MiB)\n",
+                             pick.rows, pick.pass, free_min >> 20, kv_max >> 20, arena_max >> 20);
         }
 #endif
         const long long pf_rows = env_int("FNX_PF_ROWS", rows);

@@ -307,6 +307,31 @@ def _candidate_by_header(shards: list[Path], tensors: int, payload: int, experts
     return None
 
 
+def _qwen36_candidate(shards: list[Path], issues: list[str], notes: list[str]) -> dict | None:
+    """A qwen35moe file set (#5869): every tensor's type checked against what the Qwen3.6 engine's loader takes (strata_control/q36_types.py);
+    any tensor it would refuse makes the set unsupported (the existing words), otherwise family qwen36 at the size setup installs it as."""
+    from strata_control import gguf_preflight, q36_types
+    types: dict[str, int] = {}
+    try:
+        for item in shards:
+            types.update(gguf_preflight.tensor_types(item))
+    except ProfileError as exc:
+        issues.append(f"{shards[0].name}: {exc}")
+        return None
+    if q36_types.problems(types) or len(shards) != 1:      # the engine reads one GGUF file
+        issues.append("unsupported_or_missing_architecture")
+        return None
+    model, published = q36_types.size_for(shards[0].name, types)
+    if not published:
+        notes.append(f"These files are not exactly a build Strata has tested; they have the layout of {q36_types.FAMILY} "
+                     f"{model}, so Strata uses them as that model. Check a few answers before you rely on them.")
+    from tools.gguf_reader import GGML_TYPES
+    experts = sorted({GGML_TYPES.get(t, str(t)) for n, t in types.items() if n.endswith("_exps.weight")})
+    return {"family": q36_types.FAMILY, "model": model, "basis": "qwen35moe_engine_types" if not published else "published_file_name",
+            "expected_expert_types": experts, "expected_tensor_count": len(types),
+            "setup_args_hint": ["--family", q36_types.FAMILY, "--model", model, "--gguf-dir", str(shards[0].parent)]}
+
+
 def known_set_by_header(first_shard: Any) -> str | None:
     """``family/model`` (``qwen/IQ3_S``, ``unsloth/UD-Q4_K_XL``) of the file set that starts at ``first_shard`` when its header is EXACTLY one row of data/gguf_fingerprints.json: the same tensor count,
     the same payload size and the same expert formats over every shard (the other shards are found beside the first by their ``-00001-of-0000N`` names). Never the layout guess of
@@ -765,10 +790,13 @@ def plan_import(raw_path: str) -> dict:
             observed_experts.update(inspected["expert_tensor_types"])
             observed_tensor_count += inspected["tensor_count_scanned"]
             observed_payload += int(inspected.get("payload_bytes_required") or 0)
-            if inspected["architecture"] is not None and inspected["architecture"] != "qwen4exp":
+            if inspected["architecture"] is not None and inspected["architecture"] not in ("qwen4exp", "qwen35moe"):
                 issues.append(f"{item.name}: unsupported_architecture")
+    q36_candidate = None
     if metadata is not None:
-        if metadata["architecture"] != "qwen4exp":
+        if metadata["architecture"] == "qwen35moe" and not issues:
+            q36_candidate = _qwen36_candidate(shards, issues, notes)       # #5869: Qwen3.6-35B-A3B, the files its engine loads
+        elif metadata["architecture"] != "qwen4exp":
             issues.append("unsupported_or_missing_architecture")
         if metadata["tokenizer_model"] != "gpt2" or not metadata["tokenizer_tokens_present"] or \
                 not metadata["tokenizer_merges_present"]:
@@ -786,8 +814,8 @@ def plan_import(raw_path: str) -> dict:
         messages.append(UNSUPPORTED_MODEL_TYPE)
     elif projectors:
         messages.extend(p["plain"] for p in projectors)
-    candidate = _candidate_selection(shards)
-    if candidate is None and metadata is not None and not issues:
+    candidate = q36_candidate or (_candidate_selection(shards) if not (metadata and metadata["architecture"] == "qwen35moe") else None)
+    if candidate is None and metadata is not None and not issues and metadata["architecture"] == "qwen4exp":
         candidate = _candidate_by_header(shards, observed_tensor_count, observed_payload, observed_experts)
         if candidate is None:
             candidate = _candidate_by_layout(shards, observed_tensor_count, observed_payload, observed_experts)

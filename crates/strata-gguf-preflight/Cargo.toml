@@ -1,0 +1,9 @@
+[package]
+name = "strata-gguf-preflight"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+description = "Bounded, constant-memory GGUF v3 metadata and tensor-directory preflight for Strata."
+
+[dependencies]

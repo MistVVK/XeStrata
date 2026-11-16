@@ -7,6 +7,7 @@ import { useSurfaceFocus } from '../lib/focus';
 import { cx } from '../lib/format';
 import { go, selectSession, setActiveWorkspace, setPalette, useStore } from '../lib/store';
 import { highlight, parseScope, rank } from '../lib/fuzzy';
+import { useImeKeys } from '../lib/ime-keys';
 import { Icon, type IconName } from '../components/ui';
 import { getCommands, runCommand, MOD } from '../lib/commands';
 interface Command {
@@ -34,6 +35,7 @@ export function CommandPalette({ open }: {
     const language = useStore(s => s.language);
     const [query, setQuery] = useState('');
     const [cursor, setCursor] = useState(0);
+    const ime = useImeKeys();
     const inputRef = useRef<HTMLInputElement>(null);
     const library = useStore((s) => s.library);
     const theme = useStore((s) => s.theme);
@@ -113,6 +115,9 @@ export function CommandPalette({ open }: {
     }, [filtered]);
     const flat = grouped.flatMap(([, items]) => items);
     const onKeyDown = (e: React.KeyboardEvent) => {
+        // A key that belongs to the IME (the Enter that commits a conversion, an arrow in its candidate list) is not the palette's (#5071).
+        if (ime.owns(e))
+            return;
         if (e.key === 'ArrowDown') {
             e.preventDefault();
             setCursor((c) => Math.min(flat.length - 1, c + 1));
@@ -133,7 +138,7 @@ export function CommandPalette({ open }: {
       <div ref={modalRef} className="modal" data-open={open} role="dialog" aria-modal="true" aria-label={tr("Command palette")} inert={!open}>
         <div className="modal__head">
           <Icon name="chat" size={18} style={{ color: 'var(--st-ink-muted)' }}/>
-          <input ref={inputRef} className="st-input st-input--bare" style={{ flex: 1 }} placeholder={tr("Search chats, screens or actions…")} aria-label={tr("Search commands")} aria-activedescendant={flat[cursor] ? `command-${flat[cursor].id}` : undefined} value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={onKeyDown}/>
+          <input ref={inputRef} className="st-input st-input--bare" style={{ flex: 1 }} placeholder={tr("Search chats, screens or actions…")} aria-label={tr("Search commands")} aria-activedescendant={flat[cursor] ? `command-${flat[cursor].id}` : undefined} value={query} onChange={(e) => setQuery(e.target.value)} {...ime.events} onKeyDown={onKeyDown}/>
           <kbd className="kbd">{tr("esc")}</kbd>
         </div>
         <div className="palette__list">

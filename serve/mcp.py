@@ -37,7 +37,16 @@ import urllib.request
 from serve import lifeline
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
-DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False}
+# image_results: None = not set in the config, which means on when the loaded model has a picture reader (#2343, the owner's rule
+# that every picture-capable model reads pictures by default); true / false in the config decide it (resolve_image_results)
+DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": None}
+
+
+def resolve_image_results(settings: dict, has_picture_reader: bool) -> bool:
+    """Whether MCP tool images reach the model: the config's mcp.image_results when it says true or false, else on exactly
+    when the loaded model has a picture reader (#2343)."""
+    value = settings.get("image_results")
+    return value if isinstance(value, bool) else bool(has_picture_reader)
 
 
 class McpError(RuntimeError):
@@ -59,6 +68,34 @@ class _Slot:
         self.done = threading.Event()
         self.msg = None
         self.error = None
+
+
+class McpSessionGone(McpError):
+    """An HTTP server no longer knows our session (it was restarted) and refused the request: nothing ran, so a new
+    session may send it again."""
+
+
+_SESSION_WORD = re.compile(r"\bsession", re.I)
+_GONE_WORD = re.compile(r"unknown|invalid|expired|not found|no valid|missing|terminated|reinitiali[sz]e", re.I)
+
+
+def _session_gone_error(err: dict) -> bool:
+    """A JSON-RPC error that says the session is unknown: "Unknown session id '...'; client should reinitialize"
+    (-32600), "Session not found" (-32001), "Bad Request: No valid session ID provided" (-32000 / -32600)."""
+    msg = str(err.get("message") or "")
+    return err.get("code") in (-32600, -32001, -32000) and bool(_SESSION_WORD.search(msg) and _GONE_WORD.search(msg))
+
+
+def _session_gone_text(body: str) -> bool:
+    """The same for the body of an HTTP 400 (a JSON-RPC error object, or one in a list)."""
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return False
+    for m in parsed if isinstance(parsed, list) else [parsed]:
+        if isinstance(m, dict) and isinstance(m.get("error"), dict) and _session_gone_error(m["error"]):
+            return True
+    return False
 
 
 def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str):
@@ -300,16 +337,23 @@ class HttpTransport:
                             found = m
                 if found is None:
                     raise McpError("the server's answer did not contain a response")
+                err = found.get("error")
+                if self.session and isinstance(err, dict) and _session_gone_error(err):
+                    # some servers answer a session they no longer know with a JSON-RPC error in a 200 (#6014)
+                    self.broken = McpSessionGone("the server ended the session")
+                    raise McpSessionGone(f"{err.get('message')} (code {err.get('code')})")
                 slot.msg = found
         except urllib.error.HTTPError as e:
-            detail = ""
+            body = ""
             try:
-                detail = e.read().decode("utf-8", "replace")[:300]
+                body = e.read(65536).decode("utf-8", "replace")
             except OSError:
                 pass
-            if e.code == 404 and self.session:           # the session expired: a restart starts a new one
-                self.broken = McpError("the server ended the session")
-            err = McpError(f"HTTP {e.code} {e.reason}{': ' + detail if detail else ''}")
+            detail = body[:300]
+            gone = bool(self.session) and (e.code == 404 or (e.code == 400 and _session_gone_text(body)))
+            if gone:                                     # the session expired: a restart starts a new one
+                self.broken = McpSessionGone("the server ended the session")
+            err = (McpSessionGone if gone else McpError)(f"HTTP {e.code} {e.reason}{': ' + detail if detail else ''}")
             if slot is None:
                 raise err from None
             slot.error = err
@@ -438,22 +482,32 @@ class McpServer:
             return False
 
     def call(self, tool: str, arguments: dict, timeout: float, cancel=None) -> dict:
-        with self.lock:
-            if self.transport is None or not self.transport.alive():
-                # it stopped since its last call (a crash, an expired session): start it again; one that failed to
-                # start is tried again at most every 10 s, so a broken command does not run on every call
-                if self.status == "failed" and time.monotonic() - self.last_start < 10:
-                    raise McpError(f"the server is not running ({self.error or 'it stopped'})")
-                print(f"[strata] MCP server {self.name!r} had stopped; starting it again", flush=True)
-                if not self._start():
-                    raise McpError(f"the server could not be started again: {self.error}")
-            t = self.transport
-        try:
-            return t.request("tools/call", {"name": tool, "arguments": arguments}, timeout, cancel)
-        except McpError as e:
-            if not t.alive():
-                self.status, self.error = "stopped", str(e)
-            raise
+        for attempt in (1, 2):
+            with self.lock:
+                if self.transport is None or not self.transport.alive():
+                    # it stopped since its last call (a crash, an expired session): start it again; one that failed
+                    # to start is tried again at most every 10 s, so a broken command does not run on every call.
+                    # Callers that saw the same expired session wait here for one new session, not one each.
+                    if self.status == "failed" and time.monotonic() - self.last_start < 10:
+                        raise McpError(f"the server is not running ({self.error or 'it stopped'})")
+                    print(f"[strata] MCP server {self.name!r} had stopped; starting it again", flush=True)
+                    if not self._start():
+                        raise McpError(f"the server could not be started again: {self.error}")
+                t = self.transport
+            try:
+                return t.request("tools/call", {"name": tool, "arguments": arguments}, timeout, cancel)
+            except McpSessionGone as e:
+                # the server was restarted and refused the call without running it (#6014): a new session sends it
+                # once more; a server that forgets the new session as well gets no third try
+                with self.lock:
+                    if self.transport is t:
+                        self.status, self.error = "stopped", str(e)
+                if attempt == 2:
+                    raise
+            except McpError as e:
+                if not t.alive():
+                    self.status, self.error = "stopped", str(e)
+                raise
 
     def close(self):
         with self.lock:

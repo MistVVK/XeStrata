@@ -164,5 +164,37 @@ class Sm120Compiler(unittest.TestCase):
             self.assertIsNone(setup.nvcc_build("nvcc"))
 
 
+class RocmCompiler(unittest.TestCase):
+    """#6071: rocm-core 10.1 (Arch Linux) keeps the HIP compiler only in <root>/lib/llvm/bin; ROCm 7 and TheRock in <root>/llvm/bin."""
+
+    def layout(self, *dirs):
+        import tempfile
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        for sub in dirs:
+            (root / sub).mkdir(parents=True)
+            (root / sub / "clang++").write_text("")
+        return root
+
+    def test_rocm_7_layout_keeps_llvm_bin(self):
+        root = self.layout("llvm/bin", "lib/llvm/bin")
+        self.assertEqual(setup.rocm_clang(root), root / "llvm" / "bin" / "clang++")
+
+    def test_rocm_10_1_layout_finds_lib_llvm_bin(self):
+        root = self.layout("lib/llvm/bin")
+        self.assertEqual(setup.rocm_clang(root), root / "lib" / "llvm" / "bin" / "clang++")
+
+    def test_no_compiler_names_the_old_place(self):
+        root = self.layout()
+        self.assertEqual(setup.rocm_clang(root), root / "llvm" / "bin" / "clang++")
+        self.assertFalse(setup.rocm_clang(root).exists())
+
+    def test_no_build_line_hard_codes_llvm_bin(self):
+        text = (ROOT / "setup.py").read_text(encoding="utf-8")
+        self.assertNotIn("root / 'llvm' / 'bin'", text)
+        self.assertNotIn('root / "llvm" / "bin" / "clang++").exists()', text)
+
+
 if __name__ == "__main__":
     unittest.main()

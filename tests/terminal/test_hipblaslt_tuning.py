@@ -31,8 +31,8 @@ PACKAGES = {
     ("linux-x86_64", "rx7900"): (("gfx1100", "gfx1101", "gfx1102"), 100200, {"gfx1100"}),
     ("linux-x86_64", "halo"): (("gfx1151",), 100401, {"gfx1151"}),
     # 0.2.2 RX 6000 packages: hipBLASLt ships no gfx1030 / gfx1031 kernels at any version, so no table, plain hipBLAS
-    ("windows-x86_64", "rdna2"): (("gfx1030", "gfx1031"), 100500, set()),
-    ("linux-x86_64", "rx6000"): (("gfx1030", "gfx1031"), 100400, set()),
+    ("windows-x86_64", "rdna2"): (("gfx1030", "gfx1031", "gfx1032"), 100500, set()),
+    ("linux-x86_64", "rx6000"): (("gfx1030", "gfx1031", "gfx1032"), 100400, set()),
 }
 
 

@@ -51,12 +51,14 @@ export function parseNvidiaReadings(raw) {
     return [{id,temperatureC:t!==null&&t>=0&&t<=150?t:null,utilizationPct:u!==null&&u>=0&&u<=100?u:null,memoryUsedGb:m!==null&&m>=0?round(m/1024,2):null,powerW:positive(power),powerLimitW:positive(limit),pcieGen:positive(gen),pcieGenMax:positive(maxGen),pcieWidth:positive(width),pcieRxMbs:null,fanPct:percentOf(fan),clockMhz:positive(clock)}];
   });
 }
+/** A GP100 reports just under 200 GiB/s now and then, even idle (see serve/telemetry.py). No PCIe link carries that: 6.0 x16 is under 120 GiB/s. */
+const PCIE_MBS_MAX=150*1024;
 export function parsePcieThroughput(raw) {
   const values=new Map();
   for(const line of raw.split('\n')) {
     if(line.trim().startsWith('#'))continue;
     const fields=line.trim().split(/\s+/),index=number(fields[0]),rx=number(fields[1]);
-    if(fields.length===3&&index!==null&&Number.isInteger(index)&&index>=0&&rx!==null&&rx>=0)values.set(index,rx);
+    if(fields.length===3&&index!==null&&Number.isInteger(index)&&index>=0&&rx!==null&&rx>=0&&rx<=PCIE_MBS_MAX)values.set(index,rx);
   }
   return values;
 }

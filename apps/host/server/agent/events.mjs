@@ -202,9 +202,12 @@ export class TurnProjector {
    * `policy` is the session's approval policy for this turn. Under `never` the Harness rejects an ask by itself, so
    * no question ever reaches the person: the card goes straight from running to denied, without a moment where it
    * offers Approve and Deny buttons that would do nothing.
+   * `catchUp` is for a turn followed only after it began (one the Harness started by itself): a committed reply no live frame carried is
+   * shown whole, because its stream went by before anyone listened.
    */
-  constructor({ startedAt = Date.now(), policy = 'ask', window = 0 } = {}) {
+  constructor({ startedAt = Date.now(), policy = 'ask', window = 0, catchUp = false } = {}) {
     this.startedAt = startedAt;
+    this.catchUp = catchUp;
     this.window = Number(window) || 0;   // the model's window, for the figures in the line that says the chat was summarised
     this.summarizing = false;
     this.policy = policy;
@@ -328,7 +331,7 @@ export class TurnProjector {
         // Reconcile a text the live frames did not fully carry (a socket gap), never duplicating it.
         const live = [...this.emittedText.values()].pop() ?? 0;
         const text = (d.message?.content ?? []).filter(p => p.type === 'text').map(p => p.text).join('');
-        if (text.length > live && live > 0) out.push({ type: 'delta', text: text.slice(live) });
+        if (text.length > live && (live > 0 || this.catchUp)) { if (!live) this.emittedAny = true; out.push({ type: 'delta', text: text.slice(live) }); }
         this.emittedText.clear();
         break;
       }
@@ -479,6 +482,24 @@ export class TurnProjector {
         return [{ type: 'error', message: 'The agent turn was interrupted before it finished.', code: 'INTERRUPTED' }];
     }
   }
+}
+
+/**
+ * The reply a follow opened in the middle of: the Harness's reconnect baseline (`assistantStream.activeAttempt` of a `session/follow` snapshot,
+ * its compact records) as the live `assistant-stream` items the projector reads, so the text so far is shown and counted before the rest arrives.
+ */
+export function baselineItems(baseline) {
+  const a = baseline?.activeAttempt;
+  if (!a || !Array.isArray(a.stream)) return [];
+  const out = [];
+  const item = chunk => out.push({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: a.attemptId, index: out.length, chunk } });
+  for (const r of a.stream) {
+    if (r?.type === 'text-chunks') for (const text of r.texts ?? []) item({ type: 'text-delta', index: r.index, text });
+    else if (r?.type === 'reasoning-chunks') for (const text of r.texts ?? []) item({ type: 'reasoning-delta', index: r.index, text });
+    else if (r?.type === 'tool-call-chunks') for (const [n, argumentsDelta] of (r.args ?? []).entries()) item({ type: 'tool-call-delta', index: r.index, id: r.id, ...(n === 0 && r.name ? { name: r.name } : {}), argumentsDelta });
+    else if (r?.type === 'chunk' && r.chunk) item(r.chunk);
+  }
+  return out;
 }
 
 /** Whether a failure is the model server saying the conversation does not fit its window (its code, or the engine's own words). */

@@ -58,6 +58,21 @@ int main() {
     CHECK(pcie_auto_split_default(true, true, false, "1"));
     CHECK(pcie_auto_split_default(false, false, false, "1"));
     CHECK(pcie_auto_split_default(false, true, false, ""));   // empty = unset
+    // PcieAuto on HIP outside gfx12: on for a discrete gfx103x card, off for other parts, an integrated GPU and 026; =auto turns it on
+    // anywhere, any other value (old) leaves it off, empty = unset
+    CHECK(pcie_auto_hip_default("gfx1030", true, false, nullptr));
+    CHECK(pcie_auto_hip_default("gfx1031", true, false, nullptr));
+    CHECK(pcie_auto_hip_default("gfx1030:xnack-", true, false, nullptr));
+    CHECK(pcie_auto_hip_default("gfx1030", true, false, ""));
+    CHECK(!pcie_auto_hip_default("gfx1036", false, false, nullptr));   // Raphael iGPU
+    CHECK(!pcie_auto_hip_default("gfx1030", true, true, nullptr));
+    CHECK(!pcie_auto_hip_default("gfx1030", true, false, "old"));
+    CHECK(!pcie_auto_hip_default("gfx1030", true, false, "0"));
+    CHECK(!pcie_auto_hip_default("gfx1100", true, false, nullptr));
+    CHECK(!pcie_auto_hip_default("gfx1010", true, false, nullptr));
+    CHECK(!pcie_auto_hip_default(nullptr, true, false, nullptr));
+    CHECK(pcie_auto_hip_default("gfx1100", true, false, "auto"));
+    CHECK(pcie_auto_hip_default("gfx1036", false, true, "auto"));
     if (fails == 0) std::printf("pcie_share_rule_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

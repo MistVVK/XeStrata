@@ -223,6 +223,23 @@ Use the file names and the revision setup shows for your model (the revision abo
 Keep the file's original name. Setup finds the files in `--gguf-dir`, checks their SHA-256 and does not download them again; a file that does not match the published one is
 reported and, for files in your own folder, never deleted. Without `uvx`, `pip install -U huggingface_hub` gives the same `hf` command.
 
+### Installing a model from another program (`--output jsonl`)
+
+A program that installs a model for its user (`setup.py --yes --no-start --family F --model M --data-dir D`) can add `--output jsonl`. Setup then writes
+one JSON object per line to stdout and nothing else: its usual text, and the output of every program it runs, goes to stderr. The exit codes stay the same.
+Every object has `"schema_version": 1` and an `"event"`:
+
+| `event` | Other fields | Sent when |
+| --- | --- | --- |
+| `step` | `n`, `title` | a numbered step starts (`=== Step N: ... ===` in the text) |
+| `ok` | `message` | a check passed or a part is ready (an `[ok]` line) |
+| `warning` | `message` | setup goes on but says something (a `[!]` line) |
+| `progress` | `label`, `done_bytes`, `total_bytes` | during a download: at most once a second per file, and once at the end |
+| `error` | `message`, `hint` (or null), `exit_code`; `kind` for some stops | setup stops, just before it exits with `exit_code`. `kind` is `no_space` (with `path`, `free_bytes`, `needed_bytes`) when the disk is too full, `refused` when the install would need a download it may not make, `interrupted` after Ctrl+C |
+| `done` | `exit_code`, `run_config` | the last line of a run that ends by itself: `run_config` is the absolute path of the `strata-<model>.json` setup wrote (null if it wrote none) |
+
+New fields may be added to an event; a reader should ignore fields it does not know.
+
 ## Memory modes
 
 ### KV cache
@@ -614,6 +631,22 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   A started reply ends as `"length"`, and a second hit on the retry returns an error. `STRATA_NAN_GUARD=0` turns the check off;
   `STRATA_NAN_INJECT=<n>[,<n>...]` flags the n-th checked window to test the path. The one-shot command line and the
   Intel (SYCL) port do not check.
+  The Apple Metal port has no device kernel for it; after each head window it scans the window's logits rows in
+  unified memory from the host (`metal_scan_rows` in `src/core/verify.cpp`) and records the same fact. On an M1 Max
+  the scan costs about 60 microseconds a decode window, 0.2% of the window.
+  The origin of a real poisoning was found in the Metal port: the Mixture-of-Experts activations (`XS`, the gathered
+  input, and `HS`, the gated intermediate) are fp16, and a value outside fp16's range became `inf`. The expert
+  down-GEMM multiplies those activations by quantized weights that are legitimately zero, so `inf * 0` produced a
+  canonical NaN (`0x7fc00000`) in one token row's combined expert output. That row's residual, then every layer above
+  it, then the GDN scan state went NaN, and the window's logits with them - which is why the report named a different
+  layer each time, and why the magnitudes were all O(1) with no ramp. Every fp16 activation store on that path now
+  saturates to +/-65504 (`hsat` in `metal/kernels/moe_mm.metal`) and the combine drops a non-finite term instead of
+  summing it; both only differ from the old result where that result was already non-finite, so finite answers are
+  unchanged. Non-finite words are also cleared from the GDN scan state and conv history at every prompt chunk start,
+  on checkpoint restore and on checkpoint save, because those two buffers are part of the checkpoint and the parked
+  conversation and one bad value used to come back with every later turn. Four consecutive deep probes of 104,748
+  cold prompt tokens then finished with no non-finite logits and nothing to clear, where the previous build poisoned
+  on about seven of eight.
 
 ### Context and limits
 
@@ -883,7 +916,7 @@ endpoints are refused with an error that says so.
 
 | Request | What Strata does |
 | --- | --- |
-| `input` as a string or items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)` |
+| `input` as a string or items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)`, Codex multi-agent v2's `agent_message` (a worker's task and its answer, as user messages; another server's encrypted payload is named as unreadable) and `multi_agent_call(_output)` |
 | `instructions` | The system message (with leading `developer` messages) |
 | `tools` | `function`, `namespace` and `custom` tools. Hosted tools (`web_search`, `file_search`, ...) are left out because the model cannot run them |
 | `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
@@ -962,6 +995,18 @@ after a change.
   cut with a note. Stop stops a running tool too.
 - Only the chat page uses them. API clients see the API exactly as before and keep their own tools. A request to
   `/v1/chat/completions` opts in with `"strata_mcp": true`.
+
+**A tool server that needs a key.** Settings → Tools → Add tool server connects to a web address (http:// or https://) or starts
+a program. For a web address it sends no extra headers; the "Extra settings" lines are for a program only. When your server
+expects a key in a header (MCP Proxy and most hosted servers do), add the server to the model instead: Models → your model →
+Expert settings → Add tool server, then put the header under Credentials & environment, for example:
+
+```json
+{"proxy": {"url": "http://127.0.0.1:8096/mcp", "headers": {"Authorization": "Bearer <your key>"}}}
+```
+
+The chat and the coding assistant on that model can then use its tools. The key stays in that model's settings on this
+computer; after saving, it is shown masked.
 
 **Security.** MCP tools run on your PC with your user's rights, and the model decides when to call them, also because of what
 it reads (a web page or file can contain instructions). Give a filesystem server only the folders it needs, prefer read-only
@@ -1053,7 +1098,7 @@ bits of the answer: a switch that changes rounding can change a greedy answer at
 | --- | --- | --- | --- |
 | `STRATA_PREFILL_CPU_SHARE` (`auto`, cap `STRATA_PREFILL_CPU_SHARE_MAX=1024`) | CUDA, one GPU, no `--batch`, prompt chunks under 1,024 tokens | `STRATA_PREFILL_CPU_SHARE=0` | The CPU pool computes the experts few of the chunk's tokens route to, while the GPU works on the rest. `auto` measures per layer how long each side takes and checks that sharing pays. Skipped with one log line when RAM or commit is short. Output changes in the last bits. Layer split, batch slots and HIP keep it off unless you set it. |
 | `STRATA_ROUTE_TAIL_SKIP` (7) | CUDA, and HIP gfx1200/gfx1201; one GPU or a layer split | `STRATA_ROUTE_TAIL_SKIP=0` | A missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed. Not applied when every expert is in VRAM, with `--batch` slots, with a peer tier or helper GPU, on other HIP and SYCL, or when 90% or more of the experts are cached (`STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line; it is 60% on an AMD layer split). Answers differ slightly from a run without it. |
-| PCIe share from the CPU's speed | CUDA, one GPU or a layer split, no `--pcie-frac` | `--pcie-frac N` always wins; `STRATA_PCIE_FRAC_DEFAULT=old` keeps the probe-only rule; `STRATA_PCIE_AUTO_SPLIT=0` keeps the fixed probe share on a CUDA layer split; `STRATA_PCIE_K_RULE=0` and `STRATA_PCIE_SHARE_MAX=0.60` keep the 0.2.10 rule | The share starts at the probe's value and is refined in the first decode windows from the CPU pool's time per missed expert: `L / (L + k R)`, rounded to 0.05 and kept between 0.10 and 0.95, changed at most three times. k is 1.85 from a pool rate R of 30 GB/s of expert bytes and falls linearly to 0.8 at 12 GB/s (a weak pool is compute-bound), so a strong pool gets exactly the 0.2.10 shares (below 0.60) and a weak one up to 0.95. A CUDA layer split refines each stage by its own probed link. Integrated GPUs (Strix Halo and the other APUs) and `STRATA_DEFAULTS=026` keep k 1.85 and 0.60; on HIP the layer-split refinement stays opt-in (`STRATA_PCIE_AUTO_SPLIT=1`). Each change prints a `PCIe share:` line. On HIP it is the default for gfx1200/gfx1201; `STRATA_PCIE_FRAC_DEFAULT=auto` turns it on for other HIP parts. Measured on an RTX PRO 6000 (12 GB free): 2 x 12 GB layer split +12% decode; one card with 4 pool workers 56 -> 79 tok/s, 2 workers 31 -> 63, 32 workers unchanged. Output changes in the last bits (first-window KL 0.03 on the decode-window yardstick, the same as the single-card rule). |
+| PCIe share from the CPU's speed | CUDA, one GPU or a layer split, no `--pcie-frac` | `--pcie-frac N` always wins; `STRATA_PCIE_FRAC_DEFAULT=old` keeps the probe-only rule; `STRATA_PCIE_AUTO_SPLIT=0` keeps the fixed probe share on a CUDA layer split; `STRATA_PCIE_K_RULE=0` and `STRATA_PCIE_SHARE_MAX=0.60` keep the 0.2.10 rule | The share starts at the probe's value and is refined in the first decode windows from the CPU pool's time per missed expert: `L / (L + k R)`, rounded to 0.05 and kept between 0.10 and 0.95, changed at most three times. k is 1.85 from a pool rate R of 30 GB/s of expert bytes and falls linearly to 0.8 at 12 GB/s (a weak pool is compute-bound), so a strong pool gets exactly the 0.2.10 shares (below 0.60) and a weak one up to 0.95. A CUDA layer split refines each stage by its own probed link. Integrated GPUs (Strix Halo and the other APUs) and `STRATA_DEFAULTS=026` keep k 1.85 and 0.60; on HIP the layer-split refinement stays opt-in (`STRATA_PCIE_AUTO_SPLIT=1`). Each change prints a `PCIe share:` line. On HIP it is the default for gfx1200/gfx1201 and for a discrete gfx103x card (RX 6000, #4007); `STRATA_PCIE_FRAC_DEFAULT=auto` turns it on for other HIP parts. Measured on an RTX PRO 6000 (12 GB free): 2 x 12 GB layer split +12% decode; one card with 4 pool workers 56 -> 79 tok/s, 2 workers 31 -> 63, 32 workers unchanged. Output changes in the last bits (first-window KL 0.03 on the decode-window yardstick, the same as the single-card rule). |
 | Chunk follows the host's memory | Linux file tier | `STRATA_PREFILL_HOST_PLAN=0` | See [Linux file tier](#linux-file-tier). |
 | Fused int8 prompt experts | gfx12 (R9700): IQ3_S and IQ3_XXS packs. 12.0 NVIDIA cards with 80 or more SMs: IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS gate/up | `STRATA_PF_FUSED=0` | Replaces the MMQ prompt kernels. `STRATA_PF_FUSED=1` opts in every covered format on other cards (on HIP gfx11 and gfx1200/gfx1201 too; see [AMD_HIP.md](AMD_HIP.md)). |
 | Bare `--prefill auto` takes 32768-token chunks (16384 up to 0.2.10) | gfx12, Linux, one card | `STRATA_GFX12_CHUNK=0` (8192) or `=16` (16384), or `STRATA_GFX12_DEFAULTS=0` | An explicit `--prefill N`, `auto:N` or `STRATA_PREFILL_AUTO_MAX` is untouched. A 20K prompt is one chunk instead of 16384 + a tail (R9700, IQ3_S: 20K +12%, 32K +1.3%, 64K +2.6%; UD-Q4_K_XL 20K +26%); first-token KL against 16384 is at most 5e-5. The loan of cache slots is taken only for what a prompt needs; when the RAM left does not cover it the ceiling steps down to 16384, then 8192. |

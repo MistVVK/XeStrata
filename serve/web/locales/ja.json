@@ -109,6 +109,7 @@
   "group.today": "今日",
   "group.week": "過去 7 日",
   "group.yesterday": "昨日",
+  "header.github": "GitHub の Strata",
   "hist.editAnswer": "回答を編集",
   "hist.editAnswerTitle": "回答の文章を直します。リクエストは送られません。",
   "hist.editLabel": "回答を編集",

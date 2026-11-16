@@ -423,14 +423,16 @@ def orphans_of(engine_exe: str) -> list[Ident]:
                 continue
             if not same_file(p.exe(), engine_exe):
                 continue
-            parent = p.info.get("ppid")
+            parent, started = p.info.get("ppid"), p.info.get("create_time")
+            if parent is None or started is None:
+                continue                              # #3789: its parent or start time could not be read: not provably an orphan, left alone
             if parent in mine:
                 continue                              # started by this server (or by a process above it)
             if parent and parent != 1:
                 try:
                     q = psutil.Process(parent)
                     adopted = q.name().lower() in INIT_NAMES      # an init that adopts orphans did not start it
-                    if not adopted and q.create_time() <= p.info["create_time"] + 1.0                             and q.status() != psutil.STATUS_ZOMBIE:
+                    if not adopted and q.create_time() <= started + 1.0                             and q.status() != psutil.STATUS_ZOMBIE:
                         continue                      # a live parent started it: not an orphan
                 except psutil.NoSuchProcess:
                     pass

@@ -13,6 +13,11 @@ interface Rule { kind: string; match: RegExp; message: string | ((m: RegExpMatch
 const MEMORY = 'The model stopped while starting, most likely because the PC ran low on memory.';
 const MEMORY_NEXT = 'Close other programs and try again, or choose “Leave room for my work”. In Expert mode you can also turn on the low-RAM option, so part of the model is read from the SSD.';
 
+const ENGINE_STOPPED = 'The model stopped while it was answering.';
+const ENGINE_STOPPED_NEXT = 'Send your message again. Strata starts the model again by itself. If it keeps happening, open Details and share them when you ask for help.';
+const ENGINE_PROBLEM = 'The model ran into a problem while answering.';
+const ENGINE_PROBLEM_NEXT = 'Send your message again. If it keeps happening, open Details and share them when you ask for help.';
+
 /** Order matters: the first rule that matches wins. */
 const RULES: Rule[] = [
   // A DeepSeek model of an earlier Strata (strata_control/retired.py, the owner's words of 11-11): Control's own sentences, with the model's name and where
@@ -20,6 +25,14 @@ const RULES: Rule[] = [
   // [DRAFT] translations: these sentences stay English in every language (no locale key yet) until the owner has read the wording list; then
   // the next step and the two templated sentences get keys in the nine bundles.
   { kind: 'deepseek-retired', match: /(\S.*? is a DeepSeek model\. This version of Strata no longer runs DeepSeek models, so it was not started\.(?: Its files are still on this computer: .+? in .+?\. Nothing was changed or deleted\.)?)/, message: m => m[1], next: 'Choose a Qwen model to run instead. If you no longer need the DeepSeek files, you can delete that folder to free the space.' },
+  // The engine stopped while it was answering, and strata serve restarts it on the next request (EngineDied, a fatal ERR line such as a
+  // verify timeout): its texts said 'timed out' or carried an exit code, so the rules below took them for a download without internet
+  // or a crash at start (coordinator's review of 11-16; wording approved then). Ahead of those rules; the engine's line stays under Details.
+  // It also matches its own sentence, because the chat keeps the sentence and ErrorNotice reads it again.
+  // [DRAFT] translations: English in every language until the owner's wording list is translated (as the DeepSeek sentences above).
+  { kind: 'engine-stopped-answering', match: /the next request restarts it|stopped while this request waited|The model stopped while it was answering\./i, message: ENGINE_STOPPED, next: ENGINE_STOPPED_NEXT },
+  // A chat error that is an engine's own line no rule knows (see chatFailure): its own sentence, matched again when ErrorNotice reads it.
+  { kind: 'engine-error-answering', match: /^The model ran into a problem while answering\.$/, message: ENGINE_PROBLEM, next: ENGINE_PROBLEM_NEXT },
   // The host names the files it could not find (#3478). The sentence with the names is a template in every language: tr() fills it.
   { kind: 'model-files-missing', match: /Some model files are missing: (.+?)\. Use Download/i, message: m => `These model files are missing: ${m[1]}.`, next: 'Press Download & load again to fetch them. Files that are already there are kept. If the same files are listed again, open Details and share them when you ask for help.' },
   { kind: 'tunnel-own-running', match: /Strata’s tunnel for this address is already running \(PID/i, message: 'Strata’s tunnel for this address is already running.', next: 'Stop it first, or use it as it is, then connect again here.' },
@@ -47,7 +60,7 @@ const RULES: Rule[] = [
   { kind: 'start-failed', match: /server_exited|engine stopped|exited before|died before/i, message: 'The model stopped while starting.', next: 'Try again. If it keeps happening, open Details and share them when you ask for help.' },
   { kind: 'slow-load', match: /loading took more than/i, message: 'Loading is taking too long.', next: 'The PC may be short on memory. Close other programs and try again.' },
   { kind: 'engine-missing', match: /no engine for this pc|engine component|never downloads an engine|engine .*not installed|no strata engine/i, message: 'Strata’s engine for this computer isn’t installed yet.', next: 'It is added when you download a model. Download your model again to add it.' },
-  { kind: 'network', match: /cannot reach|could not reach|can't reach|timed out|econn|enotfound|getaddrinfo|urlopen|connection (?:reset|refused|aborted)|network is unreachable/i, message: 'The download couldn’t reach the internet.', next: 'Check your connection, then press Resume download.' },
+  { kind: 'network', match: /cannot reach|could not reach|can't reach|could not resolve host|timed out|econn|enotfound|getaddrinfo|urlopen|connection (?:reset|refused|aborted)|network is unreachable/i, message: 'The download couldn’t reach the internet.', next: 'Check your connection, then press Resume download.' },
   { kind: 'integrity', match: /sha-?256|checksum|does not match|did not match|hash mismatch|safety check/i, message: 'A downloaded file didn’t pass Strata’s safety check.', next: 'Press Resume download and Strata will fetch it again.' },
   { kind: 'assistant-missing', match: /agent component|deepseek harness|component-missing|harness .*not (?:installed|found)/i, message: 'The coding assistant isn’t installed on this computer yet.', next: 'Chat works without it.' },
   { kind: 'control', match: /strata control (?:could not start|did not answer|stopped)|control did not answer/i, message: 'Strata couldn’t read its own components.', next: 'Close and reopen Strata. If this keeps happening, reinstall the app.' },
@@ -84,12 +97,26 @@ function unwrapErrorPayload(text: string): string {
     // FastAPI and the host both use `detail`/`error`/`message`, and `detail`
     // is itself sometimes an object with a `message`.
     const detail = parsed.detail;
-    const candidate = [parsed.error, parsed.message, typeof detail === 'string' ? detail : (detail as Record<string, unknown> | undefined)?.message]
+    // OpenAI-shaped bodies (strata serve, the Responses API) carry {"error": {"type", "message"}}: the message inside is the sentence.
+    const inner = parsed.error && typeof parsed.error === 'object' ? (parsed.error as Record<string, unknown>).message : undefined;
+    const candidate = [parsed.error, inner, parsed.message, typeof detail === 'string' ? detail : (detail as Record<string, unknown> | undefined)?.message]
       .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
     return candidate ? candidate.trim() : text;
   } catch {
     return text;
   }
+}
+
+/**
+ * A failure that ended a chat reply. As plainFailure, except that an engine's own line no rule knows (it starts with a lower-case word,
+ * after an optional 5xx status: "prefill: the PLE rows' upload failed: unspecified launch failure") becomes one plain sentence with a next
+ * step; the line itself goes under Details. A sentence written for people (a provider's "Insufficient balance.") is shown as it is.
+ */
+export function chatFailure(raw: string | null | undefined): PlainFailure {
+  const f = plainFailure(raw);
+  if (f.kind !== 'plain') return f;
+  const text = unwrapErrorPayload(String(raw ?? '').trim());
+  return /^(?:(?:HTTP\s+)?5\d\d\b:?\s*)?[a-z]/.test(text) ? { kind: 'engine-error-answering', message: ENGINE_PROBLEM, next: ENGINE_PROBLEM_NEXT, detail: text } : f;
 }
 
 /** Translated copy of a failure, ready to show. */

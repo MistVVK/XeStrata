@@ -35,7 +35,8 @@ REPO = Path(__file__).resolve().parents[1]
 VARIANTS = {
     # variant: (CUDA version, archs, min driver, extra configure arguments)
     "cuda13": ("13.0", (75, 86, 89, 120), "580.65", []),
-    "cuda12": ("12.9", (60, 61, 70, 75, 80, 86, 89), "576.02", ["-DSTRATA_EXPERIMENTAL_SM60=ON"]),
+    # cuda12: 120 before 89, so the PTX (for the last arch) stays compute_89 while a Blackwell card gets machine code (#5784)
+    "cuda12": ("12.9", (60, 61, 70, 75, 80, 86, 120, 89), "576.02", ["-DSTRATA_EXPERIMENTAL_SM60=ON"]),
 }
 VCVARS = [Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / r"Microsoft Visual Studio\2022\BuildTools",
           Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / r"Microsoft Visual Studio\2022\Community",

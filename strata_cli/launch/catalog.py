@@ -365,10 +365,9 @@ class Catalog:
         vram = comp.main_vram_gb
         rec = self.recommendation(hw)
         out: list[ModelRow] = []
-        own = self.strata.own_families()                # Qwen3.6 is listed for the app; the Terminal's launch list is Flash-Next's
+        # #5869: every family of the shared table, Qwen3.6-35B-A3B (an engine path of its own) included, as the app lists them: its rows
+        # are a group of their own (family_title), the Flash-Next rows are as before
         for fam in self.strata.model_table(hw):
-            if fam["family"] in own:
-                continue
             for size in fam["sizes"]:
                 f = fit_on(size, hw.get("ram_gb"), vram)
                 cat, words = verdict(size.get("on_this_pc"))
@@ -428,20 +427,31 @@ class Catalog:
         """The folder a model's files are in under `base/models`. setup.py names it with the case kept (`models/IQ3_S`), the run-config tag is
         lower case (`iq3_s`): on a case-sensitive disk the two are different folders, so the one that exists wins, and a folder that differs
         only in case is found (#3996). When none exists yet it is setup's own name, because that is where the download will go."""
+        return self.model_folder_trace(base, family, model)["folder"]
+
+    def model_folder_trace(self, base: Path, family: str, model: str) -> dict:
+        """model_folder's lookup with its steps (#4887, `strata models explain`): {"folder", "rule", "tried": [{"path", "rule", "exists"}]}. rule: "exact" (setup's
+        spelling), "lower" (the run-config tag), "case" (a folder that differs only in letter case) or "fallback" (none is there: setup's spelling, where a download goes)."""
         _m, families, _c, _s = self.tables()
         models = Path(base) / "models"
         own = models / (families[family].get("tag", "") + model)
         lower = models / self.tag_of(family, model)
-        for candidate in (own, lower):
-            if candidate.is_dir():
-                return candidate
+        tried = []
+        for candidate, rule in ((own, "exact"), (lower, "lower")):
+            if any(t["path"] == candidate for t in tried):
+                continue                                     # (a tag that is lower case already: one folder)
+            here = candidate.is_dir()
+            tried.append({"path": candidate, "rule": rule, "exists": here})
+            if here:
+                return {"folder": candidate, "rule": rule, "tried": tried}
         try:
             for entry in models.iterdir():
                 if entry.name.lower() == lower.name and entry.is_dir():
-                    return entry
+                    tried.append({"path": entry, "rule": "case", "exists": True})
+                    return {"folder": entry, "rule": "case", "tried": tried}
         except OSError:
             pass
-        return own
+        return {"folder": own, "rule": "fallback", "tried": tried}
 
     def kv_gb(self, tokens: int, kv: str = "int8") -> float:
         """The conversation memory for this many tokens, in GB (setup.py's UD_FIT_KV_BYTES: 13 attention layers)."""

@@ -113,6 +113,12 @@ kernel void mm_clear(device int* srt_tok [[buffer(0)]], constant uint& n [[buffe
     if (gid < n) srt_tok[gid] = -1;
 }
 
+// Saturating fp16 store for the expert activations.  A value outside fp16's range becomes +/-inf, and the down-GEMM
+// multiplies these activations by quantized weights that are legitimately zero, so inf * 0 = NaN poisoned a whole
+// token row's MoE output (observed: yr non-finite on a single real row, then the residual, then every layer above).
+// Saturating keeps a wrong-but-finite value, which cannot poison anything.
+static inline half hsat(float v) { return half(clamp(v, -65504.0f, 65504.0f)); }
+
 // ---- the GEMMs -----------------------------------------------------------------------------------------------------
 // weights of one expert: gate at W + gate_off + e * gu_stride (+ up_off for up), down at W + down_off + e * d_stride
 struct MmArgs {
@@ -245,7 +251,12 @@ kernel void mm_combine(device const float* YE [[buffer(0)]], device const int* p
     float s = 0.0f;
     for (uint k = 0; k < a.z; ++k) {
         const int r = pos[t * a.z + k];
-        s = fma(srt_w[r], YE[ulong(r) * a.y + d], s);
+        const float wv = srt_w[r], ev = YE[ulong(r) * a.y + d];
+        // This is where the poison below has been measured to be born (yr non-finite on a single real token row).
+        // A non-finite weight or expert output is already garbage, so dropping that term keeps the request alive
+        // with one expert's contribution missing instead of turning one token into a NaN that costs the prompt.
+        // The compare only ever discards non-finite terms, so finite results are bit-identical.
+        if (isfinite(wv) && isfinite(ev)) s = fma(wv, ev, s);
     }
     y[gid] = s;
 }
@@ -266,7 +277,7 @@ kernel void mm_gather(device const float* x [[buffer(0)]], device const int* srt
                       uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     const int t = srt_tok[tg.x];
     device half* o = XS + ulong(tg.x) * n;
-    for (uint k = tid; k < n; k += 256) o[k] = t >= 0 ? half(x[ulong(t) * n + k]) : half(0.0f);
+    for (uint k = tid; k < n; k += 256) o[k] = t >= 0 ? hsat(x[ulong(t) * n + k]) : half(0.0f);
 }
 
 // The SSD-streaming arena (as in moe.metal): with function constant 20, expert e's slot is smap[e] in the chunks W,
@@ -339,7 +350,7 @@ kernel void mm_gu2(device const uchar* W [[buffer(0)]], device const half* XS [[
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int it = tid; it < TM * TN; it += NTH) {
         const int m = it / TN, f = it - m * TN;
-        HS[ulong(row0 + m) * a.n_ff + f0 + f] = half(ot[it]);
+        HS[ulong(row0 + m) * a.n_ff + f0 + f] = hsat(ot[it]);
     }
 }
 
@@ -403,8 +414,10 @@ MMGU2(T_IQ4_XS, 16, 64, 32, 2) MMGU2(T_IQ4_XS, 16, 64, 64, 2) MMGU2(T_IQ4_XS, 32
 MMGU2(T_IQ4_XS, 64, 64, 32, 4)
 MM_GU2_SET(T_Q2_0) MM_GU2_SET(T_IQ3_XXS) MM_GU2_SET(T_IQ2_XXS) MM_GU2_SET(T_IQ2_XS) MM_GU2_SET(T_IQ2_S) MM_GU2_SET(T_IQ3_S)
 MM_GU2_SET(T_TQK6) MM_GU2_SET(T_TQ2T)   // Gyro: the trellis gate/up (units of 16 weights: TK 16 or a multiple)
+MM_GU2_SET(T_TQP5) MM_GU2_SET(T_TQP6) MM_GU2_SET(T_TQP7)   // the pair trellis gate/up (same 16-weight units)
 MM_DN2_SET(T_Q2_0)
 MM_DN2_SET(T_TQK7) MM_DN2_SET(T_TQ2T)
+MM_DN2_SET(T_TQP5) MM_DN2_SET(T_TQP6) MM_DN2_SET(T_TQP7)
 MMDN2(T_IQ4_NL, 16, 64, 32, 2) MMDN2(T_IQ4_NL, 16, 64, 64, 2) MMDN2(T_IQ4_NL, 16, 32, 32, 2) MMDN2(T_IQ4_NL, 32, 32, 32, 2) MMDN2(T_IQ4_NL, 16, 128, 32, 4)
 
 // ---- v3: the weights decoded straight into matmul2d's right-input cooperative tensor (single-simdgroup scope),
@@ -532,6 +545,36 @@ template <> struct W4<T_IQ4_NL> {   // 32 a block: d, 16 bytes; low nibbles are 
     }
 };
 
+// ---- the pair trellis (TQP5 / TQP6 / TQP7, ggml 147 / 148 / 149) --------------------------------------------------
+// A 128-value block is 64 steps of 2 weights; the lane's run k .. k + 3 is steps (k >> 1) and (k >> 1) + 1, so the
+// two states share one 16-bit window read (the pair trellis's whole point).  Step t's state: the 16 stream bits from
+// bit (63 - t)*K, LSB-first, circular over 4*K u16 words; the weight pair is lut[(s & 0x7fff) * 0x9e3779b1 >> 21]
+// as an fp16 pair, times d.  Same arithmetic as quant.metal's deq_tqp and the fork's tq.cuh.
+template <int KB, int BB>
+static inline half2 tqp_pair(device const uchar* b, int t, threadgroup const uint* tab) {
+    device const ushort* qs16 = (device const ushort*)(b + 2);
+    constexpr int NW = 4 * KB;
+    const int off = (63 - t) * KB, wb = off >> 4, r = off & 15;
+    const int wi1 = wb + 1 >= NW ? wb + 1 - NW : wb + 1;
+    const int wi2 = wb + 2 >= NW ? wb + 2 - NW : wb + 2;
+    ulong v = ulong(qs16[wb]) | (ulong(qs16[wi1]) << 16) | (ulong(qs16[wi2]) << 32);
+    v >>= r;
+    const uint s = uint(v) & TQ_STATE_MASK;
+    const uint x = s * 0x9e3779b1u;
+    return as_type<half2>(g_tq(tab, x >> 21));
+}
+template <int KB, int BB> struct W4Tqp {
+    static inline half4 run(device const uchar* row, int k, threadgroup const uint* tab) {
+        device const uchar* b = row + (k >> 7) * BB;
+        const float d = rdh(b);
+        const int t = (k & 127) >> 1;
+        const half2 a = tqp_pair<KB, BB>(b, t, tab), c = tqp_pair<KB, BB>(b, t + 1, tab);
+        return half4(half2(a * d), half2(c * d));
+    }
+};
+template <> struct W4<T_TQP5> { static inline half4 run(device const uchar* row, int k, threadgroup const uint* tab) { return W4Tqp<5, 42>::run(row, k, tab); } };
+template <> struct W4<T_TQP6> { static inline half4 run(device const uchar* row, int k, threadgroup const uint* tab) { return W4Tqp<6, 50>::run(row, k, tab); } };
+template <> struct W4<T_TQP7> { static inline half4 run(device const uchar* row, int k, threadgroup const uint* tab) { return W4Tqp<7, 58>::run(row, k, tab); } };
 // W8<F>: the runs k .. k + 3 and k + 16 .. k + 19 of a row (k % 32 < 16): one 32-group, so the per-group fields (scale,
 // sign word) are read once.  The generic one is two W4.
 // ---- the K-quant / legacy-quant W4 decoders (the UD-Q4/5/6_K_XL packs' experts): values k .. k + 3 (k % 4 == 0)
@@ -984,7 +1027,7 @@ kernel void mm_gu3(device const uchar* W [[buffer(0)]], device const half* XS [[
     simdgroup_barrier(mem_flags::mem_threadgroup);
     for (int it = lane; it < TM * TN; it += 32) {
         const int m = it / TN, f = it - m * TN;
-        HS[ulong(row0 + m) * a.n_ff + n0 + f] = half(ot[sg][it]);
+        HS[ulong(row0 + m) * a.n_ff + n0 + f] = hsat(ot[sg][it]);
     }
 }
 
@@ -1051,10 +1094,12 @@ kernel void mm_down3(device const uchar* W [[buffer(0)]], device const half* HS 
 #define MM3_DN(F) MMDN3(F, 16, 64, 32, 2) MMDN3(F, 16, 32, 32, 4) MMDN3(F, 32, 64, 32, 2) MMDN3(F, 16, 64, 64, 2) \
     MMDN3(F, 16, 32, 16, 2) MMDN3(F, 32, 32, 32, 2) MMDN3(F, 16, 64, 32, 1) MMDN3(F, 16, 64, 32, 4)     MMDN3(F, 16, 64, 16, 2) MMDN3(F, 16, 32, 16, 4) MMDN3(F, 16, 64, 32, 5) MMDN3(F, 16, 64, 16, 4)
 MM3_GU(T_Q4_K) MM3_GU(T_Q5_K) MM3_GU(T_Q6_K) MM3_GU(T_Q8_0) MM3_GU(T_IQ4_XS) MM3_GU(T_Q2_0) MM3_GU(T_IQ3_XXS) MM3_GU(T_IQ2_XXS) MM3_GU(T_IQ2_XS) MM3_GU(T_IQ2_S) MM3_GU(T_IQ3_S)
+MM3_GU(T_TQP5) MM3_GU(T_TQP6) MM3_GU(T_TQP7)   // the pair trellis on the register-operand chain (COOP_K4)
 MM3_DN(T_Q2_0) MM3_DN(T_IQ4_NL) MM3_DN(T_Q5_1) MM3_DN(T_Q5_0) MM3_DN(T_Q8_0)
 #ifdef STRATA_KQ_DOWN
 MM3_DN(T_Q4_K) MM3_DN(T_Q5_K) MM3_DN(T_Q6_K) MM3_DN(T_Q3_K) MM3_DN(T_IQ4_XS) MM3_DN(T_IQ3_S)
 #endif
+MM3_DN(T_TQP5) MM3_DN(T_TQP6) MM3_DN(T_TQP7)
 
 // mm_gu4: mm_gu3 with each decoded right operand (TN x TK weights of gate and of up) applied to MS 16-row token
 // tiles (a tile of 16 * MS rows from the plan, tm = 16 * MS): the decode, which bounds mm_gu3, is shared by MS times
@@ -1130,7 +1175,7 @@ kernel void mm_gu4(device const uchar* W [[buffer(0)]], device const half* XS [[
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (int it = lane; it < TM * TN; it += 32) {
             const int m = it / TN, f = it - m * TN;
-            HS[ulong(row0 + s * TM + m) * a.n_ff + n0 + f] = half(ot[sg][it]);
+            HS[ulong(row0 + s * TM + m) * a.n_ff + n0 + f] = hsat(ot[sg][it]);
         }
     }
 }
@@ -1210,7 +1255,7 @@ kernel void mm_gu5(device const uchar* W [[buffer(0)]], device const half* XS [[
     simdgroup_barrier(mem_flags::mem_threadgroup);
     for (int it = lane; it < TM * TN; it += 32) {
         const int m = it / TN, f = it - m * TN;
-        HS[ulong(row0 + m) * a.n_ff + n0 + f] = half(ot[sg][it]);
+        HS[ulong(row0 + m) * a.n_ff + n0 + f] = hsat(ot[sg][it]);
     }
 }
 #define MMGU5_(F, N, S) template [[host_name("mm_gu5_" #F "_" #N "_" #S)]] kernel decltype(mm_gu5<F, N, S>) mm_gu5<F, N, S>;
@@ -1354,7 +1399,7 @@ kernel void mm_gu6(device const uchar* W [[buffer(0)]], device const half* XS [[
         simdgroup_barrier(mem_flags::mem_threadgroup); \
         for (int it = lane; it < TM * TN; it += 32) { \
             const int m = it / TN, f = it - m * TN; \
-            HS[ulong(row0 + S * 16 + m) * a.n_ff + n0 + f] = half(ot[sg][it]); \
+            HS[ulong(row0 + S * 16 + m) * a.n_ff + n0 + f] = hsat(ot[sg][it]); \
         } \
     }
     MM6_OUT(0, accg0, accu0)

@@ -11,6 +11,7 @@
 #include <sycl/ext/intel/experimental/cache_control_properties.hpp>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <atomic>
 #include <unordered_map>
 #include <mutex>
@@ -128,27 +129,53 @@ inline bool doorbell_plain_payload() {
 // its window waits are the xe kind (expected to expire, so 20,000 reads), EXCEPT in a run that drafts without the MTP
 // layer (--spec N, no --mtp): the suffix drafter's own waits have to complete there, and 20,000 reads left it empty-handed
 // (0 drafts, 21.8 vs 68.8 tok/s, #1473). generate calls spin_drafts_need_long_bound(true) for such a run, before any
-// launch. A Linux xe card keeps 20,000 in every mode (unchanged).
+// launch. A Linux xe card keeps 20,000 only while the host is never asked: see spin_host_waits_expected below (1,000,000 as soon as
+// a stage has experts the device plan reads from host memory or the CPU serves).
 inline std::atomic<bool>& spin_long_drafts_flag() { static std::atomic<bool> f{false}; return f; }
 inline void spin_drafts_need_long_bound(bool on) { spin_long_drafts_flag() = on; }
+// The short xe bound above assumes the card never waits on the host (every expert resident, or the device plans the layer:
+// the wait only spins in a failure).  A verify window that does ask the host for its plan and the CPU's rows - experts
+// served by the CPU pool, no device plan - waits for them at every layer, and a host that is a few tens of ms late (a
+// multi-row MTP window, few resident experts, a busy CPU) outlasts 20,000 reads: the GPU then went on with the previous
+// layer's plan.  The verifier says so before its first launch, and xe gets 1,000,000 reads.
+inline std::atomic<bool>& spin_host_waits_flag() { static std::atomic<bool> f{false}; return f; }
+inline void spin_host_waits_expected(bool on) { if (on) spin_host_waits_flag() = true; }
+// The bound is NOT cached for the xe/Battlemage cases that depend on a process-wide flag: the verifier raises the flag when its
+// constructor finds non-resident experts, and a launch of an earlier component (prefill, a warm-up) on the same device used to
+// freeze the short 20,000-read bound for the rest of the process (a --layer-split run: stage 1's waits on the host expired at
+// --max-context 65536 although the flag was set by then). A change of the bound for a device is logged once.
+// The choice itself, a pure function of what it depends on (spin_bound_test.cpp tests it without a queue or a device):
+//   env_override  STRATA_SPIN_MAX when it is a positive number, else 0
+//   driver        intel_gpu_driver(): "xe", "i915" or "" (no sysfs driver: Windows, OpenCL)
+//   battlemage    the device is a B-series card (only asked when there is no driver name)
+//   host_waits    spin_host_waits_flag(): a stage waits for the host (CPU-served experts, device plan with non-resident experts)
+//   long_drafts   spin_long_drafts_flag(): a --spec run without the MTP layer
+inline uint32_t spin_bound_for(long env_override, const std::string& driver, bool battlemage, bool host_waits, bool long_drafts) {
+    if (env_override > 0) return (uint32_t) env_override;
+#ifdef STRATA_SYCL_SPIN_MAX
+    (void) driver; (void) battlemage; (void) host_waits; (void) long_drafts;
+    return STRATA_SYCL_SPIN_MAX;
+#else
+    if (driver == "xe") return host_waits ? 1000000u : 20000u;
+    if (driver.empty() && battlemage) return long_drafts ? 2000000u : 20000u;
+    return 2000000u;
+#endif
+}
 inline uint32_t spin_max(const sycl::queue& q) {
     static std::mutex mu;
-    static std::unordered_map<sycl::device, uint32_t> cache;
+    static std::unordered_map<sycl::device, uint32_t> cache;   // the last bound handed out, for the log line only
     const sycl::device d = q.get_device();
     std::lock_guard<std::mutex> lk(mu);
+    const char* e = std::getenv("STRATA_SPIN_MAX");
+    const std::string drv = intel_gpu_driver();
+    const uint32_t v = spin_bound_for(e ? std::atol(e) : 0, drv, drv.empty() && intel_gpu_gen(d) == IntelGpuGen::Battlemage,
+                                      spin_host_waits_flag().load(), spin_long_drafts_flag().load());
     auto it = cache.find(d);
-    if (it != cache.end()) return it->second;
-    uint32_t v;
-    if (const char* e = std::getenv("STRATA_SPIN_MAX"); e && std::atol(e) > 0) v = (uint32_t) std::atol(e);
-#ifdef STRATA_SYCL_SPIN_MAX
-    else v = STRATA_SYCL_SPIN_MAX;
-#else
-    else if (intel_gpu_driver() == "xe") v = 20000u;
-    else if (intel_gpu_driver().empty() && intel_gpu_gen(d) == IntelGpuGen::Battlemage)
-        v = spin_long_drafts_flag().load() ? 2000000u : 20000u;
-    else v = 2000000u;
-#endif
-    cache.emplace(d, v);
+    if (it == cache.end() || it->second != v) {
+        if (it != cache.end() || std::getenv("STRATA_SPIN_LOG") != nullptr)
+            std::fprintf(stderr, "strata: GPU wait bound %u reads on a device%s\n", v, it == cache.end() ? "" : " (changed)");
+        cache[d] = v;
+    }
     return v;
 }
 }  // namespace strata

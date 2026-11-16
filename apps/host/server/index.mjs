@@ -53,7 +53,7 @@ import { detectBackend, currentBackend, streamChat, inferenceLine } from './infe
 import { CONTEXT_TOKENS, VARIANTS, localModels, variant } from './catalog.mjs';
 import { browseLocalModels, inspectLocalModel } from './local-models.mjs';
 import { keepStreamAlive } from './stream-beat.mjs';
-import { EventHub, badRequest, error, json, readBody, readRaw, requestUrl, sameSecret, uid } from './util.mjs';
+import { EventHub, InvalidJsonError, badRequest, error, json, readBody, readRaw, requestUrl, sameSecret, uid } from './util.mjs';
 import { createUploads } from './chat-uploads.mjs';
 import { createNativeDrops } from './native-drop.mjs';
 import { createVisionProbe, effectiveVision, readsPicturesByDefault } from './vision-probe.mjs';
@@ -80,11 +80,12 @@ import { listEngines, changeEngine } from './engine-library.mjs';
 import { forbidden as acquisitionForbidden } from './acquisition.mjs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { nativeGateway } from './native-gateway.mjs';
+import { nativeModelEntries } from './native-models.mjs';
 import { proxyCompletion } from './inference.mjs';
 import { apiPath } from './api-paths.mjs';
 import { findFreePort, listenProblem } from './ports.mjs';
 import { validateChatImages } from './chat-images.mjs';
-import { createTimeSkip, measureFolder, timeskipRevisionMessage, imageTypeOf } from './timeskip.mjs';
+import { createTimeSkip, measureFolder, timeskipRevisionMessage, imageTypeOf, forgetTrial } from './timeskip.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -206,6 +207,7 @@ const agent = createAgentBridge({
   engineProgress: instanceId => engineProgressMark(native.readyInstances().find(i => i.id === instanceId)),
   onPlan: (chatId, event, plan) => hub.send('plan', { chatId, event, plan }),
   onQueue: (chatId, queue) => hub.send('queue', { chatId, queue }),
+  onWake: (chatId, requestId) => hub.send('chat-wake', { chatId, requestId }),
   dataDir: store.DATA_DIR,
   componentsDir: componentsDirectory(),
   // The installer ships the Harness next to the host (<install>/host/server -> <install>/harness).
@@ -218,6 +220,8 @@ const agent = createAgentBridge({
     slots: i.metrics?.live?.slots?.length || i.parallel || 1,
     // The tool servers set up for this model (Settings, Tools): the agent connects to the same ones.
     mcpServers: i.mcpServers,
+    // its "Tool timeout (seconds)": the agent waits as long for those servers as the engine does (#5788)
+    mcpTimeoutS: i.mcpTimeoutS ?? null,
   })),
   connections: () => modelProviders.withSecrets().map(c => ({ ...c, models: c.models.map(m => ({ ...m, vision: readsPicturesByDefault(m, visionProbe.known(c, m.id)), reasoning: m.reasoning ?? visionProbe.knownThinks(c, m.id) ?? null })) })),
   log: line => console.log(line),
@@ -762,6 +766,10 @@ const TIMESKIP_REVISE = process.env.STRATA_TIMESKIP_REVISE
 const INTERNAL_SECRET = randomBytes(24).toString('hex');
 /** The model a trial runs on, by run id: the chat's saved API model when it uses one, else the loaded local model. */
 const timeskipChoices = new Map();
+/** How many of those to keep: a finished run never asks for its model again, and only the newest trials can still be
+ * revised. The same bound the request board and the Time-skip listing use (serving.mjs `MAX_REQUESTS`, timeskip.mjs
+ * `MAX_LISTED`). */
+const TIMESKIP_CHOICE_CAP = 60;
 /** Trials this host is driving: run id -> { chatId (the chat that asked), turnChat (the assistant's own chat id), controller, step (the assistant's current status), lastSent }. */
 const trials = new Map();
 const trialByChat = new Map();
@@ -776,17 +784,27 @@ function trialActivity(run) {
     default: return null;
   }
 }
+/** Forget a trial this host drives: its poll, its entry, the chat's pointer to it, and the model it ran on (a trial
+ * whose record on disk is gone can never ask for that model again). Every way out of `watchTrial` and `stopTrial`
+ * goes through here, so dropping one of the four can no longer leave the other three behind. */
+function dropTrial(id, timer) {
+  if (timer) clearInterval(timer);
+  forgetTrial({ trials, trialByChat, choices: timeskipChoices }, id);
+}
 /** Tell the page when the job's phase or the assistant's step changed (SSE `timeskip`), at most every 2 s. */
 function watchTrial(id) {
   const trial = trials.get(id);
   if (!trial) return;
   const timer = setInterval(() => {
     const run = timeskip.status(id);
-    if (!run) { clearInterval(timer); return; }
+    // The run's record is gone (its folder was deleted, or another program removed it): the trial is over, so it
+    // goes with everything keyed on its id - clearing only the timer left the entry, the chat's pointer and the
+    // model choice held until the host restarted.
+    if (!run) { dropTrial(id, timer); return; }
     const activity = trialActivity(run);
     const key = JSON.stringify([run.phase, activity]);
     if (key !== trial.lastSent) { trial.lastSent = key; hub.send('timeskip', { id, phase: run.phase, activity }); }
-    if (['completed', 'cancelled', 'failed', 'interrupted'].includes(run.phase)) { clearInterval(timer); trials.delete(id); if (trial.chatId) trialByChat.delete(trial.chatId); }
+    if (['completed', 'cancelled', 'failed', 'interrupted'].includes(run.phase)) dropTrial(id, timer);
   }, 2000);
   timer.unref?.();
   trial.timer = timer;
@@ -796,7 +814,7 @@ async function stopTrial(id) {
   const trial = trials.get(id);
   if (trial) { trial.controller?.abort(); if (trial.turnChat) void agent.stop(trial.turnChat).catch(() => {}); }
   const stopped = await timeskip.stop(id);
-  if (trial) { clearInterval(trial.timer); trials.delete(id); if (trial.chatId) trialByChat.delete(trial.chatId); }
+  dropTrial(id, trial?.timer);
   if (stopped) hub.send('timeskip', { id, phase: 'cancelled', activity: null });
   return stopped;
 }
@@ -927,9 +945,9 @@ taskTimer.unref();
 // The probe listens on the loopback address only: a probe on 0.0.0.0 made Windows Defender Firewall ask "Allow Node.js to communicate on these networks?" on the
 // first start of every new install path (QA 0213). Reserved or taken ports are caught on any address; the share listener itself binds 0.0.0.0 only when the person turns sharing on.
 const sharePort = await findFreePort(Number(process.env.STRATA_SHARE_PORT ?? PORT + 1), '127.0.0.1', { skip: [PORT] });
-const localShare = createLocalShare({ handle: openai, hasKey: () => !!store.get().serving?.apiKey, port: sharePort, changed: () => serving.setSharing(localShare.state()) });
+const localShare = createLocalShare({ handle: (req, res, path, method) => openai(req, res, path, method, 'share'), hasKey: () => !!store.get().serving?.apiKey, port: sharePort, allowResponses: true, changed: () => serving.setSharing(localShare.state()) });
 const tunnelPort = await findFreePort(Number(process.env.STRATA_TUNNEL_PORT ?? PORT + 2), '127.0.0.1', { skip: [PORT, sharePort] });
-const tunnelOrigin = createLocalShare({ handle: openai, hasKey: () => !!store.get().serving?.apiKey, host: '127.0.0.1', port: tunnelPort });
+const tunnelOrigin = createLocalShare({ handle: (req, res, path, method) => openai(req, res, path, method, 'tunnel'), hasKey: () => !!store.get().serving?.apiKey, host: '127.0.0.1', port: tunnelPort });
 const connector = createConnectorInstaller({ directory: join(store.HOME, 'engine', 'cloudflare'), componentDirectory: join(componentsDirectory(), 'cloudflared') });
 const cloudflare = createCloudflare({ origin: tunnelOrigin, originUrl: `http://127.0.0.1:${tunnelPort}`, hasKey: () => !!store.get().serving?.apiKey, changed: serving.setTunnel, locate: connector.locate, prepareConnector: connector.ensure, connectorInfo: connector.connector, findRunning: findRunningConnector });
 await cloudflare.inspect();
@@ -964,7 +982,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (path.startsWith('/v1/')) {
       if (storageChanging && method !== 'GET') return error(res, 409, 'Wait for the model folder check to finish.');
-      return await openai(req, res, apiPath(path), method);
+      return await openai(req, res, apiPath(path), method, 'app');
     }
     return await staticFile(req, res, path);
   } catch (err) {
@@ -1100,7 +1118,8 @@ async function api(req, res, path, method, url) {
 
   if(path === '/api/artifacts/open' && method === 'POST') {
     const body=await readBody(req, 30*1024*1024);
-    return json(res,200,await openArtifact(body,{examplesDir:join(ROOT,'public','examples'),previewsDir:join(store.HOME,'previews')}));
+    try { return json(res,200,await openArtifact(body,{examplesDir:join(ROOT,'public','examples'),previewsDir:join(store.HOME,'previews')})); }
+    catch (e) { if (e?.status === 400) return error(res, 400, e.message); throw e; }
   }
 
   // Host-owned recurring prompts. Creating a draft never enables a schedule.
@@ -1196,7 +1215,12 @@ async function api(req, res, path, method, url) {
     trials.set(result.run.id, { chatId, turnChat: null, controller: null, step: null, lastSent: '' });
     if (chatId) trialByChat.set(chatId, result.run.id);
     watchTrial(result.run.id);
-    if (body.remoteModel?.connectionId && body.remoteModel?.modelId) timeskipChoices.set(result.run.id, { connectionId: String(body.remoteModel.connectionId), modelId: String(body.remoteModel.modelId) });
+    if (body.remoteModel?.connectionId && body.remoteModel?.modelId) {
+      timeskipChoices.set(result.run.id, { connectionId: String(body.remoteModel.connectionId), modelId: String(body.remoteModel.modelId) });
+      // The revision step reads this while the job works. Without a bound the map kept one entry for every trial this
+      // app ever started - never read again, never dropped. A Map iterates in insertion order, so the oldest goes first.
+      if (timeskipChoices.size > TIMESKIP_CHOICE_CAP) timeskipChoices.delete(timeskipChoices.keys().next().value);
+    }
     return json(res, 200, { run: { ...result.run, activity: trialActivity(result.run) }, simulated: false });
   }
   if (path === '/api/timeskip/files' && method === 'GET') {
@@ -1992,7 +2016,7 @@ async function api(req, res, path, method, url) {
   /* A page that has just loaded asks which chats have a turn running (a reload does not stop a turn), and takes one over again: the catch-up
      of what was said while no page was there, then the live frames, as on /api/chat/stream. A turn that ended while the page was away
      (the page names it by requestId) is sent once, whole. 404 when there is nothing to take over. */
-  if (path === '/api/chat/active' && method === 'GET') return json(res, 200, { turns: agent.runningTurns() });
+  if (path === '/api/chat/active' && method === 'GET') return json(res, 200, { turns: agent.runningTurns(), woken: agent.wokenTurns() });
   if (path === '/api/chat/attach' && method === 'POST') {
     const b = await readBody(req);
     if (typeof b.sessionId !== 'string' || !b.sessionId) return error(res, 400, 'sessionId is required');
@@ -2091,11 +2115,29 @@ async function api(req, res, path, method, url) {
 
 /* -------------------------------------------------- OpenAI-compatible API --- */
 
-async function openai(req, res, path, method) {
+/** The /v1 refusal of a page of another site while no API key is set (wording approved by the coordinator 11-16). */
+const V1_FOREIGN_PAGE = 'Other websites can\'t use this API while no API key is set. Set an API key in Serving to allow it.';
+/** `via`: the listener the request came in on: 'app' (this app's own port), 'share' (LAN sharing) or 'tunnel' (#5661: MCP tools only on 'app'). */
+async function openai(req, res, path, method, via) {
   if (!serving.authorized(req)) return error(res, 401, 'Invalid API key');
+  // Without an API key, a web page of another site may not use the model (serving.mjs v1OriginRefused; strata serve has the same rule).
+  if (serving.v1OriginRefused(req, via)) return error(res, 403, V1_FOREIGN_PAGE);
+  try {
+    return await routeInference(req, res, path, method, via);
+  } catch (err) {
+    if (!(err instanceof InvalidJsonError)) throw err;
+    if (res.headersSent) return res.end();
+    const message = 'Invalid JSON in request body';
+    const detail = { type: 'invalid_request_error', message };
+    if (path === '/v1/messages') return json(res, 400, { type: 'error', error: detail });
+    return json(res, 400, { error: { ...detail, param: null, code: 'invalid_json' } });
+  }
+}
+
+async function routeInference(req, res, path, method, via) {
   if(native.state().instances.length){
-    if(path==='/v1/models'&&method==='GET')return json(res,200,{object:'list',data:native.state().instances.filter(i=>i.status==='ready').map(i=>({id:i.apiModelId,object:'model',owned_by:'strata',meta:{instanceId:i.id,gpus:i.gpus,label:i.label,aliases:i.aliases}}))});
-    if(method==='POST'&&['/v1/chat/completions','/v1/messages','/v1/responses'].includes(path)){if(store.get().serving?.pauseServing)return error(res,503,'New API requests are paused.');if(path==='/v1/responses'&&!native.state().capabilities.responses)return error(res,501,'Update the native Strata installation to use the Responses API.');return nativeGateway({req,res,path,body:await readBody(req,12*1024*1024),control:native,serving});}
+    if(path==='/v1/models'&&method==='GET')return json(res,200,{object:'list',data:nativeModelEntries(native.state().instances)});
+    if(method==='POST'&&['/v1/chat/completions','/v1/messages','/v1/responses'].includes(path)){if(store.get().serving?.pauseServing)return error(res,503,'New API requests are paused.');if(path==='/v1/responses'&&!native.state().capabilities.responses)return error(res,501,'Update the native Strata installation to use the Responses API.');return nativeGateway({req,res,path,body:await readBody(req,12*1024*1024),control:native,serving,mcpAllowed:model=>serving.mcpToolsAllowed(req,via,model)});}
   }
   if(path==='/v1/responses'&&method==='POST')return error(res,503,'Load a native Strata model to use the Responses API.');
 

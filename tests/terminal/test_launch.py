@@ -13,7 +13,7 @@ from unittest import mock
 
 from strata_cli.launch import access, harness, params, settings as S, store
 from strata_cli.launch.catalog import Catalog, CatalogUnavailable, fit_on, verdict
-from strata_cli.launch.runner import Result, Runner, derive_config, desc_matches, tune_words
+from strata_cli.launch.runner import LaunchError, Result, Runner, WEB_SAMPLING_KEYS, WEB_SETTINGS_KEYS, derive_config, desc_matches, tune_words
 from tests.terminal.launch_support import HW_12, HW_24, HW_2X16, Home, catalog, run_cli
 
 
@@ -108,8 +108,11 @@ class CatalogRules(unittest.TestCase):
             self.assertIn(("qwen", "IQ3_XXS"), ids)
             models, families, contexts, source = cat.tables()
             self.assertEqual(source, "setup.py")                       # the same tables setup.py and the app read
+            own = cat.strata.own_families()                # #5869: Qwen3.6's sizes are its own table's (a size name can repeat across families)
+            sizes = {(f["family"], s["model"]): s for f in cat.strata.model_table(cat.hardware()) for s in f["sizes"]}
             for r in rows:
-                self.assertAlmostEqual(r.download_gb, models[r.model]["download_gb"])
+                want = sizes[(r.family, r.model)]["download_gb"] if r.family in own else models[r.model]["download_gb"]
+                self.assertAlmostEqual(r.download_gb, want)
             rec = [r for r in rows if r.recommended]
             self.assertEqual([(r.family, r.model) for r in rec], [("qwen", "IQ3_S")])      # 64 + 12 GB: the 64 GB tier
 
@@ -270,6 +273,21 @@ class Advanced(unittest.TestCase):
         self.assertIsNone(params.check_name("--prefill", ["--prefill"]))
         self.assertIsNone(params.check_name("--prefil", None))        # no list to check against: no warning
 
+    def test_an_environment_setting_without_a_row_is_not_a_typing_mistake(self):
+        """#5136: the engine reads environment settings its --help does not list, so the table cannot call one a newer flag or a
+        typing mistake, and it shows no default it does not know.  A flag is still checked against --help."""
+        rows = {r.name: r for r in params.build_rows(self.HELP, ["--kv", "int8"], None, {"STRATA_ROUTE_TAIL_SKIP": "0"}, {},
+                                                     {"STRATA_IQ_MT_MIN": "1", "--prefil": "1"})}
+        config, typed = rows["STRATA_ROUTE_TAIL_SKIP"], rows["STRATA_IQ_MT_MIN"]
+        self.assertEqual((config.default, config.tuned, config.yours), ("0", "0", ""))      # the run config's value
+        self.assertEqual(typed.cells(), ("STRATA_IQ_MT_MIN", "-", "-", "1"))                 # not "off": the table does not know
+        for r in (config, typed):
+            self.assertTrue(r.known)
+            self.assertNotIn("not in this engine's list", r.description)
+            self.assertNotIn("typing mistake", r.description)
+        self.assertFalse(rows["--prefil"].known)
+        self.assertIn("not in this engine's list", rows["--prefil"].description)
+
     def test_extra_becomes_argv_and_env(self):
         a, e = S.as_argv_changes({"--prefill": "65536", "--kv-grow": "", "--spec": "off", "STRATA_PIN_BY_NEED": "1"}, frozenset({"--kv-grow"}))
         self.assertEqual(a, {"--prefill": "65536", "--kv-grow": True, "--spec": None})
@@ -301,6 +319,44 @@ class RunConfig(unittest.TestCase):
         on = derive_config({**base, "mtp": False}, S.LaunchSettings(mtp="on"), bool_flags=frozenset())
         self.assertIs(on["mtp"], True)                                            # an explicit on beats an installed off
         self.assertEqual(derive_config(base, S.LaunchSettings(), bool_flags=frozenset())["args"], base["args"])
+
+    def test_settings_view_values_survive_the_next_launch(self):
+        # About > Settings on the web page writes into the config this model started with (serve/runconfig.py saves there).
+        # The next `strata launch` rebuilds that file from the installed one: a saved value must not quietly revert there.
+        prev = {**self.BASE, "idle_unload_s": 300, "reasoning_budget_tokens": 4000, "api_monitor": True,
+                "sampling": {"temperature": 0.4}}
+        cfg = derive_config(self.BASE, S.LaunchSettings(), bool_flags=frozenset(), prev=prev)
+        self.assertEqual((cfg["idle_unload_s"], cfg["reasoning_budget_tokens"], cfg["api_monitor"]), (300, 4000, True))
+        self.assertEqual(cfg["sampling"], {"temperature": 0.4})
+        self.assertEqual(cfg["args"], self.BASE["args"])                          # nothing was added to the engine's command line
+        plain = derive_config(self.BASE, S.LaunchSettings(), bool_flags=frozenset())    # no earlier start: nothing to carry
+        self.assertNotIn("idle_unload_s", plain)
+        lazy = derive_config({**self.BASE, "vision": True}, S.LaunchSettings(), bool_flags=frozenset(),
+                             prev={**self.BASE, "lazy_load": True})
+        self.assertNotIn("lazy_load", lazy)                                       # lazy loading is text-only; the page itself refuses it for a picture model
+
+    def test_idle_unload_from_a_flag_is_a_server_setting_not_an_engine_option(self):
+        # The engine knows no --idle-unload: given one it stops with "unknown argument: --idle-unload" and restarts forever.
+        # serve/server.py reads "idle_unload_s" from the run config, so --set and a preset's extra table write it there instead.
+        cfg = derive_config(self.BASE, S.LaunchSettings(extra={"--idle-unload": "60"}), bool_flags=frozenset())
+        self.assertEqual(cfg["idle_unload_s"], 60)
+        self.assertNotIn("--idle-unload", cfg["args"])
+        prev = {**self.BASE, "idle_unload_s": 300}
+        cfg = derive_config(self.BASE, S.LaunchSettings(extra={"--idle-unload": "60"}), bool_flags=frozenset(), prev=prev)
+        self.assertEqual(cfg["idle_unload_s"], 60)                                # this command line beats what an earlier start saved
+        cfg = derive_config(self.BASE, S.LaunchSettings(extra={"--idle-unload": "off"}), bool_flags=frozenset(), prev=prev)
+        self.assertNotIn("idle_unload_s", cfg)                                    # "off": never unload
+        with self.assertRaises(LaunchError):
+            derive_config(self.BASE, S.LaunchSettings(extra={"--idle-unload": "soon"}), bool_flags=frozenset())
+
+    def test_settings_view_keys_are_all_carried_or_the_launchers_own(self):
+        # serve/runconfig.py lists what the Settings view can write; the carry list must agree with it, key for key.
+        from serve.runconfig import EDITABLE
+        top = {key for key, kind, _ in EDITABLE if not (isinstance(kind, tuple) and kind[0] in ("sampling", "arg"))}
+        self.assertEqual(top - set(WEB_SETTINGS_KEYS), {"mtp", "open_browser"})   # "mtp" is the launcher's (--mtp); the page's "arg" kind rides in "args" with its "user_args" copy
+        self.assertEqual(set(WEB_SETTINGS_KEYS) - top, set())
+        sampling = {key.split(".", 1)[1] for key, kind, _ in EDITABLE if isinstance(kind, tuple) and kind[0] == "sampling"}
+        self.assertEqual(sampling, set(WEB_SAMPLING_KEYS))
 
     def test_local_and_cloudflare_stay_on_loopback_without_a_key(self):
         for kind in ("local", "cloudflare"):

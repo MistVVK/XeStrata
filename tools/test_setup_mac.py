@@ -80,7 +80,7 @@ class Recommendation(unittest.TestCase):
         rec, notes = M.recommend_model(32)
         self.assertEqual(rec, "Q2_0")
         self.assertTrue(notes and "stream" in notes[0] and "~14 tok/s" in notes[0])
-        self.assertTrue(M.streams("Q2_0", 32) and M.streams("Q2_0", 48) and not M.streams("Q2_0", 64))
+        self.assertTrue(M.streams("Q2_0", 32) and M.streams("Q2_0", 64) and not M.streams("Q2_0", 96))
 
     def test_a_bigger_choice_is_kept_with_a_note(self):
         notes = M.model_note("IQ3_XXS", 64)
@@ -276,6 +276,16 @@ class RepackGuard(unittest.TestCase):
         self.assertFalse(M.streams("UD-Q4_K_XL", 128))          # 82.6 + 8 GB: resident (measured: nothing compressed)
         self.assertTrue(M.streams("UD-Q5_K_XL", 128))
         self.assertTrue(M.streams("UD-Q4_K_XL", 96))
+
+    def test_setup_decides_streaming_as_the_engine_does(self):
+        # setup writes STRATA_METAL_STREAM=0/1 and the engine follows it: both must use stream.cpp's rule (the mapped bytes
+        # + 12 GiB against resident_cap), or a pack is forced resident where the engine would stream.  Gyro-S on a 48 GB
+        # M4 Pro (working set 40.2 GB): 29.7 + 12.9 GB does not fit, the forced resident run paged until the watchdog stopped it
+        self.assertAlmostEqual(M.OVERHEAD_GB, 12 * 2 ** 30 / 1e9, places=6)
+        self.assertTrue(M.streams("Gyro-S", 48))
+        self.assertFalse(M.streams("Gyro-S", 64))
+        self.assertTrue(M.streams("Gyro-M", 96))
+        self.assertAlmostEqual(M.gpu_budget_gb(16), 16 * 1.073741824 - 7.0, places=3)      # a small Mac: macOS keeps 7 GB
 
     @unittest.skipIf(sys.platform == "win32", "os.kill(pid, 0) is a probe on macOS and Linux only")
     def test_a_live_lock_is_seen_a_stale_one_is_dropped(self):

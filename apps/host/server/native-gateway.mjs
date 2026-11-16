@@ -1,13 +1,14 @@
 /** Preserve native protocol events and tool payloads; the gateway owns identity and cancellation. */
 import { once } from 'node:events';
-export async function nativeGateway({req,res,path,body,control,serving,fetcher=fetch}){
+/* #5661: mcpAllowed(model) says whether this request may use the model's MCP tools (serving.mjs mcpToolsAllowed); without it they stay off. */
+export async function nativeGateway({req,res,path,body,control,serving,fetcher=fetch,mcpAllowed=()=>false}){
  let instance;try{instance=control.resolveInstance(body.model);}catch(e){/* #5312: an Anthropic client sends a model name of its own (Claude Desktop: claude-5-5-sonnet) and cannot change it: with exactly one model loaded the route answers with it */if(path==='/v1/messages'&&body.model){try{instance=control.resolveInstance(undefined);}catch{}}if(!instance){res.writeHead(400,{'content-type':'application/json'});res.end(JSON.stringify({error:{message:e.message,type:'invalid_request_error',param:'model',code:null}}));return;}}
  const abort=new AbortController(),started=Date.now();let sawDone=false;/* #4690: a client that hangs up after `data: [DONE]` (the OpenAI SDK does) has the whole answer: that is not a cancel. */res.on('close',()=>{if(!res.writableEnded&&!sawDone)abort.abort();});
  const entry=serving.open({client:req.headers['user-agent']?.slice(0,100)??'API client',endpoint:path.slice(3),model:instance.apiModelId,instanceId:instance.id,gpuIds:instance.gpus.map(String),cancel:()=>abort.abort()});
  let tokensIn=null,tokensOut=null,tps=null,promptTps=null;
  const observe=value=>{/* Anthropic's stream carries the prompt count in message_start (message.usage) and only the output count in message_delta (usage): both are read (#4678). */for(const usage of [value.message?.usage,value.usage??value.response?.usage])if(usage){tokensIn=usage.prompt_tokens??usage.input_tokens??tokensIn;tokensOut=usage.completion_tokens??usage.output_tokens??tokensOut;}if(value.timings){tps=value.timings.predicted_per_second??tps;promptTps=value.timings.prompt_per_second??promptTps;}};
  try{
-  const response=await fetcher(`http://127.0.0.1:${instance.port}${path}`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${instance.key}`},signal:abort.signal,body:JSON.stringify({...body,model:instance.apiModelId,strata_mcp:false})});
+  const response=await fetcher(`http://127.0.0.1:${instance.port}${path}`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${instance.key}`},signal:abort.signal,body:JSON.stringify({...body,model:instance.apiModelId,strata_mcp:body.strata_mcp===true&&mcpAllowed(instance.apiModelId)===true})});
   if(!response.ok){const content=await response.text();serving.finish(entry.id,{durationMs:Date.now()-started,error:`Engine returned ${response.status}`});res.writeHead(response.status,{'content-type':response.headers.get('content-type')??'application/json'});res.end(content);return;}
   serving.mark(entry.id,{state:'generating'});
   res.writeHead(response.status,{'content-type':response.headers.get('content-type')??'application/json','cache-control':'no-cache','x-strata-request-id':entry.id,'x-accel-buffering':'no'});

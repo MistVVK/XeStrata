@@ -109,6 +109,7 @@
   "group.today": "Сегодня",
   "group.week": "Последние 7 дней",
   "group.yesterday": "Вчера",
+  "header.github": "Strata на GitHub",
   "hist.editAnswer": "Править ответ",
   "hist.editAnswerTitle": "Исправить текст ответа. Запрос не отправляется.",
   "hist.editLabel": "Правка ответа",

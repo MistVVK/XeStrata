@@ -1,5 +1,5 @@
 import { validMcpName, MCP_NAME_HELP } from './mcp-names.mjs';
-import { SPEED_SWITCH_TABLE, DRAFTING_FAMILIES as GENERATED_DRAFTING_FAMILIES, DFLASH2_MODEL_PATTERN } from './policy-generated.mjs';
+import { SPEED_SWITCH_TABLE, DRAFTING_FAMILIES as GENERATED_DRAFTING_FAMILIES, DFLASH2_MODEL_PATTERN, DFLASH2_NAMED_FAMILIES, DFLASH2_NAMED_PATTERN } from './policy-generated.mjs';
 /** Editable native keys. Unknown config keys and program paths stay intact. */
 /* The Drafting hint, word for word, with the size of the drafter this model would really fetch (the tuned one is 0.34 GB, 0.52 on an Arc card; the stock one 1.2). */
 export function draftingHint(gb=1.2){const size=Number.isFinite(Number(gb))&&Number(gb)>0?Number(gb):1.2;return `Which drafter guesses words ahead to make answers faster, one at a time. Auto (recommended) is DFlash2 for Qwen3.8-Flash-Next where the engine has it, the MTP otherwise; on two or more identical graphics cards that the all-cards split engine takes, it is that engine with the MTP draft layer. DFlash2 downloads a ${size} GB drafter once, the MTP its draft layer once. With Auto, several requests at once use the MTP. If you choose DFlash2 yourself, it runs with the number of requests you set. If DFlash2 cannot run, the MTP is used alone and Details says why. Off turns the drafter off.`;}
@@ -77,11 +77,14 @@ export const APP_OWNED_FIELDS=['mtp','batchMtp','drafting'];
 /** The families that have a Drafting choice and the model names the DFlash2 drafter was made for (strata_control/drafting.py SUPPORTED_FAMILIES, _SUPPORTED_NAME): Qwen3.8-Flash-Next, Gyro and Unsloth's quantizations of the same weights; not Swift, Coder or NVFP4. */
 export const DRAFTING_FAMILIES=GENERATED_DRAFTING_FAMILIES;
 const DFLASH2_MODEL=new RegExp(DFLASH2_MODEL_PATTERN,'i');
+const DFLASH2_NAMED=new RegExp(DFLASH2_NAMED_PATTERN,'i');
 /** The drafter a choice means (one per run; strata_control/drafting.py choice_of): Auto is DFlash2 where the engine has it (`served`, Control's word) and the model is one it was made for, else the MTP; off and mtp are what they say. `model` is a run config's model name or a family. */
 /** `split` (Control's plan: the all-cards split engine will take this start) makes Auto the MTP, the draft layer that engine runs; a DFlash2 the person chose by name stays. */
 export function resolveDrafter(choice,model,served,split){
  const c=String(choice??'auto').toLowerCase();if(c==='off'||c==='mtp')return c;
- const name=String(model??'');if(!(served===true&&(DRAFTING_FAMILIES.includes(name.toLowerCase())||DFLASH2_MODEL.test(name))))return 'mtp';
+ const name=String(model??'');
+ const named=c==='dflash2'&&(DFLASH2_NAMED_FAMILIES.includes(name.toLowerCase())||DFLASH2_NAMED.test(name));   // #5240: the Coder runs DFlash2 when it is chosen by name; Auto stays the MTP there
+ if(!(served===true&&(DRAFTING_FAMILIES.includes(name.toLowerCase())||DFLASH2_MODEL.test(name)||named)))return 'mtp';
  return split===true&&c!=='dflash2'?'mtp':'dflash2';
 }
 /** The engine arguments without the draft layer: --mtp <folder or count>, --spec-min-p <p> (its confidence threshold) and --batch-mtp. --spec stays: prompt lookup still uses its windows. Same rule as strata_control/draft_layer.py. */

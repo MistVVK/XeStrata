@@ -470,6 +470,34 @@ class DeleteModelTests(unittest.TestCase):
         described = self.s.describe_config(self.root / "strata-iq3_s.json")
         self.assertGreater(described["disk_bytes"], 10000)
 
+    def test_read_only_files_and_an_empty_read_only_folder_do_not_stop_the_delete(self):
+        # #4089: an empty read-only folder in the pack stopped the delete with WinError 5 and left gigabytes behind. A read-only mark
+        # inside the planned removal is cleared and the path removed; nothing outside the plan is touched or made writable.
+        import stat as st
+        pack = self.data / "packs" / "iq3_s"
+        ro_dir = pack / "cache" / "empty"
+        ro_dir.mkdir(parents=True)
+        ro_file = self.make(pack / "tokenizer" / "merges.txt", 50)
+        first = self.data / "models" / "iq3_s" / "shard-1.gguf"
+        outside = self.make(Path(self.tmp.name) / "elsewhere" / "keep.txt", 5)
+        for p in (ro_file, first, outside):
+            os.chmod(p, st.S_IREAD)
+        if os.name == "nt":
+            import ctypes
+            for p in (ro_dir, pack / "cache"):
+                self.assertTrue(ctypes.windll.kernel32.SetFileAttributesW(str(p), 0x1 | 0x10))   # FILE_ATTRIBUTE_READONLY | DIRECTORY
+        self.addCleanup(lambda: os.chmod(outside, st.S_IREAD | st.S_IWRITE))
+        result = self.tools.strata_remove(model="iq3_s", confirm=True)
+        self.assertEqual(result["failed"], [])
+        self.assertFalse(pack.exists())
+        self.assertFalse(first.exists())
+        self.assertFalse((self.data / "models" / "iq3_s").exists())
+        self.assertTrue(outside.is_file())
+        self.assertFalse(os.stat(outside).st_mode & st.S_IWRITE, "a file outside the plan keeps its read-only mark")
+        self.assertTrue((self.data / "packs" / "q2_0" / "tokenizer" / "vocab.json").is_file())
+        again = self.tools.strata_remove(model="q2_0", confirm=True)
+        self.assertEqual(again["failed"], [])
+
     def test_files_strata_downloaded_into_another_models_folder_are_deleted_too(self):
         # The app installs into its own Models folder while settings.json names another data folder (#3716).
         other = Path(self.tmp.name) / "Documents" / "Strata"

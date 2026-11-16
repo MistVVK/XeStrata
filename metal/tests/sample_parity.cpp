@@ -56,6 +56,26 @@ int main() {
             std::printf("argmax %d token(s) over %u logits: %.2f us (2 dispatches)\n", nt, V, ts[3] * 1e6);
         }
     }
-    std::printf("argmax parity, 20 windows with planted ties: %d wrong  %s\n", fails, fails ? "FAIL" : "PASS");
+    // #879 contract: an all-NaN row leaves the INT32_MAX sentinel in the pick (note_nonfinite reads the pick
+    // on Metal, where the CUDA device row check has no kernel); a row with one finite value still picks it.
+    for (size_t i = 0; i < (size_t) V * 2; ++i) lg.as<float>()[i] = std::nanf("");
+    lg.as<float>()[(size_t) V + 77777] = -3.5f;
+    {
+        mtl::Dispatch d1, d2;
+        d1.p = &pp;
+        d1.args = {mtl::Arg::B(lg), mtl::Arg::B(pv), mtl::Arg::B(pi), mtl::Arg::V(a)};
+        d1.grid[0] = PARTS; d1.grid[1] = 2; d1.tg[0] = 256;
+        d2.p = &pf;
+        d2.args = {mtl::Arg::B(pv), mtl::Arg::B(pi), mtl::Arg::B(out), mtl::Arg::V(a)};
+        d2.grid[0] = 2; d2.tg[0] = 256;
+        cx.run({d1, d2});
+        const int want[2] = {0x7fffffff, 77777};
+        for (int t = 0; t < 2; ++t)
+            if (out.as<int>()[t] != want[t]) {
+                std::printf("argmax sentinel: row %d picked %d, want %d  FAIL\n", t, out.as<int>()[t], want[t]);
+                ++fails;
+            }
+    }
+    std::printf("argmax parity, 20 windows with planted ties and the #879 sentinel rows: %d wrong  %s\n", fails, fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

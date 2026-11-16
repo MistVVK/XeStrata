@@ -2,10 +2,12 @@
    Light is default; dark via <html data-theme="dark">.
    Values marked (derived) are not in the Gainsty source and were added for the app. */
 
-@font-face{font-family:"GT Walsheim Pro";src:url("/fonts/GTWalsheimPro-Regular.woff2") format("woff2");font-weight:400;font-display:swap}
-@font-face{font-family:"GT Walsheim Pro";src:url("/fonts/GTWalsheimPro-Medium.woff2") format("woff2");font-weight:500;font-display:swap}
-@font-face{font-family:"GT Walsheim Pro";src:url("/fonts/GTWalsheimPro-Bold.woff2") format("woff2");font-weight:700;font-display:swap}
-@font-face{font-family:"GT Walsheim Pro";src:url("/fonts/GTWalsheimPro-Black.woff2") format("woff2");font-weight:900;font-display:swap}
+/* #6068: the font files class the spacing accents ` ¨ ¯ ´ ¸ ˆ ˇ ˘ ˙ ˚ ˜ ˝ as combining marks, so the
+   browser draws them with no width ("```" collapses into one mark). The faces leave those characters to the next font. */
+@font-face{font-family:"GT Walsheim Pro";src:url("/fonts/GTWalsheimPro-Regular.woff2") format("woff2");font-weight:400;font-display:swap;unicode-range:U+0000-005F,U+0061-00A7,U+00A9-00AE,U+00B0-00B3,U+00B5-00B7,U+00B9-02C5,U+02C8-02D7,U+02DB,U+02DE-10FFFF}
+@font-face{font-family:"GT Walsheim Pro";src:url("/fonts/GTWalsheimPro-Medium.woff2") format("woff2");font-weight:500;font-display:swap;unicode-range:U+0000-005F,U+0061-00A7,U+00A9-00AE,U+00B0-00B3,U+00B5-00B7,U+00B9-02C5,U+02C8-02D7,U+02DB,U+02DE-10FFFF}
+@font-face{font-family:"GT Walsheim Pro";src:url("/fonts/GTWalsheimPro-Bold.woff2") format("woff2");font-weight:700;font-display:swap;unicode-range:U+0000-005F,U+0061-00A7,U+00A9-00AE,U+00B0-00B3,U+00B5-00B7,U+00B9-02C5,U+02C8-02D7,U+02DB,U+02DE-10FFFF}
+@font-face{font-family:"GT Walsheim Pro";src:url("/fonts/GTWalsheimPro-Black.woff2") format("woff2");font-weight:900;font-display:swap;unicode-range:U+0000-005F,U+0061-00A7,U+00A9-00AE,U+00B0-00B3,U+00B5-00B7,U+00B9-02C5,U+02C8-02D7,U+02DB,U+02DE-10FFFF}
 
 :root{
   /* type */

@@ -32,13 +32,13 @@ RELEASE = [
     pkg("windows-x86_64", "cuda", "cuda12", SM_OLD, "576.02"),
     pkg("windows-x86_64", "hip", "rx9070", ("gfx1200", "gfx1201")),
     pkg("windows-x86_64", "hip", "rdna3", ("gfx1100", "gfx1101", "gfx1102", "gfx1151")),
-    pkg("windows-x86_64", "hip", "rdna2", ("gfx1030", "gfx1031")),
+    pkg("windows-x86_64", "hip", "rdna2", ("gfx1030", "gfx1031", "gfx1032")),
     pkg("linux-x86_64", "cuda", "cuda13", SM_NEW, "580.65"),
     pkg("linux-x86_64", "cuda", "cuda12", SM_OLD, "575.51"),
     pkg("linux-x86_64", "hip", "rx9070", ("gfx1200", "gfx1201")),
     pkg("linux-x86_64", "hip", "rx7900", ("gfx1100", "gfx1101", "gfx1102")),
     pkg("linux-x86_64", "hip", "halo", ("gfx1151",)),
-    pkg("linux-x86_64", "hip", "rx6000", ("gfx1030", "gfx1031")),
+    pkg("linux-x86_64", "hip", "rx6000", ("gfx1030", "gfx1031", "gfx1032")),
     pkg("linux-aarch64", "cuda", "cuda13", ("sm_121", "compute_121"), "580.65"),     # the NVIDIA DGX Spark (GB10), 0.2.7.1
     pkg("linux-x86_64", "sycl", "", ("intel-arc",)),                 # the Intel Arc (A and B series) engine, GPU code JIT-compiled
     pkg("macos-arm64", "metal", "", ("apple-gpu",)),
@@ -132,7 +132,7 @@ class ReleaseSelection(unittest.TestCase):
     def test_other_unified_memory_radeons_get_no_engine_and_the_plain_family_line(self):
         from strata_control import engine_component as ec
         for platform in ("windows-x86_64", "linux-x86_64"):
-            for gfx in ("gfx1103", "gfx1150", "gfx1152", "gfx1032"):
+            for gfx in ("gfx1103", "gfx1150", "gfx1152", "gfx1034"):   # (gfx1032 has the RX 6000 package from 0.2.16, #5174)
                 got, why = self.pick(pc(platform, "hip", gfx=[gfx]))
                 self.assertIsNone(got, f"{gfx} on {platform}")
                 self.assertTrue(any(gfx in r for r in why))
@@ -146,17 +146,18 @@ class ReleaseSelection(unittest.TestCase):
         from strata_control import engine_component as ec
         want = {"windows-x86_64": "rdna2", "linux-x86_64": "rx6000"}
         for platform, variant in want.items():
-            for gfx in ("gfx1030", "gfx1031"):
+            for gfx in ("gfx1030", "gfx1031", "gfx1032"):   # gfx1032 (RX 6600 / 6650 XT) from 0.2.16, #5174
                 self.assertEqual(self.pick(pc(platform, "hip", gfx=[gfx]))[0], (platform, "hip", variant), (platform, gfx))
             for gfx in ("gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1200", "gfx1201"):
                 got = self.pick(pc(platform, "hip", gfx=[gfx]))[0]
                 self.assertNotEqual(got[2] if got else None, variant, (platform, gfx))
         self.assertEqual(ec.NO_PACKAGE_HIP, {}, "every card family setup supports has a package; the table is for the next family without one")
         covered = {a for p in RELEASE if p["backend"] == "hip" for a in p["archs"]}
-        self.assertTrue({"gfx1030", "gfx1031"} <= covered)
+        self.assertTrue({"gfx1030", "gfx1031", "gfx1032"} <= covered)
         # the plain family line now names a build that exists
         self.assertIn("Ask for the RX 6000 build.", ec.arch_notice(("gfx1200", "gfx1201"), ["gfx1030"]))
-        self.assertIsNone(ec.no_package_note(["gfx1030", "gfx1031"]))
+        self.assertIsNone(ec.no_package_note(["gfx1030", "gfx1031", "gfx1032"]))
+        self.assertEqual(ec.hip_family("gfx1032"), "RX 6000")
 
     def test_a_pc_with_an_rx7000_beside_an_rx6000_keeps_the_package_it_always_got(self):
         """Before the RX 6000 package a PC with both cards got the RX 7000 one: the new package must not win that tie, in any feed order."""

@@ -262,7 +262,7 @@ export async function validate(draft = {}) {
     else if (p.type === 'select' && !p.options?.includes(value)) addError(p.id, 'choose a supported value.');
     else if (p.type === 'text' && typeof value !== 'string') addError(p.id, 'enter text.');
   }
-  if (!CONTEXT_TOKENS[String(values['ctx.length']).toLowerCase()] || String(values['ctx.length']).toLowerCase() === 'recommended') addError('ctx.length', 'enter a whole context size from 4K to 1024K.');
+  if (!CONTEXT_TOKENS[String(values['ctx.length']).toLowerCase()] || String(values['ctx.length']).toLowerCase() === 'recommended') addError('ctx.length', 'enter a whole context size from 1K to 1024K.');
   const kv = values['ctx.kvMode'];
   if (draft?.beginner && draft?.expert?.some(p => p.id === 'ctx.length')) {
     const effective = beginner.contextLength === 'recommended' ? '128K' : String(beginner.contextLength).toUpperCase();

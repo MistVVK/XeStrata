@@ -20,7 +20,14 @@
 #include <sched.h>
 #endif
 
-namespace strata::core { void conversation_checkpoint_join(const void* only); }
+namespace strata::core {
+void conversation_checkpoint_join(const void* only);
+/// Tests only (#6075): `hook(point)` runs at fixed points of an asynchronous checkpoint save (STRATA_CKPT_ASYNC), so a
+/// test can force two savers on two threads into one order: 1 = the save is about to take the staging buffer, 2 = a
+/// background copy is about to read it, 3 = the save has filled it and is about to start that copy.  nullptr (the
+/// default, and always outside tests): nothing runs.
+void conversation_checkpoint_test_hook(void (*hook)(int point));
+}
 namespace strata::core::conversation_detail {
 
 /// The private copy streams and ordering events (below) belong to a thread, but a thread can be short-lived: the layer

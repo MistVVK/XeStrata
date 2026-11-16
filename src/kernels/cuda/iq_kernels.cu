@@ -1885,12 +1885,14 @@ struct IqGridWords {
 // mmvq_kernel with the columns taken NC at a time.  After warp_sum every lane holds the same sum, so lane c stores
 // column c.
 // #778: `__shared__ alignas(16)` does not compile for gfx1030 (HIP); the attribute after the declarator does, but nvcc
-// with MSVC as host does not take it.  Same layout either way.
+// with MSVC as host does not take it.  Same layout either way.  #5795 / #5518: the int4 staging arrays of the expdec kernels
+// take the same form (ROCm 6.4 and Fedora's ROCm stopped there).
 #if defined(__HIPCC__)
-#define STRATA_SHARED_ALIGN16_U32(name, ...) __shared__ uint32_t name[__VA_ARGS__] __attribute__((aligned(16)))
+#define STRATA_SHARED_ALIGN16(T, name, ...) __shared__ T name[__VA_ARGS__] __attribute__((aligned(16)))
 #else
-#define STRATA_SHARED_ALIGN16_U32(name, ...) __shared__ alignas(16) uint32_t name[__VA_ARGS__]
+#define STRATA_SHARED_ALIGN16(T, name, ...) __shared__ alignas(16) T name[__VA_ARGS__]
 #endif
+#define STRATA_SHARED_ALIGN16_U32(name, ...) STRATA_SHARED_ALIGN16(uint32_t, name, __VA_ARGS__)
 template<int TY, int NC, bool STAGE_GRID = kStageIqGrid<TY>, bool EXACT_N = false>
 __global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                          const block_q8_1* __restrict__ x, float* __restrict__ y,
@@ -2591,7 +2593,7 @@ __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(
                                                                             float* __restrict__ gate, float* __restrict__ up, int rb) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
-    __shared__ alignas(16) int4 s_u[ED_NC * 2 * ED_XB];
+    STRATA_SHARED_ALIGN16(int4, s_u, ED_NC * 2 * ED_XB);
     __shared__ float s_ds[ED_NC * ED_XB];
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, EdGrid<TG>::words);
     const int tid = threadIdx.x;
@@ -2778,7 +2780,7 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(co
     if (blockIdx.y >= ng) return;
     constexpr int LANES = TD == 20 ? 8 : 16;
     constexpr int RPP = (256 / LANES) * R;   // rows per pass
-    __shared__ alignas(16) int4 s_u[ED_NC * 2 * ED_HB];
+    STRATA_SHARED_ALIGN16(int4, s_u, ED_NC * 2 * ED_HB);
     __shared__ float s_ds[ED_NC * ED_HB];
     const int tid = threadIdx.x;
     const int sw = tid / LANES, t = tid % LANES;
@@ -6415,7 +6417,11 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     if (tm <= 0) tm = (avg >= 96 && b_ok) ? 8 : (int) std::max<int64_t>(2, std::min<int64_t>(4, (avg + 8) / 16));
     const I8Volta vo = i8_volta();
     // tile 5: the Volta tensor-core form (i8h_volta.cuh; bit-identical output), on a compute capability 7.0 card for the formats it covers
+#if defined(__HIPCC__)
+    const bool h_ok = false;   // (i8h_volta.cuh is CUDA only: i8_volta() is off on HIP)
+#else
     const bool h_ok = vo.on && i8h_type(L.gu_type) && i8h_type(L.d_type) && L.n_ff % 32 == 0 && L.n_embd % 64 == 0;
+#endif
     if (tm == 5 && !h_ok) tm = 4;
     if (tm != 5) tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
     // Volta (i8_expert_rule.hpp, i8_tile_two_blocks): the big-grid formats read their grid from global memory, and the pick is lowered to the largest tile that keeps two blocks

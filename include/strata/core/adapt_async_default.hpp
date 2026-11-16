@@ -29,6 +29,7 @@ struct AdaptAsyncAuto {
     bool peer = false;           ///< --peer-device
     bool remote_opt = false;     ///< --remote-expert-opt
     bool adapt_overlap = false;  ///< the opt-in STRATA_ADAPT_OVERLAP tier, which excludes the asynchronous one
+    int fetch = 0;               ///< STRATA_ADAPT_FETCH (1 / 2): the PCIe share's admissions into the VRAM tier, which serve turns off under --adapt-async
 };
 
 /// STRATA_ADAPT_ASYNC as the process sees it (-1 unset).
@@ -52,6 +53,10 @@ inline bool adapt_async_self_decides(const AdaptAsyncAuto& a, const char** why_n
     if (a.peer) return no("--peer-device");
     if (a.remote_opt) return no("--remote-expert-opt");
     if (a.adapt_overlap) return no("STRATA_ADAPT_OVERLAP");
+    // #5814: the admissions write the residency table and a victim's slot while the asynchronous tier picks and copies its swaps on its own
+    // thread; serve keeps them apart under --adapt-async, so a session that chose that tier by itself must not run them together either.
+    // The user asked for the admissions; the self-choice is a default: the session keeps the blocking tier and its admissions.
+    if (a.fetch > 0) return no("STRATA_ADAPT_FETCH");
     return true;
 }
 

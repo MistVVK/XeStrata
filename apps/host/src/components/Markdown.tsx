@@ -9,6 +9,7 @@ import { SyntaxCode } from './SyntaxCode';
 import { MathView } from './MathView';
 import { displayBlock, hasMath, splitMath } from '../lib/math';
 import { imagePlan } from '../lib/markdown-images';
+import { splitLinks } from '../lib/autolink';
 function inlineMarks(text: string, onOpenLink?: (url: string) => void, imageSession?: string | null): ReactNode {
     return text.split(/(!\[[^\]]*\]\([^\s)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*\n]+\*|\[[^\]]+\]\([^\s)]+\))/g).map((part, i) => {
         const image = part.match(/^!\[([^\]]*)\]\(([^\s)]+)\)$/);
@@ -35,7 +36,13 @@ function inlineMarks(text: string, onOpenLink?: (url: string) => void, imageSess
                 e.preventDefault();
                 onOpenLink(link[2]);
             } }}>{link[1]}</a>;
-        return <Fragment key={i}>{part}</Fragment>;
+        // #6000: a web address written as plain text is a link too (lib/autolink.ts), opened the same way
+        return <Fragment key={i}>{splitLinks(part).map((piece, j) => piece.href
+            ? <a key={j} href={piece.href} target="_blank" rel="noreferrer" onClick={e => { if (onOpenLink) {
+                e.preventDefault();
+                onOpenLink(piece.href!);
+            } }}>{piece.text}</a>
+            : <Fragment key={j}>{piece.text}</Fragment>)}</Fragment>;
     });
 }
 /** Text with its inline marks and, outside code spans, its math (#3268). Math is cut out first: a * or _ inside a formula is not emphasis. */

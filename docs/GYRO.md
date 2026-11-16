@@ -41,8 +41,8 @@ the file on a fast local drive. The memory figure is what the weights take once 
 
 Gyro-L (agentionai's 50 GiB file) uses another trellis family, the pair trellis (types 147 to 149, TQP5 to TQP7). The
 engine reads it with the same pack step and expert kernels as the other Gyro files, on the CPU and on CUDA cards. The
-prompt path uses the trellis MMQ build where the build has it; Metal and SYCL have no kernels for it, so they use the CPU
-rows and the FP16 prompt path. We have not run the 50 GiB file ourselves yet.
+prompt path uses the trellis MMQ build where the build has it. Metal has decode and prompt kernels for it. SYCL has none,
+so it uses the CPU rows and the FP16 prompt path. We have not run the 50 GiB file ourselves yet.
 
 **Pictures.** Gyro reads pictures with the original model's picture reader file, the same one every
 Qwen3.8-Flash-Next model uses. Setup downloads it with the model. The reader opens only the vocabulary and the header of

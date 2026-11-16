@@ -90,10 +90,21 @@ export function mcpRows(servers, env, skipped = []) {
       env[variable] = String(value);
       return `@@JS:process.env.${variable}@@`;
     };
-    const config = { serverName: name, ...(server.command
-      ? { transport: 'stdio', command: String(server.command), args: Array.isArray(server.args) ? server.args.map(String) : [], ...(server.cwd ? { cwd: String(server.cwd) } : {}),
-        ...(server.env && Object.keys(server.env).length ? { env: Object.fromEntries(Object.entries(server.env).map(([k, v]) => [k, token('E', k, v)])) } : {}) }
-      : { transport: 'streamable-http', url: String(server.url), ...(server.headers && Object.keys(server.headers).length ? { headers: Object.fromEntries(Object.entries(server.headers).map(([k, v]) => [k, token('H', k, v)])) } : {}) }) };
+    const rawTimeoutSec = server.timeoutSec ?? server.timeout_s ?? server.timeout;
+    const envTimeoutMs = process.env.STRATA_MCP_TIMEOUT_MS && Number(process.env.STRATA_MCP_TIMEOUT_MS) > 0
+      ? Math.round(Number(process.env.STRATA_MCP_TIMEOUT_MS))
+      : undefined;
+    const timeoutMs = Number(rawTimeoutSec) > 0
+      ? Math.round(Number(rawTimeoutSec) * 1000)
+      : (Number(server.toolCallTimeoutMs) > 0 ? Math.round(Number(server.toolCallTimeoutMs)) : envTimeoutMs);
+    const config = {
+      serverName: name,
+      ...(timeoutMs ? { toolCallTimeoutMs: timeoutMs } : {}),
+      ...(server.command
+        ? { transport: 'stdio', command: String(server.command), args: Array.isArray(server.args) ? server.args.map(String) : [], ...(server.cwd ? { cwd: String(server.cwd) } : {}),
+          ...(server.env && Object.keys(server.env).length ? { env: Object.fromEntries(Object.entries(server.env).map(([k, v]) => [k, token('E', k, v)])) } : {}) }
+        : { transport: 'streamable-http', url: String(server.url), ...(server.headers && Object.keys(server.headers).length ? { headers: Object.fromEntries(Object.entries(server.headers).map(([k, v]) => [k, token('H', k, v)])) } : {}) }),
+    };
     rows.push({ id: `mcp-${slug(name)}`, name: '@deepseek-ai/dsh-mcp-client', config });
     index += 1;
   }
@@ -179,7 +190,10 @@ export const DEFAULT_API_OUTPUT = 32768;
 export function outputBudget(context, maxOutput = null) {
   const c = Number.isFinite(context) && context > 0 ? context : null;
   const window = c === null ? Infinity : Math.max(1024, c - Math.min(4096, Math.floor(c / 4)));
-  if (Number.isFinite(maxOutput) && maxOutput > 0) return Math.max(1024, Math.min(Math.floor(maxOutput), window));
+  // A provider's maximum is what the model can write, not what every reply should reserve (#5011): a 128K model that may write 128K left the
+  // prompt about 4K before compaction. The reply keeps the larger of 32K and half the window; a smaller maximum is still respected.
+  const cap = c === null ? Infinity : Math.max(DEFAULT_API_OUTPUT, Math.floor(c / 2));
+  if (Number.isFinite(maxOutput) && maxOutput > 0) return Math.max(1024, Math.min(Math.floor(maxOutput), window, cap));
   return Math.max(1024, Math.min(DEFAULT_API_OUTPUT, window));
 }
 
@@ -191,6 +205,16 @@ export function outputBudget(context, maxOutput = null) {
  * @returns {{patch:string, env:Record<string,string>, routes:Array, defaultRoute:object|null, signature:string}}
  */
 /** What a local model, or an OpenAI-style server on this network, takes for the thinking level (see the comment where a local route is built). */
+/**
+ * "store" is OpenAI's own field (keep the request out of its stored completions). pi-ai sends store: false to every OpenAI-style server it
+ * does not know as non-standard, and some refuse an unknown field: Google's Gemini endpoint answers 400 "Unknown name \"store\"" (#5903). Only
+ * OpenAI's own address gets it; for every other address it is left out.
+ */
+function storeCompat(baseURL) {
+  let host = '';
+  try { host = new URL(baseURL).hostname.toLowerCase(); } catch { /* not an address: leave it out */ }
+  return host === 'api.openai.com' ? {} : { supportsStore: false };
+}
 const THINKING_COMPAT = { supportsStore: false, thinkingFormat: 'chat-template', chatTemplateKwargs: { enable_thinking: { $var: 'thinking.enabled' }, reasoning_effort: { $var: 'thinking.effort', omitWhenOff: true } } };
 
 export function buildProfile({ local = [], connections = [], gate = true, tools = NO_TOOLS_SETTINGS, skillsDir = null, proxyBase = null, searchMock = null, defaultLocalId = null }) {
@@ -271,7 +295,7 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
       api: protocol,
       baseURL,
       ...(conn.apiKey || keyless ? { apiKeyEnv: keyEnv } : {}),
-      ...(ownServer ? { compat: THINKING_COMPAT } : openRouter ? { compat: { thinkingFormat: 'openrouter' } } : {}),
+      ...(ownServer ? { compat: THINKING_COMPAT } : openRouter ? { compat: { thinkingFormat: 'openrouter', ...storeCompat(baseURL) } } : protocol === 'openai-completions' ? { compat: storeCompat(baseURL) } : {}),
       models: conn.models.map(m => ({
         id: m.id, name: m.name || m.id,
         contextWindow: m.contextMax ?? ASSUMED_API_CONTEXT, maxTokens: reply(m),
@@ -293,7 +317,12 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
   const defaultRoute = routes.find(r => r.kind === 'local' && r.instanceId === defaultInstance?.id) ?? routes.find(r => r.kind === 'local') ?? null;
   // One Harness, one set of tool servers: the default local model's.
   const mcpSkipped = [];
-  const mcp = mcpRows({ ...(defaultInstance?.mcpServers ?? {}), ...(tools.servers ?? {}) }, mcpEnv, mcpSkipped);
+  // The model's own servers wait as long as its "Tool timeout (seconds)" says (mcp_timeout_s), unless a server names its own (#5788);
+  // without either the client keeps its default (60 s).
+  const modelTimeoutS = Number(defaultInstance?.mcpTimeoutS) > 0 ? Number(defaultInstance.mcpTimeoutS) : undefined;
+  const modelServers = Object.fromEntries(Object.entries(defaultInstance?.mcpServers ?? {}).map(([name, s]) => [name,
+    modelTimeoutS && s && typeof s === 'object' && s.timeoutSec == null && s.timeout_s == null && s.timeout == null && s.toolCallTimeoutMs == null ? { ...s, timeout_s: modelTimeoutS } : s]));
+  const mcp = mcpRows({ ...modelServers, ...(tools.servers ?? {}) }, mcpEnv, mcpSkipped);
   Object.assign(env, mcpEnv);
   // The person's own instruction and command tools come from the app's tool server; a command tool asks in Manual like any connected tool.
   const own = (kind, on) => on && tools.toolFile ? [{ id: `mcp-strata-${kind}`, name: '@deepseek-ai/dsh-mcp-client', config: { serverName: `strata-${kind}`, transport: 'stdio', command: process.execPath, args: [CUSTOM_TOOLS_SCRIPT, kind, tools.toolFile] } }] : [];
@@ -328,7 +357,7 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
     ...(mcp.length || ownRows.length ? [{ insert: [...mcp, ...ownRows] }] : []),
     ...webRows,
     // The reminder tools would be a second scheduler beside the app's Tasks. The tool groups the person switched off in Settings -> Tools are left out.
-    { id: 'preset-standard', name: '@deepseek-ai/dsh-agent-preset', config: standardPreset({ off: tools.off, search: searchOn, skillsDir, compaction }) },
+    { id: 'preset-standard', name: '@deepseek-ai/dsh-agent-preset', config: standardPreset({ off: tools.off, search: searchOn, skillsDir, compaction, modelNames: subagentRoutes.length > 0 }) },
     // Strata names its chats itself; the Harness's own title request would be an extra model call on
     // every first prompt (and, for an API route, an unrequested one).
     { id: 'session-title-llm', disabled: true },

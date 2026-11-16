@@ -542,7 +542,7 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         if a.parallel >= 2:
             cfg["parallel"] = a.parallel
             for i, line in enumerate(parallel_note(a.parallel, [g.get("vram_gb", 0.0) for g in chosen],
-                                                   MODELS[model]["arena_gb"], ctx, kv, streaming)):
+                                                   MODELS[model]["arena_gb"], ctx, kv, streaming, ram)):
                 (ok if i == 0 else warn)(line)
         else:
             cfg["parallel"] = 1

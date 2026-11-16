@@ -17741,6 +17741,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_METAL_KEEPALIVE_MS",
+   "backends": [
+    "metal"
+   ],
+   "reads": [
+    {
+     "file": "metal/src/mtl_rt.mm",
+     "line": 77,
+     "backend": "metal",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "250.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f12b65334f",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "f12b65334f",
+   "last_date": "2026-11-16",
+   "status": "default",
+   "owner": "metal/engine",
+   "note": "The GPU keep-alive's interval in milliseconds (default 250; 0 turns the keep-alive off). While idle, a tiny GPU job every interval keeps the engine's GPU memory in place, so the first request after a pause does not wait (#6078). Read by metal/src/mtl_rt.mm.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_METAL_KEEPALIVE_WINDOW_S",
+   "backends": [
+    "metal"
+   ],
+   "reads": [
+    {
+     "file": "metal/src/mtl_rt.mm",
+     "line": 80,
+     "backend": "metal",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "120.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f12b65334f",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "f12b65334f",
+   "last_date": "2026-11-16",
+   "status": "default",
+   "owner": "metal/engine",
+   "note": "How long the GPU keep-alive runs after the last request, in seconds (default 120). After that the GPU memory is given back; it also pauses while macOS reports memory pressure (#6078). Read by metal/src/mtl_rt.mm.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_METAL_KEEP_FREE_GB",
    "backends": [
     "metal"
@@ -26883,6 +26949,39 @@
    "status": "research",
    "owner": "prefill",
    "note": "[auto] diagnostic / trace / measurement switch by name or by code, not documented for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PF_TQ_G11",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2672,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "default",
+   "owner": "prefill",
+   "note": "on by default on the RX 7000 cards (gfx1100 / gfx1101 / gfx1102) in a build without llama.cpp's MMQ: the fused prompt kernels take Gyro-S's and Gyro-M's trellis experts instead of the dequantize + FP16 path (#6067; include/strata/prefill/fused_tq_hip.hpp kG11DefaultOn); =0 turns it off; nothing on other devices; for A/B runs only, not for users",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39474,6 +39573,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_STOP_LAYERS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 4733,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "dd1ddc6eab",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "dd1ddc6eab",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "prefill",
+   "note": "[reviewed] #6011: a batched prompt read stops between two layers of a chunk when STOP comes; on by default, 0 turns it back to stopping only between chunks. Internal: users never set it.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_STOP_STAGES",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 15091,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "dd1ddc6eab",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "dd1ddc6eab",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "program",
+   "note": "[reviewed] #6011: every stage of a layer split sees STOP (the later stages get the first stage's should_stop); on by default, 0 turns it back to the first stage only. Internal: users never set it.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_SWITCH_POINT",
    "backends": [
     "cuda-hip"
@@ -41090,6 +41255,39 @@
    "status": "research",
    "owner": "core",
    "note": "[auto] not documented for users; code default not readable from the call",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_TEST_POOL_DELAY",
+   "backends": [
+    "sycl"
+   ],
+   "reads": [
+    {
+     "file": "sycl/src/core/verify.cpp",
+     "line": 410,
+     "backend": "sycl",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "bba1a0e92a",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "bba1a0e92a",
+   "last_date": "2026-11-16",
+   "status": "research",
+   "owner": "core",
+   "note": "[reviewed] Test hook, compiled only into a -DSTRATA_SYCL_TEST_HOOKS=ON build (released engines have no such switch): W:K:MS delays the CPU step K of verify window W by MS ms, for the #5160 fault-injection check.",
    "retire_after": "",
    "retired_in": ""
   },
