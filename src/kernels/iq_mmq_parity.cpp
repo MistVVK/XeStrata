@@ -122,10 +122,30 @@ int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts)
     std::vector<float> y((size_t) (R * N));
     P::copy_out(xq.data(), dxq, xq_bytes);
     P::copy_out(y.data(), dy, y.size());
-
-    // the reference: the device's int8 activations times their scales, the weights through ggml's dequantizer
     const auto* x8 = reinterpret_cast<const int8_t*>(xq.data());
     const auto* xs = reinterpret_cast<const float*>(xq.data() + R * K);
+
+    // The Mul rule's int8 values must be ggml's, bit for bit.  The product check below reads the device's own
+    // activations, so it cannot see the int8 values change: IGC contracting x * id into round's add would still pass
+    // it.  Take d from the device (Mul::scale's output) and apply Mul::inv to it: 1 / d is computed on the host, but
+    // -foffload-fp32-prec-div on strata_sycl and the device link gives the device's 1 / d the same rounded value.
+    // Only round(x * id) is compared: the host transcription of ggml's rule, round away from zero.
+    long long qbad = 0;
+    for (int64_t r = 0; r < R; ++r)
+        for (int64_t b = 0; b < K / 32; ++b) {
+            const float d = xs[(size_t) (r * (K / 32) + b)], id = d != 0.0f ? 1.0f / d : 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                const int8_t q = (int8_t) (int) std::round(x[(size_t) (r * K + b * 32 + j)] * id);
+                if (x8[(size_t) (r * K + b * 32 + j)] != q) ++qbad;
+            }
+        }
+    if (qbad) {
+        std::printf("  %-8s K %4lld: Mul int8 values: %lld differ  *** FAIL ***\n", ggml_type_name(t),
+                    (long long) K, qbad);
+        return 1;
+    }
+
+    // the reference: the device's int8 activations times their scales, the weights through ggml's dequantizer
     const ggml_type_traits* tr = ggml_get_type_traits(t);
     std::vector<float> wf((size_t) (N * K));
     double worst = 0.0, scale = 0.0;
