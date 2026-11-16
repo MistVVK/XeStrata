@@ -1001,7 +1001,8 @@ _NATIVE_TOTAL = re.compile(r"\bn_expert (\d+), total (\d+)")
 def pack_slot_mib(args: list[Any]) -> float:
     """MiB of one engine slot for the pack ``--pack`` names. A native-experts pack (Unsloth, i-quant, NVFP4) gives its expert bytes in the first line of
     native_experts.txt, over n_expert per layer and one line per layer: UD-Q4_K_XL is 77,017,907,200 bytes over 512 x 48, 2.99 MiB a slot, as its engine
-    logs it ("expert cache 2710 slots, 7.90 GiB" on a 16 GB card). Any other pack, or none, is priced at SLOT_MIB (IQ3_S, the set the steps were measured on)."""
+    logs it ("expert cache 2710 slots, 7.90 GiB" on a 16 GB card). The ISTA-DASLab i-quant packs have the file too: IQ3_S 1.952 MiB (SLOT_MIB, the set the
+    steps were measured on), IQ3_XXS 1.665 MiB. A pack without the file (the canonical Q2_0 pack), or no --pack, is priced at SLOT_MIB."""
     pack = _flag_value(args, "--pack")
     try:
         lines = (Path(pack) / "native_experts.txt").read_text(encoding="utf-8", errors="replace").splitlines() if pack else []

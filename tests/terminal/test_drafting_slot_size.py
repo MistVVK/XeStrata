@@ -1,5 +1,5 @@
 """The automatic --draft-conf counts a card's expert slots at the pack's own slot size: a native-experts pack states its expert bytes in
-native_experts.txt; any other pack keeps IQ3_S's SLOT_MIB."""
+native_experts.txt (the ISTA-DASLab i-quant packs too); a pack without it keeps IQ3_S's SLOT_MIB."""
 
 from __future__ import annotations
 
@@ -29,7 +29,20 @@ class PackSlotSize(unittest.TestCase):
             pack = ud_q4_k_xl_pack(Path(tmp))
             self.assertAlmostEqual(drafting.pack_slot_mib(["--pack", str(pack)]), 77017907200 / (512 * 48) / 2 ** 20, places=6)   # 2.99 MiB
 
-    def test_any_other_pack_keeps_the_iq3_s_size(self):
+    def test_the_ista_i_quant_packs_have_the_file_too(self):
+        # the headers tools/iq_pack.py writes for the ISTA-DASLab sets (n_expert 512, 48 layers): IQ3_S prices as SLOT_MIB did, IQ3_XXS smaller
+        for total, want in ((50292326400, 1.9516), (42912972800, 1.6652)):
+            with tempfile.TemporaryDirectory() as tmp:
+                pack = Path(tmp) / "p"
+                pack.mkdir()
+                rows = "".join(f"{layer} 18 20 0 1 0 0 0\n" for layer in range(48))
+                (pack / "native_experts.txt").write_text(
+                    f"# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] (n_expert 512, total {total}; "
+                    "absolute offsets in x.gguf, or in the named shard beside it)\n" + rows, encoding="utf-8")
+                self.assertAlmostEqual(drafting.pack_slot_mib(["--pack", str(pack)]), want, places=4)
+        self.assertAlmostEqual(drafting.SLOT_MIB, 1.95, places=2)
+
+    def test_a_pack_without_the_file_keeps_the_iq3_s_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(drafting.pack_slot_mib(["--pack", tmp]), drafting.SLOT_MIB, "a pack folder with no native_experts.txt")
         self.assertEqual(drafting.pack_slot_mib([]), drafting.SLOT_MIB, "no --pack")
