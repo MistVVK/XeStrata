@@ -482,11 +482,69 @@ def own_log_path(base: dict) -> str | None:
     return None if _SETUP_LOG_NAME.match(Path(value.replace("\\", "/")).name) else value
 
 
+#: The keys of the Settings view (serve/runconfig.py, the web page's About > Settings) that a start saved into this
+#: launch's config. They are not launch choices, and derive_config rebuilds the config from the installed one, so a
+#: value set on the page would quietly revert at the next start unless the earlier start's config carries it — the
+#: same way strata_control/arg_layers.py keeps hand-edited engine options. Not here: "mtp" and drafting (the
+#: launcher decides those with --mtp and --drafting), "open_browser" (strata launch sets it itself), and
+#: "vram_reserve_mib" (an engine option that already survives as a flag in "args" with its "user_args" copy).
+WEB_SETTINGS_KEYS = ("reasoning_budget_tokens", "fit_max_tokens", "anthropic_thinking", "effort_position",
+                     "aliases", "idle_unload_s", "lazy_load", "engine_silence_s", "api_monitor")
+WEB_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p")     # the editable keys of the "sampling" block
+
+#: Advanced-table options (--set, a preset's extra table) that the server reads from the run config, not from the
+#: engine's command line (serve/server.py). Written into the engine args they stop the engine: it knows no
+#: "--idle-unload" and exits with "unknown argument: --idle-unload", restart and exit again.
+SERVER_CONFIG_OPTIONS = {"--idle-unload": "idle_unload_s"}
+
+
+def take_server_options(a_changes: dict) -> dict:
+    """The command-line choices that are server behavior, not engine options: taken out of the engine changes here,
+    written as config keys after the carried values (what this command line says beats what an earlier start saved).
+    Values arrive as words; they become numbers, and one that cannot be is refused in plain words."""
+    out: dict[str, float | None] = {}
+    for flag, key in SERVER_CONFIG_OPTIONS.items():
+        if flag not in a_changes:
+            continue
+        value = a_changes.pop(flag)
+        if value is None:
+            out[key] = None                                   # "--idle-unload off": remove the key (the server never unloads)
+            continue
+        try:
+            number = float(str(value))
+        except ValueError:
+            raise LaunchError(f"idle-unload={value} is not a number of seconds.",
+                              "Use 0 or 'off' to never unload, or a number of seconds such as 300.")
+        out[key] = int(number) if number.is_integer() else number
+    return out
+
+
+def carry_settings(cfg: dict, prev: dict | None) -> None:
+    """The Settings-view values a person saved in this launch's config since its last start (the web page writes into
+    the very file `strata launch` wrote): their standing choices, kept in the rebuilt config like a hand-edit."""
+    if not prev:
+        return
+    for key in WEB_SETTINGS_KEYS:
+        if key not in prev:
+            continue
+        if key == "lazy_load" and prev[key] and cfg.get("vision"):
+            continue                                         # lazy loading is text-only; the page itself refuses it for a picture model
+        cfg[key] = prev[key]
+    sampling = prev.get("sampling")
+    if isinstance(sampling, dict):
+        keep = {k: v for k, v in sampling.items() if k in WEB_SAMPLING_KEYS}
+        if keep:
+            merged = dict(cfg["sampling"]) if isinstance(cfg.get("sampling"), dict) else {}
+            merged.update(keep)
+            cfg["sampling"] = merged
+
+
 def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None,
                   prev: dict | None = None) -> dict:
     """The private run config of this launch: the installed one plus the choices that are not setup's (host, port, key, cards, advanced).
-    `prev` is the config this launch wrote last time: its calibrated values and hand edits are kept (strata_control/arg_layers.py: explicit
-    launch values, then persisted overrides, then calibrated values, then Auto)."""
+    `prev` is the config this launch wrote last time: its calibrated values, hand edits and the values the Settings view
+    saved (serve/runconfig.py, carry_settings) are kept (strata_control/arg_layers.py: explicit launch values, then
+    persisted overrides, then calibrated values, then Auto)."""
     from strata_control import arg_layers, tune_knobs
     cfg = json.loads(json.dumps(base))
     cfg["host"] = acc.host_for(s.access, s.listen)
@@ -522,11 +580,18 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         intel_spec.apply_for_launch(cfg)
     word_flags = S.WORD_VALUE_FLAGS
     a_changes, e_changes = S.as_argv_changes(s.extra, bool_flags, word_flags) if s.extra else ({}, {})
+    server_set = take_server_options(a_changes)              # a server setting (--set idle-unload=...) never rides to the engine
     arg_layers.layer(cfg, a_changes, prev, bool_flags)       # the one place that decides which value an option has
     if e_changes:
         cfg["env"] = tune_knobs.apply_to_env(dict(cfg.get("env") or {}), e_changes)
     from strata_control import draft_layer
     draft_layer.apply(cfg)                                   # "mtp": false (from the installed config too) never sits beside --mtp in the saved args (B10)
+    carry_settings(cfg, prev)                                # what the Settings view saved since the last start survives this launch
+    for key, value in server_set.items():                    # an explicit value from this command line beats what an earlier start saved
+        if value is None:
+            cfg.pop(key, None)
+        else:
+            cfg[key] = value
     return cfg
 
 
