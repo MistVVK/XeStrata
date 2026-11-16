@@ -37,9 +37,10 @@ class RuntimeTests(unittest.TestCase):
                                        "STRATA_RUNTIME_DIR": str(self.root / "runtime")})
         env.start()
         self.addCleanup(env.stop)
-        previous_key = os.environ.pop("STRATA_API_KEY", None)
-        self.addCleanup(lambda: os.environ.__setitem__("STRATA_API_KEY", previous_key)
-                        if previous_key is not None else os.environ.pop("STRATA_API_KEY", None))
+        for name in ("STRATA_API_KEY", "STRATA_TELEMETRY_KEY"):   # a developer's own keys stay out of the tests
+            previous = os.environ.pop(name, None)
+            self.addCleanup(lambda name=name, previous=previous: os.environ.__setitem__(name, previous)
+                            if previous is not None else os.environ.pop(name, None))
         engine = self.root / "engine.py"
         engine.write_text("#!" + sys.executable + "\nimport sys\nfrom pathlib import Path\n"
                           "if '--batch' in sys.argv: print('INFO batch_slots=2', flush=True)\n"
@@ -886,6 +887,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(checked["generation_ready"])
         self.assertEqual(runtime.status("local")["model_state"], "ready")
         self.assertTrue(runtime.verify("local", timeout=10)["generation_ready"])
+
+    def test_a_telemetry_key_in_the_environment_does_not_fail_readiness(self):
+        # STRATA_TELEMETRY_KEY (the monitor's read key, set once for `strata monitor`) makes the server want a key on
+        # /v1/telemetry; a profile with no API key must still pass the readiness probe, which reads that endpoint
+        with mock.patch.dict(os.environ, {"STRATA_TELEMETRY_KEY": "stk-test-read-key"}):
+            result = runtime.start("local", wait=10, shutdown_timeout=2)
+            self.assertTrue(result["ok"], result.get("error"))
+            self.assertTrue(result["api_identity_verified"])
+            self.assertTrue(result["generation_ready"])
+            self.assertTrue(runtime.verify("local", timeout=10)["generation_ready"])
 
     def test_failed_generation_probe_does_not_report_ready(self):
         engine = self.root / "engine.py"
