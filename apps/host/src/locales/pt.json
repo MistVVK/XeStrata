@@ -3537,5 +3537,8 @@
   "s9045": "O modelo parou enquanto respondia.",
   "s9046": "Envie sua mensagem novamente. O Strata reinicia o modelo sozinho. Se continuar acontecendo, abra Detalhes e compartilhe-os ao pedir ajuda.",
   "s9047": "O modelo encontrou um problema enquanto respondia.",
-  "s9048": "Envie sua mensagem novamente. Se continuar acontecendo, abra Detalhes e compartilhe-os ao pedir ajuda."
+  "s9048": "Envie sua mensagem novamente. Se continuar acontecendo, abra Detalhes e compartilhe-os ao pedir ajuda.",
+  "s9049": "Essa pergunta não está mais esperando resposta.",
+  "s9050": "Essa resposta não foi entregue",
+  "s9051": "ctx.length: insira um tamanho de contexto inteiro de 1K a 1024K."
 }

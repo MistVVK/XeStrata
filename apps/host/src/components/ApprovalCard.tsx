@@ -36,7 +36,7 @@ export function ApprovalCard({ messageId, tool: t }: {
     return <section className="toolcard toolcard--compact" data-state={t.state} aria-label={t.name}>
     <details className="toolcard__disclosure">
       <summary><Icon name={t.scope === 'shell' ? 'bolt' : 'tool'} size={17}/><span className="toolcard__title">{tr(t.verb ?? t.name)}</span><span className="toolcard__scope xs muted">{tr(scope.label)}</span><Icon name="chevron" className="toolcard__chevron" size={15}/></summary>
-      <div className="toolcard__body"><code className="toolcard__preview">{t.preview}</code><p className="small muted">{tr(t.effect)}</p>{t.result ? <p className="small">{t.result}</p> : null}</div>
+      <div className="toolcard__body"><code className="toolcard__preview">{t.preview}</code><p className="small muted">{tr(t.effect)}</p>{t.result ? <p className="small">{t.state === 'error' ? tr(t.result) : t.result}</p> : null}</div>
     </details>
     {t.target ? <code className="toolcard__what" title={t.target}>{t.target}</code> : null}
     <div className="toolcard__quick-actions"><span className="xs muted">{tr("Needs your approval")}</span><Btn size="sm" onClick={() => resolveTool(messageId, t.id, false)}>{tr("Deny")}</Btn><Btn variant="primary" size="sm" icon="check" onClick={() => resolveTool(messageId, t.id, true)}>{tr("Approve")}</Btn></div>

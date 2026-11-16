@@ -3537,5 +3537,8 @@
   "s9045": "The model stopped while it was answering.",
   "s9046": "Send your message again. Strata starts the model again by itself. If it keeps happening, open Details and share them when you ask for help.",
   "s9047": "The model ran into a problem while answering.",
-  "s9048": "Send your message again. If it keeps happening, open Details and share them when you ask for help."
+  "s9048": "Send your message again. If it keeps happening, open Details and share them when you ask for help.",
+  "s9049": "That question is no longer waiting for an answer.",
+  "s9050": "That answer was not delivered",
+  "s9051": "ctx.length: enter a whole context size from 1K to 1024K."
 }

@@ -3537,5 +3537,8 @@
   "s9045": "Das Modell hat beim Antworten angehalten.",
   "s9046": "Senden Sie Ihre Nachricht erneut. Strata startet das Modell von selbst neu. Wenn es immer wieder passiert, öffnen Sie „Details“ und teilen Sie sie, wenn Sie um Hilfe bitten.",
   "s9047": "Beim Antworten ist im Modell ein Problem aufgetreten.",
-  "s9048": "Senden Sie Ihre Nachricht erneut. Wenn es immer wieder passiert, öffnen Sie „Details“ und teilen Sie sie, wenn Sie um Hilfe bitten."
+  "s9048": "Senden Sie Ihre Nachricht erneut. Wenn es immer wieder passiert, öffnen Sie „Details“ und teilen Sie sie, wenn Sie um Hilfe bitten.",
+  "s9049": "Diese Frage wartet nicht mehr auf eine Antwort.",
+  "s9050": "Diese Antwort wurde nicht übermittelt",
+  "s9051": "ctx.length: Geben Sie eine ganze Kontextgröße von 1K bis 1024K ein."
 }
