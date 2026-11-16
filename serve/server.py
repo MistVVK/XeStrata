@@ -224,6 +224,13 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+FIT_MIN_ROOM = 1024          # #5924: fit_max_tokens never shortens max_tokens below this (a 400 instead; see fit_floor)
+
+
+def fit_floor(ctx: int) -> int:
+    """#5924: the least room fit_max_tokens shortens a max_tokens to: FIT_MIN_ROOM (thinking plus an answer or a tool
+    call), at most a quarter of a small context (test and tiny contexts keep their shortening)."""
+    return max(1, min(FIT_MIN_ROOM, (ctx - CTX_SLACK) // 4))
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -305,11 +312,13 @@ class ContextOverflow(ValueError):
     does: a client that decides from the wording (Claude Code compacts on "prompt is too long", and shortens max_tokens on "input length and
     `max_tokens` exceed context limit") then does what it does for Anthropic's own error (#4838)."""
 
-    def __init__(self, text, *, prompt, context, max_new=None):
+    def __init__(self, text, *, prompt, context, max_new=None, min_room=None):
         super().__init__(text)
-        self.prompt, self.context, self.max_new = prompt, context, max_new
+        self.prompt, self.context, self.max_new, self.min_room = prompt, context, max_new, min_room
 
     def anthropic_text(self) -> str:
+        if self.min_room:              # #5924: room left, but less than an answer needs: the client should compact
+            return f"prompt is too long: {self.prompt} tokens > {self.context - CTX_SLACK - self.min_room} maximum; {self}"
         if self.max_new is None or self.prompt > self.context - CTX_SLACK - 1:     # the prompt alone leaves no room: the largest one that still leaves a token
             return f"prompt is too long: {self.prompt} tokens > {self.context - CTX_SLACK - 1} maximum; {self}"
         return f"input length and `max_tokens` exceed context limit: {self.prompt} + {self.max_new} > {self.context - CTX_SLACK}; {self}"
@@ -6071,6 +6080,17 @@ class Service:
                                       f"({ctx}); requests are never truncated", prompt=len(ids), context=ctx)
             max_new = room
         elif max_new > room:
+            floor = fit_floor(ctx)
+            if self.fit_max_tokens and room < floor:
+                # #5924: a clamp to a few hundred tokens left a thinking model no room to answer (or to write a tool
+                # call); agents resent the turn and wrote the same truncated sentence again and again.  The context is
+                # all but full: a 400 that says so makes the client compact (Claude Code reads "prompt is too long").
+                self.forget_prompt(encoded_ids)
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"the prompt ({len(ids)} tokens) leaves {max(0, room)} of the {ctx}-token "
+                                      f"context, fewer than the {floor} an answer needs; Strata never truncates "
+                                      f"requests. Shorten the conversation, or send max_tokens {max(0, room)} or less",
+                                      prompt=len(ids), context=ctx, max_new=max_new, min_room=floor)
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
                 raise ContextOverflow("request exceeds the context window: "
