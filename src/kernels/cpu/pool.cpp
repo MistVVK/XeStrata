@@ -11,6 +11,7 @@
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <chrono>
 #include <immintrin.h>
@@ -149,6 +150,24 @@ uint64_t umwait_cycles() {
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
+#if !defined(_WIN32)
+// /sys/devices/system/cpu/cpu<N>/topology/<what> (core_id, physical_package_id): -1 where it is missing or is not a
+// whole number
+long sysfs_topology(int cpu, const char* what) {
+    char path[96];
+    std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
+    std::FILE* f = std::fopen(path, "r");
+    if (f == nullptr) return -1;
+    char text[32] = {};
+    const bool got = std::fgets(text, sizeof text, f) != nullptr;
+    std::fclose(f);
+    if (!got) return -1;
+    char* end = nullptr;
+    errno = 0;
+    const long v = std::strtol(text, &end, 10);
+    return end != text && errno == 0 && (*end == '\n' || *end == '\0') ? v : -1;
+}
+#endif
 }  // namespace
 
 std::vector<int> physical_cores(bool skip_first) {
@@ -184,16 +203,6 @@ std::vector<int> physical_cores(bool skip_first) {
     // load/store bandwidth, so a worker on each would put two workers on one core. sysfs names each CPU's
     // (package, core); the first allowed CPU of each pair is kept, so a taskset
     // that leaves out the first sibling still gets its core.  Without sysfs every allowed CPU counts, as before.
-    auto topo = [](int cpu, const char* what) -> long {
-        char path[96];
-        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
-        long v = -1;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
-            std::fclose(f);
-        }
-        return v;
-    };
     std::vector<int> allowed;
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -205,7 +214,7 @@ std::vector<int> physical_cores(bool skip_first) {
     }
     std::vector<std::pair<long, long>> seen;
     for (int cpu : allowed) {
-        const long pkg = topo(cpu, "physical_package_id"), core = topo(cpu, "core_id");
+        const long pkg = sysfs_topology(cpu, "physical_package_id"), core = sysfs_topology(cpu, "core_id");
         if (pkg >= 0 && core >= 0) {
             const std::pair<long, long> key{pkg, core};
             if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;   // an SMT sibling
@@ -240,8 +249,8 @@ std::vector<LogicalCpuInfo> logical_cpu_layout() {
                          GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask);
     long core = 0;
     for (const char* p = buf.data(); p < buf.data() + len;
-         p += ((const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p)->Size) {
-        const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
+         p += reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p)->Size) {
+        const auto* e = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p);
         if (e->Relationship != RelationProcessorCore) continue;
         for (WORD group = 0; group < e->Processor.GroupCount; ++group) {
             const GROUP_AFFINITY& g = e->Processor.GroupMask[group];
@@ -252,22 +261,12 @@ std::vector<LogicalCpuInfo> logical_cpu_layout() {
         ++core;
     }
 #else
-    auto topo = [](int cpu, const char* what) -> long {
-        char path[96];
-        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
-        long v = -1;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
-            std::fclose(f);
-        }
-        return v;
-    };
     cpu_set_t set;
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof set, &set) != 0) return out;
     for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
         if (!CPU_ISSET(cpu, &set)) continue;
-        const long pkg = topo(cpu, "physical_package_id"), core = topo(cpu, "core_id");
+        const long pkg = sysfs_topology(cpu, "physical_package_id"), core = sysfs_topology(cpu, "core_id");
         out.push_back({cpu, pkg >= 0 && core >= 0 ? pkg * 1000000 + core : -1});
     }
 #endif
@@ -436,7 +435,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core,
     : tasks_(tasks), host_works_(host_works) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     if (const char* e = strata::env_get("POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
-        spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+        spin_before_sleep_ = std::chrono::microseconds((std::max)(0L, std::strtol(e, nullptr, 10)));
     (void) umwait_cycles();   // the park's way is decided before a worker runs (auto: timed on a thread of its own)
     pinned_ = pin;
     std::vector<int> cores = physical_cores(true);
