@@ -156,10 +156,13 @@ with Coder IQ1_M 1,024 MiB fits all 12,288 experts with 2 GB of VRAM free.
   memory. Every allocation of 32 MiB or more goes through `strata::malloc_device_guarded`, which checks the range and allocates
   again behind a spacer until it is clean (a warning names each retry; under 0.5 s at startup; `STRATA_ARENA_ALIAS_CHECK=0`
   skips it). `STRATA_VERIFY_ALL_SLOTS=1` reads every filled cache slot back and compares it with the GGUF.
-- **Monitor tab.** `server_intel.py` plugs `sycl/serve/xe_telemetry.py` into the Monitor (temperature, power, PCIe link from
-  sysfs). Load and VRAM come from `/run/gpustat.json`, written by a small root sampler (`sycl/tools/gpustat.py`, installed with
-  `gpustat.service`), because `xe` reports them per client in `/proc/*/fdinfo`, which only root can read. A run config may name
-  a `model_switcher`; the web app's header then gets a Model menu.
+- **Monitor tab.** `server_intel.py` plugs the shared Intel reader (`serve/telemetry.py`) into the Monitor. Temperature, power and
+  the PCIe link come from sysfs. Load and VRAM work without root: load is the GPU busy time of the engine's own processes
+  (`/proc/<pid>/fdinfo`, readable by the user who started them), the VRAM total comes from Level Zero sysman (`libze_loader.so.1`),
+  and the VRAM in use from sysman on `xe` and from the engine's own fdinfo memory on `i915`. The root sampler
+  (`sycl/tools/gpustat.py`, `gpustat.service`) is optional: when it runs, its `/run/gpustat.json` is used first, and it also sees
+  other users' processes. PCIe traffic needs Intel PMT, which is root-only unless the host grants it; without it the Monitor leaves
+  that reading empty. A run config may name a `model_switcher`; the web app's header then gets a Model menu.
 - **Logprobs.** `/v1/chat/completions` takes `"logprobs": true` and `"top_logprobs": 0..20` through `server_intel.py`, streamed
   or not. Not on `/v1/completions` or the Anthropic endpoint.
 
