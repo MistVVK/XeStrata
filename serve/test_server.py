@@ -5342,8 +5342,8 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
 
     def test_two_cards_keep_their_own_pcie_links(self):
-        """Two cards trained to different widths: each row carries its own link, and the aggregate is the weakest
-        card's.  Card 0's reading used to be the only one anyone could see, so an x4 card hid behind x8."""
+        """Two cards trained to different widths: each row carries its own link, the top-level fields stay card 0's (additive
+        contract), and gpu_pcie_bottleneck names the x4 card, which used to hide behind card 0's x8."""
         from serve import telemetry
         with tempfile.TemporaryDirectory() as d:
             self.tree(d)
@@ -5354,11 +5354,34 @@ class AmdTelemetry(unittest.TestCase):
             with mock.patch.object(telemetry, "SYSFS", d):
                 s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
                 self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(4, 8), (4, 4)])
-                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (4, 4))   # the weakest card, not card 0's x8
+                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (4, 8))   # card 0's, as before
+                self.assertEqual(s["gpu_pcie_bottleneck"], {"card": 1, "gen": 4, "gen_max": 4, "width": 4, "width_max": None})
+
+    def test_the_bottleneck_is_one_real_card_never_a_mix(self):
+        """Gen3 x16 beside Gen5 x4: separate minima would make up "Gen3 x4", a link neither card has.  The bottleneck is the card
+        with the lower lane rate x width (Gen5 x4, 15.75 GB/s, against Gen3 x16, 15.76 GB/s), all its fields from that card."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, (speed, width) in (("renderD129", ("8.0 GT/s PCIe", "16")), ("renderD128", ("32.0 GT/s PCIe", "4"))):
+                dev = Path(d) / "class/drm" / minor / "device"
+                (dev / "current_link_speed").write_text(speed + "\n")
+                (dev / "current_link_width").write_text(width + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(3, 16), (5, 4)])
+                b = s["gpu_pcie_bottleneck"]
+                self.assertEqual((b["card"], b["gen"], b["width"]), (1, 5, 4))
+
+    def test_one_card_its_bottleneck_is_that_card_and_none_without_a_reading(self):
+        from serve import telemetry
+        self.assertEqual(telemetry.pcie_bottleneck([(0, {"pcie_gen": 4, "pcie_gen_max": 4, "pcie_width": 16, "pcie_width_max": 16})]),
+                         {"card": 0, "gen": 4, "gen_max": 4, "width": 16, "width_max": 16})
+        self.assertIsNone(telemetry.pcie_bottleneck([(0, {"pcie_gen": None, "pcie_width": 16}), (1, {"pcie_gen": 4, "pcie_width": None})]))
 
     def test_a_card_with_no_link_reading_stays_missing(self):
         """A card whose sysfs hides its link (the fake tree has no PCIe files) reports nothing: no 0, no invented
-        width, and the aggregate is the other card's link rather than a made-up one."""
+        width; the top-level fields stay card 0's (unknown) and the bottleneck is the card that has a reading."""
         from serve import telemetry
         with tempfile.TemporaryDirectory() as d:
             self.tree(d)
@@ -5368,13 +5391,14 @@ class AmdTelemetry(unittest.TestCase):
             with mock.patch.object(telemetry, "SYSFS", d):
                 s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
                 self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(None, None), (3, 16)])
-                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (3, 16))
+                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (None, None))
+                self.assertEqual(s["gpu_pcie_bottleneck"], {"card": 1, "gen": 3, "gen_max": 3, "width": 16, "width_max": None})
 
     def test_a_card_narrower_than_it_could_be_shows_the_gap(self):
         """A card the board trained down to x4 in a slot the card could do x16, beside a card that is x8 by nature:
-        the gap is one card's, so the aggregate's cap comes from the card that gave the narrowest width (the smallest
-        cap in the run would blame the other card).  Each row also carries its own power ceiling, which the summary
-        adds up - without it the Overview loses "of N W limit" on a split run."""
+        the gap is one card's, so the bottleneck's cap comes from that same card (the smallest cap in the run would blame
+        the other card).  Each row also carries its own power ceiling, which the summary adds up - without it the Overview
+        loses "of N W limit" on a split run."""
         from serve import telemetry
         with tempfile.TemporaryDirectory() as d:
             self.tree(d)
@@ -5386,7 +5410,9 @@ class AmdTelemetry(unittest.TestCase):
             with mock.patch.object(telemetry, "SYSFS", d):
                 s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
                 self.assertEqual([(c["pcie_width"], c["pcie_width_max"]) for c in s["gpus"]], [(8, 8), (4, 16)])
-                self.assertEqual((s["gpu_pcie_width"], s["gpu_pcie_width_max"]), (4, 16))    # x4 that could do x16
+                self.assertEqual((s["gpu_pcie_width"], s["gpu_pcie_width_max"]), (8, 8))      # card 0's, as before
+                self.assertEqual((s["gpu_pcie_bottleneck"]["card"], s["gpu_pcie_bottleneck"]["width"],
+                                  s["gpu_pcie_bottleneck"]["width_max"]), (1, 4, 16))          # x4 that could do x16
                 self.assertEqual([c["power_limit"] for c in s["gpus"]], [300.0, 300.0])      # each card's own ceiling
                 self.assertEqual(s["gpu_power_limit"], 600.0)                                # the run's limit
 

@@ -542,13 +542,38 @@ class _CpuRamFallback:
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
+# usable bandwidth of one lane per PCIe generation, GB/s (after the line code): only the ORDER matters here
+PCIE_LANE_GBS = {1: 0.25, 2: 0.5, 3: 0.985, 4: 1.969, 5: 3.938, 6: 7.563}
+
+
+def pcie_bottleneck(reads) -> dict | None:
+    """The card whose PCIe link carries the least: lane rate of its generation x its width, all five fields from that ONE card (#5801 #5981),
+    never a link put together from two cards.  The generation is the one the link can reach (pcie_gen_max; the current one when that is
+    not reported), since NVML reports a lower one while a card is idle; the width is the negotiated one.  A card whose generation or
+    width is unknown never wins.  None when no card reports both.  One card: that card."""
+    best = None
+    for index, r in reads:
+        gen = r.get("pcie_gen_max") if r.get("pcie_gen_max") is not None else r.get("pcie_gen")
+        width = r.get("pcie_width")
+        if gen not in PCIE_LANE_GBS or not isinstance(width, (int, float)) or width <= 0:
+            continue
+        rate = PCIE_LANE_GBS[gen] * width
+        if best is None or rate < best[0]:
+            best = (rate, index, r)
+    if best is None:
+        return None
+    _, index, r = best
+    return {"card": index, "gen": r.get("pcie_gen"), "gen_max": r.get("pcie_gen_max"), "width": r.get("pcie_width"),
+            "width_max": r.get("pcie_width_max")}
+
+
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load), hottest (temperature) or weakest (the PCIe link, so a card trained to x4 is not
-        hidden behind an x8 card), and "gpus" has each card's own, its link and its power limit included.  `amd`: the
+        PCIe traffic), mean (load) or hottest (temperature), the PCIe link fields stay card 0's, gpu_pcie_bottleneck names the
+        card with the slowest link (pcie_bottleneck), and "gpus" has each card's own, its link and its power limit included.  `amd`: the
         AMD backend's cards, numbered as HIP numbers them, read from sysfs (#301)."""
         self.extra = extra
         self.lock = threading.Lock()
@@ -630,23 +655,8 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
-                # A link is not additive.  These four used to stay card 0's reading, so a card the board had trained
-                # down to x4 hid behind the other card's "Gen5 x8" while the traffic under the tile was already the
-                # two cards' total.  The tile shows the slowest generation and the narrowest width among the cards,
-                # each field on its own: the rule `_Amd.link()` already uses for the hops of one card's path, and the
-                # worst link a token has to cross when the layers sit on both cards.  Each card's own link goes in
-                # "gpus" below, which is what the Monitor and the Terminal name card by card.
-                for k in ("pcie_gen", "pcie_gen_max", "pcie_width"):
-                    v = vals(k)
-                    g[k] = min(v) if v else None
-                # "runs at x8, could do x16" is one card's gap, so the cap goes with the card that gave the width
-                # above, not with the smallest cap in the run (that can be a different card).  Each card's own pair
-                # is in "gpus" below.
-                narrow = [(r.get("pcie_width"), p) for p, (_, r) in enumerate(reads) if r.get("pcie_width") is not None]
-                if narrow:
-                    g["pcie_width_max"] = reads[min(narrow)[1]][1].get("pcie_width_max")
-                else:
-                    g["pcie_width_max"] = None
+                # A link is not additive.  The top-level gpu_pcie_* fields stay card 0's reading (their meaning since #112); the card whose
+                # link is the slowest is named apart in gpu_pcie_bottleneck below, and each card's own link is in "gpus".
                 s["gpus"] = [{"index": i, "name": reader.name(), "util": r.get("util"), "mem_used": r.get("mem_used"),
                               "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
                               "power_limit": r.get("power_limit"),
@@ -656,6 +666,7 @@ class Telemetry:
                               "pcie_own_gen": r.get("pcie_own_gen"), "pcie_path": r.get("pcie_path")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
+            s["gpu_pcie_bottleneck"] = pcie_bottleneck(reads)
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)

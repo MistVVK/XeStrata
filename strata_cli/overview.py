@@ -97,13 +97,6 @@ def _most(values: list) -> float | None:
     return max(present) if present else None
 
 
-def _weakest(values: list) -> float | None:
-    """The smallest reading that came in.  A PCIe link is not a total or a mean: every token crosses the weakest
-    card's link too, so that is the one the tile shows."""
-    present = [v for v in values if v is not None]
-    return min(present) if present else None
-
-
 def build(metrics: dict | None) -> dict | None:
     """The numbers the Overview draws, or None when the server does not serve /metrics (an old server: the caller falls back)."""
     if not isinstance(metrics, dict) or not isinstance(metrics.get("live"), dict):
@@ -196,20 +189,14 @@ def build(metrics: dict | None) -> dict | None:
         g["power"] = _total([c["power"] for c in cards])
         g["power_limit"] = _total([c["power_limit"] for c in cards])
         g["count"] = float(len(cards))
-        # A link is not a total.  These used to be the aggregate fields, which on a split run are card 0's reading:
-        # a "Gen5 x8" tile said nothing about a second card the board had trained down to x4.  The tile shows the
-        # weakest card's link (the same rule as the server's own, and as `_Amd.link()`'s slowest/narrowest hop);
-        # the Cards strip under it names every card's own.
-        gen = _weakest([c["pcie_gen"] if c["pcie_gen"] is not None else c["pcie_gen_max"] for c in cards])
-        width = _weakest([c["pcie_width"] for c in cards])
-        if gen is not None:
-            g["pcie_gen"] = gen
-        if width is not None:
-            g["pcie_width"] = width
-        # "x8 of x16" is one card's gap, so it is taken from the card that gave the width above rather than from the
-        # smallest cap in the run (which can be another card's); the Cards strip still names every card's own.
-        narrow = min((c for c in cards if c["pcie_width"] is not None), key=lambda c: c["pcie_width"], default=None)
-        g["pcie_width_max"] = narrow["pcie_width_max"] if narrow else None
+        # A link is not a total.  The tile shows the link of the ONE card whose link carries the least (the server's own rule,
+        # serve/telemetry.py pcie_bottleneck: lane rate x width, every field from that card, never a link made of two cards' numbers;
+        # a card with no reading never wins); the Cards strip under it names every card's own.
+        from serve.telemetry import pcie_bottleneck
+        slow = pcie_bottleneck([(c["index"], c) for c in cards])
+        if slow is not None:
+            g["pcie_gen"] = slow["gen"] if slow["gen"] is not None else slow["gen_max"]
+            g["pcie_width"], g["pcie_width_max"] = slow["width"], slow["width_max"]
     return model
 
 
@@ -438,8 +425,8 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     gen = f"Gen{int(g['pcie_gen'])}" if g["pcie_gen"] else "PCIe"
     link = f"{gen} x{int(g['pcie_width'])}" if g["pcie_width"] else gen
     # a card that runs narrower than it could - capped to x8 in a x16 slot, or trained down by the board - shows both
-    # numbers, because the narrow one alone reads as a link someone chose; with several cards it is the weakest
-    # card's pair (the Cards strip names each card's own)
+    # numbers, because the narrow one alone reads as a link someone chose; with several cards it is the pair of the card
+    # with the slowest link (the Cards strip names each card's own)
     if g["pcie_width"] and g.get("pcie_width_max") and g["pcie_width_max"] > g["pcie_width"]:
         link += f" of x{int(g['pcie_width_max'])}"
     cpu_sub = (f"{int(c['sockets'])} CPUs {dot} {int(c['cores'])} cores" if c.get("sockets") and c["sockets"] > 1 and c["cores"] else
@@ -450,12 +437,12 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     # A narrow terminal has no room for the label and the ceiling together; the label wins and the tile stays whole
     # (the box crops, so a too-long line would lose its end), and each card's own ceiling is on the Hardware page.
     alone = f"of {fmt(g['power_limit'])} W limit" if g["power_limit"] else ""      # one card: exactly as before
-    together = f"all {ncards} cards of {fmt(g['power_limit'])} W" if g["power_limit"] else f"all {ncards} cards"
-    power_sub = alone if not ncards else (together if len(together) <= inner else f"all {ncards} cards")
+    together = f"{ncards} cards {dot} limit {fmt(g['power_limit'])} W" if g["power_limit"] else f"{ncards} cards"
+    power_sub = alone if not ncards else (together if len(together) <= inner else f"{ncards} cards")
     tiles2 = [
         _tile("Power", f"{fmt(g['power'])} W", power_sub, spark(g["power_hist"], inner, glyphs, lo=0),
               tile_w, accent=accent, box_style=box_style),
-        _tile("PCIe", link, f"weakest of {ncards} cards" if ncards else
+        _tile("PCIe", link, f"slowest of {ncards} cards" if ncards else
               (f"to GPU {fmt(g['pcie_rx'])} MB/s" if g["pcie_rx"] is not None else "to GPU --"),
               spark(g["pcie_hist"], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style),
         _tile("CPU", f"{fmt(c['load'])} %", cpu_sub, spark(c["hist"], inner, glyphs, lo=0, hi=100), tile_w, accent=accent, box_style=box_style),

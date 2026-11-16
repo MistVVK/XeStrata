@@ -493,7 +493,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   spark("sp-temp", h.gpu_temp, 90);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W",
             multi ? per((g) => (g.power == null ? "–" : `${fmt(g.power)} W` +
-                                             (g.power_limit ? ` of ${fmt(g.power_limit)} W ceiling` : "")))
+                                             (g.power_limit ? ` of ${fmt(g.power_limit)} W limit` : "")))
                   : hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   // each card trains its own link: with several cards the big number is the weakest card's and the line under it
@@ -504,9 +504,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const link = (g) => { const v = g.pcie_gen_max || g.pcie_gen;
                         return v ? `Gen${v}${g.pcie_width ? ` x${g.pcie_width}` +
                                (g.pcie_width_max > g.pcie_width ? ` of x${g.pcie_width_max}` : "") : ""}` : "–"; };
-  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
-  const width = hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` +
-                (hw.gpu_pcie_width_max > hw.gpu_pcie_width ? ` of x${hw.gpu_pcie_width_max}` : "") : "";
+  // the big number with several cards: the one card whose link carries the least (gpu_pcie_bottleneck); the top-level fields are card 0's
+  const slow = multi && hw.gpu_pcie_bottleneck ? hw.gpu_pcie_bottleneck : null;
+  const one = slow ? { gen: slow.gen, gen_max: slow.gen_max, width: slow.width, width_max: slow.width_max }
+                   : { gen: hw.gpu_pcie_gen, gen_max: hw.gpu_pcie_gen_max, width: hw.gpu_pcie_width, width_max: hw.gpu_pcie_width_max };
+  const gen = one.gen_max || one.gen;
+  const width = one.width ? `x${one.width}` + (one.width_max > one.width ? ` of x${one.width_max}` : "") : "";
   const rx = hw.gpu_pcie_rx_mb == null ? ""
            : `${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s`;
   setMetric("pcie", gen ? `Gen${gen}` : null, width,

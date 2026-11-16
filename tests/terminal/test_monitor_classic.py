@@ -144,7 +144,7 @@ class SeveralCards(unittest.TestCase):
         self.assertEqual(g["vram_total"], 72.0)                                                    # all cards
         self.assertEqual((g["power"], g["power_limit"]), (625.0, 1050.0))
         text = draw(m)
-        for want in ("busiest of 3 cards", "all 3 cards", "hottest card", "64.3 / 72 GB", "625 W", "all 3 cards of 1,050 W", "61 °C"):
+        for want in ("busiest of 3 cards", "all 3 cards", "hottest card", "64.3 / 72 GB", "625 W", "3 cards", "61 °C"):
             self.assertIn(want, text, want)
         self.assertNotIn("+2", text)                                                              # no more "RTX 3090 +2"
 
@@ -159,19 +159,19 @@ class SeveralCards(unittest.TestCase):
         from and this one said nothing.  The small line names the cards and keeps the added-together ceiling beside it
         while both fit; a narrow terminal keeps the label and drops the ceiling whole, since a line the box crops
         mid-sentence is worse than one less number (each card's own ceiling is on the Hardware page)."""
-        self.assertEqual(self.power_sub(three_cards()), "all 3 cards of 1,050 W")                 # width 110: room
-        self.assertEqual(self.power_sub(three_cards(), 90), "all 3 cards")                         # no room: whole
+        self.assertEqual(self.power_sub(three_cards()), "3 cards")      # 23 characters do not fit the 22 a tile holds (tiles stop growing at 110): whole
+        self.assertEqual(self.power_sub(three_cards(), 90), "3 cards")                         # no room: whole
         text = draw(overview.build(three_cards()), width=90)
         self.assertNotIn("of 1,050", text)
         self.assertNotIn("W limit", text)                                                         # never "…of 1,0"
         two = three_cards()
         two["hardware"]["gpus"] = two["hardware"]["gpus"][:2]
         two["hardware_static"]["gpu_count"] = 2
-        self.assertEqual(self.power_sub(two, 100), "all 2 cards of 700 W")                        # the pair, not the pair's biggest card
+        self.assertEqual(self.power_sub(two, 110), "2 cards · limit 700 W")                        # the pair, not the pair's biggest card
         no_limit = three_cards()
         for c in no_limit["hardware"]["gpus"]:
             c["power_limit"] = None
-        self.assertEqual(self.power_sub(no_limit), "all 3 cards")                                 # no ceiling reported: still says whose power
+        self.assertEqual(self.power_sub(no_limit), "3 cards")                                 # no ceiling reported: still says whose power
         one = metrics("generating")
         one["hardware"]["gpus"] = [{"index": 0, "name": "NVIDIA GeForce RTX 5070", "util": 88, "mem_used": 11.2 * GIB,
                                     "mem_total": 12 * GIB, "temp": 54, "power": 114, "power_limit": 250}]
@@ -200,7 +200,7 @@ class SeveralCards(unittest.TestCase):
         g = overview.build(m)["gpu"]
         self.assertEqual((g["pcie_gen"], g["pcie_width"]), (5.0, 4.0))                                # the weakest card
         text = draw(overview.build(m))
-        self.assertIn("weakest of 3 cards", text)
+        self.assertIn("slowest of 3 cards", text)
         lines = [ln for ln in text.splitlines() if ln.startswith("GPU ")]
         for want, line in zip(("Gen5 x8", "Gen5 x4", "Gen5 x16"), lines):
             self.assertIn(want, line, want)
@@ -210,7 +210,8 @@ class SeveralCards(unittest.TestCase):
         m["hardware"]["gpus"][0].update({"pcie_gen": None, "pcie_gen_max": 5, "pcie_width": 8})   # NVML reports no
         m["hardware"]["gpus"][1].update({"pcie_gen": 3, "pcie_gen_max": 3, "pcie_width": 16})      # link when idle
         g = overview.build(m)["gpu"]
-        self.assertEqual((g["pcie_gen"], g["pcie_width"]), (3.0, 8.0))                             # min of what came in
+        # one real card, never "Gen3 x8" made of two cards' numbers: Gen3 x16 (15.8 GB/s) carries less than Gen5 x8 (31.5 GB/s)
+        self.assertEqual((g["pcie_gen"], g["pcie_width"]), (3.0, 16.0))
         lines = [ln for ln in draw(overview.build(m)).splitlines() if ln.startswith("GPU ")]
         self.assertIn("Gen5 x8", lines[0])
         self.assertIn("Gen3 x16", lines[1])
