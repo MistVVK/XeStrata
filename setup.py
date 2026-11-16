@@ -7438,6 +7438,22 @@ def engine_version(exe: Path) -> tuple:
     return tuple(int(x) for x in v.split(".")[:4] if x.isdigit())
 
 
+def config_engine_version(cfg: dict) -> tuple:
+    """#4544: the version of the engine a run config starts.  On an Intel (SYCL) install the config's exe is the launcher script
+    sycl/serve/strata-sycl.sh, which carries no version (engine_version read it as 0.1.12 and every --update ended with "the engine
+    was NOT updated"): the folder setup_intel.py stamps (engine-sycl/BUILD.json) says it, else the binary the launcher runs
+    (STRATA_SYCL_BIN from the config's env or this environment, default build-sycl-aot/strata).  Nothing readable: () = unknown."""
+    exe = Path(str(cfg.get("exe") or ""))
+    if cfg.get("backend") != "sycl" and exe.name != "strata-sycl.sh":
+        return engine_version(exe)
+    stamped = engine_version_of(ROOT / "engine-sycl")
+    if stamped != "?":
+        return tuple(int(x) for x in stamped.split(".")[:4] if x.isdigit())
+    rel = (cfg.get("env") or {}).get("STRATA_SYCL_BIN") or os.environ.get("STRATA_SYCL_BIN") or "build-sycl-aot/strata"
+    binary = ROOT / rel
+    return engine_version(binary) if binary.is_file() else ()
+
+
 def is_wsl() -> bool:
     return sys.platform.startswith("linux") and "microsoft" in platform.uname().release.lower()
 
@@ -7624,7 +7640,7 @@ def update_install(have: list, a) -> int:
         if cfg.get("backend") == "hip" and WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461
         ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
-    ver = engine_version(Path(json.loads(have[0].read_text(encoding="utf-8-sig"))["exe"]))
+    ver = config_engine_version(json.loads(have[0].read_text(encoding="utf-8-sig")))
     say()
     start = "START-HERE.bat" if WIN else "./setup.sh"
     if any(ver) and tuple(ver) < MIN_ENGINE:             # #3653: the engine step failed above; "updated" would be untrue
