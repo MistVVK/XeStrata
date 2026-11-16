@@ -927,7 +927,7 @@ taskTimer.unref();
 // The probe listens on the loopback address only: a probe on 0.0.0.0 made Windows Defender Firewall ask "Allow Node.js to communicate on these networks?" on the
 // first start of every new install path (QA 0213). Reserved or taken ports are caught on any address; the share listener itself binds 0.0.0.0 only when the person turns sharing on.
 const sharePort = await findFreePort(Number(process.env.STRATA_SHARE_PORT ?? PORT + 1), '127.0.0.1', { skip: [PORT] });
-const localShare = createLocalShare({ handle: openai, hasKey: () => !!store.get().serving?.apiKey, port: sharePort, changed: () => serving.setSharing(localShare.state()) });
+const localShare = createLocalShare({ handle: openai, hasKey: () => !!store.get().serving?.apiKey, port: sharePort, allowResponses: true, changed: () => serving.setSharing(localShare.state()) });
 const tunnelPort = await findFreePort(Number(process.env.STRATA_TUNNEL_PORT ?? PORT + 2), '127.0.0.1', { skip: [PORT, sharePort] });
 const tunnelOrigin = createLocalShare({ handle: openai, hasKey: () => !!store.get().serving?.apiKey, host: '127.0.0.1', port: tunnelPort });
 const connector = createConnectorInstaller({ directory: join(store.HOME, 'engine', 'cloudflare'), componentDirectory: join(componentsDirectory(), 'cloudflared') });
