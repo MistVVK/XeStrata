@@ -226,6 +226,62 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
             self.assertEqual(c.poll(None, None)["parked"], 0)
 
+    SKIPS = [
+        "strata serve: conversation cache: skip parking (12 tokens, below the 512 minimum ...)\n",
+        "strata serve: conversation cache: skip parking (snapshot 9000 MiB exceeds available budget)\n",
+        "strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
+        "MemAvailable 5000 MiB; evicted 4, 0 still parked)\n",
+        "strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
+        "MemAvailable 5000 MiB; evicted 1, 3 still parked; the last eviction gave no memory back, so the rest stay parked)\n",
+        "strata serve: conversation cache: skip parking (RAM floor after capture: 2560 MiB needed, MemAvailable 2000 MiB)\n",
+        "strata serve: conversation cache: allocation failed; skip parking\n",
+        "strata serve: conversation cache: allocation failed; skip parking slot 2\n",
+        "strata serve: conversation cache: skip parking (stage CUDA1: invalid session running-state targets)\n",
+        "strata serve: conversation cache: skip parking (conversation snapshot: invalid live token/image metadata)\n",
+        "strata serve: conversation cache: skipped 5000 tokens in 3.0 ms; parked=0 bytes=0 evictions=2 snapshot_bytes=1 "
+        "reused_kv_bytes=0\n",
+    ]
+
+    def test_refused_parks_by_reason(self):
+        """#6081: every refusal the engine logs is counted once, under a stable reason; a poll that reads nothing new
+        counts nothing; another start of the engine starts at zero."""
+        from serve.server import ConvCacheLog
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text("", encoding="utf-8")
+            c = ConvCacheLog()
+            self.assertEqual((c.poll(str(log), 0)["refused"], c.poll(str(log), 0)["refused_total"]), ({}, 0))
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("".join(self.SKIPS) + self.PARK)
+            st = c.poll(str(log), 0)
+            self.assertEqual(st["refused"], {"short": 1, "budget": 1, "ram_floor": 1, "ram_no_progress": 1,
+                                             "ram_after_capture": 1, "alloc": 2, "estimate": 2, "put": 1})
+            self.assertEqual((st["refused_total"], st["parks"], st["last_refused"]), (10, 1, "put"))
+            st["refused"]["budget"] = 99                    # the caller's copy
+            again = c.poll(str(log), 0)
+            self.assertEqual((again["refused"]["budget"], again["refused_total"]), (1, 10))   # nothing new: nothing counted
+            start = log.stat().st_size
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(self.SKIPS[1])
+            self.assertEqual(c.poll(str(log), start)["refused"], {"budget": 1})   # the engine started again
+
+    def test_prometheus_counts_the_cache(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "Hello.", max_context=4096)
+        svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(self.PARK + "".join(self.SKIPS[1:3]), encoding="utf-8")
+            engine.log_path, engine.log_start = str(log), 0
+            text = svc.prometheus()
+        self.assertIn('strata:conversation_cache_refused_total{reason="budget"} 1\n', text)
+        self.assertIn('strata:conversation_cache_refused_total{reason="ram_floor"} 1\n', text)
+        self.assertIn("strata:conversation_cache_parks_total 1\n", text)
+        self.assertIn("# TYPE strata:conversation_cache_refused_total counter\n", text)
+        self.assertEqual(text.count("# TYPE strata:conversation_cache_refused_total"), 1)
+
     def test_metrics(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)

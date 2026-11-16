@@ -228,6 +228,40 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         check(incremental.kv[i].k==full.kv[i].k && incremental.kv[i].v==full.kv[i].v &&
               incremental.kv[i].k_scale==full.kv[i].k_scale && incremental.kv[i].v_scale==full.kv[i].v_scale &&
               incremental.kv[i].pooled==full.kv[i].pooled, "incremental and full capture agree across every payload");
+    {
+        QsaState unloaded;
+        SavedConversation meta, without_draft;
+        std::vector<SessionKvSource> sources;
+        check(!conversation_snapshot_sources(meta,sources,view,ss,g,unloaded,error) &&
+              error == "conversation snapshot: invalid K/V extent", "an explicitly supplied empty drafter remains invalid");
+        check(conversation_snapshot_sources(meta,sources,view,ss,g,nullptr,error), "disk save without an MTP drafter");
+        check(conversation_snapshot_save(without_draft,view,ss,g,nullptr,error), "capture reference without draft");
+        check(meta.kv.empty() && sources.size()==without_draft.kv.size() &&
+              sources.size()==(size_t)ss.qsa_alloc, "disk sources contain only initialized session layers");
+        for (size_t j=0;j<sources.size();++j) {
+            const auto& kv=without_draft.kv[j];
+            const std::array<const ConversationBuffer*,5> parts={&kv.k,&kv.v,&kv.k_scale,&kv.v_scale,&kv.pooled};
+            for (size_t i=0;i<parts.size();++i) {
+                std::vector<uint8_t> actual(sources[j].sizes[i]), expected(parts[i]->size());
+                check(sources[j].sizes[i]==parts[i]->size(), "no-draft source part size");
+                check(sources[j].read(i,0,actual.data(),actual.size()) &&
+                      parts[i]->read(expected.data(),0,expected.size()) && actual==expected,
+                      "no-draft disk source matches captured bytes");
+            }
+        }
+        SessionReadLimits limits, with_draft;
+        check(conversation_session_read_limits(limits,ss,g,nullptr,96,1,error), "no-draft read limits");
+        check(conversation_session_read_limits(with_draft,ss,g,draft.st,96,1,error), "draft read limits unchanged");
+        check(limits.max_kv_layers==(uint64_t)ss.qsa_alloc && limits.max_kv_bytes.size()==limits.max_kv_layers &&
+              with_draft.max_kv_layers==limits.max_kv_layers+1, "read limits omit exactly the absent draft layer");
+        for (size_t j=0;j<limits.max_kv_bytes.size();++j)
+            check(limits.max_kv_bytes[j]==with_draft.max_kv_bytes[j], "main layer byte bounds unchanged");
+        check(conversation_snapshot_validate(without_draft,ss,g,nullptr,error), "no-draft snapshot validates");
+        check(!conversation_snapshot_validate(without_draft,ss,g,draft.st,error) &&
+              !conversation_snapshot_validate(full,ss,g,nullptr,error), "draft-presence mismatch rejected in both directions");
+        check(conversation_snapshot_restore(without_draft,ss,g,nullptr,error)==ConversationRestore::restored,
+              "no-draft restore through host transfer backend");
+    }
     reuse = {full.kv,9,9};
     reuse.kv.back().k.pop_back();
     copy_calls = sync_calls = 0;
