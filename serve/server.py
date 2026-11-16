@@ -4592,7 +4592,7 @@ def engine_arch_note(cfg: dict, cards: dict[int, int] | None = None, built: dict
             return None
         names = ", ".join(f"sm_{m}" for m in miss)
         return (f"[strata] this engine was built for {', '.join(f'sm_{a}' for a in archs)}, but a graphics card in use is {names}: long prompts "
-                "can stop with \"unspecified launch failure\". Update the engine (./update.sh, or `strata update`) so it is built for every card in this PC.")
+                "can stop with \"unspecified launch failure\". Update the engine (./setup.sh --update, or `strata update`) so it is built for every card in this PC.")
     except Exception:
         return None
 

@@ -45,14 +45,20 @@ exit /b 1
 set "PYTHONNOUSERSITE=1"
 set "PYTHONHOME="
 set "PYTHONPATH="
-"python\python.exe" setup.py %*
-if errorlevel 1 pause
-exit /b
+rem one block, read before it runs: setup.py --update pulls the newest code, which can change this very file
+(
+  "python\python.exe" setup.py %*
+  if errorlevel 1 pause
+  exit /b
+)
 
 :run
-".venv\Scripts\python.exe" setup.py %*
-if errorlevel 1 pause
-exit /b
+rem one block, read before it runs: setup.py --update pulls the newest code, which can change this very file
+(
+  ".venv\Scripts\python.exe" setup.py %*
+  if errorlevel 1 pause
+  exit /b
+)
 
 :findpy
 rem the py launcher first, then python on PATH (not the Microsoft Store stub), then the usual per-user folders

@@ -46,8 +46,8 @@ class AcquisitionRefused(RuntimeError):
 def explicit_commands() -> str:
     """The commands that acquire, named for this platform."""
     if os.name == "nt":
-        return "SETUP.bat (first-time setup), UPDATE.bat (update) or `strata install`"
-    return "./setup.sh (first-time setup), ./update.sh (update) or `strata install`"
+        return "START-HERE.bat (first-time setup), START-HERE.bat --update (update) or `strata install`"
+    return "./setup.sh (first-time setup), ./setup.sh --update (update) or `strata install`"
 
 
 def is_forbidden() -> bool:
