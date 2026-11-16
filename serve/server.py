@@ -62,7 +62,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, parser_for_template, anthropic_to_messages, anthropic_tools,  # noqa: E402
+from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END, ChatTemplate, Event, OutputParser,  # noqa: E402
+                            parser_for_template, anthropic_to_messages, anthropic_tools,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config, resolve_image_results  # noqa: E402
@@ -5090,6 +5091,9 @@ class Service:
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.undeclared_tool_calls = "text"               # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
+        # (a): a reply to a request with tools that ends in tool-call markup that is no call is written again once (default
+        # on; STRATA_TOOL_MARKUP_RETRY=0 is the way back to sending it as text)
+        self.tool_markup_retry = os.environ.get("STRATA_TOOL_MARKUP_RETRY", "1").strip().lower() not in ("0", "off", "false", "no")
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
@@ -5966,6 +5970,8 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:tool_calls_unread_total", "counter", "<tool_call> blocks returned as text (an undeclared name or a form the template does not use)",
              t.get("tool_calls_unread", 0)),
+            ("strata:tool_markup_retries_total", "counter", "Replies that ended in tool-call markup that is no call and were written again once (STRATA_TOOL_MARKUP_RETRY)",
+             t.get("tool_markup_retries", 0)),
             ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written",
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
@@ -6425,8 +6431,21 @@ class Service:
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
+        # the names the parser takes as declared: the request's tools and those its history called (#4663)
+        declared = [t.get("name") for t in with_history_tools(tools, sampling) or []
+                    if isinstance(t, dict) and isinstance(t.get("name"), str)]
+        # (a): armed for a request with tools, on the template's own call form (the Qwen form; a JSON-form parser or another
+        # family keeps sending the text as it is)
+        hold = ToolMarkupHold(bool(self.tool_markup_retry and declared and self.family is None
+                                   and self.parser_cls is OutputParser))
+        parser_done, markup_retried = False, None
+
         def cut(evs):
-            """The events with the answer's text cut at a stop string (OpenAI stop, Anthropic stop_sequences)."""
+            """The events with the answer's text cut at a stop string (OpenAI stop, Anthropic stop_sequences), then
+            through the tool-markup hold (a)."""
+            return hold.push(_cut(evs))
+
+        def _cut(evs):
             if stops is None:
                 return evs
             out = []
@@ -6443,6 +6462,7 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        forced_text = force                             # (a): the retry opens a forced call again (tool_choice)
         opening = []                                    # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
             opening, force = parser.feed(force), None
@@ -6770,6 +6790,50 @@ class Service:
                             # tokens, a tag held back) or the reasoning count is short: on from the live session
                             prompt = prompt + seg
                             continue
+                        if (hold.armed and not hold.calls and finish == "stop" and not (wrap or opens)
+                                and not cancel.is_set() and not repeated and not looped and parser.state != "reasoning"
+                                and (stops is None or (stops.hit is None and not stops.held))):
+                            # (a): the model stopped (a request with tools).  Read the rest of its output here, as the
+                            # end would: a call that is whole there goes out as one; when the reply ends in tool-call
+                            # markup that is no call (held back, not sent), it is written again once
+                            for ev in cut(parser.finish("stop")):
+                                yield "event", ev
+                            parser_done = True
+                            dead = dead_markup_tail(hold.text) if hold.held and not hold.calls else None
+                            if dead is not None:
+                                names = [x for x in markup_names(hold.text) if x not in declared]
+                                kind = "rejected" if names else dead[1]
+                                near = closest_declared(names[0], declared) if names else None
+                                note = tool_retry_note(kind, names[:3], declared, near)
+                                extra = self.tok.encode(IM_END + "\n<|im_start|>user\n" + note + IM_END
+                                                        + "\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                                                        + (forced_text or ""), parse_special=True)
+                                if max_new - n - len(extra) >= TOOL_RETRY_MIN_ROOM:
+                                    dropped = hold.drop()
+                                    hold.armed = False          # one retry: its own reply goes out as it is written
+                                    markup_retried = {"reason": kind, "chars": len(dropped), "names": names[:3]}
+                                    with self.status_lock:
+                                        t = self.totals
+                                        t["tool_markup_retries"] = t.get("tool_markup_retries", 0) + 1
+                                        t["tool_calls_unread"] = t.get("tool_calls_unread", 0) + parser.unread
+                                    print(f"[strata] the reply ended in tool-call markup that is no call ({kind}"
+                                          + (f": {', '.join(names[:3])}" if names else "") + (f", closest declared "
+                                          f"{near}" if near else "") + f"; {len(dropped)} characters held back): writing "
+                                          "the reply's end again once (STRATA_TOOL_MARKUP_RETRY=0 turns this off)",
+                                          flush=True)
+                                    max_new -= len(extra)       # the note is prompt: the reply keeps inside the context
+                                    prompt = prompt + seg + extra
+                                    parser = self.parser_cls(thinking=False, tools=with_history_tools(tools, sampling),
+                                                             stream_tools=True, recover=self.tool_call_recovery,
+                                                             declared_only=declared_only,
+                                                             deferred=deferred or self.undeclared_tool_calls == "call")
+                                    detok, tail, parser_done, force, budget = Detokenizer(self.tok), "", False, None, None
+                                    if forced_text:     # a forced call (tool_choice): its opening again, read as
+                                        for ev in cut(parser.feed(forced_text)):     # if the model had written it
+                                            yield "event", ev
+                                    finish = "length"
+                                    continue
+                            break
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -6928,8 +6992,12 @@ class Service:
                 self._terminal_event_locked(request_id, event, finish)
             if emb:
                 Path(emb).unlink(missing_ok=True)
-        for ev in cut(parser.finish(finish)):
+        if not parser_done:
+            for ev in cut(parser.finish(finish)):
+                yield "event", ev
+        for ev in hold.release():                   # no retry (or its reply): the held text goes out as it is
             yield "event", ev
+        hold.armed = False
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
@@ -6955,7 +7023,6 @@ class Service:
             # #5904 / #5933 / #4622: plus the declared tool the name comes closest to, as a hint for the client or the
             # model's next turn.  Only a hint: the call is not run under that name (a guessed tool is a safety risk;
             # "undeclared_tool_calls": "call" stays the only way to run an undeclared call)
-            declared = [t.get("name") for t in tools or [] if isinstance(t, dict) and isinstance(t.get("name"), str)]
             rejected = []
             for nm in named or []:
                 entry = {"name": nm, "reason": "undeclared"}
@@ -6964,7 +7031,9 @@ class Service:
                     entry["closest_declared"] = near
                 rejected.append(entry)
         if stops is not None and stops.hit is None and stops.held:
-            yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
+            # the held tail was not a stop string after all
+            for ev in hold.push([Event("content", stops.flush())]):
+                yield "event", ev
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n,
                 "reasoning_recoveries": recovery_count}
@@ -6972,6 +7041,17 @@ class Service:
             done["stop_sequence"] = stops.hit
         if rejected:
             done["rejected_tool_calls"] = rejected
+        if markup_retried is not None:
+            done["tool_markup_retry"] = markup_retried
+        if declared:
+            # strata_unread_tool_markup (GUI-C-1116 reads it): the reply the client got ends in tool-call markup that is
+            # no call and is not one of strata_rejected_tool_calls' (a declared name's block that does not read, a cut one)
+            text = hold.reply_text()
+            tail_markup = dead_markup_tail(text)
+            if tail_markup is not None:
+                said = {e["name"] for e in rejected}
+                if not said.intersection(markup_names(text[tail_markup[0]:])):
+                    done["unread_tool_markup"] = {"reason": tail_markup[1], "chars": len(text) - tail_markup[0]}
         yield "done", done
 
 
@@ -6991,6 +7071,132 @@ def closest_declared(name: str, declared: list[str]) -> str | None:
     if best:
         return next(d for d in declared if d.lower() == best[0])
     return None
+
+
+TOOL_RETRY_MIN_ROOM = 64     # (a): the retry runs only with this many output tokens left after its note
+_MARKUP_OPENER = re.compile(r"<tool_call>|<function=")
+
+
+def _line_start(s: str, i: int) -> bool:
+    head = s[:i].rstrip(" \t")
+    return not head or head.endswith("\n")
+
+
+def dead_markup_tail(text: str) -> tuple[int, str] | None:
+    """The tool-call markup a reply's text ends in: (where the run of blocks at the end starts, "cut_off" | "unreadable"),
+    or None when the text does not end in one.  A block opens with `<tool_call>` (or a bare `<function=`) at a line
+    start, outside a ``` fence; "cut_off": the last block has no closer (`</tool_call>`, or `</function>` for a bare one),
+    "unreadable": it closed (the parser read it as no call).  Text after a block's closer means the reply went on: None."""
+    s = text.rstrip()
+    start, reason, end = None, None, len(s)
+    while True:
+        part = s[:end]
+        iw = max((m.start() for m in re.finditer(re.escape(CALL_START), part) if _line_start(part, m.start())), default=-1)
+        ib = max((m.start() for m in re.finditer(re.escape(FUNC_START), part) if _line_start(part, m.start())), default=-1)
+        bare = ib > iw and (iw < 0 or CALL_END in part[iw:ib])
+        i = ib if bare else iw
+        if i < 0:
+            break
+        body = part[i:]
+        closer = FUNC_END if bare else CALL_END
+        k = body.find(closer)
+        if k >= 0 and body[k + len(closer):].strip():
+            break                                       # the block closed and text follows it: not the reply's end
+        closed = k >= 0
+        if reason is None:
+            reason = "unreadable" if closed or body.endswith(FUNC_END) else "cut_off"
+        elif not closed:
+            break                                       # an unclosed block before the last one: the run starts after it
+        start, end = i, len(part[:i].rstrip())
+    if start is None or s[:start].count("```") % 2:
+        return None
+    return start, reason
+
+
+def markup_names(text: str) -> list[str]:
+    """The names written in the `<function=NAME>` openers of a piece of text."""
+    return [m.group(1).strip() for m in re.finditer(r"<function=([^<>\n]+?)>", text)]
+
+
+def tool_retry_note(reason: str, names: list[str], declared: list[str], near: str | None) -> str:
+    """(a): the user-turn note the one retry reads: why the call was not run, the declared tools, the hint."""
+    what = {"rejected": "it names " + ", ".join(f"`{x}`" for x in names) + ", which is not one of the tools you can call",
+            "cut_off": "it was cut off before its end",
+            "unreadable": "it is not in a form that can be read"}[reason]
+    listed = ", ".join(declared[:40]) + (f" and {len(declared) - 40} more" if len(declared) > 40 else "")
+    hint = f" Did you mean `{near}`?" if near else ""
+    return (f"[Strata server] Your last reply ended with a tool call that was not run: {what}.{hint} The tools you can "
+            f"call are: {listed}. Write the call again in this form, with a tool from that list:\n"
+            f"{CALL_START}\n{FUNC_START}TOOL_NAME>\n<parameter=PARAMETER_NAME>\nvalue\n</parameter>\n{FUNC_END}\n{CALL_END}\n"
+            "or answer in plain text if no tool is needed.")
+
+
+class ToolMarkupHold:
+    """(a) The answer's text from a tool-call opener at a line start is held back until the reply goes on past the block
+    (then it is sent as it is) or ends in it (then the server may write the reply's end again, once, in place of it).
+    Unarmed it holds nothing; it always keeps the text it sent, for strata_unread_tool_markup."""
+
+    def __init__(self, armed: bool):
+        self.armed = armed
+        self.held: list[Event] = []
+        self.text = ""
+        self.closed = False                             # a closer (`</tool_call>` / `</function>`) is in the held text
+        self.sent: list[str] = []
+        self.prev = ""                                  # the last characters sent (a line start at the reply's start)
+        self.fences = 0                                 # ``` marks sent so far
+        self.calls = False                              # a tool call came out: the reply does not end in dead markup
+
+    def _send(self, ev: Event) -> Event:
+        if ev.text:
+            self.sent.append(ev.text)
+            self.prev = (self.prev + ev.text)[-16:]
+            self.fences += ev.text.count("```")
+        return ev
+
+    def _opener(self, text: str) -> int:
+        for m in _MARKUP_OPENER.finditer(text):
+            seen = self.prev + text[:m.start()]
+            if _line_start(seen, len(seen)) and (self.fences + text[:m.start()].count("```")) % 2 == 0:
+                return m.start()
+        return -1
+
+    def push(self, evs: list) -> list:
+        out = []
+        for ev in evs:
+            if ev.kind != "content":
+                if ev.kind in ("tool_start", "tool_call"):
+                    self.calls = True
+                out += self.release()
+                out.append(ev)
+                continue
+            text = ev.text or ""
+            if not self.held:
+                p = self._opener(text) if self.armed and text else -1
+                if p < 0:
+                    out.append(self._send(ev))
+                    continue
+                if p:
+                    out.append(self._send(Event("content", text[:p])))
+                ev, text = Event("content", text[p:]), text[p:]
+            self.held.append(ev)
+            self.text += text
+            if not self.closed:                         # (until a closer arrives the block is open: held, no scan)
+                near = self.text[-(len(text) + len(CALL_END)):]
+                self.closed = CALL_END in near or FUNC_END in near
+            if self.closed and text.strip() and dead_markup_tail(self.text) is None:
+                out += self.release()                   # text after the block: the reply goes on
+        return out
+
+    def release(self) -> list:
+        evs, self.held, self.text, self.closed = self.held, [], "", False
+        return [self._send(ev) for ev in evs]
+
+    def drop(self) -> str:
+        text, self.held, self.text, self.closed = self.text, [], "", False
+        return text
+
+    def reply_text(self) -> str:
+        return "".join(self.sent)
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -7467,6 +7673,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             if x.get("rejected_tool_calls"):
                 last["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796: only when a call was refused as undeclared
+            if x.get("unread_tool_markup"):
+                last["strata_unread_tool_markup"] = x["unread_tool_markup"]
             yield last
     if not answered_done and not cancel.is_set():
         # Every admitted request ends with a "done" event that carries its finish reason. A run that simply stopped (a 200 with one chunk and no
@@ -7532,6 +7740,8 @@ def openai_collect(chunks) -> dict:
         out["timings"] = last["timings"]
     if last.get("strata_rejected_tool_calls"):
         out["strata_rejected_tool_calls"] = last["strata_rejected_tool_calls"]
+    if last.get("strata_unread_tool_markup"):
+        out["strata_unread_tool_markup"] = last["strata_unread_tool_markup"]
     return out
 
 
@@ -7718,6 +7928,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                                      "cache_read_input_tokens": reused, "output_tokens": x["completion_tokens"]}}
             if x.get("rejected_tool_calls"):
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
+            if x.get("unread_tool_markup"):
+                delta_event["strata_unread_tool_markup"] = x["unread_tool_markup"]
             yield "message_delta", delta_event
             yield "message_stop", {"type": "message_stop"}
 
@@ -7752,6 +7964,8 @@ def anthropic_collect(events) -> dict:
             msg["usage"].update(e["usage"])
             if e.get("strata_rejected_tool_calls"):
                 msg["strata_rejected_tool_calls"] = e["strata_rejected_tool_calls"]
+            if e.get("strata_unread_tool_markup"):
+                msg["strata_unread_tool_markup"] = e["strata_unread_tool_markup"]
     for i in range(len(blocks) - 1):    # a turn with no </think>: the text is the answer; it is not also a thinking block
         a, b = blocks[i], blocks[i + 1]
         if a.get("type") == "thinking" and b.get("type") == "text" and a.get("thinking", "").strip() == b.get("text", "").strip():
@@ -10807,6 +11021,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
     svc.undeclared_tool_calls = undeclared_tool_calls_setting(cfg)
+    retry = cfg.get("tool_markup_retry", True)         # (a): false (or STRATA_TOOL_MARKUP_RETRY=0) sends the markup as text
+    if not isinstance(retry, bool):
+        raise SystemExit(f"[strata] config \"tool_markup_retry\" must be true or false, not {retry!r}")
+    svc.tool_markup_retry = svc.tool_markup_retry and retry
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")

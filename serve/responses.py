@@ -837,6 +837,11 @@ class Assembler:
             "input_tokens": prompt, "input_tokens_details": {"cached_tokens": min(done.get("reused") or 0, prompt)},
             "output_tokens": n, "output_tokens_details": {"reasoning_tokens": done.get("reasoning_tokens", 0)},
             "total_tokens": prompt + n}
+        # #3796 / (a): the markers /v1/chat/completions carries, at the top level of the response object
+        if done.get("rejected_tool_calls"):
+            self.response["strata_rejected_tool_calls"] = done["rejected_tool_calls"]
+        if done.get("unread_tool_markup"):
+            self.response["strata_unread_tool_markup"] = done["unread_tool_markup"]
         if length:
             self.response["status"] = "incomplete"
             self.response["incomplete_details"] = {"reason": "max_output_tokens"}
