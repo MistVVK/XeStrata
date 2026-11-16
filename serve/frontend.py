@@ -817,17 +817,23 @@ def _close_verdict(after: str, final: bool) -> str:
 
 
 def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True,
-              allow_reopen: bool = False, names=None) -> int:
+              allow_reopen: bool = False, names=None, closer: str | None = None) -> int:
     """Where a parameter value in `text` ends: the first PARAM_END followed (after whitespace) by the next
     PARAM_START or FUNC_END, or by the wrapper's CALL_END when the call's `</function>` was left out (#4427) - the
     same text inside a value (a file that documents the call format, #210) is
     part of the value.  #4078: a close inside a call the value itself quotes (more _QUOTED_OPEN than FUNC_END before
     it), or one followed by the same string parameter `name` again, is part of the value too.  `text` starts at the value.
+    #6032 R4: `closer` (`</NAME>` of a value opened as the element `<NAME>`) ends it too, under the same follower rule;
+    close_len() says which closer stands at the answer.
     -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
-    at = text.find(PARAM_END)
+    def nxt(start):
+        a = text.find(PARAM_END, start)
+        b = text.find(closer, start) if closer else -1
+        return a if b < 0 or 0 <= a < b else b
+    at = nxt(0)
     while at >= 0:
         if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
-            after = text[at + len(PARAM_END):].lstrip()
+            after = text[at + close_len(text, at, closer):].lstrip()
             if after.startswith(PARAM_START):
                 gt = after.find(">")
                 if gt < 0:
@@ -848,8 +854,13 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                     or any(t.startswith(after) for t in FOLLOWERS) or _follower_form(after) is None \
                     or (names and opener_at(after, names, final) == "pending"):
                 return at if final else -2
-        at = text.find(PARAM_END, at + 1)
+        at = nxt(at + 1)
     return -1
+
+
+def close_len(text: str, at: int, closer: str | None = None) -> int:
+    """#6032 R4: the length of the value closer param_end found at `at`: `</parameter>`, or the element's `</NAME>`."""
+    return len(closer) if closer and not text.startswith(PARAM_END, at) and text.startswith(closer, at) else len(PARAM_END)
 
 
 # #6032 R1: what else ends a value after its `</parameter>` (Gyro / Coder-L recordings): the Anthropic XML form's
@@ -966,10 +977,12 @@ def opener_at(s: str, names=None, final: bool = False):
     return None
 
 
-def call_end(text: str, final: bool = False, hold: bool = True) -> int:
+def call_end(text: str, final: bool = False, hold: bool = True, names=None) -> int:
     """Where a tool call's body ends (#210): the `</tool_call>` after the call's own `</function>`, found by walking
     its parameters with param_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in
-    the call format ends at the first `</tool_call>`, as before."""
+    the call format ends at the first `</tool_call>`, as before.  #6032 R4 (recover): `names` - the declared
+    parameters of the call's tool - lets the walk step over damaged openers and elements as parse_tool_call reads them."""
+    seen = set()
     s = text.lstrip()
     pos = len(text) - len(s)
     if not s.startswith("<function="):
@@ -982,14 +995,29 @@ def call_end(text: str, final: bool = False, hold: bool = True) -> int:
         rest = text[pos:]
         s = rest.lstrip()
         pos += len(rest) - len(s)
+        got = opener_at(s, set(names) - seen, final) if names and not s.startswith(("<parameter=", FUNC_END)) else None
+        if got == "pending":
+            return -1
         if s.startswith("<parameter="):
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], final, param_name(text[pos:gt].split("=", 1)[1]), hold, allow_reopen=True)
+            pname = param_name(text[pos:gt].split("=", 1)[1])
+            end = param_end(text[gt + 1:], final, pname, hold, allow_reopen=True,
+                            names=(set(names) - seen - {pname}) if names else None)
             if end < 0:
                 return -1
+            seen.add(pname)
             pos = gt + 1 + end + len(PARAM_END)
+        elif got is not None and got[2] is None:              # #6032 R2 / R4: a damaged opener or an element
+            pname, length, _ = got
+            closer = "</%s>" % pname if s.startswith("<%s>" % pname) else None
+            end = param_end(text[pos + length:], final, pname, hold, allow_reopen=True,
+                            names=set(names) - seen - {pname}, closer=closer)
+            if end < 0:
+                return -1
+            seen.add(pname)
+            pos = pos + length + end + close_len(text[pos + length:], end, closer)
         elif s.startswith(FUNC_END):
             rest = text[pos + len(FUNC_END):]
             s = rest.lstrip()
@@ -1322,6 +1350,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
                 got = (param_name(rest[len(PARAM_START):rest.index(">")]), rest.index(">") + 1, None)
             s = rest
         pname, length, inline = got
+        closer = "</%s>" % pname if recover and pname and s.startswith("<%s>" % pname) else None   # #6032 R4: an element
         rest = s[length:]
         declared = declared_type(props.get(pname)) if pname else None
         if inline is not None:                               # the colon form carries its value on the opener's line
@@ -1330,9 +1359,9 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
             # #5493: a close followed by the same name again is part of a STRING value (#4078); a non-string parameter
             # written twice is two writes of it, and the later one counts
             end = param_end(rest, final=True, name=pname, allow_reopen=(declared is None or _declares(declared, "string")),
-                            names={n for n in props if n not in args and n != pname} if recover else None)
+                            names={n for n in props if n not in args and n != pname} if recover else None, closer=closer)
             value = rest[:end] if end >= 0 else rest
-            rest = rest[end + len(PARAM_END):] if end >= 0 else ""
+            rest = rest[end + close_len(rest, end, closer):] if end >= 0 else ""
             if value.startswith("\n"):
                 value = value[1:]
             if value.endswith("\n"):
@@ -1659,6 +1688,7 @@ class OutputParser:
         self.sheld: dict = {}        # #5493: the non-string parameters, sent when the call closes (a later write wins)
         self.sset: set = set()       # #6032 R2: the parameters set so far (a damaged opener counts only for the others)
         self.snames = None           # ... the declared ones not set yet, for the current value's end (recover only)
+        self.scloser = None          # #6032 R4: `</NAME>` when the current value was opened as the element `<NAME>`
         self.spname = None
         self.sraw_pname = ""
         self.svstart = 0
@@ -1705,6 +1735,18 @@ class OutputParser:
         self._function_end_checked = -1 if end >= 0 else len(self.buf)
         return end
 
+    def _call_names(self):
+        """#6032 R4 (recover): the declared parameters of the tool the call in self.buf names, for call_end's walk."""
+        if not self.recover:
+            return None
+        m = re.match(r"\s*<function=([^<>\n]*)>", self.buf)
+        if not m:
+            return None
+        name = m.group(1).strip()
+        name = self.aliases.get(name, name)
+        props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
+        return set(props) or None
+
     def _wrapped_call_end(self) -> int:
         # Without a closing tag the structural walk cannot finish. Search only
         # newly appended text plus enough overlap for a tag split across feeds.
@@ -1717,9 +1759,10 @@ class OutputParser:
                 self._call_end_checked = len(self.buf)
                 return -1
         self._restore_scan_body()
-        end = call_end(self.buf, self._final)
+        names = self._call_names()
+        end = call_end(self.buf, self._final, names=names)
         # #4701: a complete closing sequence may be waiting for lookahead or finish(), not another closing tag.
-        pending = end < 0 and not self._final and call_end(self.buf, final=True) >= 0
+        pending = end < 0 and not self._final and call_end(self.buf, final=True, names=names) >= 0
         self._call_end_checked = -1 if end >= 0 or pending else len(self.buf)
         return end
 
@@ -1789,6 +1832,8 @@ class OutputParser:
                     self.sraw_pname = pname
                     self.spname = pname
                     self.snames = (set(self.sdeclared) - self.sset - {pname}) if self.recover else None
+                    # #6032 R4: a value opened as the element `<NAME>` may end at `</NAME>` (as parse_tool_call reads it)
+                    self.scloser = "</%s>" % pname if self.recover and pname and stripped.startswith("<%s>" % pname) else None
                     if inline is not None:      # the colon form: its value is on the opener's line
                         declared = self.sdeclared.get(pname) if pname else None
                         v = coerce_value(inline, declared) if pname else _SKIP
@@ -1823,19 +1868,21 @@ class OutputParser:
                     self.sval_started = True
                     self.svstart = self.sp
                 # the walk starts at the value (a quoted call's opener counts); only a close in the new text can end it
+                closers = (PARAM_END, self.scloser) if self.scloser else (PARAM_END,)
                 end = param_end(self.buf[self.svstart:], self._final, name=self.spname, allow_reopen=True,
-                                names=self.snames) if PARAM_END in rest else -1
+                                names=self.snames, closer=self.scloser) if any(c in rest for c in closers) else -1
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
                     if value.endswith("\n"):
                         value = value[:-1]
                     args(json.dumps(value)[1:-1] + '"')
-                    self.sp += end + len(PARAM_END)
+                    self.sp += end + close_len(rest, end, self.scloser)
                     self.ss = "between"
                     continue
                 # an undecided </parameter> (-2) is held from its start, like a tag still arriving
-                safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END,))
+                safe = min(k for k in (rest.find(c) for c in closers) if k >= 0) if end == -2 \
+                    else len(rest) - self._hold(rest, closers)
                 if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
                     safe -= 1
                 if safe > 0:
@@ -1845,7 +1892,8 @@ class OutputParser:
             elif self.ss == "raw":
                 declared = self.sdeclared.get(self.sraw_pname)
                 end = param_end(rest, self._final, name=self.spname,         # the rule of parse_tool_call (#5493)
-                                allow_reopen=(declared is None or _declares(declared, "string")), names=self.snames)
+                                allow_reopen=(declared is None or _declares(declared, "string")), names=self.snames,
+                                closer=self.scloser)
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -1860,7 +1908,7 @@ class OutputParser:
                     self.sheld.pop(self.sraw_pname, None)
                     self.sheld[self.sraw_pname] = v
                     self.sset.add(self.sraw_pname)
-                self.sp += end + len(PARAM_END)
+                self.sp += end + close_len(rest, end, self.scloser)
                 self.ss = "between"
             else:
                 return out
