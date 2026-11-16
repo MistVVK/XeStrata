@@ -769,8 +769,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                         (fv != nullptr ? std::strtol(fv, nullptr, 10) != 0 : df_branch_);
         if (no_branch && (v != nullptr || fv != nullptr))
             std::fprintf(stderr, "xestrata verify: no graph branches in the windows on this device: its graph launch "
-                                 "would wait behind the window's wait for the CPU (STRATA_DF_BRANCH and "
-                                 "STRATA_FETCH_BRANCH ignored)\n");
+                                 "would wait behind the window's wait for the CPU (XESTRATA_DF_BRANCH and "
+                                 "XESTRATA_FETCH_BRANCH ignored)\n");
     }
     if (!strata::gpu::event_create(&commit_done_)) {
         err = "verify: event create failed";
