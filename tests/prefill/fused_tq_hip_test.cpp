@@ -1,5 +1,6 @@
 // the HIP rule of the fused trellis (Gyro) prompt kernels (include/strata/prefill/fused_tq_hip.hpp): gfx12 with STRATA_PF_FUSED_TQ=1 as before; gfx1151 by STRATA_PF_TQ_G1151
-// (1 on, other values off, unset = the Windows default unless STRATA_GFX1151_DEFAULTS=0); every other device off.  Every input combination is checked.  No GPU, no model.
+// (1 on, other values off, unset = the Windows default unless STRATA_GFX1151_DEFAULTS=0); gfx1100-1102 by STRATA_PF_TQ_G11 (g11_on, #6067); every other device off.
+// Every input combination is checked.  No GPU, no model.
 #include <cstdio>
 
 #include "strata/prefill/fused_tq_hip.hpp"
@@ -63,6 +64,22 @@ int main() {
     CHECK(!device_on(false, true, false, true, -1, false, true) && device_on(false, true, false, true, 1, false, true));
     // Windows gfx1151 with the default on: STRATA_GFX1151_DEFAULTS=0 or the switch at 0 turns it off
     CHECK(device_on(false, true, true, true, -1, false, true) && !device_on(false, true, true, true, -1, true, true) && !device_on(false, true, true, true, 0, false, true));
+
+    // #6067: the RDNA3 cards (gfx1100 / 1101 / 1102) by g11_on: the shipped default is on; the switch at 0 off, at 1 on; never without STRATA_PF_FUSED_TQ
+    // (a build with MMQ) and never for another device class (g11 false: gfx1103, gfx1150, gfx1151, gfx12 keep their own rules above)
+    using strata::prefill::fused_tq_hip::g11_on;
+    using strata::prefill::fused_tq_hip::kG11DefaultOn;
+    CHECK(kG11DefaultOn == true);
+    for (int m = 0; m < 8; ++m) {
+        const bool g11 = m & 1, tq = m & 2, def = m & 4;
+        for (int sw : sws) {
+            const bool want = g11 && tq && (sw >= 0 ? sw == 1 : def);
+            CHECK(g11_on(g11, tq, sw, def) == want);
+        }
+    }
+    CHECK(g11_on(true, true, -1, kG11DefaultOn));
+    CHECK(!g11_on(true, true, 0, kG11DefaultOn) && g11_on(true, true, 1, false));
+    CHECK(!g11_on(true, false, 1, kG11DefaultOn) && !g11_on(false, true, 1, kG11DefaultOn));
 
     if (failed) { std::fprintf(stderr, "fused_tq_hip_test: %d failed\n", failed); return 1; }
     std::printf("fused_tq_hip_test: ok\n");

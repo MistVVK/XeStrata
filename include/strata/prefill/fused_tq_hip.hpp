@@ -5,7 +5,8 @@
 //   gfx12 (RDNA4): both pairs whenever tq_on, as before
 //   gfx1151 (Strix Halo): only when tq_on, and then STRATA_PF_TQ_G1151 decides: 1 on, any other value off; unset = the default (default_on, under Windows only,
 //                         and not with STRATA_GFX1151_DEFAULTS=0).  Gyro-M's pair only with STRATA_PF_TQ_G1151=1 (not measured on gfx1151)
-//   every other HIP device (gfx1100-1103, gfx1150, gfx9): off (the FP16 path or MMQ, as before)
+//   gfx1100 / gfx1101 / gfx1102 (RDNA3, #6067): both pairs when tq_on, by STRATA_PF_TQ_G11 (1 on, other values off, unset = kG11DefaultOn) - g11_on below
+//   every other HIP device (gfx1103, gfx1150, gfx9): off (the FP16 path or MMQ, as before)
 // The gfx11 code of the kernel is the one the other formats run on gfx1151 (fragments, gate/up shuffle, down store); the trellis decode, the FP32-H epilogue of a
 // Hadamard-folded down and rot_quant_h_kernel have no per-architecture code.
 #pragma once
@@ -34,6 +35,19 @@ constexpr bool pair_on(bool w12, bool g1151, bool windows, bool tq_on, int sw, b
     if (!device_on(w12, g1151, windows, tq_on, sw, g1151_defaults_off, default_on)) return false;
     if (gyro_s) return true;
     return gyro_m && (w12 || sw == 1);
+}
+
+// #6067: the RDNA3 cards (gfx1100 / gfx1101 / gfx1102: RX 7900 / 7800 / 7700 / 7600) run the same gfx11 code of the kernel as gfx1151.  Without MMQ (the
+// 0.1.60 package) their Gyro layers fell to the dequantize + FP16 path per expert, 0.1.59 read them on the trellis MMQ; the report: cold prompts ~40 %
+// slower on an RX 7900.  STRATA_PF_TQ_G11: 1 on, any other value off, unset = kG11DefaultOn.  Both pairs (the report's set is Gyro-M).  Not measured on
+// a gfx1100 card: the kernels' values are checked on gfx1151 (the same device code), the speed is not.
+inline constexpr bool kG11DefaultOn = true;
+
+// whether the trellis pairs (Gyro-S's and Gyro-M's) run on an RDNA3 card (g11: gfx1100 / gfx1101 / gfx1102; never gfx1103, gfx1150 or gfx1151, which keep their rules)
+constexpr bool g11_on(bool g11, bool tq_on, int sw, bool default_on) {
+    if (!tq_on || !g11) return false;
+    if (sw >= 0) return sw == 1;
+    return default_on;
 }
 
 }  // namespace strata::prefill::fused_tq_hip
