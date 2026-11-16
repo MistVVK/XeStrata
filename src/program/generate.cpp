@@ -3580,6 +3580,24 @@ int main(int argc, char** argv) {
             std::printf("%s\n", strata::core::kGeometryName);
             return 0;
         }
+        // `strata --expert-support GU,D,N_EMBD,N_FF` (#6059): whether this BUILD has GPU expert kernels for experts of these ggml types
+        // (gate/up, down) and sizes - "supported" (exit 0) or "unsupported" (exit 3); a malformed value exits 2.  Answered here, before any
+        // GPU is touched (prime_hw_queues below asks the runtime for its devices): it says what the engine was compiled for, not whether a
+        // card is present.  The type ids are bounded before the int cast and the sizes before any product is formed.
+        if (std::strcmp(argv[i], "--expert-support") == 0) {
+            std::vector<int64_t> v;
+            std::string e;
+            const auto type_ok = [](int64_t t) { return t >= 0 && t <= 255; };
+            const auto size_ok = [](int64_t n) { return n > 0 && n <= (int64_t(1) << 20); };
+            if (i + 1 >= argc || !parse_i64_list(argv[i + 1], v, e) || v.size() != 4 || !type_ok(v[0]) || !type_ok(v[1]) ||
+                !size_ok(v[2]) || !size_ok(v[3])) {
+                std::fprintf(stderr, "--expert-support wants GU,D,N_EMBD,N_FF: two ggml type ids (0-255) and two sizes (1-1048576)\n");
+                return 2;
+            }
+            const bool ok = strata::kernels::native_expert_supported((int) v[0], (int) v[1], v[2], v[3]);
+            std::printf("%s\n", ok ? "supported" : "unsupported");
+            return ok ? 0 : 3;
+        }
     }
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
     // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
