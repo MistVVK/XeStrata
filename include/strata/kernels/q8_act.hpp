@@ -48,7 +48,7 @@ struct Ggml {
     static float inv(float) { return 0.0f; }
     static int8_t value(float x, float d, float, float amax) {
         if (amax == 0.0f) return 0;
-        const float q = sycl::round(x / d);
+        const float q = sycl::round(STRATA_CANON_NO_FUSE(x / d));
         return (int8_t) (q > 127.0f ? 127.0f : q < -127.0f ? -127.0f : q);
     }
 };
@@ -58,7 +58,9 @@ struct Mul {
     static constexpr int kGroup = kBlock;
     static float scale(float amax) { return amax / 127.0f; }
     static float inv(float d) { return d != 0.0f ? 1.0f / d : 0.0f; }
-    static int8_t value(float x, float, float id, float) { return (int8_t) (int) sycl::round(x * id); }
+    static int8_t value(float x, float, float id, float) {
+        return (int8_t) (int) sycl::round(STRATA_CANON_NO_FUSE(x * id));
+    }
 };
 /// The CPU experts' rule (cpu/expert.cpp's AVX2 rows, the same bits on the GPU): x times 1 / d rounded half away from
 /// zero by adding +-0.5 and truncating, held to +-127.
@@ -68,7 +70,7 @@ struct Half {
     static float inv(float d) { return d > 0.0f ? 1.0f / d : 0.0f; }
     static int8_t value(float x, float, float inv, float) {
         STRATA_CANON_NO_CONTRACT
-        const float t = x * inv;
+        const float t = STRATA_CANON_NO_FUSE(x * inv);
         const int v = (int) (t + (t >= 0.0f ? 0.5f : -0.5f));
         return (int8_t) (v < -127 ? -127 : (v > 127 ? 127 : v));
     }
