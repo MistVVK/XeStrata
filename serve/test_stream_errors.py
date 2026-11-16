@@ -69,10 +69,8 @@ class StreamErrors(unittest.TestCase):
     def chat_error(self, failure):
         got = self.stream(CHAT, failure)
         self.assertEqual(got[-1], "data: [DONE]")
-        closing = data_of(got[-2])                       # #5633: a chunk with a finish_reason closes the stream
-        self.assertEqual(closing["choices"], [{"index": 0, "delta": {}, "finish_reason": "error"}])
-        self.assertEqual(closing["id"], data_of(got[0])["id"])
-        return data_of(got[-3])["error"]
+        self.assertNotIn('"finish_reason": "error"', "\n".join(got))   # #5633: no value outside OpenAI's list
+        return data_of(got[-2])["error"]
 
     def anthropic_error(self, failure):
         got = self.stream(ANTHROPIC, failure)

@@ -2,9 +2,8 @@
 
     python -m pytest serve/test_stream_terminal.py -q
 
-Chat completions: the error object, then a chunk that carries finish_reason "error" (same id as the stream's other
-chunks), then [DONE]: a client that reads chunks until one carries a finish_reason sees the failure and the engine's
-reason, not "stream ended without finish_reason".  Every failure class (the engine's death, its ERR line, a refusal
+Chat completions: the error object, then [DONE] (no chunk with a finish_reason outside OpenAI's list: the SDKs raise
+on the error object).  Every failure class (the engine's death, its ERR line, a refusal
 that comes after the headers, an unexpected error in the server) ends that way on all three routes, never as HTTP
 text inside the body or as a silent end; the next request is served.
 """
@@ -76,7 +75,7 @@ class StreamTerminal(unittest.TestCase):
         return self.post("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}],
                                                   "max_tokens": 100, "stream": True})
 
-    def test_chat_stream_ends_with_a_finish_reason_for_every_failure(self):
+    def test_chat_stream_ends_with_the_error_object_then_done_for_every_failure(self):
         for name, (fail, words) in FAILURES.items():
             with self.subTest(name):
                 self.start(fail)
@@ -86,15 +85,12 @@ class StreamTerminal(unittest.TestCase):
                 self.assertTrue(text.endswith("data: [DONE]\n\n"), text[-200:])
                 frames = [f[len("data: "):] for f in text.split("\n\n") if f.startswith("data: ")]
                 self.assertEqual(frames[-1], "[DONE]")
-                err, closing = json.loads(frames[-3]), json.loads(frames[-2])
+                err = json.loads(frames[-2])                            # the error object is the last data frame
+                self.assertEqual(set(err), {"error"})
                 self.assertIn(words, err["error"]["message"])
-                self.assertEqual(closing["object"], "chat.completion.chunk")
-                self.assertEqual(closing["choices"], [{"index": 0, "delta": {}, "finish_reason": "error"}])
-                first = json.loads(frames[0])
-                self.assertEqual(closing["id"], first["id"])            # one stream, one id
-                self.assertEqual(closing["model"], first["model"])
-                self.assertEqual(sum('"finish_reason": "error"' in f or '"finish_reason":"error"' in f
-                                     for f in frames), 1)
+                for f in frames[:-2]:                                   # no made-up finish_reason (coordinator 11-16)
+                    finish = json.loads(f)["choices"][0].get("finish_reason")
+                    self.assertIn(finish, (None, "stop", "length", "tool_calls"), f)
                 code, text = self.post("/v1/chat/completions",
                                        {"model": "m", "messages": [{"role": "user", "content": "hi"}],
                                         "max_tokens": 100})

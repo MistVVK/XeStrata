@@ -8733,7 +8733,6 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
-            last = None                                      # the stream's id / model, for its closing chunk (#5633)
             # OpenAI's streaming contract: with "stream_options": {"include_usage": true} the usage rides in its own
             # last chunk, "choices": []. Clients and gateways read it there (LiteLLM ignores a usage that sits on the
             # finish_reason chunk and recounts the tokens itself, too low). Without the option the chunk is unchanged.
@@ -8746,14 +8745,12 @@ def make_handler(svc: Service):
                     if c is None:
                         self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
                     elif split_usage and c.get("usage") is not None:
-                        last = c
                         head = {k: v for k, v in c.items() if k != "usage"}
                         tail = {"id": c["id"], "object": c["object"], "created": c["created"], "model": c["model"],
                                 "choices": [], "usage": c["usage"]}
                         for part in (head, tail):
                             self.wfile.write(b"data: " + json.dumps(part, ensure_ascii=False).encode() + b"\n\n")
                     else:
-                        last = c
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -8762,19 +8759,19 @@ def make_handler(svc: Service):
                 svc.note_client_disconnect(cancel)           # client went away: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                self._chat_failed(died_note(e), last=last, req=req)
+                self._chat_failed(died_note(e))
             except QueueWaitExpired as e:
-                self._chat_failed(str(e), "rate_limit_error", "queue_wait_timeout", last=last, req=req)
+                self._chat_failed(str(e), "rate_limit_error", "queue_wait_timeout")
             except StructuredOutputError as e:
-                self._chat_failed(str(e), "structured_output_failed", "structured_output_failed", last=last, req=req)
+                self._chat_failed(str(e), "structured_output_failed", "structured_output_failed")
             except ValueError as e:                          # the engine's ERR after the stream started: the
-                self._chat_failed(str(e), last=last, req=req)   # headers are sent, so no 400 now
+                self._chat_failed(str(e))   # headers are sent, so no 400 now
             except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:
-                self._chat_failed(str(e), last=last, req=req)   # _post's handler would write HTTP into the stream's body
+                self._chat_failed(str(e))   # _post's handler would write HTTP into the stream's body
             except ClientGone:
                 raise
             except Exception:                                # no silent end: the client would take it for a whole answer
-                self._chat_failed(self._stream_crashed(), last=last, req=req)
+                self._chat_failed(self._stream_crashed())
 
         def _stream_crashed(self):
             """An unexpected error in a started stream: the traceback for the log, a plain sentence for the client."""
@@ -8782,21 +8779,14 @@ def make_handler(svc: Service):
             print("[strata] error in a started stream:\n" + traceback.format_exc(), flush=True)
             return "the server failed while answering; the server's log has the details"
 
-        def _chat_failed(self, message, kind="server_error", code=None, last=None, req=None):
-            """A chat stream that cannot finish: the error object (the web app reads it), then a chunk that closes the
-            stream with finish_reason "error" (#5633), then [DONE].  A client written for the OpenAI protocol reads
-            chunks until one carries a finish_reason; without one all it can report is "stream ended without
-            finish_reason", which hides the cause the error object names.  The chunk keeps the stream's own id."""
+        def _chat_failed(self, message, kind="server_error", code=None):
+            """A chat stream that cannot finish: the error object, then [DONE] (#5633).  No chunk with a made-up
+            finish_reason: "error" is outside OpenAI's list and strict clients reject the chunk; the OpenAI SDKs raise
+            on the error object itself, and the web app reads it."""
             error = {"type": kind, **({"code": code} if code else {}), "message": message}
             self._note(error=error)
-            last = last or {}
-            closing = {"id": last.get("id") or "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion.chunk",
-                       "created": last.get("created") or int(time.time()),
-                       "model": last.get("model") or (svc.model_for(req) if req is not None else svc.model),
-                       "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}]}
             try:
-                self.wfile.write(b"data: " + json.dumps({"error": error}).encode() + b"\n\n" +
-                                 b"data: " + json.dumps(closing).encode() + b"\n\ndata: [DONE]\n\n")
+                self.wfile.write(b"data: " + json.dumps({"error": error}).encode() + b"\n\ndata: [DONE]\n\n")
                 self.wfile.flush()
             except OSError:
                 self._note(outcome="disconnected")
