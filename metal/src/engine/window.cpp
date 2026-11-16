@@ -227,6 +227,8 @@ struct PromptBufs {
         kcur, vcur, iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta,
         stok, sw, pos, XS, HS, YE, yr, gsh, ush, hh, ys, sgv, WD, WU, Wqkv, Wz, Wal, Wbe, Wout, Wq, Wk, Wv, Wiq, Wik, Wr,
         Wsg, Wshg, Wshu, Wshd, yf, Wcat, pemb, pembh, pkey, pval, keyn, qn, gated, normW, Wpk, Wpv, mixr;
+    // Buffer has no releasing destructor. Keep each allocation once for workspace growth.
+    std::vector<mtl::Buffer> owned;
 };
 
 // The vision path (--vision, GENI requests), from the shared host code: the image rows of the prompt being read

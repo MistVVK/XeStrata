@@ -58,6 +58,9 @@ bool Window::pc_setup(int C) {
         b.lqsa = cc(lib_prompt_qsa());
         b.k4 = coop_k4();
     }
+    // pc_chunk's GPU submissions complete before it returns. Only scratch buffers are replaced;
+    // the window's KV, recurrent state and compiled libraries remain alive.
+    for (auto& buffer : b.owned) cx_->free(buffer);
     b = PromptBufs{b.lib, b.lgdn, b.lqsa, b.k4};   // (re)allocated below for the larger chunk
     // the v3 register-operand chain covers the ordinary quant types and the pair trellis (TQP5/6/7, 147-149, whose
     // W8 shares one window between the lane's runs); the TQK trio (144-146) has the v2 kernels only
@@ -96,8 +99,13 @@ bool Window::pc_setup(int C) {
     if (b.dn3[0] != b.tm) { std::fprintf(stderr, "strata metal: STRATA_PROMPT_GU/DN tile heights differ: using %d for both\n", b.tm); b.dn3[0] = b.tm; }
     b.maxrows = (int) MT * TOPK + nexp_ * b.tm;
     const int nblk_max = ((int) MT * TOPK + 1023) / 1024;
-    auto F32 = [&](size_t n) { return cx_->alloc(4 * n); };
-    auto F16 = [&](size_t n) { return cx_->alloc(2 * n); };
+    auto alloc = [&](size_t bytes) {
+        mtl::Buffer buffer = cx_->alloc(bytes);
+        b.owned.push_back(buffer);
+        return buffer;
+    };
+    auto F32 = [&](size_t n) { return alloc(4 * n); };
+    auto F16 = [&](size_t n) { return alloc(2 * n); };
     b.R = F32(MT * HC * N); if (mtp_ovl_ && mtp_on_) b.R2 = F32(MT * HC * N); b.bo = F32(MT * N); b.inj[0] = F32(MT * HC); b.inj[1] = F32(MT * HC); b.xn = F32(MT * HC * N);
     b.xnh = F16(MT * HC * N); b.V = F32(MT * (LR + HC)); b.loh = F16(MT * LR); b.mixed = F32(MT * N); b.mixh = F16(MT * N);
     b.fused = gdn_fused_inputs(cx_->device_name());
@@ -112,12 +120,12 @@ bool Window::pc_setup(int C) {
     b.ggb = F32(MT * G_HV * 2); b.gkq = F32(MT * G_HK); b.go = F32(MT * G_ZV);
     b.qfull = F32(MT * G_QFULL); b.kcur = F32(MT * G_KV); b.vcur = F32(MT * G_KV); b.iqr = F32(MT * G_IQR); b.ikr = F32(MT * G_ID);
     b.qcur = F32(MT * G_QOUT); b.qcurh = F16(MT * G_QOUT); b.qidx = F32(MT * G_IH * G_ID); b.scores = F32(MT * MB);
-    b.qids = cx_->alloc(4 * MT * PC_QB); b.part = F32(MT * PC_QCHUNKS * G_QH * (G_QD + 2)); b.XQ = F32(4 * MT * G_QOUT + MT * G_QOUT / 16);
+    b.qids = alloc(4 * MT * PC_QB); b.part = F32(MT * PC_QCHUNKS * G_QH * (G_QD + 2)); b.XQ = F32(4 * MT * G_QOUT + MT * G_QOUT / 16);
     b.xqh = F16(MT * G_QOUT);
-    b.logits = F32(MT * nexp_); b.ids = cx_->alloc(4 * MT * TOPK); b.wts = F32(MT * TOPK);
-    b.bcnt = cx_->alloc(4 * (size_t) nblk_max * nexp_); b.boff = cx_->alloc(4 * (size_t) nblk_max * nexp_);
-    b.eoff = cx_->alloc(4 * nexp_); b.tiles = cx_->alloc(8 * (size_t) (b.maxrows / b.tm + 1)); b.meta = cx_->alloc(64);
-    b.stok = cx_->alloc(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = cx_->alloc(4 * MT * TOPK);
+    b.logits = F32(MT * nexp_); b.ids = alloc(4 * MT * TOPK); b.wts = F32(MT * TOPK);
+    b.bcnt = alloc(4 * (size_t) nblk_max * nexp_); b.boff = alloc(4 * (size_t) nblk_max * nexp_);
+    b.eoff = alloc(4 * nexp_); b.tiles = alloc(8 * (size_t) (b.maxrows / b.tm + 1)); b.meta = alloc(64);
+    b.stok = alloc(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = alloc(4 * MT * TOPK);
     b.XS = F16((size_t) b.maxrows * N); b.HS = F16((size_t) b.maxrows * NFF); b.YE = F32((size_t) b.maxrows * N);
     b.yr = F32(MT * N); b.gsh = F32(MT * NFF); b.ush = F32(MT * NFF); b.hh = F16(MT * NFF); b.ys = F32(MT * N); b.sgv = F32(MT);
     b.WD = F16((size_t) (LR + HC) * HC * N); b.WU = F16((size_t) HC * N * LR);
