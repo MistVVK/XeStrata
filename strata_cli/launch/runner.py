@@ -352,8 +352,8 @@ def auto_signals(catalog, s: S.LaunchSettings, family: str | None) -> dict:
         from strata_control import drafting
         path = catalog.installed_config(catalog.tag_of(s.family, s.model))
         cfg = apply_choices(read_config(path) if path is not None else {}, s)
-        backend, archs = drafting.detect_hardware()
-        return {"model_name": cfg.get("model_name") or catalog.model_name_of(family, s.model),
+        backend, archs = drafting.hardware_for(cfg.get("backend"))   # #5109: the config's card family on a mixed NVIDIA + AMD computer
+        return {"model_name": cfg.get("model_name") or catalog.model_name_of(family, s.model), "engine_backend": cfg.get("backend"),
                 **card_signals(cfg, s.gpus, {"backend": backend, "archs": archs})}
     except Exception:                                    # noqa: BLE001 - no signal: Auto as before
         return {}
@@ -1769,7 +1769,7 @@ class Runner:
     def drafting_inputs(self, cfg: dict) -> dict:
         """What strata_control/drafting.py needs to decide for this launch: the choice, the card class, the model and the data folder."""
         from strata_control import drafting
-        backend, archs = drafting.detect_hardware()
+        backend, archs = drafting.hardware_for(cfg.get("backend"))   # #5109: the config's card family on a mixed NVIDIA + AMD computer
         mode = self.s.drafting if self.s.drafting is not None else cfg.get("drafting")
         args = cfg.get("args") or []
         if cfg.get("mtp") is False and drafting.normalize(mode) == "auto":

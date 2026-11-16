@@ -47,7 +47,7 @@ def _drafter_is_dflash2(cfg: dict) -> bool:
     """Does this run config's drafting choice mean DFlash2 on this computer (Auto included)? Never raises."""
     try:
         from strata_control import drafting
-        backend, archs = drafting.detect_hardware()
+        backend, archs = drafting.hardware_for(cfg.get("backend"))   # #5109: the config's card family on a mixed NVIDIA + AMD computer
         return cfg.get("mtp") is not False and drafting.choice_of(cfg.get("drafting"), model_name=cfg.get("model_name"), backend=backend, archs=archs) == "dflash2"
     except Exception:                                    # noqa: BLE001 - unknown means the MTP, which stays required
         return False

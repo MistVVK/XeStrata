@@ -756,12 +756,12 @@ def vram_gb(data_dir: str | Path | None = None, engine: str | os.PathLike[str] |
     return DRAFTER_GB["dflash2_selq4" if uses_selector_q4(data_dir, engine) else "dflash2"]
 
 
-def installed_engine_exe() -> Path | None:
+def installed_engine_exe(backend: str | None = None) -> Path | None:
     """The engine program of the newest installed engine component for this computer's backend (None: not found). A quick folder scan, nothing is hashed or started."""
     try:
         from strata_control import engine_component as ec
         found, _ = ec.scan(None)
-        backend = (detect_hardware()[0] or "").lower()
+        backend = (backend or detect_hardware()[0] or "").lower()   # #5109: a caller that knows the config's family passes it
         best = [c for c in found if not backend or str(c.backend).split(":")[0].lower() == backend] or list(found)
         best.sort(key=lambda c: ec._version_key(c.version), reverse=True)
         return best[0].exe if best and best[0].exe.is_file() else None

@@ -38,8 +38,8 @@ def add_parser(sp) -> None:
         one.add_argument("--output", choices=("human", "json", "jsonl"), default="human")
 
 
-def _hardware() -> tuple[str | None, list[str]]:
-    return drafting.detect_hardware()
+def _hardware(engine_backend: str | None = None) -> tuple[str | None, list[str]]:
+    return drafting.hardware_for(engine_backend)   # #5109: the config's card family on a mixed NVIDIA + AMD computer, else detect_hardware()
 
 
 def _split_expected(cfg: dict, args: list, unloading: bool = False) -> bool:
@@ -114,7 +114,7 @@ def _inputs(a) -> dict:
         if data is None:
             from strata_cli.launch.catalog import Catalog
             data = Catalog().data_dir()
-    backend, archs = _hardware()
+    backend, archs = _hardware(cfg.get("backend"))
     args = cfg.get("args") or []
     model_name = cfg.get("model_name") or _planned_model_name(a)
     mode = a.mode if a.mode else cfg.get("drafting")
@@ -167,7 +167,7 @@ def run(a) -> int:
         decision = drafting.decide(**want, **sig)
         support = drafting.hardware_support(want["backend"], want["archs"], want["model_name"])
         # serves: this computer's engine can run DFlash2 (the build has the code and the card is one it is made for); the app offers the choice only then
-        result = {**drafting_fetch.plan(folder, drafting.installed_engine_exe(), model_name=want["model_name"], backend=want["backend"], archs=want["archs"], **sig), "needed": needed, "tuned_needed": tuned_needed, "mtp_here": want["mtp_here"], "mtp_needed": mtp_needed, "mtp_gb": MTP_FETCH_GB if mtp_needed else 0.0,
+        result = {**drafting_fetch.plan(folder, drafting.installed_engine_exe(want["backend"]), model_name=want["model_name"], backend=want["backend"], archs=want["archs"], **sig), "needed": needed, "tuned_needed": tuned_needed, "mtp_here": want["mtp_here"], "mtp_needed": mtp_needed, "mtp_gb": MTP_FETCH_GB if mtp_needed else 0.0,
                   "serves": drafting.ENGINE_SERVES_DFLASH2 and support.can_run, "drafter": decision.drafter,
                   "choice": drafting.choice_of(want["mode"], model_name=want["model_name"], family=want["family"], backend=want["backend"], archs=want["archs"], **sig),
                   "split": bool(getattr(a, "_split", False)), "note": decision.note, "line": drafting.summary_line(decision), "support": support.level, "support_line": support.line}
