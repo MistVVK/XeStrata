@@ -2018,7 +2018,7 @@ struct LatentTab {
     int lat_G = 8, lat_E = 0, lat_fmt = 8;
     bool latent = false;
     std::string path;   // the D/U file open now
-    bool q4_fallback = false;   // Q8_0 by default, and the pack's Q4_0 beside it where Q8_0 leaves too small a cache
+    bool q4_fallback = false;   // Q8_0 by default, and the pack's Q4_0 beside it when Q8_0 leaves no working cache
     // detect the latent layout, open the D/U file and read the labels (host side, no device yet)
     bool open(const strata::core::ModelGeometry& g, std::string& err) {
         const auto& lay0 = strata::kernels::cpu::expert_layout();
@@ -2036,8 +2036,8 @@ struct LatentTab {
         }
         path = f;
         // The pack's two D/U files (Edge0 ships latent_dense_q4.bin and latent_dense_q8.bin), whichever of them
-        // XESTRATA_LATENT_DENSE (model.json) names: Q8_0 by default, Q4_0 where Q8_0 leaves this card too small an
-        // expert cache (to_q4, chosen where the cache is sized) or the user asks for it
+        // XESTRATA_LATENT_DENSE (model.json) names: Q8_0 by default, Q4_0 only where Q8_0 leaves no working expert
+        // cache (to_q4 below; Edge0-145B's Q8_0 pair left an RTX 4070 none) or the user asks for it
         // (XESTRATA_LATENT_DENSE_FMT=4).  Q4_0 is faster (the B70: Edge0-120B-NVFP4 1K decode 62.2 against 54.1 tok/s,
         // 32K 58.2 against 51-53; Edge0-145B-NVFP4 32K 53.4 against 37-44) but changes the output past the line an
         // approximation goes in by default at: its teacher-forced KL against Q8_0 is 0.0078 (120B) and 0.0070 (145B)
@@ -2117,7 +2117,7 @@ struct LatentTab {
             return false;
         }
         lat_fmt = dense.fmt();
-        std::fprintf(stderr, "xestrata generate: latent D/U: Q4_0 (%s) in place of Q8_0 on this card "
+        std::fprintf(stderr, "xestrata generate: latent D/U: Q4_0 (%s) - Q8_0 leaves this card no working expert cache "
                              "(XESTRATA_LATENT_DENSE_FMT=8 insists on Q8_0)\n", path.c_str());
         return upload(device, lb, le, err);
     }
@@ -5793,7 +5793,7 @@ int main(int argc, char** argv) {
                 std::string he;
                 const int64_t before = slots;
                 const uint64_t hb = native_dense.hc_q8_device_bytes();
-                if (!native_dense.hc_q8_to_host(he)) {
+                if (!native_dense.hc_q8_to_host(wt, he)) {
                     std::fprintf(stderr, "xestrata generate: %s: they stay on the device\n", he.c_str());
                 } else {
                     size_cache();
@@ -5815,41 +5815,48 @@ int main(int argc, char** argv) {
                                  slots_text(before).c_str());
                 }
             }
-            // And then the fewest layers' projections (the shell's, read every token) that give the cache its slots
-            // go to pinned memory, spread evenly, the kernels reading them in place (XESTRATA_DENSE_HOST; "on": every
-            // layer's, to measure it): a window reads each such layer's whole over the link.  The slowest step, the
-            // last: it lets a card under 8 GB run Edge0-120B at all.
+            // And then the fewest blocks of the layers' projections (the shell's, read every token; NativeDense::load
+            // puts some layers in a block where the driver keeps smaller freed allocations) that give the cache its
+            // slots go to pinned memory, spread evenly, the kernels reading them in place (XESTRATA_DENSE_HOST; "on":
+            // every block, to measure it): a window reads them whole over the link.  The slowest step, the last: it
+            // lets a card under 8 GB run Edge0-120B at all.
             const auto dh_pick = strata::core::pick_from_env("DENSE_HOST");
             if (!o.native_dense_gguf.empty() && dh_pick != strata::core::Pick::Off &&
                 (dh_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
-                const int64_t nl = g.n_layers, before = slots;
-                std::vector<uint64_t> lb((size_t) nl);
-                for (int64_t l = 0; l < nl; ++l) lb[(size_t) l] = native_dense.layer_device_bytes(wt, (int) l);
+                const int64_t before = slots;
+                std::vector<size_t> cand;   // the blocks of layers on the device
+                for (size_t i = 0; i < native_dense.layer_blocks(); ++i)
+                    if (native_dense.block_device_bytes(i) > 0) cand.push_back(i);
+                const int64_t nb = (int64_t) cand.size();
                 const int64_t want = (min_slots - slots) * blob + blob;
-                auto pick = [&](int64_t k, int64_t l) { return (l + 1) * k / nl > l * k / nl; };
-                int64_t k = nl;
+                auto pick = [&](int64_t k, int64_t j) { return (j + 1) * k / nb > j * k / nb; };
+                int64_t k = nb;
                 if (dh_pick != strata::core::Pick::On)
-                    for (k = 1; k < nl; ++k) {
+                    for (k = 1; k < nb; ++k) {
                         uint64_t sum = 0;
-                        for (int64_t l = 0; l < nl; ++l) sum += pick(k, l) ? lb[(size_t) l] : 0;
+                        for (int64_t j = 0; j < nb; ++j)
+                            sum += pick(k, j) ? native_dense.block_device_bytes(cand[(size_t) j]) : 0;
                         if ((int64_t) sum >= want) break;
                     }
                 uint64_t moved = 0;
                 std::string de;
-                for (int64_t l = 0; l < nl; ++l) {
-                    if (!pick(k, l) || lb[(size_t) l] == 0) continue;
-                    if (!native_dense.layer_to_host(wt, (int) l, de)) {
+                for (int64_t j = 0; j < nb; ++j) {
+                    if (!pick(k, j)) continue;
+                    const size_t i = cand[(size_t) j];
+                    const uint64_t b = native_dense.block_device_bytes(i);
+                    if (!native_dense.block_to_host(wt, i, de)) {
                         std::fprintf(stderr, "xestrata generate: %s\n", de.c_str());
                         return 1;
                     }
-                    moved += lb[(size_t) l];
+                    moved += b;
+                    layers += native_dense.block_last_layer(i) - native_dense.block_first_layer(i) + 1;
                 }
                 if (moved > 0) {
                     size_cache();
-                    std::fprintf(stderr, "xestrata generate: %lld layers' projections (%llu MiB) in pinned memory, read "
-                                         "in place (XESTRATA_DENSE_HOST=0 keeps them on the device): the expert cache %s "
-                                         "in place of %s\n", (long long) k, (unsigned long long) (moved >> 20),
-                                 slots_text(slots).c_str(), slots_text(before).c_str());
+                    std::fprintf(stderr, "xestrata generate: %d layers' projections (%llu MiB, %lld of %lld blocks) in "
+                                         "pinned memory, read in place (XESTRATA_DENSE_HOST=0 keeps them on the device): "
+                                         "the expert cache %s in place of %s\n", layers, (unsigned long long) (moved >> 20),
+                                 (long long) k, (long long) nb, slots_text(slots).c_str(), slots_text(before).c_str());
                 }
             }
         }
