@@ -125,8 +125,9 @@ class EveryChoiceOnEveryBackend(Base):
         for backend, archs in HARDWARE:
             for slots in (2, 4, 8):
                 d, args = self.apply(self.cfg(drafting="dflash2"), "qwen", backend, archs, slots=slots)
-                if backend == "metal":
-                    # the Metal engine has no per-request drafters: DFlash2 beside request slots would draft nothing, so today's behaviour stays (owner 2026-11-03)
+                if backend in ("metal", "sycl"):
+                    # the Metal engine has no per-request drafters: DFlash2 beside request slots would draft nothing, so today's behaviour stays (owner 2026-11-03);
+                    # the Intel engine refuses --draft dflash2 with --batch slots at start (#5747), so it does not run there either
                     self.assertEqual((d.drafter, d.note, loaded(args)), ("mtp", drafting.NOT_HERE, {"mtp"}), (backend, slots))
                     self.assertFalse([a for a in args if a.startswith("--draft")])
                     continue
