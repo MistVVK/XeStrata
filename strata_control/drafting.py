@@ -103,6 +103,8 @@ _SLOWER = {("cuda", "sm_86")}
 
 
 _HARDWARE: list = []
+_HARDWARE_MISS: list = []          # (#5427) when the last lookup found no card; asked again after HARDWARE_MISS_S
+HARDWARE_MISS_S = 5.0
 
 # --- Intel: the SYCL path gives no architecture, so the card is told by its name (Windows display adapters) or its PCI id (Linux sysfs).
 #   arc_a        Arc A-series, Alchemist: A3xx / A5xx / A7xx (the A750 was measured: RESULTS-DF2SYCL.md), PCI ids 0x56A0..0x56AF and the mobile 0x5690..0x5692
@@ -154,21 +156,29 @@ def sycl_archs_present() -> list[str]:
 
 
 def detect_hardware() -> tuple[str | None, list[str]]:
-    """(engine family, card architectures) of this computer, looked up once: ``("cuda", ["sm_120"])``, ``("hip", ["gfx1151"])``, ``("metal", [])``;
-    ``(None, [])`` when nothing answers. Read-only probes of tools that are already installed; never raises, never downloads."""
-    if not _HARDWARE:
-        backend: str | None = None
-        archs: list[str] = []
-        try:
-            from strata_control import engine_component
-            backend = engine_component.detect_backend()[0]
-            archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
-            if backend == "sycl" and not archs:
-                archs = sycl_archs_present()
-        except Exception:                                    # noqa: BLE001 - an unknown computer is "no DFlash2", never an error
-            pass
+    """(engine family, card architectures) of this computer: ``("cuda", ["sm_120"])``, ``("hip", ["gfx1151"])``, ``("metal", [])``; ``(None, [])`` when
+    nothing answers. A card that was found is looked up once. ``(None, [])`` is asked again at the next call: a service started at boot can look before
+    the graphics driver answers. Read-only probes of tools that are already installed; never raises, never downloads."""
+    if _HARDWARE:
+        return _HARDWARE[0]
+    if _HARDWARE_MISS and time.monotonic() - _HARDWARE_MISS[0] < HARDWARE_MISS_S:
+        return None, []                                  # a miss a moment ago: the callers of one start do not each run the probes again
+    backend: str | None = None
+    archs: list[str] = []
+    try:
+        from strata_control import engine_component
+        backend = engine_component.detect_backend()[0]
+        archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
+        if backend == "sycl" and not archs:
+            archs = sycl_archs_present()
+    except Exception:                                    # noqa: BLE001 - an unknown computer is "no DFlash2", never an error
+        pass
+    if backend is not None:
         _HARDWARE.append((backend, archs))
-    return _HARDWARE[0]
+        _HARDWARE_MISS.clear()
+    else:
+        _HARDWARE_MISS[:] = [time.monotonic()]
+    return backend, archs
 
 
 def hardware_support(backend: str | None, archs: Any = None, model_name: str | None = None) -> Support:
