@@ -13497,6 +13497,7 @@ int main(int argc, char** argv) {
                 // An evicted image's segments go back to the segment pool as idle (resident) memory: given back to the
                 // OS at once, or the reading could never show them.
                 bool no_progress = false;
+                std::string cannot_help_note;   // #2253: the refusal line's note when no eviction could have made room
                 if (!fits) {
                     const strata::core::EvictForRam r = strata::core::evict_for_ram(
                         admit, [&] { return mem ? std::optional<uint64_t>(mem->available) : std::nullopt; },
@@ -13510,16 +13511,26 @@ int main(int argc, char** argv) {
                             if (pools_budget.idle_bytes() > 0) pools_budget.shrink((size_t) -1);
                             return b;
                         },
-                        conversations.slots());
+                        conversations.slots(),
+                        // #2253: short by more than every parked conversation that may go holds: none is evicted
+                        (uint64_t) additional > UINT64_MAX - floor ? UINT64_MAX : (uint64_t) additional + floor,
+                        (uint64_t) conversations.evictable_bytes());
                     fits = r.fits;
                     evicted = r.evicted;
                     no_progress = r.no_progress;
+                    if (r.cannot_help) {
+                        char note[160];
+                        std::snprintf(note, sizeof note, "; short by %llu MiB, more than the %zu parked hold (%zu MiB), so none was evicted",
+                                      (unsigned long long) (r.short_by >> 20), conversations.size(), conversations.evictable_bytes() >> 20);
+                        cannot_help_note = note;
+                    }
                 }
                 if (!fits) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s)\n",
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s%s)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  evicted, conversations.size(),
-                                 no_progress ? "; the last eviction gave no memory back, so the rest stay parked" : "");
+                                 no_progress ? "; the last eviction gave no memory back, so the rest stay parked" : "",
+                                 cannot_help_note.c_str());
                     return true;
                 }
                 if (evicted)

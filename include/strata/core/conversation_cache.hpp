@@ -462,6 +462,15 @@ public:
             if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) return entries_[i].bytes();
         return 0;
     }
+    /// #2253 (PR by alanthinker, from Arthur031221's #1394): what evict_oldest() could give back in all - every parked entry
+    /// that may go (the same rule as oldest_evictable_bytes: no pinned shared prefix, not the guarded donor).  The RAM gate
+    /// evicts nothing when even all of it would leave the park short.
+    size_t evictable_bytes() const {
+        size_t n = 0;
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) n += entries_[i].bytes();
+        return n;
+    }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
     // may carry the poison.  Returns how many were parked.
