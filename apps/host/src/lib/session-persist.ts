@@ -161,6 +161,12 @@ export function failureReason(error: unknown): FailureReason {
 export interface SessionWriterOptions {
   transport: ChatTransport;
   delayMs?: number;
+  /**
+   * #5923: a scheduled save (a reply being written) waits long enough that the chats it rewrites average at most this many bytes a second;
+   * never less than delayMs, never more than maxDelayMs. A turn's end and the page going away still save at once (flush).
+   */
+  bytesPerSecond?: number;
+  maxDelayMs?: number;
   /** After a pass with failures the unsaved chats are tried again after this long. */
   retryMs?: number;
   /** Counts a serialisation of one chat; for tests. */
@@ -177,6 +183,9 @@ export function createSessionWriter(options: SessionWriterOptions) {
   const transport = options.transport;
   const delayMs = options.delayMs ?? 1_000;
   const retryMs = options.retryMs ?? 8_000;
+  const bytesPerSecond = options.bytesPerSecond ?? 64 * 1024;
+  const maxDelayMs = Math.max(delayMs, options.maxDelayMs ?? 5_000);
+  let scheduled: Session[] = [];
   let enabled = options.enabled ?? true;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -258,9 +267,22 @@ export function createSessionWriter(options: SessionWriterOptions) {
     return running;
   };
 
+  /**
+   * #5923: each save rewrites a changed chat whole, so a reply streamed into a 1 MB chat wrote about 1 MB a second, growing with the chat. The
+   * wait before a scheduled save grows with the size of the chats that changed (their last saved size): a small chat still saves within a
+   * second; a chat of about 330 KB or more every 5 s (at most 5 s of a streaming reply to lose if the app crashes; a turn's end saves at once).
+   */
+  const delayFor = (sessions: Session[]): number => {
+    const before = new Map(scheduled.map(s => [s.id, s] as const));
+    let bytes = 0;
+    for (const s of sessions) if (before.get(s.id) !== s) bytes += sent.get(s.id)?.length ?? 0;
+    return Math.max(delayMs, Math.min(maxDelayMs, Math.round((bytes / bytesPerSecond) * 1000)));
+  };
   const schedule = (sessions: Session[]) => {
+    const wait = timer === null ? delayFor(sessions) : 0;
+    scheduled = sessions;
     pending = sessions;
-    if (enabled && timer === null) timer = setTimeout(() => { timer = null; void flush(); }, delayMs);
+    if (enabled && timer === null) timer = setTimeout(() => { timer = null; void flush(); }, wait);
   };
 
   return {
