@@ -31,7 +31,7 @@ namespace {
 
 constexpr int HC = 4, MIX = 24;
 std::mt19937& rng() {
-    static std::mt19937 r(5353);   // fixed: a failure repeats
+    static std::mt19937 r(5353);   // NOLINT(bugprone-random-generator-seed): fixed, so a failure repeats
     return r;
 }
 
