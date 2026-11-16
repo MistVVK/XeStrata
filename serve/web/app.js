@@ -540,8 +540,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
 
   // recent requests
   const body = $("req-body");
+  // #5484: the VRAM hit rate column only when a request has one (a Mac and a model wholly in VRAM have no expert cache to hit)
+  const anyHit = requests.some((r) => r.hit_rate != null);
+  $("req-hit").hidden = !anyHit;
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="${anyHit ? 9 : 8}" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"],
@@ -558,7 +561,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+        ${anyHit ? `<td class="num">${hit}</td>` : ""}<td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }
   const all = $("req-all");
