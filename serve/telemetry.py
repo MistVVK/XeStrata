@@ -433,6 +433,25 @@ class _Zes:
             total += st.size
         return (total - free, total) if total else (None, None)
 
+    def integrated(self):
+        """True for a GPU built into the processor, False for a card, None when sysman cannot say: zesDeviceGetProperties'
+        core properties (ze_device_properties_t) carry ZE_DEVICE_PROPERTY_FLAG_INTEGRATED. Read from a raw buffer: stype
+        0x1 at 0, the core's stype 0x3 at 16, its vendorId at 36 (checked to be Intel's, else the layout is not this one)
+        and its flags at 44."""
+        if self.lib is None or self.dev is None:
+            return None
+        buf = ctypes.create_string_buffer(4096)
+        ctypes.c_uint32.from_buffer(buf, 0).value = 0x1           # ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES
+        ctypes.c_uint32.from_buffer(buf, 16).value = 0x3          # ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
+        try:
+            if self.lib.zesDeviceGetProperties(self.dev, buf) != 0:
+                return None
+        except (OSError, AttributeError, TypeError):
+            return None
+        if ctypes.c_uint32.from_buffer(buf, 36).value != 0x8086:
+            return None
+        return bool(ctypes.c_uint32.from_buffer(buf, 44).value & 0x1)
+
     def pci_stats(self):
         """(rx bytes, tx bytes, timestamp in us) of the card's PCIe link, or None (sysman refused or has none)."""
         if self.lib is None or self.dev is None:
