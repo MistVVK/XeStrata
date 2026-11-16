@@ -1,0 +1,8 @@
+{
+ "guic01": "Move to workspace…",
+ "guic02": "Move chat to another workspace",
+ "guic03": "Workspace",
+ "guic04": "The chat is listed under this workspace. Its next answer works in that workspace’s folder, unless you chose a folder for this chat.",
+ "guic05": "Move chat",
+ "guic06": "This chat is still working. Stop it or wait for it to finish, then move it."
+}
