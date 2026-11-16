@@ -164,7 +164,7 @@
   "model.unloading": "Entlädt…",
   "model.unloadingTitle": "Das Modell wird entladen",
   "model.unsupported": "Entladen ist nicht verfügbar",
-  "model.waiting": "Warte auf den Server",
+  "model.waiting": "Warten auf den Server",
   "pending.afterTool": "Wartet, bis das Werkzeug fertig ist, dann wird gesendet: „{text}“",
   "pending.cutting": "Die Antwort wird gestoppt, dann wird gesendet: „{text}“",
   "pending.one": "Eine Nachricht wartet bereits",
