@@ -1922,9 +1922,7 @@ bool Prefill::carve(size_t T, void* alloc) {
             p.reserve(ls.size());
             for (const size_t bytes : ls) p.push_back(c.take<uint8_t>(bytes, ok));
             if (ls.size() == 3) {
-                m.lmmq_xq_ = p[0];
-                m.lmmq_ids_ = reinterpret_cast<int32_t*>(p[1]);
-                m.lmmq_bounds_ = reinterpret_cast<int32_t*>(p[2]);
+                m.lmmq_xq_ = p[0]; m.lmmq_ids_ = (int32_t*) p[1]; m.lmmq_bounds_ = (int32_t*) p[2];
                 // in the stage's order, each read before the one that shares its place is written: xl (D's rows,
                 // T*G*ELL floats) is read by the experts' quantize into Xq; yl (the experts' rows, T*K*ELL floats)
                 // is written by their down products and read by U's quantize into U's int8 rows (Xq's place: the
