@@ -17575,7 +17575,7 @@ int main(int argc, char** argv) {
                     move_spacer = nullptr;
                 }
                 const bool head_ok = native_head.load(o.native_head_shards, g.n_embd, n_vocab, err);
-                if (move_spacer != nullptr) cudaFree(move_spacer);
+                if (move_spacer != nullptr) (void) cudaFree(move_spacer);
                 if (!head_ok) {
                     std::printf("ERR restoring the native output head failed: %s\n", err.c_str());
                     return 1;

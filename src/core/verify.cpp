@@ -4495,7 +4495,7 @@ bool Verifier::drop_window_graphs(int& dropped, std::string& err) {
         for (int t = 0; t <= strata::kernels::kVerifyLongT; ++t) {
             for (cudaGraphExec_t* e : {&exec_[s][t], &exec_nr_[s][t]})
                 if (*e != nullptr) {
-                    cudaGraphExecDestroy(*e);
+                    (void) cudaGraphExecDestroy(*e);
                     *e = nullptr;
                     ++dropped;
                 }
