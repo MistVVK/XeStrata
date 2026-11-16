@@ -7442,17 +7442,29 @@ def _with_reasoning(lps: dict, entries: list) -> dict:
 
 
 def structured_chunks(chunks, validator):
-    """Buffer structured streams so a client never receives unvalidated content."""
+    """Buffer structured streams so a client never receives unvalidated content.  A turn that calls a tool is not the
+    final answer: from its first call on, what was held goes out as it is and the rest streams unchecked, as
+    /v1/responses does."""
     buffered = []
     heartbeat = time.monotonic()
     try:
         for chunk in chunks:
+            if buffered is None:
+                yield chunk
+                continue
             progress = chunk is not None and "prompt_progress" in chunk
+            if chunk is not None and not progress and (chunk.get("choices") or [{}])[0].get("delta", {}).get("tool_calls"):
+                yield from buffered
+                yield chunk
+                buffered = None
+                continue
             if chunk is not None and not progress:
                 buffered.append(chunk)      # a progress chunk carries no content: there is nothing in it to validate
             if chunk is None or progress or time.monotonic() - heartbeat >= 1:
                 heartbeat = time.monotonic()
                 yield chunk if progress else None
+        if buffered is None:
+            return
         result = openai_collect(buffered)
         choice = result["choices"][0]
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
@@ -8727,9 +8739,9 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError("structured response_format with tools/MCP is not supported")
+            messages, validator = prepare_format(req.get("response_format"), messages, with_tools=bool(tools))
+            if validator is not None and req.get("strata_mcp"):
+                raise ValueError("structured response_format with MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             # No cap of our own on the reply's length when logprobs are asked for: the reply is already bounded by
