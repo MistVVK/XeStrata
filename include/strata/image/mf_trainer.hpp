@@ -10,6 +10,8 @@
 // joint attention without a mask, AdaLayerNormContinuous and the projection to the latent's channels.
 #pragma once
 
+#include "strata/image/train_trainer.hpp"
+
 #include "strata/image/mf_train.hpp"
 #include "strata/image/train_loop.hpp"
 #include "strata/image/train_sample.hpp"
@@ -74,6 +76,9 @@ struct MfTrainModel {
 /// Open the bf16 DiT (every weight as FP16, as the engine reads it) and an adapter set of the given rank (0: none).
 /// Throws when a shape the trainer reads is not the file's (the file's own block count and widths win).
 /// int8 makes the blocks' products a QLoRA's base (ai-toolkit's convrot8, W8A8; the modulations stay FP16).
+/// The shared trainer under the model (the VRAM budget, pause/resume, the state file: train::Control).
+train::Trainer& mf_trainer_base(MfTrainModel* m);
+
 MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err,
                               bool int8 = false);
 void mf_trainer_close(MfTrainModel* m);

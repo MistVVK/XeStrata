@@ -11,6 +11,7 @@
 #pragma once
 #include "strata/image/mf_trainer.hpp"
 #include "strata/image/train_loop.hpp"
+#include "strata/image/train_trainer.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -33,6 +34,9 @@ public:
     bool open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err,
               const train::Targets& targets = {});
     /// The cached text rows' width (the context's: the LLM adapter's).
+    /// The shared trainer under this one (the VRAM budget, pause/resume, the state file: train::Control).
+    train::Trainer& base();
+
     int64_t text_cols() const;
     /// One micro-step at sigma: x0 the latent tokens [tokens][64] (drawn from the posterior), eps the noise; the
     /// loss times `weight` (ai-toolkit's weighted timesteps), and with `backward` the adapters' gradients added.

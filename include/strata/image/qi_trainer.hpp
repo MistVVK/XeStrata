@@ -12,6 +12,7 @@
 #pragma once
 
 #include "strata/image/train_loop.hpp"
+#include "strata/image/train_trainer.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -35,6 +36,9 @@ public:
     /// `targets`: the products trained (train::Targets; every one by default), the rest without an adapter.
     bool open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err,
               int64_t max_blocks = 0, bool int8 = false, const train::Targets& targets = {});
+
+    /// The shared trainer under this one (the VRAM budget, pause/resume, the state file: train::Control).
+    train::Trainer& base();
 
     /// A caption's text encoder states [n][4096] (host FP32, the system turn already dropped) through the DiT's text
     /// projection, kept on the GPU; returns its id for step().

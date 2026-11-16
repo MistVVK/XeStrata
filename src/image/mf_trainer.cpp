@@ -62,6 +62,64 @@ struct Model : MfTrainModel, train::Trainer {
     Model() : Trainer("Mage-Flow training") {}
     std::vector<std::array<uint64_t, 12>> woff;
     bool int8 = false;
+
+    // the persistent pointers after the trainer's pause/resume (the values come back at new addresses)
+    void remap() override {
+        auto mv = [&](auto*& p) {
+            using T = std::remove_reference_t<decltype(p)>;
+            p = static_cast<T>(moved(p));
+        };
+        for (MfTrainProduct* pr : {&img_in, &txt_in, &t1, &t2, &nout, &pout}) {
+            mv(pr->w);
+            mv(pr->b);
+        }
+        mv(mdown_w);
+        mv(mdown_b);
+        mv(txt_norm);
+        for (Block& B : blk) {
+            for (int q = 0; q < 2; ++q) {
+                for (int i = 0; i < 6; ++i) mv(B.prod[q][i].b);   // w/w8/sw bound again at each use (bind)
+                mv(B.mod[q].w);
+                mv(B.mod[q].b);
+                mv(B.modlow[q]);
+                mv(B.nq[q]);
+                mv(B.nk[q]);
+            }
+            MfTrainAdapter* az = B.adap;
+            if (az == nullptr) continue;
+            for (int q = 0; q < 2; ++q) {
+                mv(az->modA[q]);
+                mv(az->modB[q]);
+                mv(az->dmodA[q]);
+                mv(az->dmodB[q]);
+                for (int i = 0; i < 6; ++i) {
+                    mv(az->A[q][i]);
+                    mv(az->B[q][i]);
+                    mv(az->M[q][i]);
+                    mv(az->W1[q][i]);
+                    mv(az->W2A[q][i]);
+                    mv(az->W2B[q][i]);
+                    train::Adapter& a = az->ad[q][i];
+                    mv(a.a);
+                    mv(a.at);
+                    mv(a.b);
+                    mv(a.bt);
+                    mv(a.dA);
+                    mv(a.dB);
+                    mv(a.m);
+                    mv(a.norms);
+                    mv(a.dm);
+                    mv(a.w1);
+                    mv(a.w1t);
+                    mv(a.w2a);
+                    mv(a.w2b);
+                    mv(a.dW1);
+                    mv(a.dW2a);
+                    mv(a.dW2b);
+                }
+            }
+        }
+    }
 };
 
 float* dev_dup(Model* m, const float* host, int64_t n) {
@@ -148,6 +206,8 @@ void bind(Model* m, int64_t b, const uint8_t* base) {
 }
 
 }  // namespace
+
+train::Trainer& mf_trainer_base(MfTrainModel* base) { return *static_cast<Model*>(base); }
 
 MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err, bool int8) {
     std::unique_ptr<Model> m(new Model());
@@ -516,8 +576,12 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
     m->set_budget(Rj, (uint64_t) ((m->nblk + 1) * C) * 2, (uint64_t) (24 * C) * 4);
     // and the last blocks' forwards kept for the backward as the memory takes them (keep_tapes, decided before the
     // step's own buffers are taken: every block's input, the backward's gradients and its blocks' outputs)
-    const bool half =
+    const bool short32 =
         keep != nullptr && m->inputs_half(Rj, (uint64_t) ((m->nblk + 1) * Rj * C) * 4, (uint64_t) (12 * C) * 4);
+    // the host form first (the inputs as FP32, byte for byte): the pinned memory had, else BF16
+    const bool hostm = short32 && m->host_inputs(m->nblk + 1, Rj * C * 4);
+    const bool half = short32 && !hostm;
+    m->set_inputs_mode(hostm ? "host" : half ? "bf16" : "fp32");
     if (keep != nullptr) {
         const size_t rc = (size_t) (Rj * C);
         // a block's tape at its largest: each product adapted where any block adapts it (train::Targets)
@@ -529,13 +593,16 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
                     if (az != nullptr && !az->off[q][i]) (q == 0 ? most.img_w : most.txt_w).ad[i] = &az->ad[q][i];
                 }
         keep->first_kept = m->nblk - m->keep_tapes(m->nblk, Rj, mf_block_tape_bytes(most, gemm),
-                                                   half ? (size_t) (m->nblk + 1) * rc * 2 + 4 * rc * 4
-                                                        : (size_t) (m->nblk + 1 + 4) * rc * 4);
+                                                   hostm ? (size_t) (6 * rc * 4)
+                                                         : half ? (size_t) (m->nblk + 1) * rc * 2 + 4 * rc * 4
+                                                                : (size_t) (m->nblk + 1 + 4) * rc * 4);
     }
     if (half) {
         bounds16 = m->get<uint16_t>((m->nblk + 1) * Rj * C);
         keep->bounds16 = bounds16;
         keep->last = m->get<float>(R * C);
+    } else if (keep != nullptr && hostm) {
+        keep->last = m->get<float>(Rj * C);   // the head's input read back from the host (the backward's)
     } else if (keep != nullptr) {
         bounds = m->get<float>((m->nblk + 1) * Rj * C);
         keep->bounds = bounds;
@@ -549,6 +616,7 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
         if (!gpu::copy(b0, img, (size_t) R * C * 4) || !gpu::copy(b0 + R * C, txt, (size_t) Rt * C * 4))
             throw std::runtime_error("image engine (Mage-Flow training): bounds");
         if (bounds16 != nullptr) train::bf16_keep(b0, Rj * C, bounds16, st);
+        if (hostm) m->host.keep(0, b0, Rj * C * 4);
     }
     if (keep != nullptr) {
         keep->R = R;
@@ -575,9 +643,11 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
         run.out_img = no;
         run.out_txt = nt;
         if (keep != nullptr && b >= keep->first_kept) run.kept = m->tape(b);
+        if (hostm && b > 0) m->host.kept_wait(b - 1);   // this block writes the buffer slot b-1 was copied from
         mf_block(run, gemm, st, &m->arena);
         m->ws.end((int) b);
         if (bounds16 != nullptr) train::bf16_keep(no, Rj * C, bounds16 + ((size_t) b + 1) * Rj * C, st);
+        if (hostm) m->host.keep(b + 1, no, Rj * C * 4);
         bi = no;
         bt = nt;
     }
@@ -586,6 +656,7 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
         if (!gpu::copy(keep->last, bi, (size_t) R * C * 4))
             throw std::runtime_error("image engine (Mage-Flow training): copy");
     }
+    if (hostm) m->host.fetch(m->nblk, keep->last, Rj * C * 4, -1);   // the head's input for the backward
     // the output norm (LayerNorm without affine, times 1 + scale, plus shift: the DiT's) and the projection to the
     // latent's channels; its statistics kept for the backward
     uint16_t* ln16 = tmp.get<uint16_t>(R * C, st);
@@ -618,6 +689,7 @@ float mf_trainer_forward_keep(MfTrainModel* base, const MfTrainSample& s, const 
 
 void mf_trainer_free_state(MfTrainModel* base, MfTrainState& s) {
     Model* m = static_cast<Model*>(base);
+    m->host.close();
     auto drop = [&](float* q) { m->release(q); };
     drop(s.x0);
     drop(s.xe);
@@ -780,7 +852,9 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     float* dsums = tmp.get<float>(R * C, st);
     train::dgrad(dv16, dvrs, pout_wt, R, m->in_ch, C, dln, dsums, false, gemm, st);
     // block 11's output (the image stream), through the output norm's scale (its shift has no gradient here)
-    const float* last = s.bounds16 != nullptr ? s.last : s.bounds + (size_t) m->nblk * Rj * C;
+    const bool hostm = s.bounds == nullptr && s.bounds16 == nullptr;   // the inputs on the host (FP32)
+    if (hostm) m->host.wait(m->nblk);   // the head's input read back (the forward's fetch)
+    const float* last = hostm || s.bounds16 != nullptr ? s.last : s.bounds + (size_t) m->nblk * Rj * C;
     float* dimg = tmp.get<float>(R * C, st);
     dit_rows::ln_mod_bwd(last, s.mean, s.inv, c.nmod, dln, R, C, dimg, nullptr, nullptr, st);
     // every block from its boundary input, the output's gradient ping-ponging down
@@ -796,10 +870,18 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     float* dmod[2] = {mod_on ? tmp.get<float>(6 * C, st) : nullptr, mod_on ? tmp.get<float>(6 * C, st) : nullptr};
     float* mh = mod_on ? tmp.get<float>(az0->rank, st) : nullptr;
     float* mg = mod_on ? tmp.get<float>(az0->rank, st) : nullptr;
-    // the blocks' outputs (their forwards' again: not read) once for all of them, and a BF16 input read back
+    // the blocks' outputs (their forwards' again: not read) once for all of them, and a BF16 input read back;
+    // host: two read-back buffers, the inputs fetched a block ahead (the values as the forward kept them, FP32)
     float* bo = tmp.get<float>(R * C, st);
     float* bt = tmp.get<float>(Rt * C, st);
     float* xin = s.bounds16 != nullptr ? tmp.get<float>(Rj * C, st) : nullptr;
+    float* lb = hostm ? tmp.get<float>(2 * Rj * C, st) : nullptr;
+    if (hostm) {
+        m->host.used(0);
+        m->host.used(1);
+        for (int64_t b = m->nblk - 1; b >= 0 && b >= m->nblk - 2; --b)
+            m->host.fetch(b, lb + (b % 2) * Rj * C, Rj * C * 4, (int) (b % 2));
+    }
     for (int64_t b = m->nblk - 1; b >= 0; --b) {
         bind(m, b, m->ws.begin((int) b, (int) b - 1));   // the block below fetched meanwhile
         const MfTrainModel::Block& blk = m->blk[(size_t) b];
@@ -820,8 +902,15 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
                 }
             }
         }
-        if (xin != nullptr) train::bf16_load(s.bounds16 + (size_t) b * Rj * C, Rj * C, xin, st);
-        run.img = xin != nullptr ? xin : s.bounds + (size_t) b * Rj * C;
+        if (hostm) {
+            m->host.wait(b);
+            run.img = lb + (b % 2) * Rj * C;
+        } else if (xin != nullptr) {
+            train::bf16_load(s.bounds16 + (size_t) b * Rj * C, Rj * C, xin, st);
+            run.img = xin;
+        } else {
+            run.img = s.bounds + (size_t) b * Rj * C;
+        }
         run.txt = run.img + R * C;
         // the block forwards (unless its forward was kept) and backwards in one call; its outputs land in bo and bt,
         // its gradients below
@@ -854,6 +943,10 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
             const MfTrainAdapter* az = blk.adap;
             train::row_lora_bwd(az->modA[q], az->modB[q], c.tsil, bw.dmod, az->alpha / (float) az->rank, az->rank, 6 * C, C,
                          az->dmodA[q], az->dmodB[q], mh, mg, st);
+        }
+        if (hostm) {
+            m->host.used((int) (b % 2));
+            if (b > 0) m->host.fetch(b - 1, lb + ((b - 1) % 2) * Rj * C, Rj * C * 4, (int) ((b - 1) % 2));
         }
         std::swap(dcur_i, dnxt_i);
         std::swap(dcur_t, dnxt_t);

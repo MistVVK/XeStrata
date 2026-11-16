@@ -102,9 +102,27 @@ struct AnimaTrainer::Impl : train::Trainer {
         for (int i = 0; i < kAnProducts; ++i)
             blk[(size_t) b].p[i].w = reinterpret_cast<const uint16_t*>(base + woff[(size_t) b][(size_t) i]);
     }
+
+    // the persistent pointers after the trainer's pause/resume (the values come back at new addresses)
+    void remap() override {
+        auto mv = [&](auto*& p) {
+            using T = std::remove_reference_t<decltype(p)>;
+            p = static_cast<T>(moved(p));
+        };
+        for (Dense* d : {&xemb, &t1, &t2, &fm1, &fm2, &flin}) mv(d->w);
+        for (Block& B : blk) {
+            for (Dense* d : {&B.w1[0], &B.w1[1], &B.w1[2], &B.w2[0], &B.w2[1], &B.w2[2]}) mv(d->w);
+            mv(B.sqn);
+            mv(B.skn);
+            mv(B.cqn);
+            mv(B.ckn);   // B.p's weights are bound again at each use (bind); the LoRAs are the trainer's
+        }
+    }
 };
 
 AnimaTrainer::AnimaTrainer() : m_(std::make_unique<Impl>()) {}
+
+train::Trainer& AnimaTrainer::base() { return *m_; }
 AnimaTrainer::~AnimaTrainer() = default;
 int64_t AnimaTrainer::text_cols() const { return m_->Cc; }
 
@@ -230,7 +248,7 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
     // and the last blocks' tapes as the memory takes them (keep_tapes), both decided before the step's own buffers
     // are taken (every block's input, the backward's two gradients and its blocks' output; in BF16, the inputs at half
     // and two FP32 rows' buffers)
-    bool half = false;
+    bool half = false, hostm = false;
     int64_t first_kept = nb;
     if (backward) {
         AnimaBlockRun z;
@@ -252,12 +270,17 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
         }
         const size_t rc = (size_t) (HW * C);
         half = m.inputs_half(HW, (uint64_t) (nb + 1 + 3) * rc * 4, (uint64_t) (13 * m.F) * 4);
+        // the host form first (the inputs as FP32, byte for byte): the pinned memory had, else BF16
+        hostm = half && m.host_inputs(nb + 1, (int64_t) rc * 4);
         first_kept = nb - m.keep_tapes(nb, HW, anima_block_tape_bytes(z, m.gemm),
-                                       half ? (size_t) (nb + 1) * rc * 2 + 4 * rc * 4 : (size_t) (nb + 1 + 3) * rc * 4);
+                                       hostm ? (size_t) (5 * rc * 4)
+                                             : half ? (size_t) (nb + 1) * rc * 2 + 4 * rc * 4
+                                                    : (size_t) (nb + 1 + 3) * rc * 4);
     }
-    const bool all32 = backward && !half;
+    m.set_inputs_mode(hostm ? "host" : half ? "bf16" : "fp32");
+    const bool all32 = backward && !half && !hostm;
     float* bounds = pool.f((all32 ? nb + 1 : 2) * HW * C);
-    uint16_t* bounds16 = half ? pool.u((nb + 1) * HW * C) : nullptr;
+    uint16_t* bounds16 = half && !hostm ? pool.u((nb + 1) * HW * C) : nullptr;
     uint16_t* x16 = pool.u(HW * std::max(C, TV));
     float* rs = pool.f(HW);
     kernels::f32_to_f16_bulk(dxs, x16, HW * TV, s);
@@ -352,17 +375,20 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
         }
         return r;
     };
+    if (hostm) m.host.keep(0, bounds, HW * C * 4);
     for (int64_t b = 0; b < nb; ++b) {
         // the next block's products fetched meanwhile; past the last, the backward's second when it follows
         m.bind(b, backward ? m.ws.begin((int) b, (int) (b + 1 < nb ? b + 1 : nb - 2)) : m.ws.begin((int) b));
         AnimaBlockRun r = run_of(b);
         if (b >= first_kept) r.tape = m.tape(b);
-        if (half && b == 0) train::bf16_keep(bounds, HW * C, bounds16, s);
+        if (bounds16 != nullptr && b == 0) train::bf16_keep(bounds, HW * C, bounds16, s);
+        if (hostm && b > 0) m.host.kept_wait(b - 1);   // this block writes the buffer slot b-1 was copied from
         r.x = all32 ? bounds + b * HW * C : bounds + (b % 2) * HW * C;
         r.out = all32 ? bounds + (b + 1) * HW * C : bounds + ((b + 1) % 2) * HW * C;
         anima_block(r, m.gemm, s, &m.arena);
         m.ws.end((int) b);
-        if (half) train::bf16_keep(r.out, HW * C, bounds16 + (b + 1) * HW * C, s);
+        if (bounds16 != nullptr) train::bf16_keep(r.out, HW * C, bounds16 + (b + 1) * HW * C, s);
+        if (hostm) m.host.keep(b + 1, r.out, HW * C * 4);
     }
     float* last = all32 ? bounds + nb * HW * C : bounds + (nb % 2) * HW * C;
     // the final layer: the norm modulated by the time, the projection to the patch's values, in the tokens' order
@@ -390,19 +416,32 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
     train::dgrad(dv16, dvrs, flin_t, HW, TV, C, dln, sums, false, m.gemm, s);
     float *dcur = pool.f(HW * C), *dnxt = pool.f(HW * C);
     dit_rows::ln_mod_bwd(last, mean, inv, fmod + C, dln, HW, C, dcur, nullptr, nullptr, s);
+    if (hostm) {   // the pass buffers are the backward's read-back buffers now; the first two blocks prefetched
+        m.host.used(0);
+        m.host.used(1);
+        for (int64_t b = nb - 1; b >= 0 && b >= nb - 2; --b)
+            m.host.fetch(b, bounds + (b % 2) * HW * C, HW * C * 4, (int) (b % 2));
+    }
     // the blocks from the last, each one's modulations' gradients to their adapters
     float* dmod = pool.f(9 * C);
     float *g = pool.f(std::max<int64_t>(rk, 1)), *dx2 = pool.f(M);
     // the blocks' outputs in the backward (their forwards' again: not read) once for all; BF16: the forward's other
     // buffer, and the last one (the head's, done with below) the input read back into
-    float* bout = half ? bounds + ((nb + 1) % 2) * HW * C : pool.f(HW * C);
+    float* bout = bounds16 != nullptr ? bounds + ((nb + 1) % 2) * HW * C : pool.f(HW * C);
     for (int64_t b = nb - 1; b >= 0; --b) {
         m.bind(b, m.ws.begin((int) b, (int) b - 1));   // the block below fetched meanwhile
         Impl::Block& B = m.blk[(size_t) b];
         AnimaBlockRun r = run_of(b);
         m.dgrad_weights(r.p, kAnProducts);
-        if (half) train::bf16_load(bounds16 + b * HW * C, HW * C, last, s);
-        r.x = half ? last : bounds + b * HW * C;
+        if (hostm) {
+            m.host.wait(b);
+            r.x = bounds + (b % 2) * HW * C;
+        } else if (half) {
+            train::bf16_load(bounds16 + b * HW * C, HW * C, last, s);
+            r.x = last;
+        } else {
+            r.x = bounds + b * HW * C;
+        }
         r.out = bout;
         r.dout = dcur;
         r.dx = b > 0 ? dnxt : nullptr;
@@ -430,9 +469,14 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
                 row_dgrad(B.w2[k].w, d, 3 * C, M, l2 != nullptr ? l2->A : nullptr, g, l2 != nullptr ? rk : 0, dx2, s);
                 train::row_lora_bwd(l1->A, l1->B, x1, dx2, 1.f, rk, M, C, l1->ad.dA, l1->ad.dB, hr, g, s);
             }
+        if (hostm) {
+            m.host.used((int) (b % 2));
+            if (b > 0) m.host.fetch(b - 1, bounds + ((b - 1) % 2) * HW * C, HW * C * 4, (int) ((b - 1) % 2));
+        }
         std::swap(dcur, dnxt);
     }
     gpu::stream_sync(s);
+    m.host.close();
     m.stepped_rows(HW);
     return loss;
 }

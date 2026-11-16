@@ -83,6 +83,57 @@ struct QiTrainer::Impl : train::Trainer {
     uint16_t* plain0[3] = {};           // an int8 base: block 0's q, k and v rotated back (QiBlockRun::w_plain)
     int64_t last_hw = 0;
 
+    // the persistent pointers after the trainer's pause/resume (the values come back at new addresses)
+    void remap() override {
+        auto mv = [&](auto*& p) {
+            using T = std::remove_reference_t<decltype(p)>;
+            p = static_cast<T>(moved(p));
+        };
+        mv(iin);
+        mv(tin);
+        mv(tout);
+        mv(tnorm);
+        mv(t1);
+        mv(t2);
+        mv(mod);
+        mv(nout);
+        mv(pout);
+        mv(pout_t);
+        mv(e16);
+        mv(s16);
+        mv(temb);
+        mv(mods);
+        mv(mb);
+        mv(scale_out);
+        mv(zero);
+        for (auto& p : plain0) mv(p);
+        for (Block& B : blk) {
+            mv(B.nq);
+            mv(B.nk);   // B.p's weights are bound again at each use (weights_of)
+        }
+        for (auto& t : texts) mv(t.first);
+        for (float*& p : ckpt) mv(p);
+        mv(ckpt16);
+        mv(tmp_out);
+        mv(dX);
+        mv(dX2);
+        mv(x0);
+        mv(nz);
+        mv(pred);
+        mv(dpred);
+        mv(dln);
+        mv(scratch);
+        mv(ln_rs);
+        mv(mean);
+        mv(inv);
+        mv(drs);
+        mv(cos);
+        mv(sin);
+        mv(xt16);
+        mv(ln16);
+        mv(d16);
+    }
+
     // a 16-bit weight [N][K] as the file holds it (`type`: F16 or bf16), on the GPU
     uint16_t* w16(const std::string& name, uint32_t type, int64_t& N, int64_t& K) {
         const TensorInfo& t = g->get(name);
@@ -112,7 +163,8 @@ struct QiTrainer::Impl : train::Trainer {
     // the blocks' scratch 13 FP32 rows of F a row before a step has shown it) - the inputs halved before any weight
     // is streamed, which costs every step its copies.
     void ensure(int64_t R) {
-        if (R <= cap) return;
+        if (R <= cap && !replan_due()) return;
+        host.close();
         for (float* p : ckpt) release(p);
         release(ckpt16);
         ckpt16 = nullptr;
@@ -121,7 +173,14 @@ struct QiTrainer::Impl : train::Trainer {
                         (void*) cos, (void*) sin, (void*) xt16, (void*) ln16, (void*) d16})
             release(p);
         const uint64_t inputs = (uint64_t) ((int64_t) (blk.size() + 1) * R * C) * 4 + (ws.total() - ws.vram());
-        if (inputs_half(R, inputs, (uint64_t) (13 * F) * 4)) {
+        const bool half = inputs_half(R, inputs, (uint64_t) (13 * F) * 4);
+        // the host form first (the inputs as FP32, byte for byte): the pinned memory had, else BF16
+        const bool hostm = half && host_inputs((int64_t) blk.size() + 1, R * C * 4);
+        if (hostm) {
+            ckpt.assign(2, nullptr);
+            std::fprintf(stderr, "image engine (Qwen-Image-2.1 training): the blocks' inputs on the host (%lld rows)\n",
+                         (long long) R);
+        } else if (half) {
             ckpt.assign(2, nullptr);
             ckpt16 = get<uint16_t>((int64_t) (blk.size() + 1) * R * C);
             std::fprintf(stderr, "image engine (Qwen-Image-2.1 training): the blocks' inputs in BF16 (%lld rows)\n",
@@ -129,6 +188,7 @@ struct QiTrainer::Impl : train::Trainer {
         } else {
             ckpt.assign(blk.size() + 1, nullptr);
         }
+        set_inputs_mode(hostm ? "host" : half ? "bf16" : "fp32");
         for (float*& p : ckpt) p = get<float>(R * C);
         tmp_out = get<float>(R * C);
         dX = get<float>(R * C);
@@ -208,6 +268,8 @@ struct QiTrainer::Impl : train::Trainer {
 QiTrainer::QiTrainer() : m_(std::make_unique<Impl>()) {}
 
 QiTrainer::~QiTrainer() = default;
+
+train::Trainer& QiTrainer::base() { return *m_; }
 
 int64_t QiTrainer::blocks() const { return (int64_t) m_->blk.size(); }
 int64_t QiTrainer::width() const { return m_->C; }
@@ -405,10 +467,11 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
         r.nk = B.nk;
         if (b == 0)
             for (int i = 0; i < 3; ++i) r.w_plain[i] = m.plain0[i];
-        r.x = m.ckpt16 != nullptr ? m.ckpt[(size_t) (b % 2)] : m.ckpt[(size_t) b];
+        r.x = (m.ckpt16 != nullptr || m.host.ok()) ? m.ckpt[(size_t) (b % 2)] : m.ckpt[(size_t) b];
         return r;
     };
     const bool half = m.ckpt16 != nullptr;
+    const bool hostm = m.host.ok();
     const int64_t cap = m.cap;
     const int64_t nb = (int64_t) m.blk.size();
     // a block's tape at its largest: each product adapted where any block adapts it (a run trains some blocks' or
@@ -418,19 +481,22 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
         for (const Impl::Block& B : m.blk)
             if (most.ad[i] == nullptr && B.l[i] != nullptr) most.ad[i] = &B.l[i]->ad;
     const int64_t first_kept = nb - m.keep_tapes(nb, R, qi_block_tape_bytes(most), 0);
+    if (hostm) m.host.keep(0, m.ckpt[0], R * C * 4);   // the head's input (the text rows and img_in's output)
     for (int64_t b = 0; b < nb; ++b) {   // the forward, each block's input kept, the last ones' tapes too
         QiBlockRun r = run_of(b);
         // the next block's weights fetched meanwhile; past the last, the backward's second (its first is this one)
         m.weights_of(b, m.ws.begin((int) b, (int) (b + 1 < nb ? b + 1 : nb - 2)), r.p);
         if (half && b == 0) train::bf16_keep(m.ckpt[0], R * C, m.ckpt16, s);
-        r.out = half ? m.ckpt[(size_t) ((b + 1) % 2)] : m.ckpt[(size_t) b + 1];
+        if (hostm && b > 0) m.host.kept_wait(b - 1);   // this block writes the buffer slot b-1 was copied from
+        r.out = (half || hostm) ? m.ckpt[(size_t) ((b + 1) % 2)] : m.ckpt[(size_t) b + 1];
         if (b >= first_kept) r.tape = m.tape(b);
         qi_block(r, m.gemm, s, &m.arena);
         m.ws.end((int) b);
         if (half) train::bf16_keep(r.out, R * C, m.ckpt16 + (b + 1) * cap * C, s);
+        if (hostm) m.host.keep(b + 1, r.out, R * C * 4);
     }
     // the final norm (the image's rows, the t row's scale) and proj_out
-    const float* xf = (half ? m.ckpt[(size_t) (nb % 2)] : m.ckpt[(size_t) nb]) + nt * C;
+    const float* xf = ((half || hostm) ? m.ckpt[(size_t) (nb % 2)] : m.ckpt[(size_t) nb]) + nt * C;
     dit_rows::rows16(dit_rows::LnMod{xf, m.zero, m.scale_out, C}, hw, C, m.ln16, m.ln_rs, s, m.mean, m.inv);
     m.gemm.f16(m.ln16, m.pout, m.pred, hw, kInCh, C);
     dit_rows::rows_back(m.pred, m.ln_rs, nullptr, hw, kInCh, s);
@@ -440,6 +506,7 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     // update still runs on the zero gradients)
     if (!std::isfinite(loss)) {
         std::fprintf(stderr, "image engine (Qwen-Image-2.1 training): the loss is not finite, the step adds nothing\n");
+        m.host.close();
         return loss;
     }
     // the backward: proj_out's dgrad, the final norm's, then the blocks from the last, each run again from its input
@@ -447,9 +514,17 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     train::dgrad(m.d16, m.drs, m.pout_t, hw, kInCh, C, m.dln, m.scratch, false, m.gemm, s);
     gpu::memset_async(m.dX, 0, (size_t) (R * C) * 4, s);
     dit_rows::ln_mod_bwd(xf, m.mean, m.inv, m.scale_out, m.dln, hw, C, m.dX + nt * C, nullptr, nullptr, s);
+    if (hostm) {   // the pass buffers are the backward's read-back buffers now; the first two blocks prefetched
+        m.host.used(0);
+        m.host.used(1);
+        for (int64_t b = nb - 1; b >= 0 && b >= nb - 2; --b)
+            m.host.fetch(b, m.ckpt[(size_t) (b % 2)], R * C * 4, (int) (b % 2));
+    }
     for (int64_t b = nb - 1; b >= 0; --b) {
         QiBlockRun r = run_of(b);
-        if (half) {   // its input read back into the buffer the head did not read
+        if (hostm) {
+            m.host.wait(b);   // r.x: this parity's pass buffer (run_of), read back a block ahead
+        } else if (half) {   // its input read back into the buffer the head did not read
             float* xin = m.ckpt[(size_t) ((nb + 1) % 2)];
             train::bf16_load(m.ckpt16 + b * cap * C, R * C, xin, s);
             r.x = xin;
@@ -465,9 +540,14 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
         r.dx = b > 0 ? m.dX2 : nullptr;
         qi_block(r, m.gemm, s, &m.arena);
         m.ws.end((int) b);
+        if (hostm) {
+            m.host.used((int) (b % 2));
+            if (b > 0) m.host.fetch(b - 1, m.ckpt[(size_t) ((b - 1) % 2)], R * C * 4, (int) ((b - 1) % 2));
+        }
         std::swap(m.dX, m.dX2);
     }
     gpu::stream_sync(s);
+    m.host.close();
     qi_block_profile_report();
     m.stepped_rows(R);
     if (strata::env_get("TRAIN_PROFILE") != nullptr) {   // the memory the step left

@@ -12,6 +12,7 @@
 #pragma once
 #include "strata/image/mf_trainer.hpp"
 #include "strata/image/train_loop.hpp"
+#include "strata/image/train_trainer.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -33,6 +34,9 @@ public:
     bool open(const std::string& dit, int64_t rank, bool int8, const train::Targets& targets, uint64_t seed,
               void* stream, std::string& err);
     /// The cached text rows' width (the DiT's hidden size).
+    /// The shared trainer under this one (the VRAM budget, pause/resume, the state file: train::Control).
+    train::Trainer& base();
+
     int64_t text_cols() const;
     /// One micro-step at sigma: x0 the sample's latent [tokens][128] (already drawn from the posterior), eps the
     /// noise; the loss times `weight` (a weighted timestep's), and with `backward` the adapters' gradients added.
