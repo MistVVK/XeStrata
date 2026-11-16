@@ -70,7 +70,7 @@ if [ ${#cpp[@]} -gt 0 ]; then
     cxx=()
     for f in "${cpp[@]}"; do
       [[ $f == *.cpp ]] || continue
-      if printf '%s\n' "${tus[@]}" | grep -qxF "$PWD/$f"; then
+      if grep -qxF "$PWD/$f" <<<"$(printf '%s\n' "${tus[@]}")"; then   # not a pipe: grep -q ends it early
         cxx+=("$f")
       else
         echo "== clang-tidy: $f skipped (not compiled in $BUILD)"
