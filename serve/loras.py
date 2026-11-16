@@ -799,8 +799,12 @@ class Folder:
                 rank = max(rank, a[0])
             targets.add(kind_of(key))
         kind = (meta.get(KIND_KEY) or "").strip().lower()
+        try:
+            steps = int(meta.get("ss_steps", ""))
+        except ValueError:
+            steps = None
         return {"name": name, "path": rel, "rank": rank, "scale": _recommended(meta), "trigger": _trigger(meta),
-                "kind": kind if kind in KINDS else None,
+                "kind": kind if kind in KINDS else None, "steps": steps,
                 "targets": sorted(targets), "size_mib": round(path.stat().st_size / 1048576, 1),
                 "ignored": sorted(ignored)}
 
