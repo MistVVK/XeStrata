@@ -202,6 +202,16 @@ export function outputBudget(context, maxOutput = null) {
  * @returns {{patch:string, env:Record<string,string>, routes:Array, defaultRoute:object|null, signature:string}}
  */
 /** What a local model, or an OpenAI-style server on this network, takes for the thinking level (see the comment where a local route is built). */
+/**
+ * "store" is OpenAI's own field (keep the request out of its stored completions). pi-ai sends store: false to every OpenAI-style server it
+ * does not know as non-standard, and some refuse an unknown field: Google's Gemini endpoint answers 400 "Unknown name \"store\"" (#5903). Only
+ * OpenAI's own address gets it; for every other address it is left out.
+ */
+function storeCompat(baseURL) {
+  let host = '';
+  try { host = new URL(baseURL).hostname.toLowerCase(); } catch { /* not an address: leave it out */ }
+  return host === 'api.openai.com' ? {} : { supportsStore: false };
+}
 const THINKING_COMPAT = { supportsStore: false, thinkingFormat: 'chat-template', chatTemplateKwargs: { enable_thinking: { $var: 'thinking.enabled' }, reasoning_effort: { $var: 'thinking.effort', omitWhenOff: true } } };
 
 export function buildProfile({ local = [], connections = [], gate = true, tools = NO_TOOLS_SETTINGS, skillsDir = null, proxyBase = null, searchMock = null, defaultLocalId = null }) {
@@ -282,7 +292,7 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
       api: protocol,
       baseURL,
       ...(conn.apiKey || keyless ? { apiKeyEnv: keyEnv } : {}),
-      ...(ownServer ? { compat: THINKING_COMPAT } : openRouter ? { compat: { thinkingFormat: 'openrouter' } } : {}),
+      ...(ownServer ? { compat: THINKING_COMPAT } : openRouter ? { compat: { thinkingFormat: 'openrouter', ...storeCompat(baseURL) } } : protocol === 'openai-completions' ? { compat: storeCompat(baseURL) } : {}),
       models: conn.models.map(m => ({
         id: m.id, name: m.name || m.id,
         contextWindow: m.contextMax ?? ASSUMED_API_CONTEXT, maxTokens: reply(m),
