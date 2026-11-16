@@ -5021,6 +5021,15 @@ def rocm_dev_missing(sysroot: Path) -> list:
     return [name for name, paths in need.items() if not any(p.is_file() for p in paths)]
 
 
+def rocm_clang(root: Path) -> Path:
+    """#6071: ROCm's HIP compiler.  ROCm 7 and TheRock's wheels have <root>/llvm/bin/clang++; rocm-core 10.1 (Arch Linux)
+    has only <root>/lib/llvm/bin/clang++.  The first that exists; when neither does, the old place (callers name it)."""
+    for d in (root / "llvm" / "bin", root / "lib" / "llvm" / "bin"):
+        if (d / "clang++").exists():
+            return d / "clang++"
+    return root / "llvm" / "bin" / "clang++"
+
+
 def rocm_root(archs):
     """ROCm for compiling and running the HIP engine for `archs` (one arch or a list: the cards of a layer split):
     (root, library folders).  A system ROCm 7 with hipcc, hipBLAS and the HIP development files (#446), else AMD's
@@ -5062,7 +5071,7 @@ def rocm_root(archs):
         stamp.write_text(json.dumps({"version": wheel, "index": index}))
     sdk = Path(sys.executable).parent / "rocm-sdk"
     root = Path(out([str(sdk), "path", "--root"]).strip())
-    if not (root / "llvm" / "bin" / "clang++").exists():
+    if not rocm_clang(root).exists():
         fail(f"ROCm was installed but its compiler is missing ({root})",
              f"remove {stamp} and run this again; or install ROCm 7 system-wide")
     # the card family's libraries only (gfx120X-all -> _rocm_sdk_libraries_gfx120X_all): another family's
@@ -5147,7 +5156,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr", "ROCM_PATH": str(root),
                        "HIP_PATH": str(root)})
     os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
-    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(rocm_clang(root).parent), os.environ.get("PATH", "")])
     say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
         if meta.get("backend") == "hip" and (eng / EXE).exists() and has_archs
         else f"  Compiling the Strata engine for your AMD GPU{'s' if len(archs) > 1 else ''} ({', '.join(archs)}; "
@@ -5155,7 +5164,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     cmake_build(ROOT, ROOT / "build-hip", "strata",
                 ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
                  "-DSTRATA_Q6K_EXPERTS=ON", "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
-                 f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+                 f"-DCMAKE_HIP_COMPILER={rocm_clang(root)}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
                  *ggml_defs(llama), *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
@@ -5216,7 +5225,7 @@ def build_vision_hip(eng: Path, stamp: Path, meta: dict, llama, vsrc, archs: lis
         os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr", "ROCM_PATH": str(root),
                            "HIP_PATH": str(root)})
         os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
-        os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+        os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(rocm_clang(root).parent), os.environ.get("PATH", "")])
     build_vision_cpu(eng, stamp, meta, llama, vsrc)
     meta = json.loads(stamp.read_text(encoding="utf-8"))
     if vision != "gpu":
@@ -5229,7 +5238,7 @@ def build_vision_hip(eng: Path, stamp: Path, meta: dict, llama, vsrc, archs: lis
     try:
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision-hip", "strata-vision",
                     ["-DSTRATA_VISION_HIP=ON", "-DSTRATA_VISION_HIP_ARCHS=" + ";".join(archs),
-                     "-DSTRATA_PORTABLE=OFF", f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
+                     "-DSTRATA_PORTABLE=OFF", f"-DCMAKE_HIP_COMPILER={rocm_clang(root)}",
                      f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}", "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                      f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"], None, "")
         shutil.copy2(ROOT / "build-vision-hip" / "bin" / HVEXE, eng / HVEXE)
