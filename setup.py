@@ -812,6 +812,38 @@ def step(n, title):
     say(f"=== Step {n}: {title} ===")
 
 
+def menu_colour(code: str) -> tuple[str, str]:
+    """(start, reset) ANSI codes for a menu name (#5935), or two empty strings: only on a terminal (never in a pipe, a log or the app's
+    installer), never with NO_COLOR set or TERM=dumb, and on Windows only where the console takes escape codes (switched on here once; a
+    console that refuses keeps plain text)."""
+    try:
+        if not sys.stdout.isatty() or os.environ.get("NO_COLOR") is not None or os.environ.get("TERM", "").lower() == "dumb":
+            return "", ""
+    except (AttributeError, ValueError):
+        return "", ""
+    if WIN and not _windows_vt():
+        return "", ""
+    return f"\033[{code}m", "\033[0m"
+
+
+_VT: list = []
+
+
+def _windows_vt() -> bool:
+    """Windows: ENABLE_VIRTUAL_TERMINAL_PROCESSING on this console's output (Windows 10 1511 and later); False when it cannot be had."""
+    if not _VT:
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            handle = k32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            _VT.append(bool(k32.GetConsoleMode(handle, ctypes.byref(mode))) and
+                       (bool(mode.value & 0x0004) or bool(k32.SetConsoleMode(handle, mode.value | 0x0004))))
+        except Exception:                              # noqa: BLE001 - plain text then
+            _VT.append(False)
+    return _VT[0]
+
+
 def ok(msg):
     say(f"  [ok] {msg}")
 
@@ -9910,7 +9942,7 @@ def main() -> int:
         family = a.family
     else:
         tier = tier_pick(ram, low_ram_vram(gpu))
-        cyan, reset = ("\033[36m", "\033[0m") if sys.stdout.isatty() else ("", "")
+        cyan, reset = menu_colour("36")
         rec_fam = STRIX_HALO_FAMILY if strix_halo_recommends(gpu, ram) and STRIX_HALO_FAMILY in fams else             tier[0] if tier and tier[0] in fams else fams[0]
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
@@ -9976,9 +10008,8 @@ def main() -> int:
             say(f"  {i}) {m}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, keeps {keeps} of its "
                 f"{d['arena_gb']:.0f} GB of experts in RAM{fit}")
             continue
-        label = f"{m:8s}"
-        if sys.stdout.isatty():
-            label = f"\033[35m{label}\033[0m"
+        magenta, reset = menu_colour("35")
+        label = f"{magenta}{m:8s}{reset}"
         say(f"  {i}) {label}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index(installed or recommended_size(family, names, ram, low_ram_vram(gpu))) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
