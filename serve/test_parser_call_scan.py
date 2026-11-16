@@ -53,7 +53,9 @@ class CallScanTests(unittest.TestCase):
                 self.assertEqual(walk.call_count, before)
                 for char in "</parameter></function></tool_call>":
                     parser.feed(char)
-                self.assertEqual(walk.call_count, before + 1)
+                # A closer may need one extra final-state probe to distinguish #4701 lookahead from a literal tag.
+                self.assertGreaterEqual(walk.call_count - before, 1)
+                self.assertLessEqual(walk.call_count - before, 2)
                 parser.finish()                    # #4701: a closed call waits for what might follow it; the end of the turn settles it
                 self.assertEqual(parser._call_end_checked, 0)
 

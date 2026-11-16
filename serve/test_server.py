@@ -2047,6 +2047,74 @@ class HipEnvGuard(unittest.TestCase):
             del os.environ["HIP_PATH"]
 
 
+class StreamUsageChunk(unittest.TestCase):
+    """OpenAI's streaming contract: with "stream_options": {"include_usage": true} the usage rides in its own last
+    chunk, "choices": []. LiteLLM (and the AI SDK) read it there; a usage on the finish_reason chunk is ignored by
+    LiteLLM, which then recounts the tokens itself, too low, so a client compacts its context too late.
+    Without the option the usage stays on the finish_reason chunk, as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "</think>\n\nanswer", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def stream(self, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64, "stream": True, **extra}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            lines = r.read().decode().split("\n\n")
+        data = [x[len("data: "):] for x in lines if x.startswith("data: ")]
+        self.assertEqual(data[-1], "[DONE]")
+        return [json.loads(x) for x in data[:-1]]
+
+    def test_usage_in_its_own_last_chunk(self):
+        chunks = self.stream(stream_options={"include_usage": True})
+        last, finish = chunks[-1], chunks[-2]
+        self.assertEqual(last["choices"], [])
+        self.assertGreater(last["usage"]["prompt_tokens"], 0)
+        self.assertGreater(last["usage"]["completion_tokens"], 0)
+        self.assertEqual(last["usage"]["total_tokens"], last["usage"]["prompt_tokens"] + last["usage"]["completion_tokens"])
+        self.assertIn("cached_tokens", last["usage"]["prompt_tokens_details"])
+        self.assertEqual(last["id"], finish["id"])
+        self.assertEqual(finish["choices"][0]["finish_reason"], "stop")
+        self.assertNotIn("usage", finish)
+        self.assertEqual(sum(1 for c in chunks if "usage" in c), 1)        # exactly one usage chunk
+
+    def test_without_the_option_the_usage_stays_on_the_finish_chunk(self):
+        for extra in ({}, {"stream_options": {"include_usage": False}}, {"stream_options": None}):
+            chunks = self.stream(**extra)
+            self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop", extra)
+            self.assertGreater(chunks[-1]["usage"]["prompt_tokens"], 0, extra)
+            self.assertTrue(all(c["choices"] for c in chunks), extra)
+
+    def test_a_stream_options_that_is_not_an_object_is_ignored(self):
+        # The spec allows an object or null. Anything else used to be served as a plain stream; it must not become an
+        # empty 200 (the usage split runs after the SSE headers are out, so an exception there leaves no body at all).
+        for extra in ({"stream_options": "yes"}, {"stream_options": True}, {"stream_options": 1}, {"stream_options": [1]}):
+            chunks = self.stream(**extra)
+            self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop", extra)
+            self.assertGreater(chunks[-1]["usage"]["prompt_tokens"], 0, extra)
+            self.assertTrue(all(c["choices"] for c in chunks), extra)
+
+    def test_same_numbers_as_the_non_streaming_answer(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            plain = json.loads(r.read())["usage"]
+        split = self.stream(stream_options={"include_usage": True})[-1]["usage"]
+        self.assertEqual((split["prompt_tokens"], split["completion_tokens"]), (plain["prompt_tokens"], plain["completion_tokens"]))
+
+
 class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_ids = list(ids)
@@ -4247,6 +4315,25 @@ class SharingTheGpu(unittest.TestCase):
         self.svc.free_vram_mib = lambda: 20000                      # the peer let go: the next try loads
         self.assertEqual(self._raw_chat()[0], 200)
 
+    def test_gpu_refusal_on_responses_sends_retry_after_too(self):
+        """The same refusal as above on /v1/responses: docs/DETAILS.md promises the header with no route limit."""
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.vram_free_wait_s = 0.2                              # (not the 15 s wait for memory)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.svc.unload()
+                r = urllib.request.Request(self.base + "/v1/responses",
+                                           data=json.dumps({"model": "m", "input": "hi", "stream": stream}).encode(),
+                                           headers={"Content-Type": "application/json"}, method="POST")
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(r, timeout=30)
+                with caught.exception as e:
+                    self.assertEqual(e.code, 503)
+                    self.assertEqual(e.headers["Retry-After"], "15")
+                    self.assertIn("in use by another program", json.loads(e.read())["error"]["message"])
+                self.assertEqual(self.engine.starts, 0)
+
     def test_before_load_strict_refuses_even_with_free_vram(self):
         self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
         self.svc.before_load_strict = True
@@ -4845,6 +4932,29 @@ class ForcedToolChoice(unittest.TestCase):
                 self.assertEqual(self.svc.totals["tool_calls_unread"], before + 1)         # /metrics counts it
                 if not stream:
                     self.assertIn("<function=execute_gdscript>", b["choices"][0]["message"]["content"])   # the text is untouched
+
+    def test_an_undeclared_call_names_the_closest_declared_tool_and_runs_nothing(self):
+        """#5904 / #5933 / #4622: `read_file` for a declared `read` stays text with finish "stop" (nothing runs under a
+        guessed name); the marker names the closest declared tool as a hint.  A name close to nothing gets no hint."""
+        tools = [{"type": "function", "function": {"name": n, "description": n, "parameters": {
+            "type": "object", "properties": {"q": {"type": "string"}}}}} for n in ("read", "write", "search")]
+        for written, hint in (("read_file", "read"), ("Write", "write"), ("serch", "search"), ("execute_gdscript", None)):
+            self.says(self._undeclared_call_answer(written))
+            for stream in (False, True):
+                with self.subTest(written=written, stream=stream):
+                    code, b = self.openai(stream=stream, tools=tools)
+                    finish, calls, _ = self.call_of(code, b, stream)
+                    self.assertEqual((finish, calls), ("stop", []), b)
+                    want = {"name": written, "reason": "undeclared", **({"closest_declared": hint} if hint else {})}
+                    self.assertEqual(self._rejected_of(b, stream), [want])
+
+    def test_closest_declared(self):
+        from serve.server import closest_declared
+        self.assertEqual(closest_declared("read_file", ["read", "write"]), "read")
+        self.assertEqual(closest_declared("ReadFile", ["read_file", "write"]), "read_file")
+        self.assertIsNone(closest_declared("file", ["read_file", "write_file"]))      # two candidates: no guess
+        self.assertIsNone(closest_declared("gashfunction_calls", ["grep", "read"]))
+        self.assertIsNone(closest_declared("x", []))
 
     def test_undeclared_tool_calls_call_hands_the_call_to_the_client(self):
         """#4622: "undeclared_tool_calls": "call" returns the well-formed call of an undeclared name as a tool call (the client has its
@@ -6883,7 +6993,9 @@ class OpenAIChunksTerminal(unittest.TestCase):
     def test_a_cancelled_run_that_stops_early_is_not_an_error(self):
         gone = threading.Event()
         gone.set()                                   # the client left: nobody reads the end
-        self.assertEqual(len(self.chunks([], cancel=gone)), 1)
+        # #4758: the role chunk goes out with the first data, and a run that stopped before any has none: no chunk
+        # at all, and no error either
+        self.assertEqual(self.chunks([], cancel=gone), [])
 
 
 
@@ -6959,3 +7071,121 @@ class PrepareCancelled(unittest.TestCase):
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
 
+
+
+class ToolCallParameterCoercionAndDedup(unittest.TestCase):
+    """Repeated non-string parameters (the model rewrites an array/object parameter in the same call), Python booleans
+    (`True`/`False`), and empty/`null`/`None` non-string parameters produce identical valid JSON in both whole and
+    streamed (`stream_tools=True`) parsing."""
+
+    SCHEMA = [
+        {
+            "name": "fit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "free": {"type": "array"},
+                    "bounds": {"type": "array"},
+                    "dry_run": {"type": "boolean"},
+                    "timeout": {"type": "integer"},
+                    "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "count": {"type": "integer"},
+                },
+            },
+        }
+    ]
+
+    def test_a_rewrite_further_down_the_call_streams_once_with_the_later_value(self):
+        # (our fix-up) the PR's check of a parameter that follows itself covered the adjacent rewrite only: a rewrite
+        # after another parameter streamed both writes (two JSON keys) or the earlier one
+        body = ("<tool_call>\n<function=fit>\n"
+                "<parameter=bounds>\n[1, 2]\n</parameter>\n"
+                "<parameter=path>\ncurve.dat\n</parameter>\n"
+                "<parameter=bounds>\n[10, 20]\n</parameter>\n"
+                "<parameter=timeout>\n5\n</parameter>\n"
+                "<parameter=timeout>\n7\n</parameter>\n"
+                "</function>\n</tool_call>")
+        self.check(body, {"path": "curve.dat", "bounds": [10, 20], "timeout": 7})
+        for step in (1, 7, 10_000):
+            evs = self.events(body, step)
+            streamed = "".join(e.text for e in evs if e.kind == "tool_args")
+            self.assertEqual(streamed.count('"bounds"'), 1, streamed)
+            self.assertEqual(streamed.count('"timeout"'), 1, streamed)
+
+    def test_null_where_the_type_allows_it_and_false_and_zero_kept(self):
+        # (our fix-up) a null placeholder is null when the declared type allows null, not left out; false and 0 stay
+        body = ("<tool_call>\n<function=fit>\n"
+                "<parameter=limit>\nNone\n</parameter>\n"
+                "<parameter=dry_run>\nfalse\n</parameter>\n"
+                "<parameter=count>\n0\n</parameter>\n"
+                "</function>\n</tool_call>")
+        self.check(body, {"limit": None, "dry_run": False, "count": 0})
+
+    def test_without_a_schema_a_none_stays_text(self):
+        from serve.frontend import parse_tool_call
+        call = parse_tool_call("<function=other>\n<parameter=x>\nNone\n</parameter>\n</function>", None)
+        self.assertEqual(call.arguments, {"x": "None"})
+
+    def events(self, body: str, step: int):
+        from serve.frontend import OutputParser
+        text = "</think>\n\n" + body
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=True, recover=True)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        return evs + p.finish()
+
+    def parse(self, body: str, stream_tools: bool, step: int):
+        from serve.frontend import OutputParser
+        text = "</think>\n\n" + body
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools, recover=True)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        evs += p.finish()
+        calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
+        if stream_tools:
+            for c in [e for e in evs if e.kind == "tool_call"]:
+                streamed = "".join(
+                    e.text for e in evs if e.kind == "tool_args" and e.call is not None and e.call.id == c.call.id
+                )
+                self.assertEqual(json.loads(streamed), c.call.arguments)
+        return calls
+
+    def check(self, body: str, expected_args: dict):
+        for stream_tools in (False, True):
+            for step in (1, 5, 19, 10_000):
+                with self.subTest(stream_tools=stream_tools, step=step):
+                    self.assertEqual(self.parse(body, stream_tools, step), [("fit", expected_args)])
+
+    def test_duplicate_array_parameter_uses_last_occurrence(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=path>\ncurve.dat\n</parameter>\n"
+            "<parameter=bounds>\n[{\"min\": 1, \"max\": 2}]\n</parameter>\n"
+            "<parameter=bounds>\n[{\"min\": 10, \"max\": 20}]\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {"path": "curve.dat", "bounds": [{"min": 10, "max": 20}]})
+
+    def test_python_booleans_and_empty_or_null_non_strings(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=path>\ncurve.dat\n</parameter>\n"
+            "<parameter=dry_run>\nTrue\n</parameter>\n"
+            "<parameter=free>\nnull\n</parameter>\n"
+            "<parameter=bounds>\nNone\n</parameter>\n"
+            "<parameter=timeout>\n\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {"path": "curve.dat", "dry_run": True})
+
+    def test_only_skipped_non_string_parameters_yield_empty_object(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=free>\nnull\n</parameter>\n"
+            "<parameter=timeout>\nNone\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {})

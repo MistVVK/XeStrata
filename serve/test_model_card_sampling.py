@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine, model_card_sampling, serve  # noqa: E402
+from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine, asks_greedy, model_card_sampling, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -98,6 +98,32 @@ class ModelCardSampling(unittest.TestCase):
         self.svc.sampling_defaults = {"temperature": 0}
         self.svc.shared = {}
         self.assertNotIn("temperature", self.keys())     # a config that asks for greedy gets it
+
+    def test_greedy_gets_no_card_penalty(self):
+        # temperature 0 asked for stays greedy: no card presence_penalty (it made the engine sample and kept Qwen3.6's
+        # MTP drafts off on every temperature-0 request); a penalty the request or config asks for still applies
+        k = self.keys(temperature=0, reasoning_effort="none")            # Flash-Next, not thinking: the card has 1.5
+        self.assertNotIn("temperature", k)
+        self.assertNotIn("penalty_present", k)
+        self.svc.model_arch = "qwen35moe"                                # Qwen3.6: 1.5 in both thinking states
+        self.assertNotIn("penalty_present", self.keys(temperature=0))
+        self.assertNotIn("penalty_present", self.keys(temperature=0, reasoning_effort="none"))
+        self.assertIn("penalty_present=1.2", self.keys(temperature=0, presence_penalty=1.2))
+        self.assertIn("penalty_present=1.5", self.keys(temperature=0.3))   # not greedy: the card as before
+        self.svc.sampling_defaults = {"temperature": 0}                 # a config that asks for greedy
+        self.assertNotIn("penalty_present", self.keys())
+        self.assertIn("penalty_present=1.5", self.keys(temperature=0.7))  # ... unless the request asks for more
+        self.svc.sampling_defaults = {}
+        self.svc.shared = {"temperature": 0}                             # the shared Chat settings
+        self.assertNotIn("penalty_present", self.keys())
+
+    def test_asks_greedy(self):
+        self.assertTrue(asks_greedy({"temperature": 0}))
+        self.assertTrue(asks_greedy({}, {"temperature": 0.0}))
+        self.assertFalse(asks_greedy({"temperature": 0.5}, {"temperature": 0}))   # the first that says one wins
+        self.assertFalse(asks_greedy({"temperature": None}, {}))
+        self.assertFalse(asks_greedy())
+        self.assertEqual(model_card_sampling("qwen35moe", True, greedy=True), {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
 
     def test_no_family_no_defaults(self):
         self.svc.model_arch = None
