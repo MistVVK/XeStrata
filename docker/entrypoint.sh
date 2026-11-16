@@ -15,6 +15,8 @@
 #   PARALLEL      requests answered at the same time, 1 to 8 (empty: fit to the card)
 #   VISION        off | on | gpu | cpu  (pictures; the picture reader file is downloaded with the model)
 #   KV            int8 | q4_0 | k8v4 | fp16  (conversation memory format)
+#   DRAFTING      auto | mtp | dflash2 | off  (which drafter guesses ahead)
+#   DRAFT_VOCAB   cjk | en | cyrillic | fr | latin  (which tokens the drafter may guess; every one but cjk keeps English and code)
 #   GPU / GPUS    card numbers, e.g. 0 or 0,1 (empty or "all": the engine's choice)
 #   GPU_ROLES     a role for each card, e.g. 1=main,0=helper (main, helper or off; cards you do not name are off; not together with GPU / GPUS)
 #   TUNE          quick | thorough | skip   (done once; RETUNE=1 tunes again)
@@ -232,6 +234,8 @@ if [ -n "$roles" ]; then
   set -- "$@" --gpu-roles "$roles"; have=1
 fi
 [ -n "${STRATA_SET:-}" ] && { for kv in $STRATA_SET; do set -- "$@" --set "$kv"; done; have=1; }
+[ -n "${DRAFTING:-}" ] && { set -- "$@" --drafting "$DRAFTING"; have=1; }
+[ -n "${DRAFT_VOCAB:-}" ] && { set -- "$@" --draft-vocab "$DRAFT_VOCAB"; have=1; }
 [ -n "$key" ] && { set -- "$@" --api-key-env STRATA_LAUNCH_KEY; }
 
 # tune once: ask only when this preset has not been tuned yet (a restart must not tune again for 20 minutes)

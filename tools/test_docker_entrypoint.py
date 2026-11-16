@@ -97,6 +97,15 @@ class Entrypoint(unittest.TestCase):
         self.assertIn("launch --stop --preset office", self.log.read_text())
         self.assertIn("stopped", self.log.read_text())
 
+    def test_drafting_and_draft_vocab_become_flags(self):
+        """#5786: DRAFTING and DRAFT_VOCAB reach strata launch as --drafting / --draft-vocab."""
+        p = self.start(MODEL="IQ3_XXS", DRAFTING="dflash2", DRAFT_VOCAB="latin")
+        line = self.launch_line(self.wait_for("--show-key"))
+        self.assertIn("--drafting dflash2", line)
+        self.assertIn("--draft-vocab latin", line)
+        code, _out, err = self.stop(p)
+        self.assertEqual(code, 0, err)
+
     def test_saved_preset_is_reused_and_a_tuned_one_is_not_tuned_again(self):
         p = self.start(STUB_PRESET="1", STUB_TUNED="tuned 2026-10-17", TUNE="quick", MODEL="Q2_0")
         line = self.launch_line(self.wait_for("--show-key"))

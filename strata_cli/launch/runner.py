@@ -1127,6 +1127,8 @@ class Runner:
             args += ["--kv", s.kv]
         if fam in ("qwen", "coder"):
             args += ["--experimental-speed-projection", "off"]
+        if s.draft_vocab and fam in modelstate.HELPER_FAMILIES:
+            args += ["--draft-vocab", s.draft_vocab]
         layer_fetch = getattr(self, "_layer_fetch", False)  # the start's safety net (fetch_missing_drafter): setup fetches the draft layer
         resolved = "mtp" if layer_fetch else self.resolved_drafting(fam)
         mtp_word = s.mtp if resolved != "off" else "off"
@@ -1157,7 +1159,7 @@ class Runner:
         if sys.platform == "darwin":
             # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu, speed projection)
             keep = {"--yes", "--no-start", "--family", "--model", "--context", "--vision", "--data-dir", "--gguf-dir", "--move-data",
-                    "--set-default-data-dir", "--feed", "--drafter", "--mtp"}     # --drafter / --mtp: setup.py's Mac step fetches the draft layer only where the
+                    "--set-default-data-dir", "--feed", "--drafter", "--mtp", "--draft-vocab"}     # --drafter / --mtp: setup.py's Mac step fetches the draft layer only where the
                                                                                   # start runs the MTP, and not after a Drafting Off (`--mtp off`)
             flags = ("--yes", "--no-start", "--move-data", "--set-default-data-dir")
             out, i = [], 0
