@@ -13337,15 +13337,30 @@ int main(int argc, char** argv) {
                 bool fits = admit();
                 if (!fits && pools_budget.idle_bytes() > 0) { pools_budget.shrink((size_t) -1); fits = admit(); }
                 fits = fits || (strata::core::release_free_heap() && admit());
-                while (!fits && conversations.size() > 0 && evicted < conversations.slots() &&
-                       conversations.evict_oldest()) {
-                    ++evicted;
-                    fits = admit();
+                // #5697: oldest first until it fits, and no further than the memory that comes back: an eviction whose
+                // bytes the reading does not show (the C library kept them) stops the loop, and the rest stay parked.
+                // An evicted image's segments go back to the segment pool as idle (resident) memory: given back to the
+                // OS at once, or the reading could never show them.
+                bool no_progress = false;
+                if (!fits) {
+                    const strata::core::EvictForRam r = strata::core::evict_for_ram(
+                        admit, [&] { return mem ? std::optional<uint64_t>(mem->available) : std::nullopt; },
+                        [&]() -> size_t {
+                            const size_t b = conversations.oldest_evictable_bytes();
+                            if (b == 0 || !conversations.evict_oldest()) return 0;
+                            if (pools_budget.idle_bytes() > 0) pools_budget.shrink((size_t) -1);
+                            return b;
+                        },
+                        conversations.slots());
+                    fits = r.fits;
+                    evicted = r.evicted;
+                    no_progress = r.no_progress;
                 }
                 if (!fits) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
-                                 evicted, conversations.size());
+                                 evicted, conversations.size(),
+                                 no_progress ? "; the last eviction gave no memory back, so the rest stay parked" : "");
                     return true;
                 }
                 if (evicted)
