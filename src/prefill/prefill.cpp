@@ -718,7 +718,7 @@ struct Prefill::Impl {
     int64_t lat_layer0_ = 0;                 // the first layer the pair holds (a layer-split stage's first; 0: all)
     std::vector<int32_t> lat_labels_;
     int32_t* lat_labels_dev_ = nullptr;
-    float* lat_xl_ = nullptr;                // scratch (allocated on the first latent layer, freed with the object)
+    float* lat_xl_ = nullptr;                // the dp4a arm's buffers: in the MoE stage's set (latent_set_sizes, carve)
     uint8_t* lat_xlq_ = nullptr;
     uint8_t* lat_xq_ = nullptr;
     float* lat_yl_ = nullptr;
@@ -736,9 +736,8 @@ struct Prefill::Impl {
     HostVec<int32_t> lat_h_ptrs[2];   // ng*2 int32: the device pointers' bytes (pinned, fast copy kernel)
     HostVec<int32_t> lat_h_start[2], lat_h_dst[2], lat_h_tok[2], lat_h_ng[2];
     strata::gpu::Event* lat_tbl_ev[2] = {};
-    int64_t lat_scratch_T_ = 0;              // the chunk the scratch was sized for
-    // the latent mmq fast path's scratch (the int8 matrix-unit products, iq_mmq)
-    // the latent experts on the standard path's int8 products (latent_mmq_d / latent_mmq_u)
+    bool lat_events_ = false;                // lat_tbl_ev made
+    // the latent experts on the standard path's int8 products (latent_mmq_d / latent_mmq_u), in the MoE stage's set
     uint8_t* lmmq_xq_ = nullptr;               // D input (q8, T rows of N)
     float* lmmq_xl_ = nullptr;                 // D output (T*G rows of ELL), the experts' rows
     float* lmmq_yl_ = nullptr;                 // the experts' outputs (T*K expert-order rows of ELL)
@@ -746,7 +745,7 @@ struct Prefill::Impl {
     int32_t* lmmq_ids_ = nullptr;              // U's row map: group-order row -> its yl row
     int32_t* lmmq_bounds_ = nullptr;           // D's {0, T} | U's group bounds (G + 1)
     HostVec<int32_t> lmmq_ids_h_, lmmq_bnd_h_; // their pinned host tables, built and uploaded once a layer
-    int64_t lmmq_scratch_T_ = 0;
+    bool lmmq_forms_ = false;                  // the D and U products' forms chosen
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -1253,6 +1252,31 @@ const MmqPlan& mmq_plan() {
 // its types: UD-Q4_K_XL) keeps the larger set's room, not both: 0.42 and 0.40 GB at an 8192-token chunk.  Their sum
 // (with the expert groups', expert_group_bytes) cost an RTX 4070 the 8192 chunk at a 32K UD-Q4_K_XL prompt: 6144-token
 // chunks streamed 36% more experts, 615 -> 460 tok/s.
+// The latent MoE's (Edge0) prompt buffers, in carve's order: the int8 arm's (latent_mmq_d / latent_mmq_u) or the dp4a
+// arm's (Prefill::latent_experts), sized by the chunk.  They live while the MoE stage runs (D, the experts, U) and
+// nowhere else, so they are part of the stage's set (moe_set_bytes, carve): the prompt path's size (bytes_needed),
+// what it borrows from the expert cache and how long a chunk it takes count them.  Allocated apart, they were not
+// counted, and the cache's automatic size took their VRAM: the RX 9060 XT stopped a 32K prompt with "the latent
+// scratch does not fit" at the default reserve (Edge0-120B-q3k, 2026-11-16).  Empty for a pack that is not latent.
+constexpr int kLatentBatch = 32;   // the dp4a arm's staged blobs a batch
+std::vector<size_t> latent_set_sizes(size_t T) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay_latent(lay)) return {};
+    const size_t ELL = (size_t) lay.fmt[0].n_embd, I = (size_t) lay.fmt[0].n_ff, TK = T * K;
+    const size_t G = (size_t) strata::core::kLatentGroups, lq_row = ELL / 32 * 36;
+    // the int8 arm: D's input rows, U's row map and bounds.  Its large rows share the stage's buffers that are not
+    // live while they are (carve): xl and yl in Dm, U's int8 rows in Xq.  Their own place cost the RTX 4070's 32K prompt
+    // its 4096-token chunk (3072 in 1.21 GiB of lent slots: 664 -> 480 tok/s, Edge0-120B-NVFP4, 2026-11-16).
+    if (latent_on_standard_path()) return {mmq::q8_bytes((int64_t) T, N), TK * 4, (G + 3) * 4};
+    size_t blob = 0;
+    for (int64_t l = 0; l < (int64_t) lay.fmt.size(); ++l) blob = std::max(blob, (size_t) lay.blob_bytes(l));
+    return {T * G * ELL * 4, T * G * lq_row, T * (N / 32) * 36, TK * ELL * 4, TK * lq_row,
+            strata::kernels::native_expert_scratch_bytes((int64_t) TK, (int64_t) I), kLatentBatch * blob,
+            (size_t) kLatentBatch * 8, (size_t) kLatentBatch * 8, ((size_t) kLatentBatch + 1) * 4,
+            ((size_t) kLatentBatch + 1) * 4, 4, 4,
+            TK * 4, TK * 4, TK * 4, TK * 4};
+}
+
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
     Alloc a; a.count_only = true; bool ok = true;
@@ -1272,7 +1296,10 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
         q8.take<float>(GR * 640, ok);
         q8.take<uint8_t>(mmq::q8_bytes((int64_t) GR, 640), ok);
     }
-    return std::max(a.used, q8.used);
+    Alloc all = a;   // carve's order: the larger of the two sets, then the latent buffers
+    all.used = std::max(a.used, q8.used);
+    for (const size_t bytes : latent_set_sizes(T)) all.take<uint8_t>(bytes, ok);
+    return all.used;
 }
 // The experts' group a layer's products read: G experts dequantized to FP16 (dq_gu, dq_d; 157 MB at 16) where some
 // layer keeps the FP16 path, MMQ_GROUP experts' int8 blocks (grp_gu, grp_d) where some layer takes the int8 one and the
@@ -1381,30 +1408,17 @@ void ple_landing_probe(void* stream, strata::kernels::PleTable& table, int64_t c
 // ELL wide) U takes back to the shell's width.  latent_mmq_d runs before the experts (D, its column scales, the U
 // stage's tables, the combine's slots); latent_mmq_u after them.  The experts themselves are the standard path's:
 // its staging, in-place reads and groups.
-bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err) {
+bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string&) {
     using namespace strata::kernels;
     const int64_t ELL = m.lat_ELL_;
     const int G = m.lat_G_, E = (int) m.g->n_expert;
     const int du_t = m.lat_fmt_ == 4 ? 2 : 8;   // ggml's Q4_0 / Q8_0 (the latent pack codes Q4_0 as fmt 4)
     const size_t row_b = m.lat_fmt_ == 4 ? 18 : 34;
     const size_t d_bytes = (size_t) G * (size_t) ELL * (size_t) (N / 32) * row_b;
-    if (m.lmmq_scratch_T_ == 0) {   // sized once for the largest chunk (freed with the object)
-        auto take = [&](void** p, size_t bytes) {
-            if (!strata::gpu::alloc_device(p, bytes)) return false;
-            m.owned.push_back(*p);
-            return true;
-        };
-        const int64_t TMM = m.T_max > T ? m.T_max : T;
-        const bool ok = take((void**) &m.lmmq_xq_, mmq::q8_bytes(TMM, N)) &&
-                        take((void**) &m.lmmq_xl_, (size_t) TMM * G * ELL * 4) &&
-                        take((void**) &m.lmmq_yl_, (size_t) TMM * K * ELL * 4) &&
-                        take((void**) &m.lmmq_ylq_, mmq::q8_bytes(TMM * K, ELL)) &&
-                        take((void**) &m.lmmq_ids_, (size_t) TMM * K * 4) &&
-                        take((void**) &m.lmmq_bounds_, (static_cast<size_t>(G) + 3) * 4);
-        if (!ok) { err = "prefill: the latent scratch does not fit"; return false; }
-        m.lmmq_scratch_T_ = TMM;
+    if (!m.lmmq_forms_) {   // the buffers are the MoE stage's (carve)
         mmq::choose_forms(du_t, G * ELL, N, 1, m.cs);
         mmq::choose_forms(du_t, N, ELL, G, m.cs);
+        m.lmmq_forms_ = true;
     }
     // U's tables: the routes bucketed by their expert's group (U takes the G groups as experts), each bucket in the
     // experts' row order; idsU maps a bucket row to its yl row, and the combine reads a route's U row (slot)
@@ -1471,37 +1485,13 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
     const size_t row_b = m.lat_fmt_ == 4 ? 18 : 34;
     const size_t d_bytes = (size_t) G * (size_t) ELL * (size_t) (N / 32) * row_b;
     const size_t u_bytes = (size_t) G * (size_t) N * (size_t) (ELL / 32) * row_b;
-    const size_t lq_row = (size_t) (ELL / 32) * 36;
     const size_t blob_bytes = (size_t) lay.blob_bytes(l);
-    constexpr int kLatBatch = 32;
-    // the scratch, sized once for the largest chunk (freed with the object)
-    if (m.lat_scratch_T_ == 0) {
-        const int64_t TM = m.T_max > T ? m.T_max : T;
-        auto take = [&](void** p, size_t bytes) {
-            if (!strata::gpu::alloc_device(p, bytes)) return false;
-            m.owned.push_back(*p);
-            return true;
-        };
-        bool ok = take((void**) &m.lat_xl_, (size_t) TM * G * ELL * 4) &&
-                  take((void**) &m.lat_xlq_, (size_t) TM * G * lq_row) &&
-                  take((void**) &m.lat_xq_, (size_t) TM * (N / 32) * 36) &&
-                  take((void**) &m.lat_yl_, (size_t) TM * K * ELL * 4) &&
-                  take((void**) &m.lat_ylq_, (size_t) TM * K * lq_row) &&
-                  take((void**) &m.lat_scratch_, native_expert_scratch_bytes(TM * K, I)) &&
-                  take((void**) &m.lat_blobs_, (size_t) kLatBatch * blob_bytes) &&
-                  take((void**) &m.lat_ptrs_[0], (size_t) kLatBatch * 8) &&
-                  take((void**) &m.lat_ptrs_[1], (size_t) kLatBatch * 8) &&
-                  take((void**) &m.lat_start_[0], (size_t) (kLatBatch + 1) * 4) &&
-                  take((void**) &m.lat_start_[1], (size_t) (kLatBatch + 1) * 4) &&
-                  take((void**) &m.lat_ng_[0], 4) &&
-                  take((void**) &m.lat_ng_[1], 4) &&
-                  take((void**) &m.lat_dst_[0], (size_t) TM * K * 4) &&
-                  take((void**) &m.lat_dst_[1], (size_t) TM * K * 4) &&
-                  take((void**) &m.lat_tok_[0], (size_t) TM * K * 4) &&
-                  take((void**) &m.lat_tok_[1], (size_t) TM * K * 4);
+    constexpr int kLatBatch = kLatentBatch;
+    if (!m.lat_events_) {   // the buffers are the MoE stage's (carve)
+        bool ok = true;
         for (int s = 0; s < 2 && ok; ++s) ok = strata::gpu::event_create(&m.lat_tbl_ev[s]);
-        if (!ok) { err = "prefill: the latent scratch does not fit"; return false; }
-        m.lat_scratch_T_ = TM;
+        if (!ok) { err = "prefill: the latent arm's events could not be made"; return false; }
+        m.lat_events_ = true;
         strata::gpu::event_record(m.used[0], m.cs);   // a valid marker: the first batch's DMA may wait on it
     }
     // D: the chunk's rows through the layer's D, the column scales, the experts' q8_1 image
@@ -1926,6 +1916,36 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.Hq = q8.take<uint8_t>(mmq::q8_bytes((int64_t) GR, 640), ok);
         }
         c.used = std::max(c.used, q8.used);
+        {   // the latent MoE's buffers (latent_set_sizes' order)
+            const std::vector<size_t> ls = latent_set_sizes(T);
+            std::vector<uint8_t*> p;
+            p.reserve(ls.size());
+            for (const size_t bytes : ls) p.push_back(c.take<uint8_t>(bytes, ok));
+            if (ls.size() == 3) {
+                m.lmmq_xq_ = p[0];
+                m.lmmq_ids_ = reinterpret_cast<int32_t*>(p[1]);
+                m.lmmq_bounds_ = reinterpret_cast<int32_t*>(p[2]);
+                // in the stage's order, each read before the one that shares its place is written: xl (D's rows,
+                // T*G*ELL floats) is read by the experts' quantize into Xq; yl (the experts' rows, T*K*ELL floats)
+                // is written by their down products and read by U's quantize into U's int8 rows (Xq's place: the
+                // experts' int8 rows are dead after their gate/up products); then U writes Dm.  Dm holds T*K*N
+                // floats: both fit (ELL < N, G <= K)
+                m.lmmq_xl_ = m.Dm;
+                m.lmmq_yl_ = m.Dm;
+                m.lmmq_ylq_ = static_cast<uint8_t*>(m.Xq);
+            } else if (ls.size() == 17) {
+                m.lat_xl_ = reinterpret_cast<float*>(p[0]); m.lat_xlq_ = p[1]; m.lat_xq_ = p[2];
+                m.lat_yl_ = reinterpret_cast<float*>(p[3]); m.lat_ylq_ = p[4];
+                m.lat_scratch_ = p[5]; m.lat_blobs_ = p[6];
+                for (int s = 0; s < 2; ++s) {
+                    m.lat_ptrs_[s] = reinterpret_cast<unsigned long long*>(p[7 + s]);
+                    m.lat_start_[s] = reinterpret_cast<int32_t*>(p[9 + s]);
+                    m.lat_ng_[s] = reinterpret_cast<int32_t*>(p[11 + s]);
+                    m.lat_dst_[s] = reinterpret_cast<int32_t*>(p[13 + s]);
+                    m.lat_tok_[s] = reinterpret_cast<int32_t*>(p[15 + s]);
+                }
+            }
+        }
         if (base == nullptr) ok = false;
     }
     // the experts' group: FP16 (dq_gu, dq_d) and int8 (grp_gu, grp_d) at one place (see expert_group_bytes)
