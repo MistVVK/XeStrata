@@ -15,7 +15,8 @@ What goes in
   `packaging/lock_wheels.py`), installed into that interpreter with
   `pip install --require-hashes --no-deps --only-binary=:all:` at BUILD time only: every package, direct or
   transitive, is named with an exact version and the SHA-256 of the wheel(s) accepted, so nothing else can land in
-  the bundle. pip itself is the one the interpreter shipped with (not upgraded);
+  the bundle. pip itself is the one the interpreter shipped with (not upgraded), and it is removed from the bundle
+  after that install, with ensurepip's spare wheel (drop_pip, #5303): the bundle never runs pip;
 * the application: `strata.py`, `strata_control`, `strata_cli`, `serve`, a `VERSION` file and the docs the CLI
   references;
 * the read-only tooling under `tools/` that the terminal paths import. Everything else under `tools/` is engine
@@ -261,6 +262,41 @@ def drop_build_path_launchers(root: Path, staging: Path, target: str) -> list[st
     return gone
 
 
+def drop_pip(root: Path, target: str) -> dict:
+    """#5303: pip leaves the bundle once the lock is installed. Only the build runs it (install_locked); at user time the bundle never
+    does (setup.run refuses `python -m ...` in the app's install mode, pip_install returns before pip there, and the start / serve side
+    may not import pip at all: tests/terminal/test_no_acquisition.py). What it carried was dead weight a scanner flags: its own old
+    copies of certifi, urllib3, msgpack and setuptools under pip/_vendor, and ensurepip's spare pip wheel with older ones still.
+    Removed: site-packages/pip and its dist-info, pip launchers left in the interpreter's bin / Scripts, and ensurepip/_bundled/*.whl
+    (the ensurepip module stays; `python -m venv` from the bundle then needs --without-pip, which nothing in Strata does).
+    -> {"version": the removed pip's version or None, "paths": the removed paths relative to root}."""
+    windows = target.startswith("windows")
+    lib = root / "python" / ("Lib" if windows else f"lib/python{PYTHON_VERSION.rsplit('.', 1)[0]}")
+    site = lib / "site-packages"
+    gone: list[str] = []
+    version = None
+
+    def remove(path: Path) -> None:
+        gone.append(path.relative_to(root).as_posix())
+        shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+
+    for info in sorted(site.glob("pip-*.dist-info")):
+        version = info.name[len("pip-"):-len(".dist-info")]
+        remove(info)
+    if (site / "pip").is_dir():
+        remove(site / "pip")
+    bundled = lib / "ensurepip" / "_bundled"
+    if bundled.is_dir():
+        for wheel in sorted(bundled.glob("*.whl")):
+            remove(wheel)
+    bindir = root / "python" / ("Scripts" if windows else "bin")
+    if bindir.is_dir():
+        for f in sorted(bindir.iterdir()):
+            if re.fullmatch(r"pip(3(\.\d+)*)?(\.exe)?", f.name, re.IGNORECASE):
+                remove(f)
+    return {"version": version, "paths": gone}
+
+
 def local_imports(folder: Path, entry: tuple[str, ...]) -> list[str]:
     """The tools/ modules `entry` imports, transitively (static: import and from-import statements)."""
     import ast
@@ -449,10 +485,13 @@ def main() -> int:
 
         installed: dict[str, str] = {}
         removed: list[str] = []
+        pip_removed: dict | None = None
         if not args.skip_deps:
             print("installing the locked runtime wheels into the bundled interpreter (build time only)")
             installed = install_locked(py, lock, root, Path(args.wheelhouse).resolve() if args.wheelhouse else None)
             removed = drop_build_path_launchers(root, staging, target)
+            pip_removed = drop_pip(root, target)            # #5303: the build's tool, not the bundle's
+            print(f"  removed pip {pip_removed['version']} and its spare wheel ({len(pip_removed['paths'])} paths)")
             # nothing the bundle writes while it is built may stay: compiled files are rebuilt on first use
             for cache_dir in list(root.rglob("__pycache__")):
                 shutil.rmtree(cache_dir, ignore_errors=True)
@@ -485,6 +524,7 @@ def main() -> int:
                      "install": "pip install --require-hashes --no-deps --only-binary=:all: (build time only)"},
             "installed": installed,
             "launchers_removed": removed,
+            "pip_removed": pip_removed,
             "payload": list(PAYLOAD),
             "tools_subset": list(TOOLS_SUBSET),
             "installer": installer,
