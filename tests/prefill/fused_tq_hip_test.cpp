@@ -80,6 +80,10 @@ int main() {
     CHECK(g11_on(true, true, -1, kG11DefaultOn));
     CHECK(!g11_on(true, true, 0, kG11DefaultOn) && g11_on(true, true, 1, false));
     CHECK(!g11_on(true, false, 1, kG11DefaultOn) && !g11_on(false, true, 1, kG11DefaultOn));
+    // the Radeon 780M: only with the switch at 1 and STRATA_PF_FUSED_TQ (never unset, never at 0)
+    using strata::prefill::fused_tq_hip::g1103_on;
+    CHECK(g1103_on(true, true, 1));
+    CHECK(!g1103_on(true, true, -1) && !g1103_on(true, true, 0) && !g1103_on(true, false, 1) && !g1103_on(false, true, 1));
 
     if (failed) { std::fprintf(stderr, "fused_tq_hip_test: %d failed\n", failed); return 1; }
     std::printf("fused_tq_hip_test: ok\n");

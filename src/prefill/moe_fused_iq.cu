@@ -2211,6 +2211,7 @@ struct DevInfo {
     bool g1151 = false; // gfx1151 (Strix Halo): Q8_0 down layers on the F16 kernel by default (q8d_f16_default)
     bool w12 = false;   // gfx12 (RDNA4): the native kernels only - the Q2_0 pack's (moe_fused.cu) are not ported there
     bool g11 = false;   // gfx1100 / gfx1101 / gfx1102 (RDNA3 cards): the trellis pairs by fused_tq_hip::g11_on (#6067)
+    bool g1103 = false; // the Radeon 780M: the trellis pairs only with STRATA_PF_TQ_G11=1 (fused_tq_hip::g1103_on)
     bool t75 = false;   // Turing (STRATA_PF_FUSED_SM75): the Q2_0 / Q2_0 layers only (what was set up and checked there)
     unsigned t75_set = 0, t75_w4 = 0;   // Turing: the i-quant gate/up and IQ4_NL down instances set up (t75_bit), and those whose 64-row (WW 4) instance fits 64 KB too
     bool q2n = false;   // sm_80+ with STRATA_PF_FUSED_Q2N=1: the native Q2_0 pack's Q2_0 gate/up is set up as well (opt-in)
@@ -2398,6 +2399,7 @@ const DevInfo& dev_info() {
         d.g1151 = props && strata::kernels::gfx_arch_is_gfx1151(prop.gcnArchName);
         d.g11 = props && (strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1100") || strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1101") ||
                           strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1102"));
+        d.g1103 = props && strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1103");
         // the arch lists of STRATA_NAT_W11 / STRATA_NAT_W12 (gfx_arch.hpp: never a prefix - another gfx11 / gfx12 part
         // has the trapping body, which hipFuncGetAttributes and the occupancy query still accept).  And the body this
         // build loaded for the device is the real one: the __builtin_trap() stub (a gfx11-generic / gfx12-generic or
@@ -2698,7 +2700,8 @@ static int tq_g11_switch() {
     return v;
 }
 static bool tq_g11(const DevInfo& d) {
-    return strata::prefill::fused_tq_hip::g11_on(d.g11, tq_hip_requested(), tq_g11_switch(), strata::prefill::fused_tq_hip::kG11DefaultOn);
+    return strata::prefill::fused_tq_hip::g11_on(d.g11, tq_hip_requested(), tq_g11_switch(), strata::prefill::fused_tq_hip::kG11DefaultOn) ||
+           strata::prefill::fused_tq_hip::g1103_on(d.g1103, tq_hip_requested(), tq_g11_switch());
 }
 bool tq_hip_device(const DevInfo& d) {
     return strata::prefill::fused_tq_hip::device_on(d.w12, d.g1151, kTqWin, tq_hip_requested(), tq_g1151_switch(), tq_g1151_defaults_off(),
