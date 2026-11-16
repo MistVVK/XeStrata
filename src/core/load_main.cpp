@@ -8,6 +8,7 @@
 // something a test should do while other work is running.
 #include "strata/core/pinned.hpp"
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -66,7 +67,16 @@ int run(int argc, char** argv) {
         };
         if (a == "--file") path = val();
         else if (a == "--layers") layers = std::strtoull(val(), nullptr, 10);
-        else if (a == "--threads") threads = std::atoi(val());
+        else if (a == "--threads") {
+            const char* v = val();
+            char* end = nullptr;
+            const long n = std::strtol(v, &end, 10);
+            if (end == v || *end != '\0' || n < 1 || n > INT_MAX) {
+                std::fprintf(stderr, "--threads takes a number of threads (1 or more), not '%s'\n", v);
+                std::exit(2);
+            }
+            threads = (int) n;
+        }
         else if (a == "--chunk-mb") chunk = std::strtoull(val(), nullptr, 10) << 20;
         else if (a == "--no-pin") pin = false;
         else if (a == "--stream") stream = true;

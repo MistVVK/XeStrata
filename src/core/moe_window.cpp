@@ -250,7 +250,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             lat_xlq_ = b.take<uint8_t>(T * G * (ELL / 32) * 36);
             lat_ylq_ = b.take<uint8_t>(T * K * (ELL / 32) * 36);
             lat_act0_ = b.take<uint8_t>(T * G * (ELL / 32) * 34);
-            lat_u_mmq_ylq_ = b.take<uint8_t>(strata::prefill::mmq::q8_bytes(T * K, ELL));
+            lat_u_mmq_ylq_ = b.take<uint8_t>(strata::prefill::mmq::q8_bytes((int64_t) (T * K), (int64_t) ELL));
             lat_u_mmq_ids_ = b.take<int32_t>(T * K);
             lat_u_mmq_bounds_ = b.take<int32_t>(G + 1);
         }
@@ -596,8 +596,9 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
     };
     // ---- the latent MoE: A reads the D stage's q8_1 rows (row = token*G + label), U projects each route back
     // to the shell's width.  The window's resident / device-plan graphs are off for a latent pack (verify forces
-    // the host plan), so the ids the plan rewrite reads are the doorbell's mapped ones.
-    if (latent_) {
+    // the host plan), so the ids the plan rewrite reads are the doorbell's mapped ones.  A latent pack is native, so the
+    // layer has its formats (fp).
+    if (latent_ && fp != nullptr) {
         const int64_t ELL = lat_ELL_, G = lat_G_;
         const size_t row_b = lat_fmt_ == 4 ? 18 : 34;
         const size_t u_bytes = (size_t) G * (size_t) N * (size_t) (ELL / 32) * row_b;
@@ -651,7 +652,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, du_t, ELL, ELL, cap, cs);
                 strata::prefill::mmq::Product up;
                 up.w = lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes; up.type = du_t; up.w_rows = N; up.w_cols = ELL;
-                up.expert_bytes = strata::prefill::mmq::matrix_bytes(du_t, N, ELL); up.n = G;
+                up.expert_bytes = strata::prefill::mmq::matrix_bytes(du_t, N, ELL); up.n = (int) G;
                 up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
                 // cap, not the largest group: the captured launch's row shape is fixed, the bounds count the rows
                 up.total_rows = cap; up.max_rows = cap; up.rows = cap; up.dst = hit_out; up.ld_dst = N;

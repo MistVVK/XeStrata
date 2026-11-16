@@ -293,8 +293,8 @@ class Tokenizer:
     @classmethod
     def from_dir(cls, path):
         """The tokenizer `extract` wrote into a pack's `tokenizer/` folder, with the `pre` it declared (an export
-        older than the field is Qwen3.8's, `qwen35`); a Unigram one (`model` t5: llm-jp-4.1) is strata_unigram's, a PLaMo
-        one (`model` plamo3: PLaMo 3 Translate) strata_plamo's."""
+        older than the field is Qwen3.8's, `qwen35`); a Unigram one (`model` t5: llm-jp-4.1) is strata_unigram's, a
+        PLaMo one (`model` plamo3: PLaMo 3 Translate) strata_plamo's."""
         path = pathlib.Path(path)
         cfg_file = path / "tokenizer.json"
         cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}

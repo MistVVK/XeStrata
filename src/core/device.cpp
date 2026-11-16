@@ -499,7 +499,7 @@ Runtime* Runtime::owner_of_stream(const void* stream) {
 }
 
 sycl::async_handler Runtime::handler() {
-    return [this](sycl::exception_list errors) {
+    return [this](const sycl::exception_list& errors) {
         std::lock_guard<std::mutex> lock(error_mutex_);
         if (!error_ && errors.size()) error_ = *errors.begin();
     };

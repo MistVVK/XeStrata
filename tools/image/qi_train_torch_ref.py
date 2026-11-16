@@ -43,6 +43,8 @@ def aitk_transformer(root: Path):
     sys.path.insert(0, str(root))
     path = root / "extensions_built_in/diffusion_models/qwen_image_2/src/transformer.py"
     spec = importlib.util.spec_from_file_location("aitk_qwen_image_2_transformer", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"{path} cannot be read")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
@@ -102,10 +104,10 @@ def main() -> int:
         lin = {"q": b.attn.to_q, "k": b.attn.to_k, "v": b.attn.to_v, "o": b.attn.to_out[0],
                "gate_up": b.img_mlp.gate_up, "down": b.img_mlp.out}
         ad = {}
-        for n, l in lin.items():
+        for n, layer in lin.items():
             A, B = (t.cuda().to(dtype).requires_grad_(True) for t in factors[n])
             ad[n] = (A, B)
-            l.register_forward_hook(lambda mod, inp, out, A=A, B=B: out + (inp[0] @ A.T) @ B.T)
+            layer.register_forward_hook(lambda mod, inp, out, A=A, B=B: out + (inp[0] @ A.T) @ B.T)
         x = x0.cuda().to(dtype).requires_grad_(True)
         out = b(hidden_states=x, modulation=modulation.cuda().to(dtype), rotary_emb=rot, attention_mask=None,
                 target_token_mask=mask.cuda(), segments=[(0, nt, True)], key_valid=None)

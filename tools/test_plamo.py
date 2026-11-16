@@ -28,7 +28,7 @@ try:
     import jinja2
     import jinja2.sandbox
 except ImportError:   # the template's check needs it; the rest does not
-    jinja2 = None
+    jinja2 = None  # type: ignore[assignment]
 
 # prose in several scripts, the pre-segmentation's cases (runs of a character and of spaces, tags spelled in the text,
 # U+EE00, a leading U+FEFF), characters outside the vocabulary, control characters
@@ -63,8 +63,8 @@ CHATS = [
      {"glossary": [{"source": "b", "target": "ビー"}]}),
     ([{"role": "system", "content": "plain context only"}, {"role": "user", "content": "x"}],
      {"target_lang": "ja(easy)"}),
-    ([{"role": "user", "content": translate.RAW_PREFIX + "<|plamo:tag|>input<|plamo:msg|>hi<|plamo:tag|>output"
-                                  "<|plamo:msg|>"}], {}),
+    ([{"role": "user",
+       "content": translate.RAW_PREFIX + "<|plamo:tag|>input<|plamo:msg|>hi<|plamo:tag|>output<|plamo:msg|>"}], {}),
     ([{"role": "user", "content": "x"}], {"target_lang": "en-US"}),            # refused: a region
     ([{"role": "user", "content": "x"}], {"source_lang": "en"}),               # refused: source without target
     ([{"role": "user", "content": "x"}], {"target_lang": "en", "form": "polite"}),   # refused: form without ja

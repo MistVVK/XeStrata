@@ -72,7 +72,7 @@ if WIN:
                     ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
 
     _KILL_ON_JOB_CLOSE, _EXTENDED_LIMITS = 0x2000, 9
-    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     _k32.CreateJobObjectW.restype = wintypes.HANDLE
     _k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
     _k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)

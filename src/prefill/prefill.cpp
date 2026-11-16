@@ -1519,7 +1519,7 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
         auto& dst = m.lat_h_dst[s];
         auto& tok = m.lat_h_tok[s];
         ptrs.resize((size_t) ng * 2);
-        start.resize((size_t) (ng + 1));
+        start.resize((size_t) ng + 1);
         dst.resize((size_t) (T * K));
         tok.resize((size_t) (T * K));
         m.lat_h_ng[s].resize(1);

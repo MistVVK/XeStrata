@@ -6087,7 +6087,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "xestrata generate: every expert is in the GPU caches (%lld of %lld): the file tier's "
                                  "Linux defaults (io prefetch, the decode gate) are off; the decode reads nothing from "
                                  "it (XESTRATA_IO_PREFETCH=1 keeps them, XESTRATA_FILE_TIER_IDLE=0 this policy)\n",
-                         (long long) gpu_held_now, (long long) (g.n_layers * g.n_expert));
+                         (long long) gpu_held_now, (long long) g.n_layers * g.n_expert);
         }
     }
     // CS-T: routing-aware prefetch of the file tier: the next layer's router on this layer's MoE input predicts its
@@ -12396,9 +12396,10 @@ int main(int argc, char** argv) {
                     while (std::getline(in, line)) {
                         std::vector<int32_t> ids;
                         for (const char* q = line.c_str(); *q != '\0';) {
-                            if (*q >= '0' && *q <= '9') {
-                                ids.push_back((int32_t) std::atoi(q));
-                                while (*q >= '0' && *q <= '9') ++q;
+                            if (*q >= '0' && *q <= '9') {   // a run of digits: a token id
+                                char* end = nullptr;
+                                ids.push_back((int32_t) std::strtol(q, &end, 10));
+                                q = end;
                             } else {
                                 ++q;
                             }

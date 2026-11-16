@@ -659,13 +659,14 @@ def parse_request(req: dict, cfg: dict) -> dict:
            "output_compression": compression, "background": background, "bucket": bucket, **requested, **cfg_fields}
     bmap = cfg.get("lora_block_map")
     if loras and bmap:   # Anima-2.9B: block weights in the release's numbering (its adapters'), to the DiT's blocks
-        n = max(int(b) for b in bmap) + 1
+        n_blocks = max(int(b) for b in bmap) + 1
         for use in loras:
             if use.get("blocks") and len(use["blocks"]) == len(bmap):
-                w = [1.0] * n   # the blocks 2.9B inserted take none of the release's adapter: theirs changes nothing
+                # the blocks 2.9B inserted take none of the release's adapter: theirs changes nothing
+                weights = [1.0] * n_blocks
                 for i, b in enumerate(bmap):
-                    w[int(b)] = use["blocks"][i]
-                use["blocks"] = w
+                    weights[int(b)] = use["blocks"][i]
+                use["blocks"] = weights
     if loras:
         job["loras"] = loras
     if unknown:
@@ -2807,7 +2808,7 @@ class ImageGen:
         self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "xestrata-image.log",
                                   self._say)
         self.tok = None
-        self.t5 = None   # Anima's T5 tokenizer (tools/strata_unigram.py), read with the first prompt
+        self.t5: Any = None   # Anima's T5 tokenizer (tools/strata_unigram.py), read with the first prompt
         self._system: str | None = None          # HunyuanImage 3.0's system prompt, read once
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}
         self.yield_turn: Callable[[], None] | None = None   # gpu_turn's, while a job has the turn

@@ -5,6 +5,7 @@ metadata:
   kind: style
   name: Danbooru tags
 ---
+
 - Write in English: translate the user's words into Danbooru tags, sentences, or both; do not expand them.
 - Separate tags with a comma and a space: `1girl, looking at viewer`.
 - Tags in lowercase, with spaces, not underscores, inside them: `long hair`. Emoticons keep theirs: `^_^`.

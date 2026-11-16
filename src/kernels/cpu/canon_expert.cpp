@@ -524,7 +524,7 @@ void canon_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const*
         for (int t = 0; t < nt; ++t) qs32[t] = act_sums(hq[t], n, 32);
         with_nt(nt, [&](auto NTc) {
             constexpr int NT = decltype(NTc)::value;
-            FxAct fa[NT];   // the activations' parts once for every row (the fixed-point sums)
+            FxAct fa[NT]{};   // the activations' parts once for every row (the fixed-point sums)
             const bool fx = exact_sums();
             if (fx)
                 for (int t = 0; t < NT; ++t) fx_act(dx[t], n / 32, fa[t]);

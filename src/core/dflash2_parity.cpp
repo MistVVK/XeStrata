@@ -28,8 +28,11 @@ void report(const char* what, int64_t bad, double worst) {
     g_failed += bad != 0;
 }
 
-std::mt19937 rng(7);   // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the inputs reproducible
-float rnd(float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng); }
+std::mt19937& rng() {
+    static std::mt19937 g(7);   // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the inputs reproducible
+    return g;
+}
+float rnd(float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng()); }
 
 // ---- references
 float bf16f(uint16_t h) { uint32_t u = (uint32_t) h << 16; float f; std::memcpy(&f, &u, 4); return f; }
@@ -84,12 +87,12 @@ void quant_planar(const float* x, int K, int ncols, std::vector<int8_t>& xq, std
     xd.assign((size_t) ncols * (K / 32), 0);
     for (int c = 0; c < ncols; ++c)
         for (int b = 0; b < K / 32; ++b) {
-            const float* row = x + (size_t) c * K + b * 32;
+            const float* row = x + (size_t) c * K + (size_t) b * 32;
             float amax = 0;
             for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(row[i]));
             const float d = amax / 127.0f, inv = amax > 0 ? 127.0f / amax : 0.0f;
             xd[(size_t) c * (K / 32) + b] = d;
-            for (int i = 0; i < 32; ++i) xq[(size_t) c * K + b * 32 + i] = (int8_t) std::nearbyint(row[i] * inv);
+            for (int i = 0; i < 32; ++i) xq[(size_t) c * K + (size_t) b * 32 + i] = (int8_t) std::nearbyint(row[i] * inv);
         }
 }
 
@@ -101,8 +104,8 @@ std::vector<uint8_t> ggml_blocks(int n_out, int n_in, bool q4, std::vector<float
     std::vector<uint8_t> out((size_t) n_out * (n_in / 32) * bs);
     for (int r = 0; r < n_out; ++r)
         for (int b = 0; b < n_in / 32; ++b) {
-            if (q4) quant_q4_block(w.data() + (size_t) r * n_in + b * 32, out.data() + ((size_t) r * (n_in / 32) + b) * bs);
-            else quant_q8_block(w.data() + (size_t) r * n_in + b * 32, out.data() + ((size_t) r * (n_in / 32) + b) * bs);
+            if (q4) quant_q4_block(w.data() + (size_t) r * n_in + (size_t) b * 32, out.data() + ((size_t) r * (n_in / 32) + b) * bs);
+            else quant_q8_block(w.data() + (size_t) r * n_in + (size_t) b * 32, out.data() + ((size_t) r * (n_in / 32) + b) * bs);
         }
     return out;
 }
@@ -131,7 +134,7 @@ void gemm_ref(const std::vector<uint8_t>& blocks, int n_out, int n_in, bool q4, 
             for (int b = 0; b < n_in / 32; ++b) {
                 double s = 0;
                 for (int i = 0; i < 32; ++i)
-                    s += (double) deq(blocks, n_in, q4, r, b * 32 + i) * xq[(size_t) c * n_in + b * 32 + i];
+                    s += (double) deq(blocks, n_in, q4, r, b * 32 + i) * xq[(size_t) c * n_in + (size_t) b * 32 + i];
                 acc += (double) xd[(size_t) c * (n_in / 32) + b] * s;
             }
             y[(size_t) c * n_out + r] = (float) acc;
@@ -205,7 +208,7 @@ void test_gemm(void* s, bool q4) {
 
 void test_conv(void* s) {
     const int rows = 8, H = 2560, group = 16, groups = H / group;
-    std::vector<float> x((size_t) rows * H), dyn((size_t) rows * 640), base(2 * H), resid((size_t) rows * H);
+    std::vector<float> x((size_t) rows * H), dyn((size_t) rows * 640), base((size_t) 2 * H), resid((size_t) rows * H);
     for (auto& v : x) v = rnd(-1, 1);
     for (auto& v : dyn) v = rnd(-0.2f, 0.2f);
     for (auto& v : base) v = rnd(-0.5f, 0.5f);
@@ -215,7 +218,7 @@ void test_conv(void* s) {
         for (int c = 0; c < H; ++c) {
             float acc = 0;
             for (int o = 0; o < 2 && b - o >= 0; ++o)
-                acc += (base[o * H + c] + dyn[(size_t) b * 640 + o * groups + c / group]) * x[(size_t) (b - o) * H + c];
+                acc += (base[o * H + c] + dyn[(size_t) b * 640 + (size_t) o * groups + c / group]) * x[(size_t) (b - o) * H + c];
             ref[(size_t) b * H + c] = resid[(size_t) b * H + c] + acc;
         }
     parity::Device dev;
@@ -279,7 +282,7 @@ void test_rms_swiglu(void* s) {
         for (int b = 0; b < N / 32; ++b) {
             const float d = xd[(size_t) r * (N / 32) + b], dr = xd_ref[(size_t) r * (N / 32) + b];
             for (int i = 0; i < 32; ++i) {
-                const size_t at = (size_t) r * N + b * 32 + i;
+                const size_t at = (size_t) r * N + (size_t) b * 32 + i;
                 const double e = std::fabs((double) xq[at] * d - (double) xq_ref[at] * dr);
                 const double bound = 1.5 * std::max(std::fabs(d), std::fabs(dr)) + 1e-6;
                 sw_worst = std::max(sw_worst, e / bound);
@@ -475,8 +478,8 @@ void test_attention(void* s, int rows) {
             for (int b = 0; b < K / 32; ++b) {
                 const float d = xd[(size_t) r * (K / 32) + b];
                 for (int i = 0; i < 32; ++i) {
-                    const size_t at = (size_t) r * K + b * 32 + i;
-                    const float got = xq[at] * d;
+                    const size_t at = (size_t) r * K + (size_t) b * 32 + i;
+                    const float got = (float) xq[at] * d;
                     const double e = std::fabs((double) got - ref[at]), bound = 1.5 * std::fabs(d) + 1e-5;
                     worst = std::max(worst, e / bound);
                     if (e > bound) ++bad;
@@ -569,14 +572,14 @@ void test_select(void* s, bool q4) {
         std::vector<uint8_t> pb((size_t) vocab * (rank / 32) * 18), sb(pb.size());
         for (int r = 0; r < vocab; ++r)
             for (int b = 0; b < rank / 32; ++b) {
-                quant_q4_block(pred_w.data() + (size_t) r * rank + b * 32, pb.data() + ((size_t) r * (rank / 32) + b) * 18);
-                quant_q4_block(succ_w.data() + (size_t) r * rank + b * 32, sb.data() + ((size_t) r * (rank / 32) + b) * 18);
+                quant_q4_block(pred_w.data() + (size_t) r * rank + (size_t) b * 32, pb.data() + ((size_t) r * (rank / 32) + b) * 18);
+                quant_q4_block(succ_w.data() + (size_t) r * rank + (size_t) b * 32, sb.data() + ((size_t) r * (rank / 32) + b) * 18);
             }
         std::memcpy(pred_cb.data(), pb.data(), pb.size());
         std::memcpy(succ_cb.data(), sb.data(), sb.size());
         // the reference reads the quantized values back
         auto deq = [&](const std::vector<uint8_t>& bytes, int r, int v) {
-            const uint8_t* blk = bytes.data() + (size_t) r * (rank / 32) * 18 + (v / 32) * 18;
+            const uint8_t* blk = bytes.data() + (size_t) r * (rank / 32) * 18 + (size_t) (v / 32) * 18;
             const float d = f16f((uint16_t) blk[0] | ((uint16_t) blk[1] << 8));
             const int j = v % 32;
             const int q = j < 16 ? (blk[2 + j] & 15) : (blk[2 + j - 16] >> 4);

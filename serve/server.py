@@ -1129,7 +1129,7 @@ class StrataEngine:
         pin: dict[str, Any] = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
-        nice = engine_nice(env)                          # Linux with a built-in Radeon: the desktop keeps its share of the CPU
+        nice = engine_nice(env)   # Linux with a built-in Radeon: the desktop keeps its share of the CPU
         if nice:
             say_nice = pin.get("preexec_fn")
             pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
@@ -3105,13 +3105,12 @@ class Vision:
                       f"(try {attempt + 2} of {self.START_RETRIES + 1})", flush=True)
                 time.sleep(1.0)
         assert failure is not None
-        e = failure
         if self.fallback is None or self.spawn == self.fallback:
-            raise e
-        why = " ".join(str(e).split())[:240]
+            raise failure
+        why = " ".join(str(failure).split())[:240]
         # the person is told the pictures became slow, whatever the cause: the card's size or the reader's own
         # reason, in the engine's log (the reader's stderr)
-        self.cpu_note = (self._no_room_note(e.room) if isinstance(e, VisionNoRoom) else
+        self.cpu_note = (self._no_room_note(failure.room) if isinstance(failure, VisionNoRoom) else
                          reader_room.not_started_on_processor(self._spawn_arg("--gpu-pci"),
                                                               getattr(self.spawn[1], "name", None)))
         self.fallback_why = why
@@ -4834,8 +4833,8 @@ class Service:
                     print(f"[xestrata] images: the expert cache cannot make room ({e}) and only {free} MiB of VRAM is "
                           f"free (the image encoder needs about {need}): this picture is read on the CPU", flush=True)
                 else:
-                    print(f"[xestrata] images: the expert cache did not make room for the image encoder ({e}); starting "
-                          "it anyway", flush=True)
+                    print(f"[xestrata] images: the expert cache did not make room for the image encoder ({e}); "
+                          "starting it anyway", flush=True)
         if self.vision_held:
             time.sleep(0.2)          # the driver's free-VRAM counter shows the cache's release a moment later
         free0, t0 = self.free_vram_mib(), time.time()
