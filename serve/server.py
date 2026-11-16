@@ -8932,7 +8932,7 @@ def make_handler(svc: Service):
             callable_tools, deferred = anthropic_tools(req)     # #4663: the deferred tools are callable, unlisted
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = callable_tools = None
-            force = svc.force_text(forced_call(req.get("tool_choice"), tools))        # "any" / {"type": "tool", "name": N}
+            force = svc.force_text(forced_call(req.get("tool_choice"), tools, callable_tools))   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences

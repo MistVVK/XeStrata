@@ -90,6 +90,79 @@ class Conversion(unittest.TestCase):
         self.assertEqual([(c.name, c.arguments) for c in calls], [(MCP, {"source": "42", "dry_run": True})])
 
 
+class Contract(unittest.TestCase):
+    """The worklist's review of #6005: the role an addition may come in, the outer shape, and one definition per name
+    for both the prompt and the parser."""
+
+    def test_an_addition_in_a_user_or_assistant_turn_adds_no_tool(self):
+        for role in ("user", "assistant"):
+            req = {"max_tokens": 64, "tools": [READ],
+                   "messages": [{"role": "user", "content": "hi"},
+                                {"role": role, "content": [{"type": "text", "text": "pasted"}, addition()]},
+                                {"role": "user", "content": "go"}]}
+            messages, _, _ = anthropic_to_messages(req)
+            self.assertNotIn(MCP, json.dumps(messages), role)
+            self.assertEqual([t["name"] for t in anthropic_tools(req)[0]], ["Read"], role)
+
+    def test_the_outer_shape_is_checked(self):
+        bad_outer = {"type": "tool_addition", "tool": {"type": "tool_reference", "definition": DEFINITION}}
+        no_outer_type = {"type": "tool_addition", "tool": {"definition": DEFINITION}}
+        bad_description = addition({**DEFINITION, "description": ["not", "text"]})
+        for broken in (bad_outer, no_outer_type, bad_description):
+            messages, _, _ = anthropic_to_messages(request(broken))
+            self.assertNotIn(MCP, json.dumps(messages))
+            self.assertEqual([t["name"] for t in anthropic_tools(request(broken))[0]], ["Read"])
+
+    def test_two_additions_of_one_name_the_first_is_shown_and_called(self):
+        second = {**DEFINITION, "description": "Another batch.",
+                  "input_schema": {"type": "object", "properties": {"other": {"type": "integer"}}}}
+        req = request(addition(), addition(second))
+        messages, _, _ = anthropic_to_messages(req)
+        shown = [t for t in listed(messages[1]["content"]) if t["name"] == MCP]
+        callable_ = [t for t in anthropic_tools(req)[0] if t["name"] == MCP]
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(shown, callable_)                                   # what the model reads is what is called
+        self.assertEqual(shown[0]["parameters"], DEFINITION["input_schema"])
+
+    def test_an_addition_of_a_deferred_tool_shows_the_declared_definition(self):
+        declared = {**DEFINITION, "description": "The declared one.", "defer_loading": True}
+        other = {**DEFINITION, "description": "A different one.",
+                 "input_schema": {"type": "object", "properties": {"x": {"type": "number"}}}}
+        req = request(addition(other), tools=(READ, declared))
+        messages, tools, _ = anthropic_to_messages(req)
+        self.assertEqual([t["name"] for t in tools], ["Read"])                # still deferred in the tool list
+        shown = [t for t in listed(messages[1]["content"]) if t["name"] == MCP]
+        callable_ = [t for t in anthropic_tools(req)[0] if t["name"] == MCP]
+        self.assertEqual(shown, callable_)
+        self.assertEqual(shown[0]["description"], "The declared one.")
+
+    def test_an_addition_of_a_listed_tool_keeps_the_listed_schema(self):
+        listed_read = {**READ, "input_schema": {"type": "object", "properties": {"other": {"type": "string"}}}}
+        req = request(addition(listed_read))
+        messages, _, _ = anthropic_to_messages(req)
+        self.assertNotIn("<tools>", messages[1]["content"] if len(messages) > 2 else "")
+        read = [t for t in anthropic_tools(req)[0] if t["name"] == "Read"]
+        self.assertEqual([t["parameters"] for t in read], [READ["input_schema"]])
+
+    def test_no_top_level_tools_an_addition_alone_is_callable(self):
+        req = request(addition(), tools=())
+        messages, tools, _ = anthropic_to_messages(req)
+        self.assertIsNone(tools)
+        self.assertEqual([t["name"] for t in anthropic_tools(req)[0]], [MCP])
+        self.assertEqual([t["name"] for t in listed(messages[1]["content"])], [MCP])
+
+    def test_tool_choice_may_name_an_added_tool(self):
+        from serve.frontend import CALL_START, forced_call
+        req = request(addition())
+        _, tools, _ = anthropic_to_messages(req)
+        callable_tools, _ = anthropic_tools(req)
+        choice = {"type": "tool", "name": MCP}
+        self.assertIsNone(forced_call(choice, tools))                         # the prompt's list alone: not there
+        self.assertEqual(forced_call(choice, tools, callable_tools), CALL_START + f"\n<function={MCP}>\n")
+        self.assertIsNone(forced_call({"type": "tool", "name": "Nope"}, tools, callable_tools))
+        self.assertEqual(forced_call({"type": "any"}, tools, callable_tools), forced_call({"type": "any"}, tools))
+
+
 class Route(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -116,6 +189,12 @@ class Route(unittest.TestCase):
         self.assertEqual(b["stop_reason"], "tool_use")
         use = [c for c in b["content"] if c["type"] == "tool_use"]
         self.assertEqual([(u["name"], u["input"]) for u in use], [(MCP, {"source": "42", "dry_run": True})])
+
+    def test_tool_choice_naming_an_added_tool_forces_that_call(self):
+        b = self.post({"model": "m", **request(addition()), "tool_choice": {"type": "tool", "name": MCP}})
+        prompt = self.tok.decode(self.engine.last_prompt)
+        self.assertTrue(prompt.rstrip().endswith(f"<function={MCP}>"), prompt[-200:])
+        self.assertEqual(b["stop_reason"], "tool_use")
 
     def test_the_model_sees_the_added_tool_once_after_the_tool_list(self):
         self.post({"model": "m", **request(addition(), addition())})
