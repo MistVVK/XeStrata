@@ -3312,8 +3312,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // candidate" answer forever.  The port has no device kernel; the head rows stand in unified memory after the
     // window and carry the same fact (metal_scan_rows, the CUDA kernel's bit test).  note_nonfinite resets and
     // honours the guard switch; the fold adds the scan's rows after it.
+    last_pos0_ = pos0;   // (before note_nonfinite: its position of a flagged row is last_pos0_ + row, as on CUDA)
     note_nonfinite(T, nullptr);
-    last_pos0_ = pos0;
     const uint32_t nf_scan = nan_guard_on() && last_stage() ? metal_scan_rows(metal_, T, n_vocab_) : 0u;
     metal_fold_nf(nf_mask_, nf_scan, T, nullptr, pos0, nf_mask_, nf_row_, nf_pos_);
     return true;
@@ -5188,11 +5188,19 @@ void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
     nf_row_ = -1;
     nf_pos_ = -1;
     nf_mask_ = 0;
+#if defined(STRATA_GPU_METAL)
+    // the Metal port has no device flags (h_nf_ stays null: its rows are scanned on the host after this, metal_scan_rows);
+    // STRATA_NAN_INJECT below still applies, so the #879 path can be tested on a Mac (#3287)
+    if (!nan_guard_on() || !last_stage()) return;
+#else
     if (!nan_guard_on() || h_nf_ == nullptr || !last_stage()) return;   // (a stage without the head checks nothing)
-    const volatile uint32_t* f = h_nf_;
-    for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t)
-        for (int b = 0; b < strata::kernels::kNonfiniteBlocks; ++b)
-            if (f[t * strata::kernels::kNonfiniteBlocks + b] != 0) { nf_mask_ |= 1u << t; break; }
+#endif
+    if (h_nf_ != nullptr) {
+        const volatile uint32_t* f = h_nf_;
+        for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t)
+            for (int b = 0; b < strata::kernels::kNonfiniteBlocks; ++b)
+                if (f[t * strata::kernels::kNonfiniteBlocks + b] != 0) { nf_mask_ |= 1u << t; break; }
+    }
     const std::vector<long long>& inject = nan_inject_list();
     if (!inject.empty()) {
         const long long k = g_nf_windows.fetch_add(1) + 1;
