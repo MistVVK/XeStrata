@@ -2591,6 +2591,7 @@ class ImageEngine:
 
     def _connect(self, addr: str) -> bool:
         import socket
+        s = None
         try:
             if os.name != "nt":
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -2601,6 +2602,9 @@ class ImageEngine:
                 s = socket.create_connection(("127.0.0.1", int(port)), timeout=10)
                 s.settimeout(None)
         except (OSError, ValueError):
+            if s is not None:
+                with contextlib.suppress(OSError):
+                    s.close()
             return False
         self.sock = s
         self.f = s.makefile("rw", encoding="utf-8", errors="replace", newline="\n")
@@ -4039,6 +4043,12 @@ TOOLS: list[dict[str, Any]] = [
          "image": IMAGE_ARG,
          "version": {"type": "string", "enum": ["general", "lite", "lite-2k", "portrait", "matting", "hr", "dynamic"]},
          "background_color": {"type": "string", "description": "e.g. #ffffff"}}}},
+    {"name": "train_lora",
+     "description": "Open the LoRA training panel in the chat: the user puts the pictures in, picks the kind "
+                    "(character, style, other), the name, the trigger word and the model, captions the pictures and "
+                    "starts the training there; it runs on the server and its versions come back to the panel. Call "
+                    "it when the user wants to make a LoRA; do not wait for the training.",
+     "parameters": {"type": "object", "properties": {}}},
 ]
 
 # the image tools every request declares; the others once the chat's model reads their skills (ImageTools.unlock)
@@ -4298,7 +4308,8 @@ class ImageTools:
         names = [t["name"] for t in offered]
         if self.all_tools or not any(n in CORE_TOOLS for n in names):
             return offered
-        return [t if t["name"] in CORE_TOOLS or t["name"] in self.unlocked else self._stub(t) for t in offered]
+        return [t if t["name"] in CORE_TOOLS or t["name"] in self.unlocked or t["name"] == "train_lora"
+                else self._stub(t) for t in offered]
 
     def _stub(self, t: dict) -> dict:
         """A tool not given yet, as its name and one line: called, it runs where its arguments are there, else answers
@@ -4345,6 +4356,10 @@ class ImageTools:
                 continue
             if t["name"] in ("upscale_video", "segment_video") and self._video("") is None:
                 continue   # offered for a video in the conversation
+            if t["name"] == "train_lora":
+                from serve import lora_train
+                if not any(lora_train.trainer_family(g) is not None for g in gens):
+                    continue   # offered where a model with a trainer is installed
             t = dict(t)
             if self.skills == "inline":   # the image button's request: the models' skills in the description
                 styles, rules = self._skill_groups(gens)
@@ -4444,7 +4459,8 @@ class ImageTools:
         lines = []
         for g in gens:
             for e in g.loras.listing() if g.loras.takes else ():
-                about = ", ".join(x for x in (e.get("kind"), f"trigger {e['trigger']}" if e.get("trigger") else None)
+                about = ", ".join(x for x in (e.get("kind"), f"trigger {e['trigger']}" if e.get("trigger") else None,
+                                              f"step {e['steps']}" if e.get("steps") else None)
                                   if x)
                 lines.append(e["name"] + (f" ({about})" if about else "") + (f" [{g.model}]" if len(gens) > 1 else ""))
         return lines
@@ -4533,7 +4549,7 @@ class ImageTools:
             want = s.meta.get("tool")
             if s.kind != "tool" or not want:
                 continue
-            if want in tools and want not in CORE_TOOLS and not self.all_tools:
+            if want in tools and want not in CORE_TOOLS and want != "train_lora" and not self.all_tools:
                 continue   # its tool's stub carries its line, and its call answers with the skill (_stub_answer)
             if want == "lora":   # with the LoRA argument only: a model lists LoRAs
                 if {"generate_image", "edit_image"} & set(tools) and self._lora_lines(self._gens()):
@@ -4796,6 +4812,23 @@ class ImageTools:
                         return f
         return None
 
+    def _train_lora_tool(self, t0: float) -> dict:
+        """train_lora: the panel opens in the chat (the page renders it by the tool's name); no job starts here.
+        The answer tells the model what the user can do there, with the models this server can train."""
+        from serve import lora_train
+        rows = [r for r in lora_train.model_rows(self.svc) if r["can_train"]]
+        names = ", ".join(f"{r['name']} ({r['model']})" for r in rows) or "none ready (the trainer is not built)"
+        text = ("The LoRA training panel is open in the chat. The user puts the training pictures in (drag and drop, "
+                "or picks this chat's images), chooses the kind (character, style, other), the name, the trigger "
+                f"word and the model ({names}), captions the pictures (the auto button writes them; they can be "
+                "edited), sets the steps and how often a version is saved, and starts the training. It runs on the "
+                "server; the panel shows its progress and, when it ends, a sample picture of every saved version "
+                "side by side. The user picks a version and registers it as a LoRA (the last one by default); it is "
+                "usable in the chat's images at once. Tell the user so and answer their questions; do not wait for "
+                "the training and do not call this tool again for the same request.")
+        return {"ok": True, "text": text, "chars": len(text), "truncated": False,
+                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "train_lora", "images": []}
+
     def _video_tool(self, args: dict, t0: float) -> dict:
         """upscale_video: a /v1/videos job on the video (videos.start_from_file), its id and where its video will be
         the call's result at once; the job runs on the server past this answer."""
@@ -4935,7 +4968,7 @@ class ImageTools:
                     "it again: answer the user, or take the next step.")
             return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
                     "tool": name, "images": [], "skipped": True}
-        if name not in self.unlocked and name not in CORE_TOOLS and not self.all_tools:
+        if name not in self.unlocked and name not in CORE_TOOLS and name != "train_lora" and not self.all_tools:
             answer = self._stub_answer(name, args, t0)   # a stub's call: its arguments, or it runs as it is
             if answer is not None:
                 return answer
@@ -4943,6 +4976,8 @@ class ImageTools:
         merged = merged if isinstance(merged, int) and not isinstance(merged, bool) and merged > 1 else None
         lend = args.pop("_lend", None) is True   # tool_parallel: on the text model's GPU, lent to the images
         self.calls += merged or 1
+        if name == "train_lora":
+            return self._train_lora_tool(t0)
         if name in ("find_region", "remove_background", "upscale_video", "segment_video"):
             r = (self._aux_tool(name, args, t0, cancel) if name in ("find_region", "remove_background") else
                  self._video_tool(args, t0) if name == "upscale_video" else self._segment_video_tool(args, t0))
@@ -5671,6 +5706,22 @@ def fix_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = N
 
 @contextlib.contextmanager
 def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
+    """The image job's GPU turn, with the LoRA training's yield first (serve/lora_train.py): a training on this GPU
+    shrinks or pauses at a micro-step boundary so the image goes first (the wait is a micro-step's seconds plus the
+    release, never the training's end)."""
+    lt = getattr(svc, "lora_jobs", None)
+    if lt is not None:
+        lt.image_begin()
+    try:
+        with _gpu_turn(svc, gen, job, cancel) as policy:
+            yield policy
+    finally:
+        if lt is not None:
+            lt.image_end()
+
+
+@contextlib.contextmanager
+def _gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
     once no slot is generating), and the text engine made room for it per the policy.  Yields the policy used.  On a
     card of its own (ImageModels.separate), that card's turn alone (separate_turn)."""
