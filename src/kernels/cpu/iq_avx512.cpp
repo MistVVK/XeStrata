@@ -99,14 +99,13 @@ template <> struct Fmt<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign bytes
     static constexpr int bytes = 82;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const int o = 8 * j;   // int, not ptrdiff_t: the wider product changed this decode's AVX-512 code
-        const uint8_t* qs = b + 2 + o;
+        const uint8_t* qs = b + 2 + 8 * (ptrdiff_t) j;
         const uint8_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
         g = _mm512_set_epi64((long long) iq2s_grid[qs[7] | ((h1 << 2) & 0x300)], (long long) iq2s_grid[qs[6] | ((h1 << 4) & 0x300)],
                              (long long) iq2s_grid[qs[5] | ((h1 << 6) & 0x300)], (long long) iq2s_grid[qs[4] | ((h1 << 8) & 0x300)],
                              (long long) iq2s_grid[qs[3] | ((h0 << 2) & 0x300)], (long long) iq2s_grid[qs[2] | ((h0 << 4) & 0x300)],
                              (long long) iq2s_grid[qs[1] | ((h0 << 6) & 0x300)], (long long) iq2s_grid[qs[0] | ((h0 << 8) & 0x300)]);
-        m = _cvtu64_mask64(u64(b + 2 + 32 + o));
+        m = _cvtu64_mask64(u64(b + 2 + 32 + 8 * (ptrdiff_t) j));
         const uint8_t s0 = b[74 + 2 * j], s1 = b[74 + 2 * j + 1];
         sc = scales4(2 * (s0 & 15) + 1, 2 * (s0 >> 4) + 1, 2 * (s1 & 15) + 1, 2 * (s1 >> 4) + 1);
     }
@@ -116,14 +115,14 @@ template <> struct Fmt<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 7-
     static constexpr int bytes = 98;
     static constexpr float K = 0.25f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* q = b + 2 + 16 * j;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j;
         // E-2: one gather of the 16 grid words (the scalar lookups assembled with set_epi32 cost ~30 uops)
-        g = gather ? _mm512_i32gather_epi32(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q)), iq3xxs_grid, 4)
+        g = gather ? _mm512_i32gather_epi32(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(q))), iq3xxs_grid, 4)
                    : _mm512_set_epi32((int) iq3xxs_grid[q[15]], (int) iq3xxs_grid[q[14]], (int) iq3xxs_grid[q[13]], (int) iq3xxs_grid[q[12]],
                              (int) iq3xxs_grid[q[11]], (int) iq3xxs_grid[q[10]], (int) iq3xxs_grid[q[9]], (int) iq3xxs_grid[q[8]],
                              (int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]], (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]],
                              (int) iq3xxs_grid[q[3]], (int) iq3xxs_grid[q[2]], (int) iq3xxs_grid[q[1]], (int) iq3xxs_grid[q[0]]);
-        const uint32_t a = u32(b + 2 + 64 + 8 * j), c = u32(b + 2 + 64 + 8 * j + 4);
+        const uint32_t a = u32(b + 2 + 64 + 8 * (ptrdiff_t) j), c = u32(b + 2 + 64 + 8 * (ptrdiff_t) j + 4);
         const uint64_t s = (uint64_t) ksigns_iq2xs[a & 127] | ((uint64_t) ksigns_iq2xs[(a >> 7) & 127] << 8) |
                            ((uint64_t) ksigns_iq2xs[(a >> 14) & 127] << 16) | ((uint64_t) ksigns_iq2xs[(a >> 21) & 127] << 24) |
                            ((uint64_t) ksigns_iq2xs[c & 127] << 32) | ((uint64_t) ksigns_iq2xs[(c >> 7) & 127] << 40) |
@@ -138,21 +137,21 @@ template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
     static constexpr int bytes = 110;
     static constexpr float K = 1.0f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* q = b + 2 + 16 * j;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j;
         const uint32_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
         if (gather) {   // E-2: the 9-bit indices (the high bit from qh under a mask), one gather
-            __m512i idx = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q));
+            __m512i idx = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(q)));
             idx = _mm512_mask_add_epi32(idx, (__mmask16) (h0 | (h1 << 8)), idx, _mm512_set1_epi32(256));
             g = _mm512_i32gather_epi32(idx, iq3s_grid, 4);
         } else {
-#define G3(k, h, kk) (int) iq3s_grid[q[k] | (((h >> kk) & 1) << 8)]
+#define G3(k, h, kk) (int) iq3s_grid[q[(k)] | ((((h) >> (kk)) & 1) << 8)]
         g = _mm512_set_epi32(G3(15, h1, 7), G3(14, h1, 6), G3(13, h1, 5), G3(12, h1, 4),
                              G3(11, h1, 3), G3(10, h1, 2), G3(9, h1, 1), G3(8, h1, 0),
                              G3(7, h0, 7), G3(6, h0, 6), G3(5, h0, 5), G3(4, h0, 4),
                              G3(3, h0, 3), G3(2, h0, 2), G3(1, h0, 1), G3(0, h0, 0));
 #undef G3
         }
-        m = _cvtu64_mask64(u64(b + 74 + 8 * j));
+        m = _cvtu64_mask64(u64(b + 74 + 8 * (ptrdiff_t) j));
         const uint8_t s = b[106 + j];
         const int sa = 2 * (s & 15) + 1, sb = 2 * (s >> 4) + 1;
         sc = scales4(sa, sa, sb, sb);
@@ -168,8 +167,8 @@ template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 13
     static constexpr float K = 1.0f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
         const __m512i tab = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl)));
-        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * j)));
-        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * j + 1)));
+        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * (ptrdiff_t) j)));
+        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * (ptrdiff_t) j + 1)));
         const __m128i m4 = _mm_set1_epi8(0x0f);
         const __m256i h0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q0, 4), m4), _mm_and_si128(q0, m4));
         const __m256i h1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q1, 4), m4), _mm_and_si128(q1, m4));
@@ -264,7 +263,7 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
             __mmask64 m;
             Fmt<TY>::decode(blk, j, g, m, sc);
             for (int t = 0; t < NT; ++t) {
-                const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
+                const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * (ptrdiff_t) j));
                 const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
                 acci[t] = _mm512_add_epi32(acci[t], _mm512_madd_epi16(_mm512_maddubs_epi16(g, ys), sc));
             }
