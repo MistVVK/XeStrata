@@ -33,6 +33,7 @@
 #include "strata/qwen35/context_fit.hpp"
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
+#include "strata/qwen35/expert_info.hpp"
 #include "q36_kernels.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -1267,6 +1268,8 @@ struct Engine {
     std::vector<Hy> hy;
     int hybrid_t = 32;
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
+    // #5012: the expert placement, for the INFO line (the Monitor's "expert cache: slots / experts"; strata/qwen35/expert_info.hpp)
+    strata::qwen35::ExpertInfo expert_info;
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
     /// state index li's layer runs hybrid (its experts not all in VRAM)
     bool lhy(size_t li) const {
@@ -3820,6 +3823,7 @@ struct Serve {
 
     int run() {
         if (E.n_sess > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
+        if (E.expert_info.experts > 0) std::fputs(strata::qwen35::expert_info_line(E.expert_info).c_str(), stdout);   // #5012
         std::printf("READY %d stop\n", E.ctx);
         std::fflush(stdout);
         std::thread reader([&] {
@@ -4032,6 +4036,7 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
+    E.expert_info = strata::qwen35::expert_info(m.layers, m.g.n_expert);   // #5012: what the placement left in VRAM
     struct Report {
         Engine& E;
         ~Report() {
