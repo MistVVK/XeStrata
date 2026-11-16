@@ -57,6 +57,21 @@ class Addresses(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
 
 
+class MonitorReachesTheAddress(unittest.TestCase):
+    """The monitor's client allowed plain HTTP to loopback only; a server on one address of this computer must be reachable there too
+    (never through a proxy), and another computer's address still needs HTTPS."""
+
+    def test_this_computers_address_over_http(self):
+        from strata_cli import client
+        with mock.patch.object(acc, "local_addresses", return_value=HERE + ["2001:db8::5"]):
+            self.assertEqual(client.server_url("http://192.168.2.100:8080"), "http://192.168.2.100:8080")
+            self.assertEqual(client.server_url("http://[2001:db8::5]:8080"), "http://[2001:db8::5]:8080")
+            self.assertTrue(client.this_computer("10.8.0.2"))
+            with self.assertRaisesRegex(ValueError, "HTTPS"):
+                client.server_url("http://192.168.7.7:8080")
+            self.assertEqual(client.server_url("http://127.0.0.1:8080"), "http://127.0.0.1:8080")
+
+
 class ListenFlag(unittest.TestCase):
     def parse(self, *argv):
         from strata_cli.launch import cmd

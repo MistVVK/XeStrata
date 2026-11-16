@@ -42,6 +42,19 @@ class ClientError(Exception):
         self.http_status = http_status
 
 
+def this_computer(host: str) -> bool:
+    """Loopback, or one of this computer's own addresses: a server started with "One address only" (#5917, strata launch --listen) listens on
+    that address alone, so the monitor reaches it there, over plain HTTP like loopback and never through a proxy."""
+    host = (host or "").strip("[]").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        from strata_cli.launch import access
+        return host in {a.lower() for a in access.local_addresses()}
+    except Exception:                                        # noqa: BLE001 - not known: treated as another computer
+        return False
+
+
 def server_url(raw: str) -> str:
     """Require a server root and prevent credential/path ambiguity."""
     if not isinstance(raw, str):
@@ -56,7 +69,7 @@ def server_url(raw: str) -> str:
     except ValueError as e:
         raise ValueError("invalid server port") from e
     host = u.hostname.lower()
-    local = host in ("localhost", "127.0.0.1", "::1")
+    local = this_computer(host)
     if u.scheme != "https" and not local:
         raise ValueError("remote monitoring requires HTTPS or a local SSH tunnel")
     authority = f"[{host}]" if ":" in host else host
@@ -105,7 +118,8 @@ class Endpoint:
         if self.credential:
             headers["Authorization"] = "Bearer " + self.credential
         req = urllib.request.Request(self.base_url + path, headers=headers)
-        opener = urllib.request.build_opener(_NoRedirect)
+        direct = [urllib.request.ProxyHandler({})] if this_computer(urllib.parse.urlsplit(self.base_url).hostname or "") else []
+        opener = urllib.request.build_opener(_NoRedirect, *direct)
         try:
             with opener.open(req, timeout=self.timeout) as response:
                 content_type = response.headers.get("Content-Type", "")
