@@ -318,10 +318,22 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
     return cfg
 
 
+def as_started(cfg: dict) -> dict:
+    """A copy of the run config as the server starts it where that changes what the drafter decision reads: serve.server.apply_vision_defaults (the
+    picture reader on demand, and on a card that keeps room for it a larger --vram-reserve-mib). #5810: the fetch had read the config before that
+    step and the start after it, on either side of the tuned pack's slot line, so setup fetched one pack and the start asked for the other."""
+    try:
+        from serve import server as _server
+        return _server.apply_vision_defaults(json.loads(json.dumps(cfg)))
+    except Exception:                                    # noqa: BLE001 - the config as it is
+        return cfg
+
+
 def card_signals(cfg: dict, gpus: Any, want: dict) -> dict:
     """Runner.drafting_signals for a run config and the launch's cards ``gpus``: the arguments with the person's own options over them, and the ONE card's memory."""
     try:
         from strata_control import drafting, user_args
+        cfg = as_started(cfg)
         args = [str(a) for a in cfg.get("args") or []]
         if cfg.get("user_args"):
             args = user_args.merge(args, cfg["user_args"])

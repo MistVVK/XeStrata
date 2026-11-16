@@ -1591,9 +1591,16 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
                       vocab_here=vocab is not None, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib,
                       slots_none=slots_draft_nothing(args, slots), pack=pinned_pack)     # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
     pack = None
+    fallback_tuned = False                                    # the tuned pack stands in for a missing stock pack (#5810): the stock pack's conf, not the tuned pack's measured one
     if decision.drafter == "dflash2":
         qualifies = tuned_applies(backend, name, archs, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
         pack = pinned_pack if pinned_pack is not None else pack_path(data_dir, engine, model_name=name, backend=backend, tuned=qualifies)
+        if pinned_pack is None and not qualifies and Path(pack) != tuned_path(data_dir, tuned_variant(backend, name)) and not pack_ready(data_dir):
+            # #5810: the stock pack is the one for this start and it is not here, but the set's tuned pack is (setup fetched it for a start that held more
+            # experts): the other DFlash2 pack of the set, before the MTP or no drafter (owner: the drafter stays on)
+            other = pack_path(data_dir, engine, model_name=name, backend=backend, tuned=True)
+            if Path(other) == tuned_path(data_dir, tuned_variant(backend, name)):
+                pack, fallback_tuned = other, True
         if pinned_pack is None and Path(pack) != tuned_path(data_dir, tuned_variant(backend, name)) and not pack_ready(data_dir):         # (only the tuned pack is here and this engine cannot read it: no drafter file for it)
             decision = Decision(decision.asked, "mtp", NOT_DOWNLOADED) if mtp_here is not False else Decision(decision.asked, "off", NONE_HERE)
     if decision.drafter == "off":
@@ -1609,9 +1616,9 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
         decision.vocab = vocab_line
         flags = list(engine_flags(pack, vocab, form))
         kept_conf = _flag_value(mine, "--draft-conf")
-        tuned_conf = tuned_conf_for(backend, name) if Path(pack) == tuned_path(data_dir, tuned_variant(backend, name)) else None     # Metal: the conf the tuned pack was measured with; CUDA / HIP: None, the backend's own conf stays
+        tuned_conf = tuned_conf_for(backend, name) if Path(pack) == tuned_path(data_dir, tuned_variant(backend, name)) and not fallback_tuned else None     # Metal: the conf the tuned pack was measured with; CUDA / HIP: None, the backend's own conf stays
         held = slots_of(base, vram_mib)
-        tuned_here = Path(pack) == tuned_path(data_dir, tuned_variant(backend, name))
+        tuned_here = Path(pack) == tuned_path(data_dir, tuned_variant(backend, name)) and not fallback_tuned
         card_conf = big_blackwell_conf_for(backend, name, archs, vram_mib, held) if tuned_here else None      # large-VRAM Blackwell, IQ3_S, tuned pack: the measured 0.55; Strix keeps 0.35 and only widens the window
         flags[flags.index("--draft-conf") + 1] = kept_conf if kept_conf is not None else f"{tuned_conf if tuned_conf is not None else card_conf if card_conf is not None else conf_for(backend, held):g}"
         flags[flags.index("--spec") + 1] = str(window_for(backend, archs, vram_mib, held))
