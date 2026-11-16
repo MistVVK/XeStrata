@@ -414,6 +414,8 @@ bool VitGpu::available(std::string& why) {
     return pick_gpu(d, why);
 }
 
+std::string VitGpu::arch_name() { return ""; }      // (only the HIP reader checks its build's architectures)
+
 bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patches, std::string& err) {
     VitGpuImpl& m = *impl_;
     (void) device;          // one GPU: the one pick_gpu chooses

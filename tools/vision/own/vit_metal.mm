@@ -356,6 +356,8 @@ bool VitGpu::available(std::string& why) {
     }
 }
 
+std::string VitGpu::arch_name() { return ""; }      // (only the HIP reader checks its build's architectures)
+
 bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patches, std::string& err) {
     @autoreleasepool {
         VitGpuImpl& m = *impl_;

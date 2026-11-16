@@ -55,6 +55,10 @@ public:
     // True when this build has a GPU backend and a device to run it on; `why` says what is missing.
     static bool available(std::string& why);
 
+    // The first device's architecture name: HIP its gcnArchName ("gfx1201:sramecc-:xnack-"), CUDA "sm_<major><minor>", "" on SYCL and Metal or when it cannot
+    // be read.  strata-vision-hip checks it against the architectures it was built for before any kernel runs.
+    static std::string arch_name();
+
     // Uploads the weights to `device` and sizes the work buffers for pictures of up to `max_patches` patches (grown by encode when a picture
     // needs more).  `g` must be supported().
     bool load(const Gguf& gg, const VitGeometry& g, int device, int max_patches, std::string& err);

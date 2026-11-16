@@ -865,6 +865,18 @@ bool VitGpu::available(std::string& why) {
     return true;
 }
 
+std::string VitGpu::arch_name() {
+#if defined(STRATA_VIT_HIP)
+    hipDeviceProp_t p;
+    if (hipGetDeviceProperties(&p, 0) != hipSuccess) { (void) hipGetLastError(); return ""; }
+    return p.gcnArchName;
+#else
+    cudaDeviceProp p;
+    if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) { (void) cudaGetLastError(); return ""; }
+    return "sm_" + std::to_string(p.major) + std::to_string(p.minor);
+#endif
+}
+
 bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patches, std::string& err) {
     VitGpuImpl& m = *impl_;
     std::string why;
