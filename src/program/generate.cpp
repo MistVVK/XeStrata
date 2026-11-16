@@ -24,6 +24,7 @@
 #include "strata/core/residency_trim.hpp"
 #include "strata/core/kfd_settle.hpp"
 #include "strata/core/kfd_quiet.hpp"
+#include "strata/core/device_error_exit.hpp"
 #if defined(STRATA_USE_HIP) && defined(__linux__)
 #include "strata/kernels/fused_gr.hpp"   // fused_gr_check, called early on an integrated gfx11 (kfd_quiet.hpp, LOAD)
 #endif
@@ -3883,7 +3884,7 @@ int main(int argc, char** argv) {
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
-        else if (a == "--serve") o.serve = true;
+        else if (a == "--serve") { o.serve = true; strata::core::set_serve_error_line(true); }   // #6054: a check that fails ends at once, with an ERR line
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
