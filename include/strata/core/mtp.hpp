@@ -76,6 +76,13 @@ public:
     static bool top2_env();
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     uint64_t vram_bytes() const { return vram_; }
+    /// The 512 routed experts moved from VRAM to pinned host memory, which the drafter's kernels read in place (the
+    /// few a draft routes to): a card the expert cache would otherwise leave short (generate's cache sizing).  Fails,
+    /// leaving them where they are, where this GPU's kernels cannot read host memory or none can be pinned.  The slot
+    /// drafters that share them follow with share_experts.
+    bool experts_to_host(std::string& err);
+    bool experts_on_host() const { return experts_host_; }
+    void share_experts(const MtpDrafter& owner) { experts_ = owner.experts_; experts_host_ = owner.experts_host_; }
     /// DF-05: the gathered draft-head rows and vocabulary (this drafter keeps owning them), for the DFlash2 drafter
     /// to share when they are the same bytes (the same head and vocabulary file).  rows null: the whole head.
     struct SharedHead { const uint8_t* rows; const int32_t* vocab_dev; int64_t n; int type; };
@@ -235,6 +242,7 @@ private:
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;
     uint8_t* experts_ = nullptr;
+    bool experts_host_ = false;   ///< experts_ is pinned host memory (experts_to_host)
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;

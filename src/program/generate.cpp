@@ -5571,22 +5571,54 @@ int main(int argc, char** argv) {
         // of memory the library holds).
         constexpr int kSmallReserveMib = 300;
         const int small_reserve_mib = kSmallReserveMib + (int) (blas_bytes >> 20);
-        if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > small_reserve_mib) {
-            // the largest reserve (in MiB) that still leaves min_slots
-            const int64_t fit_mib = ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
-            if (fit_mib >= small_reserve_mib) {
-                const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
-                int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib) << 20) + mtp_bind + pipe_first)) / blob;
-                // not below the slots a working cache needs (s2 >= min_slots: r leaves them)
-                s2 = std::max<int64_t>(min_slots, s2);
-                if (!profile.empty()) s2 = std::min<int64_t>(s2, (int64_t) profile.size());
-                std::fprintf(stderr, "xestrata generate: expert cache auto: the %d MiB reserve leaves too few slots on "
-                                     "this card (a working cache needs %lld): a %d MiB reserve instead -> %lld slots\n",
-                             o.vram_reserve_mib, (long long) min_slots, r, (long long) s2);
-                o.vram_reserve_mib = r;
-                o.expert_cache = (int) s2;
-                reserve_adapted = true;
+        auto adapt_reserve = [&] {
+            if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > small_reserve_mib) {
+                // the largest reserve (in MiB) that still leaves min_slots
+                const int64_t fit_mib =
+                    ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
+                if (fit_mib >= small_reserve_mib) {
+                    const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
+                    const int64_t taken = (((int64_t) r + prefill_mib) << 20) + mtp_bind + pipe_first;
+                    int64_t s2 = ((int64_t) free_b - taken) / blob;
+                    // not below the slots a working cache needs (s2 >= min_slots: r leaves them)
+                    s2 = std::max<int64_t>(min_slots, s2);
+                    if (!profile.empty()) s2 = std::min<int64_t>(s2, (int64_t) profile.size());
+                    std::fprintf(stderr, "xestrata generate: expert cache auto: the %d MiB reserve leaves too few "
+                                         "slots on this card (a working cache needs %lld): a %d MiB reserve instead -> "
+                                         "%lld slots\n", o.vram_reserve_mib, (long long) min_slots, r, (long long) s2);
+                    o.vram_reserve_mib = r;
+                    o.expert_cache = (int) s2;
+                    reserve_adapted = true;
+                }
             }
+        };
+        adapt_reserve();
+        // A card short of a working expert cache (8 GB with Edge0-120B): the drafter's routed experts go to pinned
+        // memory, its kernels reading the few a draft routes to in place (XESTRATA_MTP_EXPERTS_HOST): a draft step
+        // reads 10 of the 512.  A single GPU only (a layer split's stages size their own devices).  "on" takes the
+        // step whatever the cache, to measure it on a card that does not need it.
+        if (split_devs.empty()) {
+            const auto mtp_pick = strata::core::pick_from_env("MTP_EXPERTS_HOST");
+            if (mtp.loaded() && !mtp.experts_on_host() &&
+                (mtp_pick == strata::core::Pick::On ||
+                 (mtp_pick == strata::core::Pick::Auto && slots < min_slots && !reserve_adapted))) {
+                std::string me;
+                const int64_t before = slots;
+                if (!mtp.experts_to_host(me)) {
+                    std::fprintf(stderr, "xestrata generate: the drafter's experts stay on the device: %s\n",
+                                 me.c_str());
+                } else {
+                    for (auto& d : slot_mtp) d->share_experts(mtp);
+                    size_cache();
+                    std::fprintf(stderr, "xestrata generate: the drafter's routed experts in pinned memory, read in "
+                                         "place (XESTRATA_MTP_EXPERTS_HOST=0 keeps them on the device): the expert "
+                                         "cache %lld slots in place of %lld\n", (long long) slots, (long long) before);
+                }
+            }
+        }
+        if (slots > o.expert_cache) {   // the steps above made room
+            o.expert_cache = (int) slots;
+            adapt_reserve();
         }
         if (o.expert_cache == 0) {
             // what is short, and what makes room: the numbers a small card picks from
