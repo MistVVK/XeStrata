@@ -32,6 +32,29 @@ export function modelNameOf(routes, options) {
   return String(route?.name || options?.model || 'an AI model');
 }
 
+/**
+ * The route an agent's next request goes to. session/selectModel appends a "model/selection" event to the session log; the next request
+ * uses it and logs a "request/header" for it; agent.options holds only the model the agent was created with (the Harness default,
+ * "deepseek-flash" in the packaged app). Read on Strix, 11-16: the request went to the chosen model while {{model}} said "deepseek-flash",
+ * and on the real Harness here a switch was named only one turn late when the header alone was read. So: the newest selection that no
+ * request has used yet, else the last request's header, else the options.
+ */
+export function currentRoute(agent) {
+  const session = agent?.session;
+  try {
+    const log = Array.isArray(session?.log) ? session.log : [];
+    for (let i = log.length - 1; i >= 0; i--) {
+      const event = log[i];
+      if (event?.type === 'model/selection' && event.data?.model) return { provider: event.data.provider, model: event.data.model };
+      if (event?.type === 'request/header') break;
+    }
+    const header = session?.requestHeader?.()?.config;
+    if (header?.model) return { provider: header.provider, model: header.model };
+  } catch { /* the options below */ }
+  return agent?.options;
+}
+
+
 /** What the assistant is told in the tool's own text, so every model (a small local one and a hosted one alike) knows when and how. */
 export const SUBAGENT_GUIDANCE = ' Use this tool whenever the person asks you to ask a subagent, a helper or another model ("ask a subagent", "ask DeepSeek", "use the local model", "ask model X"): start it with this tool and do not look for the model yourself with shell commands, in the environment or on this computer. To use a particular model, give `model` as its name or id (for example "DeepSeek V3.2" or "deepseek/deepseek-v3.2", or "local" for the model running on this computer); `provider` is optional. `list_subagent_models` shows what can be used. After starting a helper, do not wait with sleep or commands: end your turn and its answer arrives as a new message.';
 const MODEL_WORDS = 'The model to use for the helper: its name as the person knows it ("DeepSeek V3.2"), its id ("deepseek/deepseek-v3.2") or "local" for the model running on this computer. Omit it to use this chat\'s model.';
@@ -49,7 +72,7 @@ export function subagentArgs(routes, args) {
 
 export function apply(ctx, config = {}) {
   const routes = Array.isArray(config.routes) ? config.routes : [];
-  ctx.systemPrompt.variable('model_name', context => modelNameOf(routes, context?.agent?.options));
+  ctx.systemPrompt.variable('model_name', context => modelNameOf(routes, currentRoute(context?.agent)));
 
   const wrapSubagent = def => {
     if (wrapped.has(def)) return;

@@ -4,7 +4,7 @@
 // Without model routes the plugin is not in the profile, so the persona keeps {{model}} (an unregistered variable would fail the prompt).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { apply, modelNameOf } from '../server/agent/plugins/strata-models.mjs';
+import { apply, currentRoute, modelNameOf } from '../server/agent/plugins/strata-models.mjs';
 import { agentPromptFor } from '../server/agent/preset.mjs';
 import { buildProfile } from '../server/agent/profile.mjs';
 
@@ -46,4 +46,23 @@ test('the profile: the persona names {{model_name}} exactly when the plugin that
   const none = rows(buildProfile({ local: [], connections: [] }));
   assert.ok(!flat(none).some(r => r.id === 'strata-models'));
   assert.ok(!/\{\{model_name\}\}/.test(JSON.stringify(none)), 'no plugin, no {{model_name}}');
+});
+
+// Strix, 11-16 (packaged app, real Harness): the request went to the chosen API model, but the prompt said "You are running as
+// deepseek-flash": agent.options holds the model the agent was created with; session/selectModel sets the session's request header.
+test('the name follows the model the session was switched to, not the agent creation default', () => {
+  const agent = (header) => ({ options: { provider: 'deepseek', model: 'deepseek-flash' }, session: { requestHeader: () => header } });
+  assert.deepEqual(currentRoute(agent({ config: { provider: 'api-own', model: 'deepseek/deepseek-v3.2', reasoningEffort: 'high' } })), { provider: 'api-own', model: 'deepseek/deepseek-v3.2' });
+  assert.equal(modelNameOf(routes, currentRoute(agent({ config: { provider: 'strata-local', model: 'iq3_s' } }))), 'Qwen3.8 Flash Next');
+  assert.deepEqual(currentRoute(agent(undefined)), { provider: 'deepseek', model: 'deepseek-flash' }, 'no header yet: the options');
+  assert.deepEqual(currentRoute({ options: { model: 'm' }, session: { requestHeader: () => { throw new Error('closed'); } } }), { model: 'm' });
+  assert.equal(currentRoute(undefined), undefined);
+  // a switch logged after the last request wins over that request's header; one the next request already used is the header again
+  const logged = (log, header) => ({ options: { provider: 'deepseek', model: 'deepseek-flash' }, session: { log, requestHeader: () => header } });
+  const local = { config: { provider: 'strata-local', model: 'iq3_s' } };
+  assert.deepEqual(currentRoute(logged([{ type: 'request/header' }, { type: 'model/selection', data: { provider: 'api-own', model: 'deepseek/deepseek-v3.2' } }], local)), { provider: 'api-own', model: 'deepseek/deepseek-v3.2' });
+  assert.deepEqual(currentRoute(logged([{ type: 'model/selection', data: { provider: 'api-own', model: 'x' } }, { type: 'request/header' }], local)), { provider: 'strata-local', model: 'iq3_s' });
+  const vars = new Map();
+  apply({ systemPrompt: { variable: (name, fn) => vars.set(name, fn) }, tools: { get: () => undefined }, get: () => ({ list: () => [] }), on: () => {} }, { routes });
+  assert.equal(vars.get('model_name')({ agent: agent({ config: { provider: 'api-own', model: 'deepseek/deepseek-v3.2' } }) }), 'DeepSeek V3.2');
 });
