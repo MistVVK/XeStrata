@@ -510,12 +510,16 @@ vLLM-Omni の動画の分割と同じ形です。multipart の `video`（動画�
 - setup は設定の `"images"` に `"lora_dir"` を書きます（データのフォルダーの `models/loras`）。1 つのフォルダーをどのモデルも共有し、一覧はモデルごとに絞ります。フォルダーが無ければ自分で作ります。
   ファイルは `.safetensors` と `.gguf` で、サブフォルダーも読めます（名前は `style/gouache` のように道になります）。
 - フォルダーは 10 秒まで覚え、フォルダーが更新されるとすぐ読み直します。サーバーを止める必要はありません。
-- `/health` の `image_defaults`・`image_models` と、`/v1/models` の画像モデルの項目の `defaults.loras` に、そのモデルが当てられるファイルが並びます。1 本ごとに、`name`（拡張子を除いた名前。サブフォルダーは道）、`path`（フォルダーからの道）、`rank`（OFT と全体差分は 0）、`scale`（ファイルのメタデータが勧める強さ。無ければ 1）、`trigger`（トリガーの語）、`kind`（学習で足したもの: `character`・`style`・`other`。XeStrata の学習器がメタデータ `ss_xestrata_kind` に書く。無ければ `null`）、`targets`（変える重みの種類）、`size_mib`（ファイルの大きさ）です。
+- `/health` の `image_defaults`・`image_models` と、`/v1/models` の画像モデルの項目の `defaults.loras` に、そのモデルが当てられるファイルが並びます。1 本ごとに、`name`（拡張子を除いた名前。サブフォルダーは道）、`path`（フォルダーからの道）、`rank`（OFT と全体差分は 0）、`scale`（ファイルのメタデータが勧める強さ。無ければ 1）、`trigger`（トリガーの語）、`kind`（学習で足したもの: `character`・`style`・`other`。XeStrata の学習器がメタデータ `ss_xestrata_kind` に書く。無ければ `null`）、`steps`（メタデータの `ss_steps`。保存までの step。無ければ `null`）、`targets`（変える重みの種類）、`size_mib`（ファイルの大きさ）です。
 - そのモデルの重みではないキーを持つファイルや、当てられない形式のファイルは一覧に出ません。その名前で頼むと、理由の付いた 400 が返ります。
 
 ```sh
 curl -s http://127.0.0.1:8095/health | python3 -c 'import json,sys; print(*[e["name"] for e in json.load(sys.stdin)["image_defaults"]["loras"]], sep="\n")'
 ```
+
+### 作成（ブラウザ）
+
+チャットの `train_lora`（スキル `lora-train`）か、Images の LoRA の節の「LoRA を学習…」で作成画面が開きます。画像の投入・キャプション・設定・学習の進み・版の見比べと登録までブラウザでできます。仕組みと API は [LORA_TRAIN](LORA_TRAIN.ja.md#ブラウザからの作成) にあります。
 
 ### 当てる
 

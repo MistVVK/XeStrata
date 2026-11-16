@@ -375,6 +375,18 @@ stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib=
 （状態の読み直しと重みの読み直しの時間・チャットの残り）が移る方を安いと示すときだけ（測った値が無い間は移らない）。
 帯域と計算の測りは `xestrata-device --bench`（1 枚ずつ。装置ごとのキャッシュに置く）。
 
+## ブラウザからの作成
+
+CLI の前処理と学習器を、Web のチャットから最後まで使えるようにしたものです（`serve/lora_train.py`・`serve/web/app.js` の作成パネル）。
+
+- チャットで「この子の LoRA を作りたい」と言うと、モデルがスキル `lora-train` を読み、道具 `train_lora` を呼びます。チャットの中に作成画面が出ます（Images タブの LoRA の節の「LoRA を学習…」からも開けます）。
+- 画面の流れ: 画像を入れる（ドラッグ＆ドロップ・複数・このチャットの画像も選べる）→ 種類（character・style・other）・名前・呼び出し語・模型を選ぶ → キャプションを自動で付けて（`tools/image/lora_caption.py`。チャットの画像を読める模型が書く。[キャプションの方針](#キャプションの方針)どおり）画面で直す → 設定（既定はプリセット。最大 step 数 n・何 step ごとに版を保存するか k・rank・lr・seed・層の絞り・見本の prompt。詳しい設定は畳む）→ 開始。
+- 仕事はデータフォルダの `lora-jobs/<id>/` に状態を持ち（`record.json`）、同時に 1 つだけ回ります。段は 前処理（`mf_pre.py`・`mf_pre_export.py`）→ 学習（学習器のサブプロセス）→ 見本（版ごとに同じ seed・同じ prompt で生成）→ 版の選択。serve を立て直すと途中の仕事は `interrupted` になり、再開で未完了の段からやり直せます（前処理はキャッシュが揃っていれば飛ばす）。取り消しはサブプロセスを止め、それまでに保存した版を残します。
+- 版は k ごとと最後に出ます（学習器の `--save-every` / `--checkpoint`。模型ごとの引数の違いは `serve/lora_train.py` の TRAINERS 表 1 か所が写す）。画面は版ごとの見本を並べて見比べ、選んだ版（選ばなければ最後）を LoRA の一覧に登録します（`serve/loras.py` の add。metadata の `ss_steps`・`ss_xestrata_kind`・`modelspec.trigger_phrase` は学習器が書いたまま）。登録した LoRA はすぐチャットの生成で使えます。選ばれなかった版は消せます。一覧の項目に `steps`（`ss_steps`。保存までの step）が加わります。
+- GPU の譲り合い: 学習は一番低い優先度で、LLM と同じ VRAM の帳簿（`serve/vram_ledger.py`）で分け合います。チャット中は LLM が先で学習は残りの予算で遅く回り、画像の仕事が来たら学習は縮むか step の境で一時停止して先に通します（待ち最大でもマイクロステップ 1 本＋解放）。チャットが空いたら学習は広がります。置き場所と予算の決め手は `serve/train_budget.py`（装置の報告と測った値から。模型名・機種名では決めない）。学習器は予算（MiB）を制御ファイルで受け、step の境で縮む・広がる・止まる（`--vram-budget`・`--vram-control`・`--state`・`--resume`）。キャプション付けは学習の前（チャットの模型）、見本は学習の後（GPU が空いてから）に作ります。
+- 上限: 画像 200 枚・1 枚 32 MiB・データセット 2 GiB。n は 1〜100000・k は 1〜n・rank は 1〜256。仕事フォルダの外へは書きません。
+- API: `/v1/lora/models`・`/v1/lora/jobs`（POST は multipart の画像と欄）・`/v1/lora/jobs/<id>`（record）・`.../images`・`.../captions`（PUT）・`.../caption`・`.../start`・`.../cancel`・`.../resume`・`.../register`・`.../versions/<step>`（DELETE）・`.../images|samples/<file>`（GET）。
+
 ## 確かめの手順
 
 1. **一覧**: その模型の family で `serve/loras.py` の `Folder` を読み、ファイルが `listing` に出ること（`skipped` に出たら不合格）。`rank`・`trigger`・`targets` の値が本物と合うことも見ます。

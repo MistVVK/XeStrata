@@ -510,12 +510,16 @@ The models that take one are Qwen-Image-2.1 (Turbo and the base model), MOSS-Ima
 - Setup writes `"lora_dir"` in the config's `"images"` (the data folder's `models/loras`). Every model shares the one folder, and each one's listing is narrowed to what its DiT takes. Create the folder when it is not there.
   The files are `.safetensors` and `.gguf`, and subfolders are read too (a name is its path there, `style/gouache`).
 - The folder is read again at once when it changes, and a listing is kept up to 10 seconds. The server need not be stopped.
-- `/health`'s `image_defaults` and `image_models`, and the image models' `defaults.loras` in `/v1/models`, list the files that model can apply. Each has `name` (without the extension; a subfolder by its path), `path` (from the folder), `rank` (0 for an OFT and a whole difference), `scale` (the strength the file's metadata recommends, else 1), `trigger` (its trigger words), `kind` (what it was trained to add: `character`, `style` or `other`, which XeStrata's trainers write in the metadata's `ss_xestrata_kind`; else `null`), `targets` (the kinds of weight it changes) and `size_mib` (the file's size).
+- `/health`'s `image_defaults` and `image_models`, and the image models' `defaults.loras` in `/v1/models`, list the files that model can apply. Each has `name` (without the extension; a subfolder by its path), `path` (from the folder), `rank` (0 for an OFT and a whole difference), `scale` (the strength the file's metadata recommends, else 1), `trigger` (its trigger words), `kind` (what it was trained to add: `character`, `style` or `other`, which XeStrata's trainers write in the metadata's `ss_xestrata_kind`; else `null`), `steps` (the metadata's `ss_steps`, the steps up to the save; else `null`), `targets` (the kinds of weight it changes) and `size_mib` (the file's size).
 - A file with a key that is not this model's weight, or in a form it does not apply, is not listed. Asking for that name is a 400 whose message says why.
 
 ```sh
 curl -s http://127.0.0.1:8095/health | python3 -c 'import json,sys; print(*[e["name"] for e in json.load(sys.stdin)["image_defaults"]["loras"]], sep="\n")'
 ```
+
+### Making one (the browser)
+
+The chat's `train_lora` (the `lora-train` skill), or the Images view's LoRA section's "Train a LoRA…" button, opens the training panel: the pictures, captions, settings, the training's progress, and the versions' comparison and registration, all in the browser. The mechanism and API are in [LORA_TRAIN](LORA_TRAIN.md#training-from-the-browser).
 
 ### Applying one
 

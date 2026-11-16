@@ -160,7 +160,7 @@ Each model's own license applies to its files.
 
 ### Image generation (optional)
 
-A model that makes images (Qwen-Image-2.1, Mage-Flow, MageTrail, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image or CircleStone Labs' Anima) can be installed with the text model: choose it in `xestrata --setup`'s questions, or name it, as in `xestrata --setup --images qwen-image-turbo`.
+A model that makes images (Qwen-Image-2.1, Mage-Flow, MageTrail, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image or CircleStone Labs' Anima) can be installed with the text model: choose it in `xestrata --setup`'s questions, or name it, as in `xestrata --setup --images qwen-image-turbo`. LoRA training works from the browser too: the chat's training panel takes the pictures, captions, settings and the version pick ([LORA_TRAIN](docs/LORA_TRAIN.md#training-from-the-browser)).
 The image model needs 16-20 GB of RAM besides the text model's (HunyuanImage 3.0 about 50 GB).
 Choosing one, using it and the API: [docs/IMAGE.md](docs/IMAGE.md).
 

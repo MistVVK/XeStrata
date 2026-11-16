@@ -155,7 +155,7 @@ RAM の少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の�
 
 ### 画像の生成（任意）
 
-文章のモデルと一緒に、画像を作るモデル（Qwen-Image-2.1、Mage-Flow、MageTrail、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、CircleStone Labs の Anima）を入れられます。`xestrata --setup` の質問で選ぶか、`xestrata --setup --images qwen-image-turbo` のように指定します。
+文章のモデルと一緒に、画像を作るモデル（Qwen-Image-2.1、Mage-Flow、MageTrail、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、CircleStone Labs の Anima）を入れられます。`xestrata --setup` の質問で選ぶか、`xestrata --setup --images qwen-image-turbo` のように指定します。LoRA の学習もブラウザからできます（チャットの作成画面に画像を入れて、キャプション・設定・版の選択まで。[LORA_TRAIN](docs/LORA_TRAIN.ja.md#ブラウザからの作成)）。
 画像のモデルには、文章のモデルとは別に 16〜20 GB の RAM が要ります（HunyuanImage 3.0 は約 50 GB）。
 選び方、使い方、API は [docs/IMAGE.ja.md](docs/IMAGE.ja.md) にあります。
 
