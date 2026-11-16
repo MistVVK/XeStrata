@@ -968,6 +968,27 @@ def run_launch(a: argparse.Namespace) -> int:
 
 # ------------------------------------------------------------------------------------------------ connect
 
+def _connect_write(harness, out, a, machine: bool):
+    """Run the --write block for either output mode. Returns (results, exit_code, message);
+    message is set only when nothing was written or the ask could not happen."""
+    if not out["files"]:
+        return [], 0, "Nothing to write for this app."
+    if not a.yes:
+        if not sys.stdin.isatty():
+            return [], 2, "--write asks first; run it in a terminal or add --yes."
+        ask = "\nWrite these files now? A file that exists is copied to a backup first. [y/N] "
+        if machine:                                   # stdout stays one JSON object
+            print(ask, file=sys.stderr)
+            ans = sys.stdin.readline().strip().lower()
+        else:
+            try:
+                ans = input(ask).strip().lower()
+            except EOFError:                         # the input ended: that is a no
+                ans = ""
+        if ans not in ("y", "yes"):
+            return [], 0, "Nothing was written."
+    return [harness.write_file(f) for f in out["files"]], 0, None
+
 def run_connect(a: argparse.Namespace) -> int:
     from strata_cli.launch import harness
     machine = a.output == "json"
@@ -1003,6 +1024,16 @@ def run_connect(a: argparse.Namespace) -> int:
                                                        if k != "files"},
                    "files": [{**f, "text": harness.mask(f["text"], key)} for f in out["files"]],
                    "vendor_tested": h.tested or None}
+        if a.write:                                   # the JSON path writes too, and reports each file
+            written, code, message = _connect_write(harness, out, a, True)
+            if code:
+                payload["ok"] = False
+                payload["error"] = {"code": code, "message": message}
+                print(json.dumps(payload))
+                return code
+            payload["write"] = {"written": written}
+            if message:
+                payload["write"]["note"] = message
         if not a.check:
             print(json.dumps(payload))
             return 0
@@ -1057,21 +1088,13 @@ def run_connect(a: argparse.Namespace) -> int:
         if not all(r.ok for r in results):
             return 1
     if a.write:
-        if not out["files"]:
-            _say("Nothing to write for this app.")
-            return 0
-        if not a.yes:
-            if not sys.stdin.isatty():
-                print("strata: --write asks first; run it in a terminal or add --yes.", file=sys.stderr)
-                return 2
-            try:
-                ans = input("\nWrite these files now? A file that exists is copied to a backup first. [y/N] ").strip().lower()
-            except EOFError:                                 # the input ended: that is a no
-                ans = ""
-            if ans not in ("y", "yes"):
-                _say("Nothing was written.")
-                return 0
-        for f in out["files"]:
-            r = harness.write_file(f)
+        written, code, message = _connect_write(harness, out, a, False)
+        if message:
+            if code == 2:
+                print(f"strata: {message}", file=sys.stderr)
+            else:
+                _say(message)
+            return code
+        for r in written:
             _say(f"{r['action'].capitalize()} {r['path']}" + (f" (backup: {r['backup']})" if r["backup"] else ""))
     return 0
