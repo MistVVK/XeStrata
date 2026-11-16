@@ -399,17 +399,20 @@ int selftest(const std::string& dir, uint32_t rb) {
             CHECK(rd.cache_size() <= rd.cache_capacity(), "row cache exceeded its bound");
         }
     }
-    // fault injection: a 3 ms delay must be observed, and must not change the bytes
+    // fault injection: the delay must be observed, and must not change the bytes.  A read is held back only when
+    // it completes inside the delay, so the delay is far longer than a page read takes even on a loaded machine
+    // (3 ms held none back once beside the cross build's load, 2026-11-16)
+    constexpr double kDelayUs = 50000;
     for (bool thr : {false, true}) {
         ng::PleReader rd;
         std::string err;
         CHECK(rd.open(path, HEADER, N, 16, 0, err, thr, rb), "open: %s", err.c_str());
-        rd.set_injected_delay_us(3000);
+        rd.set_injected_delay_us(kDelayUs);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
         const double t0 = now_us();
         check_rows(rd, rows, N, rb, "delayed");
-        CHECK(now_us() - t0 >= 3000, "injected delay not observed (%.0f us)", now_us() - t0);
+        CHECK(now_us() - t0 >= kDelayUs, "injected delay not observed (%.0f us)", now_us() - t0);
         CHECK(rd.stats().late_injected > 0, "no read was held back");
     }
     // keep-alive: while rows are asked for, a page goes out after `period` without a read; it stops once the

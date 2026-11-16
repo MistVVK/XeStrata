@@ -1980,9 +1980,9 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME bf16_gemm_parity COMMAND bf16_gemm_parity)
   add_test(NAME bf16_gemm_parity_scalar
            COMMAND ${CMAKE_COMMAND} -E env XESTRATA_BF16_GEMM_ISA=scalar $<TARGET_FILE:bf16_gemm_parity>)
-  add_test(NAME bf16_gemm_parity_numpy
-           COMMAND ${CMAKE_COMMAND} -E env XESTRATA_EG2_S2=$ENV{XESTRATA_EG2_S2} $<TARGET_FILE:bf16_gemm_parity>
-                   --numpy)
+  # XESTRATA_EG2_S2 (the record's s2/) is read when the test runs: set at configure time it was fixed in the test's
+  # command, and a build configured without it skipped the check whatever the run's environment said
+  add_test(NAME bf16_gemm_parity_numpy COMMAND bf16_gemm_parity --numpy)
   set_tests_properties(bf16_gemm_parity bf16_gemm_parity_scalar PROPERTIES TIMEOUT 300)
   set_tests_properties(bf16_gemm_parity_numpy PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   # The CPU forwards' int8 x int8 product (i8_gemm.hpp): each vector kernel against the scalar reference bit for bit,
@@ -1999,9 +1999,7 @@ if(STRATA_BUILD_TESTS)
            COMMAND ${CMAKE_COMMAND} -E env XESTRATA_I8_GEMM_ISA=avx2 $<TARGET_FILE:cpu_i8_gemm_parity>)
   add_test(NAME cpu_i8_gemm_parity_scalar
            COMMAND ${CMAKE_COMMAND} -E env XESTRATA_I8_GEMM_ISA=scalar $<TARGET_FILE:cpu_i8_gemm_parity>)
-  add_test(NAME cpu_i8_gemm_parity_numpy
-           COMMAND ${CMAKE_COMMAND} -E env XESTRATA_EG2_S2B=$ENV{XESTRATA_EG2_S2B} $<TARGET_FILE:cpu_i8_gemm_parity>
-                   --numpy)
+  add_test(NAME cpu_i8_gemm_parity_numpy COMMAND cpu_i8_gemm_parity --numpy)   # XESTRATA_EG2_S2B at run time, as above
   set_tests_properties(cpu_i8_gemm_parity cpu_i8_gemm_parity_avx2 cpu_i8_gemm_parity_scalar PROPERTIES TIMEOUT 600)
   set_tests_properties(cpu_i8_gemm_parity_numpy PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
   # The pack is a REQUIRED input, not an optional one: this test compares against a real expert blob, and a
@@ -2029,7 +2027,9 @@ if(STRATA_BUILD_TESTS)
   if(TARGET iq_avx2_parity)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
-      add_test(NAME isa_guard_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_isa_guard.py
+      # the script needs only Python's standard library: the python3 on the PATH when the test runs, so a build
+      # folder run on another machine (the A380 container's checks) does not need the configuring one's venv
+      add_test(NAME isa_guard_check COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_isa_guard.py
                $<TARGET_FILE:strata_kernels_cpu>)
       set_tests_properties(isa_guard_check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()

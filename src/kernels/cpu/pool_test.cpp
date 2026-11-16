@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/pool_test.cpp - P2.S3's test for the expert pool.
 //
 // The pool's correctness claims are small and specific, so they are checked directly rather than through a
@@ -17,6 +18,7 @@
 //      nothing and `n > workers` is the real case (10 experts, 5 workers).
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert.hpp"
+#include "synth_q2_blob.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -56,11 +58,12 @@ double now_ms() {
 int main(int argc, char** argv) {
     bool selftest = false;
     const char* path = "pack/full/experts.bin";
+    bool path_given = false;
     long long layer = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
-        else if (a == "--file" && i + 1 < argc) path = argv[++i];
+        else if (a == "--file" && i + 1 < argc) { path = argv[++i]; path_given = true; }
         else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
         else { std::fprintf(stderr, "usage: pool_test [--selftest] [--file P] [--layer N]\n"); return 2; }
     }
@@ -75,11 +78,23 @@ int main(int argc, char** argv) {
 
     int bad = 0;
 
+    // the pack's Q2_0 experts, or (no --file and no pack/full here) seeded blobs of the same form
+    bool synth = false;
+    if (!path_given) {
+        if (std::FILE* f = std::fopen(path, "rb")) std::fclose(f);
+        else synth = true;
+    }
+    if (synth) std::printf("  %-44s %s\n", "experts", "pack/full/experts.bin is not here: seeded Q2_0 blobs");
+    auto blob_at = [&](long long index, std::vector<uint8_t>& out) {
+        if (!synth) return read_blob(path, index, out);
+        cpu::test::synth_q2_blob(index, out);
+        return true;
+    };
     // ---- ten experts off one layer, which is exactly what a token uses
     const int NEXP = 10;
     std::vector<std::vector<uint8_t>> blobs((size_t) NEXP);
     for (int e = 0; e < NEXP; ++e)
-        if (!read_blob(path, layer * 512 + e, blobs[(size_t) e])) {
+        if (!blob_at(layer * 512 + e, blobs[(size_t) e])) {
             std::fprintf(stderr, "cannot read expert %d of layer %lld from %s\n", e, layer, path);
             return 2;
         }

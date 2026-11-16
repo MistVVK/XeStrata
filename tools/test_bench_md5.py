@@ -216,10 +216,16 @@ class ThePastRecords(unittest.TestCase):
             self.fail(f"{path}: no answer")
         return md5[:8]
 
+    def need(self, what: str, *paths: Path) -> None:
+        """Skip unless every file the test reads is there: a cleaned-up record keeps its folder, not its dumps."""
+        missing = [p for p in paths if not p.exists()]
+        if missing:
+            self.skipTest(f"{what}: {len(missing)} of its files are gone ({missing[0]})")
+
     def test_v1_answers(self):
         llm = UNIFY2 / "V1" / "llm"
-        if not llm.exists():
-            self.skipTest(f"{llm}: V1's answers")
+        names = ("q38-03-1k-after-r1", "q35-03-1k-after-r1", *(f"q35-03-1k-before-r{r}" for r in (1, 2, 3)))
+        self.need("V1's answers", *(llm / f"v-{n}.out" for n in names))
         # V1's table: q38's answer was 6f374fe1 at 1k, q35's 3db5b39a before and 6b6f4b5a after
         self.assertEqual(self.md5(llm / "v-q38-03-1k-after-r1.out"), "6f374fe1")
         self.assertEqual(self.md5(llm / "v-q35-03-1k-before-r1.out"), "3db5b39a")
@@ -231,8 +237,9 @@ class ThePastRecords(unittest.TestCase):
     def test_v1_before_against_after(self):
         """The judge lists the cells V1's own table says moved: q35 32k the same, q35 1k and ornith 1k moved."""
         llm = UNIFY2 / "V1" / "llm"
-        if not llm.exists():
-            self.skipTest(f"{llm}: V1's answers")
+        cells = (("q35", "1k"), ("q35", "32k"), ("ornith", "1k"))
+        self.need("V1's answers", *(llm / f"v-{model}-03-{tier}-{side}-r{r}.out" for side in ("before", "after")
+                                    for r in (1, 2, 3) for model, tier in cells))
         with tempfile.TemporaryDirectory() as d:
             for side in ("before", "after"):
                 rows = []
@@ -255,8 +262,8 @@ class ThePastRecords(unittest.TestCase):
         """S's table: q38 32K's answer was d6a838ce, ornith 1K's bb6bcf6a; its KL of ornith 1K (before against head,
         over 64 rows) was 6.761e-02 mean and 1.016 max, its floor bitwise equal."""
         amd, dev = UNIFY2 / "S" / "amd" / "llm", UNIFY2 / "S" / "dev"
-        if not amd.exists() or not (dev / "kl").exists():
-            self.skipTest(f"{dev}: S's answers and dumps")
+        self.need("S's answers and dumps", *(amd / f"{n}-head-r1.out" for n in ("q38-32k", "ornith-1k", "q35-1k")),
+                  *(dev / "kl" / f"ornith-b70-1k-{n}.f32" for n in ("before-a", "before-b", "head")))
         self.assertEqual(self.md5(amd / "q38-32k-head-r1.out"), "d6a838ce")
         self.assertEqual(self.md5(amd / "ornith-1k-head-r1.out"), "bb6bcf6a")
         self.assertEqual(self.md5(amd / "q35-1k-head-r1.out"), "3db5b39a")
@@ -271,8 +278,9 @@ class ThePastRecords(unittest.TestCase):
     def test_s_kl_through_the_judge(self):
         """The same cell judged from two records of dumps: the answer the same, the bits moved, the KL printed."""
         dev = UNIFY2 / "S" / "dev"
-        if not (dev / "kl").exists():
-            self.skipTest(f"{dev / 'kl'}: S's dumps")
+        names = ("head", "before-a", "before-b")
+        self.need("S's dumps", *(dev / "kl" / f"ornith-b70-1k-{n}.f32" for n in names),
+                  *(dev / "llm" / f"kl-ornith-b70-1k-{n}.out" for n in names))
         with tempfile.TemporaryDirectory() as d:
             for side, names in (("head", ("head", "head")), ("before", ("before-a", "before-b"))):
                 rows = []
