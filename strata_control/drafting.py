@@ -207,6 +207,17 @@ REPO = "incoai/Qwen3.8-Flash-Next-DFlash2"
 REVISION = "a22a1744e85c17364dcc54a6a420af7135d4c7f6"
 LICENSE = "Apache-2.0"
 BASE_URL = f"https://huggingface.co/{REPO}/resolve/{REVISION}/"
+
+
+HF_DEFAULT = "https://huggingface.co"
+
+
+def base_url(endpoint: str | None = None) -> str:
+    """BASE_URL on the host the Hugging Face endpoint variable names, read at each fetch as setup and huggingface_hub read it (#5083: a
+    mirror where the default host cannot be reached; the same rule as strata_control/pictures.py). The pinned revision and every file's
+    SHA-256 are the same whichever host serves them."""
+    base = (endpoint if endpoint is not None else (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or HF_DEFAULT)
+    return f"{base}/{REPO}/resolve/{REVISION}/"
 FILES = (
     ("config.json", 1236, "2409575986f9ea24d455343eb469c0e6940def5edab1d1be503bb8eb4cc3b1b9"),
     ("model.safetensors", 1206140008, "d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f"),
