@@ -100,7 +100,7 @@ inline __m256i sc16(int a, int b) {
                                    _mm_set1_epi16((short) b), 1);
 }
 // One scale for the whole 32-value half (IQ2_XXS, IQ3_XXS, IQ3_S).
-inline __m256i sc32(int s) { return _mm256_set1_epi16(s); }
+inline __m256i sc32(int s) { return _mm256_set1_epi16((short) s); }
 
 // keven_signs_q2xs (ggml keeps it static in arch/x86/quants.c): one u64 per 7-bit sign index, byte k
 // = 0xFF when bit k of ksigns_iq2xs[i] is set, 0x01 otherwise.  With this a whole 32-value sign vector
@@ -213,7 +213,7 @@ template <> struct Fmt32<16> {   // IQ2_XXS: d, qs[32] u16
     static constexpr int bytes = 66;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
-        const uint8_t* q = b + 2 + 16 * j + 8 * half;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j + 8 * (ptrdiff_t) half;
         const uint32_t w0 = u32(q), w1 = u32(q + 4);
         g = _mm256_set_epi64x((long long) iq2xxs_grid[w0 >> 24], (long long) iq2xxs_grid[(w0 >> 16) & 255],
                               (long long) iq2xxs_grid[(w0 >> 8) & 255], (long long) iq2xxs_grid[w0 & 255]);
@@ -228,7 +228,7 @@ template <> struct Fmt32<17> {   // IQ2_XS: d, qs[32] u16 (9-bit grid index + 7-
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
         uint16_t v[8];
-        std::memcpy(v, b + 2 + 16 * j, 16);
+        std::memcpy(v, b + 2 + 16 * (ptrdiff_t) j, 16);
         const int o = 4 * half;
         g = _mm256_set_epi64x((long long) iq2xs_grid[v[o + 3] & 511], (long long) iq2xs_grid[v[o + 2] & 511],
                               (long long) iq2xs_grid[v[o + 1] & 511], (long long) iq2xs_grid[v[o] & 511]);
@@ -279,10 +279,10 @@ template <> struct Fmt32<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 
     static constexpr int bytes = 98;
     static constexpr float K = 0.25f;
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
-        const uint8_t* q = b + 2 + 16 * j + 8 * half;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j + 8 * (ptrdiff_t) half;
         g = _mm256_set_epi32((int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]], (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]],
                              (int) iq3xxs_grid[q[3]], (int) iq3xxs_grid[q[2]], (int) iq3xxs_grid[q[1]], (int) iq3xxs_grid[q[0]]);
-        const uint32_t w = u32(b + 2 + 64 + 8 * j + 4 * half);
+        const uint32_t w = u32(b + 2 + 64 + 8 * (ptrdiff_t) j + 4 * (ptrdiff_t) half);
         sgn = _mm256_set_epi64x((long long) even_signs.v[(w >> 21) & 127], (long long) even_signs.v[(w >> 14) & 127],
                                 (long long) even_signs.v[(w >> 7) & 127], (long long) even_signs.v[w & 127]);
         sc = sc32(2 * (int) (w >> 28) + 1);
@@ -293,7 +293,7 @@ template <> struct Fmt32<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4
     static constexpr int bytes = 110;
     static constexpr float K = 1.0f;
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
-        const uint8_t* q = b + 2 + 16 * j + 8 * half;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j + 8 * (ptrdiff_t) half;
         const uint32_t h = b[66 + 2 * j + half];
         alignas(16) uint16_t sp[8];
         grid_indices(q, hi_spread.iq3s[h], sp);
@@ -330,7 +330,7 @@ template <> struct Fmt32<121> {
     static constexpr int bytes = 110;
     static constexpr float K = 1.0f;
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
-        const uint8_t* q = b + 2 + 16 * j + 8 * half;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j + 8 * (ptrdiff_t) half;
         const uint32_t h = b[66 + 2 * j + half];
         const __m256i lo = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(q)));
         const __m256i hb = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32((int) h),
@@ -349,9 +349,9 @@ template <> struct Fmt32<118> {
     static constexpr int bytes = 98;
     static constexpr float K = 0.25f;
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
-        const uint8_t* q = b + 2 + 16 * j + 8 * half;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j + 8 * (ptrdiff_t) half;
         g = _mm256_i32gather_epi32(reinterpret_cast<const int*>(iq3xxs_grid), _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(q))), 4);
-        const uint32_t w = u32(b + 2 + 64 + 8 * j + 4 * half);
+        const uint32_t w = u32(b + 2 + 64 + 8 * (ptrdiff_t) j + 4 * (ptrdiff_t) half);
         sgn = even_signs4(w);
         sc = sc32(2 * (int) (w >> 28) + 1);
     }
