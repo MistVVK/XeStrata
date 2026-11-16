@@ -44,6 +44,8 @@ mod shell;
 // Plain std, built on every platform so its decisions are tested everywhere; only the Linux window process uses it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod fontguard;
+// The same for the DMA-BUF renderer choice (#5417).
+mod renderer_choice;
 #[cfg(target_os = "linux")]
 mod supervisor;
 
@@ -856,8 +858,9 @@ fn main() {
     #[cfg(target_os = "linux")]
     {
         // WebKitGTK's DMA-BUF renderer shows a blank window on several NVIDIA + Wayland desktops (and some virtual GPUs); the plain
-        // renderer is slower to start by a hair and always works. Anyone who set the variable themselves keeps their choice.
-        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        // renderer always works but paints on the CPU, which made typing and scrolling crawl on a 4K Radeon desktop (#5417). It
+        // is chosen only where it is needed (renderer_choice.rs). Anyone who set the variable themselves keeps their choice.
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() && renderer_choice::disable_dmabuf_here(std::path::Path::new("/sys")) {
             std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
         }
     }
