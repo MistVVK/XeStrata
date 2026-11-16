@@ -32,11 +32,12 @@ class Configuration(unittest.TestCase):
             self.assertEqual(len(result['images']), 1)
             self.assertEqual(result['model_content'][1]['type'], 'image')
 
-    def test_disabled_and_omitted_switch_stay_off(self):
-        for settings in ({}, {'image_results': False}):
-            with self.subTest(settings=settings):
-                hub = hub_from_config({'mcp_servers': {'fake': {'command': 'unused'}}, 'mcp': settings})
-                self.assertFalse(hub.settings['image_results'])
+    def test_disabled_switch_stays_off_and_an_omitted_one_is_left_to_the_picture_reader(self):
+        hub = hub_from_config({'mcp_servers': {'fake': {'command': 'unused'}}, 'mcp': {'image_results': False}})
+        self.assertIs(hub.settings['image_results'], False)
+        # #2343: not set = decided at start by whether the model reads pictures (serve.mcp.resolve_image_results)
+        hub = hub_from_config({'mcp_servers': {'fake': {'command': 'unused'}}, 'mcp': {}})
+        self.assertIsNone(hub.settings['image_results'])
 
     def test_switch_rejects_non_booleans(self):
         for value in ('true', 'false', 0, 1, None, [], {}):
