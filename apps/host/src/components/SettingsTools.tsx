@@ -6,6 +6,7 @@ import { tr } from '../lib/i18n';
  * the ones the other Settings panels use. The host owns the truth (GET/PUT /api/agent/tools); a change applies from the next message.
  */
 import { useEffect, useState } from 'react';
+import { useImeKeys } from '../lib/ime-keys';
 import { api } from '../lib/client';
 import { pushToast } from '../lib/store';
 import { Btn, Dialog, ErrorNotice, Field, Icon, Select } from './ui';
@@ -84,6 +85,7 @@ export function SettingsTools({ preview }: { preview?: ToolsState }) {
   const [remove, setRemove] = useState<CustomTool | null>(null);
   const [busy, setBusy] = useState(false);
   const [blockedDraft, setBlockedDraft] = useState('');
+  const ime = useImeKeys();
 
   async function load() {
     try { setState(await api.get<ToolsState>('/api/agent/tools')); setError(''); }
@@ -185,8 +187,8 @@ export function SettingsTools({ preview }: { preview?: ToolsState }) {
         </Field>) : <p className="small muted" style={{ padding: '12px 16px' }}>{tr('No folders are blocked.')}</p>}
       </div>
       <div className="row" style={{ marginTop: 12 }}>
-        <input className="st-input" style={{ flex: 1 }} aria-label={tr('Add folder')} spellCheck={false} placeholder={isWindowsPath ? 'D:\\Private' : '/home/you/private'} value={blockedDraft} onChange={e => setBlockedDraft(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter' && blockedOk) void addBlocked(); }} />
+        <input className="st-input" style={{ flex: 1 }} aria-label={tr('Add folder')} spellCheck={false} placeholder={isWindowsPath ? 'D:\\Private' : '/home/you/private'} value={blockedDraft} onChange={e => setBlockedDraft(e.target.value)} {...ime.events}
+          onKeyDown={e => { if (ime.owns(e)) return; if (e.key === 'Enter' && blockedOk) void addBlocked(); }} />
         <Btn size="sm" icon="plus" disabled={busy || !blockedOk} onClick={() => void addBlocked()}>{tr('Add folder')}</Btn>
       </div>
     </section>
