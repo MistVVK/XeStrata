@@ -9303,6 +9303,37 @@ SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "to
                "experimental_speed_projection")
 
 
+def load_shared_settings(path, warn=print) -> dict:
+    """The Chat settings kept next to a config between starts, read so that one bad key cannot erase the others.
+
+    The strict reader below belongs to POST /settings, where a client is there to be told which key is wrong and can
+    fix it.  At start-up nobody is there: the old code called the same strict reader and caught its ValueError with
+    `svc.shared = {}`, so a single unknown key - a typo, a key from a newer version, or a setting the server does not
+    know - discarded every OTHER setting in the file, `reasoning_effort` included, without a word in the log (#4933).
+
+    So the two failures are told apart here: a file that cannot be read, or is not a JSON object, is still ignored as
+    a whole (nothing in it can be trusted); a file that IS an object keeps every key the server understands, and each
+    key it does not is named on one line and skipped."""
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}                   # no file yet: the normal case on a first start, nothing to report
+    except (OSError, ValueError) as e:
+        warn(f"[strata] the Chat settings in {path} are ignored ({e}); other apps use their own settings")
+        return {}
+    if not isinstance(doc, dict):
+        warn(f"[strata] the Chat settings in {path} are ignored (a JSON object was expected, found "
+             f"{type(doc).__name__}); other apps use their own settings")
+        return {}
+    out = {}
+    for key, value in doc.items():
+        try:
+            out.update(clean_shared_defaults({key: value}))
+        except ValueError as e:
+            warn(f"[strata] one Chat setting in {path} is skipped ({e}); the others still apply")
+    return out
+
+
 def clean_shared_defaults(d) -> dict:
     """The Chat settings other apps get (POST /settings): only known keys, each checked; ValueError names a bad one."""
     if d is None:
@@ -10455,13 +10486,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         svc.config_path = a.config                      # #564: the web page's Settings view
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
-        try:
-            svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
-            if svc.shared:
-                print("[strata] other apps use the Chat settings: " +
-                      ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
-        except (OSError, ValueError):
-            svc.shared = {}
+        svc.shared = load_shared_settings(svc.shared_path)      # #4933: one unknown key no longer clears the rest
+        if svc.shared:
+            print("[strata] other apps use the Chat settings: " +
+                  ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
     if hub is not None:
         import atexit
         svc.mcp = hub

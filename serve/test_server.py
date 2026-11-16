@@ -3378,6 +3378,68 @@ class ConfigReasoningEffort(unittest.TestCase):
         self.assertEqual(cfg, {"args": ["--ctx", "4096"]})
 
 
+class LoadSharedSettings(unittest.TestCase):
+    """#4933: one unknown key in `.shared-settings.json` used to clear EVERY shared setting, silently.
+
+    The strict reader stays for POST /settings, where a client can be told which key is wrong.  At start-up the file
+    is read key by key instead: the keys the server understands keep applying and each one it does not is named and
+    skipped.  A file that cannot be parsed, or is not an object, is still ignored as a whole."""
+
+    def load(self, text):
+        from serve.server import load_shared_settings
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "x.shared-settings.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        said = []
+        got = load_shared_settings(path, warn=said.append)
+        return got, said
+
+    def test_two_known_keys_are_both_kept(self):
+        got, said = self.load('{"reasoning_effort": "medium", "top_p": 0.9}')
+        self.assertEqual(got, {"reasoning_effort": "medium", "top_p": 0.9})
+        self.assertEqual(said, [])
+
+    def test_an_unknown_key_no_longer_clears_the_known_ones(self):
+        # A made-up key, and not `preserve_thinking`: #4932 teaches the server that name, so on a tree carrying both
+        # changes this example would be a KNOWN key and the test would pass without exercising anything.
+        got, said = self.load('{"reasoning_effort": "medium", "preserve_thoughts": false}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertEqual(len(said), 1)
+        self.assertIn("preserve_thoughts", said[0])
+        self.assertIn("skipped", said[0])
+
+    def test_a_known_key_with_a_bad_value_is_named_and_skipped(self):
+        got, said = self.load('{"reasoning_effort": "medium", "top_p": 5}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertIn("top_p", said[0])
+
+    def test_several_bad_keys_are_each_named(self):
+        got, said = self.load('{"reasoning_effort": "medium", "nope": 1, "top_k": 900}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertEqual(len(said), 2)
+
+    def test_an_unreadable_file_is_ignored_whole_and_says_so(self):
+        got, said = self.load('{not json')
+        self.assertEqual(got, {})
+        self.assertEqual(len(said), 1)
+        self.assertIn("ignored", said[0])
+
+    def test_a_non_object_is_ignored_whole_and_says_so(self):
+        got, said = self.load('["reasoning_effort"]')
+        self.assertEqual(got, {})
+        self.assertEqual(len(said), 1)
+        self.assertIn("ignored", said[0])
+
+    def test_a_missing_file_is_quiet(self):
+        from serve.server import load_shared_settings
+        said = []
+        self.assertEqual(load_shared_settings(os.path.join(tempfile.gettempdir(), "no-such-file-4933.json"),
+                                              warn=said.append), {})
+        self.assertEqual(said, [])              # no file is the normal case: nothing to report
+
+
 class JoinedEngineArgs(unittest.TestCase):
     """#2267: "--ple-io mmap" written as one element of the config's args reached the engine as one argument."""
 
