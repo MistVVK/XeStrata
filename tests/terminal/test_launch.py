@@ -273,6 +273,21 @@ class Advanced(unittest.TestCase):
         self.assertIsNone(params.check_name("--prefill", ["--prefill"]))
         self.assertIsNone(params.check_name("--prefil", None))        # no list to check against: no warning
 
+    def test_an_environment_setting_without_a_row_is_not_a_typing_mistake(self):
+        """#5136: the engine reads environment settings its --help does not list, so the table cannot call one a newer flag or a
+        typing mistake, and it shows no default it does not know.  A flag is still checked against --help."""
+        rows = {r.name: r for r in params.build_rows(self.HELP, ["--kv", "int8"], None, {"STRATA_ROUTE_TAIL_SKIP": "0"}, {},
+                                                     {"STRATA_IQ_MT_MIN": "1", "--prefil": "1"})}
+        config, typed = rows["STRATA_ROUTE_TAIL_SKIP"], rows["STRATA_IQ_MT_MIN"]
+        self.assertEqual((config.default, config.tuned, config.yours), ("0", "0", ""))      # the run config's value
+        self.assertEqual(typed.cells(), ("STRATA_IQ_MT_MIN", "-", "-", "1"))                 # not "off": the table does not know
+        for r in (config, typed):
+            self.assertTrue(r.known)
+            self.assertNotIn("not in this engine's list", r.description)
+            self.assertNotIn("typing mistake", r.description)
+        self.assertFalse(rows["--prefil"].known)
+        self.assertIn("not in this engine's list", rows["--prefil"].description)
+
     def test_extra_becomes_argv_and_env(self):
         a, e = S.as_argv_changes({"--prefill": "65536", "--kv-grow": "", "--spec": "off", "STRATA_PIN_BY_NEED": "1"}, frozenset({"--kv-grow"}))
         self.assertEqual(a, {"--prefill": "65536", "--kv-grow": True, "--spec": None})
