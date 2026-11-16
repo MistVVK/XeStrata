@@ -25,6 +25,9 @@ class MappedFile;
 
 namespace strata::core {
 
+/// The groups of an Edge0 pack's D/U pair (labels.bin's range): the driver opens the pair with it.
+constexpr int kLatentGroups = 8;
+
 /// XESTRATA_LATENT_DENSE_FMT: 4 or 8 (the user's choice), 0 for auto (unset, empty or `auto`), -1 with `err` for
 /// another value.
 int latent_dense_fmt_env(std::string& err);
