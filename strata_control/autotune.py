@@ -424,18 +424,9 @@ class Tuner:
         r.classes = tune_knobs.machine_classes(self.ctx)
 
         # ---- stage 2: plan the candidates for this machine; how many depends on the time chosen
-        planned, skipped = tune_knobs.plan_arms(self.ctx, mode=o.mode, history_bad=self.history_bad)
+        planned, skipped = plan_candidates(self.ctx, o, history_bad=self.history_bad, left_s=o.budget_s - self._elapsed(), avg_run_s=self._avg_run())
         r.skipped = skipped
         per_arm = o.rounds or 2
-        if o.mode == "thorough":
-            n_arms = len(planned)
-        else:
-            left = int((o.budget_s - self._elapsed()) / max(1.0, self._avg_run()))
-            fixed = (per_arm - 1) + 1                      # extra base rounds, the final base
-            n_arms = min(len(planned), max(0, (left - fixed) // per_arm))
-        for p in planned[n_arms:]:
-            skipped.append({"id": p.arm.id, "label": p.arm.label, "reason": "left out to stay inside the time you chose"})
-        planned = planned[:n_arms]
         arms = [ArmReport(p.arm.id, p.arm.label, dict(p.args), dict(p.env), p.arm.answer) for p in planned]
         by_id = {a.id: a for a in arms}
         by_use = {p.arm.id: ("prompt" if p.arm.metric == "prompt" else o.use) for p in planned}
@@ -831,6 +822,37 @@ class Tuner:
 
 
 # --------------------------------------------------------------------------- building a tuner from a run configuration
+
+def plan_candidates(ctx: tune_knobs.Context, o: Options, *, history_bad: set[str] | None = None, left_s: float | None = None,
+                    avg_run_s: float = 150.0) -> tuple[list[tune_knobs.PlannedArm], list[dict[str, str]]]:
+    """The candidates a tune measures, in order, and the ones it leaves out with the reason: the machine's (tune_knobs.plan_arms), then, in the quick
+    tune, only as many as fit the time left (``left_s``, at ``avg_run_s`` an engine run). The run (Tuner) and `strata tune auto --plan` (#5232) both
+    use this one function, so the preview lists what the run then measures."""
+    planned, skipped = tune_knobs.plan_arms(ctx, mode=o.mode, history_bad=history_bad)
+    per_arm = o.rounds or 2
+    if o.mode == "thorough":
+        n_arms = len(planned)
+    else:
+        left = int(((o.budget_s or 1200.0) if left_s is None else left_s) / max(1.0, avg_run_s))
+        fixed = (per_arm - 1) + 1                          # extra base rounds, the final base
+        n_arms = min(len(planned), max(0, (left - fixed) // per_arm))
+    for p in planned[n_arms:]:
+        skipped.append({"id": p.arm.id, "label": p.arm.label, "reason": "left out to stay inside the time you chose"})
+    return planned[:n_arms], skipped
+
+
+def preview(ctx: tune_knobs.Context, o: Options, *, history_bad: set[str] | None = None, avg_run_s: float = 150.0) -> dict[str, Any]:
+    """`strata tune auto --plan` (#5232): what the tune would try and leave out, the engine runs and the time, before anything starts. The time left for the
+    candidates is the run's own: the budget less the first run (your current settings). The first run's measurements are not known yet (a setting that
+    depends on them is planned from the configuration alone)."""
+    o = o.resolved()
+    planned, skipped = plan_candidates(ctx, o, history_bad=history_bad, left_s=o.budget_s - avg_run_s, avg_run_s=avg_run_s)
+    per_arm = o.rounds or 2
+    runs = 1 + per_arm * (len(planned) + 1) - 1 + 1 + (o.confirm_pairs or 0) * 2 if planned else 1
+    return {"mode": o.mode, "try": [{"id": p.arm.id, "label": p.arm.label} for p in planned], "left_out": list(skipped),
+            "engine_runs": runs, "run_minutes": round(avg_run_s / 60.0, 1), "minutes": round(runs * avg_run_s / 60.0),
+            "budget_minutes": round(o.budget_s / 60.0)}
+
 
 def split_args(argv: list[str]) -> list[str]:
     return [str(a) for a in argv]

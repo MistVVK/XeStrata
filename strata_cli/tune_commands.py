@@ -24,7 +24,8 @@ def add_tune_auto(tune_sp: argparse._SubParsersAction) -> None:
         description="Measures your configuration, tries single-knob changes in interleaved rounds against it, keeps only gains "
                     "above the noise, and saves the result as a named preset that is applied at every start. "
                     "Nothing changes if the current settings are already the fastest.")
-    p.add_argument("target", help="a saved profile name or a run configuration (JSON) to tune")
+    p.add_argument("target", help="an installed model (IQ3_S, qwen/IQ3_S or a unique part of its name), a saved profile name or a run configuration (JSON) to tune")
+    p.add_argument("--plan", action="store_true", help="say what would be tried and what is left out, and about how long it takes; start nothing")
     p.add_argument("--mode", choices=("quick", "thorough"), default="quick",
                    help="quick: about 20 minutes. thorough: up to 2 hours, 5-pair confirmation (default quick)")
     p.add_argument("--goal", default="speed", help="speed (full performance), room (leave memory free), or room:MiB "
@@ -110,9 +111,56 @@ def _fail(message: str, code: int, machine: bool) -> int:
 
 
 def _load_target(target: str) -> tuple[Path, dict[str, Any]]:
+    """A run configuration (JSON path), a saved profile, else an installed model by name (#5232): IQ3_S, iq3_s, qwen/IQ3_S, or a part of one installed run
+    config's model name that fits only one. Several or none: refused with the names, nothing is started."""
     from strata_control import profiles
-    path, _profile, _rev = profiles.resolve(target)
-    return path, profiles.read_run_config(path)
+    path = Path(target).expanduser()
+    if path.suffix.lower() == ".json" or path.is_absolute() or path.exists():
+        path, _profile, _rev = profiles.resolve(target)
+        return path, profiles.read_run_config(path)
+    try:
+        saved = profiles._path(target).is_file()             # noqa: SLF001 - a saved profile of this name comes first, its own errors stay its own
+    except profiles.ProfileError:
+        saved = False                                        # not a profile name at all (IQ3_S, qwen/IQ3_S)
+    if saved:
+        path, _profile, _rev = profiles.resolve(target)
+        return path, profiles.read_run_config(path)
+    try:
+        found = installed_model_config(target)
+    except profiles.ProfileError as miss:
+        try:
+            profiles.resolve(target)                         # the exit code a name that is no model had before (5: not saved, 2: not a profile name)
+        except profiles.ProfileError as old:
+            raise profiles.ProfileError(str(miss), old.exit_code) from None
+        raise
+    return found, profiles.read_run_config(found)
+
+
+def installed_model_config(name: str, catalog=None) -> Path:
+    """The run config of the installed model `name` names (#5232); TuneTargetError with the choices when it names several or none."""
+    from strata_control import profiles
+    if catalog is None:
+        from strata_cli.launch.catalog import Catalog
+        catalog = Catalog()
+    fam, _, size = name.partition("/") if "/" in name else (None, "", name)
+    try:
+        f, m = catalog.resolve(size.strip(), (fam or "").strip() or None)
+        path = catalog.installed_config(catalog.tag_of(f, m))
+        if path is not None:
+            return Path(path)
+    except (ValueError, KeyError):
+        pass
+    rows = [c for c in catalog.installed_configs() if c.get("path")]
+    names = {str(c["path"]): str(c.get("model_name") or Path(c["path"]).stem.removeprefix("strata-")) for c in rows}
+    want = name.strip().lower().replace("/", "-")
+    hits = sorted({p for p, n in names.items() if want and (want in n.lower() or want in Path(p).stem.lower())})
+    if len(hits) == 1:
+        return Path(hits[0])
+    if hits:
+        raise profiles.ProfileError(f"'{name}' fits {len(hits)} installed models: " + ", ".join(sorted(names[h] for h in hits))
+                                    + ". Give more of the name.", 2)
+    known = ", ".join(sorted(set(names.values()))) or "none"
+    raise profiles.ProfileError(f"No saved profile or installed model is called '{name}'. Installed models: {known}.", 5)
 
 
 def _engine_exe(cfg: dict[str, Any]) -> str:
@@ -199,6 +247,11 @@ def auto(a: argparse.Namespace) -> int:
     hw = _hw_hash(identity)
     digest = (identity.get("model") or {}).get("sha256_shard1")
     bad = presets.bad_signatures(hw_hash=hw, model_digest=digest, engine_sha=(identity.get("engine") or {}).get("sha256"))
+    if getattr(a, "plan", False):
+        plan = autotune.preview(ctx, opts, history_bad=bad)
+        plan["model"] = presets.choices_from_config(cfg).get("model")
+        plan["config"] = str(cfg_path)
+        return _print({"plan": plan}, machine, _plan_words(plan))
 
     cancel = threading.Event()
     state: dict[str, Any] = {"stage": "start", "message": "Starting", "state": "running"}
@@ -262,6 +315,23 @@ def auto(a: argparse.Namespace) -> int:
     else:
         print(_human_result(out, saved))
     return {"improved": 0, "default_confirmed": 0, "cancelled": 130}.get(result.outcome, 6)
+
+
+def _plan_words(p: dict[str, Any]) -> str:
+    lines = [f"Tuning plan for {p.get('model') or p['config']} ({p['mode']}, up to {p['budget_minutes']} minutes). Nothing was started."]
+    if p["try"]:
+        lines.append("Would try, in this order:")
+        lines += [f"  {t['label']}" for t in p["try"]]
+    else:
+        lines.append("No other setting is worth trying on this PC; the tune would only measure your current settings.")
+    if p["left_out"]:
+        lines.append("Left out:")
+        lines += [f"  {t['label']}: {t['reason']}" for t in p["left_out"]]
+    over = p["minutes"] > p["budget_minutes"]
+    lines.append(f"About {p['engine_runs']} engine runs of about {p['run_minutes']:g} minutes each, about {p['minutes']} minutes"
+                 + (f", more than the {p['mode']} tune's {p['budget_minutes']}, so the last settings may not be reached. " if over else ". ")
+                 + "The first run measures your current settings; a setting that depends on what it measures may still be left out then.")
+    return "\n".join(lines)
 
 
 def _human_result(r: dict[str, Any], saved: dict[str, Any] | None) -> str:
