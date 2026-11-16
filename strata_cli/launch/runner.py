@@ -395,6 +395,23 @@ def installed_cards(base: dict | None, usable: list[dict] | None = None) -> list
     return cards or None
 
 
+def fit_parallel_for(catalog, s: S.LaunchSettings, vram_gb: float | None) -> int:
+    """"Fit to your card": the VRAM table (S.fit_parallel), except for a model with an engine path of its own (Qwen3.6-35B-A3B), whose
+    engine refuses to start when the slots' sessions do not fit (#5239: 3 slots planned at 128K on a 24 GB card, 5.56 GiB each, the start
+    failed after the download): there setup's own rule for that model and context decides (own_path_parallel_recommend; 0 = one at a time),
+    never more than the table's number."""
+    table = S.fit_parallel(vram_gb)
+    try:
+        setup = catalog.strata.setup_module()
+        fam = (getattr(setup, "OWN_PATH_FAMILIES", None) or {}).get(s.family) if setup is not None else None
+        if fam is None or not s.model:
+            return table
+        rec = setup.own_path_parallel_recommend(fam, str(s.model), float(vram_gb or 0.0), int(s.context or 32768))
+    except Exception:                                        # noqa: BLE001 - the table as before when the rule cannot be asked
+        return table
+    return max(1, min(table, rec or 1))
+
+
 def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, base: dict | None = None) -> "list[int] | dict | None":
     """The cards this launch uses: the ones named (--gpu / --gpus, the Cards step), else the cards the installed config was set to (a person's
     earlier choice, "gpu": 1 or [1, 0] - never replaced by the automatic pick, which would put the first of equal cards back), else the
@@ -1837,7 +1854,7 @@ class Runner:
     def catalog_parallel(self) -> int | None:
         try:
             comp = self.catalog.computer()
-            return S.fit_parallel(comp.main_vram_gb) if comp.usable_gpus else None
+            return fit_parallel_for(self.catalog, self.s, comp.main_vram_gb) if comp.usable_gpus else None
         except Exception:                                    # noqa: BLE001
             return None
 
