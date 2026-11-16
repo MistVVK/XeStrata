@@ -69,6 +69,12 @@ MoeWindow::~MoeWindow() {
         if (lat_d_ != nullptr) strata::gpu::free(lat_d_);
         if (lat_u_ != nullptr) strata::gpu::free(lat_u_);
     }
+    for (strata::gpu::Stream& c : lat_side_) {
+        if (c == nullptr) continue;
+        strata::gpu::stream_sync(c);
+        strata::gpu::stream_destroy(c);
+    }
+    if (lat_ring_ != nullptr) strata::gpu::free(lat_ring_);
 }
 
 bool MoeWindow::resident_graph_on() {
@@ -116,13 +122,27 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             lat_d_ = const_cast<uint8_t*>(lat_d_shared_);
             lat_u_ = const_cast<uint8_t*>(lat_u_shared_);
             lat_fmt_ = lat_fmt_shared_;
-        } else if (const auto& sh = strata::core::latent_shared(); sh.d != nullptr) {
+        } else if (const auto& sh = strata::core::latent_shared(); sh.on()) {
             // the session's pair on this device (the driver uploaded it once); a layer-split stage holds its own
             // layers from sh.layer0
             lat_d_ = const_cast<uint8_t*>(sh.d);
             lat_u_ = const_cast<uint8_t*>(sh.u);
             lat_fmt_ = sh.fmt;
             lat_layer0_ = sh.layer0;
+            lat_sh_ = sh;
+            if (sh.ring > 0) {   // streamed layers: this window's ring and its copy branches
+                if (sh.ring > 3 ||
+                    !strata::gpu::alloc_device((void**) &lat_ring_, (size_t) sh.ring * (sh.d_bytes + sh.u_bytes))) {
+                    err = "moe window: the streamed D/U layers' ring (" +
+                          std::to_string(((uint64_t) sh.ring * (sh.d_bytes + sh.u_bytes)) >> 20) + " MiB) does not fit";
+                    return false;
+                }
+                for (int i = 0; i < sh.ring; ++i)
+                    if ((lat_side_[i] = strata::gpu::stream_create_copy()) == nullptr) {
+                        err = std::string("moe window: the D/U copy branch: ") + strata::gpu::last_error();
+                        return false;
+                    }
+            }
         } else {
             const char* dense = strata::env_get("LATENT_DENSE");
             if (dense == nullptr || dense[0] == '\0') {
@@ -492,9 +512,71 @@ void MoeWindow::publish(int tb, int n, const float* x, const int32_t* ids, const
     expert_input(tb, n, x, cs);
 }
 
-void MoeWindow::latent_d_stage(int64_t layer, int tb, int n, const float* x, strata::gpu::Stream cs) {
+const uint8_t* MoeWindow::lat_d_at(int64_t layer, size_t d_bytes) const {
+    if (lat_ring_ != nullptr) return lat_sh_.streamed(layer) ? lat_slot(layer) : lat_sh_.res_d(layer);
+    return lat_d_ + (size_t) (layer - lat_layer0_) * d_bytes;
+}
+
+const uint8_t* MoeWindow::lat_u_at(int64_t layer, size_t u_bytes) const {
+    if (lat_ring_ != nullptr) return lat_sh_.streamed(layer) ? lat_slot(layer) + lat_sh_.d_bytes : lat_sh_.res_u(layer);
+    return lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes;
+}
+
+bool MoeWindow::lat_fork_copy(int64_t layer, strata::gpu::Stream cs) {
+    const int s = (int) (lat_sh_.stream_index(layer) % lat_sh_.ring);
+    if (lat_pending_[s]) return true;   // (a slot holds one landing copy; the schedule never asks for a second)
+    if (!strata::gpu::stream_fork(cs, lat_side_[s]) ||
+        !strata::gpu::copy_async(lat_slot(layer), lat_sh_.host_du(layer), lat_sh_.d_bytes + lat_sh_.u_bytes,
+                                 lat_side_[s], "latent D/U", (int) layer))
+        return false;
+    lat_pending_[s] = true;
+    lat_slot_layer_[s] = layer;
+    return true;
+}
+
+// A streamed layer's copy runs on a branch of the window (its graph) beside the layers before it, from the moment its
+// slot's last reader (the layer `ring` streamed places earlier, its last group's U) is done to its own D stage, where
+// the branch joins.  The window's first streamed layers start landing at its first D stage.  A segmented window's
+// graphs end before each group's experts, which a branch cannot cross: there each layer is copied at its D stage.
+bool MoeWindow::lat_stream_in(int64_t layer, strata::gpu::Stream cs) {
+    if (lat_ring_ == nullptr) return true;
+    const bool here = lat_sh_.streamed(layer);
+    if (layer == win_lb_) {   // a new window: an earlier capture's branches were joined in it or discarded with it
+        for (int s = 0; s < 3; ++s) { lat_pending_[s] = false; lat_slot_layer_[s] = -1; }
+        if (!segmented_) {
+            int64_t l = lat_sh_.streamed_after(layer);
+            for (int i = here ? 1 : 0; i < lat_sh_.ring && l >= 0 && l < win_le_; ++i) {
+                if (!lat_fork_copy(l, cs)) return false;
+                l = lat_sh_.streamed_after(l);
+            }
+        }
+    }
+    if (!here) return true;
+    const int s = (int) (lat_sh_.stream_index(layer) % lat_sh_.ring);
+    if (lat_pending_[s] && lat_slot_layer_[s] == layer) {
+        lat_pending_[s] = false;
+        return strata::gpu::stream_join(cs, lat_side_[s]);
+    }
+    if (lat_pending_[s]) {   // another layer is landing in the slot: join it first (not reached by the schedule)
+        lat_pending_[s] = false;
+        if (!strata::gpu::stream_join(cs, lat_side_[s])) return false;
+    }
+    lat_slot_layer_[s] = layer;
+    return strata::gpu::copy_async(lat_slot(layer), lat_sh_.host_du(layer), lat_sh_.d_bytes + lat_sh_.u_bytes, cs,
+                                   "latent D/U", (int) layer);
+}
+
+bool MoeWindow::lat_stream_ahead(int64_t layer, strata::gpu::Stream cs) {
+    if (lat_ring_ == nullptr || segmented_ || !lat_sh_.streamed(layer)) return true;
+    const int64_t next = lat_sh_.streamed_after(layer, lat_sh_.ring);
+    if (next < 0 || next >= win_le_) return true;
+    return lat_fork_copy(next, cs);
+}
+
+bool MoeWindow::latent_d_stage(int64_t layer, int tb, int n, const float* x, strata::gpu::Stream cs) {
     using namespace strata::kernels;
-    if (!latent_ || n <= 0) return;
+    if (!latent_ || n <= 0) return true;
+    if (!lat_stream_in(layer, cs)) return false;
     const int64_t N = sh_.n_embd, ELL = lat_ELL_, G = lat_G_;
     const size_t row_b = lat_fmt_ == 4 ? 18 : 34;
     const size_t d_bytes = (size_t) G * (size_t) ELL * (size_t) (N / 32) * row_b;
@@ -502,7 +584,7 @@ void MoeWindow::latent_d_stage(int64_t layer, int tb, int n, const float* x, str
     // the input's q8_1 rows (the same bytes expert_input writes; the window's first group runs this before the
     // router, so the pool's D rows have the router + plan + doorbell stretch of head start)
     quantize_q8_1_rows(x, n, N, nat_xq(tb), cs);
-    iq_mmvq(lat_fmt_ == 4 ? 2 : 8, lat_d_ + (size_t) (layer - lat_layer0_) * d_bytes, nat_xq(tb), lat_xl_ + (size_t) tb * G * ELL,
+    iq_mmvq(lat_fmt_ == 4 ? 2 : 8, lat_d_at(layer, d_bytes), nat_xq(tb), lat_xl_ + (size_t) tb * G * ELL,
             (int) N, (int) (G * ELL), n, cs);
     // the Q3_K pack's shared column scales: the D rows take 1/s once, before every consumer reads them
     latent_colscale_rows(lat_xl_ + (size_t) tb * G * ELL, (int64_t) n * G, (int) ELL,
@@ -514,6 +596,7 @@ void MoeWindow::latent_d_stage(int64_t layer, int tb, int n, const float* x, str
     latent_publish_d(lat_xl_ + (size_t) tb * G * ELL, lat_act0_ + (size_t) tb * G * (ELL / 32) * 34,
                      (int64_t) n * G, (int) ELL, m_latxl_ + (size_t) tb * G * ELL,
                      m_latact0_ + (size_t) tb * G * (ELL / 32) * 34, m_xlseq_, (uint32_t) (layer + 1), cs);
+    return true;
 }
 
 void MoeWindow::resident_plan(const int32_t* res_layer, int grp, int n, const int32_t* ids, uint32_t ring,
@@ -651,7 +734,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 const int du_t = lat_fmt_ == 4 ? 2 : 8;
                 strata::prefill::mmq::quantize(yl, lat_u_mmq_ids_, lat_u_mmq_ylq_, du_t, ELL, ELL, cap, cs);
                 strata::prefill::mmq::Product up;
-                up.w = lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes; up.type = du_t; up.w_rows = N; up.w_cols = ELL;
+                up.w = lat_u_at(layer, u_bytes); up.type = du_t; up.w_rows = N; up.w_cols = ELL;
                 up.expert_bytes = strata::prefill::mmq::matrix_bytes(du_t, N, ELL); up.n = (int) G;
                 up.xq = lat_u_mmq_ylq_; up.bounds = lat_u_mmq_bounds_; up.ids = lat_u_mmq_ids_;
                 // cap, not the largest group: the captured launch's row shape is fixed, the bounds count the rows
@@ -659,7 +742,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 lat_mmq_ctx_->run(up, cs);
             } else {
                 quantize_q8_1_rows(yl, cap, ELL, ylq, cs);
-                latent_u_grouped(lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes, ylq, ids, labels, lay.n_expert, cap, (int) ELL, (int) N,
+                latent_u_grouped(lat_u_at(layer, u_bytes), ylq, ids, labels, lay.n_expert, cap, (int) ELL, (int) N,
                                  hit_out, cs, lat_fmt_);
             }
             if (mode.resident || dp) {   // no CPU share: its rows are zeros
@@ -671,7 +754,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 stamp(23);
                 // ylq (this group's rows) holds the pool's rows on the device: the GPU's U above read it before,
                 // in stream order
-                latent_u_matvec(lat_u_ + (size_t) (layer - lat_layer0_) * u_bytes, reinterpret_cast<const uint8_t*>(ymiss), ylq,
+                latent_u_matvec(lat_u_at(layer, u_bytes), reinterpret_cast<const uint8_t*>(ymiss), ylq,
                                 ids, labels, p_dst, p_counts + 1, lay.n_expert, cap, (int) ELL, (int) N, parts, cs, lat_fmt_);
             } else {
                 if (!segmented_) wait_flag_ge(m_flag_, ring, cs);   // the CPU's H-wide contributions
@@ -683,6 +766,12 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
             }
         } catch (const std::exception& e) {
             err = "moe window, latent MoE layer " + std::to_string(layer) + ": " + e.what();
+            return false;
+        }
+        // the layer's U read for the last group: the streamed layer `ring` places on may land in its slot
+        if (grp == groups - 1 && !lat_stream_ahead(layer, cs)) {
+            err = "moe window, latent MoE layer " + std::to_string(layer) + ": the D/U copy branch: " +
+                  strata::gpu::last_error();
             return false;
         }
         return true;

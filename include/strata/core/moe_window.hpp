@@ -27,6 +27,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/latent.hpp"
+#include "strata/core/latent_share.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -92,10 +93,14 @@ public:
     }
     /// Whether this window's pack is a latent one (the experts' width differs from the shell's).
     bool latent() const { return latent_; }
+    /// The layers [lb, le) a window runs, in order (the verifier's): a streamed D/U layer's copy is started ahead
+    /// only for a layer the same window reaches, so every copy branch a capture opens is joined in it.
+    void set_layer_range(int64_t lb, int64_t le) { win_lb_ = lb; win_le_ = le; }
     /// The D stage of MoE layer `layer`, tokens [tb, tb + n) of the WHOLE window (call once a layer, at the first
     /// token group, before the router): x's q8_1 rows through D, the column scales, the rows' q8_1 image for the
     /// experts, and the f32 rows + their Q8_0 image to mapped memory with the pool's doorbell (layer + 1).
-    void latent_d_stage(int64_t layer, int tb, int n, const float* x, strata::gpu::Stream cs);
+    /// A streamed D/U layer lands first (false: its copy failed, last_error() says why).
+    bool latent_d_stage(int64_t layer, int tb, int n, const float* x, strata::gpu::Stream cs);
     /// The pool's side of the latent window: the mapped D rows, their doorbell and their Q8_0 image (the CPU share
     /// reads them; ExpertDispatch's lat_* fields).
     const float* latent_xl_mapped() const { return h_latxl_; }
@@ -243,6 +248,25 @@ private:
     uint8_t* lat_u_ = nullptr;
     int64_t lat_layer0_ = 0;           ///< the first layer the pair holds (a layer-split stage's first; 0: all)
     bool lat_du_owned_ = false;
+    // streamed D/U layers (LatentShared::stream): this window's ring of lat_sh_.ring layers (D then U each), a copy
+    // branch a slot, and what each slot holds or is landing (-1: nothing)
+    LatentShared lat_sh_;
+    uint8_t* lat_ring_ = nullptr;
+    strata::gpu::Stream lat_side_[3] = {};
+    int64_t lat_slot_layer_[3] = {-1, -1, -1};
+    bool lat_pending_[3] = {};
+    int64_t win_lb_ = 0, win_le_ = INT64_MAX;
+    uint8_t* lat_slot(int64_t layer) const {
+        return lat_ring_ + (size_t) (lat_sh_.stream_index(layer) % lat_sh_.ring) * (lat_sh_.d_bytes + lat_sh_.u_bytes);
+    }
+    /// the layer's D and U on the device: resident, or its ring slot (lat_stream_in made it ready)
+    const uint8_t* lat_d_at(int64_t layer, size_t d_bytes) const;
+    const uint8_t* lat_u_at(int64_t layer, size_t u_bytes) const;
+    /// a streamed layer's D/U ready on `cs` before its D stage: the branch that copied it joined, or copied now
+    bool lat_stream_in(int64_t layer, strata::gpu::Stream cs);
+    /// after a layer's last U: the streamed layer `ring` places later starts landing in the slot this one freed
+    bool lat_stream_ahead(int64_t layer, strata::gpu::Stream cs);
+    bool lat_fork_copy(int64_t layer, strata::gpu::Stream cs);
     std::vector<int32_t> lat_labels_;  ///< [layers * E] group labels, host
     int32_t* lat_labels_dev_ = nullptr;
     float* lat_xl_ = nullptr;          ///< device: T*G rows of ELL (the D products)

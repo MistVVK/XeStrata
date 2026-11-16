@@ -716,7 +716,48 @@ struct Prefill::Impl {
     const uint8_t* lat_d_ = nullptr;         // the session's D/U pair on the device (latent_share.hpp)
     const uint8_t* lat_u_ = nullptr;
     int64_t lat_layer0_ = 0;                 // the first layer the pair holds (a layer-split stage's first; 0: all)
-    std::vector<int32_t> lat_labels_;
+    // streamed D/U layers (LatentShared::stream): a ring of two in the chunk's buffers (carve), the next streamed
+    // layer landing on `copy` while this one is read.  No copy outlives the chunk: its buffers may be lent slots.
+    strata::core::LatentShared lat_sh_;
+    uint8_t* lat_ring_ = nullptr;
+    strata::gpu::Event* lat_ring_copied_[2] = {};
+    strata::gpu::Event* lat_ring_free_[2] = {};
+    int64_t lat_ring_layer_[2] = {-1, -1};
+    int64_t lat_ring_last_ = -1;   // the last layer lat_stream_in saw (a smaller one starts a chunk)
+    uint8_t* lat_ring_slot(int64_t l) const {
+        return lat_ring_ + (size_t) (lat_sh_.stream_index(l) % 2) * (lat_sh_.d_bytes + lat_sh_.u_bytes);
+    }
+    const uint8_t* lat_d_at(int64_t l, size_t d_bytes) const {
+        if (lat_sh_.ring > 0) return lat_sh_.streamed(l) ? lat_ring_slot(l) : lat_sh_.res_d(l);
+        return lat_d_ + (size_t) (l - lat_layer0_) * d_bytes;
+    }
+    const uint8_t* lat_u_at(int64_t l, size_t u_bytes) const {
+        if (lat_sh_.ring > 0) return lat_sh_.streamed(l) ? lat_ring_slot(l) + lat_sh_.d_bytes : lat_sh_.res_u(l);
+        return lat_u_ + (size_t) (l - lat_layer0_) * u_bytes;
+    }
+    // before layer l's D: a streamed layer's copy landed (or made now), and the next streamed layer of the chunk
+    // starts landing in the other slot once the layer that held it is done (its U is on cs already)
+    bool lat_stream_in(int64_t l) {
+        if (lat_sh_.ring <= 0) return true;
+        if (l <= lat_ring_last_) lat_ring_layer_[0] = lat_ring_layer_[1] = -1;   // a new chunk: nothing in the ring
+        lat_ring_last_ = l;
+        if (!lat_sh_.streamed(l)) return true;
+        const uint64_t bytes = lat_sh_.d_bytes + lat_sh_.u_bytes;
+        auto land = [&](int64_t layer) {
+            const int s = (int) (lat_sh_.stream_index(layer) % 2);
+            lat_ring_layer_[s] = layer;
+            return strata::gpu::event_record(lat_ring_free_[s], cs) &&
+                   strata::gpu::stream_wait_event(copy, lat_ring_free_[s]) &&
+                   strata::gpu::copy_async(lat_ring_slot(layer), lat_sh_.host_du(layer), bytes, copy, "latent D/U",
+                                           (int) layer) &&
+                   strata::gpu::event_record(lat_ring_copied_[s], copy);
+        };
+        const int s = (int) (lat_sh_.stream_index(l) % 2);
+        if (lat_ring_layer_[s] != l && !land(l)) return false;
+        if (!strata::gpu::stream_wait_event(cs, lat_ring_copied_[s])) return false;
+        const int64_t next = lat_sh_.streamed_after(l);
+        return next < 0 || land(next);
+    }
     int32_t* lat_labels_dev_ = nullptr;
     float* lat_xl_ = nullptr;                // the dp4a arm's buffers: in the MoE stage's set (latent_set_sizes, carve)
     uint8_t* lat_xlq_ = nullptr;
@@ -1059,6 +1100,8 @@ void Prefill::release() {
     for (int b = 0; b < 2; ++b) {
         if (impl_->mgrp_used[b]) strata::gpu::event_destroy(impl_->mgrp_used[b]);
         if (impl_->lat_tbl_ev[b]) strata::gpu::event_destroy(impl_->lat_tbl_ev[b]);
+        if (impl_->lat_ring_copied_[b]) strata::gpu::event_destroy(impl_->lat_ring_copied_[b]);
+        if (impl_->lat_ring_free_[b]) strata::gpu::event_destroy(impl_->lat_ring_free_[b]);
         if (impl_->hand[b]) strata::gpu::free(impl_->hand[b]);
         if (impl_->hand_done[b]) strata::gpu::event_destroy(impl_->hand_done[b]);
         for (strata::gpu::Event* e : impl_->hand_ev[b])
@@ -1408,7 +1451,7 @@ void ple_landing_probe(void* stream, strata::kernels::PleTable& table, int64_t c
 // ELL wide) U takes back to the shell's width.  latent_mmq_d runs before the experts (D, its column scales, the U
 // stage's tables, the combine's slots); latent_mmq_u after them.  The experts themselves are the standard path's:
 // its staging, in-place reads and groups.
-bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string&) {
+bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err) {
     using namespace strata::kernels;
     const int64_t ELL = m.lat_ELL_;
     const int G = m.lat_G_, E = (int) m.g->n_expert;
@@ -1447,9 +1490,13 @@ bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string
     m.lmmq_bnd_h_.to_device(m.lmmq_bounds_, m.cs);
     m.slot_host.to_device(m.slot_dev, m.cs);
     // D: the chunk's rows through the layer's D, then the column scales
+    if (!m.lat_stream_in(l)) {
+        err = "prefill: the latent D/U copy of layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+        return false;
+    }
     mmq::quantize(m.mixed, nullptr, m.lmmq_xq_, du_t, N, N, T, m.cs);
     mmq::Product d;
-    d.w = m.lat_d_ + (size_t) (l - m.lat_layer0_) * d_bytes; d.type = du_t; d.w_rows = G * ELL; d.w_cols = N;
+    d.w = m.lat_d_at(l, d_bytes); d.type = du_t; d.w_rows = G * ELL; d.w_cols = N;
     d.expert_bytes = mmq::matrix_bytes(du_t, G * ELL, N); d.n = 1; d.xq = m.lmmq_xq_;
     d.bounds = m.lmmq_bounds_; d.ids = m.ids_identity; d.total_rows = T; d.max_rows = T; d.rows = T;
     d.dst = m.lmmq_xl_; d.ld_dst = G * ELL;
@@ -1468,7 +1515,7 @@ bool Prefill::latent_mmq_u(int64_t l, int64_t T, int64_t K, Impl& m, std::string
     for (int gg = 0; gg < G; ++gg)
         maxr = std::max<int64_t>(maxr, m.lmmq_bnd_h_[static_cast<size_t>(gg) + 3] - m.lmmq_bnd_h_[static_cast<size_t>(gg) + 2]);
     mmq::Product up;
-    up.w = m.lat_u_ + (size_t) (l - m.lat_layer0_) * u_bytes; up.type = du_t; up.w_rows = N; up.w_cols = ELL;
+    up.w = m.lat_u_at(l, u_bytes); up.type = du_t; up.w_rows = N; up.w_cols = ELL;
     up.expert_bytes = mmq::matrix_bytes(du_t, N, ELL); up.n = G; up.xq = m.lmmq_ylq_;
     up.bounds = m.lmmq_bounds_ + 2; up.ids = m.ids_identity; up.total_rows = T * K; up.max_rows = maxr; up.rows = T * K;
     up.dst = m.Dm; up.ld_dst = N;
@@ -1495,8 +1542,12 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
         strata::gpu::event_record(m.used[0], m.cs);   // a valid marker: the first batch's DMA may wait on it
     }
     // D: the chunk's rows through the layer's D, the column scales, the experts' q8_1 image
+    if (!m.lat_stream_in(l)) {
+        err = "prefill: the latent D/U copy of layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+        return false;
+    }
     quantize_q8_1_rows(m.mixed, T, N, m.lat_xq_, m.cs);
-    iq_mmvq(m.lat_fmt_ == 4 ? 2 : 8, m.lat_d_ + (size_t) (l - m.lat_layer0_) * d_bytes, m.lat_xq_, m.lat_xl_, (int) N, (int) (G * ELL),
+    iq_mmvq(m.lat_fmt_ == 4 ? 2 : 8, m.lat_d_at(l, d_bytes), m.lat_xq_, m.lat_xl_, (int) N, (int) (G * ELL),
             (int) T, m.cs);
     latent_colscale_rows(m.lat_xl_, T * G, (int) ELL, latent_colscale_dev((int) l, (int) ELL), m.cs);
     quantize_q8_1_rows(m.lat_xl_, T * G, ELL, m.lat_xlq_, m.cs);
@@ -1579,7 +1630,7 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
     }
     // U: each route's latent output back to the shell's width, then the combine (the rows are in routing order)
     quantize_q8_1_rows(m.lat_yl_, T * K, ELL, m.lat_ylq_, m.cs);
-    latent_u_grouped(m.lat_u_ + (size_t) (l - m.lat_layer0_) * u_bytes, m.lat_ylq_, m.ids, m.lat_labels_dev_ + (size_t) l * E, E, T * K,
+    latent_u_grouped(m.lat_u_at(l, u_bytes), m.lat_ylq_, m.ids, m.lat_labels_dev_ + (size_t) l * E, E, T * K,
                      (int) ELL, (int) N, m.Dm, m.cs, m.lat_fmt_);
     for (int64_t i = 0; i < T * K; ++i) m.slot_host[(size_t) i] = (int32_t) i;   // the identity: the rows are in routing order
     m.slot_host.to_device(m.slot_dev, m.cs);
@@ -1788,7 +1839,19 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.lat_u_ = sh.u;
             m.lat_fmt_ = sh.fmt;
             m.lat_layer0_ = sh.layer0;
-            if (m.lat_d_ == nullptr || m.lat_u_ == nullptr) {
+            m.lat_sh_ = sh;
+            if (sh.ring > 0) {   // streamed layers: their ring is in the chunk's buffers (carve)
+                for (int s = 0; s < 2; ++s)
+                    if ((m.lat_ring_copied_[s] == nullptr && !strata::gpu::event_create(&m.lat_ring_copied_[s])) ||
+                        (m.lat_ring_free_[s] == nullptr && !strata::gpu::event_create(&m.lat_ring_free_[s]))) {
+                        err = "prefill: the streamed D/U layers' events could not be made";
+                        return false;
+                    }
+                if (m.lat_ring_ == nullptr) {
+                    err = "prefill: the streamed D/U layers' ring is not in the chunk's buffers";
+                    return false;
+                }
+            } else if (m.lat_d_ == nullptr || m.lat_u_ == nullptr) {
                 err = "prefill: the latent D/U pair is not on the device (the driver uploads it before the prompt path)";
                 return false;
             }
@@ -1997,6 +2060,9 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.used_of[i] = i;
         }
     }
+    m.lat_ring_ = nullptr;
+    if (const uint64_t lr = strata::core::latent_prefill_ring_bytes()) m.lat_ring_ = o.take<uint8_t>((size_t) lr, ok);
+    m.lat_ring_layer_[0] = m.lat_ring_layer_[1] = -1;
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
@@ -2217,6 +2283,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
         if ((int64_t) T < stream_all_min()) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
     }
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
+    if (const uint64_t lr = strata::core::latent_prefill_ring_bytes()) o.take<uint8_t>((size_t) lr, ok);
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;

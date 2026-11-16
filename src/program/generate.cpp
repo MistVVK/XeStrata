@@ -1188,7 +1188,7 @@ bool adapt_cuts_windows() {
         if (p == strata::core::Pick::Off) return false;
         if (p == strata::core::Pick::On) return true;
         for (const auto& pair : strata::core::latent_shared_table())
-            if (pair.d != nullptr) return false;
+            if (pair.on()) return false;
         return !strata::core::adapt_layers_round_alike();
     }();
     return v;
@@ -2086,7 +2086,14 @@ struct LatentTab {
         }
         auto& t = strata::core::latent_shared_table();
         if ((size_t) device >= t.size()) t.resize((size_t) device + 1);
-        t[(size_t) device] = {d, u, lat_fmt, lb, db + ub};
+        t[(size_t) device] = {};
+        t[(size_t) device].d = d;
+        t[(size_t) device].u = u;
+        t[(size_t) device].fmt = lat_fmt;
+        t[(size_t) device].layer0 = lb;
+        t[(size_t) device].bytes = db + ub;
+        t[(size_t) device].d_bytes = dense.d_bytes();
+        t[(size_t) device].u_bytes = dense.u_bytes();
         std::fprintf(stderr, "xestrata generate: latent MoE: ELL %lld, I %lld, G %d, D/U fmt %d, layers %lld-%lld, "
                              "%.2f GiB on CUDA%d\n",
                      (long long) lat_ELL, (long long) lat_I, lat_G, lat_fmt, (long long) lb, (long long) (le - 1),
@@ -2100,6 +2107,7 @@ struct LatentTab {
             const strata::core::OnDevice on(device);
             strata::gpu::free(t[(size_t) device].d);
             strata::gpu::free(t[(size_t) device].u);
+            strata::gpu::free(t[(size_t) device].host);
             t[(size_t) device] = {};
         }
         path = strata::core::latent_dense_sibling(path, 4);
@@ -2112,6 +2120,76 @@ struct LatentTab {
         std::fprintf(stderr, "xestrata generate: latent D/U: Q4_0 (%s) - Q8_0 leaves this card no working expert cache "
                              "(XESTRATA_LATENT_DENSE_FMT=8 insists on Q8_0)\n", path.c_str());
         return upload(device, lb, le, err);
+    }
+    // Streams `n_stream` of the layers [lb, le) on `device` (a single GPU's pair): their D/U go to pinned host memory
+    // and the readers copy each into a ring of their own ahead of its use (MoeWindow, Prefill); the rest stay on the
+    // device.  The streamed layers are spread evenly, so each copy has the resident layers between it and the last
+    // one to hide behind; a window's ring holds three layers where two streamed layers are neighbours (the copy of
+    // layer l + 1 starts once layer l - 2's U is done), else two.  0 puts every layer back on the device.
+    bool stream(int device, int64_t lb, int64_t le, int64_t n_stream, std::string& err) {
+        auto& t = strata::core::latent_shared_table();
+        const strata::core::OnDevice on(device);
+        if ((size_t) device < t.size()) {
+            strata::gpu::free(t[(size_t) device].d);
+            strata::gpu::free(t[(size_t) device].u);
+            strata::gpu::free(t[(size_t) device].host);
+            t[(size_t) device] = {};
+        }
+        if (n_stream <= 0) return upload(device, lb, le, err);
+        const int64_t nl = le - lb;
+        n_stream = std::min(n_stream, nl);
+        std::vector<int32_t> at((size_t) nl);
+        int32_t nres = 0, nstr = 0;
+        bool neighbours = false;
+        for (int64_t i = 0; i < nl; ++i) {
+            const bool st = (i + 1) * n_stream / nl > i * n_stream / nl;
+            neighbours = neighbours || (st && i > 0 && at[(size_t) i - 1] < 0);
+            at[(size_t) i] = st ? -1 - nstr++ : nres++;
+        }
+        const size_t db = dense.d_bytes(), ub = dense.u_bytes();
+        uint8_t *d = nullptr, *u = nullptr, *h = nullptr;
+        if ((nres > 0 && (!strata::gpu::alloc_device((void**) &d, (size_t) nres * db) ||
+                          !strata::gpu::alloc_device((void**) &u, (size_t) nres * ub))) ||
+            !strata::gpu::alloc_host((void**) &h, (size_t) nstr * (db + ub))) {
+            strata::gpu::free(d);
+            strata::gpu::free(u);
+            strata::gpu::free(h);
+            err = "the latent D/U: " + std::to_string(nres) + " layers on the device and " + std::to_string(nstr) +
+                  " in pinned memory do not fit";
+            return false;
+        }
+        for (int64_t l = lb; l < le; ++l) {
+            const int32_t a = at[(size_t) (l - lb)];
+            if (a < 0) {
+                uint8_t* const p = h + (size_t) (-1 - a) * (db + ub);
+                std::memcpy(p, dense.d(l), db);
+                std::memcpy(p + db, dense.u(l), ub);
+            } else if (!strata::gpu::copy(d + (size_t) a * db, dense.d(l), db) ||
+                       !strata::gpu::copy(u + (size_t) a * ub, dense.u(l), ub)) {
+                err = "the latent D/U upload failed at layer " + std::to_string(l);
+                return false;
+            }
+        }
+        if ((size_t) device >= t.size()) t.resize((size_t) device + 1);
+        auto& e = t[(size_t) device];
+        e.d = d; e.u = u; e.fmt = lat_fmt; e.layer0 = lb; e.bytes = (uint64_t) nres * (db + ub);
+        e.d_bytes = db; e.u_bytes = ub; e.host = h; e.at = std::move(at); e.ring = neighbours ? 3 : 2;
+        std::fprintf(stderr, "xestrata generate: latent D/U: %d of %lld layers streamed from pinned memory "
+                             "(%.2f GiB; a window's ring of %d layers, %.0f MiB), %.2f GiB on CUDA%d\n",
+                     nstr, (long long) nl, (double) nstr * (double) (db + ub) / 1073741824.0, e.ring,
+                     (double) e.ring * (double) (db + ub) / 1048576.0, (double) e.bytes / 1073741824.0, device);
+        return true;
+    }
+    // auto, with the expert cache's slots known: Q8_0's D/U leave `slots_q8` of `blob` bytes; Q4_0's would leave
+    // the Q8_0 pair's extra bytes more.  Q8_0 stays unless the cache would lack the slots it needs (`min_slots`) or
+    // lose more than a tenth of what Q4_0 leaves: the 16 GB and smaller cards' caches, where the experts read over
+    // PCIe cost more than the coarser D/U (Edge0-145B: 3.49 GiB in Q8_0, 1.85 in Q4_0; an RTX 4070's 12 GB had no
+    // slot left with Q8_0).  The tenth is a start, to be measured on the three makers' cards.
+    bool wants_q4(int64_t slots_q8, int64_t min_slots, int64_t blob, uint64_t du_bytes) const {
+        if (!auto_fmt || lat_fmt != 8 || blob <= 0) return false;
+        const int64_t extra = (int64_t) (du_bytes - du_bytes / 34 * 18);   // Q8_0's 34-byte rows against Q4_0's 18
+        const int64_t slots_q4 = slots_q8 + extra / blob;
+        return slots_q8 < min_slots || slots_q8 * 10 < slots_q4 * 9;
     }
 };
 }  // namespace
@@ -5499,10 +5577,12 @@ int main(int argc, char** argv) {
                              : 160 + (o.prefill_chunk * 680) / 1024)
                 : 0;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-        int64_t mtp_bind = 0, reserve = 0, slots = 0;
+        int64_t mtp_bind = 0, reserve = 0, slots = 0, lat_rings = 0;
         // past XESTRATA_VRAM_LIMIT_MIB: how far, where the free memory reads 0 (an 8 GB limit on the B70: the D/U's
         // and the drafter's steps changed nothing the sizing saw, and the shortfall was understated)
         int64_t over_b = 0;
+        // the decode windows' rings for streamed D/U layers (MoeWindow): allocated with the verifiers, after the cache
+        const int lat_windows = 1 + (o.pipeline_windows > 0 ? 1 : 0);
         auto size_cache = [&] {
             size_t short_b = 0;
             strata::gpu::mem_info(&free_b, &total_b, &short_b);
@@ -5524,7 +5604,11 @@ int main(int argc, char** argv) {
             // DFlash2's draft head and logits bind after the cache too (its pack and slab are already loaded)
             if (df2_loaded && native_head.loaded())
                 mtp_bind += (int64_t) df2.bind_bytes(native_head.row_bytes(), n_vocab, df2_vocab);
-            reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
+            {
+                const auto& lsh = strata::core::latent_shared_on(0);
+                lat_rings = (int64_t) lat_windows * lsh.ring * (int64_t) (lsh.d_bytes + lsh.u_bytes);
+            }
+            reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first + lat_rings;
             // Not rounded: free VRAM moves the cache by a slot or two between starts, and with it the last bits of
             // the output (the 2026-10-02-new-machine record), but rounding to 64 slots cost the RTX 4070 3-4% of its
             // decode.  Runs that must give the same tokens fix the size with --expert-cache N.
@@ -5538,10 +5622,14 @@ int main(int argc, char** argv) {
         };
         size_cache();
         // #496 (below): the slots a working cache needs
-        const int64_t min_slots = (o.prefill_chunk > 0 && borrow)
-            ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
-        // the latent D/U's default Q8_0 leaves the cache fewer slots than it needs: the pack's Q4_0 (LatentTab)
-        if (lat_tab.latent && lat_tab.q4_fallback && slots < min_slots) {
+        auto min_slots_now = [&]() -> int64_t {
+            return (o.prefill_chunk > 0 && borrow)
+                ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
+        };
+        int64_t min_slots = min_slots_now();
+        // the latent D/U's format (auto): Q4_0 where Q8_0 leaves the cache too little (LatentTab::wants_q4)
+        if (lat_tab.latent && lat_tab.wants_q4(slots, min_slots, blob, strata::core::latent_device_bytes(0))) {
+            const int64_t slots_q8 = slots;
             std::string le;
             if (!lat_tab.to_q4(0, 0, multi_gpu ? split_at[0] : g.n_layers, le)) {
                 std::fprintf(stderr, "xestrata generate: %s\n", le.c_str());
@@ -5591,10 +5679,11 @@ int main(int argc, char** argv) {
             if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > small_reserve_mib) {
                 // the largest reserve (in MiB) that still leaves min_slots
                 const int64_t fit_mib =
-                    ((int64_t) free_b - over_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
+                    ((int64_t) free_b - over_b - mtp_bind - pipe_first - lat_rings - min_slots * blob) / (1 << 20) -
+                    prefill_mib;
                 if (fit_mib >= small_reserve_mib) {
                     const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
-                    const int64_t taken = (((int64_t) r + prefill_mib) << 20) + mtp_bind + pipe_first;
+                    const int64_t taken = (((int64_t) r + prefill_mib) << 20) + mtp_bind + pipe_first + lat_rings;
                     int64_t s2 = ((int64_t) free_b - over_b - taken) / blob;
                     // not below the slots a working cache needs (s2 >= min_slots: r leaves them)
                     s2 = std::max<int64_t>(min_slots, s2);
@@ -5609,10 +5698,13 @@ int main(int argc, char** argv) {
             }
         };
         adapt_reserve();
-        // A card short of a working expert cache (8 GB with Edge0-120B): the drafter's routed experts go to pinned
-        // memory, its kernels reading the few a draft routes to in place (XESTRATA_MTP_EXPERTS_HOST): a draft step
-        // reads 10 of the 512.  A single GPU only (a layer split's stages size their own devices).  "on" takes the
-        // step whatever the cache, to measure it on a card that does not need it.
+        // A card the resident D/U (already Q4_0) leave short of a working cache (8 GB with Edge0-120B): first the
+        // drafter's routed experts go to pinned memory, its kernels reading the few a draft routes to in place
+        // (XESTRATA_MTP_EXPERTS_HOST), then the fewest D/U layers that give the cache its slots are streamed
+        // (XESTRATA_LATENT_STREAM, LatentTab::stream).  That order is the cost's: a round reads a drafter's routed
+        // experts a draft step (10 of 512) where a streamed layer's D/U crosses the link whole, once a window.
+        // A single GPU only (a layer split's stages size their own devices).  "on" takes the step whatever the
+        // cache, to measure it on a card that does not need it.
         if (split_devs.empty()) {
             const auto mtp_pick = strata::core::pick_from_env("MTP_EXPERTS_HOST");
             if (mtp.loaded() && !mtp.experts_on_host() &&
@@ -5632,6 +5724,40 @@ int main(int argc, char** argv) {
                                  slots_text(before).c_str());
                 }
             }
+            const auto lat_pick = strata::core::pick_from_env("LATENT_STREAM");
+            if (lat_tab.latent && lat_pick != strata::core::Pick::Off &&
+                (lat_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
+                const auto& lsh = strata::core::latent_shared_on(0);
+                const int64_t L = (int64_t) (lsh.d_bytes + lsh.u_bytes), nl = g.n_layers;
+                // streaming k layers frees k of them, less the windows' rings (3 layers where two streamed layers are
+                // neighbours, k > nl / 2, else 2) and, lent from the cache, the prompt path's ring of 2
+                auto gain = [&](int64_t k) {
+                    const int64_t r = 2 * k > nl ? 3 : 2;
+                    return k * L - (int64_t) lat_windows * r * L - (borrow && o.prefill_chunk > 0 ? 2 * L : 0);
+                };
+                int64_t k = nl;
+                if (lat_pick != strata::core::Pick::On) {
+                    // the reserve may still come down to its floor (adapt_reserve, after this)
+                    const int64_t drop = o.vram_reserve_given ? 0
+                        : (int64_t) std::max(0, o.vram_reserve_mib - small_reserve_mib) << 20;
+                    const int64_t want = (min_slots - slots) * blob + blob - drop;
+                    for (k = 1; k < nl && gain(k) < want; ++k) {}
+                }
+                std::string le;
+                if (L > 0 && k > 0) {
+                    const int64_t before = slots;
+                    if (!lat_tab.stream(0, 0, nl, k, le)) {
+                        std::fprintf(stderr, "xestrata generate: %s\n", le.c_str());
+                        return 1;
+                    }
+                    min_slots = min_slots_now();   // the prompt path's ring is in its buffers now
+                    size_cache();
+                    std::fprintf(stderr, "xestrata generate: latent D/U: %lld layers streamed "
+                                         "(XESTRATA_LATENT_STREAM=0 keeps them on the device): the expert cache %lld "
+                                         "slots in place of %lld, %lld needed\n", (long long) k, (long long) slots,
+                                 (long long) before, (long long) min_slots);
+                }
+            }
         }
         if (slots > o.expert_cache) {   // the steps above made room
             o.expert_cache = (int) slots;
@@ -5641,7 +5767,8 @@ int main(int argc, char** argv) {
             // what is short, and what makes room: the numbers a small card picks from
             const int64_t at_reserve = o.vram_reserve_given ? o.vram_reserve_mib
                                                             : std::min(o.vram_reserve_mib, small_reserve_mib);
-            const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + pipe_first + min_slots * blob;
+            const int64_t need_b =
+                (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + pipe_first + lat_rings + min_slots * blob;
             const int64_t short_mib =
                 std::max<int64_t>(1, (need_b - (int64_t) free_b + over_b + (1 << 20) - 1) >> 20);
             const int64_t session_mib = (int64_t) (strata::core::session_bytes(g, o.max_context, K) >> 20);
