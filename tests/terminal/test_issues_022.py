@@ -493,3 +493,13 @@ class DoctorAndTheDrafter(unittest.TestCase):
             self.assertEqual(self.report()["status"], "optional_missing", "Intel is DFlash2 too")
         with mock.patch.object(drafting, "detect_hardware", return_value=("cpu", [])):
             self.assertEqual(self.report()["status"], "missing", "an engine without the code stays on the MTP")
+
+    def test_a_model_saved_with_off_needs_no_mtp_folder(self):
+        """0.2.15 release test (the app, after a restart): a model saved with Drafting Off and no MTP folder was "missing rt" and could not load."""
+        from unittest import mock
+        from strata_control import drafting
+        for hardware in (("cuda", ["sm_120"]), ("cuda", ["sm_60"]), ("hip", ["gfx1201"]), ("cpu", [])):
+            with mock.patch.object(drafting, "detect_hardware", return_value=hardware):
+                self.assertEqual(self.report(drafting="off")["status"], "optional_missing", hardware)
+                self.assertEqual(self.report(drafting="OFF")["status"], "optional_missing", hardware)
+                self.assertEqual(self.report(drafting="mtp")["status"], "missing", "the MTP chosen still needs its layer")

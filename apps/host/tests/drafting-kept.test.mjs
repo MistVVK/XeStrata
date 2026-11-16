@@ -26,3 +26,11 @@ test('the run-config write at ready starts from the file as it is now, so the sa
   assert.match(helper, /checkedSettingsConfig\(readFileSync\(path,'utf8'\)\)/);
   assert.match(helper, /catch\{return fallback;\}/);
 });
+
+test('after an app restart the Models screen shows the saved Drafting choice: the page follows the saved value when it arrives', () => {
+  const screen = readFileSync(fileURLToPath(new URL('../src/components/NativeModels.tsx', import.meta.url)), 'utf8').replace(/\r\n/g, '\n');
+  const at = screen.indexOf("setDrafting(installed.drafting ?? 'auto');");
+  assert.ok(at > 0, 'the page opens a model with its saved choice');
+  const deps = screen.slice(screen.indexOf('}, [', at), screen.indexOf(']);', at));
+  assert.match(deps, /installed\?\.drafting/, 'a saved choice that arrives after the page opened is shown (otherwise the next Load sends Auto)');
+});

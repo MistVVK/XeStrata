@@ -53,6 +53,20 @@ def _drafter_is_dflash2(cfg: dict) -> bool:
         return False
 
 
+def _drafter_needs_mtp(cfg: dict) -> bool:
+    """Will a start of this run config load the MTP layer? Not when the saved Drafting choice is Off, and not when the choice means DFlash2 (Auto
+    included). Only then is the --mtp folder a required file (0.2.15 release test: an app model saved with Off and no MTP folder was reported as missing
+    "rt" after a restart and could not load). A config that switched the layer off by hand ("mtp": false) is unchanged. Never raises; unknown keeps it
+    required."""
+    try:
+        from strata_control import drafting
+        if drafting.normalize(cfg.get("drafting")) == "off":
+            return False
+    except Exception:                                    # noqa: BLE001 - unknown: decided below
+        pass
+    return not _drafter_is_dflash2(cfg)
+
+
 def _item(name: str, path: Path, kind: str, *, required: bool = True) -> dict:
     try:
         if kind == "file":
@@ -216,9 +230,9 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
                 except ValueError:
                     pass
             kind = "file"
-        # The MTP layer is one of two drafters, never both: a model whose drafter is DFlash2 has no layer on disk, and the run config keeps `--mtp <folder>` for a
-        # later switch to the MTP. Its absence then does not make the model unusable (strata_control/drafting.py loads the drafter that is there).
-        components.append(_item(arg.lstrip("-"), _location(raw, cfg, config_path), kind, required=not (arg == "--mtp" and _drafter_is_dflash2(cfg))))
+        # The MTP layer is one of two drafters, never both: a model whose drafter is DFlash2, or Off, has no layer on disk, and the run config keeps `--mtp <folder>`
+        # for a later switch to the MTP. Its absence then does not make the model unusable (strata_control/drafting.py loads the drafter that is there).
+        components.append(_item(arg.lstrip("-"), _location(raw, cfg, config_path), kind, required=not (arg == "--mtp" and not _drafter_needs_mtp(cfg))))
 
     vision = cfg.get("vision")
     if isinstance(vision, dict):

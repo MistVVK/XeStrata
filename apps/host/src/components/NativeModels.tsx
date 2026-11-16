@@ -192,7 +192,7 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
             if (!contextPicked)    // a context the person picked stays; otherwise 128K
                 setContext(defaultContext(contextList));
         }
-    }, [selectedSize?.id, installed?.model, installed?.ready, installed?.context, installed?.contextChosen, installed?.kv, installed?.lowRamMode, installed?.resourceProfile]);
+    }, [selectedSize?.id, installed?.model, installed?.ready, installed?.context, installed?.contextChosen, installed?.kv, installed?.lowRamMode, installed?.drafting, installed?.resourceProfile]);    // drafting too: the saved choice that arrives after the page opened (an app restart) is the one shown, not Auto (0.2.15 release test)
     const pickVision = (next: string) => { if (selectedSize) visionPicks.current.set(selectedSize.id, next); setVision(next); };
     useEffect(() => { if (jobId && job?.state === 'done' && job.id !== toastedJob && (job.kind === 'load' || job.kind === 'install')) {
         setToastedJob(job.id);
