@@ -36,6 +36,20 @@
 #define STRATA_CANON_NO_CONTRACT
 #endif
 
+// Keep a product's own rounding on Intel's GPU.  IGC fuses a product into a following add on entry points without
+// ContractionOff, and which entry points had it changed with the module's other kernels: q8act::Mul's round(x * id)
+// moved the B70's answer by a bit (c315c0ac1).  intel/llvm 7.2.0's SPIRV-LLVM-Translator sets ContractionOff only for
+// kernels whose IR has an unfused fmul into fadd, both without a `contract` flag (isUnfusedMulAdd, then propagated up
+// the call graph); round lowers to an intrinsic with no fadd and missed it.  Adding zero leaves the value (a -0
+// becomes +0, rounded to the same integer) and makes that IR shape, so the entry point gets ContractionOff.  This
+// relies on the translator's judgement: if a later one stops marking that shape, it stops working.  Only SPIR-V:
+// NVIDIA and AMD take the flag from LLVM, and the CPU already keeps the rounding.
+#if defined(__SPIR__)
+#define STRATA_CANON_NO_FUSE(x) ((x) + 0.0f)
+#else
+#define STRATA_CANON_NO_FUSE(x) (x)
+#endif
+
 namespace strata::kernels::canon {
 
 inline float fma(float a, float b, float c) {
@@ -74,7 +88,7 @@ inline float rcp(float v) {
 inline float exp(float x) {
     STRATA_CANON_NO_CONTRACT
     x = x < -80.0f ? -80.0f : x > 80.0f ? 80.0f : x;
-    const float kf = (x * 1.44269504f + 12582912.0f) - 12582912.0f;   // round(x / ln2), to nearest even
+    const float kf = (STRATA_CANON_NO_FUSE(x * 1.44269504f) + 12582912.0f) - 12582912.0f;   // round(x / ln2), to nearest even
     float r = fma(-kf, 0.693145752f, x);                                // ln2's high bits: kf * hi is exact
     r = fma(-kf, 1.42860677e-06f, r);                                   // and its low bits
     float p = 1.0f / 720.0f;
@@ -121,7 +135,7 @@ inline float f16_value(float v) {
 /// A q8_1 block's scale for the largest |x| `amax` of its 32 values, kept finite as an fp16 (#606).
 inline float q8_scale(float amax) {
     STRATA_CANON_NO_CONTRACT
-    const float d = amax * (1.0f / 127.0f);
+    const float d = STRATA_CANON_NO_FUSE(amax * (1.0f / 127.0f));
     return d > kHalfMax ? kHalfMax : d;
 }
 /// The inverse of that scale; 0 (every value 0) for an all-zero block and below 1e-30, where rcp's seed and steps
@@ -130,7 +144,7 @@ inline float q8_inv(float d) { return d >= 1e-30f ? rcp(d) : 0.0f; }
 /// One value's int8: rounded half away from zero, held to [-127, 127].
 inline int8_t q8_value(float x, float id) {
     STRATA_CANON_NO_CONTRACT
-    const float t = x * id;
+    const float t = STRATA_CANON_NO_FUSE(x * id);
     const float r = t + (t < 0.0f ? -0.5f : 0.5f);
     const float c = r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r;
     return (int8_t) (int32_t) c;
