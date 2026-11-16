@@ -68,8 +68,8 @@ namespace strata_vit {
 namespace {
 
 // the 16-bit kind a GEMM's input takes (its weight's).  K_BH: a BF16 matrix held as F16 (every BF16 value of the weights' and activations' range is an F16 value;
-// the activations are rounded to BF16 first, so the products see the BF16 values): gfx1151's default, elsewhere STRATA_VIT_BF16_AS_F16=1.
-// K_HF: a BF16 matrix held as F16 with the activations written as F16 directly (clamped to +-65,504), the default for BF16 matrices elsewhere: BF16's 7-bit
+// the activations are rounded to BF16 first, so the products see the BF16 values): STRATA_VIT_BF16_AS_F16=1 (gfx1151's default until 0.2.16).
+// K_HF: a BF16 matrix held as F16 with the activations written as F16 directly (clamped to +-65,504), the default for BF16 matrices on every card: BF16's 7-bit
 // mantissa on the inputs of the 27 blocks' products left 50 picture tokens of 12,308 under cosine 0.99 against the float32 reference on the CUDA reader,
 // 10 bits (F16) none in a CPU emulation (RESULTS-OWN-B18.md BLOCKS 16-18).  A matrix with a weight beyond F16's range stays K_BF16.
 enum Kind { K_F32 = 0, K_F16 = 1, K_BF16 = 2, K_BH = 3, K_HF = 4 };
@@ -470,8 +470,7 @@ struct VitGpuImpl {
     int pad_for(size_t n) const { return n_pad ? n_pad : n > 16384 ? 64 : 8; }
     int align_for(size_t n) const { return q_align ? q_align : n > 16384 ? 64 : 1; }
     size_t padded(size_t n) const { const size_t p = (size_t) pad_for(n); return (n + p - 1) / p * p; }
-    // BF16 matrices as F16 with F16 inputs (K_HF) on every CUDA card, Pascal included, and on every HIP card but gfx1151 (Strix Halo: K_BH, the BF16-rounded
-    // kind, not measured with K_HF).  Pascal needs one of the F16 kinds: cuBLAS has no fast BF16 kernel there (a P100 spent 645 ms of a 1,024-token picture in
+    // BF16 matrices as F16 with F16 inputs (K_HF) on every CUDA and HIP card, Pascal and gfx1151 (Strix Halo, since 0.2.16) included.  Pascal needs one of the F16 kinds: cuBLAS has no fast BF16 kernel there (a P100 spent 645 ms of a 1,024-token picture in
     // magma_sgemmEx for BF16 against 497 ms with F16 inputs; the 12-token picture 44 ms against 15; RESULTS-OWN-3V.md 16.1).  P100, 16 pictures against the
     // float32 reference: K_HF no token under cosine 0.99 (smallest 0.9970), K_BH 44 under 0.99 (smallest 0.866), the same encode time (13.23 against 13.24 s),
     // loaded in 0.6 against 1.5 s (K_BH converts on the host).  STRATA_VIT_BF16_AS_F16 (a diagnostic) overrides: 0 = BF16 as stored (K_BF16), 1 = K_BH,
@@ -903,8 +902,9 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
         // (17 ms at 65,536 patches, which read 0.999693 against mtmd-CPU).  STRATA_VIT_FA=0 turns it off.  gfx1151 only: gfx1103 and the other gfx11 cards keep it off
         // until they have their own gate.
         hipDeviceProp_t p;
+        // BF16 matrices: K_HF (F16 inputs) as on every other card since 0.2.16; K_BH (the BF16-rounded inputs, gfx1151's default until then) left Qwen3.8's
+        // code4217.png at 0.998547 against the float32 reference on Strix.  STRATA_VIT_BF16_AS_F16=1 gives K_BH back.
         if (hipGetDeviceProperties(&p, device) == hipSuccess && vit_gpu_is_gfx1151(p.gcnArchName)) {
-            m.bf16_mode = BF16_ROUNDED;
             m.hpa16 = m.hpa16_att = true;
             fa_default = p.warpSize == 32 && g.head_dim <= 96 && g.head_dim % 8 == 0;
         }
