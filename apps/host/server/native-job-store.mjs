@@ -47,7 +47,13 @@ export function createJobStore(path, {
   return {
     save(jobs) {
       if (closed) return;
-      const text = JSON.stringify(jobs);
+      let text;
+      try { text = JSON.stringify(jobs); }
+      catch (error) {
+        // A value JSON cannot hold (a BigInt, a cycle) is a programming error, not a disk problem: say so and keep the last good file.
+        report(`[strata host] Job history could not be turned into JSON (${error.message}); the last saved history is kept, inference continues.`);
+        return;
+      }
       if (text === saved) {
         pending = null;
         if (timer !== null) clearTimer(timer);

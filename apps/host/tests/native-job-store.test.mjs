@@ -104,3 +104,17 @@ test('an unexpected polling callback failure does not leave polling stuck or rej
   assert.equal(changes,2);
   await controller.close();
 });
+
+// A value JSON cannot hold is reported and skipped like a disk failure: save() never throws out of emit() (GUI-1116 review of #5802).
+test('a job list JSON cannot hold is reported, the last good file stays, and save does not throw', () => {
+  const f=fixture();
+  f.store.save([{id:'one',state:'done'}]);
+  const cyclic={id:'two'};cyclic.self=cyclic;
+  assert.doesNotThrow(()=>f.store.save([cyclic]));
+  assert.doesNotThrow(()=>f.store.save([{id:'three',size:1n}]));
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.path)),[{id:'one',state:'done'}]);
+  assert.equal(f.warnings.filter(w=>/could not be turned into JSON/.test(w)).length,2);
+  f.store.save([{id:'four',state:'done'}]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.path)),[{id:'four',state:'done'}],'the next good list is saved');
+  f.store.close();
+});
