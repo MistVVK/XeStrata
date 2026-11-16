@@ -74,7 +74,8 @@ def ask(server: str, system: str, user: str, image: str) -> str:
     body = {"messages": [{"role": "system", "content": system},
                          {"role": "user", "content": [{"type": "text", "text": user},
                                                       {"type": "image_url", "image_url": {"url": image}}]}],
-            "max_tokens": 400, "temperature": 0}
+            # a caption is a line: a model that thinks first (Qwen3.8) spent the tokens on it and wrote none
+            "max_tokens": 1024, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}
     headers = {"Content-Type": "application/json"}
     key = os.environ.get("XESTRATA_API_KEY")
     if key:
