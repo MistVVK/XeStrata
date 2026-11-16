@@ -890,6 +890,34 @@ def param_name(opener: str) -> str | None:
     return name
 
 
+ARGS_START = "<arguments>"
+
+
+def json_args(s: str, props=None, notes: list | None = None):
+    """#6032 R3 (recover): `s` starts with `<arguments>` + a JSON object (Gyro / Coder-L wrote the call's arguments so,
+    instead of `<parameter=` tags), closed by `</arguments>`, by the stray `</parameter>` the model wrote, or by
+    nothing.  -> (arguments, length read) with each string value of a declared non-string parameter read by its type
+    (coerce_value); None while the object is not whole (a call cut inside it is never run with partial strings)."""
+    t = s[len(ARGS_START):]
+    body = t.lstrip()
+    try:
+        obj, end = json.JSONDecoder().raw_decode(body)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    tail = re.match(r"\s*(?:</arguments>|" + re.escape(PARAM_END) + r")?", body[end:])
+    args = {}
+    for k, v in obj.items():
+        declared = declared_type((props or {}).get(k))
+        if isinstance(v, str) and declared is not None and not _declares(declared, "string"):
+            v = coerce_value(v, declared, notes)
+            if v is _SKIP:
+                continue
+        args[k] = v
+    return args, len(ARGS_START) + len(t) - len(body) + end + tail.end()
+
+
 _COLON_OPENER = re.compile(r"<parameter=([^<>\s:=]+):[ \t]*([^\n<>]*)\n")
 _BARE_OPENER = re.compile(r"<(?:/|=)?([^<>\s=/]+)>")
 
@@ -1272,6 +1300,12 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
     rest = body[body.index(">") + 1:]
     props = ((schema or {}).get("parameters") or {}).get("properties") or {}
     args = {}
+    if recover and rest.lstrip().startswith(ARGS_START):     # #6032 R3: the arguments as one JSON object
+        got = json_args(rest.lstrip(), props, notes)
+        if got is None:
+            raise ValueError("malformed tool call: " + body[:80])
+        args.update(got[0])
+        rest = rest.lstrip()[got[1]:]
     while True:
         # #6032 R2 (recover): where a parameter may begin, a damaged opener of a declared parameter not set yet
         # counts (opener_at); anything else is skipped to the next `<parameter=`, as before
@@ -1719,6 +1753,19 @@ class OutputParser:
                 stripped = rest.lstrip()
                 self.sp += len(rest) - len(stripped)
                 got = None
+                if self.recover and (stripped.startswith(ARGS_START) or (stripped and ARGS_START.startswith(stripped))):
+                    # #6032 R3: the arguments as one JSON object: held until it is whole, then sent with the call's
+                    # other non-string values when it closes (as parse_tool_call reads it); a cut one sends nothing
+                    props = ((self.schemas.get(self.scall.name) or {}).get("parameters") or {}).get("properties") or {}
+                    whole = json_args(stripped, props) if stripped.startswith(ARGS_START) else None
+                    if whole is None:
+                        return out
+                    for k, v in whole[0].items():
+                        self.sheld.pop(k, None)
+                        self.sheld[k] = v
+                        self.sset.add(k)
+                    self.sp += whole[1]
+                    continue
                 if self.recover and not stripped.startswith(FUNC_END):
                     # #6032 R2: the opener parse_tool_call reads here (a damaged one of a declared parameter not set
                     # yet, or the colon form); other text up to the next `<parameter=` is skipped, as there
