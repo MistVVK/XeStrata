@@ -847,6 +847,25 @@ _PREFIX_BARE_OPEN = re.compile(r"<tool_call>\s*<function=\s*(tools|functions|def
 # #5276: `<toolcall>` / `<tool-call>` as the opener (then whitespace, `<function=NAME>`), and such an opener still arriving
 _MISSPELT_OPEN = re.compile(r"<tool-?call>(\s*)<function=(\s*[^<>\s]+\s*)>")
 _MISSPELT_PART = re.compile(r"<tool-?call>\s*<function=[^<>]{0,80}$|<tool-?call>\s*(?:<(?:f(?:u(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)?)?$")
+# #5969 (recover): Claude's `<invoke name="NAME"><parameter name="K">V</parameter></invoke>` dialect inside the wrapper
+_INVOKE_OPEN = re.compile(r'<invoke\s+name="([^"<>\n]+)"\s*>')
+_INVOKE_PART = re.compile(r'<(?:i(?:n(?:v(?:o(?:k(?:e(?:\s+(?:n(?:a(?:m(?:e(?:=(?:"[^"<>\n]*"?)?)?)?)?)?)?)?)?)?)?)?)?)?\s*$')
+_INVOKE_PARAM = re.compile(r'((?:<invoke\s+name="[^"<>\n]+"\s*>|</parameter>)\s*)<parameter\s+name="([^"<>\n]+)"\s*>')
+# the call's end: `</invoke>` right after a value's `</parameter>` or the opener (a value may hold the words)
+_INVOKE_END = re.compile(r'(?:</parameter>|<invoke\s+name="[^"<>\n]+"\s*>)\s*</invoke>')
+
+
+def invoke_to_template(raw: str) -> str:
+    """#5969: an `<invoke ...>` call body (up to its `</invoke>`) in the template's form: `<function=T>`,
+    `<parameter=K>`, `</function>`; the tags are rewritten only where the call's structure has them."""
+    m = _INVOKE_OPEN.match(raw.lstrip())
+    body = raw.lstrip()
+    body = _INVOKE_PARAM.sub(lambda p: p.group(1) + PARAM_START + p.group(2) + ">", body)
+    body = _INVOKE_PARAM.sub(lambda p: p.group(1) + PARAM_START + p.group(2) + ">", body)   # (overlapping neighbours)
+    body = FUNC_START + m.group(1) + ">" + body[m.end():]
+    return body[:len(body) - len("</invoke>")] + FUNC_END if body.endswith("</invoke>") else body
+
+
 _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
 
 
@@ -2299,6 +2318,28 @@ class OutputParser:
                 # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
                 # that ends the request.  Until its follower has arrived it is held, like a partial tag.
                 after = self.buf[i + len(CALL_START):].lstrip()
+                if self.recover and self.schemas and after.startswith("<i"):
+                    # #5969 (recover): Claude's `<invoke name="NAME">` dialect for a declared tool, its opener ending its
+                    # line: held whole as the "invoke" state reads it (a cut one, an undeclared name, or prose that only
+                    # names the tag - more text on the opener's line - stays the text it is)
+                    m = _INVOKE_OPEN.match(after)
+                    line_end = after[m.end():].lstrip(" \t")[:1] if m else ""
+                    if m and not line_end:
+                        return out                       # what follows the opener decides
+                    if m and line_end == "\n" and self._callable(m.group(1)):
+                        if i and self.buf[:i].strip():
+                            out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
+                        self.buf = self.buf[i + len(CALL_START):]
+                        self.state = "invoke"
+                        continue
+                    if not m and _INVOKE_PART.match(after) and "\n" not in after:
+                        j = i
+                        while j > 0 and self.buf[j - 1] == "\n":
+                            j -= 1
+                        if j > 0:
+                            out.append(Event("content", self._track(self.buf[:j])))
+                            self.buf = self.buf[j:]
+                        return out
                 if self.schemas and not after.startswith(FUNC_START):
                     loose = self._loose_open(after)
                     if loose == "wait":                  # may still become one: held like a partial tag
@@ -2391,6 +2432,35 @@ class OutputParser:
                     out.append(Event("tool_call", call=call))
                 self.buf = self.buf[i + len(CALL_END):]
                 self.state, self.lead = "content", call is not None
+            elif self.state == "invoke":
+                # #5969 (recover): `<invoke name="T">` + `<parameter name="K">V</parameter>` ... `</invoke>`, its
+                # `</tool_call>` after it or left out at the end of the output: read in the template's form; a body that
+                # does not read, or one the output ends inside, is the text it is
+                m = _INVOKE_END.search(self.buf)
+                if m is None:
+                    return out                          # not whole yet; at the end, finish() returns it as text
+                rest = self.buf[m.end():]
+                tail = rest.lstrip()
+                if not tail and not self._final:
+                    return out                          # its `</tool_call>` may still come
+                if tail and CALL_END.startswith(tail) and not self._final:
+                    return out
+                drop = len(rest) - len(tail) + len(CALL_END) if tail.startswith(CALL_END) else 0
+                raw = self.buf[:m.end()]
+                call = None
+                try:
+                    name = _INVOKE_OPEN.match(raw.lstrip()).group(1)
+                    name = self.aliases.get(name, name)
+                    call = parse_tool_call(invoke_to_template(raw), self.schemas.get(name), self.notes, recover=True)
+                    call.name = name
+                except (ValueError, AttributeError):
+                    call = None
+                if call is None:
+                    out.append(Event("content", self._track(CALL_START + raw + (CALL_END if drop else ""))))
+                else:
+                    out.append(Event("tool_call", call=call))
+                self.buf = self.buf[m.end() + drop:]
+                self.state, self.lead = "content", call is not None
             else:
                 drop = None
                 if self.bare:                       # no wrapper: the call ends at its </function>; a stray
@@ -2446,7 +2516,7 @@ class OutputParser:
         self._restore_scan_body()               # #4686: the call body moved out while it streamed comes back first
         if self._held:
             self.buf, self._held = self.buf + self._held, ""
-        if self.buf and self.state in ("call", "rcall"):
+        if self.buf and self.state in ("call", "rcall", "invoke"):
             self._final = True                  # #4701: a call held after its closing tags (could a file's text go on?) is whole now
             out += self.feed("")
         # The final feed may compact a still-incomplete streamed call again.
@@ -2500,7 +2570,7 @@ class OutputParser:
         if self.buf:
             # an unfinished call inside the reasoning (#804) is reasoning text, never a call
             kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
-            text = CALL_START + self.buf if self.state in ("call", "json") and not self.bare else self.buf
+            text = CALL_START + self.buf if self.state in ("call", "json", "invoke") and not self.bare else self.buf
             out.append(Event(kind, text))
             self.buf = ""
         return out
