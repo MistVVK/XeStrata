@@ -171,6 +171,24 @@ int main() {
         CHECK(i8_chunk_default_allows(-1, false, true, 8192, lim));
         CHECK(i8_chunk_default_allows(-1, false, false, 8192, lim));
     }
+    // the Volta tile rule (TUNE-0216): the largest tile 2-4 (8 counts as 4) whose shared memory leaves two blocks per multiprocessor; tile 2 when none does
+    {
+        const std::size_t v100 = 98304, res = 0;   // Tesla V100: 96 KB per multiprocessor, no reservation
+        // IQ3_S / IQ4_NL (bytes of the bench's I8-LAUNCH lines): tiles 2 / 3 / 4 = 43,008 / 48,128 / 53,248
+        CHECK(i8_tile_two_blocks(8, 43008, 48128, 53248, v100, res) == 3);
+        CHECK(i8_tile_two_blocks(4, 43008, 48128, 53248, v100, res) == 3);
+        CHECK(i8_tile_two_blocks(3, 43008, 48128, 53248, v100, res) == 3);
+        CHECK(i8_tile_two_blocks(2, 43008, 48128, 53248, v100, res) == 2);
+        // IQ2_S with its grid in shared memory (49,152 / 54,272 / 59,392): no tile gives two blocks -> tile 2; with the global grid (40,960 / 46,080 / 51,200) -> tile 3
+        CHECK(i8_tile_two_blocks(8, 49152, 54272, 59392, v100, res) == 2);
+        CHECK(i8_tile_two_blocks(8, 40960, 46080, 51200, v100, res) == 3);
+        // a reservation per block counts against the fit: 2 x (48,128 + 1,024) is exactly 96 KB (fits), 2 x (48,128 + 1,025) is not
+        CHECK(i8_tile_two_blocks(3, 43008, 48128, 53248, v100, 1024) == 3);
+        CHECK(i8_tile_two_blocks(3, 43008, 48128, 53248, v100, 1025) == 2);
+        // a bigger multiprocessor keeps the larger tile (never above 4: tile 8 is not this rule's pick)
+        CHECK(i8_tile_two_blocks(8, 43008, 48128, 53248, 233472, 1024) == 4);
+        CHECK(i8_volta_rule_on(-1) && i8_volta_rule_on(1) && !i8_volta_rule_on(0));
+    }
     if (failed) {
         std::fprintf(stderr, "i8_expert_rule_test: %d check(s) failed\n", failed);
         return 1;
