@@ -1383,7 +1383,8 @@ export function newSession(): Session {
     workspace: state.workspaces.find(w => w.id === state.activeWorkspace)?.path ?? state.workspacePath,
     tokensIn: 0,
     tokensOut: 0,
-    ...(state.activeSession === null && state.remoteModel ? { preferences: { remoteModel: state.remoteModel } } : {}),
+    // A new chat starts on the model the composer shows: the open chat's model, or the choice made before any chat was open.
+    ...(state.remoteModel ? { preferences: { remoteModel: state.remoteModel } } : {}),
   };
   const sessions = [session, ...state.sessions];
   persistSessions(sessions);
