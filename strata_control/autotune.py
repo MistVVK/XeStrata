@@ -687,8 +687,12 @@ class Tuner:
             c_runs = [c for _, c in final_pairs]
             r.chosen = {"decode_tok_s": round(statistics.median([c.decode_tok_s for c in c_runs if c.decode_tok_s]), 2)
                         if any(c.decode_tok_s for c in c_runs) else None,
-                        "pp_tok_s": round(statistics.median([c.pp_long_tok_s or c.pp_tok_s for c in c_runs if c.pp_long_tok_s or c.pp_tok_s]), 1)
+                        # #5324: the 4K prompt's speed is what a recheck measures again, so it is the one kept as pp4k; the long prompt's
+                        # (a 96K prompt of the quick tune) is kept apart, never in its place
+                        "pp_tok_s": round(statistics.median([c.pp_tok_s for c in c_runs if c.pp_tok_s]), 1)
                         if any(c.pp_tok_s for c in c_runs) else None,
+                        "pp_long_tok_s": round(statistics.median([c.pp_long_tok_s for c in c_runs if c.pp_long_tok_s]), 1)
+                        if any(c.pp_long_tok_s for c in c_runs) else None,
                         "rss_peak_mib": max([c.rss_peak_mib for c in c_runs if c.rss_peak_mib] or [None]) if any(c.rss_peak_mib for c in c_runs) else None,
                         "vram_used_mib": max([c.vram_used_mib for c in c_runs if c.vram_used_mib] or [None]) if any(c.vram_used_mib for c in c_runs) else None}
         elif r.outcome == "improved" and per_request_chosen:
@@ -938,6 +942,10 @@ def recheck(session: Session, base_args: list[str], preset: dict[str, Any], *, c
         out["measured"] = {"decode_tok_s": run.decode_tok_s, "pp4k_tok_s": run.pp_tok_s, "rss_peak_mib": run.rss_peak_mib,
                            "vram_peak_mib": run.vram_used_mib}
         sd, sp = stored.get("decode_tok_s"), stored.get("pp4k_tok_s")
+        if "pp_long_tok_s" not in stored:
+            # #5324: a preset saved before the long prompt's speed had a key of its own may hold that speed (a 96K prompt) as pp4k: a 4K
+            # recheck cannot be compared with it, so its prompt speed is not judged (answers and memory still are); a new tune writes both
+            sp = None
         problems: list[str] = []
         if sd and run.decode_tok_s and run.decode_tok_s < 0.95 * sd:
             problems.append(f"answers are {100 * (1 - run.decode_tok_s / sd):.0f}% slower than when it was saved")
