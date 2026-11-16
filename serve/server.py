@@ -8259,10 +8259,14 @@ def make_handler(svc: Service):
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
+                except (GpuBusy, EngineStarting) as e:
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
+                except EngineDied as e:                      # PR #4307: an engine that died while it started is
+                    self._json(503, {"error": {"type": "server_error", "message": died_note(e)}})   # answered, as /v1/load does
+                except EngineStuck as e:                     # (it used to close the connection with no answer)
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             reserved = False
             try:
