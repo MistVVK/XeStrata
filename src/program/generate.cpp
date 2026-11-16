@@ -16826,6 +16826,7 @@ int main(int argc, char** argv) {
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
+                const auto* session_draft = use_mtp ? &mtp.kv_state() : nullptr;
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
@@ -16867,7 +16868,7 @@ int main(int argc, char** argv) {
                             sl.state_bytes = state;
                             sl.tokens = live.size();
                             sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + (session_draft ? 1 : 0);
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         pools_budget.shrink((size_t) -1);   // (the park pools' idle memory goes back before the RAM checks of a session save)
@@ -16906,7 +16907,7 @@ int main(int argc, char** argv) {
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, session_draft,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -16953,7 +16954,7 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                limits, ss, g, session_draft, (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -16970,7 +16971,7 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g, session_draft, err)) {
                         refuse(err);
                         continue;
                     }
@@ -16983,7 +16984,7 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if (strata::core::conversation_snapshot_restore(image, ss, g, session_draft, err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
