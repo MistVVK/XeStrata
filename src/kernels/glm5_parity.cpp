@@ -372,7 +372,7 @@ int test_kda() {
         int wbad = 0;
         std::vector<float> a(s0.size()), b(s0.size());
         for (int t = 0; t < TW; ++t) {
-            strata::kernels::glm5_kda_step(dsb, dqw + t * TS, dkw + t * TS, dvw + t * TS, dgw + t * TS, dbw + t * H,
+            strata::kernels::glm5_kda_step(dsb, dqw + t * TS, dkw + t * TS, dvw + t * TS, dgw + t * TS, dbw + (ptrdiff_t) t * H,
                                            dob + t * TS, H, nullptr);
             strata::parity::sync();
             if (t == TW - 1) break;
