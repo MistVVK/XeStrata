@@ -365,10 +365,9 @@ class Catalog:
         vram = comp.main_vram_gb
         rec = self.recommendation(hw)
         out: list[ModelRow] = []
-        own = self.strata.own_families()                # Qwen3.6 is listed for the app; the Terminal's launch list is Flash-Next's
+        # #5869: every family of the shared table, Qwen3.6-35B-A3B (an engine path of its own) included, as the app lists them: its rows
+        # are a group of their own (family_title), the Flash-Next rows are as before
         for fam in self.strata.model_table(hw):
-            if fam["family"] in own:
-                continue
             for size in fam["sizes"]:
                 f = fit_on(size, hw.get("ram_gb"), vram)
                 cat, words = verdict(size.get("on_this_pc"))

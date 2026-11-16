@@ -108,8 +108,11 @@ class CatalogRules(unittest.TestCase):
             self.assertIn(("qwen", "IQ3_XXS"), ids)
             models, families, contexts, source = cat.tables()
             self.assertEqual(source, "setup.py")                       # the same tables setup.py and the app read
+            own = cat.strata.own_families()                # #5869: Qwen3.6's sizes are its own table's (a size name can repeat across families)
+            sizes = {(f["family"], s["model"]): s for f in cat.strata.model_table(cat.hardware()) for s in f["sizes"]}
             for r in rows:
-                self.assertAlmostEqual(r.download_gb, models[r.model]["download_gb"])
+                want = sizes[(r.family, r.model)]["download_gb"] if r.family in own else models[r.model]["download_gb"]
+                self.assertAlmostEqual(r.download_gb, want)
             rec = [r for r in rows if r.recommended]
             self.assertEqual([(r.family, r.model) for r in rec], [("qwen", "IQ3_S")])      # 64 + 12 GB: the 64 GB tier
 
