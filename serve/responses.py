@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import re
 import time
 import uuid
 
@@ -125,6 +126,56 @@ def _tool_output(item, param):
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
+#: An encrypted payload of another server (OpenAI's are Fernet tokens: "gAAAAA" + url-safe base64) cannot be read here.
+_FOREIGN_CIPHERTEXT = re.compile(r"gAAAAA[A-Za-z0-9_\-]{60,}={0,2}")
+_UNREADABLE_PAYLOAD = "[this part was encrypted by another server and cannot be read here]"
+
+
+def _agent_payload(enc) -> str:
+    """One `encrypted_content` part of an agent_message -> text.  Codex builds these parts itself and, with the agents
+    running on this server, they hold the plain text of the task or answer; a payload sealed by this server (reasoning's
+    ENCRYPTED_PREFIX form) is opened; another server's ciphertext is named as unreadable, never passed off as text."""
+    if not isinstance(enc, str):
+        return _UNREADABLE_PAYLOAD
+    if enc.startswith(ENCRYPTED_PREFIX):
+        try:
+            text = json.loads(base64.b64decode(enc[len(ENCRYPTED_PREFIX):], validate=True).decode("utf-8"))["text"]
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            return _UNREADABLE_PAYLOAD
+        return text if isinstance(text, str) else _UNREADABLE_PAYLOAD
+    if _FOREIGN_CIPHERTEXT.fullmatch(enc.strip()):
+        return _UNREADABLE_PAYLOAD
+    return enc
+
+
+def _agent_message(item, param) -> str:
+    """#4210 #5244: an `agent_message` item (Codex multi-agent v2: the task a parent agent sends a worker, the worker's
+    answer) -> the text of a user message.  Codex writes the attribution itself (an input_text header: "Message Type",
+    "Task name", "Sender", "Payload:"), followed by the payload in an `encrypted_content` part; both are kept as they are.
+    A message without such a header gets one line naming its author and recipient, so who said it is not lost."""
+    raw = item.get("content")
+    parts = [{"type": "input_text", "text": raw}] if isinstance(raw, str) else raw if isinstance(raw, list) else []
+    texts = []
+    for j, part in enumerate(parts):
+        if not isinstance(part, dict):
+            raise ResponsesError("expected a content part object", f"{param}.content[{j}]")
+        kind = part.get("type")
+        if kind in ("input_text", "output_text", "text"):
+            text = part.get("text")
+            texts.append(text if isinstance(text, str) else "")
+        elif kind == "encrypted_content":
+            texts.append(_agent_payload(part.get("encrypted_content")))
+        else:
+            raise ResponsesError(f"agent_message parts of type {kind!r} are not supported (text and encrypted_content are)",
+                                 f"{param}.content[{j}].type", "unsupported_parameter")
+    body = "".join(texts)
+    if body.startswith("Message Type:"):
+        return body
+    author = item.get("author") if isinstance(item.get("author"), str) and item.get("author") else "another agent"
+    recipient = item.get("recipient") if isinstance(item.get("recipient"), str) and item.get("recipient") else "this agent"
+    return f"Message from {author} to {recipient}:\n{body}"
+
+
 def input_messages(req: dict) -> list[dict]:
     """`instructions` + `input` -> the chat template's messages."""
     messages = []
@@ -141,9 +192,18 @@ def input_messages(req: dict) -> list[dict]:
         raise ResponsesError("input must be a string or an array of input items", "input")
     thinking = []                                    # reasoning waiting for the assistant turn it belongs to
     open_turn = None                                 # the assistant message the next function_call joins
+    unanswered = set()                               # call ids of the last turn's calls whose outputs have not come yet
+    held = []                                        # agent messages that arrived while calls were unanswered
+
+    def flush_held():
+        # #4210 #5244: an agent_message that arrives between a turn's calls and their outputs follows those outputs,
+        # so the template still sees each call's result right after the call
+        messages.extend(held)
+        held.clear()
 
     def turn(content=""):
         nonlocal open_turn
+        unanswered.clear()
         open_turn = {"role": "assistant", "content": content}
         if thinking:
             open_turn["reasoning_content"] = "".join(thinking)
@@ -156,6 +216,9 @@ def input_messages(req: dict) -> list[dict]:
         if not isinstance(item, dict):
             raise ResponsesError("expected an input item object", param)
         kind = item.get("type") or ("message" if "role" in item else None)
+        if held and kind not in ("function_call_output", "custom_tool_call_output", "multi_agent_call_output", "agent_message"):
+            flush_held()                             # the calls' outputs stopped coming: the held messages go here
+            unanswered.clear()
         if kind == "message":
             role = item.get("role")
             if role not in ("user", "assistant", "system", "developer"):
@@ -174,23 +237,35 @@ def input_messages(req: dict) -> list[dict]:
                 if open_turn is not None and (open_turn.get("tool_calls") or open_turn["content"]):
                     open_turn = None                 # thinking starts a new model turn
                 thinking.append(text)
-        elif kind in ("function_call", "custom_tool_call"):
-            name = item.get("name")
+        elif kind in ("function_call", "custom_tool_call", "multi_agent_call"):
+            # #5244: Codex multi-agent v2 also sends its agent calls as multi_agent_call items (the name may be "action")
+            field = "action" if kind == "multi_agent_call" and "name" not in item else "name"
+            name = item.get(field)
             if not isinstance(name, str) or not name:
-                raise ResponsesError("a function_call needs a name", param + ".name")
+                raise ResponsesError(f"a {kind} needs a {field}", f"{param}.{field}")
             if item.get("namespace"):
                 name = f"{item['namespace']}.{name}"
-            if kind == "function_call":
+            if kind in ("function_call", "multi_agent_call"):
                 args = _arguments(item.get("arguments"), param + ".arguments")
             else:
                 args = {"input": item.get("input") if isinstance(item.get("input"), str) else ""}
             target = open_turn if open_turn is not None and not thinking else turn()
             target.setdefault("tool_calls", []).append({"function": {"name": name, "arguments": args},
                                                         "_call_id": item.get("call_id")})
-        elif kind in ("function_call_output", "custom_tool_call_output"):
+            if item.get("call_id"):
+                unanswered.add(item.get("call_id"))
+        elif kind in ("function_call_output", "custom_tool_call_output", "multi_agent_call_output"):
             messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
             open_turn = None
             thinking.clear()
+            unanswered.discard(item.get("call_id"))
+            if held and not unanswered:
+                flush_held()
+        elif kind == "agent_message":
+            message = {"role": "user", "content": _agent_message(item, param)}
+            open_turn = None
+            thinking.clear()
+            (held if unanswered else messages).append(message)
         elif kind == "additional_tools":
             continue                                 # #782 (Codex): tools the client adds as an input item; see request_tools
         elif kind == "item_reference":
@@ -199,6 +274,7 @@ def input_messages(req: dict) -> list[dict]:
         else:
             raise ResponsesError(f"input items of type {kind!r} are not supported", param + ".type",
                                  "unsupported_parameter")
+    flush_held()
     _order_tool_results(messages)
     # leading system/developer messages (Codex: instructions, then its developer message) become one system message
     # at the start; later ones become user messages in place, as on the chat path
