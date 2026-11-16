@@ -8714,10 +8714,24 @@ def make_handler(svc: Service):
                 return self._json(200, openai_collect(chunks))
             self._sse()
             last = None                                      # the stream's id / model, for its closing chunk (#5633)
+            # OpenAI's streaming contract: with "stream_options": {"include_usage": true} the usage rides in its own
+            # last chunk, "choices": []. Clients and gateways read it there (LiteLLM ignores a usage that sits on the
+            # finish_reason chunk and recounts the tokens itself, too low). Without the option the chunk is unchanged.
+            # A value that is not an object is ignored (the spec allows an object or null): an exception here, after the
+            # headers are out, would end the stream with an empty 200.
+            stream_options = req.get("stream_options")
+            split_usage = isinstance(stream_options, dict) and bool(stream_options.get("include_usage"))
             try:
                 for c in chunks:
                     if c is None:
                         self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                    elif split_usage and c.get("usage") is not None:
+                        last = c
+                        head = {k: v for k, v in c.items() if k != "usage"}
+                        tail = {"id": c["id"], "object": c["object"], "created": c["created"], "model": c["model"],
+                                "choices": [], "usage": c["usage"]}
+                        for part in (head, tail):
+                            self.wfile.write(b"data: " + json.dumps(part, ensure_ascii=False).encode() + b"\n\n")
                     else:
                         last = c
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
