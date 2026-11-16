@@ -3530,5 +3530,7 @@
   "s9038": "Ce système ne laisse pas Strata utiliser le port {0}. Sous Linux et macOS, les ports inférieurs à 1024 nécessitent des droits d’administrateur. Lancez Strata avec un autre port (STRATA_PORT), par exemple 8801.",
   "s9039": "Outils pour les applications de cet ordinateur",
   "s9040": "Lorsque cette option est activée, une application de cet ordinateur qui envoie votre clé API peut laisser ce modèle utiliser ses outils, par exemple pour lire et modifier des fichiers. Les applications d’autres appareils ou passant par le lien Internet ne le peuvent jamais.",
-  "s9041": "Créez d’abord une clé API."
+  "s9041": "Créez d’abord une clé API.",
+  "s9042": "{0}{1} tok/s",
+  "s9043": "{0}{1} tok/s · dernière réponse"
 }

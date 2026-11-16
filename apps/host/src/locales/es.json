@@ -3530,5 +3530,7 @@
   "s9038": "Este sistema no deja que Strata use el puerto {0}. En Linux y macOS, los puertos por debajo de 1024 necesitan derechos de administrador. Inicia Strata con otro puerto (STRATA_PORT), por ejemplo 8801.",
   "s9039": "Herramientas para las aplicaciones de este equipo",
   "s9040": "Cuando está activado, una aplicación de este equipo que envíe tu clave de API puede dejar que este modelo use sus herramientas, como leer y cambiar archivos. Las aplicaciones de otros dispositivos o a través del enlace de internet nunca pueden.",
-  "s9041": "Crea una clave de API primero."
+  "s9041": "Crea una clave de API primero.",
+  "s9042": "{0}{1} tok/s",
+  "s9043": "{0}{1} tok/s · última respuesta"
 }

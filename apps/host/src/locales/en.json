@@ -3530,5 +3530,7 @@
   "s9038": "This system does not let Strata use port {0}. On Linux and macOS, ports below 1024 need administrator rights. Start Strata with another port (STRATA_PORT), for example 8801.",
   "s9039": "Tools for apps on this computer",
   "s9040": "When this is on, an app on this computer that sends your API key can let this model use its tools, such as reading and changing files. Apps on other devices or through the internet link never can.",
-  "s9041": "Create an API key first."
+  "s9041": "Create an API key first.",
+  "s9042": "{0}{1} tok/s",
+  "s9043": "{0}{1} tok/s · last reply"
 }
