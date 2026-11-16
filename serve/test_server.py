@@ -4818,6 +4818,29 @@ class ForcedToolChoice(unittest.TestCase):
                 if not stream:
                     self.assertIn("<function=execute_gdscript>", b["choices"][0]["message"]["content"])   # the text is untouched
 
+    def test_an_undeclared_call_names_the_closest_declared_tool_and_runs_nothing(self):
+        """#5904 / #5933 / #4622: `read_file` for a declared `read` stays text with finish "stop" (nothing runs under a
+        guessed name); the marker names the closest declared tool as a hint.  A name close to nothing gets no hint."""
+        tools = [{"type": "function", "function": {"name": n, "description": n, "parameters": {
+            "type": "object", "properties": {"q": {"type": "string"}}}}} for n in ("read", "write", "search")]
+        for written, hint in (("read_file", "read"), ("Write", "write"), ("serch", "search"), ("execute_gdscript", None)):
+            self.says(self._undeclared_call_answer(written))
+            for stream in (False, True):
+                with self.subTest(written=written, stream=stream):
+                    code, b = self.openai(stream=stream, tools=tools)
+                    finish, calls, _ = self.call_of(code, b, stream)
+                    self.assertEqual((finish, calls), ("stop", []), b)
+                    want = {"name": written, "reason": "undeclared", **({"closest_declared": hint} if hint else {})}
+                    self.assertEqual(self._rejected_of(b, stream), [want])
+
+    def test_closest_declared(self):
+        from serve.server import closest_declared
+        self.assertEqual(closest_declared("read_file", ["read", "write"]), "read")
+        self.assertEqual(closest_declared("ReadFile", ["read_file", "write"]), "read_file")
+        self.assertIsNone(closest_declared("file", ["read_file", "write_file"]))      # two candidates: no guess
+        self.assertIsNone(closest_declared("gashfunction_calls", ["grep", "read"]))
+        self.assertIsNone(closest_declared("x", []))
+
     def test_undeclared_tool_calls_call_hands_the_call_to_the_client(self):
         """#4622: "undeclared_tool_calls": "call" returns the well-formed call of an undeclared name as a tool call (the client has its
         own policy for unknown names); the default ("text") is the test above, unchanged."""

@@ -6820,7 +6820,17 @@ class Service:
             with self.status_lock:
                 self.totals["tool_calls_unread"] = self.totals.get("tool_calls_unread", 0) + parser.unread
             # #3796: the same names for the client (a machine-readable marker next to the text, which stays as the model wrote it)
-            rejected = [{"name": nm, "reason": "undeclared"} for nm in named or []]
+            # #5904 / #5933 / #4622: plus the declared tool the name comes closest to, as a hint for the client or the
+            # model's next turn.  Only a hint: the call is not run under that name (a guessed tool is a safety risk;
+            # "undeclared_tool_calls": "call" stays the only way to run an undeclared call)
+            declared = [t.get("name") for t in tools or [] if isinstance(t, dict) and isinstance(t.get("name"), str)]
+            rejected = []
+            for nm in named or []:
+                entry = {"name": nm, "reason": "undeclared"}
+                near = closest_declared(nm, declared)
+                if near:
+                    entry["closest_declared"] = near
+                rejected.append(entry)
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -6831,6 +6841,24 @@ class Service:
         if rejected:
             done["rejected_tool_calls"] = rejected
         yield "done", done
+
+
+def closest_declared(name: str, declared: list[str]) -> str | None:
+    """#5904 / #5933: the declared tool name an undeclared one comes closest to (`read_file` -> `read`), for the hint in
+    strata_rejected_tool_calls; None when none is clearly close.  The one declared name the written one contains or is
+    contained in (ignoring case and `_` / `-` / `.`), else the best difflib match at a ratio of 0.75 or more."""
+    import difflib
+    if not name or not declared:
+        return None
+    norm = lambda s: re.sub(r"[_\-.\s]", "", s.lower())     # noqa: E731
+    n = norm(name)
+    inside = [d for d in declared if norm(d) and (norm(d) in n or n in norm(d))]
+    if len(inside) == 1:
+        return inside[0]
+    best = difflib.get_close_matches(name.lower(), [d.lower() for d in declared], n=1, cutoff=0.75)
+    if best:
+        return next(d for d in declared if d.lower() == best[0])
+    return None
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
