@@ -1063,6 +1063,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(route_resident_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME route_resident_parity COMMAND route_resident_parity)
   set_tests_properties(route_resident_parity PROPERTIES TIMEOUT 120)
+  # STRATA_ROUTE_PRIOR (#5655): degenerate router rows keep the router's top-10 whole, rankable rows match a serial
+  # reference (GPU, synthetic, no model)
+  add_executable(route_prior_parity src/kernels/route_prior_parity.cu)
+  target_include_directories(route_prior_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(route_prior_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME route_prior_parity COMMAND route_prior_parity)
+  set_tests_properties(route_prior_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
   target_include_directories(router_top10_parity PRIVATE ${_strata_gpu_include_directories})
