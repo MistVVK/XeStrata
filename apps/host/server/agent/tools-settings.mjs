@@ -77,6 +77,9 @@ function validateCustom(body, existing) {
       if (url.username || url.password) throw new Error('Use a web address without a user name or password in it.');
     }
     out.args = (Array.isArray(body.args) ? body.args : []).slice(0, 50).map(a => clean(a, 1000)).filter(Boolean);
+    const before = existing.find(t => t.id === body.id && t.kind === 'server');
+    if (body.timeoutSec !== undefined && !(Number(body.timeoutSec) >= 1 && Number(body.timeoutSec) <= 3600)) throw new Error('Give the time allowed in seconds, from 1 to 3600.');
+    out.timeoutSec = body.timeoutSec !== undefined ? clampTimeoutSec(body.timeoutSec) : before?.timeoutSec ?? clampTimeoutSec(undefined);
   }
   if (existing.some(t => t.name.toLowerCase() === name.toLowerCase() && t.id !== body.id)) throw new Error('You already have a tool with that name.');
   return out;
@@ -126,7 +129,8 @@ export function createAgentTools({ read, write, dataDir, browser = () => ({ foun
         id: t.id, name: t.name, about: t.about, kind: t.kind, enabled: t.enabled,
         summary: t.kind === 'instructions' ? t.instructions.slice(0, 80) : t.kind === 'command' ? t.command : t.address,
         instructions: t.instructions, command: t.command, address: t.address, args: t.args,
-        ...(t.kind === 'command' ? { cwd: t.cwd, shell: t.shell, timeoutSec: t.timeoutSec } : {}),
+        ...(t.kind === 'command' || t.kind === 'server' ? { timeoutSec: t.timeoutSec } : {}),
+        ...(t.kind === 'command' ? { cwd: t.cwd, shell: t.shell } : {}),
       })),
     };
   }
@@ -141,7 +145,10 @@ export function createAgentTools({ read, write, dataDir, browser = () => ({ foun
       const servers = {};
       for (const t of custom.filter(t => t.kind === 'server')) {
         const name = `custom-${t.id.replace(/_/g, "-")}`.slice(0, 32);
-        servers[name] = /^https?:\/\//i.test(t.address) ? { url: t.address } : { command: t.address, args: t.args };
+        servers[name] = {
+          ...(/^https?:\/\//i.test(t.address) ? { url: t.address } : { command: t.address, args: t.args }),
+          timeoutSec: t.timeoutSec,
+        };
       }
       return {
         off: new Set(s.off),

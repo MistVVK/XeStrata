@@ -90,10 +90,21 @@ export function mcpRows(servers, env, skipped = []) {
       env[variable] = String(value);
       return `@@JS:process.env.${variable}@@`;
     };
-    const config = { serverName: name, ...(server.command
-      ? { transport: 'stdio', command: String(server.command), args: Array.isArray(server.args) ? server.args.map(String) : [], ...(server.cwd ? { cwd: String(server.cwd) } : {}),
-        ...(server.env && Object.keys(server.env).length ? { env: Object.fromEntries(Object.entries(server.env).map(([k, v]) => [k, token('E', k, v)])) } : {}) }
-      : { transport: 'streamable-http', url: String(server.url), ...(server.headers && Object.keys(server.headers).length ? { headers: Object.fromEntries(Object.entries(server.headers).map(([k, v]) => [k, token('H', k, v)])) } : {}) }) };
+    const rawTimeoutSec = server.timeoutSec ?? server.timeout_s ?? server.timeout;
+    const envTimeoutMs = process.env.STRATA_MCP_TIMEOUT_MS && Number(process.env.STRATA_MCP_TIMEOUT_MS) > 0
+      ? Math.round(Number(process.env.STRATA_MCP_TIMEOUT_MS))
+      : undefined;
+    const timeoutMs = Number(rawTimeoutSec) > 0
+      ? Math.round(Number(rawTimeoutSec) * 1000)
+      : (Number(server.toolCallTimeoutMs) > 0 ? Math.round(Number(server.toolCallTimeoutMs)) : envTimeoutMs);
+    const config = {
+      serverName: name,
+      ...(timeoutMs ? { toolCallTimeoutMs: timeoutMs } : {}),
+      ...(server.command
+        ? { transport: 'stdio', command: String(server.command), args: Array.isArray(server.args) ? server.args.map(String) : [], ...(server.cwd ? { cwd: String(server.cwd) } : {}),
+          ...(server.env && Object.keys(server.env).length ? { env: Object.fromEntries(Object.entries(server.env).map(([k, v]) => [k, token('E', k, v)])) } : {}) }
+        : { transport: 'streamable-http', url: String(server.url), ...(server.headers && Object.keys(server.headers).length ? { headers: Object.fromEntries(Object.entries(server.headers).map(([k, v]) => [k, token('H', k, v)])) } : {}) }),
+    };
     rows.push({ id: `mcp-${slug(name)}`, name: '@deepseek-ai/dsh-mcp-client', config });
     index += 1;
   }
