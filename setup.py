@@ -4029,7 +4029,7 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              "gfx1201": "AMD Radeon RX 9070 series / AI PRO R9700 (gfx1201)",
              "gfx1030": "AMD Radeon RX 6800 / 6900 series (gfx1030)",
              "gfx1031": "AMD Radeon RX 6700 XT series (gfx1031)",
-             "gfx1032": "AMD Radeon RX 6600 / 6650 XT series (gfx1032)",
+             "gfx1032": "AMD Radeon RX 6600 / 6600 XT / 6650 XT (gfx1032)",
              "gfx1151": "AMD Radeon 8060S / 8050S / 8040S (Ryzen AI Max, Strix Halo, gfx1151)",
              # integrated Radeons of other Ryzen families: named so they are not taken for Strix Halo (not supported)
              "gfx1150": "AMD Radeon 890M / 880M (Ryzen AI 300, Strix Point, gfx1150)",
@@ -4037,8 +4037,8 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              "gfx1103": "AMD Radeon 780M / 760M / 740M (Ryzen 7040 / 8040, Phoenix / Hawk Point, gfx1103)"}
 AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT (gfx1200) and "
              "RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030) and RX 6700 XT "
-             "(gfx1031, #524), and the RX 7600 / 7600 XT (gfx1102, one run reported, #942), and the RX 6600 / 6650 XT "
-             "(gfx1032, unvalidated - same dp4a path as gfx1030), all unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
+             "(gfx1031, #524), and the RX 7600 / 7600 XT (gfx1102, one run reported, #942), and the RX 6600 / 6600 XT / 6650 XT "
+             "(gfx1032), all unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
              "gfx1151: experimental, docs/STRIX_HALO.md)")
 
 
