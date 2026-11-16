@@ -7,9 +7,13 @@
 //
 // This file runs the engine's own entry loop (build_window_jobs) and WindowJobs; the snapshot of `ids` and the final
 // release are repeated in Window::run, so the wiring inside expert_pool_dispatch_multi is not covered here.
+//
+//   window_jobs_test --legacy   runs the same cases through the loop of 756242554 (live ids, no MAXT bound, job_of cleared by
+//                               walking ids after the pool, nothing cleared on an early return): it must FAIL (CTest WILL_FAIL).
 #include "strata/core/window_jobs.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 
 using namespace strata::core;
@@ -17,6 +21,7 @@ using strata::kernels::cpu::ExpertJobMulti;
 using strata::kernels::cpu::MAXT;
 
 static int g_fail = 0;
+static bool g_legacy = false;
 static void check(bool ok, const char* what) { std::printf("  %-118s %s\n", what, ok ? "ok" : "FAIL"); if (!ok) ++g_fail; }
 
 constexpr int kExperts = 512;
@@ -39,6 +44,7 @@ struct Window {
     Window(std::vector<int16_t>& j, std::vector<ExpertJobMulti>& js) : job_of(j), jobs(js) {}
 
     void run(int32_t* live_ids, int64_t n_tok, int64_t k, int64_t stop_at_expert, bool rewrite_ids_meanwhile, bool throw_after) {
+        if (g_legacy) { run_legacy(live_ids, n_tok, k, stop_at_expert, rewrite_ids_meanwhile, throw_after); return; }
         int32_t ids[128];
         for (int64_t i = 0; i < n_tok * k; ++i) ids[i] = live_ids[i];   // the snapshot
         int32_t kind[128];
@@ -58,9 +64,40 @@ struct Window {
         if (throw_after) throw std::runtime_error("the call leaves early");
         w.release();
     }
+    // expert_pool_dispatch_multi's entry loop and clean-up as of 756242554 (overflowing entries are counted, not written)
+    void run_legacy(int32_t* ids, int64_t n_tok, int64_t k, int64_t stop_at_expert, bool rewrite_ids_meanwhile, bool throw_after) {
+        njobs = 0;
+        failure = {};
+        for (int64_t t = 0; t < n_tok; ++t)
+            for (int64_t j = 0; j < k; ++j) {
+                const int64_t i = t * k + j;
+                const int64_t e = ids[i];
+                if (e < 0 || e >= kExperts) { failure = {WindowStatus::IdOutOfRange, e}; return; }
+                int16_t& jo = job_of[(size_t) e];
+                if (jo < 0) {
+                    const uint8_t* b = e == stop_at_expert ? nullptr : blob_of_expert(e);
+                    if (b == nullptr) { failure = {WindowStatus::NoBlob, e}; return; }
+                    jo = (int16_t) njobs++;
+                    jobs[(size_t) jo].blob = b;
+                    jobs[(size_t) jo].nt = 0;
+                }
+                ExpertJobMulti& jb = jobs[(size_t) jo];
+                if (jb.nt >= MAXT) nt_overflow = true;
+                else { jb.out[jb.nt] = nullptr; jb.nact[jb.nt] = nullptr; }
+                ++jb.nt;
+            }
+        if (rewrite_ids_meanwhile)
+            for (int64_t i = 0; i < n_tok * k; ++i) ids[i] = (int32_t) ((ids[i] + 1 + i) % kExperts);
+        if (throw_after) throw std::runtime_error("the call leaves early");
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            const int64_t e = ids[i];
+            if (e >= 0 && e < kExperts) job_of[(size_t) e] = -1;
+        }
+    }
 };
 
-int main() {
+int main(int argc, char** argv) {
+    g_legacy = argc > 1 && std::strcmp(argv[1], "--legacy") == 0;
     // 1. ids rewritten while the pool works: the next window must start clean
     {
         std::vector<int16_t> job_of(kExperts, -1);

@@ -318,6 +318,8 @@ if(STRATA_SYCL_PARITY)
   add_executable(window_jobs_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/window_jobs_test.cpp)
   target_include_directories(window_jobs_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include)
   add_test(NAME window_jobs_test COMMAND window_jobs_test)
+  add_test(NAME window_jobs_test_legacy COMMAND window_jobs_test --legacy)   # the 756242554 loop: must fail
+  set_tests_properties(window_jobs_test_legacy PROPERTIES WILL_FAIL TRUE)
   add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
   target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
   add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)
