@@ -77,11 +77,16 @@ bool igpu_cache_drop_default(const char* gcn_arch, bool integrated, bool windows
 /// STRATA_PF_FUSED=1 where the user has not set the variable; STRATA_PF_FUSED=0 is the way back to MMQ.
 bool igpu_fused_prompt_default(const char* gcn_arch, bool integrated, bool windows);
 /// The 16-bit prompt GEMMs FP16 in and out (STRATA_HIP_PROMPT_F16, gemm.cu prompt_f16()): `env` is the variable's text (nullptr = unset).  "1" = on, any other set
-/// value = off (as before); unset = the device rule: on for a Radeon 780M (gfx1103, integrated, Linux), off everywhere else (every other gfx11, gfx12, gfx103x,
-/// Windows and discrete cards are unchanged).  Inline: src/prefill/gemm.cu uses it without linking arch_defaults.cpp.
+/// value = off (the way back); unset = the device rule: on for a Radeon 780M (gfx1103, integrated, Linux) and, #5151, for a discrete RX 6000 card (gfx1030 /
+/// gfx1031 / gfx1032, Linux and Windows: rocBLAS has tuned kernels for FP16 in / FP16 out only there); off everywhere else (gfx11 and gfx12 cards, the integrated
+/// gfx103x APUs, every other part).  RX 6700 XT (gfx1031, ROCm 10.1, IQ2_XS, 16 prompts of 2K, 64 forced tokens, truth = the exact FP32 products): KL to the truth
+/// 0.00549 against the old default's 0.00621 (ratio 0.883 [0.829, 0.948]; first token 1.010 [0.672, 1.941]), prompts 11-14 % faster; 8K not measured.
+/// STRATA_HIP_PROMPT_F16=0 keeps the old route.  Inline: src/prefill/gemm.cu uses it without linking arch_defaults.cpp.
 inline bool prompt_f16_resolve(const char* env, const char* gcn_arch, bool integrated, bool windows) {
     if (env != nullptr) return env[0] == '1';
-    return integrated && !windows && strata::kernels::gfx_arch_is(gcn_arch, "gfx1103");
+    if (integrated) return !windows && strata::kernels::gfx_arch_is(gcn_arch, "gfx1103");
+    return strata::kernels::gfx_arch_is(gcn_arch, "gfx1030") || strata::kernels::gfx_arch_is(gcn_arch, "gfx1031") ||
+           strata::kernels::gfx_arch_is(gcn_arch, "gfx1032");
 }
 /// Whether the expert arena skips its MADV_HUGEPAGE request: `no_arena_thp` is STRATA_NO_ARENA_THP (nullptr when unset): "0" asks for the huge
 /// pages, any other value skips the request; unset leaves it to `igpu_rule` (igpu_arena_no_thp_default for this device).  `thp_always`: the
