@@ -20,6 +20,7 @@
 // finite, non-zero scales, and the blob at a DIFFERENT layer must be different data - which is what a wrong
 // stride would break.
 #include "strata/kernels/cpu/expert.hpp"
+#include "synth_q2_blob.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -84,11 +85,12 @@ float f16_at(const std::vector<uint8_t>& b, size_t off) {
 int main(int argc, char** argv) {
     bool selftest = false;
     const char* path = "pack/full/experts.bin";
+    bool path_given = false;
     long long layer = 0, expert = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
-        else if (a == "--file" && i + 1 < argc) path = argv[++i];
+        else if (a == "--file" && i + 1 < argc) { path = argv[++i]; path_given = true; }
         else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
         else if (a == "--expert" && i + 1 < argc) expert = std::atoll(argv[++i]);
         else { std::fprintf(stderr, "usage: expert_parity [--selftest] [--file P] [--layer N] [--expert N]\n");
@@ -108,10 +110,22 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // the pack's Q2_0 experts, or (no --file and no pack/full here) seeded blobs of the same form
+    bool synth = false;
+    if (!path_given) {
+        if (std::FILE* f = std::fopen(path, "rb")) std::fclose(f);
+        else synth = true;
+    }
+    if (synth) std::printf("  %-44s %s\n", "experts", "pack/full/experts.bin is not here: seeded Q2_0 blobs");
+    auto blob_at = [&](long long index, std::vector<uint8_t>& out) {
+        if (!synth) return read_blob(path, index, out);
+        cpu::test::synth_q2_blob(index, out);
+        return true;
+    };
     // ---- a real blob out of the pack: layer stride is 512 experts
     const long long idx = layer * 512 + expert;
     std::vector<uint8_t> blob;
-    if (!read_blob(path, idx, blob)) {
+    if (!blob_at(idx, blob)) {
         std::fprintf(stderr, "cannot read expert %lld (layer %lld) from %s\n", expert, layer, path);
         return 2;
     }
@@ -135,7 +149,7 @@ int main(int argc, char** argv) {
     }
     {
         std::vector<uint8_t> other;
-        if (read_blob(path, (layer * 512 + expert) + 1, other)) {
+        if (blob_at((layer * 512 + expert) + 1, other)) {
             long long diff = 0;
             for (size_t i = 0; i < blob.size(); ++i) if (blob[i] != other[i]) ++diff;
             const double frac = (double) diff / (double) blob.size();
