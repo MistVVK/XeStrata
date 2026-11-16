@@ -108,6 +108,13 @@ inline int i8_tile_two_blocks(int tm, std::size_t bytes2, std::size_t bytes3, st
     while (t > 2 && !fits(t)) --t;
     return t;
 }
+/// Volta's tensor-core form of the kernels (tile code 5, src/kernels/cuda/i8h_volta.cuh: the same products on the FP16 tensor cores, bit-identical output) from this many
+/// entries a launch's expert has on average.  Tesla V100, one layer of Flash-Next's shape, uniform routing, MMQ time / time (phaseA-tests/tune0216 bench5), tile 3 -> tile 5:
+/// at 40 entries (2,048 tokens) 1.38 -> 1.22 (slower), at 160 (8,192) 0.95 -> 0.96 (IQ3_S), 0.95 -> 0.94 (IQ3_XXS), 0.90 -> 0.94 (IQ2_S), at 508 (26,000) 0.82 -> 0.86,
+/// 0.83 -> 0.84, 0.82 -> 0.89; output hashes equal at every size.
+inline constexpr int64_t kI8hMinAvg = 160;
+/// The Volta pick: tile 5 from kI8hMinAvg entries on average when the formats have it (`h_ok`), else the two-block tile of i8_tile_two_blocks.
+inline int i8_tile_volta(int two_block_tile, int64_t avg, bool h_ok) { return h_ok && avg >= kI8hMinAvg ? 5 : two_block_tile; }
 /// STRATA_I8_SM70 read as a state (1 / 0 / -1 not set): the Volta tile rule above and the global grid are on unless it is 0.
 inline bool i8_volta_rule_on(int state) { return state != 0; }
 

@@ -188,6 +188,11 @@ int main() {
         // a bigger multiprocessor keeps the larger tile (never above 4: tile 8 is not this rule's pick)
         CHECK(i8_tile_two_blocks(8, 43008, 48128, 53248, 233472, 1024) == 4);
         CHECK(i8_volta_rule_on(-1) && i8_volta_rule_on(1) && !i8_volta_rule_on(0));
+        // the tensor-core form (tile 5) from kI8hMinAvg entries an expert, only for the formats it covers
+        CHECK(i8_tile_volta(3, kI8hMinAvg, true) == 5);
+        CHECK(i8_tile_volta(3, kI8hMinAvg - 1, true) == 3);
+        CHECK(i8_tile_volta(3, 508, false) == 3);
+        CHECK(i8_tile_volta(2, 40, true) == 2);
     }
     if (failed) {
         std::fprintf(stderr, "i8_expert_rule_test: %d check(s) failed\n", failed);
