@@ -53,7 +53,9 @@ struct Fixture {
     }
     void self(const std::string& text) { put("self_cgroup", text + "\n"); }
     MemoryProbePaths paths() const {
-        return {(dir / "meminfo").string(), (dir / "self_cgroup").string(), (dir / "cgroup").string(), (dir / "status").string()};
+        // (#5519: the ZFS arcstats file is the fixture's too - absent unless a test writes it - never the real one)
+        return {(dir / "meminfo").string(), (dir / "self_cgroup").string(), (dir / "cgroup").string(), (dir / "status").string(),
+                (dir / "arcstats").string()};
     }
     void rss_file(uint64_t bytes) { put("status", "Name:\tstrata\nRssFile:\t" + std::to_string(bytes / 1024) + " kB\n"); }
     std::optional<HostMemoryReading> sample(uint64_t explicit_limit = 0) const { return sample_host_memory(paths(), explicit_limit); }
@@ -518,6 +520,35 @@ int main() {
         check(std::string(memory_source_name(MemorySource::flag)) == "flag" &&
                   std::string(memory_source_name(MemorySource::cgroup)) == "cgroup" &&
                   std::string(memory_source_name(MemorySource::meminfo)) == "meminfo", "source names");
+    }
+    // #5519: the ZFS ARC above its floor is available RAM (MemAvailable leaves it out)
+    {
+        const auto arcstats = [](uint64_t size, uint64_t c_min) {
+            return "13 1 0x01 147 39984 5170330404 49152938520393\nname                            type data\n"
+                   "hits                            4    123456\nc_min                           4    " + std::to_string(c_min) +
+                   "\nc_max                           4    135179472896\nsize                            4    " + std::to_string(size) + "\n";
+        };
+        check(zfs_arc_reclaimable_from_text(arcstats(60 * GiB, 4 * GiB)) == 56 * GiB, "ARC 60 GiB, floor 4: 56 GiB comes back");
+        check(zfs_arc_reclaimable_from_text(arcstats(3 * GiB, 4 * GiB)) == 0, "an ARC at or under its floor gives nothing");
+        check(zfs_arc_reclaimable_from_text("name type data\nsize 4 1000\n") == 0, "no c_min line: no credit");
+        check(zfs_arc_reclaimable_from_text("size 4 12x\nc_min 4 1\n") == 0, "a malformed number: no credit");
+        check(zfs_arc_reclaimable_from_text("") == 0, "empty: none");
+        // the reporter's TrueNAS host: MemAvailable 52 GB of 128 with ~60 GB of ARC
+        Fixture f;
+        f.meminfo(128 * GiB, 52 * GiB);
+        f.self("0::/");
+        f.put("cgroup/memory.max", "max\n"); f.put("cgroup/memory.current", 70 * GiB);
+        const auto before = f.sample();
+        check(before && before->available == 52 * GiB, "without arcstats (no ZFS): MemAvailable as before");
+        f.put("arcstats", arcstats(60 * GiB, 4 * GiB));
+        const auto with = f.sample();
+        check(with && with->available == 108 * GiB, "with ZFS: MemAvailable + the ARC above its floor (52 + 56)");
+        // a container's own limit still bounds it: the ARC is the host's
+        f.self("0::/c");
+        f.put("cgroup/c/memory.max", 40 * GiB); f.put("cgroup/c/memory.current", 30 * GiB);
+        f.put("cgroup/c/memory.stat", "anon 30000000000\nfile 0\ninactive_file 0\nactive_file 0\n");
+        const auto boxed = f.sample();
+        check(boxed && boxed->available <= 10 * GiB, "under a container's 40 GiB limit: the limit's room, not the host's ARC");
     }
     std::printf("memory_guard_test: %d checks passed\n", checks);
     return 0;
