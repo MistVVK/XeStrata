@@ -4,7 +4,7 @@
 # Run on a Linux box that has ROCm (TheRock Python wheels are enough); the tester packages were built in an Ubuntu 22.04 chroot
 # (glibc 2.35) so they run on every distribution since.  All settings are environment variables:
 #
-#   VARIANT=rx9070     rx9070 (gfx1200 gfx1201) | rx7900 (gfx1100 gfx1101 gfx1102) | rx6000 (gfx1030 gfx1031) | halo (gfx1151) | igpu (gfx1103 gfx1150) | a name + ARCHS=
+#   VARIANT=rx9070     rx9070 (gfx1200 gfx1201) | rx7900 (gfx1100 gfx1101 gfx1102) | rx6000 (gfx1030 gfx1031 gfx1032) | halo (gfx1151) | igpu (gfx1103 gfx1150) | a name + ARCHS=
 #   ARCHS="gfx1200;gfx1201"          the code objects (default: the variant's)
 #   SRC=<this checkout>              the Strata source (default: the checkout this script is in)
 #   LLAMA=<llama.cpp checkout>       optional override (kept for two releases): ggml comes from that checkout instead of the vendored third_party/
@@ -33,7 +33,7 @@ JOBS=${JOBS:-16}
 case "$V" in
   rx9070) ARCHS=${ARCHS:-gfx1200;gfx1201} ;;
   rx7900) ARCHS=${ARCHS:-gfx1100;gfx1101;gfx1102} ;;
-  rx6000) ARCHS=${ARCHS:-gfx1030;gfx1031} ;;   # RDNA2: no WMMA (plain kernels), no hipBLASLt kernels; built, not tested on a real RX 6000 card
+  rx6000) ARCHS=${ARCHS:-gfx1030;gfx1031;gfx1032} ;;   # RDNA2: no WMMA (plain kernels), no hipBLASLt kernels; built, not tested on a real RX 6000 card
   halo)   ARCHS=${ARCHS:-gfx1151} ;;
   igpu)   ARCHS=${ARCHS:-gfx1103;gfx1150} ;;
   *)      ARCHS=${ARCHS:?ARCHS=gfx...} ;;

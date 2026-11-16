@@ -26887,6 +26887,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_TQ_G11",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2672,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "default",
+   "owner": "prefill",
+   "note": "on by default on the RX 7000 cards (gfx1100 / gfx1101 / gfx1102) in a build without llama.cpp's MMQ: the fused prompt kernels take Gyro-S's and Gyro-M's trellis experts instead of the dequantize + FP16 path (#6067; include/strata/prefill/fused_tq_hip.hpp kG11DefaultOn); =0 turns it off; nothing on other devices; for A/B runs only, not for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_TQ_G1151",
    "backends": [
     "hip"

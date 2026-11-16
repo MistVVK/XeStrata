@@ -2782,12 +2782,21 @@ static bool pcie_auto_split_ok() {
 // HIP outside gfx12: the same refinement, opt-in with STRATA_PCIE_FRAC_DEFAULT=auto (#2224).  Its author gate-measured it on an
 // RX 7900 XTX (gfx1100) as "no regression" only (4 alternating starts at 64K, prefill 2189 base vs 2180 with it, decode 65.4 vs
 // 65.4; under serve the share refines 0.55 -> 0.25 from the pool's 42-45 us/missed expert and the probed 28.4-28.5 GB/s link);
-// a second report (2x RX 7900 GRE) found it never engages there (95-98% of the experts cached).  The gain is measured only on
-// gfx1201 (where it is the default, decode_defaults_arch_ok), so the other parts keep the fixed share unless asked.
+// a second report (2x RX 7900 GRE) found it never engages there (95-98% of the experts cached).  #4007: on by default on
+// a discrete gfx103x card (RX 6000), where the start-up share (bandwidth only) is too high for a fast CPU pool; the measurements
+// are at strata::pcie_auto_hip_default.  The other parts keep the fixed share unless asked; STRATA_PCIE_FRAC_DEFAULT=old (or any
+// value other than auto) keeps it on gfx103x too.
 [[maybe_unused]] static bool pcie_auto_fork_arch_ok() {
 #if defined(STRATA_USE_HIP)
-    const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
-    return pfd != nullptr && std::strcmp(pfd, "auto") == 0;
+    static const bool on = [] {
+        int dev = 0;
+        cudaDeviceProp p{};
+        const char* arch = nullptr;
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess) arch = p.gcnArchName;
+        else (void) cudaGetLastError();
+        return strata::pcie_auto_hip_default(arch, spill_discrete_gpu(), strata::qwen_defaults_026(), std::getenv("STRATA_PCIE_FRAC_DEFAULT"));
+    }();
+    return on;
 #else
     return false;
 #endif
@@ -5248,8 +5257,9 @@ int main(int argc, char** argv) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
-            // 0.1.43: split opt-in + gfx12 default-on (decode_defaults_arch_ok).  Other HIP parts: STRATA_PCIE_FRAC_DEFAULT=auto
-            // turns the refinement on (pcie_auto_fork_arch_ok); the pool timings and miss counts it reads are engine-generic.
+            // 0.1.43: split opt-in + gfx12 default-on (decode_defaults_arch_ok).  #4007: discrete gfx103x default-on too; other HIP
+            // parts: STRATA_PCIE_FRAC_DEFAULT=auto turns the refinement on (pcie_auto_fork_arch_ok); the pool timings and miss counts
+            // it reads are engine-generic.
             // STRATA_PCIE_FRAC_DEFAULT=old keeps the start-up rule everywhere.
             o.pcie_frac_auto = (o.layer_split.empty() || pcie_auto_split_ok()) && !pf_old &&
                                (decode_defaults_arch_ok() || pcie_auto_fork_arch_ok());

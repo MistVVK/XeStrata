@@ -2210,6 +2210,7 @@ struct DevInfo {
     bool done = false, ok = false;
     bool g1151 = false; // gfx1151 (Strix Halo): Q8_0 down layers on the F16 kernel by default (q8d_f16_default)
     bool w12 = false;   // gfx12 (RDNA4): the native kernels only - the Q2_0 pack's (moe_fused.cu) are not ported there
+    bool g11 = false;   // gfx1100 / gfx1101 / gfx1102 (RDNA3 cards): the trellis pairs by fused_tq_hip::g11_on (#6067)
     bool t75 = false;   // Turing (STRATA_PF_FUSED_SM75): the Q2_0 / Q2_0 layers only (what was set up and checked there)
     unsigned t75_set = 0, t75_w4 = 0;   // Turing: the i-quant gate/up and IQ4_NL down instances set up (t75_bit), and those whose 64-row (WW 4) instance fits 64 KB too
     bool q2n = false;   // sm_80+ with STRATA_PF_FUSED_Q2N=1: the native Q2_0 pack's Q2_0 gate/up is set up as well (opt-in)
@@ -2395,6 +2396,8 @@ const DevInfo& dev_info() {
         const bool props = cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
         d.w12 = props && strata::kernels::gfx_arch_is_gfx12_wmma(prop.gcnArchName);
         d.g1151 = props && strata::kernels::gfx_arch_is_gfx1151(prop.gcnArchName);
+        d.g11 = props && (strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1100") || strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1101") ||
+                          strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1102"));
         // the arch lists of STRATA_NAT_W11 / STRATA_NAT_W12 (gfx_arch.hpp: never a prefix - another gfx11 / gfx12 part
         // has the trapping body, which hipFuncGetAttributes and the occupancy query still accept).  And the body this
         // build loaded for the device is the real one: the __builtin_trap() stub (a gfx11-generic / gfx12-generic or
@@ -2663,13 +2666,22 @@ constexpr bool kTqWin = true;
 #else
 constexpr bool kTqWin = false;
 #endif
+// STRATA_PF_TQ_G11 (internal, #6067): gfx1100 / gfx1101 / gfx1102 take both trellis pairs with STRATA_PF_FUSED_TQ=1 (a build without MMQ sets it): 1 on, any other
+// value off, unset = fused_tq_hip::kG11DefaultOn.
+static int tq_g11_switch() {
+    static const int v = strata::prefill::fused_tq_hip::parse_switch(std::getenv("STRATA_PF_TQ_G11"));
+    return v;
+}
+static bool tq_g11(const DevInfo& d) {
+    return strata::prefill::fused_tq_hip::g11_on(d.g11, tq_hip_requested(), tq_g11_switch(), strata::prefill::fused_tq_hip::kG11DefaultOn);
+}
 bool tq_hip_device(const DevInfo& d) {
     return strata::prefill::fused_tq_hip::device_on(d.w12, d.g1151, kTqWin, tq_hip_requested(), tq_g1151_switch(), tq_g1151_defaults_off(),
-                                                   strata::prefill::fused_tq_hip::kG1151DefaultOn);
+                                                   strata::prefill::fused_tq_hip::kG1151DefaultOn) || tq_g11(d);
 }
 static bool tq_hip_pair(const DevInfo& d, bool gyro_s, bool gyro_m) {
     return strata::prefill::fused_tq_hip::pair_on(d.w12, d.g1151, kTqWin, tq_hip_requested(), tq_g1151_switch(), tq_g1151_defaults_off(),
-                                                 strata::prefill::fused_tq_hip::kG1151DefaultOn, gyro_s, gyro_m);
+                                                 strata::prefill::fused_tq_hip::kG1151DefaultOn, gyro_s, gyro_m) || (tq_g11(d) && (gyro_s || gyro_m));
 }
 // STRATA_PF_FUSED_Q8GU on HIP (phase 4, opt-in, gfx12 only): "1" lets a Q8_0 gate/up with a Q8_0 down (the Q8_0 set's 48 layers, UD-Q6_K_XL's one Q8_0
 // layer) take native_w11_kernel's Q8_0 gate/up instance instead of MMQ (32-value blocks, two a stage, like the Q8_0 down; the same decode as CUDA's).  The

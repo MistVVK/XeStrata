@@ -57,7 +57,8 @@ def drafting_choice_available(ctx) -> bool:
     from strata_control import drafting
     if getattr(getattr(ctx, "settings", None), "family", None) not in drafting.SUPPORTED_FAMILIES or not drafting.ENGINE_SERVES_DFLASH2:
         return False
-    backend, archs = drafting.detect_hardware()
+    catalog = getattr(ctx, "catalog", None)
+    backend, archs = drafting.hardware_for(catalog.installed_backend() if catalog is not None else None)   # #5109: the installed engine's family
     return drafting.hardware_support(backend, archs).can_run
 
 

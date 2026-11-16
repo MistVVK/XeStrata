@@ -162,7 +162,7 @@ STRATA_PROGRAMS = {
 }
 OTHER_PROGRAMS = {
     "serve/mcp.py": 2,                 # the person's MCP servers and taskkill
-    "serve/telemetry.py": 2,           # sysctl, a Metal tool
+    "serve/telemetry.py": 3,           # sysctl, a Metal tool, PowerShell's Get-PnpDevice (the Windows AMD PCIe link, #4884)
     "strata_control/doctor.py": 1,
     "strata_control/engine_component.py": 4,   # nvidia-smi, powershell, lspci-style probes
     "strata_control/gpu_roles.py": 1,          # python -c

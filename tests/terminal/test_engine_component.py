@@ -294,6 +294,16 @@ class WindowsAmd(unittest.TestCase):
         with mock.patch.object(ec.shutil, "which", lambda name: None), mock.patch.object(ec.os, "name", "nt"),                 mock.patch.object(ec, "host_platform", return_value="windows-x86_64"),                 mock.patch.object(ec, "windows_display_adapters", return_value=self.TESTER_A):
             self.assertEqual(ec.detect_backend({}), ("hip", "display adapters"))
 
+    def test_the_rx6600_is_an_rx6000_card(self):
+        """#5174: an RX 6600 / 6600 XT / 6650 XT (Navi 23, gfx1032) is known by its Windows device id and its name, belongs to the RX 6000 family,
+        and the Linux RX 6000 package is built for it."""
+        for did in (0x73FF, 0x73EF, 0x73E3):
+            self.assertEqual(ec.WIN_AMD_DEVICE_ARCH[did], "gfx1032")
+        self.assertEqual(ec.gfx_from_name("AMD Radeon RX 6600 XT"), "gfx1032")
+        self.assertEqual(ec.hip_family("gfx1032"), "RX 6000")
+        script = (Path(__file__).resolve().parents[2] / "packaging" / "build_hip_linux.sh").read_text(encoding="utf-8")
+        self.assertIn("rx6000) ARCHS=${ARCHS:-gfx1030;gfx1031;gfx1032}", script)
+
     def test_the_arch_table_is_the_one_setup_uses(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         import setup as strata_setup

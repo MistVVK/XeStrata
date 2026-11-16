@@ -181,6 +181,23 @@ def detect_hardware() -> tuple[str | None, list[str]]:
     return backend, archs
 
 
+#: the card architectures of each engine family, by name (detect_hardware lists every vendor's cards a computer has)
+_FAMILY_ARCH_PREFIX = {"cuda": "sm_", "hip": "gfx"}
+
+
+def hardware_for(engine_backend: str | None) -> tuple[str | None, list[str]]:
+    """#5109: detect_hardware() for a start whose config names its engine family (cfg["backend"]).  On a computer with an NVIDIA card beside the AMD
+    card the engine serves from, detect_hardware() answers "cuda" with the NVIDIA card first, so the drafter's support line, card class and
+    confidence were the idle NVIDIA card's.  The config's family wins, and only its own cards' architectures are kept (in detect_hardware's order).
+    Without a known family (or for one whose cards are not named here): detect_hardware() unchanged."""
+    backend, archs = detect_hardware()
+    want = str(engine_backend or "").strip().lower()
+    prefix = _FAMILY_ARCH_PREFIX.get(want)
+    if not prefix:
+        return backend, archs
+    return want, [a for a in archs if str(a).lower().startswith(prefix)]
+
+
 def hardware_support(backend: str | None, archs: Any = None, model_name: str | None = None) -> Support:
     """Can the engine for this backend and card run DFlash2, and what was measured on it. ``backend`` is the engine family (cuda | hip | sycl | metal);
     ``archs`` the cards' architectures (``sm_120``, ``gfx1151``...), the first one counts like card_class does. ``model_name``: on Metal the answer is
@@ -756,12 +773,12 @@ def vram_gb(data_dir: str | Path | None = None, engine: str | os.PathLike[str] |
     return DRAFTER_GB["dflash2_selq4" if uses_selector_q4(data_dir, engine) else "dflash2"]
 
 
-def installed_engine_exe() -> Path | None:
+def installed_engine_exe(backend: str | None = None) -> Path | None:
     """The engine program of the newest installed engine component for this computer's backend (None: not found). A quick folder scan, nothing is hashed or started."""
     try:
         from strata_control import engine_component as ec
         found, _ = ec.scan(None)
-        backend = (detect_hardware()[0] or "").lower()
+        backend = (backend or detect_hardware()[0] or "").lower()   # #5109: a caller that knows the config's family passes it
         best = [c for c in found if not backend or str(c.backend).split(":")[0].lower() == backend] or list(found)
         best.sort(key=lambda c: ec._version_key(c.version), reverse=True)
         return best[0].exe if best and best[0].exe.is_file() else None

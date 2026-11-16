@@ -2,10 +2,12 @@
 // The decode miss split between the CPU pool and the PCIe link (PcieAuto): the share of a layer's missed experts the link carries is
 // link / (link + k R), R the CPU pool's rate in GB/s of expert bytes, rounded to 0.05 and kept between 0.10 and a ceiling.
 // 0.2.10.1 (HYBRID, round 0211): the ceiling is 0.95 and k falls with R, on a discrete card; STRATA_PCIE_SHARE_MAX and STRATA_PCIE_K_RULE
-// set either by hand, STRATA_PCIE_AUTO_SPLIT=0/1 decides whether a CUDA layer split refines its shares too.  Pure functions, no GPU.
+// set either by hand, STRATA_PCIE_AUTO_SPLIT=0/1 decides whether a CUDA layer split refines its shares too.  #4007: on by default on discrete
+// gfx103x (pcie_auto_hip_default).  Pure functions, no GPU.
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata {
 
@@ -40,6 +42,16 @@ inline bool pcie_auto_split_default(bool hip_build, bool discrete, bool v026, co
 inline bool pcie_k_rule_default(bool discrete, bool v026, const char* env) {
     if (env != nullptr && env[0] != 0) return std::atoi(env) != 0;
     return discrete && !v026;
+}
+
+/// PcieAuto on a HIP part outside gfx12 (gfx12 has it through the decode defaults).  `env` is STRATA_PCIE_FRAC_DEFAULT (nullptr unset): "auto"
+/// turns it on for any HIP part; any other value (for example "old", which the caller also reads to keep the start-up rule) leaves it off.
+/// Unset: on for a discrete gfx103x card (RX 6000), off for every other part, for an integrated GPU (gfx1035 / gfx1036 APUs share the host's RAM)
+/// and under the master switch 026.  Measured on 0.2.13, unset against auto, ten interleaved pairs each (#4007): RX 6900 XT on Windows decode
+/// +13.3% at 32K / +15.1% at 4K (10/10), on Linux +1.0% / +4.9% (10/10); RX 6700 XT (gfx1031, Linux) +3.4% / +4.9% (10/10, 9/10); prompts unchanged.
+inline bool pcie_auto_hip_default(const char* gcn_arch, bool discrete, bool v026, const char* env) {
+    if (env != nullptr && env[0] != 0) return std::strcmp(env, "auto") == 0;
+    return discrete && !v026 && gcn_arch != nullptr && std::strncmp(gcn_arch, "gfx103", 6) == 0;
 }
 
 /// The ceiling.  STRATA_PCIE_SHARE_MAX (nullptr unset) wins (clamped 0.10..1.0); unset: 0.95 on a discrete card, 0.60 otherwise.
