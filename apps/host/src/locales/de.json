@@ -3528,5 +3528,5 @@
   "s9036": "Drücken Sie noch einmal auf „Herunterladen und laden“, um sie zu holen. Vorhandene Dateien bleiben erhalten. Werden dieselben Dateien wieder aufgelistet, öffnen Sie die Details und teilen Sie sie mit, wenn Sie um Hilfe bitten.",
   "s9037": "Dieses Update wurde beim Neustart der App unterbrochen. Ein späteres Update ist abgeschlossen, Sie müssen nichts tun.",
   "s9038": "Dieses System erlaubt Strata nicht, Port {0} zu verwenden. Unter Linux und macOS brauchen Ports unter 1024 Administratorrechte. Starten Sie Strata mit einem anderen Port (STRATA_PORT), zum Beispiel 8801.",
-  "s9101": "Anteil der Zeit, in der die GPU Arbeit hatte. Er sagt nicht, wie viel ihrer Rechenleistung genutzt wird."
+  "s9101": "Anteil der Zeit, in der die GPU etwas zu tun hatte. Er sagt nicht aus, wie viel ihrer Rechenleistung genutzt wird."
 }
