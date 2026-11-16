@@ -6447,6 +6447,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_DUMP_TOKENS_DIR",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 19548,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, measurement only, off by default: writes each request's generated tokens to <dir> for a later STRATA_FOLLOW_DIR run.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_DUMP_WINDOW_TOP2",
    "backends": [
     "sycl"
@@ -7911,6 +7944,39 @@
    "status": "research",
    "owner": "program",
    "note": "[reviewed] Described as a \"STRATA_FOLLOW test path\"; test-only switch. [notes-148-intel.md:83]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_FOLLOW_DIR",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 19547,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, measurement only, off by default: a forced continuation from <dir> stands in for the head's picks, so two arms decode the same tokens.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -28048,6 +28114,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PIPELINE_HIT_MIN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18099,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "-1.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, opt-in (off by default until the two-card measurement): the pipelined decode launches a speculative window when the share of such windows on the path, counted in this process, is at least this (0.35 measured best on 2x RTX 3090); unset, the theta gate at 0.2.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PIPELINE_LAZY_CHAIN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18109,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, opt-in (off by default until the two-card measurement): =1 runs the MTP chain's steps only as the outputs before them call for them (chain_extend); unset, the whole chain at once.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PIPELINE_LOG",
    "backends": [
     "cuda-hip",
@@ -28124,6 +28256,39 @@
    "status": "research",
    "owner": "program",
    "note": "[auto] diagnostic / trace / measurement switch by name or by code, not documented for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PIPELINE_LOOKUP_RUN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18116,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, opt-in (off by default until the two-card measurement): =1 makes the window behind a lookup continuation that was on the path the same lookup's; unset, the chain's.",
    "retire_after": "",
    "retired_in": ""
   },
