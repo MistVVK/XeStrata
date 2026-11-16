@@ -471,7 +471,7 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
     }
     gpu::stream_sync(s);
     m.host.close();
-    m.stepped_rows(R);
+    m.stepped_rows(R, (uint64_t) R * C * 4);
     tm.mark("blocks backward", s);
     static int64_t n = 0;
     if (tm.on() && ++n % 10 == 0) {   // every 10 steps: the step's stages, then the blocks'

@@ -549,7 +549,7 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     gpu::stream_sync(s);
     m.host.close();
     qi_block_profile_report();
-    m.stepped_rows(R);
+    m.stepped_rows(R, (uint64_t) R * C * 4);
     if (strata::env_get("TRAIN_PROFILE") != nullptr) {   // the memory the step left
         size_t fb = 0, tb = 0;
         gpu::mem_info(&fb, &tb);

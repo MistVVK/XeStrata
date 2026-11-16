@@ -106,8 +106,12 @@ public:
     int64_t keep_tapes(int64_t nb, int64_t rows, size_t per, size_t step_bytes);
     /// Block b's kept tape (keep_tapes), null where it keeps none.
     Arena* tape(int64_t b) const;
-    /// A step of `rows` ran: its kernels compiled and the arena grown to it.
-    void stepped_rows(int64_t rows);
+    /// A step of `rows` ran: its kernels compiled and the arena grown to it (`row_bytes`: one R×C FP32 input).
+    void stepped_rows(int64_t rows, uint64_t row_bytes = 0);
+    /// The last step's rows and input bytes, and the arena's per-row guess (the VRAM report's figures).
+    int64_t last_rows() const { return last_rows_; }
+    uint64_t last_row_bytes() const { return last_row_bytes_; }
+    uint64_t guess_row() const { return guess_row_; }
 
     // ---- the VRAM budget: an explicit cap, the step-boundary shrink/grow, pause and resume
     /// The VRAM (bytes) this trainer may hold on its GPU, everything of its own counted (0: the automatic form,
@@ -212,6 +216,8 @@ private:
     std::vector<Param> params_;
     int64_t budget_rows_ = 0;
     bool budget_stepped_ = false;
+    int64_t last_rows_ = 0;
+    uint64_t last_row_bytes_ = 0, guess_row_ = 0;
     std::vector<std::unique_ptr<Arena>> tapes_;
     void* tape_buf_ = nullptr;
     size_t tape_cap_ = 0;

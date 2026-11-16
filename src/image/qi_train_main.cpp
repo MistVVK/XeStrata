@@ -29,6 +29,7 @@
 #include "strata/image/qi_trainer.hpp"
 #include "strata/image/train_sample.hpp"
 #include "strata/image/train_loop.hpp"
+#include "strata/image/train_control.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -52,7 +53,8 @@ void usage() {
                  "usage: xestrata-image-qi-train train --dit <gguf> --data <items> --out <prefix> [--rank N] "
                  "[--steps N] [--lr F] [--seed N] [--draw balanced|content|style] [--save-every N] "
                  "[--caption-dropout F] [--base bf16|int8] [--train-blocks LIST] [--only-if-contains PARTS] "
-                 "[--ignore-if-contains PARTS] [--kind character|style|other]\n"
+                 "[--ignore-if-contains PARTS] [--kind character|style|other] [--vram-budget MIB] "
+                 "[--vram-control FILE] [--state FILE] [--resume FILE]\n"
                  "       xestrata-image-qi-train check --dit <gguf> --dir <dir> [--blocks N] [--base bf16|int8]\n");
 }
 
@@ -144,11 +146,36 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     std::uniform_real_distribution<float> uni(0.f, 1.f);
     std::vector<size_t> order;
     size_t next = 0;
+    double loss_avg = 0.0;
+    int64_t done = 0;   // the steps completed (the state file's; --resume continues after them)
+    // the loop's state as the state file holds it (the rng's whole state, the data's order and place)
+    auto save_loop = [&](std::ostream& os) {
+        os << done << '\n' << rng << '\n' << order.size() << '\n';
+        for (size_t v : order) os << v << ' ';
+        os << '\n' << next << '\n' << loss_avg << '\n';
+    };
+    auto load_loop = [&](std::istream& is) {
+        size_t on = 0;
+        is >> done >> rng >> on;
+        order.resize(on);
+        for (size_t& v : order) is >> v;
+        is >> next >> loss_avg;
+        if (!is) throw std::runtime_error("the state file's loop state did not read");
+    };
+    train::Control::Opts co;
+    co.path = opt(f, "vram-control", "");
+    co.budget_mib = (uint64_t) std::stoll(opt(f, "vram-budget", "0"));
+    co.state = opt(f, "state", out + ".state.bin");
+    train::Control ctl(tr.base(), co);
+    ctl.load(opt(f, "resume", ""), load_loop);
+    ctl.report();
+    const int64_t start_step = done + 1;
     std::map<std::pair<int64_t, int64_t>, train::Schedule> sched;
     std::vector<float> x0, nz;
     const auto t0 = std::chrono::steady_clock::now();
-    double loss_avg = 0.0;
-    for (int64_t step = 1; step <= steps; ++step) {
+    for (int64_t step = start_step; step <= steps; ++step) {
+        done = step - 1;
+        ctl.boundary(true, save_loop);   // the budget, pause/resume, the state file (every step ends in an update)
         if (next == order.size()) {   // a new epoch: every item once, in a new order
             order.resize(all.size());
             for (size_t i = 0; i < order.size(); ++i) order[i] = i;
@@ -178,8 +205,9 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
         const double own = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
         std::printf("step %lld loss %.5f (avg %.5f) t %.1f grad %.3f %lldx%lld %.2f s (%.2f s/step)\n",
                     (long long) step, (double) loss, loss_avg, (double) timestep, norm, (long long) (w * 16),
-                    (long long) (h * 16), own, secs / (double) step);
+                    (long long) (h * 16), own, secs / (double) (step - start_step + 1));
         std::fflush(stdout);
+        ctl.report();
         if ((save_every > 0 && step % save_every == 0) || step == steps) {
             const std::string path = out + "_" + std::to_string(step) + ".safetensors";
             train::LoraMeta meta;

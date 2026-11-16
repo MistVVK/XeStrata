@@ -168,6 +168,7 @@ void Trainer::set_budget(int64_t rows, uint64_t keep_row, uint64_t guess_row) {
     budget_rows_ = std::max(budget_rows_, rows);
     budget_stepped_ = stepped;
     replan_ = false;
+    if (guess_row > 0) guess_row_ = guess_row;
     const int64_t R = budget_rows_;
     const uint64_t all = ws.total();
     uint64_t budget = all;
@@ -274,8 +275,10 @@ Arena* Trainer::tape(int64_t b) const {
     return b >= 0 && (size_t) b < tapes_.size() ? tapes_[(size_t) b].get() : nullptr;
 }
 
-void Trainer::stepped_rows(int64_t rows) {
+void Trainer::stepped_rows(int64_t rows, uint64_t row_bytes) {
     scratch_rows = std::max(scratch_rows, rows);
+    last_rows_ = rows;
+    if (row_bytes > 0) last_row_bytes_ = row_bytes;
     stepped = true;
 }
 

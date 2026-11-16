@@ -477,7 +477,7 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
     }
     gpu::stream_sync(s);
     m.host.close();
-    m.stepped_rows(HW);
+    m.stepped_rows(HW, (uint64_t) HW * C * 4);
     return loss;
 }
 

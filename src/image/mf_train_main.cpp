@@ -10,10 +10,13 @@
 #include "strata/core/runtime.hpp"
 #include "strata/image/mf_trainer.hpp"
 #include "strata/image/train_loop.hpp"
+#include "strata/image/train_control.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
 #include <cstdio>
+#include <istream>
+#include <ostream>
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
@@ -34,7 +37,8 @@ void usage() {
                  "[--checkpoint N] [--trigger S] [--title S] [--timesteps linear|logit-normal|shifted] [--sigma-max F] "
                  "[--caption-dropout F] [--warmup N] [--eps F] [--weight-decay F] [--mod 1|0] [--base int8|bf16] "
                  "[--train-blocks LIST] [--only-if-contains PARTS] [--ignore-if-contains PARTS] "
-                 "[--kind character|style|other]\n");
+                 "[--kind character|style|other] [--vram-budget MIB] [--vram-control FILE] [--state FILE] "
+                 "[--resume FILE]\n");
 }
 
 // sd-scripts' truncated logit-normal (flux_train_utils, sample_truncated_logit_normal_indices): S = sigmoid(-N),
@@ -79,6 +83,8 @@ int main(int argc, char** argv) {
     }
     const std::string cmd = argv[1];
     std::string dit, data, stem, method = "lora", out, trigger, title, revision = "card-5";
+    std::string vram_control, state_path, resume_path;   // the VRAM control (train::Control)
+    long long vram_budget = 0;
     std::string train_blocks, only_if, ignore_if, kind;   // train::Targets' values, and the metadata's kind
     // ai-toolkit's Mage-Flow defaults (its mageflow model's job): linear timesteps, rank 32 with alpha = rank,
     // AdamW lr 1e-4 eps 1e-6 weight decay 1e-4 at a constant rate, batch 1, 3,000 steps, a save every 250, the
@@ -97,7 +103,15 @@ int main(int argc, char** argv) {
             }
             return argv[++i];
         };
-        if (a == "--dit")
+        if (a == "--vram-budget")
+            vram_budget = std::stoll(val("vram-budget"));
+        else if (a == "--vram-control")
+            vram_control = val("vram-control");
+        else if (a == "--state")
+            state_path = val("state");
+        else if (a == "--resume")
+            resume_path = val("resume");
+        else if (a == "--dit")
             dit = val("dit");
         else if (a == "--data")
             data = val("data");
@@ -297,7 +311,30 @@ int main(int argc, char** argv) {
             eval_avg("init");
             std::vector<size_t> order(stems.size());
             for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-            for (int step = 0; step < steps; ++step) {
+            // the VRAM control: the budget, pause/resume, the state file (the loop's micro-step, updates, rng, order)
+            int micro = 0;
+            auto save_loop = [&](std::ostream& os) {
+                os << micro << '\n' << updates << '\n' << nskip << '\n' << rng << '\n' << order.size() << '\n';
+                for (size_t v : order) os << v << ' ';
+                os << '\n';
+            };
+            auto load_loop = [&](std::istream& is) {
+                size_t on = 0;
+                is >> micro >> updates >> nskip >> rng >> on;
+                order.resize(on);
+                for (size_t& v : order) is >> v;
+                if (!is) throw std::runtime_error("the state file's loop state did not read");
+            };
+            strata::image::train::Control::Opts co;
+            co.path = vram_control;
+            co.budget_mib = (uint64_t) vram_budget;
+            co.state = state_path.empty() ? out + ".state.bin" : state_path;
+            strata::image::train::Control ctl(strata::image::mf_trainer_base(m.get()), co);
+            ctl.load(resume_path, load_loop);
+            ctl.report();
+            for (int step = micro; step < steps; ++step) {
+                micro = step;
+                ctl.boundary(acc_n == 0, save_loop);   // save_state waits for the update's boundary (grads zero)
                 if ((size_t)(step % stems.size()) == 0)
                     std::shuffle(order.begin(), order.end(), rng);   // a shuffled epoch
                 strata::image::MfTrainSample smp =
@@ -338,6 +375,7 @@ int main(int argc, char** argv) {
                 strata::image::mf_trainer_backward(m.get(), smp, c, stt, sig, gemm);
                 strata::image::mf_trainer_free_state(m.get(), stt);
                 strata::image::mf_trainer_free_cond(m.get(), c);
+                ctl.report();
                 acc_loss += loss;
                 if (++acc_n < accum) continue;
                 acc_n = 0;
@@ -349,6 +387,7 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 }
                 acc_loss = 0;
+                ctl.report();
                 if (updates % checkpoint == 0)
                     strata::image::mf_trainer_save(m.get(), out + "." + std::to_string(updates) + ".safetensors",
                                                    title, trigger, seed, lr, updates, steps, kind);
@@ -357,6 +396,7 @@ int main(int argc, char** argv) {
                 strata::image::mf_trainer_adamw(m.get(), lr, 0.9f, 0.999f, adam_eps, wd, acc_n);
                 ++updates;
             }
+            ctl.boundary(true, save_loop);   // a save_state asked at the tail: written here, then the pause
             eval_avg("final");
             strata::image::mf_trainer_save(m.get(), out + ".final.safetensors", title, trigger, seed, lr, updates,
                                            steps, kind);

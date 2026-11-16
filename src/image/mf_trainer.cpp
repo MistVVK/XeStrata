@@ -952,7 +952,7 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
         std::swap(dcur_t, dnxt_t);
     }
     gpu::stream_sync(st);
-    m->stepped_rows(Rj);
+    m->stepped_rows(Rj, (uint64_t) Rj * C * 4);
 }
 
 void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, float eps, float wd,
