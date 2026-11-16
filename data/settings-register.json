@@ -26915,7 +26915,7 @@
    "last_date": null,
    "status": "default",
    "owner": "prefill",
-   "note": "on by default on the RX 7000 cards (gfx1100 / gfx1101 / gfx1102) in a build without llama.cpp's MMQ: the fused prompt kernels take Gyro-S's and Gyro-M's trellis experts instead of the dequantize + FP16 path (#6067; include/strata/prefill/fused_tq_hip.hpp kG11DefaultOn); =0 turns it off; nothing on other devices; for A/B runs only, not for users",
+   "note": "on by default on the RX 7000 cards (gfx1100 / gfx1101 / gfx1102) in a build without llama.cpp's MMQ: the fused prompt kernels take Gyro-S's and Gyro-M's trellis experts instead of the dequantize + FP16 path (#6067; include/strata/prefill/fused_tq_hip.hpp kG11DefaultOn); =0 turns it off; =1 also takes the Radeon 780M (gfx1103: opt-in only, never by default); nothing on other devices; for A/B runs only, not for users",
    "retire_after": "",
    "retired_in": ""
   },
