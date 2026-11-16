@@ -144,5 +144,71 @@ class SubfolderDlls(unittest.TestCase):
             self.assertEqual(binary_deps.uncovered(Path(d)), [])
 
 
+class MacMinimumOs(unittest.TestCase):
+    """#4634: a macOS binary built for a newer macOS than the app's minimum stops in dyld before main() on the older Mac."""
+
+    @staticmethod
+    def make_macho(minos):
+        major, minor = minos
+        cmd = struct.pack("<IIIIII", 0x32, 24, 1, (major << 16) | (minor << 8), (27 << 16), 0)
+        return struct.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 1, len(cmd), 0, 0) + cmd
+
+    def test_min_os_is_read_from_the_build_version(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "strata"
+            p.write_bytes(self.make_macho((27, 0)))
+            self.assertEqual(binary_deps.macho_min_os(p), (27, 0))
+
+    def test_a_binary_newer_than_the_app_minimum_is_flagged(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "strata").write_bytes(self.make_macho((15, 0)))
+            (Path(d) / "strata-vision").write_bytes(self.make_macho((27, 0)))
+            self.assertEqual(binary_deps.too_new_for_mac(Path(d)), [("strata-vision", "27.0")])
+
+    def test_the_floor_matches_the_app_and_both_cmake_projects(self):
+        import json
+        app = json.loads((ROOT / "apps/desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+        floor = ".".join(map(str, binary_deps.MAC_MIN_OS))
+        self.assertEqual(app["bundle"]["macOS"]["minimumSystemVersion"], floor)
+        for cmake in ("metal/CMakeLists.txt", "tools/vision/CMakeLists.txt"):
+            self.assertIn(f'CMAKE_OSX_DEPLOYMENT_TARGET "{floor}"', (ROOT / cmake).read_text(encoding="utf-8"), cmake)
+
+    def test_the_packager_refuses_a_macos_engine_built_for_a_newer_macos(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = Path(d) / "src", Path(d) / "out"
+            src.mkdir()
+            (src / "strata").write_bytes(self.make_macho((27, 0)))
+            with self.assertRaises(SystemExit) as caught:
+                package_engine.build(src, "metal", "9.9.9", "macos-arm64", out, archs=("apple-gpu",))
+            self.assertIn("strata (macOS 27.0)", str(caught.exception))
+            self.assertFalse(any(out.glob("*")) if out.exists() else False)
+
+    def test_the_mac_min_os_command_refuses_a_folder_with_a_newer_binary(self):
+        # the released 0.2.14 / 0.2.15 Mac engines: strata and strata-vision at minos 27.2, the app beside them at 15.0
+        with tempfile.TemporaryDirectory() as d:
+            app = Path(d) / "Strata.app" / "Contents"
+            (app / "MacOS").mkdir(parents=True)
+            (app / "Resources/engine-bundle/0.1.60-macos-arm64-metal").mkdir(parents=True)
+            (app / "MacOS/strata-desktop").write_bytes(self.make_macho((15, 0)))
+            eng = app / "Resources/engine-bundle/0.1.60-macos-arm64-metal"
+            (eng / "strata").write_bytes(self.make_macho((27, 2)))
+            (eng / "strata-vision").write_bytes(self.make_macho((27, 2)))
+            self.assertEqual(binary_deps.main(["binary_deps.py", "--mac-min-os", d]), 1)
+            (eng / "strata").write_bytes(self.make_macho((15, 0)))
+            (eng / "strata-vision").write_bytes(self.make_macho((11, 0)))
+            self.assertEqual(binary_deps.main(["binary_deps.py", "--mac-min-os", d]), 0)
+
+    def test_every_mac_release_step_checks_the_minimum_macos(self):
+        # the engine build (packaging/mac/build_engine.sh), the dmg (make-dmg.sh) and the release signing of the app and of an
+        # engine package (sign-and-notarize.sh) each run the check, so a build without the deployment target cannot ship again
+        for script, times in (("packaging/mac/build_engine.sh", 1), ("apps/desktop/scripts/make-dmg.sh", 1),
+                              ("packaging/mac/sign-and-notarize.sh", 1)):
+            text = (ROOT / script).read_text(encoding="utf-8")
+            self.assertGreaterEqual(text.count("binary_deps.py") and text.count("--mac-min-os"), times, script)
+        sign = (ROOT / "packaging/mac/sign-and-notarize.sh").read_text(encoding="utf-8")
+        self.assertIn('check_min_os "$app" "app"', sign)
+        self.assertIn('check_min_os "$edir" "engine package"', sign)
+
+
 if __name__ == "__main__":
     unittest.main()

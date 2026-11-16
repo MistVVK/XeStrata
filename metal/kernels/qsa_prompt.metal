@@ -173,7 +173,7 @@ kernel void qsa_merge_h(device const float* part [[buffer(0)]], device const flo
         L = fma(q[QD + 1], e, L);
         o = fma(q[tid], e, o);
     }
-    o = o / L;
+    o = (L > 0.0f) ? o / L : 0.0f;   // an empty row (M stays -INFINITY) makes exp(-inf - -inf) NaN; see qsa.metal
     const float gate = qfull[(t * QH + h) * 2 * QD + QD + tid];
     const float y = o * (1.0f / (1.0f + exp(-gate)));
     xh[(uint(t) * QH + uint(h)) * QD + tid] = half(y);
@@ -368,7 +368,12 @@ kernel void qsa_flash(device const half* qh [[buffer(0)]], device const char* kq
             if (h < HPG) {
                 const int hh = g * HPG + h;
                 const float gate = qfull[(uint(t) * QH + hh) * 2 * QD + QD + d];
-                xqh[(uint(t) * QH + hh) * QD + d] = half(tot[i] / lsum[h] * (1.0f / (1.0f + exp(-gate))));
+                // lsum starts at 0 and is only advanced by the online-softmax step, whose rescale is exp(mrun - m).
+                // With no finite score in the row (mrun and m both -INFINITY) that is exp(NaN), so lsum stays 0 or
+                // becomes NaN and this divide writes a canonical qNaN into xqh and from there into the residual.
+                // An empty row attends to nothing, so zero is the answer the rest of the path expects.
+                const float ls = lsum[h];
+                xqh[(uint(t) * QH + hh) * QD + d] = half((ls > 0.0f ? tot[i] / ls : 0.0f) * (1.0f / (1.0f + exp(-gate))));
             }
         }
 }

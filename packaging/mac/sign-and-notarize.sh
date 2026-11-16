@@ -485,6 +485,15 @@ smoke_terminal() {   # extracted terminal folder
   done < <(find "$root" -type f \( -name strata -o -name strata-device -o -name strata-vision \) -perm -u+x 2>/dev/null | while IFS= read -r c; do file "$c" | grep -q 'Mach-O' && printf '%s\n' "$c"; done)
 }
 
+# #4634: every Mach-O must start on the app's minimum macOS (packaging/binary_deps.py MAC_MIN_OS, = tauri.conf.json's
+# minimumSystemVersion). The 0.2.14 and 0.2.15 Mac engines (strata, strata-vision) needed macOS 27.2: no deployment target was set,
+# so they took the build Mac's SDK. Checked before anything is signed, for the app and for an engine package.
+check_min_os() {   # <folder> <what>
+  local out
+  if out="$(python3 "$HERE/../binary_deps.py" --mac-min-os "$1" 2>&1)"; then rec OK "minimum macOS ($2)" "$(printf '%s' "$out" | tail -n 1)"
+  else printf '%s\n' "$out" >>"$LOG"; fail "minimum macOS ($2)" "$(printf '%s' "$out" | head -n 3 | tr '\n' ';')"; fi
+}
+
 # ----------------------------------------------------------------------------------------------------------------- the app
 process_app() {
   local app_src="" appdir="$WORK/app" app version vol dmg_name zip out_dmg mnt bundle_real
@@ -514,6 +523,7 @@ process_app() {
   xattr -cr "$app" 2>/dev/null
   version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || echo "")"
 
+  check_min_os "$app" "app"
   sign_tree "$app" "app contents"
   update_engine_manifests "$app" "app"
   if codesign_item "$app"; then rec OK "sign the .app itself"; else fail "sign the .app itself" "see the log"; fi
@@ -727,6 +737,7 @@ process_engine() {
 
   n="$(find_macho "$edir" | wc -l | tr -d ' ')"
   [ "$n" -gt 0 ] || fail "engine folder" "no Mach-O program found in $name"
+  check_min_os "$edir" "engine package"
   sign_tree "$edir" "engine package"
   update_engine_manifests "$edir" "engine package"
 

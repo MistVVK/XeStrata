@@ -11,6 +11,7 @@
 #   cmake -S metal -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release -DMETAL_CPP_DIR=... [-DSTRATA_GGML_DIR=...]
 #   ninja -C build-metal
 cmake_minimum_required(VERSION 3.24)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "the oldest macOS the binaries run on")
 project(strata_metal LANGUAGES C CXX OBJCXX)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/strata_geometry.cmake)   # -DSTRATA_GEOMETRY=<name> (default flash_next, no flag added)
 
@@ -46,6 +47,22 @@ foreach(src ${STRATA_METAL_TESTS})
   add_executable(${t} ${src})
   target_link_libraries(${t} PRIVATE mtl_rt)
 endforeach()
+
+# tqp_parity: the TQP5/6/7 pair trellis against the agention fork's CPU reference, compiled straight out of
+# the fork's ggml-quants.c (STRATA_FORK_GGML_SRC = the fork checkout's ggml/src) - no fork ggml build; without
+# it, the in-repo ref/tqp/tqp_ref_c.c supplies the same entry points.
+set(STRATA_FORK_GGML_SRC "" CACHE PATH "the agention llama.cpp fork's ggml/src (for the TQP reference)")
+if(EXISTS "${STRATA_FORK_GGML_SRC}/ggml-quants.c")
+  set(TQP_REF "${CMAKE_BINARY_DIR}/tqp_ref.c")
+  add_custom_command(OUTPUT ${TQP_REF}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_tqp_ref.py ${STRATA_FORK_GGML_SRC} ${TQP_REF}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_tqp_ref.py ${STRATA_FORK_GGML_SRC}/ggml-quants.c)
+  target_sources(tqp_parity PRIVATE ${TQP_REF})
+else()
+  # no fork checkout: the in-repo copy of the same decoder (ref/tqp/tqp_ref_c.c, verbatim from the fork)
+  set_source_files_properties(${STRATA_ROOT}/ref/tqp/tqp_ref_c.c PROPERTIES COMPILE_DEFINITIONS TQP_REF_LIB=1)
+  target_sources(tqp_parity PRIVATE ${STRATA_ROOT}/ref/tqp/tqp_ref_c.c)
+endif()
 
 # ---- the device runtime and the engine (mac-design) ---------------------------------------------------------------
 set(METAL_CPP_DIR "" CACHE PATH "metal-cpp headers (https://developer.apple.com/metal/cpp/), e.g. metal-cpp_26")

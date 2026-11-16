@@ -7451,6 +7451,14 @@ int main(int argc, char** argv) {
                         : o.spec < 2 ? "it needs --spec T (T >= 2)" : split_same
                         ? "it needs each stage of a layer split on its own GPU"
                         : !o.serve ? "it needs --serve" : nullptr;
+#if defined(STRATA_GPU_METAL)
+        // #5674: a --batch-mtp window carries a slot's token AND its proposal, two rows of one slot; the Metal window runs one
+        // row per slot (each row advances that slot's running state) and refused such a window, which ended the engine at the
+        // first two requests that arrived together.  Plain batching runs; the drafts are left off until the Metal window can
+        // verify draft rows.
+        if (why == nullptr)
+            why = "the Mac (Metal) engine's batch windows take one row per request, so the slots run without draft rows (#5674)";
+#endif
         // the groups it would run with (the default gives way to it: one group; a number or auto given pipelines;
         // STRATA_PIPED_MTP with one slot per group: the pipelined groups draft)
         if (why == nullptr && !stages.empty() && batch_groups_for(true).groups > 1 && !batch_groups_for(true).mtp_piped)

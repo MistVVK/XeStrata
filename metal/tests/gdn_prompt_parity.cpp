@@ -92,6 +92,74 @@ int main(int argc, char** argv) {
         ds.push_back(d3);
     };
     mtl::Pipeline pre = cx.pipeline(lib, "gdn_pre"), post = cx.pipeline(lib, "gdn_post");
+    auto rel = [](const float* a, const float* b, size_t n) {
+        double se = 0, sr = 0;
+        for (size_t i = 0; i < n; ++i) { se += (double)(a[i] - b[i]) * (a[i] - b[i]); sr += (double)b[i] * b[i]; }
+        return std::sqrt(se / std::max(sr, 1e-30));
+    };
+    // --stress [T] [chunks]: the serve shape at the amplitude the quarantined 85K-token windows
+    // measured (max|gs| 14.6, max|conv| 28.3): consecutive prompt chunks chain the state just as a
+    // long conversation does, which the T <= 300, |state| <= 0.1 sweep above never reaches.  The
+    // scan variants are checked against the sequential step chunk by chunk; a non-finite state is
+    // the incident's fingerprint (the token-0 filler follows it downstream).
+    if (argc > 1 && std::string(argv[1]) == "--stress") {
+        const int T = argc > 2 ? atoi(argv[2]) : TMAX;
+        const int chunks = argc > 3 ? atoi(argv[3]) : 42;
+        const float m = argc > 4 ? (float) atof(argv[4]) : 1.0f;   // amplitude multiplier over the measured scale
+        if (T < 1 || T > TMAX) { std::printf("T must be 1..%d\n", TMAX); return 2; }
+        for (int i = 0; i < S * HV * S; ++i) st0.as<float>()[i] *= 150.0f * m;
+        for (int i = 0; i < CH * 3; ++i) h0.as<float>()[i] *= 28.0f * m;
+        for (size_t i = 0; i < (size_t)T * CH; ++i) qkv.as<float>()[i] *= 2.5f * m;
+        for (size_t i = 0; i < (size_t)T * HV * S; ++i) z.as<float>()[i] *= 2.5f * m;
+        std::printf("stress: T %d x %d chunks (= %d tokens), state +-%.3g, conv +-%.3g\n", T, chunks, T * chunks,
+                    15.0 * m, 28.0 * m);
+        int sfails = 0;
+        for (auto [nm, cb] : std::vector<std::pair<const char*, int>>{{"gdn_scanr_8", -8}, {"gdn_scan_v", -8},
+                                                                      {"gdn_scanr_4", -4}}) {
+            mtl::Constants pc;
+            if (std::string(nm) != "gdn_scan_v") pc.i(6, 0);
+            mtl::Pipeline scan = cx.pipeline(lib, nm, pc);
+            mtl::Pipeline step = cx.pipeline(lib, "gdn_step", mtl::Constants().i(2, T));
+            std::copy(st0.as<float>(), st0.as<float>() + S * HV * S, stA.as<float>());
+            std::copy(st0.as<float>(), st0.as<float>() + S * HV * S, stB.as<float>());
+            std::copy(h0.as<float>(), h0.as<float>() + CH * 3, hA.as<float>());
+            std::copy(h0.as<float>(), h0.as<float>() + CH * 3, hB.as<float>());
+            GdnArgs da{HK, HV, CH, 1, 1e-6f, 0};
+            mtl::Dispatch d;
+            d.p = &step;
+            d.args = {mtl::Arg::B(stA), mtl::Arg::B(hA), mtl::Arg::B(qkv), mtl::Arg::B(al), mtl::Arg::B(be), mtl::Arg::B(z),
+                      mtl::Arg::B(cw), mtl::Arg::B(dt), mtl::Arg::B(sa), mtl::Arg::B(gam), mtl::Arg::B(yA), mtl::Arg::V(da),
+                      mtl::Arg::B(hA2), mtl::Arg::B(yA)};
+            d.grid[0] = HV;
+            d.tg[0] = 512;
+            double worst = 0;
+            int dead_chunk = -1;
+            for (int c = 0; c < chunks; ++c) {
+                cx.run({d});   // the sequential reference advances stA/hA in place
+                std::vector<mtl::Dispatch> ds;
+                prompt_ds(T, pre, scan, post, cb, ds);   // the cb picks the threadgroup shape of the named scan
+                cx.run(ds);
+                std::copy(hA2.as<float>(), hA2.as<float>() + CH * 3, hB.as<float>());   // chain the conv history
+                double mx = 0;
+                bool nf = false;
+                for (int i = 0; i < S * HV * S; ++i) {
+                    const float v = stB.as<float>()[i];
+                    if (v != v || v > 3e38f || v < -3e38f) nf = true;
+                    const double a = std::fabs(v);
+                    if (a > mx) mx = a;
+                }
+                const double rs = rel(stB.as<float>(), stA.as<float>(), S * HV * S);
+                if (rs > worst) worst = rs;
+                if (nf || rs > 1e-2 || dead_chunk < 0 && c == chunks - 1)
+                    std::printf("%s chunk %d (%d tokens): max|state| %.3g rel %.2e  %s\n", nm, c + 1, (c + 1) * T, mx, rs,
+                                nf ? "NON-FINITE" : rs > 1e-2 ? "DIVERGED" : "ok");
+                if (nf || rs > 1e-2) { dead_chunk = c + 1; ++sfails; break; }
+            }
+            std::printf("%s over %d chunks: worst rel %.2e  %s\n", nm, chunks, worst, dead_chunk >= 0 ? "FAIL" : "PASS");
+        }
+        std::printf("%s\n", sfails ? "SOME FAILED" : "ALL PASS");
+        return sfails ? 1 : 0;
+    }
     int fails = 0;
     if (!bench)
         for (int T : {1, 3, 37, 300})
