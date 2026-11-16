@@ -3105,13 +3105,12 @@ class Vision:
                       f"(try {attempt + 2} of {self.START_RETRIES + 1})", flush=True)
                 time.sleep(1.0)
         assert failure is not None
-        e = failure
         if self.fallback is None or self.spawn == self.fallback:
-            raise e
-        why = " ".join(str(e).split())[:240]
+            raise failure
+        why = " ".join(str(failure).split())[:240]
         # the person is told the pictures became slow, whatever the cause: the card's size or the reader's own
         # reason, in the engine's log (the reader's stderr)
-        self.cpu_note = (self._no_room_note(e.room) if isinstance(e, VisionNoRoom) else
+        self.cpu_note = (self._no_room_note(failure.room) if isinstance(failure, VisionNoRoom) else
                          reader_room.not_started_on_processor(self._spawn_arg("--gpu-pci"),
                                                               getattr(self.spawn[1], "name", None)))
         self.fallback_why = why
