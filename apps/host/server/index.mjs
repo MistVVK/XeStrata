@@ -1101,7 +1101,8 @@ async function api(req, res, path, method, url) {
 
   if(path === '/api/artifacts/open' && method === 'POST') {
     const body=await readBody(req, 30*1024*1024);
-    return json(res,200,await openArtifact(body,{examplesDir:join(ROOT,'public','examples'),previewsDir:join(store.HOME,'previews')}));
+    try { return json(res,200,await openArtifact(body,{examplesDir:join(ROOT,'public','examples'),previewsDir:join(store.HOME,'previews')})); }
+    catch (e) { if (e?.status === 400) return error(res, 400, e.message); throw e; }
   }
 
   // Host-owned recurring prompts. Creating a draft never enables a schedule.
