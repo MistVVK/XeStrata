@@ -416,6 +416,15 @@ public:
                 if (stays(i)) { ++kept; kept_bytes += entries_[i].bytes(); }
             if (kept >= slots_ || kept_bytes > budget_ - held - incoming) { guard_blocked_ = true; return false; }
         }
+        {
+            // #5697: decide before anything goes.  With every entry that may go gone, would the image fit beside the
+            // ones that stay (a pinned shared prefix)?  If not, the park is refused with the cache as it was: before,
+            // the loop below evicted every other conversation (and the retained K/V) and then refused anyway.
+            size_t kept = 0, kept_bytes = 0;
+            for (size_t i = 0; i < entries_.size(); ++i)
+                if (stays(i)) { ++kept; kept_bytes += entries_[i].bytes(); }
+            if (kept >= slots_ || kept_bytes > budget_ - held - incoming) return false;
+        }
         // the pool's idle bytes go first (never an image for them); the decisions below read the images only, so they are
         // the ones the cache makes with no pool
         trim_pool(held + incoming);
