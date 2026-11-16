@@ -367,7 +367,8 @@ bool qsa_rows_pays(int n_rows, int64_t blocks, const QsaShapes& s, void* stream)
     if (core::timing_depth != 0 || q.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording)
         return false;
     const size_t nb = (size_t) blocks, nq = (size_t) n_rows;
-    float* buf = sycl::malloc_device<float>(nq * (nb * IDX_DIM + IDX_DIM + IDX_HEADS * IDX_DIM) + nq * nb + 64, q);
+    const size_t buf_n = nq * (nb * IDX_DIM + IDX_DIM + (size_t) IDX_HEADS * IDX_DIM) + nq * nb + 64;
+    float* buf = sycl::malloc_device<float>(buf_n, q);
     int32_t* steps = sycl::malloc_device<int32_t>(nq * kStepCount, q);
     if (buf == nullptr || steps == nullptr) {
         sycl::free(buf, q);
@@ -377,8 +378,8 @@ bool qsa_rows_pays(int n_rows, int64_t blocks, const QsaShapes& s, void* stream)
     float* pooled = buf;
     float* dead = pooled + nq * nb * IDX_DIM;
     float* qidx = dead + nq * IDX_DIM;
-    float* scores = qidx + nq * IDX_HEADS * IDX_DIM;
-    q.fill(buf, 0.01f, nq * (nb * IDX_DIM + IDX_DIM + IDX_HEADS * IDX_DIM) + nq * nb + 64);
+    float* scores = qidx + nq * (size_t) IDX_HEADS * IDX_DIM;
+    q.fill(buf, 0.01f, buf_n);
     std::vector<int32_t> st(nq * kStepCount, 0);
     for (int r = 0; r < n_rows; ++r) {
         int32_t* p = st.data() + (size_t) r * kStepCount;
