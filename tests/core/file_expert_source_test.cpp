@@ -651,12 +651,16 @@ void test_host_memory() {
     auto probe = [&](const std::string& self) {
         put("cgroup", self);
         m.commit = 0;
-        const bool ok = host_available_memory(m, mi, cg, root);
+        const bool ok = host_available_memory(m, mi, cg, root, (t.path / "arcstats").string());   // (#5519: the fixture's, never the real one)
         require(m.commit == ~0ull, "Linux memory probe retained a commit limit");
         return ok;
     };
     // no cgroup line at all: MemAvailable alone (before #633: "cannot determine")
     require(probe("") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "no cgroup: MemAvailable alone");
+    // #5519: a ZFS host: the ARC above its floor (20 GiB of 24, floor 4) is available too; then gone again for the cases below
+    put("arcstats", "name type data\nc_min 4 " + std::to_string(4 * GiB) + "\nsize 4 " + std::to_string(24 * GiB) + "\n");
+    require(probe("") && m.available == 120 * GiB, "ZFS: MemAvailable + the ARC above its floor");
+    fs::remove(t.path / "arcstats");
     // v2, a 48 GiB limit with 16 GiB charged, 4 GiB of it clean cache
     put("fs/cgroup.controllers", "memory\n");
     put("fs/box/memory.max", std::to_string(48 * GiB) + "\n");

@@ -404,10 +404,10 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
 namespace detail {
 
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
-                           const std::string& cgroup_root) {
+                           const std::string& cgroup_root, const std::string& zfs_arcstats) {
     m = HostMemory{};
 #if defined(_WIN32)
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
+    (void) meminfo; (void) self_cgroup; (void) cgroup_root; (void) zfs_arcstats;
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
     if (!GlobalMemoryStatusEx(&status)) return false;
@@ -429,6 +429,9 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
         else if (key == "MemTotal:" && unit == "kB" && value <= std::numeric_limits<uint64_t>::max() / 1024) mem_total = value * 1024;
     }
     if (bytes == 0) return false;
+    // #5519: the ZFS ARC's share above its floor, which MemAvailable leaves out (the cgroup room below still bounds a container)
+    if (const uint64_t arc = strata::core::zfs_arc_reclaimable_bytes(zfs_arcstats); arc > 0)
+        bytes = bytes > std::numeric_limits<uint64_t>::max() - arc ? std::numeric_limits<uint64_t>::max() : bytes + arc;
     const bool inactive_only = strata::core::mem_credit_inactive_only(std::getenv("STRATA_MEM_CREDIT_INACTIVE"));
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.

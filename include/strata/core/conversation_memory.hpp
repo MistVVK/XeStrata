@@ -55,7 +55,16 @@ struct MemoryProbePaths {
     std::string self_cgroup = "/proc/self/cgroup";
     std::string cgroup_root = "/sys/fs/cgroup";
     std::string self_status = "/proc/self/status";
+    std::string zfs_arcstats = "/proc/spl/kstat/zfs/arcstats";   ///< #5519 (absent without ZFS)
 };
+
+/// #5519: the ZFS ARC is kernel memory outside the page cache, so MemAvailable does not count it, yet it shrinks when programs
+/// need the RAM (a TrueNAS host: ~60 GB of ARC, MemAvailable 52 GB of 128, the engine sized itself to the 52 and read its experts
+/// from the SSD).  The share the ARC gives back is its size above its floor: `size - c_min` from an arcstats text (the kstat
+/// "name type data" table); 0 when either line is missing or malformed, or size is at or below c_min.
+uint64_t zfs_arc_reclaimable_from_text(const std::string& arcstats);
+/// The same from the file (`path`; absent = no ZFS = 0).  Linux only; elsewhere 0.
+uint64_t zfs_arc_reclaimable_bytes(const std::string& path = "/proc/spl/kstat/zfs/arcstats");
 
 /// One group's reclaimable file cache from its memory.stat text (v2 names, or v1's total_* names), each less the dirty
 /// and writeback pages and never more than `current`:
