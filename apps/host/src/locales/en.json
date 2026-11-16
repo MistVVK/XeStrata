@@ -3544,5 +3544,9 @@
   "s9101": "Share of the time the GPU had work to do. It does not say how much of its compute is in use.",
   "s9110": "Run as administrator",
   "s9111": "Lets the assistant run one command with administrator rights. Windows asks you each time; nothing runs if you choose No.",
-  "s9112": "Administrator rights were refused at the Windows prompt."
+  "s9112": "Administrator rights were refused at the Windows prompt.",
+  "s9113": "Blocked folders",
+  "s9114": "Strata refuses any request from the assistant that names a file or folder inside these folders, in every mode, until you remove them here. A program the assistant starts could still reach them without naming them, because Strata doesn't change Windows permissions.",
+  "s9115": "No folders are blocked.",
+  "s9116": "Blocked: {0} is in your blocked folders (Settings → Tools)."
 }

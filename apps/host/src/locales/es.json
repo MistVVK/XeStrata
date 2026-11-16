@@ -3544,5 +3544,9 @@
   "s9101": "Parte del tiempo en que la GPU tenía trabajo. No indica cuánta de su capacidad de cálculo se está usando.",
   "s9110": "Ejecutar como administrador",
   "s9111": "Permite que el asistente ejecute un comando con derechos de administrador. Windows te lo pregunta cada vez; si eliges No, no se ejecuta nada.",
-  "s9112": "Se rechazaron los derechos de administrador en el aviso de Windows."
+  "s9112": "Se rechazaron los derechos de administrador en el aviso de Windows.",
+  "s9113": "Carpetas bloqueadas",
+  "s9114": "Strata rechaza cualquier solicitud del asistente que nombre un archivo o una carpeta dentro de estas carpetas, en todos los modos, hasta que las quites aquí. Un programa que inicie el asistente aún podría llegar a ellas sin nombrarlas, porque Strata no cambia los permisos de Windows.",
+  "s9115": "No hay carpetas bloqueadas.",
+  "s9116": "Bloqueado: {0} está en tus carpetas bloqueadas (Ajustes → Herramientas)."
 }

@@ -14,6 +14,7 @@ import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { GROUP_IDS, TOOL_GROUPS } from './tools-catalog.mjs';
 import { SHELLS, clampTimeoutSec } from './custom-command-run.mjs';
+import { MAX_BLOCKED, blockedForms, checkFolder } from './blocked-folders.mjs';
 
 export const SEARCH_PROVIDERS = ['builtin', 'exa', 'perplexity', 'deepseek'];
 const KINDS = ['instructions', 'command', 'server'];
@@ -26,7 +27,7 @@ export const COMMANDS_SERVER = 'strata-commands';
 const slug = value => String(value).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'tool';
 const clean = (value, max) => String(value ?? '').replace(/\0/g, '').slice(0, max);
 
-function normalize(raw) {
+function normalize(raw, platform = process.platform) {
   const r = raw && typeof raw === 'object' ? raw : {};
   const search = r.search && typeof r.search === 'object' ? r.search : {};
   return {
@@ -37,6 +38,8 @@ function normalize(raw) {
     webWithoutAsking: r.webWithoutAsking === true,
     // #5968: Run as administrator (Windows only). Off unless the person turned it on; Windows asks for every call anyway.
     runAsAdmin: r.runAsAdmin === true,
+    // #5737: folders the assistant may not touch, in any mode (blocked-folders.mjs; the approval gate refuses calls that name them)
+    blockedFolders: [...new Set((Array.isArray(r.blockedFolders) ? r.blockedFolders : []).map(f => checkFolder(f, platform).folder).filter(Boolean))].slice(0, MAX_BLOCKED),
     custom: (Array.isArray(r.custom) ? r.custom : []).filter(t => t && NAME.test(t.name ?? '') && KINDS.includes(t.kind)).slice(0, MAX_CUSTOM).map(t => ({
       id: String(t.id), name: String(t.name), about: clean(t.about, 300), kind: t.kind, enabled: t.enabled !== false,
       instructions: clean(t.instructions, 20000), command: clean(t.command, 2000), address: clean(t.address, 2000),
@@ -98,7 +101,7 @@ const idFor = (name, existing) => {
  * @param {{read: () => object|undefined, write: (value: object) => void, dataDir: string, browser?: () => {found: boolean, name: string|null, path?: string|null, cli?: string|null}}} deps
  */
 export function createAgentTools({ read, write, dataDir, browser = () => ({ found: false, name: null }), platform = process.platform }) {
-  const state = () => normalize(read());
+  const state = () => normalize(read(), platform);
   const filePath = join(dataDir, 'agent', 'custom-tools.json');
 
   /** The file the app's own tool server reads: instruction tools and command tools that are on. */
@@ -126,6 +129,7 @@ export function createAgentTools({ read, write, dataDir, browser = () => ({ foun
       search: { provider: s.search.provider, keySet: !!s.search.key },
       webWithoutAsking: s.webWithoutAsking,
       runAsAdmin: { enabled: s.runAsAdmin, available: platform === 'win32' },
+      blockedFolders: s.blockedFolders,
       // `found` means the browser tool can run: a browser on this computer AND the tool server in the agent component.
       browser: { enabled: s.browser.enabled, found: !!(probe.found && probe.cli), name: probe.name ?? null, ...(probe.found && !probe.cli ? { missing: 'component' } : {}) },
       custom: s.custom.map(t => ({
@@ -158,6 +162,7 @@ export function createAgentTools({ read, write, dataDir, browser = () => ({ foun
         search: s.search,
         webWithoutAsking: s.webWithoutAsking,
         runAsAdminEnabled: s.runAsAdmin && platform === 'win32',
+        blockedFolders: blockedForms(s.blockedFolders, { platform }),
         browserEnabled: s.browser.enabled && !!(browser().found && browser().cli),
         browserPath: browser().path ?? null,
         browserCli: browser().cli ?? null,
@@ -189,6 +194,15 @@ export function createAgentTools({ read, write, dataDir, browser = () => ({ foun
       }
       if (typeof change?.webWithoutAsking === 'boolean') s.webWithoutAsking = change.webWithoutAsking;
       if (change?.runAsAdmin && typeof change.runAsAdmin.enabled === 'boolean') s.runAsAdmin = change.runAsAdmin.enabled;
+      if (change?.blockedFolders?.add !== undefined) {
+        const { folder, error } = checkFolder(change.blockedFolders.add, platform);
+        if (error) throw new Error(error);
+        if (!s.blockedFolders.some(f => f.toLowerCase() === folder.toLowerCase())) {
+          if (s.blockedFolders.length >= MAX_BLOCKED) throw new Error(`You can block up to ${MAX_BLOCKED} folders.`);
+          s.blockedFolders = [...s.blockedFolders, folder];
+        }
+      }
+      if (typeof change?.blockedFolders?.remove === 'string') s.blockedFolders = s.blockedFolders.filter(f => f !== change.blockedFolders.remove);
       if (change?.browser && typeof change.browser.enabled === 'boolean') s.browser = { enabled: change.browser.enabled };
       if (change?.custom) {
         for (const [id, on] of Object.entries(change.custom)) {

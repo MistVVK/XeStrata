@@ -3544,5 +3544,9 @@
   "s9101": "Part du temps pendant laquelle le GPU avait du travail. Cela n’indique pas quelle part de sa puissance de calcul est utilisée.",
   "s9110": "Exécuter en tant qu’administrateur",
   "s9111": "Permet à l’assistant d’exécuter une commande avec les droits d’administrateur. Windows vous le demande à chaque fois ; si vous choisissez Non, rien ne s’exécute.",
-  "s9112": "Les droits d’administrateur ont été refusés à l’invite de Windows."
+  "s9112": "Les droits d’administrateur ont été refusés à l’invite de Windows.",
+  "s9113": "Dossiers bloqués",
+  "s9114": "Strata refuse toute demande de l’assistant qui nomme un fichier ou un dossier à l’intérieur de ces dossiers, dans tous les modes, jusqu’à ce que vous les retiriez ici. Un programme lancé par l’assistant pourrait quand même y accéder sans les nommer, car Strata ne modifie pas les autorisations Windows.",
+  "s9115": "Aucun dossier n’est bloqué.",
+  "s9116": "Bloqué : {0} fait partie de vos dossiers bloqués (Paramètres → Outils)."
 }

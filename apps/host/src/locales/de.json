@@ -3544,5 +3544,9 @@
   "s9101": "Anteil der Zeit, in der die GPU etwas zu tun hatte. Er sagt nicht aus, wie viel ihrer Rechenleistung genutzt wird.",
   "s9110": "Als Administrator ausführen",
   "s9111": "Erlaubt dem Assistenten, einen Befehl mit Administratorrechten auszuführen. Windows fragt Sie jedes Mal; wenn Sie Nein wählen, wird nichts ausgeführt.",
-  "s9112": "Die Administratorrechte wurden in der Windows-Abfrage abgelehnt."
+  "s9112": "Die Administratorrechte wurden in der Windows-Abfrage abgelehnt.",
+  "s9113": "Gesperrte Ordner",
+  "s9114": "Strata lehnt jede Anfrage des Assistenten ab, die eine Datei oder einen Ordner in diesen Ordnern nennt, in jedem Modus, bis Sie sie hier entfernen. Ein Programm, das der Assistent startet, könnte sie trotzdem erreichen, ohne sie zu nennen, denn Strata ändert keine Windows-Berechtigungen.",
+  "s9115": "Keine Ordner gesperrt.",
+  "s9116": "Gesperrt: {0} gehört zu Ihren gesperrten Ordnern (Einstellungen → Tools)."
 }
