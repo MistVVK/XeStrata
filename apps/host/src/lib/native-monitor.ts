@@ -47,6 +47,9 @@ export function nativeMonitorData(native:NativeState,inventory:Hardware|null,sel
  };
 }
 
+/** The readings of a GPU tile the host's own sensors may fill where the engine has none. */
+const SENSOR_FIELDS=['utilizationPct','memoryUsedGb','temperatureC','powerW','powerLimitW','pcieRxMbs','pcieGen','pcieGenMax','pcieWidth'] as const satisfies readonly (keyof GpuReading)[];
+
 /** GPU temperature, load, VRAM, power and PCIe come from the engine's metrics while a model runs. With no model loaded (or an engine that
  *  reports none of them) the host's own sensors fill in: nvidia-smi, or the AMD/Intel sysfs readings the host probes itself. */
 export function withHostSensors(live:MonitorState,host:MonitorState|null):MonitorState{
@@ -55,7 +58,11 @@ export function withHostSensors(live:MonitorState,host:MonitorState|null):Monito
  const pick=<T,>(a:T,b:T)=>hasReading(a as unknown)?a:b;
  return {...live,hardware:{...h,
   // The fan and the clock are the host's own readings; the engine's metrics do not carry them (#3628).
-  gpus:(h.gpus??[]).map(g=>{const sensor=s.gpus?.find(x=>x.id===g.id);const own=sensor&&empty(g)?{...g,...sensor}:g;return sensor?{...own,fanPct:own.fanPct??sensor.fanPct,clockMhz:own.clockMhz??sensor.clockMhz}:own;}),
+  // Field by field, not card by card (#5946 #4660 #3727): an engine that reports one reading of an AMD card on Windows (its memory in use,
+  // or a power of 0) kept the host's own load and temperature out of the whole tile, which then read "not available".
+  gpus:(h.gpus??[]).map(g=>{const sensor=s.gpus?.find(x=>x.id===g.id);if(!sensor)return g;if(empty(g))return {...g,...sensor,fanPct:g.fanPct??sensor.fanPct,clockMhz:g.clockMhz??sensor.clockMhz};
+   const merged:GpuReading={...g};for(const key of SENSOR_FIELDS)if(!hasReading(g[key] as unknown)&&hasReading(sensor[key] as unknown))(merged as any)[key]=sensor[key];
+   return {...merged,fanPct:g.fanPct??sensor.fanPct,clockMhz:g.clockMhz??sensor.clockMhz};}),
   cpuTempC:s.cpuTempC,ssdTempC:s.ssdTempC,energyWh:s.energyWh,
   gpuLoad:pick(h.gpuLoad,s.gpuLoad),vramUsedGb:pick(h.vramUsedGb,s.vramUsedGb),vramTotalGb:pick(h.vramTotalGb,s.vramTotalGb),gpuTempC:pick(h.gpuTempC,s.gpuTempC),
   powerW:pick(h.powerW,s.powerW),powerLimitW:pick(h.powerLimitW,s.powerLimitW),pcieRxMbs:pick(h.pcieRxMbs,s.pcieRxMbs)}};
