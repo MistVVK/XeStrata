@@ -19418,6 +19418,45 @@
    "retired_in": "0.2.13"
   },
   {
+   "name": "STRATA_METAL_WRAP_PLE",
+   "backends": [
+    "metal"
+   ],
+   "reads": [
+    {
+     "file": "metal/src/engine/window.cpp",
+     "line": 753,
+     "backend": "metal",
+     "fn": "getenv"
+    },
+    {
+     "file": "metal/src/engine/window.cpp",
+     "line": 753,
+     "backend": "metal",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "8baf901707",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "8baf901707",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "metal/engine",
+   "note": "1 = wrap the whole Gyro file including the PLE table, the behaviour before #6024 (8baf90170). Read by metal/src/engine/window.cpp.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_METAL_WRAP_SPLIT",
    "backends": [
     "metal"

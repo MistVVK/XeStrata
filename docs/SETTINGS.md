@@ -285,7 +285,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WATCHDOG_S` | number | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 
-## Switches that go back to earlier behaviour (82)
+## Switches that go back to earlier behaviour (83)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -317,6 +317,7 @@ version made it the default.
 | `STRATA_METAL_LDB` | on / off | Mac | v0.2.10 | - |
 | `STRATA_METAL_MTP_OVERLAP` | on / off | Mac | v0.2.10 | - |
 | `STRATA_METAL_MTP_Q8` | on / off | Mac | v0.1.44 | [MAC.md](MAC.md) |
+| `STRATA_METAL_WRAP_PLE` | on / off | Mac | - | - |
 | `STRATA_MMVQ_A2` | number | Intel Arc | v0.1.40.1 | [INTEL.md](INTEL.md) |
 | `STRATA_MMVQ_IL` | on / off | NVIDIA and AMD | v0.1.40.2 | [MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md), [NVIDIA_V100.md](NVIDIA_V100.md), [OLDER_GPUS.md](OLDER_GPUS.md) |
 | `STRATA_MMVQ_IL_SM80` | text | NVIDIA and AMD | v0.2.7 | [DETAILS.md](DETAILS.md), [MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md), [release-notes-0.2.7.md](release-notes-0.2.7.md) |
