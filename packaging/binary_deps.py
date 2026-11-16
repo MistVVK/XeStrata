@@ -8,6 +8,7 @@ clean-profile test passed only because the build PC has the CUDA Toolkit on PATH
 are not covered, and `--check-deps` / the test suite run the same rule on any finished package.
 
     python packaging/binary_deps.py <package folder>          # exit 0 when every import is bundled or system, 1 with the list
+    python packaging/binary_deps.py --mac-min-os <folder>     # exit 1 when a Mach-O file needs a newer macOS than MAC_MIN_OS
 
 Library names are compared case-insensitively on Windows and by soname elsewhere.
 """
@@ -295,6 +296,15 @@ def archive_uncovered(archive: Path, base: tuple[str, ...] | None = None) -> lis
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[1] == "--mac-min-os":
+        # #4634: every Mach-O under a folder (a Mac engine package, or Strata.app before its dmg) must start on the app's minimum
+        # macOS; the 0.2.14 / 0.2.15 Mac engines needed macOS 27.2 because no deployment target was set
+        bad = too_new_for_mac(Path(argv[2]))
+        for rel, minos in bad:
+            print(f"{rel}: needs macOS {minos}, newer than the app's minimum macOS {'.'.join(map(str, MAC_MIN_OS))}")
+        if not bad:
+            print(f"{argv[2]}: every Mach-O file starts on macOS {'.'.join(map(str, MAC_MIN_OS))}")
+        return 1 if bad else 0
     if len(argv) != 2:
         print(__doc__)
         return 2

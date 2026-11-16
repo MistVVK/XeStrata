@@ -183,6 +183,32 @@ class MacMinimumOs(unittest.TestCase):
             self.assertIn("strata (macOS 27.0)", str(caught.exception))
             self.assertFalse(any(out.glob("*")) if out.exists() else False)
 
+    def test_the_mac_min_os_command_refuses_a_folder_with_a_newer_binary(self):
+        # the released 0.2.14 / 0.2.15 Mac engines: strata and strata-vision at minos 27.2, the app beside them at 15.0
+        with tempfile.TemporaryDirectory() as d:
+            app = Path(d) / "Strata.app" / "Contents"
+            (app / "MacOS").mkdir(parents=True)
+            (app / "Resources/engine-bundle/0.1.60-macos-arm64-metal").mkdir(parents=True)
+            (app / "MacOS/strata-desktop").write_bytes(self.make_macho((15, 0)))
+            eng = app / "Resources/engine-bundle/0.1.60-macos-arm64-metal"
+            (eng / "strata").write_bytes(self.make_macho((27, 2)))
+            (eng / "strata-vision").write_bytes(self.make_macho((27, 2)))
+            self.assertEqual(binary_deps.main(["binary_deps.py", "--mac-min-os", d]), 1)
+            (eng / "strata").write_bytes(self.make_macho((15, 0)))
+            (eng / "strata-vision").write_bytes(self.make_macho((11, 0)))
+            self.assertEqual(binary_deps.main(["binary_deps.py", "--mac-min-os", d]), 0)
+
+    def test_every_mac_release_step_checks_the_minimum_macos(self):
+        # the engine build (packaging/mac/build_engine.sh), the dmg (make-dmg.sh) and the release signing of the app and of an
+        # engine package (sign-and-notarize.sh) each run the check, so a build without the deployment target cannot ship again
+        for script, times in (("packaging/mac/build_engine.sh", 1), ("apps/desktop/scripts/make-dmg.sh", 1),
+                              ("packaging/mac/sign-and-notarize.sh", 1)):
+            text = (ROOT / script).read_text(encoding="utf-8")
+            self.assertGreaterEqual(text.count("binary_deps.py") and text.count("--mac-min-os"), times, script)
+        sign = (ROOT / "packaging/mac/sign-and-notarize.sh").read_text(encoding="utf-8")
+        self.assertIn('check_min_os "$app" "app"', sign)
+        self.assertIn('check_min_os "$edir" "engine package"', sign)
+
 
 if __name__ == "__main__":
     unittest.main()
