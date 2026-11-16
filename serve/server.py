@@ -7225,7 +7225,18 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-    yield chunk({"role": "assistant", "content": ""})
+    # #2391: the role-only chunk goes out right before the first data chunk, not before the prompt is read: a client
+    # that times the first data chunk (llama-benchy's TTFR / est_ppt) would otherwise see a prefill of ~0 ms.  vLLM
+    # and llama.cpp send it with the engine's first output too.  The keep-alive comments are not data and go first.
+    opened = False
+
+    def first():
+        nonlocal opened
+        if opened:
+            return ()
+        opened = True
+        return (chunk({"role": "assistant", "content": ""}),)
+
     lp = LogprobEntries(svc, allowed_ids(req), cancel) if top_logprobs(req) is not None else None
 
     def with_lp(c, key):
@@ -7244,27 +7255,35 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
             pp = prompt_progress(svc) if want_progress else None
+            if pp is not None:
+                yield from first()
             yield None if pp is None else {**chunk({}), "prompt_progress": pp}
         elif kind == "mcp":
+            yield from first()
             c = chunk({})
             c["strata_mcp"] = x
             yield c
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
+                yield from first()
                 yield with_lp(chunk({"reasoning_content": ev.text}), "reasoning_content")
             elif ev.kind == "content" and ev.text:
+                yield from first()
                 yield with_lp(chunk({"content": ev.text}), "content")
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
                 calls += 1
+                yield from first()
                 yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
                                              "function": {"name": ev.call.name, "arguments": ""}}]})
             elif ev.kind == "tool_args":
+                yield from first()
                 yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
             elif ev.kind == "tool_call" and ev.call.id in streamed:
                 finished.add(ev.call.id)
             elif ev.kind == "tool_call":
+                yield from first()
                 yield chunk({"tool_calls": [{"index": calls, "id": ev.call.id, "type": "function",
                                              "function": {"name": ev.call.name,
                                                           "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
@@ -7272,6 +7291,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         else:
             answered_done = True
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
+            yield from first()                     # an empty answer still opens with the role
             whole = calls and streamed.keys() <= finished
             finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
