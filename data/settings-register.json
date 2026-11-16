@@ -17741,6 +17741,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_METAL_KEEPALIVE_MS",
+   "backends": [
+    "metal"
+   ],
+   "reads": [
+    {
+     "file": "metal/src/mtl_rt.mm",
+     "line": 77,
+     "backend": "metal",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "250.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f12b65334f",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "f12b65334f",
+   "last_date": "2026-11-16",
+   "status": "default",
+   "owner": "metal/engine",
+   "note": "The GPU keep-alive's interval in milliseconds (default 250; 0 turns the keep-alive off). While idle, a tiny GPU job every interval keeps the engine's GPU memory in place, so the first request after a pause does not wait (#6078). Read by metal/src/mtl_rt.mm.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_METAL_KEEPALIVE_WINDOW_S",
+   "backends": [
+    "metal"
+   ],
+   "reads": [
+    {
+     "file": "metal/src/mtl_rt.mm",
+     "line": 80,
+     "backend": "metal",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "120.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f12b65334f",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "f12b65334f",
+   "last_date": "2026-11-16",
+   "status": "default",
+   "owner": "metal/engine",
+   "note": "How long the GPU keep-alive runs after the last request, in seconds (default 120). After that the GPU memory is given back; it also pauses while macOS reports memory pressure (#6078). Read by metal/src/mtl_rt.mm.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_METAL_KEEP_FREE_GB",
    "backends": [
     "metal"
