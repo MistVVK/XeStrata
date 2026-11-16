@@ -233,6 +233,15 @@ const PleFormatInfo* ple_format_for_type(const char* gguf_type_name) {
         if (std::strcmp(f.gguf_type, gguf_type_name) == 0) return &f;
     return nullptr;
 }
+bool ple_gguf_table_only(const strata::GgufFile& f) {
+    const MetaValue* v = f.get("general.architecture");
+    if (v != nullptr && v->s == "strata-ple") return true;
+    // #6026 / #6013: a file whose ONLY tensor is the table (a published PLE GGUF with the model's architecture, an
+    // Unsloth engram table without one, a set's table-only shard) holds no projections either.  By content, not by
+    // name or split keys; a file with any other tensor stays a model shard (#5942 kept every --ple-gguf out: too wide)
+    const std::vector<TensorInfo>& ts = f.tensors();
+    return ts.size() == 1 && ts[0].name == "per_layer_token_embd.weight";
+}
 std::string ple_format_list() {
     std::string out;
     for (int i = 0; i < kPleFormatCount; ++i) {

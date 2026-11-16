@@ -6,6 +6,7 @@
 //
 // Every row the synthetic table holds encodes its own index, so a wrong offset, a straddle mishandled or a
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
+#include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -458,7 +459,93 @@ void table_is_consistent_under_concurrent_use(const std::string& dir) {
     if (g_fail == 0) std::printf("ple table shared by a prompt thread, a decode window and a single gather, 9 reader configurations, vs the mapped reader: OK\n");
 }
 
+/// #6026 / #5942 / #6013: which `--ple-gguf` files are a table only (kept out of the native dense shard list) and which
+/// are a model shard.  Tiny GGUF headers, no payload beyond the table's own rows.
+struct FixtureTensor { const char* name; std::vector<uint64_t> shape; uint32_t type; uint64_t bytes; };
+std::string write_fixture_gguf(const std::string& path, const char* arch, const std::vector<FixtureTensor>& ts,
+                               bool split_keys = false) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return {};
+    const auto le = [](auto value, int bytes) {
+        std::string s((size_t) bytes, '\0');
+        for (int i = 0; i < bytes; ++i) s[(size_t) i] = (char) ((value >> (8 * i)) & 0xff);
+        return s;
+    };
+    const auto str = [&](const char* s) { return le((uint64_t) std::strlen(s), 8) + std::string(s); };
+    const uint64_t n_kv = (arch ? 1 : 0) + (split_keys ? 3 : 0);
+    std::string head = "GGUF" + le(3u, 4) + le((uint64_t) ts.size(), 8) + le(n_kv, 8);
+    if (arch) head += str("general.architecture") + le(8u, 4) + str(arch);
+    if (split_keys) {   // as Unsloth's engram file and a set's own shards carry them (UINT16 = 2, INT32 = 5)
+        head += str("split.no") + le(2u, 4) + le(2u, 2);
+        head += str("split.count") + le(2u, 4) + le(6u, 2);
+        head += str("split.tensors.count") + le(5u, 4) + le(1u, 4);
+    }
+    uint64_t offset = 0, end = 0;   // tensors 32-byte aligned; the file ends with the last one's bytes (the reader
+    for (const FixtureTensor& t : ts) {   //  refuses a table file that is longer than its table)
+        head += str(t.name) + le((uint32_t) t.shape.size(), 4);
+        for (uint64_t d : t.shape) head += le(d, 8);
+        head += le(t.type, 4) + le(offset, 8);
+        end = offset + t.bytes;
+        offset += (t.bytes + 31) / 32 * 32;
+    }
+    while (head.size() % 32) head += '\0';
+    out.write(head.data(), (std::streamsize) head.size());
+    const std::string payload((size_t) end, '\0');
+    out.write(payload.data(), (std::streamsize) payload.size());
+    out.close();
+    return out ? path : std::string();
+}
+
+void ple_files_are_told_from_model_shards(const std::string& dir) {
+    const uint32_t IQ4_NL = 20, Q8_0 = 8, F32 = 0;
+    const uint64_t rows = 4;
+    const FixtureTensor table{"per_layer_token_embd.weight", {(uint64_t) k::PLE_HEAD_DIM, rows}, IQ4_NL, rows * k::PLE_ROW_BYTES};
+    const FixtureTensor table_q8{"per_layer_token_embd.weight", {(uint64_t) k::PLE_HEAD_DIM, rows}, Q8_0, rows * k::PLE_ROW_BYTES_Q8_0};
+    const FixtureTensor proj{"blk.0.attn_qkv.weight", {32, 32}, F32, 32 * 32 * 4};
+    struct Case { const char* what; const char* arch; std::vector<FixtureTensor> ts; bool split; bool table_only; const char* open_error; };
+    const std::vector<Case> cases = {
+        {"a tools/ple_fp8_pack.py table (architecture strata-ple)", "strata-ple", {table}, false, true, nullptr},
+        {"a published PLE GGUF: the model's architecture, the one table tensor", "qwen35moe", {table}, false, true, nullptr},
+        {"an Unsloth engram table: no architecture, split keys, the one Q8_0 table tensor", nullptr, {table_q8}, true, true, nullptr},
+        {"a model shard that also holds the table", "qwen35moe", {table, proj}, false, false, nullptr},
+        {"a model shard without the table", "qwen35moe", {proj}, false, false, nullptr},
+        {"one tensor of another name", nullptr, {proj}, false, false, nullptr},
+        {"the table tensor with three dimensions (table only; refused by the reader)", nullptr,
+         {{"per_layer_token_embd.weight", {(uint64_t) k::PLE_HEAD_DIM, 2, 2}, IQ4_NL, rows * k::PLE_ROW_BYTES}}, false, true,
+         "unexpected shape"},
+        {"the table tensor as F32 (table only; refused by the reader)", nullptr,
+         {{"per_layer_token_embd.weight", {(uint64_t) k::PLE_HEAD_DIM, rows}, F32, rows * k::PLE_HEAD_DIM * 4}}, false, true,
+         "is F32, not"},
+    };
+    int n = 0;
+    for (const Case& c : cases) {
+        const std::string path = write_fixture_gguf(dir + "/ple_kind_" + std::to_string(n++) + ".gguf", c.arch, c.ts, c.split);
+        CHECK(!path.empty(), "%s: not written", c.what);
+        if (path.empty()) continue;
+        bool table_only = false;
+        try {
+            strata::GgufFile g(path);
+            table_only = k::ple_gguf_table_only(g);
+        } catch (const std::exception& e) {
+            CHECK(false, "%s: the GGUF does not parse: %s", c.what, e.what());
+        }
+        CHECK(table_only == c.table_only, "%s: classified as %s", c.what, table_only ? "a table only" : "a model shard");
+        if (c.table_only) {   // a table-only file goes to PleTable::open: a good one opens, a bad one says why
+            k::PleTable t;
+            std::string err;
+            k::PleIoOptions io;
+            io.mode = k::PleIo::Mmap;   // (a 4-row file; the reader's checks are the same in both modes)
+            const bool opened = t.open(path, err, io);
+            if (c.open_error == nullptr) CHECK(opened, "%s: the table does not open: %s", c.what, err.c_str());
+            else CHECK(!opened && err.find(c.open_error) != std::string::npos, "%s: open said \"%s\"", c.what, err.c_str());
+        }
+        std::filesystem::remove(path);
+    }
+    std::printf("ple_gguf_table_only: %zu files checked\n", cases.size());
+}
+
 void all_formats_round_trip(const std::string& dir) {
+    ple_files_are_told_from_model_shards(dir);     // #6026: which --ple-gguf files stay out of the dense shard list
     bf16_widening_is_exact();                      // BF16's own claim: a shift, exact for every pattern
     bad_sizes_are_refused(dir);
     prefetched_keys_are_reused(dir);

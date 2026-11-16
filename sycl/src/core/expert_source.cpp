@@ -16,6 +16,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/kq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
+#include "strata/core/window_jobs.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -2542,9 +2543,10 @@ namespace {
 // refused at run time rather than written past them.
 constexpr int64_t kMaxWindowEntries = 128;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+static_assert(kMaxWindowEntries <= kWindowJobsMax, "WindowJobs remembers one expert per window entry");
 }  // namespace
 
-void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids_live, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
@@ -2561,6 +2563,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    // `ids_live` is host memory the GPU writes (the verifier's h_ids_): when the GPU does not wait for this call it goes on
+    // to the next layer and rewrites it. Everything below reads this copy, taken once, so the kind[] / first_of[] tables,
+    // the plan and the jobs all see the same experts (the clean-up does not read `ids`: WindowJobs remembers what it opened).
+    int32_t ids_copy[kMaxWindowEntries];
+    for (int64_t i = 0; i < n_tok * k; ++i) ids_copy[i] = ids_live[i];
+    const int32_t* const ids = ids_copy;
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
@@ -2736,53 +2744,38 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
     int njobs = 0;
-    for (int64_t t = 0; t < n_tok; ++t)
-        for (int64_t j = 0; j < k; ++j) {
-            const int64_t i = t * k + j;
-            const int64_t e = ids[i];
+    WindowJobs wjobs(d.job_of, d.jobs_multi, njobs);   // clears job_of on every way out of the call
+    const WindowFailure wf = build_window_jobs(
+        wjobs, ids, n_tok, k, d.n_expert, kind,
+        [&](int64_t i) {                 // CUDA0, PCIe, or a remote/peer result staged into this row below
             float* row = out + (size_t) i * H;
-            if (e < 0 || e >= d.n_expert) {
-                d.failed = true;
-                d.fail = "a routed expert id is out of range";
-                d.fail_layer = d.layers;
-                d.fail_expert = e;
-                return;
-            }
-            if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
-                if (kind[i] == 0) ++d.cache_hits;
-                else ++d.offload_entries;                       // #588: PCIe or another GPU
-                if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
-                // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
-                // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
-                if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
-                      (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
-                    std::memset(row, 0, (size_t) H * sizeof(float));
-                continue;
-            }
-            ++d.cache_refused;
-            int16_t& jo = d.job_of[(size_t) e];
-            if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
-                if (b == nullptr) {
-                    d.failed = true;
-                    d.fail = "the expert source could not produce a blob";
-                    d.fail_layer = d.layers;
-                    d.fail_expert = e;
-                    ++d.missing;
-                    return;
-                }
-                jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                nj.blob = b;
-                nj.nt = 0;
-            }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+            if (kind[i] == 0) ++d.cache_hits;
+            else ++d.offload_entries;                       // #588: PCIe or another GPU
+            if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
+            // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
+            // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
+            if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
+                  (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
+                std::memset(row, 0, (size_t) H * sizeof(float));
+        },
+        [&](int64_t) { ++d.cache_refused; },
+        [&](int64_t e) { return d.src->blob(d.layers, e); },
+        [&](ExpertJobMulti& jb, int64_t t, int64_t i) {
             jb.act[jb.nt] = &d.act_multi[(size_t) t];
             jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-            jb.out[jb.nt] = row;
+            jb.out[jb.nt] = out + (size_t) i * H;
             ++jb.nt;
             ++d.multi_entries;
-        }
+        });
+    if (wf.status != WindowStatus::Ok) {
+        d.failed = true;
+        d.fail = wf.status == WindowStatus::IdOutOfRange ? "a routed expert id is out of range"
+                                                          : "the expert source could not produce a blob";
+        d.fail_layer = d.layers;
+        d.fail_expert = wf.expert;
+        if (wf.status == WindowStatus::NoBlob) ++d.missing;
+        return;
+    }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     if (njobs > 0) {
@@ -2813,10 +2806,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
-    for (int64_t i = 0; i < n_tok * k; ++i) {
-        const int64_t e = ids[i];
-        if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
-    }
+    wjobs.release();
     d.multi_misses += njobs;
     ++d.layers;
     d.experts += n_tok * k;
