@@ -250,5 +250,8 @@
   "sidebar.import": "Recuperar uma conversa salva",
   "sidebar.imported": "Conversa recuperada",
   "sidebar.importFailed": "Nada a recuperar",
-  "sidebar.importFailedText": "Este arquivo não tem mensagens de chat. Escolha um arquivo salvo com “Salvar este chat como Markdown”."
+  "sidebar.importFailedText": "Este arquivo não tem mensagens de chat. Escolha um arquivo salvo com “Salvar este chat como Markdown”.",
+  "chat.finishFromThinking": "Responder a partir deste raciocínio",
+  "chat.finishFromThinkingTitle": "Escreve uma resposta com o que o modelo tinha descoberto antes de você pará-lo. Ele não pensa mais.",
+  "chat.fromStoppedThinking": "resposta a partir do raciocínio interrompido"
 }

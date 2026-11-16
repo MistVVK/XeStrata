@@ -250,5 +250,8 @@
   "sidebar.import": "保存したチャットを戻す",
   "sidebar.imported": "チャットを戻しました",
   "sidebar.importFailed": "戻せるものがありません",
-  "sidebar.importFailedText": "このファイルにはチャットのやり取りがありません。「このチャットを Markdown で保存」で保存したファイルを選んでください。"
+  "sidebar.importFailedText": "このファイルにはチャットのやり取りがありません。「このチャットを Markdown で保存」で保存したファイルを選んでください。",
+  "chat.finishFromThinking": "この思考から回答する",
+  "chat.finishFromThinkingTitle": "停止する前にモデルが考えた内容から回答を書きます。これ以上は考えません。",
+  "chat.fromStoppedThinking": "停止した思考からの回答"
 }

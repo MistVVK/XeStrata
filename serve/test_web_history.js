@@ -330,6 +330,31 @@ Object.assign(cases, {
       assert.deepEqual(H.cleanMessages(m(bad))[0].images, [{name: "a.png"}], String(bad).slice(0, 40));
     }
   },
+  // #5508: Stop stays a plain stop; a reply it left with thinking and no answer can be finished on request, once
+  finish_from_thinking_only_where_stop_left_no_answer() {
+    const stopped = () => bot("", {reasoning: "2 + 2 is 4", stopped: true});
+    const ok = [user("q"), stopped()];
+    assert.equal(H.canFinishFromThinking(ok, ok[1]), true, "a stopped reply with thinking and no answer");
+    assert.equal(H.canFinishFromThinking(ok, ok[1], true), false, "not while something runs");
+    for (const [extra, why] of [[{text: "partial"}, "it has answer text"], [{reasoning: ""}, "it has no thinking"], [{stopped: false}, "it was not stopped"],
+                                [{interrupted: true}, "an interjection cut it"], [{error: "x"}, "it failed"], [{tools: [tool]}, "it called tools"],
+                                [{fromThinking: true}, "it was finished this way already"]]) {
+      const m = [user("q"), {...stopped(), ...extra}];
+      assert.equal(H.canFinishFromThinking(m, m[1]), false, why);
+    }
+    const older = [user("q"), stopped(), user("q2"), bot("a2")];
+    assert.equal(H.canFinishFromThinking(older, older[1]), false, "only the last reply");
+    const turn = H.finishTurn("I worked out that 2 + 2 is 4");
+    assert.equal(turn.role, "user");
+    assert.match(turn.content, /I worked out that 2 \+ 2 is 4/);
+    assert.match(turn.content, /Do not reason again\.$/);
+    const long = H.finishTurn("a".repeat(H.FINISH_CHARS) + "THE END");
+    assert.ok(long.content.includes("THE END") && long.content.includes("…"), "a long thinking keeps its end");
+    assert.ok(long.content.length < H.FINISH_CHARS + 400, "and no more than FINISH_CHARS of it");
+    const app = require("node:fs").readFileSync(path.join(__dirname, "web", "app.js"), "utf8");
+    assert.match(app, /\$\("stop-btn"\)\.onclick = \(\) => \{ if \(busy\) busy\.controller\.abort\(\); \};/, "Stop only aborts: no request of its own");
+    assert.match(app, /reasoning_effort: finishing \? "none" : settings\.thinking/, "the finishing request has thinking off");
+  },
   the_composer_attaches_first_and_adds_the_preview_later() {
     const app = require("node:fs").readFileSync(path.join(__dirname, "web", "app.js"), "utf8");
     const onload = app.slice(app.indexOf("r.onload = () => {\n        const url = r.result;"), app.indexOf("r.readAsDataURL(f);"));

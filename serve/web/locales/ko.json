@@ -250,5 +250,8 @@
   "sidebar.import": "저장한 채팅 가져오기",
   "sidebar.imported": "채팅을 가져왔습니다",
   "sidebar.importFailed": "가져올 내용이 없습니다",
-  "sidebar.importFailedText": "이 파일에는 채팅 내용이 없습니다. '이 채팅을 Markdown으로 저장'으로 저장한 파일을 고르세요."
+  "sidebar.importFailedText": "이 파일에는 채팅 내용이 없습니다. '이 채팅을 Markdown으로 저장'으로 저장한 파일을 고르세요.",
+  "chat.finishFromThinking": "이 생각으로 답하기",
+  "chat.finishFromThinkingTitle": "멈추기 전까지 모델이 생각해 낸 내용으로 답을 씁니다. 더 생각하지 않습니다.",
+  "chat.fromStoppedThinking": "멈춘 생각에서 나온 답변"
 }

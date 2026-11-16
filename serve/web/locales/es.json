@@ -250,5 +250,8 @@
   "sidebar.import": "Recuperar un chat guardado",
   "sidebar.imported": "Chat recuperado",
   "sidebar.importFailed": "Nada que recuperar",
-  "sidebar.importFailedText": "Este archivo no contiene turnos de chat. Elige un archivo guardado con «Guardar este chat como Markdown»."
+  "sidebar.importFailedText": "Este archivo no contiene turnos de chat. Elige un archivo guardado con «Guardar este chat como Markdown».",
+  "chat.finishFromThinking": "Responder a partir de este razonamiento",
+  "chat.finishFromThinkingTitle": "Escribe una respuesta con lo que el modelo había resuelto antes de que lo detuvieras. No sigue pensando.",
+  "chat.fromStoppedThinking": "respuesta a partir del razonamiento detenido"
 }

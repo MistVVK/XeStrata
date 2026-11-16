@@ -49,6 +49,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-msg { min-width: 0; }
 .st-msg__meta .st-btn--icon { width: 28px; height: 28px; }
 .st-msg__meta .st-btn--icon .st-icon { width: 16px; height: 16px; }
+.st-msg__meta .msg-finish { min-height: 28px; padding: 2px 10px; font-size: var(--st-fs-xs); }   /* #5508: "Answer from this thinking" under a reply Stop left empty */
 .cursor::after { content: ""; display: inline-block; width: 8px; height: 1.1em; margin-left: 2px; vertical-align: -3px;
                  border-radius: 2px; background: var(--st-accent); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }

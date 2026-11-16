@@ -250,5 +250,8 @@
   "sidebar.import": "Вернуть сохранённый чат",
   "sidebar.imported": "Чат возвращён",
   "sidebar.importFailed": "Возвращать нечего",
-  "sidebar.importFailedText": "В этом файле нет сообщений чата. Выберите файл, сохранённый через «Сохранить этот чат как Markdown»."
+  "sidebar.importFailedText": "В этом файле нет сообщений чата. Выберите файл, сохранённый через «Сохранить этот чат как Markdown».",
+  "chat.finishFromThinking": "Ответить по этим рассуждениям",
+  "chat.finishFromThinkingTitle": "Пишет ответ по тому, что модель успела продумать до остановки. Дальше она не рассуждает.",
+  "chat.fromStoppedThinking": "ответ по остановленным рассуждениям"
 }

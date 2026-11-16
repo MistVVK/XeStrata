@@ -250,5 +250,8 @@
   "sidebar.import": "Gespeicherten Chat zurückholen",
   "sidebar.imported": "Chat zurückgeholt",
   "sidebar.importFailed": "Nichts zurückzuholen",
-  "sidebar.importFailedText": "Diese Datei enthält keine Chat-Beiträge. Wählen Sie eine Datei, die mit „Diesen Chat als Markdown speichern“ gespeichert wurde."
+  "sidebar.importFailedText": "Diese Datei enthält keine Chat-Beiträge. Wählen Sie eine Datei, die mit „Diesen Chat als Markdown speichern“ gespeichert wurde.",
+  "chat.finishFromThinking": "Aus diesen Überlegungen antworten",
+  "chat.finishFromThinkingTitle": "Schreibt eine Antwort aus dem, was das Modell erarbeitet hatte, bevor Sie es gestoppt haben. Es denkt nicht weiter.",
+  "chat.fromStoppedThinking": "Antwort aus den gestoppten Überlegungen"
 }

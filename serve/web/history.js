@@ -202,8 +202,24 @@
     return {...newChat(now, rnd), messages};
   }
 
+  // #5508: Stop stays a plain stop. A reply Stop left with thinking and no answer can be finished on request: the last reply of the
+  // chat, stopped by the person (not cut by an interjection), no error, no tool calls, not finished this way already, and nothing running.
+  const FINISH_CHARS = 6000;
+  function canFinishFromThinking(messages, m, busy = false) {
+    return !busy && !!m && m.role === "assistant" && !!m.stopped && !m.interrupted && !m.error && !m.fromThinking && !!m.reasoning &&
+      !String(m.text || "").trim() && !(m.tools || []).length && messages[messages.length - 1] === m;
+  }
+  // The one user turn the finishing request adds after the history: what was worked out (its last FINISH_CHARS characters) and the
+  // request for the answer alone. It goes with thinking off, so the model reads its answer off this instead of thinking again.
+  function finishTurn(reasoning, max = FINISH_CHARS) {
+    const text = String(reasoning || "");
+    const worked = text.length > max ? `…${text.slice(-max)}` : text;
+    return {role: "user", content: "Your reasoning was cut off before you answered. This is what you worked out so far:\n\n" +
+      `${worked}\n\nAnswer my last question now, briefly, from this. Do not reason again.`};
+  }
+
   const api = {TITLE_MAX, newChat, chatTitle, cleanMessages, cleanChat, groupKey, filterChats, lostAttachments, draftOf, rewind,
-               regenerate, editAnswer, branch, THUMB_MAX_CHARS, validThumb, makeThumb, parseChatMarkdown};
+               regenerate, editAnswer, branch, THUMB_MAX_CHARS, validThumb, makeThumb, parseChatMarkdown, FINISH_CHARS, canFinishFromThinking, finishTurn};
   root.StrataHistory = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
