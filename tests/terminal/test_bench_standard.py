@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import threading
 import time
+import sys
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -434,6 +435,7 @@ class RunTests(StandardBase):
         self.assertEqual(record["first_delta_kind"], "reasoning")
         self.assertIsNone(record["token_accounting_note"])
 
+    @unittest.skipIf(sys.platform == "darwin", 'a Mac adds its Metal runtime to the runtimes list')
     def test_the_run_names_its_default_folder_after_the_gpu(self):
         self.server.gpu_name = "NVIDIA GeForce RTX 3060"
         with mock.patch.object(bench_facts, "nvidia_gpus", return_value=([{
@@ -1150,6 +1152,7 @@ class RealRunFindingsTests(StandardBase):
         self.assertEqual(bench_facts.lsblk_disk(plain), [{"kind": "hdd", "model": "Spinner", "bus": "sata"}])
         self.assertIsNone(bench_facts.lsblk_disk({"blockdevices": [{"name": "loop0", "type": "loop"}]}))
 
+    @unittest.skipIf(sys.platform == "darwin", 'a Mac adds its Metal runtime to the runtimes list')
     def test_the_runtime_is_the_one_the_engine_was_built_with(self):
         engine = self.root / "engine"
         engine.mkdir()

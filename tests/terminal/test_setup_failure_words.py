@@ -1,6 +1,7 @@
 """When setup.py stops with a Python error, `strata launch` says what it was and where the rest of the output is (#3613, #3467)."""
 
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,6 +27,7 @@ class SetupFailureWords(unittest.TestCase):
         self.assertIn("/tmp/a.setup.log", error.next)
         self.assertEqual(setup_failure(["nothing useful"], "", "", None, True).text, "The model could not be installed.")
 
+    @unittest.skipIf(sys.platform == "darwin", "the Docker docs are Linux's; a Mac's setup has no --kv")
     def test_setup_accepts_the_kv_format_the_docker_docs_offer(self):
         import subprocess, sys
         root = Path(__file__).resolve().parents[2]

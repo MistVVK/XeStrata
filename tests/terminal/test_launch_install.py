@@ -77,6 +77,7 @@ class Feed(unittest.TestCase):
             tf.add(top, arcname=top.name)
         return archive
 
+    @unittest.skipIf(sys.platform == "darwin", 'the local release fixture has no macOS Terminal')
     def test_make_local_feed_and_a_real_install(self):
         import make_local_feed
         with tempfile.TemporaryDirectory() as tmp:
@@ -144,6 +145,7 @@ class Feed(unittest.TestCase):
             finally:
                 server.shutdown()
 
+    @unittest.skipIf(sys.platform == "darwin", 'the local release fixture has no macOS Terminal')
     def test_the_release_path_writes_install_manifest_and_the_unchanged_install_sh_installs_from_it(self):
         """pack-control (flat names, as for GitHub assets) + build-feed, the files a release uploads; not make_local_feed."""
         import feed_tool

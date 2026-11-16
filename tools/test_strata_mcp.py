@@ -343,6 +343,7 @@ class Validation(FakeRoot):
         self.assertFalse(err, res)
         self.assertEqual(res["plan"]["images"], "no")
 
+    @unittest.skipIf(sys.platform == "darwin", "the test's temporary folder is under /var/folders, a macOS system folder the data-folder check refuses")
     def test_data_dir_paths(self):
         self.assertRejected("strata_install", {"data_dir": "models"}, "absolute")
         self.assertRejected("strata_install", {"data_dir": str(self.root.parent / "x" / ".." / "Strata-x")}, "'..'")
