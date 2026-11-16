@@ -70,7 +70,7 @@ function fixture({ plan }) {
   };
   const fetcher = async url => String(url).endsWith('/metrics') ? Response.json({ engine: {} }) : Response.json({ status: 'ok' });
   const native = createNativeControl({ control, directory: data, spawnProcess, fetcher, requests: () => [], modelsDirectory: () => modelsDir, hardwareProbe: () => [{ index: 0, vram_gb: 12 }] });
-  return { native, state, modelFolder, mtp,
+  return { native, state, modelFolder, mtp, configPath,
     cleanup: () => { if (earlier === undefined) delete process.env.STRATA_INSTALL_DIR; else process.env.STRATA_INSTALL_DIR = earlier; rmSync(root, { recursive: true, force: true }); } };
 }
 const finish = async (native, id) => { for (let i = 0; i < 1500; i++) { const job = native.state().jobs.find(j => j.id === id); if (job.state !== 'running') return job; await new Promise(r => setTimeout(r, 10)); } throw new Error('job did not finish'); };
@@ -126,6 +126,29 @@ test('(b) offline but the DFlash2 drafter on this computer stands in: the senten
     assert.equal(job.state, 'done', job.error);
     assert.equal(installs(f).length, 1);
     assert.notEqual(job.drafterNote, MTP_OFFLINE_NOTE);
+  } finally { await f.native.close(); f.cleanup(); }
+});
+
+/** Item 7 (owner 11-15): a drafter chosen in the app's Drafting setting stays chosen at later loads with no new choice, and the fallback a start takes (Control's plan
+ * names the other drafter: the chosen one's file is not here) is never written over it. */
+test('a chosen MTP stays the saved choice over a later plain load, even when the start falls back to DFlash2', async () => {
+  const seen = [];
+  const plan = (options) => {
+    if (!options.configPath) return { ok: true, serves: true, choice: 'dflash2', split: false };
+    seen.push(JSON.parse(readFileSync(options.configPath, 'utf8')).drafting ?? null);
+    return { ok: true, serves: true, split: false, choice: 'mtp', drafter: 'dflash2', needed: false, gb: 0, mtp_needed: false, mtp_gb: 0, line: 'Drafting: DFlash2 (the MTP drafter isn\'t downloaded yet)' };
+  };
+  const f = fixture({ plan });
+  try {
+    await f.native.refresh(true);
+    let job = await finish(f.native, f.native.operation('load', { model: 'ud_q4_k_xl', values: { drafting: 'mtp' } }).id);
+    assert.equal(job.state, 'done', job.error);
+    assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).drafting, 'mtp', 'the choice is saved as the person set it, not the fallback');
+    job = await finish(f.native, f.native.operation('load', { model: 'ud_q4_k_xl' }).id);
+    assert.equal(job.state, 'done', job.error);
+    assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).drafting, 'mtp', 'a plain load keeps it');
+    assert.equal(seen.at(-1), 'mtp', 'and asks Control about the chosen MTP, not Auto');
+    assert.equal(installs(f).length, 0, 'nothing was fetched for it');
   } finally { await f.native.close(); f.cleanup(); }
 });
 

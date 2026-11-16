@@ -1047,6 +1047,30 @@ class PicturesScreen(Base):
 
 # ------------------------------------------------------------------------------------------------ drafting
 
+def drafting_launch_word(ctx) -> str | None:
+    """The Drafting word this launch was given last time (its own run config): a chosen drafter stays chosen at a start with no word (Runner.keep_saved_word,
+    keep_saved_off), so the Drafting step shows it and an Auto picked there is written to replace it."""
+    try:
+        from strata_cli.launch import runner
+        return runner.saved_launch_word(runner.launch_name_of(ctx.settings))
+    except Exception:                                        # noqa: BLE001 - no readable file, no word
+        return None
+
+
+def drafting_saved_choice(ctx, choices) -> str:
+    """The Drafting row a start with no new choice runs, in the order the start reads them: the model's own saved choice (the app's Models screen), the draft
+    layer switched off with no choice (Off), the word this launch was given last time, else Auto."""
+    from strata_cli.launch import modelstate
+    base = ctx.base_config() or {}
+    own = str(base.get("drafting") or "").strip().lower()
+    if own in choices:
+        return own
+    if modelstate.layer_off_without_choice(base):
+        return "off"
+    word = drafting_launch_word(ctx)
+    return word if word in choices and modelstate.drafting_for_family(word, ctx.settings.family) is not None else "auto"
+
+
 class DraftingScreen(Base):
     step_id = "drafting"
     help_text = "Drafting is how the model guesses the next words ahead to make answers faster. One drafter runs at a time."
@@ -1062,7 +1086,7 @@ class DraftingScreen(Base):
         from strata_cli.launch import modelstate
         now = {"dflash2": "DFlash2", "mtp": "MTP", "off": "Off"}[modelstate.resolved_drafting(None, s.family)]
         items = [Item([label, Cell(now, "") if key == "auto" else Cell("", "")], key=key) for key, label in self.CHOICES]
-        shown = s.drafting if s.drafting in dict(self.CHOICES) else "off" if modelstate.layer_off_without_choice(self.ctx.base_config()) else "auto"
+        shown = s.drafting if s.drafting in dict(self.CHOICES) else drafting_saved_choice(self.ctx, dict(self.CHOICES))
         sel = [key for key, _ in self.CHOICES].index(shown)
         self.query_one(Menu).columns = [("", 24), ("", 0)]
         self.query_one(Menu).set_items(items, sel)
@@ -1074,12 +1098,13 @@ class DraftingScreen(Base):
     def commit(self) -> None:
         key = self.menu().current.key
         from strata_cli.launch import modelstate
-        # Auto stays "nobody chose" (a saved preset writes nothing) unless the model's file holds another choice the app saved: then Auto is written, so it wins
+        # Auto stays "nobody chose" (a saved preset writes nothing) unless the model's file or this launch holds another choice: then Auto is written, so it wins
         base = self.ctx.base_config() or {}
         layer_off = modelstate.layer_off_without_choice(base)  # the draft layer is off and nothing else is saved: the step showed Off
         if layer_off and key == "off" and self.ctx.settings.drafting is None:
             return                                            # Off left as it is: nothing new is written, the draft layer's "mtp": false keeps it
-        self.ctx.settings.drafting = modelstate.drafting_to_save(key, "off" if layer_off else base.get("drafting"))
+        saved = "off" if layer_off else base.get("drafting") if base.get("drafting") is not None else drafting_launch_word(self.ctx)
+        self.ctx.settings.drafting = modelstate.drafting_to_save(key, saved)
 
 
 # ------------------------------------------------------------------------------------------------ 6 parallel
