@@ -1389,12 +1389,12 @@ def choice_of(mode: Any, *, model_name: str | None = None, family: str | None = 
 
 def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None,
            backend: str | None = None, archs: Any = None, mtp_here: bool | None = None, blocked: bool = False, vocab_here: bool = True,
-           args: list[Any] | None = None, vram_mib: float | None = None, slots_none: bool = False) -> Decision:
+           args: list[Any] | None = None, vram_mib: float | None = None, slots_none: bool = False, pack: str | Path | None = None) -> Decision:
     """The drafter a start uses. Never raises. ``slots_none`` (slots_draft_nothing of the start's arguments and request count; False when the caller cannot know it): the reason for a
     DFlash2 that is not available here is NONE_IN_SLOTS instead of NOT_HERE, so the plan says what the server says. One drafter, never two. A choice that cannot be applied becomes the other drafter when that one is on this computer,
     else none, with a note in plain words. ``mtp_here`` says whether the MTP layer is on disk (None: not known, taken as there), ``blocked`` that this start is a layer
     split or has several requests at once (see blocked_by), ``vocab_here`` that the draft vocabulary DFlash2 needs is there. ``klass`` is not used any more (Auto
-    does not depend on the kind of card) and stays only so the callers keep working."""
+    does not depend on the kind of card) and stays only so the callers keep working. ``pack`` pins the person's own runtime file instead of the automatic selection."""
     asked = normalize(mode)
     if asked == "off":
         return Decision(asked, "off")
@@ -1407,11 +1407,12 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
     runnable = can_run_dflash2(model_name, family, backend, archs) and not (asked != "dflash2" and auto_mtp_only(backend, archs))
 
     if want == "dflash2":
-        reason = NOT_HERE if (blocked or not vocab_here) else NOT_DOWNLOADED if not drafter_ready(data_dir, model_name, backend) else ""
+        ready = _here(Path(pack)) if pack is not None else drafter_ready(data_dir, model_name, backend)
+        reason = NOT_HERE if (blocked or not vocab_here) else NOT_DOWNLOADED if not ready else ""
         if reason == NOT_HERE and slots_none:
             reason = NONE_IN_SLOTS
         if not reason:
-            return Decision(asked, "dflash2", flags=engine_flags(pack_path(data_dir)))
+            return Decision(asked, "dflash2", flags=engine_flags(pack if pack is not None else pack_path(data_dir)))
         return Decision(asked, "mtp", reason) if have_mtp else Decision(asked, "off", NONE_HERE)
     # the MTP: asked for, or all there is where DFlash2 cannot run
     if have_mtp:
@@ -1420,8 +1421,8 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
             why = NOT_SUPPORTED if not supported_model(model_name, family) else NOT_SERVED if not ENGINE_SERVES_DFLASH2 else NOT_THIS_CARD
         return Decision(asked, "mtp", why)
     # the layer is not on this computer: DFlash2 instead when it can run and its pack is here (said), else none (said)
-    if runnable and not blocked and vocab_here and drafter_ready(data_dir, model_name, backend):
-        return Decision(asked, "dflash2", NO_MTP, engine_flags(pack_path(data_dir)))
+    if runnable and not blocked and vocab_here and (_here(Path(pack)) if pack is not None else drafter_ready(data_dir, model_name, backend)):
+        return Decision(asked, "dflash2", NO_MTP, engine_flags(pack if pack is not None else pack_path(data_dir)))
     return Decision(asked, "off", NONE_HERE)
 
 
@@ -1531,7 +1532,7 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
           engine: str | os.PathLike[str] | None = None) -> Decision:
     """Put the config's ``"drafting"`` choice on its engine arguments (in place): ONE drafter's options and none of the other's. DFlash2: no ``--mtp``, no MTP option,
     ``--draft dflash2 --draft-model <pack> --draft-fallback none --mtp-draft-vocab <file> --spec W --draft-conf C`` (W = window_for: 8 on Strix Halo and on cc 12.0 with >= 48 GB, else 6); the person's own ``--spec`` or ``--draft-conf``
-    in ``user_args`` stays. C is 0.35 where the card holds most experts and higher where fewer slots fit (conf_for_slots): from the person's own ``--expert-cache N``,
+    in ``user_args`` stays, as does an explicit ``--draft-model`` path. C is 0.35 where the card holds most experts and higher where fewer slots fit (conf_for_slots): from the person's own ``--expert-cache N``,
     else from ``vram_mib``, the memory of the one card (None: several cards, a shared-memory chip, unknown: 0.35). MTP: the arguments without any DFlash2 option.
     ``off``: neither (the draft layer's own switch, ``"mtp": false``). ``slots`` says that this start serves several requests at
     once: with Auto that is the MTP, said in one line (except the one class of slot_drafts_by_default: 2 requests on one large Blackwell card holding every expert, where it is
@@ -1570,18 +1571,19 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     mode = cfg.get("drafting")
     if cfg.get("mtp") is False and normalize(mode) == "auto":
         mode = "off"                                          # "Draft layer (MTP)" turned off by the person, and no drafter chosen since: no drafter
+    mine = cfg.get("user_args") or []
+    pinned_pack = _flag_value(mine, "--draft-model")
     slot_drafts = slot_drafts_by_default(mode, backend=backend, archs=archs, vram_mib=vram_mib, args=args, slots=slots, split=split,
-                                         drafter_here=vocab is not None and form != FORM_NONE and drafter_ready(data_dir, name, backend))
+                                         drafter_here=vocab is not None and form != FORM_NONE and (_here(Path(pinned_pack)) if pinned_pack is not None else drafter_ready(data_dir, name, backend)))
     decision = decide(mode, model_name=name, family=family, data_dir=data_dir, backend=backend, archs=archs,
                       mtp_here=mtp_here, blocked=blocked_by(strip_draft_flags(args), split=split, slots=slots, named=normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts) or form == FORM_NONE,
                       vocab_here=vocab is not None, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib,
-                      slots_none=slots_draft_nothing(args, slots))     # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
-    mine = cfg.get("user_args") or []
+                      slots_none=slots_draft_nothing(args, slots), pack=pinned_pack)     # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
     pack = None
     if decision.drafter == "dflash2":
         qualifies = tuned_applies(backend, name, archs, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
-        pack = pack_path(data_dir, engine, model_name=name, backend=backend, tuned=qualifies)
-        if Path(pack) != tuned_path(data_dir, tuned_variant(backend, name)) and not pack_ready(data_dir):         # (only the tuned pack is here and this engine cannot read it: no drafter file for it)
+        pack = pinned_pack if pinned_pack is not None else pack_path(data_dir, engine, model_name=name, backend=backend, tuned=qualifies)
+        if pinned_pack is None and Path(pack) != tuned_path(data_dir, tuned_variant(backend, name)) and not pack_ready(data_dir):         # (only the tuned pack is here and this engine cannot read it: no drafter file for it)
             decision = Decision(decision.asked, "mtp", NOT_DOWNLOADED) if mtp_here is not False else Decision(decision.asked, "off", NONE_HERE)
     if decision.drafter == "off":
         cfg["args"] = strip_mtp_flags(strip_draft_flags(args))
