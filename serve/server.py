@@ -50,6 +50,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.request
 import uuid
 from http.client import HTTPException
@@ -64,7 +65,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, parser_for_template, anthropic_to_messages, anthropic_tools,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
-from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.mcp import McpCancelled, hub_from_config, resolve_image_results  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
@@ -224,6 +225,13 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+FIT_MIN_ROOM = 1024          # #5924: fit_max_tokens never shortens max_tokens below this (a 400 instead; see fit_floor)
+
+
+def fit_floor(ctx: int) -> int:
+    """#5924: the least room fit_max_tokens shortens a max_tokens to: FIT_MIN_ROOM (thinking plus an answer or a tool
+    call), at most a quarter of a small context (test and tiny contexts keep their shortening)."""
+    return max(1, min(FIT_MIN_ROOM, (ctx - CTX_SLACK) // 4))
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -305,11 +313,13 @@ class ContextOverflow(ValueError):
     does: a client that decides from the wording (Claude Code compacts on "prompt is too long", and shortens max_tokens on "input length and
     `max_tokens` exceed context limit") then does what it does for Anthropic's own error (#4838)."""
 
-    def __init__(self, text, *, prompt, context, max_new=None):
+    def __init__(self, text, *, prompt, context, max_new=None, min_room=None):
         super().__init__(text)
-        self.prompt, self.context, self.max_new = prompt, context, max_new
+        self.prompt, self.context, self.max_new, self.min_room = prompt, context, max_new, min_room
 
     def anthropic_text(self) -> str:
+        if self.min_room:              # #5924: room left, but less than an answer needs: the client should compact
+            return f"prompt is too long: {self.prompt} tokens > {self.context - CTX_SLACK - self.min_room} maximum; {self}"
         if self.max_new is None or self.prompt > self.context - CTX_SLACK - 1:     # the prompt alone leaves no room: the largest one that still leaves a token
             return f"prompt is too long: {self.prompt} tokens > {self.context - CTX_SLACK - 1} maximum; {self}"
         return f"input length and `max_tokens` exceed context limit: {self.prompt} + {self.max_new} > {self.context - CTX_SLACK}; {self}"
@@ -393,6 +403,9 @@ VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
 VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
 ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
 
+# A stalled peer must release the request turn; 0 preserves unbounded socket waits.
+PEER_STALL_S = _timeout_env("STRATA_PEER_STALL_S", 120.0)
+
 
 # ------------------------------------------------------------------------------------------------ engines
 class Engine(Protocol):
@@ -440,6 +453,13 @@ class EngineDied(RuntimeError):
     restarts = True        # the engine is gone, so the next request starts it again; False for an error raised while the engine is left running (#3961)
 
 
+class EngineClosing(EngineDied):
+    """#6055: the server stopped (or unloaded) the engine under a request it had already accepted, and the engine ended
+    that request on the close's STOP before it finished.  The request failed; it did not end by itself: never a
+    successful reply with no tokens and finish "length".  Nothing restarts the engine for it."""
+    restarts = False
+
+
 def died_note(e: Exception) -> str:
     """What an API error says about an EngineDied: the cause, and that the next request restarts the engine - only where it really is ended."""
     return f"{e}; the next request restarts it" if getattr(e, "restarts", True) else str(e)
@@ -453,6 +473,10 @@ class EngineStarting(RuntimeError):
 class ClientGone(Exception):
     """#1999: the client hung up while its request was being prepared (an image URL downloading, a picture encoding or
     waiting for its turn): nothing is left to answer."""
+
+
+class ServerStopping(RuntimeError):
+    """The drain deadline (--shutdown-timeout) cancelled a request whose client may still be waiting for its answer."""
 
 
 class ModelBusy(RuntimeError):
@@ -500,6 +524,45 @@ class SessionRefused(ValueError):
 class EngineStuck(RuntimeError):
     """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
     reporting its GPU and RAM as given back."""
+
+
+HOOK_REASON_MAX = 300   # #5987: the most of a before_load command's own refusal line that goes into a 503
+
+
+def hook_text(output) -> str:
+    """A before_load command's output as text: UTF-8, else the system's own encoding (a Windows console tool writes its
+    code page), never an error."""
+    if not isinstance(output, bytes):
+        return output or ""
+    try:
+        return output.decode("utf-8")
+    except UnicodeDecodeError:
+        import locale
+        return output.decode(locale.getpreferredencoding(False) or "utf-8", "replace")
+
+
+def hook_reason(output, limit: int = HOOK_REASON_MAX, stderr=None) -> str:
+    """#5987: the last non-empty line a before_load command wrote, made safe for an API message: control and format
+    characters become spaces, runs of whitespace one space, at most `limit` characters ("..." marks a cut).  The two
+    streams are read apart: the reason is stderr's last line, else stdout's - merged, their order depends on the
+    command's buffering (a Python launcher's stdout to a pipe is flushed at its exit, after its stderr line).  "" when it
+    wrote nothing."""
+    for text in (stderr, output):
+        for line in reversed(hook_text(text).splitlines()):
+            s = " ".join("".join(" " if unicodedata.category(c)[0] == "C" else c for c in line).split())
+            if s:
+                return s if len(s) <= limit else s[:limit - 3].rstrip() + "..."
+    return ""
+
+
+def hook_echo(output, stream=None) -> None:
+    """The before_load command's output, passed on to this server's own stdout (or `stream`: its stderr for the command's
+    stderr), where it went before #5987 read it."""
+    if not output:
+        return
+    lines = hook_text(output).splitlines()   # (a Windows command's \r\n would come out doubled through a text stream)
+    if lines:
+        print("\n".join(lines), file=stream or sys.stdout, flush=True)
 
 
 class GpuBusy(RuntimeError):
@@ -830,6 +893,13 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # #6081: a park the cache refused, by reason (the engine's "skip parking (...)" / "allocation failed" lines; a
+    # "skipped N tokens" line is put()'s refusal).  The first match names the reason; any other text is the size
+    # estimate's own error ("estimate").
+    SKIP = re.compile(r"conversation cache: (?:skip parking \((.*)\)|allocation failed; skip parking)")
+    REASONS = (("gave no memory back", "ram_no_progress"), ("physical RAM admission", "ram_floor"),
+               ("RAM floor after capture", "ram_after_capture"), ("exceeds available budget", "budget"),
+               ("below the", "short"), ("stage CUDA", "estimate"))
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -839,13 +909,21 @@ class ConvCacheLog:
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None, "refused": {}, "refused_total": 0, "last_refused": None}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it.  One poll at a
         time: a second one moved `pos` between the size check and the seek and raised ValueError (negative seek)."""
         with self.lock:
-            return self._poll(path, start)
+            st = self._poll(path, start)
+            st["refused"] = dict(st["refused"])         # a copy: the caller's view does not move with later polls
+            return st
+
+    def _refused(self, reason: str) -> None:
+        st = self.state
+        st["refused"][reason] = st["refused"].get(reason, 0) + 1
+        st["refused_total"] += 1
+        st["last_refused"] = reason
 
     def _poll(self, path, start) -> dict:
         if not path or start is None:
@@ -879,10 +957,20 @@ class ConvCacheLog:
                 if m.group(1) != "skipped":
                     st["parks" if m.group(1) == "parked" else "restores"] += 1
                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
+                else:
+                    self._refused("put")
                 continue
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+                continue
+            m = self.SKIP.search(line)
+            if m:
+                text = m.group(1)
+                if text is None:
+                    self._refused("alloc")
+                else:
+                    self._refused(next((r for k, r in self.REASONS if k in text), "estimate" if text else "other"))
         return dict(self.state)
 
 
@@ -924,9 +1012,11 @@ EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default -
 
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
-# finished, #267): the process may stay alive and even print DONE, but it must not take another request.
+# finished, #267; a GPU wait on the host ran out and the window was discarded, #5160 - the Intel engine ends after it):
+# the process may stay alive and even print DONE, but it must not take another request.
 FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
-                  "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
+                  "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished",
+                  "ERR verify: the GPU stopped waiting")
 
 
 def parse_engine_stage_line(line: str) -> list[dict] | None:
@@ -984,6 +1074,17 @@ def visible_device_order(env: dict | None, backend: str | None) -> list[int]:
         return []
     devices = [int(part) for part in value.split(",")]
     return devices if all(0 <= device <= 65535 for device in devices) and len(set(devices)) == len(devices) else []
+
+
+def monitored_gpu(cards: list[int], env: dict | None, backend: str | None) -> int:
+    """The card the Monitor reads, numbered as the GPU readers number them (serve/telemetry.py: AMD in KFD order, NVIDIA by PCI bus).
+    The config's own cards when it names any. Otherwise the card the engine's environment shows it first: an "Automatic" AMD start
+    (hip_auto_devices) or the person's own HIP_VISIBLE_DEVICES runs the engine on card N while the Monitor used to read card 0, an idle
+    card next to it (#4640). 0 when the environment does not say, or says it ambiguously (visible_device_order)."""
+    if cards:
+        return cards[0]
+    order = visible_device_order(env, backend)
+    return order[0] if order else 0
 
 
 def configure_batch_telemetry_env(env: dict, cfg: dict, override: bool | None) -> None:
@@ -1277,6 +1378,7 @@ class StrataEngine:
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
+        self.closing = False                            # #6055: close() is ending this engine (set before its STOP)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own); first, so
         #                                                 a request that sees the new number sees the new queues (#4451)
@@ -1677,7 +1779,10 @@ class StrataEngine:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
+        except (OSError, AttributeError, ValueError):    # the pipe is gone (or a restart's close() took the process;
+            # #6055: close() closed stdin - a write then raises ValueError, which reached the client as a 400 "malformed")
+            if getattr(self, "closing", False):
+                raise EngineClosing("this instance is draining; retry against the next instance") from None
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
     def _send_for(self, born: int, text: str):
@@ -1811,6 +1916,13 @@ class StrataEngine:
                 self._ctl_result = ("done", None)
                 return
 
+    def _raise_if_closed_under(self, finish: str | None, cancel: threading.Event) -> None:
+        """#6055: a request the engine ended with "cancel" although the request itself was not cancelled, while close()
+        is ending the engine: close()'s STOP cut it off.  It failed (EngineClosing, a 503 the client can retry), where
+        it used to end as a successful reply with the tokens so far (none, while its prompt was read) and "length"."""
+        if finish == "cancel" and getattr(self, "closing", False) and not cancel.is_set():
+            raise EngineClosing("this instance is draining; retry against the next instance")
+
     def _done_finish(self) -> str | None:
         """The finish field of the DONE line the control lines read last (None: none since it was cleared)."""
         f = (getattr(self, "_last_done", None) or "").split()
@@ -1904,8 +2016,14 @@ class StrataEngine:
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
-        releasing = self.slot_releasing
-        releasing.add(slot)
+        releasing, claims = self.slot_releasing, self.slot_claims
+        if self.gen != born:     # #5657: a restart came in since the check above (its number moves before its objects
+            return               # do): these sets may be the NEW engine's, whose request holds this slot number now
+        with self.slot_cv:
+            # Transfer the claim before the waiter can free the slot. A queued BDONE may let the next request
+            # claim it immediately; the previous request must not discard that new claim afterwards.
+            releasing.add(slot)
+            claims.discard(slot)
 
         def wait():
             end = time.monotonic() + self.QUARANTINE_S      # no-progress limit: every line of the slot starts it again
@@ -2419,6 +2537,8 @@ class StrataEngine:
                         yield t
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    if not cont:
+                        self._raise_if_closed_under(self._done_finish(), cancel)   # #6055
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         yielded_legs.append(self.last)
                         continue                            # gave way: again once the shorter request is in
@@ -2469,6 +2589,7 @@ class StrataEngine:
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        self._raise_if_closed_under(f[3] if len(f) > 3 else None, cancel)   # #6055
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -2561,7 +2682,6 @@ class StrataEngine:
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream, born)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
@@ -2694,10 +2814,13 @@ class StrataEngine:
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             head = "GEN 0 prefill=1"
+        line = f"{head} {','.join(str(int(t)) for t in ids)}\n"   # (a bad id stays the request's own ValueError)
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+            self.proc.stdin.write(line)
             self.proc.stdin.flush()
-        except (OSError, EngineDied):                    # the pipe is gone: the engine died (not the client)
+        except (OSError, ValueError, AttributeError, EngineDied):   # the pipe is gone: the engine died (not the client)
+            if getattr(self, "closing", False):         # #6055: or close() closed it (a write then raises ValueError)
+                raise EngineClosing("this instance is draining; retry against the next instance") from None
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
@@ -2783,6 +2906,7 @@ class StrataEngine:
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    self._raise_if_closed_under(self.last.get("finish"), cancel)
                     return
                 elif line.startswith("ERR"):
                     done = True
@@ -3018,7 +3142,9 @@ class StrataEngine:
             if self.proc.poll() is None:
                 try:
                     # STOP first: a request still running ends at its next step instead of being waited for (the
-                    # engine reads stdin on its own thread; QUIT behind a long answer would sit in its queue)
+                    # engine reads stdin on its own thread; QUIT behind a long answer would sit in its queue).
+                    # #6055: marked first, so that request fails (EngineClosing) instead of ending as a reply
+                    self.closing = True
                     self.proc.stdin.write("STOP\nQUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
@@ -3893,11 +4019,12 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     # has it, on one card and on a layer split over several cards. A choice that cannot be applied (no drafter file yet, several requests at once) starts the other one if it is on this computer,
     # else none, and says why in the engine's /metrics ("drafting_note"). The start never downloads.
     shaped = {**cfg, "args": args}
-    backend, archs = drafting.detect_hardware()
+    backend, archs = drafting.hardware_for(cfg.get("backend"))   # #5109: the config's engine family, not an idle card of another vendor
     parallel_n = cfg.get("parallel")
-    decision = drafting.apply(shaped, klass=drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
+    decision = drafting.apply(shaped, klass=drafting.card_class(archs) if archs else drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
                               vram_mib=drafting_vram_mib(cfg, backend, archs),
-                              slots=parallel_n if isinstance(parallel_n, int) and not isinstance(parallel_n, bool) else 0, engine=exe)
+                              slots=parallel_n if isinstance(parallel_n, int) and not isinstance(parallel_n, bool) else 0,
+                              engine=engine_binary(exe, cfg) if exe else exe)
     args = shaped["args"]
     if announce:
         drafting.remember_note(decision.note)
@@ -4367,7 +4494,9 @@ def pick_hip_devices(devices: list[dict]) -> tuple[list[int] | None, str | None]
         return None, hip_no_card_message(devices)
     pool = [d for d in runnable if not d["integrated"]] or runnable
     if devices[0] in pool:
-        return None, None
+        # device 0 runs, as before; a card the engine has no code for is not shown to it at all (#6015: such a card visible to the engine
+        # can stop it at start), and the order of the others is kept
+        return ([d["index"] for d in runnable] if len(runnable) < len(devices) else None), None
     best = max(pool, key=lambda d: (round(d["vram_gb"]), -d["index"]))
     return [best["index"]], None
 
@@ -4579,7 +4708,7 @@ def engine_arch_note(cfg: dict, cards: dict[int, int] | None = None, built: dict
             return None
         names = ", ".join(f"sm_{m}" for m in miss)
         return (f"[strata] this engine was built for {', '.join(f'sm_{a}' for a in archs)}, but a graphics card in use is {names}: long prompts "
-                "can stop with \"unspecified launch failure\". Update the engine (./update.sh, or `strata update`) so it is built for every card in this PC.")
+                "can stop with \"unspecified launch failure\". Update the engine (./setup.sh --update, or `strata update`) so it is built for every card in this PC.")
     except Exception:
         return None
 
@@ -5385,13 +5514,20 @@ class Service:
         if self.before_load:
             cmd = self.before_load
             print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
-            why = None
+            why, reason = None, ""
             try:
+                # #5987: its output is read (and passed on to this server's own output, as before) so that a refusal can
+                # carry the command's own reason
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
-                                   stdin=subprocess.DEVNULL)
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                hook_echo(r.stdout)
+                hook_echo(r.stderr, sys.stderr)
                 if r.returncode != 0:
                     why = f"it exited with code {r.returncode}"
-            except subprocess.TimeoutExpired:
+                    reason = hook_reason(r.stdout, stderr=r.stderr)
+            except subprocess.TimeoutExpired as e:
+                hook_echo(e.output)
+                hook_echo(e.stderr, sys.stderr)
                 why = f"it did not finish in {self.before_load_timeout_s:g} s (before_load_timeout_s)"
             except (OSError, subprocess.SubprocessError) as e:
                 why = f"it could not run ({e})"
@@ -5403,8 +5539,10 @@ class Service:
                 if self.before_load_strict and not self.before_load_ignore_failure:
                     print(f"[strata] the before_load command failed ({why}); the model stays unloaded and this "
                           "request is answered 503 - try again (before_load_strict)", flush=True)
-                    raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
-                                  "model was not loaded; try again in a moment", retry_after=15)
+                    # #5987: a command that refused with a line of its own (a scheduler's "no room ... for 76G of RAM")
+                    # is answered with that line, made safe for the API; without one, the generic sentence
+                    raise GpuBusy(reason or f"the before_load command failed ({why}): the GPU was not given back, so the "
+                                            "model was not loaded; try again in a moment", retry_after=15)
                 hook_failed = why
                 if self.before_load_ignore_failure or not self.min_free_vram_mib:
                     print(f"[strata] the before_load command failed ({why}); loading anyway"
@@ -5832,8 +5970,18 @@ class Service:
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
-        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
-                       for name, kind, help_, value in rows)
+        # #6081: the conversation cache from the engine's log: parks, restores, evictions and the refused parks by reason
+        cc = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        rows += [
+            ("strata:conversation_cache_parked", "gauge", "Conversations parked now", cc["parked"]),
+            ("strata:conversation_cache_parks_total", "counter", "Conversations parked", cc["parks"]),
+            ("strata:conversation_cache_restores_total", "counter", "Parked conversations restored", cc["restores"]),
+            ("strata:conversation_cache_evictions_total", "counter", "Parked conversations evicted", cc["evictions"]),
+        ]
+        refused = "strata:conversation_cache_refused_total"
+        return ("".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n" for name, kind, help_, value in rows) +
+                f"# HELP {refused} Conversations the cache did not park, by reason\n# TYPE {refused} counter\n" +
+                "".join(f'{refused}{{reason="{r}"}} {n}\n' for r, n in sorted(cc["refused"].items())))
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -6067,6 +6215,17 @@ class Service:
                                       f"({ctx}); requests are never truncated", prompt=len(ids), context=ctx)
             max_new = room
         elif max_new > room:
+            floor = fit_floor(ctx)
+            if self.fit_max_tokens and room < floor:
+                # #5924: a clamp to a few hundred tokens left a thinking model no room to answer (or to write a tool
+                # call); agents resent the turn and wrote the same truncated sentence again and again.  The context is
+                # all but full: a 400 that says so makes the client compact (Claude Code reads "prompt is too long").
+                self.forget_prompt(encoded_ids)
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"the prompt ({len(ids)} tokens) leaves {max(0, room)} of the {ctx}-token "
+                                      f"context, fewer than the {floor} an answer needs; Strata never truncates "
+                                      f"requests. Shorten the conversation, or send max_tokens {max(0, room)} or less",
+                                      prompt=len(ids), context=ctx, max_new=max_new, min_room=floor)
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
                 raise ContextOverflow("request exceeds the context window: "
@@ -6232,7 +6391,9 @@ class Service:
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
+        card = model_card_sampling(self.model_arch, thinking,
+                                   greedy=asks_greedy(sampling, self.shared, self.sampling_defaults))
+        defaults = {**card, **self.sampling_defaults, **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
@@ -6791,7 +6952,17 @@ class Service:
             with self.status_lock:
                 self.totals["tool_calls_unread"] = self.totals.get("tool_calls_unread", 0) + parser.unread
             # #3796: the same names for the client (a machine-readable marker next to the text, which stays as the model wrote it)
-            rejected = [{"name": nm, "reason": "undeclared"} for nm in named or []]
+            # #5904 / #5933 / #4622: plus the declared tool the name comes closest to, as a hint for the client or the
+            # model's next turn.  Only a hint: the call is not run under that name (a guessed tool is a safety risk;
+            # "undeclared_tool_calls": "call" stays the only way to run an undeclared call)
+            declared = [t.get("name") for t in tools or [] if isinstance(t, dict) and isinstance(t.get("name"), str)]
+            rejected = []
+            for nm in named or []:
+                entry = {"name": nm, "reason": "undeclared"}
+                near = closest_declared(nm, declared)
+                if near:
+                    entry["closest_declared"] = near
+                rejected.append(entry)
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -6802,6 +6973,24 @@ class Service:
         if rejected:
             done["rejected_tool_calls"] = rejected
         yield "done", done
+
+
+def closest_declared(name: str, declared: list[str]) -> str | None:
+    """#5904 / #5933: the declared tool name an undeclared one comes closest to (`read_file` -> `read`), for the hint in
+    strata_rejected_tool_calls; None when none is clearly close.  The one declared name the written one contains or is
+    contained in (ignoring case and `_` / `-` / `.`), else the best difflib match at a ratio of 0.75 or more."""
+    import difflib
+    if not name or not declared:
+        return None
+    norm = lambda s: re.sub(r"[_\-.\s]", "", s.lower())     # noqa: E731
+    n = norm(name)
+    inside = [d for d in declared if norm(d) and (norm(d) in n or n in norm(d))]
+    if len(inside) == 1:
+        return inside[0]
+    best = difflib.get_close_matches(name.lower(), [d.lower() for d in declared], n=1, cutoff=0.75)
+    if best:
+        return next(d for d in declared if d.lower() == best[0])
+    return None
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -7199,7 +7388,18 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-    yield chunk({"role": "assistant", "content": ""})
+    # #2391: the role-only chunk goes out right before the first data chunk, not before the prompt is read: a client
+    # that times the first data chunk (llama-benchy's TTFR / est_ppt) would otherwise see a prefill of ~0 ms.  vLLM
+    # and llama.cpp send it with the engine's first output too.  The keep-alive comments are not data and go first.
+    opened = False
+
+    def first():
+        nonlocal opened
+        if opened:
+            return ()
+        opened = True
+        return (chunk({"role": "assistant", "content": ""}),)
+
     lp = LogprobEntries(svc, allowed_ids(req), cancel) if top_logprobs(req) is not None else None
 
     def with_lp(c, key):
@@ -7218,27 +7418,35 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
             pp = prompt_progress(svc) if want_progress else None
+            if pp is not None:
+                yield from first()
             yield None if pp is None else {**chunk({}), "prompt_progress": pp}
         elif kind == "mcp":
+            yield from first()
             c = chunk({})
             c["strata_mcp"] = x
             yield c
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
+                yield from first()
                 yield with_lp(chunk({"reasoning_content": ev.text}), "reasoning_content")
             elif ev.kind == "content" and ev.text:
+                yield from first()
                 yield with_lp(chunk({"content": ev.text}), "content")
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
                 calls += 1
+                yield from first()
                 yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
                                              "function": {"name": ev.call.name, "arguments": ""}}]})
             elif ev.kind == "tool_args":
+                yield from first()
                 yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
             elif ev.kind == "tool_call" and ev.call.id in streamed:
                 finished.add(ev.call.id)
             elif ev.kind == "tool_call":
+                yield from first()
                 yield chunk({"tool_calls": [{"index": calls, "id": ev.call.id, "type": "function",
                                              "function": {"name": ev.call.name,
                                                           "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
@@ -7246,6 +7454,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         else:
             answered_done = True
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
+            yield from first()                     # an empty answer still opens with the role
             whole = calls and streamed.keys() <= finished
             finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
@@ -7393,17 +7602,29 @@ def _with_reasoning(lps: dict, entries: list) -> dict:
 
 
 def structured_chunks(chunks, validator):
-    """Buffer structured streams so a client never receives unvalidated content."""
+    """Buffer structured streams so a client never receives unvalidated content.  A turn that calls a tool is not the
+    final answer: from its first call on, what was held goes out as it is and the rest streams unchecked, as
+    /v1/responses does."""
     buffered = []
     heartbeat = time.monotonic()
     try:
         for chunk in chunks:
+            if buffered is None:
+                yield chunk
+                continue
             progress = chunk is not None and "prompt_progress" in chunk
+            if chunk is not None and not progress and (chunk.get("choices") or [{}])[0].get("delta", {}).get("tool_calls"):
+                yield from buffered
+                yield chunk
+                buffered = None
+                continue
             if chunk is not None and not progress:
                 buffered.append(chunk)      # a progress chunk carries no content: there is nothing in it to validate
             if chunk is None or progress or time.monotonic() - heartbeat >= 1:
                 heartbeat = time.monotonic()
                 yield chunk if progress else None
+        if buffered is None:
+            return
         result = openai_collect(buffered)
         choice = result["choices"][0]
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
@@ -7563,8 +7784,17 @@ class BadBody(Exception):
         self.status = status
 
 
+def anthropic_error_type(code: int, current) -> str:
+    """error.type on /v1/messages, by the status rows of platform.claude.com/docs/en/api/errors.  502 and 503 have no
+    row and keep their type: a 503 must not read as overloaded_error, which Claude Code treats as an overload."""
+    known = {401: "authentication_error", 403: "permission_error", 404: "not_found_error", 409: "conflict_error",
+             413: "request_too_large", 429: "rate_limit_error", 500: "api_error"}.get(code)
+    return known or ("invalid_request_error" if code < 500 else current or "api_error")
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
+        timeout = PEER_STALL_S
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         record = None                                       # #332: this request's monitor record, if kept
@@ -7703,12 +7933,15 @@ def make_handler(svc: Service):
                              f"turns this check off"}})
             return False
 
-        def _foreign_page(self) -> bool:
+        def _foreign_page(self, body: bool = True) -> bool:
             """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
-            then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
+            then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before.
+            The /v1 foreign-Origin rule (owner 11-16, the same contract as the app host's /v1): an Origin header
+            that is present but empty is another site too, and GET /v1 goes through the same check (body=False:
+            no content type to check)."""
             origin = self.headers.get("Origin")
-            if svc.api_key or not origin:
+            if svc.api_key or origin is None:
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
@@ -7719,7 +7952,7 @@ def make_handler(svc: Service):
                                  f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") "
                                  f"in the config"}})
                 return True
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
+            if body and not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return True
             return False
@@ -7795,6 +8028,14 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None, retry_after=None):
+            path = self.path.split("?")[0].rstrip("/")
+            if code >= 400 and isinstance(obj.get("error"), dict) and \
+                    V1_V1_ALIASES.get(path, path) in ("/v1/messages", "/v1/messages/count_tokens"):
+                # Anthropic's error shape: @ai-sdk/anthropic drops the message of a body without the top-level type
+                request_id = "req_" + (self.record["id"] if self.record is not None else uuid.uuid4().hex[:12])
+                error = {**obj["error"], "type": anthropic_error_type(code, obj["error"].get("type"))}
+                obj = {"type": "error", **obj, "error": error, "request_id": request_id}
+                headers = {**(headers or {}), "request-id": request_id}
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -7838,6 +8079,8 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/") and self._foreign_page(body=False):
+                return
             if path.startswith("/tool-media/"):
                 if not self._authorized():
                     return
@@ -8259,10 +8502,14 @@ def make_handler(svc: Service):
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
+                except (GpuBusy, EngineStarting) as e:
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
+                except EngineDied as e:                      # #2497: a program that cannot start (or died at READY)
+                    self._json(503, {"error": {"type": "server_error", "message": died_note(e)}})
+                except EngineStuck as e:                     # is a 503 with the reason, as on the request routes,
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})   # not a dropped connection
                 return
             reserved = False
             try:
@@ -8447,7 +8694,8 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            defaults = {**model_card_sampling(svc.model_arch, True), **svc.sampling_defaults, **svc.shared}
+            defaults = {**model_card_sampling(svc.model_arch, True, greedy=asks_greedy(svc.shared, svc.sampling_defaults)),
+                        **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
@@ -8599,9 +8847,12 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
             self.end_headers()
-            if STREAM_WRITE_TIMEOUT_S > 0:
+            # (#4271) a stuck write ends as OSError: disconnected.  The connection's own PEER_STALL_S deadline stays the
+            # bound when it is the shorter one: one stall rule for every socket operation.
+            limits = [x for x in (STREAM_WRITE_TIMEOUT_S, self.timeout) if x]     # self.timeout: PEER_STALL_S when the class was made
+            if limits:
                 try:
-                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)     # (#4271) a stuck write ends as OSError: disconnected
+                    self.connection.settimeout(min(limits))
                 except OSError:
                     pass
 
@@ -8653,9 +8904,9 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError("structured response_format with tools/MCP is not supported")
+            messages, validator = prepare_format(req.get("response_format"), messages, with_tools=bool(tools))
+            if validator is not None and req.get("strata_mcp"):
+                raise ValueError("structured response_format with MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             # No cap of our own on the reply's length when logprobs are asked for: the reply is already bounded by
@@ -8706,10 +8957,23 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
+            # OpenAI's streaming contract: with "stream_options": {"include_usage": true} the usage rides in its own
+            # last chunk, "choices": []. Clients and gateways read it there (LiteLLM ignores a usage that sits on the
+            # finish_reason chunk and recounts the tokens itself, too low). Without the option the chunk is unchanged.
+            # A value that is not an object is ignored (the spec allows an object or null): an exception here, after the
+            # headers are out, would end the stream with an empty 200.
+            stream_options = req.get("stream_options")
+            split_usage = isinstance(stream_options, dict) and bool(stream_options.get("include_usage"))
             try:
                 for c in chunks:
                     if c is None:
                         self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                    elif split_usage and c.get("usage") is not None:
+                        head = {k: v for k, v in c.items() if k != "usage"}
+                        tail = {"id": c["id"], "object": c["object"], "created": c["created"], "model": c["model"],
+                                "choices": [], "usage": c["usage"]}
+                        for part in (head, tail):
+                            self.wfile.write(b"data: " + json.dumps(part, ensure_ascii=False).encode() + b"\n\n")
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
@@ -8719,21 +8983,37 @@ def make_handler(svc: Service):
                 svc.note_client_disconnect(cancel)           # client went away: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": died_note(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._chat_failed(died_note(e))
             except QueueWaitExpired as e:
-                err = {"error": {"type": "rate_limit_error", "code": "queue_wait_timeout", "message": str(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._chat_failed(str(e), "rate_limit_error", "queue_wait_timeout")
             except StructuredOutputError as e:
-                err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._chat_failed(str(e), "structured_output_failed", "structured_output_failed")
             except ValueError as e:                          # the engine's ERR after the stream started: the
-                err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._chat_failed(str(e))   # headers are sent, so no 400 now
+            except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:
+                self._chat_failed(str(e))   # _post's handler would write HTTP into the stream's body
+            except ClientGone:
+                raise
+            except Exception:                                # no silent end: the client would take it for a whole answer
+                self._chat_failed(self._stream_crashed())
+
+        def _stream_crashed(self):
+            """An unexpected error in a started stream: the traceback for the log, a plain sentence for the client."""
+            import traceback
+            print("[strata] error in a started stream:\n" + traceback.format_exc(), flush=True)
+            return "the server failed while answering; the server's log has the details"
+
+        def _chat_failed(self, message, kind="server_error", code=None):
+            """A chat stream that cannot finish: the error object, then [DONE] (#5633).  No chunk with a made-up
+            finish_reason: "error" is outside OpenAI's list and strict clients reject the chunk; the OpenAI SDKs raise
+            on the error object itself, and the web app reads it."""
+            error = {"type": kind, **({"code": code} if code else {}), "message": message}
+            self._note(error=error)
+            try:
+                self.wfile.write(b"data: " + json.dumps({"error": error}).encode() + b"\n\ndata: [DONE]\n\n")
+                self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -8770,7 +9050,9 @@ def make_handler(svc: Service):
             except ModelBusy as e:
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
-                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                ra = getattr(e, "retry_after", None)         # #1997: as chat and messages (only GpuBusy carries one)
+                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"),
+                                  headers={"Retry-After": int(ra)} if ra else None)
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -8787,6 +9069,12 @@ def make_handler(svc: Service):
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done, check)
+                elif cancel.is_set() or (done or {}).get("finish") == "cancel":
+                    # no final event exists: collect() must not read the last delta as the answer, a stream must not
+                    # end without response.failed.  Cancelled by cancel_owned_requests, or by a client that left
+                    if svc.draining:
+                        raise ServerStopping("this instance is draining; retry against the next instance")
+                    raise ClientGone()
             items = self._capture(events(), "responses")
             if not req.get("stream"):
                 try:
@@ -8797,6 +9085,9 @@ def make_handler(svc: Service):
                 except QueueWaitExpired as e:
                     return self._json(429, responses_error_body(str(e), "server_error",
                                                                 code="queue_wait_timeout"), retry_after=1)
+                except ServerStopping as e:                  # as a request refused while draining
+                    return self._json(503, responses_error_body(str(e), "server_error", code="server_draining"),
+                                      retry_after=1)
                 except EngineDied as e:
                     return self._json(503, responses_error_body(died_note(e), "server_error",
                                                                 code="server_error"))
@@ -8832,12 +9123,20 @@ def make_handler(svc: Service):
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, died_note(e), "server_error", send)
+            except ServerStopping as e:                      # server_error: ResponseErrorCode is a closed list
+                self._responses_failed(asm, str(e), "server_error", send)
             except QueueWaitExpired as e:
                 self._responses_failed(asm, str(e), "queue_wait_timeout", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
+            except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:   # _post would write HTTP into the stream's body
+                self._responses_failed(asm, str(e), "server_error", send)
+            except ClientGone:
+                raise
+            except Exception:                                # no silent end: the client would take it for a whole answer
+                self._responses_failed(asm, self._stream_crashed(), "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
@@ -8902,6 +9201,14 @@ def make_handler(svc: Service):
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
+            # #4621 / #1917: what the client's own tool_search returned in THIS request's input is declared in the
+            # conversation where the search answered; after the prompt is made (so its start, and the conversation
+            # cache, stay as they were) the parser and the response accept exactly those names as declared - never a
+            # guessed one.  tool_choice "none" (tools None) hides the found tools too.
+            found, found_names = responses_api.client_found_tools(req)
+            if tools is not None and found:
+                tools = tools + [t for t in found if t["name"] not in names]
+                names = {**found_names, **names}
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
@@ -8925,7 +9232,7 @@ def make_handler(svc: Service):
             callable_tools, deferred = anthropic_tools(req)     # #4663: the deferred tools are callable, unlisted
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = callable_tools = None
-            force = svc.force_text(forced_call(req.get("tool_choice"), tools))        # "any" / {"type": "tool", "name": N}
+            force = svc.force_text(forced_call(req.get("tool_choice"), tools, callable_tools))   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -8969,6 +9276,20 @@ def make_handler(svc: Service):
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:   # _post would write HTTP into the stream's body
+                self._anthropic_failed(str(e), "overloaded_error" if isinstance(e, GpuBusy) else "api_error")
+            except ClientGone:
+                raise
+            except Exception:                                # no silent end: the client would take it for a whole answer
+                self._anthropic_failed(self._stream_crashed(), "api_error")
+
+        def _anthropic_failed(self, message, kind):
+            err = {"type": "error", "error": {"type": kind, "message": message}}
+            self._note(error=err["error"])
+            try:
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except OSError:
+                self._note(outcome="disconnected")
 
     return Handler
 
@@ -9297,6 +9618,37 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 
 SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
                "experimental_speed_projection")
+
+
+def load_shared_settings(path, warn=print) -> dict:
+    """The Chat settings kept next to a config between starts, read so that one bad key cannot erase the others.
+
+    The strict reader below belongs to POST /settings, where a client is there to be told which key is wrong and can
+    fix it.  At start-up nobody is there: the old code called the same strict reader and caught its ValueError with
+    `svc.shared = {}`, so a single unknown key - a typo, a key from a newer version, or a setting the server does not
+    know - discarded every OTHER setting in the file, `reasoning_effort` included, without a word in the log (#4933).
+
+    So the two failures are told apart here: a file that cannot be read, or is not a JSON object, is still ignored as
+    a whole (nothing in it can be trusted); a file that IS an object keeps every key the server understands, and each
+    key it does not is named on one line and skipped."""
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}                   # no file yet: the normal case on a first start, nothing to report
+    except (OSError, ValueError) as e:
+        warn(f"[strata] the Chat settings in {path} are ignored ({e}); other apps use their own settings")
+        return {}
+    if not isinstance(doc, dict):
+        warn(f"[strata] the Chat settings in {path} are ignored (a JSON object was expected, found "
+             f"{type(doc).__name__}); other apps use their own settings")
+        return {}
+    out = {}
+    for key, value in doc.items():
+        try:
+            out.update(clean_shared_defaults({key: value}))
+        except ValueError as e:
+            warn(f"[strata] one Chat setting in {path} is skipped ({e}); the others still apply")
+    return out
 
 
 def clean_shared_defaults(d) -> dict:
@@ -9714,10 +10066,31 @@ MODEL_CARD_SAMPLING = {
 }
 
 
-def model_card_sampling(arch, thinking) -> dict:
-    """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family)."""
+# The card's penalties: a greedy request must not get them (see model_card_sampling)
+CARD_PENALTIES = ("presence_penalty", "frequency_penalty", "repetition_penalty")
+
+
+def model_card_sampling(arch, thinking, greedy=False) -> dict:
+    """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family).
+    `greedy` (temperature 0 asked for, see asks_greedy): without the card's penalties, so a greedy request stays greedy.
+    A penalty makes the engine sample from its logits: the answer is no longer the greedy one, and the MTP drafts
+    (greedy requests only) never run - with Qwen3.6's presence_penalty 1.5, 0 drafts on every temperature-0 request."""
     sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
-    return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+    card = dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+    if greedy:
+        for k in CARD_PENALTIES:
+            card.pop(k, None)
+    return card
+
+
+def asks_greedy(*layers) -> bool:
+    """True when greedy is asked for: the first of `layers` (highest precedence first - the request, the shared Chat
+    settings, the config's `sampling` block) that sets a temperature sets 0."""
+    for layer in layers:
+        t = (layer or {}).get("temperature")
+        if t is not None:
+            return isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0
+    return False
 
 
 def default_model_name(cfg: dict) -> str:
@@ -9909,6 +10282,35 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
     return recovery
 
 
+#: #5787: the switch that turns the server's own crash reporter off.
+FAULTHANDLER_OFF = "STRATA_NO_FAULTHANDLER"
+
+
+def arm_faulthandler(env: dict | None = None) -> bool:
+    """#5787: arm CPython's faulthandler for this process, on its own output, and say whether it armed.
+
+    The reports of the serve process dying natively (`0xC0000005` / `0xC0000409` on Windows, SIGSEGV / SIGBUS on Linux
+    and Mac) all have the same shape: the host log carries an exit code, the crash guard restarts the server in about
+    two minutes, and nothing names the Python line.  #5787's ten restarts in three days needed the reporter to set
+    `PYTHONFAULTHANDLER=1` in his own launcher, plus the private `python312.pdb` from the package, to read anything.
+    Armed here, in the server, every launcher (the app, the Terminal, a source start) leaves the stack of the dying
+    thread, and of the request workers beside it, in the log a person can already send.
+
+    It writes nothing while the process runs.  `STRATA_NO_FAULTHANDLER=1` turns it off.  A faulthandler that cannot arm
+    (no module, a closed output) is answered with False and never stops a start.  The process still dies by the same
+    signal with the same exit code, so the crash guard, the app's restart and the OS's own dump are unchanged.
+    """
+    target = os.environ if env is None else env
+    if target.get(FAULTHANDLER_OFF) == "1":
+        return False
+    try:
+        import faulthandler
+        faulthandler.enable(all_threads=True)         # the request workers' stacks are what names a shared cause
+        return True
+    except Exception:                                  # noqa: BLE001 - arming a crash reporter never breaks a start
+        return False
+
+
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     """Serve until stopped. For as long as it runs this server holds the shared activity lease of the runtime folder (the same one `strata serve` and
     a runtime host take), so `strata update` and a calibration run see an engine that was started by running this file directly - the desktop app's
@@ -9918,6 +10320,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     Its console output goes through a bounded queue (serve/nonblocking_out.py, #4479 / #2481): a console that stops taking output must not hold a
     request's turn, a cancel or an admission.  STRATA_BLOCKING_CONSOLE=1 turns it off (testers)."""
     quiet_crash_env()                                  # every child inherits it: no gdb on a user's machine (strata_control/childenv.py)
+    arm_faulthandler()                                 # #5787: a native death names its Python line in this server's own output
     lease = None
     try:
         from strata_control import runtime as _runtime
@@ -10430,7 +10833,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
-    svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
+    svc.gpu_index = monitored_gpu(gpu_list(cfg), env if a.engine == "strata" else None, cfg.get("backend"))   # the card the engine runs on (#51, #4640)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.engine == "strata" and groups:                 # replicas: every card of every group
         svc.gpu_indices = [c for g in groups for c in g]
@@ -10451,16 +10854,15 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         svc.config_path = a.config                      # #564: the web page's Settings view
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
-        try:
-            svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
-            if svc.shared:
-                print("[strata] other apps use the Chat settings: " +
-                      ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
-        except (OSError, ValueError):
-            svc.shared = {}
+        svc.shared = load_shared_settings(svc.shared_path)      # #4933: one unknown key no longer clears the rest
+        if svc.shared:
+            print("[strata] other apps use the Chat settings: " +
+                  ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
     if hub is not None:
         import atexit
         svc.mcp = hub
+        # #2343: tool images reach a model that reads pictures unless the config says "image_results": false
+        hub.settings["image_results"] = resolve_image_results(hub.settings, svc.vision is not None)
         if hub.settings["image_results"]:
             hub.media_dir = Path(a.config).with_suffix(".tool-media") if a.config else Path.cwd() / ".tool-media"
         print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "

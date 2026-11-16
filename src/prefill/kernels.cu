@@ -6,6 +6,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/emulate.hpp"
+#include "strata/core/device_error_exit.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -105,7 +106,11 @@ __device__ float block_sum(float v, float* sh) {
 }
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) {   // #6054: under --serve an ERR line and an immediate end, not a teardown that can hang
+        char name[160];
+        std::snprintf(name, sizeof name, "prefill %s", what);
+        strata::core::exit_device_error(name, cudaGetErrorString(e));
+    }
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 

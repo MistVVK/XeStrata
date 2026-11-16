@@ -769,6 +769,11 @@ struct Prefill::Impl {
     dpct::queue_ptr cs = &dpct::get_in_order_queue(),
                     copy = &dpct::get_in_order_queue();
     std::unique_ptr<sycl::queue> copy_without_profiling;
+    // #5405: `copy` is borrowed as well until init() sets it: the default queue above, or the device's copy-engine queue
+    // (strata::make_copy_engine_queue keeps that one for every prompt path of the card). release() destroys it only when
+    // init() created it (copy_owned); a prompt path whose init() failed before that point (the smaller-chunk retry,
+    // generate.cpp: sp.reset()) used to destroy the default queue here.
+    bool copy_owned = false;
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers
@@ -850,7 +855,12 @@ struct Prefill::Impl {
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     strata::kernels::KvHostPools stage;
     int32_t* ident_table = nullptr;
+    // #5405: BORROWED until the prompt path makes a queue of its own (kv_copy_owned): it starts as the device's default
+    // in-order queue, which dpct owns. release() destroys only a queue this object created: destroying the default one freed
+    // dpct's _q_in_order, and every later get_in_order_queue() (the frees in release() itself, the next prompt path after
+    // a reset(), the frees at exit) ran on a freed queue.
     dpct::queue_ptr kv_copy = &dpct::get_in_order_queue();
+    bool kv_copy_owned = false;
     dpct::event_ptr kv_released = nullptr, kv_ready = nullptr;
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
@@ -1144,9 +1154,12 @@ void Prefill::release() {
     if (impl_->copy_without_profiling) {
         impl_->copy_without_profiling.reset();
         impl_->copy = nullptr;
-    } else if (impl_->copy) dpct::get_current_device().destroy_queue(impl_->copy);
-    if (impl_->kv_copy) dpct::get_current_device().destroy_queue(
-        impl_->kv_copy);
+    } else if (impl_->copy && impl_->copy_owned) dpct::get_current_device().destroy_queue(impl_->copy);   // #5405: never a borrowed one
+    impl_->copy = nullptr;
+    impl_->copy_owned = false;
+    if (impl_->kv_copy && impl_->kv_copy_owned) dpct::get_current_device().destroy_queue(impl_->kv_copy);   // #5405: never a borrowed one
+    impl_->kv_copy = nullptr;
+    impl_->kv_copy_owned = false;
     if (impl_->kv_released) dpct::destroy_event(impl_->kv_released);
     if (impl_->kv_ready) dpct::destroy_event(impl_->kv_ready);
     if (impl_->grp_host)
@@ -1352,9 +1365,11 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
         m.copy_without_profiling = strata::make_prefill_copy_queue(*m.cs);
         m.copy = m.copy_without_profiling.get();
     }
-    if (m.copy == nullptr &&
-        DPCT_CHECK_ERROR(m.copy = dpct::get_current_device().create_queue(true)) != 0) {
-        err = "prefill: copy stream"; return false;
+    if (m.copy == nullptr) {   // a queue of its own: release() destroys it (#5405)
+        if (DPCT_CHECK_ERROR(m.copy = dpct::get_current_device().create_queue(true)) != 0 || m.copy == nullptr) {
+            err = "prefill: copy stream"; return false;
+        }
+        m.copy_owned = true;
     }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
@@ -2496,10 +2511,14 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         DPCT1025: The SYCL queue is created ignoring the flag and priority
         options.
         */
-        if ((!m.kv_copy &&
-             DPCT_CHECK_ERROR(
-                 m.kv_copy = dpct::get_current_device().create_queue(true)) !=
-                 0) ||
+        if (!m.kv_copy) {   // a queue of its own: release() destroys it (#5405)
+            if (DPCT_CHECK_ERROR(m.kv_copy = dpct::get_current_device().create_queue(true)) != 0 || m.kv_copy == nullptr) {
+                err = "prefill: KV prefetch stream/events";
+                return false;
+            }
+            m.kv_copy_owned = true;
+        }
+        if (
             (!m.kv_released &&
              DPCT_CHECK_ERROR(m.kv_released = new sycl::event()) != 0) ||
             (!m.kv_ready &&

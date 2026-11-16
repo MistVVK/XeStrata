@@ -1,5 +1,5 @@
 import { tr } from '../lib/i18n';
-import { memoryInventory } from '../lib/hardware-summary';
+import { engineVramForHostCards, memoryInventory } from '../lib/hardware-summary';
 import { sizeGb } from '../lib/format';
 import type { Hardware } from '../lib/types';
 import type { NativeState } from '../lib/native';
@@ -10,15 +10,12 @@ export function OnboardingMemory({ hardware, native }: {
 }) {
     // The Windows host probe (Win32_VideoController) cannot read the VRAM of AMD cards and reports 0 for them; the engine's own list has
     // the real size. For a dedicated card the host reports as 0, take the engine's figure for the card of the same name, or for the
-    // card in the same position when both lists have the same length. A card the engine does not list stays at 0.
+    // card in the same position when both lists have the same length. Each engine card counts once (two identical cards are not both
+    // given the first one's figure). A card the engine does not list stays at 0.
     const nativeGpus = native?.gpus ?? [];
     const hostGpus = hardware ? hardware.gpus.filter(gpu => gpu.backend !== 'cpu') : [];
-    const engineVram = (name: string, position: number) => {
-        const norm = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const byName = nativeGpus.find(g => norm(g.name).includes(norm(name)) || norm(name).includes(norm(g.name)));
-        return (byName ?? (nativeGpus.length === hostGpus.length ? nativeGpus[position] : undefined))?.vram_gb || 0;
-    };
-    const gpus = hardware ? hostGpus.map((gpu, position) => ({ id: gpu.id ?? String(gpu.index), name: gpu.name, memory: gpu.unified || gpu.vramGb > 0 ? gpu.vramGb : engineVram(gpu.name, position), shared: gpu.unified })) : nativeGpus.map(gpu => ({ id: String(gpu.index), name: gpu.name, memory: gpu.vram_gb, shared: false }));
+    const sizes = engineVramForHostCards(hostGpus, nativeGpus);
+    const gpus = hardware ? hostGpus.map((gpu, position) => ({ id: gpu.id ?? String(gpu.index), name: gpu.name, memory: sizes[position], shared: gpu.unified })) : nativeGpus.map(gpu => ({ id: String(gpu.index), name: gpu.name, memory: gpu.vram_gb, shared: false }));
     const dedicatedCount = gpus.filter(gpu => !gpu.shared).length;
     const base = hardware ? memoryInventory(hardware) : null;
     const memory = base ? (base.shared ? base : { ...base, vram: gpus.reduce((sum, gpu) => sum + (gpu.shared ? 0 : Math.max(0, gpu.memory || 0)), 0) }) : native ? { ram: native.ram_gb, vram: native.gpus.reduce((sum, gpu) => sum + Math.max(0, gpu.vram_gb || 0), 0), total: 0, shared: false } : null;

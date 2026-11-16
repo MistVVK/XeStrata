@@ -153,6 +153,11 @@ def parser() -> argparse.ArgumentParser:
     models_inspect.add_argument("model_id")
     models_inspect.add_argument("--install-dir", help="absolute path to a Strata installation")
     models_inspect.add_argument("--output", choices=("human", "json"), default="human")
+    models_explain = models_sp.add_parser("explain", help="show where strata launch looks for a model's files and what it finds (changes nothing)")
+    models_explain.add_argument("name", metavar="NAME", help="a model size (IQ3_S, iq3_s) or family/size (qwen/IQ3_S)")
+    models_explain.add_argument("--family", help="the model family, when the size alone is not enough")
+    models_explain.add_argument("--data-dir", help="look in this data folder instead of the one strata launch uses")
+    models_explain.add_argument("--output", choices=("human", "json"), default="human")
     models_import = models_sp.add_parser("import", help="preview an existing GGUF file set without adopting it")
     models_import.add_argument("path", metavar="PATH")
     models_import.add_argument("--plan", action="store_true", required=True,
@@ -192,7 +197,7 @@ def parser() -> argparse.ArgumentParser:
         "install",
         help="the explicit installer: engine, models, Python packages (starting and serving never do this)")
     install.add_argument("--update", action="store_true",
-                         help="update an existing install (what UPDATE.bat / update.sh run) instead of setting one up")
+                         help="update an existing install (what START-HERE.bat --update / ./setup.sh --update run) instead of setting one up")
     install.add_argument("setup_args", nargs=argparse.REMAINDER,
                          help="options passed to setup.py, e.g. --family qwen --model Q2_0 --yes")
     runtime = sp.add_parser(
@@ -550,6 +555,13 @@ def _source(ref: str) -> tuple[Path, dict | None, str | None, dict]:
 
 def _models(a: argparse.Namespace) -> int:
     from strata_control import models
+    if a.models_command == "explain":
+        from strata_cli import models_explain
+        try:
+            result = models_explain.explain(a.name, family=a.family, data_dir=a.data_dir)
+        except ValueError as exc:
+            return _error(str(exc), 2, a.output == "json")
+        return _success(result, machine=a.output == "json", human=models_explain.words(result))
     if a.models_command == "import":
         result = models.plan_import(a.path)
         if result["issues"]:
@@ -1310,7 +1322,7 @@ def _bench_standard(a: argparse.Namespace, machine: bool) -> int:
             doc, out_dir = bench_standard.run(target, out, out_root=out_root, optional_concurrency=a.optional_concurrency,
                                               declared=declared, plan=plan, engine_log=engine_log, command=command, log=log,
                                               engine_run_log=(run_log, log_start) if proc is not None else None,
-                                              started_engine=proc is not None, hash_model=not a.skip_model_hash)
+                                              started_engine=proc is not None, hash_model=not a.skip_model_hash, profile=a.profile)
     finally:
         stop_problem = bench_standard.stop_engine(proc)
         if not isinstance(stop_problem, str):
@@ -2078,7 +2090,7 @@ def _install(a: argparse.Namespace) -> int:
     installer = Path(os.environ.get("STRATA_INSTALL_DIR") or ROOT) / "setup.py"
     if not installer.is_file():
         return _error("this folder has no installer (setup.py). Engines, models and updates are installed from a "
-                      "full Strata folder with SETUP.bat / ./setup.sh and UPDATE.bat / ./update.sh; "
+                      "full Strata folder with START-HERE.bat / ./setup.sh (with --update to update); "
                       "set STRATA_INSTALL_DIR to that folder to run it from here. To update the engine and Control "
                       "from the signed update feed, run `strata update`", 5)
     extra = [x for x in a.setup_args if x != "--"]

@@ -2210,6 +2210,7 @@ struct DevInfo {
     bool done = false, ok = false;
     bool g1151 = false; // gfx1151 (Strix Halo): Q8_0 down layers on the F16 kernel by default (q8d_f16_default)
     bool w12 = false;   // gfx12 (RDNA4): the native kernels only - the Q2_0 pack's (moe_fused.cu) are not ported there
+    bool g11 = false;   // gfx1100 / gfx1101 / gfx1102 (RDNA3 cards): the trellis pairs by fused_tq_hip::g11_on (#6067)
     bool t75 = false;   // Turing (STRATA_PF_FUSED_SM75): the Q2_0 / Q2_0 layers only (what was set up and checked there)
     unsigned t75_set = 0, t75_w4 = 0;   // Turing: the i-quant gate/up and IQ4_NL down instances set up (t75_bit), and those whose 64-row (WW 4) instance fits 64 KB too
     bool q2n = false;   // sm_80+ with STRATA_PF_FUSED_Q2N=1: the native Q2_0 pack's Q2_0 gate/up is set up as well (opt-in)
@@ -2395,6 +2396,8 @@ const DevInfo& dev_info() {
         const bool props = cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
         d.w12 = props && strata::kernels::gfx_arch_is_gfx12_wmma(prop.gcnArchName);
         d.g1151 = props && strata::kernels::gfx_arch_is_gfx1151(prop.gcnArchName);
+        d.g11 = props && (strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1100") || strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1101") ||
+                          strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1102"));
         // the arch lists of STRATA_NAT_W11 / STRATA_NAT_W12 (gfx_arch.hpp: never a prefix - another gfx11 / gfx12 part
         // has the trapping body, which hipFuncGetAttributes and the occupancy query still accept).  And the body this
         // build loaded for the device is the real one: the __builtin_trap() stub (a gfx11-generic / gfx12-generic or
@@ -2438,6 +2441,31 @@ const DevInfo& dev_info() {
             t75_setup<T_IQ2_XXS, true>(d, occ); t75_setup<T_IQ2_XS, true>(d, occ); t75_setup<T_IQ2_S, true>(d, occ);
             t75_setup<T_IQ3_XXS, true>(d, occ); t75_setup<T_IQ3_S, true>(d, occ); t75_setup<T_IQ4_XS, true>(d, occ);
             t75_setup<T_IQ4_NL, false>(d, occ);
+        }
+        // TUNE-0216: the K-quant pairs on Turing (UD-Q4_K_XL / UD-Q6_K_XL of Flash-Next, Qwen3.6's UD-Q4_K_XL through the Qwen3.6 copy), under the same switches as sm_80+ (a build
+        // without MMQ sets them before main: own_only_switches.hpp; a build with MMQ keeps them off unless asked).  Without these instances a Turing card ran those layers on the plain
+        // int8 dp4a kernels, 0.45-0.57 of MMQ's time at 8,192-26,000 tokens (RTX 2080 Ti, one layer).  Only the 128-row (WW 2) instance is set up (t75_ww takes it for every format
+        // outside kT75Formats), and only where it fits the card's 64 KB; each family has its own occupancy, as on sm_80+.  STRATA_PF_FUSED_SM75_KQ=0 leaves them off (a diagnostic:
+        // the int8 kernels again).
+        static const bool kq75_off = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM75_KQ"); return v != nullptr && v[0] == '0'; }();
+        if (d.ok && !kq75_off) {
+            const char* kqv = std::getenv("STRATA_PF_FUSED_KQ");
+            if (int o4 = 1 << 20; kqv != nullptr && kqv[0] == '1' && setup_ww<T_Q4_K, true, 2>(o4) && setup_ww<T_Q5_K, true, 2>(o4) && setup_ww<T_Q5_1, false, 2>(o4)) {
+                d.kq = true;
+                d.occ_kq = o4;
+                if (int o5 = 1 << 20; setup_ww<T_Q8_0, false, 2>(o5)) { d.kq8 = true; d.occ_kq8 = o5; }
+            }
+            if (int o6 = 1 << 20; q8d_cuda_requested() && setup_ww<T_Q8_0, false, 2>(o6)) { d.q8d = true; d.occ_kq8 = o6; }
+            if (int o7 = 1 << 20, o8 = 1 << 20; q8gu_cuda_requested() && setup_ww<T_Q8_0, true, 2>(o7) && setup_ww<T_Q8_0, false, 2>(o8)) {
+                d.q8gu = true;
+                d.occ_q8gu = o7;
+                d.occ_kq8 = o8;
+            }
+            if (int o9 = 1 << 20, o10 = 1 << 20; q6k_cuda_requested() && setup_ww<T_Q6_K, true, 2>(o9) && setup_ww<T_Q8_0, false, 2>(o10)) {
+                d.q6k = true;
+                d.occ_q6k = o9;
+                d.occ_kq8 = o10;
+            }
         }
         d.occ = d.ok ? occ : 1;
         cudaGetLastError();
@@ -2663,13 +2691,22 @@ constexpr bool kTqWin = true;
 #else
 constexpr bool kTqWin = false;
 #endif
+// STRATA_PF_TQ_G11 (internal, #6067): gfx1100 / gfx1101 / gfx1102 take both trellis pairs with STRATA_PF_FUSED_TQ=1 (a build without MMQ sets it): 1 on, any other
+// value off, unset = fused_tq_hip::kG11DefaultOn.
+static int tq_g11_switch() {
+    static const int v = strata::prefill::fused_tq_hip::parse_switch(std::getenv("STRATA_PF_TQ_G11"));
+    return v;
+}
+static bool tq_g11(const DevInfo& d) {
+    return strata::prefill::fused_tq_hip::g11_on(d.g11, tq_hip_requested(), tq_g11_switch(), strata::prefill::fused_tq_hip::kG11DefaultOn);
+}
 bool tq_hip_device(const DevInfo& d) {
     return strata::prefill::fused_tq_hip::device_on(d.w12, d.g1151, kTqWin, tq_hip_requested(), tq_g1151_switch(), tq_g1151_defaults_off(),
-                                                   strata::prefill::fused_tq_hip::kG1151DefaultOn);
+                                                   strata::prefill::fused_tq_hip::kG1151DefaultOn) || tq_g11(d);
 }
 static bool tq_hip_pair(const DevInfo& d, bool gyro_s, bool gyro_m) {
     return strata::prefill::fused_tq_hip::pair_on(d.w12, d.g1151, kTqWin, tq_hip_requested(), tq_g1151_switch(), tq_g1151_defaults_off(),
-                                                 strata::prefill::fused_tq_hip::kG1151DefaultOn, gyro_s, gyro_m);
+                                                 strata::prefill::fused_tq_hip::kG1151DefaultOn, gyro_s, gyro_m) || (tq_g11(d) && (gyro_s || gyro_m));
 }
 // STRATA_PF_FUSED_Q8GU on HIP (phase 4, opt-in, gfx12 only): "1" lets a Q8_0 gate/up with a Q8_0 down (the Q8_0 set's 48 layers, UD-Q6_K_XL's one Q8_0
 // layer) take native_w11_kernel's Q8_0 gate/up instance instead of MMQ (32-value blocks, two a stage, like the Q8_0 down; the same decode as CUDA's).  The
@@ -2705,10 +2742,14 @@ bool d_covered_on(int t, const DevInfo& d) {
 
 #if !defined(__HIPCC__)
 // Turing: whether the pair has set-up kernels here - the canonical Q2_0 pair, or an i-quant gate/up of kT75Formats (t75_set) with an IQ4_NL (t75_set) or Q2_0 down
+// (TUNE-0216: and the K-quant / Q8_0 families dev_info set up on Turing: Q4_K / Q5_K with Q5_1 or Q8_0, Q6_K / Q8_0 gate/up with Q8_0, an i-quant gate/up with Q8_0)
 bool t75_pair_ok(const DevInfo& d, int gu_type, int d_type) {
     if (gu_type == T_Q2_0) return d_type == T_Q2_0;
+    if (gu_type == T_Q4_K || gu_type == T_Q5_K) return d.kq && (d_type == T_Q5_1 || (d_type == T_Q8_0 && d.kq8));
+    if (gu_type == T_Q6_K) return d.q6k && d_type == T_Q8_0;
+    if (gu_type == T_Q8_0) return d.q8gu && d_type == T_Q8_0;
     if (t75_bit(gu_type, true) == 0 || (d.t75_set & t75_bit(gu_type, true)) == 0) return false;
-    return d_type == T_Q2_0 || (t75_bit(d_type, false) != 0 && (d.t75_set & t75_bit(d_type, false)) != 0);
+    return d_type == T_Q2_0 || (d_type == T_Q8_0 && d.q8d) || (t75_bit(d_type, false) != 0 && (d.t75_set & t75_bit(d_type, false)) != 0);
 }
 // Turing: the instances a launch can run.  The 64-row (WW 4) instance of a format that did not fit 64 KB does not exist, so such a launch takes the 128-row one
 int t75_ww(const DevInfo& d, const NativeGeom& g, int ww) {
@@ -2919,12 +2960,12 @@ bool native_supported(int gu_type, int d_type) {
     // A Q8_0 gate/up (phase 4, opt-in STRATA_PF_FUSED_Q8GU=1; gu_covered checked q8gu above): with a Q8_0 down only, same conditions.
     if (gu_type == T_Q8_0) {
         const DevInfo& d = dev_info();
-        return d_type == T_Q8_0 && d.ok && d.q8gu && !d.t75 && d.occ_nt <= 0 && !d.ws;
+        return d_type == T_Q8_0 && d.ok && d.q8gu && d.occ_nt <= 0 && !d.ws;
     }
     // A Q6_K gate/up (phase 4, opt-in STRATA_PF_FUSED_Q6K=1; gu_covered checked q6k above): with a Q8_0 down only, same conditions.
     if (gu_type == T_Q6_K) {
         const DevInfo& d = dev_info();
-        return d_type == T_Q8_0 && d.ok && d.q6k && !d.t75 && d.occ_nt <= 0 && !d.ws;
+        return d_type == T_Q8_0 && d.ok && d.q6k && d.occ_nt <= 0 && !d.ws;
     }
     // The trellis pairs (phase 4; default on sm_86 with 80+ SMs, STRATA_PF_FUSED_TQ=1 on any sm_80+ card; d.tq): Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T / TQ2_T only, same conditions.  (A trellis
     // down behind any other gate/up, or the reverse: MMQ.)
@@ -2949,11 +2990,11 @@ bool native_supported(int gu_type, int d_type) {
     }
     if (d_type == T_Q8_0 && gu_type != T_Q4_K && gu_type != T_Q5_K) {
         const DevInfo& d = dev_info();
-        return gu_type != T_Q2_0 && d.ok && d.q8d && !d.t75 && d.occ_nt <= 0 && !d.ws;
+        return gu_type != T_Q2_0 && d.ok && d.q8d && (!d.t75 || (d.t75_set & t75_bit(gu_type, true)) != 0) && d.occ_nt <= 0 && !d.ws;
     }
     if (gu_type == T_Q4_K || gu_type == T_Q5_K || d_type == T_Q5_1 || d_type == T_Q8_0) {
         const DevInfo& d = dev_info();
-        return (gu_type == T_Q4_K || gu_type == T_Q5_K) && (d_type == T_Q5_1 || (d_type == T_Q8_0 && d.kq8)) && d.ok && d.kq && !d.t75 &&
+        return (gu_type == T_Q4_K || gu_type == T_Q5_K) && (d_type == T_Q5_1 || (d_type == T_Q8_0 && d.kq8)) && d.ok && d.kq &&
                d.occ_nt <= 0 && !d.ws;
     }
     // CUDA, a Q5_0 down (phase 4 step 1, opt-in): with STRATA_PF_FUSED_Q50=1 such a layer takes the fused kernels on any sm_80+ card

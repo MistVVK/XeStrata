@@ -81,6 +81,15 @@ class GuiLayout(unittest.TestCase):
         p = mock.patch.object(models, "ROOT", self.terminal)
         p.start()
         self.addCleanup(p.stop)
+        # the Catalog finds its own folder from the package file, not models.ROOT: make it this fake Terminal folder
+        # too, so a real checkout with its own run configs cannot become a "here" install under the test.
+        real = Path(models.__file__).resolve().parents[1]
+        shutil.copy(real / "setup.py", self.terminal)
+        (self.terminal / "tools").mkdir()
+        shutil.copy(real / "tools" / "strata_mcp.py", self.terminal / "tools")
+        p = mock.patch("strata_cli.launch.catalog.installer_folder", return_value=self.terminal)
+        p.start()
+        self.addCleanup(p.stop)
         self.install = discovery.app_install_dir()
         self.docs = base / "home" / "Documents" / "Strata"
         gyro = self.docs / "Models" / "gyro-Gyro-S"
@@ -307,7 +316,9 @@ class GuiLayout(unittest.TestCase):
     def test_runner_counts_only_the_missing_helper_and_gives_setup_the_apps_folder(self):
         (self.docs / "mtp" / "rt" / "experts.bin").unlink()
         cat = self.catalog()
-        r = Runner(S.LaunchSettings(family="gyro", model="Gyro-S", context=131072, kv="int8", vision="cpu"), catalog=cat)
+        # The drafter is pinned: with Auto the decision reads this PC's card (drafting.detect_hardware), and on a card where Auto is
+        # DFlash2 the draft layer is not a missing part (owner PC, RTX 5070: 0.0 GB). The test is about the missing helper, not that choice.
+        r = Runner(S.LaunchSettings(family="gyro", model="Gyro-S", context=131072, kv="int8", vision="cpu", drafting="mtp"), catalog=cat)
         self.assertAlmostEqual(r.download_gb(), 5.2)
         argv = r.setup_args()
         self.assertEqual(Path(argv[argv.index("--data-dir") + 1]).resolve(), self.docs.resolve())
@@ -316,6 +327,79 @@ class GuiLayout(unittest.TestCase):
         r = Runner(S.LaunchSettings(model_path=str(self.gguf.parent), family="gyro", model="Gyro-S", vision="off"), catalog=self.catalog())
         self.assertEqual(r.download_gb(), 0.0)
         self.assertEqual(Path(r.existing_data_dir()).resolve(), self.docs.resolve())
+
+
+class NestedModelsDirs(unittest.TestCase):
+    """#3528 (PR #3528's cases, Lance Woodson, plus the record's): a data folder whose ``models`` dir holds another ``models`` dir (a nest
+    an earlier Terminal left) resolves to the outer data folder; a data folder that is itself called ``models`` (it has ``packs`` or ``mtp``)
+    stays the data folder; the picture reader is found in any level of the nest; the flat layout is unchanged."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = Path(self.tmp.name) / "Strata-data"
+        self.inner = self.data / "models" / "models"
+        self.tag = self.inner / "coder-IQ1_M"
+        self.tag.mkdir(parents=True)
+        self.gguf = self.tag / "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
+        self.gguf.write_bytes(b"x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_data_dir_of_resolves_to_the_outer_data_folder(self):
+        self.assertEqual(discovery.data_dir_of(discovery.Footprint(weights=[self.gguf])), self.data)
+
+    def test_a_deep_nest_is_one_level(self):
+        deep = self.data / "models" / "models" / "models" / "models" / "t"
+        deep.mkdir(parents=True)
+        (deep / "m.gguf").write_bytes(b"x")
+        self.assertEqual(discovery.data_dir_of(discovery.Footprint(weights=[deep / "m.gguf"])), self.data)
+        self.assertEqual(discovery.prepared_beside(deep / "m.gguf")["data_dir"], self.data)
+
+    def test_data_dir_of_flat_layout_unchanged(self):
+        flat_tag = self.data / "models" / "coder-IQ1_M"
+        flat_tag.mkdir(parents=True)
+        (flat_tag / "m.gguf").write_bytes(b"x")
+        self.assertEqual(discovery.data_dir_of(discovery.Footprint(weights=[flat_tag / "m.gguf"])), self.data)
+
+    def test_a_data_folder_called_models_stays_the_data_folder(self):
+        own = Path(self.tmp.name) / "disk" / "models"            # the person's data folder is D:/models
+        tag = own / "models" / "q"
+        tag.mkdir(parents=True)
+        (own / "packs" / "q").mkdir(parents=True)
+        (tag / "m.gguf").write_bytes(b"x")
+        self.assertEqual(discovery.data_dir_of(discovery.Footprint(weights=[tag / "m.gguf"])), own)
+        out = discovery.prepared_beside(tag / "m.gguf")
+        self.assertEqual(out["data_dir"], own)
+        self.assertEqual(out["pack"], own / "packs" / "q")
+
+    def test_prepared_beside_resolves_to_the_outer_data_folder(self):
+        (self.data / "models" / "mmproj-7b.gguf").write_bytes(b"x")
+        out = discovery.prepared_beside(self.gguf)
+        self.assertEqual(out["data_dir"], self.data)
+        self.assertEqual(out["mmproj"], self.data / "models" / "mmproj-7b.gguf")
+
+    def test_the_picture_reader_in_a_middle_level_is_found(self):
+        deep = self.data / "models" / "models" / "models" / "t"
+        deep.mkdir(parents=True)
+        (deep / "m.gguf").write_bytes(b"x")
+        (self.data / "models" / "models" / "mmproj-mid.gguf").write_bytes(b"x")
+        self.assertEqual(discovery.prepared_beside(deep / "m.gguf")["mmproj"], self.data / "models" / "models" / "mmproj-mid.gguf")
+
+    def test_prepared_beside_flat_layout_unchanged(self):
+        flat_tag = self.data / "models" / "coder-IQ1_M"
+        flat_tag.mkdir(parents=True)
+        gguf = flat_tag / "m.gguf"
+        gguf.write_bytes(b"x")
+        (self.data / "models" / "mmproj-7b.gguf").write_bytes(b"x")
+        (self.data / "packs" / "coder-iq1_m").mkdir(parents=True)
+        (self.data / "mtp" / "rt").mkdir(parents=True)
+        (self.data / "mtp" / "rt" / "experts.bin").write_bytes(b"x")
+        out = discovery.prepared_beside(gguf)
+        self.assertEqual(out["data_dir"], self.data)
+        self.assertEqual(out["pack"], self.data / "packs" / "coder-iq1_m")
+        self.assertEqual(out["mtp"], self.data / "mtp" / "rt")
+        self.assertEqual(out["mmproj"], self.data / "models" / "mmproj-7b.gguf")
 
 
 if __name__ == "__main__":

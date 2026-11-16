@@ -107,6 +107,8 @@ class EveryChoiceOnEveryBackend(Base):
     def test_other_families_never_get_dflash2_whatever_is_saved(self):
         for family in ("coder", "nvfp4", "swift"):
             for mode in (None, "auto", "mtp", "dflash2"):
+                if family == "coder" and mode == "dflash2":
+                    continue                                    # #5240: the Coder named runs DFlash2 (test_drafting_coder_named.py)
                 cfg = self.cfg(family, **({} if mode is None else {"drafting": mode}))
                 d, args = self.apply(cfg, family, "cuda", ("sm_120",))
                 self.assertNotIn("--draft", args, (family, mode))
@@ -125,8 +127,9 @@ class EveryChoiceOnEveryBackend(Base):
         for backend, archs in HARDWARE:
             for slots in (2, 4, 8):
                 d, args = self.apply(self.cfg(drafting="dflash2"), "qwen", backend, archs, slots=slots)
-                if backend == "metal":
-                    # the Metal engine has no per-request drafters: DFlash2 beside request slots would draft nothing, so today's behaviour stays (owner 2026-11-03)
+                if backend in ("metal", "sycl"):
+                    # the Metal engine has no per-request drafters: DFlash2 beside request slots would draft nothing, so today's behaviour stays (owner 2026-11-03);
+                    # the Intel engine refuses --draft dflash2 with --batch slots at start (#5747), so it does not run there either
                     self.assertEqual((d.drafter, d.note, loaded(args)), ("mtp", drafting.NOT_HERE, {"mtp"}), (backend, slots))
                     self.assertFalse([a for a in args if a.startswith("--draft")])
                     continue

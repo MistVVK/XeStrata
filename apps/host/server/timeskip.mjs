@@ -145,6 +145,19 @@ export function timeskipRevisionMessage(request) {
   ].join('\n');
 }
 
+/**
+ * Forget a trial the host drove: its entry, its model choice, and the chat's pointer to it, but only while that pointer is still this trial.
+ * A chat can start a second trial before the first ends; the first one's end used to remove the chat's pointer to the second, so the chat's
+ * Stop went to the assistant and the running trial went on (#4611).
+ * @param {{trials: Map<string, {chatId?: string|null}>, trialByChat: Map<string, string>, choices?: Map<string, unknown>}} maps
+ */
+export function forgetTrial({ trials, trialByChat, choices }, id) {
+  const trial = trials.get(id);
+  trials.delete(id);
+  choices?.delete(id);
+  if (trial?.chatId && trialByChat.get(trial.chatId) === id) trialByChat.delete(trial.chatId);
+}
+
 /** End a process and everything it started (the job, the Python it runs, the revision command and its Node). */
 function killTree(child) {
   endTreeThenKill(child);          // Windows: taskkill /T. Linux and macOS: the job leads its own process group (startDetached), so the group is ended (#4529 #4570)
@@ -480,7 +493,10 @@ export function createTimeSkip({ repoRoot, python, pythonArgs = [], timeoutMs = 
       }
       live.set(id, child);
       endedOf.set(id, ended);
-      void ended.then(() => live.delete(id));
+      // Both maps are keyed by the run id and nothing waits on them once the job has ended: `stop` took the promise
+      // before it settled (afterwards `?? Promise.resolve()` answers at once), so the ended run leaves both. The
+      // run's own record on disk is what stays, and `list` reads that.
+      void ended.then(() => { live.delete(id); endedOf.delete(id); });
       return { ok: true, run: withLive(summarise(readRun(root, id))) };
     },
 

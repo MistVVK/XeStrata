@@ -19,7 +19,7 @@ import { MOD, runCommand } from '../lib/commands';
 import { bindingFor, bindingKeys, useBindings } from '../lib/shortcut-bindings';
 import { Btn, Dialog, Icon, IconBtn, type IconName } from '../components/ui';
 import { Brand } from '../components/Brand';
-import { addWorkspace, deleteSession, go, isUnread, liveChatIds, pickWorkspace, renameSession, removeWorkspace, renameWorkspace, selectSession, setActiveWorkspace, setNavOpen, togglePin, toggleRail, setTheme, useStore } from '../lib/store';
+import { addWorkspace, deleteDamagedChat, deleteSession, go, isUnread, liveChatIds, pickWorkspace, renameSession, removeWorkspace, renameWorkspace, selectSession, setActiveWorkspace, setNavOpen, togglePin, toggleRail, setTheme, useStore } from '../lib/store';
 export function Sidebar({ containerRef }: {
     containerRef: RefObject<HTMLElement | null>;
 }) {
@@ -33,6 +33,8 @@ export function Sidebar({ containerRef }: {
     const navOpen = useStore(s => s.navOpen);
     const collapsed = compact ? !navOpen : rail;
     const sessions = useStore(s => s.sessions);
+    // Chat files the host has a name for but cannot read: listed at the foot of the chat list so one can be deleted (#5421).
+    const damaged = useStore(s => s.damagedChats), newer = useStore(s => s.newerChats);
     const library = useStore(s => s.library);
     const monitor = useStore(s => s.monitor);
     const workspaces = useStore(s => s.workspaces);
@@ -58,6 +60,7 @@ export function Sidebar({ containerRef }: {
     const [renameWsId, setRenameWsId] = useState<string | null>(null), [wsName, setWsName] = useState('');
     const [name, setName] = useState('');
     const [deleteId, setDeleteId] = useState<string | null>(null);
+    const [deleteDamagedId, setDeleteDamagedId] = useState<string | null>(null);
     const [folders, setFolders] = useState<Record<string, boolean>>({});
     const menuTrigger = useRef<HTMLElement | null>(null);
     const current = library?.variants.find(v => v.id === library.loaded);
@@ -107,6 +110,17 @@ export function Sidebar({ containerRef }: {
               </div> : null)}
             </div>;
             })}
+          {tr(damaged.length || newer.length ? <div className="ws__group nav-damaged">
+            <div className="navgroup__label">{tr("Unreadable chats")}</div>
+            <div className="navsessions">
+              {tr(damaged.length ? <p className="xs muted nav-damaged__note">{tr("Strata could not read these chat files. You can delete them here.")}</p> : null)}
+              {tr(newer.map(id => <div className="ws__session row" key={`newer-${id}`} data-newer-chat=""><span className="navsession navsession--damaged" title={tr("This chat was saved by a newer version of Strata. Update Strata to open it.")}><Icon name="chat" size={16}/><span className="navsession__title">{id}.json</span></span><p className="xs muted nav-damaged__note">{tr("This chat was saved by a newer version of Strata. Update Strata to open it.")}</p></div>))}
+              {tr(damaged.map(id => <div className="ws__session row" key={id}>
+                <span className="navsession navsession--damaged" title={tr("Strata could not read this chat file, so its messages are not shown.")}><Icon name="chat" size={16}/><span className="navsession__title">{id}.json</span></span>
+                <button className="st-btn st-btn--icon session-overflow" aria-label={tr("Delete {0}.json", [id])} title={tr("Delete chat file")} onClick={() => { setNavOpen(false); setDeleteDamagedId(id); }}><Icon name="trash" size={16}/></button>
+              </div>))}
+            </div>
+          </div> : null)}
         </div> : null}
       </div>
       <div className="nav__foot">
@@ -137,6 +151,11 @@ export function Sidebar({ containerRef }: {
                     deleteSession(deleteId);
                 setDeleteId(null);
             }}>{tr("Delete chat")}</Btn></>}><p>{tr("This chat will be permanently deleted.")}</p></Dialog>
+    <Dialog open={!!deleteDamagedId} compact title={tr("Delete this chat file?")} onClose={() => setDeleteDamagedId(null)} actions={<><Btn onClick={() => setDeleteDamagedId(null)}>{tr("Keep file")}</Btn><Btn variant="danger" onClick={() => {
+                if (deleteDamagedId)
+                    void deleteDamagedChat(deleteDamagedId);
+                setDeleteDamagedId(null);
+            }}>{tr("Delete file")}</Btn></>}><p>{tr("Strata could not read this chat file, so its messages are not shown.")}</p></Dialog>
     <Dialog open={!!removeWorkspaceId} title={tr("Remove workspace from sidebar?")} onClose={() => setRemoveWorkspaceId(null)} actions={<><Btn onClick={() => setRemoveWorkspaceId(null)}>{tr("Keep workspace")}</Btn><Btn onClick={() => {
                 if (removeWorkspaceId)
                     void removeWorkspace(removeWorkspaceId).then(() => setRemoveWorkspaceId(null));

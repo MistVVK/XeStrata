@@ -97,7 +97,8 @@ const KqDown& kqdown_info() {
     done[dev & 31] = true;
     const DevInfo& d = dev_info();
     int o5 = 1 << 20, o6 = 1 << 20;
-    if (d.ok && d.kq && setup_one<T_Q5_K, false>(o5) && setup_one<T_Q6_K, false>(o6)) {
+    // (Turing, TUNE-0216: only the 128-row instances exist there, launch_ww's t75_ww takes them for every K-quant launch)
+    if (d.ok && d.kq && (d.t75 ? setup_ww<T_Q5_K, false, 2>(o5) && setup_ww<T_Q6_K, false, 2>(o6) : setup_one<T_Q5_K, false>(o5) && setup_one<T_Q6_K, false>(o6))) {
         k.ok = true;
         k.occ5 = o5;
         k.occ6 = o6;

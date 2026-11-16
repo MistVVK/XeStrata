@@ -467,7 +467,16 @@ int main() {
         for (const char* k : {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"}) unset(k);
     }
 #endif
-    // STRATA_HIP_PROMPT_F16 (gemm.cu prompt_f16): "1" = on anywhere, any other set value = off (the way back), unset = on for the Linux integrated 780M only
+    // STRATA_HIP_PROMPT_F16 (gemm.cu prompt_f16): "1" = on anywhere, any other set value = off (the way back), unset = on for the Linux integrated 780M and
+    // (#5151) for a discrete RX 6000 card (gfx1030 / gfx1031 / gfx1032, Linux and Windows)
+    for (const char* g : {"gfx1030", "gfx1031", "gfx1032", "gfx1031:xnack-"}) {
+        CHECK(prompt_f16_resolve(nullptr, g, false, false));
+        CHECK(prompt_f16_resolve(nullptr, g, false, true));     // Windows too
+        CHECK(!prompt_f16_resolve(nullptr, g, true, false));    // an integrated part of that name: not the measured class
+        CHECK(!prompt_f16_resolve("0", g, false, false));       // the way back
+        CHECK(!prompt_f16_resolve("", g, false, false));
+        CHECK(prompt_f16_resolve("1", g, false, false));
+    }
     for (const char* g : {"gfx1103", "gfx1103:sramecc-:xnack-"}) {
         CHECK(prompt_f16_resolve(nullptr, g, true, false));
         CHECK(!prompt_f16_resolve(nullptr, g, true, true));     // Windows
@@ -476,7 +485,7 @@ int main() {
         CHECK(!prompt_f16_resolve("", g, true, false));
         CHECK(prompt_f16_resolve("1", g, true, false));
     }
-    for (const char* g : {"gfx1150", "gfx1151", "gfx1152", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1032", "gfx11030", "", "gfx90a"}) {
+    for (const char* g : {"gfx1150", "gfx1151", "gfx1152", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1034", "gfx1035", "gfx1036", "gfx10300", "gfx11030", "", "gfx90a"}) {
         CHECK(!prompt_f16_resolve(nullptr, g, true, false));    // unchanged: opt-in
         CHECK(!prompt_f16_resolve(nullptr, g, false, false));
         CHECK(prompt_f16_resolve("1", g, false, false));        // =1 still turns it on anywhere

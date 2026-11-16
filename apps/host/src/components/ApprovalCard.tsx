@@ -4,7 +4,7 @@ import { tr } from '../lib/i18n';
 import { Btn, Icon } from './ui';
 import { askQuestion, askSub, askIcon } from '../lib/ask';
 import { resolveTool, useStore } from '../lib/store';
-import { pendingApprovals } from '../lib/approvals';
+import { approvalDetail, pendingApprovals } from '../lib/approvals';
 import { QuestionCard } from './QuestionCard';
 import type { AgentAsk } from '../lib/agent-ask';
 import type { ToolCall } from '../lib/types';
@@ -31,12 +31,12 @@ export function ApprovalCard({ messageId, tool: t }: {
       <div className="askcard__top"><span className="askcard__icon"><Icon name={askIcon(t.ask)} size={18}/></span>
         <div className="askcard__text"><p className="askcard__q">{askQuestion(t.ask)}</p>{askSub(t.ask) ? <p className="askcard__why" title={askSub(t.ask)}>{askSub(t.ask)}</p> : null}</div>
         <div className="askcard__acts"><Btn size="sm" onClick={() => resolveTool(messageId, t.id, false)}>{tr("Deny")}</Btn><Btn variant="primary" size="sm" onClick={() => resolveTool(messageId, t.id, true)}>{tr("Approve")}</Btn></div></div>
-      <details className="askcard__details"><summary><Icon name="chevron" size={11}/>{tr("Details")}</summary><pre>{t.preview}</pre></details>
+      <details className="askcard__details"><summary><Icon name="chevron" size={11}/>{tr("Details")}</summary><pre tabIndex={0}>{approvalDetail(t)}</pre></details>
     </section>;
     return <section className="toolcard toolcard--compact" data-state={t.state} aria-label={t.name}>
     <details className="toolcard__disclosure">
       <summary><Icon name={t.scope === 'shell' ? 'bolt' : 'tool'} size={17}/><span className="toolcard__title">{tr(t.verb ?? t.name)}</span><span className="toolcard__scope xs muted">{tr(scope.label)}</span><Icon name="chevron" className="toolcard__chevron" size={15}/></summary>
-      <div className="toolcard__body"><code className="toolcard__preview">{t.preview}</code><p className="small muted">{tr(t.effect)}</p>{t.result ? <p className="small">{t.result}</p> : null}</div>
+      <div className="toolcard__body"><code className="toolcard__preview">{t.preview}</code><p className="small muted">{tr(t.effect)}</p>{t.result ? <p className="small">{t.state === 'error' ? tr(t.result) : t.result}</p> : null}</div>
     </details>
     {t.target ? <code className="toolcard__what" title={t.target}>{t.target}</code> : null}
     <div className="toolcard__quick-actions"><span className="xs muted">{tr("Needs your approval")}</span><Btn size="sm" onClick={() => resolveTool(messageId, t.id, false)}>{tr("Deny")}</Btn><Btn variant="primary" size="sm" icon="check" onClick={() => resolveTool(messageId, t.id, true)}>{tr("Approve")}</Btn></div>

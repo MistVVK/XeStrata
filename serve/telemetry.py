@@ -3,7 +3,8 @@
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
   pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
-  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.  On macOS (Metal backend): IOKit's
+  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power; on Windows, for the Monitor, the driver's AMD Display
+  Library (ADL2 PMLog, #4884).  On macOS (Metal backend): IOKit's
   IOAccelerator registry - load and VRAM; the temperature and power sensors need root (`powermetrics`), and an Apple
   Silicon GPU sits on the die, so there is no PCIe link.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
@@ -23,6 +24,9 @@ import threading
 import time
 
 HISTORY = 60
+# A GP100 (Pascal) reports PCIe traffic of just under 200 GiB/s now and then, even idle: 2^22 KB in NVML's 20 ms window,
+# which reads like the counter stepping back and wrapping.  No link carries it (PCIe 6.0 x16 is under 120 GiB/s).
+PCIE_KB_S_MAX = 150 << 20
 
 
 # ------------------------------------------------------------------------------------------------ NVML
@@ -101,11 +105,18 @@ class _Nvml:
         out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
         out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
         out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
-        rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
-        tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
-        out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
-        out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        # the widest the card itself can go: read beside the negotiated width, so a card capped to x8 in a x16
+        # slot, or trained down to x4 by the board, is visible as the gap instead of looking like an x8 card by choice
+        out["pcie_width_max"] = self._uint("nvmlDeviceGetMaxPcieLinkWidth")
+        out["pcie_rx_mb"] = self._pcie_mb(1)                                             # NVML_PCIE_UTIL_RX_BYTES
+        out["pcie_tx_mb"] = self._pcie_mb(0)
         return out
+
+    def _pcie_mb(self, counter):
+        kb = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(counter))           # KB/s
+        if kb is not None and kb > PCIE_KB_S_MAX:                                        # wrapped: the next read is good
+            kb = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(counter))
+        return kb / 1024.0 if kb is not None and kb <= PCIE_KB_S_MAX else None
 
 
 # ------------------------------------------------------------------------------------------------ AMD (Linux sysfs)
@@ -207,7 +218,8 @@ class _Amd:
         from each hop's `max_link_speed` / `max_link_width` (the capability, so a power-saving downgrade or a Gen3
         slot cannot make it read low).  A card that is Gen4 on its own hop but sits behind a Gen3 root port really
         runs at Gen3, and that is the number a PCIe bandwidth budget needs.
-        `pcie_own_gen` keeps the card's own hop aside: the gap between the two is what a user has to see.
+        `pcie_own_gen` and `pcie_width_max` keep the card's own capability aside: the gap between the two numbers is
+        what a user has to see (a x16 card that only reaches x8).
 
         The bottleneck is only claimed when **every** hop of the path could be read; `pcie_path` reports how many
         of them were ("4/4").  A kernel or a container that hides part of /sys/devices would otherwise drop the
@@ -229,14 +241,21 @@ class _Amd:
         whole = bool(hops) and read == len(hops)
         gen = min(gens) if (whole and gens) else own_gen
         width = min(widths) if (whole and widths) else self._int(os.path.join(own, "current_link_width"))
+        # `pcie_width_max` is the card's own cap (its own hop, kept last by `_hops()`), where `pcie_width` above is
+        # the narrowest hop of the whole path: a card that runs at x8 behind a x8 bridge, or in a slot the board
+        # trained down, reads as the gap instead of looking like an x8 card by choice.  Same split as `pcie_own_gen`.
+        cap = self._int(os.path.join(own, "max_link_width")) if own else None
+        if cap is None and hops:
+            cap = self._int(os.path.join(hops[-1], "max_link_width"))
         return {"pcie_gen": gen, "pcie_gen_max": gen, "pcie_own_gen": own_gen, "pcie_width": width,
-                "pcie_path": "%d/%d" % (read, len(hops))}
+                "pcie_width_max": cap, "pcie_path": "%d/%d" % (read, len(hops))}
 
 
     def read(self):
-        out = {"util": self._int(os.path.join(self.dev, "gpu_busy_percent")),
-               "mem_used": self._int(os.path.join(self.dev, "mem_info_vram_used")),
-               "mem_total": self._int(os.path.join(self.dev, "mem_info_vram_total"))}
+        own = self.dev or ""      # (#4884) a box with no amdgpu sysfs device (Windows): None readings, never a TypeError
+        out = {"util": self._int(os.path.join(own, "gpu_busy_percent")),
+               "mem_used": self._int(os.path.join(own, "mem_info_vram_used")),
+               "mem_total": self._int(os.path.join(own, "mem_info_vram_total"))}
         if self.hwmon:
             t = self._int(os.path.join(self.hwmon, "temp1_input"))
             out["temp"] = t / 1000.0 if t is not None else None
@@ -248,6 +267,357 @@ class _Amd:
             out["power_limit"] = cap / 1e6 if cap is not None else None
         out.update(self.link())
         return out
+
+
+# ------------------------------------------------------------------------------------------------ AMD (Windows ADL2)
+# #4884 (Lip Wee Yeo, ported from #2704's telemetry part): an AMD card's readings on Windows come from the driver's own AMD Display
+# Library (atiadlxx.dll), the interface HWInfo and LibreHardwareMonitor use, so no ROCm or pip package is needed.  ADL2's PMLog
+# (Overdrive 8) gives load, temperature and power; DedicatedVRAMUsage + MemoryInfoX4 give VRAM; Device Manager's Plug-and-Play
+# record the PCIe link.  ctypes only; every call is guarded (the ABI varies by Adrenalin version); anything that cannot be read is
+# None and nothing here can stop the server.  The Monitor only: monitor_reader() hands it out, gpu_reader() does not, so the VRAM checks the
+# server and Control decide with (free_vram_mib, gpu_vram_mib, the drafter's sizing) keep their Windows AMD behaviour.
+
+class _AdlSensor(ctypes.Structure):
+    """One PMLog sensor reading: whether the card reports it, and its raw value."""
+    _fields_ = [("supported", ctypes.c_int), ("value", ctypes.c_int)]
+
+
+class _Adl:
+    """The ADL2 ctypes bindings; `lib` is None when atiadlxx.dll is absent (and off Windows)."""
+
+    class AdapterInfo(ctypes.Structure):
+        _fields_ = [("Size", ctypes.c_int), ("AdapterIndex", ctypes.c_int),
+                    ("UDID", ctypes.c_char * 256), ("BusNumber", ctypes.c_int),
+                    ("DeviceNumber", ctypes.c_int), ("FunctionNumber", ctypes.c_int),
+                    ("VendorID", ctypes.c_int), ("AdapterName", ctypes.c_char * 256),
+                    ("DisplayName", ctypes.c_char * 256), ("Present", ctypes.c_int),
+                    ("Exist", ctypes.c_int), ("DriverPath", ctypes.c_char * 256),
+                    ("DriverPathExt", ctypes.c_char * 256), ("PNPString", ctypes.c_char * 256),
+                    ("OSDisplayIndex", ctypes.c_int)]
+
+    class MemInfoX4(ctypes.Structure):
+        _fields_ = [("iMemorySize", ctypes.c_longlong), ("strMemoryType", ctypes.c_char * 256),
+                    ("iMemoryBandwidth", ctypes.c_longlong), ("iHyperMemorySize", ctypes.c_longlong),
+                    ("iInvisibleMemorySize", ctypes.c_longlong), ("iVisibleMemorySize", ctypes.c_longlong),
+                    ("iVramVendorRevId", ctypes.c_longlong), ("iMemoryBandwidthX2", ctypes.c_longlong),
+                    ("iMemoryBitRateX2", ctypes.c_longlong)]
+
+    class PmLogSupport(ctypes.Structure):
+        _fields_ = [("usSensors", ctypes.c_ushort * 256), ("iReserved", ctypes.c_int * 16)]
+
+    class PmLogStartInput(ctypes.Structure):
+        _fields_ = [("usSensors", ctypes.c_ushort * 256), ("ulSampleRate", ctypes.c_uint),
+                    ("iReserved", ctypes.c_int * 15)]
+
+    class PmLogStartOutput(ctypes.Structure):
+        _fields_ = [("pLoggingAddress", ctypes.c_void_p)]
+
+    class PmLogDataOutput(ctypes.Structure):
+        _fields_ = [("size", ctypes.c_int), ("sensors", _AdlSensor * 256)]
+
+    # PMLog sensor ids (LibreHardwareMonitor's ADLPMLogSensors enum)
+    S_EDGE, S_MEM, S_ASIC_POWER, S_ACTIVITY_GFX, S_ACTIVITY_MEM = 8, 9, 23, 19, 20
+    S_GFX_POWER, S_BUS_SPEED, S_BUS_LANES, S_TOTAL_POWERLIMIT = 30, 40, 41, 47
+    S_BOARD_POWER = 73
+    # the temperature: the first one the card reports.  Edge first (what the discrete cards of #4884 were checked with), then the
+    # graphics, hotspot and SoC sensors (#3682: a Radeon 8060S reports the graphics one, 28, and no edge), then the memory
+    S_TEMPS = (8, 28, 27, 29, 9)
+
+    def _alloc(self, size):
+        # a raw heap pointer ADL can free(): ADL2_Main_Control_Create allocates through this callback and frees on Destroy
+        p = self.crt.malloc(size) if size else None
+        return ctypes.cast(p, ctypes.c_void_p).value if p else None
+
+    def __init__(self):
+        self.lib = None
+        if os.name != "nt" or sys.platform != "win32":      # (sys.platform too: a test that sets os.name to "nt" on Linux must not reach a Windows DLL load)
+            return
+        try:
+            self.lib = ctypes.CDLL("atiadlxx.dll")
+            # atiadlxx links ucrtbase.dll, so malloc from ucrtbase shares the heap ADL frees with; else the process's C runtime
+            try:
+                self.crt = ctypes.CDLL("ucrtbase.dll")
+            except OSError:
+                self.crt = ctypes.CDLL(None)
+            self.crt.malloc.restype = ctypes.c_void_p
+            self.crt.malloc.argtypes = [ctypes.c_size_t]
+            self.ALLOC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)(self._alloc)
+        except (OSError, TypeError, ValueError, AttributeError, ImportError):
+            self.lib = None
+
+
+def _adl_cards(buf, count):
+    """The ADL adapter rows that are cards, one per card (ADL lists a card once per display; deduped by its DEV_xxxx code):
+    every present discrete card, or, when there is none, the integrated Radeon (an APU alone, Strix Halo) - the same rule
+    as windows_amd_cards().  [(adapter row, DEV code or None, name, integrated)]."""
+    disc, integ, seen = [], [], set()
+    for i in range(count):
+        nm = buf[i].AdapterName
+        if not nm or not (buf[i].Present or buf[i].Exist):
+            continue
+        udid = buf[i].UDID or b""
+        if buf[i].VendorID not in (0x1002, 1002) and b"VEN_1002" not in udid.upper():   # ADL can list another vendor's adapter (an NVIDIA card beside the iGPU)
+            continue
+        dev = udid.split(b"DEV_", 1)[1].split(b"&", 1)[0] if b"DEV_" in udid else None
+        key = dev or nm
+        if key in seen:
+            continue
+        seen.add(key)
+        row = (i, dev.decode(errors="replace").upper() if dev else None, nm.decode(errors="replace").strip())
+        (integ if b"Graphics" in nm else disc).append(row)
+    return [r + (False,) for r in disc] or [r + (True,) for r in integ]
+
+
+class _AmdWin:
+    """An AMD card's readings on Windows through ADL2's PMLog, with _Nvml's interface: util, mem_used, mem_total, temp,
+    power, power_limit, and the PCIe link: pcie_gen / pcie_gen_max / pcie_width_max from Device Manager's record of the card,
+    pcie_width from PMLog's BUS_LANES (the lanes the card runs at).  `index` is HIP's number of the card: matched to ADL's
+    rows by name in windows_amd_cards() order (the order the rest of the server takes as HIP's), else by position."""
+
+    STALL_LIMIT = 60   # consecutive 1 s samples with identical util+power before the stream is restarted
+
+    def __init__(self, index=0):
+        self.adl = _Adl()
+        self.lib = self.adl.lib
+        self.ctx = None
+        self.adapter = None
+        self.card_count = 0
+        self.dev_code = None
+        self.display_name = None
+        self.integrated = False
+        self.device = ctypes.c_uint(0)
+        self.data = None
+        self._stall = 0
+        self._sig = None
+        if self.lib is not None:
+            try:
+                self._setup(index)
+            except Exception:  # noqa: BLE001 - a driver that answers oddly leaves the reader off, never the server down
+                self.adapter = None
+
+    def _call(self, fn_name, *args):
+        try:
+            return getattr(self.lib, fn_name)(*args)
+        except (AttributeError, OSError, ctypes.ArgumentError):
+            return None
+
+    def _setup(self, index):
+        ctx = ctypes.c_void_p()
+        if self._call("ADL2_Main_Control_Create", self.adl.ALLOC, 1, ctypes.byref(ctx)) != 0:
+            return
+        self.ctx = ctx
+        n = ctypes.c_int(0)
+        if self._call("ADL2_Adapter_NumberOfAdapters_Get", ctx, ctypes.byref(n)) != 0:
+            return
+        count = max(1, min(n.value, 40))
+        buf = (self.adl.AdapterInfo * count)()
+        if self._call("ADL2_Adapter_AdapterInfo_Get", ctx, ctypes.cast(buf, ctypes.c_void_p), ctypes.sizeof(buf)) != 0:
+            return
+        cards = _adl_cards(buf, count)
+        self.card_count = len(cards)
+        pick = _pick_card([c[2] for c in cards], index, [c["name"] for c in windows_amd_cards()])
+        if pick is None:
+            return
+        self.adapter, self.dev_code, self.display_name, self.integrated = cards[pick]
+        # start the PMLog stream here: without it the driver answers QueryPMLogData_Get with its last-known buffer (sensors
+        # frozen at idle; measured on an R9700 by the PR's author)
+        self._start_pmlog()
+
+    def ok(self):
+        return self.lib is not None and self.adapter is not None
+
+    def name(self):
+        return (self.display_name or "AMD Radeon") if self.ok() else "AMD Radeon"
+
+    def _read_pmlog(self):
+        if self.data is None:
+            self.data = self.adl.PmLogDataOutput()
+        if self._call("ADL2_New_QueryPMLogData_Get", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(self.data)) != 0:
+            return None
+        return self.data
+
+    def _start_pmlog(self):
+        if not self.ok() or self.device.value:
+            return
+        if self._call("ADL2_Device_PMLog_Device_Create", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(self.device)) != 0:
+            return
+        sup = self.adl.PmLogSupport()
+        if self._call("ADL2_Adapter_PMLog_Support_Get", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(sup)) != 0:
+            self._destroy_device()
+            return
+        inp = self.adl.PmLogStartInput()
+        for k in range(256):
+            inp.usSensors[k] = sup.usSensors[k]
+        inp.ulSampleRate = 1000
+        out = self.adl.PmLogStartOutput()
+        if self._call("ADL2_Adapter_PMLog_Start", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(inp), ctypes.byref(out),
+                      self.device) != 0:
+            self._destroy_device()
+
+    def _destroy_device(self):
+        if self.device.value and self.ctx is not None and self.adapter is not None:
+            self._call("ADL2_Device_PMLog_Device_Destroy", self.ctx, ctypes.c_int(self.adapter), self.device)
+        self.device = ctypes.c_uint(0)
+
+    def _restart_pmlog(self):
+        """Stop and re-create the stream: in deep idle the driver tears sampling down while QueryPMLogData_Get keeps
+        answering with the frozen buffer, which only a stall check notices."""
+        if self.device.value and self.adapter is not None:
+            self._call("ADL2_Adapter_PMLog_Stop", self.ctx, ctypes.c_int(self.adapter), self.device)
+        self._destroy_device()
+        self._start_pmlog()
+
+    def _watch_stall(self, out):
+        """util+power identical STALL_LIMIT samples in a row (1 s each): the stream died; restart it once."""
+        sig = (out.get("util"), out.get("power"))
+        if sig == self._sig and sig != (None, None):
+            self._stall += 1
+        else:
+            self._stall = 1
+        self._sig = sig
+        if self._stall >= self.STALL_LIMIT:
+            self._restart_pmlog()
+            self._stall = 0
+
+    def close(self):
+        """Give back the PMLog device handle and the ADL context (#1434: +2 handles a reader that is never closed).  Safe twice."""
+        if self.ctx is not None:
+            self._destroy_device()
+            self._call("ADL2_Main_Control_Destroy", self.ctx)
+            self.ctx = None
+        self.adapter = None
+        self.card_count = 0
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - interpreter shutdown can leave the driver DLL unloaded already
+            pass
+
+    def read(self):
+        out = {}
+        if not self.ok():
+            return out
+        d = self._read_pmlog()
+        if d is None:
+            self._start_pmlog()
+            d = self._read_pmlog()
+        lanes = None
+        if d is not None:
+            def val(sid):
+                s = d.sensors[sid]
+                return s.value if s.supported else None
+            u = [x for x in (val(self.adl.S_ACTIVITY_GFX), val(self.adl.S_ACTIVITY_MEM)) if x is not None]
+            out["util"] = max(u) if u else None
+            t = next((v for v in (val(sid) for sid in self.adl.S_TEMPS) if v is not None), None)
+            out["temp"] = float(t) if t is not None else None
+            # RDNA3+ report power as BOARD_POWER (73); older cards ASIC_POWER (23) or GFX_POWER (30); watts (factor 1.0)
+            p = val(self.adl.S_BOARD_POWER)
+            if p is None:
+                p = val(self.adl.S_ASIC_POWER)
+            if p is None:
+                p = val(self.adl.S_GFX_POWER)
+            out["power"] = float(p) if p else None
+            lim = val(self.adl.S_TOTAL_POWERLIMIT)
+            out["power_limit"] = float(lim) if lim else None
+            lanes = val(self.adl.S_BUS_LANES)
+        used = ctypes.c_int(0)
+        if self._call("ADL2_Adapter_DedicatedVRAMUsage_Get", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(used)) == 0 \
+                and used.value > 0:
+            out["mem_used"] = used.value * 1024 * 1024
+        mi = self.adl.MemInfoX4()
+        if self._call("ADL2_Adapter_MemoryInfoX4_Get", self.ctx, ctypes.c_int(self.adapter), ctypes.byref(mi)) == 0 \
+                and mi.iMemorySize > 0:
+            out["mem_total"] = int(mi.iMemorySize)
+        # an integrated Radeon has no PCIe slot: Device Manager still records an internal x16 link for it (Strix Halo: Gen4 x16), which
+        # is not a link the Monitor should show
+        if not self.integrated:
+            out.update(_adl_link(_dm_link_map().get(self.dev_code or ""), lanes))
+        self._watch_stall(out)
+        return out
+
+
+def _pick_card(adl_names, index, hip_names):
+    """Which of ADL's card rows is HIP's card `index`: the k-th row named like hip_names[index] (k = how many cards of
+    that name come before it in HIP's order); None when no row has that name (the Monitor then shows what it showed before
+    rather than another card's readings).  Only when the registry lists no AMD card at all: row `index`."""
+    if hip_names:
+        if not 0 <= index < len(hip_names):
+            return None
+        want = hip_names[index].strip().lower()
+        k = sum(1 for n in hip_names[:index] if n.strip().lower() == want)
+        rows = [r for r, n in enumerate(adl_names) if n.strip().lower() == want]
+        return rows[k] if k < len(rows) else None
+    return index if 0 <= index < len(adl_names) else None
+
+
+def _adl_link(dm, lanes):
+    """The link fields from Device Manager's (current speed, current width, max speed, max width) of the card and PMLog's
+    BUS_LANES.  PMLog's BUS_SPEED is the GPU's internal bus (power-saved to Gen4 at idle), so the generation is Device
+    Manager's; Device Manager's CurrentLinkWidth reports the slot's capability, so the width is BUS_LANES.  None for a
+    field that cannot be read (an APU's on-die GPU has no PCIe link)."""
+    out = {}
+    if dm:
+        cur_speed, _cur_width, max_speed, max_width = dm
+        out["pcie_gen"] = cur_speed or None
+        out["pcie_gen_max"] = max_speed or None
+        out["pcie_width_max"] = max_width or None
+    out["pcie_width"] = lanes or None
+    return out
+
+
+_DM_LINK = None        # {DEV code: (current speed, current width, max speed, max width)} from Device Manager, once read
+_DM_LINK_RETRY = 0.0   # a failed query is retried after this monotonic time, not on every 1-second sample
+_DM_LINK_STARTED = False
+_DM_LINK_LOCK = threading.Lock()
+
+
+def _dm_link_map():
+    """Every present display device's PCIe link from Device Manager's Plug-and-Play records, keyed by its DEV_xxxx code.  The
+    first call starts the (seconds-long) query in a background thread and returns {}; a failed query is retried at most every
+    60 s; {} off Windows or when unavailable."""
+    global _DM_LINK, _DM_LINK_STARTED
+    if _DM_LINK is not None:
+        return _DM_LINK
+    if os.name != "nt":
+        _DM_LINK = {}
+        return _DM_LINK
+    if time.monotonic() >= _DM_LINK_RETRY:
+        with _DM_LINK_LOCK:
+            if _DM_LINK is None and not _DM_LINK_STARTED:
+                _DM_LINK_STARTED = True
+                threading.Thread(target=_dm_link_query, daemon=True, name="dm-link").start()
+    return _DM_LINK if _DM_LINK is not None else {}
+
+
+def _dm_link_query():
+    """The Device Manager query behind _dm_link_map, in its own thread, with no console window (CREATE_NO_WINDOW)."""
+    global _DM_LINK, _DM_LINK_RETRY, _DM_LINK_STARTED
+    ps = ("Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Not Connected' } | "
+          "ForEach-Object { $id = $_.InstanceId; if ($id -match 'DEV_([0-9A-Fa-f]{4})') { $dev = $matches[1] } else { return }; "
+          "$v = foreach ($k in 'CurrentLinkSpeed','CurrentLinkWidth','MaxLinkSpeed','MaxLinkWidth') { "
+          "(Get-PnpDeviceProperty -InstanceId $id -KeyName ('DEVPKEY_PciDevice_' + $k) -ErrorAction SilentlyContinue).Data }; "
+          "Write-Output ('DEV_' + $dev + ' ' + ($v -join ' ')) }")
+    try:
+        done = subprocess.run(["powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                              text=True, timeout=20, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        _DM_LINK_RETRY = time.monotonic() + 60
+        _DM_LINK_STARTED = False
+        return
+    m = {}
+    for line in (done.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 5 and parts[0].startswith("DEV_"):
+            try:
+                m[parts[0][4:].upper()] = tuple(int(x) for x in parts[1:])
+            except ValueError:
+                continue
+    if not m and done.returncode != 0:
+        _DM_LINK_RETRY = time.monotonic() + 60
+        _DM_LINK_STARTED = False
+        return
+    _DM_LINK = m
 
 
 def metal_working_set():
@@ -345,13 +715,312 @@ class _Metal:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ Intel Arc
+#: the cards setup names by PCI id (sycl/setup_intel.py INTEL_ARC; the same table as sycl/serve/xe_telemetry.py)
+ARC_NAMES = {"e223": "Arc Pro B70", "e221": "Arc Pro B60", "e211": "Arc Pro B60", "e20b": "Arc B580", "e20c": "Arc B570",
+             "e212": "Arc B50", "56a0": "Arc A770", "56a1": "Arc A750", "56a2": "Arc A580", "56a5": "Arc A380",
+             "56a6": "Arc A310", "5690": "Arc A770M"}
+
+
+class _ZesPciAddress(ctypes.Structure):
+    _fields_ = [("domain", ctypes.c_uint32), ("bus", ctypes.c_uint32), ("device", ctypes.c_uint32), ("function", ctypes.c_uint32)]
+
+
+class _ZesPciSpeed(ctypes.Structure):
+    _fields_ = [("gen", ctypes.c_int32), ("width", ctypes.c_int32), ("max_bandwidth", ctypes.c_int64)]
+
+
+class _ZesPciProps(ctypes.Structure):    # zes_pci_properties_t
+    _fields_ = [("stype", ctypes.c_uint32), ("pnext", ctypes.c_void_p), ("address", _ZesPciAddress), ("max_speed", _ZesPciSpeed),
+                ("bw", ctypes.c_uint8), ("pkt", ctypes.c_uint8), ("replay", ctypes.c_uint8)]
+
+
+class _ZesMemState(ctypes.Structure):    # zes_mem_state_t
+    _fields_ = [("stype", ctypes.c_uint32), ("pnext", ctypes.c_void_p), ("health", ctypes.c_int32), ("free", ctypes.c_uint64),
+                ("size", ctypes.c_uint64)]
+
+
+class _ZesPciStats(ctypes.Structure):    # zes_pci_stats_t: monotonic counters, timestamp in microseconds
+    _fields_ = [("timestamp", ctypes.c_uint64), ("replayCounter", ctypes.c_uint64), ("packetCounter", ctypes.c_uint64),
+                ("rxCounter", ctypes.c_uint64), ("txCounter", ctypes.c_uint64), ("speed", _ZesPciSpeed)]
+
+
+class _Zes:
+    """#5988 (PR #5994, Rob Riggs): an Intel card's VRAM and PCIe counters through Level Zero's management API (sysman,
+    libze_loader.so.1, installed with the GPU runtime), matched to the card by its PCI address so a PC with two Intel cards reports
+    the one asked for. Runs as the calling user (xpu-smi stats reads the same API without root). The PCIe counters come from Intel
+    PMT, whose sysfs node is root-only unless the host grants it: then sysman refuses and the reading is None, never a zero."""
+
+    STYPE_PCI_PROPERTIES, STYPE_MEM_STATE = 0x2, 0x1E
+
+    def __init__(self, pci, lib=None):
+        self.lib, self.mems, self.dev = None, [], None
+        try:
+            self.lib = lib or ctypes.CDLL("libze_loader.so.1")
+            if self.lib.zesInit(ctypes.c_uint32(0)) != 0:
+                return
+            n = ctypes.c_uint32(0)
+            if self.lib.zesDriverGet(ctypes.byref(n), None) != 0 or n.value == 0:
+                return
+            drivers = (ctypes.c_void_p * n.value)()
+            self.lib.zesDriverGet(ctypes.byref(n), drivers)
+            for drv in drivers:
+                m = ctypes.c_uint32(0)
+                if self.lib.zesDeviceGet(ctypes.c_void_p(drv), ctypes.byref(m), None) != 0:
+                    continue
+                devs = (ctypes.c_void_p * m.value)()
+                self.lib.zesDeviceGet(ctypes.c_void_p(drv), ctypes.byref(m), devs)
+                for dev in devs:
+                    props = _ZesPciProps(stype=self.STYPE_PCI_PROPERTIES)
+                    if self.lib.zesDevicePciGetProperties(ctypes.c_void_p(dev), ctypes.byref(props)) != 0:
+                        continue
+                    a = props.address
+                    if f"{a.domain:04x}:{a.bus:02x}:{a.device:02x}.{a.function:x}" != pci:
+                        continue
+                    self.dev = ctypes.c_void_p(dev)
+                    k = ctypes.c_uint32(0)
+                    if self.lib.zesDeviceEnumMemoryModules(ctypes.c_void_p(dev), ctypes.byref(k), None) != 0:
+                        continue
+                    mods = (ctypes.c_void_p * k.value)()
+                    self.lib.zesDeviceEnumMemoryModules(ctypes.c_void_p(dev), ctypes.byref(k), mods)
+                    self.mems = list(mods)
+        except (OSError, AttributeError, TypeError):
+            self.mems = []
+
+    def read(self):
+        """(used, total) bytes over the card's memory modules, or (None, None) when sysman cannot say."""
+        free = total = 0
+        if self.lib is None or not self.mems:
+            return None, None
+        for mod in self.mems:
+            st = _ZesMemState(stype=self.STYPE_MEM_STATE)
+            try:
+                if self.lib.zesMemoryGetState(ctypes.c_void_p(mod), ctypes.byref(st)) != 0:
+                    return None, None
+            except (OSError, AttributeError, TypeError):
+                return None, None
+            free += st.free
+            total += st.size
+        return (total - free, total) if total else (None, None)
+
+    def pci_stats(self):
+        """(rx bytes, tx bytes, timestamp in us) of the card's PCIe link, or None (sysman refused or has none)."""
+        if self.lib is None or self.dev is None:
+            return None
+        st = _ZesPciStats()
+        try:
+            if self.lib.zesDevicePciGetStats(self.dev, ctypes.byref(st)) != 0:
+                return None
+        except (OSError, AttributeError, TypeError):
+            return None
+        return st.rxCounter, st.txCounter, st.timestamp
+
+
+class _Intel:
+    """#5353: an Intel Arc card's readings from sysfs, for every route that starts serve/server.py (the packaged Terminal and app,
+    the container), not only sycl/serve/server_intel.py. The discrete Intel cards in sysfs order (as setup numbers them): the xe
+    driver's (a tile0 folder) and the i915 driver's (an Arc A-series has a hwmon; an integrated Intel GPU has neither, so a UHD
+    iGPU beside the card is not taken for it). Temperature (xe's "pkg" sensor, else temp1), power (from the energy counter between
+    two readings), power limit and the PCIe link are world-readable sysfs. #5988 (PR #5994, Rob Riggs): VRAM and PCIe traffic from
+    Level Zero sysman (_Zes), and the load of the GPU clients this user can see in /proc/<pid>/fdinfo (the engine the server
+    started: xe counts cycles, i915 nanoseconds), so no root and no helper service are needed. The card-wide load across other
+    users' processes would need root: this is the engine's own load. A fresh /run/gpustat.json from the optional root sampler
+    (sycl/tools/gpustat.py) still wins for load and VRAM. A reading no source gives is None, never a zero."""
+    STAT = "/run/gpustat.json"
+
+    def __init__(self, index=0, sysfs=None, stat=None, proc=None, zes=None):
+        import glob
+        root = sysfs or "/sys"
+        self.proc = proc or "/proc"
+        self.stat_path = stat or self.STAT
+        self.dev = None
+        cards = []
+        for d in sorted(glob.glob(f"{root}/class/drm/card[0-9]*/device"), key=lambda p: int(re.sub(r"\D", "", p.split("/card")[-1]) or 0)):
+            try:
+                with open(f"{d}/vendor") as f:
+                    if f.read().strip() != "0x8086":
+                        continue
+            except OSError:
+                continue
+            if os.path.isdir(f"{d}/tile0") or glob.glob(f"{d}/hwmon/hwmon*/name"):
+                cards.append(os.path.realpath(d))
+        if 0 <= index < len(cards):
+            self.dev = cards[index]
+        self.hwmon = None
+        for n in sorted(glob.glob(f"{self.dev}/hwmon/hwmon*/name")) if self.dev else []:
+            self.hwmon = os.path.dirname(n)
+        self._e = None                          # (time, energy in uJ) of the last reading
+        self.pci = os.path.basename(self.dev) if self.dev else ""   # "0000:03:00.0", as fdinfo's drm-pdev names it
+        self.zes = zes if zes is not None else (_Zes(self.pci) if self.dev and sys.platform.startswith("linux") else None)
+        self._busy_prev = {}                    # client id -> (busy, total) of the last read
+        self._fd_mem = None                     # bytes the DRM clients this user can see hold on the card (fdinfo), last read
+        self.driver = ("xe" if os.path.isdir(f"{self.dev}/tile0") else "i915") if self.dev else None
+        self._pci = None                        # (rx bytes, tx bytes, ts us) of the last read
+
+    def ok(self):
+        return self.dev is not None and sys.platform.startswith("linux")
+
+    @staticmethod
+    def _rd(p):
+        try:
+            with open(p) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def _stat(self):
+        try:
+            import json
+            with open(self.stat_path) as f:
+                st = json.load(f)
+            return st if time.time() - float(st.get("ts", 0)) < 15 else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def name(self):
+        st = self._stat()
+        if (st or {}).get("name"):
+            return st["name"]
+        pid = (self._rd(f"{self.dev}/device") or "").lower().replace("0x", "")
+        return "Intel " + ARC_NAMES.get(pid, "Arc GPU")
+
+    def _link(self):
+        """The link the card trained at: its own functions sit behind an internal x1 switch, so the first port up the path wider
+        than x1; the max is what card AND slot allow (the root port caps it)."""
+        gen = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5, "64.0": 6}
+        d, chain = self.dev, []
+        while d and os.path.exists(f"{d}/current_link_speed"):
+            chain.append(d)
+            d = os.path.dirname(d)
+        for p in chain:
+            w = int(self._rd(f"{p}/current_link_width") or 0)
+            if w > 1:
+                g = lambda q, k: gen.get((self._rd(f"{q}/{k}_link_speed") or "").split(" ")[0])
+                card, slot = g(p, "max"), g(chain[-1], "max")
+                return g(p, "current"), min(x for x in (card, slot) if x) if (card or slot) else None, w
+        return None, None, None
+
+    def _busy(self):
+        """#5988 (PR #5994): the load of the DRM clients on this card that this user can read in <proc>/<pid>/fdinfo, as a
+        percentage between two reads. xe: render + compute cycles (per engine capacity) over the total cycles; i915: render +
+        compute busy nanoseconds over the wall time. None until two reads can be compared."""
+        import glob
+        now, wall, mem = {}, time.monotonic_ns(), {}
+        for f in glob.glob(f"{self.proc}/[0-9]*/fdinfo/*"):
+            try:
+                with open(f, encoding="ascii", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if f"drm-pdev:\t{self.pci}" not in text:
+                continue
+            kv = {}
+            for line in text.splitlines():
+                k, _, v = line.partition(":")
+                kv.setdefault(k, v.strip())
+            cid = kv.get("drm-client-id")
+            try:
+                if kv.get("drm-driver") == "xe":
+                    busy = sum(int(kv.get(f"drm-cycles-{e}", "0")) / int(kv.get(f"drm-engine-capacity-{e}", "1") or 1) for e in ("rcs", "ccs"))
+                    total = int(kv.get("drm-total-cycles-ccs") or kv.get("drm-total-cycles-rcs") or 0)
+                elif kv.get("drm-driver") == "i915":
+                    busy = sum(int((kv.get(f"drm-engine-{e}") or "0 ns").split()[0]) for e in ("render", "compute"))
+                    total = wall
+                else:
+                    continue
+            except (ValueError, IndexError):
+                continue
+            if cid and total:
+                now[(f.split("/fdinfo/")[0], cid)] = (busy, total)
+            if cid:   # the client's memory on this card (i915: drm-resident-local0, xe: drm-resident-vram0), "N KiB"
+                for k, v in kv.items():
+                    if re.fullmatch(r"drm-resident-(local|vram)\d+", k):
+                        parts = v.split()
+                        if parts and parts[0].isdigit():
+                            unit = {"KiB": 2**10, "MiB": 2**20, "GiB": 2**30}.get(parts[1] if len(parts) > 1 else "", 1)
+                            mem[(f.split("/fdinfo/")[0], cid, k)] = int(parts[0]) * unit
+        self._fd_mem = sum(mem.values()) if mem else None
+        prev, self._busy_prev = self._busy_prev, now
+        spans = [now[c][1] - prev[c][1] for c in now if c in prev and now[c][1] > prev[c][1]]
+        if not spans:
+            return 0.0 if (now and prev) else None
+        used = sum(max(0, now[c][0] - prev[c][0]) for c in now if c in prev)
+        return max(0.0, min(100.0, 100.0 * used / max(spans)))
+
+    def read(self):
+        out = {"util": None, "mem_used": None, "mem_total": None, "temp": None, "power": None, "power_limit": None}
+        st = self._stat()
+        if st:
+            out["util"] = st.get("busy_pct")
+            if st.get("vram_used_mb") is not None:
+                out["mem_used"] = st["vram_used_mb"] * 2**20
+                out["mem_total"] = st.get("vram_total_mb", 0) * 2**20 or None
+            out["temp"] = st.get("temp_pkg")
+            out["power"] = st.get("power_w")
+            out["power_limit"] = st.get("power_cap_w")
+        busy = self._busy()                     # read every time, so the next read has a span to compare
+        if out["util"] is None:
+            out["util"] = busy
+        if out["mem_used"] is None:
+            used, total = self.zes.read() if self.zes is not None else (None, None)
+            if self.driver == "i915":
+                # sysman on i915 (Arc A-series) reports the card's size but no use: free == size, so "used 0" while an engine holds
+                # gigabytes (measured on an A750, p1006 11-16). The engine's own DRM clients' resident memory is the reading there.
+                used = self._fd_mem
+            out["mem_used"], out["mem_total"] = used, total
+        if self.hwmon:
+            if out["temp"] is None:
+                files = os.listdir(self.hwmon)
+                src = next((lab[:-6] for lab in files if lab.endswith("_label") and self._rd(f"{self.hwmon}/{lab}") == "pkg"), None)
+                v = self._rd(f"{self.hwmon}/{src or 'temp1'}_input")
+                out["temp"] = int(v) / 1000 if v and v.lstrip("-").isdigit() else None
+            if out["power"] is None:
+                e, t = self._rd(f"{self.hwmon}/energy1_input"), time.time()
+                if e and e.isdigit():
+                    if self._e and t > self._e[0] and int(e) >= self._e[1]:
+                        out["power"] = (int(e) - self._e[1]) / 1e6 / (t - self._e[0])
+                    self._e = (t, int(e))
+            if out["power_limit"] is None:
+                for cap in ("power1_cap", "power1_max"):   # xe / i915
+                    v = self._rd(f"{self.hwmon}/{cap}")
+                    if v and v.isdigit() and int(v) > 0:
+                        out["power_limit"] = int(v) / 1e6
+                        break
+        out["pcie_gen"], out["pcie_gen_max"], out["pcie_width"] = self._link()
+        out["pcie_rx_mb"] = out["pcie_tx_mb"] = None    # sysfs has no PCIe traffic counters; sysman has them when the host allows
+        st = self.zes.pci_stats() if self.zes is not None else None
+        prev, self._pci = self._pci, st
+        if st and prev and st[2] > prev[2] and st[0] >= prev[0] and st[1] >= prev[1]:
+            dt = (st[2] - prev[2]) / 1e6
+            out["pcie_rx_mb"] = (st[0] - prev[0]) / dt / 2**20
+            out["pcie_tx_mb"] = (st[1] - prev[1]) / dt / 2**20
+        return out
+
+
 def gpu_reader(index=0, amd=False):
     """The card's readings: NVML (NVIDIA), the amdgpu sysfs files with the AMD backend (#301), or IOKit's
     IOAccelerator registry on macOS (Metal backend).  `amd` comes first: no Mac runs the HIP backend, and the
-    tests' AMD trees are read on a Mac too."""
+    tests' AMD trees are read on a Mac too.  On Linux without NVML, an Intel Arc card's sysfs readings (#5353)."""
     if amd:
         return _Amd(index)
-    return _Metal(index) if sys.platform == "darwin" else _Nvml(index)
+    if sys.platform == "darwin":
+        return _Metal(index)
+    nv = _Nvml(index)
+    if not nv.ok() and sys.platform.startswith("linux"):
+        intel = _Intel(index)
+        if intel.ok():
+            return intel
+    return nv
+
+
+def monitor_reader(index=0, amd=False):
+    """The Monitor's reader (Telemetry): gpu_reader's, except that with the AMD backend on Windows, where the amdgpu sysfs reader
+    has nothing to read, the driver's ADL2 (#4884).  Every other caller (the server's VRAM checks, the drafter's sizing) keeps
+    gpu_reader, so their decisions on Windows AMD are unchanged."""
+    g = gpu_reader(index, amd)
+    if amd and os.name == "nt" and not g.ok():
+        return _AmdWin(index)
+    return g
 
 
 _DISPLAY_CLASS = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
@@ -532,19 +1201,45 @@ class _CpuRamFallback:
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
+# usable bandwidth of one lane per PCIe generation, GB/s (after the line code): only the ORDER matters here
+PCIE_LANE_GBS = {1: 0.25, 2: 0.5, 3: 0.985, 4: 1.969, 5: 3.938, 6: 7.563}
+
+
+def pcie_bottleneck(reads) -> dict | None:
+    """The card whose PCIe link carries the least: lane rate of its generation x its width, all five fields from that ONE card (#5801 #5981),
+    never a link put together from two cards.  The generation is the one the link can reach (pcie_gen_max; the current one when that is
+    not reported), since NVML reports a lower one while a card is idle; the width is the negotiated one.  A card whose generation or
+    width is unknown never wins.  None when no card reports both.  One card: that card."""
+    best = None
+    for index, r in reads:
+        gen = r.get("pcie_gen_max") if r.get("pcie_gen_max") is not None else r.get("pcie_gen")
+        width = r.get("pcie_width")
+        if gen not in PCIE_LANE_GBS or not isinstance(width, (int, float)) or width <= 0:
+            continue
+        rate = PCIE_LANE_GBS[gen] * width
+        if best is None or rate < best[0]:
+            best = (rate, index, r)
+    if best is None:
+        return None
+    _, index, r = best
+    return {"card": index, "gen": r.get("pcie_gen"), "gen_max": r.get("pcie_gen_max"), "width": r.get("pcie_width"),
+            "width_max": r.get("pcie_width_max")}
+
+
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
-        cards, numbered as HIP numbers them, read from sysfs (#301)."""
+        PCIe traffic), mean (load) or hottest (temperature), the PCIe link fields stay card 0's, gpu_pcie_bottleneck names the
+        card with the slowest link (pcie_bottleneck), and "gpus" has each card's own, its link and its power limit included.  `amd`: the
+        AMD backend's cards, numbered as HIP numbers them, read from sysfs (#301)."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
-        self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
+        self.gpus = [(i, monitor_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
         try:
@@ -619,10 +1314,18 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
+                # A link is not additive.  The top-level gpu_pcie_* fields stay card 0's reading (their meaning since #112); the card whose
+                # link is the slowest is named apart in gpu_pcie_bottleneck below, and each card's own link is in "gpus".
                 s["gpus"] = [{"index": i, "name": reader.name(), "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
+                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
+                              "power_limit": r.get("power_limit"),
+                              "pcie_gen": r.get("pcie_gen"), "pcie_gen_max": r.get("pcie_gen_max"),
+                              "pcie_width": r.get("pcie_width"), "pcie_width_max": r.get("pcie_width_max"),
+                              "pcie_rx_mb": r.get("pcie_rx_mb"), "pcie_tx_mb": r.get("pcie_tx_mb"),
+                              "pcie_own_gen": r.get("pcie_own_gen"), "pcie_path": r.get("pcie_path")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
+            s["gpu_pcie_bottleneck"] = pcie_bottleneck(reads)
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)

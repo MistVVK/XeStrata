@@ -16,8 +16,9 @@ export const energyWh = () => meter.wh;
 /**
  * The power the meter adds up (#6012): the sum over the GPUs that report one. A GPU with no power counter (an AMD iGPU
  * on Windows, a unified-memory GPU) adds nothing instead of making the whole sum unknown; with no reading at all, null.
+ * PR #4430: the Monitor's total power and power limit are summed the same way (the `key` argument), so the tile shows what the meter counts.
  */
-export function reportedPowerW(readings) {
-  const values = (readings ?? []).map(g => g?.powerW).filter(v => typeof v === 'number' && Number.isFinite(v) && v >= 0);
+export function reportedPowerW(readings, key = 'powerW') {
+  const values = (readings ?? []).map(g => g?.[key]).filter(v => typeof v === 'number' && Number.isFinite(v) && v >= 0);
   return values.length ? values.reduce((n, v) => n + v, 0) : null;
 }

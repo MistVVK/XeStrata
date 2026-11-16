@@ -49,6 +49,11 @@ static inline void put_x16(device float* xp, uint plane, uint idx, uint jj, floa
 #define T_TQ2T 144    // agentionai's trellis types (Gyro): 128 values a block, 34 / 26 / 30 bytes, Hadamard-folded experts
 #define T_TQK6 145
 #define T_TQK7 146
+#define T_TQP5 147    // the pair trellis (V = 2): 64 steps of 2 weights, K = 5 / 6 / 7 bits a step, 42 / 50 / 58 bytes
+#define T_TQP6 148
+#define T_TQP7 149
+#define TQ_STATE_BITS 15    // the pair trellis state: the low 15 of the 16 stream bits
+#define TQ_STATE_MASK 0x7fffu
 
 template <int F> struct fmt;
 // QK block elements, BB block bytes, UNIT weights per unit, TAB words of threadgroup table
@@ -77,6 +82,10 @@ template <> struct fmt<T_Q5_1>    { enum { QK = 32,  BB = 24,  UNIT = 32, TAB = 
 template <> struct fmt<T_TQ2T>    { enum { QK = 128, BB = 34,  UNIT = 16, TAB = 2048 }; };
 template <> struct fmt<T_TQK6>    { enum { QK = 128, BB = 26,  UNIT = 16, TAB = 2048 }; };
 template <> struct fmt<T_TQK7>    { enum { QK = 128, BB = 30,  UNIT = 16, TAB = 2048 }; };
+// pair trellis: a unit is 8 steps of 2 weights = 16 weights
+template <> struct fmt<T_TQP5>    { enum { QK = 128, BB = 42,  UNIT = 16, TAB = 2048 }; };
+template <> struct fmt<T_TQP6>    { enum { QK = 128, BB = 50,  UNIT = 16, TAB = 2048 }; };
+template <> struct fmt<T_TQP7>    { enum { QK = 128, BB = 58,  UNIT = 16, TAB = 2048 }; };
 
 static inline uint rd32(device const uchar* p) {
     device const ushort* s = (device const ushort*)p;
@@ -372,6 +381,9 @@ template <int F> static inline void load_tab_tq(threadgroup uint* tab, ushort ti
 template <> inline void load_tab<T_TQ2T>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQ2T>(tab, tid, nth); }
 template <> inline void load_tab<T_TQK6>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQK6>(tab, tid, nth); }
 template <> inline void load_tab<T_TQK7>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQK7>(tab, tid, nth); }
+template <> inline void load_tab<T_TQP5>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQP5>(tab, tid, nth); }
+template <> inline void load_tab<T_TQP6>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQP6>(tab, tid, nth); }
+template <> inline void load_tab<T_TQP7>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQP7>(tab, tid, nth); }
 template <> inline void load_tab<T_Q2_0R>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q8_0>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q4_0>(threadgroup uint*, ushort, ushort) {}
@@ -504,6 +516,30 @@ template <> inline float deq<T_IQ2_S>(device const uchar* b, int ui, thread floa
     }
     const uint sc = b[74 + ib];
     return rdh(b) * (0.5f + float((sc >> (4 * h)) & 15)) * 0.25f;
+}
+
+// IQ1_M: qs[32], qh[16], scales[8] (56 bytes); the fp16 scale is packed in the four u16 scales' nibbles.  One unit =
+// one 32-group half of 16 (grids l = 2h, 2h + 1 of group ib = ui >> 1, h = ui & 1), each grid's delta bit in qh.  The
+// delta (+-1/8) folds into q[j], the unit's scale is dl (dl1's nibble for the first unit half, dl2's for the second).
+// Ported from the 0.1.45 line's deq<T_IQ1_M>: there a packed grid_iq1m constant stores nibble j = grid-row byte j + 1
+// (the rows' bytes are -1/0/1), so here the same value is the row's signed byte straight out of the module's
+// iq1s_grid constant (the 0.1.45 threadgroup-table path is gone: TAB = 1, and load_tab<T_IQ1_M> is a no-op).
+template <> inline float deq<T_IQ1_M>(device const uchar* b, int ui, thread float* q, threadgroup const uint*) {
+    const int ib = ui >> 1, h = ui & 1;
+    device const ushort* sc = (device const ushort*)(b + 48);
+    const float d = float(as_type<half>(ushort((sc[0] >> 12) | ((sc[1] >> 8) & 0x0f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000))));
+    const float dl = d * (2 * ((sc[ib >> 1] >> (6 * (ib & 1) + 3 * h)) & 7) + 1);
+    const uint qh = b[32 + 2 * ib + h];
+    const int qb = 4 * ib + 2 * h;
+    const ulong g0 = iq1s_grid[uint(b[qb]) | ((qh << 8) & 0x700u)];
+    const ulong g1 = iq1s_grid[uint(b[qb + 1]) | ((qh << 4) & 0x700u)];
+    const float d0 = (qh & 0x08) ? -0.125f : 0.125f, d1 = (qh & 0x80) ? -0.125f : 0.125f;
+    for (int j = 0; j < 8; ++j) {
+        const uint b0 = uint((g0 >> (8 * j)) & 0xffu), b1 = uint((g1 >> (8 * j)) & 0xffu);
+        q[j] = float(int(b0) - ((b0 & 0x80u) ? 256 : 0)) + d0;
+        q[8 + j] = float(int(b1) - ((b1 & 0x80u) ? 256 : 0)) + d1;
+    }
+    return dl;
 }
 
 // IQ3_S: qs[64] low 8 bits of 9-bit indices, qh[8], signs[32], scales[4] (nibble per 32).
@@ -643,6 +679,40 @@ static inline float deq_tq(device const uchar* b, int ui, thread float* q, threa
 template <> inline float deq<T_TQ2T>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<8>(b, ui, q, tab); }
 template <> inline float deq<T_TQK6>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<6>(b, ui, q, tab); }
 template <> inline float deq<T_TQK7>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<7>(b, ui, q, tab); }
+
+// Pair trellis (ggml 147 TQP5, 148 TQP6, 149 TQP7): a 128-value block is {fp16 d; qs}, 64 steps of 2 weights; a unit
+// is lane ui = steps 8ui..8ui+7, 16 weights.  Step t's 15-bit state: the 16 stream bits from bit (63 - t)*K, LSB
+// first, circular over 64*K bits (the fork's tqp_state).  The lane's steps lie in the bits from S = (56 - 8ui)*K =
+// 8*(7 - ui)*K, so r = S & 15 is 0 or 8; step 8ui + j is at S + (7 - j)*K and r + 7*K + 15 <= 72: five u16 words of
+// the 4*K-word stream cover the lane's window (the fifth only when r + 7K + 15 > 64, never for K = 5).  Weight pair
+// j = the FIRST codebook point of the hash: lut[x >> 21] as an fp16 pair, times d.  Same arithmetic as the fork's
+// ggml-cuda/tq.cuh (tqp_states8) and ggml-quants.c (dequantize_row_tqp_impl).
+template <int KB>
+static inline float deq_tqp(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) {
+    device const ushort* qs16 = (device const ushort*)(b + 2);
+    constexpr int NW = 4 * KB;
+    const int S = (56 - 8 * ui) * KB, wb = S >> 4, r = S & 15;
+    const int wi1 = wb + 1 >= NW ? wb + 1 - NW : wb + 1;
+    const int wi2 = wb + 2 >= NW ? wb + 2 - NW : wb + 2;
+    const int wi3 = wb + 3 >= NW ? wb + 3 - NW : wb + 3;
+    ulong v = ulong(qs16[wb]) | (ulong(qs16[wi1]) << 16) | (ulong(qs16[wi2]) << 32) | (ulong(qs16[wi3]) << 48);
+    v >>= r;
+    if (8 + 7 * KB + TQ_STATE_BITS > 64 && r) {   // r is 0 or 8; for r = 0 the fifth word is not needed
+        const int wi4 = wb + 4 >= NW ? wb + 4 - NW : wb + 4;
+        v |= ulong(qs16[wi4]) << (64 - r);
+    }
+    for (int j = 0; j < 8; ++j) {
+        const uint s = uint(v >> ((7 - j) * KB)) & TQ_STATE_MASK;
+        const uint x = s * 0x9e3779b1u;
+        const float2 a = float2(as_type<half2>(g_tq(tab, x >> 21)));
+        q[2 * j] = a.x;
+        q[2 * j + 1] = a.y;
+    }
+    return rdh(b);
+}
+template <> inline float deq<T_TQP5>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tqp<5>(b, ui, q, tab); }
+template <> inline float deq<T_TQP6>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tqp<6>(b, ui, q, tab); }
+template <> inline float deq<T_TQP7>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tqp<7>(b, ui, q, tab); }
 
 // sum over groups of LPR consecutive lanes (LPR = 1, 2, 4, 8, 16 or 32); the result is valid in every lane
 template <int LPR>

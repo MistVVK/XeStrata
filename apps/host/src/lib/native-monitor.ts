@@ -20,7 +20,7 @@ export function nativeMonitorData(native:NativeState,inventory:Hardware|null,sel
   else{const index=instance.gpus.length===1?instance.gpus[0]:native.hardware?.gpus.length===1?native.hardware.gpus[0].index:null;if(index!==null)devices.set(index,{util:h.gpu_util,mem_used:h.gpu_mem_used,temp:h.gpu_temp,power:h.gpu_power,power_limit:h.gpu_power_limit,pcie_rx_mb:h.gpu_pcie_rx_mb,pcie_gen:h.gpu_pcie_gen,pcie_gen_max:h.gpu_pcie_gen_max,pcie_width:h.gpu_pcie_width});}
  }
  const gpus:GpuReading[]=(inventory?.gpus??[]).map(gpu=>{const r=devices.get(gpu.index);return{id:gpuId(gpu),utilizationPct:value(r?.util),memoryUsedGb:bytes(r?.mem_used),temperatureC:value(r?.temp),powerW:value(r?.power),powerLimitW:value(r?.power_limit),pcieRxMbs:value(r?.pcie_rx_mb),pcieGen:value(r?.pcie_gen),pcieGenMax:value(r?.pcie_gen_max),pcieWidth:value(r?.pcie_width),source:r?'sensor':'unavailable',sampledAt:new Date((raw?.time??Date.now()/1000)*1000).toISOString()};});
- const requests:ServeRequest[]=scoped.flatMap(instance=>(instance.metrics?.requests??[]).map((r:Record<string,any>,index:number)=>({id:String(r.id??`${instance.id}:${r.time}:${index}`),instanceId:instance.id,at:new Date((r.time??0)*1000).toISOString(),client:'Native engine',endpoint:'/v1/chat/completions',state:r.error?'error' as const:'done' as const,tokensIn:value(r.prompt_tokens),tokensOut:value(r.output_tokens),cachedTokens:value(r.reused),durationMs:reading(r.duration_s)*1000,model:instance.label,tps:value(r.decode_tok_s),promptTps:hasReading(r.prompt_ms)&&r.prompt_ms>0&&hasReading(r.prompt_tokens)&&hasReading(r.reused)?(r.prompt_tokens-r.reused)/(r.prompt_ms/1000):null,usageSource:'reported' as const,finishReason:r.finish_reason}))).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at));
+ const requests:ServeRequest[]=scoped.flatMap(instance=>(instance.metrics?.requests??[]).map((r:Record<string,any>,index:number)=>({id:String(r.id??`${instance.id}:${r.time}:${index}`),instanceId:instance.id,at:new Date((r.time??0)*1000).toISOString(),client:'Native engine',endpoint:'/v1/chat/completions',state:r.error?'error' as const:'done' as const,tokensIn:value(r.prompt_tokens),tokensOut:value(r.output_tokens),cachedTokens:value(r.reused),hitRate:value(r.hit_rate),pcieShare:value(r.pcie_share),durationMs:reading(r.duration_s)*1000,model:instance.label,tps:value(r.decode_tok_s),promptTps:hasReading(r.prompt_ms)&&r.prompt_ms>0&&hasReading(r.prompt_tokens)&&hasReading(r.reused)?(r.prompt_tokens-r.reused)/(r.prompt_ms/1000):null,usageSource:'reported' as const,finishReason:r.finish_reason??r.finish}))).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at));
  const last=requests[0],phase=selected?.phase??'idle',active=['reading','thinking','generating'].includes(phase);
  const used=active?hasReading(live?.prompt_tokens)&&hasReading(live?.generated)?live.prompt_tokens+live.generated:NaN:last&&hasReading(last.tokensIn)&&hasReading(last.tokensOut)?last.tokensIn+last.tokensOut:NaN;
  const maxContext=reading(engine?.max_context??selected?.context);
@@ -47,6 +47,9 @@ export function nativeMonitorData(native:NativeState,inventory:Hardware|null,sel
  };
 }
 
+/** The readings of a GPU tile the host's own sensors may fill where the engine has none. */
+const SENSOR_FIELDS=['utilizationPct','memoryUsedGb','temperatureC','powerW','powerLimitW','pcieRxMbs','pcieGen','pcieGenMax','pcieWidth'] as const satisfies readonly (keyof GpuReading)[];
+
 /** GPU temperature, load, VRAM, power and PCIe come from the engine's metrics while a model runs. With no model loaded (or an engine that
  *  reports none of them) the host's own sensors fill in: nvidia-smi, or the AMD/Intel sysfs readings the host probes itself. */
 export function withHostSensors(live:MonitorState,host:MonitorState|null):MonitorState{
@@ -55,7 +58,11 @@ export function withHostSensors(live:MonitorState,host:MonitorState|null):Monito
  const pick=<T,>(a:T,b:T)=>hasReading(a as unknown)?a:b;
  return {...live,hardware:{...h,
   // The fan and the clock are the host's own readings; the engine's metrics do not carry them (#3628).
-  gpus:(h.gpus??[]).map(g=>{const sensor=s.gpus?.find(x=>x.id===g.id);const own=sensor&&empty(g)?{...g,...sensor}:g;return sensor?{...own,fanPct:own.fanPct??sensor.fanPct,clockMhz:own.clockMhz??sensor.clockMhz}:own;}),
+  // Field by field, not card by card (#5946 #4660 #3727): an engine that reports one reading of an AMD card on Windows (its memory in use,
+  // or a power of 0) kept the host's own load and temperature out of the whole tile, which then read "not available".
+  gpus:(h.gpus??[]).map(g=>{const sensor=s.gpus?.find(x=>x.id===g.id);if(!sensor)return g;if(empty(g))return {...g,...sensor,fanPct:g.fanPct??sensor.fanPct,clockMhz:g.clockMhz??sensor.clockMhz};
+   const merged:GpuReading={...g};for(const key of SENSOR_FIELDS)if(!hasReading(g[key] as unknown)&&hasReading(sensor[key] as unknown))(merged as any)[key]=sensor[key];
+   return {...merged,fanPct:g.fanPct??sensor.fanPct,clockMhz:g.clockMhz??sensor.clockMhz};}),
   cpuTempC:s.cpuTempC,ssdTempC:s.ssdTempC,energyWh:s.energyWh,
   gpuLoad:pick(h.gpuLoad,s.gpuLoad),vramUsedGb:pick(h.vramUsedGb,s.vramUsedGb),vramTotalGb:pick(h.vramTotalGb,s.vramTotalGb),gpuTempC:pick(h.gpuTempC,s.gpuTempC),
   powerW:pick(h.powerW,s.powerW),powerLimitW:pick(h.powerLimitW,s.powerLimitW),pcieRxMbs:pick(h.pcieRxMbs,s.pcieRxMbs)}};

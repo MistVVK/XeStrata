@@ -207,6 +207,8 @@ def build(src: Path, backend: str, version: str, target: str, out: Path, *, entr
             shutil.copy2(src / rel, destination)
             files.append({"path": rel, "sha256": sha256(destination), "bytes": destination.stat().st_size})
         files += _bundle_missing_libraries(staging, target, [f["path"] for f in files], search or [], allow_libs or [])
+        if target.startswith("macos"):
+            _refuse_too_new_for_mac(staging)
         component_id = shape_engine.component_id(shape) if shape else ec.COMPONENT_ID     # the engine of a model shape is its own component (strata_control/shape_engine.py)
         manifest = {"schema_version": ec.SCHEMA_VERSION, "id": component_id, "name": component_id,
                     "version": version, "platform": target, "backend": backend, "archs": list(archs),
@@ -279,6 +281,15 @@ def _bundle_missing_libraries(staging: Path, target: str, rels: list[str], searc
     return added
 
 
+def _refuse_too_new_for_mac(folder: Path) -> None:
+    bad = binary_deps.too_new_for_mac(folder)
+    if bad:
+        floor = ".".join(map(str, binary_deps.MAC_MIN_OS))
+        raise SystemExit(f"refusing to package: these programs need a newer macOS than {floor}, the oldest the app supports, so they stop "
+                         "before they start on it (#4634): " + ", ".join(f"{rel} (macOS {v})" for rel, v in bad)
+                         + f". Build with -DCMAKE_OSX_DEPLOYMENT_TARGET={floor}.")
+
+
 def package_sha256(folder: Path) -> str:
     """One digest for the whole package: SHA-256 of the manifest file (it holds every file's hash)."""
     return sha256(folder / ec.MANIFEST)
@@ -323,6 +334,12 @@ def main(argv: list[str] | None = None) -> int:
         except ec.ComponentProblem as exc:
             print(f"{a.verify}: REFUSED: {exc}")
             return 1
+        if component.platform.startswith("macos"):
+            try:
+                _refuse_too_new_for_mac(a.verify)
+            except SystemExit as exc:
+                print(f"{a.verify}: REFUSED: {exc}")
+                return 1
         bad = binary_deps.uncovered(a.verify)
         if bad:
             for rel, name in bad:

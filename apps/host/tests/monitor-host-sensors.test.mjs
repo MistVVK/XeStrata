@@ -29,3 +29,19 @@ test('what a running engine reports wins over the host sensors', () => {
 test('no host monitor, no change', () => {
   assert.equal(withHostSensors(live, null), live);
 });
+
+// #5946 #4660 #3727: an AMD card on Windows. The engine reported one reading (its memory in use, read through HIP) and the card counted as
+// "not empty", so the host's own load and temperature (Windows GPU counters, D3DKMT) were dropped and the tile read "not available".
+test('the host fills each reading the engine has not got, field by field, and never overwrites one it has', () => {
+  const partial = { hardware: { ...live.hardware, gpus: [{ ...none, memoryUsedGb: 5.2 }] } };
+  const g = withHostSensors(partial, host).hardware.gpus[0];
+  assert.equal(g.memoryUsedGb, 5.2, 'the engine\'s own reading stays');
+  assert.equal(g.utilizationPct, 7, 'load from the host');
+  assert.equal(g.temperatureC, 41, 'temperature from the host');
+  assert.equal(g.powerW, 22);
+  const zeroPower = withHostSensors({ hardware: { ...live.hardware, gpus: [{ ...none, powerW: 0 }] } }, host).hardware.gpus[0];
+  assert.equal(zeroPower.powerW, 0, 'a reading of 0 is a reading');
+  assert.equal(zeroPower.temperatureC, 41);
+  const other = withHostSensors({ hardware: { ...live.hardware, gpus: [{ ...none, id: 'GPU-2', memoryUsedGb: 1 }] } }, host).hardware.gpus[0];
+  assert.equal(other.utilizationPct, null, 'another card is not filled from this one');
+});

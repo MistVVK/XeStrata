@@ -1,0 +1,108 @@
+{
+  "model": "Qwen3.8-Flash-Next-Gyro-Coder-L-TQ3_0.gguf",
+  "nblocks": 64,
+  "fixtures": [
+    {
+      "type": "TQP5",
+      "type_id": 147,
+      "k": 5,
+      "tensor": "blk.32.ffn_gate_exps.weight",
+      "type_shape": [
+        2560,
+        640,
+        256
+      ],
+      "block_bytes": 42,
+      "nblocks": 64,
+      "first_block": 1638368,
+      "byte_offset": 75047631360,
+      "raw": "TQP5-blk.32.ffn_gate_exps.weight.bin",
+      "f32": "TQP5-blk.32.ffn_gate_exps.weight.f32"
+    },
+    {
+      "type": "TQP5",
+      "type_id": 147,
+      "k": 5,
+      "tensor": "blk.32.ffn_down_exps.weight",
+      "type_shape": [
+        640,
+        2560,
+        256
+      ],
+      "block_bytes": 42,
+      "nblocks": 64,
+      "first_block": 1638368,
+      "byte_offset": 74908264960,
+      "raw": "TQP5-blk.32.ffn_down_exps.weight.bin",
+      "f32": "TQP5-blk.32.ffn_down_exps.weight.f32"
+    },
+    {
+      "type": "TQP6",
+      "type_id": 148,
+      "k": 6,
+      "tensor": "blk.0.ffn_up_exps.weight",
+      "type_shape": [
+        2560,
+        640,
+        256
+      ],
+      "block_bytes": 50,
+      "nblocks": 64,
+      "first_block": 1638368,
+      "byte_offset": 56229444864,
+      "raw": "TQP6-blk.0.ffn_up_exps.weight.bin",
+      "f32": "TQP6-blk.0.ffn_up_exps.weight.f32"
+    },
+    {
+      "type": "TQP6",
+      "type_id": 148,
+      "k": 6,
+      "tensor": "blk.0.ffn_down_exps.weight",
+      "type_shape": [
+        640,
+        2560,
+        256
+      ],
+      "block_bytes": 50,
+      "nblocks": 64,
+      "first_block": 1638368,
+      "byte_offset": 55895651584,
+      "raw": "TQP6-blk.0.ffn_down_exps.weight.bin",
+      "f32": "TQP6-blk.0.ffn_down_exps.weight.f32"
+    },
+    {
+      "type": "TQP7",
+      "type_id": 149,
+      "k": 7,
+      "tensor": "blk.16.ffn_gate_exps.weight",
+      "type_shape": [
+        2560,
+        640,
+        256
+      ],
+      "block_bytes": 58,
+      "nblocks": 64,
+      "first_block": 1638368,
+      "byte_offset": 65316392448,
+      "raw": "TQP7-blk.16.ffn_gate_exps.weight.bin",
+      "f32": "TQP7-blk.16.ffn_gate_exps.weight.f32"
+    },
+    {
+      "type": "TQP7",
+      "type_id": 149,
+      "k": 7,
+      "tensor": "blk.16.ffn_down_exps.weight",
+      "type_shape": [
+        640,
+        2560,
+        256
+      ],
+      "block_bytes": 58,
+      "nblocks": 64,
+      "first_block": 1638368,
+      "byte_offset": 65124597248,
+      "raw": "TQP7-blk.16.ffn_down_exps.weight.bin",
+      "f32": "TQP7-blk.16.ffn_down_exps.weight.f32"
+    }
+  ]
+}

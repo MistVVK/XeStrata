@@ -59,7 +59,10 @@ bool Window::pc_setup(int C) {
         b.k4 = coop_k4();
     }
     b = PromptBufs{b.lib, b.lgdn, b.lqsa, b.k4};   // (re)allocated below for the larger chunk
-    b.v3e = b.k4 && T("blk.0.ffn_gate_exps.weight").type < 144;   // the trellis experts have the v2 kernels only
+    // the v3 register-operand chain covers the ordinary quant types and the pair trellis (TQP5/6/7, 147-149, whose
+    // W8 shares one window between the lane's runs); the TQK trio (144-146) has the v2 kernels only
+    const int egt = T("blk.0.ffn_gate_exps.weight").type;
+    b.v3e = b.k4 && (egt < 144 || egt >= 147);
     b.C = C;
     const size_t MT = (size_t) C;
     const int MB = (int) max_cells_ / 4 + 2;

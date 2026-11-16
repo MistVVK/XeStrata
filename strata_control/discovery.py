@@ -369,8 +369,26 @@ def footprint(cfg: dict, config: Path | None = None) -> Footprint:
     return fp
 
 
+def _models_chain(first: Path) -> tuple[Path, list[Path]]:
+    """#3528: the data folder for a model under the ``models`` dir ``first``, and the ``models`` dirs from ``first`` up to that data folder.
+    One ``models`` level is the plain layout: its parent is the data folder.  Several in a row (``Strata-data/models/models/...``, a nest an
+    earlier Terminal left, one level per install) are one: the innermost level whose parent shows the data folder's own layout (a ``packs`` or
+    ``mtp`` folder) is it, so a data folder that is itself called ``models`` keeps working; with no such sign, the outermost."""
+    chain = [first]
+    while chain[-1].parent != chain[-1] and chain[-1].parent.name.lower() == "models" and len(chain) < 512:
+        chain.append(chain[-1].parent)
+    if len(chain) == 1:
+        return first.parent, chain
+    for i, models in enumerate(chain):
+        data = models.parent
+        if (data / "packs").is_dir() or (data / "mtp").is_dir():
+            return data, chain[:i + 1]
+    return chain[-1].parent, chain
+
+
 def data_dir_of(fp: Footprint) -> Path | None:
-    """The data folder an installed model lives in: the parent of its ``packs`` folder, else the one holding ``models``."""
+    """The data folder an installed model lives in: the parent of its ``packs`` folder, else the one holding ``models`` (a nest of
+    ``models`` dirs counts as one, ``_models_chain``)."""
     if fp.pack is not None:
         return fp.pack.parent.parent
     if fp.mtp is not None and fp.mtp.name.lower() == "rt":
@@ -378,7 +396,7 @@ def data_dir_of(fp: Footprint) -> Path | None:
     for w in fp.weights:
         for parent in w.parents:
             if parent.name.lower() == "models":
-                return parent.parent
+                return _models_chain(parent)[0]
     return None
 
 
@@ -462,14 +480,15 @@ def prepared_beside(gguf: Path, data_dirs: Iterable[str | os.PathLike[str] | Non
     out: dict = {"data_dir": None, "pack": None, "mtp": None, "mmproj": None}
     for parent in folder.parents:
         if parent.name.lower() == "models":
-            data = parent.parent
+            data, levels = _models_chain(parent)                # #3528: a nest of models dirs is one
             out["data_dir"] = data
-            tag = folder.name.lower() if folder != parent else ""
+            tag = folder.name.lower() if folder not in levels else ""
             if tag and (data / "packs" / tag).is_dir():
                 out["pack"] = data / "packs" / tag
             if (data / "mtp" / "rt" / "experts.bin").is_file():
                 out["mtp"] = data / "mtp" / "rt"
-            for cand in sorted(parent.glob("mmproj*.gguf")) + sorted(folder.glob("mmproj*.gguf")):
+            # the picture reader in any models level of the nest (innermost first, as before), then beside the model
+            for cand in [c for level in levels for c in sorted(level.glob("mmproj*.gguf"))] + sorted(folder.glob("mmproj*.gguf")):
                 out["mmproj"] = cand
                 break
             break

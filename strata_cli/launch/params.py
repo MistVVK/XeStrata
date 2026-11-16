@@ -186,16 +186,24 @@ def build_rows(engine_help: str | None, base_args: list[Any], tuned_args: list[A
         d = (base_env or {}).get(name) if is_env else base.get(name)
         t = (tuned_env or {}).get(name) if is_env else tuned.get(name)
         if d is None:
-            d = (p.help_default if p and p.help_default else ("off" if is_env else ""))
+            d = (p.help_default if p and p.help_default else ("off" if is_env and p else ""))
         if is_env:
             t = t if t is not None else d
         else:
             t = t if t is not None else ""
         shown = lambda v: "on" if v == "" and not is_env and name in (base if v is d else tuned) else v     # noqa: E731
         y = extra.get(name, "")
+        # #5136: the engine reads environment settings that its --help does not list, so a name with no row here is not a typing
+        # mistake, and its default is not known (the run config's value is shown when it has one).  Only a flag is checked.
+        if p:
+            description = p.full or p.short
+        elif is_env:
+            description = "(no description for this environment setting)"
+        else:
+            description = "(not in this engine's list: newer flag or a typing mistake)"
         rows.append(Row(name=name, default=str(d) if d else "", tuned=str(t) if t else "", yours=str(y),
-                        description=((p.full or p.short) if p else "(not in this engine's list: newer flag or a typing mistake)"),
-                        experimental=bool(p and p.experimental), known=bool(p) or not params))
+                        description=description, experimental=bool(p and p.experimental),
+                        known=bool(p) or is_env or not params))
     in_use = lambda r: (r.name in base or r.name in tuned or r.name in extra or r.name in (base_env or {}) or r.name in (tuned_env or {}))     # noqa: E731
     rows.sort(key=lambda r: (not in_use(r), switch_order.get(r.name, len(switch_order)), r.name))
     return rows
@@ -218,8 +226,8 @@ def flag_list(engine: str | Path | None) -> list[str] | None:
     if not engine:
         return None
     try:
-        from strata_control import tuning
-        return tuning.engine_flag_inventory(Path(engine))
+        from strata_control import tune_knobs, tuning
+        return tuning.engine_flag_inventory(Path(engine), wanted=tuning.dimension_flags() | tune_knobs.arm_flags())
     except Exception:                                        # noqa: BLE001
         return None
 

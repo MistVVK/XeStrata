@@ -609,9 +609,9 @@ bool prompt_f16() {
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDev) { (void) hipGetLastError(); return false; }
     if (const int8_t c = cached[dev].load(std::memory_order_relaxed)) return c == 2;
-    // Opt-in (#835): STRATA_HIP_PROMPT_F16=1 turns it on.  It changes the prompt path's numbers (an FP16 rounding of
-    // each 16-bit GEMM's output), so a card gets it unasked only where it was measured against the FP16 path's level: the Radeon 780M
-    // (gfx1103, integrated, Linux; strata::core::prompt_f16_resolve), where =0 is the way back.  On gfx103x it is ~2x faster, so we say so once.
+    // (#835) STRATA_HIP_PROMPT_F16=1 turns it on.  It changes the prompt path's numbers (an FP16 rounding of each 16-bit GEMM's output), so a card
+    // gets it unasked only where it was measured: the Radeon 780M (gfx1103, integrated, Linux) and the discrete RX 6000 cards (gfx1030 / 1031 / 1032, #5151;
+    // strata::core::prompt_f16_resolve), where =0 is the way back.
     const char* e = std::getenv("STRATA_HIP_PROMPT_F16");
     hipDeviceProp_t p{};
     if (hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); p.gcnArchName[0] = 0; p.integrated = 0; }
@@ -624,10 +624,11 @@ bool prompt_f16() {
     if (on && e != nullptr) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=1: the prompt's 16-bit GEMMs run FP16 in and out "
                                  "(rocBLAS is tuned only for that on gfx103x; not bit-identical to the default)%s",
                          dev, p.gcnArchName[0] ? " " : "", p.gcnArchName, "\n");
-    else if (e == nullptr && std::strncmp(p.gcnArchName, "gfx103", 6) == 0)
-        std::fprintf(stderr, "strata prefill: HIP device %d %s - tip: STRATA_HIP_PROMPT_F16=1 reads long prompts about 2x faster here "
-                             "(FP16 prompt GEMMs, rocBLAS is tuned only for FP16 on gfx103x; the numbers differ slightly, see docs/AMD_HIP.md)%s",
-                     dev, p.gcnArchName, "\n");
+    else if (on && std::strncmp(p.gcnArchName, "gfx103", 6) == 0)
+        std::fprintf(stderr, "strata prefill: HIP device %d %s - the prompt's 16-bit GEMMs run FP16 in and out by default here (rocBLAS is tuned for that on "
+                             "gfx103x; STRATA_HIP_PROMPT_F16=0 keeps the old route)%s", dev, p.gcnArchName, "\n");
+    // (#5151: the start-up tip that asked gfx103x owners to set STRATA_HIP_PROMPT_F16=1 is gone: users never set variables.  On a discrete RX 6000 card the
+    // FP16 route is the default now (prompt_f16_resolve): against the exact FP32 products it is no further from exact than the old route and 11-14 % faster.)
     cached[dev].store(on ? 2 : 1, std::memory_order_relaxed);
     return on;
 #else

@@ -6,6 +6,7 @@
 #include "strata/sycl_queue.hpp"
 #include "strata/sycl_doorbell.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/core/window_wait.hpp"
 #include "strata/kernels/dp4a.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
@@ -383,10 +384,15 @@ __dpct_inline__ void doorbell_ring_kernel(uint32_t *seq) {
 #endif
 }
 
+struct DoorbellLoad { uint32_t operator()(const volatile uint32_t* p) const { return strata::sys_load(p); } };
+struct DoorbellStore { void operator()(volatile uint32_t* p, uint32_t v) const { strata::sys_store(p, v); } };
+struct DoorbellPause { void operator()() const { strata_spin_pause(); } };
 __dpct_inline__ void doorbell_wait_kernel(const volatile uint32_t *flag,
-                                          const volatile uint32_t *seq, uint32_t spin_max) {
+                                          const volatile uint32_t *seq, uint32_t spin_max, volatile uint32_t *rec) {
     const uint32_t want = strata::sys_load(seq);
-    for (uint32_t spin = 0; spin < spin_max && strata::sys_load(flag) != want; ++spin) strata_spin_pause();
+    // a wait that runs out writes the session's record (strata/core/window_wait.hpp): the host then fails the token
+    strata::core::bounded_wait(flag, spin_max, rec, strata::core::kWaitDoorbell, want, DoorbellLoad{}, DoorbellStore{},
+                               DoorbellPause{}, [want](uint32_t v) { return v == want; });
     /*
     DPCT1078: Consider replacing memory_order::acq_rel with
     memory_order::seq_cst for correctness if strong memory order restrictions
@@ -396,6 +402,9 @@ __dpct_inline__ void doorbell_wait_kernel(const volatile uint32_t *flag,
 }
 
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) {
+    doorbell_wait(d_flag, d_seq, stream, nullptr);
+}
+void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream, uint32_t* rec) {
     if (d_flag == nullptr || d_seq == nullptr) return;
     const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));
     {
@@ -406,7 +415,7 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
             ->template parallel_for<dpct_kernel_name<class doorbell_wait_kernel_47b360>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1), sycl::range(1, 1, 1)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    doorbell_wait_kernel(d_flag, d_seq, spin_max);
+                    doorbell_wait_kernel(d_flag, d_seq, spin_max, rec);
                 });
     }
     check_launch("doorbell_wait");

@@ -20,6 +20,8 @@ import { createHash } from 'node:crypto';
 import { flattenPnpm } from './flatten-pnpm.mjs';
 import { isOtherOsBinaryFolder, missingHarnessImports } from './harness-prune.mjs';
 import { patchStagedHarnessBudget } from './harness-budget.mjs';
+import { patchStagedHarnessSearch } from './harness-search-partial.mjs';
+import { patchStagedHarnessMcpSession } from './harness-mcp-session.mjs';
 
 const args = process.argv.slice(2);
 const opt = (name, fallback) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : fallback; };
@@ -145,8 +147,9 @@ function prune(dir) {
 }
 prune(out);
 
-// Strata's provenance-recorded output-budget correction applies only to this copy.
-const patches = [patchStagedHarnessBudget(out)];
+// Strata's provenance-recorded corrections apply only to this copy: the output budget, search results kept when one folder cannot be
+// read (#5964), and a new MCP session when a restarted server no longer knows the old one (#6014).
+const patches = [patchStagedHarnessBudget(out), patchStagedHarnessSearch(out), patchStagedHarnessMcpSession(out)];
 
 // --- licence: the MIT text and the third-party notices travel with the files ---------------------------------------------
 for (const name of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {

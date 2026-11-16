@@ -2047,6 +2047,74 @@ class HipEnvGuard(unittest.TestCase):
             del os.environ["HIP_PATH"]
 
 
+class StreamUsageChunk(unittest.TestCase):
+    """OpenAI's streaming contract: with "stream_options": {"include_usage": true} the usage rides in its own last
+    chunk, "choices": []. LiteLLM (and the AI SDK) read it there; a usage on the finish_reason chunk is ignored by
+    LiteLLM, which then recounts the tokens itself, too low, so a client compacts its context too late.
+    Without the option the usage stays on the finish_reason chunk, as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "</think>\n\nanswer", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def stream(self, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64, "stream": True, **extra}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            lines = r.read().decode().split("\n\n")
+        data = [x[len("data: "):] for x in lines if x.startswith("data: ")]
+        self.assertEqual(data[-1], "[DONE]")
+        return [json.loads(x) for x in data[:-1]]
+
+    def test_usage_in_its_own_last_chunk(self):
+        chunks = self.stream(stream_options={"include_usage": True})
+        last, finish = chunks[-1], chunks[-2]
+        self.assertEqual(last["choices"], [])
+        self.assertGreater(last["usage"]["prompt_tokens"], 0)
+        self.assertGreater(last["usage"]["completion_tokens"], 0)
+        self.assertEqual(last["usage"]["total_tokens"], last["usage"]["prompt_tokens"] + last["usage"]["completion_tokens"])
+        self.assertIn("cached_tokens", last["usage"]["prompt_tokens_details"])
+        self.assertEqual(last["id"], finish["id"])
+        self.assertEqual(finish["choices"][0]["finish_reason"], "stop")
+        self.assertNotIn("usage", finish)
+        self.assertEqual(sum(1 for c in chunks if "usage" in c), 1)        # exactly one usage chunk
+
+    def test_without_the_option_the_usage_stays_on_the_finish_chunk(self):
+        for extra in ({}, {"stream_options": {"include_usage": False}}, {"stream_options": None}):
+            chunks = self.stream(**extra)
+            self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop", extra)
+            self.assertGreater(chunks[-1]["usage"]["prompt_tokens"], 0, extra)
+            self.assertTrue(all(c["choices"] for c in chunks), extra)
+
+    def test_a_stream_options_that_is_not_an_object_is_ignored(self):
+        # The spec allows an object or null. Anything else used to be served as a plain stream; it must not become an
+        # empty 200 (the usage split runs after the SSE headers are out, so an exception there leaves no body at all).
+        for extra in ({"stream_options": "yes"}, {"stream_options": True}, {"stream_options": 1}, {"stream_options": [1]}):
+            chunks = self.stream(**extra)
+            self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop", extra)
+            self.assertGreater(chunks[-1]["usage"]["prompt_tokens"], 0, extra)
+            self.assertTrue(all(c["choices"] for c in chunks), extra)
+
+    def test_same_numbers_as_the_non_streaming_answer(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            plain = json.loads(r.read())["usage"]
+        split = self.stream(stream_options={"include_usage": True})[-1]["usage"]
+        self.assertEqual((split["prompt_tokens"], split["completion_tokens"]), (plain["prompt_tokens"], plain["completion_tokens"]))
+
+
 class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_ids = list(ids)
@@ -3378,6 +3446,68 @@ class ConfigReasoningEffort(unittest.TestCase):
         self.assertEqual(cfg, {"args": ["--ctx", "4096"]})
 
 
+class LoadSharedSettings(unittest.TestCase):
+    """#4933: one unknown key in `.shared-settings.json` used to clear EVERY shared setting, silently.
+
+    The strict reader stays for POST /settings, where a client can be told which key is wrong.  At start-up the file
+    is read key by key instead: the keys the server understands keep applying and each one it does not is named and
+    skipped.  A file that cannot be parsed, or is not an object, is still ignored as a whole."""
+
+    def load(self, text):
+        from serve.server import load_shared_settings
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "x.shared-settings.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        said = []
+        got = load_shared_settings(path, warn=said.append)
+        return got, said
+
+    def test_two_known_keys_are_both_kept(self):
+        got, said = self.load('{"reasoning_effort": "medium", "top_p": 0.9}')
+        self.assertEqual(got, {"reasoning_effort": "medium", "top_p": 0.9})
+        self.assertEqual(said, [])
+
+    def test_an_unknown_key_no_longer_clears_the_known_ones(self):
+        # A made-up key, and not `preserve_thinking`: #4932 teaches the server that name, so on a tree carrying both
+        # changes this example would be a KNOWN key and the test would pass without exercising anything.
+        got, said = self.load('{"reasoning_effort": "medium", "preserve_thoughts": false}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertEqual(len(said), 1)
+        self.assertIn("preserve_thoughts", said[0])
+        self.assertIn("skipped", said[0])
+
+    def test_a_known_key_with_a_bad_value_is_named_and_skipped(self):
+        got, said = self.load('{"reasoning_effort": "medium", "top_p": 5}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertIn("top_p", said[0])
+
+    def test_several_bad_keys_are_each_named(self):
+        got, said = self.load('{"reasoning_effort": "medium", "nope": 1, "top_k": 900}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertEqual(len(said), 2)
+
+    def test_an_unreadable_file_is_ignored_whole_and_says_so(self):
+        got, said = self.load('{not json')
+        self.assertEqual(got, {})
+        self.assertEqual(len(said), 1)
+        self.assertIn("ignored", said[0])
+
+    def test_a_non_object_is_ignored_whole_and_says_so(self):
+        got, said = self.load('["reasoning_effort"]')
+        self.assertEqual(got, {})
+        self.assertEqual(len(said), 1)
+        self.assertIn("ignored", said[0])
+
+    def test_a_missing_file_is_quiet(self):
+        from serve.server import load_shared_settings
+        said = []
+        self.assertEqual(load_shared_settings(os.path.join(tempfile.gettempdir(), "no-such-file-4933.json"),
+                                              warn=said.append), {})
+        self.assertEqual(said, [])              # no file is the normal case: nothing to report
+
+
 class JoinedEngineArgs(unittest.TestCase):
     """#2267: "--ple-io mmap" written as one element of the config's args reached the engine as one argument."""
 
@@ -4185,6 +4315,25 @@ class SharingTheGpu(unittest.TestCase):
         self.svc.free_vram_mib = lambda: 20000                      # the peer let go: the next try loads
         self.assertEqual(self._raw_chat()[0], 200)
 
+    def test_gpu_refusal_on_responses_sends_retry_after_too(self):
+        """The same refusal as above on /v1/responses: docs/DETAILS.md promises the header with no route limit."""
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.vram_free_wait_s = 0.2                              # (not the 15 s wait for memory)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.svc.unload()
+                r = urllib.request.Request(self.base + "/v1/responses",
+                                           data=json.dumps({"model": "m", "input": "hi", "stream": stream}).encode(),
+                                           headers={"Content-Type": "application/json"}, method="POST")
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(r, timeout=30)
+                with caught.exception as e:
+                    self.assertEqual(e.code, 503)
+                    self.assertEqual(e.headers["Retry-After"], "15")
+                    self.assertIn("in use by another program", json.loads(e.read())["error"]["message"])
+                self.assertEqual(self.engine.starts, 0)
+
     def test_before_load_strict_refuses_even_with_free_vram(self):
         self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
         self.svc.before_load_strict = True
@@ -4195,6 +4344,59 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertTrue(int(headers["Retry-After"]) > 0)
         self.assertEqual(self.engine.starts, 0)
+
+    def _strict_hook(self, code: str):
+        self.svc.before_load = [sys.executable, "-c", code]
+        self.svc.before_load_strict = True
+        self.svc.unload()
+        return self._raw_chat()
+
+    def test_before_load_refusal_carries_the_commands_own_reason(self):
+        """#5987: a scheduler's launcher refuses with its own line; the 503 says that line, at once, with no start."""
+        # its stdout is written AFTER the stderr line (as a buffered stdout is on Windows, flushed at exit): the reason is
+        # stderr's line wherever the streams' order lands
+        status, headers, body = self._strict_hook(
+            "import sys; print('checking', flush=True); "
+            "print('no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB', file=sys.stderr, flush=True); "
+            "print('done checking', flush=True); sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["message"], "no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB")
+        self.assertTrue(int(headers["Retry-After"]) > 0)
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_refusal_without_output_keeps_the_generic_sentence(self):
+        status, _, body = self._strict_hook("import sys; sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertIn("the before_load command failed (it exited with code 75)", body["error"]["message"])
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_reason_is_made_safe(self):
+        # UTF-8 bytes on stdout's buffer: the console code page of the machine (cp1250 on the owner PC) cannot fail the child
+        status, _, body = self._strict_hook(
+            "import sys; sys.stdout.buffer.write(('first line\\r\\n\\x1b[31mred \\x07alert\\ttab\\u200b\\x00 ' + 'x' * 400 + "
+            "'\\r\\n  \\r\\n').encode('utf-8')); sys.exit(1)")
+        msg = body["error"]["message"]
+        self.assertEqual(status, 503)
+        self.assertLessEqual(len(msg), 300)
+        self.assertTrue(msg.startswith("[31mred alert tab ") and msg.endswith("..."), msg[:60])
+        self.assertFalse(any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c == "​" for c in msg), repr(msg[:60]))
+        from serve.server import hook_reason, hook_text
+        self.assertEqual(hook_reason(b"a\r\nb \x1b\x00 c\n"), "b c")
+        self.assertEqual(hook_reason(""), "")
+        self.assertEqual(hook_reason(None), "")
+        self.assertEqual(hook_reason("x" * 300), "x" * 300)
+        self.assertEqual(len(hook_reason("y" * 301)), 300)
+        # the streams apart: stderr's last line wins, stdout's when stderr is empty or blank
+        self.assertEqual(hook_reason(b"progress\nlater progress\n", stderr=b"no room for 76G of RAM\n"), "no room for 76G of RAM")
+        self.assertEqual(hook_reason(b"busy: try later\n", stderr=b"  \n"), "busy: try later")
+        # not UTF-8 (a Windows console tool's code page): decoded, never an error
+        t = hook_text(b"caf\xe9 full")
+        self.assertTrue(t.startswith("caf") and t.endswith(" full") and len(t) == 9, repr(t))
+
+    def test_before_load_that_allows_loads_and_its_output_reaches_the_log(self):
+        status, _, _ = self._strict_hook("print('room reserved: 76.0 GB')")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.engine.starts, 1)
 
     def test_failing_before_load_without_a_vram_limit_loads(self):
         self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
@@ -4731,6 +4933,29 @@ class ForcedToolChoice(unittest.TestCase):
                 if not stream:
                     self.assertIn("<function=execute_gdscript>", b["choices"][0]["message"]["content"])   # the text is untouched
 
+    def test_an_undeclared_call_names_the_closest_declared_tool_and_runs_nothing(self):
+        """#5904 / #5933 / #4622: `read_file` for a declared `read` stays text with finish "stop" (nothing runs under a
+        guessed name); the marker names the closest declared tool as a hint.  A name close to nothing gets no hint."""
+        tools = [{"type": "function", "function": {"name": n, "description": n, "parameters": {
+            "type": "object", "properties": {"q": {"type": "string"}}}}} for n in ("read", "write", "search")]
+        for written, hint in (("read_file", "read"), ("Write", "write"), ("serch", "search"), ("execute_gdscript", None)):
+            self.says(self._undeclared_call_answer(written))
+            for stream in (False, True):
+                with self.subTest(written=written, stream=stream):
+                    code, b = self.openai(stream=stream, tools=tools)
+                    finish, calls, _ = self.call_of(code, b, stream)
+                    self.assertEqual((finish, calls), ("stop", []), b)
+                    want = {"name": written, "reason": "undeclared", **({"closest_declared": hint} if hint else {})}
+                    self.assertEqual(self._rejected_of(b, stream), [want])
+
+    def test_closest_declared(self):
+        from serve.server import closest_declared
+        self.assertEqual(closest_declared("read_file", ["read", "write"]), "read")
+        self.assertEqual(closest_declared("ReadFile", ["read_file", "write"]), "read_file")
+        self.assertIsNone(closest_declared("file", ["read_file", "write_file"]))      # two candidates: no guess
+        self.assertIsNone(closest_declared("gashfunction_calls", ["grep", "read"]))
+        self.assertIsNone(closest_declared("x", []))
+
     def test_undeclared_tool_calls_call_hands_the_call_to_the_client(self):
         """#4622: "undeclared_tool_calls": "call" returns the well-formed call of an undeclared name as a tool call (the client has its
         own policy for unknown names); the default ("text") is the test above, unchanged."""
@@ -5255,6 +5480,35 @@ class ModelAliases(unittest.TestCase):
             httpd.server_close()
 
 
+class NvmlPcieTraffic(unittest.TestCase):
+    """A GP100 hands back 200 GiB/s now and then, idle: it reaches neither the tile nor a card's total."""
+    WRAPPED = 209_708_000                                                            # 7 MB/s under 2^22 KB / 20 ms
+
+    def reads(self, *kb_s):
+        """What one reading gives from these driver answers, and how many answers were left unread."""
+        from serve import telemetry
+
+        class Lib:
+            left = list(kb_s)
+
+            def nvmlDeviceGetPcieThroughput(self, dev, counter, out):
+                out._obj.value = self.left.pop(0)
+                return 0
+
+        g = telemetry._Nvml.__new__(telemetry._Nvml)
+        g.dev, g.lib = None, Lib()
+        return g._pcie_mb(1), len(g.lib.left)
+
+    def test_a_real_reading_is_kept(self):
+        self.assertEqual(self.reads(58 << 20, 0), (59392.0, 1))                      # about PCIe 5.0 x16's top
+
+    def test_a_wrapped_reading_is_read_again(self):
+        self.assertEqual(self.reads(self.WRAPPED, 2048), (2.0, 0))
+
+    def test_it_is_read_again_once(self):
+        self.assertEqual(self.reads(self.WRAPPED, self.WRAPPED, 2048), (None, 1))
+
+
 class AmdTelemetry(unittest.TestCase):
     """#301: the AMD backend's readings from a fake amdgpu sysfs tree: KFD node -> render node, as setup numbers the
     cards (the CPU node skipped), and free_vram_mib on HIP."""
@@ -5283,7 +5537,8 @@ class AmdTelemetry(unittest.TestCase):
 
     def test_pcie_link_is_the_narrowest_slowest_hop(self):
         """#1733: the link is the slowest/narrowest hop between the root port and the card; the bottleneck is only
-        claimed when every hop could be read (pcie_path says how many were)."""
+        claimed when every hop could be read (pcie_path says how many were).  The card's own width is kept beside it
+        (`pcie_width_max`), because a x16 card behind a x8 bridge has to read as the gap, not as an x8 card."""
         from serve import telemetry
         with tempfile.TemporaryDirectory() as d:
             hops = []
@@ -5299,10 +5554,12 @@ class AmdTelemetry(unittest.TestCase):
             a.dev = hops[-1]
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops):
                 self.assertEqual(a.link(), {"pcie_gen": 3, "pcie_gen_max": 3, "pcie_own_gen": 4, "pcie_width": 8,
+                                            "pcie_width_max": 16,       # the bridge narrows it to x8, the card could do x16
                                             "pcie_path": "3/3"})
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops[:2] + [str(Path(d) / "hidden")]):
                 got = a.link()             # an unreadable hop: fall back to the card's own negotiated link
-                self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_path"]), (4, 16, "2/3"))
+                self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_width_max"], got["pcie_path"]),
+                                 (4, 16, 16, "2/3"))
             self.assertEqual(telemetry._Amd._gen("32.0 GT/s PCIe"), 5)
             self.assertIsNone(telemetry._Amd._gen("unknown"))
             self.assertTrue(telemetry._Amd._bdf("0000:03:00.0"))
@@ -5322,6 +5579,7 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
                                             "power": 85.0, "power_limit": 300.0, "pcie_gen": None,
                                             "pcie_gen_max": None, "pcie_own_gen": None, "pcie_width": None,
+                                            "pcie_width_max": None,
                                             "pcie_path": "0/0"})    # #1733: no PCIe files in this fake tree
                 r = telemetry.gpu_reader(1, amd=True).read()
                 self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
@@ -5336,6 +5594,100 @@ class AmdTelemetry(unittest.TestCase):
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
+
+    def test_two_cards_keep_their_own_pcie_links(self):
+        """Two cards trained to different widths: each row carries its own link, the top-level fields stay card 0's (additive
+        contract), and gpu_pcie_bottleneck names the x4 card, which used to hide behind card 0's x8."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, width in (("renderD129", "8"), ("renderD128", "4")):
+                dev = Path(d) / "class/drm" / minor / "device"
+                (dev / "current_link_speed").write_text("16.0 GT/s PCIe\n")      # both cards at Gen4
+                (dev / "current_link_width").write_text(width + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(4, 8), (4, 4)])
+                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (4, 8))   # card 0's, as before
+                self.assertEqual(s["gpu_pcie_bottleneck"], {"card": 1, "gen": 4, "gen_max": 4, "width": 4, "width_max": None})
+
+    def test_the_bottleneck_is_one_real_card_never_a_mix(self):
+        """Gen3 x16 beside Gen5 x4: separate minima would make up "Gen3 x4", a link neither card has.  The bottleneck is the card
+        with the lower lane rate x width (Gen5 x4, 15.75 GB/s, against Gen3 x16, 15.76 GB/s), all its fields from that card."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, (speed, width) in (("renderD129", ("8.0 GT/s PCIe", "16")), ("renderD128", ("32.0 GT/s PCIe", "4"))):
+                dev = Path(d) / "class/drm" / minor / "device"
+                (dev / "current_link_speed").write_text(speed + "\n")
+                (dev / "current_link_width").write_text(width + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(3, 16), (5, 4)])
+                b = s["gpu_pcie_bottleneck"]
+                self.assertEqual((b["card"], b["gen"], b["width"]), (1, 5, 4))
+
+    def test_one_card_its_bottleneck_is_that_card_and_none_without_a_reading(self):
+        from serve import telemetry
+        self.assertEqual(telemetry.pcie_bottleneck([(0, {"pcie_gen": 4, "pcie_gen_max": 4, "pcie_width": 16, "pcie_width_max": 16})]),
+                         {"card": 0, "gen": 4, "gen_max": 4, "width": 16, "width_max": 16})
+        self.assertIsNone(telemetry.pcie_bottleneck([(0, {"pcie_gen": None, "pcie_width": 16}), (1, {"pcie_gen": 4, "pcie_width": None})]))
+
+    def test_a_card_with_no_link_reading_stays_missing(self):
+        """A card whose sysfs hides its link (the fake tree has no PCIe files) reports nothing: no 0, no invented
+        width; the top-level fields stay card 0's (unknown) and the bottleneck is the card that has a reading."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            dev = Path(d) / "class/drm/renderD128/device"
+            (dev / "current_link_speed").write_text("8.0 GT/s PCIe\n")
+            (dev / "current_link_width").write_text("16\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_gen"], c["pcie_width"]) for c in s["gpus"]], [(None, None), (3, 16)])
+                self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_width"]), (None, None))
+                self.assertEqual(s["gpu_pcie_bottleneck"], {"card": 1, "gen": 3, "gen_max": 3, "width": 16, "width_max": None})
+
+    def test_a_card_narrower_than_it_could_be_shows_the_gap(self):
+        """A card the board trained down to x4 in a slot the card could do x16, beside a card that is x8 by nature:
+        the gap is one card's, so the bottleneck's cap comes from that same card (the smallest cap in the run would blame
+        the other card).  Each row also carries its own power ceiling, which the summary adds up - without it the Overview
+        loses "of N W limit" on a split run."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, (cur, cap) in (("renderD129", ("8", "8")), ("renderD128", ("4", "16"))):
+                dev = Path(d) / "class/drm" / minor / "device"
+                (dev / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+                (dev / "current_link_width").write_text(cur + "\n")
+                (dev / "max_link_width").write_text(cap + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+                self.assertEqual([(c["pcie_width"], c["pcie_width_max"]) for c in s["gpus"]], [(8, 8), (4, 16)])
+                self.assertEqual((s["gpu_pcie_width"], s["gpu_pcie_width_max"]), (8, 8))      # card 0's, as before
+                self.assertEqual((s["gpu_pcie_bottleneck"]["card"], s["gpu_pcie_bottleneck"]["width"],
+                                  s["gpu_pcie_bottleneck"]["width_max"]), (1, 4, 16))          # x4 that could do x16
+                self.assertEqual([c["power_limit"] for c in s["gpus"]], [300.0, 300.0])      # each card's own ceiling
+                self.assertEqual(s["gpu_power_limit"], 600.0)                                # the run's limit
+
+    def test_each_card_has_its_own_link_in_gpus(self):
+        """The app reads each GPU tile from that card's record: "gpus" had no PCIe keys, so every PCIe tile in the Monitor was empty on
+        a two-card PC (f5c07ddfd). Additive contract (11-16): the top-level gpu_pcie_* fields stay card 0's reading, and the narrower
+        card (a Gen3 x8 beside a Gen4 x16) is named in gpu_pcie_bottleneck."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, speed, width in (("129", "16.0 GT/s PCIe", "16"), ("128", "8.0 GT/s PCIe", "8")):
+                dev = Path(d) / f"class/drm/renderD{minor}/device"
+                (dev / "current_link_speed").write_text(speed + "\n")
+                (dev / "current_link_width").write_text(width + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+            self.assertEqual([(g["index"], g["pcie_gen"], g["pcie_gen_max"], g["pcie_width"]) for g in s["gpus"]],
+                             [(0, 4, 4, 16), (1, 3, 3, 8)])
+            self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_gen_max"], s["gpu_pcie_width"]), (4, 4, 16))   # card 0's
+            b = s["gpu_pcie_bottleneck"]
+            self.assertEqual((b["card"], b["gen"], b["width"]), (1, 3, 8))
 
     def test_free_vram_on_hip(self):
         from serve import telemetry
@@ -6641,7 +6993,9 @@ class OpenAIChunksTerminal(unittest.TestCase):
     def test_a_cancelled_run_that_stops_early_is_not_an_error(self):
         gone = threading.Event()
         gone.set()                                   # the client left: nobody reads the end
-        self.assertEqual(len(self.chunks([], cancel=gone)), 1)
+        # #4758: the role chunk goes out with the first data, and a run that stopped before any has none: no chunk
+        # at all, and no error either
+        self.assertEqual(self.chunks([], cancel=gone), [])
 
 
 
@@ -6717,3 +7071,121 @@ class PrepareCancelled(unittest.TestCase):
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
 
+
+
+class ToolCallParameterCoercionAndDedup(unittest.TestCase):
+    """Repeated non-string parameters (the model rewrites an array/object parameter in the same call), Python booleans
+    (`True`/`False`), and empty/`null`/`None` non-string parameters produce identical valid JSON in both whole and
+    streamed (`stream_tools=True`) parsing."""
+
+    SCHEMA = [
+        {
+            "name": "fit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "free": {"type": "array"},
+                    "bounds": {"type": "array"},
+                    "dry_run": {"type": "boolean"},
+                    "timeout": {"type": "integer"},
+                    "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "count": {"type": "integer"},
+                },
+            },
+        }
+    ]
+
+    def test_a_rewrite_further_down_the_call_streams_once_with_the_later_value(self):
+        # (our fix-up) the PR's check of a parameter that follows itself covered the adjacent rewrite only: a rewrite
+        # after another parameter streamed both writes (two JSON keys) or the earlier one
+        body = ("<tool_call>\n<function=fit>\n"
+                "<parameter=bounds>\n[1, 2]\n</parameter>\n"
+                "<parameter=path>\ncurve.dat\n</parameter>\n"
+                "<parameter=bounds>\n[10, 20]\n</parameter>\n"
+                "<parameter=timeout>\n5\n</parameter>\n"
+                "<parameter=timeout>\n7\n</parameter>\n"
+                "</function>\n</tool_call>")
+        self.check(body, {"path": "curve.dat", "bounds": [10, 20], "timeout": 7})
+        for step in (1, 7, 10_000):
+            evs = self.events(body, step)
+            streamed = "".join(e.text for e in evs if e.kind == "tool_args")
+            self.assertEqual(streamed.count('"bounds"'), 1, streamed)
+            self.assertEqual(streamed.count('"timeout"'), 1, streamed)
+
+    def test_null_where_the_type_allows_it_and_false_and_zero_kept(self):
+        # (our fix-up) a null placeholder is null when the declared type allows null, not left out; false and 0 stay
+        body = ("<tool_call>\n<function=fit>\n"
+                "<parameter=limit>\nNone\n</parameter>\n"
+                "<parameter=dry_run>\nfalse\n</parameter>\n"
+                "<parameter=count>\n0\n</parameter>\n"
+                "</function>\n</tool_call>")
+        self.check(body, {"limit": None, "dry_run": False, "count": 0})
+
+    def test_without_a_schema_a_none_stays_text(self):
+        from serve.frontend import parse_tool_call
+        call = parse_tool_call("<function=other>\n<parameter=x>\nNone\n</parameter>\n</function>", None)
+        self.assertEqual(call.arguments, {"x": "None"})
+
+    def events(self, body: str, step: int):
+        from serve.frontend import OutputParser
+        text = "</think>\n\n" + body
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=True, recover=True)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        return evs + p.finish()
+
+    def parse(self, body: str, stream_tools: bool, step: int):
+        from serve.frontend import OutputParser
+        text = "</think>\n\n" + body
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools, recover=True)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        evs += p.finish()
+        calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
+        if stream_tools:
+            for c in [e for e in evs if e.kind == "tool_call"]:
+                streamed = "".join(
+                    e.text for e in evs if e.kind == "tool_args" and e.call is not None and e.call.id == c.call.id
+                )
+                self.assertEqual(json.loads(streamed), c.call.arguments)
+        return calls
+
+    def check(self, body: str, expected_args: dict):
+        for stream_tools in (False, True):
+            for step in (1, 5, 19, 10_000):
+                with self.subTest(stream_tools=stream_tools, step=step):
+                    self.assertEqual(self.parse(body, stream_tools, step), [("fit", expected_args)])
+
+    def test_duplicate_array_parameter_uses_last_occurrence(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=path>\ncurve.dat\n</parameter>\n"
+            "<parameter=bounds>\n[{\"min\": 1, \"max\": 2}]\n</parameter>\n"
+            "<parameter=bounds>\n[{\"min\": 10, \"max\": 20}]\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {"path": "curve.dat", "bounds": [{"min": 10, "max": 20}]})
+
+    def test_python_booleans_and_empty_or_null_non_strings(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=path>\ncurve.dat\n</parameter>\n"
+            "<parameter=dry_run>\nTrue\n</parameter>\n"
+            "<parameter=free>\nnull\n</parameter>\n"
+            "<parameter=bounds>\nNone\n</parameter>\n"
+            "<parameter=timeout>\n\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {"path": "curve.dat", "dry_run": True})
+
+    def test_only_skipped_non_string_parameters_yield_empty_object(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=free>\nnull\n</parameter>\n"
+            "<parameter=timeout>\nNone\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {})

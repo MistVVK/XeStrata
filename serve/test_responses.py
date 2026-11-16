@@ -9,7 +9,10 @@ import contextlib
 import http.client
 import io
 import json
+import socket
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -17,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import responses  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.responses import (ENCRYPTED_PREFIX, ResponsesError, collect, input_messages, prompt_made,  # noqa: E402
-                             prompt_tools, request_tools, template_kwargs, text_format, thread_title_events)
+                             prompt_tools, request_tools, client_found_tools, template_kwargs, text_format,
+                             thread_title_events)
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +32,15 @@ CALL = ("Let me look.\n</think>\n\nChecking.\n\n<tool_call>\n<function=exec_comm
 ANSWER = "Read it.\n</think>\n\nThe file says before."
 TOOLS = [{"type": "function", "name": "exec_command", "description": "Runs a command.", "strict": False,
           "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}]
+# #1917: Codex's client-side tool discovery as it declares it (no name), and an answer to one of its searches
+SEARCH_TOOL = {"type": "tool_search", "execution": "client", "description": "Searches deferred tools.",
+               "parameters": {"type": "object",
+                              "properties": {"query": {"type": "string"}, "limit": {"type": "number"}},
+                              "required": ["query"], "additionalProperties": False}}
+FOUND = {"type": "tool_search_output", "call_id": "s1", "execution": "client", "status": "completed",
+         "tools": [{"type": "namespace", "name": "mcp__fs", "description": "Files.", "tools": [
+             {"type": "function", "name": "read", "defer_loading": True,
+              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]}]}
 
 
 # ------------------------------------------------------------------------------------------------ parsing
@@ -126,6 +139,68 @@ class Parsing(unittest.TestCase):
         tools, names, _ = request_tools(req)
         self.assertEqual([t["name"] for t in tools], ["exec_command", "later_tool"])
         self.assertIn("later_tool", names)
+
+    def test_a_client_tool_search_is_a_function_and_a_hosted_one_is_left_out(self):
+        """#1917: the client runs its own search, so the model gets an ordinary function to call (declared once)."""
+        tools, names, skipped = request_tools({"tools": [*TOOLS, SEARCH_TOOL, dict(SEARCH_TOOL)]})
+        self.assertEqual([t["name"] for t in tools], ["exec_command", "tool_search"])
+        self.assertEqual(tools[1]["parameters"], SEARCH_TOOL["parameters"])
+        self.assertEqual((names["tool_search"], skipped), ((None, "tool_search", "tool_search"), []))
+        for hosted in ({"type": "tool_search"}, {"type": "tool_search", "execution": "server"}):
+            tools, _, skipped = request_tools({"tools": [*TOOLS, hosted]})
+            self.assertEqual(([t["name"] for t in tools], skipped), (["exec_command"], ["tool_search"]))
+
+    def test_a_tool_search_declares_its_finds_where_it_answered(self):
+        call = {"type": "tool_search_call", "call_id": "s1", "execution": "client", "status": "completed",
+                "arguments": {"query": "read a file"}}
+        req = {"tools": [*TOOLS, SEARCH_TOOL], "input": [{"role": "user", "content": "read a.txt"}, call, FOUND]}
+        _, turn, result = input_messages(req)
+        self.assertEqual(turn["tool_calls"], [{"function": {"name": "tool_search",
+                                                            "arguments": {"query": "read a file"}}}])
+        self.assertEqual(result["role"], "tool")
+        self.assertEqual(result["content"], 'These functions can be called from now on:\n\nmcp__fs: Files.\n<tools>\n'
+                         '{"name": "mcp__fs.read", "description": "", "parameters": {"type": "object", '
+                         '"properties": {"path": {"type": "string"}}}}\n</tools>')
+        # the tool list is the request's own; the parser and the response get the finds
+        self.assertEqual([t["name"] for t in request_tools(req)[0]], ["exec_command", "tool_search"])
+        found, names = client_found_tools({"input": [*req["input"], {**FOUND, "call_id": "s2"}]})
+        self.assertEqual(([t["name"] for t in found], names), (["mcp__fs.read"], {"mcp__fs.read": ("mcp__fs", "read",
+                                                                                                  "function")}))
+        empty = input_messages({"input": [{**FOUND, "tools": []}]})
+        self.assertEqual(empty[0]["content"], "No tools matched this search.")
+
+    def test_a_namespace_is_described_once_and_a_tool_found_again_is_only_named(self):
+        """Two searches of one turn find the same namespace: its description is said once, before its tools, and the
+        search the model reads second only names the tools the first one declared (results arrive in any order)."""
+        both = {**FOUND, "tools": [{**FOUND["tools"][0], "tools": [
+            *FOUND["tools"][0]["tools"], {"type": "function", "name": "write", "parameters": {"type": "object"}}]}]}
+        again = {**FOUND, "call_id": "s2"}
+        calls = [{"type": "tool_search_call", "call_id": c, "execution": "client", "arguments": {"query": "files"}}
+                 for c in ("s1", "s2")]
+        first, second = input_messages({"input": [{"role": "user", "content": "go"}, *calls, again, both]})[-2:]
+        self.assertEqual(first["content"].count("Files."), 1)
+        self.assertIn('{"name": "mcp__fs.write", "description": ""', first["content"])
+        self.assertEqual(second["content"], "Already available: mcp__fs.read")
+        # a later search with a new tool of a namespace already described: the tool, not the description again
+        more = {**FOUND, "call_id": "s3", "tools": [{**FOUND["tools"][0], "tools": [
+            {"type": "function", "name": "list", "parameters": {"type": "object"}}]}]}
+        third = input_messages({"input": [{"role": "user", "content": "go"}, *calls, again, both,
+                                          {**calls[0], "call_id": "s3"}, more]})[-1]
+        self.assertNotIn("Files.", third["content"])
+        self.assertIn('"name": "mcp__fs.list"', third["content"])
+
+    def test_found_tools_keep_the_prompt_start(self):
+        """Declared after the search, the finds leave the prompt before it (the tool list included) as it was, so the
+        conversation cache holds; in the tool list, every search would change the prompt's start."""
+        before = {"tools": [*TOOLS, SEARCH_TOOL], "input": [{"role": "user", "content": "read a.txt"}]}
+        after = {**before, "input": [*before["input"], {"type": "tool_search_call", "call_id": "s1",
+                                                        "execution": "client", "arguments": {"query": "read"}}, FOUND]}
+
+        def render(req, **kwargs):
+            return TEMPLATE.render(input_messages(req), tools=request_tools(req)[0], **kwargs)
+
+        self.assertTrue(render(after).startswith(render(before, add_generation_prompt=False)))
+        self.assertNotIn("mcp__fs.read", render(after).split("<|im_end|>")[0])
 
     def test_effort_and_text_format(self):
         self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}, {}), {"enable_thinking": False})
@@ -312,7 +387,7 @@ class Server(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 c.request("POST", path, body=json.dumps(body).encode(),
                           headers={"Content-Type": "application/json", **(headers or {})})
-                r = c.getresponse()
+                r = self.response = c.getresponse()
                 raw = r.read().decode()
             if r.getheader("Content-Type") == "text/event-stream":
                 events = []
@@ -482,6 +557,108 @@ class OverHttp(Server):
         self.assertEqual(events[-1]["type"], "response.failed")
         self.assertEqual(events[-1]["response"]["error"]["code"], "structured_output_failed")
 
+    def say(self, text):
+        self.engine.scripts = [self.tok.encode(text + "<|im_end|>", parse_special=True)]
+        self.engine.script = self.engine.scripts[0]
+
+    def test_json_format_cut_by_the_cap_ends_incomplete(self):
+        answer = "{\"a\": \"bcdefghijklmnopqrstuvwxyz\"}"
+        self.say(answer)
+        ask = {"model": "m", "input": "json", "reasoning": {"effort": "none"}, "max_output_tokens": 8}
+        code, plain = self.post(ask)
+        self.assertEqual((code, plain["status"]), (200, "incomplete"))
+        cut = plain["output"][-1]["content"][0]["text"]
+        self.assertTrue(answer.startswith(cut) and cut != answer, cut)
+        schema = {"type": "json_schema", "name": "x", "strict": True,
+                  "schema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}}
+        for fmt in ({"type": "json_object"}, schema):
+            with self.subTest(fmt=fmt["type"]):
+                body = {**ask, "text": {"format": fmt}}
+                code, r = self.post(body)
+                self.assertEqual((code, r.get("status")), (200, "incomplete"), r)
+                self.assertEqual(r["incomplete_details"], {"reason": "max_output_tokens"})
+                self.assertIsNone(r["error"])
+                # as a plain answer is cut: the words so far, and the item says it is not whole
+                self.assertEqual([o["type"] for o in r["output"]], ["message"])
+                self.assertEqual(r["output"][0]["status"], "incomplete")
+                self.assertEqual(r["output"][0]["content"][0]["text"], cut)
+                code, events = self.post({**body, "stream": True})
+                self.assertEqual(code, 200)
+                self.assertEqual([e["type"] for e in events],
+                                 ["response.created", "response.in_progress", "response.output_item.added",
+                                  "response.content_part.added", "response.output_text.delta",
+                                  "response.output_text.done", "response.content_part.done",
+                                  "response.output_item.done", "response.incomplete"])
+                self.assertEqual(events[-2]["item"]["status"], "incomplete")
+                final = events[-1]["response"]
+                self.assertEqual((final["status"], final["incomplete_details"], final["error"]),
+                                 ("incomplete", {"reason": "max_output_tokens"}, None))
+                self.assertEqual(final["output"][0]["status"], "incomplete")
+                self.assertEqual(final["output"][0]["content"][0]["text"], cut)
+
+    def test_json_format_cut_in_the_thinking_has_no_message(self):
+        self.say("Thinking about it for a while.\n</think>\n\n{\"a\": 1}")
+        body = {"model": "m", "input": "json", "max_output_tokens": 8, "text": {"format": {"type": "json_object"}}}
+        code, r = self.post(body)
+        self.assertEqual((code, r.get("status")), (200, "incomplete"), r)
+        self.assertEqual([(o["type"], o["status"]) for o in r["output"]], [("reasoning", "incomplete")])
+        code, events = self.post({**body, "stream": True})
+        self.assertEqual((code, events[-1]["type"]), (200, "response.incomplete"))
+
+    def test_json_format_finished_answer_is_still_checked(self):
+        # only the cap skips the check: an answer the model finished is still JSON, or 502, under a cap it did not reach
+        body = {"model": "m", "input": "json", "reasoning": {"effort": "none"}, "max_output_tokens": 200,
+                "text": {"format": {"type": "json_object"}}}
+        self.say("{\"a\": 1}")
+        code, r = self.post(body)
+        self.assertEqual(code, 200, r)
+        self.assertEqual((r["status"], r["output"][0]["status"]), ("completed", "completed"))
+        self.say("not json")
+        code, r = self.post(body)
+        self.assertEqual((code, r["error"]["code"]), (502, "structured_output_failed"))
+        code, events = self.post({**body, "stream": True})
+        self.assertEqual(events[-1]["type"], "response.failed")
+        self.assertEqual(events[-1]["response"]["error"]["code"], "structured_output_failed")
+
+    def assert_cut_short(self, body, text):
+        code, r = self.post(body)
+        self.assertEqual(code, 200, r)
+        self.assertEqual((r["status"], r["incomplete_details"]), ("incomplete", {"reason": "max_output_tokens"}))
+        self.assertEqual([(o["type"], o["status"]) for o in r["output"]], [("message", "incomplete")])
+        self.assertEqual(r["output"][0]["content"][0]["text"], text)
+
+    def test_json_format_cut_right_after_whole_json_is_still_incomplete(self):
+        # the check takes only finish stop, so the text can be whole JSON and is still not called finished
+        self.say("{\"a\":1}xxxxxxxx")
+        self.assert_cut_short({"model": "m", "input": "json", "reasoning": {"effort": "none"}, "max_output_tokens": 7,
+                               "text": {"format": {"type": "json_object"}}}, "{\"a\":1}")
+
+    def test_json_format_cut_with_no_cap_ends_incomplete(self):
+        # the other length finishes, with no max_output_tokens: the same end as a plain answer
+        plain = {"model": "m", "input": "json", "reasoning": {"effort": "none"}}
+        body = {**plain, "text": {"format": {"type": "json_object"}}}
+        answer = "{\"a\": \"" + "".join(f"{i:04d}" for i in range(100)) + "\"}"
+        self.say(answer)
+        self.post(body)
+        self.engine.max_context = len(self.engine.last_prompt) + 8 + 30      # CTX_SLACK, and room for 30 tokens
+        with self.subTest("full context"):
+            self.assert_cut_short(body, answer[:30])
+        self.engine.max_context = 16384
+        self.svc.repeat_stop_tokens = 20
+        self.say("{\"a\": \"" + "b" * 100)
+        with self.subTest("repeat stop"):
+            code, r = self.post(plain)
+            cut = r["output"][0]["content"][0]["text"]
+            self.assertLess(len(cut), 40, r)
+            self.assert_cut_short(body, cut)
+
+    def test_chat_json_format_cut_is_still_502(self):
+        self.say("{\"a\": \"bcdefghijklmnopqrstuvwxyz\"}")
+        body = {"model": "m", "messages": [{"role": "user", "content": "json"}], "max_tokens": 8,
+                "response_format": {"type": "json_object"}}
+        code, r = self.post(body, path="/v1/chat/completions")
+        self.assertEqual((code, r["error"]["code"]), (502, "structured_output_failed"))
+
     def test_monitor_and_status(self):
         self.svc.api_monitor = True
         self.post({"model": "m", "input": "hi", "stream": True})
@@ -616,6 +793,44 @@ class ToolRoundTrip(Server):
                                           "output": "2"}]})
         self.assertEqual([c["function"]["name"] for c in msgs[1]["tool_calls"]],
                          ["multi_agent_v1.spawn_agent", "apply_patch"])
+
+    def test_tool_search_then_a_found_tool(self):
+        """#1917 end to end: the model searches, the client answers with what it found, the model calls a found tool.
+        The second prompt continues the first one exactly (the cache holds), and the finds stay out of the tool list."""
+        search = ("Let me search.\n</think>\n\nSearching.\n\n<tool_call>\n<function=tool_search>\n<parameter=query>\n"
+                  "read a file\n</parameter>\n</function>\n</tool_call>")
+        read = ("Found it.\n</think>\n\nReading.\n\n<tool_call>\n<function=mcp__fs.read>\n<parameter=path>\na.txt\n"
+                "</parameter>\n</function>\n</tool_call>")
+        self.engine.scripts = [self.tok.encode(s + "<|im_end|>", parse_special=True) for s in (search, read)]
+        self.engine.script = self.engine.scripts[0]
+        user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read a.txt"}]}
+        base = {"model": "m", "instructions": "You are a coding agent.", "tools": [*TOOLS, SEARCH_TOOL],
+                "store": False, "include": ["reasoning.encrypted_content"]}
+        code, events = self.post({**base, "input": [user], "stream": True})
+        self.assertEqual(code, 200)
+        first_prompt = self.tok.decode(self.engine.last_prompt)
+        self.assertNotIn("response.function_call_arguments.delta", [e["type"] for e in events])
+        output = events[-1]["response"]["output"]
+        call = output[-1]
+        self.assertEqual((call["type"], call["execution"], call["arguments"], call["status"]),
+                         ("tool_search_call", "client", {"query": "read a file"}, "completed"))
+        self.assertNotIn("name", call)
+        code, r = self.post({**base, "input": [user, *output, {**FOUND, "call_id": call["call_id"]}]})
+        self.assertEqual(code, 200, r)
+        second_prompt = self.tok.decode(self.engine.last_prompt)
+        self.assertTrue(second_prompt.startswith(first_prompt + search + "<|im_end|>"), second_prompt[-800:])
+        self.assertNotIn("mcp__fs.read", first_prompt)
+        # the parser and the response accept the found tool (request-scoped; the prompt above is unchanged)
+        fc = r["output"][-1]
+        self.assertEqual((fc["type"], fc["namespace"], fc["name"], json.loads(fc["arguments"])),
+                         ("function_call", "mcp__fs", "read", {"path": "a.txt"}))
+        # ... and only what the search returned in this request: without the search's output in the input the same
+        # text is not read as the found tool (no mcp__fs / read call; nothing carries over from an earlier request)
+        self.engine.scripts = [self.tok.encode(read + "<|im_end|>", parse_special=True)]
+        self.engine.script = self.engine.scripts[0]
+        code, r = self.post({**base, "input": [user]})
+        self.assertEqual(code, 200, r)
+        self.assertFalse([o for o in r["output"] if o.get("type") == "function_call" and o.get("name") == "read"], r)
 
 
 class JsonFormatWithTools(Server):
@@ -789,6 +1004,126 @@ class CodexCompactionOverHttp(Server):
         again, code, r = self.compaction(codex_meta("compaction"), between=fails)
         self.assertEqual(code, 200, r)
         self.assertEqual(again, before)                  # so A's compaction still starts as A's turn
+
+
+class HeldEngine(MockEngine):
+    """Says `tokens` of its script, then holds the answer open until the request is cancelled or released."""
+    tokens = 5
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.holding, self.release = threading.Event(), threading.Event()
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        yield from self.script[:self.tokens]
+        self.holding.set()
+        while not (cancel.is_set() or self.release.is_set()):
+            time.sleep(0.01)
+        if not cancel.is_set():
+            yield from self.script[self.tokens:]
+
+
+class ServerCancel(Server):
+    """A drain deadline (--shutdown-timeout) cancels requests whose clients are still connected: they are told the
+    server is stopping, not that the request was malformed (KeyError 'response'), and a stream ends in response.failed."""
+    script = "</think>\n\nThe file says before."
+    body = {"input": "hi", "reasoning": {"effort": "none"}}
+
+    def setUp(self):
+        super().setUp()
+        self.engine = self.svc.engine = HeldEngine(self.tok, self.script, max_context=16384)
+
+    def stop_during(self, body):
+        """post(body), and when the engine holds it run the shutdown's own steps, as at a drain deadline."""
+        seen = {}
+
+        def stop():
+            self.engine.holding.wait(30)
+            self.svc.begin_drain()
+            seen["pending"] = self.svc.wait_for_drain(0)
+            seen["cancelled"] = self.svc.cancel_owned_requests()
+        t = threading.Thread(target=stop)
+        t.start()
+        try:
+            result = self.post(body)
+        finally:
+            t.join()
+        self.assertEqual(seen, {"pending": 1, "cancelled": 1})
+        return result
+
+    def assert_stopping(self, code, r):
+        self.assertEqual(code, 503, r)
+        self.assertEqual(r["error"]["type"], "server_error")
+        self.assertEqual(r["error"]["code"], "server_draining")
+        self.assertEqual(self.response.getheader("Retry-After"), "1")
+
+    def assert_failed_stream(self, code, events):
+        self.assertEqual(code, 200)
+        self.assertEqual(events[-1]["type"], "response.failed")
+        response = events[-1]["response"]
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["error"]["code"], "server_error")     # OpenAI's ResponseErrorCode is a closed list
+        self.assertIn("draining", response["error"]["message"])
+
+    def test_non_stream_cancelled_mid_answer(self):
+        self.assert_stopping(*self.stop_during(self.body))
+
+    def test_non_stream_cancelled_before_the_first_token(self):
+        self.engine.tokens = 0                           # was a 200 with status "in_progress" and no output
+        self.assert_stopping(*self.stop_during(self.body))
+
+    def test_stream_cancelled_mid_answer(self):
+        code, events = self.stop_during({**self.body, "stream": True})
+        self.assert_failed_stream(code, events)
+        self.assertIn("response.output_text.delta", [e["type"] for e in events])
+
+    def test_stream_cancelled_before_the_first_token(self):
+        self.engine.tokens = 0
+        code, events = self.stop_during({**self.body, "stream": True})
+        self.assert_failed_stream(code, events)
+        self.assertNotIn("response.output_text.delta", [e["type"] for e in events])
+
+    def test_a_request_that_ends_within_the_drain_is_answered(self):
+        def stop():
+            self.engine.holding.wait(30)
+            self.svc.begin_drain()
+            self.engine.release.set()
+        t = threading.Thread(target=stop)
+        t.start()
+        code, r = self.post(self.body)
+        t.join()
+        self.assertEqual((code, r["status"]), (200, "completed"), r)
+
+    def hang_up(self, draining):
+        """A client sends a request and closes its socket while the engine holds it; the watcher cancels it within
+        0.5 s.  -> (what the server logged, the state in the monitor)."""
+        self.svc.api_monitor = True
+        data = json.dumps(self.body).encode()
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=30) as s:
+                s.sendall(b"POST /v1/responses HTTP/1.1\r\nContent-Type: application/json\r\n"
+                          b"Content-Length: %d\r\n\r\n" % len(data) + data)
+                self.assertTrue(self.engine.holding.wait(30))
+                if draining:
+                    self.svc.begin_drain()
+            self.assertEqual(self.svc.wait_for_drain(30), 0)
+            deadline = time.monotonic() + 30             # the record closes just after the call is released
+            while "finished_at" not in self.svc.request_records()[0] and time.monotonic() < deadline:
+                time.sleep(0.01)
+        return log.getvalue(), self.svc.request_records()[0]["state"]
+
+    def test_a_client_that_hangs_up_is_a_disconnect_not_a_malformed_request(self):
+        log, state = self.hang_up(draining=False)
+        self.assertNotIn("malformed", log)
+        self.assertNotIn("Traceback", log)
+        self.assertEqual(state, "disconnected")
+
+    def test_a_client_that_hangs_up_during_a_drain(self):
+        log, state = self.hang_up(draining=True)
+        self.assertNotIn("malformed", log)
+        self.assertNotIn("Traceback", log)
+        self.assertEqual(state, "error")                 # the 503 nobody reads: known, and named in the pull request
 
 
 if __name__ == "__main__":

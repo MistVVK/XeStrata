@@ -136,6 +136,11 @@ into `components/engine/` and re-resolve to make sure a start now picks it. Any 
 Every older engine is kept until the person deletes it (Settings > Engine, `strata components remove`); `state.json` `engine.previous` is the one the last
 switch left. A new engine becomes the one in use and clears any pin. With no model installed yet (first run)
 the test is `--version` only, and the report says so.
+When the memory free at that moment is less than what the test load of the model needs, from the engine's own plan, plus 4 GB, the model is not
+loaded: the test is `--version` only, the update goes on and says so, and `state.json` marks the engine `engine.unproven`. Its first real start
+proves it (ready clears the mark). If that start fails because of the engine, not a refusal such as no memory or a busy port, the owner runtime
+switches back to `engine.previous` by itself, once, and starts again; that version is then held back (`engine.failed_unproven`) until
+`strata update --force`.
 
 Not while an engine is serving: the check uses the activity lease `strata serve` and the owner runtime already hold. `--wait SECONDS` waits;
 a terminal asks whether to wait; scripts get exit 7. The download itself may run first; the check is repeated right before the test start and

@@ -38,8 +38,9 @@ while IFS= read -r k; do
 done < <(compgen -e)
 envs=()
 for k in "${!setting[@]}"; do
-    # the engine tests the switches by presence: a value of 0 (or empty) means "not set", so it is not passed on
-    case "${setting[$k]}" in 0|"") ;; *) envs+=(-e "$k=${setting[$k]}") ;; esac
+    # an empty value means "not set", so it is not passed on. A value of 0 is a real value
+    # (e.g. STRATA_PREFILL_MMQ=0 selects the FP16 prompt path) and is passed through verbatim.
+    case "${setting[$k]}" in "") ;; *) envs+=(-e "$k=${setting[$k]}") ;; esac
 done
 shm=()
 if [ "${STRATA_SYCL_SHM:-1}" != 0 ] && [ -d /dev/shm ]; then shm=(-v /dev/shm:/dev/shm); fi

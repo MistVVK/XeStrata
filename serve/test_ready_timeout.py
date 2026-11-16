@@ -138,6 +138,26 @@ class SpawnFailure(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(narrators, [])
 
+    def test_load_with_a_missing_engine_answers_503(self):
+        """#2497's /load gap: POST /load (the web page, ahead of a request) with an engine program that cannot be
+        started is a 503 with the reason, as a request is, not a dropped connection; the server serves on."""
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        eng = StrataEngine(str(root / 'no-such-engine'), [], log=str(root / 'engine.log'), lazy=True)
+        svc = Service(eng, ByteTokenizer(), ChatTemplate(Path(__file__).parent / 'chat_template.jinja'))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.shutdown); self.addCleanup(httpd.server_close)
+        base = f'http://127.0.0.1:{httpd.server_address[1]}'
+        for _ in range(2):                                      # a second try gets the same answer
+            req = urllib.request.Request(base + '/load', data=b'{}', headers={'Content-Type': 'application/json'})
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req, timeout=30)
+            self.assertEqual(cm.exception.code, 503)
+            self.assertIn('the engine could not be started', cm.exception.read().decode())
+            self.assertTrue(eng.log.closed)
+        with urllib.request.urlopen(base + '/health', timeout=10) as r:   # the server itself is fine
+            self.assertEqual(r.status, 200)
+
 
 if __name__ == '__main__':
     unittest.main()

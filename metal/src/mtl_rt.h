@@ -23,6 +23,8 @@ struct Buffer {
     std::shared_ptr<std::vector<void*>> chunks;
     size_t stride = 0;
     size_t bias = 0;          // bytes from the MTLBuffer's start to ptr (a view onto an allocation the runtime owns)
+    // or disjoint regions (Context::wrap_ranges): chunk k holds the bytes from starts[k]; the gaps are not wrapped
+    std::shared_ptr<std::vector<size_t>> starts;
     template <class T> T* as() const { return static_cast<T*>(ptr); }
 };
 
@@ -105,6 +107,9 @@ public:
     // the same, also when bytes > maxBufferLength: then overlapping chunks, each holding any range of up to
     // max_span bytes that starts in it (max_span = the largest tensor bound at one offset)
     Buffer wrap(void* page_aligned, size_t bytes, size_t max_span);
+    // only the given [begin, end) byte ranges (page-aligned, ascending, each up to maxBufferLength), bound by their
+    // offsets from the start of p: what lies between them is never wrapped, so it stays out of the GPU's working set
+    Buffer wrap_ranges(void* page_aligned, const std::vector<std::pair<size_t, size_t>>& ranges);
     void free(Buffer& b);
 
     // Encodes `ds` into ONE compute encoder (serial or concurrent dispatch type) and ONE command buffer, `reps`

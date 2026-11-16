@@ -201,6 +201,94 @@ class HttpClient(unittest.TestCase):
         self.assertIn("could not reach", self.hub.servers["down"].error)
 
 
+class HttpSessionRestart(unittest.TestCase):
+    """#6014: an HTTP server restarted under a running engine (UE5's editor) forgets the session.  The next call starts
+    a new session (initialize + initialized) and runs once, whether the server says so with a 404 or with a JSON-RPC
+    "-32600 Unknown session id ...; client should reinitialize" in a 400 or a 200.  Nothing runs twice."""
+
+    def setUp(self):
+        self.log = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+        self.log.close()
+        self.old_log = os.environ.get("FAKE_MCP_LOG")
+        os.environ["FAKE_MCP_LOG"] = self.log.name
+
+    def tearDown(self):
+        if self.old_log is None:
+            os.environ.pop("FAKE_MCP_LOG", None)
+        else:
+            os.environ["FAKE_MCP_LOG"] = self.old_log
+        os.unlink(self.log.name)
+
+    def events(self):
+        return [json.loads(line) for line in Path(self.log.name).read_text().splitlines()]
+
+    def hub_for(self, mode, timeout_s=5.0):
+        httpd = fake.http_server(0, unknown_session=mode)
+        hub = McpHub({"web": {"url": f"http://127.0.0.1:{httpd.server_address[1]}/mcp"}}, {"timeout_s": timeout_s})
+        hub.start(wait=True)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(hub.close)
+        hub.routes()
+        return httpd, hub
+
+    def test_a_restarted_server_gets_a_new_session_and_the_call_runs_once(self):
+        for mode in ("404", "jsonrpc-400", "jsonrpc-200"):
+            with self.subTest(mode=mode):
+                httpd, hub = self.hub_for(mode)
+                self.assertEqual(hub.call("web__echo", {"text": "before"})["text"], "before")
+                first = hub.servers["web"].transport.session
+                httpd.restart()
+                open(self.log.name, "w").close()
+                r = hub.call("web__echo", {"text": "after"})
+                self.assertTrue(r["ok"], r["text"])
+                self.assertEqual(r["text"], "after")
+                self.assertNotEqual(hub.servers["web"].transport.session, first)
+                self.assertEqual(hub.servers["web"].status, "ready")
+                seen = self.events()
+                self.assertEqual(sum(1 for e in seen if e.get("call") == "echo"), 1, seen)
+                self.assertEqual(sum(1 for e in seen if "initialize" in e), 1, seen)
+
+    def test_two_callers_at_once_start_one_session(self):
+        httpd, hub = self.hub_for("jsonrpc-200")
+        httpd.restart()
+        open(self.log.name, "w").close()
+        out = {}
+        threads = [threading.Thread(target=lambda k=k: out.__setitem__(k, hub.call("web__echo", {"text": k})))
+                   for k in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(20)
+        self.assertEqual({k: v["text"] for k, v in out.items()}, {"a": "a", "b": "b"})
+        seen = self.events()
+        self.assertEqual(sum(1 for e in seen if "initialize" in e), 1, seen)
+        self.assertEqual(sum(1 for e in seen if e.get("call") == "echo"), 2, seen)
+
+    def test_a_server_that_keeps_forgetting_is_not_retried_for_ever(self):
+        httpd, hub = self.hub_for("jsonrpc-200")
+        httpd.restart()
+        httpd.forget_sessions = True
+        open(self.log.name, "w").close()
+        r = hub.call("web__echo", {"text": "x"})
+        self.assertFalse(r["ok"])
+        seen = self.events()
+        self.assertEqual(sum(1 for e in seen if e.get("call") == "echo"), 0, seen)
+        self.assertLessEqual(sum(1 for e in seen if "initialize" in e), 1, seen)
+
+    def test_other_errors_do_not_start_a_new_session_or_run_again(self):
+        httpd, hub = self.hub_for("jsonrpc-200", timeout_s=1.0)
+        first = hub.servers["web"].transport.session
+        open(self.log.name, "w").close()
+        self.assertEqual(hub.call("web__fail", {})["text"], "error: it failed on purpose")
+        self.assertIn("timed out", hub.call("web__sleep", {"seconds": 2})["text"])     # an answer lost after the work
+        time.sleep(1.2)                                                                # let the slow call finish
+        seen = self.events()
+        self.assertEqual([e.get("call") for e in seen if "call" in e], ["fail", "sleep"], seen)
+        self.assertFalse(any("initialize" in e for e in seen), seen)
+        self.assertEqual(hub.servers["web"].transport.session, first)
+
+
 class Config(unittest.TestCase):
     def test_both_spellings_and_the_file(self):
         with tempfile.TemporaryDirectory() as d:

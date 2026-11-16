@@ -91,6 +91,7 @@ if has pkg; then
   python3 packaging/package_engine.py --src "$STAGE" --backend metal --version "$VERSION" --out "$OUT" --arch apple-gpu --build-id "$BUILD_ID+metal" --platform macos-arm64 --tree
   python3 packaging/package_engine.py --verify "$PKG"
   python3 packaging/binary_deps.py "$PKG"
+  python3 packaging/binary_deps.py --mac-min-os "$PKG"            # #4634: strata and strata-vision start on the app's minimum macOS
   test -f "$PKG/strata-vision" || { echo "strata-vision is not in the Mac engine package"; exit 1; }
   # the quant header must be the text in the package, under both names (a forwarder there would leave the Metal kernels without their block layouts)
   for n in strata-quant-common.h ggml-common.h; do

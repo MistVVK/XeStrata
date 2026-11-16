@@ -38,6 +38,8 @@ STORY_SCHEMA = object_schema({
     "suggestions": {"type": "array", "items": object_schema({"what": TEXT, "why": TEXT,
         "boxes": {"type": "array", "items": {"type": "integer"}}, "description": TEXT})}})
 FORMAT = {"type": "json_schema", "json_schema": {"name": "h3_story", "strict": True, "schema": STORY_SCHEMA}}
+EXEC = [{"type": "function", "function": {"name": "exec_command", "description": "Runs a command.",
+         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}}]
 
 
 class Structured(unittest.TestCase):
@@ -176,10 +178,40 @@ class Structured(unittest.TestCase):
             for fmt in formats:
                 with self.subTest(fmt=fmt):
                     self.assertEqual(self.chat(response_format=fmt)[0], 400)
-            self.assertEqual(self.chat(tools=[{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}])[0], 400)
             self.assertEqual(self.chat(strata_mcp=True)[0], 400)
             self.assertEqual(self.request("/v1/chat/completions", [])[0], 400)
             load.assert_not_called()
+
+    def test_a_tool_call_passes_through_with_a_format(self):
+        call = ("Let me look.\n</think>\n\nChecking.\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\n"
+                "cat a.txt\n</parameter>\n</function>\n</tool_call>")
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                code, reply = self.chat(call, tools=EXEC, stream=stream)
+                self.assertEqual(code, 200, reply)
+                if stream:
+                    chunks = [json.loads(line[6:]) for line in reply.splitlines() if line.startswith("data: {")]
+                    calls = [tc for c in chunks for tc in c["choices"][0]["delta"].get("tool_calls") or []]
+                    self.assertEqual(calls[0]["function"]["name"], "exec_command")
+                    self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+                else:
+                    message = reply["choices"][0]["message"]
+                    self.assertEqual(reply["choices"][0]["finish_reason"], "tool_calls")
+                    self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {"cmd": "cat a.txt"})
+        self.assertIn("applies only to your final answer", self.tok.decode(self.engine.last_prompt))
+
+    def test_the_final_answer_with_tools_is_the_schema_object(self):
+        code, reply = self.chat(tools=EXEC)
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(json.loads(reply["choices"][0]["message"]["content"]), STORY)
+        code, raw = self.chat(tools=EXEC, stream=True)
+        chunks = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        self.assertEqual(json.loads("".join(c["choices"][0]["delta"].get("content", "") for c in chunks)), STORY)
+
+    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")
+    def test_a_final_answer_with_tools_that_breaks_the_schema_fails(self):
+        code, reply = self.chat('{"title":"Only a title"}', tools=EXEC)
+        self.assertEqual((code, reply["error"]["code"]), (502, "structured_output_failed"))
 
     def test_without_jsonschema_an_object_is_still_required(self):
         # jsonschema is optional: without it json_schema answers are checked to be one JSON object, json_object

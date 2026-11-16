@@ -98,7 +98,7 @@ function hardwareSnapshot() {
     vramTotalGb:memory.total,
     ramUsedGb:systemReading?.ramUsedGb??null,ramTotalGb:systemReading?.ramTotalGb??hw.ramTotalGb,
     gpuTempC:aggregate(readings,'temperatureC','max'),tempLimitC:hw.tempLimitC,
-    powerW:aggregate(readings,'powerW'),powerLimitW:aggregate(readings,'powerLimitW'),
+    powerW:reportedPowerW(readings),powerLimitW:reportedPowerW(readings,'powerLimitW'),
     pcieRxMbs:aggregate(readings,'pcieRxMbs'),
     cpuTempC:demo?54:temperatures.cpuTempC,ssdTempC:demo?41:temperatures.ssdTempC,energyWh:round(energyWh(),3),
     diskReadGbs:systemReading?.diskReadGbs??null,diskWriteMbs:systemReading?.diskWriteMbs??null,

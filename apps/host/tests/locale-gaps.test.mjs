@@ -13,7 +13,7 @@ for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) await loadCata
 
 test('every tr("...") literal and every command hint has a key in the English catalog, so no language is stuck in English (#3479)', async () => {
   const known = new Set();
-  for (const name of ['en', 'tune-en', 'tools-en', 'fix-en', 'gh-en', 'ui-en', 'engine-en', 'pick-en', 'df2-en', 'upd-en', 'r3-en', 'pic-en', 'gui-en', 'sav-en']) for (const v of Object.values(await read(name))) known.add(String(v));
+  for (const name of ['en', 'tune-en', 'tools-en', 'fix-en', 'gh-en', 'ui-en', 'engine-en', 'pick-en', 'df2-en', 'upd-en', 'r3-en', 'pic-en', 'gui-en', 'sav-en', 'dmg-en']) for (const v of Object.values(await read(name))) known.add(String(v));
   const missing = [];
   const scan = async dir => {
     for (const entry of await readdir(dir, { withFileTypes: true })) {

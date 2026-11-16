@@ -646,6 +646,51 @@ htest("language: /?lang= is for one visit, an unknown code stays English, every 
   }
 });
 
+// ------------------------------------------------------------------------------------------------ IME keys (#5071)
+// A headless browser has no IME: the events one sends are replayed in the page. Safari's commit is a compositionend, then
+// keydown(Enter, keyCode 229, isComposing false); Chrome's commit and cancel are keydowns with isComposing true and keyCode 229.
+const imeKeys = (page, selector, steps) => page.$eval(selector, (el, steps) => {
+  for (const s of steps) {
+    if (s === "start" || s === "end") { el.dispatchEvent(new CompositionEvent(s === "start" ? "compositionstart" : "compositionend", { bubbles: true, data: "日本語" })); continue; }
+    const e = new KeyboardEvent("keydown", { key: s.key, code: s.key, isComposing: !!s.composing, bubbles: true, cancelable: true });
+    Object.defineProperty(e, "keyCode", { value: 229 });
+    el.dispatchEvent(e);
+  }
+}, steps);
+
+htest("ime: the key that commits or cancels a conversion does not send, end a rename or close the answer editor (#5071)", async ({ browser, mock }) => {
+  const page = await openPage(browser, mock, { seed: on() });
+  await page.click("#input");
+  await page.$eval("#input", (e) => { e.value = "日本語"; e.dispatchEvent(new Event("input")); });
+  await imeKeys(page, "#input", ["start", "end", { key: "Enter" }]);            // Safari's order
+  await imeKeys(page, "#input", ["start", { key: "Enter", composing: true }, "end"]);   // Chrome's
+  await sleep(150);
+  assert.equal(mock.state.requests.length, 0, "a commit Enter sent the message");
+  await page.keyboard.press("Enter");
+  await idle(page); await sleep(80);
+  assert.deepEqual(await texts(page), ["u:日本語", "a:Mock answer 1."], "the next Enter sends, once");
+  // rename: neither the commit Enter nor the cancelling Escape ends it; a real Enter keeps the name
+  const row = await (await page.evaluateHandle(() => document.querySelector(".chat-item"))).asElement();
+  await row.hover();
+  await (await row.$("[data-rename]")).click();
+  await page.$eval(".chat-item__input", (e) => { e.value = "庭の計画"; });
+  await imeKeys(page, ".chat-item__input", ["start", "end", { key: "Enter" }]);
+  await imeKeys(page, ".chat-item__input", ["start", { key: "Escape", composing: true }, "end"]);
+  assert.ok(await page.$(".chat-item__input"), "the rename was ended by an IME key");
+  await sleep(100);                                   // a person's next key comes later than the commit window (50 ms)
+  await page.keyboard.press("Enter");
+  assert.deepEqual(await sidebarTitles(page), ["庭の計画"]);
+  // the answer editor: the cancelling Escape does not close it, a real Escape does
+  await clickAction(page, 1, "Edit answer");
+  await imeKeys(page, ".history-editor textarea", ["start", { key: "Escape", composing: true }, "end"]);
+  assert.ok(await page.$(".history-editor"), "the editor was closed by an IME key");
+  await sleep(100);
+  await page.keyboard.press("Escape");
+  assert.equal(await page.$(".history-editor"), null);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+});
+
 const mock = await startMock();
 const browser = await launch();
 await run(async () => ({ browser, mock, close: async () => { await browser.close(); await mock.stop(); } }));

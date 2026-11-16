@@ -3,6 +3,8 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_doorbell.hpp"
+#include "strata/core/window_wait.hpp"
 #include "strata/sycl_queue.hpp"
 #include "strata/kprof.hpp"
 #include "strata/core/verify.hpp"
@@ -398,6 +400,21 @@ const int64_t g_test_stall = [] {
     const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
     return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
 }();
+// #5160 test hook, compiled only into a test build (cmake -DSTRATA_SYCL_TEST_HOOKS=ON; released engines have no such switch):
+// STRATA_TEST_POOL_DELAY=W:K:MS sleeps MS ms after the CPU step K of window W (0-based), so the GPU's wait on that step
+// runs out with a small STRATA_SPIN_MAX.  Without the build option this is an empty function.
+void test_pool_delay(int64_t window, int64_t step) {
+#ifdef STRATA_SYCL_TEST_HOOKS
+    static long long tw = -1, tk = -1, tms = 0;
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_TEST_POOL_DELAY");
+        return e != nullptr && std::sscanf(e, "%lld:%lld:%lld", &tw, &tk, &tms) == 3 && tms > 0;
+    }();
+    if (on && window == tw && step == tk) std::this_thread::sleep_for(std::chrono::milliseconds(tms));
+#else
+    (void) window; (void) step;
+#endif
+}
 }  // namespace
 
 bool Verifier::release_gpu_waits(int timeout_ms) try {
@@ -427,6 +444,58 @@ bool Verifier::release_gpu_waits(int timeout_ms) try {
     return true;
 } catch (...) {
     return false;   // the runtime may already be tearing down (the watchdog's path ends the engine)
+}
+
+bool Verifier::drain_failed_window(int timeout_ms) try {
+    trace_ev("DRAIN", -1, -1, timeout_ms);
+    // as release_gpu_waits: every flag past every ring, so the window's remaining waits pass at once (the host has stopped
+    // serving it); then the queues, bounded.  Drained: the next stage_inputs() resets the flags and re-arms the record.
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
+        if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    for (dpct::queue_ptr q : {cs_, copy_}) {
+        if (q == nullptr) continue;
+        while (!q->ext_oneapi_empty()) {
+            if (ms_since(t0) > timeout_ms) {
+                released_.store(true);   // still running: no later window may share its buffers
+                trace_ev("DRAIN-NOT-DRAINED", -1, -1, (int64_t) ms_since(t0));
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    trace_ev("DRAINED", -1, -1, (int64_t) ms_since(t0));
+    return true;
+} catch (...) {
+    released_.store(true);
+    return false;
+}
+
+bool Verifier::wait_failed(int64_t pos0, int T, int G, bool drain, std::string& err) {
+    const WaitExpiry x = wait_record_read(h_wrec_);
+    if (!x.expired()) return false;
+    const bool drained = drain ? drain_failed_window(5000) : true;
+    ++waits_expired;
+    const int g = G > 0 ? G : 1;
+    const int64_t step = x.step > 0 ? (int64_t) x.step - 1 : 0;
+    const int64_t layer = (x.site == kWaitFirst) ? 1 : lb_ + step / g;
+    const int grp = (int) (step % g);
+    char buf[640];
+    std::snprintf(buf, sizeof buf,
+                  "verify: the GPU stopped waiting for %s of layer %lld (group %d, window %lld at position %lld, %d tokens, "
+                  "device %d layers [%lld,%lld)): the CPU took %.0f ms, longer than the GPU's wait of %u reads; the window was "
+                  "discarded%s%s%s",
+                  wait_site_name(x.site), (long long) layer, grp, (long long) windows, (long long) pos0, T, device_,
+                  (long long) lb_, (long long) le_, wpool_ms_, (unsigned) strata::spin_max(*cs_),
+                  x.count > 1 ? (" (" + std::to_string(x.count) + " waits ran out)").c_str() : "",
+                  x.epoch != wepoch_ ? " (the record carries another window's epoch)" : "",
+                  drained ? "" : "; the GPU did not finish within 5 s, so this verifier takes no further windows");
+    err = buf;
+    trace_ev("WAIT-EXPIRED", (int64_t) x.step, layer, (int64_t) x.site);
+    return true;
 }
 
 void Verifier::trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const {
@@ -545,7 +614,7 @@ Verifier::~Verifier() try {
     if (tap_dev_) sycl::free(tap_dev_, dpct::get_in_order_queue());
     if (arena_) sycl::free(arena_, dpct::get_in_order_queue());
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_wrec_};
     for (void* h : hosts)
         if (h) strata::host_free_polled(h, dpct::get_in_order_queue());
 } catch (...) {
@@ -634,6 +703,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
+              mapped(64, (void**) &h_wrec_, (void**) &m_wrec_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // DFlash2 taps (set_taps): off, and nothing is allocated or recorded, otherwise
@@ -853,6 +923,14 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
         device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
     }
+    // a window the host serves waits for it: with CPU-served experts (no device plan), with the device plan and non-resident
+    // experts, and ALSO a stage that starts 100% resident: refresh_ar() runs its windows on the doorbell graph whenever a prompt
+    // loan, a VRAM shrink or a swap takes an expert out of VRAM, and that graph asks the host at every layer (measured:
+    // --layer-split 26, --max-context 65536, "100% VRAM resident" stages, a wait expired at 20,000 reads under 4 concurrent
+    // extractions). None of these is the xe "every expert resident, the wait only spins in a failure" case the short bound is
+    // sized for, so the bound goes up whenever the host can be asked (h_res_ present) or must be (not all resident). The flag is
+    // process-wide (a stage of a --layer-split run raises it for every device) and spin_max() no longer freezes its answer.
+    if (!all_resident_ || h_res_ != nullptr) strata::spin_host_waits_expected(true);
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
         if (DPCT_CHECK_ERROR(qcnt_ = sycl::malloc_device<unsigned int>(
@@ -1058,7 +1136,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
             if (grp == 0) {
-                if (ar_on()) wait_flag_ge(m_flag_, 1, cs);
+                if (ar_on()) wait_flag_ge(m_flag_, 1, cs, m_wrec_, kWaitFirst);
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
@@ -1681,10 +1759,10 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             stamp(l, 20, grp);
         } else {
             if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
-                if (!lean) wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
+                if (!lean) wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs, m_wrec_, kWaitDevicePlan);
                 if (!lean) copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
             } else {
-                wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
+                wait_flag_ge(m_flagA_, ring, cs, m_wrec_, kWaitPlan);   // the pool published this group's GPU plan
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
             stamp(l, 19, grp);
@@ -1692,8 +1770,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             stamp(l, 20, grp);
             // stepped mode: the plan copy + VRAM groups end a segment, so they run while the CPU computes its rows
             if (step_hook2_ && !step_hook2_(l, grp)) { if (err.empty()) err = "verify: stepped split failed"; return false; }
-            if (device_plan_) { if (!lean) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs); }
-            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+            if (device_plan_) { if (!lean) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs, m_wrec_, kWaitDevicePlan); }
+            else wait_flag_ge(m_flagB_, ring, cs, m_wrec_, kWaitPcie);   // the PCIe share is in staging (DMA) or mapped
             if (!lean && sink_.pcie_mode == 2) {                 // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
@@ -1706,11 +1784,11 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             if (!lean) grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);   // (lean: the device plan leaves it empty)
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
-                if (!lean) wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+                if (!lean) wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs, m_wrec_, kWaitDevicePlan);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
             } else {
-                wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
+                wait_flag_ge(m_flag_, ring, cs, m_wrec_, kWaitRows);   // the CPU's share is in the mapped rows
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
@@ -2211,6 +2289,8 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    wait_record_arm(h_wrec_, ++wepoch_);   // #5160: this window's wait record (the previous window has completed)
+    wpool_ms_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -2590,6 +2670,9 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
         if (remote_opt_) remote_opt_->end();
+        test_pool_delay(windows, k);
+        wpool_ms_ = std::max(wpool_ms_, ms_since(b));
+        if (wait_failed(pos0, T, G, true, err)) return false;   // #5160: the GPU went on without this step: give the window up
         if (std::FILE* lf = layer_hash_file()) {   // debug only (STRATA_LAYER_HASH_FILE)
             std::fprintf(lf, "%lld %lld %d %016llx %016llx %016llx %016llx\n", (long long) windows, (long long) l, n,
                          (unsigned long long) layer_hash_fnv(h_x_ + (size_t) tb * g.n_embd, (size_t) n * g.n_embd * 4),
@@ -2660,6 +2743,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         err = std::string("verify: ") + dpct::get_error_string_dummy(se);
         return false;
     }
+    if (wait_failed(pos0, T, G, false, err)) return false;   // #5160: a wait ran out: the window's tokens are not used
     if (expert_usage_counts_d_) {
         if (!expert_usage_counter_ || expert_usage_counter_->size() != expert_usage_counts_h_.size())
             throw std::runtime_error("mirror adaptive expert usage is unbound");
@@ -3524,6 +3608,8 @@ bool Verifier::stage_batch(const int *rows, int S, int hbase,
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    wait_record_arm(h_wrec_, ++wepoch_);   // #5160: this window's wait record (the previous window has completed)
+    wpool_ms_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
@@ -3606,6 +3692,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
           return false;
         }
         copy_->wait();
+        if (wait_failed(pos[0], S, 1, false, err)) return false;   // #5160
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -3655,6 +3742,9 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
         set_plan_slot(0);
         progress_at("verify batch: the CPU experts of layer", l);
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        test_pool_delay(windows, k);
+        wpool_ms_ = std::max(wpool_ms_, ms_since(b));
+        if (wait_failed(pos[0], S, 1, true, err)) return false;   // #5160
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -3689,6 +3779,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
       return false;
     }
     copy_->wait();
+    if (wait_failed(pos[0], S, 1, false, err)) return false;   // #5160
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -3926,6 +4017,9 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
         cur_layer_ = want - 1;
         set_plan_slot(0);
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+        test_pool_delay(windows, b_k_);
+        wpool_ms_ = std::max(wpool_ms_, ms_since(b));
+        if (wait_failed(last_pos_b_[0], S, 1, true, err)) { b_running_ = false; return -1; }   // #5160
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -3980,6 +4074,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
     to rewrite this code.
     */
     if (qc == 1) return 0;
+    if (wait_failed(last_pos_b_[0], S, 1, false, err)) { b_running_ = false; return -1; }   // #5160
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
@@ -4256,6 +4351,9 @@ int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        test_pool_delay(windows, fl_k_);
+        wpool_ms_ = std::max(wpool_ms_, ms_since(b));
+        if (wait_failed(last_pos0_, T, G, true, err)) { fl_active_ = false; return -1; }   // #5160
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", fl_k_, l,
                               (int64_t) ms_since(b));
         progress_tick();
@@ -4344,6 +4442,10 @@ bool Verifier::pl_finish(int32_t *out, std::string &err) try {
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     fl_active_ = false;
+    {   // #5160: a wait of this window ran out: its tokens are not used
+        const int Gp = groups_[fl_T_] > 0 ? groups_[fl_T_] : 1;
+        if (wait_failed(last_pos0_, fl_T_, Gp, false, err)) return false;
+    }
     if (fl_prof_) accumulate_profile(prof_pin_);
     ++windows;
     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));

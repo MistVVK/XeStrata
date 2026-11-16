@@ -14,6 +14,9 @@ export const PICTURE_FETCH_FAMILIES = ['qwen', 'coder', 'unsloth', 'gyro', 'swif
 export const fetchesPictures = (version: { sourceFamily?: string } | undefined, packaged: boolean | undefined) => !!version && packaged === true && PICTURE_FETCH_FAMILIES.includes(version.sourceFamily ?? '');
 /** The one line that says how a version differs from its neighbours (the three NVFP4 versions); empty for the rest. */
 export const versionNote=(model:string)=>{const nv=nvfp4Version(model);return nv?tr(nv.note):'';};
+/** Whether a display group has a KV-format choice (the Models screen's "Context memory"): Qwen3.6-35B-A3B has none, its engine path ignores --kv and
+ *  setup records no format for it, so the select is not shown there (#5919, owner's decision). Every other group keeps it. */
+export const hasKvChoice=(group?:string)=>group!=='qwen3.6';
 /** Display groups are distinct from the engine's installation family IDs. */
 export function nativeCatalogModels(families:NativeFamily[]):CatalogModel[]{
  if(!families.length)return[];

@@ -719,6 +719,52 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+        // #5697: an image that cannot fit beside the pinned entry even with every other entry gone is refused BEFORE
+        // anything is evicted: the two ordinary conversations stay parked (before, both were evicted, then refused)
+        auto p3 = image({1,2,3});
+        p3.checkpoints.push_back(ConversationCheckpoint{});
+        p3.checkpoints.back().ids = {1,2};
+        p3.checkpoints.back().pinned = true;
+        p3.checkpoints.back().gdn.resize(64, 1);
+        ConversationCache keep(pinned_bytes + one * 2, 4);
+        check(keep.put(std::move(p3)) && keep.put(image({7,8,9})) && keep.put(image({4,5,6})) && keep.size() == 3,
+              "a pinned conversation and two ordinary ones are parked");
+        check(!keep.make_room(one * 2 + 1) && keep.size() == 3 && keep.evictions() == 0,
+              "a park too big for the room beside the pin is refused with nothing evicted");
+        check(keep.best(std::vector<int32_t>{7,8,9,1}, {}, true).tokens == 3 && keep.best(std::vector<int32_t>{4,5,6,1}, {}, true).tokens == 3,
+              "both ordinary conversations can still be restored");
+        check(keep.make_room(one * 2) && keep.size() == 1 && keep.evictions() == 2,
+              "a park that fits once both go evicts both (as before)");
+        ConversationCache slots(pinned_bytes * 4 + one * 4, 1);
+        auto p4 = image({1,2,3});
+        p4.checkpoints.push_back(ConversationCheckpoint{});
+        p4.checkpoints.back().ids = {1,2};
+        p4.checkpoints.back().pinned = true;
+        p4.checkpoints.back().gdn.resize(64, 1);
+        check(slots.put(std::move(p4)) && !slots.make_room(one) && slots.size() == 1 && slots.evictions() == 0,
+              "one slot, held by a pin: refused, nothing evicted");
+    }
+    {   // P2: an evicted conversation goes to the sink (the SSD tier), whole; superseded copies and clear() do not
+        const size_t one = image({1,2,3}).bytes();
+        ConversationCache c(one * 2, 4);
+        std::vector<SavedConversation> sunk;
+        c.set_evict_sink([&](SavedConversation&& s) { sunk.push_back(std::move(s)); });
+        check(c.put(image({1,2,3})) && c.put(image({4,5,6})), "two parked");
+        check(c.put(image({7,8,9})) && sunk.size() == 1 && sunk[0].live.ids == std::vector<int32_t>({1,2,3}) &&
+              sunk[0].live.gdn == std::vector<uint8_t>(64, 7), "the budget's eviction hands the oldest over whole");
+        check(c.evict_oldest() && sunk.size() == 2 && sunk[1].live.ids == std::vector<int32_t>({4,5,6}),
+              "the RAM gate's eviction too");
+        check(c.size() == 1 && c.evictions() == 2, "the cache keeps its own count as before");
+        auto chained = image({7,8,9,10});
+        chained.checkpoints.push_back(ConversationCheckpoint{});
+        chained.checkpoints.back().ids = {7,8,9};
+        check(c.drop_superseded(chained.live.ids, chained.live.imgs, chained.checkpoints, true) == 0 && sunk.size() == 2,
+              "(a parked entry with no checkpoint is never superseded)");
+        c.put(image({11,12,13}));
+        const size_t before = sunk.size();
+        check(c.clear() > 0 && sunk.size() == before, "#879's clear() hands nothing over");
+        ConversationCache plain(one, 4);
+        check(plain.put(image({1,2,3})) && plain.put(image({4,5,6})) && plain.size() == 1, "without a sink: evicted as before");
     }
     {
         // #4420: a batch slot's chain holds one checkpoint (its admission's): parking it must not drop (#342) the main session's copy of the

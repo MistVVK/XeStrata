@@ -102,8 +102,87 @@ def real_model_file(path: Path) -> Path:
     return target
 
 
+def tensor_types(path: Path) -> dict[str, int]:
+    """name -> GGML type of every tensor in one GGUF v3 shard's directory (a link to one is followed), read within the same bounds as
+    inspect_metadata; the metadata values are skipped. For the Qwen3.6 loader check (strata_control/q36_types.py)."""
+    try:
+        path = real_model_file(Path(path))
+        descriptor = os.open(path, os.O_RDONLY)
+        with os.fdopen(descriptor, "rb") as stream:
+            details = os.fstat(stream.fileno())
+            if not stat.S_ISREG(details.st_mode):
+                raise ProfileError("GGUF shard must be a regular file", 5)
+            reader = _Reader(stream, details.st_size)
+            if reader.take(4) != b"GGUF":
+                raise ProfileError("file does not begin with a GGUF header", 5)
+            version, tensors, keys = reader.u32(), reader.u64(), reader.u64()
+            if version != 3:
+                raise ProfileError("Strata metadata preflight requires GGUF v3", 5)
+            if not 0 <= tensors <= MAX_TENSORS or keys > MAX_METADATA_KEYS:
+                raise ProfileError("GGUF tensor or metadata count exceeds the inspection limit", 5)
+            for _ in range(keys):
+                if reader.string() is not None:                # (skipped)
+                    pass
+                reader.value(reader.u32())
+            out: dict[str, int] = {}
+            for _ in range(tensors):
+                name = reader.string(capture=True)
+                if not name or len(name) > 256:
+                    raise ProfileError("GGUF tensor name is invalid or too long", 5)
+                dimensions = reader.u32()
+                if not 1 <= dimensions <= 8:
+                    raise ProfileError("GGUF tensor dimension count is invalid", 5)
+                reader.skip(8 * dimensions)
+                out[name] = reader.u32()
+                reader.skip(8)
+            return out
+    except OSError:
+        raise ProfileError("GGUF metadata could not be read", 5) from None
+
+
+_RESULT_TYPES = {"architecture": (str, type(None)), "projector_type": (str, type(None)), "tokenizer_model": (str, type(None)),
+                 "tokenizer_tokens_present": bool, "tokenizer_merges_present": bool, "tensor_count_reported": int,
+                 "tensor_count_scanned": int, "tensor_types": dict, "expert_tensor_types": dict, "header_bytes_scanned": int,
+                 "payload_bytes_required": int, "payload_extent_valid": bool}
+
+
+def _valid_result(value: object) -> bool:
+    """The native helper's result has exactly the Python result's keys and types (bool is not taken for int)."""
+    if not isinstance(value, dict) or set(value) != set(_RESULT_TYPES):
+        return False
+    for key, kinds in _RESULT_TYPES.items():
+        item = value[key]
+        if not isinstance(item, kinds) or (kinds is int and type(item) is bool):
+            return False
+        if kinds is int and item < 0:
+            return False
+    for key in ("tensor_types", "expert_tensor_types"):
+        if not all(isinstance(k, str) and type(v) is int and v >= 0 for k, v in value[key].items()):
+            return False
+    return value["tensor_count_scanned"] == value["tensor_count_reported"] and value["payload_extent_valid"] is True
+
+
+def _native_inspect(path: Path) -> dict | None:
+    """#5961: the strata-gguf-preflight helper's answer under the native-helper contract (strata_control/native_helpers.py), only when it is
+    opted in. None: not opted in, or the helper broke the contract (the Python reader below is then the answer). A rejection it gives within
+    the contract is a rejection here too, with its code."""
+    from strata_control import native_helpers
+    if not native_helpers.enabled("gguf-preflight"):
+        return None
+    target = real_model_file(Path(path))                 # the same link and regular-file rule as the Python path, before the helper sees it
+    try:
+        return native_helpers.call("gguf-preflight", "inspect", [str(target)], validate=_valid_result)
+    except native_helpers.Rejected as exc:
+        raise ProfileError(exc.message, exc.code if exc.code in (5, 6) else 5) from None
+    except native_helpers.Unavailable:
+        return None
+
+
 def inspect_metadata(path: Path) -> dict:
     """Return only bounded compatibility signals from one regular GGUF v3 shard (a link to one is followed)."""
+    native = _native_inspect(path)
+    if native is not None:
+        return native
     try:
         path = real_model_file(Path(path))
         descriptor = os.open(path, os.O_RDONLY)

@@ -125,6 +125,45 @@ class ContextOverflow(unittest.TestCase):
                     self.assertEqual(status, 400, body)
                     self.assertIn("no room to answer", body["error"]["message"])
 
+    def test_fit_never_shortens_below_room_for_an_answer(self):
+        # #5924: "max_tokens 4096 shortened to 221" left a thinking model no answer; agents looped on one sentence.
+        # Below the floor the default (fit on) answers the context 400 instead, before anything is generated;
+        # Anthropic's wording is the one Claude Code compacts on.  At the floor it still shortens, and a max_tokens
+        # the room holds is never touched.
+        from serve.server import FIT_MIN_ROOM, fit_floor
+        self.assertEqual(fit_floor(CTX), FIT_MIN_ROOM)
+        self.assertEqual(fit_floor(1024 + CTX_SLACK), 256)          # a small context keeps a quarter as its floor
+        self.svc.fit_max_tokens = True
+        tight = CTX - CTX_SLACK - 221                               # the report's 221 tokens of room
+        for path, key in APIS:
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    with mock.patch.object(self.engine, "generate") as generate:
+                        status, _, body = self.post(path, key, tight, 4096, stream)
+                    generate.assert_not_called()
+                    self.assertEqual(status, 400, body)
+                    message = body["error"]["message"]
+                    self.assertIn("exceeds the context window", message)
+                    self.assertIn(f"the prompt ({tight} tokens) leaves 221 of the {CTX}-token context, fewer than "
+                                  f"the {FIT_MIN_ROOM} an answer needs", message)
+                    self.assertIn("send max_tokens 221 or less", message)
+                    if path == "/v1/messages":
+                        self.assertTrue(message.startswith(
+                            f"prompt is too long: {tight} tokens > {CTX - CTX_SLACK - FIT_MIN_ROOM} maximum; "), message)
+                    if path == "/v1/responses":
+                        self.assertEqual(body["error"]["code"], "context_length_exceeded")
+        for path, key in APIS:
+            with self.subTest(path=path, case="at the floor"):
+                with mock.patch.object(self.engine, "generate", wraps=self.engine.generate) as generate:
+                    status, _, body = self.post(path, key, CTX - CTX_SLACK - FIT_MIN_ROOM, 4096)
+                self.assertEqual(status, 200, body)
+                self.assertEqual(generate.call_args.args[1], FIT_MIN_ROOM)
+            with self.subTest(path=path, case="fits"):
+                with mock.patch.object(self.engine, "generate", wraps=self.engine.generate) as generate:
+                    status, _, body = self.post(path, key, tight, 200)
+                self.assertEqual(status, 200, body)
+                self.assertEqual(generate.call_args.args[1], 200)
+
     def test_one_token_of_room_still_answers_but_zero_is_rejected(self):
         for path, key in APIS:
             for fit in (False, True):

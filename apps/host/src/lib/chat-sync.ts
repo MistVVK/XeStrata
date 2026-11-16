@@ -25,7 +25,7 @@ export function createHttpTransport(fetchImpl: typeof fetch = (...args) => fetch
     throw new TransportError(message, res.status, code);
   }
   return {
-    async list() { return await (await call('GET', '/api/chats')).json() as { chats: HostChatEntry[]; damaged?: string[] }; },
+    async list() { return await (await call('GET', '/api/chats')).json() as { chats: HostChatEntry[]; damaged?: string[]; newer?: string[] }; },
     async get(id) {
       try {
         const data = await (await call('GET', `/api/chats/${encodeURIComponent(id)}`)).json() as { rev: number; session: Session };
@@ -58,6 +58,11 @@ export interface HydrateResult {
   failed: { id: string; error: string; code?: string }[];
   /** Chats that came back from the last-moment copy because the host's version was older. */
   recovered: string[];
+  /** The chat files the host has a name for but cannot read (a hand-edited file, a truncated one, a format from a later release).
+   *  They have no entries to show, so the page lists the ids and lets the person delete one (#5421). */
+  damaged: string[];
+  /** Chats saved by a newer Strata: shown with a note to update, never offered for deletion (#5421 review). */
+  newer: string[];
 }
 
 /** By name, so it holds across two copies of this module (a bundle per test file). */
@@ -94,26 +99,47 @@ export async function hydrateChats(opts: {
   isLive?: (id: string) => boolean;
   /** Whether a chat in memory has changes the host does not have yet. */
   isDirty?: (session: Session) => boolean;
+  /** For tests: this window's name, the clock and the wait while another window moves the browser's chats. */
+  windowId?: string;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }): Promise<HydrateResult> {
   const { transport, browser } = opts;
   const isLive = opts.isLive ?? (() => false);
   const isDirty = opts.isDirty ?? (() => false);
   let moved = 0;
   const failed: HydrateResult['failed'] = [];
+  const owner = opts.windowId ?? WINDOW_ID;
+  const now = opts.now ?? Date.now;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
   try {
-    let flagged = false;
-    try { flagged = browser.getItem(HOST_FLAG_KEY) === '1'; } catch { flagged = false; }
     let list = await transport.list();
-    if (!flagged) {
-      const old = readBrowserSessions(browser).sessions;
-      if (old.length) {
-        const result = await transport.importMany(old);
-        moved = result.imported.length;
-        failed.push(...result.failed);
-        list = await transport.list();
+    // Read after the list: two windows opened together both see "not moved" before either has finished (#5422).
+    let move = claimHandover(browser, owner, now());
+    while (move === 'theirs') {
+      // Another window is moving the browser's chats now: wait for it, then read what it moved. A claim it never finishes
+      // (the window closed) runs out and this window moves them; one it gave up (the host refused a chat) is taken over at once.
+      await sleep(HANDOVER_POLL_MS);
+      move = claimHandover(browser, owner, now());
+      if (move === 'done') list = await transport.list();
+    }
+    if (move === 'mine') {
+      const mine = readFlag(browser);
+      try {
+        const old = readBrowserSessions(browser).sessions;
+        if (old.length) {
+          const result = await transport.importMany(old);
+          moved = result.imported.length;
+          failed.push(...result.failed);
+          list = await transport.list();
+        }
+      } catch (e) {
+        releaseHandover(browser, mine);
+        throw e;
       }
-      // Set only when nothing was refused: a disk-full move is tried again at the next start.
-      if (!failed.length) { try { browser.setItem(HOST_FLAG_KEY, '1'); } catch { /* the flag is a courtesy; the host skips what it has */ } }
+      // Done only when nothing was refused: a disk-full move is tried again at the next start.
+      if (failed.length) releaseHandover(browser, mine);
+      else { try { browser.setItem(HOST_FLAG_KEY, '1'); } catch { /* the flag is a courtesy; the host skips what it has */ } }
     }
     const fromHost = await readAll(transport, list.chats);
     const revs = new Map([...fromHost].map(([id, v]) => [id, v.rev]));
@@ -131,11 +157,53 @@ export async function hydrateChats(opts: {
     const onlyHere = opts.current.filter(s => !hostIds.has(s.id));
     const sessions = [...onlyHere, ...merged];
     const recovered = takeLastMomentCopy(browser, sessions, revs);
-    return { sessions: recovered.sessions, revs, offline: false, moved, failed, recovered: recovered.ids };
+    return { sessions: recovered.sessions, revs, offline: false, moved, failed, recovered: recovered.ids, damaged: list.damaged ?? [], newer: list.newer ?? [] };
   } catch (e) {
-    if (isTransportError(e)) return { sessions: opts.current, revs: new Map(), offline: true, moved, failed, recovered: [] };
+    if (isTransportError(e)) return { sessions: opts.current, revs: new Map(), offline: true, moved, failed, recovered: [], damaged: [], newer: [] };
     throw e;
   }
+}
+
+/* ---------------------------------------------------------- one window moves the browser's chats */
+
+/** How long one window's claim on the move holds; after that another window takes it over (the first one closed mid-move). */
+export const HANDOVER_LEASE_MS = 30_000;
+const HANDOVER_POLL_MS = 250;
+const CLAIM = 'claim:';
+
+function readFlag(browser: StorageLike): string | null {
+  try { return browser.getItem(HOST_FLAG_KEY); } catch { return null; }
+}
+
+/**
+ * Who moves the browser's chats to the host: 'done' (moved before), 'mine' (this window, now) or 'theirs' (another window that
+ * claimed it moments ago). The claim is the flag itself ("claim:<window>:<time>"), written before the move and read back, so two
+ * windows opened together do not both send the whole archive (#5422). Storage that cannot be read or written moves as before
+ * (the host skips what it has).
+ */
+export function claimHandover(browser: StorageLike, owner: string, now: number): 'done' | 'mine' | 'theirs' {
+  const v = readFlag(browser);
+  if (v === '1') return 'done';
+  if (v?.startsWith(CLAIM)) {
+    const at = Number(v.slice(v.lastIndexOf(':') + 1));
+    const who = v.slice(CLAIM.length, v.lastIndexOf(':'));
+    if (who !== owner && Number.isFinite(at) && now - at < HANDOVER_LEASE_MS && now >= at) return 'theirs';
+  }
+  const mine = `${CLAIM}${owner}:${now}`;
+  try { browser.setItem(HOST_FLAG_KEY, mine); } catch { return 'mine'; }
+  const back = readFlag(browser);
+  if (back === mine) return 'mine';
+  if (back === '1') return 'done';
+  // Only another window's claim, written between our write and our read, makes this window wait. A write that is not kept at all
+  // (the read gives nothing, or not a claim) is storage that cannot be used: move as before. Waiting on it never ended - the poll
+  // below found no claim to run out, wrote again, and read nothing again, every 250 ms (11-16: a test's storage stub that drops
+  // writes hung host-test on every OS).
+  return back?.startsWith(CLAIM) ? 'theirs' : 'mine';
+}
+
+/** Gives the move back (a refused chat, the host gone) so it is tried again; never clears another window's claim or a finished move. */
+function releaseHandover(browser: StorageLike, mine: string | null) {
+  try { if (mine && mine.startsWith(CLAIM) && browser.getItem(HOST_FLAG_KEY) === mine) browser.removeItem(HOST_FLAG_KEY); } catch { /* best effort */ }
 }
 
 /* ---------------------------------------------------------- the last-moment copy */

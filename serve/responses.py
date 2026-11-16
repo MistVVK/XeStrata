@@ -10,6 +10,9 @@ Codex CLI is the first client.  What it needs, and what this does:
     and the conversation cache holds across turns);
   * function tools, also inside `namespace` tools (Codex's MCP and agent tools: the model sees `namespace.name`) and
     `custom` tools (a free-form `input` string); hosted tools (web search, ...) are left out, the model cannot run them;
+  * Codex's client-side `tool_search` (#1917): the model gets it as the function `tool_search` and its call goes back
+    as a `tool_search_call`; the tools the client then finds are declared in that search's tool result, so the
+    prompt before it (the tool list included) stays as it was and the conversation cache holds;
   * reasoning items: the model's thinking is returned as `reasoning_text` content (no summaries: this model does not
     write them, see docs/DETAILS.md) and, when `include` asks for `reasoning.encrypted_content`, also as an opaque
     `encrypted_content` string (base64, not encrypted: the client already holds the text).  Either form sent back is
@@ -24,6 +27,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import re
 import time
 import uuid
 
@@ -32,6 +36,8 @@ from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
                 "code_interpreter", "image_generation", "local_shell", "mcp", "tool_search")
+CLIENT_TOOL_SEARCH = "tool_search"                # the template name of a client-side tool_search (it has none)
+CALL_ITEMS = ("function_call", "custom_tool_call", "tool_search_call")
 
 
 class ResponsesError(ValueError):
@@ -125,6 +131,56 @@ def _tool_output(item, param):
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
+#: An encrypted payload of another server (OpenAI's are Fernet tokens: "gAAAAA" + url-safe base64) cannot be read here.
+_FOREIGN_CIPHERTEXT = re.compile(r"gAAAAA[A-Za-z0-9_\-]{60,}={0,2}")
+_UNREADABLE_PAYLOAD = "[this part was encrypted by another server and cannot be read here]"
+
+
+def _agent_payload(enc) -> str:
+    """One `encrypted_content` part of an agent_message -> text.  Codex builds these parts itself and, with the agents
+    running on this server, they hold the plain text of the task or answer; a payload sealed by this server (reasoning's
+    ENCRYPTED_PREFIX form) is opened; another server's ciphertext is named as unreadable, never passed off as text."""
+    if not isinstance(enc, str):
+        return _UNREADABLE_PAYLOAD
+    if enc.startswith(ENCRYPTED_PREFIX):
+        try:
+            text = json.loads(base64.b64decode(enc[len(ENCRYPTED_PREFIX):], validate=True).decode("utf-8"))["text"]
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            return _UNREADABLE_PAYLOAD
+        return text if isinstance(text, str) else _UNREADABLE_PAYLOAD
+    if _FOREIGN_CIPHERTEXT.fullmatch(enc.strip()):
+        return _UNREADABLE_PAYLOAD
+    return enc
+
+
+def _agent_message(item, param) -> str:
+    """#4210 #5244: an `agent_message` item (Codex multi-agent v2: the task a parent agent sends a worker, the worker's
+    answer) -> the text of a user message.  Codex writes the attribution itself (an input_text header: "Message Type",
+    "Task name", "Sender", "Payload:"), followed by the payload in an `encrypted_content` part; both are kept as they are.
+    A message without such a header gets one line naming its author and recipient, so who said it is not lost."""
+    raw = item.get("content")
+    parts = [{"type": "input_text", "text": raw}] if isinstance(raw, str) else raw if isinstance(raw, list) else []
+    texts = []
+    for j, part in enumerate(parts):
+        if not isinstance(part, dict):
+            raise ResponsesError("expected a content part object", f"{param}.content[{j}]")
+        kind = part.get("type")
+        if kind in ("input_text", "output_text", "text"):
+            text = part.get("text")
+            texts.append(text if isinstance(text, str) else "")
+        elif kind == "encrypted_content":
+            texts.append(_agent_payload(part.get("encrypted_content")))
+        else:
+            raise ResponsesError(f"agent_message parts of type {kind!r} are not supported (text and encrypted_content are)",
+                                 f"{param}.content[{j}].type", "unsupported_parameter")
+    body = "".join(texts)
+    if body.startswith("Message Type:"):
+        return body
+    author = item.get("author") if isinstance(item.get("author"), str) and item.get("author") else "another agent"
+    recipient = item.get("recipient") if isinstance(item.get("recipient"), str) and item.get("recipient") else "this agent"
+    return f"Message from {author} to {recipient}:\n{body}"
+
+
 def input_messages(req: dict) -> list[dict]:
     """`instructions` + `input` -> the chat template's messages."""
     messages = []
@@ -141,9 +197,18 @@ def input_messages(req: dict) -> list[dict]:
         raise ResponsesError("input must be a string or an array of input items", "input")
     thinking = []                                    # reasoning waiting for the assistant turn it belongs to
     open_turn = None                                 # the assistant message the next function_call joins
+    unanswered = set()                               # call ids of the last turn's calls whose outputs have not come yet
+    held = []                                        # agent messages that arrived while calls were unanswered
+
+    def flush_held():
+        # #4210 #5244: an agent_message that arrives between a turn's calls and their outputs follows those outputs,
+        # so the template still sees each call's result right after the call
+        messages.extend(held)
+        held.clear()
 
     def turn(content=""):
         nonlocal open_turn
+        unanswered.clear()
         open_turn = {"role": "assistant", "content": content}
         if thinking:
             open_turn["reasoning_content"] = "".join(thinking)
@@ -156,6 +221,10 @@ def input_messages(req: dict) -> list[dict]:
         if not isinstance(item, dict):
             raise ResponsesError("expected an input item object", param)
         kind = item.get("type") or ("message" if "role" in item else None)
+        if held and kind not in ("function_call_output", "custom_tool_call_output", "multi_agent_call_output", "tool_search_output",
+                                 "agent_message"):
+            flush_held()                             # the calls' outputs stopped coming: the held messages go here
+            unanswered.clear()
         if kind == "message":
             role = item.get("role")
             if role not in ("user", "assistant", "system", "developer"):
@@ -174,23 +243,47 @@ def input_messages(req: dict) -> list[dict]:
                 if open_turn is not None and (open_turn.get("tool_calls") or open_turn["content"]):
                     open_turn = None                 # thinking starts a new model turn
                 thinking.append(text)
-        elif kind in ("function_call", "custom_tool_call"):
-            name = item.get("name")
+        elif kind in ("function_call", "custom_tool_call", "multi_agent_call"):
+            # #5244: Codex multi-agent v2 also sends its agent calls as multi_agent_call items (the name may be "action")
+            field = "action" if kind == "multi_agent_call" and "name" not in item else "name"
+            name = item.get(field)
             if not isinstance(name, str) or not name:
-                raise ResponsesError("a function_call needs a name", param + ".name")
+                raise ResponsesError(f"a {kind} needs a {field}", f"{param}.{field}")
             if item.get("namespace"):
                 name = f"{item['namespace']}.{name}"
-            if kind == "function_call":
+            if kind in ("function_call", "multi_agent_call"):
                 args = _arguments(item.get("arguments"), param + ".arguments")
             else:
                 args = {"input": item.get("input") if isinstance(item.get("input"), str) else ""}
             target = open_turn if open_turn is not None and not thinking else turn()
             target.setdefault("tool_calls", []).append({"function": {"name": name, "arguments": args},
                                                         "_call_id": item.get("call_id")})
-        elif kind in ("function_call_output", "custom_tool_call_output"):
-            messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
+            if item.get("call_id"):
+                unanswered.add(item.get("call_id"))
+        elif kind == "tool_search_call":
+            # #4621: the model wrote it as the function `tool_search`, so it goes back as that call
+            target = open_turn if open_turn is not None and not thinking else turn()
+            target.setdefault("tool_calls", []).append({
+                "function": {"name": CLIENT_TOOL_SEARCH, "arguments": _arguments(item.get("arguments"),
+                                                                               param + ".arguments")},
+                "_call_id": item.get("call_id")})
+            if item.get("call_id"):
+                unanswered.add(item.get("call_id"))
+        elif kind in ("function_call_output", "custom_tool_call_output", "multi_agent_call_output", "tool_search_output"):
+            if kind == "tool_search_output":         # declared below, once the results are in the model's order
+                messages.append({"role": "tool", "content": "", "_found": (item, param), "_call_id": item.get("call_id")})
+            else:
+                messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
             open_turn = None
             thinking.clear()
+            unanswered.discard(item.get("call_id"))
+            if held and not unanswered:
+                flush_held()
+        elif kind == "agent_message":
+            message = {"role": "user", "content": _agent_message(item, param)}
+            open_turn = None
+            thinking.clear()
+            (held if unanswered else messages).append(message)
         elif kind == "additional_tools":
             continue                                 # #782 (Codex): tools the client adds as an input item; see request_tools
         elif kind == "item_reference":
@@ -199,7 +292,13 @@ def input_messages(req: dict) -> list[dict]:
         else:
             raise ResponsesError(f"input items of type {kind!r} are not supported", param + ".type",
                                  "unsupported_parameter")
+    flush_held()
     _order_tool_results(messages)
+    searched = set()                                 # what earlier searches declared, in the order the model reads
+    for m in messages:
+        found = m.pop("_found", None)
+        if found is not None:
+            m["content"] = _found_declarations(*found, searched)
     # leading system/developer messages (Codex: instructions, then its developer message) become one system message
     # at the start; later ones become user messages in place, as on the chat path
     lead = 0
@@ -233,6 +332,61 @@ def _order_tool_results(messages):
             c.pop("_call_id", None)
 
 
+def _declare(tool, param, tools, names, namespace=None, ns_description=""):
+    """One function, custom or client-side tool_search tool -> its template declaration in `tools` and its template
+    name in `names` ({template name: (namespace, name, kind)})."""
+    kind = tool.get("type")
+    name = CLIENT_TOOL_SEARCH if kind == "tool_search" else tool.get("name")   # Codex's search has no name
+    if not isinstance(name, str) or not name:
+        raise ResponsesError("a tool needs a name", param + ".name")
+    flat = f"{namespace}.{name}" if namespace else name
+    description = tool.get("description") or ""
+    if ns_description:
+        description = ns_description + ("\n\n" + description if description else "")
+    if kind in ("function", "tool_search"):
+        params = tool.get("parameters") or {"type": "object", "properties": {}}
+    else:                                            # custom: free-form text, maybe in a grammar the model reads
+        fmt = tool.get("format") or {}
+        if isinstance(fmt, dict) and fmt.get("type") == "grammar" and fmt.get("definition"):
+            description += f"\n\nThe input must follow this {fmt.get('syntax', '')} grammar:\n{fmt['definition']}"
+        params = {"type": "object", "properties": {"input": {"type": "string", "description": "the raw input"}},
+                  "required": ["input"]}
+    tools.append({"name": flat, "description": description, "parameters": params})
+    names[flat] = (namespace, name, kind)
+
+
+def _declare_tools(given, prefix, tools, names, skipped, ns_descriptions=None):
+    """A `tools` array (the request's, or what a tool search found) -> declarations; hosted tools go to `skipped`.
+    A namespace's description starts each of its tools' descriptions, unless `ns_descriptions` collects it
+    ({namespace: description}) to be said once."""
+    for i, tool in enumerate(given):
+        param = f"{prefix}[{i}]"
+        if not isinstance(tool, dict):
+            raise ResponsesError("expected a tool object", param)
+        kind = tool.get("type")
+        if kind in ("function", "custom"):
+            _declare(tool, param, tools, names)
+        elif kind == "namespace":
+            ns_description = tool.get("description") or ""
+            if ns_descriptions is not None:
+                if ns_description:
+                    ns_descriptions.setdefault(tool.get("name"), ns_description)
+                ns_description = ""
+            for j, member in enumerate(tool.get("tools") or []):
+                if not isinstance(member, dict) or member.get("type", "function") not in ("function", "custom"):
+                    raise ResponsesError("a namespace holds function tools", f"{param}.tools[{j}]")
+                _declare({"type": "function", **member}, f"{param}.tools[{j}]", tools, names, tool.get("name"),
+                         ns_description)
+        elif kind == "tool_search" and tool.get("execution") == "client":
+            # #1917: the client runs this search itself, so the model gets an ordinary function to call; one is enough
+            if CLIENT_TOOL_SEARCH not in names:
+                _declare(tool, param, tools, names)
+        elif kind in HOSTED_TOOLS or isinstance(kind, str):
+            skipped.append(kind)                     # the model cannot run OpenAI's hosted tools: left out
+        else:
+            raise ResponsesError("a tool needs a type", param + ".type")
+
+
 def request_tools(req: dict):
     """-> (template tools or None, {template name: (namespace, name, kind)}, names of hosted tools left out)."""
     tools, names, skipped = [], {}, []
@@ -244,49 +398,63 @@ def request_tools(req: dict):
     extra = [t for item in (req.get("input") if isinstance(req.get("input"), list) else [])
              if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list)
              for t in item["tools"]]
-    given = list(given) + extra
-
-    def add(tool, param, namespace=None, ns_description=""):
-        kind = tool.get("type")
-        name = tool.get("name")
-        if not isinstance(name, str) or not name:
-            raise ResponsesError("a tool needs a name", param + ".name")
-        flat = f"{namespace}.{name}" if namespace else name
-        description = tool.get("description") or ""
-        if ns_description:
-            description = ns_description + ("\n\n" + description if description else "")
-        if kind == "function":
-            params = tool.get("parameters") or {"type": "object", "properties": {}}
-        else:                                        # custom: free-form text, maybe in a grammar the model reads
-            fmt = tool.get("format") or {}
-            if isinstance(fmt, dict) and fmt.get("type") == "grammar" and fmt.get("definition"):
-                description += f"\n\nThe input must follow this {fmt.get('syntax', '')} grammar:\n{fmt['definition']}"
-            params = {"type": "object", "properties": {"input": {"type": "string", "description": "the raw input"}},
-                      "required": ["input"]}
-        tools.append({"name": flat, "description": description, "parameters": params})
-        names[flat] = (namespace, name, kind)
-
-    for i, tool in enumerate(given):
-        param = f"tools[{i}]"
-        if not isinstance(tool, dict):
-            raise ResponsesError("expected a tool object", param)
-        kind = tool.get("type")
-        if kind in ("function", "custom"):
-            add(tool, param)
-        elif kind == "namespace":
-            for j, member in enumerate(tool.get("tools") or []):
-                if not isinstance(member, dict) or member.get("type", "function") not in ("function", "custom"):
-                    raise ResponsesError("a namespace holds function tools", f"{param}.tools[{j}]")
-                add({"type": "function", **member}, f"{param}.tools[{j}]", tool.get("name"),
-                    tool.get("description") or "")
-        elif kind in HOSTED_TOOLS or isinstance(kind, str):
-            skipped.append(kind)                     # the model cannot run OpenAI's hosted tools: left out
-        else:
-            raise ResponsesError("a tool needs a type", param + ".type")
+    _declare_tools(list(given) + extra, "tools", tools, names, skipped)
     choice = req.get("tool_choice")
     if choice == "none":
         return None, names, skipped
     return tools or None, names, skipped
+
+
+def _found_tools(item, param):
+    """A `tool_search_output` item -> (the declarations of the tools it found, their names, {namespace: its
+    description})."""
+    tools, names, ns_descriptions = [], {}, {}
+    found = item.get("tools")
+    _declare_tools(found if isinstance(found, list) else [], param + ".tools", tools, names, [], ns_descriptions)
+    return tools, names, ns_descriptions
+
+
+def _found_declarations(item, param, searched: set) -> str:
+    """A tool search's result as the model reads it, at the place the search answered: the tools no earlier search
+    declared, as the template declares tools (one JSON object per line in <tools>), each namespace's description said
+    once in the conversation, before its first tools.  A tool found again is only named.  `searched` holds what
+    earlier searches declared: tool names, and ("namespace", name) for the namespaces they described."""
+    tools, _, ns_descriptions = _found_tools(item, param)
+    if not tools:
+        return "No tools matched this search."
+    new = [t for t in tools if t["name"] not in searched]
+    again = [t["name"] for t in tools if t["name"] in searched]
+    searched.update(t["name"] for t in new)
+    parts = []
+    if new:
+        notes = []
+        for ns, text in ns_descriptions.items():
+            if ("namespace", ns) not in searched and any(t["name"].startswith(ns + ".") for t in new):
+                notes.append(f"{ns}: {text}")
+                searched.add(("namespace", ns))
+        lines = "\n".join(json.dumps(t, ensure_ascii=False) for t in new)
+        head = "\n\n".join(["These functions can be called from now on:", *notes])
+        parts.append(f"{head}\n<tools>\n{lines}\n</tools>")
+    if again:
+        parts.append("Already available: " + ", ".join(again))
+    return "\n".join(parts)
+
+
+def client_found_tools(req: dict):
+    """#4621: the request-scoped list of the tools Codex's client-side tool searches found in this request's input
+    (`tool_search_output` items) -> (declarations in request_tools' template form, {template name: (namespace, name,
+    kind)} as request_tools' `names`).  A tool found twice is listed once; a request with no search returns ([], {}).
+    The prompt has them where each search answered (input_messages), never in its tool list: adding them there would
+    change the prompt's start and drop the conversation cache with every search.  Whether the tool-call parser and the
+    response accept these names is decided where the request's tools and names reach them (serve/server.py's
+    /v1/responses handler, after the prompt is made): that eligibility change is separate (ENG-SERVE)."""
+    tools, names = [], {}
+    for i, item in enumerate(req.get("input") if isinstance(req.get("input"), list) else []):
+        if isinstance(item, dict) and item.get("type") == "tool_search_output":
+            found, found_names, _ = _found_tools(item, f"input[{i}]")
+            tools += [t for t in found if t["name"] not in names]   # a tool found twice is declared once
+            names = {**found_names, **names}
+    return tools, names
 
 
 def _turn_body(req: dict):
@@ -527,7 +695,7 @@ class Assembler:
         if item is None:
             return []
         at, out = self.response["output"].index(item), []
-        item["status"] = status or ("incomplete" if item["type"] in ("function_call", "custom_tool_call") else "completed")
+        item["status"] = status or ("incomplete" if item["type"] in CALL_ITEMS else "completed")
         if item["type"] == "message":
             part = item["content"][0]
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
@@ -605,10 +773,12 @@ class Assembler:
                 item["input"] = value if isinstance(value, str) else json.dumps(ev.call.arguments, ensure_ascii=False)
                 out.append(self.event("response.custom_tool_call_input.delta", item_id=item["id"],
                                       output_index=self.index, delta=item["input"]))
+            elif item["type"] == "tool_search_call":    # the client reads an object, sent whole: no argument deltas
+                item["arguments"] = ev.call.arguments if isinstance(ev.call.arguments, dict) else {}
             out += self.close("completed")
         return out
 
-    def _release(self, text: str) -> list[dict]:
+    def _release(self, text: str, status=None) -> list[dict]:
         """A held structured answer (or the words written beside a tool call) as one message item."""
         if not text.strip():
             return []
@@ -617,7 +787,7 @@ class Assembler:
         self.item["content"][0]["text"] = text
         out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
                               content_index=0, delta=text, logprobs=[]))
-        return out + self.close()
+        return out + self.close(status)
 
     def _call_started(self) -> list[dict]:
         """The first tool call of a JSON-format turn: this turn is not the final answer, so what the model wrote
@@ -635,6 +805,9 @@ class Assembler:
         if kind == "custom":
             item = {"id": new_id("ctc"), "type": "custom_tool_call", "status": "in_progress", "call_id": ev.call.id,
                     "name": name, "input": ""}
+        elif kind == "tool_search":                  # Codex's item: no name, and the client runs the search
+            item = {"id": new_id("tsc"), "type": "tool_search_call", "status": "in_progress", "call_id": ev.call.id,
+                    "execution": "client", "arguments": {}}
         else:
             item = {"id": new_id("fc"), "type": "function_call", "status": "in_progress", "call_id": ev.call.id,
                     "name": name, "arguments": ""}
@@ -647,13 +820,15 @@ class Assembler:
         `validate(text, finish)` checks a structured answer and returns its text (or raises)."""
         length = done.get("finish") == "length"
         # a call still open was cut off (its tool_call never came, #211): incomplete, whatever the finish
-        unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
+        unfinished = self.item is not None and self.item["type"] in CALL_ITEMS
         out = self.close("incomplete" if length or unfinished else "completed")
         if self.json_mode:
             text = "".join(self.json_text)
             self.json_text = []
             if self.called:
                 out += self._release(text)           # beside a tool call: as written (#782)
+            elif length:
+                out += self._release(text, "incomplete")   # cut short: the check takes only finish stop, so ended as plain text is
             else:
                 out += self._release(validate(text, done.get("finish")))
         n = done.get("completion_tokens", 0)
