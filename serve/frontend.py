@@ -1285,8 +1285,8 @@ class OutputParser:
     @property
     def clean(self) -> bool:
         """Nothing is held back: a clean point to stop the thinking at (a parser that rewrites the model's text also counts
-        what it holds)."""
-        return not self.buf and not self._held
+        what it holds; #4686: so does a call body moved out of the buffer while it streams)."""
+        return not self.buf and not self._held and not self._scan_parts
 
     def _ok_at(self, p: int) -> bool:
         """self.buf[p] would open a call: at the start of a line, outside a code fence and inline code."""
@@ -1505,6 +1505,8 @@ class OutputParser:
 
     def _reset_scan(self):
         self._call_end_checked = 0   # closing-tag search progress for the current wrapped call
+        self._function_end_checked = 0
+        self._scan_parts = []        # consumed call body, kept in chunks until the final call needs the whole text
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
         self.ss = "name"             # name -> between -> str|raw -> ... -> function_done -> done
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
@@ -1516,19 +1518,65 @@ class OutputParser:
         self.sraw_pname = ""
         self.svstart = 0
 
+    def _restore_scan_body(self) -> None:
+        """Put compacted call text back before a structural walk or the final parse."""
+        if not self._scan_parts:
+            return
+        prefix = "".join(self._scan_parts)
+        shift = len(prefix)
+        self.buf = prefix + self.buf
+        self.sp += shift
+        if self.ss == "str" and self.sval_started:
+            self.svstart += shift
+        if self._call_end_checked >= 0:
+            self._call_end_checked += shift
+        if self._function_end_checked >= 0:
+            self._function_end_checked += shift
+        self._scan_parts.clear()
+
+    def _compact_scan_body(self) -> None:
+        """Move streamed, consumed call text out of the string that grows on every token."""
+        if self.sp < 4096:
+            return
+        cut = self.sp
+        self._scan_parts.append(self.buf[:cut])
+        self.buf = self.buf[cut:]
+        self.sp = 0
+        if self.ss == "str" and self.sval_started:
+            self.svstart -= cut
+        if self._call_end_checked >= 0:
+            self._call_end_checked = max(0, self._call_end_checked - cut)
+        if self._function_end_checked >= 0:
+            self._function_end_checked = max(0, self._function_end_checked - cut)
+
+    def _function_end(self) -> int:
+        """Run the full function walk only when newly appended text contains a possible closer."""
+        start = max(0, self._function_end_checked - len(FUNC_END) + 1)
+        if self.buf.find(FUNC_END, start) < 0:
+            self._function_end_checked = len(self.buf)
+            return -1
+        self._restore_scan_body()
+        end = function_end(self.buf)
+        self._function_end_checked = -1 if end >= 0 else len(self.buf)
+        return end
+
     def _wrapped_call_end(self) -> int:
         # Without a closing tag the structural walk cannot finish. Search only
         # newly appended text plus enough overlap for a tag split across feeds.
         # A literal closing tag inside a value needs structural disambiguation:
-        # once any candidate appears, keep the original full walk for this call.
-        # Recovery can rewrite the buffer, so it always uses the full walk.
-        if not self.recover and self._call_end_checked >= 0:
+        # once a candidate appears, restore compacted text for the structural walk. If it was a literal tag in a
+        # value, wait for another newly appended candidate instead of walking the unchanged body for every token.
+        if self._call_end_checked >= 0:
             start = max(0, self._call_end_checked - len(CALL_END) + 1)
             if self.buf.find(CALL_END, start) < 0:
                 self._call_end_checked = len(self.buf)
                 return -1
-            self._call_end_checked = -1
-        return call_end(self.buf, self._final)
+        self._restore_scan_body()
+        end = call_end(self.buf, self._final)
+        # #4701: a complete closing sequence may be waiting for lookahead or finish(), not another closing tag.
+        pending = end < 0 and not self._final and call_end(self.buf, final=True) >= 0
+        self._call_end_checked = -1 if end >= 0 or pending else len(self.buf)
+        return end
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -1993,7 +2041,7 @@ class OutputParser:
             else:
                 drop = None
                 if self.bare:                       # no wrapper: the call ends at its </function>; a stray
-                    i = function_end(self.buf)      # </tool_call> after it is the wrapper's closer, dropped
+                    i = self._function_end()        # </tool_call> after it is the wrapper's closer, dropped
                     if i >= 0:
                         after = self.buf[i:].lstrip()
                         if after.startswith(CALL_END):
@@ -2005,7 +2053,7 @@ class OutputParser:
                     if i >= 0:
                         drop = len(CALL_END)
                     # Only a following call opener confirms an omitted wrapper closer.
-                    f = function_end(self.buf)
+                    f = self._function_end()
                     nxt = self.buf[f:].lstrip() if f >= 0 else ""
                     if re.match(r"<tool_call>\s*<function=\s*[^<>\s]+\s*>", nxt):
                         i, drop = f, 0
@@ -2026,6 +2074,8 @@ class OutputParser:
                     else:
                         out += self._scan()
                 if i < 0 or drop is None:
+                    if self.stream_tools:
+                        self._compact_scan_body()
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + drop:]
@@ -2040,11 +2090,14 @@ class OutputParser:
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
+        self._restore_scan_body()               # #4686: the call body moved out while it streamed comes back first
         if self._held:
             self.buf, self._held = self.buf + self._held, ""
         if self.buf and self.state in ("call", "rcall"):
             self._final = True                  # #4701: a call held after its closing tags (could a file's text go on?) is whole now
             out += self.feed("")
+        # The final feed may compact a still-incomplete streamed call again.
+        self._restore_scan_body()
         if self.state == "rcall" and reason in (None, "stop"):
             # #4427: a call in the reasoning whose `</function>` is the end of the output (the `</tool_call>` left out)
             # is as whole as one in the answer: it waits for the turn's end like the others

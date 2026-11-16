@@ -1,4 +1,5 @@
 """Native tool parsing regressions; no model or GPU required."""
+import json
 import unittest
 from serve.frontend import OutputParser
 
@@ -6,6 +7,58 @@ CALL = "<tool_call>\n<function=mcp__files__read>\n<parameter=path>\n123\n</param
 TOOLS = [{"name": "mcp__files.read", "parameters": {"properties": {"path": {"type": "string"}}}}]
 
 class NativeTools(unittest.TestCase):
+    def test_a_large_streamed_string_does_not_keep_one_growing_buffer(self):
+        tools = [{"name": "write", "parameters": {"properties": {"content": {"type": "string"}}}}]
+        value = ("x" * 5000 + " literal </parameter> and </function> and </tool_call> " + "y" * 5000)
+        parser = OutputParser(thinking=False, tools=tools, stream_tools=True, recover=True)
+        opening = "<tool_call><function=write><parameter=content>\n"
+        events = parser.feed(opening + value)
+        self.assertTrue(parser._scan_parts)       # consumed text is chunked instead of recopied on every next token
+        self.assertFalse(parser.clean)
+        closing = "\n</parameter></function></tool_call>"
+        for i in range(0, len(closing), 3):
+            events += parser.feed(closing[i:i + 3])
+        events += parser.finish()
+        calls = [event.call for event in events if event.kind == "tool_call"]
+        self.assertEqual([(call.name, call.arguments) for call in calls], [("write", {"content": value})])
+        streamed = "".join(event.text for event in events if event.kind == "tool_args")
+        self.assertEqual(json.loads(streamed), {"content": value})
+
+    def test_compacted_call_keeps_closing_sequence_lookahead(self):
+        tools = [{"name": "write", "parameters": {"properties": {"content": {"type": "string"}}}}]
+        opening = "<tool_call><function=write><parameter=content>"
+        closing = "</parameter></function></tool_call>"
+        value = "x" * 5000
+        for recover in (False, True):
+            for tail in ("", " prose", " prose " * 220, opening + "second" + closing,
+                         " more file text " + closing):
+                with self.subTest(recover=recover, tail=tail[:40]):
+                    parser = OutputParser(thinking=False, tools=tools, stream_tools=True, recover=recover)
+                    events = parser.feed(opening + value)
+                    events += parser.feed(closing)
+                    self.assertFalse(any(event.kind == "tool_call" for event in events))
+                    for i in range(0, len(tail), 7):
+                        events += parser.feed(tail[i:i + 7])
+                    if len(tail) > 1500 or tail.startswith(opening):
+                        self.assertTrue(any(event.kind == "tool_call" for event in events))
+                    events += parser.finish()
+                    expected = [value + closing + " more file text " if tail.startswith(" more") else value]
+                    if tail.startswith(opening):
+                        expected.append("second")
+                    self.assertEqual([event.call.arguments["content"] for event in events if event.kind == "tool_call"],
+                                     expected)
+
+    def test_compacted_incomplete_call_restores_body_after_final_feed(self):
+        tools = [{"name": "write", "parameters": {"properties": {"content": {"type": "string"}}}}]
+        parser = OutputParser(thinking=False, tools=tools, stream_tools=True)
+        value = "x" * 5000
+        events = parser.feed("<tool_call><function=write><parameter=content>" + value)
+        events += parser.feed("</parameter></function>")
+        events += parser.finish()
+        self.assertEqual([event.call.arguments for event in events if event.kind == "tool_call"], [{"content": value}])
+        self.assertEqual(json.loads("".join(event.text for event in events if event.kind == "tool_args")),
+                         {"content": value})
+
     def test_unclosed_think_call_and_split_tags(self):
         for streaming in (False, True):
             for step in (1, 7, 4096):
