@@ -161,9 +161,64 @@ export function localOutputBudget(context) {
  * which on a local window of 32K to 128K leaves no room at all (it then reports a configuration error once and never compacts). An eighth
  * of what the window has left after the reply's room works from 16K up to the largest windows. Compaction then starts at about 60 percent.
  */
-export function compactionHeadroom(context, outputBudget) {
+export function compactionHeadroom(context, outputBudget, env = process.env) {
   const room = Math.max(0, (Number.isFinite(context) && context > 0 ? context : 32768) - outputBudget);
-  return Math.max(512, Math.min(65536, Math.floor(room * 0.125)));
+  return Math.max(512, Math.min(65536, Math.floor(room * headroomFraction(env))));
+}
+
+/**
+ * The pressure fraction at which compaction starts, the Harness's own default (compaction-basic `thresholdRatio`, 0.8).
+ * `STRATA_COMPACTION_THRESHOLD_RATIO` (0.1..0.99) moves it: on a large window the fraction, not the headroom, is what
+ * decides, so 0.8 makes a 256K chat summarise its history at 204K tokens. A value outside the range is ignored.
+ */
+export const DEFAULT_THRESHOLD_RATIO = 0.8;
+
+/**
+ * The person's own choice in the app (Settings -> "Summarize older messages"), set by the host from its saved settings.
+ * It sets the whole choice: a name left null means "not chosen", so the environment and then the default still apply for
+ * it, and an operator's `STRATA_COMPACTION_*` keep working until the person touches the control.
+ */
+let chosen = { thresholdRatio: null, headroomFraction: null };
+/**
+ * A saved or sent value as a number, or null. Only a real number counts: `Number(null)` is 0, and 0 is a legal
+ * headroom, so an unset setting would otherwise quietly become "keep no room at all".
+ */
+export function compactionNumber(value, min, max) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
+  const n = typeof value === 'number' ? value : Number.parseFloat(String(value));
+  return Number.isFinite(n) && n >= min && n <= max ? n : null;
+}
+export function setCompactionChoice(next = {}) {
+  chosen = {
+    thresholdRatio: compactionNumber(next?.thresholdRatio, 0.1, 0.99),
+    headroomFraction: compactionNumber(next?.headroomFraction, 0, 0.5),
+  };
+  return { ...chosen };
+}
+export const compactionChoice = () => ({ ...chosen });
+
+export function thresholdRatio(env = process.env) {
+  if (chosen.thresholdRatio !== null) return chosen.thresholdRatio;
+  const v = Number.parseFloat(env?.STRATA_COMPACTION_THRESHOLD_RATIO);
+  return Number.isFinite(v) && v >= 0.1 && v <= 0.99 ? v : DEFAULT_THRESHOLD_RATIO;
+}
+
+/** The fraction of the room left after the reply that compaction keeps free; `STRATA_COMPACTION_HEADROOM_FRACTION` (0..0.5) moves it from the default 0.125. */
+export const DEFAULT_HEADROOM_FRACTION = 0.125;
+export function headroomFraction(env = process.env) {
+  if (chosen.headroomFraction !== null) return chosen.headroomFraction;
+  const v = Number.parseFloat(env?.STRATA_COMPACTION_HEADROOM_FRACTION);
+  return Number.isFinite(v) && v >= 0 && v <= 0.5 ? v : DEFAULT_HEADROOM_FRACTION;
+}
+
+/**
+ * Where compaction starts on one window, in real tokens: the smaller of the pressure fraction and the room the window has
+ * after the reply and the headroom. The same arithmetic the Harness applies (compaction-basic resolveCompactSpec), so the
+ * app's pre-send check and the Harness's own step-boundary check agree.
+ */
+export function compactionThreshold(context, outputBudget, env = process.env) {
+  const w = Number.isFinite(context) && context > 0 ? context : 32768;
+  return Math.floor(Math.min(w * thresholdRatio(env), w - outputBudget - compactionHeadroom(w, outputBudget, env)));
 }
 
 /**
@@ -237,7 +292,7 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
       const key = `${route}~s${budget}`;
       providers[key] = { ...def, displayName: `${def.displayName} (with your response settings)`, baseURL: `${proxyBase}/${key}/v1`, ...(budget ? { headers: { ...(def.headers ?? {}), 'x-strata-budget': String(budget) } } : {}) };
       shapeTargets[key] = realBase;
-      for (const m of def.models) { const w = m.contextWindow, out = m.maxTokens; compaction.push({ provider: key, model: m.id, headroomTokens: compactionHeadroom(w, out) }); }
+      for (const m of def.models) { const w = m.contextWindow, out = m.maxTokens; compaction.push({ provider: key, model: m.id, headroomTokens: compactionHeadroom(w, out), thresholdRatio: thresholdRatio() }); }
       keys[budget] = key;
     }
     return keys;
@@ -267,7 +322,7 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
         reasoning: true, reasoningEfforts: LOCAL_EFFORTS,
       }],
     };
-    compaction.push({ provider: route, model: inst.modelId, headroomTokens: compactionHeadroom(context, localOutputBudget(context)) });
+    compaction.push({ provider: route, model: inst.modelId, headroomTokens: compactionHeadroom(context, localOutputBudget(context)), thresholdRatio: thresholdRatio() });
     slots = Math.max(slots, Number.isFinite(inst.slots) && inst.slots >= 1 ? Math.floor(inst.slots) : 1);
     const shaped = addShaped(route, providers[route], inst.baseUrl);
     routes.push({ route, fp: fingerprint(providers[route], env[keyEnv]), kind: 'local', connectionName: 'this computer', instanceId: inst.id, modelId: inst.modelId, name: inst.label || inst.modelId, contextWindow: context, ...(shaped ? { shaped } : {}) });
@@ -309,7 +364,7 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
     };
     const fp = fingerprint(providers[route], conn.apiKey ?? '');
     const shaped = ownServer ? addShaped(route, providers[route], baseURL) : null;
-    for (const m of conn.models) { const ctx = m.contextMax ?? ASSUMED_API_CONTEXT; compaction.push({ provider: route, model: m.id, headroomTokens: compactionHeadroom(ctx, reply(m)) }); }
+    for (const m of conn.models) { const ctx = m.contextMax ?? ASSUMED_API_CONTEXT; compaction.push({ provider: route, model: m.id, headroomTokens: compactionHeadroom(ctx, reply(m)), thresholdRatio: thresholdRatio() }); }
     for (const m of conn.models) routes.push({ route, fp, kind: 'api', connectionId: conn.id, connectionName: conn.name, modelId: m.id, name: m.name || m.id, contextWindow: m.contextMax ?? ASSUMED_API_CONTEXT, ...(shaped ? { shaped } : {}) });
   });
 

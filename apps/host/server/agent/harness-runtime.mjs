@@ -93,12 +93,22 @@ export class HarnessProcess {
     child.stderr.on('data', keep);
     const info = await new Promise((resolveInfo, reject) => {
       const timer = setTimeout(() => reject(new Error(`the agent did not print its address within ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
-      child.stdout.on('data', chunk => {
+      const onData = chunk => {
         keep(chunk);
         text += chunk.toString();
         const m = URL_PATTERN.exec(text);
-        if (m) { clearTimeout(timer); resolveInfo({ port: Number(m[1]), token: m[2], baseUrl: `http://127.0.0.1:${m[1]}` }); }
-      });
+        if (m) {
+          clearTimeout(timer);
+          // The address is out: the rest of the agent's life streams its log to stdout, and nothing here reads it. Without
+          // this the string and the regex grew with the whole uptime of one long session (the app's memory climbed until WebView2 OOMed).
+          child.stdout.removeListener('data', onData);
+          text = '';
+          resolveInfo({ port: Number(m[1]), token: m[2], baseUrl: `http://127.0.0.1:${m[1]}` });
+        } else if (text.length > 64 * 1024) {
+          text = text.slice(-8 * 1024);   // a stray address can only be near the end of what came so far
+        }
+      };
+      child.stdout.on('data', onData);
       child.on('exit', code => { clearTimeout(timer); reject(new Error(`the agent exited during start (code ${code}): ${redact(log.join('').slice(-600), Object.values(this.extraEnv))}`)); });
       child.on('error', e => { clearTimeout(timer); reject(e); });
     }).catch(async error => { await this.stop(); throw error; });

@@ -17,7 +17,7 @@ import { materializeSkills, parseSkillFile, skillSlug, writeCreatedSkill } from 
 import { systemFonts } from './fonts.mjs';
 import { tuningDir } from './platform-paths.mjs';
 import { createAgentBridge, plainTurnFailure } from './agent/agent-bridge.mjs';
-import { mcpSkippedNotices } from './agent/profile.mjs';
+import { mcpSkippedNotices, setCompactionChoice, compactionNumber, thresholdRatio, headroomFraction, compactionThreshold, localOutputBudget, DEFAULT_THRESHOLD_RATIO, DEFAULT_HEADROOM_FRACTION } from './agent/profile.mjs';
 import { createAgentTools } from './agent/tools-settings.mjs';
 import { withPlainStatus } from './agent/status.mjs';
 import { findBrowser, findPlaywrightMcp } from './agent/browser-probe.mjs';
@@ -226,6 +226,32 @@ const agent = createAgentBridge({
   connections: () => modelProviders.withSecrets().map(c => ({ ...c, models: c.models.map(m => ({ ...m, vision: readsPicturesByDefault(m, visionProbe.known(c, m.id)), reasoning: m.reasoning ?? visionProbe.knownThinks(c, m.id) ?? null })) })),
   log: line => console.log(line),
 });
+// The person's choice of when the assistant summarises an old part of a chat, before the first profile is written.
+setCompactionChoice(store.get().agentChat);
+/** Where compaction starts on the model the chat would use now, for the Settings line that says it in tokens. */
+function compactionModelLine() {
+  const list = native.readyInstances();
+  const inst = list.find(i => i.id === native.defaultInstanceId()) ?? list[0] ?? null;
+  const context = inst?.metrics?.engine?.max_context ?? inst?.context ?? 0;
+  if (!inst || !(context > 0)) return null;
+  const thresholdTokens = compactionThreshold(context, localOutputBudget(context));
+  return { name: inst.label || inst.apiModelId, context, thresholdTokens, percent: Math.round((thresholdTokens / context) * 100) };
+}
+/** What Settings -> Chat shows about the summarising point: the saved choice, what answers now, and where it came from. */
+function compactionView() {
+  const saved = store.get().agentChat ?? {};
+  const fromEnv = name => { const v = Number.parseFloat(process.env[name]); return Number.isFinite(v) ? v : null; };
+  const validRatio = v => compactionNumber(v, 0.1, 0.99) !== null;
+  const validFraction = v => compactionNumber(v, 0, 0.5) !== null;
+  const sourceOf = (savedValue, envName, valid) => (valid(savedValue) ? 'setting' : (valid(fromEnv(envName)) ? 'environment' : 'default'));
+  return {
+    choice: { thresholdRatio: validRatio(saved.thresholdRatio) ? saved.thresholdRatio : null, headroomFraction: validFraction(saved.headroomFraction) ? saved.headroomFraction : null },
+    effective: { thresholdRatio: thresholdRatio(), headroomFraction: headroomFraction() },
+    defaults: { thresholdRatio: DEFAULT_THRESHOLD_RATIO, headroomFraction: DEFAULT_HEADROOM_FRACTION },
+    source: { thresholdRatio: sourceOf(saved.thresholdRatio, 'STRATA_COMPACTION_THRESHOLD_RATIO', validRatio), headroomFraction: sourceOf(saved.headroomFraction, 'STRATA_COMPACTION_HEADROOM_FRACTION', validFraction) },
+    model: compactionModelLine(),
+  };
+}
 let storageChanging = false;
 let modelOperations = 0;
 const requestQueue = new RequestQueue(n => monitor.queueWaiting(n));
@@ -1922,6 +1948,32 @@ async function api(req, res, path, method, url) {
 
   // --- agent --------------------------------------------------------------
   if (path === '/api/agent/status' && method === 'GET') return json(res, 200, agent.status());
+  // A chat the person deleted in the app: drop its Harness session and the host's entry for it, so the two registries
+  // do not grow with every chat of every day (the app's memory climbed until the WebView2 renderer OOMed).
+  if (path === '/api/agent/chat/forget' && method === 'POST') {
+    const body = await readBody(req);
+    if (typeof body.chatId !== 'string' || !body.chatId) return error(res, 400, 'chatId is required');
+    agent.forget(body.chatId);
+    return json(res, 200, { ok: true });
+  }
+  // When the assistant summarises an old part of a chat (Settings -> Chat). null puts a name back to automatic;
+  // the running assistant picks the new number up on its next message (it is part of the profile's signature).
+  if (path === '/api/agent/compaction' && method === 'GET') return json(res, 200, compactionView());
+  if (path === '/api/agent/compaction' && method === 'POST') {
+    const body = await readBody(req);
+    const saved = store.get().agentChat ?? {};
+    const next = { ...saved };
+    for (const [name, min, max] of [['thresholdRatio', 0.1, 0.99], ['headroomFraction', 0, 0.5]]) {
+      if (!Object.hasOwn(body, name)) continue;
+      if (body[name] === null) { next[name] = null; continue; }
+      const value = compactionNumber(body[name], min, max);
+      if (value === null) return error(res, 400, `${name} is a fraction between ${min} and ${max}, or null for automatic.`);
+      next[name] = value;
+    }
+    store.update({ agentChat: next });
+    setCompactionChoice(next);
+    return json(res, 200, compactionView());
+  }
   // The assistant's model requests, with the person's Response settings added (llm-shape.mjs). This computer only.
   const llmRoute = /^\/api\/internal\/agent-llm\/([A-Za-z0-9_.~-]+)(\/.*)$/.exec(path);
   if (llmRoute) { llmProxy(req, res, llmRoute[1], llmRoute[2] + (url.search ?? '')); return undefined; }

@@ -22,7 +22,7 @@ import { randomUUID } from 'node:crypto';
 import { GatewayClient } from './gateway-client.mjs';
 import { HarnessProcess, resolveHarness, redact, stopStaleAgent } from './harness-runtime.mjs';
 import { StatusReporter } from './status.mjs';
-import { buildProfile, routeFor, MODE_PRESETS, modeOf, effortOf, localOutputBudget, compactionHeadroom } from './profile.mjs';
+import { buildProfile, routeFor, MODE_PRESETS, modeOf, effortOf, localOutputBudget, compactionThreshold } from './profile.mjs';
 import { TurnProjector, parseArguments as parseArgs, baselineItems } from './events.mjs';
 import { ChildProjector } from './children.mjs';
 import { nearestBudget } from './llm-shape.mjs';
@@ -1373,9 +1373,10 @@ ${note.text}
     const now = fresh ? null : await contextOf(runtime, sessionId);
     const window = now?.window || route.contextWindow;
     const pressure = now?.tokens ?? 0;
-    // Where the Harness starts summarising by itself on this window (profile.mjs: the reply keeps its room, then the headroom).
+    // Where the Harness starts summarising by itself on this window (profile.mjs: the reply keeps its room, then the headroom;
+    // STRATA_COMPACTION_THRESHOLD_RATIO moves the pressure fraction the same way the generated profile tells the Harness to).
     const reply = localOutputBudget(window);
-    const threshold = Math.floor(Math.min(window * 0.8, window - reply - compactionHeadroom(window, reply)));
+    const threshold = compactionThreshold(window, reply);
     let verdict = decideFit({ window, pressure, messageTokens: tokens, threshold });
     // The earlier conversation carried into a fresh session is what pushed it over: send the message alone instead.
     if (verdict.action === 'too-large' && carried !== message) {
