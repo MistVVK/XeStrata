@@ -60,7 +60,7 @@ template <> struct Fmt<16> {   // IQ2_XXS: d, qs[32] u16
     static constexpr int bytes = 66;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* q = b + 2 + 16 * j;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j;
         const uint32_t a0 = u32(q), a1 = u32(q + 4), b0 = u32(q + 8), b1 = u32(q + 12);
         g = _mm512_set_epi64((long long) iq2xxs_grid[b0 >> 24], (long long) iq2xxs_grid[(b0 >> 16) & 255],
                              (long long) iq2xxs_grid[(b0 >> 8) & 255], (long long) iq2xxs_grid[b0 & 255],
@@ -80,7 +80,7 @@ template <> struct Fmt<17> {   // IQ2_XS: d, qs[32] u16 (9-bit grid index + 7-bi
     static constexpr int bytes = 74;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* q = b + 2 + 16 * j;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j;
         uint16_t v[8];
         std::memcpy(v, q, 16);
         g = _mm512_set_epi64((long long) iq2xs_grid[v[7] & 511], (long long) iq2xs_grid[v[6] & 511],
