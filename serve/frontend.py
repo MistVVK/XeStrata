@@ -1044,6 +1044,8 @@ def json_args(s: str, props=None, notes: list | None = None):
 
 _COLON_OPENER = re.compile(r"<parameter=([^<>\s:=]+):[ \t]*([^\n<>]*)\n")
 _BARE_OPENER = re.compile(r"<(?:/|=)?([^<>\s=/]+)>")
+# #5969: the Anthropic XML form's parameter opener written inside the call format's `<function=NAME>` (a declared parameter)
+_NAMED_OPENER = re.compile(r'<parameter\s+name\s*=\s*"?([^"<>\s]+)"?\s*>')
 
 
 def opener_at(s: str, names=None, final: bool = False):
@@ -1080,6 +1082,12 @@ def opener_at(s: str, names=None, final: bool = False):
             return (param_name(s[len(PARAM_START):gt]), gt + 1, None) if gt >= 0 else None
         return None, len(line), None        # #6032 R5: an opener cut before its `>` (its line ends first): dropped
     if names:
+        m = _NAMED_OPENER.match(s)
+        if m:                                # #5969: `<parameter name="NAME">` inside a `<function=` call
+            return (m.group(1), m.end(), None) if m.group(1) in names else None
+        if not final and any(f'<parameter name="{n}">'.startswith(s) or f"<parameter name={n}>".startswith(s)
+                             for n in names):
+            return "pending"
         m = _BARE_OPENER.match(s)
         if m:
             return (m.group(1), m.end(), None) if m.group(1) in names else None
