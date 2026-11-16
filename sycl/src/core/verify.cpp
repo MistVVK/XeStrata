@@ -3,6 +3,7 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_doorbell.hpp"
 #include "strata/sycl_queue.hpp"
 #include "strata/kprof.hpp"
 #include "strata/core/verify.hpp"
@@ -853,6 +854,14 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
         device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
     }
+    // a window the host serves waits for it: with CPU-served experts (no device plan), with the device plan and non-resident
+    // experts, and ALSO a stage that starts 100% resident: refresh_ar() runs its windows on the doorbell graph whenever a prompt
+    // loan, a VRAM shrink or a swap takes an expert out of VRAM, and that graph asks the host at every layer (measured:
+    // --layer-split 26, --max-context 65536, "100% VRAM resident" stages, a wait expired at 20,000 reads under 4 concurrent
+    // extractions). None of these is the xe "every expert resident, the wait only spins in a failure" case the short bound is
+    // sized for, so the bound goes up whenever the host can be asked (h_res_ present) or must be (not all resident). The flag is
+    // process-wide (a stage of a --layer-split run raises it for every device) and spin_max() no longer freezes its answer.
+    if (!all_resident_ || h_res_ != nullptr) strata::spin_host_waits_expected(true);
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
         if (DPCT_CHECK_ERROR(qcnt_ = sycl::malloc_device<unsigned int>(

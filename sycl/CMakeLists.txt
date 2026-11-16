@@ -53,8 +53,8 @@ if(STRATA_SYCL_IQ_DECODE_FAST)
                          STRATA_IQ4_LUT_SWAR=1 STRATA_IQ3S_SIGN_FAST=1 STRATA_IQ3S_SIGN_APPLY_FAST=1)
 endif()
 # The device spins on host flags are bounded (include/strata/sycl_doorbell.hpp). The bound is chosen per device at run
-# time (20,000 reads on a B-series card, 2,000,000 elsewhere; STRATA_SPIN_MAX overrides). STRATA_SYCL_SPIN_MAX fixes one
-# bound for every device in this build.
+# time (20,000 reads on a B-series card, 1,000,000 when the CPU serves experts and the host is waited for, 2,000,000
+# elsewhere; STRATA_SPIN_MAX overrides). STRATA_SYCL_SPIN_MAX fixes one bound for every device in this build.
 set(STRATA_SYCL_SPIN_MAX "" CACHE STRING "fixed bound of the device's spins on host flags, in reads (empty: chosen per device at run time)")
 if(STRATA_SYCL_SPIN_MAX)
   add_compile_definitions(STRATA_SYCL_SPIN_MAX=${STRATA_SYCL_SPIN_MAX}u)
@@ -459,6 +459,9 @@ if(STRATA_SYCL_PARITY)
   add_executable(short_cache_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/short_cache_test.cpp)   # the sizing of a start short of VRAM (CPU, no model)
   target_include_directories(short_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME short_cache_test COMMAND short_cache_test)
+  add_executable(spin_bound_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/spin_bound_test.cpp)   # the choice of the device-spin bound (CPU, no device)
+  target_include_directories(spin_bound_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME spin_bound_test COMMAND spin_bound_test)
   add_executable(verify_refusal_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/verify_refusal_test.cpp)   # a refused start (no VRAM expert tier) ends cleanly: the verifiers leave the default queue alone
   target_link_libraries(verify_refusal_test PRIVATE strata_engine strata_prefill strata_spec)
   add_test(NAME verify_refusal_test COMMAND verify_refusal_test)   # needs one SYCL GPU
