@@ -20,8 +20,8 @@ SCHEMA = "strata.launch/1"
 #: setup.py's CONTEXTS (kept here only as the fallback when the installer files are not next to this terminal).
 FALLBACK_CONTEXTS = (8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288)
 
-ACCESS_KINDS = ("local", "lan", "cloudflare", "tailscale")
-ACCESS_WORDS = {"local": "This computer only", "lan": "My local network", "cloudflare": "Cloudflare tunnel",
+ACCESS_KINDS = ("local", "lan", "address", "cloudflare", "tailscale")
+ACCESS_WORDS = {"local": "This computer only", "lan": "My local network", "address": "One address only", "cloudflare": "Cloudflare tunnel",
                 "tailscale": "Tailscale"}
 TUNE_MODES = ("quick", "thorough", "skip")
 VISION_MODES = ("off", "on", "gpu", "cpu")
@@ -99,6 +99,7 @@ class LaunchSettings:
     tune: str = "skip"                         # quick | thorough | skip
     tune_allow_small: bool = False             # the "answer-changing" tick, off by default, as in the app
     access: str = "local"
+    listen: str | None = None                  # access "address" (#5917): the one address of this computer the server listens on
     port: int = DEFAULT_PORT
     api_key: str | None = None                 # never shown whole; stored only in the private preset file
     no_key: bool = False                       # served beyond this computer without a key, on purpose (--no-api-key); a warning, never a refusal
@@ -313,7 +314,7 @@ def flags_text(s: LaunchSettings, *, preset: str | None = None) -> str:
         parts.append(f"--tune {s.tune}")
         if s.tune_allow_small:
             parts.append("--tune-allow-small")
-        parts.append(f"--access {s.access}")
+        parts.append(f"--listen {s.listen}" if s.access == "address" and s.listen else f"--access {s.access}")
         parts.append(f"--port {s.port}")
         if s.gpu_roles:
             parts.append("--gpu-roles " + ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0]))))

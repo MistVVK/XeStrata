@@ -1413,7 +1413,8 @@ class AccessScreen(Base):
                  "for you (recommended); press t if you would rather have no key: it still starts, but anyone who can reach it can use it. "
                  "To see the key later: strata launch --show-key. To use a key of your own: strata launch --api-key YOUR-KEY (or --api-key-env NAME).")
 
-    BINDINGS = Base.BINDINGS + [Binding("p", "port", show=False), Binding("k", "newkey", show=False), Binding("t", "keytoggle", show=False)]
+    BINDINGS = Base.BINDINGS + [Binding("p", "port", show=False), Binding("k", "newkey", show=False), Binding("t", "keytoggle", show=False),
+                                Binding("n", "go_next", show=False)]
 
     def body(self) -> ComposeResult:
         yield Static(Text("Who can use it?", style=f"bold {ACCENT}"), markup=False)
@@ -1439,7 +1440,7 @@ class AccessScreen(Base):
 
     def build(self) -> None:
         s = self.ctx.settings
-        opts = acc.options(s.port)
+        opts = acc.options(s.port, listen=s.listen)
         items = []
         sel = 0
         for i, o in enumerate(opts):
@@ -1475,8 +1476,10 @@ class AccessScreen(Base):
                 out.append(fw + "\n", style=WARN)
             if cur.key == "cloudflare":
                 out.append("A Cloudflare quick tunnel gives a temporary public address; anyone with it can try to use the server, so an API key keeps others out.", style=MUTE)
-            elif cur.key == "lan":
+            elif cur.key in ("lan", "address"):
                 out.append("Other computers on your network can use it at the address shown. An API key is recommended.", style=MUTE)
+                if cur.key == "address" and len(acc.local_addresses()) > 1:
+                    out.append("\nEnter = next address   n next", style=MUTE)        # #5917
             elif cur.key == "tailscale":
                 out.append("Only devices signed in to your Tailscale network can reach it.", style=MUTE)
             else:
@@ -1487,6 +1490,9 @@ class AccessScreen(Base):
         kind = self.menu().current.key
         s = self.ctx.settings
         s.access = kind
+        if kind == "address" and s.listen not in acc.local_addresses():
+            found = acc.local_addresses()
+            s.listen = found[0] if found else None
         if kind == "local" and self.drop_cursor_key():
             self.say("")
         elif kind != "local" and not s.api_key and not s.no_key:
@@ -1533,12 +1539,27 @@ class AccessScreen(Base):
     def action_next(self) -> None:
         if self.input_open():
             return
+        s = self.ctx.settings
+        found = acc.local_addresses() if self.menu().current.key == "address" else []
+        if len(found) > 1:                                   # #5917: Enter on "One address only" goes to the next address; n goes on
+            s.listen = found[(found.index(s.listen) + 1) % len(found)] if s.listen in found else found[0]
+            self.build()
+            self.paint()
+            return
+        self.action_go_next()
+
+    def action_go_next(self) -> None:
+        if self.input_open():
+            return
         self.commit()
         self.app.advance()           # type: ignore[attr-defined]
 
     def commit(self) -> None:
         s = self.ctx.settings
         s.access = self.menu().current.key
+        if s.access == "address" and not s.listen:
+            found = acc.local_addresses()
+            s.listen = found[0] if found else None
         if s.access == "local":
             self.drop_cursor_key()
         elif not s.api_key and not s.no_key:

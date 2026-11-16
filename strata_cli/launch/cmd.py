@@ -125,8 +125,11 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                         "lscpu show). The default is one worker per physical core, which the engine's start line names; "
                         "two entries on one core are kept with a warning")
     a = p.add_argument_group("who can use it")
-    a.add_argument("--access", type=_choice("a way to share Strata", S.ACCESS_KINDS), metavar="local|lan|cloudflare|tailscale",
-                   help="local: this computer only; lan: your network; cloudflare: a quick tunnel; tailscale: your tailnet")
+    a.add_argument("--access", type=_choice("a way to share Strata", S.ACCESS_KINDS), metavar="local|lan|address|cloudflare|tailscale",
+                   help="local: this computer only; lan: your network; address: one address of this computer (see --listen); "
+                        "cloudflare: a quick tunnel; tailscale: your tailnet")
+    a.add_argument("--listen", metavar="ADDRESS",
+                   help="serve on this one address of this computer (a second network card or a VPN) instead of all of them")
     a.add_argument("--port", type=_port, metavar="N", help=f"port (default {S.DEFAULT_PORT})")
     a.add_argument("--api-key", metavar="KEY", help="the key clients must send (made for you when you share beyond this computer)")
     a.add_argument("--api-key-env", metavar="NAME", help="read the key from this environment variable")
@@ -268,6 +271,12 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.tune_allow_small = True
     if a.access:
         s.access = a.access
+    if getattr(a, "listen", None):                       # #5917: --listen ADDRESS is the "One address only" way to share
+        s.access, s.listen = "address", a.listen.strip()
+    elif s.access == "address" and not s.listen:
+        from strata_cli.launch import access
+        found = access.local_addresses()
+        s.listen = found[0] if found else None
     if a.port:
         s.port = a.port
     if a.api_key:

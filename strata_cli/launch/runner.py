@@ -472,7 +472,7 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
     launch values, then persisted overrides, then calibrated values, then Auto)."""
     from strata_control import arg_layers, tune_knobs
     cfg = json.loads(json.dumps(base))
-    cfg["host"] = acc.host_for(s.access)
+    cfg["host"] = acc.host_for(s.access, s.listen)
     cfg["port"] = int(s.port)
     if s.api_key:
         cfg["api_key"] = s.api_key
@@ -1802,7 +1802,7 @@ class Runner:
             parallel = None                                  # the slots Strata fills in by itself would keep the MTP: DFlash2 answers one request at a time
         if parallel and self.run_config_owns_slots(config):
             parallel = None                                  # the all-cards split engine's run config carries its lanes (--batch N, from --parallel N or its default): a profile override would only collide with them
-        sets = [f"host={acc.host_for(self.s.access)}", f"port={int(self.s.port)}"] + ([f"parallel={parallel}"] if parallel else [])
+        sets = [f"host={acc.host_for(self.s.access, self.s.listen)}", f"port={int(self.s.port)}"] + ([f"parallel={parallel}"] if parallel else [])
         try:
             current, _rev = profiles.load(name)
         except profiles.ProfileError:
@@ -2545,6 +2545,10 @@ class Runner:
         self.keep_saved_word()                               # a restart with no word keeps the saved one (it was written as null before)
         try:
             self.check_own_files()                         # a wrong --model-path is said before the engine is downloaded
+            if start and self.s.access == "address":       # #5917: an address that left this computer stops here, never a silent 0.0.0.0
+                problem = acc.listen_problem(self.s.listen)
+                if problem:
+                    raise LaunchError(problem, "", 2)
             if start:
                 reused = self.check_serving()                # before anything is downloaded or stopped
                 if reused is not None:

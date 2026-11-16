@@ -25,11 +25,48 @@ TUNNEL_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 WINDOWS = os.name == "nt"
 
 
-def host_for(kind: str) -> str:
-    """The address the server listens on: loopback for this computer only, every address for the rest.
+def host_for(kind: str, listen: str | None = None) -> str:
+    """The address the server listens on: loopback for this computer only, the one address chosen for "One address only" (#5917),
+    every address for the rest.
 
     Cloudflare's tunnel connects from the same computer, so it too can stay on loopback."""
+    if kind == "address" and listen:
+        return listen
     return "127.0.0.1" if kind in ("local", "cloudflare") else "0.0.0.0"
+
+
+def local_addresses() -> list[str]:
+    """Every address of this computer a server can listen on for others: the private IPv4 ones first (the default route's first), then the
+    other IPv4 and IPv6 ones (a VPN's included); never loopback or link-local (169.254.x.x, fe80::)."""
+    found = list(lan_ips())
+    try:
+        import psutil
+        for infos in psutil.net_if_addrs().values():
+            for i in infos:
+                if i.family in (socket.AF_INET, socket.AF_INET6):
+                    address = str(i.address).split("%", 1)[0]
+                    low = address.lower()
+                    if address.startswith(("127.", "169.254.", "0.")) or low in ("::1", "::") or low.startswith("fe80:"):
+                        continue
+                    found.append(address)
+    except Exception:                                      # noqa: BLE001
+        pass
+    return list(dict.fromkeys(found))
+
+
+def url_host(address: str) -> str:
+    """An address as it goes into a URL: an IPv6 one in brackets."""
+    return f"[{address}]" if ":" in address and not address.startswith("[") else address
+
+
+def listen_problem(address: str | None) -> str | None:
+    """None when `address` is one of this computer's addresses now; else the plain line that stops the launch (#5917: never a silent
+    fallback to every address)."""
+    here = local_addresses()
+    if address and address.split("%", 1)[0] in here:
+        return None
+    return (f"{address} is no longer an address of this computer. Its addresses now: {', '.join(here) or 'none'}. "
+            "Choose one in the Access step.")
 
 
 def lan_ips() -> list[str]:
@@ -239,10 +276,12 @@ class AccessOption:
     warn: bool = False
 
 
-def options(port: int, *, tunnel_url: str | None = None) -> list[AccessOption]:
-    """The four ways to share, with the address each would give and what is missing for it."""
+def options(port: int, *, tunnel_url: str | None = None, listen: str | None = None) -> list[AccessOption]:
+    """The five ways to share, with the address each would give and what is missing for it."""
     ips = lan_ips()
     lan = ips[0] if ips else None
+    addresses = local_addresses()
+    one = listen if listen in addresses else (addresses[0] if addresses else None)
     cf = find_cloudflared()
     ts = tailscale_status()
     out = [AccessOption("local", "This computer only", f"http://127.0.0.1:{port}",
@@ -260,6 +299,9 @@ def options(port: int, *, tunnel_url: str | None = None) -> list[AccessOption]:
         out.append(AccessOption("tailscale", "Tailscale", f"http://<tailnet address>:{port}",
                                 "Tailscale is not connected" if ts["installed"] else
                                 "Tailscale is not installed", False, warn=True))
+    out.append(AccessOption("address", "One address only", f"http://{url_host(one) if one else '<network address>'}:{port}",
+                            "listens on one network address of this computer (a second network card or a VPN)" if one else
+                            "no network address found on this computer", bool(one), warn=not one))
     return out
 
 
@@ -277,13 +319,15 @@ def missing_helper(kind: str) -> str | None:
             return "Tailscale is not installed on this computer. " + install_help("tailscale")
         if not ts["running"]:
             return "Tailscale is installed but not connected. Run: tailscale up"
-    if kind == "lan" and not lan_ips():
+    if (kind == "lan" and not lan_ips()) or (kind == "address" and not local_addresses()):
         return "No local network address was found on this computer. Check that it is connected to your network."
     return None
 
 
 def urls_for(s: LaunchSettings, *, tunnel_url: str | None = None) -> list[str]:
     """The addresses a client can use for these choices (the first is the main one)."""
+    if s.access == "address" and s.listen:                 # the server listens on that address only: 127.0.0.1 would not answer
+        return [f"http://{url_host(s.listen)}:{s.port}"]
     base = [f"http://127.0.0.1:{s.port}"]
     if s.access == "lan":
         base += [f"http://{ip}:{s.port}" for ip in lan_ips()[:1]]
@@ -298,7 +342,7 @@ def urls_for(s: LaunchSettings, *, tunnel_url: str | None = None) -> list[str]:
 
 def firewall_note(kind: str) -> str | None:
     """Windows asks the first time a program listens for other computers: say so before it happens, in plain words."""
-    if WINDOWS and kind in ("lan", "tailscale"):
+    if WINDOWS and kind in ("lan", "address", "tailscale"):
         return ("Windows may ask whether to allow Strata (python.exe) on your network: choose Allow for private networks. "
                 "If you choose Cancel, the model still works on this computer.")
     return None
