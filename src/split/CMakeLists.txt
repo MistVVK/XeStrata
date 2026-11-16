@@ -25,11 +25,11 @@ if(NOT _fnx_hip AND (NOT STRATA_ENABLE_CUDA OR WIN32 OR APPLE))
   message(STATUS "STRATA_BUILD_SPLIT: needs a Linux CUDA or HIP build, skipped")
   return()
 endif()
-# the quant header (block layouts, codebook tables): the split's only file from third_party/strata-ggml; its dot products are its own
+# the quant header (block layouts, codebook tables): Strata's include/strata/quant/strata-quant-common.h, the split's only header from the root include/; its dot products are its own
 # (src/qdot.cuh, ggml vecdotq.cuh's arithmetic), so no ggml-cuda header is on its include path
-get_filename_component(_sp_quant "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/strata-ggml" ABSOLUTE)
-if(NOT EXISTS "${_sp_quant}/strata-quant-common.h")
-  message(WARNING "STRATA_BUILD_SPLIT: third_party/strata-ggml/strata-quant-common.h is missing; strata-split skipped")
+get_filename_component(_sp_quant "${CMAKE_CURRENT_SOURCE_DIR}/../../include" ABSOLUTE)
+if(NOT EXISTS "${_sp_quant}/strata/quant/strata-quant-common.h")
+  message(WARNING "STRATA_BUILD_SPLIT: include/strata/quant/strata-quant-common.h is missing; strata-split skipped")
   return()
 endif()
 if(_fnx_hip)

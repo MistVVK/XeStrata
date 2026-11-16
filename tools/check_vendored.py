@@ -26,7 +26,7 @@ import sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 TREE = os.path.join("third_party", "strata-ggml")
 IDENTITY = ()      # a tree that keeps llama.cpp's layout and has no file under another name (third_party/strata-llama): an empty map, every file `upstream`
-GGML_RENAMED = {"strata-quant-common.h": "ggml/src/ggml-common.h"}   # the one file of third_party/strata-ggml whose upstream name differs
+GGML_RENAMED = {}   # (no file of third_party/strata-ggml has another name upstream: the quant header is ours since 0.2.16, include/strata/quant)
 # every vendored tree: (folder, maps a path in the tree to the path in the llama.cpp checkout at the pin)
 GGUF_PY_MAP = (("gguf/", "gguf-py/gguf/"), ("converter/conversion/", "conversion/"), ("converter/convert_hf_to_gguf.py", "convert_hf_to_gguf.py"),
                ("converter/LICENSE", "LICENSE"), ("LICENSE", "gguf-py/LICENSE"), ("pyproject.toml", "gguf-py/pyproject.toml"))

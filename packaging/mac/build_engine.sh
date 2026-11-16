@@ -17,8 +17,8 @@
 # Layout of the package (the engine finds these beside its executable, metal/src/resource_path.h):
 #   strata, strata-vision, BUILD.json
 #   metal/kernels/*.metal           metal/engine-msl/*.metal          metal/data/{expert-profile.bin,draft_vocab.bin}
-#   metal/strata-quant-common.h     the quant header's TEXT (the runtime reads it: it cannot follow an #include). It is the real file of
-#                                   third_party/strata-ggml/, NOT third_party/ggml/ggml-common.h, which is only a one-line forwarder since own-stack 1B.
+#   metal/strata-quant-common.h     the quant header's TEXT (the runtime reads it: it cannot follow an #include). It is the generated file
+#                                   include/strata/quant/strata-quant-common.h, NOT third_party/ggml/ggml-common.h, which is only a one-line forwarder.
 #   metal/ggml-common.h             the same text under the old name, kept for two releases (an engine of an earlier release reads this name)
 set -eo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -76,8 +76,8 @@ fi
 
 if has pkg; then
   echo "== metal engine package (strata + strata-vision)"
-  QUANT=third_party/strata-ggml/strata-quant-common.h
-  [ -f "$QUANT" ] && [ "$(head -c 24 "$QUANT")" = "#ifndef GGML_COMMON_DECL" ] || { echo "$QUANT is missing or is not the header text"; exit 1; }
+  QUANT=include/strata/quant/strata-quant-common.h
+  [ -f "$QUANT" ] && grep -q "^#ifndef GGML_COMMON_DECL$" "$QUANT" || { echo "$QUANT is missing or is not the header text"; exit 1; }
   rm -rf "$STAGE"; mkdir -p "$STAGE/metal/kernels" "$STAGE/metal/engine-msl" "$STAGE/metal/data"
   cp "$BUILD/strata" "$STAGE/"
   cp "$WORK/vision-out/strata-vision" "$STAGE/"                 # BEFORE package_engine.py: it takes strata-vision from --src

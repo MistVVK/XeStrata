@@ -4,7 +4,7 @@
     python tools/test_strata_gguf.py --freeze        rewrite tools/strata_gguf_digests.json from gguf-py's outputs (needs gguf-py)
 
 What is proven:
-  * tools/strata_quant_tables.py is exactly what tools/gen_strata_quant_tables.py makes from strata-quant-common.h;
+  * tools/strata_quant_tables.py is exactly what tools/gen_strata_quant_tables.py makes from the GGUF reference tables;
   * the type table agrees with tools/gguf_reader.py and (when it is available) with gguf-py;
   * with llama.cpp's gguf-py (third_party/strata-gguf-py, or $STRATA_GGUF_PY): every dequantizer and quantizer gives bit-identical results
     on random and edge-case blocks, the writer produces byte-identical files, and the reader gives the same fields and tensors;

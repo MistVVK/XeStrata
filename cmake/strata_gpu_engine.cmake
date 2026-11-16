@@ -229,7 +229,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(pa_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(pa_bench PRIVATE strata_kernels CUDA::cudart)
   endif()
-  # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
+  # plan v0.3 P6: the GGUF block layouts and codebook grids for the i-quant formats (third_party/ggml/ggml-common.h forwards to include/strata/quant/strata-quant-common.h)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
   if(STRATA_ENABLE_CUDA)
