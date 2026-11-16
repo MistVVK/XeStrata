@@ -114,7 +114,7 @@ test('reload in the middle of an agent turn: the chat shows as running with a St
     const saved = JSON.parse(await chatStore.read('s_run')).session.messages.at(-1);
     assert.equal(saved.content, 'I will start by reading the folder, then writing the file.', 'and the whole answer is what is saved');
     assert.equal(saved.streaming, false);
-  } finally { page?.fake.restore(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { page?.fake.restore(); rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test('a turn that ended while the page was away is shown whole; a chat with nothing to take over keeps its reply and gets no error', async () => {
@@ -154,5 +154,5 @@ test('a turn that ended while the page was away is shown whole; a chat with noth
     assert.equal(store.useStore((s) => s.toasts).length, 0, 'no failure is announced');
     assert.deepEqual(globalThis.__attachCalls.map((c) => c.body.requestId).sort(), ['req-done', 'req-gone'], JSON.stringify(globalThis.__attachCalls));
     assert.equal(store.useStore((s) => s.streaming), false);
-  } finally { page?.fake.restore(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { page?.fake.restore(); rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
