@@ -4369,7 +4369,9 @@ def pick_hip_devices(devices: list[dict]) -> tuple[list[int] | None, str | None]
         return None, hip_no_card_message(devices)
     pool = [d for d in runnable if not d["integrated"]] or runnable
     if devices[0] in pool:
-        return None, None
+        # device 0 runs, as before; a card the engine has no code for is not shown to it at all (#6015: such a card visible to the engine
+        # can stop it at start), and the order of the others is kept
+        return ([d["index"] for d in runnable] if len(runnable) < len(devices) else None), None
     best = max(pool, key=lambda d: (round(d["vram_gb"]), -d["index"]))
     return [best["index"]], None
 
