@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { Screen } from './layout';
 import { Btn, ErrorNotice, Icon } from './ui';
 import { api } from '../lib/client';
+import { useImeKeys } from '../lib/ime-keys';
 import { parseLocation } from '../lib/router';
 import { nativeAction, useNative, type NativeJob } from '../lib/native';
 import { nativeCatalogModels, catalogVersionLabel } from '../lib/native-catalog';
@@ -28,7 +29,7 @@ function problem(issues: string[]): { message: string; next: string } {
 /** "Use a local GGUF": choose the folder of a model you already have, Strata checks it, and prepares and loads it without copying
  *  or downloading the model files. The same page layout and cards as the optimized models page. */
 export function NativeLocalModel({ onBack }: { onBack: () => void }) {
-    const native = useNative();
+    const native = useNative(), ime = useImeKeys();
     const [typed, setTyped] = useState(''), [checked, setChecked] = useState<Preview | null>(null), [pending, setPending] = useState(false), [error, setError] = useState(''), [jobId, setJobId] = useState('');
     const job = native?.jobs.find(j => j.id === jobId);
     const active = native?.jobs.find(j => j.state === 'running');
@@ -73,7 +74,7 @@ export function NativeLocalModel({ onBack }: { onBack: () => void }) {
    <div className="stack stack--lg">
     <section className="st-card native-choice"><h2 className="h3">{tr("Use a local GGUF…")}</h2>
      <p className="small muted">{tr("Already have a supported model on this computer? Choose the folder that holds its files, or one of its .gguf files. Strata checks them, prepares the model and loads it. Nothing is copied or downloaded.")}</p>
-     <label className="input-field"><span>{tr("Folder with the GGUF files, or one .gguf file")}</span><input className="st-input" value={typed} placeholder={tr("Full path to the folder or the file")} spellCheck={false} onChange={e => setTyped(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && typed.trim()) void check(typed); }}/></label>
+     <label className="input-field"><span>{tr("Folder with the GGUF files, or one .gguf file")}</span><input className="st-input" value={typed} placeholder={tr("Full path to the folder or the file")} spellCheck={false} onChange={e => setTyped(e.target.value)} {...ime.events} onKeyDown={e => { if (ime.owns(e)) return; if (e.key === 'Enter' && typed.trim()) void check(typed); }}/></label>
      <div className="native-settings-actions"><Btn icon="folder" disabled={pending || !!active} onClick={() => void check('')}>{tr("Choose folder")}</Btn><Btn disabled={pending || !typed.trim() || !!active} onClick={() => void check(typed)}>{tr(pending && !jobId ? 'Checking…' : 'Check files')}</Btn></div>
     </section>
     {tr(checked ? <section className="st-card native-choice">{tr(usable ? <>

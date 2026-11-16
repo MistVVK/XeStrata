@@ -177,7 +177,9 @@ function renameChat(row, c) {
     if (keep) { c.title = input.value.trim(); chatStore.put(H.cleanChat(c)); }
     renderSidebar();
   };
+  const imeKey = StrataIme.watch(input);              // Enter and Escape inside an IME conversion are the IME's (#5071)
   input.addEventListener("keydown", (e) => {
+    if (imeKey(e)) return;
     if (e.key === "Enter") { e.preventDefault(); finish(true); }
     else if (e.key === "Escape") { e.preventDefault(); finish(false); }
   });
@@ -332,9 +334,11 @@ function editAnswerAt(i) {
   box.querySelector("[data-edit-cancel]").textContent = tr("cancel", "Cancel");
   save.onclick = () => saveAnswerEdit(i, input.value);
   box.querySelector("[data-edit-cancel]").onclick = closePanel;
+  const imeKey = StrataIme.watch(input);              // an Escape that cancels an IME conversion does not close the editor (#5071)
   input.onkeydown = (e) => {
+    if (imeKey(e)) return;
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closePanel(); }
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); save.click(); }
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save.click(); }
   };
   el.dataset.editing = "true";
   el.appendChild(box);

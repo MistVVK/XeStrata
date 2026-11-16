@@ -1,10 +1,11 @@
 import { tr } from '../lib/i18n';
 import { useEffect, useState } from 'react';
 import { api } from '../lib/client';
+import { useImeKeys } from '../lib/ime-keys';
 import { setFontFamily, useStore } from '../lib/store';
 import { Btn, Select } from './ui';
 export function FontChoice() {
-    const value = useStore(state => state.fontFamily), [fonts, setFonts] = useState<string[]>([]), [loading, setLoading] = useState(true), [manual, setManual] = useState(false), [draft, setDraft] = useState(value);
+    const value = useStore(state => state.fontFamily), [fonts, setFonts] = useState<string[]>([]), [loading, setLoading] = useState(true), [manual, setManual] = useState(false), [draft, setDraft] = useState(value), ime = useImeKeys();
     useEffect(() => { let active = true; void api.get<{
         fonts: string[];
     }>('/api/fonts').then(result => { if (active)
@@ -17,7 +18,7 @@ export function FontChoice() {
     else {
         setManual(false);
         setFontFamily(name);
-    } }}/>{tr(loading ? <small className="muted">{tr("Loading installed fonts\u2026")}</small> : null)}{!loading && !fonts.length ? <small className="muted">{tr("Your browser cannot list installed fonts. Enter the name of a font installed on your computer.")}</small> : null}{tr(manual ? <div className="font-choice-manual"><input className="st-input" aria-label={tr("Font family name")} placeholder={tr("Enter a font family name")} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && draft.trim()) {
+    } }}/>{tr(loading ? <small className="muted">{tr("Loading installed fonts\u2026")}</small> : null)}{!loading && !fonts.length ? <small className="muted">{tr("Your browser cannot list installed fonts. Enter the name of a font installed on your computer.")}</small> : null}{tr(manual ? <div className="font-choice-manual"><input className="st-input" aria-label={tr("Font family name")} placeholder={tr("Enter a font family name")} value={draft} onChange={event => setDraft(event.target.value)} {...ime.events} onKeyDown={event => { if (ime.owns(event)) return; if (event.key === 'Enter' && draft.trim()) {
         setFontFamily(draft);
         setManual(false);
     } }}/><Btn size="sm" disabled={!draft.trim()} onClick={() => { setFontFamily(draft); setManual(false); }}>{tr("Apply font")}</Btn></div> : null)}</div>;
