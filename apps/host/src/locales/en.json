@@ -3527,5 +3527,6 @@
   "s9035": "These model files are missing: {0}.",
   "s9036": "Press Download & load again to fetch them. Files that are already there are kept. If the same files are listed again, open Details and share them when you ask for help.",
   "s9037": "This update was cut short when the app restarted. A later update finished, so nothing needs doing.",
-  "s9038": "This system does not let Strata use port {0}. On Linux and macOS, ports below 1024 need administrator rights. Start Strata with another port (STRATA_PORT), for example 8801."
+  "s9038": "This system does not let Strata use port {0}. On Linux and macOS, ports below 1024 need administrator rights. Start Strata with another port (STRATA_PORT), for example 8801.",
+  "s9101": "Share of the time the GPU had work to do. It does not say how much of its compute is in use."
 }

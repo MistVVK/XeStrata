@@ -30,8 +30,10 @@ function ReadingBar({ label, value, tone = 'accent' }: {
 }) {
     return hasReading(value) ? <Bar label={tr(label)} value={value} tone={tone}/> : <div className="st-progress" role="img" aria-label={tr("{0}: unavailable", [label])}/>;
 }
-function MonitorMetric({ label, icon, value, unit, sub, chart, source, secondary }: {
+function MonitorMetric({ label, icon, value, unit, sub, chart, source, secondary, hint }: {
     label: string;
+    /** What the reading is, as the label's tooltip (#5484). */
+    hint?: string;
     icon: IconName;
     value: ReactNode;
     unit?: string;
@@ -41,7 +43,7 @@ function MonitorMetric({ label, icon, value, unit, sub, chart, source, secondary
     secondary?: ReactNode;
 }) {
     return <section className="st-card monitor-metric" aria-label={tr(label)}>
-    <div className="st-metric__label"><Icon name={icon} size={18}/>{tr(label)}<span className="monitor-metric__source xs">{tr(source)}</span></div>
+    <div className="st-metric__label" title={hint}><Icon name={icon} size={18}/>{tr(label)}<span className="monitor-metric__source xs">{tr(source)}</span></div>
     <div className={secondary ? 'monitor-speed-values' : 'monitor-metric__reading'}><div><div className="st-metric__value">{tr(value)}{tr(unit ? <span className="st-metric__unit">{tr(unit)}</span> : null)}</div><div className="monitor-metric__sub xs muted">{tr(sub)}</div></div>{tr(secondary)}</div>
     {tr(chart)}
   </section>;
@@ -190,7 +192,7 @@ function LegacyMonitorScreen({ native }: {
     </section>
     <div className="monitor-metrics">
       {tr(!multipleScope ? <MonitorMetric label={tr("Speed")} icon="gauge" value={number(decode, 1)} unit={hasReading(decode) ? 'tok/s' : ''} source={throughput} sub={writing ? 'Decode now' : last ? 'Decode last request' : 'Decode'} secondary={<div><div className="st-metric__value">{tr(number(prefill))}{tr(hasReading(prefill) ? <span className="st-metric__unit">{tr("tok/s")}</span> : null)}</div><div className="monitor-metric__sub xs muted">{tr(data.phase === 'reading' ? 'Prefill now' : writing ? 'Prefill this request' : last ? 'Prefill last request' : 'Prefill')}</div></div>} chart={<ReferenceSpark label={tr("Speed")} data={history.map(s => throughputKnown ? s.outputTps : null)} secondary={{ data: history.map(s => throughputKnown ? s.promptTps : null), label: 'Prefill', tone: 'var(--st-chart-prefill)' }} tone="var(--st-chart-decode)" unit="tok/s" timestamps={timestamps}/>}/> : null)}
-      <MonitorMetric label={tr("GPU load")} icon="gpu" value={number(gpuLoad)} unit={hasReading(gpuLoad) ? '%' : ''} source={gpuSource('utilizationPct', 'mean')} sub={whose('utilizationPct', 'mean') ?? gpuName} chart={chart('GPU load', historyGpu('utilizationPct', 'gpuLoad', 'mean'), '%', 100)}/>
+      <MonitorMetric label={tr("GPU load")} hint={tr("Share of the time the GPU had work to do. It does not say how much of its compute is in use.")} icon="gpu" value={number(gpuLoad)} unit={hasReading(gpuLoad) ? '%' : ''} source={gpuSource('utilizationPct', 'mean')} sub={whose('utilizationPct', 'mean') ?? gpuName} chart={chart('GPU load', historyGpu('utilizationPct', 'gpuLoad', 'mean'), '%', 100)}/>
       <MonitorMetric label={tr(shared ? 'Shared GPU memory' : 'VRAM')} icon="layers" value={number(vram, 1)} unit={hasReading(vram) ? vramTotal ? `/ ${number(vramTotal, 0)} GB` : 'GB' : ''} source={gpuSource('memoryUsedGb')} sub={whose('memoryUsedGb') ?? (shared ? 'Same memory pool as system RAM' : multipleGpus ? 'Total across selected GPUs' : cacheKnown && devices.length === 1 ? `${number(data.expertCache.used)} experts cached` : 'GPU memory')} chart={chart(shared ? 'Shared GPU memory' : 'VRAM', historyGpu('memoryUsedGb', 'vramUsedGb'), 'GB', vramTotal)}/>
       <MonitorMetric label={tr("GPU temp")} icon="thermometer" value={number(temperature)} unit={hasReading(temperature) ? '°C' : ''} source={gpuSource('temperatureC', 'max')} sub={whose('temperatureC', 'max') ?? (multipleGpus ? 'Hottest selected GPU' : selectedGpus[0]?.name ?? (selectedInstance && !selectedInstance.gpuIds.length ? native ? 'Automatic GPU placement' : 'CPU only · no GPU assigned' : 'No GPU detected'))} chart={chart('GPU temperature', historyGpu('temperatureC', 'gpuTempC', 'max'), '°C', 90, 'var(--st-warn)')}/>
       <MonitorMetric label={tr("Power")} icon="bolt" value={number(power)} unit={hasReading(power) ? 'W' : ''} source={gpuSource('powerW')} sub={whose('powerW') ?? (hasReading(powerLimit) ? `of ${number(powerLimit)} W limit` : multipleGpus ? 'Total across selected GPUs' : 'GPU power draw')} chart={chart('GPU power', historyGpu('powerW', 'powerW'), 'W', powerLimit ?? undefined)}/>

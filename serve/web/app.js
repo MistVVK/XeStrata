@@ -128,7 +128,9 @@ async function loadHealth() {
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
   {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
-  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
+  // #5484: what the load is (NVML, amdgpu and the Mac report time busy, not compute in use)
+  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100,
+   hint: "Share of the time the GPU had work to do. It does not say how much of its compute is in use."},
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
@@ -138,7 +140,7 @@ const METRICS = [
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
-    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
+    <span class="st-metric__label"${m.hint ? ` title="${esc(m.hint)}"` : ""}>${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     ${m.key === "speed" ? `<div class="speed-values">
       <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
       <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>

@@ -3527,5 +3527,6 @@
   "s9035": "Faltan estos archivos del modelo: {0}.",
   "s9036": "Pulse de nuevo «Descargar y cargar» para obtenerlos. Los archivos que ya están se conservan. Si vuelven a aparecer los mismos archivos, abra los detalles y compártalos cuando pida ayuda.",
   "s9037": "Esta actualización se interrumpió cuando la aplicación se reinició. Una actualización posterior terminó, así que no hay nada que hacer.",
-  "s9038": "Este sistema no deja que Strata use el puerto {0}. En Linux y macOS, los puertos por debajo de 1024 necesitan derechos de administrador. Inicia Strata con otro puerto (STRATA_PORT), por ejemplo 8801."
+  "s9038": "Este sistema no deja que Strata use el puerto {0}. En Linux y macOS, los puertos por debajo de 1024 necesitan derechos de administrador. Inicia Strata con otro puerto (STRATA_PORT), por ejemplo 8801.",
+  "s9101": "Parte del tiempo en que la GPU tenía trabajo. No indica cuánta de su capacidad de cálculo se está usando."
 }
