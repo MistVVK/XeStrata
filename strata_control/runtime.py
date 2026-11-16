@@ -583,6 +583,8 @@ CHILD_EXIT_GRACE = 10.0     # seconds a host whose server ended on its own keeps
 DIE_WITH_MISSES = 3         # consecutive looks, a second apart, at a process that cannot be found before the owner calls it gone (#4973)
 STATUS_RPC_TIMEOUT = 10.0   # seconds one status question may take; a busy owner is asked again until the start's wait is over (#5177)
 VERIFY_BUDGET = 180.0       # seconds an engine that says it is up may take to answer its first token, whatever is left of the load wait (#5177 #5059)
+STOP_KILL_GRACE = 8.0       # seconds past shutdown_timeout the host waits for its server to end before it kills the tree (Host._stop_child)
+STOP_REAP_WAIT = 10.0       # seconds it then waits for the killed tree to be gone
 MAX_START_WAIT = 1800     # seconds a start may wait for the model: a 250 GB set on a slow disk needs more than 10 minutes (#3949)
 
 
@@ -893,6 +895,7 @@ class Host:
         self.probe_key: tuple[int, str] | None = None
         self.probe_result: dict | None = None
         self.rollback_snapshots: set[Path] = set()
+        self.last_teardown_s: float | None = None   # what the last stop of a running server took here (informational, never a bound: #5956)
 
     def _mark_child(self, phase: str, *, pid: int | None = None, ready: Path | None = None) -> None:
         payload = {"host_token": self.token, "phase": phase}
@@ -1124,17 +1127,22 @@ class Host:
             if self.ready_path is not None:
                 self.ready_path.unlink(missing_ok=True)
             return {"ok": True, "state": "stopped", "exit_code": child.returncode if child else 0}
+        began = time.monotonic()
         if WINDOWS:
             self._close_owner_pipe()             # EOF on the server's stdin: it drains and stops (no SIGTERM here)
         else:
             child.send_signal(signal.SIGTERM)
         try:
-            code = child.wait(timeout=self.shutdown_timeout + 8)
+            code = child.wait(timeout=self.shutdown_timeout + STOP_KILL_GRACE)
         except subprocess.TimeoutExpired:
             self._kill_child_tree()
-            child.wait(timeout=10)
+            try:
+                child.wait(timeout=STOP_REAP_WAIT)
+            finally:
+                self.last_teardown_s = round(time.monotonic() - began, 1)
             self._close_owner_pipe()
             return {"ok": False, "state": "failed", "error": "server_stop_deadline_expired", "exit_code": 8}
+        self.last_teardown_s = round(time.monotonic() - began, 1)
         self._close_owner_pipe()
         if self.ready_path is not None:
             self.ready_path.unlink(missing_ok=True)
@@ -1291,6 +1299,12 @@ class Host:
                 "changed": switched or migrated or self.args != candidate_args or
                            self.revision != plan["profile_revision"],
                 "shutdown_timeout": self.shutdown_timeout,
+                # #5956: the stop phase's own worst case (the drain, then the kill and the reap: Host._stop_child) and, apart from it, what the last
+                # stop here took. last_teardown_s is informational: a fast stop says nothing about the next one, so no client may wait less than
+                # the limit. A restart's whole budget is teardown_limit_s + its startup wait, and on a failed load another
+                # teardown_limit_s + startup wait for the rollback (docs/MANAGEMENT_PROTOCOL.md).
+                "teardown_limit_s": round(self.shutdown_timeout + STOP_KILL_GRACE + STOP_REAP_WAIT, 1),
+                "last_teardown_s": self.last_teardown_s,
                 "would_drain": False, "would_start": False}
 
     def _handle(self, request: dict) -> dict:
