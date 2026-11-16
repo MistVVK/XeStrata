@@ -19723,6 +19723,14 @@ int main(int argc, char** argv) {
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
+            if (multi_gpu) {
+                // #6011: the prompt pass is over.  A layer split's checkpoint parts that no complete set used are stale: a
+                // cancelled read leaves the first stages' parts past the last chunk the last stage reported (a finished pass
+                // has reported every chunk, so nothing usable is dropped).  They go now, not at the next request's start -
+                // its park, before that, would count their host RAM against the RAM floor.
+                std::lock_guard<std::mutex> lk(part_mu);
+                part_at.clear();
+            }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             const double read_pass_ms = std::chrono::duration<double, std::milli>(Clock::now() - read_t0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
