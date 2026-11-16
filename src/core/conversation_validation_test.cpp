@@ -234,6 +234,13 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         std::vector<SessionKvSource> sources;
         check(!conversation_snapshot_sources(meta,sources,view,ss,g,unloaded,error) &&
               error == "conversation snapshot: invalid K/V extent", "an explicitly supplied empty drafter remains invalid");
+        // #4384 (the part kept): a K/V byte estimate that fails says which part and why, instead of a bare "invalid or
+        // overflowing K/V byte estimate" - here the draft part, an empty drafter
+        size_t empty_estimate = 0;
+        error.clear();
+        check(!conversation_snapshot_bytes(view,ss,g,&unloaded,empty_estimate,error) &&
+              error.find("byte estimate (the draft part") != std::string::npos,
+              "#4384: a byte estimate that fails names the part it failed on");
         check(conversation_snapshot_sources(meta,sources,view,ss,g,nullptr,error), "disk save without an MTP drafter");
         check(conversation_snapshot_save(without_draft,view,ss,g,nullptr,error), "capture reference without draft");
         check(meta.kv.empty() && sources.size()==without_draft.kv.size() &&

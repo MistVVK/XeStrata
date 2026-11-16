@@ -39507,6 +39507,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_STOP_LAYERS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 4733,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "dd1ddc6eab",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "dd1ddc6eab",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "prefill",
+   "note": "[reviewed] #6011: a batched prompt read stops between two layers of a chunk when STOP comes; on by default, 0 turns it back to stopping only between chunks. Internal: users never set it.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_STOP_STAGES",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 15091,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "dd1ddc6eab",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "dd1ddc6eab",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "program",
+   "note": "[reviewed] #6011: every stage of a layer split sees STOP (the later stages get the first stage's should_stop); on by default, 0 turns it back to the first stage only. Internal: users never set it.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_SWITCH_POINT",
    "backends": [
     "cuda-hip"

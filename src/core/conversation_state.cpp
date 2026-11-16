@@ -517,7 +517,16 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
     for (uint64_t i = 0; i < qsa + (draft ? 1 : 0); ++i) {
         const auto& st = i == qsa ? *draft : owned(ss, (size_t) i);
         const size_t n = conversation_kv_bytes(st, g, upto, i != qsa);
-        if (!n || !add(bytes, n)) return fail(error, "invalid or overflowing K/V byte estimate");
+        if (!n || !add(bytes, n)) {
+            // #4384: say which part and why - the estimate itself only goes to zero; the capture's check has the reason
+            std::string why;
+            size_t unused = 0;
+            if (!n) (void) conversation_kv_capture_bytes(ConversationKv{}, st, g, upto, i != qsa, unused, why);
+            const std::string what = std::string("invalid or overflowing K/V byte estimate (") +
+                                     (i == qsa ? std::string("the draft part") : "layer " + std::to_string(i)) +
+                                     (why.empty() ? std::string() : ": " + why) + ")";
+            return fail(error, what.c_str());
+        }
     }
     return true;
 }
