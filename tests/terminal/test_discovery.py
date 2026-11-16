@@ -81,6 +81,15 @@ class GuiLayout(unittest.TestCase):
         p = mock.patch.object(models, "ROOT", self.terminal)
         p.start()
         self.addCleanup(p.stop)
+        # the Catalog finds its own folder from the package file, not models.ROOT: make it this fake Terminal folder
+        # too, so a real checkout with its own run configs cannot become a "here" install under the test.
+        real = Path(models.__file__).resolve().parents[1]
+        shutil.copy(real / "setup.py", self.terminal)
+        (self.terminal / "tools").mkdir()
+        shutil.copy(real / "tools" / "strata_mcp.py", self.terminal / "tools")
+        p = mock.patch("strata_cli.launch.catalog.installer_folder", return_value=self.terminal)
+        p.start()
+        self.addCleanup(p.stop)
         self.install = discovery.app_install_dir()
         self.docs = base / "home" / "Documents" / "Strata"
         gyro = self.docs / "Models" / "gyro-Gyro-S"
