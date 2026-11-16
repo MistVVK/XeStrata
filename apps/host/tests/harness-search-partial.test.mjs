@@ -117,7 +117,7 @@ test('patched: everything else fails as before', async () => {
 test('the installer\'s Harness staging applies the patch and records it in BUNDLE.json', () => {
   const stage = readFileSync(new URL('../../desktop/scripts/stage-harness.mjs', import.meta.url), 'utf8');
   assert.match(stage, /import \{ patchStagedHarnessSearch \} from '\.\/harness-search-partial\.mjs';/);
-  assert.match(stage, /const patches = \[patchStagedHarnessBudget\(out\), patchStagedHarnessSearch\(out\)\];/);
+  assert.match(stage, /const patches = \[[^\]]*patchStagedHarnessSearch\(out\)[^\]]*\];/);
   assert.match(stage, /\bpatches,/, 'the provenance list goes into BUNDLE.json');
 });
 
