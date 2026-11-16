@@ -73,8 +73,20 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
     const files = names.filter(n => n.endsWith('.json') && n !== 'index.json' && !/\.tmp-/.test(n)).map(n => n.slice(0, -5)).filter(validChatId);
     const map = new Map();
     // A chat rename can succeed before its index write fails or the host exits. Even a valid index can be behind for an existing id:
-    // recover from every chat envelope so the next save cannot reuse a revision or miss an older window's conflict.
+    // recover from the chat envelope so the next save cannot reuse a revision or miss an older window's conflict. Such a chat file is
+    // never older than the index (the index is written after the chat), so an index entry is still used for a file that is older than
+    // the index and has the size the index recorded: a start reads only the chats saved since (#5359 review: no full read of a large history).
+    let saved = null, indexMs = -1;
+    try {
+      const path = join(root, 'index.json');
+      const parsed = JSON.parse(readFileSync(path, 'utf8'));
+      if (parsed?.v === CHAT_FORMAT && Array.isArray(parsed.chats)) { saved = new Map(parsed.chats.filter(e => e && validChatId(e.id)).map(e => [e.id, e])); indexMs = statSync(path).mtimeMs; }
+    } catch { /* every chat is read below */ }
     for (const id of files) {
+      const known = saved?.get(id);
+      if (known && Number.isFinite(known.rev)) {
+        try { const st = statSync(fileOf(id)); if (st.mtimeMs < indexMs && st.size === known.bytes) { map.set(id, known); continue; } } catch { /* read below */ }
+      }
       try {
         const parsed = JSON.parse(readFileSync(fileOf(id), 'utf8'));
         if (parsed?.v !== CHAT_FORMAT || !parsed.session || parsed.session.id !== id) throw new Error('not a chat file');
