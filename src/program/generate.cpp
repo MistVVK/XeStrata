@@ -2018,7 +2018,7 @@ struct LatentTab {
     int lat_G = 8, lat_E = 0, lat_fmt = 8;
     bool latent = false;
     std::string path;   // the D/U file open now
-    bool q4_fallback = false;   // Q8_0 by default, and the pack's Q4_0 beside it when Q8_0 leaves no working cache
+    bool q4_fallback = false;   // Q8_0 by default, and the pack's Q4_0 beside it where Q8_0 leaves too small a cache
     // detect the latent layout, open the D/U file and read the labels (host side, no device yet)
     bool open(const strata::core::ModelGeometry& g, std::string& err) {
         const auto& lay0 = strata::kernels::cpu::expert_layout();
@@ -2036,8 +2036,8 @@ struct LatentTab {
         }
         path = f;
         // The pack's two D/U files (Edge0 ships latent_dense_q4.bin and latent_dense_q8.bin), whichever of them
-        // XESTRATA_LATENT_DENSE (model.json) names: Q8_0 by default, Q4_0 only where Q8_0 leaves no working expert
-        // cache (to_q4 below; Edge0-145B's Q8_0 pair left an RTX 4070 none) or the user asks for it
+        // XESTRATA_LATENT_DENSE (model.json) names: Q8_0 by default, Q4_0 where Q8_0 leaves this card too small an
+        // expert cache (to_q4, chosen where the cache is sized) or the user asks for it
         // (XESTRATA_LATENT_DENSE_FMT=4).  Q4_0 is faster (the B70: Edge0-120B-NVFP4 1K decode 62.2 against 54.1 tok/s,
         // 32K 58.2 against 51-53; Edge0-145B-NVFP4 32K 53.4 against 37-44) but changes the output past the line an
         // approximation goes in by default at: its teacher-forced KL against Q8_0 is 0.0078 (120B) and 0.0070 (145B)
@@ -2117,7 +2117,7 @@ struct LatentTab {
             return false;
         }
         lat_fmt = dense.fmt();
-        std::fprintf(stderr, "xestrata generate: latent D/U: Q4_0 (%s) - Q8_0 leaves this card no working expert cache "
+        std::fprintf(stderr, "xestrata generate: latent D/U: Q4_0 (%s) in place of Q8_0 on this card "
                              "(XESTRATA_LATENT_DENSE_FMT=8 insists on Q8_0)\n", path.c_str());
         return upload(device, lb, le, err);
     }
@@ -5839,6 +5839,7 @@ int main(int argc, char** argv) {
                         if ((int64_t) sum >= want) break;
                     }
                 uint64_t moved = 0;
+                int layers = 0;
                 std::string de;
                 for (int64_t j = 0; j < nb; ++j) {
                     if (!pick(k, j)) continue;
