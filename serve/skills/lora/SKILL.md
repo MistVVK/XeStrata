@@ -8,10 +8,10 @@ metadata:
 - Use a LoRA only when the user names it, or asks for the character or the style it adds (its name, kind and trigger
   in `lora` say which). None otherwise.
 - Write its trigger words in the prompt.
-- A character LoRA (kind `character`, or a person's or creature's name): `blocks` `"character"` and `scale` 1 where
-  `blocks` lists `"character"`; else leave `blocks` out and give `scale` about 0.7. Either way, write the style the
-  picture should have, in the model's prompt style (the user's, else the model's own: `watercolor`, `photo`,
-  `anime coloring`), so the LoRA brings the character and not its pictures' style.
+- A character LoRA (kind `character`, or a person's or creature's name): `scale` 1, and `blocks` `"character"` where
+  `blocks` lists it (else leave `blocks` out). A lower strength takes the character away before the LoRA's style:
+  keep 1. Write the style the picture should have, in the model's prompt style (the user's, else the model's own:
+  `watercolor`, `photo`, `anime coloring`), so the LoRA brings the character and not its pictures' style.
 - A style LoRA (kind `style`): `blocks` `"style"` where `blocks` lists it, else leave `blocks` out; `scale` 1.
   Describe the subject as the user asked.
 - A kind not given: judge it by its name and trigger; when unsure, leave `blocks` out.
