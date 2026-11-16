@@ -106,8 +106,8 @@ class BuildEngineStamp(unittest.TestCase):
 
     def test_the_build_without_mmq_is_named_on_the_configure_line(self):
         """STRATA_MMQ's default became OFF; a build/ folder configured before keeps ON in CMakeCache.txt, so the line names it.
-        ARM64 (DGX Spark) keeps the build with MMQ (not measured without it)."""
-        for arm, want in ((False, "-DSTRATA_MMQ=OFF"), (True, "-DSTRATA_MMQ=ON")):
+        ARM64 (DGX Spark) builds without MMQ too since 0.2.15 (spark/build_engine.sh)."""
+        for arm, want in ((False, "-DSTRATA_MMQ=OFF"), (True, "-DSTRATA_MMQ=OFF")):
             with mock.patch.object(setup, "is_arm64", lambda arm=arm: arm):
                 (self.eng / "BUILD.json").write_text(json.dumps(self.old_stamp))
                 setup.build_engine(GPU, "none", True, Path("llama"), toolkit=13)
