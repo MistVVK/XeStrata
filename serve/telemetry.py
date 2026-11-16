@@ -722,18 +722,116 @@ ARC_NAMES = {"e223": "Arc Pro B70", "e221": "Arc Pro B60", "e211": "Arc Pro B60"
              "56a6": "Arc A310", "5690": "Arc A770M"}
 
 
+class _ZesPciAddress(ctypes.Structure):
+    _fields_ = [("domain", ctypes.c_uint32), ("bus", ctypes.c_uint32), ("device", ctypes.c_uint32), ("function", ctypes.c_uint32)]
+
+
+class _ZesPciSpeed(ctypes.Structure):
+    _fields_ = [("gen", ctypes.c_int32), ("width", ctypes.c_int32), ("max_bandwidth", ctypes.c_int64)]
+
+
+class _ZesPciProps(ctypes.Structure):    # zes_pci_properties_t
+    _fields_ = [("stype", ctypes.c_uint32), ("pnext", ctypes.c_void_p), ("address", _ZesPciAddress), ("max_speed", _ZesPciSpeed),
+                ("bw", ctypes.c_uint8), ("pkt", ctypes.c_uint8), ("replay", ctypes.c_uint8)]
+
+
+class _ZesMemState(ctypes.Structure):    # zes_mem_state_t
+    _fields_ = [("stype", ctypes.c_uint32), ("pnext", ctypes.c_void_p), ("health", ctypes.c_int32), ("free", ctypes.c_uint64),
+                ("size", ctypes.c_uint64)]
+
+
+class _ZesPciStats(ctypes.Structure):    # zes_pci_stats_t: monotonic counters, timestamp in microseconds
+    _fields_ = [("timestamp", ctypes.c_uint64), ("replayCounter", ctypes.c_uint64), ("packetCounter", ctypes.c_uint64),
+                ("rxCounter", ctypes.c_uint64), ("txCounter", ctypes.c_uint64), ("speed", _ZesPciSpeed)]
+
+
+class _Zes:
+    """#5988 (PR #5994, Rob Riggs): an Intel card's VRAM and PCIe counters through Level Zero's management API (sysman,
+    libze_loader.so.1, installed with the GPU runtime), matched to the card by its PCI address so a PC with two Intel cards reports
+    the one asked for. Runs as the calling user (xpu-smi stats reads the same API without root). The PCIe counters come from Intel
+    PMT, whose sysfs node is root-only unless the host grants it: then sysman refuses and the reading is None, never a zero."""
+
+    STYPE_PCI_PROPERTIES, STYPE_MEM_STATE = 0x2, 0x1E
+
+    def __init__(self, pci, lib=None):
+        self.lib, self.mems, self.dev = None, [], None
+        try:
+            self.lib = lib or ctypes.CDLL("libze_loader.so.1")
+            if self.lib.zesInit(ctypes.c_uint32(0)) != 0:
+                return
+            n = ctypes.c_uint32(0)
+            if self.lib.zesDriverGet(ctypes.byref(n), None) != 0 or n.value == 0:
+                return
+            drivers = (ctypes.c_void_p * n.value)()
+            self.lib.zesDriverGet(ctypes.byref(n), drivers)
+            for drv in drivers:
+                m = ctypes.c_uint32(0)
+                if self.lib.zesDeviceGet(ctypes.c_void_p(drv), ctypes.byref(m), None) != 0:
+                    continue
+                devs = (ctypes.c_void_p * m.value)()
+                self.lib.zesDeviceGet(ctypes.c_void_p(drv), ctypes.byref(m), devs)
+                for dev in devs:
+                    props = _ZesPciProps(stype=self.STYPE_PCI_PROPERTIES)
+                    if self.lib.zesDevicePciGetProperties(ctypes.c_void_p(dev), ctypes.byref(props)) != 0:
+                        continue
+                    a = props.address
+                    if f"{a.domain:04x}:{a.bus:02x}:{a.device:02x}.{a.function:x}" != pci:
+                        continue
+                    self.dev = ctypes.c_void_p(dev)
+                    k = ctypes.c_uint32(0)
+                    if self.lib.zesDeviceEnumMemoryModules(ctypes.c_void_p(dev), ctypes.byref(k), None) != 0:
+                        continue
+                    mods = (ctypes.c_void_p * k.value)()
+                    self.lib.zesDeviceEnumMemoryModules(ctypes.c_void_p(dev), ctypes.byref(k), mods)
+                    self.mems = list(mods)
+        except (OSError, AttributeError, TypeError):
+            self.mems = []
+
+    def read(self):
+        """(used, total) bytes over the card's memory modules, or (None, None) when sysman cannot say."""
+        free = total = 0
+        if self.lib is None or not self.mems:
+            return None, None
+        for mod in self.mems:
+            st = _ZesMemState(stype=self.STYPE_MEM_STATE)
+            try:
+                if self.lib.zesMemoryGetState(ctypes.c_void_p(mod), ctypes.byref(st)) != 0:
+                    return None, None
+            except (OSError, AttributeError, TypeError):
+                return None, None
+            free += st.free
+            total += st.size
+        return (total - free, total) if total else (None, None)
+
+    def pci_stats(self):
+        """(rx bytes, tx bytes, timestamp in us) of the card's PCIe link, or None (sysman refused or has none)."""
+        if self.lib is None or self.dev is None:
+            return None
+        st = _ZesPciStats()
+        try:
+            if self.lib.zesDevicePciGetStats(self.dev, ctypes.byref(st)) != 0:
+                return None
+        except (OSError, AttributeError, TypeError):
+            return None
+        return st.rxCounter, st.txCounter, st.timestamp
+
+
 class _Intel:
     """#5353: an Intel Arc card's readings from sysfs, for every route that starts serve/server.py (the packaged Terminal and app,
     the container), not only sycl/serve/server_intel.py. The discrete Intel cards in sysfs order (as setup numbers them): the xe
     driver's (a tile0 folder) and the i915 driver's (an Arc A-series has a hwmon; an integrated Intel GPU has neither, so a UHD
     iGPU beside the card is not taken for it). Temperature (xe's "pkg" sensor, else temp1), power (from the energy counter between
-    two readings), power limit and the PCIe link are world-readable; load and VRAM need root on both drivers (per-client fdinfo),
-    so they come only from the optional root sampler's /run/gpustat.json (sycl/tools/gpustat.py) and are otherwise absent."""
+    two readings), power limit and the PCIe link are world-readable sysfs. #5988 (PR #5994, Rob Riggs): VRAM and PCIe traffic from
+    Level Zero sysman (_Zes), and the load of the GPU clients this user can see in /proc/<pid>/fdinfo (the engine the server
+    started: xe counts cycles, i915 nanoseconds), so no root and no helper service are needed. The card-wide load across other
+    users' processes would need root: this is the engine's own load. A fresh /run/gpustat.json from the optional root sampler
+    (sycl/tools/gpustat.py) still wins for load and VRAM. A reading no source gives is None, never a zero."""
     STAT = "/run/gpustat.json"
 
-    def __init__(self, index=0, sysfs=None, stat=None):
+    def __init__(self, index=0, sysfs=None, stat=None, proc=None, zes=None):
         import glob
         root = sysfs or "/sys"
+        self.proc = proc or "/proc"
         self.stat_path = stat or self.STAT
         self.dev = None
         cards = []
@@ -752,6 +850,12 @@ class _Intel:
         for n in sorted(glob.glob(f"{self.dev}/hwmon/hwmon*/name")) if self.dev else []:
             self.hwmon = os.path.dirname(n)
         self._e = None                          # (time, energy in uJ) of the last reading
+        self.pci = os.path.basename(self.dev) if self.dev else ""   # "0000:03:00.0", as fdinfo's drm-pdev names it
+        self.zes = zes if zes is not None else (_Zes(self.pci) if self.dev and sys.platform.startswith("linux") else None)
+        self._busy_prev = {}                    # client id -> (busy, total) of the last read
+        self._fd_mem = None                     # bytes the DRM clients this user can see hold on the card (fdinfo), last read
+        self.driver = ("xe" if os.path.isdir(f"{self.dev}/tile0") else "i915") if self.dev else None
+        self._pci = None                        # (rx bytes, tx bytes, ts us) of the last read
 
     def ok(self):
         return self.dev is not None and sys.platform.startswith("linux")
@@ -796,6 +900,53 @@ class _Intel:
                 return g(p, "current"), min(x for x in (card, slot) if x) if (card or slot) else None, w
         return None, None, None
 
+    def _busy(self):
+        """#5988 (PR #5994): the load of the DRM clients on this card that this user can read in <proc>/<pid>/fdinfo, as a
+        percentage between two reads. xe: render + compute cycles (per engine capacity) over the total cycles; i915: render +
+        compute busy nanoseconds over the wall time. None until two reads can be compared."""
+        import glob
+        now, wall, mem = {}, time.monotonic_ns(), {}
+        for f in glob.glob(f"{self.proc}/[0-9]*/fdinfo/*"):
+            try:
+                with open(f, encoding="ascii", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if f"drm-pdev:\t{self.pci}" not in text:
+                continue
+            kv = {}
+            for line in text.splitlines():
+                k, _, v = line.partition(":")
+                kv.setdefault(k, v.strip())
+            cid = kv.get("drm-client-id")
+            try:
+                if kv.get("drm-driver") == "xe":
+                    busy = sum(int(kv.get(f"drm-cycles-{e}", "0")) / int(kv.get(f"drm-engine-capacity-{e}", "1") or 1) for e in ("rcs", "ccs"))
+                    total = int(kv.get("drm-total-cycles-ccs") or kv.get("drm-total-cycles-rcs") or 0)
+                elif kv.get("drm-driver") == "i915":
+                    busy = sum(int((kv.get(f"drm-engine-{e}") or "0 ns").split()[0]) for e in ("render", "compute"))
+                    total = wall
+                else:
+                    continue
+            except (ValueError, IndexError):
+                continue
+            if cid and total:
+                now[(f.split("/fdinfo/")[0], cid)] = (busy, total)
+            if cid:   # the client's memory on this card (i915: drm-resident-local0, xe: drm-resident-vram0), "N KiB"
+                for k, v in kv.items():
+                    if re.fullmatch(r"drm-resident-(local|vram)\d+", k):
+                        parts = v.split()
+                        if parts and parts[0].isdigit():
+                            unit = {"KiB": 2**10, "MiB": 2**20, "GiB": 2**30}.get(parts[1] if len(parts) > 1 else "", 1)
+                            mem[(f.split("/fdinfo/")[0], cid, k)] = int(parts[0]) * unit
+        self._fd_mem = sum(mem.values()) if mem else None
+        prev, self._busy_prev = self._busy_prev, now
+        spans = [now[c][1] - prev[c][1] for c in now if c in prev and now[c][1] > prev[c][1]]
+        if not spans:
+            return 0.0 if (now and prev) else None
+        used = sum(max(0, now[c][0] - prev[c][0]) for c in now if c in prev)
+        return max(0.0, min(100.0, 100.0 * used / max(spans)))
+
     def read(self):
         out = {"util": None, "mem_used": None, "mem_total": None, "temp": None, "power": None, "power_limit": None}
         st = self._stat()
@@ -807,6 +958,16 @@ class _Intel:
             out["temp"] = st.get("temp_pkg")
             out["power"] = st.get("power_w")
             out["power_limit"] = st.get("power_cap_w")
+        busy = self._busy()                     # read every time, so the next read has a span to compare
+        if out["util"] is None:
+            out["util"] = busy
+        if out["mem_used"] is None:
+            used, total = self.zes.read() if self.zes is not None else (None, None)
+            if self.driver == "i915":
+                # sysman on i915 (Arc A-series) reports the card's size but no use: free == size, so "used 0" while an engine holds
+                # gigabytes (measured on an A750, p1006 11-16). The engine's own DRM clients' resident memory is the reading there.
+                used = self._fd_mem
+            out["mem_used"], out["mem_total"] = used, total
         if self.hwmon:
             if out["temp"] is None:
                 files = os.listdir(self.hwmon)
@@ -826,7 +987,13 @@ class _Intel:
                         out["power_limit"] = int(v) / 1e6
                         break
         out["pcie_gen"], out["pcie_gen_max"], out["pcie_width"] = self._link()
-        out["pcie_rx_mb"] = out["pcie_tx_mb"] = None    # neither driver exposes PCIe traffic counters
+        out["pcie_rx_mb"] = out["pcie_tx_mb"] = None    # sysfs has no PCIe traffic counters; sysman has them when the host allows
+        st = self.zes.pci_stats() if self.zes is not None else None
+        prev, self._pci = self._pci, st
+        if st and prev and st[2] > prev[2] and st[0] >= prev[0] and st[1] >= prev[1]:
+            dt = (st[2] - prev[2]) / 1e6
+            out["pcie_rx_mb"] = (st[0] - prev[0]) / dt / 2**20
+            out["pcie_tx_mb"] = (st[1] - prev[1]) / dt / 2**20
         return out
 
 

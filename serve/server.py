@@ -4023,7 +4023,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     parallel_n = cfg.get("parallel")
     decision = drafting.apply(shaped, klass=drafting.card_class(archs) if archs else drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
                               vram_mib=drafting_vram_mib(cfg, backend, archs),
-                              slots=parallel_n if isinstance(parallel_n, int) and not isinstance(parallel_n, bool) else 0, engine=exe)
+                              slots=parallel_n if isinstance(parallel_n, int) and not isinstance(parallel_n, bool) else 0,
+                              engine=engine_binary(exe, cfg) if exe else exe)
     args = shaped["args"]
     if announce:
         drafting.remember_note(decision.note)
