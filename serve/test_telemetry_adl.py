@@ -115,6 +115,35 @@ class Mapping(unittest.TestCase):
         self.assertEqual(t._adl_link((0, 0, 0, 0), None)["pcie_gen_max"], None)
 
 
+class Sensors(unittest.TestCase):
+    """The PMLog sensors a reading takes: the first temperature the card reports (an 8060S has the graphics one, 28, no edge),
+    board power before ASIC power, and an integrated Radeon shows no PCIe link."""
+
+    def reader(self, sensors, integrated=False):
+        r = t._AmdWin(0)
+        r.lib, r.adapter, r.integrated, r.dev_code = object(), 0, integrated, "1586"
+        d = t._Adl.PmLogDataOutput()
+        for sid, v in sensors.items():
+            d.sensors[sid].supported, d.sensors[sid].value = 1, v
+        r._read_pmlog = lambda: d
+        r._call = lambda *a: 1                       # every other ADL call fails: no VRAM numbers
+        self.addCleanup(lambda: setattr(r, "lib", None))
+        return r
+
+    def test_temperature_order(self):
+        self.assertEqual(self.reader({28: 53, 27: 70}).read()["temp"], 53.0)
+        self.assertEqual(self.reader({8: 45, 28: 53}).read()["temp"], 45.0)
+        self.assertIsNone(self.reader({19: 5}).read()["temp"])
+
+    def test_power_and_link(self):
+        with mock.patch.object(t, "_dm_link_map", return_value={"1586": (4, 16, 4, 16)}):
+            out = self.reader({73: 120, 23: 90, 41: 8}).read()
+            self.assertEqual((out["power"], out["pcie_width"], out["pcie_gen_max"]), (120.0, 8, 4))
+            apu = self.reader({23: 45}, integrated=True).read()
+            self.assertEqual(apu["power"], 45.0)
+            self.assertFalse(any(k.startswith("pcie") for k in apu))
+
+
 class Stall(unittest.TestCase):
     def test_stalled_sensors_restart_the_stream_once(self):
         r = t._AmdWin(0)

@@ -319,6 +319,9 @@ class _Adl:
     S_EDGE, S_MEM, S_ASIC_POWER, S_ACTIVITY_GFX, S_ACTIVITY_MEM = 8, 9, 23, 19, 20
     S_GFX_POWER, S_BUS_SPEED, S_BUS_LANES, S_TOTAL_POWERLIMIT = 30, 40, 41, 47
     S_BOARD_POWER = 73
+    # the temperature: the first one the card reports.  Edge first (what the discrete cards of #4884 were checked with), then the
+    # graphics, hotspot and SoC sensors (#3682: a Radeon 8060S reports the graphics one, 28, and no edge), then the memory
+    S_TEMPS = (8, 28, 27, 29, 9)
 
     def _alloc(self, size):
         # a raw heap pointer ADL can free(): ADL2_Main_Control_Create allocates through this callback and frees on Destroy
@@ -504,9 +507,7 @@ class _AmdWin:
                 return s.value if s.supported else None
             u = [x for x in (val(self.adl.S_ACTIVITY_GFX), val(self.adl.S_ACTIVITY_MEM)) if x is not None]
             out["util"] = max(u) if u else None
-            t = val(self.adl.S_EDGE)
-            if t is None:
-                t = val(self.adl.S_MEM)
+            t = next((v for v in (val(sid) for sid in self.adl.S_TEMPS) if v is not None), None)
             out["temp"] = float(t) if t is not None else None
             # RDNA3+ report power as BOARD_POWER (73); older cards ASIC_POWER (23) or GFX_POWER (30); watts (factor 1.0)
             p = val(self.adl.S_BOARD_POWER)
