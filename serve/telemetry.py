@@ -345,13 +345,135 @@ class _Metal:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ Intel Arc
+#: the cards setup names by PCI id (sycl/setup_intel.py INTEL_ARC; the same table as sycl/serve/xe_telemetry.py)
+ARC_NAMES = {"e223": "Arc Pro B70", "e221": "Arc Pro B60", "e211": "Arc Pro B60", "e20b": "Arc B580", "e20c": "Arc B570",
+             "e212": "Arc B50", "56a0": "Arc A770", "56a1": "Arc A750", "56a2": "Arc A580", "56a5": "Arc A380",
+             "56a6": "Arc A310", "5690": "Arc A770M"}
+
+
+class _Intel:
+    """#5353: an Intel Arc card's readings from sysfs, for every route that starts serve/server.py (the packaged Terminal and app,
+    the container), not only sycl/serve/server_intel.py. The discrete Intel cards in sysfs order (as setup numbers them): the xe
+    driver's (a tile0 folder) and the i915 driver's (an Arc A-series has a hwmon; an integrated Intel GPU has neither, so a UHD
+    iGPU beside the card is not taken for it). Temperature (xe's "pkg" sensor, else temp1), power (from the energy counter between
+    two readings), power limit and the PCIe link are world-readable; load and VRAM need root on both drivers (per-client fdinfo),
+    so they come only from the optional root sampler's /run/gpustat.json (sycl/tools/gpustat.py) and are otherwise absent."""
+    STAT = "/run/gpustat.json"
+
+    def __init__(self, index=0, sysfs=None, stat=None):
+        import glob
+        root = sysfs or "/sys"
+        self.stat_path = stat or self.STAT
+        self.dev = None
+        cards = []
+        for d in sorted(glob.glob(f"{root}/class/drm/card[0-9]*/device"), key=lambda p: int(re.sub(r"\D", "", p.split("/card")[-1]) or 0)):
+            try:
+                with open(f"{d}/vendor") as f:
+                    if f.read().strip() != "0x8086":
+                        continue
+            except OSError:
+                continue
+            if os.path.isdir(f"{d}/tile0") or glob.glob(f"{d}/hwmon/hwmon*/name"):
+                cards.append(os.path.realpath(d))
+        if 0 <= index < len(cards):
+            self.dev = cards[index]
+        self.hwmon = None
+        for n in sorted(glob.glob(f"{self.dev}/hwmon/hwmon*/name")) if self.dev else []:
+            self.hwmon = os.path.dirname(n)
+        self._e = None                          # (time, energy in uJ) of the last reading
+
+    def ok(self):
+        return self.dev is not None and sys.platform.startswith("linux")
+
+    @staticmethod
+    def _rd(p):
+        try:
+            with open(p) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def _stat(self):
+        try:
+            import json
+            with open(self.stat_path) as f:
+                st = json.load(f)
+            return st if time.time() - float(st.get("ts", 0)) < 15 else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def name(self):
+        st = self._stat()
+        if (st or {}).get("name"):
+            return st["name"]
+        pid = (self._rd(f"{self.dev}/device") or "").lower().replace("0x", "")
+        return "Intel " + ARC_NAMES.get(pid, "Arc GPU")
+
+    def _link(self):
+        """The link the card trained at: its own functions sit behind an internal x1 switch, so the first port up the path wider
+        than x1; the max is what card AND slot allow (the root port caps it)."""
+        gen = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5, "64.0": 6}
+        d, chain = self.dev, []
+        while d and os.path.exists(f"{d}/current_link_speed"):
+            chain.append(d)
+            d = os.path.dirname(d)
+        for p in chain:
+            w = int(self._rd(f"{p}/current_link_width") or 0)
+            if w > 1:
+                g = lambda q, k: gen.get((self._rd(f"{q}/{k}_link_speed") or "").split(" ")[0])
+                card, slot = g(p, "max"), g(chain[-1], "max")
+                return g(p, "current"), min(x for x in (card, slot) if x) if (card or slot) else None, w
+        return None, None, None
+
+    def read(self):
+        out = {"util": None, "mem_used": None, "mem_total": None, "temp": None, "power": None, "power_limit": None}
+        st = self._stat()
+        if st:
+            out["util"] = st.get("busy_pct")
+            if st.get("vram_used_mb") is not None:
+                out["mem_used"] = st["vram_used_mb"] * 2**20
+                out["mem_total"] = st.get("vram_total_mb", 0) * 2**20 or None
+            out["temp"] = st.get("temp_pkg")
+            out["power"] = st.get("power_w")
+            out["power_limit"] = st.get("power_cap_w")
+        if self.hwmon:
+            if out["temp"] is None:
+                files = os.listdir(self.hwmon)
+                src = next((lab[:-6] for lab in files if lab.endswith("_label") and self._rd(f"{self.hwmon}/{lab}") == "pkg"), None)
+                v = self._rd(f"{self.hwmon}/{src or 'temp1'}_input")
+                out["temp"] = int(v) / 1000 if v and v.lstrip("-").isdigit() else None
+            if out["power"] is None:
+                e, t = self._rd(f"{self.hwmon}/energy1_input"), time.time()
+                if e and e.isdigit():
+                    if self._e and t > self._e[0] and int(e) >= self._e[1]:
+                        out["power"] = (int(e) - self._e[1]) / 1e6 / (t - self._e[0])
+                    self._e = (t, int(e))
+            if out["power_limit"] is None:
+                for cap in ("power1_cap", "power1_max"):   # xe / i915
+                    v = self._rd(f"{self.hwmon}/{cap}")
+                    if v and v.isdigit() and int(v) > 0:
+                        out["power_limit"] = int(v) / 1e6
+                        break
+        out["pcie_gen"], out["pcie_gen_max"], out["pcie_width"] = self._link()
+        out["pcie_rx_mb"] = out["pcie_tx_mb"] = None    # neither driver exposes PCIe traffic counters
+        return out
+
+
 def gpu_reader(index=0, amd=False):
     """The card's readings: NVML (NVIDIA), the amdgpu sysfs files with the AMD backend (#301), or IOKit's
     IOAccelerator registry on macOS (Metal backend).  `amd` comes first: no Mac runs the HIP backend, and the
-    tests' AMD trees are read on a Mac too."""
+    tests' AMD trees are read on a Mac too.  On Linux without NVML, an Intel Arc card's sysfs readings (#5353)."""
     if amd:
         return _Amd(index)
-    return _Metal(index) if sys.platform == "darwin" else _Nvml(index)
+    if sys.platform == "darwin":
+        return _Metal(index)
+    nv = _Nvml(index)
+    if not nv.ok() and sys.platform.startswith("linux"):
+        intel = _Intel(index)
+        if intel.ok():
+            return intel
+    return nv
 
 
 _DISPLAY_CLASS = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
