@@ -6,6 +6,7 @@ metadata:
   for: anima
   style: booru
 ---
+
 - Start with `masterpiece, best quality, score_7, safe,` except with anima-aesthetic. Score tags keep their
   underscores: `score_9`.
 - A space between a number and a noun: `2 dogs`; `1girl`, `2girls`, `1boy` stay as they are.

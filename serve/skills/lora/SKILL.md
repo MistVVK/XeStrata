@@ -5,6 +5,7 @@ metadata:
   kind: tool
   tool: lora
 ---
+
 - Use a LoRA only when the user names it, or asks for the character or the style it adds (its name, kind and trigger
   in `lora` say which). None otherwise.
 - Write its trigger words in the prompt.

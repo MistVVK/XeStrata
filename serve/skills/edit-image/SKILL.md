@@ -5,6 +5,7 @@ metadata:
   kind: tool
   tool: edit_image
 ---
+
 - The prompt says the change ("her coat red"); a model without edits (img2img) needs the whole picture described.
 - `references`: other pictures' links, images 2, 3, ... after the edited image 1; name them in the prompt ("the pose
   of image 2", "the face from image 3"). Without them the user's attached pictures go in.

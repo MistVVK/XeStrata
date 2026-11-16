@@ -21,6 +21,7 @@ flowchart LR
   steps of different image models stand side by side.
 
 Recipes:
+
 - A pose in words: edit_image. Another picture's pose: edit_image with that picture in `references` ("the person
   in image 1 in the pose of image 2"). A new image in an attached picture's pose: control `pose`.
 - One part (hair, clothes, sky): edit_region; or find_region, then edit_image with its mask.

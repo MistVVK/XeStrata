@@ -5,6 +5,7 @@ metadata:
   kind: tool
   tool: upscale_video
 ---
+
 - A job on the server that answers at once: tell the user it runs, that they follow it in the Video tab and where the
   video will be; do not call again to check.
 - `scale` 2 (1.5 a little); a long video at 2 takes long: say so. `method` auto; `lanczos` only for a plain resize.

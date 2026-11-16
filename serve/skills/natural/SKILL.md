@@ -5,6 +5,7 @@ metadata:
   kind: style
   name: natural language
 ---
+
 - Write English sentences: translate the user's words, do not expand them.
 - Describe what the image shows: the subject, and the setting and style the user asked for.
 - No Danbooru tags, quality tags or weights such as `(word:1.2)`.
