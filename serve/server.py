@@ -1129,7 +1129,7 @@ class StrataEngine:
         pin: dict[str, Any] = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
-        nice = engine_nice(env)                          # Linux with a built-in Radeon: the desktop keeps its share of the CPU
+        nice = engine_nice(env)   # Linux with a built-in Radeon: the desktop keeps its share of the CPU
         if nice:
             say_nice = pin.get("preexec_fn")
             pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
