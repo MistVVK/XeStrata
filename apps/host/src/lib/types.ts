@@ -241,6 +241,8 @@ export interface ServingState {
   stats: { running: number; waiting: number; completed: number; failed: number; tokensOut: number };
   requests: ServeRequest[];
   pauseServing: boolean;
+  /** #5661: models whose MCP tools an API client of this computer may use (opt-in, default none). */
+  mcpTools?: string[];
 }
 
 export interface MonitorSample {

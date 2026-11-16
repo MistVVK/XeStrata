@@ -60,6 +60,7 @@ export function state() {
     },
     requests: [...requests].reverse(),
     pauseServing: !!s.serving?.pauseServing,
+    mcpTools: Array.isArray(s.serving?.mcpTools) ? [...s.serving.mcpTools] : [],
   };
 }
 
@@ -77,6 +78,12 @@ export function patch(body) {
   else if (typeof body.apiKey === 'string' && body.apiKey.trim()) serving.apiKey = body.apiKey.trim();
   else if (body.generateKey) serving.apiKey = `sk-strata-${randomBytes(12).toString('hex')}`;
   if (typeof body.pauseServing === 'boolean') serving.pauseServing = body.pauseServing;
+  // #5661: the models whose MCP tools an API client of this computer may use (default: none).
+  const choice = body.mcpTools;
+  if (choice && typeof choice.model === 'string' && choice.model.trim() && choice.model.length <= 256 && typeof choice.on === 'boolean') {
+    const rest = (Array.isArray(serving.mcpTools) ? serving.mcpTools : []).filter(m => m !== choice.model);
+    serving.mcpTools = choice.on ? [...rest, choice.model].slice(-MCP_TOOL_MODELS_MAX) : rest;
+  }
   update({ serving });
   emit();
   return state();
@@ -93,6 +100,29 @@ export function authorized(req) {
   const viaHeader = sameSecret(alt, key);
   return viaBearer || viaHeader;
 }
+
+/**
+ * #5661: may this API request use the model's MCP tools (strata_mcp)? Those tools act on this computer (files, programs), so a request may
+ * only when every guard holds: it came in on the app's own listener (not LAN sharing, not the tunnel), from this computer (a loopback
+ * address), with no Origin of another site (a web page in a browser cannot reach them), with an API key set and sent, and the person
+ * turned it on for this model in Serving (default off). The answer is the first guard that refuses, or null.
+ */
+export const MCP_TOOL_MODELS_MAX = 64;
+const LOOPBACK = /^(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1|::ffff:127\.\d{1,3}\.\d{1,3}\.\d{1,3})$/;
+export function foreignOrigin(origin) {
+  if (origin === undefined) return false;
+  try { return !['localhost', '127.0.0.1', '[::1]'].includes(new URL(String(origin)).hostname); } catch { return true; }   // "null", "", garbage
+}
+export function mcpToolsRefusal(req, via, model) {
+  if (via !== 'app') return 'listener';
+  if (!LOOPBACK.test(String(req?.socket?.remoteAddress ?? ''))) return 'not-loopback';
+  if (foreignOrigin(req?.headers?.origin)) return 'foreign-origin';
+  if (!getStore().serving?.apiKey || !authorized(req)) return 'no-key';
+  const on = getStore().serving?.mcpTools;
+  if (!Array.isArray(on) || typeof model !== 'string' || !on.includes(model)) return 'off';
+  return null;
+}
+export const mcpToolsAllowed = (req, via, model) => mcpToolsRefusal(req, via, model) === null;
 
 export function open({ client, endpoint, tokensIn = null, model, instanceId, gpuIds, cancel }) {
   const entry = {

@@ -944,9 +944,9 @@ taskTimer.unref();
 // The probe listens on the loopback address only: a probe on 0.0.0.0 made Windows Defender Firewall ask "Allow Node.js to communicate on these networks?" on the
 // first start of every new install path (QA 0213). Reserved or taken ports are caught on any address; the share listener itself binds 0.0.0.0 only when the person turns sharing on.
 const sharePort = await findFreePort(Number(process.env.STRATA_SHARE_PORT ?? PORT + 1), '127.0.0.1', { skip: [PORT] });
-const localShare = createLocalShare({ handle: openai, hasKey: () => !!store.get().serving?.apiKey, port: sharePort, allowResponses: true, changed: () => serving.setSharing(localShare.state()) });
+const localShare = createLocalShare({ handle: (req, res, path, method) => openai(req, res, path, method, 'share'), hasKey: () => !!store.get().serving?.apiKey, port: sharePort, allowResponses: true, changed: () => serving.setSharing(localShare.state()) });
 const tunnelPort = await findFreePort(Number(process.env.STRATA_TUNNEL_PORT ?? PORT + 2), '127.0.0.1', { skip: [PORT, sharePort] });
-const tunnelOrigin = createLocalShare({ handle: openai, hasKey: () => !!store.get().serving?.apiKey, host: '127.0.0.1', port: tunnelPort });
+const tunnelOrigin = createLocalShare({ handle: (req, res, path, method) => openai(req, res, path, method, 'tunnel'), hasKey: () => !!store.get().serving?.apiKey, host: '127.0.0.1', port: tunnelPort });
 const connector = createConnectorInstaller({ directory: join(store.HOME, 'engine', 'cloudflare'), componentDirectory: join(componentsDirectory(), 'cloudflared') });
 const cloudflare = createCloudflare({ origin: tunnelOrigin, originUrl: `http://127.0.0.1:${tunnelPort}`, hasKey: () => !!store.get().serving?.apiKey, changed: serving.setTunnel, locate: connector.locate, prepareConnector: connector.ensure, connectorInfo: connector.connector, findRunning: findRunningConnector });
 await cloudflare.inspect();
@@ -981,7 +981,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (path.startsWith('/v1/')) {
       if (storageChanging && method !== 'GET') return error(res, 409, 'Wait for the model folder check to finish.');
-      return await openai(req, res, apiPath(path), method);
+      return await openai(req, res, apiPath(path), method, 'app');
     }
     return await staticFile(req, res, path);
   } catch (err) {
@@ -2114,10 +2114,11 @@ async function api(req, res, path, method, url) {
 
 /* -------------------------------------------------- OpenAI-compatible API --- */
 
-async function openai(req, res, path, method) {
+/** `via`: the listener the request came in on: 'app' (this app's own port), 'share' (LAN sharing) or 'tunnel' (#5661: MCP tools only on 'app'). */
+async function openai(req, res, path, method, via) {
   if (!serving.authorized(req)) return error(res, 401, 'Invalid API key');
   try {
-    return await routeInference(req, res, path, method);
+    return await routeInference(req, res, path, method, via);
   } catch (err) {
     if (!(err instanceof InvalidJsonError)) throw err;
     if (res.headersSent) return res.end();
@@ -2128,10 +2129,10 @@ async function openai(req, res, path, method) {
   }
 }
 
-async function routeInference(req, res, path, method) {
+async function routeInference(req, res, path, method, via) {
   if(native.state().instances.length){
     if(path==='/v1/models'&&method==='GET')return json(res,200,{object:'list',data:native.state().instances.filter(i=>i.status==='ready').map(i=>({id:i.apiModelId,object:'model',owned_by:'strata',meta:{instanceId:i.id,gpus:i.gpus,label:i.label,aliases:i.aliases}}))});
-    if(method==='POST'&&['/v1/chat/completions','/v1/messages','/v1/responses'].includes(path)){if(store.get().serving?.pauseServing)return error(res,503,'New API requests are paused.');if(path==='/v1/responses'&&!native.state().capabilities.responses)return error(res,501,'Update the native Strata installation to use the Responses API.');return nativeGateway({req,res,path,body:await readBody(req,12*1024*1024),control:native,serving});}
+    if(method==='POST'&&['/v1/chat/completions','/v1/messages','/v1/responses'].includes(path)){if(store.get().serving?.pauseServing)return error(res,503,'New API requests are paused.');if(path==='/v1/responses'&&!native.state().capabilities.responses)return error(res,501,'Update the native Strata installation to use the Responses API.');return nativeGateway({req,res,path,body:await readBody(req,12*1024*1024),control:native,serving,mcpAllowed:model=>serving.mcpToolsAllowed(req,via,model)});}
   }
   if(path==='/v1/responses'&&method==='POST')return error(res,503,'Load a native Strata model to use the Responses API.');
 
