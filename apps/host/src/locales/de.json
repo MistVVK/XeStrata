@@ -3533,5 +3533,9 @@
   "s9041": "Zuerst einen API-Schlüssel erstellen.",
   "s9042": "{0}{1} tok/s",
   "s9043": "{0}{1} tok/s · letzte Antwort",
-  "s9044": "Dieses Ziel ist immer wieder auf dieselben Fehler gestoßen, deshalb habe ich es pausiert. Sieh dir die letzten Schritte an, behebe, was im Weg ist, und setze das Ziel dann fort."
+  "s9044": "Dieses Ziel ist immer wieder auf dieselben Fehler gestoßen, deshalb habe ich es pausiert. Sehen Sie sich die letzten Schritte an, beheben Sie, was im Weg ist, und setzen Sie das Ziel dann fort.",
+  "s9045": "Das Modell hat beim Antworten angehalten.",
+  "s9046": "Senden Sie Ihre Nachricht erneut. Strata startet das Modell von selbst neu. Wenn es immer wieder passiert, öffnen Sie „Details“ und teilen Sie sie, wenn Sie um Hilfe bitten.",
+  "s9047": "Beim Antworten ist im Modell ein Problem aufgetreten.",
+  "s9048": "Senden Sie Ihre Nachricht erneut. Wenn es immer wieder passiert, öffnen Sie „Details“ und teilen Sie sie, wenn Sie um Hilfe bitten."
 }

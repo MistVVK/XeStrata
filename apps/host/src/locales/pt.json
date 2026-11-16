@@ -3533,5 +3533,9 @@
   "s9041": "Crie uma chave de API primeiro.",
   "s9042": "{0}{1} tok/s",
   "s9043": "{0}{1} tok/s · última resposta",
-  "s9044": "Este objetivo continuava esbarrando nos mesmos erros, então eu o pausei. Veja os últimos passos, corrija o que está atrapalhando e depois retome o objetivo."
+  "s9044": "Este objetivo continuava esbarrando nos mesmos erros, então eu o pausei. Veja os últimos passos, corrija o que está atrapalhando e depois retome o objetivo.",
+  "s9045": "O modelo parou enquanto respondia.",
+  "s9046": "Envie sua mensagem novamente. O Strata reinicia o modelo sozinho. Se continuar acontecendo, abra Detalhes e compartilhe-os ao pedir ajuda.",
+  "s9047": "O modelo encontrou um problema enquanto respondia.",
+  "s9048": "Envie sua mensagem novamente. Se continuar acontecendo, abra Detalhes e compartilhe-os ao pedir ajuda."
 }

@@ -3533,5 +3533,9 @@
   "s9041": "Créez d’abord une clé API.",
   "s9042": "{0}{1} tok/s",
   "s9043": "{0}{1} tok/s · dernière réponse",
-  "s9044": "Cet objectif rencontrait sans cesse les mêmes erreurs, je l’ai donc mis en pause. Regardez les dernières étapes, corrigez ce qui bloque, puis reprenez l’objectif."
+  "s9044": "Cet objectif rencontrait sans cesse les mêmes erreurs, je l’ai donc mis en pause. Regardez les dernières étapes, corrigez ce qui bloque, puis reprenez l’objectif.",
+  "s9045": "Le modèle s’est arrêté pendant qu’il répondait.",
+  "s9046": "Renvoyez votre message. Strata redémarre le modèle de lui-même. Si cela se reproduit, ouvrez Détails et partagez-les quand vous demandez de l’aide.",
+  "s9047": "Le modèle a rencontré un problème pendant qu’il répondait.",
+  "s9048": "Renvoyez votre message. Si cela se reproduit, ouvrez Détails et partagez-les quand vous demandez de l’aide."
 }

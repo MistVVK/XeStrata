@@ -183,3 +183,15 @@ test('in a chat, an engine line no rule knows becomes one plain sentence with th
   assert.match(store, /const failure = typeof frame\.key === 'string' \? null : chatFailure\(String\(frame\.message \?\? 'Engine error'\)\);/);
   assert.match(store, /\.\.\.\(detail \? \{ errorDetail: detail \} : \{\}\)/, 'the engine line is kept for Details');
 });
+
+// GUI-1116 (owner 11-16: every language checked for 0.2.16): the engine-failure sentences of 7bcb5a69c have catalog keys, so the chat shows
+// them in the person's language instead of English. The translations are drafts on the lane's [DRAFT] list for the release review.
+test('the engine-failure sentences and next steps are translated in all nine languages', () => {
+  const sentences = [chatFailure('the model stopped; the next request restarts it'), chatFailure('HTTP 500: weird engine text')].flatMap(f => [f.message, f.next]);
+  assert.equal(sentences.length, 4);
+  for (const text of sentences) {
+    const id = Object.entries(catalogs.en).find(([, v]) => v === text)?.[0];
+    assert.ok(id, `"${text}" has a catalog key`);
+    for (const l of languages) if (l !== 'en') assert.ok(catalogs[l][id] && catalogs[l][id] !== text, `${l}: "${text}" is translated`);
+  }
+});

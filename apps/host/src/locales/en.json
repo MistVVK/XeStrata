@@ -3533,5 +3533,9 @@
   "s9041": "Create an API key first.",
   "s9042": "{0}{1} tok/s",
   "s9043": "{0}{1} tok/s · last reply",
-  "s9044": "This goal kept running into the same errors, so I paused it. Look at the last steps, fix what is in the way, then resume the goal."
+  "s9044": "This goal kept running into the same errors, so I paused it. Look at the last steps, fix what is in the way, then resume the goal.",
+  "s9045": "The model stopped while it was answering.",
+  "s9046": "Send your message again. Strata starts the model again by itself. If it keeps happening, open Details and share them when you ask for help.",
+  "s9047": "The model ran into a problem while answering.",
+  "s9048": "Send your message again. If it keeps happening, open Details and share them when you ask for help."
 }
