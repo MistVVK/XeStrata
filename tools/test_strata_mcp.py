@@ -1122,6 +1122,28 @@ class DiskUsageTest(unittest.TestCase):
         desc = s.describe_config(s.configs()[0])
         self.assertEqual([m for m in desc["missing_files"] if m.endswith(".gguf")], [])
 
+    def test_the_engine_component_is_missing_only_when_it_is_not_installed(self):
+        # every install writes "exe": "component:strata-engine"; it is not a path, so it was always counted missing and the app listed
+        # "the engine program" beside any file that really was missing (0.2.15 release test)
+        from strata_control import engine_component as ec
+        part1 = self.blob(self.own / "Model-00001-of-00002.gguf", 10)
+        cfg = {"exe": "component:strata-engine", "args": ["--native", part1], "port": 8080, "backend": "cuda"}
+        (self.root / "strata-two-parts.json").write_text(json.dumps(cfg), encoding="utf-8")
+        s = M.Strata(self.root)
+        with mock.patch.object(ec, "expand", return_value=str(self.root / "engine" / "strata")) as looked:
+            desc = s.describe_config(s.configs()[0])
+            self.assertEqual(len(desc["missing_files"]), 1, desc["missing_files"])
+            self.assertTrue(desc["missing_files"][0].endswith("Model-00002-of-00002.gguf"))
+            self.assertEqual(looked.call_args.kwargs.get("full"), False, "no SHA-256 pass for a list")
+            self.blob(self.own / "Model-00002-of-00002.gguf", 10)
+            desc = s.describe_config(s.configs()[0])
+            self.assertEqual(desc["missing_files"], [])
+            self.assertTrue(desc["ready"])
+        with mock.patch.object(ec, "expand", side_effect=ec.EngineMissing("no package here", None)):
+            desc = s.describe_config(s.configs()[0])
+        self.assertEqual(desc["missing_files"], ["component:strata-engine"])      # the app's word for it: "the engine program"
+        self.assertFalse(desc["ready"])
+
 
 class DraftLayerAndCancel(unittest.TestCase):
     """#3257: the draft layer's download shows real progress, and a cancel ends the whole tree."""
