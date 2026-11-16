@@ -80,7 +80,7 @@ inline float h2f(const uint8_t* p) {
 void quantize_oracle_q8_0(const float* x, int n, ActQ& a) {
     a.nchunks = n / QKA;
     for (int chunk = 0; chunk < a.nchunks; ++chunk) {
-        const float* xb = x + chunk * QKA;
+        const float* xb = x + (ptrdiff_t) chunk * QKA;
         __m256 v0 = _mm256_loadu_ps(xb);
         __m256 v1 = _mm256_loadu_ps(xb + 8);
         __m256 v2 = _mm256_loadu_ps(xb + 16);
@@ -105,11 +105,11 @@ void quantize_oracle_q8_0(const float* x, int n, ActQ& a) {
         const __m256i i2 = _mm256_packs_epi32(_mm256_cvtps_epi32(v2), _mm256_cvtps_epi32(v3));
         i0 = _mm256_packs_epi16(i0, i2);
         i0 = _mm256_permutevar8x32_epi32(i0, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
-        int8_t* q = a.q + chunk * QKA;
-        _mm256_storeu_si256((__m256i*) q, i0);
+        int8_t* q = a.q + (ptrdiff_t) chunk * QKA;
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(q), i0);
         int32_t sum = 0;
         for (int j = 0; j < QKA; ++j) sum += q[j];
-        a.scale[chunk] = h2f((const uint8_t*) &half_d);
+        a.scale[chunk] = h2f(reinterpret_cast<const uint8_t*>(&half_d));
         a.sum[chunk] = sum;
         a.hx[chunk] = a.scale[chunk] * float(sum);
     }
@@ -126,7 +126,7 @@ void quantize_oracle_q8_0(const float* x, int n, ActQ& a) {
 /// The result is the 32 codes of ONE ACTIVATION CHUNK (4 qword lanes), which is the unit the Q8_1 scale is
 /// defined on - not the 64-weight block.
 inline __m256i unpack_q2_0(const uint8_t* codes) {
-    const __m128i packed = _mm_loadl_epi64((const __m128i*) codes);   // 8 bytes -> 4 u16 in the low half
+    const __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(codes));   // 8 bytes -> 4 u16 in the low half
     const __m256i lanes = _mm256_cvtepu16_epi64(packed);              // 4 qwords, 8 codes each
     const __m256i ctrl = _mm256_set1_epi64x((long long) 0x0E0C0A0806040200ULL);
     return _mm256_and_si256(_mm256_multishift_epi64_epi8(ctrl, lanes), _mm256_set1_epi8(3));
@@ -136,7 +136,7 @@ inline __m256i unpack_q2_0(const uint8_t* codes) {
 /// narrow load leaves behind are harmless.
 inline __m256i block_dot(const uint8_t* codes, const int8_t* xq) {
     return _mm256_dpbusd_epi32(_mm256_setzero_si256(), unpack_q2_0(codes),
-                               _mm256_load_si256((const __m256i*) xq));
+                               _mm256_load_si256(reinterpret_cast<const __m256i*>(xq)));
 }
 
 inline float hsum_ps(__m256 v) {
@@ -156,7 +156,7 @@ inline float hsum_ps(__m256 v) {
 static const bool kZmm = strata::env_get("CPU_YMM") == nullptr;
 
 inline __m512i unpack64_q2_0(const uint8_t* codes) {
-    const __m128i packed = _mm_loadu_si128((const __m128i*) codes);          // 8 u16 = 64 codes
+    const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes));          // 8 u16 = 64 codes
     const __m512i lanes = _mm512_cvtepu16_epi64(packed);                    // 8 qwords, 8 codes each
     const __m512i ctrl = _mm512_set1_epi64((long long) 0x0E0C0A0806040200ULL);
     return _mm512_and_si512(_mm512_multishift_epi64_epi8(ctrl, lanes), _mm512_set1_epi8(3));
@@ -165,13 +165,13 @@ inline __m512i unpack64_q2_0(const uint8_t* codes) {
 // For blocks [b0, b0+nb) (nb <= 8): p[2i+h] = d_{b0+i} * xscale[2(b0+i)+h], dd[2i+h] = d_{b0+i}.
 inline void scales8(const uint8_t* wscales, const ActQ& a, int b0, int nb, __m512& p, __m512& dd) {
     const __mmask8 m8 = nb >= 8 ? (__mmask8) 0xFF : (__mmask8) ((1u << nb) - 1u);
-    const __m128i h = _mm_maskz_loadu_epi16(m8, wscales + 2 * b0);
+    const __m128i h = _mm_maskz_loadu_epi16(m8, wscales + (ptrdiff_t) 2 * b0);
     const __m512 d8 = _mm512_castps256_ps512(_mm256_cvtph_ps(h));
     const __m512i dup = _mm512_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
     dd = _mm512_permutexvar_ps(dup, d8);
     const __mmask16 m16 = nb >= 8 ? (__mmask16) 0xFFFF : (__mmask16) ((1u << (2 * nb)) - 1u);
     dd = _mm512_maskz_mov_ps(m16, dd);
-    p = _mm512_mul_ps(dd, _mm512_maskz_loadu_ps(m16, a.scale + 2 * b0));
+    p = _mm512_mul_ps(dd, _mm512_maskz_loadu_ps(m16, a.scale + (ptrdiff_t) 2 * b0));
 }
 
 inline float row_dot_z(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
@@ -182,11 +182,11 @@ inline float row_dot_z(const uint8_t* codes, const uint8_t* scales, const ActQ& 
         __m512 p, dd;
         scales8(scales, a, b0, nb, p, dd);
         const __mmask16 m16 = nb >= 8 ? (__mmask16) 0xFFFF : (__mmask16) ((1u << (2 * nb)) - 1u);
-        corr = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a.hx + 2 * b0), corr);
+        corr = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a.hx + (ptrdiff_t) 2 * b0), corr);
         for (int i = 0; i < nb; ++i) {
             const int b = b0 + i;
-            const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), unpack64_q2_0(codes + b * 16),
-                                                    _mm512_load_si512((const void*) (a.q + b * QK)));
+            const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), unpack64_q2_0(codes + (ptrdiff_t) b * 16),
+                                                    _mm512_load_si512((const void*) (a.q + (ptrdiff_t) b * QK)));
             const __m512 sv = _mm512_permutexvar_ps(_mm512_add_epi32(base, _mm512_set1_epi32(2 * i)), p);
             acc = _mm512_fmadd_ps(sv, _mm512_cvtepi32_ps(dot), acc);
         }
@@ -207,15 +207,15 @@ inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const A
         for (int t = 0; t < NT; ++t) {
             __m512 dd;
             scales8(scales, *a[t], b0, nb, p[t], dd);
-            corr[t] = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->hx + 2 * b0), corr[t]);
+            corr[t] = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->hx + (ptrdiff_t) 2 * b0), corr[t]);
         }
         for (int i = 0; i < nb; ++i) {
             const int b = b0 + i;
-            const __m512i w = unpack64_q2_0(codes + b * 16);
+            const __m512i w = unpack64_q2_0(codes + (ptrdiff_t) b * 16);
             const __m512i idx = _mm512_add_epi32(base, _mm512_set1_epi32(2 * i));
             for (int t = 0; t < NT; ++t) {
                 const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w,
-                                                        _mm512_load_si512((const void*) (a[t]->q + b * QK)));
+                                                        _mm512_load_si512((const void*) (a[t]->q + (ptrdiff_t) b * QK)));
                 acc[t] = _mm512_fmadd_ps(_mm512_permutexvar_ps(idx, p[t]), _mm512_cvtepi32_ps(dot), acc[t]);
             }
         }
@@ -239,12 +239,12 @@ inline float row_dot(const uint8_t* codes, const uint8_t* scales, const ActQ& a,
     // apply it eight times per block.
     float corr = 0.f;
     for (int b = 0; b < nblocks; ++b) {
-        const float d = h2f(scales + 2 * b);
-        const __m256 slo = _mm256_cvtepi32_ps(block_dot(codes + b * 16, a.q + b * QK));
-        const __m256 shi = _mm256_cvtepi32_ps(block_dot(codes + b * 16 + 8, a.q + b * QK + QKA));
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d * a.scale[2 * b]), slo, acc);
+        const float d = h2f(scales + (ptrdiff_t) 2 * b);
+        const __m256 slo = _mm256_cvtepi32_ps(block_dot(codes + (ptrdiff_t) b * 16, a.q + (ptrdiff_t) b * QK));
+        const __m256 shi = _mm256_cvtepi32_ps(block_dot(codes + (ptrdiff_t) b * 16 + 8, a.q + (ptrdiff_t) b * QK + QKA));
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d * a.scale[(ptrdiff_t) 2 * b]), slo, acc);
         acc = _mm256_fmadd_ps(_mm256_set1_ps(d * a.scale[2 * b + 1]), shi, acc);
-        corr += d * (a.hx[2 * b] + a.hx[2 * b + 1]);
+        corr += d * (a.hx[(ptrdiff_t) 2 * b] + a.hx[2 * b + 1]);
     }
     return hsum_ps(acc) - corr;
 }
@@ -267,10 +267,11 @@ inline float row_dot_oracle(const uint8_t* codes, const uint8_t* scales, const A
         float block = 0.0f;
         for (int half = 0; half < 2; ++half) {
             const int chunk = 2 * b + half;
-            const int dot = chunk_dot_oracle(codes + b * 16 + half * 8, a.q + chunk * QKA, a.sum[chunk]);
+            const int dot = chunk_dot_oracle(codes + (ptrdiff_t) b * 16 + (ptrdiff_t) half * 8,
+                                             a.q + (ptrdiff_t) chunk * QKA, a.sum[chunk]);
             block += a.scale[chunk] * float(dot);
         }
-        result += h2f(scales + 2 * b) * block;
+        result += h2f(scales + (ptrdiff_t) 2 * b) * block;
     }
     return result;
 }
@@ -285,18 +286,19 @@ inline void row_dot_multi(const uint8_t* codes, const uint8_t* scales, const Act
     float corr[NT];
     for (int t = 0; t < NT; ++t) { acc[t] = _mm256_setzero_ps(); corr[t] = 0.f; }
     for (int b = 0; b < nblocks; ++b) {
-        const float d = h2f(scales + 2 * b);
-        const __m256i lo = unpack_q2_0(codes + b * 16);
-        const __m256i hi = unpack_q2_0(codes + b * 16 + 8);
+        const float d = h2f(scales + (ptrdiff_t) 2 * b);
+        const __m256i lo = unpack_q2_0(codes + (ptrdiff_t) b * 16);
+        const __m256i hi = unpack_q2_0(codes + (ptrdiff_t) b * 16 + 8);
         for (int t = 0; t < NT; ++t) {
             const __m256 slo = _mm256_cvtepi32_ps(
-                _mm256_dpbusd_epi32(_mm256_setzero_si256(), lo, _mm256_load_si256((const __m256i*) (a[t]->q + b * QK))));
+                _mm256_dpbusd_epi32(_mm256_setzero_si256(), lo,
+                                    _mm256_load_si256((const __m256i*) (a[t]->q + (ptrdiff_t) b * QK))));
             const __m256 shi = _mm256_cvtepi32_ps(
                 _mm256_dpbusd_epi32(_mm256_setzero_si256(), hi,
-                                    _mm256_load_si256((const __m256i*) (a[t]->q + b * QK + QKA))));
-            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b]), slo, acc[t]);
+                                    _mm256_load_si256((const __m256i*) (a[t]->q + (ptrdiff_t) b * QK + QKA))));
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[(ptrdiff_t) 2 * b]), slo, acc[t]);
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b + 1]), shi, acc[t]);
-            corr[t] += d * (a[t]->hx[2 * b] + a[t]->hx[2 * b + 1]);
+            corr[t] += d * (a[t]->hx[(ptrdiff_t) 2 * b] + a[t]->hx[2 * b + 1]);
         }
     }
     for (int t = 0; t < NT; ++t) res[t] = hsum_ps(acc[t]) - corr[t];
@@ -357,7 +359,7 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
         const __m512i lo = _mm512_set1_epi32(-127), hi = _mm512_set1_epi32(127);
         const __m512 absmask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
         for (int k = 0; k < a.nchunks; ++k) {
-            const float* xb = x + k * QKA;
+            const float* xb = x + (ptrdiff_t) k * QKA;
             const __m512 x0 = _mm512_loadu_ps(xb), x1 = _mm512_loadu_ps(xb + 16);
             const float amax = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_and_ps(x0, absmask), _mm512_and_ps(x1, absmask)));
             const float s = amax > 0.f ? amax / 127.f : 0.f;
@@ -369,8 +371,8 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
             __m512i v0 = _mm512_cvttps_epi32(r0), v1 = _mm512_cvttps_epi32(r1);
             v0 = _mm512_min_epi32(_mm512_max_epi32(v0, lo), hi);
             v1 = _mm512_min_epi32(_mm512_max_epi32(v1, lo), hi);
-            _mm_storeu_si128((__m128i*) (a.q + k * QKA), _mm512_cvtepi32_epi8(v0));
-            _mm_storeu_si128((__m128i*) (a.q + k * QKA + 16), _mm512_cvtepi32_epi8(v1));
+            _mm_storeu_si128((__m128i*) (a.q + (ptrdiff_t) k * QKA), _mm512_cvtepi32_epi8(v0));
+            _mm_storeu_si128((__m128i*) (a.q + (ptrdiff_t) k * QKA + 16), _mm512_cvtepi32_epi8(v1));
             const int32_t sum = _mm512_reduce_add_epi32(_mm512_add_epi32(v0, v1));
             a.scale[k] = s;
             a.sum[k] = sum;
@@ -379,13 +381,13 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
         return;
     }
     for (int k = 0; k < a.nchunks; ++k) {
-        const float* xb = x + k * QKA;
+        const float* xb = x + (ptrdiff_t) k * QKA;
         float amax = 0.f;
         for (int j = 0; j < QKA; ++j) amax = std::fmax(amax, std::fabs(xb[j]));
         const float s = amax > 0.f ? amax / 127.f : 0.f;
         const float inv = s > 0.f ? 1.f / s : 0.f;
         int32_t sum = 0;
-        int8_t* q = a.q + k * QKA;
+        int8_t* q = a.q + (ptrdiff_t) k * QKA;
         for (int j = 0; j < QKA; ++j) {
             // **`std::lround` IS A FUNCTION CALL AND IT COST 51 us PER LAYER.**  Measured: quantizing 2560
             // floats took 51.3 us - 20 ns per element, about 60 cycles for a fabs, a multiply and a round.
@@ -519,12 +521,12 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks,
         const __mmask16 m16 = nb >= 8 ? (__mmask16) 0xFFFF : (__mmask16) ((1u << (2 * nb)) - 1u);
         alignas(16) uint16_t sc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (int i = 0; i < nb; ++i) std::memcpy(&sc[i], row + (size_t) (b0 + i) * 18, 2);
-        const __m512 d8 = _mm512_castps256_ps512(_mm256_cvtph_ps(_mm_load_si128((const __m128i*) sc)));
+        const __m512 d8 = _mm512_castps256_ps512(_mm256_cvtph_ps(_mm_load_si128(reinterpret_cast<const __m128i*>(sc))));
         const __m512 dd = _mm512_maskz_mov_ps(m16, _mm512_permutexvar_ps(dup, d8));
         __m512 p[NT];
         for (int t = 0; t < NT; ++t) {
-            p[t] = _mm512_mul_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->scale + 2 * b0));
-            corr[t] = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->hx + 2 * b0), corr[t]);
+            p[t] = _mm512_mul_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->scale + (ptrdiff_t) 2 * b0));
+            corr[t] = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->hx + (ptrdiff_t) 2 * b0), corr[t]);
         }
         for (int i = 0; i < nb; ++i) {
             const int b = b0 + i;
@@ -532,7 +534,7 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks,
             const __m512i idx = _mm512_add_epi32(base, _mm512_set1_epi32(2 * i));
             for (int t = 0; t < NT; ++t) {
                 const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w,
-                                                        _mm512_load_si512((const void*) (a[t]->q + b * QK)));
+                                                        _mm512_load_si512((const void*) (a[t]->q + (ptrdiff_t) b * QK)));
                 acc[t] = _mm512_fmadd_ps(_mm512_permutexvar_ps(idx, p[t]), _mm512_cvtepi32_ps(dot), acc[t]);
             }
         }
@@ -606,7 +608,7 @@ void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool q
         const uint8_t* us = blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2;
         float sg = 0.f, su = 0.f;
         for (int b = 0; b < SC_GU; ++b) {
-            const float dg = h2f(gs + 2 * b), du = h2f(us + 2 * b);
+            const float dg = h2f(gs + (ptrdiff_t) 2 * b), du = h2f(us + (ptrdiff_t) 2 * b);
             for (int j = 0; j < QK; ++j) {
                 const int o = b * QK + j;
                 sg += (float) (((gc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * dg * x[o];
@@ -627,7 +629,7 @@ void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool q
         const uint8_t* ds = blob + O_D_SCALES + (size_t) r * SC_D * 2;
         float acc = 0.f;
         for (int b = 0; b < SC_D; ++b) {
-            const float d = h2f(ds + 2 * b);
+            const float d = h2f(ds + (ptrdiff_t) 2 * b);
             for (int j = 0; j < QK; ++j)
                 acc += (float) (((dc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * d * ff[b * QK + j];
         }
