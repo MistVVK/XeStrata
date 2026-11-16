@@ -12,5 +12,9 @@
  "guic11": "{0} de 64 KB usados",
  "guic12": "Salvar regras",
  "guic13": "Estas regras são longas demais. Deixe-as com menos de 64 KB e salve de novo.",
- "guic14": "As regras foram alteradas em outra janela. Feche isto e abra-as de novo para ver a versão mais recente."
+ "guic14": "As regras foram alteradas em outra janela. Feche isto e abra-as de novo para ver a versão mais recente.",
+ "guic15": "Pular partes do modelo pouco usadas",
+ "guic16": "Respostas mais rápidas: as partes do modelo que menos importam para uma palavra são puladas quando ainda não estão na placa de vídeo. As respostas podem mudar um pouco. Ligado por padrão onde ajuda.",
+ "guic17": "Automático (recomendado)",
+ "guic18": "Números menores pulam mais partes e são mais rápidos; as respostas podem mudar mais. Só o 7 foi medido."
 }

@@ -39,7 +39,7 @@ export const ENV_FLAG=/^STRATA_[A-Z0-9_]+$/;
  * same for the Terminal (tests/terminal/test_speed_switches.py compares the two).
  */
 /* The table (ids, words, defaults, environment entries) is generated from strata_control/speed_switches.py into policy-generated.mjs; this file only adds the group the screen lists them under and the rules for where a switch applies (below), which tests/speed-switches.test.mjs and tests/terminal/test_speed_switches.py run against the same cases. */
-export const SPEED_SWITCHES=SPEED_SWITCH_TABLE.map(s=>({id:s.id,label:s.label,group:s.group??'Speed',hint:s.hint,default:s.default,env:s.env,...(s.legacy?{legacy:s.legacy}:{}),...(s.words?{words:s.words}:{})}));
+export const SPEED_SWITCHES=SPEED_SWITCH_TABLE.map(s=>({id:s.id,label:s.label,group:s.group??'Speed',hint:s.hint,default:s.default,env:s.env,...(s.legacy?{legacy:s.legacy}:{}),...(s.words?{words:s.words}:{}),...(s.choices?{choices:s.choices,choiceNote:s.choiceNote}:{})}));
 const GFX12=/^gfx120[01]$/i, RADEON_9000=/\b(?:RX\s*9\d{3}|AI\s*PRO\s*R97\d{2}|R97\d{2})\b/i;
 /**
  * Which switches make sense for this model on this PC: only those are shown. `backend` is the engine's (cuda, hip, sycl, metal, cpu). `arch` is the "arch"
@@ -54,11 +54,14 @@ const smallNvidia=gpus=>(gpus??[]).some(g=>{
  if(vendor!=='nvidia'&&!(vendor===''&&/nvidia|geforce|\brtx\b|\bgtx\b|quadro|tesla/i.test(String(g.name??''))))return false;
  return g.vram_gb>0&&g.vram_gb<=13;
 });
+/** A Radeon RX 9000 / AI PRO R9700 (gfx1200 / gfx1201, or the name where the arch is not known). */
+const radeon9000=gpus=>(gpus??[]).some(g=>(!g.vendor||g.vendor==='amd')&&(GFX12.test(String(g.arch??''))||(!g.arch&&RADEON_9000.test(String(g.name??'')))));
 export function speedSwitchApplies(id,{deepseek=false,backend=null,gpus=[],arch=null,vision=false}={}){
  if(deepseek)return false;                                              // a DeepSeek settings file (no longer run): no switch
  if(id==='faster_long_prompts')return !arch&&(backend==='cuda'||backend==='hip');
  if(id==='faster_12gb_nvidia')return !arch&&backend==='cuda'&&smallNvidia(gpus);   // the engine's routing needs the Flash-Next shape (512 experts, top-10) and a CUDA build
- if(id==='faster_radeon_9000')return backend==='hip'&&(gpus??[]).some(g=>(!g.vendor||g.vendor==='amd')&&(GFX12.test(String(g.arch??''))||(!g.arch&&RADEON_9000.test(String(g.name??'')))));
+ if(id==='route_tail_skip')return backend==='cuda'||(backend==='hip'&&radeon9000(gpus));   // the engine reads STRATA_ROUTE_TAIL_SKIP on CUDA and gfx1200/gfx1201 only
+ if(id==='faster_radeon_9000')return backend==='hip'&&radeon9000(gpus);
  return false;
 }
 /** The switch is outside its default when every entry it writes is in the environment with its value; anything less or other (a hand-edited file, STRATA_KVA=0) is the default state and is left alone. */

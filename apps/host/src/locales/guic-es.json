@@ -12,5 +12,9 @@
  "guic11": "{0} de 64 KB usados",
  "guic12": "Guardar reglas",
  "guic13": "Estas reglas son demasiado largas. Acórtalas a menos de 64 KB y vuelve a guardar.",
- "guic14": "Las reglas se cambiaron en otra ventana. Cierra esto y ábrelas de nuevo para ver la versión más reciente."
+ "guic14": "Las reglas se cambiaron en otra ventana. Cierra esto y ábrelas de nuevo para ver la versión más reciente.",
+ "guic15": "Omitir partes del modelo que casi no se usan",
+ "guic16": "Respuestas más rápidas: las partes del modelo que menos importan para una palabra se omiten cuando aún no están en la tarjeta gráfica. Las respuestas pueden cambiar un poco. Activado por defecto donde ayuda.",
+ "guic17": "Automático (recomendado)",
+ "guic18": "Los números más bajos omiten más partes y son más rápidos; las respuestas pueden cambiar más. Solo se ha medido el 7."
 }

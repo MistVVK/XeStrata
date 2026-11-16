@@ -23,9 +23,10 @@ ENV = {      # what each switch writes outside its default
     "faster_long_prompts": {"STRATA_KVA": "1"},
     "faster_12gb_nvidia": {"STRATA_ROUTE_PRIOR": "1.5"},
     "faster_radeon_9000": {"STRATA_PCIE_FRAC_DEFAULT": "old"},
+    "route_tail_skip": {"STRATA_ROUTE_TAIL_SKIP": "0"},          # 0.2.16: a choice (Automatic / Off / 1-9), test_tail_skip_choice.py
     "qwen_defaults_026": {"STRATA_DEFAULTS": "026"},         # the Terminal's troubleshooting switch: not in the app
 }
-DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "qwen_defaults_026": "off"}
+DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "route_tail_skip": "on", "qwen_defaults_026": "off"}
 RTX3060 = {"name": "NVIDIA GeForce RTX 3060", "vendor": "nvidia", "arch": "86", "vram_gb": 12.0}
 RTX4070S = {"name": "NVIDIA GeForce RTX 4070 SUPER", "vendor": "nvidia", "arch": "89", "vram_gb": 12.0}
 RTX4060TI16 = {"name": "NVIDIA GeForce RTX 4060 Ti 16GB", "vendor": "nvidia", "arch": "89", "vram_gb": 16.0}
@@ -40,8 +41,8 @@ DEEPSEEK = {"arch": "deepseek41", "exe": "C:/s/engine-dsv41/0.1.52-win/strata-ds
 
 
 def ids(cfg, gpus, backend=None):
-    """The switches the app would show (the Terminal-only one is tested apart)."""
-    return [s.id for s in W.applicable(cfg, gpus, backend) if not s.terminal_only]
+    """The two-state switches the app would show (the Terminal-only one, and the route tail skip choice of test_tail_skip_choice.py, are tested apart)."""
+    return [s.id for s in W.applicable(cfg, gpus, backend) if not s.terminal_only and not s.choices]
 
 
 class Contract(unittest.TestCase):
@@ -53,7 +54,9 @@ class Contract(unittest.TestCase):
 
     def test_an_effect_text_says_what_the_feature_does_in_plain_words(self):
         for s in W.SWITCHES:
-            if s.words:                                       # a choice between two named options: the text names the other one
+            if s.choices:                                     # a value to choose (test_tail_skip_choice.py): its note says what the numbers do
+                self.assertTrue(s.choice_note, s.id)
+            elif s.words:                                     # a choice between two named options: the text names the other one
                 self.assertIn("Choose " + dict(s.words)["off"], s.effect, s.id)
             elif not s.terminal_only:
                 self.assertRegex(s.effect, r"Off by default" if s.default == "off" else r"[Tt]urn off", s.id)
@@ -184,11 +187,11 @@ class Terminal(unittest.TestCase):
             rows = P.build_rows(None, cfg["args"], None, cfg["env"], None, extra or {}, P.switch_params(W.applicable(cfg, gpus)))
             return [r.name for r in rows if r.name in W.env_names()]
         # (STRATA_DEFAULTS, the Qwen "0.2.6 behaviour" row, closes every Qwen table)
-        self.assertEqual(names(QWEN, [RTX]), ["STRATA_KVA", "STRATA_DEFAULTS"])
-        self.assertEqual(names(QWEN, [RTX3060]), ["STRATA_KVA", "STRATA_ROUTE_PRIOR", "STRATA_DEFAULTS"])
-        self.assertEqual(names({**QWEN, "backend": "hip"}, [R9700]), ["STRATA_KVA", "STRATA_PCIE_FRAC_DEFAULT", "STRATA_DEFAULTS"])
+        self.assertEqual(names(QWEN, [RTX]), ["STRATA_KVA", "STRATA_ROUTE_TAIL_SKIP", "STRATA_DEFAULTS"])
+        self.assertEqual(names(QWEN, [RTX3060]), ["STRATA_KVA", "STRATA_ROUTE_PRIOR", "STRATA_ROUTE_TAIL_SKIP", "STRATA_DEFAULTS"])
+        self.assertEqual(names({**QWEN, "backend": "hip"}, [R9700]), ["STRATA_KVA", "STRATA_PCIE_FRAC_DEFAULT", "STRATA_ROUTE_TAIL_SKIP", "STRATA_DEFAULTS"])
         self.assertEqual(names({**QWEN, "backend": "sycl"}, [R9700]), ["STRATA_DEFAULTS"])
-        self.assertEqual(names(QWEN36, [RTX]), ["STRATA_DEFAULTS"])
+        self.assertEqual(names(QWEN36, [RTX]), ["STRATA_ROUTE_TAIL_SKIP", "STRATA_DEFAULTS"])
 
     def test_the_qwen_0_2_6_row_in_the_advanced_table(self):
         rows = P.build_rows(None, QWEN["args"], None, QWEN["env"], None, {}, P.switch_params(W.applicable(QWEN, [RTX])))
