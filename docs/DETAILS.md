@@ -961,6 +961,18 @@ after a change.
 - Only the chat page uses them. API clients see the API exactly as before and keep their own tools. A request to
   `/v1/chat/completions` opts in with `"strata_mcp": true`.
 
+**A tool server that needs a key.** Settings → Tools → Add tool server connects to a web address (http:// or https://) or starts
+a program. For a web address it sends no extra headers; the "Extra settings" lines are for a program only. When your server
+expects a key in a header (MCP Proxy and most hosted servers do), add the server to the model instead: Models → your model →
+Expert settings → Add tool server, then put the header under Credentials & environment, for example:
+
+```json
+{"proxy": {"url": "http://127.0.0.1:8096/mcp", "headers": {"Authorization": "Bearer <your key>"}}}
+```
+
+The chat and the coding assistant on that model can then use its tools. The key stays in that model's settings on this
+computer; after saving, it is shown masked.
+
 **Security.** MCP tools run on your PC with your user's rights, and the model decides when to call them, also because of what
 it reads (a web page or file can contain instructions). Give a filesystem server only the folders it needs, prefer read-only
 tools and add only servers you trust. If Strata is reachable from other devices, set an API key.
