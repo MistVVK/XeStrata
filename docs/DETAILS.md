@@ -223,6 +223,23 @@ Use the file names and the revision setup shows for your model (the revision abo
 Keep the file's original name. Setup finds the files in `--gguf-dir`, checks their SHA-256 and does not download them again; a file that does not match the published one is
 reported and, for files in your own folder, never deleted. Without `uvx`, `pip install -U huggingface_hub` gives the same `hf` command.
 
+### Installing a model from another program (`--output jsonl`)
+
+A program that installs a model for its user (`setup.py --yes --no-start --family F --model M --data-dir D`) can add `--output jsonl`. Setup then writes
+one JSON object per line to stdout and nothing else: its usual text, and the output of every program it runs, goes to stderr. The exit codes stay the same.
+Every object has `"schema_version": 1` and an `"event"`:
+
+| `event` | Other fields | Sent when |
+| --- | --- | --- |
+| `step` | `n`, `title` | a numbered step starts (`=== Step N: ... ===` in the text) |
+| `ok` | `message` | a check passed or a part is ready (an `[ok]` line) |
+| `warning` | `message` | setup goes on but says something (a `[!]` line) |
+| `progress` | `label`, `done_bytes`, `total_bytes` | during a download: at most once a second per file, and once at the end |
+| `error` | `message`, `hint` (or null), `exit_code`; `kind` for some stops | setup stops, just before it exits with `exit_code`. `kind` is `no_space` (with `path`, `free_bytes`, `needed_bytes`) when the disk is too full, `refused` when the install would need a download it may not make, `interrupted` after Ctrl+C |
+| `done` | `exit_code`, `run_config` | the last line of a run that ends by itself: `run_config` is the absolute path of the `strata-<model>.json` setup wrote (null if it wrote none) |
+
+New fields may be added to an event; a reader should ignore fields it does not know.
+
 ## Memory modes
 
 ### KV cache
