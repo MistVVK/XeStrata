@@ -99,13 +99,14 @@ template <> struct Fmt<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign bytes
     static constexpr int bytes = 82;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* qs = b + 2 + 8 * (ptrdiff_t) j;
+        const int o = 8 * j;   // int, not ptrdiff_t: the wider product changed this decode's AVX-512 code
+        const uint8_t* qs = b + 2 + o;
         const uint8_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
         g = _mm512_set_epi64((long long) iq2s_grid[qs[7] | ((h1 << 2) & 0x300)], (long long) iq2s_grid[qs[6] | ((h1 << 4) & 0x300)],
                              (long long) iq2s_grid[qs[5] | ((h1 << 6) & 0x300)], (long long) iq2s_grid[qs[4] | ((h1 << 8) & 0x300)],
                              (long long) iq2s_grid[qs[3] | ((h0 << 2) & 0x300)], (long long) iq2s_grid[qs[2] | ((h0 << 4) & 0x300)],
                              (long long) iq2s_grid[qs[1] | ((h0 << 6) & 0x300)], (long long) iq2s_grid[qs[0] | ((h0 << 8) & 0x300)]);
-        m = _cvtu64_mask64(u64(b + 2 + 32 + 8 * (ptrdiff_t) j));
+        m = _cvtu64_mask64(u64(b + 2 + 32 + o));
         const uint8_t s0 = b[74 + 2 * j], s1 = b[74 + 2 * j + 1];
         sc = scales4(2 * (s0 & 15) + 1, 2 * (s0 >> 4) + 1, 2 * (s1 & 15) + 1, 2 * (s1 >> 4) + 1);
     }
@@ -167,8 +168,10 @@ template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 13
     static constexpr float K = 1.0f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
         const __m512i tab = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl)));
-        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * (ptrdiff_t) j)));
-        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * (ptrdiff_t) j + 1)));
+        // int, not ptrdiff_t: the wider products changed this decode's AVX-512 code
+        const int o0 = 16 * (2 * j), o1 = 16 * (2 * j + 1);
+        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + o0));
+        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + o1));
         const __m128i m4 = _mm_set1_epi8(0x0f);
         const __m256i h0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q0, 4), m4), _mm_and_si128(q0, m4));
         const __m256i h1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q1, 4), m4), _mm_and_si128(q1, m4));
