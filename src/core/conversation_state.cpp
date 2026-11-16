@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -181,6 +182,10 @@ struct CkptAsync {
     int dev = -1;
 };
 CkptAsync& ckpt_async() { static CkptAsync a; return a; }
+std::atomic<void (*)(int)> ckpt_test_hook{nullptr};   // (conversation_checkpoint_test_hook: tests only)
+void ckpt_test_point(int point) {
+    if (void (*h)(int) = ckpt_test_hook.load(std::memory_order_acquire)) h(point);
+}
 // STRATA_CKPT_VRAM_SLOTS=N (with STRATA_CKPT_ASYNC): the last N saved GDN states stay in VRAM (allocated only while
 // more than 1.5 GB stays free); a restore of a checkpoint whose tag a slot holds copies device to device.
 struct VramSlot { void* p = nullptr; size_t n = 0; uint64_t tag = 0, used = 0; int dev = -1; };
@@ -268,15 +273,21 @@ int ckpt_gather_small(ConversationCheckpoint& c, const SessionState& ss, const C
     if (block_pos) std::memcpy(c.block_pos.data(), h + ple + tails + dead, block_pos);
     return 1;
 }
-}  // namespace
-
-void conversation_checkpoint_join(const void* only) {
-    CkptAsync& a = ckpt_async();
-    std::lock_guard<std::mutex> lk(a.mu);
+// the copy in flight (all of them: only == nullptr; else only the one writing `only`) has landed; the caller holds a.mu
+void join_locked(CkptAsync& a, const void* only) {
     if (a.pending.valid() && (only == nullptr || only == a.dst)) {
         const cudaError_t e = a.pending.get();
         if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", cudaGetErrorString(e));
     }
+}
+}  // namespace
+
+void conversation_checkpoint_test_hook(void (*hook)(int point)) { ckpt_test_hook.store(hook, std::memory_order_release); }
+
+void conversation_checkpoint_join(const void* only) {
+    CkptAsync& a = ckpt_async();
+    std::lock_guard<std::mutex> lk(a.mu);
+    join_locked(a, only);
 }
 
 namespace {
@@ -307,6 +318,14 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
         conversation_trace::thread_minflt() - rf0, c.gdn.size() >> 20, (const void*) c.gdn.data(), conversation_trace::where(c.gdn.data()));
     if (ckpt_async_on() && c.gdn.size() >= ((size_t) 1 << 20)) {
         CkptAsync& a = ckpt_async();
+        // #6075: one owner from here to the launch.  The staging buffer, its pinned twin, the stream and the VRAM slots
+        // are one set for the process, and a layer split saves its stages' parts on several threads: a save that resized
+        // or refilled the set between its join and its launch freed or overwrote what another stage's copy was about to
+        // read ("invalid resource handle", then a crash).  Under the lock the copy in flight lands first, then the set
+        // is resized, filled and handed to the new copy; the background copy itself takes no lock.
+        std::lock_guard<std::mutex> lk(a.mu);
+        join_locked(a, nullptr);
+        ckpt_test_point(1);
         int dev = 0;
         (void) cudaGetDevice(&dev);
         if (a.stage != nullptr && (a.cap < c.gdn.size() || a.dev != dev)) {
@@ -326,7 +345,9 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
         if (slot != nullptr) slot->tag = 0;   // (being rewritten)
         void* dsrc = slot != nullptr ? slot->p : a.stage;
         c.dev_tag = 0;
-        if (dsrc != nullptr && copy(dsrc, ss.gdn_state, c.gdn.size(), error)) {   // device to device: fast
+        // (a VRAM slot without the pinned buffer and stream - their allocation failed - has nowhere to copy to: plain copy)
+        if (dsrc != nullptr && a.host != nullptr && a.stream != nullptr &&
+            copy(dsrc, ss.gdn_state, c.gdn.size(), error)) {   // device to device: fast
             const auto q1 = std::chrono::steady_clock::now();
             if (slot != nullptr) {
                 VramSlots& v = vram_slots();
@@ -340,13 +361,14 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
             cudaStream_t st = a.stream;
             if (atr) std::fprintf(stderr, "strata parktrace: async ckpt d2d %.2f ms\n",
                 std::chrono::duration<double, std::milli>(q1 - q0).count());
-            std::lock_guard<std::mutex> lk(a.mu);
+            ckpt_test_point(3);
             // the DMA in 4 MiB pieces, one in flight: a D2H copy queues behind the one before it on the copy engine, and
             // the decode's own small reads would otherwise wait for the whole 100+ MB at the link's ~1.6 GB/s
             a.dst = dst;
             a.pending = std::async(std::launch::async, [dst, host, stage, n, st, dev] {
                 conversation_detail::background_thread_placement();
                 (void) cudaSetDevice(dev);
+                ckpt_test_point(2);
                 cudaEvent_t done = nullptr;
                 cudaError_t e = cudaEventCreateWithFlags(&done, cudaEventDisableTiming | cudaEventBlockingSync);
                 constexpr size_t PIECE = (size_t) 4 << 20;
@@ -394,15 +416,8 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
                                      const ModelGeometry& g, std::string& error) {
-    const VramSlot* hit = nullptr;
-    if (c.dev_tag != 0) {
-        int dev = 0;
-        (void) cudaGetDevice(&dev);
-        for (VramSlot& x : vram_slots().s)
-            if (x.tag == c.dev_tag && x.dev == dev && x.n == c.gdn.size()) { x.used = ++vram_slots().clock; hit = &x; }
-    }
-    if (hit == nullptr) conversation_checkpoint_join(c.gdn.data());
 #if defined(STRATA_GPU_METAL)
+    conversation_checkpoint_join(c.gdn.data());
     (void) g;
     if (!strata::metal_engine::window_checkpoint_restore(c, &ss, error)) return false;
     ss.ple_prev[0] = c.ids.size() >= 2 ? c.ids[c.ids.size() - 2] : -1;
@@ -413,8 +428,26 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, hit != nullptr ? hit->p : (const void*) c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    bool from_slot = false;
+    if (c.dev_tag != 0) {
+        // STRATA_CKPT_VRAM_SLOTS (#6075): looked up and read under the lock a save holds while it takes or refills a slot
+        CkptAsync& a = ckpt_async();
+        std::lock_guard<std::mutex> lk(a.mu);
+        int dev = 0;
+        (void) cudaGetDevice(&dev);
+        for (VramSlot& x : vram_slots().s)
+            if (x.tag == c.dev_tag && x.dev == dev && x.n == c.gdn.size()) {
+                x.used = ++vram_slots().clock;
+                if (!copy(ss.gdn_state, x.p, c.gdn.size(), error)) return false;
+                from_slot = true;
+                break;
+            }
+    }
+    if (!from_slot) {
+        conversation_checkpoint_join(c.gdn.data());
+        if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error)) return false;
+    }
+    if (!copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
         if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||

@@ -420,6 +420,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME conversation_snapshot_test_ckpt_vram_slots COMMAND conversation_snapshot_test)
     set_tests_properties(conversation_snapshot_test_ckpt_vram_slots PROPERTIES
       ENVIRONMENT "STRATA_TEST_BIG_GDN=1;STRATA_CKPT_ASYNC=1;STRATA_CKPT_VRAM_SLOTS=3" SKIP_RETURN_CODE 77 TIMEOUT 300)
+    # #6075: two threads saving checkpoints through the one background-copy buffer, forced to overlap; alone and with
+    # recent states kept in VRAM
+    add_executable(conversation_ckpt_race_test src/core/conversation_ckpt_race_test.cpp)
+    target_link_libraries(conversation_ckpt_race_test PRIVATE strata_engine)
+    add_test(NAME conversation_ckpt_race_test COMMAND conversation_ckpt_race_test)
+    set_tests_properties(conversation_ckpt_race_test PROPERTIES
+      ENVIRONMENT "STRATA_CKPT_ASYNC=1" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    add_test(NAME conversation_ckpt_race_test_vram_slots COMMAND conversation_ckpt_race_test)
+    set_tests_properties(conversation_ckpt_race_test_vram_slots PROPERTIES
+      ENVIRONMENT "STRATA_CKPT_ASYNC=1;STRATA_CKPT_VRAM_SLOTS=2" SKIP_RETURN_CODE 77 TIMEOUT 120)
     add_executable(conversation_validation_test src/core/conversation_validation_test.cpp)
     target_link_libraries(conversation_validation_test PRIVATE strata_engine)
     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
