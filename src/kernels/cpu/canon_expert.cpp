@@ -287,7 +287,7 @@ void fx_act(const float* dx, int nb, FxAct& a) {
         a.e[b] = p.e;
         a.top = std::max(a.top, p.e);
     }
-    a.top = canon::fx_row_top(a.e[0], a.top);   // the activation's part of the top, as the weights'
+    if (nb > 0) a.top = canon::fx_row_top(a.e[0], a.top);   // the activation's part of the top, as the weights'
 }
 
 // ---- the AVX2 forms of the down rows (the gate/up rows: iq_avx2's iq256_canon_rows)
@@ -525,7 +525,7 @@ void canon_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const*
         for (int t = 0; t < nt; ++t) qs32[t] = act_sums(hq[t], n, 32);
         with_nt(nt, [&](auto NTc) {
             constexpr int NT = decltype(NTc)::value;
-            FxAct fa[NT];   // the activations' parts once for every row (the fixed-point sums)
+            FxAct fa[NT]{};   // the activations' parts once for every row (the fixed-point sums)
             const bool fx = exact_sums();
             if (fx)
                 for (int t = 0; t < NT; ++t) fx_act(dx[t], n / 32, fa[t]);
