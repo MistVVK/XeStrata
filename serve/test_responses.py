@@ -820,8 +820,17 @@ class ToolRoundTrip(Server):
         second_prompt = self.tok.decode(self.engine.last_prompt)
         self.assertTrue(second_prompt.startswith(first_prompt + search + "<|im_end|>"), second_prompt[-800:])
         self.assertNotIn("mcp__fs.read", first_prompt)
-        # That the parser and the response accept the found tool (mcp__fs.read comes back as a function_call) is the
-        # request-scoped eligibility change, ENG-SERVE's part: it reads responses.client_found_tools(req).
+        # the parser and the response accept the found tool (request-scoped; the prompt above is unchanged)
+        fc = r["output"][-1]
+        self.assertEqual((fc["type"], fc["namespace"], fc["name"], json.loads(fc["arguments"])),
+                         ("function_call", "mcp__fs", "read", {"path": "a.txt"}))
+        # ... and only what the search returned in this request: without the search's output in the input the same
+        # text is not read as the found tool (no mcp__fs / read call; nothing carries over from an earlier request)
+        self.engine.scripts = [self.tok.encode(read + "<|im_end|>", parse_special=True)]
+        self.engine.script = self.engine.scripts[0]
+        code, r = self.post({**base, "input": [user]})
+        self.assertEqual(code, 200, r)
+        self.assertFalse([o for o in r["output"] if o.get("type") == "function_call" and o.get("name") == "read"], r)
 
 
 class JsonFormatWithTools(Server):
