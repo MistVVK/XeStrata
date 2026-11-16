@@ -11046,6 +11046,7 @@ int main(int argc, char** argv) {
         aa.peer = peer.valid();
         aa.remote_opt = remote_opt != nullptr;
         aa.adapt_overlap = adapt_overlap();
+        aa.fetch = adapt_fetch();   // #5814
         o.adapt_async_self = strata::core::adapt_async_self_decides(aa);
     }
     if (o.adapt_async) {
