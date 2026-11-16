@@ -462,10 +462,13 @@ __device__ __forceinline__ const uint32_t* i8_grid_src() {
 
 // shared memory of an instance, in dwords: grid | sign table | stage weights x2 | stage activations x2 | scale records x2 |
 // activation scales x2 | source rows
-template <int T, int TM>
+// GG (TUNE-0216, Volta): the codebook grid is read from global memory (L1-cached) instead of being staged in shared memory, so that a tile of a big-grid format
+// (IQ2_S 8 KB, IQ2_XS 4 KB, IQ1_M 8 KB) fits two blocks into a Volta multiprocessor's 96 KB.  The same grid words are read: the output is bit-identical.
+__host__ __device__ constexpr bool i8_gg_type(int t) { return i8_grid_words(t) > 512; }
+template <int T, int TM, bool GG = false>
 struct I8Smem {
     static constexpr int BM = 16 * TM;
-    static constexpr int GW = (i8_grid_words(T) + 3) / 4 * 4;
+    static constexpr int GW = GG ? 0 : (i8_grid_words(T) + 3) / 4 * 4;
     static constexpr int SG = i8_sign_type(T) ? 512 : 0;
     static constexpr int SZ_W = 64 * I8_LD, SZ_A = BM * I8_LD, SZ_R = 64 * I8_RS, SZ_D = BM * 4, SZ_S = i8_min_type(T) ? BM * 4 : 0;   // SZ_S: the activation sums of the minimum formats
     static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + 2 * SZ_W, o_r = o_a + 2 * SZ_A, o_d = o_r + 2 * SZ_R, o_s = o_d + 2 * SZ_D, o_src = o_s + 2 * SZ_S,
@@ -536,16 +539,17 @@ __device__ __forceinline__ int i8_row_t(const uint4 (&w)[2], const uint4& rc, co
 // rows tx + 16 (2 half + i2)) and one entry of each 8-entry slice (entry ty % 8 + 8 js), so a block with 6 entries runs one slice with all 256 threads busy
 // where the 16-entry slice left 10 of 16 entry rows computing nothing.  Every (row, entry) accumulates the same terms in the same order: bit-identical output.
 // The gate/up epilogue needs the gate (row pair 0) and up (row pair 1) values of one entry together: the up half hands them over through shared memory.
-template <int T, bool GU, int TM, bool NR>
+template <int T, bool GU, int TM, bool NR, bool GG = false>
 __global__ void __launch_bounds__(I8_NT)
 i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
           const int32_t* __restrict__ tile_off, const int32_t* __restrict__ ent_idx, const block_q8_1* __restrict__ A,
           block_q8_1* __restrict__ hq, float* __restrict__ out, NativeExpertLayout L, int bisect) {
-    using SM = I8Smem<T, TM>;
+    using SM = I8Smem<T, TM, GG>;
     constexpr int BM = SM::BM;
     extern __shared__ uint4 i8_dyn[];
     uint32_t* const smem = (uint32_t*) i8_dyn;
     uint32_t* const s_grid = smem;
+    const uint32_t* const grid_rd = GG ? i8_grid_src<T>() : s_grid;   // GG: the grid words straight from global memory (through L1)
     uint32_t* const s_sg = smem + SM::o_sg;
     uint32_t* const s_w = smem + SM::o_w;
     uint32_t* const s_a = smem + SM::o_a;
@@ -579,7 +583,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
     const int ns = K / I8_KS;
     const size_t wrb = GU ? L.gu_row : L.d_row;
 
-    if constexpr (i8_grid_words(T) > 4) {
+    if constexpr (i8_grid_words(T) > 4 && !GG) {
         const uint32_t* src = i8_grid_src<T>();
         for (int i = tid; i < i8_grid_words(T); i += I8_NT) s_grid[i] = src[i];
     }
@@ -628,7 +632,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         float base, minv = 0.0f;
         const int ibs = (st * 4 + wp) & 7;
         i8_pack<T>(r, ibs, w);   // (ib of a 256-value super-block; the K-quants and IQ3_S read it)
-        i8_convert<T>(w, s_grid, (const uint2*) s_sg, kv, q, m0, m1, base, ibs, &minv);
+        i8_convert<T>(w, grid_rd, (const uint2*) s_sg, kv, q, m0, m1, base, ibs, &minv);
         uint4* dst = (uint4*) (s_w + b * SM::SZ_W + wr * I8_LD + wp * 8);
         dst[0] = make_uint4(q[0], q[1], q[2], q[3]);
         dst[1] = make_uint4(q[4], q[5], q[6], q[7]);
@@ -1104,6 +1108,7 @@ struct I8Args {
     int64_t tiles_ub;
     int bisect;
     bool n8 = false;     // tile codes 2-4: 8-entry slices with two weight rows per thread (see i8_kernel, NR)
+    bool gg = false;     // tile codes 2-4, a big-grid format (i8_gg_type): the grid read from global memory (see I8Smem, GG; Volta)
 };
 
 // what the last native_expert_i8 call asked its two launches for (the tile code, the dynamic shared memory in bytes passed as the launch's third argument, and
@@ -1120,28 +1125,35 @@ void i8_note_launch(bool gu, int tile, size_t bytes) {
     else { g_i8_last.down_bytes = bytes; g_i8_last.down_err = e; }
 }
 
-template <int T, bool GU, int TM>
-void i8_launch_tm(const I8Args& a, cudaStream_t s) {
-    constexpr size_t smem = I8Smem<T, TM>::bytes;
+template <int T, bool GU, int TM, bool GG>
+void i8_launch_tm_g(const I8Args& a, cudaStream_t s) {
+    constexpr size_t smem = I8Smem<T, TM, GG>::bytes;
 #if !defined(__HIPCC__)
     if (smem > 48 * 1024) {
-        cudaFuncSetAttribute(i8_kernel<T, GU, TM, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        cudaFuncSetAttribute(i8_kernel<T, GU, TM, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(i8_kernel<T, GU, TM, false, GG>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(i8_kernel<T, GU, TM, true, GG>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
     }
 #endif
     const dim3 grid((unsigned) a.tiles_ub, (unsigned) (GU ? a.L.n_ff / 32 : a.L.n_embd / 64));
     if (a.n8) {   // 8-entry slices (i8_n8_takes)
         if constexpr (GU)
-            i8_kernel<T, true, TM, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+            i8_kernel<T, true, TM, true, GG><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
         else
-            i8_kernel<T, false, TM, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+            i8_kernel<T, false, TM, true, GG><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
     } else {
         if constexpr (GU)
-            i8_kernel<T, true, TM, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+            i8_kernel<T, true, TM, false, GG><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
         else
-            i8_kernel<T, false, TM, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+            i8_kernel<T, false, TM, false, GG><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
     }
     i8_note_launch(GU, TM, smem);
+}
+template <int T, bool GU, int TM>
+void i8_launch_tm(const I8Args& a, cudaStream_t s) {
+    if constexpr (i8_gg_type(T)) {
+        if (a.gg) { i8_launch_tm_g<T, GU, TM, true>(a, s); return; }
+    }
+    i8_launch_tm_g<T, GU, TM, false>(a, s);
 }
 template <int T, bool GU>
 void i8b_launch(const I8Args& a, cudaStream_t s) {
@@ -1158,13 +1170,16 @@ void i8b_launch(const I8Args& a, cudaStream_t s) {
 }
 // shared memory of the instances of a gate/up and a down type for tile code tm (2, 3, 4: rows of 16 entries; 8: variant B), and the device's limit per block
 template <int T>
-size_t i8_sm(int tm) {
+size_t i8_sm(int tm, bool gg = false) {
+    if (gg && i8_gg_type(T) && tm != 8) return tm <= 2 ? I8Smem<T, 2, true>::bytes : tm == 3 ? I8Smem<T, 3, true>::bytes : I8Smem<T, 4, true>::bytes;
     return tm == 8 ? I8BSmem<T>::bytes : tm <= 2 ? I8Smem<T, 2>::bytes : tm == 3 ? I8Smem<T, 3>::bytes : I8Smem<T, 4>::bytes;
 }
-size_t i8_smem_bytes(int gu, int dt, int tm) {
-    const size_t a = gu == 16 ? i8_sm<16>(tm) : gu == 17 ? i8_sm<17>(tm) : gu == 18 ? i8_sm<18>(tm) : gu == 21 ? i8_sm<21>(tm) : gu == 23 ? i8_sm<23>(tm) :
-                     gu == 29 ? i8_sm<29>(tm) : gu == 42 ? i8_sm<42>(tm) : gu == 12 ? i8_sm<12>(tm) : gu == 13 ? i8_sm<13>(tm) : gu == 14 ? i8_sm<14>(tm) : gu == 8 ? i8_sm<8>(tm) : i8_sm<22>(tm);
-    const size_t b = dt == 20 ? i8_sm<20>(tm) : dt == 6 ? i8_sm<6>(tm) : dt == 8 ? i8_sm<8>(tm) : dt == 7 ? i8_sm<7>(tm) : dt == 13 ? i8_sm<13>(tm) : dt == 14 ? i8_sm<14>(tm) : i8_sm<42>(tm);
+size_t i8_smem_bytes(int gu, int dt, int tm, bool gg = false) {
+    const size_t a = gu == 16 ? i8_sm<16>(tm, gg) : gu == 17 ? i8_sm<17>(tm, gg) : gu == 18 ? i8_sm<18>(tm, gg) : gu == 21 ? i8_sm<21>(tm, gg) : gu == 23 ? i8_sm<23>(tm, gg) :
+                     gu == 29 ? i8_sm<29>(tm, gg) : gu == 42 ? i8_sm<42>(tm, gg) : gu == 12 ? i8_sm<12>(tm, gg) : gu == 13 ? i8_sm<13>(tm, gg) : gu == 14 ? i8_sm<14>(tm, gg) :
+                     gu == 8 ? i8_sm<8>(tm, gg) : i8_sm<22>(tm, gg);
+    const size_t b = dt == 20 ? i8_sm<20>(tm, gg) : dt == 6 ? i8_sm<6>(tm, gg) : dt == 8 ? i8_sm<8>(tm, gg) : dt == 7 ? i8_sm<7>(tm, gg) : dt == 13 ? i8_sm<13>(tm, gg) :
+                     dt == 14 ? i8_sm<14>(tm, gg) : i8_sm<42>(tm, gg);
     return a > b ? a : b;
 }
 int i8_env_int(const char* name, int dflt);

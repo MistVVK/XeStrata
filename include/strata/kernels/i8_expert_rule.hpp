@@ -11,6 +11,7 @@
 // environment read here (the caller passes the variable's text and the device's gcnArchName), so the rule is unit-tested without a card.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "strata/kernels/gfx_arch.hpp"
@@ -91,6 +92,24 @@ inline bool i8_n8_takes(int state, int tile) {
     if (state == 0) return false;
     return state == 1 ? tile >= 2 && tile <= 4 : tile == 2;
 }
+
+// Volta (compute capability 7.0: 96 KB of shared memory per multiprocessor, no int8 matrix cores, so every routed expert of a prompt runs on these kernels).  The tile the
+// other cards take from 96 entries a group on average (tile 8, 128 x 128, 54-62 KB) and tile 4 (51-59 KB) leave one block of 8 warps per multiprocessor there; tiles 2 and 3 of
+// the IQ3 formats (43 / 48 KB) run two.  Tesla V100-SXM2 32 GB, one layer of Flash-Next's shape, uniform routing, MMQ time / int8 time (above 1: ours faster), the call's
+// own pick against tile 3 (phaseA-tests/tune0216, bench1-v100): IQ3_S / IQ4_NL 0.745 -> 0.949 at 8,192 tokens and 0.795 -> 0.820 at 26,000, IQ3_XXS / IQ4_NL 0.721 -> 0.955 and
+// 0.795 -> 0.831; output bits equal at every tile (the tile only groups entries).  The big-grid formats (IQ2_S's 8 KB grid table) read their grid from global memory there
+// (I8Smem GG: the same words, the same bits), so their tile 3 fits two blocks too.  So on Volta the call's pick is lowered to the largest tile that still gives two blocks per
+// multiprocessor (tile 8 counts as 4 first); a tile set by STRATA_I8_TM is kept as given.
+/// `tm` the pick (2, 3, 4 or 8), `bytes2/3/4` the dynamic shared memory of tiles 2-4 for the layer's formats, `smem_sm` the multiprocessor's shared memory, `reserved` the
+/// driver's reservation per block (cudaDevAttrReservedSharedMemoryPerBlock).
+inline int i8_tile_two_blocks(int tm, std::size_t bytes2, std::size_t bytes3, std::size_t bytes4, std::size_t smem_sm, std::size_t reserved) {
+    int t = tm >= 4 ? 4 : tm <= 2 ? 2 : 3;
+    auto fits = [&](int k) { const std::size_t b = (k == 2 ? bytes2 : k == 3 ? bytes3 : bytes4) + reserved; return 2 * b <= smem_sm; };
+    while (t > 2 && !fits(t)) --t;
+    return t;
+}
+/// STRATA_I8_SM70 read as a state (1 / 0 / -1 not set): the Volta tile rule above and the global grid are on unless it is 0.
+inline bool i8_volta_rule_on(int state) { return state != 0; }
 
 // The Tesla P100 (compute capability 6.0) in a build without MMQ.  There the build WITH MMQ takes the FP16 prompt path by default (prefill.cpp gp100_fp16_default: GP100 has no
 // dp4a), so the unset-switch int8 default of a build without MMQ (i8_switch_effective) must not replace it where the int8 kernel loses to it.  Measured on the P100 (OUT build,

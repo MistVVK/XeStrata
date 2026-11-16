@@ -85,6 +85,41 @@ int main() {
         strata::prefill::own_only_build_flag() = true;
         CHECK(strata::prefill::own_only_build());
     }
+    // TUNE-0216: the Qwen3.6 engine's two entries see the same fused switches on a CUDA card.  `strata --model`: prefill.cpp's start-up list
+    // (own_only_apply_defaults), then run()'s own (q36_entry_switches, set when unset); the standalone strata-q36: run()'s only.  Every switch the
+    // fused decision of a Turing (and any CUDA) card reads must end up with the same value on both, in a build without MMQ and with it.
+    {
+        auto entry_env = [](bool via_strata, bool mmq_built) {
+            std::vector<std::pair<std::string, std::string>> env;
+            auto get = [&](const char* k) -> const char* {
+                for (const auto& kv : env) if (kv.first == k) return kv.second.c_str();
+                return nullptr;
+            };
+            auto set1 = [&](const char* k) { if (!get(k)) env.push_back({k, "1"}); };
+            std::vector<std::string> rec;
+            if (via_strata && !mmq_built) strata::prefill::own_only_apply_defaults(false, get, set1, rec);
+            for (const char* k : strata::prefill::q36_entry_switches(mmq_built)) set1(k);
+            return env;
+        };
+        const char* const turing_reads[] = {"STRATA_PF_FUSED_SM75", "STRATA_PF_FUSED_KQ", "STRATA_PF_FUSED_Q6K", "STRATA_PF_FUSED_Q8GU"};
+        for (bool mmq_built : {false, true}) {
+            const auto a = entry_env(true, mmq_built), b = entry_env(false, mmq_built);
+            for (const char* k : turing_reads) {
+                auto val = [&](const std::vector<std::pair<std::string, std::string>>& e) -> std::string {
+                    for (const auto& kv : e) if (kv.first == k) return kv.second;
+                    return "(unset)";
+                };
+                if (val(a) != val(b)) {
+                    std::fprintf(stderr, "FAIL q36 entries differ on %s (MMQ %d): strata --model %s, strata-q36 %s\n", k, (int) mmq_built, val(a).c_str(), val(b).c_str());
+                    ++failed;
+                }
+            }
+        }
+        // the Turing set-up in a build without MMQ on both, and only there
+        auto has = [](const std::vector<const char*>& v, const char* k) { for (const char* x : v) if (std::strcmp(x, k) == 0) return true; return false; };
+        CHECK(has(strata::prefill::q36_entry_switches(false), "STRATA_PF_FUSED_SM75"));
+        CHECK(!has(strata::prefill::q36_entry_switches(true), "STRATA_PF_FUSED_SM75"));
+    }
     if (failed) {
         std::fprintf(stderr, "own_only_switches_test: %d check(s) failed\n", failed);
         return 1;

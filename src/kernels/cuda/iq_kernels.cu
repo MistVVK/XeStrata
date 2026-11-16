@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <utility>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -6263,6 +6264,35 @@ const char* i8_device_gcn() {
     return "";
 #endif
 }
+// TUNE-0216: the Volta rule of the int8 kernels (i8_expert_rule.hpp, i8_tile_two_blocks; the global grid of I8Smem GG) - on for a compute capability 7.0 card unless
+// STRATA_I8_SM70=0; the multiprocessor's shared memory and the per-block reservation read once per device.  A HIP card: off.
+struct I8Volta {
+    bool on = false;
+    size_t smem_sm = 0, reserved = 0;
+};
+I8Volta i8_volta() {
+#if defined(__HIPCC__)
+    return {};
+#else
+    static const int sw = strata::kernels::i8_switch_parse(std::getenv("STRATA_I8_SM70"));
+    static std::mutex mu;
+    static I8Volta per[64];
+    static bool done[64] = {};
+    int dev = 0;
+    if (!strata::kernels::i8_volta_rule_on(sw) || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return {};
+    std::lock_guard<std::mutex> lk(mu);
+    if (!done[dev]) {
+        done[dev] = true;
+        int major = 0, minor = 0, sm = 0, res = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        cudaDeviceGetAttribute(&sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+        if (cudaDeviceGetAttribute(&res, cudaDevAttrReservedSharedMemoryPerBlock, dev) != cudaSuccess) { cudaGetLastError(); res = 0; }
+        per[dev] = {strata::cc_major_of(major) == 7 && strata::cc_minor_of(minor) == 0 && sm > 0, (size_t) sm, (size_t) res};
+    }
+    return per[dev];
+#endif
+}
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
@@ -6341,6 +6371,24 @@ void native_expert_i8_quantize(const float* x, int64_t n_rows, int64_t n_cols, v
     check("native_expert_i8_quantize");
 }
 
+namespace {
+struct I8RecArg {
+    uint32_t w[kI8PutRecordMax / 4];
+};
+__global__ void i8_put_record_kernel(const I8RecArg a, uint32_t* __restrict__ dst, int nw) {
+    for (int i = threadIdx.x; i < nw; i += blockDim.x) dst[i] = a.w[i];
+}
+}  // namespace
+
+bool native_expert_i8_put_record(void* dst, const void* src, size_t bytes, void* stream) {
+    if (bytes == 0) return true;
+    if (bytes > kI8PutRecordMax || bytes % 4 != 0 || dst == nullptr) return false;
+    I8RecArg a{};
+    std::memcpy(a.w, src, bytes);
+    i8_put_record_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(a, (uint32_t*) dst, (int) (bytes / 4));
+    return cudaGetLastError() == cudaSuccess;
+}
+
 void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                       const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
                       void* scratch, float* out, void* stream) {
@@ -6363,14 +6411,21 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     int tm = i8_env_int("STRATA_I8_TM", 0);   // research: the tile code (2, 3 or 4 rows of 16 entries per thread -> 32, 48 or 64 entries; 8 = variant B, 128 entries)
     const int64_t avg = cap_entries / cap_groups;
     const bool b_ok = L.n_embd % 128 == 0 && L.n_ff % 64 == 0;
+    const bool tm_set = tm > 0;
     if (tm <= 0) tm = (avg >= 96 && b_ok) ? 8 : (int) std::max<int64_t>(2, std::min<int64_t>(4, (avg + 8) / 16));
     tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
+    // Volta (i8_expert_rule.hpp, i8_tile_two_blocks): the big-grid formats read their grid from global memory, and the pick is lowered to the largest tile that keeps two blocks
+    // per multiprocessor (a tile set by STRATA_I8_TM is kept; STRATA_I8_SM70=0 turns both off)
+    const I8Volta vo = i8_volta();
+    const bool gg = vo.on && i8_gg_type(L.gu_type);
+    if (vo.on && !tm_set) tm = strata::kernels::i8_tile_two_blocks(tm, i8_smem_bytes(L.gu_type, L.d_type, 2, gg), i8_smem_bytes(L.gu_type, L.d_type, 3, gg),
+                                                                  i8_smem_bytes(L.gu_type, L.d_type, 4, gg), vo.smem_sm, vo.reserved);
     const size_t smem_limit = i8_smem_limit();   // a tile that does not fit the device's shared memory per block falls to the next smaller one
-    while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm) > smem_limit) tm = tm == 8 ? 4 : tm - 1;
+    while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm, gg) > smem_limit) tm = tm == 8 ? 4 : tm - 1;
     const int bm = tm == 8 ? 128 : 16 * tm;
     i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
     I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
-             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm)};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
+             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm), gg};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
     switch (L.gu_type) {
         case 16: i8_launch<16, true>(tm, a, s); break;
         case 17: i8_launch<17, true>(tm, a, s); break;

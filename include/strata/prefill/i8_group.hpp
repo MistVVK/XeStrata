@@ -29,6 +29,7 @@ constexpr size_t kRecStart = 8 * (size_t) kGroupMax;   ///< the bounds, after th
 constexpr size_t kRecN = kRecStart + 80;               ///< the group count
 constexpr size_t kRecBytes = kRecN + 16;
 static_assert(4 * (size_t) (kGroupMax + 1) <= 80, "the bounds of a full group fit their 80 bytes");
+static_assert(kRecBytes <= strata::kernels::kI8PutRecordMax && kRecBytes % 4 == 0, "the record goes down as native_expert_i8_put_record's argument");
 
 /// The open group: experts [first, n) of the group are held and not launched yet.  `j0` is the position in the layer's `order` of the group's first
 /// expert (expert i of the group is order[j0 + i]).  A launch in the middle of a group (the walk skipped a ring entry) runs [first, n) as a group of its
