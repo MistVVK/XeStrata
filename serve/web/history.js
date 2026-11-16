@@ -24,7 +24,8 @@
   }
 
   // pictures and files are kept as their names only: a data URL would fill the browser's storage
-  const cleanMessages = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
+  // a picture keeps its small preview (thumb) when it has one; records saved before that still clean to names alone
+  const cleanMessages = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => (i.thumb ? {name: i.name, thumb: i.thumb} : {name: i.name})),
                                                     files: (m.files || []).map((f) => ({name: f.name}))}));
   const cleanChat = (c) => ({...c, messages: cleanMessages(c.messages)});
 

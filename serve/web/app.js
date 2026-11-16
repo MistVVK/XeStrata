@@ -828,7 +828,7 @@ function msgEl(m, i) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
       for (const im of m.images) {
-        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || tr("chat.image", "image"); wrap.appendChild(img); }
+        if (im.url || im.thumb) { const img = document.createElement("img"); img.src = im.url || im.thumb; img.alt = im.name || tr("chat.image", "image"); wrap.appendChild(img); }  // the session keeps the original, a reloaded chat shows the small preview
         else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || tr("chat.image", "image")); wrap.appendChild(c); }
       }
       el.appendChild(wrap);
@@ -1358,13 +1358,31 @@ function isTextFile(f) {
   return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
 }
+// a small preview kept next to the name: the full data URL would fill the browser's store, the thumbnail does not
+const makeThumb = (dataUrl) => new Promise((res) => {
+  const im = new Image();
+  im.onload = () => {
+    const s = Math.min(1, 480 / Math.max(im.width, im.height));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(im.width * s)); c.height = Math.max(1, Math.round(im.height * s));
+    c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+    res(c.toDataURL("image/jpeg", 0.72));
+  };
+  im.onerror = () => res(null);                       // a picture the browser cannot draw: no thumb, the name chip stays
+  im.src = dataUrl;
+});
+
 function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
       if (!health.images) { toast("warn", tr("file.picturesOff", "Pictures are off"), tr("file.picturesOffText", "This model was set up for text only.")); continue; }
       if (f.size > 20e6) { toast("warn", tr("file.pictureBig", "Picture too large"), tr("file.pictureBigText", "{name} is over 20 MB.", {name: f.name})); continue; }
       const r = new FileReader();
-      r.onload = () => { attachments.push({kind: "image", name: f.name || tr("file.pasted", "pasted image"), url: r.result}); renderAttachments(); };
+      r.onload = async () => {
+        const url = r.result;
+        attachments.push({kind: "image", name: f.name || tr("file.pasted", "pasted image"), url, thumb: await makeThumb(url)});
+        renderAttachments();
+      };
       r.readAsDataURL(f);
       continue;
     }

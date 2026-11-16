@@ -47,6 +47,14 @@ const cases = {
     assert.equal(clean[1].text, "a1", "the text stays");
     assert.deepEqual(convo()[0].files, [{kind: "file", name: "n.txt", text: "notes"}], "a copy: the screen keeps its contents");
   },
+  clean_keeps_a_thumbnail_next_to_the_name() {
+    const withThumb = convo();
+    withThumb[0].images[0].thumb = "data:image/jpeg;base64,Kw==";
+    const clean = H.cleanMessages(withThumb);
+    assert.deepEqual(clean[0].images, [{name: "a.png", thumb: "data:image/jpeg;base64,Kw=="}], "the preview rides along, not the original");
+    assert.ok(!JSON.stringify(clean).includes("data:image/png"), "the full data URL is still dropped");
+    assert.deepEqual(H.cleanMessages(convo())[0].images, [{name: "a.png"}], "a record saved before thumbnails still cleans to the name alone");
+  },
   rewind_a_question() {
     const m = convo();
     const plan = H.rewind(m, 2);
