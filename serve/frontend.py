@@ -817,7 +817,7 @@ def _close_verdict(after: str, final: bool) -> str:
 
 
 def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True,
-              allow_reopen: bool = False) -> int:
+              allow_reopen: bool = False, names=None) -> int:
     """Where a parameter value in `text` ends: the first PARAM_END followed (after whitespace) by the next
     PARAM_START or FUNC_END, or by the wrapper's CALL_END when the call's `</function>` was left out (#4427) - the
     same text inside a value (a file that documents the call format, #210) is
@@ -842,8 +842,11 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                     return -2
             elif after.startswith(FOLLOWERS) or _follower_form(after):    # #6032 R1: the damaged followers
                 return at
+            elif names and opener_at(after, names, final) not in (None, "pending"):
+                return at                       # #6032 R2: `<NAME>` / `</NAME>` of a declared parameter not set yet
             elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after) \
-                    or any(t.startswith(after) for t in FOLLOWERS) or _follower_form(after) is None:
+                    or any(t.startswith(after) for t in FOLLOWERS) or _follower_form(after) is None \
+                    or (names and opener_at(after, names, final) == "pending"):
                 return at if final else -2
         at = text.find(PARAM_END, at + 1)
     return -1
@@ -885,6 +888,54 @@ def param_name(opener: str) -> str | None:
     if not name or name in NOT_PARAMS or name.lower() in ("null", "none"):
         return None
     return name
+
+
+_COLON_OPENER = re.compile(r"<parameter=([^<>\s:=]+):[ \t]*([^\n<>]*)\n")
+_BARE_OPENER = re.compile(r"<(?:/|=)?([^<>\s=/]+)>")
+
+
+def opener_at(s: str, names=None, final: bool = False):
+    """#6032 R2: the parameter opener `s` starts with (no leading whitespace), at a point where one may begin (after
+    the function opener or a value's `</parameter>`).  -> (name, length, inline value): name None = read and dropped;
+    inline value: the colon form's own value, the rest None.  "pending": it may still become one (streaming; `final`
+    decides); None: no opener here.
+      `<parameter=NAME>`: the call format's own (the name as param_name reads it);
+      `<parameter=NAME: value` + line break (no `>` on the line): NAME with that value, quotes around it dropped,
+          then its `</parameter>` (Gyro / Coder-L, recorded);
+      `<NAME>`, `</NAME>`, `<=NAME>`: an opener of NAME when NAME is in `names` (the call's declared parameters not
+          set yet); any other such tag is no opener (a tag of the text, or one R1 drops)."""
+    if s.startswith(PARAM_START):
+        line = s.split("\n", 1)[0]
+        gt = line.find(">")
+        if gt >= 0:
+            return param_name(s[len(PARAM_START):gt]), gt + 1, None
+        m = _COLON_OPENER.match(s)
+        if m:
+            value = m.group(2).strip()
+            if value.startswith('"'):
+                value = value[1:]
+                value = value[:-1] if value.endswith('"') else value
+            tail = re.match(r"\s*" + re.escape(PARAM_END), s[m.end():])
+            if tail is None and not final and PARAM_END.startswith(s[m.end():].lstrip()):
+                return "pending"
+            return param_name(m.group(1)), m.end() + (tail.end() if tail else 0), value
+        if "\n" not in s:
+            # the `>` still arriving, or a long name: held, except that the call's own scan reads it as before when
+            # the line ends (a `<parameter=` line with neither `>` nor a colon form is no opener)
+            if s.find(">") < 0 and not final:
+                return "pending"
+            gt = s.find(">")
+            return (param_name(s[len(PARAM_START):gt]), gt + 1, None) if gt >= 0 else None
+        gt = s.find(">")
+        return (param_name(s[len(PARAM_START):gt]), gt + 1, None) if gt >= 0 else None
+    if names:
+        m = _BARE_OPENER.match(s)
+        if m:
+            return (m.group(1), m.end(), None) if m.group(1) in names else None
+        if not final and re.fullmatch(r"<[/=]?[^<>\s=/]*", s) and any(
+                n.startswith(s.lstrip("</=")) for n in names):
+            return "pending"
+    return None
 
 
 def call_end(text: str, final: bool = False, hold: bool = True) -> int:
@@ -1210,7 +1261,7 @@ def coerce_value(value: str, declared, notes: list | None = None):
     return v
 
 
-def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = None) -> ToolCall:
+def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = None, recover: bool = False) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
     objects/arrays/numbers/booleans)."""
@@ -1221,20 +1272,37 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
     rest = body[body.index(">") + 1:]
     props = ((schema or {}).get("parameters") or {}).get("properties") or {}
     args = {}
-    while "<parameter=" in rest:
-        rest = rest[rest.index("<parameter=") + len("<parameter="):]
-        pname = param_name(rest[:rest.index(">")])         # #6032 R1: None = read the value and drop it
-        rest = rest[rest.index(">") + 1:]
+    while True:
+        # #6032 R2 (recover): where a parameter may begin, a damaged opener of a declared parameter not set yet
+        # counts (opener_at); anything else is skipped to the next `<parameter=`, as before
+        unset = {n for n in props if n not in args} if recover else None
+        s = rest.lstrip()
+        got = opener_at(s, unset, final=True) if (recover and not s.startswith(PARAM_START)) else None
+        if got is None:
+            if "<parameter=" not in rest:
+                break
+            rest = rest[rest.index("<parameter="):]
+            if recover:
+                got = opener_at(rest, unset, final=True)
+            if got is None:                                  # the old reading (a `<parameter=` with no `>` raises)
+                got = (param_name(rest[len(PARAM_START):rest.index(">")]), rest.index(">") + 1, None)
+            s = rest
+        pname, length, inline = got
+        rest = s[length:]
         declared = declared_type(props.get(pname)) if pname else None
-        # #5493: a close followed by the same name again is part of a STRING value (#4078); a non-string parameter
-        # written twice is two writes of it, and the later one counts
-        end = param_end(rest, final=True, name=pname, allow_reopen=(declared is None or _declares(declared, "string")))
-        value = rest[:end] if end >= 0 else rest
-        rest = rest[end + len(PARAM_END):] if end >= 0 else ""
-        if value.startswith("\n"):
-            value = value[1:]
-        if value.endswith("\n"):
-            value = value[:-1]
+        if inline is not None:                               # the colon form carries its value on the opener's line
+            value = inline
+        else:
+            # #5493: a close followed by the same name again is part of a STRING value (#4078); a non-string parameter
+            # written twice is two writes of it, and the later one counts
+            end = param_end(rest, final=True, name=pname, allow_reopen=(declared is None or _declares(declared, "string")),
+                            names={n for n in props if n not in args and n != pname} if recover else None)
+            value = rest[:end] if end >= 0 else rest
+            rest = rest[end + len(PARAM_END):] if end >= 0 else ""
+            if value.startswith("\n"):
+                value = value[1:]
+            if value.endswith("\n"):
+                value = value[:-1]
         v = coerce_value(value, declared, notes) if pname else _SKIP
         if v is not _SKIP:
             args[pname] = v
@@ -1555,6 +1623,8 @@ class OutputParser:
         self.sval_started = False
         self.sdeclared = {}
         self.sheld: dict = {}        # #5493: the non-string parameters, sent when the call closes (a later write wins)
+        self.sset: set = set()       # #6032 R2: the parameters set so far (a damaged opener counts only for the others)
+        self.snames = None           # ... the declared ones not set yet, for the current value's end (recover only)
         self.spname = None
         self.sraw_pname = ""
         self.svstart = 0
@@ -1648,15 +1718,44 @@ class OutputParser:
             elif self.ss == "between":
                 stripped = rest.lstrip()
                 self.sp += len(rest) - len(stripped)
-                if stripped.startswith("<parameter="):
-                    b = stripped.find(">")
-                    if b < 0:
+                got = None
+                if self.recover and not stripped.startswith(FUNC_END):
+                    # #6032 R2: the opener parse_tool_call reads here (a damaged one of a declared parameter not set
+                    # yet, or the colon form); other text up to the next `<parameter=` is skipped, as there
+                    got = opener_at(stripped, set(self.sdeclared) - self.sset, self._final)
+                    if got == "pending":
                         return out
-                    pname = param_name(stripped[11:b])   # #6032 R1: as parse_tool_call names it; None = dropped
-                    self.sp += b + 1
+                    if got is None and not stripped.startswith("<parameter="):
+                        k = stripped.find("<parameter=")
+                        if k < 0:
+                            return out          # trailing text, or a tag still arriving: wait
+                        self.sp += k
+                        continue
+                if got is not None or stripped.startswith("<parameter="):
+                    if got is None:
+                        b = stripped.find(">")
+                        if b < 0:
+                            return out
+                        got = (param_name(stripped[11:b]), b + 1, None)  # #6032 R1: as parse_tool_call names it
+                    pname, length, inline = got
+                    self.sp += length
                     self.sraw_pname = pname
                     self.spname = pname
+                    self.snames = (set(self.sdeclared) - self.sset - {pname}) if self.recover else None
+                    if inline is not None:      # the colon form: its value is on the opener's line
+                        declared = self.sdeclared.get(pname) if pname else None
+                        v = coerce_value(inline, declared) if pname else _SKIP
+                        if v is not _SKIP and declared == "string":
+                            args(("" if self.sfirst else ",") + json.dumps(pname) + ":" + json.dumps(v))
+                            self.sfirst = False
+                            self.sset.add(pname)
+                        elif v is not _SKIP:
+                            self.sheld.pop(pname, None)
+                            self.sheld[pname] = v
+                            self.sset.add(pname)
+                        continue
                     if pname is not None and self.sdeclared.get(pname) == "string":
+                        self.sset.add(pname)
                         args(("" if self.sfirst else ",") + json.dumps(pname) + ':"')
                         self.sfirst = False
                         self.ss, self.sval_started = "str", False
@@ -1677,7 +1776,8 @@ class OutputParser:
                     self.sval_started = True
                     self.svstart = self.sp
                 # the walk starts at the value (a quoted call's opener counts); only a close in the new text can end it
-                end = param_end(self.buf[self.svstart:], self._final, name=self.spname, allow_reopen=True) if PARAM_END in rest else -1
+                end = param_end(self.buf[self.svstart:], self._final, name=self.spname, allow_reopen=True,
+                                names=self.snames) if PARAM_END in rest else -1
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
@@ -1698,7 +1798,7 @@ class OutputParser:
             elif self.ss == "raw":
                 declared = self.sdeclared.get(self.sraw_pname)
                 end = param_end(rest, self._final, name=self.spname,         # the rule of parse_tool_call (#5493)
-                                allow_reopen=(declared is None or _declares(declared, "string")))
+                                allow_reopen=(declared is None or _declares(declared, "string")), names=self.snames)
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -1712,6 +1812,7 @@ class OutputParser:
                     # call) streams once, with the value the final call has (the later write), not as two JSON keys
                     self.sheld.pop(self.sraw_pname, None)
                     self.sheld[self.sraw_pname] = v
+                    self.sset.add(self.sraw_pname)
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:
@@ -1853,7 +1954,7 @@ class OutputParser:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
                         name = self.aliases.get(name, name)
                         if self._callable(name):
-                            call = parse_tool_call(body[:end], self.schemas.get(name), self.notes)
+                            call = parse_tool_call(body[:end], self.schemas.get(name), self.notes, recover=self.recover)
                             call.name = name
                     except ValueError:
                         pass
@@ -2148,7 +2249,7 @@ class OutputParser:
             name = self.aliases.get(name, name)
             if f >= 0 and not body[f:].strip() and self._callable(name):
                 try:
-                    call = parse_tool_call(body[:f], self.schemas.get(name), self.notes)
+                    call = parse_tool_call(body[:f], self.schemas.get(name), self.notes, recover=self.recover)
                     call.name = name
                     self.pending.append([self.buf, call])
                     self.buf, self.state = "", "reasoning"
@@ -2171,7 +2272,7 @@ class OutputParser:
                 out += self._close_scan()
                 call = self.scall
                 try:            # the final event carries the call's arguments, as the one _finish_call sends does
-                    call = parse_tool_call(self.buf, self.schemas.get(call.name), self.notes)
+                    call = parse_tool_call(self.buf, self.schemas.get(call.name), self.notes, recover=self.recover)
                     call.name, call.id = self.scall.name, self.scall.id
                 except ValueError:
                     pass
@@ -2201,7 +2302,7 @@ class OutputParser:
         try:
             if raw_name != raw_name.strip() and name not in self.schemas:
                 raise ValueError("whitespace tool name is not declared")
-            call = parse_tool_call(body, self.schemas.get(name), self.notes)
+            call = parse_tool_call(body, self.schemas.get(name), self.notes, recover=self.recover)
             call.name = name
         except ValueError:
             if not self.recover:
