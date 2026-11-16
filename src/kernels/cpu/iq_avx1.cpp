@@ -20,8 +20,6 @@
 // are constexpr, like iq_avx2.cpp's.
 #include "strata/kernels/cpu/iq_avx1.hpp"
 
-#include "ggml.h"
-
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"

@@ -191,7 +191,12 @@ set_property(SOURCE ${STRATA_ROOT}/src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY C
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC strata_includes Threads::Threads)
 
-option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
+option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support (the CPU expert pool)" ON)
+# Own-stack step 4 (0.2.16): the CPU expert pool and --mtp-q4 on the Strata quant layer (src/quant, its x86 tiers picked at run time, as in the
+# x86 CUDA / HIP engines) instead of ggml-cpu's type traits.  -DSTRATA_OWN_CPU_QUANT=OFF builds the ggml-cpu pool (ggml-cpu built for this
+# build machine's CPU, GGML_NATIVE, as up to 0.2.15).
+option(STRATA_OWN_CPU_QUANT "CPU expert pool and --mtp-q4 on the Strata quant layer instead of ggml-cpu's type traits" ON)
+option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
 # Q6_K gate/up in the grouped expert kernels (UD-Q6_K_XL, layer 2 of UD-Q5_K_XL): on by default, as in the CUDA / HIP
 # build (MODEL-UPDATE Phase 1)
 option(STRATA_Q6K_EXPERTS "Build the Q6_K gate/up grouped expert kernels (UD-Q6_K_XL, UD-Q5_K_XL)" ON)
@@ -200,9 +205,16 @@ if(STRATA_Q6K_EXPERTS)
 endif()
 include(${STRATA_ROOT}/cmake/strata_ggml.cmake)        # -DSTRATA_GGML_DIR, or the vendored third_party/strata-ggml
 include(${STRATA_ROOT}/cmake/backends/sycl.cmake)
+include(${STRATA_ROOT}/cmake/backends/quant.cmake)     # strata_quant_layer(): the Strata quant layer
 strata_ggml_resolve("${STRATA_ROOT}")
 if(STRATA_NATIVE_EXPERTS)
-  strata_sycl_ggml()
+  # ggml-base / ggml-cpu only where something links them: the ggml-cpu pool and the parity programs (ggml as their reference).  The release
+  # build (packaging/build_sycl_linux.sh: parity off) has no ggml.
+  if(NOT STRATA_OWN_CPU_QUANT OR STRATA_SYCL_PARITY)
+    strata_sycl_ggml()
+  else()
+    message(STATUS "Strata SYCL: no ggml in this build (own CPU pool, parity tests off)")
+  endif()
   strata_resolve(_cpu_native src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
                              src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx1.cpp   # 0.1.31: the Q4_K/Q5_K/Q5_1/Q8_0 expert rows
                              src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp   # 0.1.42: AVX1 (no AVX2) Q2_0 / i-quant rows
@@ -222,8 +234,17 @@ if(STRATA_NATIVE_EXPERTS)
   set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx1.cpp ${STRATA_ROOT}/src/kernels/cpu/iq_avx1.cpp PROPERTIES
     COMPILE_OPTIONS "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
   set_property(SOURCE ${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
-  target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
+  if(TARGET ggml-base)   # the ggml-cpu pool, or a parity build: ggml's libraries as before (with the own pool the engine calls none of them)
+    target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
+  endif()
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  if(STRATA_OWN_CPU_QUANT)
+    set(STRATA_QUANT_ROOT ${STRATA_ROOT})
+    set(STRATA_CPU_X86 ON)   # (the SYCL engine is built for Linux x86_64 only)
+    strata_quant_layer()
+    target_link_libraries(strata_kernels_cpu PUBLIC strata_quant)
+    target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_OWN_CPU_QUANT=1)
+  endif()
 endif()
 
 # --- the GPU engine ------------------------------------------------------------------------------------------------
@@ -307,8 +328,7 @@ add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
-option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
-if(STRATA_SYCL_PARITY)
+if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU_QUANT: it decides whether ggml is configured)
   enable_testing()
   # Host-only proposal contracts of the gated MTP proposal; no SYCL runtime or GPU library needed.
   add_executable(gated_proposal_test ${STRATA_ROOT}/src/core/gated_proposal_test.cpp)
