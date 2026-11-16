@@ -1458,7 +1458,9 @@ class AccessScreen(Base):
         t = Text()
         t.append(f"\n   Port      [ {s.port} ]   press p to change\n")
         t.append(f"   API key   [ {'on' if on else 'off'} ]   {acc.mask_key(s.api_key)}  ", style=FG if on else WARN)
-        t.append(("(recommended for anything beyond this computer; t = no key)" if on else "(t = make a key)") if beyond else "(not needed on this computer)", style=MUTE)
+        # #5948: a key that is on is checked on this computer too, so a local launch with one does not say it is not needed
+        t.append(("(recommended for anything beyond this computer; t = no key)" if on else "(t = make a key)") if beyond else
+                 "(apps on this computer must send it too; t = no key)" if on else "(not needed on this computer)", style=MUTE)
         self.query_one("#portkey", Static).update(t)
 
     def explain(self) -> Text:

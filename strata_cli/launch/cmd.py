@@ -1084,6 +1084,9 @@ def run_connect(a: argparse.Namespace) -> int:
         for k, v in out["env"].items():
             _say((f"  {k}={v}" if os.name != "nt" else f"  set {k}={v}") if shown_key or v == key and not key else
                  (f"  {k}={harness.mask(v, key)}" if os.name != "nt" else f"  set {k}={harness.mask(v, key)}"))
+    if key and not shown_key and (any(key in f["text"] for f in out["files"]) or any(key in str(v) for v in out["env"].values())):
+        _say("")
+        _say("The key is hidden here; add --show-key to print it.")      # #5948: a masked key copied as it is fails with "invalid API key"
     if out["limits"]:
         _say("")
         _say("Good to know:")
