@@ -9,8 +9,8 @@
  *   in the middle leaves the older file whole. Temporary files left by a crash are removed at the next start.
  * - `rev` counts the saves of a chat. A save that names a `baseRev` older than the stored one (a second window saved first) is still
  *   written, but the version it displaces is kept in conflicts/ first, so nothing is lost.
- * - The index is a list for fast start. If it is missing or does not match the files it is rebuilt from the files; a file that cannot
- *   be read is reported and left exactly as it is.
+ * - The index is a derived list. At start it is rebuilt from the chat files, which own their revisions even if the last index write
+ *   failed; a file that cannot be read is reported and left exactly as it is.
  * - Nothing is cut: the chat is stored byte for byte as received (a text splice, no re-serialising).
  * - Owner-only: the folder is created private (POSIX 0700 and files 0600; on Windows the folder gets a protected ACL that its files
  *   inherit), the same level as the rest of the profile.
@@ -71,13 +71,10 @@ export function createChatStore({ dir, io = realIo, privateDir = () => {}, now =
     try { names = readdirSync(root); } catch { /* empty */ }
     for (const name of names) if (/\.tmp-\d+-\d+$/.test(name)) { try { unlinkSync(join(root, name)); } catch { /* left */ } }
     const files = names.filter(n => n.endsWith('.json') && n !== 'index.json' && !/\.tmp-/.test(n)).map(n => n.slice(0, -5)).filter(validChatId);
-    let saved = null;
-    try { const parsed = JSON.parse(readFileSync(join(root, 'index.json'), 'utf8')); if (parsed?.v === CHAT_FORMAT && Array.isArray(parsed.chats)) saved = parsed.chats; } catch { /* rebuilt below */ }
     const map = new Map();
-    if (saved) for (const e of saved) if (e && validChatId(e.id) && files.includes(e.id)) map.set(e.id, e);
-    // Files the index does not know (a crash before the index was written, an index lost): read from the files.
+    // A chat rename can succeed before its index write fails or the host exits. Even a valid index can be behind for an existing id:
+    // recover from every chat envelope so the next save cannot reuse a revision or miss an older window's conflict.
     for (const id of files) {
-      if (map.has(id)) continue;
       try {
         const parsed = JSON.parse(readFileSync(fileOf(id), 'utf8'));
         if (parsed?.v !== CHAT_FORMAT || !parsed.session || parsed.session.id !== id) throw new Error('not a chat file');

@@ -162,6 +162,55 @@ test('the index is rebuilt from the files when it is lost, damaged or behind; an
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a failed index write after a chat save cannot roll its revision back at restart or lose a stale window conflict', async () => {
+  const dir = scratch();
+  try {
+    let failIndex = false, failures = 0;
+    const store = createChatStore({ dir, io: { ...realIo, async writeFile(path, data) {
+      if (failIndex && path.startsWith(join(dir, 'chats', 'index.json.tmp-'))) {
+        failures++;
+        throw Object.assign(new Error('no room for the index'), { code: 'ENOSPC' });
+      }
+      return realIo.writeFile(path, data);
+    } } });
+    const first = chat('s_index', 2, 10);
+    await store.save(first.id, text(first));
+    failIndex = true;
+    const newer = chat(first.id, 6, 100, { title: 'Saved before the index failed' });
+    assert.equal((await store.save(first.id, text(newer), { baseRev: 1 })).rev, 2);
+    assert.equal(failures, 1, 'only the index write failed');
+    assert.equal(JSON.parse(readFileSync(join(dir, 'chats', 'index.json'), 'utf8')).chats[0].rev, 1, 'the old index is still valid JSON');
+    assert.equal((await readChat(store, first.id)).rev, 2, 'the chat was committed before the index failed');
+
+    const restarted = createChatStore({ dir });
+    const listed = restarted.list().chats[0];
+    assert.equal(restarted.rev(first.id), 2, 'the chat envelope owns its revision');
+    assert.equal(listed.title, newer.title);
+    assert.equal(listed.updatedAt, newer.updatedAt);
+    assert.equal(listed.bytes, statSync(join(dir, 'chats', `${first.id}.json`)).size);
+    assert.deepEqual((await readChat(restarted, first.id)).session, newer);
+    const saved = await restarted.save(first.id, text(first), { baseRev: 1 });
+    assert.equal(saved.rev, 3, 'the revision is never reused after restart');
+    assert.equal(saved.conflict, true, 'the older window still displaces a newer chat');
+    const displaced = JSON.parse(readFileSync(join(dir, 'chats', 'conflicts', `${first.id}.rev2.json`), 'utf8'));
+    assert.deepEqual(displaced.session, newer, 'the newer chat is kept before the older window saves');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an indexed chat that becomes damaged is reported at restart without changing its file', async () => {
+  const dir = scratch();
+  try {
+    const store = createChatStore({ dir });
+    await store.save('s_broken', text(chat('s_broken', 2, 10)));
+    const path = join(dir, 'chats', 's_broken.json'), broken = '{"v":1,"rev":2,"session":';
+    writeFileSync(path, broken);
+    const restarted = createChatStore({ dir });
+    assert.deepEqual(restarted.list().chats, []);
+    assert.deepEqual(restarted.list().damaged, ['s_broken']);
+    assert.equal(readFileSync(path, 'utf8'), broken, 'recovery leaves the damaged chat untouched');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('a chat is refused when it does not match its id or is not JSON; delete removes the file and tolerates a chat that is gone', async () => {
   const dir = scratch();
   try {
