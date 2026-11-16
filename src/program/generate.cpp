@@ -6087,7 +6087,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "xestrata generate: every expert is in the GPU caches (%lld of %lld): the file tier's "
                                  "Linux defaults (io prefetch, the decode gate) are off; the decode reads nothing from "
                                  "it (XESTRATA_IO_PREFETCH=1 keeps them, XESTRATA_FILE_TIER_IDLE=0 this policy)\n",
-                         (long long) gpu_held_now, (long long) (g.n_layers * g.n_expert));
+                         (long long) gpu_held_now, (long long) g.n_layers * g.n_expert);
         }
     }
     // CS-T: routing-aware prefetch of the file tier: the next layer's router on this layer's MoE input predicts its
