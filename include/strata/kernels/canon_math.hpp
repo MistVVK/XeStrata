@@ -95,6 +95,29 @@ inline float silu_mul(float g, float u) {
 
 constexpr float kHalfMax = 65504.0f;
 
+/// The fp16 value nearest v (ties to even; an fp16 subnormal where v is below fp16's normal range, inf past
+/// kHalfMax's rounding), as a float: what `(float) (sycl::half) v` and the CPU's _cvtss_sh give, from v's bits.  The
+/// round trip through sycl::half is not left to the compiler: A380's (Alchemist, IGC 2.28.4) kept the FP32 value, so its
+/// activations' scales differed from the CPU's canonical rows in the low bits (iq_mmq_parity's fixed-point checks,
+/// 2026-11-16).  Every step is an integer one but the last scaling of a subnormal by 2^-24, which is exact.
+inline float f16_value(float v) {
+    const uint32_t u = bits(v), s = u & 0x80000000u;
+    uint32_t a = u ^ s;
+    if (a >= 0x7F800000u) return v;                                // inf, NaN
+    if (a >= 0x477FF000u) return from_bits(s | 0x7F800000u);       // 65520 and past: inf
+    if (a >= 0x38800000u) {                                        // fp16's normals: 10 of the 23 mantissa bits
+        a += 0x0FFFu + ((a >> 13) & 1u);
+        return from_bits(s | (a & ~0x1FFFu));
+    }
+    const uint32_t e = a >> 23;                                    // below 2^-14: multiples of 2^-24
+    if (e < 102u) return from_bits(s);                             // below 2^-25: 0
+    const uint32_t m = (a & 0x7FFFFFu) | 0x800000u, sh = 126u - e;
+    const uint32_t rem = m & ((1u << sh) - 1u), half = 1u << (sh - 1u);
+    uint32_t q = m >> sh;
+    if (rem > half || (rem == half && (q & 1u) != 0u)) ++q;
+    return from_bits(s | bits((float) q * 0x1p-24f));
+}
+
 /// A q8_1 block's scale for the largest |x| `amax` of its 32 values, kept finite as an fp16 (#606).
 inline float q8_scale(float amax) {
     STRATA_CANON_NO_CONTRACT
