@@ -410,8 +410,10 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // v3 packs record their expert count in the header; a pruned model (GSQ-RCO Coder) ships
                 // fewer experts than the canonical geometry the caller passes, which is a compile-time
                 // default, so the header wins.
-                const size_t at = line.find("(n_expert ");
-                if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                if (!header_number("(n_expert ", L.n_expert)) {
+                    err = "native_experts.txt: the header's n_expert is not a number";
+                    return false;
+                }
                 // v6 (the latent MoE): the experts' widths, the shell's hidden width and FF when absent
                 if (!header_number("expert_embd ", expert_embd) || !header_number("expert_ff ", expert_ff)) {
                     err = "native_experts.txt: the header's expert_embd or expert_ff is not a number";
