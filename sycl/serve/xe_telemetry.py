@@ -139,6 +139,8 @@ class _XeGpu:
     """The Intel Arc readings in NVML's shape: VRAM from sysman, load from the DRM clients this process can see,
     temperature, power and the PCIe link from sysfs.  No root, no sampler outside the process."""
 
+    STAT = "/run/gpustat.json"               # the old root sampler (a fallback only, #5994 review)
+
     def __init__(self, index=0):
         import glob
         self.dev = self.hwmon = self.zes = None
@@ -157,6 +159,7 @@ class _XeGpu:
         if self.dev:
             self.zes = _Zes(self.pci)
         self._cycles = {}                       # client id -> (busy cycles, total cycles) of the last read
+        self._proc = "/proc"                    # where the DRM clients' fdinfo is read (tests point it at a fixture)
         self._e = None                          # (t, card energy uJ) for power
         self._pci = None                        # (rx bytes, tx bytes, ts us) of the last read, for the traffic rate
 
@@ -193,13 +196,15 @@ class _XeGpu:
         return None, None, None
 
     def _busy(self):
-        """The render and compute load of the DRM clients this process can read in /proc/<pid>/fdinfo: the share of
-        the cycles they consumed out of the cycles the card ran, as a percentage.  None until two reads can be
-        compared (and after that, when every client is new).  Card-wide load needs other users' fdinfo, so this is
-        the engine's own load and says nothing about a second user of the card."""
+        """The render and compute load of the DRM clients this process can read in <proc>/<pid>/fdinfo, as a percentage of
+        the cycles the card ran.  Scope: the clients this user can see (in a container that is the engine; on a host it
+        can include other programs of the same user), never the whole card, which needs other users' fdinfo.
+        Unknown (None) until a client has two readings whose counters moved forward: a client seen for the first time,
+        or one whose counters went back (a reset, a reused id), says nothing about the load yet and is never taken as
+        idle (#5994 review).  A client open in several file descriptors is counted once."""
         import glob
         now = {}
-        for f in glob.glob("/proc/[0-9]*/fdinfo/*"):
+        for f in glob.glob(os.path.join(self._proc, "[0-9]*", "fdinfo", "*")):
             try:
                 with open(f, encoding="ascii", errors="replace") as fh:
                     text = fh.read()
@@ -215,17 +220,30 @@ class _XeGpu:
                 busy = sum(int(kv.get(f"drm-cycles-{e}", "0")) / int(kv.get(f"drm-engine-capacity-{e}", "1") or 1)
                            for e in ("rcs", "ccs"))
                 total = int(kv.get("drm-total-cycles-ccs") or kv.get("drm-total-cycles-rcs") or 0)
-            except (ValueError, IndexError):
+            except (ValueError, IndexError, ZeroDivisionError):
                 continue
             cid = kv.get("drm-client-id")
             if cid and total:
                 now[cid] = (busy, total)
         prev, self._cycles = self._cycles, now
-        spans = [now[c][1] - prev[c][1] for c in now if c in prev and now[c][1] > prev[c][1]]
-        if not spans:
-            return 0.0 if (now and prev) else None
-        used = sum(max(0, now[c][0] - prev[c][0]) for c in now if c in prev)
-        return max(0.0, min(100.0, 100.0 * used / max(spans)))
+        # only clients with an earlier reading whose counters both moved forward give a delta
+        moved = [c for c in now if c in prev and now[c][1] > prev[c][1] and now[c][0] >= prev[c][0]]
+        if not moved:
+            return None
+        span = max(now[c][1] - prev[c][1] for c in moved)
+        used = sum(now[c][0] - prev[c][0] for c in moved)
+        return max(0.0, min(100.0, 100.0 * used / span))
+
+    def _stat(self):
+        """The old root sampler's file (sycl/tools/gpustat.py, /run/gpustat.json) when it is fresh: a PC that still runs it
+        keeps its readings for what this process cannot read itself (VRAM without sysman, the load before a delta)."""
+        try:
+            import json
+            with open(self.STAT) as f:
+                st = json.load(f)
+            return st if time.time() - float(st.get("ts", 0)) < 15 else None
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
 
     def _temps(self):
         """The GPU's own sensor (label "pkg") as the GPU temperature, as NVIDIA's core and AMD's edge readings are;
@@ -254,6 +272,14 @@ class _XeGpu:
         out["util"] = self._busy()
         used, total = self.zes.read() if self.zes else (None, None)
         out["mem_used"], out["mem_total"] = used, total
+        if out["util"] is None or out["mem_used"] is None:
+            st = self._stat()
+            if st:
+                if out["util"] is None and st.get("busy_pct") is not None:
+                    out["util"] = st["busy_pct"]
+                if out["mem_used"] is None and st.get("vram_used_mb") is not None:
+                    out["mem_used"] = st["vram_used_mb"] * 2**20
+                    out["mem_total"] = (st.get("vram_total_mb") or 0) * 2**20 or out["mem_total"]
         out["temp"], out["vram_temp"] = self._temps()
         out["power"] = out["power_limit"] = None
         if self.hwmon:
