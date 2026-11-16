@@ -60,7 +60,9 @@ Control::Control(Trainer& tr, Opts o) : tr_(tr), opts_(std::move(o)), budget_mib
         const long v = std::strtol(e, nullptr, 10);
         if (v >= 10 && v <= 10000) poll_ms_ = (int) v;
     }
-    if (enabled()) tr_.set_vram_budget(budget_mib_ << 20);
+    // the first budget stands even without a control file (--vram-budget alone: the tests' fixed form); 0 without
+    // a control file is the automatic form (a pause needs somewhere to resume from)
+    if (budget_mib_ > 0) tr_.set_vram_budget(budget_mib_ << 20);
 }
 
 void Control::read() {
