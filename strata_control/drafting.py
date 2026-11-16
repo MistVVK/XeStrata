@@ -817,6 +817,10 @@ def card_vram_mib(cfg: dict[str, Any], backend: str | None, archs: Any = None) -
         reader = gpu_reader((indices or [0])[0], amd=(backend == "hip"))
         if not reader.ok():
             return None
+        from serve import telemetry as _tm
+        if isinstance(reader, _tm._Metal):                   # (M2) a Mac's total is the Metal working set: no live registry read for it
+            total = _tm.metal_working_set()
+            return float(int(total) >> 20) if total else None
         total = reader.read().get("mem_total")
         return float(int(total) >> 20) if total else None
     except Exception:                                    # noqa: BLE001 - an unreadable card means "not known to be resident"
