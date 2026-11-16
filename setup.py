@@ -7971,47 +7971,85 @@ PARALLEL_COST_NOTE = ("parallel N reduces waiting for several users but costs ab
                       "card")
 
 
+PARALLEL_CELL_BYTES = 1850     # VRAM per context cell beyond 32K a session keeps in any KV mode (QSA indexer rows,
+                               # RoPE tables): 0.95 GiB at 262K, 2.27 GiB at 1M per slot with --kv-resident 32768
+PARALLEL_PIN_SHARE = 0.75      # share of the RAM the expert arena plus every session's pinned K/V may take: measured on
+                               # a 125.6 GiB PC, pinning was refused at 99 GiB (79%)
+
+
+def _parallel_kv_tok(kv: str) -> int:
+    # 12 layers: the measured pin (12.38 GiB at 1M int8), not the 13 of kv_streaming_ram_gb
+    return 12 * KV_CELL_BYTES.get(kv, 1056)
+
+
 def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
     """#465: the VRAM one batch slot's session takes: its KV cache (12 QSA layers; with KV streaming only the 32K
-    positions the attention reads stay in VRAM) and the DeltaNet state (~0.17 GB).  Measured: 0.56 GiB at 32K int8."""
-    kv_tok = 12 * (576 if kv == "q4_0" else 1056)
-    return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
+    positions the attention reads stay in VRAM), the DeltaNet state (~0.17 GB) and the per-cell rows every session
+    sizes on the whole context.  Measured: 0.56 GiB at 32K int8; with KV streaming, 0.95 GiB at 262K and 2.27 GiB at
+    1M (RTX 5090, 15/11/2026)."""
+    kv_cells = min(ctx, 32768) if streaming else ctx
+    return (kv_cells * _parallel_kv_tok(kv) + max(0, ctx - 32768) * PARALLEL_CELL_BYTES) / 1e9 + 0.17
 
 
-def parallel_recommend(vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool) -> int:
+def parallel_pinned_gb(ctx: int, kv: str) -> float:
+    """The RAM one session pins with KV streaming: the host copy of its whole K/V (12.38 GiB at 1M int8, measured).
+    The server's own session and every slot each pin one.  Callers apply it only when streaming."""
+    return ctx * _parallel_kv_tok(kv) / 1e9
+
+
+def parallel_ram_fits(n: int, ram_gb: float | None, arena_gb: float, ctx: int, kv: str, streaming: bool) -> bool:
+    """Whether the expert arena plus the pinned K/V of the server's session and n slots stay within PARALLEL_PIN_SHARE
+    of the RAM (ram_gb is in GiB, the arena and the pins in GB).
+    Measured on 125.6 GiB with the 50.3 GB IQ3_S arena at 1M: 8 slots stopped the engine (pinning refused at 99 GiB),
+    4 slots started with 8 GiB free and half the arena unpinned, every request 3-4x slower.  ram_gb None: not known."""
+    if ram_gb is None or not streaming:
+        return True
+    pinned_gib = (arena_gb + (n + 1) * parallel_pinned_gb(ctx, kv)) * 1e9 / 2**30
+    return pinned_gib <= PARALLEL_PIN_SHARE * ram_gb
+
+
+def parallel_recommend(vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool,
+                       ram_gb: float | None = None) -> int:
     """#465: how many requests at once ("parallel") to recommend: 0 = none (one at a time).  Only where the experts
     mostly fit in VRAM - the expert cache (each card's VRAM less ~5 GB, every card of a layer split) still holds
     PARALLEL_HELD of the model's experts beside the slots' sessions, which take at most PARALLEL_SHARE of it, up to 4.
     Where the experts mostly run on the CPU a batch reads about as many experts as the requests one by one and every
     slot's VRAM is expert cache lost: measured on a 12 GB RTX 5070 (Q2_0, 32K), a request alone 11-24% slower with 2-4
-    slots, 4 requests together 63 tok/s against 71 one after the other (docs/BATCHING.md)."""
+    slots, 4 requests together 63 tok/s against 71 one after the other (docs/BATCHING.md).  With KV streaming each
+    slot also pins its whole K/V in RAM, so the count must fit there too (parallel_ram_fits)."""
     if isinstance(vram_gbs, (int, float)):
         vram_gbs = [vram_gbs]
     cache_gb = sum(max(0.0, v - 5) for v in vram_gbs)
     slot = parallel_slot_gb(ctx, kv, streaming)
     best = 0
     for n in (2, 3, 4):
-        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb:
+        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb \
+                and parallel_ram_fits(n, ram_gb, arena_gb, ctx, kv, streaming):
             best = n
     return best
 
 
-def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool) -> list[str]:
+def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool,
+                  ram_gb: float | None = None) -> list[str]:
     """#465: what setup says about "parallel": the recommendation (or, where it would cost speed, why it is left at
     one), or how the asked count compares with it (kept as asked: recommend, never force)."""
-    rec = parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming)
+    rec = parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming, ram_gb)
     slot = parallel_slot_gb(ctx, kv, streaming)
+    pinned = parallel_pinned_gb(ctx, kv) if streaming else 0.0
+    ram_bound = rec == 0 and parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming) >= 2
+    why = (f"each request at once pins ~{pinned:.1f} GB of RAM for its K/V at this context, more than this PC can "
+           "spare beside the experts" if ram_bound else PARALLEL_COST_NOTE)
     if asked is None or asked <= 1:
         if not rec:
-            return [f"Several requests at once: left at one at a time - {PARALLEL_COST_NOTE} (docs/BATCHING.md)."]
+            return [f"Several requests at once: left at one at a time - {why} (docs/BATCHING.md)."]
         return [f"Several requests at once (opt-in): --parallel {rec} decodes up to {rec} together instead of one "
                 f"after the other (each takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md)."]
     lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
-             f"{asked * slot:.1f} GB in all)"]
+             f"{asked * slot:.1f} GB in all" + (f"; each also pins ~{pinned:.1f} GB of RAM" if pinned else "") + ")"]
     if asked > PARALLEL_MAX:
         lines.append(f"the engine runs at most {PARALLEL_MAX} at once; it will use {PARALLEL_MAX}")
     if not rec:
-        lines.append(f"recommended for this card: one at a time - {PARALLEL_COST_NOTE}; kept as you chose")
+        lines.append(f"recommended for this card: one at a time - {why}; kept as you chose")
     elif asked > rec:
         lines.append(f"recommended for this card: {rec} - more slots leave fewer experts in VRAM, which can make every "
                      "request slower; kept as you chose")
@@ -10404,7 +10442,7 @@ def main() -> int:
         say(f"  Image generation: POST http://127.0.0.1:{port}/v1/images/generations (OpenAI's images API)")
     if a.parallel is None:                             # #465: the opt-in, said once (nothing changes)
         for line in parallel_note(None, [g.get("vram_gb", 0.0) for g in chosen], MODELS[model]["arena_gb"], ctx, kv,
-                                  "--kv-resident" in cfg["args"]):
+                                  "--kv-resident" in cfg["args"], ram):
             say("  " + line)
     if tuned is False:                                 # #447: a failed tuning is repeated here, not only above
         say("  Tuning:           FAILED (the reason is above): the default settings stay - "

@@ -144,7 +144,9 @@ where the experts do not all fit, 16 slots cost the single-user speed (see docs 
 
 Every slot's session takes VRAM that the expert cache would otherwise hold: 0.56 GiB at a 32K context with 8-bit
 KV, more with a longer context unless the KV cache streams (`--kv-resident`: then only the attention's 32K window
-stays in VRAM, and each slot's whole KV cache takes pinned RAM - 1.6 GB at 128K). On a card whose experts mostly run
+stays in VRAM, and each slot's whole KV cache takes pinned RAM - 1.6 GB at 128K, 12.4 GiB at 1M). Even with
+streaming, a session keeps about 1.8 KB of VRAM per context cell beyond 32K (indexer rows, RoPE tables): measured on
+an RTX 5090 with `--kv-resident 32768`, 0.95 GiB per slot at 262K and 2.27 GiB at 1M. On a card whose experts mostly run
 on the CPU, a batch also reads about as many distinct experts as the requests one by one (different conversations
 route to different experts), so the gain is in **latency** (nobody waits for a whole answer), and a request alone
 runs slower (the smaller expert cache): 11-24 % on a 12 GB card, see the measurements below. With several requests at once
@@ -156,7 +158,11 @@ less ~5 GB, every card of a layer split counted) must still hold at least half o
 slots, and the slots may take at most a fifth of it, up to 4 slots. With Q2_0 at 32K that is 3 slots on a 24 GB
 card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split. Everywhere else (any 12 or 16 GB
 card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
-about 10-25% speed per request on this card". `--parallel N` is honoured as asked either way.
+about 10-25% speed per request on this card". With KV streaming the slots must also fit in RAM: the expert arena,
+the server's own session and every slot's pinned K/V must stay within 75 % of the RAM (Windows refused to pin more
+at 99 of 125.6 GiB), or setup stays at one at a time and says how much RAM each request would pin. Measured on 125.6 GiB with IQ3_S at 1M: 8 slots stopped the
+engine (pinning refused at 99 GiB), 4 slots started with 8 GiB free and half the arena unpinned, and every request
+ran 3-4x slower, a request alone included. `--parallel N` is honoured as asked either way.
 
 ## How the server uses the slots
 
