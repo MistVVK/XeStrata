@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -189,8 +190,8 @@ def install_root(explicit: str | os.PathLike | None = None, src: str | os.PathLi
     return discovery.find_install(here=installer_folder(src))[0]
 
 
-# Intel Arc cards by PCI id: (name, memory in GB).  The kernel does not tell an ordinary user how much memory the card has, so the discrete
-# cards are listed (the same ids as sycl/setup_intel.py; tests/terminal/test_intel_cards_029.py keeps the two in step).  An id that is not
+# Intel Arc cards by PCI id: (name, memory in GB).  The memory figure is the fallback: a card's own size (arc_vram_gb: sysfs, else Level
+# Zero sysman) is used when it can be read, and the kernel does not always tell an ordinary user. The discrete cards are listed (the same ids as sycl/setup_intel.py; tests/terminal/test_intel_cards_029.py keeps the two in step).  An id that is not
 # here is NOT counted: it is skipped, because an Intel chip built into the processor shares this vendor id and must never be named as a card.
 # (A770: the 8 GB model shares the id of the 16 GB one, so the smaller figure is used.)
 INTEL_ARC = {"0x56a1": ("Arc A750", 8.0), "0x56a2": ("Arc A580", 8.0), "0x56a0": ("Arc A770", 8.0), "0x56a5": ("Arc A380", 6.0),
@@ -217,6 +218,46 @@ def _arc_entry(did: str) -> tuple[str, float] | None:
     return None
 
 
+#: Files under /sys/class/drm/cardN that hold an Intel card's own memory size in bytes, where the kernel lets an ordinary user read them
+#: (xe: the tile's physical VRAM; i915: the local memory total). A card's PCI BAR is not used: it is a power of two (a 24 GB card has a
+#: 32 GiB BAR) or a 256 MiB window.
+ARC_VRAM_FILES = ("device/tile0/physical_vram_size_bytes", "lmem_total_bytes", "device/lmem_total_bytes")
+_PCI_ADDRESS = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
+_SYSMAN_TOTAL: dict[str, int | None] = {}
+
+
+def _sysman_total(pci: str) -> int | None:
+    """The card's memory size in bytes from Level Zero sysman (serve/telemetry.py _Zes, the Monitor's reader), asked once per card."""
+    if pci not in _SYSMAN_TOTAL:
+        try:
+            from serve.telemetry import _Zes
+            _SYSMAN_TOTAL[pci] = _Zes(pci).read()[1]
+        except Exception:                                    # noqa: BLE001 - no runtime, no card: the table's figure is used
+            _SYSMAN_TOTAL[pci] = None
+    return _SYSMAN_TOTAL[pci]
+
+
+def arc_vram_gb(card: Path) -> float | None:
+    """An Intel card's own memory in GiB (one decimal, as the NVIDIA and AMD readers count it): a sysfs size file, else sysman; None when
+    neither says, and then the id table's figure stands."""
+    size = None
+    for rel in ARC_VRAM_FILES:
+        try:
+            size = int((card / rel).read_text().strip(), 0)
+        except (OSError, ValueError):
+            continue
+        if size > 0:
+            break
+        size = None
+    if size is None:
+        try:
+            pci = os.path.basename(os.path.realpath(card / "device")).lower()
+        except OSError:
+            pci = ""
+        size = _sysman_total(pci) if _PCI_ADDRESS.fullmatch(pci) else None
+    return round(size / 2**30, 1) if size and size > 0 else None
+
+
 def intel_arc_cards(root: str = "/sys/class/drm") -> list[dict]:
     """The Intel Arc cards on this Linux computer, read from the kernel's device list (empty elsewhere). One unreadable entry or a card number
     above 9 never hides the others, and the cards of other makes beside them (an AMD APU's graphics) do not matter here (#4971, #5111)."""
@@ -239,6 +280,7 @@ def intel_arc_cards(root: str = "/sys/class/drm") -> list[dict]:
         if entry is None:
             continue
         name, gb = entry
+        gb = arc_vram_gb(card) or gb                         # the card's own size; the table (an unlisted id: the family's smallest) when unread
         cards.append({"vendor": "intel", "name": "Intel " + name, "vram_gb": gb, "usable": True, "index": len(cards)})
     return cards
 
