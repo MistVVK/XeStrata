@@ -1670,7 +1670,9 @@ function toolHtml(t, k) {
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>` +
     // the images an image tool made, under its block (the server keeps them: /v1/images/files/). Their addresses are
     // strings; an MCP server's picture ({url: "tool-media/..."}, mcp.image_results) is drawn by toolImages below
-    imageToolHtml(t, k);
+    imageToolHtml(t, k) +
+    // train_lora: the LoRA training panel opens here (ltwHydrate mounts it)
+    (t.tool === "train_lora" && t.state === "done" ? `<div class="ltw" data-ltw="${k}"></div>` : "");
 }
 // a generate_image call with a layout (MOSS-Image's boxes) also gets a button that opens it in the Images tab
 function imageToolHtml(t, k) {
@@ -1814,6 +1816,7 @@ function updateAssistant(el, m, streaming) {
     if (settings.math) StrataMath.hydrate(bubble);
     StrataMermaid.hydrate(bubble, planSteps(m));
     hydrateToolImages(bubble);
+    ltwHydrate(bubble);
     if (!streaming) paintMarks();
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
@@ -5443,3 +5446,291 @@ $("tr-form").onsubmit = (ev) => {
 $("trn-input").onkeydown = (ev) => {
   if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); if (!trnAbort) trnRun(); }
 };
+
+// ------------------------------------------------------------------ LoRA training (serve/lora_train.py)
+// The chat's train_lora tool opens this panel (data-ltw under the tool block); the Images view's "Train a LoRA"
+// button opens the same panel in a dialog.  One job a panel: the setup (images, kind, name, trigger, model,
+// captions, settings), the run (stage, step, loss, the GPU's give-and-take, cancel), and the versions (a sample
+// picture each, pick one, register it as a LoRA; the unselected ones can go).
+const ltwMounted = new WeakSet();
+function ltwHydrate(root) {
+  root.querySelectorAll("[data-ltw]").forEach((el) => {
+    if (ltwMounted.has(el)) return;
+    ltwMounted.add(el);
+    ltwPanel(el);
+  });
+}
+const LTW_ACTIVE = ["queued", "preprocessing", "training", "sampling", "captioning"];
+async function ltwFetch(path, opts) {
+  const r = await fetch(path.replace(/^\//, ""), opts);
+  let j = null;
+  try { j = await r.json(); } catch (e) { /* not JSON */ }
+  if (!r.ok) throw new Error((j && j.error && (j.error.message || j.error)) || `HTTP ${r.status}`);
+  return j;
+}
+function ltwPanel(el) {
+  const st = {models: [], job: null, timer: null, view: "", picked: null, regName: ""};
+  const base = () => st.job ? `v1/lora/jobs/${st.job.id}` : "";
+  const stop = () => { if (st.timer) { clearInterval(st.timer); st.timer = null; } };
+  const err = (e) => toast("error", tr("ltw.title", "LoRA training"), String(e.message || e), 6000);
+  async function loadModels() {
+    try { st.models = (await ltwFetch("v1/lora/models", {headers: headers()})).models || []; }
+    catch (e) { st.models = []; }
+  }
+  async function refresh() {
+    if (!st.job) return;
+    try {
+      st.job = await ltwFetch(base(), {headers: headers()});
+      render();
+      if (!LTW_ACTIVE.includes(st.job.status)) stop();
+    } catch (e) { stop(); err(e); }
+  }
+  function poll() { stop(); st.timer = setInterval(refresh, 2000); }
+  function fields() {
+    return {model: el.querySelector("[data-ltw-model]").value, kind: el.querySelector("[data-ltw-kind]").value,
+            name: el.querySelector("[data-ltw-name]").value.trim(), trigger: el.querySelector("[data-ltw-trigger]").value.trim()};
+  }
+  async function addFiles(files) {
+    const pics = [...files].filter((f) => /^image\/(png|jpeg|webp|bmp)/.test(f.type));
+    if (!pics.length) return;
+    try {
+      if (!st.job) {
+        const f = fields();
+        if (!f.name || !f.trigger) { err(new Error(tr("ltw.needFields", "Give the LoRA a name and a trigger word first."))); return; }
+        const fd = new FormData();
+        for (const [k, v] of Object.entries(f)) fd.append(k, v);
+        pics.forEach((p) => fd.append("images", p, p.name));
+        st.job = await ltwFetch("v1/lora/jobs", {method: "POST", headers: {...headers(), "X-XeStrata-Upload": "1"}, body: fd});
+      } else {
+        const fd = new FormData();
+        pics.forEach((p) => fd.append("images", p, p.name));
+        st.job = await ltwFetch(`${base()}/images`, {method: "POST", headers: {...headers(), "X-XeStrata-Upload": "1"}, body: fd});
+      }
+      render();
+    } catch (e) { err(e); }
+  }
+  async function chatPics() {
+    const urls = [...new Set([...document.querySelectorAll("#view-chat img")]
+      .map((i) => i.getAttribute("src") || "").filter((u) => u.includes("/v1/images/files/")))];
+    if (!urls.length) { toast("warn", tr("ltw.title", "LoRA training"), tr("ltw.noChatPics", "This chat has no images to pick.")); return; }
+    const box = el.querySelector("[data-ltw-chatpics]");
+    box.hidden = false;
+    box.innerHTML = urls.map((u, i) =>
+      `<label class="ltw-pick"><input type="checkbox" data-ltw-pick="${i}"><img src="${esc(u)}" alt=""></label>`).join("") +
+      `<div class="ltw-row"><button type="button" class="st-btn" data-ltw-addpicked>${esc(tr("ltw.addPicked", "Add the picked pictures"))}</button></div>`;
+    box.querySelector("[data-ltw-addpicked]").onclick = async () => {
+      const picked = [...box.querySelectorAll("[data-ltw-pick]")].filter((c) => c.checked).map((c) => urls[+c.dataset.ltwPick]);
+      const files = [];
+      for (const u of picked) {
+        try {
+          const b = await (await fetch(u.replace(/^\//, ""), {headers: headers()})).blob();
+          files.push(new File([b], u.split("/").pop(), {type: b.type || "image/png"}));
+        } catch (e) { /* the server's file is gone */ }
+      }
+      box.hidden = true;
+      if (files.length) await addFiles(files);
+    };
+  }
+  async function autoCaption() {
+    try { st.job = await ltwFetch(`${base()}/caption`, {method: "POST", headers: headers(true), body: "{}"}); render(); poll(); }
+    catch (e) { err(e); }
+  }
+  async function saveCaptions() {
+    const caps = {};
+    el.querySelectorAll("[data-ltw-cap]").forEach((t) => { caps[t.dataset.ltwCap] = t.value; });
+    try { st.job = await ltwFetch(`${base()}/captions`, {method: "PUT", headers: headers(true), body: JSON.stringify(caps)}); }
+    catch (e) { err(e); }
+  }
+  function settings() {
+    const g = (k) => { const i = el.querySelector(`[data-ltw-set="${k}"]`); return i ? i.value : ""; };
+    const out = {};
+    for (const k of ["steps", "save_every", "rank", "lr", "seed", "dropout", "accum", "base", "method",
+                     "train_blocks", "only_if_contains", "ignore_if_contains", "sample_seed"]) {
+      const v = g(k);
+      if (v !== "") out[k] = v;
+    }
+    const sp = g("sample_prompts");
+    if (sp.trim()) out.sample_prompts = sp.split("\n").map((s) => s.trim()).filter(Boolean);
+    return out;
+  }
+  async function start() {
+    await saveCaptions();
+    try { st.job = await ltwFetch(`${base()}/start`, {method: "POST", headers: headers(true), body: JSON.stringify(settings())}); render(); poll(); }
+    catch (e) { err(e); }
+  }
+  async function act(action, body) {
+    try { st.job = await ltwFetch(`${base()}/${action}`, {method: "POST", headers: headers(true), body: JSON.stringify(body || {})}); render(); if (LTW_ACTIVE.includes(st.job.status)) poll(); }
+    catch (e) { err(e); }
+  }
+  async function register() {
+    const step = st.picked != null ? st.picked : (st.job.versions.at(-1) || {}).step;
+    const name = (el.querySelector("[data-ltw-regname]") || {}).value || st.job.name;
+    try { st.job = await ltwFetch(`${base()}/register`, {method: "POST", headers: headers(true), body: JSON.stringify({step, name})}); render(); toast("ok", tr("ltw.title", "LoRA training"), tr("ltw.registeredToast", "The LoRA is in the model's list; the chat's images can use it now.")); }
+    catch (e) { err(e); }
+  }
+  async function deleteUnselected() {
+    const keep = st.picked != null ? st.picked : (st.job.versions.at(-1) || {}).step;
+    try {
+      for (const v of st.job.versions) {
+        if (v.step !== keep && !v.registered) await ltwFetch(`${base()}/versions/${v.step}`, {method: "DELETE", headers: headers()});
+      }
+      await refresh();
+    } catch (e) { err(e); }
+  }
+  function setupHtml() {
+    const j = st.job;
+    const models = st.models.filter((m) => m.can_train);
+    const modelOpts = (st.models.length ? st.models : [{model: "", name: tr("ltw.noModels", "no trainable model here"), can_train: false, why: ""}])
+      .map((m) => `<option value="${esc(m.model)}"${j && j.model === m.model ? " selected" : ""}${m.can_train ? "" : " disabled"}>${esc(m.name || m.model)}${m.can_train ? "" : " — " + esc(m.why || "")}</option>`).join("");
+    const preset = (models.find((m) => m.model === (j ? j.model : models[0] && models[0].model)) || models[0] || {}).preset || {};
+    const kind = j ? j.kind : "character";
+    const imgs = j ? j.images.map((im) =>
+      `<div class="ltw-img"><img src="${base()}/images/${esc(im.file)}" alt="${esc(im.file)}">` +
+      `<textarea class="st-input" rows="2" data-ltw-cap="${esc(im.file)}" placeholder="${esc(tr("ltw.captionPh", "trigger, description"))}">${esc(im.caption || "")}</textarea>` +
+      `<button type="button" class="st-btn st-btn--icon" data-ltw-delimg="${esc(im.file)}" title="${esc(tr("ltw.remove", "Remove"))}">×</button></div>`).join("") : "";
+    return `<div class="ltw-head">${esc(tr("ltw.title", "LoRA training"))}</div>
+      <div class="ltw-grid">
+        <label class="st-field"><span>${esc(tr("ltw.model", "Model"))}</span><select class="st-input" data-ltw-model${j ? " disabled" : ""}>${modelOpts}</select></label>
+        <label class="st-field"><span>${esc(tr("ltw.kind", "Kind"))}</span><select class="st-input" data-ltw-kind${j ? " disabled" : ""}>
+          <option value="character"${kind === "character" ? " selected" : ""}>${esc(tr("ltw.character", "Character"))}</option>
+          <option value="style"${kind === "style" ? " selected" : ""}>${esc(tr("ltw.style", "Style"))}</option>
+          <option value="other"${kind === "other" ? " selected" : ""}>${esc(tr("ltw.other", "Other"))}</option></select></label>
+        <label class="st-field"><span>${esc(tr("ltw.name", "Name"))}</span><input class="st-input" data-ltw-name value="${esc(j ? j.name : "")}"${j ? " disabled" : ""}></label>
+        <label class="st-field"><span>${esc(tr("ltw.trigger", "Trigger word"))}</span><input class="st-input" data-ltw-trigger value="${esc(j ? j.trigger : "")}"${j ? " disabled" : ""}></label>
+      </div>
+      <div class="ltw-drop" data-ltw-drop tabindex="0">${esc(tr("ltw.drop", "Drop the training pictures here (several at once)"))}
+        <div class="ltw-row">
+          <button type="button" class="st-btn st-btn--secondary" data-ltw-choose>${esc(tr("ltw.choose", "Choose files…"))}</button>
+          <button type="button" class="st-btn st-btn--secondary" data-ltw-fromchat>${esc(tr("ltw.fromChat", "Pick this chat's images"))}</button>
+          <input type="file" data-ltw-file accept="image/png,image/jpeg,image/webp,image/bmp" multiple hidden>
+        </div></div>
+      <div class="ltw-chatpics" data-ltw-chatpics hidden></div>
+      ${j ? `<div class="ltw-imgs">${imgs}</div>
+      <div class="ltw-row">
+        <button type="button" class="st-btn st-btn--secondary" data-ltw-autocap${j.status !== "draft" ? " disabled" : ""}>${esc(tr("ltw.autoCaption", "Caption automatically"))}</button>
+        <span class="muted small">${esc(tr("ltw.captionHint", "One line each: the trigger word, then the description. The lora-caption rules: a character's own look stays with the trigger; a style captions the content only."))}</span>
+      </div>
+      <details class="st-collapse ltw-settings"><summary>${esc(tr("ltw.settings", "Settings"))} <span class="muted small">${esc(tr("ltw.presetLine", "{n} steps, a version every {k}", {n: preset.steps || 3000, k: preset.save_every || 250}))}</span></summary>
+        <div class="st-collapse__body ltw-grid">
+          <label class="st-field"><span>${esc(tr("ltw.steps", "Most steps (n)"))}</span><input class="st-input" type="number" min="1" data-ltw-set="steps" placeholder="${preset.steps || 3000}"></label>
+          <label class="st-field"><span>${esc(tr("ltw.saveEvery", "Save a version every (k)"))}</span><input class="st-input" type="number" min="1" data-ltw-set="save_every" placeholder="${preset.save_every || 250}"></label>
+          <label class="st-field"><span>${esc(tr("ltw.rank", "Rank"))}</span><input class="st-input" type="number" min="1" data-ltw-set="rank" placeholder="${preset.rank || 32}"></label>
+          <label class="st-field"><span>${esc(tr("ltw.lr", "Learning rate"))}</span><input class="st-input" data-ltw-set="lr" placeholder="${preset.lr || 1e-4}"></label>
+          <label class="st-field"><span>${esc(tr("ltw.seed", "Seed"))}</span><input class="st-input" type="number" data-ltw-set="seed" placeholder="${preset.seed != null ? preset.seed : 42}"></label>
+          <label class="st-field"><span>${esc(tr("ltw.dropout", "Caption dropout"))}</span><input class="st-input" data-ltw-set="dropout" placeholder="${preset.dropout != null ? preset.dropout : 0.05}"></label>
+          ${preset.accum != null ? `<label class="st-field"><span>${esc(tr("ltw.accum", "Gradient accumulation"))}</span><input class="st-input" type="number" min="1" data-ltw-set="accum" placeholder="${preset.accum}"></label>` : ""}
+          ${preset.base ? `<label class="st-field"><span>${esc(tr("ltw.base", "Base precision"))}</span><select class="st-input" data-ltw-set="base"><option value="">${esc(preset.base)}</option><option value="bf16">bf16</option><option value="int8">int8</option></select></label>` : ""}
+          ${preset.method ? `<label class="st-field"><span>${esc(tr("ltw.method", "Method"))}</span><select class="st-input" data-ltw-set="method"><option value="">${esc(preset.method)}</option><option value="lora">lora</option><option value="lokr">lokr</option><option value="dora">dora</option></select></label>` : ""}
+          <label class="st-field"><span>${esc(tr("ltw.trainBlocks", "Train blocks (e.g. 0-5,10)"))}</span><input class="st-input" data-ltw-set="train_blocks"></label>
+          <label class="st-field"><span>${esc(tr("ltw.onlyIf", "Only names containing"))}</span><input class="st-input" data-ltw-set="only_if_contains"></label>
+          <label class="st-field"><span>${esc(tr("ltw.ignoreIf", "Ignore names containing"))}</span><input class="st-input" data-ltw-set="ignore_if_contains"></label>
+          <label class="st-field"><span>${esc(tr("ltw.sampleSeed", "Sample seed"))}</span><input class="st-input" type="number" data-ltw-set="sample_seed" placeholder="7"></label>
+          <label class="st-field ltw-wide"><span>${esc(tr("ltw.samplePrompts", "Sample prompts (one a line; {trigger} is the trigger word)"))}</span>
+            <textarea class="st-input" rows="2" data-ltw-set="sample_prompts"></textarea></label>
+        </div></details>
+      <div class="ltw-row">
+        <button type="button" class="st-btn" data-ltw-start${j.status !== "draft" || !j.images.length ? " disabled" : ""}>${esc(tr("ltw.start", "Start the training"))}</button>
+        <button type="button" class="st-btn st-btn--secondary" data-ltw-deljob>${esc(tr("ltw.deleteJob", "Delete this job"))}</button>
+        ${j.status === "captioning" ? `<span class="st-badge st-badge--generating">${esc(tr("ltw.captioning", "Writing captions…"))}</span>` : ""}
+      </div>` : ""}`;
+  }
+  function runHtml() {
+    const j = st.job, p = j.progress || {}, pl = j.place || {};
+    const pct = p.total ? Math.min(100, Math.round(100 * (p.step || 0) / p.total)) : 0;
+    const stage = {queued: tr("ltw.queued", "Waiting"), preprocessing: tr("ltw.preprocess", "Preparing the pictures (VAE and text)"),
+                   training: tr("ltw.training", "Training"), sampling: tr("ltw.sampling", "Making the sample pictures")}[j.status] || j.status;
+    const mode = {run: ["st-badge--generating", tr("ltw.modeRun", "running full")],
+                  shrunk: ["st-badge--reading", tr("ltw.modeShrunk", "slowed (sharing the GPU)")],
+                  paused: ["st-badge--queued", tr("ltw.modePaused", "paused")]}[pl.mode] || ["", pl.mode || ""];
+    const eta = p.eta_s != null ? tr("ltw.eta", "about {t} left", {t: p.eta_s > 3600 ? `${(p.eta_s / 3600).toFixed(1)} h` : `${Math.ceil(p.eta_s / 60)} min`}) : "";
+    return `<div class="ltw-head">${esc(tr("ltw.title", "LoRA training"))} · ${esc(j.name)} <span class="muted small">${esc(j.model)}</span></div>
+      <div class="ltw-row"><span class="st-badge ${mode[0]}">${esc(stage)}${pl.mode ? " · " + esc(mode[1]) : ""}</span>
+        ${pl.name ? `<span class="muted small">${esc(pl.name)}${pl.budget_mib != null ? ` · ${fmt(pl.budget_mib / 1024, 1)} GiB` : ""}</span>` : ""}</div>
+      ${pl.reason ? `<div class="muted small">${esc(pl.reason)}</div>` : ""}
+      <div class="ltw-bar"><div class="ltw-bar__fill" style="width:${pct}%"></div></div>
+      <div class="ltw-row muted small">
+        <span>${esc(tr("ltw.stepLine", "step {i} of {n}", {i: p.step || 0, n: p.total || (j.settings || {}).steps || "?"}))}</span>
+        ${p.loss != null ? `<span>${esc(tr("ltw.loss", "loss"))} ${fmt(p.loss, 5)}</span>` : ""}
+        ${p.s_per_step ? `<span>${fmt(p.s_per_step, 2)} s/step</span>` : ""}
+        ${eta ? `<span>${esc(eta)}</span>` : ""}
+      </div>
+      <div class="ltw-row"><button type="button" class="st-btn st-btn--secondary" data-ltw-cancel>${esc(tr("ltw.cancel", "Cancel"))}</button>
+        <span class="muted small">${esc(tr("ltw.shareHint", "The chat stays usable; image jobs go first. The versions saved so far stay on a cancel."))}</span></div>`;
+  }
+  function versionsHtml() {
+    const j = st.job;
+    const note = {awaiting_choice: tr("ltw.awaiting", "Pick a version and register it as a LoRA (the last one by default)."),
+                  cancelled: tr("ltw.cancelledNote", "Cancelled. The versions saved so far are here to pick."),
+                  interrupted: tr("ltw.interruptedNote", "The server stopped mid-job. Resume it, or pick a version saved so far."),
+                  completed: tr("ltw.completedNote", "Registered. The LoRA is in the model's list.")}[j.status] || "";
+    const cards = j.versions.map((v) =>
+      `<label class="ltw-ver${v.registered ? " ltw-ver--reg" : ""}">
+        <input type="radio" name="ltw-ver-${esc(j.id)}" data-ltw-ver="${v.step}"${st.picked === v.step || (st.picked == null && v === j.versions.at(-1)) ? " checked" : ""}${v.registered ? " disabled" : ""}>
+        <div class="ltw-ver__step">${esc(tr("ltw.stepN", "step {n}", {n: v.step}))}${v.registered ? ` · ${esc(tr("ltw.registered", "registered"))}` : ""}</div>
+        <div class="ltw-ver__pics">${(v.samples || []).map((s) => `<img src="${base()}/samples/${esc(s)}" alt="${esc(tr("ltw.sample", "sample"))}" loading="lazy">`).join("") || `<span class="muted small">${esc(tr("ltw.noSample", "no sample yet"))}</span>`}</div>
+      </label>`).join("");
+    return `<div class="ltw-head">${esc(tr("ltw.title", "LoRA training"))} · ${esc(j.name)}</div>
+      ${j.error ? `<div class="msg-error">${esc(j.error.message || "")}</div>` : ""}
+      <div class="muted small">${esc(note)}</div>
+      <div class="ltw-vers">${cards}</div>
+      <div class="ltw-row">
+        <input class="st-input" data-ltw-regname placeholder="${esc(j.name)}" aria-label="${esc(tr("ltw.name", "Name"))}">
+        <button type="button" class="st-btn" data-ltw-register${j.registered || !j.versions.length ? " disabled" : ""}>${esc(tr("ltw.register", "Register the picked version"))}</button>
+        ${j.status === "interrupted" ? `<button type="button" class="st-btn st-btn--secondary" data-ltw-resume>${esc(tr("ltw.resume", "Resume"))}</button>` : ""}
+        <button type="button" class="st-btn st-btn--secondary" data-ltw-delunsel${j.registered ? " disabled" : ""}>${esc(tr("ltw.deleteUnselected", "Delete the unselected versions"))}</button>
+        <button type="button" class="st-btn st-btn--secondary" data-ltw-deljob>${esc(tr("ltw.deleteJob", "Delete this job"))}</button>
+      </div>`;
+  }
+  function render() {
+    const j = st.job;
+    const view = !j || j.status === "draft" || j.status === "captioning" ? "setup"
+      : LTW_ACTIVE.includes(j.status) ? "run" : "versions";
+    st.view = view;
+    el.innerHTML = view === "setup" ? setupHtml() : view === "run" ? runHtml() : versionsHtml();
+    const q = (s) => el.querySelector(s);
+    const on = (s, ev, fn) => { const n = q(s); if (n) n[ev] = fn; };
+    if (view === "setup") {
+      const drop = q("[data-ltw-drop]"), file = q("[data-ltw-file]");
+      drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("ltw-drop--over"); };
+      drop.ondragleave = () => drop.classList.remove("ltw-drop--over");
+      drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("ltw-drop--over"); addFiles(e.dataTransfer.files); };
+      on("[data-ltw-choose]", "onclick", () => file.click());
+      file.onchange = () => { addFiles(file.files); file.value = ""; };
+      on("[data-ltw-fromchat]", "onclick", chatPics);
+      on("[data-ltw-autocap]", "onclick", autoCaption);
+      on("[data-ltw-start]", "onclick", start);
+      el.querySelectorAll("[data-ltw-delimg]").forEach((b) => {
+        b.onclick = async () => {
+          try { st.job = await ltwFetch(`${base()}/images/${b.dataset.ltwDelimg}`, {method: "DELETE", headers: headers()}); render(); }
+          catch (e) { err(e); }
+        };
+      });
+      el.querySelectorAll("[data-ltw-cap]").forEach((t) => { t.onchange = saveCaptions; });
+    } else if (view === "run") {
+      on("[data-ltw-cancel]", "onclick", () => act("cancel"));
+    } else {
+      el.querySelectorAll("[data-ltw-ver]").forEach((r) => { r.onchange = () => { st.picked = +r.dataset.ltwVer; }; });
+      on("[data-ltw-register]", "onclick", register);
+      on("[data-ltw-resume]", "onclick", () => act("resume"));
+      on("[data-ltw-delunsel]", "onclick", deleteUnselected);
+    }
+    on("[data-ltw-deljob]", "onclick", async () => {
+      try { stop(); await ltwFetch(base(), {method: "DELETE", headers: headers()}); st.job = null; st.picked = null; render(); }
+      catch (e) { err(e); }
+    });
+  }
+  loadModels().then(render);
+  return {stop};
+}
+// The Images view's button: the same panel in a dialog
+(function () {
+  const btn = $("img-lora-train");
+  if (!btn) return;
+  btn.onclick = () => {
+    const d = $("ltw-dialog");
+    const box = d.querySelector("[data-ltw-dialog]");
+    if (!ltwMounted.has(box)) { ltwMounted.add(box); ltwPanel(box); }
+    d.showModal();
+  };
+  $("ltw-dialog-close").onclick = () => $("ltw-dialog").close();
+})();
