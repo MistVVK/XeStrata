@@ -3256,10 +3256,15 @@ static uint32_t metal_scan_rows(void* metal, int T, int64_t n_vocab) {
     for (int t = 0; t < lim; ++t) {
         const float* row = strata::metal_engine::window_logits(metal, t);
         if (row == nullptr) continue;   // (a window without a head for that row checks nothing)
-        for (int64_t i = 0; i < n_vocab; ++i) {
-            uint32_t u;
-            std::memcpy(&u, &row[i], 4);
-            if ((u & 0x7f800000u) == 0x7f800000u) { mask |= 1u << t; break; }
+        // the same bit test, as a branch-free reduction over blocks of 4096 values (the compiler turns it into NEON;
+        // the per-value early exit kept it scalar): one decode window's rows cost about 1.5% of the M5 Max's decode otherwise
+        typedef uint32_t __attribute__((may_alias)) u32_alias;
+        const u32_alias* u = reinterpret_cast<const u32_alias*>(row);
+        for (int64_t i0 = 0; i0 < n_vocab; i0 += 4096) {
+            const int64_t i1 = i0 + 4096 < n_vocab ? i0 + 4096 : n_vocab;
+            uint32_t hit = 0;
+            for (int64_t i = i0; i < i1; ++i) hit |= (uint32_t) ((u[i] & 0x7f800000u) == 0x7f800000u);
+            if (hit) { mask |= 1u << t; break; }
         }
     }
     return mask;
