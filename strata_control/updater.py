@@ -1088,6 +1088,11 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
         # paths setup wrote inside a Control folder that is gone (an AppImage's /tmp/.mount_<random>, a moved install): this Control's own files (QAGUI-LIN 0213)
         from strata_control import control_paths
         cfg = control_paths.repoint(cfg)
+        # #5681: paths in a version folder an update removed (components/control/0.1.56/...) are resolved to the current version HERE, while
+        # STRATA_COMPONENTS_DIR is still the real one: under the sandbox's (the stage, which has no control folder) the start's own repair
+        # found no current Control and the test start failed with a ProfileError about the old file
+        from strata_control import cfg_paths
+        cfg, _moved, _lost = cfg_paths.resolve_config(cfg)
         cfg["exe"] = ec.REFERENCE_PREFIX + ec.COMPONENT_ID
         cfg["backend"] = component.backend
         cfg.pop("lib_dirs", None)
