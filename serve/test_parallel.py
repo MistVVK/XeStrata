@@ -717,6 +717,34 @@ class ParallelService(FakeEngineCase):
         self.assertEqual(self.chat("fine again")["choices"][0]["message"]["content"], "ok, done.")
         self.assertEqual(self.get("/metrics")["totals"]["requests"], 2, "a later admitted request counts")
 
+    def test_bgen_refused_for_good_in_a_stream_is_each_apis_error_frame(self):
+        """The same refusal once the 200 is sent: the API's own last frame, not a second HTTP response in the body."""
+        self.start(2)
+        self.engine.SLOT_PARK_S = 0.05
+        text = [{"role": "user", "content": "BUSYALL hello"}]
+        cases = (
+            ("/v1/chat/completions", {"messages": text, "max_tokens": 8}, b'data: {"error": ', b"data: [DONE]\n\n"),
+            ("/v1/messages", {"model": "m", "messages": text, "max_tokens": 8}, b"event: error\n", b"\n\n"),
+            ("/v1/responses", {"input": "BUSYALL hello", "max_output_tokens": 8}, b"event: response.failed\n", b"\n\n"),
+        )
+        for path, body, frame, end in cases:
+            with self.subTest(path):
+                long = threading.Thread(target=self.chat, args=("LONGREPLY please",))
+                long.start()
+                time.sleep(0.15)
+                req = urllib.request.Request(self.base + path, data=json.dumps({**body, "stream": True}).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    self.assertEqual(r.status, 200)
+                    got = r.read()
+                long.join(30)
+                self.assertNotIn(b"HTTP/1.", got)
+                self.assertIn(frame, got)
+                self.assertIn(b"slots are not free", got)
+                self.assertTrue(got.endswith(end), got[-80:])
+                time.sleep(0.5)
+                self.assertEqual(self.engine.slot_busy, [False, False])
+
     def test_engine_reports_fewer_slots(self):
         self.start(4, fit=2)
         self.assertEqual(self.engine.batch, 2)

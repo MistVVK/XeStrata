@@ -8734,6 +8734,26 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:
+                self._chat_failed(str(e))                    # _post's handler would write HTTP into the stream's body
+            except ClientGone:
+                raise
+            except Exception:                                # no silent end: the client would take it for a whole answer
+                self._chat_failed(self._stream_crashed())
+
+        def _stream_crashed(self):
+            """An unexpected error in a started stream: the traceback for the log, a plain sentence for the client."""
+            import traceback
+            print("[strata] error in a started stream:\n" + traceback.format_exc(), flush=True)
+            return "the server failed while answering; the server's log has the details"
+
+        def _chat_failed(self, message):
+            err = {"error": {"type": "server_error", "message": message}}
+            self._note(error=err["error"])
+            try:
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except OSError:
+                self._note(outcome="disconnected")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -8838,6 +8858,12 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
+            except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:   # _post would write HTTP into the stream's body
+                self._responses_failed(asm, str(e), "server_error", send)
+            except ClientGone:
+                raise
+            except Exception:                                # no silent end: the client would take it for a whole answer
+                self._responses_failed(asm, self._stream_crashed(), "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
@@ -8969,6 +8995,20 @@ def make_handler(svc: Service):
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:   # _post would write HTTP into the stream's body
+                self._anthropic_failed(str(e), "overloaded_error" if isinstance(e, GpuBusy) else "api_error")
+            except ClientGone:
+                raise
+            except Exception:                                # no silent end: the client would take it for a whole answer
+                self._anthropic_failed(self._stream_crashed(), "api_error")
+
+        def _anthropic_failed(self, message, kind):
+            err = {"type": "error", "error": {"type": kind, "message": message}}
+            self._note(error=err["error"])
+            try:
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except OSError:
+                self._note(outcome="disconnected")
 
     return Handler
 
