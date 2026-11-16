@@ -153,7 +153,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         for (size_t k = 0; k < stages; ++k) {
             auto& dst = out.parts[k][w];
             auto& src = c.stage_parts[k];
-            dst.gdn = std::move(src.gdn); dst.ple = std::move(src.ple);
+            dst.gdn = std::move(src.gdn); dst.dev_tag = src.dev_tag; dst.ple = std::move(src.ple);
             dst.tails = std::move(src.tails); dst.dead = std::move(src.dead);
             dst.block_pos = std::move(src.block_pos);
         }
