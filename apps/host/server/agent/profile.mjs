@@ -304,7 +304,12 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
   const defaultRoute = routes.find(r => r.kind === 'local' && r.instanceId === defaultInstance?.id) ?? routes.find(r => r.kind === 'local') ?? null;
   // One Harness, one set of tool servers: the default local model's.
   const mcpSkipped = [];
-  const mcp = mcpRows({ ...(defaultInstance?.mcpServers ?? {}), ...(tools.servers ?? {}) }, mcpEnv, mcpSkipped);
+  // The model's own servers wait as long as its "Tool timeout (seconds)" says (mcp_timeout_s), unless a server names its own (#5788);
+  // without either the client keeps its default (60 s).
+  const modelTimeoutS = Number(defaultInstance?.mcpTimeoutS) > 0 ? Number(defaultInstance.mcpTimeoutS) : undefined;
+  const modelServers = Object.fromEntries(Object.entries(defaultInstance?.mcpServers ?? {}).map(([name, s]) => [name,
+    modelTimeoutS && s && typeof s === 'object' && s.timeoutSec == null && s.timeout_s == null && s.timeout == null && s.toolCallTimeoutMs == null ? { ...s, timeout_s: modelTimeoutS } : s]));
+  const mcp = mcpRows({ ...modelServers, ...(tools.servers ?? {}) }, mcpEnv, mcpSkipped);
   Object.assign(env, mcpEnv);
   // The person's own instruction and command tools come from the app's tool server; a command tool asks in Manual like any connected tool.
   const own = (kind, on) => on && tools.toolFile ? [{ id: `mcp-strata-${kind}`, name: '@deepseek-ai/dsh-mcp-client', config: { serverName: `strata-${kind}`, transport: 'stdio', command: process.execPath, args: [CUSTOM_TOOLS_SCRIPT, kind, tools.toolFile] } }] : [];

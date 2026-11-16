@@ -219,6 +219,8 @@ const agent = createAgentBridge({
     slots: i.metrics?.live?.slots?.length || i.parallel || 1,
     // The tool servers set up for this model (Settings, Tools): the agent connects to the same ones.
     mcpServers: i.mcpServers,
+    // its "Tool timeout (seconds)": the agent waits as long for those servers as the engine does (#5788)
+    mcpTimeoutS: i.mcpTimeoutS ?? null,
   })),
   connections: () => modelProviders.withSecrets().map(c => ({ ...c, models: c.models.map(m => ({ ...m, vision: readsPicturesByDefault(m, visionProbe.known(c, m.id)), reasoning: m.reasoning ?? visionProbe.knownThinks(c, m.id) ?? null })) })),
   log: line => console.log(line),
