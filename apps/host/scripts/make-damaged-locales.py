@@ -97,7 +97,7 @@ add("{0} was deleted. Your other chats are not affected.",
     "{0}을(를) 삭제했습니다. 다른 채팅에는 영향이 없습니다.",
     "{0} a été supprimé. Vos autres conversations ne sont pas concernées.")
 add("The chat file could not be deleted",
-    "聊天文件无法删除",
+    "无法删除聊天文件",
     "チャットファイルを削除できませんでした",
     "Die Chat-Datei konnte nicht gelöscht werden",
     "No se pudo eliminar el archivo de chat",
@@ -107,7 +107,7 @@ add("The chat file could not be deleted",
     "Le fichier de conversation n'a pas pu être supprimé")
 # dmg11 (coordinator 11-16): a chat file of a newer Strata is not damaged and is never offered for deletion.
 add("This chat was saved by a newer version of Strata. Update Strata to open it.",
-    "此聊天由更新版本的 Strata 保存。请更新 Strata 后再打开。",
+    "此聊天由较新版本的 Strata 保存。请先更新 Strata 再打开。",
     "このチャットは新しいバージョンの Strata で保存されています。開くには Strata を更新してください。",
     "Dieser Chat wurde mit einer neueren Version von Strata gespeichert. Aktualisieren Sie Strata, um ihn zu öffnen.",
     "Este chat se guardó con una versión más reciente de Strata. Actualiza Strata para abrirlo.",
