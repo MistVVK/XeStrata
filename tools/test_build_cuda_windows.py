@@ -26,7 +26,7 @@ class ConfigureLine(unittest.TestCase):
         # the 0.1.59 zips' line: 75;86;89;120 real + 120 PTX, portable, native experts, no tests (the K-quant and Q6_K options at their defaults)
         got = B.configure_args(Path("S"), Path("Bd"), "cuda13", CUDA13, [])
         self.assertEqual(got, ["-G", "Ninja", "-S", "S", "-B", "Bd", "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF",
-                               "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_PORTABLE=ON", "-DSTRATA_MMQ=OFF",
+                               "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_PORTABLE=ON",
                                "-DCMAKE_CUDA_ARCHITECTURES=75-real;86-real;89-real;120-real;120-virtual",
                                "-DCMAKE_CUDA_COMPILER=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/bin/nvcc.exe",
                                "-DCUDAToolkit_ROOT=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0"])
@@ -39,9 +39,9 @@ class ConfigureLine(unittest.TestCase):
         self.assertEqual(B.VARIANTS["cuda13"][2], "580.65")
 
     def test_extra_arguments_come_last_and_the_override_is_named(self):
-        got = B.configure_args(Path("S"), Path("Bd"), "cuda13", CUDA13, ["-DSTRATA_MMQ=ON"], ggml_dir="C:\\ref\\llama.cpp")
-        self.assertEqual(got[-2:], ["-DSTRATA_GGML_DIR=C:/ref/llama.cpp", "-DSTRATA_MMQ=ON"])
-        self.assertLess(got.index("-DSTRATA_MMQ=OFF"), got.index("-DSTRATA_MMQ=ON"))   # the A/B override wins (the last -D counts)
+        got = B.configure_args(Path("S"), Path("Bd"), "cuda13", CUDA13, ["-DSTRATA_WINDOW_MAX_T=16"], ggml_dir="C:\\ref\\llama.cpp")
+        self.assertEqual(got[-2:], ["-DSTRATA_GGML_DIR=C:/ref/llama.cpp", "-DSTRATA_WINDOW_MAX_T=16"])
+        self.assertEqual([a for a in got if "MMQ" in a], [])   # 0.2.16: no MMQ option exists any more
 
     def test_an_arch_override_keeps_ptx_for_the_last(self):
         self.assertEqual(B.parse_archs("120"), (120,))

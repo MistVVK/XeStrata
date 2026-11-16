@@ -14211,11 +14211,11 @@
    "since": "v0.2.12",
    "last_commit": "7bf5ec4ebf",
    "last_date": "2026-11-06",
-   "status": "opt-in",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[reviewed] Documented =1/2 int8 kernel for IQ4 experts, \"each is off unless you set it\". [docs/DETAILS.md:1082]",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [reviewed] Documented =1/2 int8 kernel for IQ4 experts, \"each is off unless you set it\". [docs/DETAILS.md:1082]",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_IQ512_FUSED_MAX",
@@ -19427,11 +19427,11 @@
    "since": "v0.1.45",
    "last_commit": "9d53a1a8db",
    "last_date": "2026-11-13",
-   "status": "opt-in",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[reviewed] Documented opt-in needing STRATA_MMQ_TAB build; E23 rejected it as default but it is a user feature. [docs/DETAILS.md:1081]",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [reviewed] Documented opt-in needing STRATA_MMQ_TAB build; E23 rejected it as default but it is a user feature. [docs/DETAILS.md:1081]",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_MMQ_DIRECT_LOG",
@@ -19534,18 +19534,6 @@
     {
      "file": "src/core/gfx12_extra_test.cpp",
      "line": 96,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "src/prefill/mmq_kq_loader.cpp",
-     "line": 110,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "src/prefill/moe_mmq.cu",
-     "line": 51,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -19676,11 +19664,11 @@
    "since": "v0.2.7",
    "last_commit": "62b6a47ea4",
    "last_date": "2026-11-12",
-   "status": "opt-in",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[auto] documented for users (docs/OLDER_GPUS.md:191), 1 more",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [auto] documented for users (docs/OLDER_GPUS.md:191), 1 more",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_MMVF_CHECK",
@@ -30143,31 +30131,12 @@
   {
    "name": "STRATA_PREFILL_NVFP4",
    "backends": [
-    "cuda",
     "cuda-hip"
    ],
    "reads": [
     {
-     "file": "src/prefill/mmq_expert_bench.cpp",
-     "line": 114,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "src/prefill/mmq_nvfp4_parity.cpp",
-     "line": 340,
-     "backend": "cuda",
-     "fn": "getenv"
-    },
-    {
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2946,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "src/prefill/moe_mmq.cu",
-     "line": 201,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -33984,11 +33953,11 @@
    "since": "v0.1.45",
    "last_commit": "c675f5b787",
    "last_date": "2026-10-14",
-   "status": "research",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[reviewed] \"No gain measured; keep the defaults\"; documented tuning pair. [docs/DETAILS.md:1119]",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [reviewed] \"No gain measured; keep the defaults\"; documented tuning pair. [docs/DETAILS.md:1119]",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_RAM_ADAPT",
@@ -43555,11 +43524,11 @@
    "since": "v0.2.12",
    "last_commit": "7bf5ec4ebf",
    "last_date": "2026-11-06",
-   "status": "research",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[auto] not documented for users; code default not readable from the call",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [auto] not documented for users; code default not readable from the call",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_WARM_GRAPHS",
@@ -43898,11 +43867,11 @@
    "since": "v0.2.7",
    "last_commit": "5dbd8774d8",
    "last_date": "2026-10-26",
-   "status": "opt-in",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[auto] documented for users (docs/OLDER_GPUS.md:197)",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [auto] documented for users (docs/OLDER_GPUS.md:197)",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_XN_F16",

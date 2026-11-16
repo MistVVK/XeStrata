@@ -49,17 +49,16 @@ real=""; for a in $(echo "$archs" | tr ';,' '  '); do real="$real;${a}-real"; do
 last=$(echo "$archs" | tr ';,' '  ' | awk '{print $NF}')
 cd "$repo"
 "$cmake" -G Ninja -S . -B "$build" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
-    -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
+    -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_SKIP_BUILD_RPATH=OFF '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
-    -DSTRATA_MMQ=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake
-# without llama.cpp's MMQ, as the x86 release builds since 0.2.14 (named here: a build folder configured before keeps ON in its cache).
+    "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake
+# without llama.cpp's MMQ, as the x86 release builds since 0.2.14 (the MMQ build path left the tree in 0.2.16).
 # Such a build turns Strata's fused prompt kernels on for every layer they cover (src/prefill/prefill.cpp, own_only_switches.hpp), on the
 # GB10 too: IQ3_S, UD-IQ4_XS and UD-Q4_K_XL ran 48 of 48 layers on them on a GB10 (par/RESULTS-SPARK-R1.md, 11-14 / 11-15), the rest
 # takes the FP16 path.  On a GB10 (11-16, users' launch lines) this build gave the same tokens as the same source built with MMQ (IQ3_S and
 # UD-Q4_K_XL, 125 of 125 requests each) and the same forced-token KL against the FP16 prompt path at 8,192 tokens (IQ3_S, bit-identical);
 # against the released 0.1.59 engine its prompt time was 0.66 / 1.01 / 0.99 / 0.98 (IQ3_S) and 0.58 / 0.80 / 0.86 / 0.89 (UD-Q4_K_XL)
-# at 256 / 2,048 / 8,192 / 32,000 tokens (medians of 5 interleaved pairs).  strata_kq (libstrata_kq.so) exists only in a build with MMQ: STRATA_CMAKE_EXTRA=-DSTRATA_MMQ=ON builds the old
-# path (A/B runs)
+# at 256 / 2,048 / 8,192 / 32,000 tokens (medians of 5 interleaved pairs).  MMQ comparison builds come from the v0.2.15 tag.
 . "$repo/packaging/engine_targets.sh"
 targets=$(engine_targets "$cmake" "$build")
 # shellcheck disable=SC2086

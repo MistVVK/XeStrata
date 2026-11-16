@@ -26,17 +26,17 @@ class Gfx906CMake(unittest.TestCase):
             before = text[:match.start()]
             self.assertGreater(before.rfind("#if defined(STRATA_HAVE_QWEN35)"), before.rfind("#endif"), match.group(0))
 
-    def test_the_w4a4_target_gets_the_hip_definition(self):
-        self.assertRegex(TEXT, r"if\(TARGET strata_mmq_w4a4\)\n\s+target_compile_definitions\(strata_mmq_w4a4 PRIVATE GGML_USE_HIP\)")
-
-    def test_overlay_sources_and_the_f16_stub_are_in_the_gfx906_build(self):
+    def test_the_f16_stub_is_in_the_gfx906_build(self):
+        # 0.2.16: llama.cpp's MMQ (and with it the trellis overlay and the W4A4 unit) is out of the tree; strata_pf_own, Strata's own prompt
+        # kernels, takes moe_f16_kq.cu and moe_p1a.cu on gfx906 (moe_fused_iq.cu calls them), and every .cu of src/ is compiled as HIP
+        own = re.search(r"macro\(strata_cuda_pf_own\).*?endmacro\(\)", TEXT, re.S)
+        self.assertIsNotNone(own)
+        block = own.group(0)[own.group(0).index("if(STRATA_HIP_GFX906)"):]
+        self.assertIn("target_sources(strata_pf_own PRIVATE src/prefill/moe_f16_kq.cu)", block)
+        self.assertIn("target_sources(strata_pf_own PRIVATE src/prefill/moe_p1a.cu)", block)
         tail = HIP_TEXT[HIP_TEXT.index("# HIP gfx906: every CUDA source"):]
-        self.assertIn("${_strata_tq_overlay_dir}/quantize.cu", tail)
-        self.assertIn("mmq-instance-${_t}.cu", tail)
-        # (P4-SPLIT: in strata_pf_own, Strata's own prompt kernels, beside moe_fused_iq.cu that calls it)
-        self.assertIn("target_sources(strata_pf_own PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu)", tail)
-        self.assertLess(tail.index("moe_f16_kq.cu"), tail.index("set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)"))
-
+        self.assertIn("set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)", tail)
+        self.assertNotIn("strata_mmq", TEXT.replace("strata_mmq_ids", ""))
 
 if __name__ == "__main__":
     unittest.main()

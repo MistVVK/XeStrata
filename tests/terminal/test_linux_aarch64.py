@@ -115,12 +115,12 @@ class ReleaseTools(unittest.TestCase):
         self.assertIn(b"-DSTRATA_PORTABLE=ON", raw)
 
     def test_the_spark_engine_is_built_without_mmq(self):
-        # 0.2.15: the Spark's engine has no llama.cpp MMQ, as the x86 release builds (the release script and setup's own build)
+        # 0.2.15: the Spark's engine has no llama.cpp MMQ, as the x86 release builds; 0.2.16: the MMQ build path is gone, so no line names it
         raw = (ROOT / "spark" / "build_engine.sh").read_bytes()
-        self.assertIn(b"-DSTRATA_MMQ=OFF", raw)
-        self.assertNotIn(b"    -DSTRATA_MMQ=ON", raw)
+        self.assertNotIn(b"-DSTRATA_MMQ=", raw)
+        self.assertNotIn(b"option(STRATA_MMQ ", (ROOT / "CMakeLists.txt").read_bytes())
         setup_text = (ROOT / "setup.py").read_text(encoding="utf-8")
-        self.assertIn('"-DSTRATA_MMQ=OFF",', setup_text)
+        self.assertNotIn('"-DSTRATA_MMQ=', setup_text)
         self.assertNotIn('("ON" if is_arm64() else "OFF")', setup_text)
 
 

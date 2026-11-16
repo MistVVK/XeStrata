@@ -274,8 +274,7 @@ bartowski's Swift-1.5 Q4_0, whose header shows the same formats.
 - Tests: the packer's synthetic 4-shard and conversion tests
   (`.venv/bin/python -m unittest discover -s tools -p test_iq_pack.py`) and the CTests `gguf_split_test`,
   `expert_layout_test`, `native_expert_parity_*` (the three real expert format pairs against ggml-cpu, the Q5_1 min term,
-  Q8_0 rows, Q4_0/Q4_0 and Q4_0/Q4_1). With `-DSTRATA_MMQ_KQUANTS=ON`, `prefill_mmq_kquant_test` checks the prompt path's
-  MMQ products for Q4_K / Q5_K / Q5_1 / Q8_0 against ggml's dequantized weights.
+  Q8_0 rows, Q4_0/Q4_0 and Q4_0/Q4_1).
 - Not validated: sampled decoding and long conversations. Please report what you see.
 
 ## Credits

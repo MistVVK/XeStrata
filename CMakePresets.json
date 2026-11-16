@@ -25,7 +25,7 @@
     {
       "name": "cuda-compile",
       "displayName": "CUDA compile-only (the release flags of packaging/build_cuda_linux.sh, no tests)",
-      "description": "Builds the strata and strata_kq targets for the given CUDA architectures. No GPU is needed to compile; nothing is run. ggml is the vendored third_party/strata-ggml; -DSTRATA_GGML_DIR=<llama.cpp checkout> overrides it.",
+      "description": "Builds the strata target for the given CUDA architectures. No GPU is needed to compile; nothing is run. ggml is the vendored third_party/strata-ggml; -DSTRATA_GGML_DIR=<llama.cpp checkout> overrides it.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
@@ -35,7 +35,6 @@
         "STRATA_NATIVE_EXPERTS": "ON",
         "STRATA_PORTABLE": "ON",
         "STRATA_Q6K_EXPERTS": "ON",
-        "STRATA_MMQ_KQUANTS": "ON",
         "STRATA_EXPERIMENTAL_SM60": "OFF",
         "CMAKE_CUDA_ARCHITECTURES": "86-real;89-real;89-virtual"
       }
@@ -51,7 +50,6 @@
         "STRATA_ENABLE_HIP": "ON",
         "STRATA_ENABLE_CUDA": "OFF",
         "STRATA_BUILD_TESTS": "OFF",
-        "STRATA_PREFILL_MMQ": "ON",
         "STRATA_PORTABLE": "ON",
         "CMAKE_HIP_ARCHITECTURES": "gfx1100;gfx1201"
       }
@@ -60,7 +58,7 @@
   "buildPresets": [
     { "name": "cpu-check", "configurePreset": "cpu-check", "jobs": 0 },
     { "name": "cpu-check-native", "configurePreset": "cpu-check-native", "jobs": 0 },
-    { "name": "cuda-compile", "configurePreset": "cuda-compile", "targets": ["strata", "strata_kq"], "jobs": 0 },
+    { "name": "cuda-compile", "configurePreset": "cuda-compile", "targets": ["strata"], "jobs": 0 },
     { "name": "hip-compile", "configurePreset": "hip-compile", "targets": ["strata"], "jobs": 0 }
   ],
   "testPresets": [

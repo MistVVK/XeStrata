@@ -187,16 +187,6 @@ if(STRATA_BUILD_TESTS)
   target_compile_options(split_moe_tile_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
   set_target_properties(split_moe_tile_test PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CXX_STANDARD 17)
   target_link_libraries(split_moe_tile_test PRIVATE Threads::Threads)
-  # src/qdot.cuh (the split's decode dots) against ggml-cuda's vecdotq.cuh, bit for bit, on random blocks (not a ctest: needs a GPU). The one split
-  # target that includes ggml-cuda, as the reference; it goes when the vendored tree goes (phaseA-tests/par/RESULTS-OWN-4S.md, oracle note)
-  if(NOT _fnx_hip AND _strata_ggml_root AND EXISTS "${_strata_ggml_root}/ggml/src/ggml-cuda/vecdotq.cuh")
-    add_executable(split_qdot_test ${_sp}/tools/qdot_test.cu)
-    target_include_directories(split_qdot_test PRIVATE ${_sp}/src ${_strata_ggml_root}/ggml/src/ggml-cuda ${_strata_ggml_root}/ggml/src
-                               ${_strata_ggml_root}/ggml/include ${_sp_quant})
-    target_compile_definitions(split_qdot_test PRIVATE FNX_NCARD=${_n0} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0)
-    target_compile_options(split_qdot_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
-    set_target_properties(split_qdot_test PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CXX_STANDARD 17)
-  endif()
   # the same dots against the stored digests tools/qdot_golden.txt (written by split_qdot_test --write-golden), without ggml: the check that stays when the
   # vendored tree goes.  A ctest that skips (77) without a GPU.  CUDA only for now: the HIP build gets it once its bits were compared on a card.
   if(NOT _fnx_hip)
