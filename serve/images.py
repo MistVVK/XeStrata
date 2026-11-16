@@ -4459,19 +4459,17 @@ class ImageTools:
             for n in lora_api.BLOCK_PRESETS.get(g.family, {}):
                 has.setdefault(n, []).append(g.model)
         presets = ["all (every model)"] + [n if len(v) == len(gens) else f"{n} ({', '.join(v)} only)"
-                                           for n, v in has.items()]
+                                            for n, v in has.items()]
         names = list(dict.fromkeys(e["name"] for g in gens if g.loras.takes for e in g.loras.listing()))
         params = dict(t["parameters"])
         params["properties"] = {**params["properties"], "lora": {
             "type": "array", "description": "LoRAs: " + "; ".join(self._lora_lines(gens)),
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "enum": names},
-                    "scale": {"type": "number", "description": "strength, default 1"},
-                    "blocks": {"type": "string",
-                               "description": ("the strength each DiT block: " + "; ".join(presets)
-                                               + "; or a number each block with commas")}},
+            "items": {"type": "object", "properties": {
+                "name": {"type": "string", "enum": names},
+                "scale": {"type": "number", "description": "strength, default 1"},
+                "blocks": {"type": "string",
+                           "description": "the strength each DiT block: " + "; ".join(presets)
+                                          + "; or a number each block with commas"}},
                 "required": ["name"]}}}
         t = {**t, "parameters": params}
         if self.skills == "inline" and (body := self._skills().body(SKILL_LORA)):

@@ -14,6 +14,7 @@ metadata:
   `watercolor`, `photo`, `anime coloring`), so the LoRA brings the character and not its pictures' style.
 - A style LoRA (kind `style`): `blocks` `"style"` where `blocks` lists it, else leave `blocks` out; `scale` 1.
   Describe the subject as the user asked.
-- A kind not given: judge it by its name and trigger; when unsure, leave `blocks` out.
+- A kind not given: judge it by its name and trigger. A character's name (a person, a creature, a series'
+  character) is a character LoRA; an artist's or a look's name, a style LoRA. When still unsure, leave `blocks` out.
 - The user's own strength or block weights are used as they give them.
 - A character LoRA with a style LoRA: both, the style's words left to the style LoRA.
