@@ -6417,7 +6417,11 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     if (tm <= 0) tm = (avg >= 96 && b_ok) ? 8 : (int) std::max<int64_t>(2, std::min<int64_t>(4, (avg + 8) / 16));
     const I8Volta vo = i8_volta();
     // tile 5: the Volta tensor-core form (i8h_volta.cuh; bit-identical output), on a compute capability 7.0 card for the formats it covers
+#if defined(__HIPCC__)
+    const bool h_ok = false;   // (i8h_volta.cuh is CUDA only: i8_volta() is off on HIP)
+#else
     const bool h_ok = vo.on && i8h_type(L.gu_type) && i8h_type(L.d_type) && L.n_ff % 32 == 0 && L.n_embd % 64 == 0;
+#endif
     if (tm == 5 && !h_ok) tm = 4;
     if (tm != 5) tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
     // Volta (i8_expert_rule.hpp, i8_tile_two_blocks): the big-grid formats read their grid from global memory, and the pick is lowered to the largest tile that keeps two blocks
