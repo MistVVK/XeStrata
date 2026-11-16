@@ -11943,7 +11943,10 @@ int main(int argc, char** argv) {
         } else if (o.prefill_auto && d_res == nullptr) {
             o.prefill_chunk = 1024;       // #85: no expert cache at all (a full 8 GB card): small buffers of its own
         }
-        if (o.prefill_head_alias) {
+        // pf_parts is empty when there is no VRAM expert tier (no --expert-profile, or no VRAM left for it): the alias has
+        // nothing to borrow then, and the verifier below stops the start with its own "--expert-profile" error.  It read
+        // pf_parts[0] before and ended in a SIGSEGV instead (found on p2003 with #5188's gate).
+        if (o.prefill_head_alias && !pf_parts.empty()) {
             for (PfPart& p : pf_parts) {
                 p.first = p.cache->slots() > 1 ? 1 : -1;
                 p.first_now = p.first;
