@@ -152,6 +152,7 @@ STRATA_PROGRAMS = {
     "strata_control/tune_session.py": 1,  # tuning worker (quiet_crash_env)
     "strata_control/tuning.py": 1,     # engine --help (engine_env)
     "strata_control/shape_engine.py": 2,  # engine --version / --geometry (inherit)
+    "strata_control/native_helpers.py": 1,  # an opted-in native helper (strata-<name>, no ggml; inherits)
     "strata_control/updater.py": 4,       # --version probes and the AMD test start's strata-device probe (inherit)
     "strata_cli/bench_standard.py": 2,    # `strata.py serve` (inherits: cli.main sets it) + taskkill
     "strata_cli/launch/runner.py": 2,     # setup.py and the other children (_env)
