@@ -329,10 +329,12 @@ class Catalog:
         hw["gpus"] = self._admit_old_nvidia(list(hw.get("gpus") or []))
         if not str(hw.get("os", "")).startswith("Windows"):
             arc = intel_arc_cards()
-            if arc:
-                # the shared hardware reader knows NVIDIA and AMD only; an Arc is added here, also beside other makes (the plan then says the
-                # Intel cards exist and how to use them: --backend intel); their numbers are the Intel engine's own (0, 1, ...)
-                have = list(hw.get("gpus") or [])
+            have = list(hw.get("gpus") or [])
+            if arc and not any(g.get("vendor") == "intel" for g in have):
+                # the shared hardware reader adds the Arc only on a PC with no usable NVIDIA / AMD card and the Intel engine
+                # (strata_control/intel_app.py cards_to_add, the same reader); the rest get it here, also beside other makes (the plan
+                # then says the Intel cards exist and how to use them: --backend intel); their numbers are the Intel engine's own
+                # (0, 1, ...). Added once: an A750 with the Intel engine was listed twice ("Arc A750 8 GB x2", p1006 11-16).
                 hw["gpus"] = have + arc
         return hw
 
