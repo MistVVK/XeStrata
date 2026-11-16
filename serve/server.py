@@ -1904,12 +1904,14 @@ class StrataEngine:
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
-        releasing = self.slot_releasing
+        releasing, claims = self.slot_releasing, self.slot_claims
+        if self.gen != born:     # #5657: a restart came in since the check above (its number moves before its objects
+            return               # do): these sets may be the NEW engine's, whose request holds this slot number now
         with self.slot_cv:
             # Transfer the claim before the waiter can free the slot. A queued BDONE may let the next request
             # claim it immediately; the previous request must not discard that new claim afterwards.
             releasing.add(slot)
-            self.slot_claims.discard(slot)
+            claims.discard(slot)
 
         def wait():
             end = time.monotonic() + self.QUARANTINE_S      # no-progress limit: every line of the slot starts it again
