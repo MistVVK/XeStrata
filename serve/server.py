@@ -2772,6 +2772,7 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         lines_q, stop_line = self.lines, "STOP\n"
+        proc0 = self.proc                # the engine this request runs on (#5573: its STOP goes to it, never to a successor)
         # logprobs: the engine writes "LP <logprob> [id:logprob ...]" right after each "T <id>" (the same
         # flush), read here before the token is yielded, so whoever takes the token finds its line in
         # lp_lines.  Not asked for = the deque stays empty and nothing on this path changes.
@@ -2890,6 +2891,8 @@ class StrataEngine:
                 # write then raises ValueError) before it clears `proc` (None then) - the STOP has nobody to reach, and
                 # the request's own outcome must not be replaced by that error
                 proc = self.proc
+                if proc is not proc0:        # #5573: a restart replaced the engine; a STOP would end its successor's request
+                    proc = None
                 if self.can_stop and proc is not None:
                     try:
                         proc.stdin.write(stop_line)
