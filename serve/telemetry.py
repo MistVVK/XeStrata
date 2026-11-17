@@ -659,27 +659,44 @@ class _Metal:
             "die, so there is no PCIe link to show; the engine's own figures are in its log")
     cmd = ("ioreg", "-l", "-w0", "-r", "-c", "IOAccelerator")
 
+    _first: list = []                       # (M2 11-16) the registry as the first reader of this process saw it: the nodes and the name do not change
+
     def __init__(self, index=0, run=None):
         self.index = index
         self._run = run or self._ioreg
-        self.nodes = len(self._blocks())
+        if run is None:                     # the real registry: read once per process for what does not change (a plan asked it six times)
+            if not _Metal._first:
+                _Metal._first.append(self._ioreg())
+            text = _Metal._first[0]
+            blocks = self._blocks(text)
+        else:
+            blocks = self._blocks()
+        self.nodes = len(blocks)
         self._name = None
-        b = self._block()
+        b = blocks[index] if 0 <= index < len(blocks) else None
         if b:
             m = re.search(r'"model" = "([^"]+)"', b)
             self._name = m.group(1) if m else None
 
+    _recent: list = []                      # (M2) [monotonic time, text]: one registry read serves the questions of the same moment
+    FRESH_S = 1.0                           # the server's telemetry polls every few seconds, so its readings stay live
+
     @staticmethod
     def _ioreg():
+        now = time.monotonic()
+        if _Metal._recent and now - _Metal._recent[0][0] < _Metal.FRESH_S:
+            return _Metal._recent[0][1]
         try:
-            return subprocess.run(list(_Metal.cmd), capture_output=True, text=True, timeout=10).stdout or ""
+            text = subprocess.run(list(_Metal.cmd), capture_output=True, text=True, timeout=10).stdout or ""
         except (OSError, subprocess.SubprocessError):
-            return ""
+            text = ""
+        _Metal._recent[:] = [(time.monotonic(), text)]
+        return text
 
-    def _blocks(self):
-        """The accelerator nodes, in the registry's order: every node that carries a PerformanceStatistics."""
+    def _blocks(self, text=None):
+        """The accelerator nodes, in the registry's order: every node that carries a PerformanceStatistics. `text`: a registry already read."""
         try:
-            out = self._run() or ""
+            out = (self._run() if text is None else text) or ""
         except OSError:                     # ioreg missing, or a caller's runner that raises
             return []
         return [b for b in re.split(r"^\s*\+-o ", out, flags=re.M) if '"PerformanceStatistics"' in b]

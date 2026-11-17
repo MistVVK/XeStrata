@@ -20,12 +20,16 @@ from strata_control import acquisition, engine_component as ec, feed as feedmod,
 from strata_control.targets import host_platform
 from tests.terminal import update_fixture as fx
 
-PLATFORM = host_platform()
+# each case names the engine family and the folder tag of the machine it runs on (see UpdaterCase.setUp)
 WINDOWS = os.name == "nt"
+PLATFORM = host_platform()          # (the other update test files import it: the platform key of this machine)
 
 
 class UpdaterCase(unittest.TestCase):
     def setUp(self):
+        self.platform = host_platform()           # the machine this case really runs on: a package built here has to be one
+        self.family = fx.local_family()           # this platform takes, or the resolver drops it before the test starts
+        self.tag = f"{self.family['backend']}-{self.family['variant']}" if self.family["variant"] else self.family["backend"]
         self.temp = tempfile.TemporaryDirectory(prefix="strata-updater-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -40,7 +44,7 @@ class UpdaterCase(unittest.TestCase):
             os.environ.pop(name, None)
         env = mock.patch.dict(os.environ, {
             "STRATA_PROFILE_DIR": str(self.root / "profiles"), "STRATA_RUNTIME_DIR": str(self.root / "runtime"),
-            "STRATA_COMPONENTS_DIR": str(self.components), "STRATA_ENGINE_BACKEND": "cuda",
+            "STRATA_COMPONENTS_DIR": str(self.components), "STRATA_ENGINE_BACKEND": self.family["backend"],
             "FAKE_ENGINE_MARK": str(self.root / "ran.txt")})
         env.start()
         self.addCleanup(env.stop)
@@ -64,7 +68,7 @@ class UpdaterCase(unittest.TestCase):
         patch = mock.patch.dict(os.environ, {"STRATA_UPDATE_TRUSTED_KEYS": str(self.test_keys)})
         patch.start()
         self.addCleanup(patch.stop)
-        self.hardware = {"platform": PLATFORM, "backend": "cuda", "runtime": None, "nvidia_driver": "610.47",
+        self.hardware = {"platform": self.platform, "backend": self.family["backend"], "runtime": None, "nvidia_driver": "610.47",
                          "cuda_archs": ["sm_86"], "gfx": []}
         self.models = self.root / "models"
         self.models.mkdir()
@@ -98,7 +102,7 @@ class UpdaterCase(unittest.TestCase):
         (tokenizer / "merges.txt").write_text("a b")
         (tokenizer / "token_type.json").write_text(json.dumps([0] * 257 + [3, 3, 3]))
         self.config = self.root / "run.json"
-        self.config.write_text(json.dumps({"exe": "/some/old/engine", "backend": "cuda", "tokenizer": str(tokenizer), "args": [],
+        self.config.write_text(json.dumps({"exe": "/some/old/engine", "backend": self.family["backend"], "tokenizer": str(tokenizer), "args": [],
                                            "cwd": str(self.root), "model_name": "fake", "host": "127.0.0.1", "port": 0}))
 
     # ------------------------------------------------------------------ helpers
@@ -145,7 +149,7 @@ class UpdaterCase(unittest.TestCase):
         return sorted(p.name for p in folder.iterdir() if p.is_dir()) if folder.exists() else []
 
     def resolved(self):
-        return ec.resolve(self.components, backend="cuda").version
+        return ec.resolve(self.components, backend=self.family["backend"]).version
 
     def assert_user_data_untouched(self):
         self.assertEqual(self.preset.read_bytes(), self.preset_bytes, "a saved preset must not change")
@@ -163,7 +167,7 @@ class EngineUpdate(UpdaterCase):
         self.assertEqual(report["engine"]["status"], "available")
         self.assertEqual((report["engine"]["installed"]["version"], report["engine"]["offered"]["version"]), ("0.1.45", "0.1.46"))
         self.assertEqual([r[1] for r in self.server.requests], ["/strata-feed.json", "/strata-feed.json.sig"])
-        self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-cuda-cuda13"])
+        self.assertEqual(self.engine_folders(), [f"0.1.45-{self.platform}-{self.tag}"])
 
     def test_update_downloads_verifies_test_starts_then_switches(self):
         old = self.install_current()
@@ -174,7 +178,7 @@ class EngineUpdate(UpdaterCase):
         self.assertEqual((out["exit_code"], result["status"], result["changed"]), (0, "updated", True), out)
         self.assertEqual(result["test_start"]["mode"], "full")
         self.assertEqual(self.resolved(), "0.1.46")
-        self.assertEqual(sorted(self.engine_folders()), [f"0.1.45-{PLATFORM}-cuda-cuda13", f"0.1.46-{PLATFORM}-cuda-cuda13"],
+        self.assertEqual(sorted(self.engine_folders()), [f"0.1.45-{self.platform}-{self.tag}", f"0.1.46-{self.platform}-{self.tag}"],
                          "the previous version stays for a manual rollback")
         # the test start ran the staged copy, not a file in the live folder
         ran = (self.root / "ran.txt").read_text().splitlines()[0]
@@ -209,7 +213,7 @@ class EngineUpdate(UpdaterCase):
         self.publish(("0.1.47", fx.GOOD_ENGINE))
         out = updater.run_update(self.ctx(), control=False)
         self.assertEqual(out["results"][0]["status"], "updated")
-        self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-cuda-cuda13", f"0.1.46-{PLATFORM}-cuda-cuda13", f"0.1.47-{PLATFORM}-cuda-cuda13"])
+        self.assertEqual(self.engine_folders(), [f"0.1.45-{self.platform}-{self.tag}", f"0.1.46-{self.platform}-{self.tag}", f"0.1.47-{self.platform}-{self.tag}"])
         self.assertEqual(out["results"][0]["removed"], [])
         self.assertEqual(self.resolved(), "0.1.47")
 
@@ -224,7 +228,7 @@ class EngineUpdate(UpdaterCase):
         self.assertNotIn("server_exited", result["error"], "the engine's own words stay out of the sentence")
         self.assertIn("strata update --force", result["error"])
         self.assertEqual(self.resolved(), "0.1.45")
-        self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-cuda-cuda13"], "the failed engine was never put in the live folder")
+        self.assertEqual(self.engine_folders(), [f"0.1.45-{self.platform}-{self.tag}"], "the failed engine was never put in the live folder")
         self.assertEqual(sorted(p.name for p in (self.components / ".s").iterdir()), [])
         self.assertEqual(preset_marks.pending(self.state_base), [])
         self.assert_user_data_untouched()
@@ -361,7 +365,7 @@ class EngineUpdate(UpdaterCase):
         out = updater.rollback_engine(self.ctx())
         self.assertEqual((out["status"], out["from"], out["to"]), ("rolled-back", "0.1.46", "0.1.45"))
         self.assertEqual(self.resolved(), "0.1.45")
-        self.assertEqual(ec.status(self.components, backend="cuda")["pinned"], f"0.1.45-{PLATFORM}-cuda-cuda13")
+        self.assertEqual(ec.status(self.components, backend=self.family["backend"])["pinned"], f"0.1.45-{self.platform}-{self.tag}")
         self.assertEqual(preset_marks.pending(self.state_base), [], "back on the engine the presets were measured on: nothing owed")
         self.assertEqual(self.resolved(), "0.1.45")
         # the update still offers the version that was rolled back from; it is already here, so nothing is downloaded and it becomes the engine in use
@@ -391,7 +395,7 @@ class EngineUpdate(UpdaterCase):
 
     def test_a_broken_installed_engine_is_replaced_by_a_good_one(self):
         folder = self.install_current("0.1.46")
-        library = next(p for p in folder.iterdir() if p.name.startswith(("cudart", "libcudart")))
+        library = next(p for p in folder.iterdir() if p.name.startswith(("cudart", "libcudart", "libggml")))
         body = bytearray(library.read_bytes())
         body[5] ^= 0xFF
         library.write_bytes(bytes(body))
@@ -402,8 +406,10 @@ class EngineUpdate(UpdaterCase):
         self.assertEqual(self.resolved(), "0.1.46")
 
     def test_the_package_for_another_gpu_is_not_offered(self):
-        self.publish(("0.1.46", fx.GOOD_ENGINE, {"archs": ("sm_90",)}))
-        out = updater.run_update(self.ctx(hardware={**self.hardware, "cuda_archs": ["sm_61"]}), control=False)
+        fx.cuda_pc(self)                        # about CUDA code for another card: name a PC that takes CUDA
+        cuda = {**self.hardware, "platform": host_platform(), "backend": "cuda", "cuda_archs": ["sm_61"]}
+        self.publish(("0.1.46", fx.GOOD_ENGINE, {"backend": "cuda", "archs": ("sm_90",)}))
+        out = updater.run_update(self.ctx(hardware=cuda), control=False)
         self.assertEqual(out["results"][0]["status"], "none-for-this-pc")
         self.assertIn("sm_61", " ".join(out["results"][0]["reasons"]))
         self.assertEqual(self.archive_requests(), [])
@@ -452,7 +458,7 @@ class StartPathSignature(UpdaterCase):
         (target / ec.MANIFEST).write_text(json.dumps(manifest))
         ec.register_signature_verifier(None)
         with self.assertRaises(ec.EngineMissing) as caught:
-            ec.resolve(self.components, backend="cuda")
+            ec.resolve(self.components, backend=self.family["backend"])
         self.assertIn("signature", str(caught.exception))
 
     def test_without_trusted_keys_a_signed_package_is_unverified_and_required_signing_refuses_it(self):
@@ -555,7 +561,7 @@ class OtherComponents(UpdaterCase):
         (self.release / "app" / "Strata_setup.bin").write_bytes(installer)
         sig = fx.minisign_sign(installer + (b"x" if tamper else b""), secret)
         app = {"version": version, "notes": "Faster starts.", "pub_date": "2026-10-15T00:00:00Z",
-               "platforms": {feedmod.TAURI_TARGETS[PLATFORM]: {"url": "app/Strata_setup.bin", "signature": sig,
+               "platforms": {feedmod.TAURI_TARGETS[self.platform]: {"url": "app/Strata_setup.bin", "signature": sig,
                                                               "sha256": hashlib.sha256(installer).hexdigest(), "size": len(installer)}}}
         (self.root / "tauri.json").write_text(json.dumps(app))
         from feed_tool import build_feed
@@ -601,7 +607,7 @@ class OtherComponents(UpdaterCase):
         (bundle / "strata_control" / "__init__.py").write_text("")
         from feed_tool import build_feed, pack_control
         (self.release / "control").mkdir()
-        pack_control(bundle, self.release / "control", version="0.1.46", platform=PLATFORM)
+        pack_control(bundle, self.release / "control", version="0.1.46", platform=self.platform)
         build_feed(self.release, key=self.key, sequence=1, control_dir=self.release / "control")
         out = updater.run_update(self.ctx(), engine=False, control=True)
         self.assertEqual(out["results"][0]["status"], "updated", out)
@@ -617,7 +623,7 @@ class OtherComponents(UpdaterCase):
         (bundle / "strata.py").write_text("import sys; sys.exit(9)\n")
         from feed_tool import build_feed, pack_control
         (self.release / "control").mkdir()
-        pack_control(bundle, self.release / "control", version="0.1.46", platform=PLATFORM)
+        pack_control(bundle, self.release / "control", version="0.1.46", platform=self.platform)
         build_feed(self.release, key=self.key, sequence=1, control_dir=self.release / "control")
         out = updater.run_update(self.ctx(), engine=False, control=True)
         self.assertEqual((out["exit_code"], out["results"][0]["status"]), (6, "failed"))
@@ -633,7 +639,7 @@ class OtherComponents(UpdaterCase):
         os.symlink("libpython3.12.so", bundle / "python" / "lib" / "libpython3.so")
         from feed_tool import build_feed, pack_control
         (self.release / "control").mkdir()
-        entry = pack_control(bundle, self.release / "control", version="0.1.46", platform=PLATFORM)
+        entry = pack_control(bundle, self.release / "control", version="0.1.46", platform=self.platform)
         build_feed(self.release, key=self.key, sequence=1, control_dir=self.release / "control")
         out = updater.run_update(self.ctx(), engine=False, control=True)
         self.assertEqual(out["results"][0]["status"], "updated", out)
@@ -658,7 +664,7 @@ class OtherComponents(UpdaterCase):
                     tar.addfile(info)
                 data = archive.read_bytes()
                 (self.release / "control" / "evil.entry.json").write_text(json.dumps({
-                    "version": "0.1.46", "platform": PLATFORM, "format": "tar.gz", "url": "control/evil.tar.gz", "size": len(data),
+                    "version": "0.1.46", "platform": self.platform, "format": "tar.gz", "url": "control/evil.tar.gz", "size": len(data),
                     "sha256": hashlib.sha256(data).hexdigest(), "installed_bytes": 100, "entry": "strata.py"}))
                 build_feed(self.release, key=self.key, sequence=self.sequence + 1, control_dir=self.release / "control")
                 self.sequence += 1

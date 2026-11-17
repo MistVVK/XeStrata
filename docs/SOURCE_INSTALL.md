@@ -139,6 +139,15 @@ this does not make every model pack compatible. Q2_0's CPU requirements differ f
 See the [CPU and build notes](DETAILS.md) and [older GPU guide](OLDER_GPUS.md) for the relevant hardware.
 Record the actual CPU, compiler, model and validation results when reporting an experimental build.
 
+### Using an engine you built with `strata launch`
+
+`strata launch` and the app start the engine installed in Strata's component folder, not the one in your checkout. To use your own build,
+run `strata components add-build <folder>`, where the folder holds the engine program you built (`strata`, its libraries and `BUILD.json`).
+Strata first checks that the program runs on this computer (`strata --version`) and is for this computer's kind of graphics card. It then
+copies it in as a local engine, not signed by Strata, and uses it from then on. `strata components engines` and `strata doctor` show it as
+a local build. Strata never switches to a local build by itself, not even when it is newer than the released engines.
+`strata components use newest` goes back to the released engines, and `strata components remove <folder>` deletes the local build.
+
 ## Updating
 
 Stop the running source engine before replacing it. Run `UPDATE.bat` on Windows or `./update.sh` on Linux.

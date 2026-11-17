@@ -105,6 +105,7 @@ class FetchInOwnFolder(unittest.TestCase):
         self.assertEqual(lay.config.read_bytes(), cfg_before, "the run config is the caller's to write")
         self.assertFalse((self.base / "Strata-data").exists(), "no second data folder")
 
+    @unittest.skipIf(sys.platform == "darwin", 'NVIDIA / AMD picture-reader rules, asked on a Mac host')
     def test_the_section_is_the_one_setup_writes_for_this_card(self):
         lay = Layout(self.base)
         small = lay.fetch(hardware={"vram_gb": 12, "make": "nvidia", "arch": 120})["vision"]
@@ -136,6 +137,7 @@ class FetchInOwnFolder(unittest.TestCase):
         self.assertTrue(result["fetched"], "downloaded because the copy there is not the pinned file")
         self.assertEqual(wrong.read_bytes(), BODY, "the bad copy was replaced by the checked download")
 
+    @unittest.skipIf(sys.platform == "darwin", 'NVIDIA / AMD picture-reader rules, asked on a Mac host')
     def test_the_path_the_run_config_names_is_kept_when_its_folder_is_there(self):
         lay = Layout(self.base, with_vision=True)
         named = Path(json.loads(lay.config.read_text())["vision"]["mmproj"])
@@ -292,6 +294,7 @@ class ReaderRule(unittest.TestCase):
     def section(self, asked="yes", **hw):
         return pictures.reader_section(self.engine, Path("/m/mm.gguf"), Path("/m/a.gguf"), asked, hw)
 
+    @unittest.skipIf(sys.platform == "darwin", 'NVIDIA / AMD picture-reader rules, asked on a Mac host')
     def test_amd_gets_the_gpu_reader_with_the_cpu_one_behind_it_from_24_gb(self):
         self.make(self.cpu, self.hip, build={"vision_archs": "gfx1201;gfx1100"})
         s, _ = self.section(vram_gb=32, make="amd", arch="gfx1201")
@@ -302,6 +305,7 @@ class ReaderRule(unittest.TestCase):
         self.assertFalse(s["gpu"])
         self.assertIn("gfx1030", note)
 
+    @unittest.skipIf(sys.platform == "darwin", 'NVIDIA / AMD picture-reader rules, asked on a Mac host')
     def test_nvidia_reader_the_build_has_no_code_for_runs_on_the_cpu(self):
         self.make(self.cpu, build={"vision_archs": "86;89", "ptx": False})
         s, note = self.section("gpu", vram_gb=48, make="nvidia", arch=75)

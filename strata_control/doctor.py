@@ -194,6 +194,15 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
     if components[-1]["status"] == "ok" and os.name != "nt" and not os.access(exe, os.X_OK):
         components[-1]["status"] = "invalid"
         components[-1]["reason"] = "engine file is not executable"
+    try:                                                 # (#5114) a local build added with `strata components add-build`: said, never hidden
+        from strata_control import engine_component as _ec
+        if _ec.read_manifest(exe.parent).local:
+            components[-1]["local_build"] = True
+            report["issues"].append({"code": "LOCAL_ENGINE_BUILD", "severity": "info",
+                                     "message": "the engine is a local build from this computer, not signed by Strata "
+                                                "(`strata components use newest` goes back to the released engines)"})
+    except (_ec.ComponentProblem, OSError):
+        pass
     build = exe.parent / "BUILD.json"
     if build.is_file():
         try:

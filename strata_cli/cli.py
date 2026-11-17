@@ -2154,7 +2154,7 @@ def _run(a: argparse.Namespace) -> int:
             return _components_backends(a)
         if a.command == "components" and a.components_command == "engine":
             return _components_engine(a)
-        if a.command == "update" or (a.command == "components" and a.components_command in ("update", "rollback", "install-file", "engines", "use", "remove")):
+        if a.command == "update" or (a.command == "components" and a.components_command in ("update", "rollback", "install-file", "engines", "use", "remove", "add-build")):
             from strata_cli import update_cmd
             return update_cmd.run(a)
         if a.command in ("doctor", "components"):

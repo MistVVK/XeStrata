@@ -107,7 +107,9 @@ class FolderScreen(Base):
             await press(pilot, *("enter",) * 7, "n", "enter")
             t = flat(app)
             self.assertIn("Storage", t)
-            self.assertIn(str(ctx.default_folder()), t)
+            folder = Path(ctx.default_folder())
+            # the end of the path: a long one is shortened in the middle on the screen (macOS: /private/var/folders/...)
+            self.assertIn(folder.parent.name + os.sep + folder.name, t)
         self.run_app(case)
 
     def test_the_save_summary_shows_a_typed_folder(self):

@@ -92,7 +92,11 @@ def add_parsers(sp, components_sp) -> list:
     install_file = components_sp.add_parser("install-file", help="install an engine package you downloaded yourself (no network; the package's signature is checked)")
     install_file.add_argument("file", help="the engine package (.tar.gz or .zip) from the release page")
     _common(install_file)
-    return [update, comp_update, rollback, install_file, engines, use, remove]
+    add_build = components_sp.add_parser("add-build", help="use an engine you built on this computer (./setup --build): added as a local, unsigned engine "
+                                                           "and used from now on; `strata components use newest` goes back")
+    add_build.add_argument("folder", help="the folder with the engine program you built (strata, its libraries and BUILD.json)")
+    _common(add_build)
+    return [update, comp_update, rollback, install_file, engines, use, remove, add_build]
 
 
 class _EngineFamilies(tuple):
@@ -332,6 +336,8 @@ def run(a) -> int:
             return 0
         if getattr(a, "components_command", None) in ("engines", "use", "remove"):
             return _engines_command(a, ctx, machine, fail)
+        if getattr(a, "components_command", None) == "add-build":
+            return _add_build_command(a, ctx, machine, root)
         if getattr(a, "components_command", None) == "install-file":
             ctx.trusted = signing.load_trusted_keys()
             ctx.serving = updater.serving_now
@@ -416,6 +422,26 @@ def _gb(n: int | None) -> str:
     return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{max(1, round(n / 1e6))} MB"
 
 
+def _add_build_command(a, ctx, machine: bool, root: Path) -> int:
+    """`strata components add-build FOLDER` (#5114): the build becomes a local, unsigned engine package and the engine in use, by this choice."""
+    from strata_control import engine_library as lib, local_engine, updater
+    ctx.serving = updater.serving_now
+    _maybe_wait(a, ctx, machine)
+    try:
+        added = local_engine.add_build(root, Path(a.folder), backend=a.backend, detected=None if a.backend else ctx.hardware.get("backend"))
+    except local_engine.AddBuildError as exc:
+        raise updater.UpdateError(str(exc), exc.exit_code) from None
+    out = lib.use_engine(ctx, lib.QWEN, added["folder"])
+    if machine:
+        print(json.dumps({"schema_version": 1, "ok": True, "added": added, **out}, ensure_ascii=False))
+        return 0
+    print(f"Engine {added['version']} from {Path(a.folder).expanduser()} is added as a local build ({added['folder']}) and is now in use.")
+    print("It is not signed by Strata: it runs because you chose it, and Strata never picks it by itself.")
+    print("`strata components use newest` goes back to the released engines; `strata components remove "
+          f"{added['folder']}` deletes it (after switching away from it).")
+    return 0
+
+
 def _engines_command(a, ctx, machine: bool, fail) -> int:
     """`strata components engines | use | remove`: the same list and the same switch / delete the app's Settings > Engine uses (strata_control/engine_library.py)."""
     from strata_control import engine_library as lib, updater
@@ -430,7 +456,8 @@ def _engines_command(a, ctx, machine: bool, fail) -> int:
         for family in listing["families"]:
             print(f"\n{family['title'] or family.get('shape') or family['family']}")      # a model shape's engine: its shape's name, as shape_engine.py names it here
             for e in family["engines"]:
-                tags = ["in use" if e["active"] else "", "newest" if e["newest"] else "", "" if e["fits"] else "not for this computer"]
+                tags = ["in use" if e["active"] else "", "newest" if e["newest"] else "", "local build, not signed" if e.get("local") else "",
+                        "" if e["fits"] else "not for this computer"]
                 print(f"  {e['version']:<12}{_gb(e['bytes']):>9}  {e['backend'] + ('-' + e['variant'] if e['variant'] else ''):<14}{', '.join(t for t in tags if t)}")
                 if e["why_not"] and not e["fits"]:
                     print(f"      {e['why_not']}")
