@@ -194,7 +194,7 @@ void bind(Model* m, int64_t b, const uint8_t* base) {
     for (int q = 0; q < 2; ++q)
         for (int i = 0; i < 6; ++i) {
             MfTrainProduct& pr = blk.prod[q][i];
-            auto* at = const_cast<uint8_t*>(base) + off[(size_t) (q * 6 + i)];
+            auto* at = const_cast<uint8_t*>(base) + off[(size_t) q * 6 + (size_t) i];
             if (m->int8) {
                 pr.w8 = reinterpret_cast<int8_t*>(at);
                 pr.sw = reinterpret_cast<float*>(at + pr.N * pr.K);
@@ -271,7 +271,7 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
                     pr.N = t->shape[0];
                     pr.K = t->shape[1];
                     const auto* src = reinterpret_cast<const uint16_t*>(data + t->begin);
-                    auto& h = h16[(size_t) (q * 6 + i)];
+                    auto& h = h16[(size_t) q * 6 + (size_t) i];
                     h.resize((size_t) (pr.N * pr.K));
                     for (int64_t k = 0; k < pr.N * pr.K; ++k)
                         h[(size_t) k] = f16_from_f32(dit_rows::bf16_value(src[k]));
@@ -284,7 +284,7 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
             for (int q = 0; q < 2; ++q)
                 for (int i = 0; i < 6; ++i) {
                     const MfTrainProduct& pr = blk.prod[q][i];
-                    const auto& h = h16[(size_t) (q * 6 + i)];
+                    const auto& h = h16[(size_t) q * 6 + (size_t) i];
                     const int64_t n = pr.N * pr.K;
                     uint64_t bytes = (uint64_t) n * 2;
                     if (int8) {
