@@ -131,7 +131,9 @@ def _inputs(a) -> dict:
     return {"mode": mode, "klass": drafting.card_class(archs), "model_name": model_name, "family": a.family, "data_dir": data,
             "backend": backend, "archs": archs, "mtp_here": drafting.mtp_ready(args) if cfg else None,
             "blocked": drafting.blocked_by(args, slots=parallel, named=drafting.normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts),
-            "slots_none": drafting.slots_draft_nothing(drafting.merged_args(cfg), parallel)}      # (False when the request count is not in the config: today's line)
+            "slots_none": drafting.slots_draft_nothing(drafting.merged_args(cfg), parallel),      # (False when the request count is not in the config: today's line)
+            "mtp_dropped": drafting.batch_mtp_dropped(drafting.merged_args(cfg), parallel,
+                                                      len(cfg["gpu"]) if isinstance(cfg.get("gpu"), list) and "--peer-device" not in args else 1)}
 
 
 def _signals(a, want: dict) -> dict:

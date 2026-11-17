@@ -4082,7 +4082,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     decision = drafting.apply(shaped, klass=drafting.card_class(archs) if archs else drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
                               vram_mib=drafting_vram_mib(cfg, backend, archs),
                               slots=parallel_n if isinstance(parallel_n, int) and not isinstance(parallel_n, bool) else 0,
-                              engine=engine_binary(exe, cfg) if exe else exe)
+                              engine=engine_binary(exe, cfg) if exe else exe,
+                              stages=len(gpu_list(cfg)) if layer_split_of(cfg) else 1)
     args = shaped["args"]
     if announce:
         drafting.remember_note(decision.note)

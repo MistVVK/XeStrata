@@ -922,6 +922,30 @@ def slots_draft_nothing(args: list[Any], slots: int | float | None = 0) -> bool:
     return os.environ.get("STRATA_BATCH_MTP", "0") in ("", "0")
 
 
+def batch_mtp_dropped(args: list[Any], slots: int | float | None = 0, stages: int = 1) -> bool:
+    """Will the engine run this start's request slots with NO drafts although ``--batch-mtp`` is in the arguments? Yes on a layer split (``stages``: the cards of the split) of
+    2 or more requests when the slots are pipelined in groups: without a group count the engine pipelines by default (the most groups, at most one per stage, that divide the
+    slots: batch_groups.hpp ``auto_groups``) and switches ``--batch-mtp`` off (``resolve``: ``mtp_dropped``); with a group count above 1 (or ``auto``) the pipelined groups
+    carry no slot drafts either. Not when the groups would be 1 (``--batch-groups 1``, or the slots do not divide), with ``STRATA_BATCH_MTP_SERIAL`` or ``--adapt-async 1`` (the
+    serial windows draft), or with ``STRATA_PIPED_MTP`` (the opt-in drafts in the pipelined groups: not claimed here). The single request still drafts (NONE_IN_SLOTS)."""
+    items = [str(a) for a in args or []]
+    if "--batch-mtp" not in items and os.environ.get("STRATA_BATCH_MTP", "0") in ("", "0"):
+        return False
+    n = request_count(items, slots)
+    if stages < 2 or n < 2 or "--pipeline-windows" in items:
+        return False
+    if os.environ.get("STRATA_PIPED_MTP", "") not in ("", "0"):
+        return False
+    given = _flag_value(items, "--batch-groups")
+    if given is not None:
+        return given.strip().lower() != "1"
+    if max([d for d in range(2, min(stages, n) + 1) if n % d == 0] or [1]) < 2:
+        return False
+    if os.environ.get("STRATA_BATCH_MTP_SERIAL", "0") not in ("", "0") or _flag_value(items, "--adapt-async") == "1":
+        return False
+    return True
+
+
 def slot_drafts_run(args: list[Any], slots: int | float | None = 0, split: bool = False) -> bool:
     """Does a DFlash2 start draft in its request slots too (``--draft dflash2 --batch N``, a drafter per slot)? Yes for 2 or more requests at once, unless ``STRATA_BATCH_DF2=0`` (the way back,
     as the engine reads it), a layer split (``split`` or ``--layer-split``: its slots draft only where they run as one group, not decided here) or ``--pipeline-windows``."""
@@ -1480,7 +1504,8 @@ def choice_of(mode: Any, *, model_name: str | None = None, family: str | None = 
 
 def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None,
            backend: str | None = None, archs: Any = None, mtp_here: bool | None = None, blocked: bool = False, vocab_here: bool = True,
-           args: list[Any] | None = None, vram_mib: float | None = None, slots_none: bool = False, pack: str | Path | None = None) -> Decision:
+           args: list[Any] | None = None, vram_mib: float | None = None, slots_none: bool = False, pack: str | Path | None = None,
+           mtp_dropped: bool = False) -> Decision:
     """The drafter a start uses. Never raises. ``slots_none`` (slots_draft_nothing of the start's arguments and request count; False when the caller cannot know it): the reason for a
     DFlash2 that is not available here is NONE_IN_SLOTS instead of NOT_HERE, so the plan says what the server says. One drafter, never two. A choice that cannot be applied becomes the other drafter when that one is on this computer,
     else none, with a note in plain words. ``mtp_here`` says whether the MTP layer is on disk (None: not known, taken as there), ``blocked`` that this start is a layer
@@ -1500,7 +1525,7 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
     if want == "dflash2":
         ready = _here(Path(pack)) if pack is not None else drafter_ready(data_dir, model_name, backend)
         reason = NOT_HERE if (blocked or not vocab_here) else NOT_DOWNLOADED if not ready else ""
-        if reason == NOT_HERE and slots_none:
+        if reason == NOT_HERE and (slots_none or mtp_dropped):
             reason = NONE_IN_SLOTS
         if not reason:
             return Decision(asked, "dflash2", flags=engine_flags(pack if pack is not None else pack_path(data_dir)))
@@ -1510,6 +1535,8 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
         why = ""
         if asked == "dflash2":                      # named, and it cannot run on this model or this computer
             why = NOT_SUPPORTED if not supported_model(model_name, family, named=True) else NOT_SERVED if not ENGINE_SERVES_DFLASH2 else NOT_THIS_CARD
+        elif mtp_dropped:                           # --batch-mtp on a layer split whose slots are pipelined: the engine drops it, the slots draft nothing (batch_mtp_dropped)
+            why = NONE_IN_SLOTS
         return Decision(asked, "mtp", why)
     # the layer is not on this computer: DFlash2 instead when it can run and its pack is here (said), else none (said)
     if runnable and not blocked and vocab_here and (_here(Path(pack)) if pack is not None else drafter_ready(data_dir, model_name, backend)):
@@ -1620,7 +1647,7 @@ def _without_flag(args: list[str], flag: str) -> list[str]:
 
 def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | None = None, family: str | None = None,
           backend: str | None = None, archs: Any = None, vram_mib: float | None = None, split: bool = False, slots: int = 0,
-          engine: str | os.PathLike[str] | None = None) -> Decision:
+          engine: str | os.PathLike[str] | None = None, stages: int = 1) -> Decision:
     """Put the config's ``"drafting"`` choice on its engine arguments (in place): ONE drafter's options and none of the other's. DFlash2: no ``--mtp``, no MTP option,
     ``--draft dflash2 --draft-model <pack> --draft-fallback none --mtp-draft-vocab <file> --spec W --draft-conf C`` (W = window_for: 8 on Strix Halo and on cc 12.0 with >= 48 GB, else 6); the person's own ``--spec`` or ``--draft-conf``
     in ``user_args`` stays, as does an explicit ``--draft-model`` path. C is 0.35 where the card holds most experts and higher where fewer slots fit (conf_for_slots): from the person's own ``--expert-cache N``,
@@ -1669,7 +1696,8 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     decision = decide(mode, model_name=name, family=family, data_dir=data_dir, backend=backend, archs=archs,
                       mtp_here=mtp_here, blocked=blocked_by(strip_draft_flags(args), split=split, slots=slots, named=normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts) or form == FORM_NONE,
                       vocab_here=vocab is not None, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib,
-                      slots_none=slots_draft_nothing(args, slots), pack=pinned_pack)     # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
+                      slots_none=slots_draft_nothing(args, slots), pack=pinned_pack,     # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
+                      mtp_dropped=batch_mtp_dropped(args, slots, stages))                # --batch-mtp on a layer split with pipelined groups: the engine drops it, same line
     pack = None
     fallback_tuned = False                                    # the tuned pack stands in for a missing stock pack (#5810): the stock pack's conf, not the tuned pack's measured one
     if decision.drafter == "dflash2":
