@@ -107,8 +107,12 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
     uint64_t pool = 0, compact = 0;
     int align = 0;
     while (std::fgets(line, sizeof line, f)) {
-        if (line[0] == '#') {
-            if (std::strncmp(line, "# align ", 8) == 0 && !index_header(line, align, pool)) {
+        size_t start = 0;
+        while (start + 1 < sizeof line && line[start] && std::strchr(" \t\r\n", line[start])) ++start;
+        const char* text = line + start;
+        if (!*text) continue;
+        if (*text == '#') {
+            if (std::strncmp(text, "# align ", 8) == 0 && !index_header(text, align, pool)) {
                 err = "index.txt: could not parse the header";
                 std::fclose(f);
                 return false;
@@ -119,7 +123,7 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
         std::string name;
         uint64_t dst_bytes = 0, dummy = 0;
         int i1 = 0, i2 = 0;
-        std::istringstream fields(line);
+        std::istringstream fields(text);
         if (!(fields >> name >> i1 >> i2 >> dummy >> dummy >> dummy >> dst_bytes) || name.size() > 255) {
             err = "index.txt: could not parse a row";
             std::fclose(f);
@@ -167,8 +171,12 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     std::vector<IndexRow> rows;
     char line[1024];
     while (std::fgets(line, sizeof line, idx)) {
-        if (line[0] == '#') {
-            if (std::strncmp(line, "# align ", 8) == 0 && !index_header(line, align, pool)) {
+        size_t start = 0;
+        while (start + 1 < sizeof line && line[start] && std::strchr(" \t\r\n", line[start])) ++start;
+        const char* text = line + start;
+        if (!*text) continue;
+        if (*text == '#') {
+            if (std::strncmp(text, "# align ", 8) == 0 && !index_header(text, align, pool)) {
                 err = "index.txt: could not parse the header";
                 std::fclose(idx);
                 return false;
@@ -179,7 +187,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         std::string name;
         int kind = 0;
         // The format is space-separated with no quoting; refuse a malformed row instead of using a wrong offset.
-        std::istringstream fields(line);
+        std::istringstream fields(text);
         if (!(fields >> name >> r.file >> kind >> r.src_off >> r.src_bytes >> r.dst_off >> r.dst_bytes >> r.ne0 >> r.ne1
                      >> r.code_bits >> r.code_bias >> r.group_elems >> r.codebook >> r.has_offset >> r.codes_bytes
                      >> r.scales_bytes >> r.offset_bytes >> r.scales_fp16 >> r.act_kind) || name.size() > 255) {
