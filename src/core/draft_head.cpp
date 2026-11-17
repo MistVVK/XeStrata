@@ -95,8 +95,6 @@ int64_t DraftSubset::file_tokens(const std::string& path) {
 
 bool DraftSubset::load(const std::string& path, int64_t n_vocab, const void* head_rows, size_t row_bytes, void* stream,
                        const char* who, std::string& err, bool virtual_rows) {
-    original_head_ = head_rows;
-    original_row_bytes_ = row_bytes;
     ids_.clear();
     if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
         int32_t v = 0;
@@ -167,11 +165,6 @@ bool DraftSubset::restore(std::string& err) {
     if (mapping_ == nullptr || !gpu::copy(rows_, saved_rows_, mapping_bytes_) || !gpu::device_sync()) {
         err = "draft head: restore failed"; return false;
     }
-    // The host copy back to a remapped range read correctly on the host on the RX 9060 XT, but its draft kernel
-    // produced no usable draft probabilities.  Gathering the same rows again on the GPU restored the draft results.
-    k::gather_rows(static_cast<const uint8_t*>(original_head_), (int64_t) original_row_bytes_, d_ids_,
-                   (int64_t) ids_.size(), rows_, nullptr);
-    if (!gpu::device_sync()) { err = "draft head: restore gather failed"; return false; }
     return true;
 }
 

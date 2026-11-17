@@ -51,8 +51,6 @@ public:
     bool restore(std::string& err);
 
 private:
-    const void* original_head_ = nullptr;
-    size_t original_row_bytes_ = 0;
     uint8_t* rows_ = nullptr;
     int32_t* d_ids_ = nullptr;
     std::vector<int32_t> ids_;
