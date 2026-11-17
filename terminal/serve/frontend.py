@@ -511,10 +511,33 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
     return _stable_tool_order(tools, lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
-def tool_arguments(raw) -> dict:
-    """A call's arguments from a client's history -> the mapping the template renders (both APIs).  A JSON object
-    (as text or already parsed) is used as it is; empty is {}; anything else (cut-off or malformed JSON, a list, a
-    number) is kept as text under "arguments" instead of refusing the whole conversation (#510)."""
+def declared_parameters(tools, name):
+    """The parameter names a request declares for the tool `name` (the OpenAI, Anthropic and Responses tool shapes, a
+    Responses namespace included): a set, empty when the tool declares none; None when the request does not declare it."""
+    for t in tools if isinstance(tools, list) else ():
+        if not isinstance(t, dict):
+            continue
+        fn = t["function"] if isinstance(t.get("function"), dict) else t
+        if isinstance(t.get("tools"), list):                          # a namespace of tools
+            found = declared_parameters(t["tools"], name)
+            if found is not None:
+                return found
+        if isinstance(name, str) and name and (fn.get("name") == name or (isinstance(fn.get("name"), str) and name.endswith("." + fn["name"]))):
+            schema = fn.get("parameters") or fn.get("input_schema")
+            props = schema.get("properties") if isinstance(schema, dict) else None
+            return set(props) if isinstance(props, dict) else set()
+    return None
+
+
+def tool_arguments(raw, declared=None) -> dict:
+    """A call's arguments from a client's history -> the mapping the template renders (all three APIs).  A JSON object
+    (as text or already parsed) is used as it is; empty is {}.  Text that starts like an object but is not valid JSON, a
+    call max_tokens cut short, gives the members it still holds (cut_arguments): the model sees the call it wrote, with
+    its parameters, not a parameter called "arguments" it would then write itself (soak 11-17: after a dozen cut calls in
+    a history the model wrote {"arguments": "<json>"} calls).  `declared` = the tool's parameter names
+    (declared_parameters), None when unknown: a tool that really has a parameter "arguments" keeps the old form.
+    Anything else (a list, a number, prose) is kept as text under "arguments" instead of refusing the whole
+    conversation (#510)."""
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return {}
     if isinstance(raw, dict):
@@ -523,6 +546,10 @@ def tool_arguments(raw) -> dict:
         try:
             value = json.loads(raw)
         except ValueError:
+            if declared is None or "arguments" not in declared:
+                cut = cut_arguments(raw)
+                if cut is not None:
+                    return cut
             return {"arguments": raw}
         return value if isinstance(value, dict) else {"arguments": raw}
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
@@ -585,7 +612,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
-                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))},
+                calls.append({"function": {"name": fn.get("name"),
+                                           "arguments": tool_arguments(fn.get("arguments"), declared_parameters(req.get("tools"), fn.get("name")))},
                               "_call_id": c.get("id")})
             out["tool_calls"] = calls
         messages.append(out)
@@ -765,7 +793,8 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                     text.append(added)
                     parts.append({"type": "text", "text": added})
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))},
+                calls.append({"function": {"name": block.get("name"),
+                                           "arguments": tool_arguments(block.get("input"), declared_parameters(req.get("tools"), block.get("name")))},
                               "_call_id": block.get("id")})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
@@ -1280,6 +1309,8 @@ class _Lenient:
 
     def __init__(self, text: str):
         self.s, self.i = text, 0
+        self.cut_ok = False        # cut_arguments: a string the text ends inside is returned as far as it goes (and `cut` says so)
+        self.cut = False
 
     def peek(self) -> str:
         s, n = self.s, len(self.s)
@@ -1299,6 +1330,10 @@ class _Lenient:
             if c == "\\":
                 self.i += 1
                 e = s[self.i:self.i + 1]
+                if self.cut_ok and (not e or (e == "u" and len(s) - self.i - 1 < 4 and re.fullmatch(r"[0-9a-fA-F]*", s[self.i + 1:]))):
+                    self.i = len(s)                 # cut inside an escape: the half escape is not text
+                    self.cut = True
+                    return "".join(out)
                 if e == "u" and re.fullmatch(r"[0-9a-fA-F]{4}", s[self.i + 1:self.i + 5]):
                     out.append(chr(int(s[self.i + 1:self.i + 5], 16)))
                     self.i += 5
@@ -1309,6 +1344,9 @@ class _Lenient:
             else:
                 out.append(c)
             self.i += 1
+        if self.cut_ok:
+            self.cut = True
+            return "".join(out)
         raise ValueError("string not closed")
 
     def value(self, depth: int = 0):
@@ -1380,6 +1418,50 @@ def lenient_json(text: str):
     if t[r.i:].strip("]}) \t\r\n"):
         raise ValueError("text after the value")
     return v
+
+
+def cut_arguments(text: str):
+    """The members a call's JSON-object arguments got before the output ended inside them (a client replays what it was
+    sent, and max_tokens cuts a call short), as a dict: every complete `"key": value` pair, and a string value the text
+    ends inside as far as it goes.  A value that is cut short and is not a string (a number, an array, an object) and a
+    cut key are left out.  {} when nothing is recoverable (`{`, `{"pa`); None when the text is not an object cut short
+    (it does not start with `{` and then a key or the end: `{cut`, prose, a list).
+    It reads with _Lenient, so the slips that class forgives (single quotes, a trailing comma) are forgiven here too."""
+    t = text.strip()
+    if not t.startswith("{") or len(t) > LENIENT_MAX:
+        return None
+    r = _Lenient(t)
+    r.cut_ok = True
+    r.i = 1
+    first = r.peek()
+    if first and first not in ('"', "'"):
+        return None                             # `{cut`, `{malformed_json`: not a JSON object cut short, kept as text (#510)
+    out: dict = {}
+    while True:
+        c = r.peek()
+        if not c or c == "}":
+            break
+        if c == ",":
+            r.i += 1
+            continue
+        if c not in ('"', "'"):
+            break
+        try:
+            key = r.string()
+            if r.cut or r.peek() != ":":
+                break
+            r.i += 1
+            value = r.value()
+        except (ValueError, RecursionError):
+            break
+        if r.cut:
+            if isinstance(value, str):
+                out[key] = value
+            break
+        if r.i >= len(t) and not isinstance(value, str):
+            break                               # a number or word the text ends in: it may be cut
+        out[key] = value
+    return out
 
 
 def declared_type(prop, depth: int = 0):
