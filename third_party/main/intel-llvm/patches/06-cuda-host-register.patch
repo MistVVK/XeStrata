@@ -44,8 +44,8 @@ index 1a65db90fe..f4659661df 100644
  
 -UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t,
 -                                                    void *) {
-+UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t hContext,
-+                                                    void *pMem) {
++UR_APIEXPORT ur_result_t UR_APICALL
++urUSMReleaseExp(ur_context_handle_t hContext, void *pMem) {
 +  try {
 +    ScopedContext Active(hContext->getDevices()[0]);
 +    const CUresult Result = cuMemHostUnregister(pMem);

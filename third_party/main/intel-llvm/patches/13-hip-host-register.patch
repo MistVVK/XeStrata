@@ -67,8 +67,8 @@ index 78bbe94348..9c1299dba4 100644
  
 -UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t,
 -                                                    void *) {
-+UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t hContext,
-+                                                    void *pMem) {
++UR_APIEXPORT ur_result_t UR_APICALL
++urUSMReleaseExp(ur_context_handle_t hContext, void *pMem) {
 +  try {
 +    ScopedDevice Active(hContext->getDevices()[0]);
 +    const hipError_t Result = hipHostUnregister(pMem);
