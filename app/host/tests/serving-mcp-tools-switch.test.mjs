@@ -53,8 +53,9 @@ test('the list holds at most 64 models', () => {
 
 test('each Serving model row has the switch, wired to setMcpTools, with the approved words', () => {
   const screen = readFileSync(fileURLToPath(new URL('../src/screens/Serving.tsx', import.meta.url)), 'utf8');
-  assert.match(screen, /const sw = mcpToolsSwitch\(serving, i\.apiModelId\);/);
-  assert.match(screen, /<input type="checkbox" role="switch" checked=\{sw\.checked\} disabled=\{sw\.disabled \|\| pending\} onChange=\{e => void operation\(\(\) => setMcpTools\(i\.apiModelId, e\.target\.checked\)\)\}\/>\{tr\("Tools for apps on this computer"\)\}/);
+  assert.match(screen, /const toolsSwitch = \(apiModelId: string, bare = false\) => \{ const sw = mcpToolsSwitch\(serving, apiModelId\);/);
+  assert.match(screen, /\{toolsSwitch\(i\.apiModelId\)\}/);
+  assert.match(screen, /<input type="checkbox" role="switch" aria-label=\{tr\("Tools for apps on this computer"\)\} checked=\{sw\.checked\} disabled=\{sw\.disabled \|\| pending\} onChange=\{e => void operation\(\(\) => setMcpTools\(apiModelId, e\.target\.checked\)\)\}\/>\{bare \? null : tr\("Tools for apps on this computer"\)\}/);
   assert.match(screen, /sw\.hint === 'help' \? tr\("When this is on, an app on this computer that sends your API key can let this model use its tools, such as reading and changing files\. Apps on other devices or through the internet link never can\."\) : tr\("Create an API key first\."\)/);
   const store = readFileSync(fileURLToPath(new URL('../src/lib/store.ts', import.meta.url)), 'utf8');
   assert.match(store, /export async function setMcpTools\(model: string, on: boolean\) \{\s*const result = await api\.patch<ServingState>\('\/api\/serving', mcpToolsPatch\(model, on\)\);/);
