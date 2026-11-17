@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """The draft head's token subset (rt/draft_vocab.bin): the vocabulary rows the MTP draft layer may propose.
 
 The engine reads rt/draft_vocab.bin (int32 token ids) when the draft layer binds and computes the draft logits over
