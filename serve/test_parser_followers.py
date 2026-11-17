@@ -55,9 +55,9 @@ CASES = {
     "anthropic_invoke_closer": (
         CS + "\n" + F + "Read" + GT + "\n" + P + "file_path" + GT + "\n/d/f\n" + PE + "\n</invoke>\n" + CE,
         ("Read", {"file_path": "/d/f"})),
-    "anthropic_parameter_name_follower": (
+    "anthropic_parameter_name_follower": (     # (#5969's third form: the opener of a declared parameter not set yet reads it)
         body("Grep", P + "pattern" + GT + "\nfoo\n" + PE + "\n<parameter name=\"path\">/d</parameter>"),
-        ("Grep", {"pattern": "foo"})),
+        ("Grep", {"pattern": "foo", "path": "/d"})),
     "stray_closer_before_the_wrapper_closer": (
         CS + "\n" + F + "Read" + GT + "\n" + P + "file_path" + GT + "\n/d/f\n" + PE + "\n</Read>\n" + CE,
         ("Read", {"file_path": "/d/f"})),
