@@ -6951,7 +6951,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                      **({"skipped": True} if r.get("skipped") else {}),
                      **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
                      **({"image": r["image"]} if r.get("image") else {}),
-                     **({"sources": r["sources"]} if "sources" in r else {})}, seen)   # a web search's (search.py)
+                     **({"sources": r["sources"]} if "sources" in r else {}),  # a web search's (search.py)
+                     **{k: r[k] for k in ("requested_model", "training_model", "model_switched") if k in r}}, seen)
 
         # the image and video calls of this reply, two or more: run side by side (serve/tool_parallel.py), their
         # results kept in the reply's order; every other call runs in turn as before, meanwhile

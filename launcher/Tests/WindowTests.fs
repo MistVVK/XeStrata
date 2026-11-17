@@ -509,13 +509,15 @@ let ``an installed model's image models are set by install.py`` () =
     pick w "image-gpu" "same"
     let sam3 = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text.StartsWith "Agree to Meta's SAM License" | _ -> false)
     sam3.IsChecked <- Nullable true
+    let training = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text = labelOf "image-lora-training" | _ -> false)
+    training.IsChecked <- Nullable true
     pump ()
     click w "Apply"
     let r = setup.Last
     Assert.Equal(Places.imageInstallPy, r.Script)
     for part in
         [ [ "--config"; d.Installed[0].Config ]; [ "--model"; d.Images[0].Id + "-uncensored" ]; [ "--yes" ]; [ "--gpu"; "same" ]
-          [ "--sam3-license"; "agree" ] ] do
+          [ "--sam3-license"; "agree" ]; [ "--lora-training" ] ] do
         Assert.True(contains part r.Args, sprintf "%A not in %A" part r.Args)
 
 /// The install page passes the image options as setup's --image-<name>, SAM 3.1's license not agreed unless checked;
@@ -527,9 +529,12 @@ let ``an install passes the image options, SAM 3.1's license only where it is no
     let setup = FakeSetup(d, none)
     let w = open' setup
     installPage w |> ignore
+    let training = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text = labelOf "image-lora-training" | _ -> false)
+    training.IsChecked <- Nullable true
+    pump ()
     click w "Install"
     let args = setup.Last.Args
-    for part in [ [ "--image-gpu"; "auto" ]; [ "--image-sam3-license"; "no" ] ] do
+    for part in [ [ "--image-gpu"; "auto" ]; [ "--image-sam3-license"; "no" ]; [ "--image-lora-training" ] ] do
         Assert.True(contains part args, sprintf "%A not in %A" part args)
     let agreed = FakeSetup({ d with Sam3 = { d.Sam3 with Agreed = true } }, none)
     let w2 = open' agreed

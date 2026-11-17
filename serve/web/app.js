@@ -1653,6 +1653,8 @@ function toolHtml(t, k) {
   const [cls, labelOf] = TOOL_STATE[t.state] || ["", () => t.state];
   const label = labelOf();
   const args = t.arguments == null ? "" : JSON.stringify(t.arguments, null, 2);
+  let toolArgs = t.arguments;
+  if (typeof toolArgs === "string") { try { toolArgs = JSON.parse(toolArgs); } catch (e) { toolArgs = null; } }
   const preview = t.result != null ? t.result : args.replace(/\s+/g, " ");
   let body = "";
   if (t.open) {
@@ -1672,7 +1674,7 @@ function toolHtml(t, k) {
     // strings; an MCP server's picture ({url: "tool-media/..."}, mcp.image_results) is drawn by toolImages below
     imageToolHtml(t, k) +
     // train_lora: the LoRA training panel opens here (ltwHydrate mounts it)
-    (t.tool === "train_lora" && t.state === "done" ? `<div class="ltw" data-ltw="${k}"></div>` : "");
+    (t.tool === "train_lora" && t.state === "done" ? `<div class="ltw" data-ltw="${k}" data-ltw-requested="${esc((toolArgs || {}).model || "")}"></div>` : "");
 }
 // a generate_image call with a layout (MOSS-Image's boxes) also gets a button that opens it in the Images tab
 function imageToolHtml(t, k) {
@@ -5591,9 +5593,11 @@ function ltwPanel(el) {
   function setupHtml() {
     const j = st.job;
     const models = st.models.filter((m) => m.can_train);
+    const requested = el.dataset.ltwRequested || "";
+    const selected = j ? j.model : ((models.find((m) => m.model === requested || (m.requested_models || []).includes(requested)) || models[0] || {}).model || "");
     const modelOpts = (st.models.length ? st.models : [{model: "", name: tr("ltw.noModels", "no trainable model here"), can_train: false, why: ""}])
-      .map((m) => `<option value="${esc(m.model)}"${j && j.model === m.model ? " selected" : ""}${m.can_train ? "" : " disabled"}>${esc(m.name || m.model)}${m.can_train ? "" : " — " + esc(m.why || "")}</option>`).join("");
-    const preset = (models.find((m) => m.model === (j ? j.model : models[0] && models[0].model)) || models[0] || {}).preset || {};
+      .map((m) => `<option value="${esc(m.model)}"${selected === m.model ? " selected" : ""}${m.can_train ? "" : " disabled"}>${esc(m.name || m.model)}${m.can_train ? "" : " — " + esc(m.why || "")}</option>`).join("");
+    const preset = (models.find((m) => m.model === selected) || models[0] || {}).preset || {};
     const kind = j ? j.kind : "character";
     const imgs = j ? j.images.map((im) =>
       `<div class="ltw-img"><img src="${base()}/images/${esc(im.file)}" alt="${esc(im.file)}">` +

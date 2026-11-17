@@ -14,10 +14,12 @@ Nothing is downloaded and no GPU is used: the cases are arithmetic on the tables
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "image"))
@@ -188,6 +190,48 @@ class Config(unittest.TestCase):
         for model in ("qwen-image-turbo", "mage-flow-turbo", "moss-image"):
             cfg = QI.image_config("Q8_0", "/engine/xestrata-image", "/models", model=model)
             self.assertEqual(cfg["lora_dir"], "/models/loras", model)
+
+
+class TrainingBases(unittest.TestCase):
+    def test_opt_in_downloads_bases_without_extra_edit_models(self):
+        import setup
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            eng = root / "engine"
+            eng.mkdir()
+            (eng / setup.IMAGE_EXE).touch()
+            a = argparse.Namespace(images="qwen-image-turbo,mage-flow-turbo,moss-image-4-step,anima-turbo",
+                                   image_lora_training=False, yes=True, image_quant=None, image_gpu_policy="auto")
+
+            def fetch(url, path, what):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+
+            with mock.patch.object(setup, "remove_old_image_engine"), mock.patch.object(setup, "download", fetch), \
+                    mock.patch.object(setup, "verify_sha256"), mock.patch.object(setup, "ask_sam3_license"), \
+                    mock.patch.object(setup, "free_gb", return_value=1000):
+                default, more = setup.setup_images(a, {}, root / "inference", eng)
+                self.assertEqual(len(more), 3)
+                self.assertFalse(QI.local_path(root / "inference", "base-F16").exists())
+                a.image_lora_training = True
+                default, more = setup.setup_images(a, {}, root / "training", eng)
+                from serve.images import ImageModels
+                models = ImageModels([default, *more])
+                self.assertFalse(models.missing())
+                cfgs = {c["model_name"]: c for c in [default, *more]}
+                self.assertTrue(cfgs["qwen-image-2.1"]["training_base_only"])
+                self.assertNotIn("training_base_only", cfgs["qwen-image-2.1-turbo"])
+                self.assertIn("qwen-image-2.1", cfgs)
+                self.assertIn("mage-flow", cfgs)
+                self.assertIn("moss-image", cfgs)
+                self.assertIn("anima-base", cfgs)
+                for key in ("base-F16", "mf-rl-bf16", "anima-base-bf16"):
+                    self.assertTrue(QI.local_path(root / "training", key).is_file(), key)
+                self.assertFalse(QI.local_path(root / "training", "mf-edit-rl-bf16").exists())
+                self.assertNotIn("edit_model", cfgs["mage-flow"])
+                self.assertNotIn("few_step", cfgs["moss-image"])
+                self.assertEqual(cfgs["qwen-image-2.1"]["diffusion_model"],
+                                 str(QI.local_path(root / "training", "base-F16")))
 
 
 if __name__ == "__main__":

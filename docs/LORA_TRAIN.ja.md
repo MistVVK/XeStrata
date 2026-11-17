@@ -384,6 +384,10 @@ stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib=
 
 CLI の前処理と学習器を、Web のチャットから最後まで使えるようにしたものです（`serve/lora_train.py`・`serve/web/app.js` の作成パネル）。
 
+学習の土台は setup の `--images qwen-image-turbo --image-lora-training` のように用意します。画像モデルを複数選ぶと、それぞれの土台を取得します。対話とランチャーでも同じ選択ができます。指定しなければ学習用の追加ダウンロードはありません。
+
+蒸留モデルは学習の一覧に出ません。Qwen-Image-2.1 Turbo は Qwen-Image-2.1 の F16、Mage-Flow Turbo は `mage-flow`（RL）、MOSS-Image 4-step は `moss-image`（SFT）、MOSS-Image Base 4-step は `moss-image-base`、Anima Turbo は `anima-base` を使います。Anima Base は作者の学習向けの選択であり、Turbo の教師と断定するものではありません。MageTrail は独立して学習し、Mage-Flow の LoRA との互換性は未検証です。蒸留モデルを API やチャットで指定すると土台に切り替え、その事実を返します。できた LoRA は対応する蒸留モデルにも使えます。
+
 - チャットで「この子の LoRA を作りたい」と言うと、モデルがスキル `lora-train` を読み、道具 `train_lora` を呼びます。チャットの中に作成画面が出ます（Images タブの LoRA の節の「LoRA を学習…」からも開けます）。
 - 画面の流れ: 画像を入れる（ドラッグ＆ドロップ・複数・このチャットの画像も選べる）→ 種類（character・style・other）・名前・呼び出し語・模型を選ぶ → キャプションを自動で付けて（`tools/image/lora_caption.py`。チャットの画像を読める模型が書く。[キャプションの方針](#キャプションの方針)どおり）画面で直す → 設定（既定はプリセット。最大 step 数 n・何 step ごとに版を保存するか k・rank・lr・seed・層の絞り・見本の prompt。詳しい設定は畳む）→ 開始。
 - 仕事はデータフォルダの `lora-jobs/<id>/` に状態を持ち（`record.json`）、同時に 1 つだけ回ります。段は 前処理（`mf_pre.py`・`mf_pre_export.py`）→ 学習（学習器のサブプロセス）→ 見本（版ごとに同じ seed・同じ prompt で生成）→ 版の選択。serve を立て直すと途中の仕事は `interrupted` になり、再開で未完了の段からやり直せます（前処理はキャッシュが揃っていれば飛ばす）。取り消しはサブプロセスを止め、それまでに保存した版を残します。

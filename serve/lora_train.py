@@ -52,6 +52,7 @@ from typing import Any
 
 from serve import envvars
 from serve import loras as lora_api
+from serve.model_terms import _qimage
 
 MAX_IMAGES = 200                  # the most training images one job takes
 MAX_IMAGE_BYTES = 32 << 20        # the largest one image
@@ -112,6 +113,38 @@ TRAINERS: dict[str, dict] = {
 }
 
 
+# Setup choices and served names differ for Qwen-Image.  Both names refer to the same training base.
+_qi = _qimage()
+DISTILLED = {name: (_qi.IMAGE_MODELS[base][0], base)
+             for source, base in _qi.TRAINING_BASE.items()
+             for name in {source, _qi.IMAGE_MODELS.get(source, (source,))[0]}}
+SETUP_ALIASES = {choice: values[0] for choice, values in _qi.IMAGE_MODELS.items() if choice != values[0]}
+
+
+def training_model(model: str) -> tuple[str, str | None]:
+    """The served training model and setup choice if a distilled model was requested."""
+    if model in DISTILLED:
+        return DISTILLED[model]
+    return SETUP_ALIASES.get(model, model), None
+
+
+def setup_command(svc, base_choice: str) -> str:
+    """Keep the configured image choices while adding the requested training base."""
+    images = getattr(svc, "images", None)
+    choices = []
+    for gen in list(images.gens.values()) if images is not None else []:
+        if gen.cfg.get("training_base_only"):
+            continue
+        choice = str(gen.cfg.get("setup_choice") or next(
+            (k for k, v in _qi.IMAGE_MODELS.items() if v[0] == gen.model), gen.model))
+        if choice not in choices:
+            choices.append(choice)
+    target = training_model(base_choice)[0]
+    if not any(training_model(c.split(":", 1)[0])[0] == target for c in choices):
+        choices.append(base_choice)
+    return f"setup --images {','.join(choices)} --image-lora-training"
+
+
 class TrainError(ValueError):
     """A training request that cannot run: the message says why (the panel shows it)."""
 
@@ -168,10 +201,16 @@ def train_base(gen) -> tuple[Path | None, str]:
         f16 = dit.parent / "qwen-image-2.1-F16.gguf"
         if not f16.is_file():
             return None, (f"{f16.name} is not beside the DiT: the training reads the F16 base "
-                          "(setup --images downloads it, tools/image/qimage.py's base-F16)")
+                          "(the training base is missing)")
         return f16, ""
-    if not dit.exists():
-        return None, f"the DiT is not here: {dit}"
+    if gen.family == "moss-image":
+        parts = [dit / "config.json", *(dit / f"diffusion_pytorch_model-{i:05d}-of-00003.safetensors"
+                                        for i in range(1, 4))]
+        ready = dit.is_dir() and all(p.is_file() for p in parts)
+    else:
+        ready = dit.is_file()
+    if not ready:
+        return None, f"the DiT is not complete: {dit}"
     return dit, ""
 
 
@@ -182,15 +221,36 @@ def model_rows(svc) -> list[dict]:
     images = getattr(svc, "images", None)
     for gen in list(images.gens.values()) if images is not None else []:
         fam = trainer_family(gen)
-        if fam is None:
+        if fam is None or gen.model in DISTILLED:
             continue
         exe = trainer_exe(gen)
-        base, why = train_base(gen)
-        ok = exe.is_file() and base is not None
-        rows.append({"model": gen.model, "family": fam, "name": lora_api.FAMILY_NAMES.get(fam, fam),
+        dit, why = train_base(gen)
+        ok = exe.is_file() and dit is not None
+        if dit is None:
+            choice = str(gen.cfg.get("setup_choice") or next(
+                (k for k, v in _qi.IMAGE_MODELS.items() if v[0] == gen.model), gen.model)).split(":", 1)[0]
+            why += f"; run {setup_command(svc, choice)} and restart the server"
+        rows.append({"model": gen.model, "family": fam, "name": f"{lora_api.FAMILY_NAMES.get(fam, fam)} — {gen.model}",
                      "preset": PRESETS[fam], "sample_prompts": SAMPLE_PROMPTS, "sample_seed": SAMPLE_SEED,
                      "can_train": ok,
                      "why": "" if ok else (f"the trainer is not built: {exe.name}" if not exe.is_file() else why)})
+    # A base not configured on the server cannot be used, even if its derivative is installed.
+    present = {r["model"] for r in rows}
+    for gen in list(images.gens.values()) if images is not None else []:
+        if gen.model not in DISTILLED:
+            continue
+        base, choice = DISTILLED[gen.model]
+        if base in present:
+            continue
+        fam = trainer_family(gen)
+        if fam is None:
+            continue
+        rows.append({"model": base, "family": fam, "name": base, "preset": PRESETS[fam],
+                     "sample_prompts": SAMPLE_PROMPTS, "sample_seed": SAMPLE_SEED, "can_train": False,
+                     "why": f"install the base with {setup_command(svc, choice)} and restart the server"})
+        present.add(base)
+    for row in rows:
+        row["requested_models"] = [name for name, (base, _) in DISTILLED.items() if base == row["model"]]
     return rows
 
 
@@ -484,7 +544,17 @@ class TrainJobs:
 
     # ---- creating and editing a draft
     def create(self, fields: dict, images: list[tuple[str, bytes]]) -> dict:
-        gen = self._gen(str(fields.get("model") or ""))
+        requested = str(fields.get("model") or "")
+        if not requested:
+            requested = self._gen("").model
+        model, choice = training_model(requested)
+        try:
+            gen = self._gen(model)
+        except TrainError:
+            if choice:
+                raise TrainError(f"{requested} needs its training base: run {setup_command(self.svc, choice)} "
+                                 "and restart the server", 503) from None
+            raise
         fam = trainer_family(gen)
         if fam is None:
             raise TrainError(f"model: {gen.model} has no trainer (the families: {', '.join(FAMILIES)})")
@@ -502,7 +572,8 @@ class TrainJobs:
                "kind": kind, "name": name, "trigger": trigger, "style_words": "", "settings": None, "images": [],
                "versions": [], "progress": None, "place": None, "error": None,
                "created_at": int(time.time()), "started_at": None, "completed_at": None,
-               "pid": None, "pid_start": None, "registered": None}
+               "pid": None, "pid_start": None, "registered": None,
+               "requested_model": requested, "model_switched": bool(choice)}
         self._write(rec)
         try:
             for fname, data in images:
@@ -641,6 +712,8 @@ class TrainJobs:
         rec = self._need(jid, ("draft", "cancelled", "interrupted", "awaiting_choice"))
         if rec["status"] in ("cancelled", "interrupted", "awaiting_choice"):
             return self.resume(jid)
+        if rec["model"] in DISTILLED:
+            raise TrainError("this older draft uses a distilled model: create a new job with the base model")
         gen = self._gen(rec["model"])
         fam = rec["family"]
         if not TRAINERS[fam]["elastic"]:
@@ -651,7 +724,9 @@ class TrainJobs:
             raise TrainError(f"the trainer is not built: {exe}", 503)
         base, why = train_base(gen)
         if base is None:
-            raise TrainError(why, 503)
+            choice = str(gen.cfg.get("setup_choice") or next(
+                (k for k, v in _qi.IMAGE_MODELS.items() if v[0] == gen.model), gen.model)).split(":", 1)[0]
+            raise TrainError(f"{why}; run {setup_command(self.svc, choice)} and restart the server", 503)
         if not rec["images"]:
             raise TrainError("images: none to train on")
         missing = [i["file"] for i in rec["images"] if not i["caption"].strip()]
@@ -687,6 +762,8 @@ class TrainJobs:
         rec = self._need(jid, ("interrupted", "cancelled", "awaiting_choice"))
         if rec["status"] == "awaiting_choice":
             return rec                          # its versions are already here to pick
+        if rec["model"] in DISTILLED:
+            raise TrainError("this older job uses a distilled model: create a new job with the base model")
         if not rec.get("settings"):
             raise TrainError("the job was never started: start it")
         rec.update(status="queued", error=None)

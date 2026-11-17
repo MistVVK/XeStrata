@@ -4052,7 +4052,8 @@ TOOLS: list[dict[str, Any]] = [
                     "(character, style, other), the name, the trigger word and the model, captions the pictures and "
                     "starts the training there; it runs on the server and its versions come back to the panel. Call "
                     "it when the user wants to make a LoRA; do not wait for the training.",
-     "parameters": {"type": "object", "properties": {}}},
+     "parameters": {"type": "object", "properties": {
+         "model": {"type": "string", "description": "The image model requested for the LoRA, if specified"}}}},
 ]
 
 # the image tools every request declares; the others once the chat's model reads their skills (ImageTools.unlock)
@@ -4816,11 +4817,23 @@ class ImageTools:
                         return f
         return None
 
-    def _train_lora_tool(self, t0: float) -> dict:
+    def _train_lora_tool(self, args: dict, t0: float) -> dict:
         """train_lora: the panel opens in the chat (the page renders it by the tool's name); no job starts here.
         The answer tells the model what the user can do there, with the models this server can train."""
         from serve import lora_train
-        rows = [r for r in lora_train.model_rows(self.svc) if r["can_train"]]
+        all_rows = lora_train.model_rows(self.svc)
+        rows = [r for r in all_rows if r["can_train"]]
+        requested = str(args.get("model") or "")
+        target, choice = lora_train.training_model(requested)
+        row = next((r for r in all_rows if r["model"] == target), None) if requested else None
+        if requested and (row is None or not row["can_train"]):
+            why = (row["why"] if row else
+                   f"install the base with {lora_train.setup_command(self.svc, choice)} and restart the server"
+                   if choice else f"{target} is not configured on this server")
+            text = f"Cannot prepare training for {requested}: {why}"
+            return {"ok": False, "text": text, "chars": len(text), "truncated": False,
+                    "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "train_lora", "images": [],
+                    "requested_model": requested, "training_model": target, "model_switched": bool(choice)}
         names = ", ".join(f"{r['name']} ({r['model']})" for r in rows) or "none ready (the trainer is not built)"
         text = ("The LoRA training panel is open in the chat. The user puts the training pictures in (drag and drop, "
                 "or picks this chat's images), chooses the kind (character, style, other), the name, the trigger "
@@ -4830,8 +4843,13 @@ class ImageTools:
                 "side by side. The user picks a version and registers it as a LoRA (the last one by default); it is "
                 "usable in the chat's images at once. Tell the user so and answer their questions; do not wait for "
                 "the training and do not call this tool again for the same request.")
+        if choice:
+            text += (f" {requested} is distilled for fewer steps and is not suitable for training. "
+                     f"The panel selects {target} instead. Tell the user; the resulting LoRA can also be used "
+                     f"with {requested}.")
         return {"ok": True, "text": text, "chars": len(text), "truncated": False,
-                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "train_lora", "images": []}
+                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "train_lora", "images": [],
+                "requested_model": requested, "training_model": target, "model_switched": bool(choice)}
 
     def _video_tool(self, args: dict, t0: float) -> dict:
         """upscale_video: a /v1/videos job on the video (videos.start_from_file), its id and where its video will be
@@ -4981,7 +4999,7 @@ class ImageTools:
         lend = args.pop("_lend", None) is True   # tool_parallel: on the text model's GPU, lent to the images
         self.calls += merged or 1
         if name == "train_lora":
-            return self._train_lora_tool(t0)
+            return self._train_lora_tool(args, t0)
         if name in ("find_region", "remove_background", "upscale_video", "segment_video"):
             r = (self._aux_tool(name, args, t0, cancel) if name in ("find_region", "remove_background") else
                  self._video_tool(args, t0) if name == "upscale_video" else self._segment_video_tool(args, t0))

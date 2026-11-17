@@ -5795,7 +5795,8 @@ def ask_images(cfg_path: Path) -> str | None:
     if isinstance(cfg, dict) and isinstance(cfg.get("images"), dict):
         picks = [x.get("setup_choice") or by_name[x["model_name"]]
                  for x in [cfg["images"], *(cfg.get("image_models") or [])]
-                 if isinstance(x, dict) and (x.get("setup_choice") or x.get("model_name") in by_name)]
+                 if isinstance(x, dict) and not x.get("training_base_only")
+                 and (x.get("setup_choice") or x.get("model_name") in by_name)]
     else:
         picks = [] if cfg else list(qi.SETUP_DEFAULT)
     while True:
@@ -5929,6 +5930,9 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
     choices = QI.parse_choices(a.images)
+    training = getattr(a, "image_lora_training", None)
+    if training is None and not a.yes and not JSON_OUT:
+        training = ask_option("image-lora-training", False)
     for c, _ in choices:
         if c.startswith(QI.ANIMA_USER):
             path = models_dir / QI.ANIMA_DIR / (c[len(QI.ANIMA_USER):] + ".safetensors")
@@ -5936,7 +5940,27 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
             if why:
                 fail(f"{c}: {path}: {why}", f"put the derivative's DiT (.safetensors) in {path.parent}")
     plans = [image_plan(a, choice, text_gb, size, chat_gguf) for choice, size in choices]
-    names = list(dict.fromkeys(n for p in plans for n in p["names"]))   # the files the models share, once
+    extra_names = []
+    if training:
+        chosen = {p["choice"] for p in plans}
+        for source in list(plans):
+            choice = source["choice"]
+            base = QI.TRAINING_BASE.get(choice, choice)
+            if choice.startswith("qwen-image-"):
+                extra_names.append("base-F16")
+            if base == choice or base in chosen:
+                continue
+            # These configs expose the base to the training panel.  Its VAE and text encoder are the same as the
+            # derivative's; fetch only the base DiT, not the base's unrelated editing weights.
+            _, dit, _ = QI.IMAGE_MODELS[base]
+            quant = "F16" if dit == "base" else QI.default_quant(dit)
+            files = QI.file_names(quant, QI.IMAGE_MODELS[base][2], source["tquant"], dit)
+            dit_files = files[:4] if QI.is_moss(dit) else files[:1]
+            plans.append({**source, "choice": base, "requested_size": None, "quant": quant,
+                          "lowered": None, "names": dit_files, "training_base_only": True})
+            chosen.add(base)
+    # The files the models share, once.
+    names = list(dict.fromkeys([*(n for p in plans for n in p["names"]), *extra_names]))
     need = sum(QI.FILES[k][2] for k in names) / 1e9
     what = "the image model" if len(plans) == 1 else f"the {len(plans)} image models"
     if ask(f"Download {what} ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
@@ -5962,6 +5986,11 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
                               uma=bool((gpu or {}).get("integrated")), policy=a.image_gpu_policy or "auto",
                               ssd_offload=getattr(a, "image_ssd_offload", None) == "on", text_quant=p["tquant"],
                               dit_q8=p["q8"], dit_keep=getattr(a, "image_dit_keep", None) != "off")
+        if p.get("training_base_only"):
+            # The full-step base shares the derivative's text/VAE files.  No editing adapters were downloaded.
+            cfg["training_base_only"] = True
+            for key in ("edit_model", "edit_steps", "edit_lora", "edit_adapter", "edit_adapters"):
+                cfg.pop(key, None)
         cfg["setup_choice"] = p["choice"] + ((":" + p["requested_size"]) if p["requested_size"] else "")
         if p["lowered"]:
             cfg["quant_lowered"] = p["lowered"]
@@ -9259,6 +9288,11 @@ OPTIONS = [
             "skip starting the model once at the end of setup to compile its GPU code (the first request then "
             "compiles it: ~30 s more)", kind="flag", place="advanced", default=False),
     # ---- how the image models run (setup's --image-NAME, tools/image/install.py's --NAME)
+    _option("image-lora-training", "Also prepare the bases for LoRA training",
+            "download the full-step training bases for the selected image models (Qwen-Image also needs its F16 "
+            "base); without this option only inference files are downloaded",
+            kind="flag", place="images", default=False, when=["images"],
+            question="Prepare the image models for LoRA training too?", cli={"default": None}),
     _option("image-gpu", "The GPU that makes the images",
             "the GPU of the image jobs (default auto: a discrete GPU the text model does not take, the one with the "
             "most VRAM, where the images are made beside the chat; else the text model's); same: the text model's "
@@ -9587,7 +9621,7 @@ def describe() -> dict:
         installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
                           "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095,
                           "images": [s.get("setup_choice") or by_name[s["model_name"]] for s in secs
-                                     if isinstance(s, dict)
+                                     if isinstance(s, dict) and not s.get("training_base_only")
                                      and (s.get("setup_choice") or s.get("model_name") in by_name)]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
             "ram_gb": round(ram_gb(), 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),

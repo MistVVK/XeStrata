@@ -89,7 +89,7 @@ print("done", flush=True)
 
 
 class FakeGen:
-    def __init__(self, tmp: Path, model="mage-flow-turbo", family="mage-flow"):
+    def __init__(self, tmp: Path, model="mage-flow", family="mage-flow"):
         self.model, self.family = model, family
         exe = tmp / "engine" / "xestrata-image"
         exe.parent.mkdir(parents=True, exist_ok=True)
@@ -620,6 +620,54 @@ class Training(unittest.TestCase):
         rows = lt.model_rows(self.svc)
         self.assertFalse(rows[0]["can_train"])
         self.assertIn("not built", rows[0]["why"])
+
+    def test_distilled_models_use_full_step_base(self):
+        from serve import images as img
+        cases = [("mage-flow-turbo", "mage-flow"), ("moss-image-4-step", "moss-image"),
+                 ("moss-image-base-4-step", "moss-image-base"), ("anima-turbo", "anima-base"),
+                 ("qwen-image-2.1-turbo", "qwen-image-2.1")]
+        families = {"mage-flow": "mage-flow", "moss-image": "moss-image", "moss-image-base": "moss-image",
+                    "anima-base": "anima", "qwen-image-2.1": "qwen-image"}
+        for requested, base in cases:
+            with self.subTest(model=requested):
+                gen = FakeGen(self.root, model=base, family=families[base])
+                self.svc.images.gens[base] = gen
+                derivative = FakeGen(self.root, model=requested, family=families[base])
+                derivative.cfg["few_step"] = {"lora": "BAD_LORA", "time_path": "BAD_TIME", "dataspace": "BAD_DATA"}
+                self.svc.images.gens[requested] = derivative
+                if gen.family == "moss-image":
+                    moss = self.root / base
+                    moss.mkdir(exist_ok=True)
+                    (moss / "config.json").touch()
+                    for i in range(1, 4):
+                        (moss / f"diffusion_pytorch_model-{i:05d}-of-00003.safetensors").touch()
+                    gen.cfg["diffusion_model"] = str(moss)
+                if base == "anima-base":
+                    gen.cfg["t5_tokenizer"] = gen.cfg["vae"]
+                if base == "qwen-image-2.1":
+                    (Path(gen.cfg["diffusion_model"]).parent / "qwen-image-2.1-F16.gguf").write_bytes(b"base")
+                rec = self.jobs.create({"model": requested, "name": "x", "kind": "character", "trigger": "x"},
+                                       [("x.png", self._png())])
+                self.assertEqual(rec["model"], base)
+                self.assertTrue(rec["model_switched"])
+                rec["settings"] = lt.check_settings({}, rec["family"])
+                argv = str(lt.TrainJobs.preprocess_argv(self.jobs, rec)) + str(self.jobs.train_argv(rec, 100, False))
+                self.assertNotIn("BAD_", argv)
+                rows = lt.model_rows(self.svc)
+                self.assertFalse(any(r["model"] == requested for r in rows))
+                self.assertTrue(any(r["model"] == base for r in rows))
+                # The chat tool's choice is the same one exposed to the panel.
+                tool = img.ImageTools._train_lora_tool(type("T", (), {"svc": self.svc})(),
+                                                       {"model": requested}, time.monotonic())
+                self.assertEqual(tool["training_model"], base)
+                self.assertTrue(tool["model_switched"])
+        del self.svc.images.gens["mage-flow"]
+        self.svc.images.pick = lambda name: self.svc.images.gens.get(name, self.svc.images.gens["mage-flow-turbo"])
+        with self.assertRaisesRegex(lt.TrainError, "--image-lora-training"):
+            self.jobs.create({"model": "mage-flow-turbo"}, [("x.png", self._png())])
+        row = next(r for r in lt.model_rows(self.svc) if r["model"] == "mage-flow")
+        self.assertFalse(row["can_train"])
+        self.assertIn("--image-lora-training", row["why"])
 
     def test_status_row(self):
         self.assertIsNone(lt.status_row(self.svc))

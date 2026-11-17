@@ -169,6 +169,7 @@
  "setup.image-gpu-policy.label": "Текстовая модель, пока создаётся изображение",
  "setup.image-gpu.choice.auto": "Авто: GPU, который не использует текстовая модель, иначе GPU текстовой модели",
  "setup.image-gpu.choice.same": "GPU текстовой модели",
+ "setup.image-lora-training.label": "Подготовить также базовые модели для обучения LoRA",
  "setup.image-gpu.label": "GPU, который создаёт изображения",
  "setup.image-sam3-license.about": "Лицензия: {license}",
  "setup.image-sam3-license.label": "Принять SAM License от Meta, чтобы SAM 3.1 находила часть изображения по словам (find_region, edit_region); без неё части находит Florence-2 (MIT)",

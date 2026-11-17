@@ -7,7 +7,12 @@ metadata:
 ---
 
 - When the user wants to make a LoRA ("I want a LoRA of this character", "a LoRA of this painter's style", "train a
-  LoRA on these pictures"), call `train_lora`. The training panel opens in the chat; the user does the work there.
+  LoRA on these pictures"), call `train_lora`. Pass `model` if the user named an image model. The training panel opens
+  in the chat; the user does the work there.
+- Distilled models are not training bases. If the tool says it switched models, tell the user that the requested
+  model is distilled for few steps and unsuitable for training, name the full-step base selected, and say the LoRA
+  can also be used on the requested model. If the base is missing, give the setup command in the tool's error instead
+  of saying training can start.
 - Tell the user what the panel does, briefly: put the pictures in (drag and drop, several at once, or pick this
   chat's images), choose the kind (character, style, other), the name, the trigger word and the model, caption the
   pictures (the auto button writes them with the lora-caption rules; every caption can be edited), set the most

@@ -844,6 +844,13 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
                 "anima-aesthetic": ("anima-aesthetic", "anima-aesthetic", "anima-stock"),
                 "anima-turbo": ("anima-turbo", "anima-turbo", "anima-stock"),
                 "anima-2.9b": ("anima-2.9b", "anima-2.9b", "anima-stock")}
+# Training uses the full-step model, not its distilled derivative.  The text encoder's variant is kept.
+TRAINING_BASE = {"qwen-image-turbo": "qwen-image-base", "qwen-image-turbo-uncensored": "qwen-image-base-uncensored",
+                 "mage-flow-turbo": "mage-flow", "mage-flow-turbo-uncensored": "mage-flow-uncensored",
+                 "moss-image-4-step": "moss-image", "moss-image-4-step-uncensored": "moss-image-uncensored",
+                 "moss-image-base-4-step": "moss-image-base",
+                 "moss-image-base-4-step-uncensored": "moss-image-base-uncensored", "anima-turbo": "anima-base"}
+
 DEFAULT_MODEL = "qwen-image-turbo"
 # the image models setup's question and the Windows launcher's checkboxes offer a text model set up for the first
 # time (the first the default model); one set up again offers what it has

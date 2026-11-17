@@ -169,6 +169,7 @@
  "setup.image-gpu-policy.label": "生成图片期间的文本模型",
  "setup.image-gpu.choice.auto": "自动：文本模型不用的 GPU，没有则用文本模型的 GPU",
  "setup.image-gpu.choice.same": "文本模型的 GPU",
+ "setup.image-lora-training.label": "同时准备 LoRA 训练的基础模型",
  "setup.image-gpu.label": "生成图片的 GPU",
  "setup.image-sam3-license.about": "许可证：{license}",
  "setup.image-sam3-license.label": "同意 Meta 的 SAM License，让 SAM 3.1 按文字找出图片的某个部分（find_region、edit_region）；不同意时由 Florence-2（MIT）找出这些部分",
