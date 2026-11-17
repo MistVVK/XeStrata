@@ -133,9 +133,9 @@ template<int HK, int HV>
 struct GdnChunkPrep {
     static constexpr int C = 2 * HK * S + HV * S, VPK = HV / HK, NT = 256;
     static constexpr int KF = S + 1, GP = CK + 1;   // the FP32 rows in local memory
-    static constexpr size_t O_K = 0, O_Q = (size_t) CK * KF, O_KK = 2 * (size_t) CK * KF, O_QK = O_KK + CK * GP,
-                            O_A = O_QK + CK * GP, O_G = O_A + (size_t) VPK * CK * GP, O_B = O_G + VPK * CK,
-                            LOCAL = O_B + VPK * CK;   // floats
+    static constexpr size_t O_K = 0, O_Q = (size_t) CK * KF, O_KK = 2 * (size_t) CK * KF, O_QK = O_KK + (size_t) CK * GP,
+                            O_A = O_QK + (size_t) CK * GP, O_G = O_A + (size_t) VPK * CK * GP, O_B = O_G + (size_t) VPK * CK,
+                            LOCAL = O_B + (size_t) VPK * CK;   // floats
     static_assert(CK * CK == NT && VPK * CK <= NT, "a work-item a Gram product; a work-item a column of T");
     const float* h;
     const float* gate;
@@ -154,7 +154,7 @@ struct GdnChunkPrep {
             const int64_t tok = tb + t;
             const bool ok = tok < T;
             const float* ht = h + (ok ? tok : 0) * C + (int64_t) (qh * S + r);
-            lm[O_K + (size_t) (t * KF + r)] = ok ? ht[HK * S] : 0.0f;
+            lm[O_K + (size_t) (t * KF + r)] = ok ? ht[(size_t) HK * S] : 0.0f;
             lm[O_Q + (size_t) (t * KF + r)] = ok ? ht[0] : 0.0f;
         }
         if (tid < VPK) {   // past the end: gate 0, beta 0
@@ -189,13 +189,13 @@ struct GdnChunkPrep {
             const float gt = lm[O_G + (size_t) (j * CK + t)], gi = lm[O_G + (size_t) (j * CK + i)];
             lm[O_A + (size_t) ((j * CK + t) * GP + i)] =
                 i < t ? lm[O_B + (size_t) (j * CK + t)] * sycl::exp(gt - gi) * lm[O_KK + (size_t) (t * GP + i)] : 0.0f;
-            half* pv = tp + ((size_t) ch * HV + (size_t) vh) * (3 * CK * CK) + 2 * CK * CK;
+            half* pv = tp + ((size_t) ch * HV + (size_t) vh) * (size_t{3} * CK * CK) + size_t{2} * CK * CK;
             pv[t * CK + i] = half(i <= t ? sycl::exp(gt - gi) * lm[O_QK + (size_t) (t * GP + i)] : 0.0f);
         }
         if (tid < VPK * CK) {
             const int j = tid / CK, t = tid % CK, vh = qh + j * HK;
             const float gt = lm[O_G + (size_t) (j * CK + t)], gl = lm[O_G + (size_t) (j * CK + CK - 1)];
-            float* s = sc + ((size_t) ch * HV + (size_t) vh) * (3 * CK);
+            float* s = sc + ((size_t) ch * HV + (size_t) vh) * (size_t{3} * CK);
             s[t] = sycl::exp(gt);
             s[CK + t] = sycl::exp(gl - gt);
             s[2 * CK + t] = lm[O_B + (size_t) (j * CK + t)];
@@ -203,7 +203,7 @@ struct GdnChunkPrep {
         sycl::group_barrier(it.get_group());
         if (tid < VPK * CK) {   // column c of T: T[t][c] = [t == c] - sum_{m < t} A[t][m] T[m][c]
             const int j = tid / CK, c = tid % CK, vh = qh + j * HK;
-            half* tv = tp + ((size_t) ch * HV + (size_t) vh) * (3 * CK * CK);
+            half* tv = tp + ((size_t) ch * HV + (size_t) vh) * (size_t{3} * CK * CK);
             float tc[CK];
 #pragma unroll
             for (int t = 0; t < CK; ++t) {
@@ -309,15 +309,15 @@ struct GdnChunkScan {
                                                             (int64_t) (2 * HK * S + vh * S + cg * CPW + c));
             pre.v[n] = x;
         }
-        const half* tpc = tp + ((size_t) ch * HV + (size_t) vh) * (3 * CK * CK);
+        const half* tpc = tp + ((size_t) ch * HV + (size_t) vh) * (size_t{3} * CK * CK);
 #pragma unroll
         for (int n = 0; n < NTP; ++n) {
             const int p = tid + n * NT;
             if (p >= TP4) break;
-            pre.tpv[n] = *reinterpret_cast<const sycl::vec<half, 4>*>(tpc + 4 * p);
+            pre.tpv[n] = *reinterpret_cast<const sycl::vec<half, 4>*>(tpc + (size_t) p * 4);
         }
         for (int p = tid; p < 3 * CK; p += NT)
-            pre.s[p / NT] = sc[((size_t) ch * HV + (size_t) vh) * (3 * CK) + (size_t) p];
+            pre.s[p / NT] = sc[((size_t) ch * HV + (size_t) vh) * (size_t{3} * CK) + (size_t) p];
     }
 
     // the registers into local memory
@@ -596,7 +596,7 @@ uint16_t* probe(sycl::queue& q) {
     bool ok = true;
     for (uint16_t w : host) {
         const int r = w >> 8, c = w & 0xff;
-        if (r >= K::TM || c >= K::TN || seen[(size_t) (r * K::TN + c)]++ != 0) ok = false;
+        if (r >= K::TM || c >= K::TN || seen[(size_t) r * K::TN + (size_t) c]++ != 0) ok = false;
     }
     if (!ok) {
         sycl::free(dev, q);
