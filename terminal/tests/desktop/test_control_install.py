@@ -81,13 +81,16 @@ class ControlModeTests(unittest.TestCase):
             with self.subTest(allowed=tool), mock.patch.object(S.subprocess, "run", return_value=done) as runner:
                 S.run([sys.executable, str(ROOT.parent / "engine" / "metal" / "tools" / tool), "--help"], check=False)
                 runner.assert_called_once()
+        # a ".." climb out of metal/tools to a REAL setup.py (the Terminal's, since the 0.2.16 layout): refused for the climb, not for a missing file
+        escape = ROOT.parent / "engine" / "metal" / "tools" / ".." / ".." / ".." / "terminal" / "setup.py"
+        self.assertTrue(escape.resolve().is_file(), escape)
         for refused in (
             [sys.executable, "-m", "metal.tools.metal_repack"],                      # -m is never allowed
             ["python3", str(ROOT.parent / "engine" / "metal" / "tools" / "metal_repack.py")],          # another interpreter
             [sys.executable, str(ROOT.parent / "engine" / "metal" / "kernels" / "evil.py")],           # another folder of the bundle
             [sys.executable, str(ROOT.parent / "engine" / "metal" / "evil.py")],                       # metal/ itself
             [sys.executable, str(self.home / "metal" / "tools" / "metal_repack.py")],  # a copy in the install folder
-            [sys.executable, str(ROOT.parent / "engine" / "metal" / "tools" / ".." / ".." / "setup.py")],
+            [sys.executable, str(escape)],
             [sys.executable],
         ):
             with self.subTest(refused=refused), mock.patch.object(S.subprocess, "run", side_effect=AssertionError("ran")):
