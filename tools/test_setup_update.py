@@ -104,18 +104,35 @@ class Update(unittest.TestCase):
             with mock.patch.object(setup, "ROOT", Path(d)), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(setup.installed_configs(), [p])
 
-    def test_main_update_never_starts(self):
+    def run_main_update(self, pulled):
+        """setup.main() --update with every outside effect mocked.  `--update` first gets the newest code (setup.update_pull, a
+        real `git pull` in the clone setup runs from) and carries the old layout over (setup.move_over_old_layout, which moves
+        files of the clone): both are mocked, or the test would pull into, and fail in, a checkout it runs from - a detached head,
+        a branch with no upstream, no network - and could move that checkout's own files."""
         with tempfile.TemporaryDirectory() as d:
             p = self.config(Path(d))
             with mock.patch.object(sys, "argv", ["setup.py", "--update"]), \
                     mock.patch.object(setup, "data_folder", return_value=(Path(d), [])), \
                     mock.patch.object(setup, "installed_configs", return_value=[p]), \
+                    mock.patch.object(setup, "update_pull", return_value=pulled) as pull, \
+                    mock.patch.object(setup, "move_over_old_layout", return_value=[]), \
                     mock.patch.object(setup, "update_install", return_value=0) as up, \
                     mock.patch.object(setup, "start") as start, \
                     contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(setup.main(), 0)
-        up.assert_called_once()
+                code = setup.main()
         start.assert_not_called()
+        pull.assert_called_once()
+        return code, up
+
+    def test_main_update_never_starts(self):
+        code, up = self.run_main_update(None)        # None: nothing new to pull, go on with this run
+        self.assertEqual(code, 0)
+        up.assert_called_once()
+
+    def test_main_update_ends_with_the_run_the_pull_started(self):
+        code, up = self.run_main_update(7)           # new code came: the update ran in the new setup.py, its exit code is ours
+        self.assertEqual(code, 7)
+        up.assert_not_called()
 
 
 class SettingsLine(unittest.TestCase):
