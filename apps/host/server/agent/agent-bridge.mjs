@@ -1425,7 +1425,13 @@ ${note.text}
     if (!known) return say(FIT_TEXT.noChatYet);
     let runtime;
     try { ({ rt: runtime } = await ensureRuntime(choice, signal)); } catch { return say(FIT_TEXT.compactFailed); }
-    const done = await compactChat(runtime, known);
+    // The Harness runs /compact as turn events on this idle session. The watch for a turn the agent starts by itself (#6070) would take them for one,
+    // follow it and keep the chat "still working" (the next message refused). It is closed for the summary and set again after it, so the summary's own events are past.
+    const watched = !!c.wake;
+    c.wake?.close(); c.wake = null;
+    let done;
+    try { done = await compactChat(runtime, known); }
+    finally { if (watched && !c.turn && !c.starting && rt === runtime && !c.wake) armWake(c, runtime, known); }
     if (done.ok) {
       const note = summarizedNote(done.before, done.after, 0);
       return say(note.key, note.values);
