@@ -613,7 +613,9 @@ def check_request(req: dict) -> None:
                              "prompt", "unsupported_parameter")
     n = req.get("max_output_tokens")
     # -1 and 0 mean no cap, as max_tokens does on the chat path (docs/DETAILS.md); anything lower is a mistake
-    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < -1):
+    # (a whole number sent as a float, 4096.0, is one: some clients write their JSON numbers that way, #4037)
+    if n is not None and (isinstance(n, bool) or not isinstance(n, (int, float)) or n < -1 or
+                          (isinstance(n, float) and not n.is_integer())):
         raise ResponsesError("max_output_tokens must be a whole number, 1 or more, or -1 or 0 for no cap",
                              "max_output_tokens")
     reasoning = req.get("reasoning")
