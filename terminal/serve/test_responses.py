@@ -100,7 +100,13 @@ class Parsing(unittest.TestCase):
         msgs = input_messages({"input": [{"role": "user", "content": "q"},
                                          {"type": "function_call", "call_id": "c", "name": "f", "arguments": "{\"a"},
                                          {"type": "function_call_output", "call_id": "c", "output": "x"}]})
-        self.assertEqual(msgs[1]["tool_calls"][0]["function"]["arguments"], {"arguments": "{\"a"})
+        # a call cut inside its first key holds no member: it is shown with no parameters (a parameter called "arguments" would
+        # teach the model to write one; soak 11-17); text that is not an object cut short keeps the #510 form
+        self.assertEqual(msgs[1]["tool_calls"][0]["function"]["arguments"], {})
+        msgs = input_messages({"input": [{"role": "user", "content": "q"},
+                                         {"type": "function_call", "call_id": "c", "name": "f", "arguments": "{cut"},
+                                         {"type": "function_call_output", "call_id": "c", "output": "x"}]})
+        self.assertEqual(msgs[1]["tool_calls"][0]["function"]["arguments"], {"arguments": "{cut"})
 
     def test_unsupported_items_are_named(self):
         for items, param in (([{"type": "item_reference", "id": "msg_1"}], "input[0]"),
