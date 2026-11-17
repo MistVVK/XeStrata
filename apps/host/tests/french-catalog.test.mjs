@@ -15,7 +15,7 @@ test('French is in the language picker under its own name', () => {
   const entry = LANGUAGES.find(item => item.value === 'fr');
   assert.equal(entry?.label, 'Français');
   assert.ok(validLanguage('fr'));
-  assert.equal(LANGUAGES.length, 9);
+  assert.equal(LANGUAGES.length, 10);
   setTranslationLanguage('fr');
   assert.equal(currentLanguage(), 'fr');
   assert.equal(localeTag(), 'fr');
