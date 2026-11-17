@@ -12082,6 +12082,15 @@ def _main() -> int:
             ap.error("--engine xestrata needs --config")
         vision = None
         env = child_env(cfg)
+        if cfg.get("images") and not envvars.get("GPU_PCI", env=env):
+            # The image and training ledgers need the text engine's actual card even when setup chose it automatically.
+            from serve import gpu_select
+            iexe = str(cfg["images"]["exe"])
+            iexe = iexe if os.path.isabs(iexe) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", iexe))
+            try:
+                envvars.put(env, "GPU_PCI", gpu_select.selected_pci(iexe, env))
+            except ValueError as e:
+                raise SystemExit(f"[xestrata] image GPU: {e}") from e
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
@@ -12219,13 +12228,18 @@ def _main() -> int:
         try:
             ilog = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
             # the text engine's environment: its libraries, and its GPU unless the images have a card of their own
-            ienv, separate, said = image_env(cfg, child_env(cfg))
+            text_env = env if a.engine == "xestrata" else child_env(cfg)
+            ienv, separate, said = image_env(cfg, text_env)
             if said:
                 print(f"[xestrata] {said}", flush=True)
+            from serve import gpu_select
+            pci = envvars.get("GPU_PCI", env=ienv) or gpu_select.selected_pci(icfgs[0]["exe"], ienv)
+            ienv = gpu_select.scope(icfgs[0]["exe"], ienv, pci)
             svc.images = images_api.ImageModels(icfgs, log=ilog, env=ienv, separate=separate)
             svc.images.helper_card = image_helper_card(cfg)
             if separate and not svc.images.helper_card:   # the text model's GPU may be lent to them (use_text_gpu)
-                svc.images.lend_cfgs = (icfgs, ilog, child_env(cfg))
+                text_pci = envvars.get("GPU_PCI", env=text_env) or gpu_select.selected_pci(icfgs[0]["exe"], text_env)
+                svc.images.lend_cfgs = (icfgs, ilog, gpu_select.scope(icfgs[0]["exe"], text_env, text_pci))
             svc.images.gpu_pci = envvars.get("GPU_PCI", env=ienv) if separate else None   # the Monitor's image card
         except ValueError as e:
             raise SystemExit(f"[xestrata] config: {e}")

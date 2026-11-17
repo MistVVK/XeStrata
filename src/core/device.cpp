@@ -1186,6 +1186,23 @@ uint64_t max_alloc_bytes() {
     return v;
 }
 
+int device_selector_index(int ordinal) {
+    if (ordinal < 0 || ordinal >= Runtime::count())
+        throw DeviceError("no engine device " + std::to_string(ordinal));
+    const auto& target = engine_devices()[(size_t) ordinal];
+    std::map<sycl::backend, int> next;
+    // Match SYCL's selector numbering: all root devices across platforms of each backend, before the engine's
+    // usability checks and preference sort. The caller must run without device filters.
+    for (const auto& platform : sycl::platform::get_platforms()) {
+        const auto backend = platform.get_backend();
+        for (const auto& device : platform.get_devices()) {
+            const int index = next[backend]++;
+            if (device == target) return index;
+        }
+    }
+    throw DeviceError("the GPU is not in the SYCL platform list");
+}
+
 DeviceInfo device_info(int ordinal) {
     if (ordinal < 0 || ordinal >= Runtime::count())
         throw DeviceError("no engine device " + std::to_string(ordinal));

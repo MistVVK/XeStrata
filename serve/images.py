@@ -2466,7 +2466,9 @@ def gpu_key(env: dict) -> str:
     """The GPU an engine environment names (its device selection; none: the system's first), for GpuTurn."""
     import hashlib
     others = ("CUDA_VISIBLE_DEVICES", "ONEAPI_DEVICE_SELECTOR", "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK")
-    sel = [envvars.get("GPU_PCI", env=env)] + [env.get(k) for k in others]
+    pci = envvars.get("GPU_PCI", env=env)
+    # With a PCI address, selectors only narrow visibility; all environments naming that physical card share a turn.
+    sel = [pci.lower(), None, None, None, None] if pci else [None] + [env.get(k) for k in others]
     return hashlib.sha256(json.dumps(sel).encode()).hexdigest()[:16]
 
 

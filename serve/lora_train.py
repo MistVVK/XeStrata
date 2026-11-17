@@ -339,13 +339,11 @@ def text_placement(svc) -> tuple[set[str], str, dict[str, int]]:
 
 
 def card_env(svc, pci: str) -> dict:
-    """The trainer's environment on the card `pci` (the image engine's env over this process's, narrowed to it)."""
+    """The trainer's environment on `pci`, with only that device exposed to SYCL."""
+    from serve import gpu_select
     env = dict(os.environ)
     env.update(svc.images.default.engine.env or {})
-    env["XESTRATA_GPU_PCI"] = pci
-    for k in ("CUDA_VISIBLE_DEVICES", "ONEAPI_DEVICE_SELECTOR", "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK"):
-        env.pop(k, None)
-    return env
+    return gpu_select.scope(svc.images.default.cfg["exe"], env, pci)
 
 
 def free_mib(svc, pci: str) -> int:

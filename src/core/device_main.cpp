@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -32,7 +33,17 @@ static std::string json_text(const std::string& s) {
 
 // --list-devices: every GPU the engine can drive, one JSON object a line, device 0 (the one it would take) first: what
 // setup reads where it has no sysfs to read (Windows).  `free_bytes` is null when the driver does not report it.
-static int list_devices() {
+static int list_devices(bool selectors) {
+    if (selectors) {
+        for (const char* name : {"ONEAPI_DEVICE_SELECTOR", "SYCL_DEVICE_FILTER", "SYCL_DEVICE_ALLOWLIST",
+                                 "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
+                                 "GPU_DEVICE_ORDINAL", "ZE_AFFINITY_MASK"}) {
+            if (std::getenv(name) != nullptr) {
+                std::fprintf(stderr, "cannot list selector indices with %s set\n", name);
+                return 2;
+            }
+        }
+    }
     const int n = strata::core::Runtime::count();
     for (int i = 0; i < n; ++i) {
         const strata::core::DeviceInfo d = strata::core::device_info(i);
@@ -42,8 +53,10 @@ static int list_devices() {
                     (unsigned long long) d.total_bytes);
         if (d.free_bytes_known) std::printf("%llu", (unsigned long long) d.free_bytes);
         else std::printf("null");
-        std::printf(", \"integrated\": %s, \"compute_units\": %u, \"arch\": %s}\n", d.integrated ? "true" : "false",
+        std::printf(", \"integrated\": %s, \"compute_units\": %u, \"arch\": %s", d.integrated ? "true" : "false",
                     d.compute_units, json_text(d.arch).c_str());
+        if (selectors) std::printf(", \"selector_index\": %d", strata::core::device_selector_index(i));
+        std::puts("}");
     }
     return 0;
 }
@@ -143,17 +156,18 @@ static std::string human(uint64_t b) {
 }
 
 int main(int argc, char** argv) {
-    bool selftest = false, list = false, do_bench = false;
+    bool selftest = false, list = false, selectors = false, do_bench = false;
     const char* version = "XeStrata " STRATA_VERSION " (backend " STRATA_BACKEND
         ", upstream Strata " STRATA_UPSTREAM_VERSION ", " STRATA_UPSTREAM_COMMIT ")";
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list = true;
+        else if (std::strcmp(argv[i], "--list-device-selectors") == 0) list = selectors = true;
         else if (std::strcmp(argv[i], "--bench") == 0) do_bench = true;
         else if (std::strcmp(argv[i], "--cpu") == 0) return cpu_report();
         else if (std::strcmp(argv[i], "--version") == 0) { std::puts(version); return 0; }
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: xestrata-device [--selftest] [--list-devices] [--bench] [--cpu] [--version]\n");
+            std::printf("usage: xestrata-device [--selftest] [--list-devices] [--list-device-selectors] [--bench] [--cpu] [--version]\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -162,7 +176,7 @@ int main(int argc, char** argv) {
     }
 
     try {
-        if (list) return list_devices();
+        if (list) return list_devices(selectors);
         if (do_bench) return bench();
         const strata::core::DeviceInfo d = strata::core::device_info(0);
         std::puts(version);

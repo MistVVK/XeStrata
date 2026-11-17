@@ -38,6 +38,10 @@ struct DeviceInfo {
 // Ordinal 0 is the GPU the runtime selected, 1.. the other usable GPUs (src/core/device.cpp, find_devices).
 DeviceInfo device_info(int ordinal = 0);
 
+/// ONEAPI_DEVICE_SELECTOR's backend-local index, including devices the engine cannot use. Call only in a process
+/// without device filters: a filtered SYCL enumeration cannot recover the original indices.
+int device_selector_index(int ordinal);
+
 /// A smaller device, for checking the engine's choices on the B70 (AGENTS.md, the first rule):
 /// STRATA_VRAM_LIMIT_MIB caps the memory the engine sees (its total, and its free part as total less what is used),
 /// STRATA_MAX_ALLOC_MIB the largest allocation it assumes.  0 when unset.
