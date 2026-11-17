@@ -51,7 +51,7 @@ so treat it as a test. The ready-made CUDA 12 engine holds no sm_52 code; build 
 cannot compile for Maxwell):
 
 ```
-cmake -B build -G Ninja -DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=52
+cmake -S engine -B build -G Ninja -DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=52
 cmake --build build -j
 ```
 
@@ -109,7 +109,7 @@ other card or toolkit changes. Use CUDA 13.0 or newer for an RTX 50 card.
 
 ```sh
 # Linux (Windows: the same with the toolkit's nvcc.exe)
-cmake -S . -B build-cuda12 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_EXPERIMENTAL_SM60=ON \
+cmake -S engine -B build-cuda12 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_EXPERIMENTAL_SM60=ON \
       -DCMAKE_CUDA_ARCHITECTURES="61;70" -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc
 cmake --build build-cuda12 --target strata -j
 ```

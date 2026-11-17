@@ -27,7 +27,7 @@ if [[ "${AOT:-}" =~ ^(bmg|lnl) ]] && [[ "${I8_ESIMD:-AUTO}" != "OFF" ]] && [[ "$
   if [[ -n "$v" ]] && known_bad_ocloc "$v"; then
     cat >&2 <<EOF
 build.sh: this image's ocloc is $v (IGC 2.36.3). It is known to crash while it compiles the int8 ESIMD kernels for AOT=${AOT} (#3219).
-  Fix: rebuild the image with a fresh base, then build again:   docker build --pull -t strata-sycl-dev sycl/tools
+  Fix: rebuild the image with a fresh base, then build again:   docker build --pull -t strata-sycl-dev engine/sycl/tools
   Or build without those kernels (the prompt's experts take the slower XMX path):   I8_ESIMD=OFF
   Or build anyway:   ALLOW_BAD_OCLOC=1
 EOF
@@ -47,6 +47,6 @@ echo "BUILD EXIT $rc"
 grep -c 'error:' $b/build.log | sed 's/^/errors: /'
 grep -E '^FAILED' $b/build.log | sed 's#.*/##' | sort | uniq | head -60
 if grep -q 'IGC: Internal Compiler Error' $b/build.log 2>/dev/null; then
-  echo "build.sh: the device compiler (ocloc $(ocloc_version || echo '?')) crashed: try  docker build --pull -t strata-sycl-dev sycl/tools  or  I8_ESIMD=OFF  (#3219)"
+  echo "build.sh: the device compiler (ocloc $(ocloc_version || echo '?')) crashed: try  docker build --pull -t strata-sycl-dev engine/sycl/tools  or  I8_ESIMD=OFF  (#3219)"
 fi
 exit "$rc"

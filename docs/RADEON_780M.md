@@ -31,7 +31,7 @@ the wheel route was not exercised by the numbers below - they come from a hand b
 By hand, the steps of [STRIX_HALO.md](STRIX_HALO.md) with the architecture and the paths changed:
 
 ```sh
-cmake -S . -B build-780m -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S engine -B build-780m -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
   -DCMAKE_HIP_ARCHITECTURES=gfx1103 \
   -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \

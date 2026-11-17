@@ -180,7 +180,7 @@ hipBLASLt development files, CMake 3.24+, a C++20 host compiler, and Git. The mo
 SSD for its PLE table.
 
 ```sh
-cmake -S . -B build-hip \
+cmake -S engine -B build-hip \
   -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
   -DCMAKE_HIP_ARCHITECTURES=gfx1100
@@ -581,7 +581,7 @@ on the kernel's amdgpu driver. hipBLASLt is not used.
 ```sh
 # inside the image, with this checkout at /src and llama.cpp at the pinned commit in third_party/llama.cpp
 apt-get update && apt-get install -y cmake ninja-build git python3 build-essential
-cmake -S . -B build-906 -G Ninja -DSTRATA_HIP_GFX906=ON -DCMAKE_HIP_ARCHITECTURES=gfx906 \
+cmake -S engine -B build-906 -G Ninja -DSTRATA_HIP_GFX906=ON -DCMAKE_HIP_ARCHITECTURES=gfx906 \
   -DSTRATA_GGML_DIR=/src/third_party/llama.cpp \
   -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++
 ninja -C build-906 strata

@@ -23,7 +23,7 @@ Which table a card gets:
 
 ## Measuring a card that has no table yet
 
-1. Build with tests: `cmake -S . -B build -DSTRATA_BUILD_TESTS=ON` and `cmake --build build --target mmvq_il_parity`.
+1. Build with tests: `cmake -S engine -B build -DSTRATA_BUILD_TESTS=ON` and `cmake --build build --target mmvq_il_parity`.
 2. Close everything else on the GPU, then run `build/mmvq_il_parity --bench --emit-table` (a few minutes).
    It first checks bit-for-bit parity of every shape and every rows choice (it must end with `mmvq_il_parity: OK`),
    prints a `BENCH` line per shape and token count, and last a ready-to-paste block, one line per type.

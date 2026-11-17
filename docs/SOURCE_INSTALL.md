@@ -76,7 +76,7 @@ claiming to have tested a code change. A released engine cannot validate changes
 For a direct NVIDIA build, with the required compiler and CUDA toolkit installed:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
+cmake -S engine -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
 cmake --build build --target strata -j8
 ```
 

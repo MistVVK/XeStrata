@@ -19,7 +19,7 @@ reported on the named machines. They are not a guarantee for another V100 setup.
 CUDA 13 dropped Volta, so the build needs a CUDA 12.x toolkit (12.8 was used) and a host GCC that toolkit accepts.
 
 ```sh
-cmake -S . -B build -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
+cmake -S engine -B build -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
       -DCMAKE_CUDA_ARCHITECTURES=70 -DSTRATA_EXPERIMENTAL_SM60=ON
 cmake --build build --target strata -j
 ```
@@ -71,7 +71,7 @@ did in the check in the history section).
 ## Checking and benchmarking the Volta kernels
 
 ```sh
-cmake -S . -B build -DSTRATA_PARITY_PROMPT_ATTN=ON ... && cmake --build build --target qsa_prompt_attn_parity
+cmake -S engine -B build -DSTRATA_PARITY_PROMPT_ATTN=ON ... && cmake --build build --target qsa_prompt_attn_parity
 CUDA_VISIBLE_DEVICES=0 ./build/qsa_prompt_attn_parity 32768 2048 5     # synthetic, no model; exit 0 = PASS
 ```
 

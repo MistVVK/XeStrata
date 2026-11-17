@@ -72,7 +72,7 @@ llama.cpp's `ggml` sources are pinned by this repository, and CMake fetches the 
 
 ```sh
 git clone https://github.com/Niko1221/Strata.git && cd Strata
-cmake -S . -B build-halo -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S engine -B build-halo -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
   -DCMAKE_HIP_ARCHITECTURES=gfx1151 \
   -DCMAKE_HIP_COMPILER=$SDK/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$SDK \

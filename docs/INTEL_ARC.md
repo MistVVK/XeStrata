@@ -72,11 +72,11 @@ About 10 minutes the first time. From the checkout, called `Strata` here:
 
 ```sh
 cd Strata
-docker build --pull -t strata-sycl-dev sycl/tools     # once: about 6 minutes, a 13 GB image
+docker build --pull -t strata-sycl-dev engine/sycl/tools     # once: about 6 minutes, a 13 GB image
 H=$(basename "$PWD")
 # Arc B-series: bmg-g31 (Pro B70), bmg-g21 (B580, B570, Pro B60). Arc A-series (Alchemist): leave out AOT (JIT) and use build-sycl
 docker run --rm -u $(id -u):$(id -g) -v "$PWD/..:/work" -e AOT=bmg-g31 -e REPO=/work/$H \
-    -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash sycl/tools/build.sh strata"
+    -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash engine/sycl/tools/build.sh strata"
 ```
 
 `--pull` matters: [INTEL.md](INTEL.md#how-to-build-it) says why. Then run `./setup.sh --backend sycl`. Do not run
@@ -101,8 +101,8 @@ Build the engine through the top-level CMake option or by configuring the `sycl/
 
 ```sh
 source /opt/intel/oneapi/setvars.sh
-cmake -S . -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DSTRATA_ENABLE_SYCL=ON
-#   or: cmake -S sycl -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+cmake -S engine -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DSTRATA_ENABLE_SYCL=ON
+#   or: cmake -S engine/sycl -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 cmake --build build-sycl --target strata
 ```
 
