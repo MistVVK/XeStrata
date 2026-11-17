@@ -46,6 +46,7 @@ code() {  # code PATTERN: as pick, without the lint configurations here (each to
   pick "$1" | grep -v "^$C/" || true
 }
 
+mapfile -t patches < <(pick '^third_party/[^/]+/[^/]+/patches/.*\.patch$')
 mapfile -t py < <(code '\.py$')
 mapfile -t sh < <(pick '\.sh$')
 mapfile -t cpp < <(pick '\.(cpp|hpp)$')
@@ -56,6 +57,9 @@ mapfile -t js < <(code '\.js$')
 mapfile -t html < <(pick '\.html$')
 mapfile -t text < <(pick '\.(py|sh|cpp|hpp|cu|h|inc|cmake|md|css|js|html|jinja|txt|toml|ini|yaml|rb|mjs)$|CMakeLists\.txt$')
 
+if [ ${#patches[@]} -gt 0 ]; then
+  run "patch changes" python3 "$C/patches.py" "${patches[@]}"
+fi
 if [ ${#py[@]} -gt 0 ]; then
   run flake8 flake8 --config "$C/flake8.ini" "${py[@]}"
   run ruff .lint/venv/bin/ruff check --quiet --config "$C/ruff.toml" "${py[@]}"

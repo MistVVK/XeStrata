@@ -2,6 +2,7 @@ SPDX-FileCopyrightText: The LLVM project contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 hip-virtual-mem: a commit of intel/llvm that v7.2.0 does not have, applied by tools/intel_llvm_build.py.
+upstream commit: c13ad6c7e3899094734cd664dfcabc069256bf96
 
 It is intel/llvm's c13ad6c7e3899094734cd664dfcabc069256bf96, "[UR][HIP] Implement virtual and physical
 memory management" (pull request 22671, 2026-08-03), as it is: the commit's diff without a change, which
