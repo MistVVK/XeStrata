@@ -702,6 +702,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
     }
+    arena_bytes_ = count.used;
     strata::gpu::memset(arena_, 0, count.used);
     prof_on_ = strata::env_get("VERIFY_PROFILE") != nullptr;
     // The stamps are recorded in the window graph, so they need a clock a kernel reads: without one the profile is off

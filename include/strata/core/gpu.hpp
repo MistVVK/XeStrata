@@ -122,7 +122,7 @@ void vmem_free(void* va, size_t bytes);
 /// A new physical segment of `bytes` mapped read-write at `va`; null when the device has no memory for it.
 VmemSegment* vmem_map(void* va, size_t bytes);
 /// Unmaps `seg` from `va` and gives its memory back (the device must not be using it).
-void vmem_unmap(void* va, size_t bytes, VmemSegment* seg);
+bool vmem_unmap(void* va, size_t bytes, VmemSegment* seg);
 /// The chunk form (the elastic K/V, vmm.hpp): a physical segment of `bytes` not mapped anywhere (null: no memory),
 /// mapped read-write at a reserved `va`, unmapped from it (it keeps its bytes and can be mapped elsewhere), freed.
 VmemSegment* vmem_new(size_t bytes);

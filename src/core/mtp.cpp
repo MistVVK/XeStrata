@@ -609,7 +609,7 @@ MtpDrafter::SharedHead MtpDrafter::shared_head() const {
 }
 
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
-                      const MtpDrafter* shared) {
+                      const MtpDrafter* shared, bool prompt_only) {
     const OnDevice on_device(device_);
     wt_ = &wt;
     head_ = head;
@@ -618,6 +618,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     if (!wo) { err = "mtp: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
     if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
+    if (prompt_only) return true;
     if (head_logits_ == nullptr &&
         !strata::gpu::alloc_device((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float))) {
         err = "mtp: the draft logits do not fit";
@@ -639,7 +640,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     const std::string vocab = rt_dir_ + "/" + vocab_file_;
     if (dhead_ == nullptr && shared == nullptr && !full_head_env() && DraftSubset::file_tokens(vocab) > 0) {
         auto sub = std::make_shared<DraftSubset>();
-        if (!sub->load(vocab, n_vocab_, head->weights(), head->row_bytes(), nullptr, "xestrata mtp", err)) return false;
+        if (!sub->load(vocab, n_vocab_, head->weights(), head->row_bytes(), nullptr, "xestrata mtp", err, parkable_head_)) return false;
         if (sub->size() > 0) {
             subset_ = sub;
             dhead_ = const_cast<uint8_t*>(sub->rows());

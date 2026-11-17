@@ -315,14 +315,29 @@ VmemSegment* vmem_map(void* va, size_t bytes) {
             delete seg;
             throw;
         }
+        {
+            std::lock_guard<std::mutex> lock(g_live_mu);
+            g_live[va] = {bytes, rt().ordinal()};
+            g_live_bytes += bytes;
+            g_live_on[rt().ordinal()] += bytes;
+        }
         return seg;
     } catch (const std::exception& e) { fail("vmem_map", e); return nullptr; }
 }
 
-void vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
+bool vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
     try { sx::unmap(va, bytes, rt().context()); }
-    catch (const std::exception& e) { fail("vmem_unmap", e); }
+    catch (const std::exception& e) { return fail("vmem_unmap", e); }
+    {
+        std::lock_guard<std::mutex> lock(g_live_mu);
+        if (auto it = g_live.find(va); it != g_live.end()) {
+            g_live_bytes -= it->second.first;
+            g_live_on[it->second.second] -= it->second.first;
+            g_live.erase(it);
+        }
+    }
     delete seg;
+    return true;
 }
 
 VmemSegment* vmem_new(size_t bytes) {

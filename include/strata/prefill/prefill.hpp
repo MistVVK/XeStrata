@@ -236,6 +236,7 @@ public:
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 
     const PrefillStats& stats() const { return stats_; }
+    void set_stats(const PrefillStats& stats) { stats_ = stats; }
 
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its

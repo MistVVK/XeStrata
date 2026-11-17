@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+namespace strata::gpu { struct VmemSegment; }
+
 namespace strata::core {
 
 /// The drafts' token subset (tools/draft_vocab.py's int32 ids, setup's data/draft_vocab*.bin) and the head's rows of
@@ -36,18 +38,26 @@ public:
     /// False (and `err`) when they do not fit, after a hint of the smaller subsets setup ships; true with size() 0
     /// when the file has no usable id (`who` names the engine in the lines).
     bool load(const std::string& path, int64_t n_vocab, const void* head_rows, size_t row_bytes, void* stream,
-              const char* who, std::string& err);
+              const char* who, std::string& err, bool virtual_rows = false);
     int64_t size() const { return (int64_t) ids_.size(); }
     const uint8_t* rows() const { return rows_; }
     const int32_t* ids_device() const { return d_ids_; }
     const std::vector<int32_t>& ids() const { return ids_; }
     uint64_t bytes() const { return bytes_; }
+    bool can_park() const { return mapping_ != nullptr; }
+    bool park(std::string& err);
+    bool restore(std::string& err);
 
 private:
+    const void* original_head_ = nullptr;
+    size_t original_row_bytes_ = 0;
     uint8_t* rows_ = nullptr;
     int32_t* d_ids_ = nullptr;
     std::vector<int32_t> ids_;
     uint64_t bytes_ = 0;
+    size_t mapping_bytes_ = 0;
+    strata::gpu::VmemSegment* mapping_ = nullptr;
+    void* saved_rows_ = nullptr;
 };
 
 class DraftHeadInt2 {

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
 #include <thread>
 #include <vector>
 
@@ -76,7 +77,10 @@ void draft_head_hint(const char* who, int64_t n_tokens, int64_t row_bytes) {
 }  // namespace
 
 DraftSubset::~DraftSubset() {
-    if (rows_ != nullptr) gpu::free(rows_);
+    if (mapping_ != nullptr) gpu::vmem_unmap(rows_, mapping_bytes_, mapping_);
+    if (mapping_bytes_ != 0 && rows_ != nullptr) gpu::vmem_free(rows_, mapping_bytes_);
+    else if (rows_ != nullptr) gpu::free(rows_);
+    if (saved_rows_ != nullptr) gpu::free(saved_rows_);
     if (d_ids_ != nullptr) gpu::free(d_ids_);
 }
 
@@ -90,7 +94,9 @@ int64_t DraftSubset::file_tokens(const std::string& path) {
 }
 
 bool DraftSubset::load(const std::string& path, int64_t n_vocab, const void* head_rows, size_t row_bytes, void* stream,
-                       const char* who, std::string& err) {
+                       const char* who, std::string& err, bool virtual_rows) {
+    original_head_ = head_rows;
+    original_row_bytes_ = row_bytes;
     ids_.clear();
     if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
         int32_t v = 0;
@@ -104,8 +110,23 @@ bool DraftSubset::load(const std::string& path, int64_t n_vocab, const void* hea
         return true;
     }
     const int64_t n = (int64_t) ids_.size();
-    if (!gpu::alloc_device(&d_ids_, ids_.size() * 4) || !gpu::alloc_device(&rows_, (size_t) n * row_bytes)) {
-        err = std::string(who) + ": the draft head does not fit";
+    if (!gpu::alloc_device(&d_ids_, ids_.size() * 4)) {
+        err = std::string(who) + ": the draft vocabulary does not fit";
+        return false;
+    }
+    const size_t row_size = (size_t) n * row_bytes;
+    if (virtual_rows) {
+        const size_t gran = gpu::vmem_granularity();
+        if (gran == 0) { err = std::string(who) + ": virtual memory granularity"; return false; }
+        const size_t page = std::lcm(gran, size_t(2) << 20);
+        mapping_bytes_ = ((row_size + page - 1) / page) * page;
+        rows_ = static_cast<uint8_t*>(gpu::vmem_reserve(mapping_bytes_));
+        if (rows_ != nullptr) mapping_ = gpu::vmem_map(rows_, mapping_bytes_);
+    } else {
+        rows_ = static_cast<uint8_t*>(gpu::alloc_device(row_size));
+    }
+    if (rows_ == nullptr || (virtual_rows && mapping_ == nullptr)) {
+        err = std::string(who) + ": the draft head does not fit: " + gpu::last_error();
         draft_head_hint(who, n, (int64_t) row_bytes);
         return false;
     }
@@ -121,6 +142,35 @@ bool DraftSubset::load(const std::string& path, int64_t n_vocab, const void* hea
     bytes_ = (uint64_t) n * row_bytes + ids_.size() * 4;
     std::fprintf(stderr, "%s: draft head over %lld tokens (%.1f MiB)\n", who, (long long) n,
                  (double) ((uint64_t) n * row_bytes) / 1048576.0);
+    return true;
+}
+
+bool DraftSubset::park(std::string& err) {
+    if (mapping_ == nullptr) { err = "draft head: not mapped"; return false; }
+    if (saved_rows_ == nullptr && !gpu::alloc_host(&saved_rows_, mapping_bytes_)) {
+        err = "draft head: pinned memory allocation failed"; return false;
+    }
+    if (!gpu::copy(saved_rows_, rows_, mapping_bytes_) || !gpu::device_sync()) {
+        err = "draft head: copy to host failed"; return false;
+    }
+    if (!gpu::vmem_unmap(rows_, mapping_bytes_, mapping_)) {
+        err = std::string("draft head: unmap failed: ") + gpu::last_error(); return false;
+    }
+    mapping_ = nullptr;
+    return true;
+}
+
+bool DraftSubset::restore(std::string& err) {
+    if (mapping_ != nullptr || saved_rows_ == nullptr) { err = "draft head: not parked"; return false; }
+    mapping_ = gpu::vmem_map(rows_, mapping_bytes_);
+    if (mapping_ == nullptr || !gpu::copy(rows_, saved_rows_, mapping_bytes_) || !gpu::device_sync()) {
+        err = "draft head: restore failed"; return false;
+    }
+    // The host copy back to a remapped range read correctly on the host on the RX 9060 XT, but its draft kernel
+    // produced no usable draft probabilities.  Gathering the same rows again on the GPU restored the draft results.
+    k::gather_rows(static_cast<const uint8_t*>(original_head_), (int64_t) original_row_bytes_, d_ids_,
+                   (int64_t) ids_.size(), rows_, nullptr);
+    if (!gpu::device_sync()) { err = "draft head: restore gather failed"; return false; }
     return true;
 }
 

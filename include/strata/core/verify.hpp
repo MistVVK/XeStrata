@@ -167,6 +167,8 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Whether the last run() captured its window's graph: that round's time is mostly the capture's, not the window's
     bool captured_last() const { return captured_last_; }
+    size_t captured_graph_bytes() const { return graph_bytes_max_; }
+    size_t device_arena_bytes() const { return arena_bytes_; }
     /// Whether a window of T tokens can run without running the card out of memory: its graph is captured already,
     /// or the VRAM free leaves room to capture it (half as much again as the most a capture has taken, and 64 MiB)
     bool window_fits(int T) const;
@@ -616,6 +618,7 @@ private:
 
     // device
     void* arena_ = nullptr;
+    size_t arena_bytes_ = 0;
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;

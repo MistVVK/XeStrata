@@ -5544,6 +5544,7 @@ int main(int argc, char** argv) {
             }
         }
     }
+    bool small_card_final = false;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
     const int64_t pipe_first = o.pipeline_windows <= 0 ? 0
@@ -5796,6 +5797,7 @@ int main(int argc, char** argv) {
                 if (!native_dense.hc_q8_to_host(wt, he)) {
                     std::fprintf(stderr, "xestrata generate: %s: they stay on the device\n", he.c_str());
                 } else {
+                    small_card_final = true;
                     size_cache();
                     std::fprintf(stderr, "xestrata generate: the hyper-connection projections (%llu MiB) in pinned "
                                          "memory, read in place (XESTRATA_HC_HOST=0 keeps them on the device): the "
@@ -5808,6 +5810,7 @@ int main(int argc, char** argv) {
                 (en_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
                 const int64_t before = slots;
                 if (mtp.use_vocab_file("draft_vocab_en.bin")) {
+                    small_card_final = true;
                     size_cache();
                     std::fprintf(stderr, "xestrata generate: the drafter's head on the English subset "
                                          "(draft_vocab_en.bin; XESTRATA_MTP_VOCAB_EN=0 keeps %s): the expert cache %s in "
@@ -5853,6 +5856,7 @@ int main(int argc, char** argv) {
                     layers += native_dense.block_last_layer(i) - native_dense.block_first_layer(i) + 1;
                 }
                 if (moved > 0) {
+                    small_card_final = true;
                     size_cache();
                     std::fprintf(stderr, "xestrata generate: %d layers' projections (%llu MiB, %lld of %lld blocks) in "
                                          "pinned memory, read in place (XESTRATA_DENSE_HOST=0 keeps them on the device): "
@@ -7969,6 +7973,30 @@ int main(int argc, char** argv) {
         if (adapt_device_table_lags()) ver.set_always_publish(true);
         if (df2_loaded) ver.set_taps(df2.tap_layers());   // the DFlash2 drafter's taps (before init allocates them)
         else if (df2_deferred) ver.set_taps(df2_shape.taps);
+        const uint64_t draft_reserve = use_mtp ? mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
+        bool park_head = !small_card_final && !kvg.on && g.n_expert > 0 &&
+                         strata::kernels::cpu::expert_layout().max_blob > 0 && use_mtp && o.prefill_auto && o.batch <= 0 && !multi_gpu && !pipe && !df2_loaded &&
+                         !df2_deferred && drive.d.remote_count == 0 && lend_first >= 0 &&
+                         o.prefill_chunk < o.max_context && strata::gpu::vmem_supported();
+        if (park_head) {
+            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            const int64_t slots = xcache.slots() + (int64_t) (draft_reserve / (uint64_t) blob);
+            const int64_t larger = strata::prefill::auto_chunk(o.max_context, [&](int64_t c) {
+                if (c <= o.prefill_chunk) return false;
+                for (const bool cap : {false, true})
+                    for (const int ring : {0, 96}) {
+                        strata::prefill::Prefill::set_group_cap(cap);
+                        strata::prefill::Prefill::set_ring_override(ring);
+                        const int64_t bytes = (int64_t) strata::prefill::Prefill::bytes_needed(g, ss, c);
+                        const int64_t k = (bytes + blob - 1) / blob;
+                        if (k + 128 <= slots && k * 100 <= 85 * slots) return true;
+                    }
+                return false;
+            });
+            (void) auto_slots(o.prefill_chunk);
+            park_head = larger > o.prefill_chunk;
+        }
+        mtp.set_parkable_head(park_head);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? batch_rows : std::max(o.spec, o.batch), err) ||
             (use_mtp &&
@@ -7976,6 +8004,16 @@ int main(int argc, char** argv) {
                        pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "xestrata serve: %s\n", err.c_str());
             return 1;
+        }
+        double head_park_ms = 0.0;
+        if (park_head && mtp.head_can_park()) {
+            const auto t0 = Clock::now();
+            if (!mtp.park_head(err) || !mtp.restore_head(err)) {
+                std::fprintf(stderr, "xestrata serve: draft head parking: %s\n", err.c_str());
+                return 1;
+            }
+            head_park_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::fprintf(stderr, "xestrata serve: draft head parking and restore: %.1f ms\n", head_park_ms);
         }
         if (df2_loaded) {
             // auto: the MTP's gathered draft head is the same bytes (the same vocabulary file): share it
@@ -12333,7 +12371,90 @@ int main(int argc, char** argv) {
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 if (o.batch <= 0) {
                     const int64_t cpu0 = sp.stats().experts_cpu;
-                    if (!sp.run(ids.data() + a0, b0 - a0, a0, e)) return false;
+                    bool expanded = false;
+                    bool planned = false;
+                    int64_t candidate = 0;
+                    uint64_t needed = 0;
+                    const uint64_t hb = mtp.parkable_head_bytes();
+                    const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+                    size_t free = 0, total = 0;
+                    if (head_park_ms > 0 && mtp.head_can_park() && b0 - a0 > sp.chunk() && blob > 0 &&
+                        strata::gpu::mem_info(&free, &total)) {
+                        planned = true;
+                        free = (size_t) strata::core::counted_free(free, start_free_b, o.vram_free_mib);
+                        const int64_t slots = xcache.slots() + (int64_t) (hb / (uint64_t) blob);
+                        // The verifier prices another capture at 1.5 times its measured largest graph plus 64 MiB
+                        // (window_fits).  After a graph exists, that is the room it still needs; the rest of the
+                        // initial reserve is already held by the verifier and the drafter.
+                        const uint64_t reserve = ver.captured_graph_bytes() > 0
+                            ? ver.captured_graph_bytes() / 2 * 3 + (64ull << 20)
+                            : (uint64_t) std::max<int64_t>(0, ((int64_t) o.vram_reserve_mib << 20) -
+                                                                  (int64_t) draft_reserve -
+                                                                  (int64_t) ver.device_arena_bytes());
+                        candidate = strata::prefill::auto_chunk(std::min<int64_t>(o.max_context, (b0 - a0 + 255) / 256 * 256),
+                            [&](int64_t c) {
+                                if (c <= sp.chunk()) return false;
+                                for (const bool cap : {false, true})
+                                    for (const int ring : {0, 96}) {
+                                        strata::prefill::Prefill::set_group_cap(cap);
+                                        strata::prefill::Prefill::set_ring_override(ring);
+                                        needed = strata::prefill::Prefill::bytes_needed(g, ss, c);
+                                        const int64_t nk = (int64_t) ((needed + blob - 1) / blob);
+                                        if (nk + 128 <= slots && nk * 100 <= 85 * slots &&
+                                            needed <= strata::core::max_alloc_bytes() && free + hb >= reserve &&
+                                            needed <= free + hb - reserve) return true;
+                                    }
+                                return false;
+                            });
+                        const double experts = (double) g.n_expert *
+                            (1.0 - std::pow(1.0 - (double) K / (double) g.n_expert, (double) sp.chunk()));
+                        const double misses = std::max(0.0, (double) g.n_layers * experts - (double) xcache.slots());
+                        const int64_t old_chunks = (b0 - a0 + sp.chunk() - 1) / sp.chunk();
+                        const int64_t new_chunks = candidate > 0 ? (b0 - a0 + candidate - 1) / candidate : old_chunks;
+                        std::fprintf(stderr, "xestrata serve: prompt scratch planning: free %zu MiB, head %llu MiB, "
+                                             "reserve %llu MiB, candidate %lld, scratch %llu MiB\n", free >> 20,
+                                     (unsigned long long) (hb >> 20), (unsigned long long) (reserve >> 20),
+                                     (long long) candidate, (unsigned long long) (needed >> 20));
+                        const double copy_bw = 2.0 * (double) hb / head_park_ms;
+                        const double saved_ms = (double) (old_chunks - new_chunks) * misses * (double) blob / copy_bw;
+                        expanded = candidate > sp.chunk() && saved_ms > head_park_ms;
+                    }
+                    if (expanded) {
+                        if (!refill(e)) return false;
+                        const auto t0 = Clock::now();
+                        if (!mtp.park_head(e)) return false;
+                        void* slab = nullptr;
+                        if (!strata::gpu::alloc_device(&slab, needed)) {
+                            e = "the prompt scratch allocation failed";
+                            (void) mtp.restore_head(e);
+                            return false;
+                        }
+                        const auto previous = sp.stats();
+                        sp.reset();
+                        if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), candidate, main_cs, e, slab, needed)) {
+                            strata::gpu::free(slab);
+                            (void) mtp.restore_head(e);
+                            return false;
+                        }
+                        sp.set_stats(previous);
+                        const bool ok = sp.run(ids.data() + a0, b0 - a0, a0, e);
+                        const auto result = sp.stats();
+                        sp.reset();
+                        strata::gpu::free(slab);
+                        if (!mtp.restore_head(e)) return false;
+                        (void) auto_slots(o.prefill_chunk);
+                        if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk,
+                                     main_cs, e, xcache.device_slot(lend_first), borrow_bytes)) return false;
+                        sp.set_stats(result);
+                        lend_first_now = lend_first;
+                        std::fprintf(stderr, "xestrata serve: temporary prompt scratch: %lld tokens, %.1f ms including "
+                                             "draft head parking and restore\n", (long long) candidate,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                        if (!ok) return false;
+                    } else {
+                        if (planned) (void) auto_slots(o.prefill_chunk);
+                        if (!sp.run(ids.data() + a0, b0 - a0, a0, e)) return false;
+                    }
                     // the measured share, which setup's warm-up writes into the config (--prefill-cpu-share)
                     if (strata::prefill::cpu_share_setting() < 0.0 && sp.stats().experts_cpu > cpu0)
                         std::fprintf(stderr, "xestrata serve: prefill CPU share %.2f (measured)\n", sp.stats().cpu_share);
@@ -14148,6 +14269,8 @@ int main(int argc, char** argv) {
     // plan v0.3 P6: where the speculative loop starts (a native pack's one-token prompt starts it at 0)
     int64_t spec_pos = strata::spec::kSpecNotStarted;
     strata::prefill::Prefill prefill;
+    strata::prefill::PrefillStats saved_prefill_stats{};
+    bool defer_draft = false;
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
@@ -14156,6 +14279,7 @@ int main(int argc, char** argv) {
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
+        void* prompt_trial = nullptr;
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
             int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
@@ -14167,8 +14291,71 @@ int main(int argc, char** argv) {
                 chunk = strata::prefill::one_chunk_cap(chunk, n_prompt - 1);
                 k = auto_slots(chunk);
             }
+            if (!small_card_final && !strata::core::qsa_kv_elastic() && g.n_expert > 0 &&
+                strata::kernels::cpu::expert_layout().max_blob > 0 && o.prefill_auto && k > 0 && !o.mtp.empty() && o.spec > 0 && !multi_gpu && !df2_loaded &&
+                !o.no_prefill_borrow && n_prompt > chunk) {
+                const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+                const uint64_t head_bytes = mtp.bind_bytes(native_head.row_bytes(), n_vocab);
+                size_t free = 0, total = 0;
+                const int64_t extra = (int64_t) (head_bytes / (uint64_t) blob);
+                const int64_t slots = xcache.slots() + extra;
+                const uint64_t reserve = (uint64_t) std::max<int64_t>(0, ((int64_t) o.vram_reserve_mib << 20) -
+                                                                           (int64_t) head_bytes);
+                const bool have_free = strata::gpu::mem_info(&free, &total);
+                if (have_free) free = (size_t) strata::core::counted_free(free, start_free_b, o.vram_free_mib);
+                uint64_t need = 0;
+                int64_t candidate = strata::prefill::auto_chunk(std::min<int64_t>(o.max_context, (n_prompt + 255) / 256 * 256),
+                    [&](int64_t c) {
+                        if (c <= chunk) return false;
+                        for (const bool cap : {false, true})
+                            for (const int ring : {0, 96}) {
+                                strata::prefill::Prefill::set_group_cap(cap);
+                                strata::prefill::Prefill::set_ring_override(ring);
+                                need = strata::prefill::Prefill::bytes_needed(g, ss, c);
+                                const int64_t n = (int64_t) ((need + blob - 1) / blob);
+                                if (n + 128 <= slots && n * 100 <= 85 * slots && have_free &&
+                                    need <= strata::core::max_alloc_bytes() && free >= reserve && need <= free - reserve)
+                                    return true;
+                            }
+                        return false;
+                    });
+                if (candidate > chunk) {
+                    if (!strata::gpu::alloc_device(&prompt_trial, need)) {
+                        std::fprintf(stderr, "xestrata generate: prompt scratch allocation: %s\n", strata::gpu::last_error());
+                        return 1;
+                    }
+                    const size_t sample = std::min<uint64_t>(need, 4ull << 20);
+                    void* host = nullptr;
+                    double bw = -1;
+                    if (strata::gpu::alloc_host(&host, sample)) {
+                        std::memset(host, 0, sample);
+                        bw = strata::core::best_copy_gbps(prompt_trial, host, sample, nullptr);
+                        strata::gpu::free(host);
+                    }
+                    const double experts = (double) g.n_expert *
+                        (1.0 - std::pow(1.0 - (double) K / (double) g.n_expert, (double) chunk));
+                    const double misses = std::max(0.0, (double) g.n_layers * experts - (double) xcache.slots());
+                    const int64_t old_chunks = (n_prompt - 1 + chunk - 1) / chunk;
+                    const int64_t new_chunks = (n_prompt - 1 + candidate - 1) / candidate;
+                    const double saved = (double) (old_chunks - new_chunks) * misses * (double) blob;
+                    const double saved_ms = bw > 0 ? saved / (bw * 1e6) : 0;
+                    const double head_ms = bw > 0 ? 2.0 * (double) head_bytes / (bw * 1e6) : 0;
+                    if (bw > 0 && saved_ms > head_ms) {
+                        std::fprintf(stderr, "xestrata generate: prompt scratch: %lld -> %lld tokens; %.1f GB/s link, "
+                                             "%.1f MiB to prepare the draft head\n", (long long) chunk,
+                                     (long long) candidate, bw, (double) head_bytes / 1048576.0);
+                        chunk = candidate;
+                        k = 0;
+                        defer_draft = true;
+                    } else {
+                        strata::gpu::free(prompt_trial);
+                        prompt_trial = nullptr;
+                    }
+                }
+                if (!defer_draft) (void) auto_slots(chunk);
+            }
             if (o.prefill_auto) {
-                o.prefill_chunk = k > 0 ? chunk : 1024;
+                o.prefill_chunk = k > 0 || defer_draft ? chunk : 1024;
                 std::fprintf(stderr, "xestrata generate: prompt chunk auto: %lld tokens%s\n", (long long) o.prefill_chunk,
                              strata::prefill::Prefill::group_cap() ? " (the int8 group scratch holds one group's rows)" : "");
             } else if (chunk != o.prefill_chunk) {
@@ -14194,6 +14381,10 @@ int main(int argc, char** argv) {
                              (double) borrow_bytes / 1073741824.0);
             }
         }
+        if (defer_draft) {
+            borrow_bytes = strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk);
+            borrow = prompt_trial;
+        }
         if (borrow == nullptr)
             std::fprintf(stderr, "xestrata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
         if (!multi_gpu && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
@@ -14207,7 +14398,7 @@ int main(int argc, char** argv) {
         }
         if (drive.d.remote_count > 0 && !multi_gpu) attach_prompt_helper(prefill, *drive.d.remote[0], "generate");
         if (!o.mtp.empty()) {
-            if (!mtp.bind(wt, &native_head, nullptr, err)) {
+            if (!mtp.bind(wt, &native_head, nullptr, err, nullptr, defer_draft)) {
                 std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -14266,7 +14457,12 @@ int main(int argc, char** argv) {
         // the PLE window of the token path: the two tokens before `pos_start`
         ss.ple_prev[0] = pos_start >= 2 ? (int32_t) o.tokens[(size_t) (pos_start - 2)] : -1;
         ss.ple_prev[1] = pos_start >= 1 ? (int32_t) o.tokens[(size_t) (pos_start - 1)] : -1;
-        const strata::prefill::PrefillStats& ps = prefill.stats();
+        saved_prefill_stats = prefill.stats();
+        if (defer_draft) {
+            prefill.reset();
+            strata::gpu::free(prompt_trial);
+        }
+        const strata::prefill::PrefillStats& ps = saved_prefill_stats;
         std::fprintf(stderr, "xestrata generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
                              "streamed %lld (%lld by DMA, host %.1f ms), resident %lld, on the CPU %lld (share %.2f); "
                              "PLE %.1f ms\n",
@@ -14539,9 +14735,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         const bool use_mtp = !o.mtp.empty();
+        const auto draft_bind_start = Clock::now();
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
             return 1;
+        }
+        if (use_mtp && defer_draft) {
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - draft_bind_start).count();
+            prefill_ms += ms;
+            std::fprintf(stderr, "xestrata generate: draft head prepared after prompt in %.1f ms\n", ms);
         }
         if (df2_loaded) {
             if (use_mtp && same_bytes(df2_vocab, o.mtp + "/" + mtp.vocab_file())) {
@@ -14579,12 +14781,12 @@ int main(int argc, char** argv) {
         // what a swapped-in expert costs on the CPU against the GPU (the split probe's times): what a window the lag
         // keeps it on the CPU costs (auto_pick.hpp's ADAPT_LAG); 0.04 ms when the probe could not run
         const double per_expert_ms = pcie_split.c > 0.0 ? std::max(0.0, pcie_split.c - pcie_split.q) : 0.04;
-        pcie_move_if_pays(drive.d, ver.fetch_branch(), prefill.stats(), host_res, o.spec);
+        pcie_move_if_pays(drive.d, ver.fetch_branch(), saved_prefill_stats, host_res, o.spec);
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         {
             std::vector<int64_t> seen;   // the whole prompt
-            seed_usage_from_prompt(drive.d.usage, prefill.stats(), seen, g.n_expert, 4 * (int64_t) o.adapt_every, o.adapt_decay);
+            seed_usage_from_prompt(drive.d.usage, saved_prefill_stats, seen, g.n_expert, 4 * (int64_t) o.adapt_every, o.adapt_decay);
         }
         // the adaptive tier at fixed positions of the text: it counts the routing of the rows whose input was the
         // text (Verifier::add_routing) and swaps when a window ends on a multiple of 4 x --adapt-every tokens, the

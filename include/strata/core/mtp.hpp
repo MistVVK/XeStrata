@@ -92,6 +92,12 @@ public:
     /// to share when they are the same bytes (the same head and vocabulary file).  rows null: the whole head.
     struct SharedHead { const uint8_t* rows; const int32_t* vocab_dev; int64_t n; int type; };
     SharedHead shared_head() const;
+    void set_parkable_head(bool on) { parkable_head_ = on; }
+    bool head_can_park() const { return subset_ && subset_->can_park(); }
+    uint64_t parkable_head_bytes() const { return subset_ ? subset_->bytes() : 0; }
+    bool park_head(std::string& err) { return subset_ && subset_->park(err); }
+    bool restore_head(std::string& err) { return subset_ && subset_->restore(err); }
+
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
@@ -102,7 +108,7 @@ public:
     uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
-              const MtpDrafter* shared = nullptr);
+              const MtpDrafter* shared = nullptr, bool prompt_only = false);
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.
@@ -246,6 +252,7 @@ private:
     // a slot drafter borrows the immutable weights and the draft head; each still owns its state and scratch
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;
+    bool parkable_head_ = false;
     uint8_t* experts_ = nullptr;
     bool experts_host_ = false;   ///< experts_ is pinned host memory (experts_to_host)
     void* state_arena_ = nullptr;
