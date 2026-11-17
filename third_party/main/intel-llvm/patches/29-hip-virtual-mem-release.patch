@@ -79,8 +79,8 @@ diff --git a/unified-runtime/source/adapters/hip/virtual_mem.cpp b/unified-runti
 +    while (std::fgets(Line, sizeof Line, Maps)) {
 +      unsigned long Lo = 0, Hi = 0, Inode = 0;
 +      int PathAt = 0;
-+      if (std::sscanf(Line, "%lx-%lx %*4s %*x %*x:%*x %lu %n", &Lo, &Hi,
-+                      &Inode, &PathAt) < 3 ||
++      if (std::sscanf(Line, "%lx-%lx %*4s %*x %*x:%*x %lu %n", &Lo, &Hi, &Inode,
++                      &PathAt) < 3 ||
 +          Addr < Lo || Addr >= Hi)
 +        continue;
 +      if (Inode == 0) {
