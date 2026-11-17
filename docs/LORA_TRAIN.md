@@ -386,7 +386,9 @@ stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib=
   GPU allocation since process start, rounded up to MiB; it excludes the runtime's own allocations. `process_mib` includes
   the runtime. `process_source` is `fdinfo` (this Linux DRM process), `nvml` (this NVIDIA driver process), `delta` (the
   device's free-memory difference), or `global` (the conservative device-wide value). The difference can include changes
-  by other processes and excludes runtime allocations made before the first reading. `min` estimates the least form
+  by other processes and excludes runtime allocations made before the first reading. On Linux, serve reads its trainer's
+  process use on both sides of the device's free-memory query and adds the smaller reading. When the process use cannot
+  be read, it confirms a shortage twice before lowering the budget; chat and image work do not wait. `min` estimates the least form
   (no resident block, no tape, the inputs on the host); `peak_est` estimates the next step's peak. `min_source=estimate`
   uses the measurement table; `step` uses the process memory with the backward's buffers still alive, less what can be
   reclaimed. `raw_min_mib` is the value before the table; `raw_min_source` is `floor` or `step`.

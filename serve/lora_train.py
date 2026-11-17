@@ -278,7 +278,7 @@ def check_caption(text: str) -> str:
 _DEV_CACHE: dict[str, tuple[float, list[dict]]] = {}
 
 
-def devices(svc) -> list[dict]:
+def devices(svc, *, fresh: bool = False) -> list[dict]:
     """The GPUs as xestrata-device --list-devices reports them (one JSON a device: ordinal, pci, total_bytes,
     free_bytes, integrated, compute_units, arch).  [] when the program is not here.  Cached DEVICES_CACHE_S."""
     images = getattr(svc, "images", None)
@@ -286,7 +286,7 @@ def devices(svc) -> list[dict]:
         return []
     exe = str(Path(images.default.cfg["exe"]).parent / "xestrata-device")
     got = _DEV_CACHE.get(exe)
-    if got is not None and time.monotonic() - got[0] < DEVICES_CACHE_S:
+    if not fresh and got is not None and time.monotonic() - got[0] < DEVICES_CACHE_S:
         return got[1]
     out: list[dict] = []
     if Path(exe).is_file():
@@ -883,20 +883,32 @@ class TrainJobs:
 
     def _state(self, rec: dict) -> dict:
         """The current device room and trainer report in train_budget.Decider's input format."""
-        reports = devices(self.svc)
+        from serve.vram_ledger import process_memory_mib
         current = str((self.place or {}).get("pci") or "")
+        proc = self._proc
+        alive = proc is not None and proc.poll() is None
+        source = self._train_state.get("process_source")
+        before = process_memory_mib(proc.pid, current, source) if proc is not None and alive and current else None
+        # Bypass the device cache even if another thread refills it: the process and free readings are paired.
+        reports = devices(self.svc, fresh=alive)
+        after = process_memory_mib(proc.pid, current, source) if proc is not None and alive and current else None
         free = {str(d["pci"]).lower(): int(d.get("free_bytes") or 0) >> 20 for d in reports}
         device_free = dict(free)
         _, helper, held = text_placement(self.svc)
         status = getattr(self.svc, "status", {})
         train = dict(self._train_state)
+        train["process_live"] = bool(before is not None and after is not None and before[1] == after[1])
+        if train["process_live"]:
+            assert before is not None and after is not None
+            # The lower bracketing reading is conservative when a step allocates or frees during the device query.
+            train.update(process_mib=min(before[0], after[0]), process_source=before[1])
         with self.lock:
             needs = list(self.image_needs.values())
             image_seq = self.image_seq
         known = [n for n in needs if n is not None]
         image_need = max(known) if needs and len(known) == len(needs) else None
         return {"free": free, "device_free": device_free,
-                "proc_alive": self._proc is not None and self._proc.poll() is None,
+                "proc_alive": proc is not None and proc.poll() is None,
                 "chat_busy": self._chat_busy(), "chat_queued": bool(status.get("queued")),
                 "chat_eta_s": None, "image_job": bool(needs), "image_need_mib": image_need, "image_seq": image_seq,
                 "helper_mib": held.get(helper, 0), "train": train, "current_pci": current,

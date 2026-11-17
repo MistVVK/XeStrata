@@ -89,6 +89,72 @@ def process_start(pid: int) -> float | None:
     return None
 
 
+def drm_process_memory_mib(pid: int, pci: str, proc: Path = Path("/proc")) -> int | None:
+    """The process's DRM VRAM on one PCI device, with each DRM client counted once (gpu.cpp's rule)."""
+    try:
+        files = list((proc / str(pid) / "fdinfo").iterdir())
+    except OSError:
+        return None
+    clients: dict[str, int] = {}
+    for f in files:
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        driver = device = client = ""
+        xe = amd = 0
+        found_xe = found_amd = False
+        for line in lines:
+            key, sep, value = line.partition(":")
+            if not sep:
+                continue
+            fields = value.split()
+            if key == "drm-driver" and fields:
+                driver = fields[0]
+            elif key == "drm-pdev" and fields:
+                device = fields[0]
+            elif key == "drm-client-id" and fields:
+                client = fields[0]
+            elif key.startswith("drm-total-vram") or key == "drm-memory-vram":
+                if not fields or len(fields) > 2 or (len(fields) == 2 and fields[1] not in ("B", "KiB", "MiB")):
+                    continue
+                try:
+                    value_bytes = int(fields[0]) * ({"B": 1, "KiB": 1024, "MiB": 1048576}.get(
+                        fields[1], 1) if len(fields) == 2 else 1)
+                except ValueError:
+                    continue
+                if value_bytes < 0:
+                    continue
+                if key.startswith("drm-total-vram"):
+                    xe += value_bytes
+                    found_xe = True
+                else:
+                    amd += value_bytes
+                    found_amd = True
+        if device.lower() != pci.lower() or (driver == "xe" and not found_xe) or \
+                (driver == "amdgpu" and not found_amd) or driver not in ("xe", "amdgpu"):
+            continue
+        name = client or f.name
+        clients[name] = max(clients.get(name, 0), xe if driver == "xe" else amd)
+    return sum(clients.values()) >> 20 if clients else None
+
+
+def process_memory_mib(pid: int, pci: str, source: str | None) -> tuple[int, str] | None:
+    """Read a process on this card now, or None when its source cannot identify the process."""
+    if not sys.platform.startswith("linux"):
+        return None
+    if source in (None, "fdinfo"):
+        used = drm_process_memory_mib(pid, pci)
+        if used is not None:
+            return used, "fdinfo"
+    if source in (None, "nvml"):
+        from serve import telemetry
+        used = telemetry.nvml_process_memory_mib(pid, pci)
+        if used is not None:
+            return used, "nvml"
+    return None
+
+
 def _user() -> str:
     return str(os.getuid()) if hasattr(os, "getuid") else re.sub(r"\W", "", os.environ.get("USERNAME", "user"))
 

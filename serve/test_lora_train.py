@@ -192,7 +192,7 @@ class Training(unittest.TestCase):
         self.tb = FakeBudget()
         self.patches = [
             mock.patch.object(lt, "budget_mod", lambda: self.tb),
-            mock.patch.object(lt, "devices", lambda svc: [
+            mock.patch.object(lt, "devices", lambda svc, **kwargs: [
                 {"pci": "0000:00:02.0", "name": "Fake GPU A", "total_bytes": 24 << 30, "free_bytes": 20 << 30},
                 {"pci": "0000:00:03.0", "name": "Fake GPU B", "total_bytes": 24 << 30, "free_bytes": 20 << 30}]),
             mock.patch.dict(lt.TRAINERS["mage-flow"], {"elastic": True}),

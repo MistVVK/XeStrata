@@ -354,6 +354,8 @@ stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib=
   `process_mib` はランタイムを含む使用量、`process_source` は `fdinfo`（Linux DRM の自プロセス）、
   `nvml`（NVIDIA ドライバーの自プロセス）、`delta`（装置の空きの差）、`global`（装置全体の保守的な値）。
   差の測定には他プロセスの増減が混ざり得る。測り始める前のランタイムの確保は含まない。
+  serve は Linux で自プロセスを読める場合、装置の空きの前後に使用量を読み、小さい方を足す。読めない場合は
+  予算を下げる前に空き不足を 2 回確かめる（チャット・画像の仕事が来たときは待たない）。
   `min` は常駐 0・tape 0・入力ホスト退避の形の見積もり、`peak_est` は次の step のピークの見積もり。
   `min_source=estimate` は測定表からの見積もり、`step` は後向きの作業領域を持つ時点の使用量から返せる分を
   引いた値。`raw_min_mib` は表を足す前の値で、`raw_min_source` は `floor` または `step`。
