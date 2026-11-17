@@ -266,6 +266,13 @@ class Handover(unittest.TestCase):
         self.assertFalse(os.path.exists(self.dir))
         self.assertFalse(self.p.up or self.d.up)
 
+    def test_reused_comes_from_the_side_serving_the_request(self):
+        self.p.reused, self.d.reused = 400, 7
+        self.e.__dict__["cur"] = self.p
+        self.assertEqual(self.e.reused, 400)                        # the prompt is read on the prefill card
+        self.e.__dict__["cur"] = self.d
+        self.assertEqual(self.e.reused, 7)                          # on the decode side: that engine's count
+
 
 if __name__ == "__main__":
     unittest.main()

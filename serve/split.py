@@ -246,6 +246,12 @@ class SplitEngine:
         return self.cur.prefill_tok_s_mean
 
     @property
+    def reused(self):
+        # #4636: the engine the request is on now. While the decode engine restores the hand-over's session (well under a second) cur is
+        # already the decode engine, so the Monitor can show that engine's previous request for that moment; _hand_over is left as it is.
+        return self.cur.reused
+
+    @property
     def batch(self) -> int:
         return 0
 

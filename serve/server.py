@@ -1897,6 +1897,11 @@ class StrataEngine:
                     send_stop()
                     stopped = True
                 yield None
+            elif line.startswith("RESUME "):          # #4636: the reused prefix (the Monitor's Context gauge); read only there
+                try:
+                    self.reused = int(line.split()[1])
+                except (IndexError, ValueError):
+                    pass
             elif line.startswith("DONE"):
                 self._parse_done(line)
                 self._last_done = line
@@ -5924,6 +5929,8 @@ class Service:
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
+                # #4636: prompt tokens the prefix cache already held for the running request (RESUME): the Context gauge's Cached share
+                "reused": int(getattr(self.engine, "reused", 0) or 0) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
@@ -5946,6 +5953,9 @@ class Service:
         if hasattr(self.engine, "split_view"):          # opt-in split serving: the hand-overs so far (serve/split.py)
             live["split_serve"] = self.engine.split_view()
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
+                  # #4636: the engine process generation; a history record from an earlier one is from before a restart, so its
+                  # KV cache is gone and the Context gauge must not show it as cached
+                  "gen": getattr(self.engine, "gen", None),
                   **dict(getattr(self.engine, "info", {}) or {})}
         if getattr(self.vision, "cpu_note", None):         # the card had no room for the picture reader: the Terminal says so in its summary
             engine["vision_note"] = self.vision.cpu_note
@@ -6928,6 +6938,7 @@ class Service:
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                "gen": getattr(self.engine, "gen", None),       # #4636: the engine process this record is from
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "first_engine_token_s": first_engine_token_s,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)

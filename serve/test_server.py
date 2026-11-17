@@ -2442,6 +2442,59 @@ class DraftCounts(unittest.TestCase):
         self.assertEqual((m["totals"]["drafts_offered"], m["totals"]["drafts_accepted"]), (17, 10))
 
 
+class ControlLineReading(unittest.TestCase):
+    """The control-line reader (batch, and the solo leg of a batched engine) parses RESUME, so a batch request's
+    live.reused is the real count - not the static 0 the reader left before it saw the line."""
+
+    def test_resume_line_sets_reused(self):
+        import queue
+
+        class Fake:
+            def __init__(self):
+                self.lines = queue.Queue()
+                self._ctl_mode = "solo"
+                self._ctl_result = None
+                self._last_done = None
+                self._ctl_erred = False
+                self._yielded = None
+                self.progress = None
+                self.progress_ms = 0
+                self.prefill_tok_s_mean = None
+                self.reused = 0
+
+            def _send(self, line):
+                pass
+
+            def _parse_done(self, line):
+                pass
+
+        f = Fake()
+        f.lines.put("RESUME 1234")
+        f.lines.put("DONE 4 20 40.0 30.0 stop")
+        list(StrataEngine._control(f, threading.Event(), lambda t: None))
+        self.assertEqual(f.reused, 1234)
+        self.assertEqual(f._ctl_result, ("done", None))
+
+
+class EngineGenerationMarker(unittest.TestCase):
+    """A history record notes the engine process that produced it and metrics() reports the current one, so the
+    frontend can drop the idle Context arc once a restart wiped the KV cache (the record is from an older generation)."""
+
+    def test_history_and_engine_carry_the_generation(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok", max_context=CTX)
+        engine.gen = 5
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
+        m = svc.metrics()
+        self.assertEqual(m["engine"]["gen"], 5)
+        self.assertEqual(m["requests"][0]["gen"], 5)
+        engine.gen = 6                                             # a restart: the KV cache is gone
+        m2 = svc.metrics()
+        self.assertEqual(m2["engine"]["gen"], 6)
+        self.assertEqual(m2["requests"][0]["gen"], 5)              # the record keeps the generation it was made under
+
+
 class PrometheusMetrics(unittest.TestCase):
     """GET /metrics/prometheus: the totals in Prometheus' text format, under llama-server's names."""
 
@@ -3265,6 +3318,43 @@ class LiveRate(unittest.TestCase):
         self.svc.status["busy"] = False
         self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
 
+    def test_live_reused_is_the_resumed_prefix(self):
+        """live.reused is what the Context ring shows as the cached share: the prefix the engine said it
+        already held (the RESUME line), live from the first report on; 0 for an engine too old to print it;
+        None when nothing is in flight."""
+        import io
+        import queue
+        from types import SimpleNamespace
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # alive() asks it (#208)
+        engine.lines = queue.Queue()
+        engine.can_stop = False
+        engine.max_context = 262144
+        engine.lines.put("RESUME 4096")                        # the checkpoint's reused prefix, printed once
+        engine.lines.put("PP 8192 12000")                      # the first chunk starts after it
+        engine.lines.put("DONE 1 12000 4000 10 stop 0 0 4096")
+        gen = engine.generate([1], 1, {}, threading.Event())
+        self.assertIsNone(next(gen))
+        self.svc.engine = engine
+        self.svc.status.update(busy=True, first_token=None)    # state: reading
+        self.assertEqual(self.metrics()["live"]["reused"], 4096)
+        list(gen)                                              # let the request reach its DONE, no abandoned generator
+
+        old = StrataEngine.__new__(StrataEngine)               # an engine too old to print RESUME never sets it
+        old.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)
+        old.lines = queue.Queue()
+        old.can_stop = False
+        old.max_context = 262144
+        old.lines.put("PP 8192 12000")
+        old.lines.put("DONE 1 12000 4000 10 stop 0 0 0")
+        gen2 = old.generate([1], 1, {}, threading.Event())
+        next(gen2)
+        self.svc.engine = old
+        self.assertEqual(self.metrics()["live"]["reused"], 0, "an old engine counts the prefix as work")
+        list(gen2)
+        self.svc.status["busy"] = False
+        self.assertIsNone(self.metrics()["live"]["reused"], "idle: there is no in-flight prefix to show")
+
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()
 
@@ -3401,6 +3491,24 @@ class PromptProgress(unittest.TestCase):
         self.engine.reused = 0                        # an engine too old to print RESUME never sets it
         self.assertEqual(prompt_progress(self.svc)["cache"], 0,
                          "an engine too old to print RESUME counts the reused prefix as work")
+
+
+    def test_the_live_metrics_row_carries_the_same_reused_number(self):
+        """The Monitor's Context ring reads live.reused from GET /metrics: while a prompt is being read it is
+        the RESUME prefix the pings already carry; 0 for an engine too old to print it; never a stale value."""
+        self.svc.status.update(busy=True, first_token=None)   # a request in its reading phase
+        try:
+            with urllib.request.urlopen(self.base + "/metrics", timeout=10) as r:
+                live = json.loads(r.read())["live"]
+            self.assertEqual(live["state"], "reading")
+            self.assertEqual(live["reused"], self.engine.reused, "4096 from setUp, while reading")
+            self.engine.reused = 0                            # an engine too old to print RESUME never sets it
+            with urllib.request.urlopen(self.base + "/metrics", timeout=10) as r:
+                self.assertEqual(json.loads(r.read())["live"]["reused"], 0)
+        finally:
+            self.svc.status["busy"] = False
+            with urllib.request.urlopen(self.base + "/metrics", timeout=10) as r:
+                self.assertIsNone(json.loads(r.read())["live"]["reused"], "idle: no in-flight prefix")
 
 
 class ConfigReasoningEffort(unittest.TestCase):

@@ -158,6 +158,54 @@ class RouteChoice(unittest.TestCase):
         self.assertEqual(selected, [1])
 
 
+class ReusedRouting(unittest.TestCase):
+    """live.reused is read from the replica that serves the request, never from a finished request's stale value."""
+
+    def test_the_request_replica_is_read(self):
+        a, b = FakeEngine(), FakeEngine()
+        a.reused, b.reused = 0, 1234
+        e = ReplicaEngine([a, b])
+        e.tl.cur = b
+        self.assertEqual(e.reused, 1234)
+        e.tl.cur = a
+        self.assertEqual(e.reused, 0)                               # its own request holds no prefix: 0, not b's
+
+    def test_the_status_thread_reads_the_replica_with_a_request_in_flight(self):
+        a, b = FakeEngine(), FakeEngine()
+        a.reused, b.reused = 1234, 500                              # a: finished earlier (stale); b: reading now
+        e = ReplicaEngine([a, b])
+        e.inflight = [0, 1]
+        self.assertEqual(e.reused, 500)
+        b.reused = 0                                                # b's request resumes nothing
+        self.assertEqual(e.reused, 0)
+        e.inflight = [0, 0]
+        self.assertEqual(e.reused, 0)
+
+    def test_progress_is_read_from_the_replica_in_flight(self):
+        a, b = FakeEngine(), FakeEngine()
+        a.progress = (12000, 12000)                                 # a: finished earlier (stale)
+        b.progress = None                                           # b: reading now, no chunk yet
+        e = ReplicaEngine([a, b])
+        e.inflight = [0, 1]
+        self.assertIsNone(e.progress)                               # strict 0 before the first confirmed chunk
+        b.progress = (10, 100)
+        self.assertEqual(e.progress, (10, 100))
+        e.inflight = [0, 0]
+        self.assertIsNone(e.progress)
+
+    def test_prefill_rate_is_read_from_the_replica_in_flight(self):
+        a, b = FakeEngine(), FakeEngine()
+        a.prefill_tok_s_mean = 4000.0                               # a: finished earlier (stale)
+        b.prefill_tok_s_mean = None
+        e = ReplicaEngine([a, b])
+        e.inflight = [0, 1]
+        self.assertIsNone(e.prefill_tok_s_mean)
+        b.prefill_tok_s_mean = 123.4
+        self.assertEqual(e.prefill_tok_s_mean, 123.4)
+        e.inflight = [0, 0]
+        self.assertIsNone(e.prefill_tok_s_mean)
+
+
 class ReplicaService(unittest.TestCase):
     def start(self, slots=4, n=2):
         import serve.server as server

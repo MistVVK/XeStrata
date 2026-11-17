@@ -437,14 +437,30 @@ class ReplicaEngine:
         c = getattr(self.tl, "cur", None)
         if c is not None:
             return c.progress
-        return next((e.progress for e in self.engines if getattr(e, "progress", None)), None)
+        # #4636: the /metrics thread holds no tl.cur: read it off a replica with a request in flight (a finished one's value is stale)
+        return next((e.progress for k, e in enumerate(self.engines) if self.inflight[k] and getattr(e, "progress", None)), None)
 
     @property
     def prefill_tok_s_mean(self):
         c = getattr(self.tl, "cur", None)
         if c is not None:
             return c.prefill_tok_s_mean
-        return next((e.prefill_tok_s_mean for e in self.engines if getattr(e, "prefill_tok_s_mean", None)), None)
+        return next((e.prefill_tok_s_mean for k, e in enumerate(self.engines)
+                     if self.inflight[k] and getattr(e, "prefill_tok_s_mean", None) is not None), None)
+
+    @property
+    def reused(self):
+        """#4636: the running request's reused prefix: its own replica's, else one with a request in flight (never a finished one's)."""
+        c = getattr(self.tl, "cur", None)
+        if c is not None:
+            return c.reused
+        return next((e.reused for k, e in enumerate(self.engines) if self.inflight[k] and getattr(e, "reused", 0)), 0)
+
+    @property
+    def gen(self):
+        """#4636: the serving replica's engine process generation; the /metrics thread has no serving replica, so none."""
+        c = getattr(self.tl, "cur", None)
+        return c.gen if c is not None else None
 
     def alive(self) -> bool:
         return any(e.alive() for e in self.engines)
