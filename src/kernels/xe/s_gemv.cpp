@@ -205,17 +205,18 @@ sycl::event launch_q8_split(sycl::queue& q, const uint8_t* x, const uint8_t* cod
             constexpr int QW = 4 * CODE_BITS / 8;              // bytes per four-code word: 1, 2 or 4
             constexpr unsigned MASK = (1u << CODE_BITS) - 1u;
             long long i = (long long) lane * QE;
-            for (; i + QE <= n_in; i += (long long) WARP * QE) {
+            // WARP and QE are compile-time constants (32 and 16).
+            for (; i + QE <= n_in; i += WARP * QE) { // NOLINT(bugprone-implicit-widening-of-multiplication-result)
                 const long long g = i >> group_shift;
                 const float d = s[g];
                 const float b = off ? off[g] : 0.0f;
                 const uint8_t* cp = c + i / PER_BYTE;
                 unsigned vw[4];
-                // k < 4, so the byte offsets fit int.
+                // k < 4, so these byte offsets fit int.
                 for (int k = 0; k < 4; ++k) {
                     if constexpr (QW == 1) vw[k] = cp[k];
-                    else if constexpr (QW == 2) vw[k] = *reinterpret_cast<const uint16_t*>(cp + static_cast<size_t>(k * 2));
-                    else vw[k] = *reinterpret_cast<const uint32_t*>(cp + static_cast<size_t>(k * 4));
+                    else if constexpr (QW == 2) vw[k] = *reinterpret_cast<const uint16_t*>(cp + 2 * k); // NOLINT(bugprone-implicit-widening-of-multiplication-result)
+                    else vw[k] = *reinterpret_cast<const uint32_t*>(cp + 4 * k); // NOLINT(bugprone-implicit-widening-of-multiplication-result)
                 }
                 // all sixteen elements lie in one activation block (see the CUDA source)
                 constexpr int blk_elems = Q8K ? Q8K_BLOCK_ELEMS : Q8_0_BLOCK_ELEMS;
@@ -232,7 +233,7 @@ sycl::event launch_q8_split(sycl::queue& q, const uint8_t* x, const uint8_t* cod
                 }
             }
             // the last, partial run - at most one per lane
-            for (; i < n_in; i += (long long) WARP * QE) {
+            for (; i < n_in; i += WARP * QE) { // NOLINT(bugprone-implicit-widening-of-multiplication-result)
                 for (int k = 0; k < QE && i + k < n_in; ++k) {
                     const long long e = i + k;
                     const long long g = e >> group_shift;
@@ -459,8 +460,8 @@ void s2_gemv_fast(const uint16_t* x, const uint8_t* codes, const float* scales, 
             for (long long qd = tid; qd < n_quads; qd += tpr) {
                 const uint8_t byte = c[qd];
                 const float d = s[qd >> 4];
-                // byte <= 255, so its table offset fits int.
-                const float* cv = &kS2Lut[static_cast<size_t>(byte * 4)];
+                // byte <= 255, so the table offset fits int.
+                const float* cv = &kS2Lut[byte * 4]; // NOLINT(bugprone-implicit-widening-of-multiplication-result)
                 const float h0 = f32_from_f16(stage ? sx[qd * 4] : x[qd * 4]);
                 const float h1 = f32_from_f16(stage ? sx[qd * 4 + 1] : x[qd * 4 + 1]);
                 const float h2 = f32_from_f16(stage ? sx[qd * 4 + 2] : x[qd * 4 + 2]);
