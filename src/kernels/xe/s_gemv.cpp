@@ -211,10 +211,11 @@ sycl::event launch_q8_split(sycl::queue& q, const uint8_t* x, const uint8_t* cod
                 const float b = off ? off[g] : 0.0f;
                 const uint8_t* cp = c + i / PER_BYTE;
                 unsigned vw[4];
+                // k < 4, so the byte offsets fit int.
                 for (int k = 0; k < 4; ++k) {
                     if constexpr (QW == 1) vw[k] = cp[k];
-                    else if constexpr (QW == 2) vw[k] = *reinterpret_cast<const uint16_t*>(cp + size_t(k) * 2);
-                    else vw[k] = *reinterpret_cast<const uint32_t*>(cp + size_t(k) * 4);
+                    else if constexpr (QW == 2) vw[k] = *reinterpret_cast<const uint16_t*>(cp + static_cast<size_t>(k * 2));
+                    else vw[k] = *reinterpret_cast<const uint32_t*>(cp + static_cast<size_t>(k * 4));
                 }
                 // all sixteen elements lie in one activation block (see the CUDA source)
                 constexpr int blk_elems = Q8K ? Q8K_BLOCK_ELEMS : Q8_0_BLOCK_ELEMS;
@@ -458,7 +459,8 @@ void s2_gemv_fast(const uint16_t* x, const uint8_t* codes, const float* scales, 
             for (long long qd = tid; qd < n_quads; qd += tpr) {
                 const uint8_t byte = c[qd];
                 const float d = s[qd >> 4];
-                const float* cv = &kS2Lut[size_t(byte) * 4];
+                // byte <= 255, so its table offset fits int.
+                const float* cv = &kS2Lut[static_cast<size_t>(byte * 4)];
                 const float h0 = f32_from_f16(stage ? sx[qd * 4] : x[qd * 4]);
                 const float h1 = f32_from_f16(stage ? sx[qd * 4 + 1] : x[qd * 4 + 1]);
                 const float h2 = f32_from_f16(stage ? sx[qd * 4 + 2] : x[qd * 4 + 2]);

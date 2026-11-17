@@ -34,6 +34,8 @@ namespace {
 namespace xe = strata::kernels::xe;
 using sycl::nd_item;
 
+// DFlash2 has 8 KV heads, 4 queries per head and a 128-wide head.
+// Its per-head and per-row tile indices below fit in int.
 constexpr int HD = kDf2Hd;
 constexpr int WARP = 32;
 core::TimedCache<sycl::device, int, bool> g_gemm_warmed;
@@ -193,7 +195,7 @@ sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring
             for (int i = lane; i < 8 * HD; i += WARP) {   // the group's 8 queries, scaled once
                 const int ql = i / HD, d = i % HD;
                 const int qi = qg * 8 + ql, row = qi >> 2, g = qi & 3;
-                Qs[ql][d] = q[((size_t) row * 32 + (size_t) kvh * kDf2Gqa + g) * HD + d] * scale;
+                Qs[ql][d] = q[((size_t) row * 32 + static_cast<size_t>(kvh * kDf2Gqa) + g) * HD + d] * scale;
             }
             float m[8], l[8], O[8][4];
 #pragma unroll
@@ -274,7 +276,7 @@ sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring
             sycl::group_barrier(it.get_group());
 #pragma unroll
             for (int qi = 0; qi < 8; ++qi) {
-                if (lane == 0) { pbase[(size_t) qi * 130] = m[qi]; pbase[(size_t) qi * 130 + 1] = l[qi]; }
+                if (lane == 0) { pbase[static_cast<size_t>(qi * 130)] = m[qi]; pbase[static_cast<size_t>(qi * 130) + 1] = l[qi]; }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) pbase[qi * 130 + 2 + lane * 4 + j] = O[qi][j];
             }
@@ -312,7 +314,7 @@ sycl::event df2_attention_v2(sycl::queue& qu, const float* q, const float* kring
             for (int i = tid; i < 32 * HD; i += 256) {   // the group's 32 queries, scaled once
                 const int ql = i / HD, d = i % HD;
                 const int row = ql >> 2, g = ql & 3;
-                Qs[ql][d] = q[((size_t) row * 32 + (size_t) kvh * kDf2Gqa + g) * HD + d] * scale;
+                Qs[ql][d] = q[((size_t) row * 32 + static_cast<size_t>(kvh * kDf2Gqa) + g) * HD + d] * scale;
             }
             float m[4], l[4], O[4][4];
 #pragma unroll
@@ -392,7 +394,7 @@ sycl::event df2_attention_v2(sycl::queue& qu, const float* q, const float* kring
             sycl::group_barrier(it.get_group());
 #pragma unroll
             for (int qi = 0; qi < 4; ++qi) {
-                if (lane == 0) { pbase[(size_t) qi * 130] = m[qi]; pbase[(size_t) qi * 130 + 1] = l[qi]; }
+                if (lane == 0) { pbase[static_cast<size_t>(qi * 130)] = m[qi]; pbase[static_cast<size_t>(qi * 130) + 1] = l[qi]; }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) pbase[qi * 130 + 2 + lane * 4 + j] = O[qi][j];
             }
@@ -519,7 +521,7 @@ void df2_attention_f32(const float* q, const float* kring, const float* vring, c
             value = sycl::fma(p[2 + d], weight, value);
         }
         const int row = qi >> 2, head = kvh * kDf2Gqa + (qi & 3);
-        out[(size_t) row * 32 * HD + (size_t) head * HD + d] = sum > 0.0f ? value / sum : 0.0f;
+        out[(size_t) row * 32 * HD + static_cast<size_t>(head * HD) + d] = sum > 0.0f ? value / sum : 0.0f;
     });
 }
 
@@ -538,6 +540,7 @@ namespace {
 template <int NC, bool Q4, bool PAIR16>
 void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, int n_out, int n_in,
                  const int8_t* xq, const float* xd) {
+    // r < 8 and st < n_in / 512, so r * 32 and st * 32 fit int.
     const int nb = n_in / 32, steps = nb / 16;
     qu.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> halves(PAIR16 ? NC * WARP : 1, h);
@@ -546,13 +549,13 @@ void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, 
         const sycl::sub_group sg = it.get_sub_group();
         const int row = (int) it.get_group(0), lane = (int) it.get_local_id(0);
         const int g = row / 8, r = row % 8;
-        const uint16_t* wd = dpl + (size_t) g * 8 * nb + (size_t) r * 16 + (lane >> 1);
+        const uint16_t* wd = dpl + (size_t) g * 8 * nb + static_cast<size_t>(r * 16) + (lane >> 1);
         const sycl::int4* xv = reinterpret_cast<const sycl::int4*>(xq) + lane;
         float acc[NC];
 #pragma unroll
         for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
         if constexpr (Q4) {
-            const sycl::uint2* wq = reinterpret_cast<const sycl::uint2*>(w) + (size_t) g * (n_in / 2) + (size_t) r * 32 + lane;
+            const sycl::uint2* wq = reinterpret_cast<const sycl::uint2*>(w) + (size_t) g * (n_in / 2) + static_cast<size_t>(r * 32) + lane;
             for (int st = 0; st < steps; ++st) {
                 const sycl::uint2 raw = wq[(size_t) st * 256];
                 // bytewise (q - 8) for q = 0..15: ((q | 0x80) - 8) ^ 0x80, no borrow across bytes
@@ -563,28 +566,28 @@ void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, 
                 const float dw = (float) sycl::bit_cast<sycl::half>(wd[(size_t) st * 128]);
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
-                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + (size_t) st * 32];
+                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + static_cast<size_t>(st * 32)];
                     int isum = xe::dp4a(w0, x.x(), 0);
                     isum = xe::dp4a(w1, x.y(), isum);
                     isum = xe::dp4a(w2, x.z(), isum);
                     isum = xe::dp4a(w3, x.w(), isum);
-                    const float xs = xd[(size_t) c * nb + (size_t) st * 16 + (lane >> 1)];
+                    const float xs = xd[(size_t) c * nb + static_cast<size_t>(st * 16) + (lane >> 1)];
                     acc[c] = sycl::fma(dw * xs, (float) isum, acc[c]);
                 }
             }
         } else {
-            const sycl::int4* wq = reinterpret_cast<const sycl::int4*>(w) + (size_t) g * (n_in / 2) + (size_t) r * 32 + lane;
+            const sycl::int4* wq = reinterpret_cast<const sycl::int4*>(w) + (size_t) g * (n_in / 2) + static_cast<size_t>(r * 32) + lane;
             for (int st = 0; st < steps; ++st) {
                 const sycl::int4 raw = wq[(size_t) st * 256];
                 const float dw = (float) sycl::bit_cast<sycl::half>(wd[(size_t) st * 128]);
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
-                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + (size_t) st * 32];
+                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + static_cast<size_t>(st * 32)];
                     int isum = xe::dp4a(raw.x(), x.x(), 0);
                     isum = xe::dp4a(raw.y(), x.y(), isum);
                     isum = xe::dp4a(raw.z(), x.z(), isum);
                     isum = xe::dp4a(raw.w(), x.w(), isum);
-                    const float xs = xd[(size_t) c * nb + (size_t) st * 16 + (lane >> 1)];
+                    const float xs = xd[(size_t) c * nb + static_cast<size_t>(st * 16) + (lane >> 1)];
                     acc[c] = sycl::fma(dw * xs, (float) isum, acc[c]);
                 }
             }

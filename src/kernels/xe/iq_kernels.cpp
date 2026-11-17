@@ -1390,13 +1390,14 @@ int latent_a_env(const char* name) {
         throw core::DeviceError(std::string("XESTRATA_") + name + ": expected an integer");
     return static_cast<int>(n);
 }
-int latent_a_lpr_env() { return latent_a_env("LATENT_A_LPR"); }
-int latent_a_ne_env() { return latent_a_env("LATENT_A_ENTRIES"); }
+int latent_a_lpr_env() { static const int value = latent_a_env("LATENT_A_LPR"); return value; }
+int latent_a_ne_env() { static const int value = latent_a_env("LATENT_A_ENTRIES"); return value; }
 std::pair<int, int> latent_a_choice(sycl::queue& q, const NativeExpertLayout& L) {
     auto c = g_latent_a_choices.get(q.get_device(), LatentAKey{L.gu_type, L.n_embd, L.n_ff})
                  .value_or(std::pair<int, int>{GU_LPR, kEntriesPass});
-    if (latent_a_lpr_env() > 0) c.first = latent_a_lpr_env();
-    if (latent_a_ne_env() > 0) c.second = latent_a_ne_env();
+    const int lpr = latent_a_lpr_env(), entries = latent_a_ne_env();
+    if (lpr > 0) c.first = lpr;
+    if (entries > 0) c.second = entries;
     return c;
 }
 // The gate/up rows of type `ty` in their LPR / entries form: the decode's launch and the timing's take this one

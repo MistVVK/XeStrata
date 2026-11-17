@@ -47,6 +47,7 @@ inline __m256i pairs8(const int32_t* tab, const uint8_t* qs, uint64_t wr, int t0
 template <int TY, int NT>
 void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, float* const* out, int r0, int r1) {
     constexpr int nt = NT;
+    // i < n / 128 and n is int, so i * 128 and i * 4 fit int.
     const int nb = n / 128;
     constexpr size_t bsz = 2 + TqFmt<TY>::NB;
     const long long* tab = (const long long*) tq_state_table();
@@ -71,7 +72,7 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, fl
             }
             const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
             for (int t = 0; t < nt; ++t) {
-                const __m256i* q = (const __m256i*) (a[t]->q + (size_t) i * 128);
+                const __m256i* q = (const __m256i*) (a[t]->q + static_cast<size_t>(i * 128));
                 const __m256i p0 = _mm256_add_epi32(_mm256_madd_epi16(wv[0], _mm256_load_si256(q + 0)),
                                                     _mm256_madd_epi16(wv[1], _mm256_load_si256(q + 1)));
                 const __m256i p1 = _mm256_add_epi32(_mm256_madd_epi16(wv[2], _mm256_load_si256(q + 2)),
@@ -83,7 +84,7 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, fl
                 // per 128-bit lane [p0, p1, p2, p3] partial sums, then the two lanes added: S[0..3], exact
                 const __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(p0, p1), _mm256_hadd_epi32(p2, p3));
                 const __m128i s = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
-                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + (size_t) i * 4));
+                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + static_cast<size_t>(i * 4)));
                 acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), sc, acc[t]);
             }
         }

@@ -96,9 +96,10 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         }
     } else if constexpr (TYPE == 11) {                             // Q3_K: hmask[32] qs[64] scales[12] d
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 110;
+        // gi < 8, so n * 32 fits int.
         const int gi = gi_in_row % 8, n = gi / 4, jj = gi % 4;
         const uint8_t* hm = b;
-        const uint8_t* q = b + 32 + size_t(n) * 32;
+        const uint8_t* q = b + 32 + static_cast<size_t>(n * 32);
         const uint8_t* sc = b + 96;
         const float d_all = h2f(b + 108);
         uint32_t aux[4];
@@ -118,22 +119,24 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         }
     } else if constexpr (TYPE == 12) {                             // Q4_K: d dmin scales[12] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 144;
+        // gi < 8, so j64 * 32 fits int.
         const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
         const float d = h2f(b), dmin = h2f(b + 2);
         int sc, m;
         scale_min_k4(gi, b + 4, sc, m);
         const float d1 = d * (float) sc, m1 = dmin * (float) m;
-        const uint8_t* q = b + 16 + size_t(j64) * 32;
+        const uint8_t* q = b + 16 + static_cast<size_t>(j64 * 32);
         for (int l = 0; l < 32; ++l) put(out, l, d1 * (float) (hi ? (q[l] >> 4) : (q[l] & 0xF)) - m1);
     } else if constexpr (TYPE == 13) {                             // Q5_K: d dmin scales[12] qh[32] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 176;
+        // gi < 8, so j64 * 32 fits int.
         const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
         const float d = h2f(b), dmin = h2f(b + 2);
         int sc, m;
         scale_min_k4(gi, b + 4, sc, m);
         const float d1 = d * (float) sc, m1 = dmin * (float) m;
         const uint8_t* qh = b + 16;
-        const uint8_t* ql = b + 48 + size_t(j64) * 32;
+        const uint8_t* ql = b + 48 + static_cast<size_t>(j64 * 32);
         const uint8_t u = (uint8_t) (1u << (2 * j64 + hi));
         for (int l = 0; l < 32; ++l) {
             const int nib = hi ? (ql[l] >> 4) : (ql[l] & 0xF);
@@ -141,10 +144,11 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         }
     } else if constexpr (TYPE == 14) {                             // Q6_K: ql[128] qh[64] scales[16] d
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 210;
+        // gi < 8, so n * 64, n * 32 and n * 8 fit int.
         const int gi = gi_in_row % 8, n = gi / 4, qu = gi % 4;
-        const uint8_t* ql = b + size_t(n) * 64;
-        const uint8_t* qh = b + 128 + size_t(n) * 32;
-        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + size_t(n) * 8;
+        const uint8_t* ql = b + static_cast<size_t>(n * 64);
+        const uint8_t* qh = b + 128 + static_cast<size_t>(n * 32);
+        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + static_cast<size_t>(n * 8);
         const float d = h2f(b + 208);
         for (int l = 0; l < 32; ++l) {
             const int is = l / 16;
@@ -190,12 +194,13 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         }
     } else if constexpr (TYPE == 23) {                             // IQ4_XS: d scales_h scales_l[4] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 136;
+        // ib < 8, so ib * 16 fits int.
         const int ib = gi_in_row % 8;
         const float d = h2f(b);
         const uint16_t scales_h = (uint16_t) (b[2] | (b[3] << 8));
         const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4);
         const float dl = d * (float) (ls - 32);
-        const uint8_t* qs = b + 8 + size_t(ib) * 16;
+        const uint8_t* qs = b + 8 + static_cast<size_t>(ib * 16);
         for (int j = 0; j < 16; ++j) {
             put(out, j, dl * (float) kv_iq4nl[qs[j] & 0xf]);
             put(out, j + 16, dl * (float) kv_iq4nl[qs[j] >> 4]);

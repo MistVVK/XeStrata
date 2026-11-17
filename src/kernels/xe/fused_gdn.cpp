@@ -87,10 +87,11 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         auto lo = [](uint32_t u) { return sycl::bit_cast<float>(u << 16); };
         auto hi = [](uint32_t u) { return sycl::bit_cast<float>(u & 0xffff0000u); };
         float acc = 0.0f;
+        // j < n / 8 and n is int, so both products fit int.
         for (int j = lane; j < n / 8; j += 32) {
-            const size_t wj = (size_t) j * 4;
+            const size_t wj = static_cast<size_t>(j * 4); // NOLINT(bugprone-misplaced-widening-cast)
             const uint32_t w0 = w[wj], w1 = w[wj + 1], w2 = w[wj + 2], w3 = w[wj + 3];
-            const float* xa = x + (size_t) j * 8;
+            const float* xa = x + static_cast<size_t>(j * 8);
             acc = sycl::fma(lo(w0), xa[0], acc); acc = sycl::fma(hi(w0), xa[1], acc);
             acc = sycl::fma(lo(w1), xa[2], acc); acc = sycl::fma(hi(w1), xa[3], acc);
             acc = sycl::fma(lo(w2), xa[4], acc); acc = sycl::fma(hi(w2), xa[5], acc);
