@@ -2607,7 +2607,7 @@
    "doc_mentions": [],
    "status": "research",
    "owner": "program",
-   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1 runs a batch slot's rows of one window (its token and its proposals) as one launch per layer (K/V append, indexer step, block scores, top-k, resolve, attention); unset, a launch per row.",
+   "note": "[reviewed] #5864, opt-in (off by default): =1 runs a batch slot's rows of one window (its token and its proposals) as one launch per layer (K/V append, indexer step, block scores, top-k, resolve, attention); unset, a launch per row. Measured on 2x RTX A6000, UD-Q4_K_XL, conversations of about 2K tokens, 3 turns per client, STRATA_PIPED_MTP=2 with and without it, 4 repeats: 1 / 2 / 4 / 8 clients 56.6 / 67.1 / 78.4 / 75.6 committed tok/s against 56.6 / 67.1 / 78.1 / 75.4 without; whether its run path was taken is not verified.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -15681,7 +15681,7 @@
    "doc_mentions": [],
    "status": "research",
    "owner": "program",
-   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1 lets a direct K/V copy between a batch slot and the main sessions carry the streamed K/V's VRAM pages and map along; unset, the target's residency is reset.",
+   "note": "[reviewed] #5864, opt-in (off by default): =1 lets a direct K/V copy between a batch slot and the main sessions carry the streamed K/V's VRAM pages and map along; unset, the target's residency is reset. Not measured here.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -27902,7 +27902,7 @@
    "doc_mentions": [],
    "status": "research",
    "owner": "program",
-   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1, with STRATA_PIPED_MTP and the prompt lookup (--suffix-draft): a slot's window in the pipelined groups may carry the lookup's drafts instead of the draft layer's; unset, the draft layer's only.",
+   "note": "[reviewed] #5864, opt-in (off by default): =1, with STRATA_PIPED_MTP and the prompt lookup (--suffix-draft): a slot's window in the pipelined groups may carry the lookup's drafts instead of the draft layer's; unset, the draft layer's only. Measured on 2x RTX A6000, UD-Q4_K_XL, conversations of about 2K tokens, 3 turns per client, STRATA_PIPED_MTP=2 with and without it, 4 repeats: 1 / 2 / 4 / 8 clients 55.5 / 66.7 / 77.9 / 75.3 committed tok/s against 56.6 / 67.1 / 78.1 / 75.4 without.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -28331,7 +28331,7 @@
    "last_date": null,
    "status": "research",
    "owner": "program",
-   "note": "[reviewed] #5860, opt-in (off by default until the two-card measurement): the pipelined decode launches a speculative window when the share of such windows on the path, counted in this process, is at least this (0.35 measured best on 2x RTX 3090); unset, the theta gate at 0.2.",
+   "note": "[reviewed] #5860, opt-in (off by default): the pipelined decode launches a speculative window when the share of such windows on the path, counted in this process, is at least this (0.35 measured best on 2x RTX 3090); unset, the theta gate at 0.2. Measured on 2x RTX A6000, UD-Q4_K_XL, one client, --pipeline-windows 2, 3 starts of 4 requests of about 1.9K tokens: 58.3 committed tok/s with it against 58.1 with none set.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -28364,7 +28364,7 @@
    "last_date": null,
    "status": "research",
    "owner": "program",
-   "note": "[reviewed] #5860, opt-in (off by default until the two-card measurement): =1 runs the MTP chain's steps only as the outputs before them call for them (chain_extend); unset, the whole chain at once.",
+   "note": "[reviewed] #5860, opt-in (off by default): =1 runs the MTP chain's steps only as the outputs before them call for them (chain_extend); unset, the whole chain at once. Measured on 2x RTX A6000, UD-Q4_K_XL, one client, --pipeline-windows 2, 3 starts of 4 requests of about 1.9K tokens: 58.6 committed tok/s with it against 58.1 with none set.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -28477,7 +28477,7 @@
    "last_date": null,
    "status": "research",
    "owner": "program",
-   "note": "[reviewed] #5860, opt-in (off by default until the two-card measurement): =1 makes the window behind a lookup continuation that was on the path the same lookup's; unset, the chain's.",
+   "note": "[reviewed] #5860, opt-in (off by default): =1 makes the window behind a lookup continuation that was on the path the same lookup's; unset, the chain's. Measured on 2x RTX A6000, UD-Q4_K_XL, one client, --pipeline-windows 2, 3 starts of 4 requests of about 1.9K tokens: 58.3 committed tok/s with it against 58.1 with none set.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -37170,7 +37170,7 @@
    "doc_mentions": [],
    "status": "research",
    "owner": "program",
-   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1, with STRATA_SLOT_COPY_DIRECT=1: the hand-back of a turn checkpoint copies the K/V straight from the slot's pools; unset, through a host image.",
+   "note": "[reviewed] #5864, opt-in (off by default): =1, with STRATA_SLOT_COPY_DIRECT=1: the hand-back of a turn checkpoint copies the K/V straight from the slot's pools; unset, through a host image. Not measured here.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -37390,7 +37390,7 @@
    "doc_mentions": [],
    "status": "research",
    "owner": "program",
-   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1, with STRATA_PIPED_MTP: the next turn of a conversation is read in the batch slot that holds it, in the slot's own windows; unset, through the main sessions.",
+   "note": "[reviewed] #5864, opt-in (off by default): =1, with STRATA_PIPED_MTP: the next turn of a conversation is read in the batch slot that holds it, in the slot's own windows; unset, through the main sessions. Measured on 2x RTX A6000, UD-Q4_K_XL, conversations of about 2K tokens, 3 turns per client, STRATA_PIPED_MTP=2 with and without it, 4 repeats each: 4 clients 57.4 committed tok/s with it against 78.1 without, 8 clients 53.2 against 75.4, 2 clients 66.8 against 67.1, 1 client 56.4 against 56.6; time to first token of the later turns, p95: 5.72 s against 0.77 s at 4 clients and 11.79 s against 1.14 s at 8 clients. The pull request reports 115.5 against 102.9 committed tok/s over a round of two turns on 178K-token conversations on 2x RTX 3090 (not measured here).",
    "retire_after": "",
    "retired_in": ""
   },
