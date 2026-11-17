@@ -143,7 +143,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
  * @param {string} [options.nodePath]                   the Node runtime that runs the Harness
  * @param {(line:string)=>void} [options.log]
  */
-export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, helperLimitMs = () => 0, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
+export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, helperLimitMs = () => 0, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, liveMs = 90_000, startRuntimeImpl = null, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
   const root = join(dataDir, 'agent');
   const home = join(root, 'home');
   const sessionsFile = join(root, 'sessions.json');
@@ -191,9 +191,12 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
 
   const chat = id => { let c = chats.get(id); if (!c) { c = { id, turn: null, route: null, routeGeneration: -1 }; chats.set(id, c); } return c; };
   const activeTurns = () => [...chats.values()].filter(c => c.turn).length;
-  const notifyIdle = () => { if (activeTurns() === 0) { for (const w of idleWaiters) w(); idleWaiters.clear(); } };
+  // A restart of the Harness waits for every chat that works on the running one: a turn, and also a chat that already holds the running Harness
+  // (c.holding: from the moment ensureRuntime handed it over until the chat's turn exists) but is not a turn yet, which a restart would close under it.
+  const busyChats = () => [...chats.values()].filter(c => c.turn || c.holding).length;
+  const notifyIdle = () => { if (busyChats() === 0) { for (const w of idleWaiters) w(); idleWaiters.clear(); } };
   const waitIdle = (signal, ms) => new Promise((resolve, reject) => {
-    if (activeTurns() === 0) return resolve();
+    if (busyChats() === 0) return resolve();
     const timer = setTimeout(() => { idleWaiters.delete(done); reject(new AgentUnavailable('Another chat is still working and the list of models changed. Try again when it finishes.', 'agent-busy')); }, ms);
     const done = () => { clearTimeout(timer); resolve(); };
     idleWaiters.add(done);
@@ -293,7 +296,13 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
           const old = rt; rt = null;
           old.events?.close(); old.gw.close(); await old.hp.stop();
         }
-        try { return await startRuntime(profile); } catch (e) {
+        try {
+          if (!startRuntimeImpl) return await startRuntime(profile);
+          // (tests) a runtime made by the caller, installed the way startRuntime installs its own
+          const made = await startRuntimeImpl(profile);
+          made.generation ??= ++generation; rt = made; lastError = null;
+          return made;
+        } catch (e) {
           lastError = redact(String(e.message ?? e), Object.values(profile.env));
           throw e instanceof AgentUnavailable ? e : new AgentUnavailable(plainAgentFailure(lastError) === lastError ? 'The coding assistant could not start. Try again. If it keeps happening, close and reopen Strata.' : plainAgentFailure(lastError), 'agent-start-failed', lastError);
         }
@@ -395,7 +404,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     // Our own turn follows the session from here: the idle watch for a turn the Harness starts by itself ends, and arms again when this one ends.
     c.wake?.close(); c.wake = null;
     c.wakeOptions = { workspacePath: options.workspacePath, choice: options.choice ?? null, mode: options.mode ?? null, thinking: options.thinking ?? null, thinkingBudget: options.thinkingBudget ?? 0 };
-    try { return await runTurnInner(c, options); } finally { c.starting = false; }
+    try { return await runTurnInner(c, options); } finally { c.starting = false; if (c.holding) { c.holding = false; notifyIdle(); } }
   }
 
   /**
@@ -407,7 +416,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     c.starting = true; c.cancelStart = false;
     try { await runTurnInner(c, { ...c.wakeOptions, chatId: c.id, message: '', onFrame: () => {}, requestId: `wake-${randomUUID()}`, adopt: { seq } }); }
     catch (e) { log(`agent · a turn the agent started by itself could not be followed: ${e?.message ?? e}`); }
-    finally { c.starting = false; }
+    finally { c.starting = false; if (c.holding) { c.holding = false; notifyIdle(); } }
   }
   function armWake(c, runtime, sessionId, after) {
     c.wake?.close();
@@ -463,6 +472,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     emit({ type: 'queued', requestId });
     reporter.set({ phase: 'starting', code: 'starting', text: 'Starting…' });
     const { rt: runtime, route } = await ensureRuntime(choice, signal);
+    c.holding = true;   // this chat now works on `runtime`: a restart of the Harness waits for it (busyChats); cleared when its turn exists or the start ends (runTurn)
     const made = await sessionFor(c, workspacePath, runtime, { onWait: () => reporter.set({ phase: 'starting', code: 'assistant-starting', text: 'Starting the assistant…' }) });
     const { sessionId, fresh } = made ?? {};
     const cancelled = () => { reporter.clear(); emit({ type: 'done', finishReason: 'aborted', cancelled: true, tokensIn: null, tokensOut: null, usageSource: 'unavailable', durationMs: 0, model: route.name, contextMax: route.contextWindow }); return { cancelled: true }; };
@@ -526,7 +536,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       plan: null, advancing: false, goalRun: false, lastActivity: Date.now(), heard: Date.now(), engineMark: null, watchdog: null,
       research: researchTopic ? { phase: 'gather', nudged: false, waitingStart: false } : null, wake: !!adopt, fix,
     };
-    c.turn = turn;
+    c.turn = turn; c.holding = false;
     if (adopt) { log(`agent · ${chatId}: the agent started a turn by itself (a background job finished); following it as ${requestId}`); onWake(chatId, requestId); }
     if (workspacePath) folderClaims.begin(workspacePath, chatId);
     /**
@@ -560,6 +570,21 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       }
       const toolRunning = [...projector.tools.values()].some(x => x.card?.state === 'running' || x.card?.state === 'proposed') || pending.size > 0 && pendingFor(chatId).length > 0;
       const limit = toolRunning ? stallToolMs : stallMs;
+      const endStalled = sinceMs => {
+        turn.stalledFor = Math.round(sinceMs / 1000);
+        turn.stopping = true;
+        void runtime.gw.rpc('session/cancel', { request: { sessionId } }).catch(() => {});
+        for (const h of turn.children.values()) if (!h.done) void runtime.gw.rpc('subagents/interruptByParent', { childSessionId: h.id, parentSessionId: sessionId, mode: 'continuable' }).catch(() => {});
+        const mins = Math.max(1, Math.round(turn.stalledFor / 60));
+        turn.finish(`The assistant stopped answering for ${mins > 1 ? mins + ' minutes' : 'a minute'}, so I ended this turn. Anything it already finished is kept. Send your message again to go on.`);
+      };
+      // A turn whose own message never showed up in the session's events (it never became "live") within liveMs of the Harness accepting it cannot reach the page,
+      // whatever the engine does for other chats: it ends with the plain message instead of waiting, and the engine's progress does not count here.
+      if (!turn.live && turn.promptedAt && Date.now() - turn.promptedAt >= liveMs) {
+        log(`agent · ${chatId}: this turn never became live ${Math.round((Date.now() - turn.promptedAt) / 1000)} s after the prompt was accepted (session ${sessionId}); ending it`);
+        endStalled(Date.now() - turn.promptedAt);
+        return;
+      }
       // A local engine reading a long prompt sends the Harness nothing for minutes (#3623). Its /metrics progress counts as activity,
       // for at most engineGraceMs after the Harness last spoke: progress for another chat cannot keep a lost turn alive forever.
       if (turn.route?.kind === 'local' && Date.now() - turn.heard < engineGraceMs) {
@@ -568,13 +593,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
         if (mark != null && mark !== turn.engineMark) { turn.engineMark = mark; turn.lastActivity = Date.now(); return; }
       }
       if (Date.now() - turn.lastActivity < limit) return;
-      turn.stalledFor = Math.round((Date.now() - turn.lastActivity) / 1000);
-      turn.stopping = true;
-      void runtime.gw.rpc('session/cancel', { request: { sessionId } }).catch(() => {});
-      for (const h of turn.children.values()) if (!h.done) void runtime.gw.rpc('subagents/interruptByParent', { childSessionId: h.id, parentSessionId: sessionId, mode: 'continuable' }).catch(() => {});
-      const mins = Math.max(1, Math.round(turn.stalledFor / 60));
-      turn.finish(`The assistant stopped answering for ${mins > 1 ? mins + ' minutes' : 'a minute'}, so I ended this turn. Anything it already finished is kept. Send your message again to go on.`);
-    }, Math.min(15_000, Math.max(200, Math.floor(stallMs / 4))));
+      endStalled(Date.now() - turn.lastActivity);
+    },Math.min(15_000, Math.max(200, Math.floor(stallMs / 4))));
     turn.watchdog.unref?.();
     async function finishTurn(failure) {
       if (turn.finished) return;
@@ -658,8 +678,6 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
 
     function handle(item) {
       if (turn.finished) return;
-      turn.lastActivity = Date.now();
-      turn.heard = turn.lastActivity;
       if (item.type === 'event') {
         const e = item.event;
         if (e.seq <= turn.lastSeq) return;
@@ -667,10 +685,14 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
         // The turn is ours from the user message that carries our request id. Until then an older,
         // detached turn on the same session may still be finishing; its events are not ours.
         if (!turn.live) {
-          if (e.type === 'user/message' && e.data?.source?.rpcId === requestId) turn.live = true;
+          if (e.type === 'user/message' && e.data?.source?.rpcId === requestId) { turn.live = true; turn.lastActivity = turn.heard = Date.now(); }
           return;
         }
       } else if (!turn.live) return;
+      // Only an item that belongs to this turn shows that it is alive: events of an older turn, replays and anything dropped above never refresh the
+      // watchdog's clock (a turn that never became ours used to look alive for as long as the session was busy with something else).
+      turn.lastActivity = Date.now();
+      turn.heard = turn.lastActivity;
       for (const f of projector.consume(item)) emit(f);
       if (guard && projector.contextTokens != null) trip(guard.context(projector.contextTokens));
       if (item.type === 'event') watchParent(item.event);
@@ -1019,7 +1041,7 @@ ${note.text}
       }
     }
     if (!goal && !adopt) reporter.set({ phase: 'waiting', code: 'reading-prompt', text: 'Reading your message…' });
-    turn.prompted = true;
+    turn.prompted = true; turn.promptedAt = Date.now();
     if (turn.stopBeforePrompt) {
       // Stop landed in the instant between 'prompt sent' and 'prompt accepted'. A cancel before the turn
       // starts arms nothing, so wait for the turn to be ours, then cancel it.
@@ -1498,8 +1520,9 @@ ${note.text}
     const watched = !!c.wake;
     c.wake?.close(); c.wake = null;
     let done;
+    c.holding = true;   // a restart of the Harness waits until the summary is done (busyChats)
     try { done = await compactChat(runtime, known); }
-    finally { if (watched && !c.turn && !c.starting && rt === runtime && !c.wake) armWake(c, runtime, known); }
+    finally { c.holding = false; notifyIdle(); if (watched && !c.turn && !c.starting && rt === runtime && !c.wake) armWake(c, runtime, known); }
     if (done.ok) {
       const note = summarizedNote(done.before, done.after, 0);
       return say(note.key, note.values);

@@ -70,7 +70,16 @@ export class GatewayClient {
   openStream(endpoint, args, handlers) {
     const streamId = `s${++this.#nextStream}`;
     const entry = { streamId, endpoint, args, ...handlers, closed: false };
+    // A stream opened on a gateway that is closed (a Harness the bridge already replaced) can never deliver: the owner is told, so a turn
+    // that follows it ends with a plain error instead of waiting for items that will not come.
+    if (this.#closed) {
+      entry.closed = true;
+      queueMicrotask(() => handlers.onError?.(new GatewayError('the agent connection was closed', { code: 'gateway/closed' })));
+      return { streamId, close: () => {} };
+    }
     this.#streams.set(streamId, entry);
+    // A socket that fails to open is retried by the reconnect below, which tells the owner when that fails too; a client closed before the stream
+    // was ever opened retries nothing, and close() tells the owner (so a follower is never left waiting on a connection that is gone).
     void this.#ensureSocket().then(() => this.#sendOpen(entry), () => {});
     return {
       streamId,
@@ -90,11 +99,16 @@ export class GatewayClient {
     return this.rpc('$events/result', { clientId, eventId, outcome: wire });
   }
 
+  /** True once close() was called: nothing opened on this client afterwards can deliver. */
+  get closed() { return this.#closed; }
+
   close() {
     this.#closed = true;
     clearTimeout(this.#reconnectTimer);
-    for (const s of this.#streams.values()) s.closed = true;
+    const neverOpened = [];
+    for (const s of this.#streams.values()) { s.closed = true; if (!s.opened) neverOpened.push(s); }
     this.#streams.clear();
+    for (const s of neverOpened) queueMicrotask(() => s.onError?.(new GatewayError('the agent connection was closed before the stream opened', { code: 'gateway/closed' })));
     try { this.#ws?.close(); } catch { /* already closed */ }
     this.#ws = null;
   }
@@ -133,6 +147,7 @@ export class GatewayClient {
 
   #sendOpen(entry) {
     if (entry.closed || this.#ws?.readyState !== 1) return;
+    entry.opened = true;
     this.#ws.send(JSON.stringify({ type: 'open', streamId: entry.streamId, endpoint: entry.endpoint, payload: { args: entry.args } }));
   }
 
