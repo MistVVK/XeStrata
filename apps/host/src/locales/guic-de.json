@@ -21,6 +21,6 @@
  "guic20": "{0} wird aufgerufen…",
  "guic21": "Datei {0} wird geschrieben…",
  "guic22": "{0} läuft…",
- "guic23": "Das Modell wird gebeten, seinen Werkzeugaufruf zu korrigieren…",
- "guic24": "Das Modell hat zweimal hintereinander Werkzeugaufrufe geschrieben, die Strata nicht ausführen konnte, deshalb hat Strata diesen Durchgang beendet. Es wurde nichts ausgeführt. Senden Sie Ihre Nachricht erneut, oder wählen Sie ein anderes Modell."
+ "guic23": "Das Modell wird gebeten, seinen Tool-Aufruf zu korrigieren…",
+ "guic24": "Das Modell hat zweimal hintereinander Tool-Aufrufe geschrieben, die Strata nicht ausführen konnte, deshalb hat Strata diese Runde beendet. Es wurde nichts ausgeführt. Senden Sie Ihre Nachricht erneut, oder wählen Sie ein anderes Modell."
 }

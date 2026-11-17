@@ -22,5 +22,5 @@
  "guic21": "Escrevendo o arquivo {0}…",
  "guic22": "Executando {0}…",
  "guic23": "Pedindo ao modelo que corrija a chamada de ferramenta…",
- "guic24": "O modelo escreveu duas vezes seguidas chamadas de ferramenta que o Strata não conseguiu executar, então o Strata interrompeu esta resposta. Nada foi executado. Envie sua mensagem de novo ou escolha outro modelo."
+ "guic24": "O modelo escreveu duas vezes seguidas chamadas de ferramenta que o Strata não conseguiu executar, então o Strata interrompeu este turno. Nada foi executado. Envie sua mensagem de novo ou escolha outro modelo."
 }
