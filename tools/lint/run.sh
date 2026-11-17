@@ -68,7 +68,7 @@ fi
 [ ${#sh[@]} -gt 0 ] && run shellcheck shellcheck "${sh[@]}"
 if [ ${#cpp[@]} -gt 0 ]; then
   if [ -n "$CLANG_TIDY" ] && [ -f "$BUILD/compile_commands.json" ]; then
-    tidy=("$CLANG_TIDY" --quiet -p "$BUILD" --config-file="$C/clang-tidy.yaml")
+    tidy=("$CLANG_TIDY" --quiet -p "$BUILD" --config-file="$C/clang-tidy.yaml" --warnings-as-errors='*')
     mapfile -t tus < <(python3 -c 'import json, sys; print("\n".join(sorted({e["file"] for e in json.load(open(sys.argv[1]))})))' \
       "$BUILD/compile_commands.json")
     # a source this build does not compile (another GPU maker's, as the AMD-only HIP files on a build without HIP):
@@ -83,7 +83,12 @@ if [ ${#cpp[@]} -gt 0 ]; then
       fi
     done
     mapfile -t hpp < <(printf '%s\n' "${cpp[@]}" | grep '\.hpp$')
-    [ ${#cxx[@]} -gt 0 ] && run clang-tidy "${tidy[@]}" "${cxx[@]}"
+    if [ ${#cxx[@]} -gt 0 ]; then
+      # Select only these source files. A header filter alone can match an external path containing /src/../.
+      line_filter=$(python3 -c 'import json, os, sys; print(json.dumps([{"name": os.path.abspath(f)} for f in sys.argv[1:]]))' \
+        "${cxx[@]}")
+      run clang-tidy "${tidy[@]}" --header-filter='.*' --line-filter="$line_filter" "${cxx[@]}"
+    fi
     # A header is checked inside a source that includes it, with that source's command: alone it gets the command of
     # whichever source's path is nearest, often one without -fsycl, and misses the macros a source defines before the
     # include (strata/kernels/device_arch_tag.hpp).  --line-filter keeps the header's findings only.
@@ -98,9 +103,9 @@ if [ ${#cpp[@]} -gt 0 ]; then
           done < <(grep -rl -E "^#include $inc" include 2>/dev/null)
         fi
         if [ -n "$tu" ]; then
-          run "clang-tidy $h (in ${tu#"$PWD"/})" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$h\"}]" "$tu"
+          run "clang-tidy $h (in ${tu#"$PWD"/})" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$PWD/$h\"}]" "$tu"
         else
-          run "clang-tidy $h" "${tidy[@]}" "$h"
+          run "clang-tidy $h" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$PWD/$h\"}]" "$h"
         fi
       done
     fi

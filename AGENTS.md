@@ -152,7 +152,7 @@ Before committing, run `tools/lint/run.sh` from the repository root (no argument
 
 | Files | Lints |
 | --- | --- |
-| C++ (and SYCL) | the compiler's warnings (`strata_warnings`; `-DSTRATA_WERROR=ON` makes them errors), clang-tidy (reads `compile_commands.json` from `build/free` or `XESTRATA_LINT_BUILD`), cppcheck |
+| C++ (and SYCL) | the compiler's warnings (`strata_warnings`; `-DSTRATA_WERROR=ON` makes them errors), clang-tidy (reads `compile_commands.json` from `build/free` or `XESTRATA_LINT_BUILD`; warnings in the selected files fail), cppcheck |
 | Python | flake8, ruff, mypy |
 | Shell / CMake | shellcheck / cmake-lint |
 | Markdown | mdl, lychee (`--offline`) |
