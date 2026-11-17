@@ -888,6 +888,7 @@
   "img.ctrlPose": "姿势（人物）",
   "img.ctrlDepth": "深度（构图）",
   "img.ctrlCanny": "轮廓（Canny）",
+  "img.ctrlDrawing": "图像是手绘线稿",
   "img.ctrlLineart": "线稿",
   "img.ctrlLineartCoarse": "线稿（粗略）",
   "img.ctrlHed": "柔和轮廓（HED）",

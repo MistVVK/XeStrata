@@ -903,6 +903,7 @@
   "img.ctrlPose": "Pose (personnes)",
   "img.ctrlDepth": "Profondeur (composition)",
   "img.ctrlCanny": "Contours (Canny)",
+  "img.ctrlDrawing": "L’image est un dessin au trait fait à la main",
   "img.ctrlLineart": "Dessin au trait",
   "img.ctrlLineartCoarse": "Dessin au trait, grossier",
   "img.ctrlHed": "Contours doux (HED)",

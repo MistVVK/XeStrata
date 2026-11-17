@@ -888,6 +888,7 @@
   "img.ctrlPose": "Pose (personas)",
   "img.ctrlDepth": "Profundidad (composición)",
   "img.ctrlCanny": "Contornos (Canny)",
+  "img.ctrlDrawing": "La imagen es un dibujo a mano",
   "img.ctrlLineart": "Dibujo de líneas",
   "img.ctrlLineartCoarse": "Dibujo de líneas, tosco",
   "img.ctrlHed": "Contornos suaves (HED)",

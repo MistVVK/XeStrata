@@ -888,6 +888,7 @@
   "img.ctrlPose": "자세 (사람)",
   "img.ctrlDepth": "깊이 (구도)",
   "img.ctrlCanny": "윤곽 (Canny)",
+  "img.ctrlDrawing": "이미지가 손으로 그린 선화입니다",
   "img.ctrlLineart": "선화",
   "img.ctrlLineartCoarse": "선화 (거칠게)",
   "img.ctrlHed": "부드러운 윤곽 (HED)",

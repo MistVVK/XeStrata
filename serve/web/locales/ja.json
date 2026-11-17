@@ -888,6 +888,7 @@
   "img.ctrlPose": "姿勢（人物）",
   "img.ctrlDepth": "深度（構図）",
   "img.ctrlCanny": "輪郭（Canny）",
+  "img.ctrlDrawing": "画像は手描きの線画",
   "img.ctrlLineart": "線画",
   "img.ctrlLineartCoarse": "線画（粗い）",
   "img.ctrlHed": "柔らかい輪郭（HED）",

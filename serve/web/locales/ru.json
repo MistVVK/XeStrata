@@ -888,6 +888,7 @@
   "img.ctrlPose": "Поза (люди)",
   "img.ctrlDepth": "Глубина (композиция)",
   "img.ctrlCanny": "Контуры (Canny)",
+  "img.ctrlDrawing": "Изображение — нарисованный от руки рисунок",
   "img.ctrlLineart": "Штриховой рисунок",
   "img.ctrlLineartCoarse": "Штриховой рисунок, грубый",
   "img.ctrlHed": "Мягкие контуры (HED)",

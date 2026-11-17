@@ -912,6 +912,7 @@
   "img.ctrlPose": "Pose (people)",
   "img.ctrlDepth": "Depth (composition)",
   "img.ctrlCanny": "Outlines (Canny)",
+  "img.ctrlDrawing": "The picture is a hand-drawn line drawing",
   "img.ctrlLineart": "Line art",
   "img.ctrlLineartCoarse": "Line art, rough",
   "img.ctrlHed": "Soft outlines (HED)",

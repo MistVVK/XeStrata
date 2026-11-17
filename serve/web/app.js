@@ -3857,6 +3857,7 @@ function imgCtrlKind() {
   $("img-ctrl-body").hidden = !k;
   $("img-ctrl-canny-f").hidden = k !== "canny";
   $("img-ctrl-pose-f").hidden = k !== "pose";
+  $("img-ctrl-drawing-f").hidden = mode !== "controlnet" || !["lineart", "lineart_coarse"].includes(k);
   $("img-ctrl-preview").hidden = k === "none";
   imgCtrlReset();
 }
@@ -3875,6 +3876,7 @@ async function imgCtrlFields() {
   num("img-ctrl-res", "resolution");
   if (k === "canny") { num("img-ctrl-low", "low_threshold"); num("img-ctrl-high", "high_threshold"); }
   if (k === "pose") Object.assign(c, {detect_body: $("img-ctrl-body-on").checked, detect_hands: $("img-ctrl-hands").checked, detect_face: $("img-ctrl-face").checked});
+  if (!$("img-ctrl-drawing-f").hidden && $("img-ctrl-drawing").checked) c.lineart_input = "drawing";
   return c;
 }
 async function imgCtrlBody(body) {
@@ -3882,8 +3884,10 @@ async function imgCtrlBody(body) {
   const c = await imgCtrlFields();
   if (!c) return tr("img.ctrlNoPicture", "Choose the picture to take the composition from (or turn the control off).");
   // the map shown, as it is: MOSS-Image's color and depth keep their kind (preprocess false), the others are "none"
-  if (imgCtrlMap && $("img-ctrl-use").checked)
+  if (imgCtrlMap && $("img-ctrl-use").checked) {
+    delete c.lineart_input;
     Object.assign(c, imgCtrlMode() === "moss" ? {preprocess: false, image: imgCtrlMap} : {type: "none", image: imgCtrlMap});
+  }
   if (!$("img-ctrl-strength-f").hidden && $("img-ctrl-strength").value !== "") c.strength = Number($("img-ctrl-strength").value);
   if (!$("img-ctrl-span-f").hidden) {
     if ($("img-ctrl-start").value !== "" && !$("img-ctrl-start").hidden) c.start = Number($("img-ctrl-start").value);
@@ -3894,7 +3898,7 @@ async function imgCtrlBody(body) {
 }
 $("img-ctrl-type").onchange = imgCtrlKind;
 $("img-ctrl-file").onchange = imgCtrlReset;
-for (const id of ["img-ctrl-res", "img-ctrl-low", "img-ctrl-high", "img-ctrl-body-on", "img-ctrl-hands", "img-ctrl-face"]) $(id).addEventListener("change", imgCtrlReset);
+for (const id of ["img-ctrl-res", "img-ctrl-low", "img-ctrl-high", "img-ctrl-body-on", "img-ctrl-hands", "img-ctrl-face", "img-ctrl-drawing"]) $(id).addEventListener("change", imgCtrlReset);
 $("img-ctrl-preview").onclick = async () => {
   const c = await imgCtrlFields();
   if (!c) { toast("error", tr("img.ctrlMap", "The control map"), tr("img.ctrlNoPicture", "Choose the picture to take the composition from (or turn the control off)."), 6000); return; }

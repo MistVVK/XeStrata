@@ -888,6 +888,7 @@
   "img.ctrlPose": "Pose (Personen)",
   "img.ctrlDepth": "Tiefe (Bildaufbau)",
   "img.ctrlCanny": "Umrisse (Canny)",
+  "img.ctrlDrawing": "Das Bild ist eine handgezeichnete Strichzeichnung",
   "img.ctrlLineart": "Strichzeichnung",
   "img.ctrlLineartCoarse": "Strichzeichnung, grob",
   "img.ctrlHed": "Weiche Umrisse (HED)",
