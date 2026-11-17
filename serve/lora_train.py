@@ -96,22 +96,22 @@ SAMPLE_PROMPTS = {
 SAMPLE_SEED = 7                   # LORA2's sweeps' seed (fixed, so the versions compare)
 SAMPLE_SIZE = (1024, 1024)
 
-# The trainers' entry points (LORAWEB DESIGN §2).  elastic: the trainer takes --vram-budget/--vram-control (TRAINVRAM);
-# False until it lands - a start is refused with the reason until then.  ckpt: how a version's file name carries its
+# The trainers' entry points (LORAWEB DESIGN §2).  elastic: the trainer takes --vram-budget/--vram-control.
+# ckpt: how a version's file name carries its
 # step ("_N" = <prefix>_<step>.safetensors, ".N" = <prefix>.<step>.safetensors and <prefix>.final.safetensors).
 TRAINERS: dict[str, dict] = {
     "qwen-image": {"exe": "xestrata-image-qi-train", "save_flag": "--save-every", "ckpt": "_N", "cache": "qi",
-                   "elastic": False,
+                   "elastic": True,
                    "progress": re.compile(r"^step (\d+) loss ([\d.eE+-]+) \(avg ([\d.eE+-]+)\).*"
                                           r"\(([\d.]+) s/step\)")},
     "mage-flow": {"exe": "xestrata-image-mf-train", "save_flag": "--checkpoint", "ckpt": ".N", "cache": "mf",
-                  "elastic": False, "progress": re.compile(r"^step\s+(\d+) loss ([\d.eE+-]+) lr")},
+                  "elastic": True, "progress": re.compile(r"^step\s+(\d+) loss ([\d.eE+-]+) lr")},
     "moss-image": {"exe": "xestrata-image-moss-train", "save_flag": "--save-every", "ckpt": "_N", "cache": "ms",
-                   "elastic": False,
+                   "elastic": True,
                    "progress": re.compile(r"^step (\d+) loss ([\d.eE+-]+) \(avg ([\d.eE+-]+)\).*"
                                           r"\(([\d.]+) s/step\)")},
     "anima": {"exe": "xestrata-image-anima-train", "save_flag": "--save-every", "ckpt": "_N", "cache": "an",
-              "elastic": False,
+              "elastic": True,
               "progress": re.compile(r"^step (\d+) loss ([\d.eE+-]+) \(avg ([\d.eE+-]+)\).*"
                                      r"\(([\d.]+) s/step\)")},
 }
@@ -233,7 +233,10 @@ def check_settings(fields: dict, fam: str, kind: str = "other") -> dict:
 
     n = num("steps", 1, STEPS_MAX, int, p["steps"])
     k = num("save_every", 1, n, int, min(p["save_every"], n))
-    out = {"steps": n, "save_every": k,
+    size = num("max_size", 512, 1024, int, 1024)
+    if size not in (512, 768, 1024):
+        raise TrainError("max_size: choose 512, 768 or 1024")
+    out = {"steps": n, "save_every": k, "max_size": size,
            "rank": num("rank", 1, RANK_MAX, int, p["rank"]),
            "lr": num("lr", 1e-6, 1e-2, float, p["lr"]),
            "seed": num("seed", 0, 2**31 - 1, int, p["seed"]),
@@ -383,6 +386,7 @@ class TrainJobs:
         self.yielded = threading.Event()         # the training made room for the image jobs
         self._proc: subprocess.Popen | None = None
         self._train_state: dict = {}             # the trainer's last vram line
+        self._step_clock: tuple[int, float] | None = None
         self._state_saved = threading.Event()    # the trainer wrote its state (state saved line)
         self._decider: Any = None
         self._log: Any = None
@@ -427,22 +431,46 @@ class TrainJobs:
         recs.sort(key=lambda r: r.get("created_at", 0), reverse=True)
         return recs
 
+    @staticmethod
+    def _stop_wait(rec: dict) -> float:
+        # Three observed steps leave room for the active micro-step and cleanup. Before the first report, allow
+        # 120 s for model open: a fixed 10 s can terminate an active GPU copy (especially on Windows).
+        step = (rec.get("progress") or {}).get("s_per_step")
+        return max(30.0, float(step) * 3) if step and float(step) > 0 else 120.0
+
     def _stop_orphan(self, rec: dict) -> None:
-        """A trainer (or preprocessor) the last server left running: stop it when its pid and start time match."""
+        """Stop a matching orphan gracefully before any signal; never signal a reused PID."""
         from serve.vram_ledger import process_start
-        pid = rec.get("pid")
-        if not pid:
+        pid = int(rec.get("pid") or 0)
+        start = rec.get("pid_start")
+        if not pid or start is None:
             return
-        start = process_start(int(pid))
-        if start is None or abs(start - float(rec.get("pid_start", -1))) > 1e-3:
+
+        def alive():
+            current = process_start(pid)
+            return current is not None and abs(current - float(start)) < 1e-3
+
+        if not alive():
             return
-        with contextlib.suppress(OSError):
-            os.kill(int(pid), 15)
-            for _ in range(40):
-                time.sleep(0.25)
-                if process_start(int(pid)) is None:
-                    return
-            os.kill(int(pid), 9)
+        if rec.get("stage") == "train":
+            d = self.dir_of(rec["id"])
+            try:
+                control = json.loads((d / "vram.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                control = {}
+            self._write_control(d, int(control.get("budget_mib") or 0), bool(control.get("save_state")), stop=True)
+            end = time.monotonic() + self._stop_wait(rec)
+            while alive() and time.monotonic() < end:
+                threading.Event().wait(0.25)
+        if alive():
+            with contextlib.suppress(OSError):
+                os.kill(pid, 15)
+            end = time.monotonic() + self._stop_wait(rec)
+            while alive() and time.monotonic() < end:
+                threading.Event().wait(0.25)
+        if alive():
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
 
     def _gen(self, model: str):
         images = getattr(self.svc, "images", None)
@@ -574,7 +602,7 @@ class TrainJobs:
         try:
             while proc.poll() is None:
                 if cancel.is_set():
-                    self._terminate(proc)
+                    self._terminate(proc, 10.0)  # captioner, not a GPU training process
                     raise _Cancelled()
                 time.sleep(0.25)
             out, _ = proc.communicate()
@@ -661,12 +689,15 @@ class TrainJobs:
             raise TrainError(f"{jid}: no such job", 404)
         if rec["status"] in ("queued", "preprocessing", "training", "sampling", "captioning"):
             self.cancel(jid)
-            for _ in range(120):
-                time.sleep(0.1)
+            deadline = time.monotonic() + self._stop_wait(rec) * 2 + 5
+            while time.monotonic() < deadline:
                 cur = self.get(jid)
                 if cur is None or cur["status"] not in ("queued", "preprocessing", "training", "sampling",
                                                         "captioning"):
                     break
+                threading.Event().wait(0.1)
+            else:
+                raise TrainError("the job is still stopping; try deleting it again", 409)
         shutil.rmtree(self.dir_of(jid), ignore_errors=True)
         return {"id": jid, "deleted": True}
 
@@ -782,7 +813,8 @@ class TrainJobs:
         tag = cache_tag(gen)
         pre = [sys.executable, str(tool / "mf_pre.py"), "--cache", tag, "--dir", str(d / "images"),
                "--vae", str(gen.cfg["vae"]), "--text", str(gen.cfg["llm"]),
-               "--pre", str(Path(gen.cfg["exe"]).parent / "xestrata-image-mf-pre")]
+               "--pre", str(Path(gen.cfg["exe"]).parent / "xestrata-image-mf-pre"),
+               "--budget", ",".join(str(n) for n in (512, 768, 1024) if n <= rec["settings"]["max_size"])]
         if rec["family"] == "qwen-image":
             pre += ["--out", str(d / "cache"), "--trigger", rec["trigger"]]
             return [pre]
@@ -882,9 +914,10 @@ class TrainJobs:
             return bool(getattr(svc, "live_reqs", None)) or bool(svc.status.get("busy"))
         return False
 
-    def _write_control(self, d: Path, budget: int, save_state: bool) -> None:
+    def _write_control(self, d: Path, budget: int, save_state: bool, stop: bool = False) -> None:
         tmp = d / "vram.json.tmp"
-        tmp.write_text(json.dumps({"budget_mib": int(budget), "save_state": bool(save_state)}), encoding="utf-8")
+        tmp.write_text(json.dumps({"budget_mib": int(budget), "save_state": bool(save_state), "stop": bool(stop)}),
+                       encoding="utf-8")
         os.replace(tmp, d / "vram.json")
 
     def _spawn(self, rec: dict, pci: str, budget: int, resume: bool, cancel: threading.Event) -> subprocess.Popen:
@@ -914,6 +947,7 @@ class TrainJobs:
         self._proc = proc
         self._state_saved.clear()
         self._train_state = {}
+        self._step_clock = None
         from serve.vram_ledger import process_start
         rec.update(pid=proc.pid, pid_start=process_start(proc.pid))
         self._write(rec)
@@ -925,28 +959,52 @@ class TrainJobs:
         from serve import images as img
         from serve.vram_ledger import Ledger
         tb = budget_mod()
-        self._decider = tb.Decider(run_config(self.svc), *self._budget_model(rec), devices=devices(self.svc))
         d = self.dir_of(rec["id"])
+        model, base = self._budget_model(rec)
+        data = d / "cache" / "items.txt" if model == "qwen-image-2.1" else d / "export"
+        tokens = tb.dataset_tokens(model, data)
+        rank = rec["settings"]["rank"]
+        minimum, need = tb.initial_vram(model, base, tokens, rank)
+        rec["training_shape"] = {"tokens": tokens, "rank": rank, "min_mib": minimum, "need_mib": need}
+        self._write(rec)
+        self._decider = tb.Decider(run_config(self.svc), model, base, devices=devices(self.svc),
+                                   image_tokens=tokens, rank=rank)
         act = self._decider.tick(self._state(rec))
         if not act or not act.get("pci"):
-            raise TrainError("no GPU can take the training now (the least VRAM is not free anywhere)", 503)
+            raise TrainError(str((act or {}).get("reason") or "no GPU can take the training now"), 503)
         pci = str(act["pci"]).lower()
         self.place = {"pci": pci, "budget_mib": int(act.get("budget_mib", 0)),
                       "mode": self._mode(rec, act), "reason": str(act.get("reason", ""))}
         log = open(d / "train.log", "a", encoding="utf-8")
         self._log = log
         proc = None
+        pending = None
         try:
             proc = self._spawn(rec, pci, int(act.get("budget_mib", 0)),
                                resume=bool(rec.get("resume_state")), cancel=cancel)
             led = Ledger(img.gpu_key(card_env(self.svc, pci)))
-            pending = None
             deadline = 0.0
             while True:
                 if cancel.is_set():
                     raise _Cancelled()
                 if proc is not None and proc.poll() is not None:
-                    break
+                    if pending is None:
+                        break
+                    assert self._reader is not None
+                    self._reader.join()
+                    self._reader = None
+                    if proc.returncode != 0 or not self._state_saved.is_set() or not (d / "state.bin").is_file():
+                        raise TrainError("the trainer stopped without saving its state", 500)
+                    self._proc = None
+                    self._train_state = {}
+                    _DEV_CACHE.clear()
+                    self._scan_versions(rec)
+                    pci = str(pending.get("pci") or pci).lower()
+                    self.place["pci"] = pci
+                    proc = None
+                    pending = None
+                    rec["resume_state"] = True
+                    self._write(rec)
                 if proc is None:
                     if self.image_waiting:
                         # The policy also checks the device's actual free room after the process exits.
@@ -968,31 +1026,16 @@ class TrainJobs:
                     card = str(act.get("pci") or pci).lower()
                     self.place = {"pci": pci, "budget_mib": budget, "mode": self._mode(rec, act),
                                   "reason": str(act.get("reason", "")), "name": self._device_name(pci)}
-                    self._write_control(d, budget, bool(act.get("save_state")))
+                    self._write_control(d, budget, bool(act.get("save_state")), stop=bool(act.get("save_state")))
                     led.hold("train", max(budget, int(self._train_state.get("used_mib", 0))), proc.pid,
                              exact=False, whole=True)
                     rec["place"] = self.place
                     self._write(rec)
                     if act.get("save_state"):
                         if pending is None:
-                            pending, deadline = act, time.monotonic() + OPEN_WAIT_S
-                        if self._state_saved.is_set():
-                            self._terminate(proc)
-                            assert self._reader is not None
-                            self._reader.join()
-                            self._reader = None
-                            self._proc = None
-                            self._train_state = {}
-                            _DEV_CACHE.clear()  # process exit can return runtime-held VRAM
-                            self._scan_versions(rec)
-                            pci = card
-                            self.place["pci"] = pci
-                            proc = None
-                            pending = None
-                            rec["resume_state"] = True
-                            self._write(rec)
-                        elif time.monotonic() >= deadline:
-                            raise TrainError("the trainer did not save its state in time", 503)
+                            pending, deadline = act, time.monotonic() + self._stop_wait(rec)
+                        if time.monotonic() >= deadline:
+                            self._terminate(proc, self._stop_wait(rec))
                     elif self.image_waiting and act.get("image_ready") is True and \
                             self._train_state.get("state") == "paused":
                         # Only the policy can certify the paused process left enough memory.
@@ -1011,7 +1054,7 @@ class TrainJobs:
                 raise TrainError("the trainer saved no version", 500)
         finally:
             if proc is not None and proc.poll() is None:
-                self._terminate(proc)
+                self._stop_trainer(rec, proc, save_state=pending is not None)
             if self._reader is not None:
                 self._reader.join()
                 self._reader = None
@@ -1055,8 +1098,13 @@ class TrainJobs:
             if m:
                 g = m.groups()
                 step = int(g[0])
+                now = time.monotonic()
+                speed = float(g[3]) if len(g) > 3 else None
+                if not speed and self._step_clock and step > self._step_clock[0]:
+                    speed = (now - self._step_clock[1]) / (step - self._step_clock[0])
+                self._step_clock = step, now
                 rec["progress"] = {"step": step, "total": rec["settings"]["steps"], "loss": float(g[1]),
-                                   "s_per_step": float(g[3]) if len(g) > 3 else None, "eta_s": self._eta(rec, step)}
+                                   "s_per_step": speed, "eta_s": self._eta(rec, step)}
                 self._scan_versions(rec)
                 self._write(rec)
                 continue
@@ -1064,8 +1112,9 @@ class TrainJobs:
             if tok and tok[0] == "vram" and len(tok) >= 5 and tok[4] in ("running", "paused"):
                 with contextlib.suppress(ValueError):
                     _DEV_CACHE.clear()  # the pause/grow changed free VRAM; the policy needs a fresh report
+                    need = next((int(t.split("=", 1)[1]) for t in tok[5:] if t.startswith("need_mib=")), None)
                     self._train_state = {"used_mib": int(tok[1]), "peak_est_mib": int(tok[2]), "min_mib": int(tok[3]),
-                                         "state": tok[4]}
+                                         "need_mib": need, "state": tok[4]}
                     self.wake.set()
                 continue
             if tok and tok[0] == "state" and len(tok) >= 3 and tok[1] == "saved":
@@ -1114,15 +1163,28 @@ class TrainJobs:
             rec["versions"].append({"step": step, "file": fname, "samples": [], "registered": None})
             rec["versions"].sort(key=lambda v: v["step"])
 
-    def _terminate(self, proc: subprocess.Popen) -> None:
+    def _stop_trainer(self, rec: dict, proc: subprocess.Popen, save_state: bool = False) -> None:
+        d = self.dir_of(rec["id"])
+        try:
+            control = json.loads((d / "vram.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            control = {}
+        self._write_control(d, int(control.get("budget_mib") or 0), save_state, stop=True)
+        try:
+            proc.wait(self._stop_wait(rec))
+        except subprocess.TimeoutExpired:
+            self._terminate(proc, self._stop_wait(rec))
+
+    def _terminate(self, proc: subprocess.Popen, wait_s: float) -> None:
+        """Last resort after the trainer's JSON stop did not finish."""
         with contextlib.suppress(OSError):
             proc.terminate()
         try:
-            proc.wait(10)
+            proc.wait(wait_s)
         except subprocess.TimeoutExpired:
             with contextlib.suppress(OSError):
                 proc.kill()
-            proc.wait(10)
+            proc.wait(wait_s)
 
     # ---- samples (after the training, the GPU free; the image jobs' own turn)
     def _samples(self, rec: dict, cancel: threading.Event) -> None:

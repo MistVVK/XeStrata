@@ -139,6 +139,7 @@
   "ltw.preprocess": "画像の前処理（VAE と文）",
   "ltw.presetLine": "{n} step・{k} step ごとに版",
   "ltw.queued": "待ち",
+  "ltw.maxSize": "学習画像の大きさの上限",
   "ltw.rank": "ランク",
   "ltw.register": "選んだ版を登録",
   "ltw.registered": "登録済み",

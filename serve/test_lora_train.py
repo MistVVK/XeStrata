@@ -45,41 +45,33 @@ if f.get("resume"):
     open(out + ".resumed", "w").write(f["resume"])
 def budget():
     if not control or not os.path.exists(control):
-        return int(f.get("vram-budget", "0")) or peak, False
-    try:
-        c = json.load(open(control))
-        return int(c.get("budget_mib", 0)), bool(c.get("save_state"))
-    except (OSError, ValueError):
-        return peak, False
+        return int(f.get("vram-budget", "0")) or peak, False, False
+    c = json.load(open(control))
+    return int(c.get("budget_mib", 0)), bool(c.get("save_state")), bool(c.get("stop"))
 def save(step):
     name = f"{out}.{step}.safetensors" if mf else f"{out}_{step}.safetensors"
     open(name, "wb").write(ckpt(step, f.get("kind", "other"), f.get("trigger", "")))
-b, ss = budget()
-print(f"vram 100 {peak} {least} running budget_mib={b}", flush=True)
-for step in range(1, steps + 1):
-    b, ss = budget()
+def read_control():
+    b, ss, stop = budget()
     if ss and state:
         open(state, "wb").write(b"XSTRAIN1")
         print(f"state saved {state}", flush=True)
-        print(f"vram 0 {peak} {least} paused", flush=True)
-        while True:   # serve ends the process after the state is saved; wait for it (or a change of mind)
-            time.sleep(0.05)
-            b2, ss2 = budget()
-            if not ss2 and b2 > 0:
-                break
+    if stop:
+        open(out + ".stopped", "w").write("save=" + str(ss))
+        sys.exit(0)
+    return b
+b = read_control()
+print(f"vram 100 {peak} {least} running budget_mib={b} need_mib=8252", flush=True)
+for step in range(1, steps + 1):
+    b = read_control()
     if b <= 0:
-        print(f"vram 0 {peak} {least} paused", flush=True)
+        print(f"vram 0 {peak} {least} paused need_mib=8252", flush=True)
         while True:
-            b, ss = budget()
-            if ss:
-                open(state, "wb").write(b"XSTRAIN1")
-                print(f"state saved {state}", flush=True)
-                while budget()[1]:
-                    time.sleep(0.05)
+            b = read_control()
             if b > 0:
                 break
             time.sleep(0.05)
-        print(f"vram 100 {peak} {least} running", flush=True)
+        print(f"vram 100 {peak} {least} running need_mib=8252", flush=True)
     if mf:
         print(f"step {step:5d} loss 0.100000 lr 1.0e-04", flush=True)
     else:
@@ -142,7 +134,15 @@ class FakeBudget:
     def figures(self, model, base):
         return 0, 8192, 14848
 
-    def Decider(self, cfg, model, base, devices=None):
+    def dataset_tokens(self, model, data):
+        from serve.train_budget import dataset_tokens
+        return dataset_tokens(model, data)
+
+    def initial_vram(self, model, base, image_tokens, rank):
+        return 6737, 6782
+
+    def Decider(self, cfg, model, base, devices=None, image_tokens=None, rank=None):
+        self.args = (model, base, image_tokens, rank)
         return self.DeciderCls(self)
 
     class DeciderCls:
@@ -160,6 +160,9 @@ class FakeBudget:
                 alive = st["proc_alive"]
                 return {"pci": o.card, "budget_mib": 0, "save_state": alive and paused and not known,
                         "image_ready": not alive or (paused and known), "reason": "an image job goes first"}
+            if o.mode == "refuse":
+                return {"pci": None, "reason": ("not enough free GPU memory: need 6782 MiB, "
+                                                "available 6200 MiB after reserve")}
             if o.mode == "pause":
                 return {"pci": o.card, "budget_mib": 0, "save_state": False, "reason": "the chat goes first"}
             if o.mode == "move" and not o.moved:
@@ -206,7 +209,8 @@ class Training(unittest.TestCase):
         self.jobs.preprocess_argv = lambda rec: [
             [sys.executable, "-c",
              f"from pathlib import Path; d = Path({str(self.jobs.dir_of(rec['id']))!r}); "
-             "(d / 'export').mkdir(exist_ok=True); (d / 'export' / 'manifest.tsv').write_text('001\\n')"]]
+             "(d / 'export').mkdir(exist_ok=True); "
+             "(d / 'export' / 'manifest.tsv').write_text('001\\t48\\t48\\tx\\t29\\t29\\n')"]]
         self.jobs._samples = self._fake_samples
 
     def tearDown(self):
@@ -314,6 +318,8 @@ class Training(unittest.TestCase):
         self.assertEqual([v["step"] for v in done["versions"]], [10, 20, 30, 40])
         self.assertTrue(all(v["samples"] for v in done["versions"]))
         self.assertEqual(done["progress"]["step"], 40)
+        self.assertEqual(done["training_shape"], {"tokens": 2333, "rank": 32, "min_mib": 6737, "need_mib": 6782})
+        self.assertEqual(self.tb.args, ("mage-flow", "int8", 2333, 32))
         # the last version by default
         got = self.jobs.register(rec["id"], None, None)
         self.assertEqual(got["status"], "completed")
@@ -342,6 +348,7 @@ class Training(unittest.TestCase):
         self.assertGreaterEqual(len(done["versions"]), 2)
         self.assertIsNone(done["error"])
         self.assertIsNone(self.jobs._proc)
+        self.assertEqual((self.jobs.dir_of(rec["id"]) / "out" / "lora.stopped").read_text(), "save=False")
         got = self.jobs.register(rec["id"], done["versions"][0]["step"], "early")
         self.assertEqual(got["registered"]["name"], "early")
 
@@ -370,6 +377,89 @@ class Training(unittest.TestCase):
         self.assertEqual(done["versions"][-1]["step"], 40)
         if jobs2.worker is not None:
             jobs2.worker.join(15)
+
+    def test_cache_size_and_refusal_reason(self):
+        rec = self._draft()
+        rec["settings"] = lt.check_settings({"max_size": 768, "rank": 64}, "mage-flow")
+        with mock.patch.object(self.jobs, "preprocess_argv", wraps=lt.TrainJobs.preprocess_argv.__get__(self.jobs)):
+            pre = self.jobs.preprocess_argv(rec)[0]
+        self.assertEqual(pre[pre.index("--budget") + 1], "512,768")
+        with self.assertRaises(lt.TrainError):
+            lt.check_settings({"max_size": 900}, "mage-flow")
+        self.tb.mode = "refuse"
+        self._start(rec, max_size=768, rank=64)
+        failed = wait_for(lambda: (r := self.jobs.get(rec["id"]))["status"] == "failed" and r, what="refusal")
+        self.assertEqual(failed["error"]["message"],
+                         "not enough free GPU memory: need 6782 MiB, available 6200 MiB after reserve")
+        self.assertEqual(self.tb.args, ("mage-flow", "int8", 2333, 64))
+        self.assertEqual(failed["settings"]["max_size"], 768)
+
+    def test_orphan_stop_control_precedes_any_signal(self):
+        import subprocess
+        from serve.vram_ledger import process_start
+        rec = self._draft()
+        d = self.jobs.dir_of(rec["id"])
+        (d / "out").mkdir()
+        self.jobs._write_control(d, 12000, False)
+        proc = subprocess.Popen([str(self.root / "engine" / "xestrata-image-mf-train"), "train",
+                                 "--steps", "300", "--checkpoint", "50", "--out", str(d / "out" / "lora"),
+                                 "--vram-control", str(d / "vram.json"), "--state", str(d / "state.bin"),
+                                 "--kind", "character", "--trigger", "test"], stdout=subprocess.DEVNULL)
+        try:
+            started = process_start(proc.pid)
+            self.assertIsNotNone(started)
+            rec.update(stage="train", pid=proc.pid, pid_start=started)
+
+            def still_running(pid):
+                return started if proc.poll() is None else None
+
+            with mock.patch("serve.vram_ledger.process_start", side_effect=still_running), \
+                    mock.patch.object(lt.os, "kill", side_effect=AssertionError("unexpected signal")):
+                self.jobs._stop_orphan(rec)
+            self.assertEqual(proc.wait(5), 0)
+            self.assertEqual((d / "out" / "lora.stopped").read_text(), "save=False")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    def test_real_cache_shapes_are_read_again(self):
+        import struct
+        from serve.train_budget import dataset_tokens
+        d = self.root / "cache-probe"
+        d.mkdir()
+        lat = d / "latent"
+        text = d / "text"
+        empty = d / "empty"
+        lat.write_bytes(struct.pack("<ff", 48, 48))
+        text.write_bytes(struct.pack("<f", 29))
+        empty.write_bytes(struct.pack("<f", 35))
+        items = d / "items.txt"
+        items.write_text(f"empty {empty}\n{lat} {text}\n")
+        self.assertEqual(dataset_tokens("qwen-image-2.1", items), 48 * 48 + 35)
+        lat.write_bytes(struct.pack("<ff", 64, 64))
+        self.assertEqual(dataset_tokens("qwen-image-2.1", items), 64 * 64 + 35)
+
+    def test_stop_timeout_escalates_only_after_json(self):
+        import subprocess
+        import json
+        rec = self._draft()
+        rec["progress"] = {"s_per_step": 40}
+        d = self.jobs.dir_of(rec["id"])
+        self.jobs._write_control(d, 9000, False)
+        proc = mock.Mock()
+        proc.wait.side_effect = subprocess.TimeoutExpired("trainer", 120)
+        with mock.patch.object(self.jobs, "_terminate") as terminate:
+            self.jobs._stop_trainer(rec, proc, save_state=True)
+        self.assertEqual(json.loads((d / "vram.json").read_text()),
+                         {"budget_mib": 9000, "save_state": True, "stop": True})
+        proc.wait.assert_called_once_with(120.0)
+        terminate.assert_called_once_with(proc, 120.0)
+
+    def test_stop_wait_scales_with_step(self):
+        self.assertEqual(self.jobs._stop_wait({}), 120.0)
+        self.assertEqual(self.jobs._stop_wait({"progress": {"s_per_step": 2}}), 30.0)
+        self.assertEqual(self.jobs._stop_wait({"progress": {"s_per_step": 40}}), 120.0)
 
     # ---- the TRAINERS mapping
     def test_train_argv(self):
@@ -415,6 +505,7 @@ class Training(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, lt.IMAGE_YIELD_WAIT_S)
         self.assertIsNone(self.jobs._proc)   # the unknown image need required a state save and process exit
         self.assertTrue((self.jobs.dir_of(rec["id"]) / "state.bin").exists())
+        self.assertEqual((self.jobs.dir_of(rec["id"]) / "out" / "lora.stopped").read_text(), "save=True")
         self.assertFalse((self.jobs.dir_of(rec["id"]) / "out" / "lora.resumed").exists())
         token2 = self.jobs.image_begin(4096)
         self.jobs.image_end(token)
@@ -511,6 +602,7 @@ class Training(unittest.TestCase):
         st = self.jobs._train_state
         self.assertEqual(st["used_mib"], 100)          # the trailing budget_mib= field ignored
         self.assertEqual(st["peak_est_mib"], 14848)
+        self.assertEqual(st["need_mib"], 8252)
         wait_for(lambda: self.jobs.get(rec["id"])["status"] == "awaiting_choice", what="the end")
 
     # ---- the models row and the status

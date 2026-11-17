@@ -139,6 +139,7 @@
   "ltw.preprocess": "그림 전처리(VAE와 텍스트)",
   "ltw.presetLine": "{n} 스텝, {k}마다 버전",
   "ltw.queued": "대기 중",
+  "ltw.maxSize": "학습 이미지 최대 크기",
   "ltw.rank": "랭크",
   "ltw.register": "선택한 버전 등록",
   "ltw.registered": "등록됨",

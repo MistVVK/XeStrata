@@ -139,6 +139,7 @@
   "ltw.preprocess": "图片预处理（VAE 与文本）",
   "ltw.presetLine": "{n} 步，每 {k} 步一个版本",
   "ltw.queued": "等待中",
+  "ltw.maxSize": "训练图像最大尺寸",
   "ltw.rank": "秩",
   "ltw.register": "注册所选版本",
   "ltw.registered": "已注册",

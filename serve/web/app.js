@@ -5544,7 +5544,7 @@ function ltwPanel(el) {
   function settings() {
     const g = (k) => { const i = el.querySelector(`[data-ltw-set="${k}"]`); return i ? i.value : ""; };
     const out = {};
-    for (const k of ["steps", "save_every", "rank", "lr", "seed", "dropout", "accum", "base", "method",
+    for (const k of ["steps", "save_every", "max_size", "rank", "lr", "seed", "dropout", "accum", "base", "method",
                      "train_blocks", "only_if_contains", "ignore_if_contains", "sample_seed"]) {
       const v = g(k);
       if (v !== "") out[k] = v;
@@ -5614,6 +5614,7 @@ function ltwPanel(el) {
         <div class="st-collapse__body ltw-grid">
           <label class="st-field"><span>${esc(tr("ltw.steps", "Most steps (n)"))}</span><input class="st-input" type="number" min="1" data-ltw-set="steps" placeholder="${preset.steps || 3000}"></label>
           <label class="st-field"><span>${esc(tr("ltw.saveEvery", "Save a version every (k)"))}</span><input class="st-input" type="number" min="1" data-ltw-set="save_every" placeholder="${preset.save_every || 250}"></label>
+          <label class="st-field"><span>${esc(tr("ltw.maxSize", "Maximum training image size"))}</span><select class="st-input" data-ltw-set="max_size"><option value="1024">1024</option><option value="768">768</option><option value="512">512</option></select></label>
           <label class="st-field"><span>${esc(tr("ltw.rank", "Rank"))}</span><input class="st-input" type="number" min="1" data-ltw-set="rank" placeholder="${preset.rank || 32}"></label>
           <label class="st-field"><span>${esc(tr("ltw.lr", "Learning rate"))}</span><input class="st-input" data-ltw-set="lr" placeholder="${preset.lr || 1e-4}"></label>
           <label class="st-field"><span>${esc(tr("ltw.seed", "Seed"))}</span><input class="st-input" type="number" data-ltw-set="seed" placeholder="${preset.seed != null ? preset.seed : 42}"></label>

@@ -139,6 +139,7 @@
   "ltw.preprocess": "Preparando as imagens (VAE e texto)",
   "ltw.presetLine": "{n} passos, uma versão a cada {k}",
   "ltw.queued": "Aguardando",
+  "ltw.maxSize": "Tamanho máximo das imagens de treino",
   "ltw.rank": "Rank",
   "ltw.register": "Registrar a versão escolhida",
   "ltw.registered": "registrado",
