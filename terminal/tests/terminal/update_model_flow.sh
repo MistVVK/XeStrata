@@ -166,7 +166,7 @@ if [ "$STAGE" = B ]; then
   ( cd "$REPO" && "${PY:-python3}" - "$BADDIR" "$COMP" <<'PY'
 import json, shutil, sys
 from pathlib import Path
-sys.path.insert(0, "packaging")
+sys.path.insert(0, "../tools/packaging")
 import feed_tool, package_engine
 from strata_control import components, signing
 out, comp = Path(sys.argv[1]), Path(sys.argv[2])

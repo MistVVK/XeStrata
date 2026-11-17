@@ -32,7 +32,7 @@ if [ -n "${TERMINAL_ARCHIVE:-}" ]; then
   echo "using the archive built beforehand: $ARCHIVE"
 else
   export STRATA_COMMIT="${STRATA_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null)}"   # a checkout copied without .git: pass STRATA_COMMIT
-  ( cd "$REPO" && python3 packaging/package_terminal.py --out "$W/pkg" --target linux-x86_64 ) > "$W/build.log" 2>&1 || { tail -20 "$W/build.log"; bad "package build"; exit 1; }
+  ( cd "$REPO/.." && python3 tools/packaging/package_terminal.py --out "$W/pkg" --target linux-x86_64 ) > "$W/build.log" 2>&1 || { tail -20 "$W/build.log"; bad "package build"; exit 1; }
   ARCHIVE="$(ls "$W"/pkg/*.tar.gz | head -1)"
 fi
 tar -xzf "$ARCHIVE" -C "$W/term"
