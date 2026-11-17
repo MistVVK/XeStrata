@@ -44,6 +44,8 @@ export function relTime(iso: string | number | Date): string {
  */
 export function relTimeShort(iso: string | number | Date): string {
     const then = new Date(iso).getTime();
+    if (!Number.isFinite(then))
+        return '';                                   // a chat file without a usable date shows no time, not "NaNm"
     const diff = Date.now() - then;
     if (diff < 45000)
         return 'now';
