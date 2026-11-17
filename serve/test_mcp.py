@@ -291,7 +291,8 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual(len({m["id"] for m in mcp}), 1)
         content = "".join((c["choices"][0]["delta"].get("content") or "") for c in cs)
         self.assertEqual(content, "Let me check.The tool said hello.")
-        self.assertFalse([c for c in cs if c["choices"][0]["delta"].get("tool_calls")])   # nothing for the client to run
+        # Nothing for the client to run.
+        self.assertFalse([c for c in cs if c["choices"][0]["delta"].get("tool_calls")])
         self.assertEqual(cs[-1]["choices"][0]["finish_reason"], "stop")
         self.assertEqual(len(self.engine.prompts), 2)
         first, second = self.engine.prompt_text(0), self.engine.prompt_text(1)
@@ -444,7 +445,8 @@ class ToolLoop(unittest.TestCase):
 class NoServers(unittest.TestCase):
     def test_opt_in_without_servers_is_a_plain_chat(self):
         tok = ByteTokenizer()
-        svc = Service(ScriptedEngine(tok, ["</think>\n\nhi"]), tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        svc = Service(ScriptedEngine(tok, ["</think>\n\nhi"]), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         httpd = serve(svc, port=0)
         try:
             base = f"http://127.0.0.1:{httpd.server_address[1]}"

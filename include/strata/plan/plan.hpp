@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/plan/plan.hpp - P1.S9 census + memory planner.
 //
 // This is the component that makes one binary adapt to the GPU it is running on.  The engine has 33.97 GB of
@@ -154,7 +155,7 @@ inline Plan make_plan(uint64_t max_context, const Geometry& g, const Costs& c,
 }
 
 inline std::string to_string(const Plan& p) {
-    auto gb = [](uint64_t b) { return std::to_string(b / 1e9); };
+    auto gb = [](uint64_t b) { return std::to_string(static_cast<double>(b) / 1e9); };
     std::string s;
     s += "memory plan  --max-context " + std::to_string(p.max_context) + "\n";
     s += "  KV + indexer keys   " + gb(p.kv_bytes) + " GB\n";

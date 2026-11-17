@@ -91,7 +91,8 @@ void native_gdn_conv_silu(float* history, const float* input, const float* weigh
     }
     queue_for(stream).parallel_for(sycl::range<1>(size_t(channels)), [=](sycl::id<1> id) {
         const int c = int(id[0]);
-        const float values[4] = {history[c * 3], history[c * 3 + 1], history[c * 3 + 2], input[c]};
+        // count_and_stream bounds c below 65535, so the int offsets do not overflow.
+        const float values[4] = {history[c * 3], history[c * 3 + 1], history[c * 3 + 2], input[c]}; // NOLINT(bugprone-implicit-widening-of-multiplication-result)
         float sum = 0.0f;
         for (int tap = 0; tap < 4; ++tap) sum += values[tap] * weights[c * 4 + tap];
         sum = sum + 0.0f;   // the native SSM kernel adds its zero bias even when there is no bias input

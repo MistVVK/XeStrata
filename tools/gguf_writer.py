@@ -164,8 +164,8 @@ class GGUFWriter:
         body += struct.pack("<I", 3)                       # GGUF v3
         body += struct.pack("<Q", len(self.tensors))
         body += struct.pack("<Q", len(self.metadata))
-        for k, (t, v) in self.metadata.items():
-            body += self._kv_bytes(k, t, v)
+        for k, (type_name, v) in self.metadata.items():
+            body += self._kv_bytes(k, type_name, v)
 
         # Tensor directory: offsets are relative to the start of the data section.
         offset = 0
@@ -212,14 +212,21 @@ def _selfcheck() -> int:
     g = GGUFFile(p)
     ok = True
     print(f"  version {g.version}  tensors {len(g.tensors)}  metadata {len(g.metadata)}")
-    if g.metadata.get("general.architecture") != "qwen4exp": print("  FAIL arch"); ok = False
-    if g.metadata.get("qwen4exp.block_count") != 8:         print("  FAIL u32"); ok = False
-    if g.metadata.get("qwen4exp.test.array") != [1, 2, 3, 4]: print("  FAIL array"); ok = False
+    if g.metadata.get("general.architecture") != "qwen4exp":
+        print("  FAIL arch")
+        ok = False
+    if g.metadata.get("qwen4exp.block_count") != 8:
+        print("  FAIL u32")
+        ok = False
+    if g.metadata.get("qwen4exp.test.array") != [1, 2, 3, 4]:
+        print("  FAIL array")
+        ok = False
 
     by = {t.name: t for t in g.tensors}
     t = by.get("blk.0.ffn_gate_exps.weight")
     if t is None or t.type_name != "Q2_0" or t.shape != [64, 16]:
-        print(f"  FAIL tensor dir: {t}"); ok = False
+        print(f"  FAIL tensor dir: {t}")
+        ok = False
     else:
         with p.open("rb") as fh:
             fh.seek(g.data_start + t.offset)
@@ -232,7 +239,8 @@ def _selfcheck() -> int:
         # The real check: re-quantizing the DEQUANTIZED values must be a fixed point.
         again = dequantize_q2_0(quantize_q2_0(back))
         if not np.array_equal(again, back):
-            print("  FAIL Q2_0 is not a fixed point under requantization"); ok = False
+            print("  FAIL Q2_0 is not a fixed point under requantization")
+            ok = False
         else:
             print("  Q2_0 fixed point: PASS (requantizing the dequantized values is exact)")
     print("SELF-CHECK " + ("PASS" if ok else "FAIL"))

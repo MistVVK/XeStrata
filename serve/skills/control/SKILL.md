@@ -13,5 +13,5 @@ metadata:
   clothes) in another pose: edit_image with references instead.
 - ControlNet (Qwen-Image-2.1): `strength` (0 to 2) 1, 0.5 to 0.8 departs more; `end` (the share of the steps it
   follows) 1, 0.6 to 0.8 frees the details. `size` the picture's shape by default.
-- MOSS-Image: `color` and `depth` by its adapter (`end` the share of the steps: 0.5 from a 3D mannequin, 0.3 with
-  moss-image-4-step). Other models take the map as a reference image.
+- MOSS-Image: `color` and `depth` by its adapter (`end` the share of the steps: 0.5 from a 3D mannequin).
+  Other models take the map as a reference image.

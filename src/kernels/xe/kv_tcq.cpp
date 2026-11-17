@@ -125,8 +125,9 @@ sycl::event ring_write(sycl::queue& queue, const KvAppend& p, int kv_heads, int 
             const float am = sycl::reduce_over_group(sg, sycl::fabs(x), sycl::maximum<float>());
             if (sg.get_local_linear_id() == 0) wmax[sg.get_group_linear_id()] = am;
             sycl::group_barrier(it.get_group());
+            // d < HD (256), so g * 2 fits int.
             const int g = d / 64;
-            const float amax = sycl::fmax(wmax[2 * g], wmax[2 * g + 1]);
+            const float amax = sycl::fmax(wmax[static_cast<size_t>(g * 2)], wmax[static_cast<size_t>(g * 2) + 1]); // NOLINT(bugprone-misplaced-widening-cast)
             const uint16_t sbits = f16_gpu::f16_from_f32(amax / 127.0f);
             const float sf = f16_gpu::f32_from_f16(sbits);
             int q = 0;
@@ -299,8 +300,9 @@ void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream) {
             // the multiplier of least error over the four chains (ties to the first)
             int best = 0;
             float best_e = 0.0f;
+            // mu.n <= MAX_MULT, so mi * 4 fits int.
             for (int mi = 0; mi < mu.n; ++mi) {
-                const float e4 = ((err[mi * 4] + err[mi * 4 + 1]) + err[mi * 4 + 2]) + err[mi * 4 + 3];
+                const float e4 = ((err[static_cast<size_t>(mi * 4)] + err[static_cast<size_t>(mi * 4) + 1]) + err[static_cast<size_t>(mi * 4) + 2]) + err[static_cast<size_t>(mi * 4) + 3]; // NOLINT(bugprone-misplaced-widening-cast)
                 if (mi == 0 || e4 < best_e) { best_e = e4; best = mi; }
             }
             const long long page = (long long) p.page_table[pos / page_size];

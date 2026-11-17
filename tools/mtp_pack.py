@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/mtp_pack.py - plan v0.3 P6 prep: the MTP draft block as a Strata GGUF, from the BF16 tensors.
 
 llama.cpp's qwen4exp converter drops the MTP head (`supports_mtp_export = False`), and the flyweight MTP GGUF is
@@ -148,7 +149,8 @@ def main() -> int:
     w.add_string("strata.mtp.source_sha256", hashlib.sha256(
         json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
     w.add_string("strata.mtp.expert_format", a.experts)
-    w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
+    w.add_string("strata.mtp.expert_quantizer",
+                 "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
     report = []
     for t in sorted(manifest, key=lambda t: t["name"]):
         name, shape = t["name"], t["shape"]

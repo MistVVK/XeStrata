@@ -18,7 +18,8 @@ ENGINE = Path(__file__).resolve().parents[1]
 
 def gguf_py() -> str:
     cands = [envvars.get("GGUF_PY"), ENGINE / "third_party" / "main" / "llama.cpp" / "gguf-py",
-             ENGINE.parents[min(1, len(ENGINE.parents) - 1)] / ".ref" / "llama.cpp" / "gguf-py"]   # the dev tree; a shallow install (G:\Strata) has no grandparent
+             # The dev tree; a shallow install (G:\Strata) has no grandparent.
+             ENGINE.parents[min(1, len(ENGINE.parents) - 1)] / ".ref" / "llama.cpp" / "gguf-py"]
     for c in cands:
         if c and (Path(c) / "gguf").is_dir():
             return str(c)

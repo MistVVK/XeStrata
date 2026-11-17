@@ -19,10 +19,14 @@
 #include "strata/platform/env.hpp"
 
 #include <atomic>
+#include <cerrno>
+#include <cctype>
+#include <climits>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 // `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
@@ -222,8 +226,8 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         // `moe_combine` needs the pool's answer and the pool needs the router's.
         auto capture = [&](bool post, strata::gpu::Graph** out, const char* what, int half = 0,
                            int stage_prefix = 0) -> bool {
-            strata::gpu::Stream cs = nullptr;
-            if (!(cs = strata::gpu::stream_create())) {
+            strata::gpu::Stream cs = strata::gpu::stream_create();
+            if (!cs) {
                 err = std::string("session_capture: stream create failed");
                 return false;
             }
@@ -242,7 +246,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
             if (!ok) {
                 strata::gpu::abandon_capture(cs);
                 strata::gpu::stream_destroy(cs);
-                err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
+                err.insert(0, "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": ");
                 return false;
             }
             // an executable graph replays on any stream of the runtime, so the recording stream can go
@@ -805,7 +809,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
             : block_layer(tables, g, l, pos, pos_base, s.gdn, s.qsa_states[s.qsa_primary()], s.qsa_bufs, s.moe, s.k,
                           s.block, parts, stream, err, nullptr, s.ple.ready() ? &s.ple : nullptr);
         if (!ok) {
-            err = "layer " + std::to_string(l) + ": " + err;
+            err.insert(0, "layer " + std::to_string(l) + ": ");
             return false;
         }
         if (is_qsa_layer(g, l)) ++qsa_index;
@@ -847,8 +851,8 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         err = "session_capture_token: the parts staging is not mapped pinned memory";
         return false;
     }
-    strata::gpu::Stream cs = nullptr;
-    if (!(cs = strata::gpu::stream_create())) { err = "session_capture_token: stream create failed"; return false; }
+    strata::gpu::Stream cs = strata::gpu::stream_create();
+    if (!cs) { err = "session_capture_token: stream create failed"; return false; }
     if (!strata::gpu::begin_capture(cs)) {
         strata::gpu::stream_destroy(cs);
         err = "session_capture_token: begin capture failed";
@@ -863,7 +867,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         err.clear();
         ok = block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k, s.block, (void*) cs, err, s.db,
                              s.ple.ready() ? &s.ple : nullptr);
-        if (!ok) { err = "session_capture_token: pre layer " + std::to_string(l) + ": " + err; break; }
+        if (!ok) { err.insert(0, "session_capture_token: pre layer " + std::to_string(l) + ": "); break; }
         if (hits != nullptr) {
             // After the ring (and the shared expert): the GPU's experts run while the CPU computes the misses.
             strata::kernels::moe_hit_select(s.moe.ids, hits->d_res + l * hits->n_expert, (int) s.k,
@@ -879,7 +883,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         if (hits != nullptr)
             strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
         ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*) cs, err);
-        if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
+        if (!ok) { err.insert(0, "session_capture_token: post layer " + std::to_string(l) + ": "); break; }
         if (qsa) ++qsa_index;
     }
     if (!ok) {
@@ -913,7 +917,14 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     (void) strata::gpu::stream_idle(cs);                     // enter the driver before polling the mapped doorbell
     static const int flush_us = [] {
         const char* e = strata::env_get("TG_FLUSH_US");
-        return e ? std::atoi(e) : 2000;   // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
+        if (!e) return 2000;   // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
+        errno = 0;
+        char* end = nullptr;
+        const long n = std::strtol(e, &end, 10);
+        if (end != e) while (std::isspace(static_cast<unsigned char>(*end))) ++end;
+        if (end == e || *end || errno == ERANGE || n < INT_MIN || n > INT_MAX)
+            throw std::invalid_argument("XESTRATA_TG_FLUSH_US: expected an integer");
+        return static_cast<int>(n);
     }();
     volatile uint32_t* const seq = s.db->h_seq;
     volatile uint32_t* const flag = s.db->h_flag;

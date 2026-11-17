@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -46,6 +47,23 @@ const uint16_t kScales[] = {
 
 }  // namespace
 
+// A malformed argument must be an error, not a silently accepted zero.
+static bool parse_i64(const char* s, long long& out) {
+    char* end = nullptr;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return false;
+    out = v;
+    return true;
+}
+
+static bool parse_f64(const char* s, double& out) {
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (end == s || *end != '\0') return false;
+    out = v;
+    return true;
+}
+
 int main(int argc, char** argv) {
     long long n_in = 2560;          // the real n_embd, so the row length is the engine's
     long long n_out = 640;          // the real expert intermediate width
@@ -53,9 +71,15 @@ int main(int argc, char** argv) {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
-        else if (std::strcmp(argv[i], "--n-in") == 0 && i + 1 < argc) n_in = std::atoll(argv[++i]);
-        else if (std::strcmp(argv[i], "--n-out") == 0 && i + 1 < argc) n_out = std::atoll(argv[++i]);
-        else if (std::strcmp(argv[i], "--tol") == 0 && i + 1 < argc) tol = std::atof(argv[++i]);
+        else if (std::strcmp(argv[i], "--n-in") == 0 && i + 1 < argc) {
+            if (!parse_i64(argv[++i], n_in)) { std::fprintf(stderr, "s2_gemv_parity: invalid --n-in value\n"); return 2; }
+        }
+        else if (std::strcmp(argv[i], "--n-out") == 0 && i + 1 < argc) {
+            if (!parse_i64(argv[++i], n_out)) { std::fprintf(stderr, "s2_gemv_parity: invalid --n-out value\n"); return 2; }
+        }
+        else if (std::strcmp(argv[i], "--tol") == 0 && i + 1 < argc) {
+            if (!parse_f64(argv[++i], tol)) { std::fprintf(stderr, "s2_gemv_parity: invalid --tol value\n"); return 2; }
+        }
         else {
             std::fprintf(stderr, "usage: s2_gemv_parity [--selftest] [--n-in N] [--n-out N] [--tol T]\n");
             return 2;
@@ -64,7 +88,7 @@ int main(int argc, char** argv) {
     if (n_in % QK != 0) { std::fprintf(stderr, "--n-in must be a multiple of %d\n", QK); return 2; }
     const long long nb = n_in / QK;
 
-    std::mt19937 rng(999);
+    std::mt19937 rng(999);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
 
     // FP16 activations.  Patterns are drawn from the same finite/exact table as the decode test, because a

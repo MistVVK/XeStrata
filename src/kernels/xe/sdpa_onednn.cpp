@@ -188,7 +188,7 @@ dg::compiled_partition compile_train(const dnnl::engine& eng, int64_t rows, int6
     size_t id = 100;
     dg::graph g(dnnl::engine::kind::gpu);
     std::vector<dg::op> ops;
-    auto add = [&](dg::op::kind k, const char* name, std::vector<lt> in, std::vector<lt> out) -> dg::op& {
+    auto add = [&](dg::op::kind k, const char* name, const std::vector<lt>& in, const std::vector<lt>& out) -> dg::op& {
         ops.emplace_back(id++, k, name);
         ops.back().add_inputs(in);
         ops.back().add_outputs(out);

@@ -38,7 +38,7 @@ magetrail[-uncensored]: MageTrail, Mage-Flow tuned on Danbooru and e621 images, 
 encoder with the refusal direction removed; several, comma-separated: the first the default, the others named by a
 request's "model"; hunyuan-image-3-distil: HunyuanImage 3.0 Instruct-Distil in 8 steps, its own tokenizer and
 system prompt, no text encoder; moss-image|moss-image-base[-uncensored]: MOSS-Image in 50 with guidance, the text
-encoder Qwen3.5-9B; moss-image-4-step[-uncensored]: MOSS-Image with darask0's 4-step adapter, 4 steps;
+encoder Qwen3.5-9B; moss-image-4-step[-uncensored]: MOSS-Image with akhaliq's 4-step LoRA;
 --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image) or w4a8|int8 (HunyuanImage 3.0), --image-dit-q8
 auto|on|off (Mage-Flow, MOSS-Image) and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off,
 --image-gpu-policy auto|keep|shrink|unload, --image-gpu auto|same|PCI).
@@ -9774,9 +9774,9 @@ def main() -> int:
                          "(HunyuanImage 3.0 Instruct-Distil, 8 steps, guidance 2.5, about 50 GB of RAM), which reads "
                          "its own prompt with the model's tokenizer and system prompt (no text encoder); moss-image "
                          "(MOSS-Image, 50 steps, guidance 3; text and a layout of boxes in the prompt) or "
-                         "moss-image-base (its base model) or moss-image-4-step (MOSS-Image with darask0's 4-step "
-                         "adapter, 4 steps without guidance, no edits), the text encoder Qwen3.5-9B (Unsloth's or, "
-                         "-uncensored, "
+                         "moss-image-base (its base model) or moss-image-4-step "
+                         "(akhaliq's 4-step LoRA, without guidance, no edits), the text encoder Qwen3.5-9B "
+                         "(Unsloth's or, -uncensored, "
                          "HauhauCS's; Q8_0, lowered first (Q6_K, Q4_K_M), or the chat model's own file when that is "
                          "Qwen3.5-9B of the same maker); several, "
                          "comma-separated (qwen-image-turbo,magetrail): the first the default, the others named by a "

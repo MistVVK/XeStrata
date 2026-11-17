@@ -31,59 +31,62 @@ int failed = 0;
 constexpr int64_t W = 2, H = 2, n = W * H;
 
 // a 2 x 2 RGBA8 picture: one opaque pixel, one clear, one of a quarter's alpha, one of half
-const std::vector<uint8_t> px = {10, 20, 30, 255, 100, 150, 200, 0, 0, 128, 255, 64, 7, 8, 9, 128};
+const std::vector<uint8_t>& px() {
+    static const std::vector<uint8_t> v = {10, 20, 30, 255, 100, 150, 200, 0, 0, 128, 255, 64, 7, 8, 9, 128};
+    return v;
+}
 
-float alpha(int64_t q) { return (float) px[(size_t) (q * 4 + 3)] / 255.f; }
+float alpha(int64_t q) { return (float) px()[(size_t) (q * 4 + 3)] / 255.f; }
 
 // Qwen-Image's VAE input: each channel as the file has it, 0 .. 1, the alpha one of them
 void keep_unit() {
-    const std::vector<float> p = image_planes(px, W, H, 4, PlaneAlpha::Keep, PlaneRange::Unit);
+    const std::vector<float> p = image_planes(px(), W, H, 4, PlaneAlpha::Keep, PlaneRange::Unit);
     CHECK(p.size() == (size_t) (4 * n));
     for (int64_t q = 0; q < n; ++q)
         for (int64_t c = 0; c < 4; ++c)
-            CHECK(p[(size_t) (c * n + q)] == (float) px[(size_t) (q * 4 + c)] / 255.f);
+            CHECK(p[(size_t) (c * n + q)] == (float) px()[(size_t) (q * 4 + c)] / 255.f);
 }
 
 // Qwen-Image's vision encoder's input: over white in the 0 .. 1 floats, not rounded to a byte, then -1 .. 1
 void white_unit_vision() {
-    const std::vector<float> p = image_planes(px, W, H, 3, PlaneAlpha::WhiteUnit, PlaneRange::Signed);
+    const std::vector<float> p = image_planes(px(), W, H, 3, PlaneAlpha::WhiteUnit, PlaneRange::Signed);
     for (int64_t q = 0; q < n; ++q) {
         const float a = alpha(q);
         for (int64_t c = 0; c < 3; ++c)
-            CHECK(p[(size_t) (c * n + q)] == 2.f * ((float) px[(size_t) (q * 4 + c)] / 255.f * a + 1.f - a) - 1.f);
+            CHECK(p[(size_t) (c * n + q)] == 2.f * ((float) px()[(size_t) (q * 4 + c)] / 255.f * a + 1.f - a) - 1.f);
     }
 }
 
 // the over-white composite at the whole byte, as the three other models read it: Mage-Flow keeps 0 .. 255 (it resizes
 // and maps itself), MOSS-Image -1 .. 1, Anima 0 .. 1 with an opaque alpha plane
 void white_byte() {
-    const std::vector<float> p = image_planes(px, W, H, 3, PlaneAlpha::White, PlaneRange::Byte);
+    const std::vector<float> p = image_planes(px(), W, H, 3, PlaneAlpha::White, PlaneRange::Byte);
     for (int64_t q = 0; q < n; ++q) {
         const float a = alpha(q);
         for (int64_t c = 0; c < 3; ++c)
             CHECK(p[(size_t) (c * n + q)] ==
-                  std::nearbyint((float) px[(size_t) (q * 4 + c)] * a + 255.f * (1.f - a)));
+                  std::nearbyint((float) px()[(size_t) (q * 4 + c)] * a + 255.f * (1.f - a)));
     }
 }
 
 void white_signed() {
-    const std::vector<float> p = image_planes(px, W, H, 3, PlaneAlpha::White, PlaneRange::Signed);
+    const std::vector<float> p = image_planes(px(), W, H, 3, PlaneAlpha::White, PlaneRange::Signed);
     for (int64_t q = 0; q < n; ++q) {
         const float a = alpha(q);
         for (int64_t c = 0; c < 3; ++c) {
-            const float v = std::nearbyint((float) px[(size_t) (q * 4 + c)] * a + 255.f * (1.f - a));
+            const float v = std::nearbyint((float) px()[(size_t) (q * 4 + c)] * a + 255.f * (1.f - a));
             CHECK(p[(size_t) (c * n + q)] == v / 127.5f - 1.f);
         }
     }
 }
 
 void white_rgba_unit() {
-    const std::vector<float> p = image_planes(px, W, H, 4, PlaneAlpha::White, PlaneRange::Unit);
+    const std::vector<float> p = image_planes(px(), W, H, 4, PlaneAlpha::White, PlaneRange::Unit);
     for (int64_t q = 0; q < n; ++q) {
         const float a = alpha(q);
         for (int64_t c = 0; c < 3; ++c)
             CHECK(p[(size_t) (c * n + q)] ==
-                  std::nearbyint((float) px[(size_t) (q * 4 + c)] * a + 255.f * (1.f - a)) / 255.f);
+                  std::nearbyint((float) px()[(size_t) (q * 4 + c)] * a + 255.f * (1.f - a)) / 255.f);
         CHECK(p[(size_t) (3 * n + q)] == 1.f);   // Anima's fourth channel: the opaque white
     }
 }

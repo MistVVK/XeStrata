@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <string>
 #include <vector>
@@ -51,6 +52,7 @@ float bf16_to_f32(uint16_t h) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  try {
     if (argc < 2) {
         std::fprintf(stderr, "usage: dequant_bf16_test SHARD.gguf [SHARD2.gguf]\n");
         return 2;
@@ -104,4 +106,8 @@ int main(int argc, char** argv) {
     }
     std::printf("dequant_bf16_test: %d types checked, %s\n", checked, fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "dequant_bf16_test: %s\n", e.what());
+    return 2;
+  }
 }

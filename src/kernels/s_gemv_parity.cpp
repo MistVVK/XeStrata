@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <random>
@@ -63,8 +64,8 @@ int q2_0_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, siz
     // byte i/4 bits (i%4)*2.  The two coincide as a byte layout only if you confuse them, which is exactly the
     // mistake the first version of this function made by copying 16 bytes verbatim.
     for (int b = 0; b < 16; ++b) {
-        raw[2 + b] = (uint8_t) ((codes[co + 4 * b + 0] & 3) | ((codes[co + 4 * b + 1] & 3) << 2) |
-                                ((codes[co + 4 * b + 2] & 3) << 4) | ((codes[co + 4 * b + 3] & 3) << 6));
+        raw[2 + b] = (uint8_t) ((codes[co + (size_t) 4 * b + 0] & 3) | ((codes[co + (size_t) 4 * b + 1] & 3) << 2) |
+                                ((codes[co + (size_t) 4 * b + 2] & 3) << 4) | ((codes[co + (size_t) 4 * b + 3] & 3) << 6));
     }
     return 64;
 }
@@ -128,7 +129,7 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
     using strata::kernels::SForm;
     const SForm form{4, 0, 32, Codebook::Affine, true};
 
-    std::mt19937 rng(777);
+    std::mt19937 rng(777);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
     const long long n_groups = n_in / 32;
     const long long codes_per_row = n_in / 2;
@@ -196,7 +197,7 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
             }
             for (int step = 0; step < 4; ++step) {
                 for (int l = 0; l < 32; ++l) {     // elements 0..31 LOW nibbles, 32..63 HIGH
-                    const long long e0 = o * n_in + sb * 256 + step * 64 + l;
+                    const long long e0 = (long long) o * n_in + (long long) sb * 256 + (long long) step * 64 + l;
                     const long long e1 = e0 + 32;
                     blk[16 + step * 32 + l] =
                         (uint8_t) ((codes_el[(size_t) e0] & 0x0F) | (codes_el[(size_t) e1] << 4));
@@ -325,7 +326,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     mean /= (double) ms.size();
 
     const double weights = (double) n_in * (double) n_out;
-    const double bytes = (double) n_out * (double) codes_per_row + (double) n_out * n_groups * 4.0;
+    const double bytes = (double) n_out * (double) codes_per_row + (double) n_out * (double) n_groups * 4.0;
     std::printf("s2_gemv bench  [%lld x %lld]  %d iters\n", n_in, n_out, iters);
     std::printf("  ms per gemv: min %.4f  median %.4f  mean %.4f\n", ms.front(), ms[ms.size() / 2], mean);
     std::printf("  min -> %.1f G weights/s, %.1f GiB/s of S2 streamed\n", weights / ms.front() / 1e6,
@@ -449,6 +450,15 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     }
 }
 
+// A malformed argument must be an error, not a silently accepted zero.
+static bool parse_i64(const char* s, long long& out) {
+    char* end = nullptr;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return false;
+    out = v;
+    return true;
+}
+
 int main(int argc, char** argv) {
     long long n_in = 2560;
     long long n_out = 128;
@@ -463,9 +473,20 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--bench") bench = true;
-        else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
-        else if (a == "--n-in" && i + 1 < argc) n_in = std::atoll(argv[++i]);
-        else if (a == "--n-out" && i + 1 < argc) n_out = std::atoll(argv[++i]);
+        else if (a == "--iters" && i + 1 < argc) {
+            long long n = 0;
+            if (!parse_i64(argv[++i], n) || n < 1 || (long long) (int) n != n) {
+                std::fprintf(stderr, "s_gemv_parity: invalid --iters value\n");
+                return 2;
+            }
+            iters = (int) n;
+        }
+        else if (a == "--n-in" && i + 1 < argc) {
+            if (!parse_i64(argv[++i], n_in)) { std::fprintf(stderr, "s_gemv_parity: invalid --n-in value\n"); return 2; }
+        }
+        else if (a == "--n-out" && i + 1 < argc) {
+            if (!parse_i64(argv[++i], n_out)) { std::fprintf(stderr, "s_gemv_parity: invalid --n-out value\n"); return 2; }
+        }
         else {
             std::fprintf(stderr, "usage: s_gemv_parity [--selftest] [--n-in N] [--n-out N]\n");
             return 2;
@@ -480,7 +501,7 @@ int main(int argc, char** argv) {
     cases.push_back({"S4/IQ4_NL", SForm{4, 0, 32, Codebook::Iq4Nl, false}, 18, iq4_to_raw, iq4_deq});
     cases.push_back({"S8/Q8_0", SForm{8, -128, 32, Codebook::Affine, false}, 34, q8_0_to_raw, q8_0_deq});
 
-    std::mt19937 rng(4242);
+    std::mt19937 rng(4242);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
     int total_bad = 0;
 

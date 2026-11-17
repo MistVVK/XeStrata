@@ -14,12 +14,12 @@ index f75018597d..ccb4ec4cf9 100644
 @@ -4,6 +4,7 @@
  // See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
- // Modified 2026 by MistVVK and the XeStrata contributors: the CUDA adapter is handed the device image itself (cuda-binary-to-adapter)
-+// Modified 2026 by MistVVK and the XeStrata contributors: the CUDA adapter is handed every NVIDIA image (cuda-binaries-to-adapter)
+ // Modified 2026 by MistVVK and the XeStrata contributors: CUDA image input.
++// Modified 2026 by MistVVK and the XeStrata contributors: CUDA image list.
  //
  //===----------------------------------------------------------------------===//
  
-@@ -1310,10 +1311,12 @@ const RTDeviceBinaryImage *getBinImageFromMultiMap(
+@@ -1310,10 +1311,13 @@ const RTDeviceBinaryImage *getBinImageFromMultiMap(
      return nullptr;
  
    const size_t NumImgs = DeviceFilteredImgs.size();
@@ -29,8 +29,9 @@ index f75018597d..ccb4ec4cf9 100644
 +  // selection. We pass it the raw binary as a {ptr, length} pair.
    std::vector<std::pair<const unsigned char *, size_t>> UrBinariesStorage;
 -  if (DeviceImpl.getBackend() == backend::ext_oneapi_hip)
-+  const bool PassBinaries = DeviceImpl.getBackend() == backend::ext_oneapi_hip ||
-+                            DeviceImpl.getBackend() == backend::ext_oneapi_cuda;
++  const bool PassBinaries =
++      DeviceImpl.getBackend() == backend::ext_oneapi_hip ||
++      DeviceImpl.getBackend() == backend::ext_oneapi_cuda;
 +  if (PassBinaries)
      UrBinariesStorage.reserve(NumImgs);
  

@@ -20,7 +20,7 @@ index d63175baa0..8c4453d4a7 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM
  // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: no module unload after the process began to exit (hip-exit-unload)
++// Modified 2026 by MistVVK and the XeStrata contributors: HIP exit cleanup.
  //
  //===----------------------------------------------------------------------===//
  

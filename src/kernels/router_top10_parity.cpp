@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
     const int NE = 512;          // the real n_expert
     const int K = 10;            // the real top-k
     const int NT = 64;
-    std::mt19937 rng(2024);
+    std::mt19937 rng(2024);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;
 

@@ -16,6 +16,7 @@ prompt.  The answers (token ids) are written to OUT.json to compare two runs.
 """
 
 import json
+from typing import Any, cast
 import os
 import re
 import sys
@@ -31,7 +32,7 @@ from serve.server import StrataEngine, child_env, engine_args  # noqa: E402
 cfg = json.load(open(sys.argv[1]))
 tp = Path(cfg["tokenizer"])
 vocab = json.loads((tp / "vocab.json").read_text())
-toks = [None] * len(vocab)
+toks = cast(list[str], [None] * len(vocab))
 for t, i in vocab.items():
     toks[i] = t
 tok = ST.Tokenizer(toks, (tp / "merges.txt").read_text().split("\n"), json.loads((tp / "token_type.json").read_text()))
@@ -58,8 +59,8 @@ def first(tag, n):
 
 
 conv = {"A": first("alpha", 250), "B": first("bravo", 250)}
-answers = {"A": [], "B": []}
-prev_len = {}
+answers: dict[str, list[list[int]]] = {"A": [], "B": []}
+prev_len: dict[str, int] = {}
 rounds = []
 
 
@@ -70,7 +71,7 @@ def one(name, ids, out):
 
 for rnd in range(3):
     lens = {k: len(v) for k, v in conv.items()}
-    out = {}
+    out: dict[str, list[int]] = {}
     ts = [threading.Thread(target=one, args=(k, conv[k], out)) for k in ("A", "B")]
     for t in ts:
         t.start()
@@ -81,11 +82,11 @@ for rnd in range(3):
     for k in conv:
         answers[k].append(out[k])
         conv[k] = conv[k] + out[k] + enc(f"<|im_end|>\n<|im_start|>user\nNow count from {rnd + 2} to {rnd + 60}." + GEN)
-eng.proc.stdin.close()
+cast(Any, eng.proc).stdin.close()
 try:
-    eng.proc.wait(60)
+    cast(Any, eng.proc).wait(60)
 except Exception:
-    eng.proc.kill()
+    cast(Any, eng.proc).kill()
 json.dump(rounds, open(sys.argv[2], "w"))
 
 text = open(log, errors="replace").read()

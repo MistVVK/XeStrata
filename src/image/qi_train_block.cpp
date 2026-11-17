@@ -12,16 +12,29 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
+#include <string>
 
 #include "dit_rows.hpp"
 
 namespace strata::image {
 
 namespace {
+
+int64_t setting_integer(const char* text, const char* name) {
+    errno = 0;
+    char* end = nullptr;
+    const long long value = std::strtoll(text, &end, 10);
+    if (end != text) while (std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end == text || *end || errno == ERANGE)
+        throw std::invalid_argument(std::string("XESTRATA_") + name + ": expected an integer");
+    return static_cast<int64_t>(value);
+}
 
 constexpr float kEps = 1e-6f;   // the q and k norms' eps, as the inference takes it
 
@@ -130,7 +143,7 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
         chunkable = chunkable && P[i].dw == nullptr &&
                     (run.ad[i] == nullptr || run.ad[i]->method == train::AdapterMethod::lora);
     int64_t mlp_rows = run.mlp_rows;
-    if (const char* e = strata::env_get("TRAIN_MLP_ROWS")) mlp_rows = std::atoll(e);   // fixed, for the checks
+    if (const char* e = strata::env_get("TRAIN_MLP_ROWS")) mlp_rows = setting_integer(e, "TRAIN_MLP_ROWS");   // fixed, for the checks
     const int64_t RC = chunkable && mlp_rows > 0 ? std::min(R, mlp_rows) : R;
     auto rows_of_product = [&](int i) { return i >= kQiGateUp ? RC : R; };
 

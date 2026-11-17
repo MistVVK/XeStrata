@@ -230,7 +230,7 @@ bool MossTrainer::open(const std::string& dit, int64_t rank, bool int8, const tr
             blk.nk = m.dev_vec(f.f32(p + "k_norm.weight"));
             for (int i = 0; i < kMossProducts && rank > 0; ++i)
                 if (targets.take(b, p + kProduct[i])) blk.l[i] = &m.add_lora(blk.p[i].N, blk.p[i].K, rank, rng);
-            m.blk.push_back(std::move(blk));
+            m.blk.push_back(blk);
         }
         if (m.blk.empty()) throw std::runtime_error("image engine (MOSS-Image training): the DiT has no blocks");
         if (rank > 0 && m.loras().empty())

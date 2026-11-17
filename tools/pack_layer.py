@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+from typing import Any
 
 import numpy as np
 
@@ -71,7 +72,7 @@ def build(n_layers: int, out_path: pathlib.Path) -> dict:
     g = GGUFFile(SHARD1)
     by_name = {t.name: t for t in g.tensors}
     src = open(SHARD1, "rb")
-    manifest = {"blob_bytes": BLOB_BYTES, "offsets": OFF, "layers": [], "n_layers": n_layers}
+    manifest: dict[str, Any] = {"blob_bytes": BLOB_BYTES, "offsets": OFF, "layers": [], "n_layers": n_layers}
     total = n_layers * NE * BLOB_BYTES
     out_path.parent.mkdir(parents=True, exist_ok=True)
 

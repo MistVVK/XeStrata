@@ -17,7 +17,7 @@ index f954873a06..2e166726e6 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
  // See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: temporary lists and tables registered with their types (cuda-temp-lists)
++// Modified 2026 by MistVVK and the XeStrata contributors: CUDA temp lists.
  //
  //===----------------------------------------------------------------------===//
  
@@ -41,7 +41,7 @@ index 084cf76141..5a713fdaa0 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
  // See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: temporary lists and tables registered with their types (cuda-temp-lists)
++// Modified 2026 by MistVVK and the XeStrata contributors: CUDA temp lists.
  //
  //===----------------------------------------------------------------------===//
  #include "SYCL.h"

@@ -204,7 +204,7 @@ Rows host(const Model& m, const Rows& emb, const std::vector<int64_t>& pos3, con
         auto rope = [&](std::vector<double>& r, int64_t heads, int64_t t) {   // NEOX pairs (j, j + 64)
             for (int64_t h = 0; h < heads; ++h)
                 for (int64_t j = 0; j < kHd / 2; ++j) {
-                    const int a = j % 3 == 1 && j < 3 * kSecH ? 1 : j % 3 == 2 && j < 3 * kSecW ? 2 : 0;
+                    const int a = j % 3 == 1 && j < 3 * (int64_t) kSecH ? 1 : j % 3 == 2 && j < 3 * (int64_t) kSecW ? 2 : 0;
                     const double ang = (double) pos3[(size_t) (t * 3 + a)] * std::pow(kBase, -2.0 * (double) j / kHd);
                     double& x0 = r[(size_t) (h * kHd + j)];
                     double& x1 = r[(size_t) (h * kHd + j + kHd / 2)];

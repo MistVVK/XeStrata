@@ -118,11 +118,11 @@ void rms_rep(sycl::queue& q, const float* input, const float* gamma, float* outp
 }
 
 struct Span { const void* p; size_t bytes; size_t alignment; };
-bool overlaps(Span a, Span b) {
+bool overlaps(const Span& a, const Span& b) {
     const auto x = reinterpret_cast<uintptr_t>(a.p), y = reinterpret_cast<uintptr_t>(b.p);
     return x < y + b.bytes && y < x + a.bytes;
 }
-void validate(Span span) {
+void validate(const Span& span) {
     const auto p = reinterpret_cast<uintptr_t>(span.p);
     if (!p || p % span.alignment || p > std::numeric_limits<uintptr_t>::max() - span.bytes)
         throw std::invalid_argument("native PLE postops require nonnull aligned bounded spans");

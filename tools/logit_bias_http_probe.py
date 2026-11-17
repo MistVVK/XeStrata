@@ -5,6 +5,7 @@
 
 import argparse
 import json
+from typing import cast
 import sys
 import time
 import urllib.error
@@ -31,7 +32,7 @@ for flag in ["--conversation-cache-spill-dir", "--conversation-cache-disk-mib", 
 args = [a for a in args if a != "--conversation-cache-disk-only"]
 tp = Path(cfg["tokenizer"])
 vocab = json.loads((tp / "vocab.json").read_text())
-tokens = [None] * len(vocab)
+tokens = cast(list[str], [None] * len(vocab))
 for t, i in vocab.items():
     tokens[i] = t
 tok = ST.Tokenizer(

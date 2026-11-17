@@ -20,10 +20,12 @@ else
 fi
 [ ${#files[@]} -gt 0 ] || { echo "nothing to lint"; exit 0; }
 all=("${files[@]}")
-# another project's files in third_party/<area>/<project>/, kept as that project wrote them: gitleaks and reuse only
-# (XeStrata's patches there are linted as usual)
+# Other projects' files, community benchmark records and license texts are kept as received: gitleaks and reuse only.
+# XeStrata's patches in third_party are linted.
 mapfile -t files < <(printf '%s\n' "${files[@]}" | while read -r f; do
-  case "$f" in third_party/*/*/patches/*) ;; third_party/*/*/*) continue ;; esac
+  case "$f" in ""|third_party/*/*/*|bench/XeStrataBenchResults/*|LICENSES/*)
+    case "$f" in third_party/*/*/patches/*) ;; *) continue ;; esac ;;
+  esac
   echo "$f"
 done)
 
@@ -44,6 +46,7 @@ code() {  # code PATTERN: as pick, without the lint configurations here (each to
   pick "$1" | grep -v "^$C/" || true
 }
 
+mapfile -t patches < <(pick '^third_party/[^/]+/[^/]+/patches/.*\.patch$')
 mapfile -t py < <(code '\.py$')
 mapfile -t sh < <(pick '\.sh$')
 mapfile -t cpp < <(pick '\.(cpp|hpp)$')
@@ -54,6 +57,9 @@ mapfile -t js < <(code '\.js$')
 mapfile -t html < <(pick '\.html$')
 mapfile -t text < <(pick '\.(py|sh|cpp|hpp|cu|h|inc|cmake|md|css|js|html|jinja|txt|toml|ini|yaml|rb|mjs)$|CMakeLists\.txt$')
 
+if [ ${#patches[@]} -gt 0 ]; then
+  run "patch changes" python3 "$C/patches.py" "${patches[@]}"
+fi
 if [ ${#py[@]} -gt 0 ]; then
   run flake8 flake8 --config "$C/flake8.ini" "${py[@]}"
   run ruff .lint/venv/bin/ruff check --quiet --config "$C/ruff.toml" "${py[@]}"
@@ -62,7 +68,7 @@ fi
 [ ${#sh[@]} -gt 0 ] && run shellcheck shellcheck "${sh[@]}"
 if [ ${#cpp[@]} -gt 0 ]; then
   if [ -n "$CLANG_TIDY" ] && [ -f "$BUILD/compile_commands.json" ]; then
-    tidy=("$CLANG_TIDY" --quiet -p "$BUILD" --config-file="$C/clang-tidy.yaml")
+    tidy=("$CLANG_TIDY" --quiet -p "$BUILD" --config-file="$C/clang-tidy.yaml" --warnings-as-errors='*')
     mapfile -t tus < <(python3 -c 'import json, sys; print("\n".join(sorted({e["file"] for e in json.load(open(sys.argv[1]))})))' \
       "$BUILD/compile_commands.json")
     # a source this build does not compile (another GPU maker's, as the AMD-only HIP files on a build without HIP):
@@ -77,7 +83,12 @@ if [ ${#cpp[@]} -gt 0 ]; then
       fi
     done
     mapfile -t hpp < <(printf '%s\n' "${cpp[@]}" | grep '\.hpp$')
-    [ ${#cxx[@]} -gt 0 ] && run clang-tidy "${tidy[@]}" "${cxx[@]}"
+    if [ ${#cxx[@]} -gt 0 ]; then
+      # Select only these source files. A header filter alone can match an external path containing /src/../.
+      line_filter=$(python3 -c 'import json, os, sys; print(json.dumps([{"name": os.path.abspath(f)} for f in sys.argv[1:]]))' \
+        "${cxx[@]}")
+      run clang-tidy "${tidy[@]}" --header-filter='.*' --line-filter="$line_filter" "${cxx[@]}"
+    fi
     # A header is checked inside a source that includes it, with that source's command: alone it gets the command of
     # whichever source's path is nearest, often one without -fsycl, and misses the macros a source defines before the
     # include (strata/kernels/device_arch_tag.hpp).  --line-filter keeps the header's findings only.
@@ -92,9 +103,9 @@ if [ ${#cpp[@]} -gt 0 ]; then
           done < <(grep -rl -E "^#include $inc" include 2>/dev/null)
         fi
         if [ -n "$tu" ]; then
-          run "clang-tidy $h (in ${tu#"$PWD"/})" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$h\"}]" "$tu"
+          run "clang-tidy $h (in ${tu#"$PWD"/})" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$PWD/$h\"}]" "$tu"
         else
-          run "clang-tidy $h" "${tidy[@]}" "$h"
+          run "clang-tidy $h" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$PWD/$h\"}]" "$h"
         fi
       done
     fi
@@ -120,11 +131,13 @@ for f in "${all[@]}"; do
     || { echo "== gitleaks: a possible secret in $f (gitleaks detect --no-git --redact --source $f)"; status=1; }
 done
 # upstream's name where a user reads XeStrata's (messages, environment variables, programs, documents)
-echo "== upstream's name"
-python3 "$C/upstream_name.py" "${files[@]}" || status=1
-# each file's SPDX header against where its code comes from (AGENTS.md, Licenses)
-echo "== license classes"
-python3 tools/license_class.py "${all[@]}" || status=1
+if [ ${#files[@]} -gt 0 ]; then
+  echo "== upstream's name"
+  python3 "$C/upstream_name.py" "${files[@]}" || status=1
+  # Each file's SPDX header against where its code comes from (AGENTS.md, Licenses).
+  echo "== license classes"
+  python3 tools/license_class.py "${files[@]}" || status=1
+fi
 REUSE=$(command -v reuse || echo .lint/venv/bin/reuse)
 run reuse "$REUSE" lint --quiet
 exit $status

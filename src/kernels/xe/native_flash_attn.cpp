@@ -65,18 +65,18 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
     if (!stream) throw core::DeviceError("native FlashAttention requires an explicit stream");
     auto& queue = core::Runtime::get().stream(stream);
     const std::size_t kv_bytes = std::size_t(capacity) * 1024;
-    const Span spans[] = {{q, 24 * 256 * 4, 4}, {k, kv_bytes, 2}, {v, kv_bytes, 2},
-                          {step, kStepCount * 4, 4}, {out, 24 * 256 * 4, 4},
-                          {status, 4, 4}, {mask, 256 * 2, 2}};
+    const Span spans[] = {{q, std::size_t{24} * 256 * 4, 4}, {k, kv_bytes, 2}, {v, kv_bytes, 2},
+                          {step, std::size_t{kStepCount} * 4, 4}, {out, std::size_t{24} * 256 * 4, 4},
+                          {status, 4, 4}, {mask, std::size_t{256} * 2, 2}};
     validate_spans(spans, mask ? 7 : 6);
     // the pinned launcher's padded length 256 gives one KV tile
     constexpr int padded_length = 256;
     constexpr float scale = 0.0625f;
     queue.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> tile(sycl::range<1>(4 * 4 * 256), h);
+        sycl::local_accessor<float, 1> tile(sycl::range<1>(std::size_t{4} * 4 * 256), h);
         sycl::local_accessor<float, 1> max_shared(sycl::range<1>(32), h);
         sycl::local_accessor<float, 1> sum_shared(sycl::range<1>(32), h);
-        h.parallel_for(sycl::nd_range<1>(24 * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        h.parallel_for(sycl::nd_range<1>(std::size_t{24} * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int tid = int(it.get_local_id(0)), lane = tid % 32, warp = tid / 32;
             const int head = int(it.get_group(0)), kv = head / 12;

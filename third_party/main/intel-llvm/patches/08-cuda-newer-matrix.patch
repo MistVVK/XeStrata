@@ -16,7 +16,7 @@ index 19aa05f24b..892f97a44f 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
  // See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: matrix combinations for compute capabilities above 9.0 (cuda-newer-matrix)
++// Modified 2026 by MistVVK and the XeStrata contributors: CUDA matrix shapes.
  //
  //===----------------------------------------------------------------------===//
  
@@ -24,7 +24,7 @@ index 19aa05f24b..892f97a44f 100644
          return 0.f;
        };
        float ComputeCapability = GetArchNum(DeviceArch);
-+      if (ComputeCapability == 0.f) {   // newer than the table: sm_90's shapes
++      if (ComputeCapability == 0.f) { // newer than the table: sm_90's shapes
 +        const std::string Version =
 +            get_info_impl<UrInfoCode<sycl::info::device::version>::value>();
 +        if (std::strtof(Version.c_str(), nullptr) >= 9.0f)

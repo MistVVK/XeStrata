@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """The draft head's token subset (rt/draft_vocab.bin): the vocabulary rows the MTP draft layer may propose.
 
 The engine reads rt/draft_vocab.bin (int32 token ids) when the draft layer binds and computes the draft logits over
@@ -10,7 +11,8 @@ Chinese drafted almost nothing (#137).  This adds whole scripts to a subset:
     python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab.bin --add cjk \
         --out data/draft_vocab.bin
 
---add takes han, kana, hangul, cjk_punct, cjk (those four) or cyrillic.  The base ids keep their order; the added ones follow in
+--add takes han, kana, hangul, cjk_punct, cjk (those four) or cyrillic.
+The base ids keep their order; the added ones follow in
 id order.  --stats prints what a subset holds.
 
 A language written in a script the base already holds (French, Spanish, German... in Latin letters) needs specific

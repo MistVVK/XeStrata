@@ -30,6 +30,7 @@ def chunked(data: bytes, size: int = 7, trailers: bytes = b"") -> bytes:
 
 class ChunkedBody(unittest.TestCase):
     port: int
+    svc: Service
 
     @classmethod
     def setUpClass(cls):

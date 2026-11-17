@@ -249,8 +249,8 @@ def main() -> int:
 
     names = {VERBATIM: "VERBATIM", BF16_IN_F32: "BF16_IN_F32", F32_COPY: "F32", F16_IN_F32: "F16_IN_F32"}
     print("%s: %d tensors, engine pool %d B (%.3f GiB)" % (out_path, len(rows), dst, dst / 2**30))
-    for k in sorted(kinds):
-        print("   kind %-12s %4d tensors" % (names[k], kinds[k]))
+    for kind_id in sorted(kinds):
+        print("   kind %-12s %4d tensors" % (names[kind_id], kinds[kind_id]))
     print("   %d tensors re-rounded to 16 bits, saving %d B (%.3f GiB)"
           % (n_reduced, saved, saved / 2**30))
     print("   %d tensors widened fp16 scales -> f32, costing %d B (%.3f GiB)"

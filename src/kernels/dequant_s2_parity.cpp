@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -32,12 +33,23 @@ const uint16_t kScales[] = {0x3C00, 0x3800, 0x3400, 0x3000, 0x2C00, 0x2800, 0x20
 
 }  // namespace
 
+// A malformed argument must be an error, not a silently accepted zero.
+static bool parse_i64(const char* s, long long& out) {
+    char* end = nullptr;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return false;
+    out = v;
+    return true;
+}
+
 int main(int argc, char** argv) {
     long long n_blocks = 200000;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
-        else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) n_blocks = std::atoll(argv[++i]);
+        else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
+            if (!parse_i64(argv[++i], n_blocks)) { std::fprintf(stderr, "dequant_s2_parity: invalid --blocks value\n"); return 2; }
+        }
         else {
             std::fprintf(stderr, "usage: dequant_s2_parity [--selftest] [--blocks N]\n");
             return 2;
@@ -45,7 +57,7 @@ int main(int argc, char** argv) {
     }
     if (n_blocks <= 0) { std::fprintf(stderr, "--blocks must be positive\n"); return 2; }
 
-    std::mt19937 rng(12345);
+    std::mt19937 rng(12345);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
 
     // raw Q2_0 blocks: { fp16 d ; uint8 qs[16] } - what ggml produced and what the artifact stores
@@ -91,7 +103,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < cpu.size(); ++i) {
         // bit comparison, not a tolerance: S2's decode is exact integer-to-float arithmetic, so ANY
         // difference is a bug and a tolerance would only hide which one
-        if (std::memcmp(&cpu[i], &gpu[i], sizeof(float)) != 0) {
+        if (std::memcmp(&cpu[i], &gpu[i], sizeof(float)) != 0) {  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
             if (first_bad < 0) first_bad = (long long) i;
             ++bad;
         }

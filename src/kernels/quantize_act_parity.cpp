@@ -84,7 +84,7 @@ int run_case(const char* name, const std::vector<float>& x, bool check_bytes) {
         std::vector<float> rt((size_t) n);
         strata::parity::copy_bytes_out(rt.data(), d_x, (size_t) n * sizeof(float));
         long long diff = 0;
-        for (long long i = 0; i < n; ++i) if (std::memcmp(&rt[(size_t) i], &x[(size_t) i], 4) != 0) ++diff;
+        for (long long i = 0; i < n; ++i) if (std::memcmp(&rt[(size_t) i], &x[(size_t) i], 4) != 0) ++diff;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
         if (diff) std::printf("    PROBE: device x differs from host x in %lld of %lld elements\n", diff, n);
     }
     strata::kernels::quantize_q8_0(d_x, d_b, n, nullptr);
@@ -99,7 +99,7 @@ int run_case(const char* name, const std::vector<float>& x, bool check_bytes) {
     for (long long i = 0; i < n; ++i) {
         const float a = r_back[(size_t) i], b = g_back[(size_t) i];
         // the round trip is `q * d16`: both sides use the SAME fp16 d, so this is exact when q agrees
-        if (std::memcmp(&a, &b, sizeof(float)) != 0) ++val_bad;
+        if (std::memcmp(&a, &b, sizeof(float)) != 0) ++val_bad;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
     }
     if (byte_bad && check_bytes) {
         for (size_t i = 0; i < g_blocks.size(); ++i) {
@@ -151,12 +151,12 @@ void reference_q8_K(const float* x, long long n, std::vector<uint8_t>& blocks, s
         }
         if (amax == 0.0f) continue;                        // d = 0, qs = 0, bsums = 0 (see the kernel note)
         const float iscale = scale_num / max;              // -127 by default; -128 is the rival reading
-        int8_t* qs = (int8_t*) (out + 4);
+        int8_t* qs = reinterpret_cast<int8_t*>(out + 4);
         for (int j = 0; j < QK; ++j) {
             const int v = nearest_int_host(iscale * xb[j]);
             qs[j] = (int8_t) std::min(127, v);
         }
-        int16_t* bsums = (int16_t*) (out + 4 + QK);
+        int16_t* bsums = reinterpret_cast<int16_t*>(out + 4 + QK);
         for (int j = 0; j < QK / 16; ++j) {
             int sum = 0;
             for (int ii = 0; ii < 16; ++ii) sum += qs[j * 16 + ii];
@@ -191,7 +191,7 @@ int run_case_k(const char* name, const std::vector<float>& x, bool check_bytes, 
         for (size_t i = 0; i < g_blocks.size(); ++i)
             if (g_blocks[i] != r_blocks[i]) { if (first_bad < 0) first_bad = (long long) i; ++byte_bad; }
     for (long long i = 0; i < n; ++i)
-        if (std::memcmp(&r_back[(size_t) i], &g_back[(size_t) i], 4) != 0) ++val_bad;
+        if (std::memcmp(&r_back[(size_t) i], &g_back[(size_t) i], 4) != 0) ++val_bad;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
     std::printf("  %-26s blocks %s (%lld bad bytes)   round trip %s (%lld differ)\n", name,
                 !check_bytes ? "not compared" : (byte_bad ? "*** WRONG ***" : "byte-exact"), byte_bad,
                 val_bad ? "*** WRONG ***" : "bit-exact", val_bad);
@@ -229,10 +229,10 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
         else { std::fprintf(stderr, "usage: quantize_act_parity [--selftest]\n"); return 2; }
     }
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;
-    const long long N = 32 * 4096;
+    const long long N = 32LL * 4096;
 
     // ---- ordinary activations
     std::vector<float> a((size_t) N);
@@ -255,7 +255,7 @@ int main(int argc, char** argv) {
     for (long long i = 0; i < N; ++i) {
         // construct so that x / d32 is very close to a .5 boundary: d32 = amax/127, so pick amax = 127.0 and
         // x = k + 0.5 for integer k
-        d[(size_t) i] = ((i % 200) - 100) + 0.5f;
+        d[(size_t) i] = (float) ((i % 200) - 100) + 0.5f;
     }
     d[0] = 127.0f;
     bad += run_case("exact .5 boundaries", d, true);
@@ -328,7 +328,7 @@ int main(int argc, char** argv) {
 
     std::printf("\nQ8_K  (ggml block_q8_K: 292 bytes / 256 elements, {f32 d; i8 qs[256]; i16 bsums[16]})\n");
     int bad_k = 0;
-    const long long NK = 256 * 2048;
+    const long long NK = 256LL * 2048;
 
     std::vector<float> ka((size_t) NK);
     for (auto& v : ka) v = gauss(rng);
@@ -347,7 +347,7 @@ int main(int argc, char** argv) {
     // k+0.5, and the two rules disagree for every EVEN k.
     std::vector<float> kd((size_t) NK, 0.0f);
     for (long long blk = 0; blk < NK / 256; ++blk)
-        for (int j = 0; j < 256; ++j) kd[(size_t) (blk * 256 + j)] = -(float) ((j % 100) + 0.5f);
+        for (int j = 0; j < 256; ++j) kd[(size_t) (blk * 256 + j)] = -((float) (j % 100) + 0.5f);
     for (long long blk = 0; blk < NK / 256; ++blk) kd[(size_t) (blk * 256)] = 127.0f;   // fixes max = 127
     bad_k += run_case_k("exact .5 ties (half-to-even)", kd, true);
     {
@@ -366,7 +366,7 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("  %-26s %lld ties, %lld where half-to-even != half-away (%.1f%%)\n",
-                    "  tie fixture discriminates", ties, differ, ties ? 100.0 * (double) differ / ties : 0.0);
+                    "  tie fixture discriminates", ties, differ, ties ? 100.0 * (double) differ / (double) ties : 0.0);
         if (differ < ties / 3) { std::printf("    *** the tie fixture cannot see the rounding rule ***\n"); ++bad_k; }
     }
 

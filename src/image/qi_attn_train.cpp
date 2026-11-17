@@ -29,6 +29,8 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <tuple>
 #include <chrono>
@@ -46,6 +48,16 @@
 namespace strata::image {
 
 namespace {
+
+int64_t setting_integer(const char* text, const char* name) {
+    errno = 0;
+    char* end = nullptr;
+    const long long value = std::strtoll(text, &end, 10);
+    if (end != text) while (std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end == text || *end || errno == ERANGE)
+        throw std::invalid_argument(std::string("XESTRATA_") + name + ": expected an integer");
+    return static_cast<int64_t>(value);
+}
 
 constexpr int64_t kWG = 256;
 constexpr int kT = 32;              // the transposes' and maps' tile: 32 x 32 through local memory
@@ -801,7 +813,7 @@ void products_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     int64_t tile = std::clamp<int64_t>(kMaps / (14 * H * std::max<int64_t>(keys, 1)) / kT * kT, kT,
                                        (T + kT - 1) / kT * kT);
     // XESTRATA_ATTN_BWD_TILE: the tile's rows set (a multiple of 32), so a check with few rows takes several tiles
-    if (const char* e = strata::env_get("ATTN_BWD_TILE")) tile = std::max<int64_t>(kT, std::atoll(e) / kT * kT);
+    if (const char* e = strata::env_get("ATTN_BWD_TILE")) tile = std::max<int64_t>(kT, setting_integer(e, "ATTN_BWD_TILE") / kT * kT);
     const int64_t ntiles = (T + tile - 1) / tile;
     const float scale = 1.f / std::sqrt((float) hd);
     // every head's Q and dO (FP16 [H][T][hd]), K, V and K^T ([H][keys][hd], K^T [H][hd][keys]), D [H][T], dK and dV

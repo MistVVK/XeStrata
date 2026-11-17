@@ -10,11 +10,11 @@
 #include "strata/core/gpu.hpp"
 
 #include <chrono>
-#include <cinttypes>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <sstream>
 
 #if defined(_WIN32)
@@ -27,6 +27,14 @@ namespace strata::core {
 namespace {
 
 constexpr uint64_t CHUNK = 8ull << 20;   // 8 MiB of SOURCE per staging round
+
+bool index_header(const char* line, int& align, uint64_t& pool) {
+    std::istringstream in(line);
+    std::string hash, a, p, t;
+    int tensors = 0;
+    return static_cast<bool>(in >> hash >> a >> align >> p >> pool >> t >> tensors) &&
+           hash == "#" && a == "align" && p == "pool" && t == "tensors";
+}
 
 double now_ms() {
     using namespace std::chrono;
@@ -99,18 +107,28 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
     uint64_t pool = 0, compact = 0;
     int align = 0;
     while (std::fgets(line, sizeof line, f)) {
-        if (line[0] == '#') {
-            unsigned long long p = 0;
-            int a = 0, tensors = 0;
-            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &tensors) == 3) { pool = p; align = a; }
+        size_t start = 0;
+        while (start + 1 < sizeof line && line[start] && std::strchr(" \t\r\n", line[start])) ++start;
+        const char* text = line + start;
+        if (!*text) continue;
+        if (*text == '#') {
+            if (std::strncmp(text, "# align ", 8) == 0 && !index_header(text, align, pool)) {
+                err = "index.txt: could not parse the header";
+                std::fclose(f);
+                return false;
+            }
             continue;
         }
         if (skip == nullptr) continue;
-        char name[256] = {0};
-        unsigned long long dst_bytes = 0, dummy = 0;
+        std::string name;
+        uint64_t dst_bytes = 0, dummy = 0;
         int i1 = 0, i2 = 0;
-        if (std::sscanf(line, "%255s %d %d %llu %llu %llu %llu", name, &i1, &i2, &dummy, &dummy, &dummy, &dst_bytes) != 7)
-            continue;
+        std::istringstream fields(text);
+        if (!(fields >> name >> i1 >> i2 >> dummy >> dummy >> dummy >> dst_bytes) || name.size() > 255) {
+            err = "index.txt: could not parse a row";
+            std::fclose(f);
+            return false;
+        }
         if (skip->count(name)) continue;
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
         compact += (dst_bytes + a - 1) / a * a;
@@ -153,28 +171,27 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     std::vector<IndexRow> rows;
     char line[1024];
     while (std::fgets(line, sizeof line, idx)) {
-        if (line[0] == '#') {
-            unsigned long long p = 0;
-            int a = 0, t = 0;
-            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &t) == 3) { pool = p; align = a; }
+        size_t start = 0;
+        while (start + 1 < sizeof line && line[start] && std::strchr(" \t\r\n", line[start])) ++start;
+        const char* text = line + start;
+        if (!*text) continue;
+        if (*text == '#') {
+            if (std::strncmp(text, "# align ", 8) == 0 && !index_header(text, align, pool)) {
+                err = "index.txt: could not parse the header";
+                std::fclose(idx);
+                return false;
+            }
             continue;
         }
         IndexRow r;
-        char name[256] = {0};
+        std::string name;
         int kind = 0;
-        // The format is written by tools/pack_index.py and is space-separated with no quoting; a name with a
-        // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
-        const int n = std::sscanf(line,
-                                  "%255s %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNd64 " %" SCNd64
-                                  " %d %d %d %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %d %d",
-                                  name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
-                                  &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
-                                  &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
-                                  &r.scales_fp16, &r.act_kind);
-        if (n != 19) {
-            // A malformed index line is a WRONG BYTE OFFSET waiting to happen, and a wrong offset decodes to
-            // a plausible weight.  Refuse loudly instead of loading the rows that happened to parse.
-            err = "index.txt: could not parse a row (" + std::to_string(n) + " of 19 fields)";
+        // The format is space-separated with no quoting; refuse a malformed row instead of using a wrong offset.
+        std::istringstream fields(text);
+        if (!(fields >> name >> r.file >> kind >> r.src_off >> r.src_bytes >> r.dst_off >> r.dst_bytes >> r.ne0 >> r.ne1
+                     >> r.code_bits >> r.code_bias >> r.group_elems >> r.codebook >> r.has_offset >> r.codes_bytes
+                     >> r.scales_bytes >> r.offset_bytes >> r.scales_fp16 >> r.act_kind) || name.size() > 255) {
+            err = "index.txt: could not parse a row (expected 19 fields)";
             std::fclose(idx);
             return false;
         }
@@ -233,7 +250,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     }
 
     uint8_t* dst_base = (uint8_t*) arena_base;
-    std::FILE* cur = nullptr;
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> cur(nullptr, &std::fclose);
     int cur_file = -1;
     table_.clear();
     report_ = LoadReport{};
@@ -275,17 +292,17 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             return false;
         }
         if (r.file != cur_file) {
-            if (cur) std::fclose(cur);
+            cur.reset();
             const char* fn = file_name(r.file);
             const std::string p = pack_dir + "/" + (fn ? fn : "?");
-            cur = std::fopen(p.c_str(), "rb");
+            cur.reset(std::fopen(p.c_str(), "rb"));
             if (!cur) { err = "cannot open " + p; strata::gpu::free(stage_in); strata::gpu::free(stage_out); return false; }
             cur_file = r.file;
 #if !defined(_WIN32)
             // ask for this file's remaining rows up front so their reads overlap
             for (size_t j = row_i; j < rows.size(); ++j)
                 if (rows[j].file == r.file && !skipped[j])
-                    strata::platform::advise_willneed(fileno(cur), rows[j].src_off, rows[j].src_bytes);
+                    strata::platform::advise_willneed(fileno(cur.get()), rows[j].src_off, rows[j].src_bytes);
 #endif
         }
 
@@ -328,8 +345,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                 std::snprintf(buf, sizeof buf,
                               "%s: a promoted tensor of %llu elements is %llu B in and %llu B out, not %llu/%llu",
                               r.name.c_str(), (unsigned long long) elems, (unsigned long long) r.src_bytes,
-                              (unsigned long long) r.dst_bytes, (unsigned long long) (elems * 4),
-                              (unsigned long long) (elems * 2));
+                              (unsigned long long) r.dst_bytes, (unsigned long long) elems * 4,
+                              (unsigned long long) elems * 2);
                 err = buf;
                 bad = true;
             }
@@ -367,7 +384,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                     if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; strata::gpu::free(stage_in); strata::gpu::free(stage_out); return false; }
                     n -= 1;
                 }
-                if (!read_at(cur, r.src_off + s.src_off + done, stage_in, (size_t) n, err, r.name.c_str())) {
+                if (!read_at(cur.get(), r.src_off + s.src_off + done, stage_in, (size_t) n, err, r.name.c_str())) {
                     strata::gpu::free(stage_in); strata::gpu::free(stage_out);
                     return false;
                 }
@@ -467,7 +484,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             report_.bytes_saved += r.src_bytes - r.dst_bytes;
         }
     }
-    if (cur) std::fclose(cur);
+    cur.reset();
     strata::gpu::free(stage_in);
     strata::gpu::free(stage_out);
 

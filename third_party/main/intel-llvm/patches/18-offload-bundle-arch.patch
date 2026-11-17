@@ -20,7 +20,7 @@ index f51707bd88..ad910e00eb 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
  // See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: a SYCL bundle ID's GPU is its target ID (offload-bundle-arch)
++// Modified 2026 by MistVVK and the XeStrata contributors: SYCL bundle IDs.
  //
  //===----------------------------------------------------------------------===//
  ///

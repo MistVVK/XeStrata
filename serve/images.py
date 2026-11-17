@@ -61,7 +61,7 @@ all of it the DiT's, at most MOSS_MAX_IDS ids), the steps asked for (default 50)
 5; the engine builds the sigmas), guidance at any scale but 1 (default 3) with negative_prompt (default empty), the
 blocks its negative pass skips (uncond_skip_layers, default [22]) and skip-layer guidance (slg_layers, slg_scale,
 slg_start, slg_stop), by its pipeline's names (moss_request).  A layout of boxes (layout: its prompt enhancer's draft,
-boxes in the image's pixels) becomes its JSON prompt (moss_layout_prompt).  It has no edits: an image is img2img's.
+boxes in the image's pixels) becomes its JSON prompt (moss_layout_prompt). Its edits use an edit adapter.
 Its text encoder is Qwen3.5-9B, read by the chat's engine when that reads the same file (text_states).
 enhance has the chat's model write the prompt out first (enhance_prompt).
 
@@ -113,7 +113,7 @@ byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt":
   lists what its DiT takes and checks a request's names); without one, "loras" beside the DiT's file
   crop_edit: false draws an edit with a mask at the output's size, without cutting the part out (plan_crop; a
   request's crop_edit overrides it)
-  MOSS-Image's edit_adapters ({name: {"lora", "format", "vision"}}, setup's chinoll, armv5 and armv6) and
+  MOSS-Image's edit_adapters ({name: {"lora", "format", "vision"}}, setup's chinoll) and
   edit_adapter (the one used; XESTRATA_MOSS_EDIT over it: moss_edit_adapter); edit_format: an edit_lora's layout
   (moss_edit_format)
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
@@ -292,7 +292,7 @@ MOSS_CFG = _qimage().MOSS_CFG       # block 22 skipped by the negative pass, no 
 MOSS_SHIFT = _qimage().MOSS_SHIFT
 MOSS_NEG = ""
 MOSS_UNCOND_SKIP = [22]
-MOSS_FEW_STEPS = 4                 # the 4-step adapter's step codes (its card: 1 to 4, 4 recommended)
+MOSS_TURBO_MIN_STEPS, MOSS_TURBO_MAX_STEPS = 4, 8  # the 4-step LoRA: card tests 4 to 8
 MOSS_BLOCKS = 42                   # its DiT's blocks (the skip lists' range)
 MOSS_SHIFT_MAX = 20.0
 # MOSS-Image's edits: chinoll's Moss-Image-Edit adapter (the config's "edit_lora", at strength 1: below 1 the scene is
@@ -458,13 +458,15 @@ def model_defaults(cfg: dict) -> dict:
         steps, least, fixed = int(cfg.get("steps") or HUNYUANIMAGE3_STEPS), 1, False
     elif cfg.get("schedule") == "moss":   # MOSS-Image: any count on its static shift
         steps, least, fixed = int(cfg.get("steps") or MOSS_STEPS), 1, False
+        if cfg.get("turbo_lora"):
+            least = MOSS_TURBO_MIN_STEPS
     else:
         steps, least, fixed = TURBO_STEPS, TURBO_STEPS, True
     edit = (int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else
             int(cfg.get("edit_steps") or MOSS_EDIT_STEPS) if moss and cfg.get("edit_lora") else steps)
     # "strength": an img2img's at most, lowered by the steps as img2img_strength (the web page's imgStrength)
     out = {"steps": steps, "edit_steps": edit, "steps_min": least,
-           "steps_max": MOSS_FEW_STEPS if cfg.get("few_step") else MAX_STEPS, "steps_fixed": fixed,
+           "steps_max": MOSS_TURBO_MAX_STEPS if cfg.get("turbo_lora") else MAX_STEPS, "steps_fixed": fixed,
            "max_n": int(cfg.get("max_n") or MAX_N), "budget_s": float(cfg.get("budget_s") or BUDGET_S),
            "formats": output_formats(),
            "guidance": (float(cfg.get("guidance") or HUNYUANIMAGE3_GUIDANCE) if hunyuan
@@ -502,9 +504,9 @@ def model_defaults(cfg: dict) -> dict:
         out.update(samplers=list(MF_SAMPLERS), sampler=cfg.get("sampler") or MF_SAMPLERS[0])
     if moss and cfg.get("edit_lora"):   # its edits' guidance (MOSS_EDIT_CFG)
         out["edit_guidance"] = float(cfg.get("edit_cfg_scale") or MOSS_EDIT_CFG)
-    if moss and cfg.get("few_step"):   # the 4-step adapter: its sampler (no shift, no skips), no guidance
+    if moss and cfg.get("turbo_lora"):   # the 4-step LoRA uses the release schedule without guidance
         out.update(shift=MOSS_SHIFT, uncond_skip_layers=[], slg_layers=[], slg_scale=0.0, slg_start=0.0, slg_stop=1.0,
-                   blocks=MOSS_BLOCKS, layout=True, enhance=True, few_step=True, negative_prompt=None)
+                   blocks=MOSS_BLOCKS, layout=True, enhance=True, moss_turbo=True, negative_prompt=None)
     elif moss:
         out.update(shift=float(cfg.get("shift") or MOSS_SHIFT), uncond_skip_layers=list(MOSS_UNCOND_SKIP),
                    slg_layers=[], slg_scale=0.0, slg_start=0.0, slg_stop=1.0, blocks=MOSS_BLOCKS, layout=True,
@@ -641,6 +643,11 @@ def parse_request(req: dict, cfg: dict) -> dict:
         steps = _int_field(req, "steps", 2, MAX_STEPS, QUALITY_STEPS.get(quality or "auto") or dflt["steps"])
     elif cfg.get("schedule") == "mage":   # Mage-Flow: any count on its static shift, the config's by default
         steps = _int_field(req, "steps", 1, MAX_STEPS, dflt["steps"])
+    elif cfg.get("turbo_lora"):
+        # The card recommends four up to 1024², six above that, eight above 1536².
+        pixels = (-(-w // SIZE_STEP) * SIZE_STEP) * (-(-h // SIZE_STEP) * SIZE_STEP)
+        default = 4 if pixels <= 1024**2 else 6 if pixels <= 1536**2 else 8
+        steps = _int_field(req, "steps", MOSS_TURBO_MIN_STEPS, MOSS_TURBO_MAX_STEPS, default)
     elif cfg.get("schedule") in ("hunyuanimage3", "moss", "anima"):   # the count on the engine's own sigmas
         steps = _int_field(req, "steps", 1, MAX_STEPS, dflt["steps"])
     else:   # Turbo's own sigmas: steps asked for are ignored, as its diffusers pipeline (sample_sigmas) does
@@ -736,15 +743,13 @@ def moss_request(req: dict, cfg: dict) -> dict:
                            "slg_stop": _number(req, "slg_stop", 0.0, 1.0, 1.0)}
     if out["slg_start"] > out["slg_stop"]:
         raise ImageRequestError("slg_start: at most slg_stop")
-    few = cfg.get("few_step")
-    if few:   # the 4-step adapter (darask0's DMAD): its own sampler, no guidance, its skips and shift none
-        steps = req.get("steps", req.get("num_inference_steps"))
-        if steps not in (None, "") and not (isinstance(steps, int) and 1 <= steps <= MOSS_FEW_STEPS):
-            raise ImageRequestError(f"steps: 1 to {MOSS_FEW_STEPS} with this model's 4-step adapter")
-        for key in ("uncond_skip_layers", "slg_layers", "shift"):
+    if cfg.get("turbo_lora"):
+        for key in ("uncond_skip_layers", "slg_layers"):
             if req.get(key) not in (None, [], ""):
-                raise ImageRequestError(f"{key}: not with this model's 4-step adapter (its own sampler)")
-        out.update(few_step=dict(few), uncond_skip=[], slg_layers=[], slg_scale=0.0)
+                raise ImageRequestError(f"{key}: not with this model's 4-step LoRA")
+        if out["slg_scale"] != 0 or out["shift"] != MOSS_SHIFT:
+            raise ImageRequestError("4-step LoRA: use the release shift and no skip-layer guidance")
+        out.update(turbo_lora=cfg["turbo_lora"], uncond_skip=[], slg_layers=[], slg_scale=0.0)
     enhance = req.get("enhance")
     if isinstance(enhance, str):
         word = enhance.strip().lower()
@@ -918,6 +923,11 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
         v = parse_number(req.get(key), key, 0, CFG_MAX)
         if v is not None:
             out[key] = v
+    if (cfg or {}).get("turbo_lora"):
+        if neg not in (None, "") or any(out.get(k, 1.0) != 1.0 for k in ("guidance_scale", "true_cfg_scale")):
+            raise ImageRequestError("4-step LoRA: no negative prompt and guidance scale 1")
+        out.pop("negative_prompt", None)
+        return out
     if _pipeline((cfg or {}).get("family")) == "guided_token":
         out.pop("negative_prompt", None)
         scale = out.get("guidance_scale")
@@ -2344,8 +2354,8 @@ def moss_edit_layout(path: Path) -> str | None:
 
 
 def moss_edit_adapters(cfg: dict) -> dict[str, dict]:
-    """The MOSS-Image edit adapters a request may name (edit_adapter): the config's "edit_adapters" (setup's chinoll,
-    armv5 and armv6: {"lora", "format", "vision", "about"}), then the LoRA folder's files moss_edit_layout knows, by
+    """The MOSS-Image edit adapters a request may name (edit_adapter): the config's "edit_adapters" (setup's chinoll:
+    {"lora", "format", "vision", "about"}), then the LoRA folder's files moss_edit_layout knows, by
     their listing's names - ai-toolkit's with the config's vision encoder (Qwen3.5-9B's mmproj; without it, not
     offered)."""
     out = {k: dict(v) for k, v in (cfg.get("edit_adapters") or {}).items()}
@@ -2776,6 +2786,14 @@ class ImageGen:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
         self.cfg = dict(cfg)
+        if "few_step" in self.cfg:   # old setup: use the new LoRA in memory; the config file stays unchanged
+            self.cfg.pop("few_step")
+            for key in ("edit_lora", "edit_adapters", "edit_adapter", "edit_format", "edit_steps", "vision"):
+                self.cfg.pop(key, None)
+            self.cfg.update(turbo_lora=str(Path(self.cfg["vae"]).with_name(_qimage().LOCAL_NAMES["moss-4-step-lora"])),
+                            edit_lora=str(Path(self.cfg["vae"]).with_name(_qimage().FILES["moss-edit-lora"][1])),
+                            edit_format="moss-image-edit", edit_steps=4, edit_cfg_scale=1.0,
+                            lora_bake=False, steps=4, cfg_scale=1.0, shift=MOSS_SHIFT)
         policy = self.cfg.get("gpu_policy") or "auto"
         if policy not in POLICIES:
             raise ValueError(f'images "gpu_policy" must be one of {", ".join(POLICIES)}, not {policy!r}')
@@ -2919,7 +2937,19 @@ class ImageGen:
         return ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
 
     def missing(self) -> list[str]:
-        return [self.cfg[k] for k in self._file_keys() if not Path(self.cfg[k]).exists()]
+        keys = self._file_keys() + (("turbo_lora",) if self.cfg.get("turbo_lora") else ())
+        return [self.cfg[k] for k in keys if not Path(self.cfg[k]).exists()]
+
+    def availability_error(self) -> str | None:
+        """The 4-step LoRA is installed by setup, not by a generation request."""
+        path = self.cfg.get("turbo_lora")
+        if path and not Path(path).is_file():
+            return "the 4-step LoRA is missing; run setup --images moss-image-4-step again"
+        return None
+
+    def require_available(self) -> None:
+        if error := self.availability_error():
+            raise ImageJobFailed(error)
 
     def _tokenizer_path(self) -> str:
         """HunyuanImage 3.0's tokenizer.json or Qwen3-VL's text encoder GGUF, as the config names them."""
@@ -2973,6 +3003,7 @@ class ImageGen:
         return p if p.is_file() else None
 
     def _ready(self, start: bool = True) -> None:
+        self.require_available()
         if self.tok is None:
             self.tok = load_tokenizer(self._tokenizer_path(), self.family)
         if not self.engine.alive():
@@ -3090,11 +3121,6 @@ class ImageGen:
     def _moss_words(job: dict) -> str:
         """MOSS-Image's words of IMG: its steps and shift (the engine makes its sigmas), the blocks the negative pass
         skips, and skip-layer guidance's (moss_request)."""
-        few = job.get("few_step")
-        if few:   # the 4-step adapter: its time path and data space (its LoRA among _lora_words')
-            return (f" STEPS:{min(int(job['steps']), MOSS_FEW_STEPS)} USKIP:none"
-                    f" TIMEPATH:{lora_api.encode_path(few['time_path'])}"
-                    f" DATASPACE:{lora_api.encode_path(few['dataspace'])}")
         words = (f" STEPS:{job['steps']} SHIFT:{job.get('shift', MOSS_SHIFT)!r}"
                  f" USKIP:{','.join(str(b) for b in job.get('uncond_skip', MOSS_UNCOND_SKIP)) or 'none'}")
         if job.get("slg_layers") and job.get("slg_scale"):
@@ -3110,8 +3136,8 @@ class ImageGen:
         engine splits the line on whitespace - encode_path); a MOSS-Image edit's adapter (job["edit_lora"]) first, at
         1."""
         edit = f" LORA:1.0:{lora_api.encode_path(job['edit_lora'])}" if job.get("edit_lora") else ""
-        if job.get("few_step"):   # the 4-step adapter's LoRA, at 1 (the engine adds it to the products)
-            edit = f" LORA:1.0:{lora_api.encode_path(job['few_step']['lora'])}" + edit
+        if job.get("turbo_lora"):   # unmerged, at strength 1
+            edit = f" LORA:1.0:{lora_api.encode_path(job['turbo_lora'])}" + edit
         return edit + "".join(f" LORA:{use['scale']!r}"
                               + ("@" + ",".join(repr(float(b)) for b in use["blocks"]) if use.get("blocks") else "")
                               + f":{lora_api.encode_path(use['path'])}"
@@ -3773,6 +3799,9 @@ class ImageGen:
                "gpu_policy": self.policy, "running": self.engine.alive(), **self.totals}
         if self.note():
             out["note"] = self.note()
+        if self.cfg.get("turbo_lora"):
+            error = self.availability_error()
+            out.update(available=error is None, error=error)
         if self.progress:
             out["step"], out["steps"] = self.progress
         if self.last:
@@ -3921,7 +3950,9 @@ class ImageModels:
 
     def models(self) -> list[dict]:
         """Each model's name, defaults and whether it edits (the web page's choice), the default first."""
-        return [{"id": g.model, "defaults": g.defaults(), "edits": can_edit(g.cfg)} for g in self.gens.values()]
+        return [{"id": g.model, "defaults": g.defaults(), "edits": can_edit(g.cfg),
+                 **({"available": (error := g.availability_error()) is None, "error": error}
+                    if g.cfg.get("turbo_lora") else {})} for g in self.gens.values()]
 
 
 # ------------------------------------------------------------------------------------------- chat's image tools
@@ -5475,6 +5506,7 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
     of its own (separate: the chat does not wait for it).  Too many
     images for budget_s are refused first (ImageGen.check_n).  MOSS-Image's prompt enhancer (enhance_prompt) runs
     first, in the chat model's turn."""
+    gen.require_available()   # before a control or GPU turn can disturb another model
     if job.get("control"):   # the control map first (its own GPU turn), then the model's way of taking it
         _controls().prepare(svc, gen, job, cancel)
     if job.get("fix"):

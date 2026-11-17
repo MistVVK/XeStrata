@@ -588,7 +588,7 @@ void Sam3::encode_bucket(const float* pix, const uint16_t* mux16, const std::vec
     int64_t side = S;
     for (size_t i = 0; i < mds_.size(); ++i) {
         const Conv& c = i == 0 && first != nullptr ? *first : mds_[i];
-        const int64_t out = (side + 2 * c.pad - c.k) / c.stride + 1;
+        const int64_t out = (side + int64_t{2} * c.pad - c.k) / c.stride + 1;
         float* y = scratch(kConvA, (size_t) (out * out * c.o * 4));
         convolve(c, in16, side, side, y, kCol);
         auto* y16 = scratch_as<uint16_t>(i % 2 == 0 ? kConv16 : kFeat16, (size_t) (out * out * c.o));
@@ -638,7 +638,8 @@ void Sam3::ptr_positions(const std::vector<int64_t>& t, int64_t max_abs, float* 
     for (int64_t r = 0; r < n; ++r) {
         const float pos = (float) t[(size_t) r] / (float) std::max<int64_t>(max_abs - 1, 1);
         for (int64_t i = 0; i < F; ++i) {
-            const float dt = std::pow(kTheta, (float) (2 * (i / 2)) / (float) F);
+            // Each pair of channels uses the same integer frequency index.
+            const float dt = std::pow(kTheta, (float) (2 * (i / 2)) / (float) F); // NOLINT(bugprone-integer-division)
             pe[(size_t) (r * d + i)] = std::sin(pos / dt);
             pe[(size_t) (r * d + F + i)] = std::cos(pos / dt);
         }

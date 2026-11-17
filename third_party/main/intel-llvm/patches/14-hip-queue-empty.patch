@@ -16,7 +16,7 @@ index f9b58b6989..a11827eeb5 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM
  // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: a busy stream's hipErrorNotReady is not logged (hip-queue-empty)
++// Modified 2026 by MistVVK and the XeStrata contributors: HIP queue status.
  //
  //===----------------------------------------------------------------------===//
  

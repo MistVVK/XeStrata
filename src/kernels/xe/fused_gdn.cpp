@@ -49,7 +49,7 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
         hd.parallel_for(sycl::nd_range<1>((size_t) channels, S), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int tid = (int) it.get_local_id(0);
-            const int c = (int) it.get_global_id(0);
+            const size_t c = it.get_global_id(0);
             const float v0 = history[c * 3], v1 = history[c * 3 + 1], v2 = history[c * 3 + 2], x = qkv[c];
             const float sum = v0 * conv_w[c * 4] + v1 * conv_w[c * 4 + 1] + v2 * conv_w[c * 4 + 2] + x * conv_w[c * 4 + 3];
             history[c * 3] = v1;
@@ -87,9 +87,11 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         auto lo = [](uint32_t u) { return sycl::bit_cast<float>(u << 16); };
         auto hi = [](uint32_t u) { return sycl::bit_cast<float>(u & 0xffff0000u); };
         float acc = 0.0f;
+        // j < n / 8 and n is int, so both products fit int.
         for (int j = lane; j < n / 8; j += 32) {
-            const uint32_t w0 = w[j * 4], w1 = w[j * 4 + 1], w2 = w[j * 4 + 2], w3 = w[j * 4 + 3];
-            const float* xa = x + j * 8;
+            const size_t wj = static_cast<size_t>(j * 4); // NOLINT(bugprone-misplaced-widening-cast)
+            const uint32_t w0 = w[wj], w1 = w[wj + 1], w2 = w[wj + 2], w3 = w[wj + 3];
+            const float* xa = x + static_cast<size_t>(j * 8);
             acc = sycl::fma(lo(w0), xa[0], acc); acc = sycl::fma(hi(w0), xa[1], acc);
             acc = sycl::fma(lo(w1), xa[2], acc); acc = sycl::fma(hi(w1), xa[3], acc);
             acc = sycl::fma(lo(w2), xa[4], acc); acc = sycl::fma(hi(w2), xa[5], acc);
@@ -117,11 +119,11 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
     const auto e = qu.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd);
         sycl::local_accessor<float, 1> sq(sycl::range<1>(S), hd);
-        sycl::local_accessor<float, 1> red(sycl::range<1>(RG * S), hd);
+        sycl::local_accessor<float, 1> red(sycl::range<1>(size_t{RG} * S), hd);
         sycl::local_accessor<float, 1> wsum(sycl::range<1>(S * RG / WARP), hd);
         const bool silu = gdn_silu_gate();   // the closing norm's gate (gdn.hpp)
         // one work-group per head; work-item tid = rg * 128 + col, as CUDA's (col, rg) block linearises
-        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * S * RG, S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * S * RG, size_t{S} * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int head = (int) it.get_group(0);
             const int tid = (int) it.get_local_id(0);

@@ -12,7 +12,8 @@ API (thinking off, greedy). One line per test: length, depth, found or not, prom
     python tools/needle_bench.py --out needles.json --api-key KEY
 
 The lengths are targets, 2% under so that "128k" fits a 128K context: the text is cut by characters (about 3.2 per
-token), and the line reports the prompt's real token count from the server. A length the server's context cannot hold is skipped.
+token), and the line reports the prompt's real token count from the server.
+A length the server's context cannot hold is skipped.
 """
 from __future__ import annotations
 
@@ -26,7 +27,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCES = [("docs", "*.md"), ("src", "*.cpp"), ("src", "*.cu"), ("include", "*.hpp"), ("serve", "*.py"), ("tools", "*.py"),
+SOURCES = [("docs", "*.md"), ("src", "*.cpp"), ("src", "*.cu"), ("include", "*.hpp"),
+           ("serve", "*.py"), ("tools", "*.py"),
            ("third_party/main/llama.cpp/docs", "*.md")]
 WORDS = ["amber", "falcon", "quartz", "willow", "copper", "harbor", "saffron", "glacier", "orchid", "lantern",
          "meadow", "cobalt", "juniper", "tundra", "velvet", "ember"]
@@ -63,7 +65,8 @@ def ask(url: str, key: str, prompt: str, timeout: float) -> tuple[str, int, floa
     if key:
         headers["Authorization"] = "Bearer " + key
     t0 = time.time()
-    req = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions", data=json.dumps(body).encode(), headers=headers)
+    req = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions",
+                                 data=json.dumps(body).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         out = json.loads(r.read())
     return (out["choices"][0]["message"].get("content") or ""), out["usage"]["prompt_tokens"], time.time() - t0

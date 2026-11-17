@@ -102,7 +102,7 @@ sycl::event launch_u(sycl::queue& q, const uint8_t* u, const uint8_t* ylq, const
         acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
         if (lane == 0) out[(size_t) r * (size_t) H + h] = acc;
     };
-    constexpr size_t wg = kSubGroups * kWarp;
+    constexpr size_t wg = size_t{kSubGroups} * kWarp;
     // the entries a launch at most: the first dimension's limit, and a global range that an int holds (the kernels'
     // id queries are ints: a prompt chunk's 35840 entries x 2560 rows x 32 lanes did not)
     const int64_t step = std::min<int64_t>((int64_t) kMaxFirstDim, (int64_t) INT32_MAX / ((int64_t) xgroups * (int64_t) wg));

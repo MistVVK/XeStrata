@@ -12,4 +12,7 @@ metadata:
   `caption` how it looks. `bbox` [x_min, y_min, x_max, y_max] in the image's pixels from its top-left corner: where it
   is, not a frame to draw; a text box large enough to read; `\n` breaks its line.
 - `summary.caption` the whole image; `summary.canvas` `multi_panel` for panels, `collage` for pictures put together.
-- moss-image-4-step: 4 steps without guidance, no negative prompt, no edits.
+- moss-image-4-step: use for fast local edits as well as generation, without guidance or a negative prompt.
+  Use 4 steps up to 1024², 6 above that, or 8 above 1536². For a whole-image style change, use the regular model.
+- To combine two or more reference images, tell the user and switch to Qwen-Image-2.1 for the edit,
+  even when MOSS-Image is selected: chinoll can overlay the references rather than combine them.

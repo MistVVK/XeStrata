@@ -194,9 +194,7 @@ void MossPipeline::use_loras(const QiRequest& r) {
     const std::string before = dit_->lora_key();
     std::vector<LoraUse> dit;
     lora_split(r.loras, dit, te_loras_);
-    // a few-step adapter's LoRA is added to the products, not folded into the weights: its delta is below the 16-bit
-    // weights' rounding (its author's measure: 81% of it lost to bf16's)
-    dit_->set_lora_bake(lora_bake_ && r.dataspace.empty());
+    dit_->set_lora_bake(lora_bake_);
     if (!dit_->set_loras(dit, err)) throw LoraRejected(err);
     if (te_ && !te_->set_loras(te_loras_, err)) throw LoraRejected(err);
     te_loras_now(lora_key_of(te_loras_));   // the states kept were the encoder's with the other adapters
@@ -617,8 +615,6 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         throw std::invalid_argument("image engine: the VAE file has no encoder for a base image");
     if (!r.sampler.empty() && r.sampler != "euler" && r.sampler != "er_sde")
         throw std::invalid_argument("image engine: MOSS-Image's sampler is euler or er_sde");
-    if (!r.dataspace.empty() && (r.guide.any() || r.sampler == "er_sde"))
-        throw std::invalid_argument("image engine: the few-step data-space sampler takes neither guidance nor er_sde");
     MossDit::Guide g;
     g.cfg = guided ? r.cfg : 1.0f;
     g.uncond_skip = r.uncond_skip_set ? r.uncond_skip : std::vector<int>{kUncondSkip};
@@ -651,10 +647,6 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     MossDit& d = *dit_;
     if (d.ref_rows() > 0) d.set_refs({});   // the last edit's references: this request makes its own (or has none)
     use_loras(r);   // before the plan (their bytes are fixed) and the contexts (a set that changed makes them again)
-    dit_->set_time_path(r.time_path);
-    if (!r.dataspace.empty() && (r.strength < 1.0 || !r.mask.rgba.empty()))
-        throw std::invalid_argument("image engine: the few-step adapter (DATASPACE:) draws from noise only (no strength "
-                                    "below 1, no mask)");
     LatentStart ls;
     if (base != nullptr) {
         if (stage) stage("refs");
@@ -821,10 +813,8 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
                 return img;
             });
         auto peek = [&](int done, const std::function<void(float*)>& make) { preview(done, make); };
-        if (r.dataspace.empty())
-            d.sample(x, h, w, sigmas, g, first, total, step, ls.after(s_), peek, &r.guide,
-                     r.sampler == "er_sde", r.shift > 0 ? r.shift : kShift, r.seed);
-        else few_steps(r, x, h, w, step, peek);
+        d.sample(x, h, w, sigmas, g, first, total, step, ls.after(s_), peek, &r.guide,
+                 r.sampler == "er_sde", r.shift > 0 ? r.shift : kShift, r.seed);
         preview.release();
         const auto t2 = clock::now();
         if (stage) stage("decode");
@@ -870,68 +860,6 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     // a mask's kept part is the base image's own pixels (not through the VAE), blended by the mask's alpha
     if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
     return img;
-}
-
-namespace moss_few_k {   // the kernels' names (an anonymous namespace mangles the same in every file)
-// y [n][C] = z + Q x0 (Q [C][C], a token's channels), C the latent's
-void mix(const float* z, const float* q, const float* x0, int64_t n, int64_t C, float* y, void* s) {
-    core::Runtime::get().stream(s).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / C, o = i - t * C;
-        const float* row = q + o * C;
-        const float* xt = x0 + t * C;
-        float acc = 0.f;
-        for (int64_t c = 0; c < C; ++c) acc += row[c] * xt[c];
-        y[i] = z[i] + acc;
-    });
-}
-// x0 = z - v
-void sub(const float* z, const float* v, int64_t n, float* x0, void* s) {
-    core::Runtime::get().stream(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        x0[id[0]] = z[id[0]] - v[id[0]];
-    });
-}
-}  // namespace moss_few_k
-
-void MossPipeline::few_steps(const QiRequest& r, float* x, int64_t h, int64_t w,
-                             const std::function<bool(int, int)>& step,
-                             const std::function<void(int, const std::function<void(float*)>&)>& peek) {
-    SafeTensors st(r.dataspace);
-    MossDit& d = *dit_;
-    const int64_t C = d.latent_channels(), n = h * w * C;
-    const SafeTensor* qt = st.find("latent_mix.Q");
-    const SafeTensor* ct = st.find("step_codes");
-    if (qt == nullptr || qt->shape != std::vector<int64_t>{C, C} || ct == nullptr || ct->shape.size() != 1)
-        throw std::runtime_error(r.dataspace + ": not a few-step adapter's data space (latent_mix.Q [" +
-                                 std::to_string(C) + "][" + std::to_string(C) + "], step_codes)");
-    const std::vector<float> q = st.f32("latent_mix.Q"), codes = st.f32("step_codes");
-    const int steps = (int) std::min<int64_t>(r.steps > 0 ? r.steps : (int64_t) codes.size(), (int64_t) codes.size());
-    float *z = nullptr, *qd = nullptr, *x0 = nullptr, *v = nullptr;
-    struct Free {
-        std::vector<float*> ps;
-        void* s;
-        ~Free() {
-            gpu::stream_sync(s);
-            for (float* p : ps) gpu::free(p);
-        }
-    } owned{{}, s_};
-    for (auto [p, m] : {std::pair<float**, int64_t>{&z, n}, {&qd, C * C}, {&x0, n}, {&v, n}}) {
-        if (!gpu::alloc_device(p, (size_t) m * 4))
-            throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
-        owned.ps.push_back(*p);
-    }
-    gpu::copy(qd, q.data(), q.size() * 4);
-    gpu::copy_async(z, x, (size_t) n * 4, s_);
-    gpu::memset_async(x0, 0, (size_t) n * 4, s_);
-    for (int i = 0; i < steps; ++i) {
-        moss_few_k::mix(z, qd, x0, h * w, C, x, s_);
-        d.forward(x, codes[(size_t) i], h, w, 1, v);
-        moss_few_k::sub(z, v, n, x0, s_);
-        if (peek) peek(i + 1, [&](float* out) { gpu::copy_async(out, x0, (size_t) n * 4, s_); });
-        if (step && !step(i + 1, steps)) throw QiStopped();
-    }
-    gpu::copy_async(x, x0, (size_t) n * 4, s_);
-    gpu::stream_sync(s_);
 }
 
 }  // namespace strata::image

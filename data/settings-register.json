@@ -2080,9 +2080,19 @@
     "src/program/generate.cpp:14625"
    ]
   },
+  "TRAIN_CONTROL_MS": {
+   "reads": [
+    "src/image/train_control.cpp:130"
+   ]
+  },
   "TRAIN_INPUTS16": {
    "reads": [
     "src/image/train_trainer.cpp:187"
+   ]
+  },
+  "TRAIN_INPUTS_HOST": {
+   "reads": [
+    "src/image/train_trainer.cpp:515"
    ]
   },
   "TRAIN_MLP_ROWS": {

@@ -92,8 +92,8 @@ struct Bwd {
         const uint16_t* xb = DQ ? a.dO : a.v;
         typename Ops::A ta[D / TK], tb[DP ? D / TK : 1];
         for (int kk = 0; kk < D / TK; ++kk) {
-            Ops::load(sg, ta[kk], xa + my0 * ld + col + kk * TK, ld);
-            if constexpr (DP) Ops::load(sg, tb[kk], xb + my0 * ld + col + kk * TK, ld);
+            Ops::load(sg, ta[kk], xa + my0 * ld + col + int64_t(kk) * TK, ld);
+            if constexpr (DP) Ops::load(sg, tb[kk], xb + my0 * ld + col + int64_t(kk) * TK, ld);
         }
         // the gradient's tiles: one set a kernel (dK's and dV's in one gave wrong tiles past the second on the B70:
         // IGC with 16 accumulators beside the operands, 2026-11-09)
@@ -127,7 +127,7 @@ struct Bwd {
                     constexpr int PR = CH, PC = 32, NB = D / PC;
                     const uint16_t* second = DP ? ob2 : ob3;
                     for (int b = g; b < 2 * NB; b += nsg) {
-                        const uint16_t* base = (b < NB ? ob1 : second) + jn * ld + col + (b % NB) * PC;
+                        const uint16_t* base = (b < NB ? ob1 : second) + jn * ld + col + int64_t(b % NB) * PC;
                         mx::joint_matrix_prefetch<PR, PC>(
                             sg, const_cast<sycl::half*>(reinterpret_cast<const sycl::half*>(base)), (size_t) ld,
                             mx::layout::row_major, syclex::properties{syclex::prefetch_hint_L1});
@@ -140,11 +140,11 @@ struct Bwd {
                 if constexpr (DP) Ops::zero(sg, c2);
                 for (int kk = 0; kk < D / TK; ++kk) {
                     typename Ops::Bc b1;
-                    Ops::load(sg, b1, ob1 + (j0 + nt * TN) * ld + col + kk * TK, ld);
+                    Ops::load(sg, b1, ob1 + (j0 + int64_t(nt) * TN) * ld + col + int64_t(kk) * TK, ld);
                     Ops::mad(sg, c1, ta[kk], b1);
                     if constexpr (DP) {
                         typename Ops::Bc b2;
-                        Ops::load(sg, b2, ob2 + (j0 + nt * TN) * ld + col + kk * TK, ld);
+                        Ops::load(sg, b2, ob2 + (j0 + int64_t(nt) * TN) * ld + col + int64_t(kk) * TK, ld);
                         Ops::mad(sg, c2, tb[kk], b2);
                     }
                 }
@@ -158,7 +158,7 @@ struct Bwd {
             float cl[CW], cd[CW];
             if constexpr (!DQ)
                 for (int i = 0; i < CW; ++i) {
-                    const int64_t qq = j0 + lane + SG * i;
+                    const int64_t qq = j0 + lane + int64_t(i) * SG;
                     cl[i] = qq < QR ? a.lse[qq * H + h] : 0.f;
                     cd[i] = DP && qq < QR ? a.D[h * R + qq] : 0.f;
                 }
@@ -183,7 +183,7 @@ struct Bwd {
                 Ops::load(sg, pa, at(ph, poff + (size_t) kc * TK), PLD);
                 for (int nt = 0; nt < NT; ++nt) {
                     typename Ops::Br b;
-                    Ops::load(sg, b, ob3 + (j0 + kc * TK) * ld + col + nt * TN, ld);
+                    Ops::load(sg, b, ob3 + (j0 + int64_t(kc) * TK) * ld + col + int64_t(nt) * TN, ld);
                     Ops::mad(sg, acc[nt], pa, b);
                 }
             }
@@ -198,7 +198,7 @@ struct Bwd {
             for (int e = lane; e < TM * TN; e += SG) {
                 const int64_t row = my0 + e / TN;
                 if (row >= (DQ ? QR : R)) continue;
-                float* o = out + row * (H * D) + col + nt * TN + e % TN;
+                float* o = out + row * (H * D) + col + int64_t(nt) * TN + e % TN;
                 const float x = st[soff + e] * gh;
                 *o = add ? *o + x : x;
             }

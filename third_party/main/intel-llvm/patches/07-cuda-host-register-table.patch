@@ -15,7 +15,7 @@ index 95672aa7d6..ba4e799a21 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM
  // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: host memory registration in the adapter's table (cuda-host-register-table)
++// Modified 2026 by MistVVK and the XeStrata contributors: CUDA host tracking.
  //
  //===----------------------------------------------------------------------===//
  

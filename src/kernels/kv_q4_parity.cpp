@@ -87,7 +87,7 @@ void quantize_block_q4_0_host(const float* x, k::block_q4_0& blk) {
 
 int main() {
     std::printf("=== Running kv_q4_parity test ===\n");
-    std::mt19937 rng(42);
+    std::mt19937 rng(42);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> nd(0.0f, 1.0f);
 
     // -------------------------------------------------------------
@@ -95,8 +95,8 @@ int main() {
     // -------------------------------------------------------------
     std::printf("[1/4] Verifying FWHT-256 CUDA kernel vs exact mathematical reference...\n");
     constexpr int n_vectors = 64;
-    std::vector<float> h_in(n_vectors * 256);
-    std::vector<float> h_ref(n_vectors * 256);
+    std::vector<float> h_in((size_t) n_vectors * 256);
+    std::vector<float> h_ref((size_t) n_vectors * 256);
     for (size_t i = 0; i < h_in.size(); ++i) {
         h_in[i] = nd(rng);
     }
@@ -104,18 +104,18 @@ int main() {
 
     // Run CPU reference on each row
     for (int r = 0; r < n_vectors; ++r) {
-        fwht256_host_reference(h_ref.data() + r * 256);
+        fwht256_host_reference(h_ref.data() + (size_t) r * 256);
     }
 
     // Run GPU kernel
-    float* d_src = dalloc<float>(n_vectors * 256);
-    float* d_dst = dalloc<float>(n_vectors * 256);
+    float* d_src = dalloc<float>((size_t) n_vectors * 256);
+    float* d_dst = dalloc<float>((size_t) n_vectors * 256);
     strata::parity::copy_bytes_in(d_src, h_in.data(), h_in.size() * sizeof(float));
 
     k::fwht256_cuda(d_src, d_dst, n_vectors, nullptr);
     strata::parity::sync();
 
-    std::vector<float> h_out(n_vectors * 256);
+    std::vector<float> h_out((size_t) n_vectors * 256);
     strata::parity::copy_bytes_out(h_out.data(), d_dst, h_out.size() * sizeof(float));
 
     double max_fwht_diff = 0.0;
@@ -153,10 +153,10 @@ int main() {
     std::printf("[2/4] Verifying Attention Score Invariance: <H*q, H*k> == <q, k>...\n");
     double max_dot_diff = 0.0;
     for (int r = 0; r < n_vectors; r += 2) {
-        const float* q = h_in.data() + r * 256;
-        const float* k_vec = h_in.data() + (r + 1) * 256;
-        const float* hq = h_ref.data() + r * 256;
-        const float* hk = h_ref.data() + (r + 1) * 256;
+        const float* q = h_in.data() + (size_t) r * 256;
+        const float* k_vec = h_in.data() + ((size_t) r + 1) * 256;
+        const float* hq = h_ref.data() + (size_t) r * 256;
+        const float* hk = h_ref.data() + ((size_t) r + 1) * 256;
 
         double dot_raw = 0.0;
         double dot_rot = 0.0;
@@ -194,8 +194,8 @@ int main() {
     const size_t pool_bytes = (size_t) pages * H * P * k::kv_q4_bytes_per_head(D);
     uint8_t* d_k_q4 = dalloc<uint8_t>(pool_bytes);
     uint8_t* d_v_q4 = dalloc<uint8_t>(pool_bytes);
-    float* d_kcur = dalloc<float>(H * D);
-    float* d_vcur = dalloc<float>(H * D);
+    float* d_kcur = dalloc<float>((size_t) H * D);
+    float* d_vcur = dalloc<float>((size_t) H * D);
     int32_t* d_step = dalloc<int32_t>(k::kStepCount);
 
     std::vector<std::vector<float>> host_k(cells), host_v(cells);
@@ -206,14 +206,14 @@ int main() {
     const int n_fill = cells - 25; // leave some cells empty
     for (int n = 0; n < n_fill; ++n) {
         const int pos = positions[n];
-        std::vector<float> kv(H * D), vv(H * D);
+        std::vector<float> kv((size_t) H * D), vv((size_t) H * D);
         for (auto& x : kv) x = nd(rng) * 2.0f;
         for (auto& x : vv) x = nd(rng) * 2.0f;
 
         // Apply FWHT before append
         for (int h = 0; h < H; ++h) {
-            fwht256_host_reference(kv.data() + h * D);
-            fwht256_host_reference(vv.data() + h * D);
+            fwht256_host_reference(kv.data() + (size_t) h * D);
+            fwht256_host_reference(vv.data() + (size_t) h * D);
         }
         host_k[pos] = kv;
         host_v[pos] = vv;
@@ -234,7 +234,7 @@ int main() {
 
     long bad_blocks = 0;
     const int blocks_per_head = D / k::QK4_0; // 8
-    const int bytes_per_head = blocks_per_head * sizeof(k::block_q4_0); // 144
+    const int bytes_per_head = (int) (blocks_per_head * sizeof(k::block_q4_0)); // 144
 
     for (int n = 0; n < n_fill; ++n) {
         const int pos = positions[n];
@@ -243,11 +243,11 @@ int main() {
                 const long long page = (long long) table[pos / P];
                 const long long row = (page * H + h) * P + (pos % P);
                 const uint8_t* pool_ptr = (is_v ? h_v_q4.data() : h_k_q4.data()) + row * bytes_per_head;
-                const float* raw_vec = (is_v ? host_v[pos].data() : host_k[pos].data()) + h * D;
+                const float* raw_vec = (is_v ? host_v[pos].data() : host_k[pos].data()) + (size_t) h * D;
 
                 for (int b = 0; b < blocks_per_head; ++b) {
                     k::block_q4_0 host_blk;
-                    quantize_block_q4_0_host(raw_vec + b * 32, host_blk);
+                    quantize_block_q4_0_host(raw_vec + (size_t) b * 32, host_blk);
 
                     const k::block_q4_0* gpu_blk = reinterpret_cast<const k::block_q4_0*>(pool_ptr) + b;
                     if (std::memcmp(&host_blk, gpu_blk, sizeof(k::block_q4_0)) != 0) {
@@ -306,8 +306,8 @@ int main() {
         const int cell = ids[i];
         for (int is_v = 0; is_v < 2; ++is_v) {
             for (int h = 0; h < H; ++h) {
-                const float* orig = (is_v ? host_v[cell].data() : host_k[cell].data()) + h * D;
-                const uint16_t* gathered = (is_v ? h_v_scratch.data() : h_k_scratch.data()) + (i * H + h) * D;
+                const float* orig = (is_v ? host_v[cell].data() : host_k[cell].data()) + (size_t) h * D;
+                const uint16_t* gathered = (is_v ? h_v_scratch.data() : h_k_scratch.data()) + ((size_t) i * (size_t) H + (size_t) h) * (size_t) D;
 
                 for (int d = 0; d < D; ++d) {
                     float deq = k::f32_from_f16(gathered[d]);

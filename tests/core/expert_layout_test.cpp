@@ -181,8 +181,8 @@ void latent_v6() {
     {
         std::vector<float> s0(1792), s1(1792);
         for (int64_t c = 0; c < 1792; ++c) { s0[(size_t) c] = 2.0f; s1[(size_t) c] = 0.5f; }
-        std::ofstream(d.path / "scales/l0.f32", std::ios::binary).write(reinterpret_cast<const char*>(s0.data()), 1792 * 4);
-        std::ofstream(d.path / "scales/l1.f32", std::ios::binary).write(reinterpret_cast<const char*>(s1.data()), 1792 * 4);
+        std::ofstream(d.path / "scales/l0.f32", std::ios::binary).write(reinterpret_cast<const char*>(s0.data()), (std::streamsize) 1792 * 4);
+        std::ofstream(d.path / "scales/l1.f32", std::ios::binary).write(reinterpret_cast<const char*>(s1.data()), (std::streamsize) 1792 * 4);
     }
     ok = load(d.path, 2, 2, err);
     const float* sc0 = strata::kernels::cpu::latent_gu_colscale(0, &w);

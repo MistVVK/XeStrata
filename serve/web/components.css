@@ -1,5 +1,6 @@
 /* SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors */
-/* SPDX-License-Identifier: MIT */
+/* SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors */
+/* SPDX-License-Identifier: LGPL-3.0-or-later AND MIT */
 /* Strata UI — components. Requires tokens.css. */
 *,*::before,*::after{box-sizing:border-box}
 html,body{margin:0;background:var(--st-bg);color:var(--st-ink);font-family:var(--st-font);font-size:var(--st-fs-base);line-height:var(--st-lh-body);-webkit-font-smoothing:antialiased}
@@ -81,7 +82,6 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
 .st-code{border-radius:var(--st-r-md);background:var(--st-code-bg);color:var(--st-code-ink);overflow:hidden}
 .st-code__head{display:flex;align-items:center;justify-content:space-between;padding:8px 8px 8px 14px;font:500 var(--st-fs-xs)/1 var(--st-font);color:#9aa3ab;border-bottom:1px solid rgba(255,255,255,.06)}
 .st-code pre{margin:0;padding:14px;overflow:auto;font:400 13px/1.6 var(--st-font-mono)}
-.st-code .st-btn--icon{color:#9aa3ab} .st-code .st-btn--icon:hover{background:rgba(255,255,255,.08);color:#fff}
 
 /* composer */
 .st-composer{display:flex;flex-direction:column;gap:8px;padding:10px;background:var(--st-surface);border:1px solid var(--st-line);border-radius:var(--st-r-lg);box-shadow:var(--st-sh-bar)}
@@ -107,6 +107,7 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
 .st-btn--icon{width:36px;height:36px;padding:0;border-radius:10px;background:transparent;color:var(--st-ink-muted)}
 .st-btn--icon:hover{background:var(--st-surface-2);color:var(--st-ink)}
 .st-btn:disabled{opacity:.45;cursor:not-allowed}
+.st-code .st-btn--icon{color:#9aa3ab} .st-code .st-btn--icon:hover{background:rgba(255,255,255,.08);color:#fff}
 
 /* form controls */
 .st-field{display:flex;flex-direction:column;gap:8px}

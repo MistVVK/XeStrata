@@ -125,6 +125,7 @@ bool scan_levels(const std::vector<fs::path>& dirs, const char* const* limit_nam
     for (size_t i = 0; i < dirs.size(); ++i) {
         const Value current = read_value(dirs[i] / current_name);
         std::vector<Value> limits;
+        limits.reserve(n_limits);
         for (size_t k = 0; k < n_limits; ++k) limits.push_back(read_value(dirs[i] / limit_names[k]));
         bool unusable = current.kind == Value::bad || current.kind == Value::max;
         bool finite_limit = false;

@@ -52,8 +52,8 @@ std::vector<float> layer_gpu(const lr::Fixture& f, void* s) {
     const unsigned long long* dptr = dev.upload(ptrs);
     // the plan: the routes in expert order, one group an expert
     std::vector<int32_t> order((size_t) f.cap), start((size_t) (f.E + 1), 0);
-    for (int64_t r = 0; r < f.cap; ++r) start[(size_t) (f.ids[(size_t) r] + 1)]++;
-    for (int e = 0; e < f.E; ++e) start[(size_t) (e + 1)] += start[(size_t) e];
+    for (int64_t r = 0; r < f.cap; ++r) start[(size_t) f.ids[(size_t) r] + 1]++;
+    for (int e = 0; e < f.E; ++e) start[(size_t) e + 1] += start[(size_t) e];
     {
         std::vector<int32_t> pos(start.begin(), start.end() - 1);
         for (int64_t r = 0; r < f.cap; ++r) order[(size_t) pos[(size_t) f.ids[(size_t) r]]++] = (int32_t) r;
@@ -76,13 +76,13 @@ std::vector<float> layer_gpu(const lr::Fixture& f, void* s) {
         if (!same) ++g_fail;
     }
     uint8_t* dxq = dev.alloc<uint8_t>((size_t) (T * (H / 32) * 36));
-    uint8_t* dxlq = dev.alloc<uint8_t>((size_t) (T * G * (ELL / 32) * 36));
-    float* dxl = dev.alloc<float>((size_t) (T * G * ELL));
+    uint8_t* dxlq = dev.alloc<uint8_t>((size_t) T * G * (ELL / 32) * 36);
+    float* dxl = dev.alloc<float>((size_t) T * G * ELL);
     k::quantize_q8_1_rows(dx, T, H, dxq, s);
     k::iq_mmvq(f.fmt == 4 ? 2 : 8, dD, dxq, dxl, (int) H, (int) (G * ELL), T, s);
     k::latent_colscale_rows(dxl, (int64_t) T * G, (int) ELL, dinv, s);
     {   // the column scales on a fresh vector: the same float multiply, bit for bit
-        std::vector<float> probe((size_t) (T * G * ELL));
+        std::vector<float> probe((size_t) T * G * ELL);
         for (size_t i = 0; i < probe.size(); ++i) probe[i] = (float) (i % 977) * 0.01f - 4.f;
         float* dmut = dev.alloc<float>(probe.size());
         par::copy_in(dmut, probe.data(), probe.size());
@@ -92,7 +92,7 @@ std::vector<float> layer_gpu(const lr::Fixture& f, void* s) {
         bool same = true;
         for (size_t i = 0; i < probe.size(); ++i) {
             const float w = probe[i] * f.inv[i % (size_t) ELL];
-            same = same && std::memcmp(&got[i], &w, 4) == 0;
+            same = same && std::memcmp(&got[i], &w, 4) == 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
         }
         std::printf("  %-72s %s\n", "latent_colscale_rows: bit for bit", same ? "ok" : "FAIL");
         if (!same) ++g_fail;

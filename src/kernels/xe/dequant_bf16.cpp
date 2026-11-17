@@ -64,8 +64,8 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         const float d = h2f(b);
         const uint32_t qh = (uint32_t) b[2] | ((uint32_t) b[3] << 8) | ((uint32_t) b[4] << 16) | ((uint32_t) b[5] << 24);
         for (int j = 0; j < 16; ++j) {
-            const int xh0 = ((qh >> j) << 4) & 0x10;
-            const int xh1 = (qh >> (j + 12)) & 0x10;
+            const int xh0 = static_cast<int>(((qh >> j) << 4) & 0x10);
+            const int xh1 = static_cast<int>((qh >> (j + 12)) & 0x10);
             put(out, j, (float) (((b[6 + j] & 0x0F) | xh0) - 16) * d);
             put(out, j + 16, (float) (((b[6 + j] >> 4) | xh1) - 16) * d);
         }
@@ -96,9 +96,10 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         }
     } else if constexpr (TYPE == 11) {                             // Q3_K: hmask[32] qs[64] scales[12] d
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 110;
+        // gi < 8, so n * 32 fits int.
         const int gi = gi_in_row % 8, n = gi / 4, jj = gi % 4;
         const uint8_t* hm = b;
-        const uint8_t* q = b + 32 + n * 32;
+        const uint8_t* q = b + 32 + static_cast<size_t>(n * 32);
         const uint8_t* sc = b + 96;
         const float d_all = h2f(b + 108);
         uint32_t aux[4];
@@ -118,22 +119,24 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         }
     } else if constexpr (TYPE == 12) {                             // Q4_K: d dmin scales[12] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 144;
+        // gi < 8, so j64 * 32 fits int.
         const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
         const float d = h2f(b), dmin = h2f(b + 2);
         int sc, m;
         scale_min_k4(gi, b + 4, sc, m);
         const float d1 = d * (float) sc, m1 = dmin * (float) m;
-        const uint8_t* q = b + 16 + 32 * j64;
+        const uint8_t* q = b + 16 + static_cast<size_t>(j64 * 32);
         for (int l = 0; l < 32; ++l) put(out, l, d1 * (float) (hi ? (q[l] >> 4) : (q[l] & 0xF)) - m1);
     } else if constexpr (TYPE == 13) {                             // Q5_K: d dmin scales[12] qh[32] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 176;
+        // gi < 8, so j64 * 32 fits int.
         const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
         const float d = h2f(b), dmin = h2f(b + 2);
         int sc, m;
         scale_min_k4(gi, b + 4, sc, m);
         const float d1 = d * (float) sc, m1 = dmin * (float) m;
         const uint8_t* qh = b + 16;
-        const uint8_t* ql = b + 48 + 32 * j64;
+        const uint8_t* ql = b + 48 + static_cast<size_t>(j64 * 32);
         const uint8_t u = (uint8_t) (1u << (2 * j64 + hi));
         for (int l = 0; l < 32; ++l) {
             const int nib = hi ? (ql[l] >> 4) : (ql[l] & 0xF);
@@ -141,10 +144,11 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         }
     } else if constexpr (TYPE == 14) {                             // Q6_K: ql[128] qh[64] scales[16] d
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 210;
+        // gi < 8, so n * 64, n * 32 and n * 8 fit int.
         const int gi = gi_in_row % 8, n = gi / 4, qu = gi % 4;
-        const uint8_t* ql = b + 64 * n;
-        const uint8_t* qh = b + 128 + 32 * n;
-        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + 8 * n;
+        const uint8_t* ql = b + static_cast<size_t>(n * 64);
+        const uint8_t* qh = b + 128 + static_cast<size_t>(n * 32);
+        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + static_cast<size_t>(n * 8);
         const float d = h2f(b + 208);
         for (int l = 0; l < 32; ++l) {
             const int is = l / 16;
@@ -190,12 +194,13 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         }
     } else if constexpr (TYPE == 23) {                             // IQ4_XS: d scales_h scales_l[4] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 136;
+        // ib < 8, so ib * 16 fits int.
         const int ib = gi_in_row % 8;
         const float d = h2f(b);
         const uint16_t scales_h = (uint16_t) (b[2] | (b[3] << 8));
         const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4);
         const float dl = d * (float) (ls - 32);
-        const uint8_t* qs = b + 8 + 16 * ib;
+        const uint8_t* qs = b + 8 + static_cast<size_t>(ib * 16);
         for (int j = 0; j < 16; ++j) {
             put(out, j, dl * (float) kv_iq4nl[qs[j] & 0xf]);
             put(out, j + 16, dl * (float) kv_iq4nl[qs[j] >> 4]);
@@ -252,8 +257,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case kNativeQ8Rows: block_elems = 64; block_bytes = 68; return true;
     case 23: block_elems = 256; block_bytes = 136; return true;
     case 42: block_elems = 64; block_bytes = 18; return true;
-    case 30: block_elems = 32; block_bytes = 64; return true;   // BF16, in 32-value pieces
-    case 1: block_elems = 32; block_bytes = 64; return true;    // F16, in 32-value pieces (an F16 GGUF's embedding)
+    case 30: case 1: block_elems = 32; block_bytes = 64; return true;   // BF16 or F16, in 32-value pieces
     default: return false;
     }
 }
@@ -287,6 +291,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 42: STRATA_DQ(42);
     case 30: STRATA_DQ(30);
     case 1: STRATA_DQ(1);
+    default: throw core::DeviceError("dequant: missing dispatch for type " + std::to_string(type));
     }
 #undef STRATA_DQ
     if (!stream) core::Runtime::get().wait(e, "dequant");

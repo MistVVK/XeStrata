@@ -15,7 +15,7 @@ index d9a6a8cf02..4953403efc 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM
  // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: the command-buffer's sync points are not copied for every node (hip-sync-points)
++// Modified 2026 by MistVVK and the XeStrata contributors: HIP sync points.
  //
  //===----------------------------------------------------------------------===//
  

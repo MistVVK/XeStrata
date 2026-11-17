@@ -744,37 +744,6 @@ void MossDit::rope_tables(Ctx& c, int64_t h, int64_t w) {
 // the time's embedding as the reference makes it: the sinusoid [cos, sin] of the timestep by freq / 2 frequencies
 // 10000^(-i / (freq / 2)) in FP64, rounded to bf16 (its first layer's type), through the two layers; then the shared
 // modulation's six rows (mod_) and the head's two (head_)
-void MossDit::set_time_path(const std::string& path) {
-    if (path == tp_path_) return;
-    gpu::stream_sync(s_);
-    for (float* p : {tp_smod_b_, tp_hmod_b_})
-        if (p != nullptr) release(allocs_, p);
-    tp_smod_b_ = tp_hmod_b_ = nullptr;
-    tp_w1_.clear(), tp_b1_.clear(), tp_w2_.clear(), tp_b2_.clear();
-    tp_path_.clear();
-    if (path.empty()) return;
-    SafeTensors st(path);
-    // the model's own layers' shapes: the file replaces them, or it is not a time path of this model
-    const auto take = [&](const std::string& name, int64_t rows, int64_t cols) {
-        const SafeTensor* t = st.find(name);
-        const std::vector<int64_t> want = cols > 0 ? std::vector<int64_t>{rows, cols} : std::vector<int64_t>{rows};
-        if (t == nullptr || t->shape != want)
-            throw std::runtime_error(path + ": not a MOSS-Image time path (" + name + " of the model's shape)");
-        return st.f32(name);
-    };
-    tp_w1_ = take("time_embedding.0.weight", t1_.n, t1_.k);
-    tp_b1_ = take("time_embedding.0.bias", t1_.n, 0);
-    tp_w2_ = take("time_embedding.2.weight", t2_.n, t2_.k);
-    tp_b2_ = take("time_embedding.2.bias", t2_.n, 0);
-    const std::vector<float> sb = take("shared_block_modulation.bias", smod_.n, 0);
-    const std::vector<float> hb = take("video_head_modulation.bias", hmod_.n, 0);
-    tp_smod_b_ = alloc<float>(allocs_, smod_.n, "image engine (MOSS-Image DiT)");
-    tp_hmod_b_ = alloc<float>(allocs_, hmod_.n, "image engine (MOSS-Image DiT)");
-    gpu::copy(tp_smod_b_, sb.data(), sb.size() * 4);
-    gpu::copy(tp_hmod_b_, hb.data(), hb.size() * 4);
-    tp_path_ = path;
-}
-
 void moss_time_sinusoid(double t, int64_t freq, std::vector<uint16_t>& e) {
     const int64_t half = freq / 2;
     e.assign((size_t) freq, 0);
@@ -786,35 +755,6 @@ void moss_time_sinusoid(double t, int64_t freq, std::vector<uint16_t>& e) {
 }
 
 void MossDit::time_embedding(float timestep) {
-    const int64_t half = freq_ / 2;
-    if (!tp_path_.empty()) {   // the adapter's time path, in FP32 (its training's): the sinusoid, two layers, SiLU between
-        std::vector<float> e((size_t) freq_), h1((size_t) t1_.n), temb((size_t) t2_.n);
-        for (int64_t i = 0; i < half; ++i) {
-            const double ph = (double) timestep * std::pow(10000.0, -(double) i / (double) half);
-            e[(size_t) i] = (float) std::cos(ph);
-            e[(size_t) (half + i)] = (float) std::sin(ph);
-        }
-        const auto layer = [](const std::vector<float>& w, const std::vector<float>& b, const std::vector<float>& x,
-                              std::vector<float>& y) {
-            const size_t k = x.size();
-            for (size_t o = 0; o < y.size(); ++o) {
-                double s = b[o];
-                const float* row = w.data() + o * k;
-                for (size_t j = 0; j < k; ++j) s += (double) row[j] * x[j];
-                y[o] = (float) s;
-            }
-        };
-        layer(tp_w1_, tp_b1_, e, h1);
-        for (float& v : h1) v = v / (1.f + std::exp(-v));
-        layer(tp_w2_, tp_b2_, h1, temb);
-        gpu::stream_sync(s_);   // the last step's products may still read temb_
-        gpu::copy(temb_, temb.data(), temb.size() * 4);
-        uint16_t* h16 = t16_ + freq_;
-        kernels::f32_to_f16_bulk(temb_, h16 + C_, C_, s_);
-        product(h16 + C_, nullptr, smod_, nullptr, mod_, 1, tp_smod_b_);
-        product(h16 + C_, nullptr, hmod_, nullptr, head_, 1, tp_hmod_b_);
-        return;
-    }
     std::vector<uint16_t> e;
     moss_time_sinusoid((double) timestep, freq_, e);
     gpu::copy_async(t16_, e.data(), e.size() * 2, s_);

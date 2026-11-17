@@ -162,7 +162,16 @@ Out run(const Inputs& in, int form) {
 int main() {
     // the scan is opt-in (kernels.cpp): the parity runs when it is enabled, else CTest skips it
     const char* enabled = std::getenv("XESTRATA_GDN_CHUNKED");
-    if (enabled == nullptr || std::atoi(enabled) != 1) {
+    long scan = 0;
+    if (enabled != nullptr) {
+        char* end = nullptr;
+        scan = std::strtol(enabled, &end, 10);
+        if (end == enabled || *end != '\0') {
+            std::fprintf(stderr, "gdn_chunk_parity: invalid XESTRATA_GDN_CHUNKED '%s': skipped\n", enabled);
+            return 77;
+        }
+    }
+    if (scan != 1) {
         std::printf("the chunked DeltaNet scan is opt-in (XESTRATA_GDN_CHUNKED=1): skipped\n");
         return 77;
     }
@@ -173,7 +182,7 @@ int main() {
     setenv("XESTRATA_GDN_CHUNKED", "0", 1);
 #endif
     struct Case { int form; int64_t T; bool silu; };
-    std::mt19937 rng(20261114);
+    std::mt19937 rng(20261114);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     int fail = 0, shapes = 0;
     for (const int hv : {48, 32, 16}) {   // the engine's three Gdn shapes (kernels.cpp)
         const auto& forms = strata::prefill::gdn_chunk_forms(strata::core::Runtime::get().compute(), HK, hv);

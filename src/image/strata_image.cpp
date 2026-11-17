@@ -100,9 +100,7 @@
 //                            MOSS-Image's color and depth control (moss_dit.hpp's set_control): MCTL:<path> the
 //                            adapter's file (its LoRA as a LORA: word beside it), MCOLOR:<path> the color map,
 //                            MDEPTH:<path> the depth map (near white), MCTLENDS:<color end>,<depth end> (1, 1: the
-//                            shares of the steps each is on for); its few-step adapter (darask0's 4-step DMAD):
-//                            TIMEPATH:<path> its time path (moss_dit.hpp's set_time_path; its LoRA as a LORA: word,
-//                            not baked), DATASPACE:<path> its sampler's latent mix and step codes (STEPS: at most them)
+//                            shares of the steps each is on for)
 //   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>] [LORA:<strength>:<path>]...
 //                            the VRAM an image of n prompt ids needs (from the files); MASK: or INIT:, a base image
 //                            (with a strength below 1 and references, MASK:<their first>); NEG: guidance's negative
@@ -507,8 +505,7 @@ bool read_word(const std::string& w, WordRead& t) {
         // present is all a NEED line reads of these: the IMG line reads their values (and checks them)
         if (w.rfind("COLOR:", 0) == 0 || w == "UPSCALE" || w.rfind("TILES:", 0) == 0 || w.rfind("CTRL:", 0) == 0 ||
             w.rfind("CTRLS:", 0) == 0 || w == "CTRLNOINPAINT" || w.rfind("MCTL:", 0) == 0 ||
-            w.rfind("MCOLOR:", 0) == 0 || w.rfind("MDEPTH:", 0) == 0 || w.rfind("MCTLENDS:", 0) == 0 ||
-            w.rfind("TIMEPATH:", 0) == 0 || w.rfind("DATASPACE:", 0) == 0)
+            w.rfind("MCOLOR:", 0) == 0 || w.rfind("MDEPTH:", 0) == 0 || w.rfind("MCTLENDS:", 0) == 0)
             return true;
         if (w.rfind("UPSIN:", 0) == 0) {
             const std::vector<int32_t> v = parse_ids(w.substr(6));
@@ -611,8 +608,6 @@ bool read_word(const std::string& w, WordRead& t) {
     }
     else if (w == "CTRLNOINPAINT") r.control_inpaint = false;
     else if (w.rfind("MCTL:", 0) == 0) r.mctl = decoded_path(w.substr(5));
-    else if (w.rfind("TIMEPATH:", 0) == 0) r.time_path = decoded_path(w.substr(9));
-    else if (w.rfind("DATASPACE:", 0) == 0) r.dataspace = decoded_path(w.substr(10));
     else if (w.rfind("MCOLOR:", 0) == 0) r.mctl_color = read_image(decoded_path(w.substr(7)));
     else if (w.rfind("MDEPTH:", 0) == 0) r.mctl_depth = read_image(decoded_path(w.substr(7)));
     else if (w.rfind("MCTLENDS:", 0) == 0) {
@@ -1407,9 +1402,8 @@ int serve(si::ImagePipeline& p) {
                 if (!r.control_net.empty() && !p.takes_control_net())
                     throw std::invalid_argument("image engine: CNET: is Qwen-Image-2.1's ControlNet; this model takes "
                                                 "a control image as a reference image instead");
-                if ((!r.mctl.empty() || !r.time_path.empty() || !r.dataspace.empty()) &&
-                    !p.takes_moss_options())
-                    throw std::invalid_argument("image engine: MCTL:, TIMEPATH: and DATASPACE: are MOSS-Image's");
+                if (!r.mctl.empty() && !p.takes_moss_options())
+                    throw std::invalid_argument("image engine: MCTL: is MOSS-Image's");
                 if (r.guide.any() && !p.takes_guidance())
                     throw std::invalid_argument("image engine: this image model takes no CFGNORM:, CFGZERO, APG:, "
                                                 "DSLG: or DD:");

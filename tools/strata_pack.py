@@ -29,6 +29,7 @@ import hashlib
 import json
 import pathlib
 import sys
+from typing import Any
 
 import numpy as np
 
@@ -241,7 +242,7 @@ def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_
     print("source %s: %d tensors, data at %d" % (gguf.name, len(g.tensors), data_off))
 
     n_layers = 48 if n_layers is None else n_layers
-    man = {
+    man: dict[str, Any] = {
         "format": "strata-pack", "format_version": FORMAT_VERSION,
         "source": {"shard1": str(gguf), "shard2": str(SHARD2)},
         "n_layers": n_layers, "align": ALIGN,
@@ -264,8 +265,8 @@ def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_
                       "scales_fp16": True, "source_type": "Q2_0", "form": "S2"}
 
     # ---- dense.bin and embd.bin
-    dense = []
-    embd = []
+    dense: list[G.TensorInfo] = []
+    embd: list[G.TensorInfo] = []
     for t in g.tensors:
         if is_expert(t.name):
             continue
@@ -415,7 +416,7 @@ def info(out_dir: pathlib.Path) -> int:
     print("strata-pack v%d  layers=%d" % (man["format_version"], man["n_layers"]))
     for f, n in man.get("files", {}).items():
         print("  %-12s %12.3f GiB" % (f, n / 2**30))
-    forms = {}
+    forms: dict[str, int] = {}
     for e in man["tensors"].values():
         forms[e["form"]] = forms.get(e["form"], 0) + 1
     print("  dense/embd by form: %s" % ", ".join("%s=%d" % kv for kv in sorted(forms.items())))

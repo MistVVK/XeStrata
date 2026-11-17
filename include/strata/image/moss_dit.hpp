@@ -134,12 +134,6 @@ public:
     /// The images' rows take its first `in` columns (the adapter trained them with the rest).
     void set_control(const std::string& path);
     const std::string& control_path() const { return ctl_path_; }
-    /// A few-step adapter's time path (darask0's 4-step DMAD: its time_embedding.* and the two modulations' biases,
-    /// FP32; known by its tensors and their shapes, whatever the file's name) in place of the model's own, the time
-    /// embedding then made in FP32 on the host; "" the model's own again.
-    void set_time_path(const std::string& path);
-    const std::string& time_path() const { return tp_path_; }
-
     /// The request's control tokens [h w][in] (device FP32, the caller's, alive through sample(); null: that map off)
     /// and the share of the steps each is on for (a map past its end: zero tokens, as the adapter was trained).
     void set_control_input(const float* color, const float* depth, float color_end, float depth_end);
@@ -279,10 +273,6 @@ private:
     float ctl_color_end_ = 1.f, ctl_depth_end_ = 1.f;
     double ctl_at_ = 0.0;
     uint16_t* ctl16_ = nullptr;
-    // the time path's replacement (set_time_path): its two layers on the host (FP32), the modulations' biases on the GPU
-    std::string tp_path_;
-    std::vector<float> tp_w1_, tp_b1_, tp_w2_, tp_b2_;
-    float *tp_smod_b_ = nullptr, *tp_hmod_b_ = nullptr;
     uint64_t ctl_bytes_ = 0;
     int64_t ctl16_rows_ = 0;
     /// The images' rows through the input projection: the control's where one is set (with the maps on at this step:

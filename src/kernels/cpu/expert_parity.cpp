@@ -82,6 +82,15 @@ float f16_at(const std::vector<uint8_t>& b, size_t off) {
 
 }  // namespace
 
+// A malformed argument must be an error, not a silently accepted zero.
+static bool parse_i64(const char* s, long long& out) {
+    char* end = nullptr;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return false;
+    out = v;
+    return true;
+}
+
 int main(int argc, char** argv) {
     bool selftest = false;
     const char* path = "pack/full/experts.bin";
@@ -91,8 +100,12 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--file" && i + 1 < argc) { path = argv[++i]; path_given = true; }
-        else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
-        else if (a == "--expert" && i + 1 < argc) expert = std::atoll(argv[++i]);
+        else if (a == "--layer" && i + 1 < argc) {
+            if (!parse_i64(argv[++i], layer)) { std::fprintf(stderr, "expert_parity: invalid --layer value\n"); return 2; }
+        }
+        else if (a == "--expert" && i + 1 < argc) {
+            if (!parse_i64(argv[++i], expert)) { std::fprintf(stderr, "expert_parity: invalid --expert value\n"); return 2; }
+        }
         else { std::fprintf(stderr, "usage: expert_parity [--selftest] [--file P] [--layer N] [--expert N]\n");
                return 2; }
     }
@@ -161,7 +174,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- a realistic activation
-    std::mt19937 rng(4242);
+    std::mt19937 rng(4242);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     std::vector<float> x(cpu::H);
     for (auto& v : x) v = gauss(rng);

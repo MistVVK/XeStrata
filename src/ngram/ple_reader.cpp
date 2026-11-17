@@ -7,11 +7,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 
@@ -23,8 +25,9 @@ using platform::now_us;
 
 double ReaderStats::percentile(double q) const {
     if (read_us.empty()) return 0.0;
+    if (!std::isfinite(q) || q < 0.0 || q > 1.0) throw std::invalid_argument("percentile must be in [0, 1]");
     std::vector<float> v(read_us);
-    const size_t k = std::min(v.size() - 1, (size_t) (q * (double) (v.size() - 1) + 0.5));
+    const size_t k = (size_t) std::lround(q * (double) (v.size() - 1));
     std::nth_element(v.begin(), v.begin() + (ptrdiff_t) k, v.end());
     return v[k];
 }

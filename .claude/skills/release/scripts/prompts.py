@@ -9,6 +9,7 @@ Run from the repository root.  PACK_DIR is any pack (its `tokenizer/` is read). 
 comma-separated, for `xestrata-engine generate --tokens-file` (upstream's `strata generate`).
 """
 import json
+from typing import cast
 import pathlib
 import subprocess
 import sys
@@ -24,7 +25,7 @@ TIERS = {"1k": 1017, "4k": 3562, "32k": 31566, "64k": 64162, "128k": 128478, "26
 p = pathlib.Path(sys.argv[1]) / "tokenizer"
 out = pathlib.Path(sys.argv[2])
 vocab = json.loads((p / "vocab.json").read_text(encoding="utf-8"))
-tokens = [None] * len(vocab)
+tokens = cast(list[str], [None] * len(vocab))
 for t, i in vocab.items():
     tokens[i] = t
 tok = ST.Tokenizer(tokens, (p / "merges.txt").read_text(encoding="utf-8").split("\n"),

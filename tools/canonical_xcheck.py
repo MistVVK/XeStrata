@@ -673,7 +673,7 @@ def run_full(args) -> int:
         nblocks_sec = max(1, args.chunk // m.block_bytes)          # WHOLE blocks per chunk
         n_t = n_b = n_bad = 0
         t0 = time.time()
-        seen = collections.Counter()
+        seen: collections.Counter[str] = collections.Counter()
         for t in by_type[tname]:
             if t.elements % m.block_elems:
                 print("  %-34s %d elements not a multiple of %d - SKIPPED" % (t.name, t.elements, m.block_elems))

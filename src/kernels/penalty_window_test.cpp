@@ -32,6 +32,7 @@ constexpr int32_t kOldAnswer = 7777;   // a token of an earlier assistant turn, 
 // assistant header whose last token is the fed-back head x.
 std::vector<int32_t> prompt() {
     std::vector<int32_t> ids;
+    ids.reserve(334);
     for (int i = 0; i < 300; ++i) ids.push_back(1000 + i);
     for (int i = 0; i < 20; ++i) ids.push_back(kOldAnswer + (i % 3));
     for (int i = 0; i < 10; ++i) ids.push_back(kTaskTok);
@@ -101,6 +102,7 @@ int main() {
     // ---- a long reply: the window slides over the reply alone, the prompt never comes back
     {
         std::vector<int32_t> reply;
+        reply.reserve(200);
         for (int i = 0; i < 200; ++i) reply.push_back(2000 + (i % 7));
         const std::vector<int32_t> r = row_after(ids, reply, false);
         check(filled(r) == kH, "default: a reply longer than the window fills it");

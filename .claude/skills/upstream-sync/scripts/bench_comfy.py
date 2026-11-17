@@ -30,6 +30,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tools"))
 import bench_core as B  # noqa: E402
@@ -111,7 +112,8 @@ def one(weights: str, rnd: int, stem: str) -> None:
             # a second warm-up when the first fails: ComfyUI on the RX 9060 XT runs out of memory in the first image's
             # VAE decode, unloads its models and makes the next image (2026-10-21, 2026-10-23)
             jobs: list[tuple[str, int, str]] = [(WARM, 1, "warm"), (WARM, 2, "warm2"),
-                                                (str(B.IMAGE_REQUEST["prompt"]), int(B.IMAGE_REQUEST["seed"]), "run")]
+                                                (str(B.IMAGE_REQUEST["prompt"]),
+                                                 int(cast(int, B.IMAGE_REQUEST["seed"])), "run")]
             for prompt, seed, tag in jobs:
                 if tag == "warm2" and "cold_s" in r:
                     continue

@@ -14,6 +14,7 @@
 // No model runs; this measures the drafter on text, not on the model's own outputs.
 #include "strata/spec/suffix_drafter.hpp"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -108,6 +109,7 @@ void unit_tests() {
     {   // bounded memory: appending beyond the nominal capacity does not crash and still works
         SuffixDrafter d(3, 32, 1024);
         std::vector<int32_t> doc;
+        doc.reserve(5000);
         for (int i = 0; i < 5000; ++i) doc.push_back(i % 997);
         d.append(doc.data(), doc.size());
         int32_t out[4];
@@ -185,21 +187,34 @@ void unit_tests() {
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--simulate") == 0) {
         int K = 8, first = 2;
-        if (argc > 3 && std::strcmp(argv[2], "--k") == 0) { K = std::atoi(argv[3]); first = 4; }
+        if (argc > 3 && std::strcmp(argv[2], "--k") == 0) {
+            char* end = nullptr;
+            const long long n = std::strtoll(argv[3], &end, 10);
+            if (end == argv[3] || *end != '\0' || n < 1 || (long long) (int) n != n) {
+                std::fprintf(stderr, "suffix_drafter_test: invalid --k value '%s'\n", argv[3]);
+                return 2;
+            }
+            K = (int) n;
+            first = 4;
+        }
         std::printf("%-28s %8s | %-44s | %-44s\n", "prompt", "tokens", "continue: tok/step  proposals  acc/proposal",
                     "copy: tok/step  proposals  acc/proposal");
         for (int f = first; f < argc; ++f) {
             const std::vector<int32_t> ids = read_ids(argv[f]);
             if (ids.size() < 64) continue;
             const size_t half = ids.size() / 2;
-            const Sim c = simulate({ids.begin(), ids.begin() + half}, {ids.begin() + half, ids.end()}, K);
-            const size_t a = ids.size() / 3, b = 2 * ids.size() / 3;
-            const Sim p = simulate(ids, {ids.begin() + a, ids.begin() + b}, K);
+            const auto mid = ids.begin() + (std::ptrdiff_t) half;
+            const Sim c = simulate({ids.begin(), mid}, {mid, ids.end()}, K);
+            const auto third = ids.begin() + (std::ptrdiff_t) (ids.size() / 3);
+            const auto two_thirds = ids.begin() + (std::ptrdiff_t) (2 * ids.size() / 3);
+            const Sim p = simulate(ids, {third, two_thirds}, K);
             const char* name = std::strrchr(argv[f], '/') ? std::strrchr(argv[f], '/') + 1 : argv[f];
             std::printf("%-28s %8zu | %8.2f %10.1f%% %10.2f              | %8.2f %10.1f%% %10.2f\n", name, ids.size(),
-                        (double) c.tokens / c.steps, 100.0 * c.proposals / c.steps,
-                        c.proposals ? (double) c.accepted / c.proposals : 0.0, (double) p.tokens / p.steps,
-                        100.0 * p.proposals / p.steps, p.proposals ? (double) p.accepted / p.proposals : 0.0);
+                        (double) c.tokens / (double) c.steps, 100.0 * (double) c.proposals / (double) c.steps,
+                        c.proposals ? (double) c.accepted / (double) c.proposals : 0.0,
+                        (double) p.tokens / (double) p.steps,
+                        100.0 * (double) p.proposals / (double) p.steps,
+                        p.proposals ? (double) p.accepted / (double) p.proposals : 0.0);
         }
         return 0;
     }

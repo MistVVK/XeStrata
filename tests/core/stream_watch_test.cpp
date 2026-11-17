@@ -7,6 +7,7 @@
 // watched.
 #include "strata/core/stream_watch.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -29,10 +30,16 @@ std::string report_text() {
         return StreamState::failed;
     });
     std::string out;
-    std::rewind(f);
+    if (std::fseek(f, 0, SEEK_SET) != 0) { std::fclose(f); return "<seek failed>"; }
     char buf[512];
+    errno = 0;
     while (std::fgets(buf, sizeof buf, f)) out += buf;
+    const int read_errno = errno;
     std::fclose(f);
+    if (read_errno != 0) {
+        std::fprintf(stderr, "stream_watch_test: read failed: %s\n", std::strerror(read_errno));
+        ++failed;
+    }
     return out;
 }
 }  // namespace

@@ -18,7 +18,7 @@ index 2b15e2f9f8..0565ce268e 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM
  // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: host memory registration in the adapter's table (hip-host-register)
++// Modified 2026 by MistVVK and the XeStrata contributors: HIP host tracking.
  //
  //===----------------------------------------------------------------------===//
  
@@ -39,7 +39,7 @@ index 78bbe94348..9c1299dba4 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM
  // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: host memory registration with hipHostRegister (hip-host-register)
++// Modified 2026 by MistVVK and the XeStrata contributors: HIP host memory.
  //
  //===----------------------------------------------------------------------===//
  
@@ -67,8 +67,8 @@ index 78bbe94348..9c1299dba4 100644
  
 -UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t,
 -                                                    void *) {
-+UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t hContext,
-+                                                    void *pMem) {
++UR_APIEXPORT ur_result_t UR_APICALL
++urUSMReleaseExp(ur_context_handle_t hContext, void *pMem) {
 +  try {
 +    ScopedDevice Active(hContext->getDevices()[0]);
 +    const hipError_t Result = hipHostUnregister(pMem);
