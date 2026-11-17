@@ -78,5 +78,6 @@
  "guic77": "Quel module d’anticipation devine les mots à l’avance pour accélérer les réponses, un seul à la fois. Auto (recommandé) est DFlash2 pour Qwen3.8-Flash-Next là où le moteur l’a, et MTP sinon ; avec au moins deux cartes graphiques identiques prises en charge par le moteur de répartition sur toutes les cartes, c’est ce moteur avec la couche de brouillon MTP. DFlash2 télécharge une fois un module de {0} Go, et MTP sa couche de brouillon une fois. Avec Auto, plusieurs requêtes simultanées utilisent MTP. Si vous choisissez DFlash2 vous-même, il fonctionne avec le nombre de requêtes que vous réglez. Si DFlash2 ne peut pas fonctionner, seul MTP est utilisé et Détails en donne la raison. Désactivé coupe le module d’anticipation.",
  "guic78": "Dernier : {0} jetons à {1} tok/s",
  "guic79": "Dernier : {0} jetons",
- "guic80": "Strata n’a pas pu lire sa liste de téléchargements et ne peut pas encore choisir de moteur. Cliquez sur Réessayer ou choisissez une autre option ci-dessous."
+ "guic80": "Strata n’a pas pu lire sa liste de téléchargements et ne peut pas encore choisir de moteur. Cliquez sur Réessayer ou choisissez une autre option ci-dessous.",
+ "guic81": "Les tâches s’exécutent sur un modèle chargé sur cet ordinateur. Chargez-en un dans Modèles."
 }

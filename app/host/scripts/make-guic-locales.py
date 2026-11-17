@@ -846,6 +846,17 @@ add(en="Strata couldn’t read its download list, so it can’t pick an engine y
     ko="Strata가 다운로드 목록을 읽지 못해 아직 엔진을 고를 수 없습니다. 다시 시도를 누르거나 아래의 다른 방법을 선택하세요.",
     fr="Strata n’a pas pu lire sa liste de téléchargements et ne peut pas encore choisir de moteur. Cliquez sur Réessayer ou choisissez une autre option ci-dessous.",
     he="Strata לא הצליחה לקרוא את רשימת ההורדות שלה ולכן עדיין לא יכולה לבחור מנוע. יש ללחוץ על \"נסו שוב\" או לבחור אפשרות אחרת למטה.")
+# Tasks without a model on this computer (an API model is not run for a task), and the connection banner after two failed Retries: GUI-VIS-1117 packaged run; lane drafts, the owner is asked.
+add(en="Tasks run on a model loaded on this computer. Load one in Models.",
+    zh="任务在本机已加载的模型上运行。请在“模型”中加载一个。",
+    ja="タスクはこのコンピューターに読み込まれたモデルで実行されます。「モデル」で読み込んでください。",
+    de="Aufgaben laufen auf einem Modell, das auf diesem Computer geladen ist. Laden Sie unter Modelle eines.",
+    es="Las tareas se ejecutan con un modelo cargado en este equipo. Carga uno en Modelos.",
+    ru="Задачи выполняются на модели, загруженной на этом компьютере. Загрузите её в разделе «Модели».",
+    pt="As tarefas são executadas em um modelo carregado neste computador. Carregue um em Modelos.",
+    ko="작업은 이 컴퓨터에 불러온 모델에서 실행됩니다. 모델 화면에서 불러오세요.",
+    fr="Les tâches s’exécutent sur un modèle chargé sur cet ordinateur. Chargez-en un dans Modèles.",
+    he="משימות רצות על מודל שנטען במחשב הזה. טענו מודל במסך המודלים.")
 here = APP / "src" / "locales"
 NBSP = " "
 

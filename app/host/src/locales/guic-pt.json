@@ -78,5 +78,6 @@
  "guic77": "Qual rascunhador adivinha palavras à frente para deixar as respostas mais rápidas, um de cada vez. Automático (recomendado) é DFlash2 para o Qwen3.8-Flash-Next onde o motor o tem, e MTP nos demais casos; com duas ou mais placas gráficas idênticas que o motor de divisão em todas as placas assume, é esse motor com a camada de rascunho MTP. O DFlash2 baixa uma vez um rascunhador de {0} GB, e o MTP baixa uma vez a sua camada de rascunho. Com Automático, várias solicitações ao mesmo tempo usam o MTP. Se você escolher o DFlash2 por conta própria, ele roda com o número de solicitações que você definir. Se o DFlash2 não puder rodar, só o MTP é usado e Detalhes explica o motivo. Desativado desliga o rascunhador.",
  "guic78": "Último: {0} tokens a {1} tok/s",
  "guic79": "Último: {0} tokens",
- "guic80": "O Strata não conseguiu ler a lista de downloads e ainda não pode escolher um motor. Clique em Tentar novamente ou escolha outra opção abaixo."
+ "guic80": "O Strata não conseguiu ler a lista de downloads e ainda não pode escolher um motor. Clique em Tentar novamente ou escolha outra opção abaixo.",
+ "guic81": "As tarefas são executadas em um modelo carregado neste computador. Carregue um em Modelos."
 }
