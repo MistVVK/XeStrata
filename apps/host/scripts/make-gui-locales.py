@@ -45,12 +45,14 @@ add("{0} files",
     "{0} 个文件", "{0} 個のファイル", "{0} Dateien", "{0} archivos", "Файлов: {0}", "{0} arquivos", "파일 {0}개", "{0} fichiers",
     he="{0} קבצים")
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
-NBSP = " "
+NBSP = "\u00a0"
 
 
 def french(text):
     text = re.sub(r"(?<=[A-Za-zÀ-ſ])'(?=[A-Za-zÀ-ſ{])", "’", text)
     text = re.sub(r"(?<=\S) ([:;?!])", NBSP + r"\1", text)
+    text = re.sub(r"« ", "«" + NBSP, text)
+    text = re.sub(r" »", NBSP + "»", text)
     text = re.sub(r"(?<=[\d}]) %", NBSP + "%", text)
     return text
 

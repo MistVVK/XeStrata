@@ -212,6 +212,8 @@ NBSP = " "
 def french(text):
     text = re.sub(r"(?<=[A-Za-zÀ-ſ])'(?=[A-Za-zÀ-ſ{])", "’", text)
     text = re.sub(r"(?<=\S) ([:;?!])", NBSP + r"\1", text)
+    text = re.sub(r"« ", "«" + NBSP, text)
+    text = re.sub(r" »", NBSP + "»", text)
     return text
 
 

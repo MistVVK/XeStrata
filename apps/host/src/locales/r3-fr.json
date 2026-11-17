@@ -1,7 +1,7 @@
 {
  "r3_01": "Nécessite une mise à jour du moteur",
  "r3_02": "peut être plus lent",
- "r3_03": "Ce contexte occupe environ {0} Go de mémoire graphique et laisse peu de place au modèle sur cette carte. Strata va essayer ; s’il ne démarre pas, choisissez un contexte plus court.",
+ "r3_03": "Ce contexte occupe environ {0} Go de mémoire graphique et laisse peu de place au modèle sur cette carte. Strata va essayer ; s’il ne démarre pas, choisissez un contexte plus court.",
  "r3_04": "En cours de travail · {0}",
  "r3_05": "{0} conversations en cours",
  "r3_06": "{0} lignes"

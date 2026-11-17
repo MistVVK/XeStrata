@@ -281,12 +281,14 @@ add("Your model is downloaded, but the engine for this PC isn't ready yet. Open 
     he="המודל הורד, אבל המנוע למחשב הזה עדיין לא מוכן. יש לפתוח את הגדרות > אודות כדי להתקין אותו.")
 
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
-NBSP = " "
+NBSP = "\u00a0"
 
 
 def french(text):
     text = re.sub(r"(?<=[A-Za-zÀ-ſ])'(?=[A-Za-zÀ-ſ{])", "’", text)
     text = re.sub(r"(?<=\S) ([:;?!])", NBSP + r"\1", text)
+    text = re.sub(r"« ", "«" + NBSP, text)
+    text = re.sub(r" »", NBSP + "»", text)
     text = re.sub(r"(?<=[\d}]) %", NBSP + "%", text)
     return text
 

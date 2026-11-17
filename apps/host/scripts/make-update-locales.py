@@ -122,7 +122,7 @@ add("A model that was not started from this app is running, so nothing was chang
     he="פועל מודל שלא הופעל מהאפליקציה הזו, ולכן לא שונה דבר. יש לעצור אותו ולעדכן שוב את המנוע.")
 
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
-NBSP = " "
+NBSP = "\u00a0"
 
 
 def french(text):

@@ -254,7 +254,7 @@ add("Drafting: none in parallel slots (one token per request and step); a single
     "Anticipation : aucune dans les emplacements parallèles (un token par requête et par étape) ; une requête unique anticipe toujours",
     he="טיוטה: לא בחריצים מקבילים (טוקן אחד לכל בקשה ולכל צעד); בקשה יחידה עדיין משתמשת בטיוטה")
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
-NBSP = " "
+NBSP = "\u00a0"
 
 
 def french(text):
