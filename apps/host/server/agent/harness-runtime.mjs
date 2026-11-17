@@ -124,7 +124,7 @@ export class HarnessProcess {
     const done = new Promise(r => child.once('exit', r));
     if (process.platform === 'win32') {
       // /T takes the shells and PTYs the agent started; /PID is this child only.
-      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
+      taskkillTree(child.pid);
     } else {
       child.kill('SIGTERM');
       setTimeout(() => { if (!this.exited) child.kill('SIGKILL'); }, graceMs).unref();
@@ -157,9 +157,20 @@ export function stopStaleAgent(pidFile) {
   rmSync(pidFile, { force: true });
   const cmd = commandLineOf(pid);
   if (!cmd || !/lib[\\/]bin\.js/.test(cmd) || !/--profile web/.test(cmd)) return null;
-  if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true });
+  if (process.platform === 'win32') taskkillTree(pid);
   else { try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ } }
   return pid;
+}
+
+/** How long a taskkill may take. spawnSync blocks the host's whole event loop (every timer and every HTTP call) until the program returns, so it must have an end. */
+export const TASKKILL_TIMEOUT_MS = 10_000;
+
+/**
+ * Windows: end a process and its children (`taskkill /PID <pid> /T /F`, that PID's tree only). Bounded by TASKKILL_TIMEOUT_MS: a taskkill that stalls (a process the
+ * system cannot end, a machine out of memory) used to freeze the host for as long as it stalled. `run` is injectable for tests.
+ */
+export function taskkillTree(pid, run = spawnSync) {
+  return run('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: TASKKILL_TIMEOUT_MS });
 }
 
 /** Remove any occurrence of a secret value from text bound for a log. */
