@@ -9,7 +9,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
+#include <system_error>
 
 #if defined(__linux__)
 #include <sys/stat.h>
@@ -112,8 +114,9 @@ int main() {
                     std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count() / 10000);
     }
 
-    const std::string rm = "rm -rf '" + r + "'";
-    if (std::system(rm.c_str()) != 0) std::fprintf(stderr, "could not remove %s\n", r.c_str());
+    std::error_code ec;
+    std::filesystem::remove_all(r, ec);
+    if (ec) std::fprintf(stderr, "could not remove %s: %s\n", r.c_str(), ec.message().c_str());
 #else
     CHECK(gpu_pause_ms("C:/nowhere", 1) == -1);
     CHECK(gpu_pause_ms_self() == -1);

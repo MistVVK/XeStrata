@@ -151,12 +151,12 @@ void reference_q8_K(const float* x, long long n, std::vector<uint8_t>& blocks, s
         }
         if (amax == 0.0f) continue;                        // d = 0, qs = 0, bsums = 0 (see the kernel note)
         const float iscale = scale_num / max;              // -127 by default; -128 is the rival reading
-        int8_t* qs = (int8_t*) (out + 4);
+        int8_t* qs = reinterpret_cast<int8_t*>(out + 4);
         for (int j = 0; j < QK; ++j) {
             const int v = nearest_int_host(iscale * xb[j]);
             qs[j] = (int8_t) std::min(127, v);
         }
-        int16_t* bsums = (int16_t*) (out + 4 + QK);
+        int16_t* bsums = reinterpret_cast<int16_t*>(out + 4 + QK);
         for (int j = 0; j < QK / 16; ++j) {
             int sum = 0;
             for (int ii = 0; ii < 16; ++ii) sum += qs[j * 16 + ii];
