@@ -109,6 +109,7 @@
   "ltw.cancelledNote": "Cancelado. Las versiones guardadas hasta ahora se pueden elegir.",
   "ltw.captionHint": "Una línea cada una: la palabra disparadora, luego la descripción. Reglas de lora-caption: el aspecto del personaje queda en la palabra disparadora; un estilo describe solo el contenido.",
   "ltw.captionPh": "disparador, descripción",
+  "ltw.notePh": "Nota de la imagen para la descripción (opcional)",
   "ltw.captioning": "Escribiendo subtítulos…",
   "ltw.character": "Personaje",
   "ltw.choose": "Elegir archivos…",

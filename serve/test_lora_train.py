@@ -239,7 +239,8 @@ class Training(unittest.TestCase):
             Image.new("RGB", (8, 8), (i * 40, 80, 120)).save(buf, format="PNG")
             pics.append((f"pic{i}.png", buf.getvalue()))
         rec = self.jobs.create({"model": self.gen.model, "name": "my lora", "kind": kind, "trigger": trigger}, pics)
-        caps = {im["file"]: f"{trigger}, a girl in scene {i}" for i, im in enumerate(rec["images"])}
+        caps = {im["file"]: {"caption": f"{trigger}, a girl in scene {i}", "note": ""}
+                for i, im in enumerate(rec["images"])}
         return self.jobs.set_captions(rec["id"], caps)
 
     def _start(self, rec, **fields):
@@ -295,10 +296,11 @@ class Training(unittest.TestCase):
 
     def test_start_needs_captions_and_trigger(self):
         rec = self._draft()
-        self.jobs.set_captions(rec["id"], {rec["images"][0]["file"]: ""})
+        self.jobs.set_captions(rec["id"], {rec["images"][0]["file"]: {"caption": "", "note": ""}})
         with self.assertRaises(lt.TrainError):
             self._start(rec)
-        self.jobs.set_captions(rec["id"], {i["file"]: "no trigger here" for i in rec["images"]})
+        self.jobs.set_captions(rec["id"],
+                               {i["file"]: {"caption": "no trigger here", "note": ""} for i in rec["images"]})
         with self.assertRaises(lt.TrainError):
             self._start(rec)
 

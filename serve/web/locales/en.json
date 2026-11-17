@@ -996,6 +996,7 @@
   "ltw.cancelledNote": "Cancelled. The versions saved so far are here to pick.",
   "ltw.captionHint": "One line each: the trigger word, then the description. The lora-caption rules: a character's own look stays with the trigger; a style captions the content only.",
   "ltw.captionPh": "trigger, description",
+  "ltw.notePh": "Image note for captioning (optional)",
   "ltw.captioning": "Writing captions…",
   "ltw.character": "Character",
   "ltw.choose": "Choose files…",

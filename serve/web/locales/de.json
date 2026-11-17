@@ -109,6 +109,7 @@
   "ltw.cancelledNote": "Abgebrochen. Die bisher gespeicherten Versionen können gewählt werden.",
   "ltw.captionHint": "Je eine Zeile: Triggerwort, dann Beschreibung. Nach lora-caption: Das Aussehen der Figur bleibt beim Triggerwort; ein Stil beschreibt nur den Inhalt.",
   "ltw.captionPh": "Triggerwort, Beschreibung",
+  "ltw.notePh": "Bildnotiz für die Beschriftung (optional)",
   "ltw.captioning": "Beschriftungen werden geschrieben…",
   "ltw.character": "Charakter",
   "ltw.choose": "Dateien wählen…",

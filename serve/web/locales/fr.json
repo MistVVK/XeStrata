@@ -109,6 +109,7 @@
   "ltw.cancelledNote": "Annulé. Les versions déjà enregistrées restent à choisir.",
   "ltw.captionHint": "Une ligne chacune : le mot déclencheur, puis la description. Règles lora-caption : l'apparence du personnage reste au mot déclencheur ; un style ne décrit que le contenu.",
   "ltw.captionPh": "déclencheur, description",
+  "ltw.notePh": "Note d’image pour la légende (facultatif)",
   "ltw.captioning": "Écriture des légendes…",
   "ltw.character": "Personnage",
   "ltw.choose": "Choisir des fichiers…",

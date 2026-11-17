@@ -58,7 +58,7 @@ def picture(path: Path) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def tidy(text: str, trigger: str) -> str:
+def tidy(text: str, trigger: str, kind: str) -> str:
     """The model's answer as one caption line: its thinking and fences out, the first line that says something, the
     trigger first."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
@@ -67,6 +67,22 @@ def tidy(text: str, trigger: str) -> str:
     line = line.strip('"').strip()
     if not line.lower().startswith(trigger.lower()):
         line = f"{trigger}, {line}" if line else trigger
+    front, _ = skills_api.parse((skills_api.BUILTIN / "lora-caption" / "SKILL.md").read_text(encoding="utf-8"))
+    prefix, content = line[:len(trigger)], line[len(trigger):]
+    patterns = front["metadata"]["reading_exclude"]
+    if kind == "style":
+        patterns = patterns + front["metadata"]["style_exclude"]
+    for pattern in patterns:
+        content = re.sub(pattern, "", content, flags=re.I)
+    content = re.sub(r"\b(?:reading|reads|saying)\s*(?=,|[.!?]|$)", "", content, flags=re.I)
+    content = re.sub(r"\b(?:and|with)\s*,", ",", content, flags=re.I)
+    content = re.sub(r"\ba showing\b", "showing", content, flags=re.I)
+    content = re.sub(r"\bin a with\b", "with", content, flags=re.I)
+    content = re.sub(r"(?:,\s*)?\b(?:with|and)\s*([.!?]?)$", r"\1", content, flags=re.I)
+    content = re.sub(r"\s+,", ",", content)
+    content = re.sub(r",(?:\s*,)+", ",", content)
+    content = re.sub(r",\s*([.!?]|$)", r"\1", content)
+    line = prefix + content
     return " ".join(line.split())
 
 
@@ -119,7 +135,10 @@ def main() -> int:
             kept += 1
             continue
         try:
-            line = tidy(ask(a.server, system, user, picture(f)), a.trigger)
+            sidecar = f.with_suffix(".json")
+            note = json.loads(sidecar.read_text(encoding="utf-8")).get("note", "") if sidecar.exists() else ""
+            image_user = user + (f" Image notes (context only; check against the picture): {note}" if note else "")
+            line = tidy(ask(a.server, system, image_user, picture(f)), a.trigger, a.kind)
         except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
             print(f"lora_caption: {f.name}: {e}", file=sys.stderr)
             return 1

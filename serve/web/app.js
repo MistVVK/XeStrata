@@ -5470,6 +5470,7 @@ async function ltwFetch(path, opts) {
 }
 function ltwPanel(el) {
   const st = {models: [], job: null, timer: null, view: "", picked: null, regName: ""};
+  let edits = Promise.resolve();
   const base = () => st.job ? `v1/lora/jobs/${st.job.id}` : "";
   const stop = () => { if (st.timer) { clearInterval(st.timer); st.timer = null; } };
   const err = (e) => toast("error", tr("ltw.title", "LoRA training"), String(e.message || e), 6000);
@@ -5532,14 +5533,19 @@ function ltwPanel(el) {
     };
   }
   async function autoCaption() {
-    try { st.job = await ltwFetch(`${base()}/caption`, {method: "POST", headers: headers(true), body: "{}"}); render(); poll(); }
+    try { await saveCaptions(); st.job = await ltwFetch(`${base()}/caption`, {method: "POST", headers: headers(true), body: "{}"}); render(); poll(); }
     catch (e) { err(e); }
   }
   async function saveCaptions() {
     const caps = {};
-    el.querySelectorAll("[data-ltw-cap]").forEach((t) => { caps[t.dataset.ltwCap] = t.value; });
-    try { st.job = await ltwFetch(`${base()}/captions`, {method: "PUT", headers: headers(true), body: JSON.stringify(caps)}); }
-    catch (e) { err(e); }
+    el.querySelectorAll("[data-ltw-cap]").forEach((t) => {
+      const note = el.querySelector(`[data-ltw-note="${CSS.escape(t.dataset.ltwCap)}"]`);
+      caps[t.dataset.ltwCap] = {caption: t.value, note: note.value};
+    });
+    edits = edits.catch(() => {}).then(async () => {
+      st.job = await ltwFetch(`${base()}/captions`, {method: "PUT", headers: headers(true), body: JSON.stringify(caps)});
+    });
+    await edits;
   }
   function settings() {
     const g = (k) => { const i = el.querySelector(`[data-ltw-set="${k}"]`); return i ? i.value : ""; };
@@ -5554,8 +5560,7 @@ function ltwPanel(el) {
     return out;
   }
   async function start() {
-    await saveCaptions();
-    try { st.job = await ltwFetch(`${base()}/start`, {method: "POST", headers: headers(true), body: JSON.stringify(settings())}); render(); poll(); }
+    try { await saveCaptions(); st.job = await ltwFetch(`${base()}/start`, {method: "POST", headers: headers(true), body: JSON.stringify(settings())}); render(); poll(); }
     catch (e) { err(e); }
   }
   async function act(action, body) {
@@ -5586,7 +5591,8 @@ function ltwPanel(el) {
     const kind = j ? j.kind : "character";
     const imgs = j ? j.images.map((im) =>
       `<div class="ltw-img"><img src="${base()}/images/${esc(im.file)}" alt="${esc(im.file)}">` +
-      `<textarea class="st-input" rows="2" data-ltw-cap="${esc(im.file)}" placeholder="${esc(tr("ltw.captionPh", "trigger, description"))}">${esc(im.caption || "")}</textarea>` +
+      `<div><textarea class="st-input" rows="2" data-ltw-cap="${esc(im.file)}" placeholder="${esc(tr("ltw.captionPh", "trigger, description"))}">${esc(im.caption || "")}</textarea>` +
+      `<textarea class="st-input" rows="2" data-ltw-note="${esc(im.file)}" placeholder="${esc(tr("ltw.notePh", "Image note for captioning (optional)"))}">${esc(im.note || "")}</textarea></div>` +
       `<button type="button" class="st-btn st-btn--icon" data-ltw-delimg="${esc(im.file)}" title="${esc(tr("ltw.remove", "Remove"))}">×</button></div>`).join("") : "";
     return `<div class="ltw-head">${esc(tr("ltw.title", "LoRA training"))}</div>
       <div class="ltw-grid">
@@ -5706,7 +5712,7 @@ function ltwPanel(el) {
           catch (e) { err(e); }
         };
       });
-      el.querySelectorAll("[data-ltw-cap]").forEach((t) => { t.onchange = saveCaptions; });
+      el.querySelectorAll("[data-ltw-cap], [data-ltw-note]").forEach((t) => { t.onchange = () => saveCaptions().catch(err); });
     } else if (view === "run") {
       on("[data-ltw-cancel]", "onclick", () => act("cancel"));
     } else {

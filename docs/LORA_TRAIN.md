@@ -310,6 +310,7 @@ read both folders:
 
 `tools/image/lora_caption.py` has the chat's model (one that reads images) caption the training images, and puts `NN.txt` (one line, `<trigger word>, <description>`) beside each image.
 The captions follow the skill `serve/skills/lora-caption`, the policy above: a character LoRA's caption leaves out the character's own look (given as `--keep`) and writes the clothes, the pose, the background, the framing and **the picture's style (medium, coloring, line, texture, an artist's style) every time**. A word written is learned with that word, so the style is not learned with the trigger. A style LoRA's is the other way round: the style left out, what the picture shows written.
+For a picture’s title or note, put `{"note": "..."}` in `NN.json` beside it, or enter the note in the panel. The reader receives the note with that picture. For a style LoRA, postprocessing also removes the style and technique words listed in the skill. A visible shape, text, signature or seal stays as content. Text is not transcribed, and museum marks and seals are left out. Check and edit the automatic descriptions against the pictures.
 They are written as the trained model reads a prompt (`--style booru`: Anima's and MageTrail's Danbooru tags; `natural`: the other models' English sentences; `--model-skill` adds the model's own skill). A `.txt` already there is kept unless `--overwrite`.
 
 ```sh

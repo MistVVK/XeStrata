@@ -109,6 +109,7 @@
   "ltw.cancelledNote": "已取消。已保存的版本仍可选择。",
   "ltw.captionHint": "每张一行：触发词，然后是描述。lora-caption 规则：角色外貌留给触发词；风格只写内容。",
   "ltw.captionPh": "触发词, 描述",
+  "ltw.notePh": "用于说明的图片备注（可选）",
   "ltw.captioning": "正在写入字幕…",
   "ltw.character": "角色",
   "ltw.choose": "选择文件…",

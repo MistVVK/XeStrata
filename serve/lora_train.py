@@ -547,7 +547,7 @@ class TrainJobs:
             stem = f"{n:03d}"
         dest = self.dir_of(jid) / "images" / (stem + ext)
         dest.write_bytes(data)
-        rec["images"].append({"file": dest.name, "stem": stem, "bytes": len(data), "caption": ""})
+        rec["images"].append({"file": dest.name, "stem": stem, "bytes": len(data), "caption": "", "note": ""})
         self._write(rec)
         return rec
 
@@ -557,7 +557,7 @@ class TrainJobs:
         if item is None:
             raise TrainError(f"images: {fname!r} is not one of this job's", 404)
         d = self.dir_of(jid) / "images"
-        for p in (d / item["file"], d / (item["stem"] + ".txt")):
+        for p in (d / item["file"], d / (item["stem"] + ".txt"), d / (item["stem"] + ".json")):
             with contextlib.suppress(OSError):
                 p.unlink()
         rec["images"].remove(item)
@@ -567,13 +567,24 @@ class TrainJobs:
     def set_captions(self, jid: str, captions: dict) -> dict:
         rec = self._need(jid, ("draft",))
         by_file = {i["file"]: i for i in rec["images"]}
-        for fname, text in captions.items():
+        checked = []
+        for fname, fields in captions.items():
             item = by_file.get(fname)
             if item is None:
                 raise TrainError(f"captions: {fname!r} is not one of this job's images")
-            item["caption"] = check_caption(text)
-            (self.dir_of(jid) / "images" / (item["stem"] + ".txt")).write_text(
-                item["caption"] + "\n", encoding="utf-8")
+            if not isinstance(fields, dict) or not isinstance(fields.get("caption"), str) or \
+                    not isinstance(fields.get("note"), str):
+                raise TrainError("captions: each image needs caption and note strings")
+            checked.append((item, check_caption(fields["caption"]), check_caption(fields["note"])))
+        d = self.dir_of(jid) / "images"
+        for item, caption, note in checked:
+            item.update(caption=caption, note=note)
+            txt = d / (item["stem"] + ".txt")
+            if caption:
+                txt.write_text(caption + "\n", encoding="utf-8")
+            else:
+                txt.unlink(missing_ok=True)   # an empty caption must not make the captioner keep it
+            (d / (item["stem"] + ".json")).write_text(json.dumps({"note": note}, ensure_ascii=False), encoding="utf-8")
         self._write(rec)
         return rec
 

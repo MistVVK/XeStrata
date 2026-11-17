@@ -8319,7 +8319,7 @@ def make_handler(svc: Service):
                 try:
                     req = json.loads(self._body() or b"{}")
                     if not isinstance(req, dict):
-                        raise ValueError("send a JSON object of image file name -> caption")
+                        raise ValueError("send a JSON object of image file name -> {caption, note}")
                     self._json(200, self._lora_jobs().set_captions(parts[3], req))
                 except (lora_train_api.TrainError, ValueError) as e:
                     self._json(*lora_train_api.explain(e))

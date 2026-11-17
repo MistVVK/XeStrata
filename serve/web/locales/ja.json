@@ -109,6 +109,7 @@
   "ltw.cancelledNote": "取り消しました。それまでに保存した版はここから選べます。",
   "ltw.captionHint": "1 行ずつ: 呼び出し語、続いて説明。lora-caption の決まり: キャラ自身の見た目は呼び出し語に任せ、画風は中身だけを書きます。",
   "ltw.captionPh": "呼び出し語, 説明",
+  "ltw.notePh": "キャプション用の画像メモ（任意）",
   "ltw.captioning": "キャプションを書いています…",
   "ltw.character": "キャラクター",
   "ltw.choose": "ファイルを選ぶ…",

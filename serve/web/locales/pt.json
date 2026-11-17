@@ -109,6 +109,7 @@
   "ltw.cancelledNote": "Cancelado. As versões salvas até agora podem ser escolhidas.",
   "ltw.captionHint": "Uma linha cada: a palavra-gatilho, depois a descrição. Regras do lora-caption: a aparência do personagem fica com o gatilho; um estilo descreve só o conteúdo.",
   "ltw.captionPh": "gatilho, descrição",
+  "ltw.notePh": "Nota da imagem para legenda (opcional)",
   "ltw.captioning": "Escrevendo legendas…",
   "ltw.character": "Personagem",
   "ltw.choose": "Escolher arquivos…",
