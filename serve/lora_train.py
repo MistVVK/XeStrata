@@ -230,10 +230,10 @@ def model_rows(svc) -> list[dict]:
             choice = str(gen.cfg.get("setup_choice") or next(
                 (k for k, v in _qi.IMAGE_MODELS.items() if v[0] == gen.model), gen.model)).split(":", 1)[0]
             why += f"; run {setup_command(svc, choice)} and restart the server"
+        reasons = ([f"the trainer is not built: {exe.name}"] if not exe.is_file() else []) + ([why] if why else [])
         rows.append({"model": gen.model, "family": fam, "name": f"{lora_api.FAMILY_NAMES.get(fam, fam)} — {gen.model}",
                      "preset": PRESETS[fam], "sample_prompts": SAMPLE_PROMPTS, "sample_seed": SAMPLE_SEED,
-                     "can_train": ok,
-                     "why": "" if ok else (f"the trainer is not built: {exe.name}" if not exe.is_file() else why)})
+                     "can_train": ok, "why": "; ".join(reasons)})
     # A base not configured on the server cannot be used, even if its derivative is installed.
     present = {r["model"] for r in rows}
     for gen in list(images.gens.values()) if images is not None else []:
