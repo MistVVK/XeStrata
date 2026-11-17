@@ -179,10 +179,36 @@ const failure = (result, fallback) => {
   return new ControlError(message, { exitCode: result.code, output: result.json, ...(UPDATE_LOCK_HELD.test(String(message)) ? { code: 'update_busy' } : {}) });
 };
 
-/** Operations the app uses. `run` is injectable so the host's tests need no Python. */
-export function createControl({ control = findControl(), env = process.env, run = null } = {}) {
+/**
+ * What a call to Control is called in the host log: its first two words and, when there is one, the profile it is about (`runtime stop (profile web-1)`).
+ * Nothing else of the command line is written: paths, feed addresses and keys stay out of the log.
+ */
+export function controlCallName(args) {
+  const words = args.slice(0, 2).map(String);
+  const at = args.indexOf('--profile');
+  const profile = at >= 0 && typeof args[at + 1] === 'string' && /^[\w.-]{1,64}$/.test(args[at + 1]) ? args[at + 1] : null;
+  return profile ? `${words.join(' ')} (profile ${profile})` : words.join(' ');
+}
+
+/** Operations the app uses. `run` is injectable so the host's tests need no Python; `log` (a line writer) makes every call write its start, its end and how long it took. */
+export function createControl({ control = findControl(), env = process.env, run = null, log = null, now = () => Date.now() } = {}) {
   if (!control) return null;
-  const call = run ?? ((args, options) => runCli(control, args, { env, ...options }));
+  const base = run ?? ((args, options) => runCli(control, args, { env, ...options }));
+  // A call to Control that never returns (a stuck stop, a start that waits) used to leave nothing in the host log to say which call it was or for how long.
+  let numbered = 0;
+  const call = !log ? base : async (args, options) => {
+    const n = ++numbered, name = controlCallName(args), t0 = now();
+    const secs = () => ((now() - t0) / 1000).toFixed(1);
+    try { log(`control #${n} begin ${name}`); } catch { /* a log must not break a call */ }
+    try {
+      const result = await base(args, options);
+      try { log(`control #${n} end ${name}: exit ${result?.code ?? '?'} after ${secs()} s`); } catch { /* as above */ }
+      return result;
+    } catch (error) {
+      try { log(`control #${n} failed ${name}: ${error?.code ?? error?.name ?? 'error'} after ${secs()} s`); } catch { /* as above */ }
+      throw error;
+    }
+  };
   const feedArgs = feed => (feed ? ['--feed', feed] : []);
   return {
     control,
