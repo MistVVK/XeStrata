@@ -5,6 +5,9 @@
 #include <cstdlib>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 static unsigned long io_prio() {
     using Query = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
