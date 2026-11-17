@@ -14,6 +14,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX   // std::min / std::max in the files that include this
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <psapi.h>
 #else
