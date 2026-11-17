@@ -584,6 +584,7 @@ class Training(unittest.TestCase):
             gen.need.assert_called_once_with({}, start=False)
             jobs.image_begin.assert_called_with(4096)
         idle = images.ImageGen.__new__(images.ImageGen)
+        idle.cfg = {}
         idle.tok = object()
         idle.engine = mock.Mock()
         idle.engine.alive.return_value = False
