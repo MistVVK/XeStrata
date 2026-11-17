@@ -22,5 +22,6 @@
  "guic21": "Écriture du fichier {0}…",
  "guic22": "Exécution de {0}…",
  "guic23": "Demande au modèle de corriger son appel d’outil…",
- "guic24": "Le modèle a écrit deux fois de suite des appels d’outil que Strata n’a pas pu exécuter, Strata a donc arrêté ce tour. Rien n’a été exécuté. Envoyez de nouveau votre message, ou choisissez un autre modèle."
+ "guic24": "Le modèle a écrit deux fois de suite des appels d’outil que Strata n’a pas pu exécuter, Strata a donc arrêté ce tour. Rien n’a été exécuté. Envoyez de nouveau votre message, ou choisissez un autre modèle.",
+ "guic25": "Un appel d’outil qui n’a pas pu s’exécuter"
 }

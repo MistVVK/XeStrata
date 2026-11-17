@@ -2485,6 +2485,32 @@ textarea.st-input {
   border: 1px solid var(--st-line);
 }
 
+/* A tool call the model wrote as text that nothing ran: one quiet line that opens to the raw text. */
+.md-failedcall {
+  margin: 8px 0;
+  border: 1px solid var(--st-line-soft);
+  border-radius: 8px;
+  background: var(--st-surface-2);
+}
+.md-failedcall > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 6px 12px;
+  font-size: var(--st-fs-xs);
+  color: var(--st-ink-muted);
+}
+.md-failedcall > summary::-webkit-details-marker { display: none; }
+.md-failedcall__raw {
+  margin: 0;
+  padding: 8px 12px;
+  border-top: 1px solid var(--st-line-soft);
+  font-family: var(--st-font-mono);
+  font-size: var(--st-fs-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--st-ink-muted);
+}
+
 .md-image {
   max-width: 100%;
   height: auto;

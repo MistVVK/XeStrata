@@ -22,5 +22,6 @@
  "guic21": "Escribiendo el archivo {0}…",
  "guic22": "Ejecutando {0}…",
  "guic23": "Pidiendo al modelo que corrija su llamada a la herramienta…",
- "guic24": "El modelo escribió dos veces seguidas llamadas a herramientas que Strata no pudo ejecutar, así que Strata detuvo este turno. No se ejecutó nada. Envía tu mensaje de nuevo o elige otro modelo."
+ "guic24": "El modelo escribió dos veces seguidas llamadas a herramientas que Strata no pudo ejecutar, así que Strata detuvo este turno. No se ejecutó nada. Envía tu mensaje de nuevo o elige otro modelo.",
+ "guic25": "Una llamada a herramienta que no se pudo ejecutar"
 }

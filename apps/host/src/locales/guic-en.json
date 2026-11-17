@@ -22,5 +22,6 @@
  "guic21": "Writing file {0}…",
  "guic22": "Running {0}…",
  "guic23": "Asking the model to fix its tool call…",
- "guic24": "The model wrote tool calls that Strata could not run, twice in a row, so Strata stopped this turn. Nothing was run. Send your message again, or choose another model."
+ "guic24": "The model wrote tool calls that Strata could not run, twice in a row, so Strata stopped this turn. Nothing was run. Send your message again, or choose another model.",
+ "guic25": "A tool call that could not run"
 }
