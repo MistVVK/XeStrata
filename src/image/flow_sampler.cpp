@@ -68,7 +68,7 @@ struct ErStep {
     int stage;
 };
 
-void er_sde_step(float* x, const float* den, const float* old_den, float* old_dd, const float* noise, ErStep e, int64_t n,
+void er_sde_step(float* x, const float* den, const float* old_den, float* old_dd, const float* noise, const ErStep& e, int64_t n,
                  void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const size_t i = id[0];
