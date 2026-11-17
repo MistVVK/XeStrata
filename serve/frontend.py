@@ -1848,12 +1848,17 @@ class OutputParser:
 
     def _compact_scan_body(self) -> None:
         """Move streamed, consumed call text out of the string that grows on every token."""
-        if self.sp < 4096:
-            return
         cut = self.sp
+        if self.ss == "str" and self.sval_started:
+            # the open string value is walked from its start (param_end over buf[svstart:]) each time a closer may have arrived: its text stays in
+            # self.buf, so only what lies before it can move out (cutting at sp left svstart negative: buf[svstart:] then read the end of the
+            # buffer, and the value's </parameter> was not seen once the scan position passed 4096)
+            cut = min(cut, self.svstart)
+        if cut < 4096:
+            return
         self._scan_parts.append(self.buf[:cut])
         self.buf = self.buf[cut:]
-        self.sp = 0
+        self.sp -= cut
         if self.ss == "str" and self.sval_started:
             self.svstart -= cut
         if self._call_end_checked >= 0:
