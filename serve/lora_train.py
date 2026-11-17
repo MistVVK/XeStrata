@@ -16,15 +16,15 @@ updates: Mage-Flow's --steps counts micro-steps, so they are multiplied by its a
 the output folder (the mf trainer prints no save line) and kept only once serve/loras.py's read_header reads them (a
 cancel mid-save leaves a broken file, not a version).
 
-The GPU (LORAWEB DESIGN §5, the user's decision): training is the lowest priority.  The decisions (the card, the
-budget, shrink / pause / move) are TRAINVRAM's serve/train_budget.py, one place; TrainPlace here calls its Decider at
+The GPU: training is the lowest priority.  The decisions (the card, the budget, shrink / pause / move) are in
+serve/train_budget.py; TrainPlace here calls its Decider at
 every step boundary's cadence (each second and on a chat/image signal), writes the control file, charges the ledger
 and shows the state.  Chat and image jobs come first: training shrinks or pauses at a micro-step boundary (its LoRA
 and optimizer state kept) and expands or resumes when they leave.  Image jobs are never kept waiting for the
 training's end (images.gpu_turn's image_begin waits at most a micro-step's seconds plus the release).  The helper
 card is never closed for hours.
 
-The budget protocol (TRAINVRAM DESIGN §2, agreed): the trainer takes --vram-budget (0 = start paused; the open still
+The budget protocol: the trainer takes --vram-budget (0 = start paused; the open still
 needs open_mib of temporary room, checked before the start), --vram-control <file> ({"budget_mib", "save_state"},
 atomic write, read at a step boundary), --state <file> and --resume <file>.  It reports on stdout:
 `vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [key=value ...]` (the trailing fields are ignored here)
@@ -67,18 +67,17 @@ RANK_MAX = 256
 JOB_DISK_MARGIN = 1 << 30         # free disk an upload leaves (videos.py's JOB_DISK_MARGIN)
 KINDS = ("character", "style", "other")
 FAMILIES = ("qwen-image", "mage-flow", "moss-image", "anima")   # the families with a trainer
-# The image job's wait for the training's yield: one micro-step plus the release (TRAINVRAM DESIGN §2).  Mage-Flow's
-# 1024-class micro-step is 8.9 s (records 2026-11-03-mf-trainer §3); qi/moss/anima are measured at REC - until then
-# the wait covers the slowest known micro-step with room.  Past it the ledger's room still guards the VRAM.
+# The image job's wait for training to yield: one micro-step plus the release. Mage-Flow's 1024-class micro-step
+# was measured at 8.9 s; the wait leaves room for the slowest known micro-step. The ledger still guards VRAM.
 IMAGE_YIELD_WAIT_S = 60.0
 OPEN_WAIT_S = 600.0               # the longest wait for open_mib of temporary room before a trainer starts
 DEVICES_CACHE_S = 5.0             # xestrata-device --list-devices is a subprocess; not one every tick
 
-# The one place of the browser's training defaults (LORAWEB DESIGN §3). Caption dropout is off by default;
+# The one place of the browser's training defaults. Caption dropout is off by default;
 # Qwen-Image's print-style comparison favored 0 over 0.2 for that dataset. Other models can set it explicitly.
 # peak_mib: the training's peak VRAM at the 1024 class
 # (Mage-Flow measured, docs/LORA_TRAIN; Qwen-Image the user's number; MOSS-Image and Anima estimates, unverified).
-# The least budget and the open's room are train_budget.py's (min_mib / open_mib, TRAINVRAM's measurements).
+# The least budget and the open's room are train_budget.py's (min_mib / open_mib).
 PRESETS: dict[str, dict] = {
     "qwen-image": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 42, "dropout": CAPTION_DROPOUT,
                    "base": "bf16", "peak_mib": 15360},
@@ -109,10 +108,10 @@ SAMPLE_PROMPTS = {
     "other": ["{trigger}, a quiet street with a cat on a windowsill",
               "{trigger}, a bowl of fruit on a wooden table by a window"],
 }
-SAMPLE_SEED = 7                   # LORA2's sweeps' seed (fixed, so the versions compare)
+SAMPLE_SEED = 7                   # fixed, so the versions compare
 SAMPLE_SIZE = (1024, 1024)
 
-# The trainers' entry points (LORAWEB DESIGN §2).  elastic: the trainer takes --vram-budget/--vram-control.
+# The trainers' entry points. elastic: the trainer takes --vram-budget/--vram-control.
 # ckpt: how a version's file name carries its
 # step ("_N" = <prefix>_<step>.safetensors, ".N" = <prefix>.<step>.safetensors and <prefix>.final.safetensors).
 TRAINERS: dict[str, dict] = {
@@ -172,8 +171,8 @@ class _Cancelled(Exception):
 
 
 def budget_mod():
-    """TRAINVRAM's decisions (serve/train_budget.py: figures, Decider).  One place; not
-    duplicated here.  The tests replace this with a fake of the same shape."""
+    """The training budget decisions (serve/train_budget.py: figures, Decider).
+    The tests replace this with a fake of the same shape."""
     from serve import train_budget
     return train_budget
 
@@ -733,8 +732,8 @@ class TrainJobs:
         gen = self._gen(rec["model"])
         fam = rec["family"]
         if not TRAINERS[fam]["elastic"]:
-            raise TrainError("the trainer does not take a VRAM budget yet (the elastic training, TRAINVRAM, is not "
-                             "integrated): the training cannot share the GPU with the chat and the images", 503)
+            raise TrainError("the trainer does not take a VRAM budget: the training cannot share the GPU "
+                             "with the chat and the images", 503)
         exe = trainer_exe(gen)
         if not exe.is_file():
             raise TrainError(f"the trainer is not built: {exe}", 503)
@@ -1086,7 +1085,7 @@ class TrainJobs:
 
     def _spawn(self, rec: dict, pci: str, budget: int, resume: bool, cancel: threading.Event) -> subprocess.Popen:
         """Start the trainer on the card, after open_mib of temporary room is free (the open reads and quantizes the
-        weights even when the budget starts at 0 - TRAINVRAM's note 1)."""
+        weights even when the budget starts at 0)."""
         tb = budget_mod()
         need = int(tb.figures(*self._budget_model(rec))[0])
         waited = 0.0
