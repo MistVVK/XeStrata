@@ -31,7 +31,7 @@ class CommitWarning(unittest.TestCase):
 
     def test_the_pattern_follows_the_engines_format_string(self):
         # host_limits.hpp builds the text from these pieces: if the engine's words change, this fails here instead of the notice silently never showing
-        header = Path(__file__).resolve().parents[1] / "include" / "strata" / "platform" / "host_limits.hpp"
+        header = Path(__file__).resolve().parents[2] / "engine" / "include" / "strata" / "platform" / "host_limits.hpp"
         if not header.exists():
             self.skipTest("the engine headers are not in this checkout")
         source = header.read_text(encoding="utf-8")
