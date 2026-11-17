@@ -307,6 +307,7 @@ struct Sam3Video::Impl {
                             (size_t) d * 4, s);
         ptr_pos.grow((size_t) (std::max<size_t>(ptrs.size(), 1) * d) * 4);
         std::vector<int64_t> pos;
+        pos.reserve(ptrs.size());
         for (const auto& p : ptrs) pos.push_back(p.second);
         sam.ptr_positions(pos, maxp, ptr_pos.as<float>());
         pix_mem.grow((size_t) (P * d) * 4);
@@ -478,7 +479,7 @@ struct Sam3Video::Impl {
                 if (im[i][j] >= cfg.trk_assoc) matched_trk[j] = 1;
                 if (im[i][j] >= cfg.assoc) any = true;
             }
-            is_new[i] = dets[i].prob >= cfg.new_det && !any;
+            is_new[i] = static_cast<char>(dets[i].prob >= cfg.new_det && !any);
         }
         // the pairs the reconditioning may use: a sure detection (high_conf, not a new object) and a masklet that are
         // each the other's only overlap of recondition_iom or more
