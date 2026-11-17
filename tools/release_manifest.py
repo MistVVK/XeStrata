@@ -142,12 +142,7 @@ def check(manifest):
             carried = bool(manifest.get("engines_from")) and manifest["engines_from"] != manifest["tag"] \
                 and _vkey(manifest["control_version"]) > _vkey(want) \
                 and any(a.startswith("strata-engine-%s-" % want) for a in manifest["assets"])
-            # A release that builds its own engines but whose Control had to move past the previous release's Control (0.2.16: Control 0.1.61 went
-            # out with v0.2.15, so Control is 0.1.62, and the engines, new in this release, are 0.1.61) says so in "control_ahead"; the engine
-            # packages at engine_version must be in the asset list.
-            ahead = bool(manifest.get("control_ahead")) and _vkey(manifest["control_version"]) > _vkey(want) \
-                and any(a.startswith("strata-engine-%s-" % want) for a in manifest["assets"])
-            if found != manifest["control_version"] or not (found == want or found.startswith(want + ".") or carried or ahead):
+            if found != manifest["control_version"] or not (found == want or found.startswith(want + ".") or carried):
                 problems.append("%s says %s, docs/data/release.json %s is %s (control_version %s)" % (where, found, key, want, manifest["control_version"]))
         elif found != want:
             problems.append("%s says %s, docs/data/release.json %s is %s" % (where, found, key, want))

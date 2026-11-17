@@ -59,10 +59,8 @@ class ReleaseManifest(unittest.TestCase):
         """0.2.15: Control 0.1.61 and the 0.1.60 engines of v0.2.14 (no engine built). Without "engines_from" Control may not be ahead of
         the engines; with it, the engines at engine_version must be packages the release offers."""
         m = copy.deepcopy(rm.load())
-        m.pop("control_ahead", None)                                # the other way to have Control ahead (the test below)
         m["engines_from"] = "v0.2.14"
         m["control_version"], m["engine_version"] = "0.1.61", "0.1.60"
-        m["assets"] = [a for a in m["assets"] if not a.startswith("strata-engine-")] + ["strata-engine-0.1.60-linux-x86_64-cuda-cuda13.tar.gz"]   # the live list's engines are the release's own
         cmake = {"CMakeLists.txt (engine)": ("0.1.61", "engine_version"), "CMakeLists.txt (Control)": ("0.1.61", "control_version")}
         real = rm.code_versions
         try:
@@ -74,28 +72,6 @@ class ReleaseManifest(unittest.TestCase):
             gone = copy.deepcopy(m)
             gone["engine_version"] = "0.1.58"                       # no 0.1.58 engine package in the asset list
             self.assertIn("CMakeLists.txt (engine) says", "\n".join(rm.check(gone)))
-        finally:
-            rm.code_versions = real
-
-    def test_a_release_with_new_engines_may_have_control_ahead_when_it_says_so(self):
-        """0.2.16: Control 0.1.62 (0.1.61 went out with v0.2.15) and the engines, new in this release, at 0.1.61. Without "control_ahead" Control
-        may not be ahead of the engines; with it, the engine packages at engine_version must be in the asset list."""
-        m = copy.deepcopy(rm.load())
-        m.pop("engines_from", None)
-        m["control_version"], m["engine_version"] = "0.1.62", "0.1.61"
-        m["control_ahead"] = "Control 0.1.61 went out with v0.2.15"
-        m["assets"] = list(m["assets"]) + ["strata-engine-0.1.61-linux-x86_64-cuda-cuda13.tar.gz"]
-        cmake = {"CMakeLists.txt (engine)": ("0.1.62", "engine_version"), "CMakeLists.txt (Control)": ("0.1.62", "control_version")}
-        real = rm.code_versions
-        try:
-            rm.code_versions = lambda: {**real(), **cmake}
-            self.assertNotIn("CMakeLists.txt (engine) says", "\n".join(rm.check(m)))
-            without = copy.deepcopy(m)
-            without.pop("control_ahead")
-            self.assertIn("CMakeLists.txt (engine) says", "\n".join(rm.check(without)))
-            no_engines = copy.deepcopy(m)
-            no_engines["assets"] = [a for a in no_engines["assets"] if not a.startswith("strata-engine-0.1.61-")]
-            self.assertIn("CMakeLists.txt (engine) says", "\n".join(rm.check(no_engines)))
         finally:
             rm.code_versions = real
 
