@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- a realistic activation
-    std::mt19937 rng(4242);
+    std::mt19937 rng(4242);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     std::vector<float> x(cpu::H);
     for (auto& v : x) v = gauss(rng);

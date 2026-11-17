@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
     }
     if (n_blocks <= 0) { std::fprintf(stderr, "--blocks must be positive\n"); return 2; }
 
-    std::mt19937 rng(12345);
+    std::mt19937 rng(12345);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
 
     // raw Q2_0 blocks: { fp16 d ; uint8 qs[16] } - what ggml produced and what the artifact stores

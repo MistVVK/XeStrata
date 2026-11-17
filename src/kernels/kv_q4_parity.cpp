@@ -87,7 +87,7 @@ void quantize_block_q4_0_host(const float* x, k::block_q4_0& blk) {
 
 int main() {
     std::printf("=== Running kv_q4_parity test ===\n");
-    std::mt19937 rng(42);
+    std::mt19937 rng(42);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> nd(0.0f, 1.0f);
 
     // -------------------------------------------------------------

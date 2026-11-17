@@ -75,7 +75,7 @@ int main(int argc, char** argv) try {
             dq_err = num / (den + 1e-30);
         }
         // the dot, two columns
-        std::mt19937 rng(7);
+        std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x((size_t) 2 * cols);
         for (auto& v : x) v = nd(rng);

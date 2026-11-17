@@ -267,7 +267,7 @@ int main(int argc, char** argv) {
     // ---- fixture 1: plain greedy.  top_k = 0 (disabled), top_p = 1 (disabled), T = 1 -> argmax.
     {
         strata::kernels::SamplerParams p; p.top_k = 0; p.top_p = 1.0f; p.temperature = 1.0f; p.greedy = true;
-        std::mt19937 rng(3); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(3); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
         std::vector<int> want((size_t) NT);
@@ -318,7 +318,7 @@ int main(int argc, char** argv) {
     {
         strata::kernels::SamplerParams a; a.top_k = 20; a.top_p = 0.95f; a.temperature = 1.0f; a.greedy = true; a.seed = 1;
         strata::kernels::SamplerParams b = a; b.seed = 999999;
-        std::mt19937 rng(5); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(5); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
         std::vector<int> wa((size_t) NT);
@@ -616,7 +616,7 @@ int main(int argc, char** argv) {
     // from a previous penalised request while this request disables the penalties - the run must equal the
     // no-history run in both kernels, and the bitmap the launch did not size must stay untouched.
     {
-        std::mt19937 rng(11); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(11); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
         std::vector<int> hist((size_t) NT * 8, -1);
@@ -659,7 +659,7 @@ int main(int argc, char** argv) {
             }
             return best;
         };
-        std::mt19937 rng(12); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(12); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         const int TAIL = 5000;                           // longer than the widest window below
         std::vector<int32_t> tail((size_t) TAIL);
         for (auto& v : tail) v = (int32_t) (rng() % NV);
@@ -706,7 +706,7 @@ int main(int argc, char** argv) {
     // an id >= n_vocab used to set a bit past its end (a shared-memory write out of bounds - compute-sanitizer
     // memcheck reports it).  They can never be a candidate, so the result equals the reference without them.
     {
-        std::mt19937 rng(13); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(13); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         const int H = 16;
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
@@ -750,7 +750,7 @@ int main(int argc, char** argv) {
     // kernel keeps, 64 - and every row is written (the sampled kernel used to print an error for 0 and leave the
     // row unwritten, which a verify window then read as a token; `run` pre-fills -1 so that fails here).
     {
-        std::mt19937 rng(14); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(14); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng) * 0.3f;             // flat: the 64-wide list matters to the draw
         strata::kernels::SamplerParams p64;

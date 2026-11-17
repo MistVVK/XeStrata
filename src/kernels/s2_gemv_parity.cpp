@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
     if (n_in % QK != 0) { std::fprintf(stderr, "--n-in must be a multiple of %d\n", QK); return 2; }
     const long long nb = n_in / QK;
 
-    std::mt19937 rng(999);
+    std::mt19937 rng(999);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
 
     // FP16 activations.  Patterns are drawn from the same finite/exact table as the decode test, because a

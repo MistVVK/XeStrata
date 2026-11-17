@@ -128,7 +128,7 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
     using strata::kernels::SForm;
     const SForm form{4, 0, 32, Codebook::Affine, true};
 
-    std::mt19937 rng(777);
+    std::mt19937 rng(777);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
     const long long n_groups = n_in / 32;
     const long long codes_per_row = n_in / 2;
@@ -480,7 +480,7 @@ int main(int argc, char** argv) {
     cases.push_back({"S4/IQ4_NL", SForm{4, 0, 32, Codebook::Iq4Nl, false}, 18, iq4_to_raw, iq4_deq});
     cases.push_back({"S8/Q8_0", SForm{8, -128, 32, Codebook::Affine, false}, 34, q8_0_to_raw, q8_0_deq});
 
-    std::mt19937 rng(4242);
+    std::mt19937 rng(4242);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
     int total_bad = 0;
 

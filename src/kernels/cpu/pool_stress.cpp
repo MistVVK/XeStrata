@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
         }
     });
 
-    std::mt19937 rng(29);
+    std::mt19937 rng(29);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const float SENTINEL = -1.2345e33f;
     long long batches = 0, sleeps = 0, missed = 0;
     const auto t0 = std::chrono::steady_clock::now();

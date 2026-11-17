@@ -173,7 +173,7 @@ int main() {
     setenv("XESTRATA_GDN_CHUNKED", "0", 1);
 #endif
     struct Case { int form; int64_t T; bool silu; };
-    std::mt19937 rng(20261114);
+    std::mt19937 rng(20261114);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     int fail = 0, shapes = 0;
     for (const int hv : {48, 32, 16}) {   // the engine's three Gdn shapes (kernels.cpp)
         const auto& forms = strata::prefill::gdn_chunk_forms(strata::core::Runtime::get().compute(), HK, hv);

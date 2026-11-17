@@ -34,7 +34,7 @@ int main() {
     s.page_size = 64;                                                              // several pages in a small pool
     const int H = (int) s.n_head_kv, D = (int) s.head_dim, P = (int) s.page_size, G = D / k::KV_Q8_GROUP;
     const int pages = 8, cells = pages * P;
-    std::mt19937 rng(17);
+    std::mt19937 rng(17);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::vector<int32_t> table(pages);
     for (int i = 0; i < pages; ++i) table[i] = (i * 5 + 3) % pages;            // a non-identity permutation
     int32_t* d_table = dalloc<int32_t>(pages);

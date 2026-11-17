@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
         else { std::fprintf(stderr, "usage: quantize_act_parity [--selftest]\n"); return 2; }
     }
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;
     const long long N = 32 * 4096;

@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
 
     const long long n_in = 2560, n_out = 64;
     const int tpr = 32;
-    std::mt19937 rng(31);
+    std::mt19937 rng(31);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> gauss(0.0f, 1.0f);
 
     std::vector<float> x((size_t) n_in);

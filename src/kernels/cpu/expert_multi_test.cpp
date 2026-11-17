@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
         std::printf("expert_multi_test: skipped, this CPU cannot run the AVX-512 expert kernel (%s)\n", f.reason());
         return 77;
     }
-    std::mt19937 rng(9);
+    std::mt19937 rng(9);  // NOLINT(bugprone-random-generator-seed): a fixed fixture
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     const int E = bench ? (argc > 2 ? std::atoi(argv[2]) : 256) : 4;
     std::vector<uint8_t> blobs((size_t) E * c::BLOB);
