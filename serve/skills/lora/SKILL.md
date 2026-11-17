@@ -9,14 +9,15 @@ metadata:
 - Use a LoRA only when the user names it, or asks for the character or the style it adds (its name, kind and trigger
   in `lora` say which). None otherwise.
 - Put its trigger words at the start of the prompt.
-- Use these starting points. The combination is a guide from one Qwen-Image-2.1 Turbo print-style comparison, not a
-  guarantee for every LoRA. Leave `blocks` out for all layers.
+- Use these starting points for a character trained on blocks 8–15 and a style trained on all blocks. They are a
+  guide from one character and a print style on Qwen-Image-2.1 Turbo, seeds 7 and 8, not a guarantee for every LoRA.
+  Leave `blocks` out when applying them; the character LoRA already contains only the trained blocks.
 
-  | LoRAs | Strength | Blocks |
+  | LoRAs | Strength | Blocks on application |
   | --- | --- | --- |
-  | Character only | 1 | `character` where offered; otherwise all |
-  | Style only | 1 | `style` where offered; otherwise all |
-  | Character and style | character 0.8, style 1.0 | all for both |
+  | Character only | 1.0; for a photo, 1.4 | all |
+  | Style only | 1.0 | all |
+  | Character and style | character 1.0, style 1.0 | all for both |
 
 - With a character alone, write the desired style in the model's prompt style (the user's, else the model's own:
   `watercolor`, `photo`, `anime coloring`) so the LoRA brings the character and not its pictures' style.

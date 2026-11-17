@@ -5565,7 +5565,7 @@ function ltwPanel(el) {
     for (const k of ["steps", "save_every", "max_size", "rank", "lr", "seed", "dropout", "accum", "base", "method",
                      "train_blocks", "only_if_contains", "ignore_if_contains", "sample_seed"]) {
       const v = g(k);
-      if (v !== "") out[k] = v;
+      if (v !== "" || k === "train_blocks") out[k] = v;
     }
     const sp = g("sample_prompts");
     if (sp.trim()) out.sample_prompts = sp.split("\n").map((s) => s.trim()).filter(Boolean);
@@ -5601,8 +5601,8 @@ function ltwPanel(el) {
     const selected = j ? j.model : ((models.find((m) => m.model === requested || (m.requested_models || []).includes(requested)) || models[0] || {}).model || "");
     const modelOpts = (st.models.length ? st.models : [{model: "", name: tr("ltw.noModels", "no trainable model here"), can_train: false, why: ""}])
       .map((m) => `<option value="${esc(m.model)}"${selected === m.model ? " selected" : ""}${m.can_train ? "" : " disabled"}>${esc(m.name || m.model)}${m.can_train ? "" : " — " + esc(m.why || "")}</option>`).join("");
-    const preset = (models.find((m) => m.model === selected) || models[0] || {}).preset || {};
     const kind = j ? j.kind : "character";
+    const preset = ((models.find((m) => m.model === selected) || models[0] || {}).presets || {})[kind] || {};
     const imgs = j ? j.images.map((im) =>
       `<div class="ltw-img"><img src="${base()}/images/${esc(im.file)}" alt="${esc(im.file)}">` +
       `<div><textarea class="st-input" rows="2" data-ltw-cap="${esc(im.file)}" placeholder="${esc(tr("ltw.captionPh", "trigger, description"))}">${esc(im.caption || "")}</textarea>` +
@@ -5644,7 +5644,7 @@ function ltwPanel(el) {
           ${preset.accum != null ? `<label class="st-field"><span>${esc(tr("ltw.accum", "Gradient accumulation"))}</span><input class="st-input" type="number" min="1" data-ltw-set="accum" placeholder="${preset.accum}"></label>` : ""}
           ${preset.base ? `<label class="st-field"><span>${esc(tr("ltw.base", "Base precision"))}</span><select class="st-input" data-ltw-set="base"><option value="">${esc(preset.base)}</option><option value="bf16">bf16</option><option value="int8">int8</option></select></label>` : ""}
           ${preset.method ? `<label class="st-field"><span>${esc(tr("ltw.method", "Method"))}</span><select class="st-input" data-ltw-set="method"><option value="">${esc(preset.method)}</option><option value="lora">lora</option><option value="lokr">lokr</option><option value="dora">dora</option></select></label>` : ""}
-          <label class="st-field"><span>${esc(tr("ltw.trainBlocks", "Train blocks (e.g. 0-5,10)"))}</span><input class="st-input" data-ltw-set="train_blocks"></label>
+          <label class="st-field"><span>${esc(tr("ltw.trainBlocks", "Train blocks (e.g. 0-5,10)"))}</span><input class="st-input" data-ltw-set="train_blocks" value="${esc(preset.train_blocks || "")}"></label>
           <label class="st-field"><span>${esc(tr("ltw.onlyIf", "Only names containing"))}</span><input class="st-input" data-ltw-set="only_if_contains"></label>
           <label class="st-field"><span>${esc(tr("ltw.ignoreIf", "Ignore names containing"))}</span><input class="st-input" data-ltw-set="ignore_if_contains"></label>
           <label class="st-field"><span>${esc(tr("ltw.sampleSeed", "Sample seed"))}</span><input class="st-input" type="number" data-ltw-set="sample_seed" placeholder="7"></label>

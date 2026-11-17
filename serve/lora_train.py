@@ -89,6 +89,16 @@ PRESETS: dict[str, dict] = {
     "anima": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 42, "dropout": CAPTION_DROPOUT,
               "peak_mib": 12288},
 }
+
+
+def preset(family: str, kind: str) -> dict:
+    result = PRESETS[family].copy()
+    # One Qwen-Image-2.1 character, two seeds: the middle blocks preserve scenes better than all blocks.
+    if family == "qwen-image" and kind == "character":
+        result.update(steps=1500, train_blocks="8-15")
+    return result
+
+
 # The sample pictures of every version (the same seed and prompts across versions): a subject the data does not have
 # (docs/LORA_TRAIN's check: a character in new clothes and scene, a style on new content).  The panel edits them.
 SAMPLE_PROMPTS = {
@@ -236,7 +246,8 @@ def model_rows(svc) -> list[dict]:
             why += f"; run {setup_command(svc, choice)} and restart the server"
         reasons = ([f"the trainer is not built: {exe.name}"] if not exe.is_file() else []) + ([why] if why else [])
         rows.append({"model": gen.model, "family": fam, "name": f"{lora_api.FAMILY_NAMES.get(fam, fam)} — {gen.model}",
-                     "preset": PRESETS[fam], "sample_prompts": SAMPLE_PROMPTS, "sample_seed": SAMPLE_SEED,
+                     "presets": {kind: preset(fam, kind) for kind in KINDS},
+                     "sample_prompts": SAMPLE_PROMPTS, "sample_seed": SAMPLE_SEED,
                      "can_train": ok, "why": "; ".join(reasons)})
     # A base not configured on the server cannot be used, even if its derivative is installed.
     present = {r["model"] for r in rows}
@@ -249,7 +260,7 @@ def model_rows(svc) -> list[dict]:
         fam = trainer_family(gen)
         if fam is None:
             continue
-        rows.append({"model": base, "family": fam, "name": base, "preset": PRESETS[fam],
+        rows.append({"model": base, "family": fam, "name": base, "presets": {kind: preset(fam, kind) for kind in KINDS},
                      "sample_prompts": SAMPLE_PROMPTS, "sample_seed": SAMPLE_SEED, "can_train": False,
                      "why": f"install the base with {setup_command(svc, choice)} and restart the server"})
         present.add(base)
@@ -276,7 +287,7 @@ def check_trigger(trigger: str) -> str:
 
 def check_settings(fields: dict, fam: str, kind: str = "other") -> dict:
     """The start's settings over the preset: n (steps), k (save_every), rank, lr, seed, and the advanced ones."""
-    p = PRESETS[fam]
+    p = preset(fam, kind)
 
     def num(key, lo, hi, cast, default):
         v = fields.get(key)
@@ -312,7 +323,7 @@ def check_settings(fields: dict, fam: str, kind: str = "other") -> dict:
             raise TrainError("base: bf16 or int8")
         out["base"] = base
     for key in ("train_blocks", "only_if_contains", "ignore_if_contains"):
-        v = str(fields.get(key) or "").strip()
+        v = str(fields.get(key, p.get(key, "")) or "").strip()
         if len(v) > 400 or "\n" in v:
             raise TrainError(f"{key}: one line, up to 400 characters")
         out[key] = v

@@ -22,6 +22,9 @@ metadata:
   the character, while the artist name brought its own era and displaced the character. Before training, compare one
   or two prompts with and without the candidate word, using the same seed and no LoRA; choose another if it changes
   the image. The panel suggests a word; the user can edit it.
+- For Qwen-Image-2.1 character training, the panel defaults to blocks 8–15 and 1500 updates. This is a starting
+  point from one character and seeds 7 and 8 on Qwen-Image-2.1 Turbo. Clear the train-blocks field to train all
+  blocks when the user wants a stronger character together with the training images' style.
 - The captions follow the lora-caption skill: a character's own look is left to the trigger word (write what
   changes - clothes, pose, background - and the pictures' style); a style LoRA captions the content only, never the
   style's words. Read that skill when the user asks how to caption.
