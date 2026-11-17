@@ -13,6 +13,7 @@
 // (layer 0 | layers 1..47 + head).
 #include "gguf_lite.h"
 #include "mtl_rt.h"
+#include "moe_tiles.h"
 #include "resource_path.h"
 #include "ref_quant.h"
 #include "arena_budget.h"
@@ -2967,20 +2968,9 @@ struct PgDq { uint32_t n_in, n_out, row_bytes, perm; };
 struct PgGemm { int M, N, K, pad; };
 struct PgEpi { uint32_t n_tok, n_embd, hc, hc_lr; };
 struct PgGdnP { uint32_t n_tok, h_k, h_v, channels; float eps; uint32_t f32; };
-struct PgPlan { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
+struct PgPlan { uint32_t n_ent, topk, n_expert, tm, n_blocks, gu_gx, dn_gx; };   // moe_mm.metal's MmPlanArgs
 struct PgMm { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
 int pg_unit(int t) { return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 ? 16 : 32; }
-// the v2 (M4) expert tiles: the K-quants need TK 128, Q8_0 / IQ4_XS TK 32 (their 32-value units), the rest TK 16
-std::string gu2_tile(int t) {
-    if (t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K) return "_16_16_128_2";   // the M4's best (513fc615)
-    if (t == ref::Q8_0 || t == ref::IQ4_XS) return "_16_64_32_2";
-    return "_16_64_16_2";
-}
-std::string dn2_tile(int t) {
-    if (t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K) return "_16_16_128_2";   // Q4-KQ: the K-quants' down experts need TK 128 as their gate/up do
-    if (t == ref::Q3_K || t == ref::IQ4_XS) return "_16_64_32_2";
-    return t == ref::IQ4_NL || t == ref::Q5_1 || t == ref::Q5_0 || t == ref::Q8_0 ? "_16_64_32_2" : "_16_64_16_2";
-}
 }  // namespace
 
 struct Window::PromptGemm {
@@ -3104,8 +3094,9 @@ bool Window::prompt_gemm_init(std::string& err) {
 
 bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err) {
     PromptGemm& p = *pg_;
-    p.meta.as<uint32_t>()[2] = p.gu_v3 ? NFF / (32 * 4) : NFF / 64;
-    p.meta.as<uint32_t>()[5] = p.dn_v3 ? N / (64 * 2) : N / 64;
+    // p.meta's indirect grids are mm_scan's to write, one layer's worth per layer (it knows the tile count, and the
+    // plan carries the grid x of that layer's tiles): the gate/up grid is not one number for the whole chunk, since
+    // the tile is chosen from the layer's quant type and the K-quants take TN 16 where the rest take 64.
     auto TN = [this](const std::string& n) -> const gguf::Tensor& { return this->T(n); };
     if (Tn < 1 || Tn > p.MT) { err = "metal prompt: chunk size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal prompt: the chunk runs past the context"; return false; }
@@ -3298,7 +3289,13 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         const uint32_t nt = (uint32_t) T;
         D(PP(p.lib, "route_topk"), {mtl::Arg::B(p.logits), mtl::Arg::B(p.ids), mtl::Arg::B(p.wts), mtl::Arg::V(nt), mtl::Arg::V((uint32_t) nexp_)}, (T + 7) / 8, 1, 256);
         const int nent = T * TOPK, nblk = (nent + 1023) / 1024;
-        PgPlan pa{(uint32_t) nent, TOPK, (uint32_t) nexp_, (uint32_t) p.TM, (uint32_t) nblk};
+        // this layer's tiles and the grid x each one is dispatched over, computed together (src/moe_tiles.h): the
+        // tile is the layer's own quant type's, so a K-quant layer's gate/up grid is 640 / 16 and not 640 / 64
+        const MoeTile gu_t = p.gu_v3 ? MoeTile{"_16_32_32_4", GU3_TN} : gu2_tile(eg.type);
+        const MoeTile dn_t = p.dn_v3 ? MoeTile{"_16_64_32_2", DN3_TN} : dn2_tile(ed.type);
+        PgPlan pa{(uint32_t) nent, TOPK, (uint32_t) nexp_, (uint32_t) p.TM, (uint32_t) nblk,
+                  (uint32_t) moe_grid_x(NFF, gu_t.tn, p.gu_v3 ? GU3_SG : 1),
+                  (uint32_t) moe_grid_x(N, dn_t.tn, p.dn_v3 ? DN3_SG : 1)};
         const uint32_t nclr = (uint32_t) p.maxrows;
         D(PP(p.lib, "mm_clear"), {mtl::Arg::B(p.stok), mtl::Arg::V(nclr)}, (p.maxrows + 255) / 256, 1, 256);
         D(PP(p.lib, "mm_hist"), {mtl::Arg::B(p.ids), mtl::Arg::B(p.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
@@ -3332,18 +3329,12 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         };
         const std::string ak = stream_ ? "#arena" : "";
         mtl::Dispatch gu;
-        if (p.gu_v3) {
-            const std::string fn = "mm_gu3_" + std::to_string(eg.type) + "_16_32_32_4";
-            mtl::Constants c = mtl::Constants().b(7, p.k4);
+        {
+            const std::string fn = "mm_gu" + std::string(p.gu_v3 ? "3_" : "2_") + std::to_string(eg.type) + gu_t.name;
+            mtl::Constants c = p.gu_v3 ? mtl::Constants().b(7, p.k4) : mtl::Constants().i(5, 0);
             if (stream_) c.b(20, true);
             gu.p = PP(p.lib, fn, c, fn + ak);
-            gu.tg[0] = 32 * 4;
-        } else {
-            const std::string fn = "mm_gu2_" + std::to_string(eg.type) + gu2_tile(eg.type);
-            mtl::Constants c = mtl::Constants().i(5, 0);
-            if (stream_) c.b(20, true);
-            gu.p = PP(p.lib, fn, c, fn + ak);
-            gu.tg[0] = 64;
+            gu.tg[0] = p.gu_v3 ? 32 * GU3_SG : 64;
         }
         gu.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(p.XS), mtl::Arg::B(p.HS), mtl::Arg::B(p.tiles), mtl::Arg::V(ma)};
         arena_args(gu);
@@ -3353,18 +3344,12 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         push(ds, gu);
         if (hd) had_rows_ind(ds, p.lib, "pg:", p.HS, p.meta);
         mtl::Dispatch dn;
-        if (p.dn_v3) {
-            const std::string fn = "mm_down3_" + std::to_string(ed.type) + "_16_64_32_2";
-            mtl::Constants c = mtl::Constants().b(7, p.k4);
+        {
+            const std::string fn = "mm_down" + std::string(p.dn_v3 ? "3_" : "2_") + std::to_string(ed.type) + dn_t.name;
+            mtl::Constants c = p.dn_v3 ? mtl::Constants().b(7, p.k4) : mtl::Constants();
             if (stream_) c.b(20, true);
             dn.p = PP(p.lib, fn, c, fn + ak);
-            dn.tg[0] = 32 * 2;
-        } else {
-            const std::string fn = "mm_down2_" + std::to_string(ed.type) + dn2_tile(ed.type);
-            mtl::Constants c;
-            if (stream_) c.b(20, true);
-            dn.p = PP(p.lib, fn, c, fn + ak);
-            dn.tg[0] = 64;
+            dn.tg[0] = p.dn_v3 ? 32 * DN3_SG : 64;
         }
         dn.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(p.HS), mtl::Arg::B(p.YE), mtl::Arg::B(p.tiles), mtl::Arg::V(ma)};
         arena_args(dn);
