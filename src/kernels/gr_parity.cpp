@@ -458,6 +458,71 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         }
         std::printf("  fused GR read + q8_1 (STRATA_QFUSE), T 1..8, direct and graph replays: %s\n", qbad ? "FAIL" : "pass");
         bad += qbad;
+
+        // D1: STRATA_HC_Q8=1 (q8_down, q8_up, and q8_inject with w_inject == nullptr) + STRATA_TSUM=0 vs 1 bitwise parity
+        // (PR #3225). Note: launch_q8_t (fused_gr.cu) reads STRATA_TSUM once per process and T, so in one gr_parity run both
+        // halves of the STRATA_TSUM pair take the setting of the first read; what this block checks is the Q8_0 read and
+        // q8_inject against the q8_1 reference and against w_inject, for T 1..8.
+        uint8_t *d_qd = nullptr, *d_qu = nullptr, *d_qi = nullptr;
+        check(cudaMalloc(&d_qd, (size_t) (LR * D / 32) * 34), "q8_down alloc");
+        check(cudaMalloc(&d_qu, (size_t) (D * LR / 32) * 34), "q8_up alloc");
+        check(cudaMalloc(&d_qi, (size_t) (HC * D / 32) * 34), "q8_inject alloc");
+        fused_gr_quantize_q8_0(d_down, d_qd, LR * D / 32, stream);
+        fused_gr_quantize_q8_0(d_up, d_qu, D * LR / 32, stream);
+        fused_gr_quantize_q8_0(d_inject, d_qi, HC * D / 32, stream);
+        int q8_bad = 0;
+        const char* prev_ts = std::getenv("STRATA_TSUM");
+        const std::string saved_ts = prev_ts ? prev_ts : "";
+        auto set_ts = [](const char* val) {
+#if defined(_WIN32)
+            _putenv_s("STRATA_TSUM", val ? val : "");
+#else
+            if (val) setenv("STRATA_TSUM", val, 1);
+            else unsetenv("STRATA_TSUM");
+#endif
+        };
+        for (int tt = 1; tt <= T && !q8_bad; ++tt) {
+            for (int qinj = 0; qinj < 2 && !q8_bad; ++qinj) {
+                Snapshot snap_ts[2];
+                std::vector<uint8_t> qimg_ts[2];
+                for (int ts = 0; ts < 2; ++ts) {
+                    set_ts(ts ? "1" : "0");
+                    check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "q8 R");
+                    check(cudaMemsetAsync(d_inj_out, 0x5a, (size_t) T * HC * sizeof(float), stream), "q8 inj poison");
+                    check(cudaMemsetAsync(d_q, 0x5a, qbytes, stream), "q8 qimg poison");
+                    std::vector<FusedGrArgs> qa(args.begin(), args.begin() + tt);
+                    for (int t = 0; t < tt; ++t) {
+                        qa[t].q8_down = d_qd;
+                        qa[t].q8_up = d_qu;
+                        qa[t].w_inject = qinj ? nullptr : d_inject;
+                        qa[t].q8_inject = qinj ? d_qi : nullptr;
+                        qa[t].q8_mixed = d_q + (size_t) t * (N / 32) * 36;
+                        qa[t].q8_cnt = d_cnt;
+                    }
+                    const bool wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                    strata::kernels::native_quantize_q8_1(d_mixed, d_ref, N, tt, stream);
+                    check(cudaStreamSynchronize(stream), "q8 sync");
+                    snap_ts[ts] = snapshot();
+                    qimg_ts[ts].resize((size_t) tt * (N / 32) * 36);
+                    check(cudaMemcpy(qimg_ts[ts].data(), d_q, qimg_ts[ts].size(), cudaMemcpyDeviceToHost), "q8 qimg read");
+                    check(cudaMemcpy(hr.data(), d_ref, qimg_ts[ts].size(), cudaMemcpyDeviceToHost), "q8 qref read");
+                    if (!wrote || std::memcmp(qimg_ts[ts].data(), hr.data(), qimg_ts[ts].size()) != 0) ++q8_bad;
+                    for (int i = 0; i < tt * HC; ++i)
+                        if (!std::isfinite(snap_ts[ts].inject[i])) ++q8_bad;
+                }
+                if (std::memcmp(snap_ts[0].r_out.data(), snap_ts[1].r_out.data(), (size_t) tt * D * 4) != 0 ||
+                    std::memcmp(snap_ts[0].rs.data(), snap_ts[1].rs.data(), (size_t) tt * HC * 4) != 0 ||
+                    std::memcmp(snap_ts[0].inject.data(), snap_ts[1].inject.data(), (size_t) tt * HC * 4) != 0 ||
+                    std::memcmp(snap_ts[0].mixed.data(), snap_ts[1].mixed.data(), (size_t) tt * N * 4) != 0 ||
+                    std::memcmp(qimg_ts[0].data(), qimg_ts[1].data(), qimg_ts[0].size()) != 0) {
+                    ++q8_bad;
+                }
+            }
+        }
+        set_ts(prev_ts ? saved_ts.c_str() : nullptr);
+        cudaFree(d_qd); cudaFree(d_qu); cudaFree(d_qi);
+        std::printf("  fused GR Q8_0 multi (STRATA_HC_Q8 + q8_inject + STRATA_TSUM), T 1..8: %s\n", q8_bad ? "FAIL" : "pass");
+        bad += q8_bad;
 #if (defined(STRATA_USE_HIP) || defined(__HIP_PLATFORM_AMD__)) && !defined(STRATA_HIP_GFX906)
         // Counter-free q8_mixed path (q8_cnt == nullptr, used by MTP when STRATA_QFUSE_HC_LOCAL=1 on wave32 HIP where
         // STRATA_GR_FAST_BUILD == 0): must return true and write identical q8_1 bytes across T=1..8 and graph replays,
