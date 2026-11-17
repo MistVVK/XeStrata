@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""The settings register: every STRATA_* environment setting the engine reads, in one file (data/settings-register.json).
+"""The settings register: every STRATA_* environment setting the engine reads, in one file (terminal/data/settings-register.json).
 
-    python tools/settings_register.py             # regenerate data/settings-register.json (keeps the hand-kept fields)
+    python tools/settings_register.py             # regenerate terminal/data/settings-register.json (keeps the hand-kept fields)
     python tools/settings_register.py --check     # scan only; print what is missing from / extra in the register; exit 1 on a difference
     python tools/settings_register.py --names     # print the names the engine reads, one per line
     python tools/settings_register.py --no-git    # regenerate without the git history fields (fast)
     python tools/settings_register.py --docs      # write docs/SETTINGS.md from the register
 
 What counts as "the engine reads it": the name is the string literal argument of a ``getenv`` call or of one of the engine's env
-helpers (``env_on``, ``env_int``, ``pipe_dbg_env`` ...) in src/, include/, metal/src/ or sycl/src/. Calls that write or remove a
+helpers (``env_on``, ``env_int``, ``pipe_dbg_env`` ...) in engine/src/, engine/include/, engine/metal/src/ or sycl/src/. Calls that write or remove a
 variable (``_putenv_s``, ``put_env``, ``set_env``, ``unset_env``) are not reads; they are listed as ``engine_sets``.
 
 Automatic fields (rebuilt on every run): backends, reads, parse, code_default, default_state, engine_sets, launch_sets, launch_reads,
@@ -31,11 +31,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-REGISTER = ROOT / "data" / "settings-register.json"
+REGISTER = ROOT / "terminal" / "data" / "settings-register.json"
 SETTINGS_PAGE = "docs/SETTINGS.md"
 
-ENGINE_DIRS = ("src", "include", "metal/src", "sycl/src")
-LAUNCH_PATHS = ("strata_control", "strata_cli", "setup.py", "apps/host/server", "serve")
+ENGINE_DIRS = ("engine/src", "engine/include", "engine/metal/src", "engine/sycl/src")
+LAUNCH_PATHS = ("strata_control", "strata_cli", "terminal/setup.py", "app/host/server", "serve")
 DOC_PATHS = ("docs", "README.md", "AGENTS.md")
 LAUNCH_EXT = (".py", ".mjs", ".js", ".cjs", ".ts")
 SKIP_PARTS = ("node_modules", "/tests/", "/test/", "__pycache__")
@@ -195,9 +195,9 @@ def _pp_states(lines):
 
 def _backend_of(path: str, flavours: set[str]) -> list[str]:
     p = path
-    if p.startswith("sycl/src"):
+    if p.startswith("engine/sycl/src"):
         return ["sycl"]
-    if p.startswith("metal/src"):
+    if p.startswith("engine/metal/src"):
         return ["metal"]
     if "/cpu/" in p or p.endswith(("_cpu.cpp", "_cpu.hpp")):
         return ["cpu"]
@@ -353,7 +353,7 @@ _SET_PATTERNS = [
 
 def _is_test(rel: str) -> bool:
     b = os.path.basename(rel)
-    return (b.startswith("test_") or b.endswith(("_test.py", ".test.mjs", ".test.js", ".spec.mjs")) or b == "conftest.py"
+    return (b.startswith("test_") or b.endswith(("_test.py", ".test.mjs", ".test.js", ".spec.mjs")) or b == "terminal/conftest.py"
             or any(s in "/" + rel for s in SKIP_PARTS))
 
 
@@ -397,7 +397,7 @@ def scan_launch(names):
 
 # ---------------------------------------------------------------- engine default tables
 
-DEFAULT_TABLE_FILES = ("src/core/arch_defaults.cpp", "src/core/nv_defaults.cpp", "src/core/amd_community.cpp", "src/core/gfx12_extra.cpp",
+DEFAULT_TABLE_FILES = ("engine/src/core/arch_defaults.cpp", "engine/src/core/nv_defaults.cpp", "src/core/amd_community.cpp", "src/core/gfx12_extra.cpp",
                        "src/core/defaults_026.cpp")
 
 
@@ -540,12 +540,12 @@ def render_page(entries):
     out = [
         "# Engine settings",
         "",
-        "<!-- Generated from data/settings-register.json by tools/settings_register.py --docs. Do not edit by hand; change the register. -->",
+        "<!-- Generated from terminal/data/settings-register.json by tools/settings_register.py --docs. Do not edit by hand; change the register. -->",
         "",
         "The engine reads its settings from environment variables whose names start with `STRATA_`. The Terminal and the app choose what",
         "your hardware needs, so most people never set one. This page lists the ones meant for people: switches that are off until you",
         "turn them on, and switches that take a newer default back to the earlier behaviour. The other settings are for measuring and",
-        "debugging and are kept in `data/settings-register.json`.",
+        "debugging and are kept in `terminal/data/settings-register.json`.",
         "",
         "A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`",
         "puts it in the model's run configuration.",

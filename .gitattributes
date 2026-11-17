@@ -1,40 +1,40 @@
 # Frozen prompts are hashed byte for byte (manifest sha256): never convert their line endings.
-bench/prompts/** -text
+terminal/bench/prompts/** -text
 
 # launchers keep their platform line endings wherever the repository is cloned
 *.sh text eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
-bin/strata text eol=lf
+terminal/bin/strata text eol=lf
 
-# copies of real packs' native_experts.txt, parsed byte for byte by tests/core/expert_layout_test.cpp
-tests/data/native_experts/** -text
+# copies of real packs' native_experts.txt, parsed byte for byte by engine/tests/core/expert_layout_test.cpp
+engine/tests/data/native_experts/** -text
 
 # the quant yardstick's text set: tokenized byte for byte (set.ids.json), never convert its line endings
-data/quant_quality/** -text
+terminal/data/quant_quality/** -text
 
 # the license text is shipped and checked as LF text on every checkout
 LICENSE text eol=lf
 
 # container scripts run in Linux: always LF
-docker/*.sh text eol=lf
-Dockerfile text eol=lf
-docker/Dockerfile text eol=lf
-docker/compose/* text eol=lf
+tools/docker/*.sh text eol=lf
+tools/docker/Dockerfile.src text eol=lf
+tools/docker/Dockerfile text eol=lf
+tools/docker/compose/* text eol=lf
 
 # Apple tools (codesign, plutil) read these: LF only, wherever the repository is cloned
 *.plist text eol=lf
 
-# vendored KaTeX (serve/web/vendor): the files are hashed byte for byte (PROVENANCE.json), never convert their line endings.
-serve/web/vendor/** -text
-third_party/strata-ggml/** text eol=lf
-third_party/strata-gguf-py/** text eol=lf
-third_party/strata-llama/** text eol=lf
+# vendored KaTeX (terminal/serve/web/vendor): the files are hashed byte for byte (PROVENANCE.json), never convert their line endings.
+terminal/serve/web/vendor/** -text
+engine/third_party/strata-ggml/** text eol=lf
+engine/third_party/strata-gguf-py/** text eol=lf
+engine/third_party/strata-llama/** text eol=lf
 
 # chat templates are read and hashed byte for byte (the served prompt, tools/test_qwen4_intake): LF wherever the repository is cloned
 *.jinja text eol=lf
 
 # the image gate's recorded data (merges with their ranks, expected token ids, table hashes) is read byte for byte by the test programs
-# (tools/test_te_tokenizer.py: a CR at a line end made every merge unknown on a Windows checkout); never convert its line endings
-tools/image/gate/data/** -text
+# (terminal/tools/test_te_tokenizer.py: a CR at a line end made every merge unknown on a Windows checkout); never convert its line endings
+terminal/tools/image/gate/data/** -text

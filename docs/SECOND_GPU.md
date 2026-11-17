@@ -126,5 +126,5 @@ Each row is one machine, reported by the author of the change or a community mem
 | --- | --- | --- |
 | `--remote-expert-opt` | dual RTX 4090 (PR author) | +63% mixed, +132% code decode over the plain helper path |
 | `--remote-expert-opt` | RTX 5090 + RTX 4090 (PR author) | +28% mixed, +63% code |
-| Helper PCIe share on HIP | 2x RX 6900 XT, PCIe 4.0 x8 each, IQ3_S (community) | before the fix, decode 40 tok/s with the primary waiting 43 ms per verify window; after, 66 tok/s and 19 ms. `--pcie-frac 0` avoided the cost ([report](../bench/results/2026-10-04-rdna2-helper-pcie-share/README.md)) |
+| Helper PCIe share on HIP | 2x RX 6900 XT, PCIe 4.0 x8 each, IQ3_S (community) | before the fix, decode 40 tok/s with the primary waiting 43 ms per verify window; after, 66 tok/s and 19 ms. `--pcie-frac 0` avoided the cost ([report](bench-results/2026-10-04-rdna2-helper-pcie-share/README.md)) |
 | Resident RAM mode with a helper | RX 6800 (16 GB) + RX 6600 (8 GB), Windows 11, i5-11400F, 32 GB RAM | RX 6800 alone ~37.5 tok/s; with a 3,800-slot helper ~40.6 / 44.2 tok/s on 8K-token requests; CPU pool share of experts down from ~2.9 to ~0.4 entries per layer-window |

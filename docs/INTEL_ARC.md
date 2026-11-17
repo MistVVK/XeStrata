@@ -167,7 +167,7 @@ Things that matter on an Arc (details in [INTEL.md](INTEL.md)):
 | Community | 2x Arc Pro B70, `--layer-split` | Flash-Next IQ3_XXS 66 tok/s decode, 394 tok/s prompt | #423 |
 | Community | Arc Pro B50 16 GB | Coder IQ1_M about 23 tok/s, IQ2_XS about 25-27 tok/s, up to 128K | #423 |
 | Community | Arc B580 12 GB, WSL2 | IQ2_XS about 21 tok/s, Coder about 15 tok/s; device loss also seen | #423 |
-| Community | 2x Arc Pro B60 24 GB, `--layer-split`, Ryzen 5 5600, 64 GB, PCIe 3.0 x8 per card | Coder IQ1_M: 56.6 tok/s decode, 428 tok/s prompt (2,129 tokens); Flash-Next IQ2_XS: 58.6-61.3 tok/s decode, 436 tok/s prompt; all experts in VRAM; 8K context | [report](../bench/results/2026-10-04-community-2x-arc-pro-b60/README.md) |
+| Community | 2x Arc Pro B60 24 GB, `--layer-split`, Ryzen 5 5600, 64 GB, PCIe 3.0 x8 per card | Coder IQ1_M: 56.6 tok/s decode, 428 tok/s prompt (2,129 tokens); Flash-Next IQ2_XS: 58.6-61.3 tok/s decode, 436 tok/s prompt; all experts in VRAM; 8K context | [report](bench-results/2026-10-04-community-2x-arc-pro-b60/README.md) |
 | Community | One Arc Pro B60 24 GB | Coder IQ1_M with 4,042 of 12,288 experts mirrored in RAM: 11.9 tok/s decode | same |
 | Maintainers | Arc Pro B70 32 GB (xe), 0.1.40.2 and later | Flash-Next IQ3_S with 11.5k of 24.6k experts resident: 10-prompt gate passes, prompt 980-1,000 tok/s on 4K tokens, decode 30 (prose) to 41 (code) tok/s | [INTEL.md](INTEL.md#arc-pro-b70-with-a-model-that-does-not-fit-flash-next-iq3_s) |
 | Maintainers | Arc A750 8 GB (i915) | Flash-Next IQ3_XXS about 10-19 tok/s decode | [INTEL.md](INTEL.md#arc-a750-and-the-other-alchemist-cards) |

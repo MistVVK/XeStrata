@@ -5,7 +5,7 @@ labels: ["enhancement"]
 body:
   - type: markdown
     value: |
-      Explain what you want in plain language. For a large feature, a change to a default or a refactor, please agree the scope here first. Read [CONTRIBUTING.md](https://github.com/Niko1221/Strata/blob/main/CONTRIBUTING.md).
+      Explain what you want in plain language. For a large feature, a change to a default or a refactor, please agree the scope here first. Read [CONTRIBUTING.md](https://github.com/Niko1221/Strata/blob/main/.github/CONTRIBUTING.md).
 
       **The title must start with its area:** [Engine], [GUI], [TUI], [Benchmark], [Docs] or [Other]. Choose the same one below.
   - type: dropdown

@@ -4,9 +4,9 @@ name: Backend compile checks
 # exists for another backend (or an API a toolkit version dropped) fails here instead of on a user's machine.  Hardware runs are separate.
 #   CUDA 12.9 and 13.0   nvidia/cuda devel container   target strata (no MMQ, the default) (CMake preset cuda-compile)
 #   HIP (ROCm 7.2)       rocm/dev container            target strata                      (CMake preset hip-compile)
-#   SYCL (oneAPI 2026.1) ubuntu + Intel's apt repo     target strata of sycl/             (the commands of packaging/build_sycl_linux.sh)
-#   Metal                macOS runner                  target strata                      (metal/; metal-build.yml keeps its own strata build)
-# ggml comes from the vendored third_party/strata-ggml (frozen at llama.cpp's pin), the same tree the release builds use: nothing is downloaded.
+#   SYCL (oneAPI 2026.1) ubuntu + Intel's apt repo     target strata of engine/sycl/             (the commands of tools/packaging/build_sycl_linux.sh)
+#   Metal                macOS runner                  target strata                      (engine/metal/; metal-build.yml keeps its own strata build)
+# ggml comes from the vendored engine/third_party/strata-ggml (frozen at llama.cpp's pin), the same tree the release builds use: nothing is downloaded.
 # Architectures are fewer than the release package's (compile time); the flags that decide which sources and defines are built are the release's.
 
 on:
@@ -14,33 +14,33 @@ on:
     branches: [main]
     paths:
       - .github/workflows/backends.yml
-      - CMakeLists.txt
-      - CMakePresets.json
-      - cmake/**
-      - src/**
-      - include/**
-      - third_party/**
-      - sycl/**
-      - metal/**
-      - setup.py
-      - packaging/build_cuda_linux.sh
-      - packaging/build_hip_linux.sh
-      - packaging/build_sycl_linux.sh
+      - engine/CMakeLists.txt
+      - engine/CMakePresets.json
+      - engine/cmake/**
+      - engine/src/**
+      - engine/include/**
+      - engine/third_party/**
+      - engine/sycl/**
+      - engine/metal/**
+      - terminal/setup.py
+      - tools/packaging/build_cuda_linux.sh
+      - tools/packaging/build_hip_linux.sh
+      - tools/packaging/build_sycl_linux.sh
   pull_request:
     paths:
       - .github/workflows/backends.yml
-      - CMakeLists.txt
-      - CMakePresets.json
-      - cmake/**
-      - src/**
-      - include/**
-      - third_party/**
-      - sycl/**
-      - metal/**
-      - setup.py
-      - packaging/build_cuda_linux.sh
-      - packaging/build_hip_linux.sh
-      - packaging/build_sycl_linux.sh
+      - engine/CMakeLists.txt
+      - engine/CMakePresets.json
+      - engine/cmake/**
+      - engine/src/**
+      - engine/include/**
+      - engine/third_party/**
+      - engine/sycl/**
+      - engine/metal/**
+      - terminal/setup.py
+      - tools/packaging/build_cuda_linux.sh
+      - tools/packaging/build_hip_linux.sh
+      - tools/packaging/build_sycl_linux.sh
   workflow_dispatch:
 
 permissions:
@@ -64,7 +64,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # the cuda12 package is the one for Pascal and Volta: sm_60 needs STRATA_EXPERIMENTAL_SM60 (packaging/build_cuda_linux.sh)
+          # the cuda12 package is the one for Pascal and Volta: sm_60 needs STRATA_EXPERIMENTAL_SM60 (tools/packaging/build_cuda_linux.sh)
           - { cuda: '12.9', image: '12.9.1-devel-ubuntu24.04', archs: '60-real;61-real;70-real;86-real', sm60: 'ON' }
           - { cuda: '13.0', image: '13.0.2-devel-ubuntu24.04', archs: '75-real;86-real;120-real', sm60: 'OFF' }
     steps:
@@ -79,12 +79,12 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-cuda${{ matrix.cuda }}-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**', 'cmake/**') }}
+          key: ccache-cuda${{ matrix.cuda }}-${{ hashFiles('engine/CMakeLists.txt', 'engine/src/**', 'engine/include/**', 'engine/cmake/**') }}
           restore-keys: ccache-cuda${{ matrix.cuda }}-
       - name: Configure (preset cuda-compile)
         run: |
           nvcc --version | tail -2
-          cmake --preset cuda-compile -B build \
+          cmake -S engine --preset cuda-compile -B build \
             "-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.archs }}" -DSTRATA_EXPERIMENTAL_SM60=${{ matrix.sm60 }} \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
       - name: Build strata
@@ -109,12 +109,12 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-hip72-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**', 'cmake/**') }}
+          key: ccache-hip72-${{ hashFiles('engine/CMakeLists.txt', 'engine/src/**', 'engine/include/**', 'engine/cmake/**') }}
           restore-keys: ccache-hip72-
       - name: Configure (preset hip-compile)
         run: |
           /opt/rocm/llvm/bin/clang++ --version | head -1
-          cmake --preset hip-compile -B build \
+          cmake -S engine --preset hip-compile -B build \
             -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm -DCMAKE_PREFIX_PATH=/opt/rocm \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
       - name: Build strata
@@ -123,7 +123,7 @@ jobs:
         run: ccache -s | head -8
 
   sycl:
-    # The engine needs oneAPI 2026.1 or newer (sycl/include/dpct/util.hpp uses the entangle and chunked_partition extensions, which the
+    # The engine needs oneAPI 2026.1 or newer (engine/sycl/include/dpct/util.hpp uses the entangle and chunked_partition extensions, which the
     # 2025.3.2 compiler does not have: it stops at "no member named 'entangle'"; the intel/oneapi-basekit images end at 2025.3), so the
     # compiler comes from Intel's apt repository at a pinned version.
     name: SYCL oneAPI 2026.1
@@ -146,14 +146,14 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-sycl-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**', 'sycl/**') }}
+          key: ccache-sycl-${{ hashFiles('engine/CMakeLists.txt', 'engine/src/**', 'engine/include/**', 'engine/sycl/**') }}
           restore-keys: ccache-sycl-
-      - name: Configure and build (the commands of packaging/build_sycl_linux.sh)
+      - name: Configure and build (the commands of tools/packaging/build_sycl_linux.sh)
         shell: bash
         run: |
           . /opt/intel/oneapi/setvars.sh --force >/dev/null
           icpx --version | head -1
-          cmake -S sycl -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+          cmake -S engine/sycl -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
             -DSTRATA_SYCL_PARITY=OFF -DSTRATA_SYCL_IQ_DECODE_FAST=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build build --target strata -j "$(nproc)"
@@ -162,11 +162,11 @@ jobs:
 
   metal:
     name: Metal strata
-    # the macOS 26 SDK: metal/src/mtl_rt.mm names MTLGPUFamilyMetal4 behind @available (a run-time check); the names must be in the SDK
+    # the macOS 26 SDK: engine/metal/src/mtl_rt.mm names MTLGPUFamilyMetal4 behind @available (a run-time check); the names must be in the SDK
     runs-on: macos-26
     timeout-minutes: 60
     env:
-      # metal/setup_mac.py's metal-cpp pin (the same as metal-build.yml)
+      # engine/metal/setup_mac.py's metal-cpp pin (the same as metal-build.yml)
       METAL_CPP_URL: https://developer.apple.com/metal/cpp/files/metal-cpp_26.zip
       METAL_CPP_SHA256: 4df3c078b9aadcb516212e9cb03004cbc5ce9a3e9c068fa3144d021db585a3a4
     steps:
@@ -183,11 +183,11 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-metal-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**', 'metal/**') }}
+          key: ccache-metal-${{ hashFiles('engine/CMakeLists.txt', 'engine/src/**', 'engine/include/**', 'engine/metal/**') }}
           restore-keys: ccache-metal-
       - name: Configure
         run: |
-          cmake -S metal -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          cmake -S engine/metal -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DMETAL_CPP_DIR="$PWD/_mcpp/metal-cpp" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build and link strata

@@ -295,7 +295,7 @@ existing config; this is not a complete run config:
 
 `STRATA_BF16_TC=1` improved prompt throughput by 20-34% on one Quadro RTX 8000 and changed replies in 3 of 9 paired requests, so
 use it only if different rounding is acceptable. It did not improve decode. Numbers are in the history section. These switches are
-existing code ([gemm.cu](../src/prefill/gemm.cu), [qsa_select.cu](../src/kernels/cuda/qsa_select.cu)), not new kernels.
+existing code ([gemm.cu](../engine/src/prefill/gemm.cu), [qsa_select.cu](../engine/src/kernels/cuda/qsa_select.cu)), not new kernels.
 
 ## AMD: building gfx906 and gfx1012
 
@@ -322,14 +322,14 @@ Dated numbers. Each row is one machine and one engine version, as labelled. They
 
 | Card | Measured on | Result |
 | --- | --- | --- |
-| 2x Tesla P100 | IQ3_S, engine 0.1.39 ([report](../bench/results/2026-10-06-community-2x-p100/README.md), #1157) | prompt 526-532 tok/s; decode 28-32 tok/s at 128K prompt tokens; 3 of 3 needle checks at 122K |
+| 2x Tesla P100 | IQ3_S, engine 0.1.39 ([report](bench-results/2026-10-06-community-2x-p100/README.md), #1157) | prompt 526-532 tok/s; decode 28-32 tok/s at 128K prompt tokens; 3 of 3 needle checks at 122K |
 | PH402 (4 GP100 dies) | IQ3_XXS, engine 0.1.40.2 | decode 28.3 -> 38.9 tok/s with `STRATA_Q8_SM60=1` and a Q8_0 dense shard |
 | Tesla P40 | IQ3_S, engine 0.1.30 (#395) | prompt 217-374 tok/s; decode 30-33 tok/s |
 | Tesla P40 | IQ3_S, engine 0.1.43.1 with the sm_61 changes | prompt 255 tok/s at 565 tokens (was 205); decode 37-38 tok/s (was 34-35); with `STRATA_DENSE_F32=1` 464-474 tok/s at 7K tokens (was 360-432) |
 | V100-PCIE-32GB | UD-IQ4_XS (#600) | prompt 1,123-1,251 tok/s |
 | V100 32GB | IQ2_XS (#540) | prompt +22% |
 | RTX 2080 Ti | Q2_0 (#655) | prompt +15-18% with `STRATA_BF16_TC=1` |
-| RX 6900 XT | IQ3_S ([report](../bench/results/2026-10-04-rdna2-pre75-attention/README.md)) | prompts +4-6% alone, +7-12% with #835 |
+| RX 6900 XT | IQ3_S ([report](bench-results/2026-10-04-rdna2-pre75-attention/README.md)) | prompts +4-6% alone, +7-12% with #835 |
 | RX 5500 XT, 8 GB | IQ3_S, 8K prompt (#442) | decode 15.3 tok/s |
 | RX 5700 XT, 8 GB | Coder IQ1_M, 32K context | prompt 115 / 144 / 149 tok/s and decode 18.0 / 20.3 / 23.3 tok/s at 4K / 16K / 30K; 6 of 6 needle checks; 607 of 12,288 experts in VRAM |
 | 2x MI50 | Coder IQ1_M, 128K context (#677) | decode 50.1 / 47.8 / 45.7 tok/s at 4K / 32K / 128K; prompt about 520 tok/s |
@@ -352,7 +352,7 @@ GPU time per verify window: dense projections 19.2 -> 11.2 ms, head 4.25 -> 2.1 
 10.7K). Locking clocks at 1050 MHz took one case from 25.0 to 29.1 tok/s at 10.7K context.
 
 **Tesla P40 sm_61 kernels.** Measured on: one Tesla P40 24 GB in a 20-vCPU VM (Xeon E5-2695 v4, 98 GB RAM), CUDA 12.4 (cuBLAS
-12.4.5.8), IQ3_S with MTP (`--spec 4`), int8 KV, `--max-context 262144`, engine 0.1.43.1 ([report](../bench/results/2026-10-12-p40-sm61-kernels/README.md)).
+12.4.5.8), IQ3_S with MTP (`--spec 4`), int8 KV, `--max-context 262144`, engine 0.1.43.1 ([report](bench-results/2026-10-12-p40-sm61-kernels/README.md)).
 
 | Change | Result on the P40 |
 | --- | --- |

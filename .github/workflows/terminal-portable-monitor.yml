@@ -4,26 +4,26 @@ on:
   push:
     paths:
       - .github/workflows/terminal-portable-monitor.yml
-      - packaging/monitor_bundle.py
-      - strata.py
-      - strata_cli/**
-      - strata_control/**
-      - tools/minimal_cli_smoke.py
-      - tools/portable_monitor_smoke.py
-      - tools/portable_monitor_pty_smoke.py
-      - requirements-monitor.txt
+      - tools/packaging/monitor_bundle.py
+      - terminal/strata.py
+      - terminal/strata_cli/**
+      - terminal/strata_control/**
+      - terminal/tools/minimal_cli_smoke.py
+      - terminal/tools/portable_monitor_smoke.py
+      - terminal/tools/portable_monitor_pty_smoke.py
+      - terminal/requirements-monitor.txt
       - LICENSE
   pull_request:
     paths:
       - .github/workflows/terminal-portable-monitor.yml
-      - packaging/monitor_bundle.py
-      - strata.py
-      - strata_cli/**
-      - strata_control/**
-      - tools/minimal_cli_smoke.py
-      - tools/portable_monitor_smoke.py
-      - tools/portable_monitor_pty_smoke.py
-      - requirements-monitor.txt
+      - tools/packaging/monitor_bundle.py
+      - terminal/strata.py
+      - terminal/strata_cli/**
+      - terminal/strata_control/**
+      - terminal/tools/minimal_cli_smoke.py
+      - terminal/tools/portable_monitor_smoke.py
+      - terminal/tools/portable_monitor_pty_smoke.py
+      - terminal/requirements-monitor.txt
       - LICENSE
   workflow_dispatch:
 
@@ -56,7 +56,7 @@ jobs:
           from pathlib import Path
 
           report = Path(os.environ['RUNNER_TEMP']) / 'minimal-cli-smoke.json'
-          subprocess.run([sys.executable, 'tools/minimal_cli_smoke.py',
+          subprocess.run([sys.executable, 'terminal/tools/minimal_cli_smoke.py',
                           '--report', str(report)], check=True)
           print(report.read_text())
           PY
@@ -71,15 +71,15 @@ jobs:
 
           bundle = Path(os.environ['RUNNER_TEMP']) / 'strata-monitor.pyz'
           report = bundle.with_name('monitor-stdlib-smoke.json')
-          subprocess.run([sys.executable, 'packaging/monitor_bundle.py',
+          subprocess.run([sys.executable, 'tools/packaging/monitor_bundle.py',
                           'build', str(bundle)], check=True)
-          subprocess.run([sys.executable, 'tools/portable_monitor_smoke.py',
+          subprocess.run([sys.executable, 'terminal/tools/portable_monitor_smoke.py',
                           '--bundle', str(bundle), '--report', str(report)], check=True)
           print(report.read_text())
           PY
       - name: Install optional Textual dependency
         if: matrix.python == '3.11'
-        run: python -m pip install -r requirements-monitor.txt
+        run: python -m pip install -r terminal/requirements-monitor.txt
       - name: Smoke test packaged interactive Overview
         if: matrix.python == '3.11'
         shell: bash
@@ -92,7 +92,7 @@ jobs:
 
           bundle = Path(os.environ['RUNNER_TEMP']) / 'strata-monitor.pyz'
           report = bundle.with_name('monitor-interactive-smoke.json')
-          subprocess.run([sys.executable, 'tools/portable_monitor_smoke.py',
+          subprocess.run([sys.executable, 'terminal/tools/portable_monitor_smoke.py',
                           '--bundle', str(bundle), '--interactive',
                           '--report', str(report)], check=True)
           print(report.read_text())
@@ -109,7 +109,7 @@ jobs:
 
           bundle = Path(os.environ['RUNNER_TEMP']) / 'strata-monitor.pyz'
           report = bundle.with_name('monitor-pty-smoke.json')
-          subprocess.run([sys.executable, 'tools/portable_monitor_pty_smoke.py',
+          subprocess.run([sys.executable, 'terminal/tools/portable_monitor_pty_smoke.py',
                           '--bundle', str(bundle), '--report', str(report)], check=True)
           print(report.read_text())
           PY

@@ -1,39 +1,39 @@
 name: Config snapshot
 
-# tests/snapshot: what `strata launch`, the app's plain Load and the app's Models-screen Load hand the engine (arguments, environment, drafter,
+# terminal/tests/snapshot: what `strata launch`, the app's plain Load and the app's Models-screen Load hand the engine (arguments, environment, drafter,
 # confidence), for every simulated machine class and model set, against the golden files in tests/snapshot/golden.  Nothing is loaded,
 # downloaded or run on a GPU.  Windows and Linux must give byte-identical output, so both run.  A change that moves what users
-# get has to update the golden files in the same commit (STRATA_SNAPSHOT_UPDATE=1 python -m pytest tests/snapshot, see tests/snapshot/README.md).
+# get has to update the golden files in the same commit (STRATA_SNAPSHOT_UPDATE=1 python -m pytest terminal/tests/snapshot, see terminal/tests/snapshot/README.md).
 
 on:
   push:
     branches: [main]
     paths:
       - .github/workflows/snapshot.yml
-      - tests/snapshot/**
-      - serve/**
-      - strata_cli/**
-      - strata_control/**
-      - setup.py
-      - strata.py
+      - terminal/tests/snapshot/**
+      - terminal/serve/**
+      - terminal/strata_cli/**
+      - terminal/strata_control/**
+      - terminal/setup.py
+      - terminal/strata.py
       - requirements*.txt
-      - apps/host/server/**
-      - apps/host/package*.json
-      - packaging/**
+      - app/host/server/**
+      - app/host/package*.json
+      - tools/packaging/**
       - tools/check
   pull_request:
     paths:
       - .github/workflows/snapshot.yml
-      - tests/snapshot/**
-      - serve/**
-      - strata_cli/**
-      - strata_control/**
-      - setup.py
-      - strata.py
+      - terminal/tests/snapshot/**
+      - terminal/serve/**
+      - terminal/strata_cli/**
+      - terminal/strata_control/**
+      - terminal/setup.py
+      - terminal/strata.py
       - requirements*.txt
-      - apps/host/server/**
-      - apps/host/package*.json
-      - packaging/**
+      - app/host/server/**
+      - app/host/package*.json
+      - tools/packaging/**
       - tools/check
   workflow_dispatch:
 
@@ -74,11 +74,11 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-          cache-dependency-path: apps/host/package-lock.json
+          cache-dependency-path: app/host/package-lock.json
       - name: Python packages
-        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+        run: python -m pip install -r terminal/requirements.txt -r terminal/requirements-dev.txt
       - name: Host packages (the app's Load runs in Node)
-        working-directory: apps/host
+        working-directory: app/host
         run: npm ci --no-audit --no-fund
       - name: tools/check snapshot
         run: python tools/check --only snapshot --keep --scratch "${{ runner.temp }}/check" --timeout-scale ${{ matrix.timeout_scale }}

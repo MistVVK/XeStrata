@@ -1,13 +1,13 @@
-# Generated, not source: deterministic build products of tools/ (see docs/).
+# Generated, not source: deterministic build products of terminal/tools/ (see docs/).
 # tiny-qwen4exp.gguf is ~113 MB, over GitHub's 100 MB file limit -- regenerate with
-#   python tools/make_tiny_model.py
-bench/tiny-*.gguf
-bench/wide-*.gguf
-bench/micro/*.exe
-bench/micro/*.obj
-bench/micro/*.bin
-bench/micro/*.dll
-bench/micro/*.txt
+#   python terminal/tools/make_tiny_model.py
+tools/bench/tiny-*.gguf
+tools/bench/wide-*.gguf
+engine/bench/micro/*.exe
+engine/bench/micro/*.obj
+engine/bench/micro/*.bin
+engine/bench/micro/*.dll
+engine/bench/micro/*.txt
 *.log
 build*/
 pack/
@@ -25,46 +25,68 @@ __pycache__/
 *.occ1
 td.log
 
-# created by setup.py on the user's machine
+# created by terminal/setup.py on the user's machine
+/terminal/.venv/
 /.venv/
+/terminal/build/
 /build/
-/third_party/llama.cpp
+/engine/third_party/llama.cpp
+/terminal/third_party/llama.cpp
+/terminal/models/
 /models/
+/terminal/packs/
 /packs/
+/terminal/mtp/
 /mtp/
+/terminal/run-*.bat
 /run-*.bat
+/terminal/run-*.sh
 /run-*.sh
+/terminal/strata-*.json
 /strata-*.json
+/terminal/strata-*.log
 /strata-*.log
+/terminal/build-strata.bat
 /build-strata.bat
+/terminal/build-strata-cuda12.bat
 /build-strata-cuda12.bat
+/terminal/build-cuda12/
 /build-cuda12/
+/terminal/.strata-mcp/
 /.strata-mcp/
 
-# image encoder (setup.py --vision): build output and the generated build script
+# image encoder (terminal/setup.py --vision): build output and the generated build script
 build-vision*/
 build-vision.bat
 build-vision-cuda12.bat
 
-# setup.py outputs (engine, downloads) and release builds
-/engine/
+# terminal/setup.py outputs (engine, downloads) and release builds
+/terminal/engine/
+/terminal/engine-sycl/
 /engine-sycl/
+/terminal/engine-cuda12/
 /engine-cuda12/
+/terminal/build-release*/
 /build-release*/
+/terminal/dist/
 /dist/
 *.done
-/third_party/*.zip
+/engine/third_party/*.zip
+/terminal/third_party/*.zip
 
 # IDEs
 .vscode/
 .idea/
 .cursor/
 
+/terminal/.ccache/
 /.ccache/
+/terminal/.rocm-win/
 /.rocm-win/
 
 # Optional MCP raster cache
 *.tool-media/
+/terminal/.tool-media/
 /.tool-media/
 
 # local Windows HIP packaging output
@@ -75,23 +97,28 @@ dist-hip/
 .terminal-test-venv/
 node_modules/
 *.dmg
+/terminal/release/artifacts/
 /release/artifacts/
-/apps/host/dist/
-/apps/desktop/src-tauri/target/
-/apps/desktop/src-tauri/resources/node/*
-!/apps/desktop/src-tauri/resources/node/.gitignore
-# the Control component (bundled CPython + wheels + strata_control) is built by apps/desktop/scripts/stage-control.py
-/apps/desktop/src-tauri/resources/control/*
-!/apps/desktop/src-tauri/resources/control/.gitignore
-# the pruned DeepSeek Harness (MIT) is built by apps/desktop/scripts/stage-harness.mjs
-/apps/desktop/src-tauri/resources/harness/*
-!/apps/desktop/src-tauri/resources/harness/.gitignore
+/app/host/dist/
+/app/desktop/src-tauri/target/
+/app/desktop/src-tauri/resources/node/*
+!/app/desktop/src-tauri/resources/node/.gitignore
+# the Control component (bundled CPython + wheels + strata_control) is built by app/desktop/scripts/stage-control.py
+/app/desktop/src-tauri/resources/control/*
+!/app/desktop/src-tauri/resources/control/.gitignore
+# the pruned DeepSeek Harness (MIT) is built by app/desktop/scripts/stage-harness.mjs
+/app/desktop/src-tauri/resources/harness/*
+!/app/desktop/src-tauri/resources/harness/.gitignore
 # screenshots and checkpoints from the Mac rebuild live outside git (StrataSplit\evidence-archive)
-/apps/host/docs/evidence/
-/apps/host/docs/checkpoints/
+/app/host/docs/evidence/
+/app/host/docs/checkpoints/
 
 # DGX Spark build outputs and local venv (docs/DGX_SPARK_LINUX.md)
+/terminal/out-spark/
 /out-spark/
+/terminal/build-spark/
 /build-spark/
+/terminal/build-vision-spark/
 /build-vision-spark/
+/terminal/.venv-build/
 /.venv-build/

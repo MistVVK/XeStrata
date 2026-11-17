@@ -5,13 +5,13 @@
     python tools/release_manifest.py --write     write the manifest's versions into the current pages
 
 What it covers (standard library only, no network):
-  * the manifest against the code: app/Terminal version (strata_cli/__init__.py, apps/host and apps/desktop package
+  * the manifest against the code: app/Terminal version (terminal/strata_cli/__init__.py, app/host and app/desktop package
     files, Cargo.toml) and Control/engine version (the CMake project version);
   * the three installer file names in the manifest's asset list;
   * every installer file name (Strata-<version>-windows-x64-setup.exe, ...-linux-x86_64.AppImage, ...-macos-arm64.dmg)
     in a current page: the version must be the manifest's, and the file must be in the release's asset list;
   * the version lines of the pages listed in LINES below.
-Release notes, measurement logs and history/ keep the versions they were written with; tools/doc_pages.py says which
+Release notes, measurement logs and docs/history/ keep the versions they were written with; tools/doc_pages.py says which
 pages are archived.  To bump a release: change the version sources, edit docs/data/release.json, run --write, run --check.
 """
 import argparse
@@ -41,18 +41,18 @@ LINES = [
     ("AGENTS.md", r"^Version " + V + r", engine " + V + r"\.", ["product_version", "engine_version"]),
     ("docs/AI_REFERENCE.md", r"against the " + V + r" release tree \(app and Terminal " + V + r"; Control " + V + r", engines " + V + r"\)",
      ["product_version", "product_version", "control_version", "engine_version"]),
-    ("packaging/UPDATES.md", r"one per OS \(" + V + r"\)", ["product_version"]),
-    ("packaging/UPDATES.md", r'"app": \{[^\n]*\n\s*"version": "' + V + '"', ["product_version"]),
-    ("packaging/UPDATES.md", r"--target [a-z0-9_-]+ +--version " + V, ["product_version"]),
-    ("packaging/UPDATES.md", r'"control": \{"version": "' + V + '"', ["control_version"]),
-    ("packaging/UPDATES.md", r"pack-control <control folder> --version " + V, ["control_version"]),
-    ("packaging/UPDATES.md", r"VERSION file\s*\n\s*# \(" + V + r"\)", ["control_version"]),
-    ("packaging/UPDATES.md", r'"version": "' + V + r'", "platform": "linux-x86_64", "backend": "cuda"', ["engine_version"]),
-    ("packaging/UPDATES.md", r"engine/strata-engine-" + V + r"-linux-x86_64-cuda-cuda13", ["engine_version"]),
+    ("tools/packaging/UPDATES.md", r"one per OS \(" + V + r"\)", ["product_version"]),
+    ("tools/packaging/UPDATES.md", r'"app": \{[^\n]*\n\s*"version": "' + V + '"', ["product_version"]),
+    ("tools/packaging/UPDATES.md", r"--target [a-z0-9_-]+ +--version " + V, ["product_version"]),
+    ("tools/packaging/UPDATES.md", r'"control": \{"version": "' + V + '"', ["control_version"]),
+    ("tools/packaging/UPDATES.md", r"pack-control <control folder> --version " + V, ["control_version"]),
+    ("tools/packaging/UPDATES.md", r"VERSION file\s*\n\s*# \(" + V + r"\)", ["control_version"]),
+    ("tools/packaging/UPDATES.md", r'"version": "' + V + r'", "platform": "linux-x86_64", "backend": "cuda"', ["engine_version"]),
+    ("tools/packaging/UPDATES.md", r"engine/strata-engine-" + V + r"-linux-x86_64-cuda-cuda13", ["engine_version"]),
     ("docs/MEDIA_KIT.md", r"for Strata " + V + r"\.", ["product_version"]),
-    ("packaging/README.md", r"\(app and Terminal " + V + r", Control " + V + r", engines " + V + r"\)", ["product_version", "control_version", "engine_version"]),
-    ("packaging/ENGINE-COMPONENT.md", r'"name": "strata-engine", "version": "' + V + '"', ["engine_version"]),
-    ("packaging/ENGINE-COMPONENT.md", r"package_engine.py --src <build folder> --backend cuda --version " + V, ["engine_version"]),
+    ("tools/packaging/README.md", r"\(app and Terminal " + V + r", Control " + V + r", engines " + V + r"\)", ["product_version", "control_version", "engine_version"]),
+    ("tools/packaging/ENGINE-COMPONENT.md", r'"name": "strata-engine", "version": "' + V + '"', ["engine_version"]),
+    ("tools/packaging/ENGINE-COMPONENT.md", r"package_engine.py --src <build folder> --backend cuda --version " + V, ["engine_version"]),
 ]
 
 
@@ -73,13 +73,13 @@ def first(rel_path, pattern):
 
 def code_versions():
     """Where the versions come from in the source tree: name -> (value found, manifest key)."""
-    cmake = first("CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) ")
+    cmake = first("engine/CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) ")
     return {
         # the Terminal says the product version, or (a Control-only hotfix such as 0.2.13.1) the manifest's optional terminal_version
-        "strata_cli/__init__.py": (first("strata_cli/__init__.py", r'^PRODUCT_VERSION = "([^"]+)"'), "terminal_version"),
-        "apps/host/package.json": (json.loads(read("apps/host/package.json")).get("version"), "product_version"),
-        "apps/desktop/package.json": (json.loads(read("apps/desktop/package.json")).get("version"), "product_version"),
-        "apps/desktop/src-tauri/Cargo.toml": (first("apps/desktop/src-tauri/Cargo.toml", r'^version = "([^"]+)"'), "product_version"),
+        "terminal/strata_cli/__init__.py": (first("terminal/strata_cli/__init__.py", r'^PRODUCT_VERSION = "([^"]+)"'), "terminal_version"),
+        "app/host/package.json": (json.loads(read("app/host/package.json")).get("version"), "product_version"),
+        "app/desktop/package.json": (json.loads(read("app/desktop/package.json")).get("version"), "product_version"),
+        "app/desktop/src-tauri/Cargo.toml": (first("app/desktop/src-tauri/Cargo.toml", r'^version = "([^"]+)"'), "product_version"),
         "CMakeLists.txt (engine)": (cmake, "engine_version"),
         "CMakeLists.txt (Control)": (cmake, "control_version"),
     }

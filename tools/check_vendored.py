@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify third_party/strata-ggml, strata-gguf-py, strata-llama and stb against their manifests (UPSTREAM.md).   python tools/check_vendored.py [--upstream <llama.cpp dir>]
+"""Verify engine/third_party/strata-ggml, strata-gguf-py, strata-llama and stb against their manifests (UPSTREAM.md).   python tools/check_vendored.py [--upstream <llama.cpp dir>]
 
 The vendored ggml / ggml-cuda sources are frozen at the llama.cpp commit named in UPSTREAM.md.  The manifest lists every file with its
 kind and sha256 (text files are hashed with LF line ends, so a Windows checkout agrees with a Linux one):
@@ -13,7 +13,7 @@ kind and sha256 (text files are hashed with LF line ends, so a Windows checkout 
   patched    the same, with additions (checked here: every line of the counterpart is still there, in order; only lines were added)
 
 Checks: every listed file exists and has the listed hash; no file of the tree is missing from the list; the pin equals
-third_party/ggml/VERSION.txt; the LICENSE is there; every `edited` row names its upstream hash.  With --upstream <dir> the upstream
+engine/third_party/ggml/VERSION.txt; the LICENSE is there; every `edited` row names its upstream hash.  With --upstream <dir> the upstream
 hashes are also checked against that checkout (the files at the pin, e.g. `git archive` of the commit): `upstream` rows must equal the file
 there, `edited` rows must carry its hash.  Standard library only.  Exit 0 clean, 1 on any problem.
 """
@@ -24,13 +24,13 @@ import re
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-TREE = os.path.join("third_party", "strata-ggml")
-IDENTITY = ()      # a tree that keeps llama.cpp's layout and has no file under another name (third_party/strata-llama): an empty map, every file `upstream`
-GGML_RENAMED = {}   # (no file of third_party/strata-ggml has another name upstream: the quant header is ours since 0.2.16, include/strata/quant)
+TREE = os.path.join("engine", "third_party", "strata-ggml")
+IDENTITY = ()      # a tree that keeps llama.cpp's layout and has no file under another name (engine/third_party/strata-llama): an empty map, every file `upstream`
+GGML_RENAMED = {}   # (no file of engine/third_party/strata-ggml has another name upstream: the quant header is ours since 0.2.16, engine/include/strata/quant)
 # every vendored tree: (folder, maps a path in the tree to the path in the llama.cpp checkout at the pin)
 GGUF_PY_MAP = (("gguf/", "gguf-py/gguf/"), ("converter/conversion/", "conversion/"), ("converter/convert_hf_to_gguf.py", "convert_hf_to_gguf.py"),
                ("converter/LICENSE", "LICENSE"), ("LICENSE", "gguf-py/LICENSE"), ("pyproject.toml", "gguf-py/pyproject.toml"))
-STB_MAP = (("stb_image.h", "vendor/stb/stb_image.h"),)   # third_party/stb: the one header, from llama.cpp's vendor/stb
+STB_MAP = (("stb_image.h", "vendor/stb/stb_image.h"),)   # engine/third_party/stb: the one header, from llama.cpp's vendor/stb
 BEGIN, END = "<!-- vendored-files:begin -->", "<!-- vendored-files:end -->"
 NOT_LISTED = {"UPSTREAM.md"}          # the manifest itself
 TEXT_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".txt", ".cmake", ".in", ".md", ".inc", ".py", ".toml", ".typed"}
@@ -101,11 +101,11 @@ def check_tree(root, tree_rel, upmap, upstream, problems):
     """Check one vendored tree against its UPSTREAM.md; returns the one-line summary."""
     tree = os.path.join(root, tree_rel)
     rows, pin = parse(os.path.join(tree, "UPSTREAM.md"))
-    ver = os.path.join(root, "third_party", "ggml", "VERSION.txt")
+    ver = os.path.join(root, "engine", "third_party", "ggml", "VERSION.txt")
     if os.path.exists(ver):
         vpin = open(ver, encoding="utf-8").read().split()[0]
         if vpin != pin:
-            problems.append("%s: pin %s in UPSTREAM.md differs from third_party/ggml/VERSION.txt (%s)" % (tree_rel, pin, vpin))
+            problems.append("%s: pin %s in UPSTREAM.md differs from engine/third_party/ggml/VERSION.txt (%s)" % (tree_rel, pin, vpin))
     if not os.path.exists(os.path.join(tree, "LICENSE")):
         problems.append("%s: LICENSE is missing" % tree_rel)
     listed = set()
@@ -159,14 +159,14 @@ def check_tree(root, tree_rel, upmap, upstream, problems):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--upstream", help="a llama.cpp tree at the pinned commit (file paths as in llama.cpp; third_party/strata-gguf-py maps as in its UPSTREAM.md)")
+    ap.add_argument("--upstream", help="a llama.cpp tree at the pinned commit (file paths as in llama.cpp; engine/third_party/strata-gguf-py maps as in its UPSTREAM.md)")
     ap.add_argument("--root", default=ROOT)
     a = ap.parse_args(argv)
     problems = []
     summary = [check_tree(a.root, TREE, None, a.upstream, problems),
-               check_tree(a.root, os.path.join("third_party", "strata-gguf-py"), GGUF_PY_MAP, a.upstream, problems),
-               check_tree(a.root, os.path.join("third_party", "strata-llama"), IDENTITY, a.upstream, problems),
-               check_tree(a.root, os.path.join("third_party", "stb"), STB_MAP, a.upstream, problems)]
+               check_tree(a.root, os.path.join("engine", "third_party", "strata-gguf-py"), GGUF_PY_MAP, a.upstream, problems),
+               check_tree(a.root, os.path.join("engine", "third_party", "strata-llama"), IDENTITY, a.upstream, problems),
+               check_tree(a.root, os.path.join("engine", "third_party", "stb"), STB_MAP, a.upstream, problems)]
     for p in problems:
         print("check_vendored: " + p)
     if problems:

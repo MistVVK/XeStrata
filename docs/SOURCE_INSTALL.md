@@ -85,7 +85,7 @@ cmake --build build --target strata -j8
 
 Run against the resulting binary and the matching model config. Use the build instructions for
 [HIP](AMD_HIP.md), [SYCL](INTEL_ARC.md) or [Metal](MAC.md) when changing those backends.
-Follow [contribution validation requirements](../CONTRIBUTING.md) before requesting review.
+Follow [contribution validation requirements](../.github/CONTRIBUTING.md) before requesting review.
 
 For the Terminal monitor from a checkout:
 

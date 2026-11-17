@@ -3,7 +3,7 @@ name: Docs
 # The documentation checks (python tools/check --only docs): every local link in the current pages resolves, the version lines and
 # installer names agree with docs/data/release.json, the capability table and its summaries are what docs/data/capabilities.json says, and the
 # settings page matches the register.  Python standard library only; nothing is built, downloaded or run on a GPU.
-# Archived pages (history/, release notes, bench/results) are not checked; their baseline is history/LINK-BASELINE.md.
+# Archived pages (docs/history/, release notes, docs/bench-results) are not checked; their baseline is history/LINK-BASELINE.md.
 
 on:
   push:
@@ -13,34 +13,34 @@ on:
       - '**/*.md'
       - docs/data/release.json
       - docs/data/capabilities.json
-      - data/settings-register.json
+      - terminal/data/settings-register.json
       - tools/check
       - tools/check_links.py
       - tools/doc_pages.py
       - tools/release_manifest.py
       - tools/capability_table.py
       - tools/settings_register.py
-      - strata_cli/__init__.py
-      - CMakeLists.txt
-      - apps/host/package.json
-      - apps/desktop/package.json
+      - terminal/strata_cli/__init__.py
+      - engine/CMakeLists.txt
+      - app/host/package.json
+      - app/desktop/package.json
   pull_request:
     paths:
       - .github/workflows/docs.yml
       - '**/*.md'
       - docs/data/release.json
       - docs/data/capabilities.json
-      - data/settings-register.json
+      - terminal/data/settings-register.json
       - tools/check
       - tools/check_links.py
       - tools/doc_pages.py
       - tools/release_manifest.py
       - tools/capability_table.py
       - tools/settings_register.py
-      - strata_cli/__init__.py
-      - CMakeLists.txt
-      - apps/host/package.json
-      - apps/desktop/package.json
+      - terminal/strata_cli/__init__.py
+      - engine/CMakeLists.txt
+      - app/host/package.json
+      - app/desktop/package.json
 
 permissions:
   contents: read

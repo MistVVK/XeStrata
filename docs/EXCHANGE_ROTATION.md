@@ -182,9 +182,9 @@ AMD and Windows GPU execution remain untested.
 
 The same Blackwell binary passed both CTest checks and the three-mode CUDA
 fixture; Compute Sanitizer reported 0 errors. The
-[receipt](../bench/results/exchange-rotation-ab.json) contains source, binary,
+[receipt](bench-results/exchange-rotation-ab.json) contains source, binary,
 model, pack and profile hashes, arguments, timings and diagnostics. The
-[raw IDs](../bench/results/exchange-rotation-token-ids.json) retain the input
+[raw IDs](bench-results/exchange-rotation-token-ids.json) retain the input
 and both outputs. To check the token comparison without a model:
 
 ```bash

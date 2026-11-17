@@ -5,7 +5,7 @@ labels: ["question"]
 body:
   - type: markdown
     value: |
-      Not sure how to do something, or want to share numbers from your machine? Ask here. To share a full benchmark, see [CONTRIBUTING.md](https://github.com/Niko1221/Strata/blob/main/CONTRIBUTING.md#share-a-benchmark).
+      Not sure how to do something, or want to share numbers from your machine? Ask here. To share a full benchmark, see [CONTRIBUTING.md](https://github.com/Niko1221/Strata/blob/main/.github/CONTRIBUTING.md#share-a-benchmark).
 
       **The title must start with its area:** [Engine], [GUI], [TUI], [Benchmark], [Docs] or [Other]. Choose the same one below.
   - type: dropdown

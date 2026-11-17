@@ -14,8 +14,8 @@ SKIP_DIRS = {".git", "node_modules", "third_party", "dist", "target", "build", "
 # Archived material: dated reports, finished campaigns, release notes, measurement logs.  They keep the versions and
 # the links they had when they were written.  (Folders end in "/"; "docs/release-notes-" is a file-name prefix.)
 ARCHIVE_PREFIXES = (
-    "history/",
-    "bench/results/",
+    "docs/history/",
+    "docs/bench-results/",
     "phaseA-tests/",
     "docs/release-notes-",
 )

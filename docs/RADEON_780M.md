@@ -132,7 +132,7 @@ this checkout's own documentation, 128 greedy tokens each: prefill holds ~310 to
 the average over the full read, and the last ~14K tokens at 128K depth read at ~206 tok/s with the prefix cached.
 Decode holds ~16 tok/s to 32K, then 12.1 at 64K and 9.8-9.9 at 96-128K (draft acceptance stays ~70%, so it is
 context cost, not the drafter). Memory stays flat: 38.1 of 50 GiB GTT at 131K. Raw:
-[bench/results/2026-10-12-community-gfx1103](../bench/results/2026-10-12-community-gfx1103/README.md).
+[bench/results/2026-10-12-community-gfx1103](bench-results/2026-10-12-community-gfx1103/README.md).
 
 ## 8. Not tested
 

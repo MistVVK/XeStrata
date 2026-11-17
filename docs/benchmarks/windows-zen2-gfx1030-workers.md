@@ -54,7 +54,7 @@ With `--expert-cache auto`, it selected 2,675 effective slots and had 1,143 MiB 
 Three fresh requests per short/4K case produced decode medians of **43.13 / 57.91 tok/s** and client TTFT medians of
 **2.20 / 14.29 seconds**. These are separate validation of the final automatic path: cache capacity differs from
 the paired runs, and outputs/draft acceptance also differ, so this row is not an additional affinity-only speedup.
-The [final configuration and metadata](../../bench/results/2026-10-03-windows-groups/final-auto-metadata.json)
+The [final configuration and metadata](../bench-results/2026-10-03-windows-groups/final-auto-metadata.json)
 and raw data are preserved with the paired results.
 
 ## Scope and checks
@@ -77,10 +77,10 @@ container environment and multiple NUMA nodes; this Strata measurement used a na
 does not claim an operating-system or Docker fix.
 
 The full probe, raw inference runs, configs, build metadata, and reproduction script are preserved at
-[the measurement directory](../../bench/results/2026-10-03-windows-groups/README.md).
-The [original official-release measurements](../../bench/results/2026-10-03-rx6900xt-coder/README.md) retain the earlier manual-worker sweep as historical evidence.
+[the measurement directory](../bench-results/2026-10-03-windows-groups/README.md).
+The [original official-release measurements](../bench-results/2026-10-03-rx6900xt-coder/README.md) retain the earlier manual-worker sweep as historical evidence.
 
 After these measurements, PR #626 changed the host path to reversible CPU Set selection while keeping hard group
 affinity on pool-owned workers. The saved throughput figures above belong to their recorded revisions, not this
-later host-restoration change. Its [review validation](../../bench/results/2026-10-03-windows-groups/review-validation.md)
+later host-restoration change. Its [review validation](../bench-results/2026-10-03-windows-groups/review-validation.md)
 records the build and regression tests; inference throughput was not remeasured for that revision.

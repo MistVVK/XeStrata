@@ -1,0 +1,2 @@
+# <path glob> | <text that occurs in the line> | <reason>   (hits of checks/path_scan.py that are not breaks)
+terminal/tools/test_cyrillic_paths.py | "../START-HERE.bat" | the test joins the name onto the Terminal folder (terminal/), whose parent holds START-HERE.bat; edited by move_0216_edits.py

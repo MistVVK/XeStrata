@@ -14,7 +14,7 @@ There are two ways in:
 - **The Strata app (`.dmg`) and the Terminal (`strata launch`).** The Metal engine comes ready-made: the `.dmg` has it inside and
   the Terminal fetches it as an engine component. Nothing is built on your Mac and you need no Command Line Tools. If macOS says
   the app is "damaged", see [Troubleshooting](TROUBLESHOOTING.md#the-desktop-app-and-the-terminal). How the builds are signed:
-  [packaging/mac/README.md](../packaging/mac/README.md).
+  [packaging/mac/README.md](../tools/packaging/mac/README.md).
 - **From source: `./setup.sh`.** It sets things up the way `START-HERE.bat` does on Windows and builds the engine on your Mac
   (about 1 to 15 minutes).
 
