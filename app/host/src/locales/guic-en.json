@@ -79,5 +79,6 @@
  "guic78": "Last: {0} tokens at {1} tok/s",
  "guic79": "Last: {0} tokens",
  "guic80": "Strata couldn’t read its download list, so it can’t pick an engine yet. Press Try again, or choose another way below.",
- "guic81": "Tasks run on a model loaded on this computer. Load one in Models."
+ "guic81": "Tasks run on a model loaded on this computer. Load one in Models.",
+ "guic82": "Strata’s background part has stopped. Close Strata and open it again."
 }

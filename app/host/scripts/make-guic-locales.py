@@ -857,6 +857,16 @@ add(en="Tasks run on a model loaded on this computer. Load one in Models.",
     ko="작업은 이 컴퓨터에 불러온 모델에서 실행됩니다. 모델 화면에서 불러오세요.",
     fr="Les tâches s’exécutent sur un modèle chargé sur cet ordinateur. Chargez-en un dans Modèles.",
     he="משימות רצות על מודל שנטען במחשב הזה. טענו מודל במסך המודלים.")
+add(en="Strata’s background part has stopped. Close Strata and open it again.",
+    zh="Strata 的后台部分已停止。请关闭 Strata 后重新打开。",
+    ja="Strata のバックグラウンド部分が停止しました。Strata を閉じて、もう一度開いてください。",
+    de="Der Hintergrundteil von Strata wurde beendet. Schließen Sie Strata und öffnen Sie es erneut.",
+    es="La parte en segundo plano de Strata se ha detenido. Cierra Strata y ábrelo de nuevo.",
+    ru="Фоновая часть Strata остановлена. Закройте Strata и откройте её снова.",
+    pt="A parte em segundo plano do Strata parou. Feche o Strata e abra-o novamente.",
+    ko="Strata의 백그라운드 부분이 중지되었습니다. Strata를 닫았다가 다시 여세요.",
+    fr="La partie en arrière-plan de Strata s’est arrêtée. Fermez Strata et rouvrez-le.",
+    he="החלק הפועל ברקע של Strata נעצר. יש לסגור את Strata ולפתוח אותו מחדש.")
 here = APP / "src" / "locales"
 NBSP = " "
 

@@ -79,5 +79,6 @@
  "guic78": "Último: {0} tokens a {1} tok/s",
  "guic79": "Último: {0} tokens",
  "guic80": "Strata no pudo leer su lista de descargas, así que todavía no puede elegir un motor. Pulsa Volver a intentarlo o elige otra opción más abajo.",
- "guic81": "Las tareas se ejecutan con un modelo cargado en este equipo. Carga uno en Modelos."
+ "guic81": "Las tareas se ejecutan con un modelo cargado en este equipo. Carga uno en Modelos.",
+ "guic82": "La parte en segundo plano de Strata se ha detenido. Cierra Strata y ábrelo de nuevo."
 }

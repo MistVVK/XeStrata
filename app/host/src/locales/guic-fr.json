@@ -79,5 +79,6 @@
  "guic78": "Dernier : {0} jetons à {1} tok/s",
  "guic79": "Dernier : {0} jetons",
  "guic80": "Strata n’a pas pu lire sa liste de téléchargements et ne peut pas encore choisir de moteur. Cliquez sur Réessayer ou choisissez une autre option ci-dessous.",
- "guic81": "Les tâches s’exécutent sur un modèle chargé sur cet ordinateur. Chargez-en un dans Modèles."
+ "guic81": "Les tâches s’exécutent sur un modèle chargé sur cet ordinateur. Chargez-en un dans Modèles.",
+ "guic82": "La partie en arrière-plan de Strata s’est arrêtée. Fermez Strata et rouvrez-le."
 }

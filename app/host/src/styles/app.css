@@ -3707,6 +3707,11 @@ textarea.st-input {
   flex: 1 1 220px;
   min-width: 0;
 }
+.connbar__stopped {
+  flex-basis: 100%;
+  margin: 0 0 0 18px;
+  font-weight: 600;
+}
 
 /* The recommended model carries one step more weight than the rest.
    Restrained on purpose: it already explains itself in words, so this only has
