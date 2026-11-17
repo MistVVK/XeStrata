@@ -22,6 +22,7 @@
 //   prefill_decode_golden <file>            check: every format this build decodes must match the file (exit 1 if not, 77 without a card)
 //   prefill_decode_golden --write <file>    write the file (only if the oracle holds)
 //   prefill_decode_golden --print           print the lines
+#include "ggml.h"   // the oracle's ggml_type / ggml_get_type_traits (moe_fused_iq.cu no longer includes ggml.h: it uses strata/quant/types.hpp)
 #define STRATA_FUSED_DECODE_ONLY 1
 #include "../../src/prefill/moe_fused_iq.cu"
 
