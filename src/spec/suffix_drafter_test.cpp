@@ -14,6 +14,7 @@
 // No model runs; this measures the drafter on text, not on the model's own outputs.
 #include "strata/spec/suffix_drafter.hpp"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -207,9 +208,11 @@ int main(int argc, char** argv) {
             const Sim p = simulate(ids, {ids.begin() + a, ids.begin() + b}, K);
             const char* name = std::strrchr(argv[f], '/') ? std::strrchr(argv[f], '/') + 1 : argv[f];
             std::printf("%-28s %8zu | %8.2f %10.1f%% %10.2f              | %8.2f %10.1f%% %10.2f\n", name, ids.size(),
-                        (double) c.tokens / c.steps, 100.0 * c.proposals / c.steps,
-                        c.proposals ? (double) c.accepted / c.proposals : 0.0, (double) p.tokens / p.steps,
-                        100.0 * p.proposals / p.steps, p.proposals ? (double) p.accepted / p.proposals : 0.0);
+                        (double) c.tokens / (double) c.steps, 100.0 * (double) c.proposals / (double) c.steps,
+                        c.proposals ? (double) c.accepted / (double) c.proposals : 0.0,
+                        (double) p.tokens / (double) p.steps,
+                        100.0 * (double) p.proposals / (double) p.steps,
+                        p.proposals ? (double) p.accepted / (double) p.proposals : 0.0);
         }
         return 0;
     }

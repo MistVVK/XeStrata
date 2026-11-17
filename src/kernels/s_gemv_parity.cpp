@@ -326,7 +326,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     mean /= (double) ms.size();
 
     const double weights = (double) n_in * (double) n_out;
-    const double bytes = (double) n_out * (double) codes_per_row + (double) n_out * n_groups * 4.0;
+    const double bytes = (double) n_out * (double) codes_per_row + (double) n_out * (double) n_groups * 4.0;
     std::printf("s2_gemv bench  [%lld x %lld]  %d iters\n", n_in, n_out, iters);
     std::printf("  ms per gemv: min %.4f  median %.4f  mean %.4f\n", ms.front(), ms[ms.size() / 2], mean);
     std::printf("  min -> %.1f G weights/s, %.1f GiB/s of S2 streamed\n", weights / ms.front() / 1e6,

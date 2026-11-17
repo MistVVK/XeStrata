@@ -234,7 +234,7 @@ int main() {
 
     long bad_blocks = 0;
     const int blocks_per_head = D / k::QK4_0; // 8
-    const int bytes_per_head = blocks_per_head * sizeof(k::block_q4_0); // 144
+    const int bytes_per_head = (int) (blocks_per_head * sizeof(k::block_q4_0)); // 144
 
     for (int n = 0; n < n_fill; ++n) {
         const int pos = positions[n];
