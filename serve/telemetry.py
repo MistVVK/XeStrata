@@ -5,8 +5,8 @@ A background thread samples once a second and keeps the last 60 readings of each
   pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
   amdgpu driver's Linux sysfs files - load, VRAM, temperature and power; on Windows, for the Monitor, the driver's AMD Display
   Library (ADL2 PMLog, #4884).  On macOS (Metal backend): IOKit's
-  IOAccelerator registry - load and VRAM; the temperature and power sensors need root (`powermetrics`), and an Apple
-  Silicon GPU sits on the die, so there is no PCIe link.
+  IOAccelerator registry - load and VRAM; temperature and power from the HID sensors and IOReport's energy counter
+  without root (AppleSensors, as Stats reads them; opt-in, only for the Monitor), and an Apple Silicon GPU sits on the die, so there is no PCIe link.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -18,6 +18,7 @@ import ctypes
 import os
 from strata_control import sysinfo
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -649,21 +650,331 @@ def metal_working_set():
         return None
 
 
+class _SMCKeyData(ctypes.Structure):
+    """AppleSMC's 80-byte call record (the SMCKeyData_t of Stats' SMC/smc.swift): key, then the command in data8."""
+    class _Info(ctypes.Structure):
+        _fields_ = [("size", ctypes.c_uint32), ("type", ctypes.c_uint32), ("attr", ctypes.c_uint8)]
+
+    _fields_ = [("key", ctypes.c_uint32), ("vers", ctypes.c_uint8 * 6), ("plimit", ctypes.c_uint8 * 16),
+                ("info", _Info), ("result", ctypes.c_uint8), ("status", ctypes.c_uint8), ("data8", ctypes.c_uint8),
+                ("data32", ctypes.c_uint32), ("bytes", ctypes.c_uint8 * 32)]
+
+
+# AppleSMC's GPU die temperature keys, by chip.  The rows are Stats' (exelban/stats, MIT: Modules/Sensors/values.swift at
+# commit 032f4a5e4, the GPU temperature rows of each chip generation, in Stats' order); nothing here was worked out
+# independently.  Only the M5's have been run, on an M5 Pro (idle readings also on an M5 Max); the rest are copied and have not been run on those chips.
+# A key does not keep its meaning from chip to chip (Tg0j is GPU 2 on an M2, GPU 7 on an M4 and GPU 5 on an M5, and an
+# M3's are Tf..), and on the M4 the base chip and the Pro/Max differ in their first two (SMC_GPU_TIER_KEYS), so the
+# table is keyed by the chip and never guessed.  A key a chip variant does not have is skipped, and a chip that is not
+# here reads none and falls back to the HID sensors.
+SMC_GPU_KEYS = {
+    "M1": ("Tg05", "Tg0D", "Tg0L", "Tg0T"),
+    "M2": ("Tg0f", "Tg0j"),
+    "M3": ("Tf14", "Tf18", "Tf19", "Tf1A", "Tf24", "Tf28", "Tf29", "Tf2A"),
+    "M4": ("Tg0K", "Tg0L", "Tg0d", "Tg0e", "Tg0j", "Tg0k"),
+    "M5": ("Tg0U", "Tg0X", "Tg0d", "Tg0g", "Tg0j", "Tg1Y", "Tg1c", "Tg1g"),
+    "M6": ("Tg1e", "Tg0d", "Tg0c", "Tg0b", "Tg1c", "Tg1d", "Tg07", "Tg1f", "Tg09", "Tg0a", "Tg1g", "Tg1h"),
+    "A18 Pro": ("Tg05", "Tg0D", "Tg0L", "Tg0e"),
+}
+SMC_GPU_TIER_KEYS = {("M4", ""): ("Tg0G", "Tg0H"), ("M4", "Pro"): ("Tg1U", "Tg1k"), ("M4", "Max"): ("Tg1U", "Tg1k")}
+
+
+def smc_gpu_keys(brand):
+    """The SMC keys of the GPU's die sensors for this CPU brand string ("Apple M4 Pro"), or None for a chip the table
+    does not have (Intel, or an Apple chip newer than Stats' table)."""
+    m = re.search(r"\bApple (M\d+|A\d+ Pro)(?: (Pro|Max|Ultra))?\b", brand or "")
+    keys = SMC_GPU_KEYS.get(m.group(1)) if m else None
+    if not keys:
+        return None
+    if m.group(1) == "M4":                          # the first two keys depend on the tier
+        first = SMC_GPU_TIER_KEYS.get(("M4", m.group(2) or ""))
+        return first + keys if first else None
+    return keys
+
+
+class _AppleNative:
+    """The macOS calls behind the Apple Silicon GPU's temperature and power, made without root the way Stats
+    (exelban/stats, MIT: Modules/Sensors/reader.m, readers.swift) makes them: IOHIDEventSystemClient's temperature
+    sensors (Apple's usage page 0xff00, usage 5), AppleSMC's per-chip GPU temperature keys, and IOReport's "Energy
+    Model" channels.  All are private API: every function is looked up by name, and a macOS without one leaves that
+    reading empty instead of raising."""
+    EV_TEMP = 15                                    # kIOHIDEventTypeTemperature
+    UTF8 = 0x08000100                               # kCFStringEncodingUTF8
+    SINT32 = 3                                      # kCFNumberSInt32Type
+    SMC_INDEX, SMC_KEY_INFO, SMC_READ = 2, 9, 5     # the AppleSMC user-client selector, and its two commands
+    SMC_FLT = int.from_bytes(b"flt ", "big")
+
+    def __init__(self):
+        self.hid = None                             # the HID client, None without the calls
+        self.rep = None                             # (subscription, its channels), None without IOReport
+        self.smc = None                             # (AppleSMC connection, this chip's GPU keys), None without them
+        self._prev = None                           # the last IOReport sample, for the next delta
+        try:
+            self.cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            self.io = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+        except OSError:
+            return
+        try:
+            self._cf_init()
+        except (AttributeError, ValueError):
+            return
+        for init in (self._hid_init, self._report_init, self._smc_init):
+            try:
+                init()
+            except (OSError, AttributeError, ValueError):
+                pass
+
+    @staticmethod
+    def _sig(lib, sigs):
+        for name, res, args in sigs:
+            f = getattr(lib, name)                  # AttributeError when this macOS has no such symbol
+            f.restype, f.argtypes = res, args
+
+    def _cf_init(self):
+        vp, long_ = ctypes.c_void_p, ctypes.c_long
+        self._sig(self.cf, [
+            ("CFRelease", None, [vp]),
+            ("CFStringCreateWithCString", vp, [vp, ctypes.c_char_p, ctypes.c_uint32]),
+            ("CFStringGetCString", ctypes.c_bool, [vp, ctypes.c_char_p, long_, ctypes.c_uint32]),
+            ("CFNumberCreate", vp, [vp, long_, vp]),
+            ("CFDictionaryCreate", vp, [vp, vp, vp, long_, vp, vp]),
+            ("CFDictionaryCreateMutableCopy", vp, [vp, long_, vp]),
+            ("CFDictionaryGetCount", long_, [vp]),
+            ("CFDictionaryGetValue", vp, [vp, vp]),
+            ("CFArrayGetCount", long_, [vp]),
+            ("CFArrayGetValueAtIndex", vp, [vp, long_])])
+
+    def _str(self, s):
+        return self.cf.CFStringCreateWithCString(None, s.encode(), self.UTF8)
+
+    def _pystr(self, ref):
+        buf = ctypes.create_string_buffer(256)
+        return buf.value.decode("utf-8", "replace") if ref and self.cf.CFStringGetCString(ref, buf, 256, self.UTF8) else ""
+
+    def _hid_init(self):
+        vp = ctypes.c_void_p
+        self._sig(self.io, [
+            ("IOHIDEventSystemClientCreate", vp, [vp]),
+            ("IOHIDEventSystemClientSetMatching", ctypes.c_int, [vp, vp]),
+            ("IOHIDEventSystemClientCopyServices", vp, [vp]),
+            ("IOHIDServiceClientCopyProperty", vp, [vp, vp]),
+            ("IOHIDServiceClientCopyEvent", vp, [vp, ctypes.c_int64, ctypes.c_int32, ctypes.c_int64]),
+            ("IOHIDEventGetFloatValue", ctypes.c_double, [vp, ctypes.c_int32])])
+        cf = self.cf
+        page, usage = ctypes.c_int32(0xFF00), ctypes.c_int32(5)
+        keys = (vp * 2)(self._str("PrimaryUsagePage"), self._str("PrimaryUsage"))
+        vals = (vp * 2)(cf.CFNumberCreate(None, self.SINT32, ctypes.byref(page)),
+                        cf.CFNumberCreate(None, self.SINT32, ctypes.byref(usage)))
+        kcb = ctypes.addressof(ctypes.c_char.in_dll(cf, "kCFTypeDictionaryKeyCallBacks"))
+        vcb = ctypes.addressof(ctypes.c_char.in_dll(cf, "kCFTypeDictionaryValueCallBacks"))
+        match = cf.CFDictionaryCreate(None, ctypes.cast(keys, vp), ctypes.cast(vals, vp), 2, kcb, vcb)
+        for o in (*keys, *vals):                    # the dictionary keeps its own references
+            if o:
+                cf.CFRelease(o)
+        if not match:
+            return
+        client = self.io.IOHIDEventSystemClientCreate(None)
+        if client:
+            self.io.IOHIDEventSystemClientSetMatching(client, match)
+            self._product = self._str("Product")
+            self.hid = client
+        cf.CFRelease(match)
+
+    def _report_init(self):
+        vp = ctypes.c_void_p
+        rep = ctypes.CDLL("/usr/lib/libIOReport.dylib")
+        self._sig(rep, [
+            ("IOReportCopyChannelsInGroup", vp, [vp, vp, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]),
+            ("IOReportCreateSubscription", vp, [vp, vp, ctypes.POINTER(vp), ctypes.c_uint64, vp]),
+            ("IOReportCreateSamples", vp, [vp, vp, vp]),
+            ("IOReportCreateSamplesDelta", vp, [vp, vp, vp]),
+            ("IOReportChannelGetChannelName", vp, [vp]),
+            ("IOReportChannelGetUnitLabel", vp, [vp]),
+            ("IOReportSimpleGetIntegerValue", ctypes.c_int64, [vp, ctypes.c_int32])])
+        self.lib_rep = rep
+        group = self._str("Energy Model")
+        chan = rep.IOReportCopyChannelsInGroup(group, None, 0, 0, 0)
+        self.cf.CFRelease(group)
+        if not chan:
+            return
+        mut = self.cf.CFDictionaryCreateMutableCopy(None, self.cf.CFDictionaryGetCount(chan), chan)
+        self.cf.CFRelease(chan)
+        subbed = vp()
+        sub = rep.IOReportCreateSubscription(None, mut, ctypes.byref(subbed), 0, None)
+        if sub and subbed:
+            self._channels_key = self._str("IOReportChannels")
+            self.rep = (sub, subbed)
+
+    def _smc_init(self):
+        brand = ctypes.create_string_buffer(128)
+        size = ctypes.c_size_t(len(brand))
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib")
+        if libc.sysctlbyname(b"machdep.cpu.brand_string", brand, ctypes.byref(size), None, 0):
+            return
+        keys = smc_gpu_keys(brand.value.decode("utf-8", "replace"))
+        if not keys:
+            return
+        vp, u32 = ctypes.c_void_p, ctypes.c_uint32
+        self._sig(self.io, [
+            ("IOServiceMatching", vp, [ctypes.c_char_p]),
+            ("IOServiceGetMatchingService", u32, [u32, vp]),
+            ("IOServiceOpen", ctypes.c_int, [u32, u32, u32, ctypes.POINTER(u32)]),
+            ("IOObjectRelease", ctypes.c_int, [u32]),
+            ("IOConnectCallStructMethod", ctypes.c_int,
+             [u32, u32, vp, ctypes.c_size_t, vp, ctypes.POINTER(ctypes.c_size_t)])])
+        dev = self.io.IOServiceGetMatchingService(0, self.io.IOServiceMatching(b"AppleSMC"))
+        if not dev:
+            return
+        conn = u32()
+        opened = self.io.IOServiceOpen(dev, u32.in_dll(libc, "mach_task_self_").value, 0, ctypes.byref(conn)) == 0
+        self.io.IOObjectRelease(dev)
+        if opened:
+            self.smc = (conn.value, keys)
+
+    def _smc_call(self, key, cmd, size=0):
+        """The SMC's answer to one command on a key, or None when the key is not there (result 0x84) or the call fails."""
+        i, o = _SMCKeyData(), _SMCKeyData()
+        i.key, i.data8, i.info.size = int.from_bytes(key.encode(), "big"), cmd, size
+        n = ctypes.c_size_t(ctypes.sizeof(o))
+        r = self.io.IOConnectCallStructMethod(self.smc[0], self.SMC_INDEX, ctypes.byref(i), ctypes.sizeof(i),
+                                              ctypes.byref(o), ctypes.byref(n))
+        return o if r == 0 and o.result == 0 else None
+
+    def gpu_smc(self):
+        """[°C] of this chip's GPU SMC keys that exist (all four-byte floats, as on an M5); [] without them."""
+        if not self.smc:
+            return []
+        out = []
+        for key in self.smc[1]:
+            info = self._smc_call(key, self.SMC_KEY_INFO)
+            if not info or (info.info.type, info.info.size) != (self.SMC_FLT, 4):
+                continue
+            val = self._smc_call(key, self.SMC_READ, 4)
+            if val:
+                out.append(struct.unpack("<f", bytes(val.bytes[:4]))[0])
+        return out
+
+    def temps(self):
+        """[(sensor name, °C)] of every HID temperature sensor; [] without the calls."""
+        if not self.hid:
+            return []
+        cf, io = self.cf, self.io
+        svcs = io.IOHIDEventSystemClientCopyServices(self.hid)
+        if not svcs:
+            return []
+        out = []
+        try:
+            for i in range(cf.CFArrayGetCount(svcs)):
+                s = cf.CFArrayGetValueAtIndex(svcs, i)
+                name = io.IOHIDServiceClientCopyProperty(s, self._product)
+                ev = io.IOHIDServiceClientCopyEvent(s, self.EV_TEMP, 0, 0)
+                try:
+                    if name and ev:
+                        out.append((self._pystr(name), io.IOHIDEventGetFloatValue(ev, self.EV_TEMP << 16)))
+                finally:
+                    for o in (name, ev):
+                        if o:
+                            cf.CFRelease(o)
+        finally:
+            cf.CFRelease(svcs)
+        return out
+
+    def energy(self):
+        """[(channel name, unit label, value)] of the Energy Model channels since the previous call; [] on the
+        first call and without IOReport."""
+        if not self.rep:
+            return []
+        cf, rep = self.cf, self.lib_rep
+        cur = rep.IOReportCreateSamples(self.rep[0], self.rep[1], None)
+        prev, self._prev = self._prev, cur
+        if not (prev and cur):
+            if prev:
+                cf.CFRelease(prev)
+            return []
+        delta = rep.IOReportCreateSamplesDelta(prev, cur, None)
+        cf.CFRelease(prev)
+        if not delta:
+            return []
+        out = []
+        try:
+            arr = cf.CFDictionaryGetValue(delta, self._channels_key)   # not retained: owned by the delta
+            for i in range(cf.CFArrayGetCount(arr) if arr else 0):
+                ch = cf.CFArrayGetValueAtIndex(arr, i)
+                out.append((self._pystr(rep.IOReportChannelGetChannelName(ch)),
+                            self._pystr(rep.IOReportChannelGetUnitLabel(ch)),
+                            rep.IOReportSimpleGetIntegerValue(ch, 0)))
+        finally:
+            cf.CFRelease(delta)
+        return out
+
+
+class AppleSensors:
+    """The Apple Silicon GPU's temperature and power from _AppleNative's raw readings (a fake one in the tests).
+
+    Temperature: the mean of the chip's SMC GPU keys (Stats' per-chip TgXX table, which is where an M5 has them: its
+    HID service names no GPU sensor), else of the HID sensors named "GPU MTR Temp..."; readings outside 0-110 °C are
+    dropped as Stats does.  A chip with neither shows no temperature.
+    Power: the "GPU Energy" channel's energy since the last reading over the time since it.  Opt-in:
+    STRATA_MACOS_SENSORS=1."""
+    GPU_PREFIX = "GPU MTR Temp"
+    JOULES = {"mJ": 1e-3, "uJ": 1e-6, "µJ": 1e-6, "nJ": 1e-9}
+
+    def __init__(self, native=None, clock=time.monotonic):
+        self.native = native if native is not None else _AppleNative()
+        self.clock = clock
+        self._t = None
+        self.energy()                               # the first delta's baseline
+
+    def gpu_temp(self):
+        v = [t for t in getattr(self.native, "gpu_smc", list)() if 0 < t < 110]   # 0: the SMC's "no data"
+        if not v:
+            v = [t for name, t in self.native.temps() if name.startswith(self.GPU_PREFIX) and 0 <= t < 110]
+        return round(sum(v) / len(v), 1) if v else None
+
+    def energy(self):
+        """Joules the GPU used since the previous call, and the seconds since it; (None, None) on the first call."""
+        rows, now = self.native.energy(), self.clock()
+        prev, self._t = self._t, now
+        j = [v * self.JOULES[u] for name, u, v in rows if name.endswith("GPU Energy") and u in self.JOULES]
+        return (sum(j), now - prev) if j and prev is not None and now > prev else (None, None)
+
+    def gpu_power(self):
+        j, dt = self.energy()
+        return round(j / dt, 2) if j is not None else None
+
+    def available(self):
+        """Whether either reading can be there: a GPU temperature now, or IOReport's subscription (its first power
+        reading needs a second sample)."""
+        return self.gpu_temp() is not None or bool(getattr(self.native, "rep", None))
+
+
+def apple_sensors():
+    """AppleSensors on macOS when STRATA_MACOS_SENSORS=1, else None: the sensors are private API, so they are opt-in and
+    a Mac's Monitor is what it was without the variable."""
+    if sys.platform != "darwin" or os.environ.get("STRATA_MACOS_SENSORS") != "1":
+        return None
+    return AppleSensors()
+
+
 class _Metal:
     """macOS: an Apple GPU's readings from the IOKit registry (`ioreg -l -w0 -r -c IOAccelerator`, 22 ms), with
     _Nvml's interface: the load and the memory are the driver's PerformanceStatistics of the index'th accelerator
     node - Device Utilization % and the in-use system memory in bytes.  The total is the device's Metal working set,
-    the budget one app gets of the unified memory.  No temperature or power reading exists without root
-    (`powermetrics`), and an Apple Silicon GPU sits on the die, so the PCIe cards have nothing to show."""
+    the budget one app gets of the unified memory.  The temperature and the power come from AppleSensors when
+    gpu_reader passes them (macOS's private sensor calls, no root); without them the note keeps the old words.  An
+    Apple Silicon GPU sits on the die, so the PCIe cards have nothing to show."""
     note = ("no GPU temperature or power reading without root (powermetrics), and an Apple Silicon GPU sits on the "
             "die, so there is no PCIe link to show; the engine's own figures are in its log")
     cmd = ("ioreg", "-l", "-w0", "-r", "-c", "IOAccelerator")
 
     _first: list = []                       # (M2 11-16) the registry as the first reader of this process saw it: the nodes and the name do not change
 
-    def __init__(self, index=0, run=None):
+    def __init__(self, index=0, run=None, sensors=None):
         self.index = index
         self._run = run or self._ioreg
+        self.sensors = None
+        if sensors is not None:
+            self.attach_sensors(sensors)
         if run is None:                     # the real registry: read once per process for what does not change (a plan asked it six times)
             if not _Metal._first:
                 _Metal._first.append(self._ioreg())
@@ -692,6 +1003,13 @@ class _Metal:
             text = ""
         _Metal._recent[:] = [(time.monotonic(), text)]
         return text
+
+    def attach_sensors(self, sensors):
+        """AppleSensors for this reader (monitor_reader hands them over; the server's own readers never get them), or None."""
+        self.sensors = sensors
+        if sensors is not None and sensors.available():
+            self.note = ("GPU temperature and power from macOS's sensors without root (STRATA_MACOS_SENSORS=1 "
+                         "turned them on); an Apple Silicon GPU sits on the die, so there is no PCIe link to show")
 
     def _blocks(self, text=None):
         """The accelerator nodes, in the registry's order: every node that carries a PerformanceStatistics. `text`: a registry already read."""
@@ -729,6 +1047,9 @@ class _Metal:
         used = num("In use system memory")
         out["mem_used"] = int(used) if used is not None else None
         out["mem_total"] = metal_working_set()
+        if self.sensors is not None:
+            out["temp"] = self.sensors.gpu_temp()
+            out["power"] = self.sensors.gpu_power()
         return out
 
 
@@ -1067,9 +1388,14 @@ def gpu_reader(index=0, amd=False):
 
 def monitor_reader(index=0, amd=False):
     """The Monitor's reader (Telemetry): gpu_reader's, except that with the AMD backend on Windows, where the amdgpu sysfs reader
-    has nothing to read, the driver's ADL2 (#4884).  Every other caller (the server's VRAM checks, the drafter's sizing) keeps
-    gpu_reader, so their decisions on Windows AMD are unchanged."""
+    has nothing to read, the driver's ADL2 (#4884), and on a Mac the Apple Silicon temperature and power when STRATA_MACOS_SENSORS=1
+    (AppleSensors: private calls, so only here, never in the server's VRAM checks or the drafter's sizing).  Every other caller keeps
+    gpu_reader, so their decisions are unchanged."""
     g = gpu_reader(index, amd)
+    if sys.platform == "darwin" and not amd and hasattr(g, "attach_sensors"):
+        sensors = apple_sensors()                    # None unless STRATA_MACOS_SENSORS=1
+        if sensors is not None:
+            g.attach_sensors(sensors)
     if amd and os.name == "nt" and not g.ok():
         return _AmdWin(index)
     return g
