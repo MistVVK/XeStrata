@@ -380,6 +380,11 @@ html[data-motion='reduced'] .task-tree-row[data-leaving] { opacity: 0; }
   .main__head .main__titles { flex-basis: auto; }
   .main__head:has(+ .main__body .tuning) { align-items: flex-start; gap: 12px; }
   .main__head:has(+ .main__body .tuning) .main__actions { width: 100%; margin-left: 0; flex-wrap: wrap; justify-content: flex-start; }
+  /* Tasks (GUI-VIS-1117 7b): the controls are one width of their own (about 540 px) beside a title that cannot shrink below it, so they ran off the right edge; they take a row under the title */
+  .main__head:has(.tasks-actions) { flex-wrap: wrap; row-gap: 10px; }
+  .main__head:has(.tasks-actions) .main__actions { flex: 1 1 100%; min-width: 0; }
+  .tasks-actions { min-width: 0; max-width: 100%; justify-content: flex-start; }
+  .tasks-actions > .select, .tasks-actions > .select__trigger { max-width: 100%; }
 }
 @media (max-width: 360px) {
   .serving-overview .summary-list dd.row { gap: 4px; }
