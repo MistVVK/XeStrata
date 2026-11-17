@@ -3802,6 +3802,7 @@ bool fused_gr_read_persist(const FusedGrArgs* a, int n_tok, void* stream) {
     const hcp::DevState& st = hcp::g_dev[dev];
     if (n_tok > st.max_t) return false;
     if (a[0].q8_down != nullptr || a[0].q8_up != nullptr) return false;    // STRATA_HC_Q8: the default read
+    if (a[0].s_down != nullptr || a[0].s_up != nullptr) return false;      // #5560 STRATA_HC_REQ8: int8 rows + scales, the default read (it knows them)
     for (int t = 0; t < n_tok; ++t)
         if (a[t].q8_mixed != nullptr) return false;                         // STRATA_QFUSE: the default read
     hcp::launch(a, n_tok, st, (cudaStream_t) stream, hcp::kTicksRun);
