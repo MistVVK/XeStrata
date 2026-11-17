@@ -59,12 +59,17 @@ DEVICE_LIBS_SRC = BASE / "rocm-device-libs"
 
 # Fixes the release lacks (its sycl branch too, on 2026-10-05): third_party/main/intel-llvm/patches/NN-<id>.patch,
 # applied in order to the clone before the configuration (under intel/llvm's license, Apache-2.0 with LLVM
-# exceptions).  A finished install records the ids it was built with.
+# exceptions).  A finished install records the ids and full-file hashes it was built with.
 PATCHES = sorted((ROOT / "third_party" / "main" / "intel-llvm" / "patches").glob("[0-9][0-9]-*.patch"))
 
 
 def patch_id(patch: Path) -> str:
     return patch.stem.split("-", 1)[1]
+
+
+def patch_fingerprints() -> list[dict[str, str]]:
+    """Names, order and contents identify the patches in a finished toolchain."""
+    return [{"name": p.name, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in PATCHES]
 
 
 def patched_files() -> tuple[list, list]:
@@ -388,7 +393,8 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     gpus = probe(INSTALL)
     backends = sorted(p.name.split("_adapter_")[1].split(".")[0] for p in (INSTALL / "lib").glob("libur_adapter_*.so"))
-    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES], "zstd": True,
+    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES],
+                                  "patches": patch_fingerprints(), "zstd": True,
                                   "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60), "backends": backends,
                                   "device_libs": device_libs,
@@ -585,6 +591,9 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
     if rec.get("tag") != tag or "cuda" not in rec.get("backends", []):
         fail(f"--windows runs the tools of the contrib toolchain of {tag} on this machine, which is not built",
              f"build it first: tools/intel_llvm_build.py --contrib --tag {tag}")
+    if rec.get("patches") != patch_fingerprints():
+        fail("the contrib toolchain was built with different patches",
+             "build it again: tools/intel_llvm_build.py --contrib --rebuild")
     lacking = [t for t in (*HOST_TOOLS, *HOST_TOOLS_EXTRA) if not (host / "bin" / t).exists()]
     if lacking:
         fail(f"the contrib toolchain lacks {', '.join(lacking)} (built before --windows needed them)",
@@ -675,7 +684,8 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
                 shutil.copy2(f, lic / f"{dep.name[:-4]}-{f.name}")
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES],
-                                  "target": "x86_64-pc-windows-msvc", "cuda": WIN_CUDA, "zstd": WIN_ZSTD,
+                                  "patches": patch_fingerprints(), "target": "x86_64-pc-windows-msvc",
+                                  "cuda": WIN_CUDA, "zstd": WIN_ZSTD,
                                   "hip": WIN_HIP_DLL if hip else None,
                                   "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60)}, indent=1))
@@ -708,7 +718,7 @@ def main() -> None:
         set_out(WIN_OUT)
         have = json.loads(RECORD.read_text()) if RECORD.exists() else {}
         # an install from before zstd and Level Zero's headers were in it is built again
-        if a.rebuild or have.get("tag") != a.tag or have.get("fixes") != [patch_id(p) for p in PATCHES] or \
+        if a.rebuild or have.get("tag") != a.tag or have.get("patches") != patch_fingerprints() or \
                 have.get("zstd") != WIN_ZSTD or not (INSTALL / "include" / "level_zero" / "ze_api.h").exists():
             say(f"building intel/llvm {a.tag}'s SYCL runtime for Windows in {OUT} ...")
             build_windows(a.tag, a.xwin.resolve(), a.keep_build, a.jobs)
@@ -721,13 +731,10 @@ def main() -> None:
     have = finished()
     if have and not a.rebuild:
         if have.get("tag") == a.tag:
-            # the CUDA fixes ask only the contrib toolchain to be built again, the HIP ones only a toolchain with HIP
-            # or one that would have it now (ROCm installed since); the fixes to the build itself (build-) none
+            # A changed name, order or byte of any patch, including its description, changes the build input.
+            # Old records have no hashes, so they ask for one rebuild too.
             hip = "hip" in have.get("backends", []) or rocm_dirs() is not None
-            missing = [patch_id(p) for p in PATCHES if patch_id(p) not in have.get("fixes", [])
-                       and not patch_id(p).startswith("build-")
-                       and (a.contrib or not patch_id(p).startswith("cuda-"))
-                       and (hip or not patch_id(p).startswith("hip-"))]
+            missing = [] if have.get("patches") == patch_fingerprints() else ["the current patches"]
             # an AMD GPU's code needs the HIP target, which the build gets only when ROCm's HIP is there while it is
             # built: a record whose backends have none was built before ROCm was installed (and its deploy may be
             # incomplete, as an interrupted one leaves the record of the build before it)
