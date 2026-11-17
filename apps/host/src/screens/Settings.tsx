@@ -11,7 +11,7 @@ import { AboutVersions, SettingsUpdates } from '../components/SettingsUpdates';
 import { NativeOperations } from '../components/NativeOperations';
 import { FontChoice } from '../components/FontChoice';
 import { ElectricityPrice } from '../components/ElectricityPrice';
-import { ApprovalNotifySetting, DoneSoundSetting, PortSetting, TraySetting, useShellState } from '../components/ShellSettings';
+import { ApprovalNotifySetting, DoneSoundSetting, NumberQuotesSetting, PortSetting, TraySetting, useShellState } from '../components/ShellSettings';
 import { CompactionSetting } from '../components/CompactionSetting';
 import { ChatDefaultsSetting } from '../components/ChatDefaultsSetting';
 import { LANGUAGES } from '../lib/i18n';
@@ -37,6 +37,7 @@ export function SettingsScreen() {
         { section: 'General', label: 'Notify me when Strata needs an answer', hint: 'In Manual mode, shows a desktop notification when the assistant waits for your approval and Strata is in the background.', aliases: 'approval permission alert notification manual', control: <ApprovalNotifySetting /> },
         ...(shell?.tray ? [{ section: 'General', label: 'Minimise to tray', hint: 'Closing the window keeps Strata running in the tray, next to the clock. Choose Quit in the tray menu to stop it. Applies the next time Strata starts.', aliases: 'tray background close notification area', control: <TraySetting shell={shell} save={saveShell} /> }] : []),
         ...(shell?.desktop ? [{ section: 'General', label: 'App port', hint: 'The port Strata’s window and local address use. Leave it empty to let Strata choose (47831 when it is free). Applies the next time Strata starts.', aliases: 'network address 47831 localhost api', control: <PortSetting shell={shell} save={saveShell} /> }] : []),
+        { section: 'General', label: 'Number quotes', hint: 'When one message quotes several passages, each gets a number and says who wrote it, so the assistant can tell them apart. Start a line with [1] or [2] to answer one of them.', aliases: 'quote quoting numbered reference passages', control: <NumberQuotesSetting /> },
         { section: 'General', label: 'Your rules', hint: 'Rules the assistant follows in every chat, for example "Answer in German" or "Keep answers short". New answers use them right away.', aliases: 'instructions system prompt agents.md custom global always', control: <UserRulesSetting /> },
         { section: 'General', label: 'Electricity price', hint: 'Price of one kilowatt-hour. The Monitor then shows what your graphics card has cost since Strata started. Leave it empty to hide the cost.', aliases: 'cost power energy kwh currency money', control: <ElectricityPrice /> },
         { section: 'General', label: 'Summarize older messages', hint: 'How full a chat has to get before the assistant condenses its beginning to make room. Later keeps more of the conversation and leaves less room for one answer; the assistant picks the new number up on its next message.', aliases: 'compact compaction context window threshold summarize tokens history memory', control: <CompactionSetting /> },

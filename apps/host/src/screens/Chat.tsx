@@ -38,7 +38,7 @@ import { ApprovalDock, SCOPE } from '../components/ApprovalCard';
 import { artifactFromUrl, type PreviewArtifact } from '../lib/artifacts';
 import { openExternal } from '../lib/open-external';
 import { busyPlan, parkedReady } from '../lib/while-busy';
-import { composeQuoted, parseQuoted, type Quote } from '../lib/quotes';
+import { composeNumbered, composeQuoted, parseQuoted, rememberQuoteSources, type Quote, type QuoteSource } from '../lib/quotes';
 /** Chat — talk to the one loaded model. */
 import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Markdown } from '../components/Markdown';
@@ -62,6 +62,7 @@ export function ChatScreen() {
     const library = useStore((s) => s.library);
     const streaming = useStore((s) => s.streaming);
     const whileBusy = useStore(s => s.whileBusy);
+    const numberQuotes = useStore(s => s.numberQuotes);   // #5993
     const setup = useStore(s => s.setup);
     const setupFlag = useStore(s => s.setupOpen);
     const setupVisible = location.route === 'setup' || setupFlag || !!setup && !setup.complete && !setup.dismissed;
@@ -456,7 +457,7 @@ export function ChatScreen() {
             if (!text || !session)
                 return;
             const plan = busyPlan(whileBusy);
-            const out = quotedMessage(quotes, text);
+            const out = quotedMessage(quotes, text, numberQuotes);
             // Interrupt: the answer stops where it is (what is written stays) and the message goes as soon as it has stopped (the effect below sends it).
             if (plan === 'interrupt') {
                 updateDraft('');
@@ -481,7 +482,7 @@ export function ChatScreen() {
         }
         updateDraft('');
         if (session) clearQuotes(session.id);
-        void sendMessage(session ? quotedMessage(quotes, text) : text);
+        void sendMessage(session ? quotedMessage(quotes, text, numberQuotes) : text);
     }
     function onComposerKey(_e: React.KeyboardEvent) { }
     if (!session) {
@@ -602,8 +603,13 @@ function readerHasSelection(scroller: HTMLElement): boolean {
 }
 const NO_QUOTES: Quote[] = [];
 /** The message that goes out: the quoted passages in their fixed form, then the person's words. A command such as /plan goes out as typed. */
-function quotedMessage(quotes: readonly Quote[], text: string): string {
-    return quotes.length && !text.startsWith('/') ? composeQuoted(quotes.map(q => q.text), text) : text;
+function quotedMessage(quotes: readonly Quote[], text: string, numbered = false): string {
+    if (!quotes.length || text.startsWith('/')) return text;
+    if (!numbered) return composeQuoted(quotes.map(q => q.text), text);
+    // #5993: two or more quotes are numbered and say who wrote them; where each came from is kept with the sent message
+    const out = composeNumbered(quotes, text);
+    rememberQuoteSources(out.text, out.sources);
+    return out.text;
 }
 function Composer({ draft, setDraft, loaded, streaming, onSubmit, onKey, session, onPreview, textareaRef, }: {
     draft: string;
@@ -749,9 +755,11 @@ function MessageView({ message: m, isLast, onEditPrompt, onPreview, onClosePrevi
     const grouped = !!m.blocks?.some(b => b.kind === 'group');
     const [sentTime, setSentTime] = useState(() => relTime(m.at));
     const sentQuote = m.role === 'user' ? parseQuoted(m.content) : null;
+    // #5993: which of this message's numbered quotes still have their source message in the chat ('1' / '0' each; '' when it has none), so a deleted source shows its label without the jump
+    const quoteSourcesHere = useStore(s => m.quotes?.length ? m.quotes.map(q => s.sessions.find(x => x.id === activeSession)?.messages.some(y => y.id === q.messageId) ? '1' : '0').join('') : '');
     if (m.role === 'user') {
         return (<div className="st-msg st-msg--user" data-message-id={m.id} onMouseEnter={() => setSentTime(relTime(m.at))} onFocus={() => setSentTime(relTime(m.at))}>
-        <div className="st-bubble">{tr(m.photos?.length ? <ChatPhotos photos={m.photos}/> : null)}{sentQuote ? <><SentQuotes quotes={sentQuote.quotes}/><span className="st-bubble__text">{sentQuote.reply}</span></> : m.markdown ? <Markdown text={m.content} onOpenLink={onOpenLink} imageSession={activeSession}/> : <span className="st-bubble__text">{m.content}</span>}</div>
+        <div className="st-bubble">{tr(m.photos?.length ? <ChatPhotos photos={m.photos}/> : null)}{sentQuote ? <><SentQuotes quotes={sentQuote.quotes} numbered={sentQuote.numbered} sources={m.quotes} exists={id => { const i = m.quotes?.findIndex(q => q.messageId === id) ?? -1; return i >= 0 && quoteSourcesHere[i] === '1'; }}/><span className="st-bubble__text">{sentQuote.reply}</span></> : m.markdown ? <Markdown text={m.content} onOpenLink={onOpenLink} imageSession={activeSession}/> : <span className="st-bubble__text">{m.content}</span>}</div>
         <div className="st-msg__meta">
           <time dateTime={m.at} title={tr(new Date(m.at).toLocaleString(localeTag()))}>{tr(sentTime)}</time>
           <span className="st-msg__actions">
@@ -814,8 +822,15 @@ function MessageView({ message: m, isLast, onEditPrompt, onPreview, onClosePrevi
     </div>);
 }
 /** The passages a sent message quoted, one or two lines each; a click shows the rest. */
-function SentQuotes({ quotes }: { quotes: string[] }) {
+function SentQuotes({ quotes, numbered, sources, exists }: { quotes: string[]; numbered?: { n: number; role: 'user' | 'assistant' }[]; sources?: QuoteSource[]; exists?: (id: string) => boolean }) {
     const [open, setOpen] = useState(false);
+    // #5993: the numbered form labels each quote ("Quote 1 · you") and, while its source message is still in the chat, jumps to it (also after a restart)
+    if (numbered) return <div className="sent-quotes" data-open={open || undefined}>{quotes.map((q, i) => {
+        const n = numbered[i]?.n ?? i + 1, role = numbered[i]?.role ?? 'user', source = sources?.find(s => s.n === n);
+        const label = tr(role === 'user' ? "Quote {0} · you" : "Quote {0} · the assistant", [n]);
+        const canJump = !!source && !!exists?.(source.messageId);
+        return <div key={i} className="sent-quote sent-quote--numbered">{canJump ? <button type="button" className="sent-quote__label" title={tr("Go to the quoted message")} onClick={() => document.querySelector(`[data-message-id="${CSS.escape(source!.messageId)}"]`)?.scrollIntoView({ block: 'center', behavior: scrollBehavior() })}>{label}</button> : <span className="sent-quote__label xs muted">{label}</span>}<button type="button" className="sent-quote__text" aria-expanded={open} title={tr("Show or hide the rest of the quote")} onClick={() => setOpen(v => !v)}>{q}</button></div>;
+    })}</div>;
     return <div className="sent-quotes" data-open={open || undefined}>{quotes.map((q, i) => <button type="button" key={i} className="sent-quote" aria-expanded={open} title={tr("Show or hide the rest of the quote")} onClick={() => setOpen(v => !v)}><span className="xs muted">{tr("Quoted")}</span><span className="sent-quote__text">{q}</span></button>)}</div>;
 }
 function MessageMenu({ label, children }: {

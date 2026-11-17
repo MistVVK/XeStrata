@@ -22,5 +22,11 @@
  "guic21": "Datei {0} wird geschrieben…",
  "guic22": "{0} läuft…",
  "guic23": "Das Modell wird gebeten, seinen Tool-Aufruf zu korrigieren…",
- "guic24": "Das Modell hat zweimal hintereinander Tool-Aufrufe geschrieben, die Strata nicht ausführen konnte, deshalb hat Strata diese Runde beendet. Es wurde nichts ausgeführt. Senden Sie Ihre Nachricht erneut, oder wählen Sie ein anderes Modell."
+ "guic24": "Das Modell hat zweimal hintereinander Tool-Aufrufe geschrieben, die Strata nicht ausführen konnte, deshalb hat Strata diese Runde beendet. Es wurde nichts ausgeführt. Senden Sie Ihre Nachricht erneut, oder wählen Sie ein anderes Modell.",
+ "guic25": "Nur mit Strata auf einem anderen Computer verbinden",
+ "guic26": "Es wird nichts heruntergeladen. Sie können die Engine später auf der Seite „Modelle“ hinzufügen.",
+ "guic27": "Zitate nummerieren",
+ "guic28": "Wenn eine Nachricht mehrere Textstellen zitiert, erhält jede eine Nummer und den Hinweis, wer sie geschrieben hat, damit der Assistent sie auseinanderhalten kann. Beginnen Sie eine Zeile mit [1] oder [2], um auf eine davon zu antworten.",
+ "guic29": "Zitat {0} · Sie",
+ "guic30": "Zitat {0} · der Assistent"
 }

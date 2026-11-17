@@ -7595,6 +7595,11 @@ html[data-motion='reduced'] .native-progress__bar[data-indeterminate] > i { anim
 .sent-quotes { display: flex; flex-direction: column; gap: 6px; margin: 0 0 8px; }
 .sent-quote { display: flex; flex-direction: column; gap: 2px; padding: 6px 10px; border: 0; border-left: 3px solid var(--st-accent); border-radius: var(--st-r-sm); background: var(--st-surface-2); color: var(--st-ink-soft); font: inherit; text-align: left; cursor: pointer; }
 .sent-quotes[data-open] .sent-quote__text { -webkit-line-clamp: unset; line-clamp: unset; display: block; }
+/* #5993: a numbered quote has its own label (a jump to the source while that message is there) and the text that opens it */
+.sent-quote--numbered { cursor: default; }
+.sent-quote--numbered .sent-quote__text { padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: var(--st-fs-sm); text-align: left; cursor: pointer; }
+.sent-quote__label { padding: 0; border: 0; background: none; font-size: var(--st-fs-xs); color: var(--st-ink-muted); text-align: left; }
+button.sent-quote__label { text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .quote-selection { position: fixed; z-index: var(--layer-popover, 100); padding: 6px 12px; border: 1px solid var(--st-line); border-radius: var(--st-r-pill); background: var(--st-surface); color: var(--st-ink); box-shadow: var(--st-sh-pop); font: 600 var(--st-fs-sm) var(--st-font); cursor: pointer; }
 
 /* ---- the agent's own question: the approval card with options (#4244) ---- */

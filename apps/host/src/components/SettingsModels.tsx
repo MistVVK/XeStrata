@@ -1,3 +1,4 @@
+import { takeCustomConnectionRequest } from '../lib/connect-only';
 import { tr } from '../lib/i18n';
 import { useEffect, useRef, useState } from 'react';
 import { useImeKeys } from '../lib/ime-keys';
@@ -23,6 +24,8 @@ export function SettingsModels() {
     const discovery = useRef<AbortController | null>(null);
     const editor = useRef<HTMLDivElement>(null);
     useEffect(() => () => discovery.current?.abort(), []);
+    // #5529: the first-run engine card's "Only connect to Strata on another computer" opens this page with a Custom model API connection started
+    useEffect(() => { if (takeCustomConnectionRequest()) { reset(); setDraft({ kind: 'custom', provider: null, name: '', baseUrl: '', protocol: 'openai-chat', apiKey: '', models: [] }); } }, []);
     const saved = providers?.connections.find(c => c.id === draft?.id);
     const preset = providers?.catalog.find(p => p.id === draft?.provider);
     function reset() { discovery.current?.abort(); setFetching(false); setAvailable([]); setFilter(''); setModelId(''); setModelName(''); setError(''); setNotice(''); }

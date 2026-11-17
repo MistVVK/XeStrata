@@ -22,5 +22,11 @@
  "guic21": "Escribiendo el archivo {0}…",
  "guic22": "Ejecutando {0}…",
  "guic23": "Pidiendo al modelo que corrija su llamada a la herramienta…",
- "guic24": "El modelo escribió dos veces seguidas llamadas a herramientas que Strata no pudo ejecutar, así que Strata detuvo este turno. No se ejecutó nada. Envía tu mensaje de nuevo o elige otro modelo."
+ "guic24": "El modelo escribió dos veces seguidas llamadas a herramientas que Strata no pudo ejecutar, así que Strata detuvo este turno. No se ejecutó nada. Envía tu mensaje de nuevo o elige otro modelo.",
+ "guic25": "Conectarse solo a Strata en otro equipo",
+ "guic26": "No se descarga nada. Puedes añadir el motor más tarde desde la página Modelos.",
+ "guic27": "Numerar las citas",
+ "guic28": "Cuando un mensaje cita varios pasajes, cada uno recibe un número e indica quién lo escribió, para que el asistente pueda distinguirlos. Empieza una línea con [1] o [2] para responder a uno de ellos.",
+ "guic29": "Cita {0} · tú",
+ "guic30": "Cita {0} · el asistente"
 }

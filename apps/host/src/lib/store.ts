@@ -3,7 +3,7 @@ import { shortTitle } from './title-text';
 import { DEFAULT_CONTENT_FS, DEFAULT_UI_SCALE, SIZE_DEFAULTS_VERSION, savedSizes } from './default-sizes';
 import { detectLanguage } from './language-detect';
 import { validWhileBusy, type WhileBusy } from './while-busy';
-import { addToQuotes, type Quote } from './quotes';
+import { addToQuotes, takeQuoteSources, type Quote } from './quotes';
 import { readAsk, type AgentAnswer, type AgentAsk } from './agent-ask';
 import { chatFailure, plainFailureText } from './plain-errors';
 import { showcaseMessages, SHOWCASE_AGENTS } from './chat-showcase';
@@ -103,6 +103,8 @@ export interface AppState {
   doneSound: boolean;
   /** Opt-in: a desktop notification when Manual mode waits for an approval (#3477). */
   approvalNotify: boolean;
+  /** #5993: a message that quotes two or more passages numbers them and names who wrote each (off by default). */
+  numberQuotes: boolean;
   /** What Enter does while an answer is being written: wait, send after, or interrupt (#4783). */
   whileBusy: WhileBusy;
   /** What a new conversation starts with (Settings → General): mode, reasoning effort, thinking limit. */
@@ -188,6 +190,7 @@ export interface Prefs {
   electricityCurrency: string;
   doneSound: boolean;
   approvalNotify: boolean;
+  numberQuotes: boolean;
   /** What Enter does while an answer is being written: wait, send after, or interrupt (#4783). */
   whileBusy: WhileBusy;
   /** What a new conversation starts with: its mode, reasoning effort and thinking limit. */
@@ -241,6 +244,7 @@ const PREFS_DEFAULTS: Prefs = {
   electricityCurrency: '',
   doneSound: false,
   approvalNotify: false,
+  numberQuotes: false,
   whileBusy: 'wait',
   chatDefaults: CHAT_DEFAULTS,
   shareTelemetry: false,
@@ -308,6 +312,7 @@ function loadPrefs(): Prefs {
         electricityCurrency: typeof parsed.electricityCurrency === 'string' && /^[A-Za-z]{3}$/.test(parsed.electricityCurrency) ? parsed.electricityCurrency.toUpperCase() : '',
         doneSound: parsed.doneSound === true,
         approvalNotify: parsed.approvalNotify === true,
+        numberQuotes: parsed.numberQuotes === true,
         whileBusy: validWhileBusy(parsed.whileBusy) ? parsed.whileBusy : 'wait',
         chatDefaults: validChatDefaults(parsed.chatDefaults),
       };
@@ -348,6 +353,7 @@ let state: AppState = {
   electricityCurrency: prefs.electricityCurrency,
   doneSound: prefs.doneSound,
   approvalNotify: prefs.approvalNotify,
+  numberQuotes: prefs.numberQuotes,
   whileBusy: prefs.whileBusy,
   parked: {},
   quotes: {},
@@ -585,6 +591,7 @@ function savePrefs() {
     electricityCurrency: state.electricityCurrency,
     doneSound: state.doneSound,
     approvalNotify: state.approvalNotify,
+    numberQuotes: state.numberQuotes,
     whileBusy: state.whileBusy,
     chatDefaults: state.chatDefaults,
     shareTelemetry: state.shareTelemetry,
@@ -778,6 +785,12 @@ export function setDoneSound(doneSound: boolean) {
 
 export function setApprovalNotify(approvalNotify: boolean) {
   set({ approvalNotify });
+  savePrefs();
+}
+
+/** Settings > General > Number quotes (#5993). */
+export function setNumberQuotes(numberQuotes: boolean) {
+  set({ numberQuotes: numberQuotes === true });
   savePrefs();
 }
 
@@ -2086,7 +2099,8 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
   let sessionId = reattach ?? state.activeSession;
   if (!sessionId) sessionId = newSession().id;
 
-  const userMsg: ChatMessage = { id: uid('m'), role: 'user', content: options.shown ?? body, at: new Date().toISOString(),...(pictures.length?{photos:pictures}:{}),...(options.markdown?{markdown:true}:{}) };
+  const quoteSources = takeQuoteSources(body);   // #5993: the numbers of a numbered quote and the messages they came from
+  const userMsg: ChatMessage = { id: uid('m'), role: 'user', content: options.shown ?? body, at: new Date().toISOString(),...(pictures.length?{photos:pictures}:{}),...(options.markdown?{markdown:true}:{}),...(quoteSources?{quotes:quoteSources}:{}) };
   // A taken-over turn goes on in the reply the page already has (the last one, if it is the assistant's).
   const lastReply = reattach ? [...(state.sessions.find(s => s.id === sessionId)?.messages ?? [])].reverse()[0] : undefined;
   // A turn the agent started by itself (a background command finished) is a new reply, not the end of the last one.
@@ -2230,7 +2244,7 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
             // The host has just sent it into the run: it becomes an ordinary message here, and the answer to it starts a new reply.
             const before = assistantId; assistantId = uid('m');
             const next: ChatMessage = { id: assistantId, role: 'assistant', content: '', at: new Date().toISOString(), streaming: true };
-            patchSession(sessionId, sess => ({ ...sess, messages: [...sess.messages.map(m => m.id === before ? { ...m, streaming: false } : m), { id: uid('m'), role: 'user', content: sent.text as string, at: new Date().toISOString() }, next] }));
+            patchSession(sessionId, sess => ({ ...sess, messages: [...sess.messages.map(m => m.id === before ? { ...m, streaming: false } : m), { id: uid('m'), role: 'user', content: sent.text as string, at: new Date().toISOString(), ...(((q) => (q ? { quotes: q } : {}))(takeQuoteSources(String(sent.text ?? '')))) }, next] }));
           }
         } else if (type === 'queued-release') {
           // The goal ended with messages left: they go out now, in order, as ordinary messages once this turn has finished.

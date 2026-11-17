@@ -394,8 +394,9 @@ test('#4785 quoting is wired: the menu, the selection, the box above the compose
   assert.equal((chat.match(/addQuote\(activeSession, m\.content, m\.id, '(user|assistant)'\)/g) ?? []).length, 2, 'a Quote item in the menu of both kinds of message');
   assert.match(chat, /document\.addEventListener\('selectionchange', read\)/);
   assert.match(chat, /data-message-id=\{m\.id\}/);
-  assert.match(chat, /return quotes\.length && !text\.startsWith\('\/'\) \? composeQuoted\(quotes\.map\(q => q\.text\), text\) : text;/, 'a command goes out as typed');
-  assert.match(chat, /void sendMessage\(session \? quotedMessage\(quotes, text\) : text\);/);
+  assert.match(chat, /if \(!quotes\.length \|\| text\.startsWith\('\/'\)\) return text;/, 'a command goes out as typed');
+  assert.match(chat, /if \(!numbered\) return composeQuoted\(quotes\.map\(q => q\.text\), text\);/, '#5993: with "Number quotes" off the form is the one of #4785');
+  assert.match(chat, /void sendMessage\(session \? quotedMessage\(quotes, text, numberQuotes\) : text\);/);
   assert.match(chat, /const sentQuote = m\.role === 'user' \? parseQuoted\(m\.content\) : null;/);
 });
 

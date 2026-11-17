@@ -22,5 +22,11 @@
  "guic21": "Writing file {0}…",
  "guic22": "Running {0}…",
  "guic23": "Asking the model to fix its tool call…",
- "guic24": "The model wrote tool calls that Strata could not run, twice in a row, so Strata stopped this turn. Nothing was run. Send your message again, or choose another model."
+ "guic24": "The model wrote tool calls that Strata could not run, twice in a row, so Strata stopped this turn. Nothing was run. Send your message again, or choose another model.",
+ "guic25": "Only connect to Strata on another computer",
+ "guic26": "Nothing is downloaded. You can add the engine later from the Models page.",
+ "guic27": "Number quotes",
+ "guic28": "When one message quotes several passages, each gets a number and says who wrote it, so the assistant can tell them apart. Start a line with [1] or [2] to answer one of them.",
+ "guic29": "Quote {0} · you",
+ "guic30": "Quote {0} · the assistant"
 }
