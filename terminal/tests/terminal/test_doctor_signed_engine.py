@@ -91,12 +91,30 @@ class DoctorProfileSignedEngine(unittest.TestCase):
         self.assertEqual(engine_row(inspect(self.config))["status"], "missing")
         ec.register_signature_verifier(None)
         code, report = self.doctor_cli()
-        self.assertEqual(engine_row(report)["status"], "missing", report)
+        row = engine_row(report)
+        self.assertEqual(row["status"], "missing", report)
         self.assertIn("COMPONENT_MISSING", [issue["code"] for issue in report["issues"]])
         self.assertNotEqual(code, 0)
+        ec.register_signature_verifier(None)
         with self.assertRaises(ec.EngineIntegrityError) as caught:
-            ec.resolve(self.components.parent / "components", backend=FAMILY)
+            ec.resolve(self.components, backend=FAMILY)
         self.assertIn("does not trust", str(caught.exception))
+        # the row says what `strata components engine` says (the integrity sentence with its reason), and names the installed engine's folder
+        self.assertEqual(row["reason"], str(caught.exception))
+        self.assertTrue(row["reason"].startswith("The engine package failed its integrity check"), row)
+        self.assertEqual(Path(row["path"]), next((self.components / "engine").iterdir()), row)
+        self.assertNotIn("no engine for this PC", row["path"])
+        issue = next(i for i in report["issues"] if i["code"] == "COMPONENT_MISSING" and i.get("component") == "engine")
+        self.assertEqual(issue["message"], str(caught.exception))
+
+    def test_a_folder_with_no_engine_still_says_no_engine_for_this_pc(self):
+        import shutil
+        shutil.rmtree(self.components / "engine")
+        (self.components / "engine").mkdir()
+        row = engine_row(inspect(self.config))
+        self.assertEqual(row["status"], "missing")
+        self.assertIn("no engine for this PC", row["path"])
+        self.assertNotIn("reason", row)
 
 
 if __name__ == "__main__":
