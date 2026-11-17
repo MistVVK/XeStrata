@@ -29,6 +29,11 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The browser developer tools (#5408): compiled into release builds on Windows and Linux so a person who is asked for a console log can open them;
+# the window keeps them off unless STRATA_DEVTOOLS=1 (main.rs devtools_wanted). Not on macOS: there Tauri's devtools call private functions.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+tauri = { version = "2", features = ["devtools"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

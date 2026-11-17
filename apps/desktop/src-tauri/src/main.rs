@@ -971,12 +971,19 @@ fn run_embedded() {
         });
 }
 
+/// Whether the window opens with the browser developer tools available (#5408): only when STRATA_DEVTOOLS is 1. A debug build has them anyway;
+/// a release build has them compiled in (Cargo.toml) but off, so the packaged window behaves as it always did unless someone asks.
+fn devtools_wanted(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// The one window, on the host's own origin so the page and its API share an origin exactly as the browser build does.
 #[cfg_attr(windows, allow(unused_variables))]
 fn open_window(app: &tauri::App, port: u16, shell_token: &str) -> Result<(), Box<dyn std::error::Error>> {
     let origin = format!("http://127.0.0.1:{port}");
     let url = origin.parse().expect("a valid loopback URL");
-    let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url)).title("Strata").inner_size(1440.0, 920.0).min_inner_size(900.0, 600.0);
+    let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url)).title("Strata").inner_size(1440.0, 920.0).min_inner_size(900.0, 600.0)
+        .devtools(devtools_wanted(std::env::var("STRATA_DEVTOOLS").ok().as_deref()));
     // Dropping pictures on the chat (QA report 1, item 4). Windows: the shell's own file-drop handler is off, because with it on the system hands
     // the dropped file to the shell and the page never sees it; with it off the page gets ordinary drag and drop events (apps/host DropZone), as
     // in a browser. Linux and macOS: the page gets the drag events but WebKit gives it no files, so the handler stays on and the shell passes the
@@ -1299,6 +1306,14 @@ fn run_window_process() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn developer_tools_are_off_unless_asked_for() {
+        assert!(!devtools_wanted(None));
+        for off in ["", "0", "true", "yes", "on", "11"] { assert!(!devtools_wanted(Some(off)), "{off}"); }
+        assert!(devtools_wanted(Some("1")));
+        assert!(devtools_wanted(Some(" 1 ")));
+    }
 
     #[test]
     fn dropped_file_addresses_become_paths_and_nothing_else_does() {
