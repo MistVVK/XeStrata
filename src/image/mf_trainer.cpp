@@ -375,16 +375,6 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
         }
         m->nblk = (int64_t) m->blk.size();
         if (m->nblk == 0) throw std::runtime_error("image engine (Mage-Flow training): no transformer blocks");
-        // the backward's dgrad weights, one block's reused for every block (all blocks' do not fit beside the weights)
-        {
-            train::Product ps[12];
-            for (int q = 0; q < 2; ++q)
-                for (int i = 0; i < 6; ++i) {
-                    ps[q * 6 + i].N = m->blk[0].prod[q][i].N;
-                    ps[q * 6 + i].K = m->blk[0].prod[q][i].K;
-                }
-            m->dgrad_scratch(ps, 12, int8);
-        }
         // the modulations' linears stay on the host: one row a step, read once
         (void) data;
         m->set_budget(0, 0, 0);
@@ -503,6 +493,7 @@ struct KeepTmp {
 static MfBlockRun block_run(Model* m, int64_t b, const MfTrainCond& c, int64_t R, int64_t Rt) {
     const MfTrainModel::Block& blk = m->blk[(size_t) b];
     MfBlockRun run;
+    run.lazy_dgrad = true;
     run.C = m->C;
     run.heads = m->heads;
     run.hd = m->hd;
@@ -849,8 +840,7 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     float* dvrs = tmp.get<float>(R, st);
     dit_rows::rows16(dit_rows::Grad{{s.dv_pred, m->in_ch}}, R, m->in_ch, dv16, dvrs, st);
     float* dln = tmp.get<float>(R * C, st);
-    float* dsums = tmp.get<float>(R * C, st);
-    train::dgrad(dv16, dvrs, pout_wt, R, m->in_ch, C, dln, dsums, false, gemm, st);
+    train::dgrad(dv16, dvrs, pout_wt, R, m->in_ch, C, dln, nullptr, false, gemm, st);
     // block 11's output (the image stream), through the output norm's scale (its shift has no gradient here)
     const bool hostm = s.bounds == nullptr && s.bounds16 == nullptr;   // the inputs on the host (FP32)
     if (hostm) m->host.wait(m->nblk);   // the head's input read back (the forward's fetch)
@@ -872,7 +862,7 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     float* mg = mod_on ? tmp.get<float>(az0->rank, st) : nullptr;
     // the blocks' outputs (their forwards' again: not read) once for all of them, and a BF16 input read back;
     // host: two read-back buffers, the inputs fetched a block ahead (the values as the forward kept them, FP32)
-    float* bo = tmp.get<float>(R * C, st);
+    float* bo = dln;   // the output norm's gradient is dead; replayed blocks write their unused outputs here
     float* bt = tmp.get<float>(Rt * C, st);
     float* xin = s.bounds16 != nullptr ? tmp.get<float>(Rj * C, st) : nullptr;
     float* lb = hostm ? tmp.get<float>(2 * Rj * C, st) : nullptr;
@@ -886,22 +876,6 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
         bind(m, b, m->ws.begin((int) b, (int) b - 1));   // the block below fetched meanwhile
         const MfTrainModel::Block& blk = m->blk[(size_t) b];
         MfBlockRun run = block_run(m, b, c, R, Rt);
-        {   // the dgrads' weights (an int8 base's straight through)
-            train::Product ps[12];
-            for (int q = 0; q < 2; ++q)
-                for (int i = 0; i < 6; ++i) {
-                    const MfTrainProduct& pr = blk.prod[q][i];
-                    ps[q * 6 + i] = train::Product{pr.N, pr.K, pr.w, nullptr, nullptr, nullptr, pr.w8, pr.sw};
-                }
-            m->dgrad_weights(ps, 12);
-            for (int q = 0; q < 2; ++q) {
-                MfBlockW* w = q == 0 ? &run.img_w : &run.txt_w;
-                for (int i = 0; i < 6; ++i) {
-                    w->wt[i] = ps[q * 6 + i].wt;
-                    w->wr[i] = ps[q * 6 + i].wr;
-                }
-            }
-        }
         if (hostm) {
             m->host.wait(b);
             run.img = lb + (b % 2) * Rj * C;

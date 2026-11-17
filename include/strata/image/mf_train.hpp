@@ -61,6 +61,7 @@ struct MfBlockRun {
     /// forward again.
     train::Arena* kept = nullptr;
     bool kept_replay = false;
+    bool lazy_dgrad = false;  // make one product's dgrad weight at a time, in the block scratch
 };
 
 /// The block's forward tape, widened to FP32 and copied out for tools/image/mf_train_torch_ref.py to compare stage by

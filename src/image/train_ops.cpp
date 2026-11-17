@@ -114,7 +114,8 @@ void lora_bwd(const float* hr, const float* xr, const uint16_t* h16t, const uint
     float* dh = scratch;                  // [T][rank]
     float* sums = scratch + (int64_t) T * rank;
     uint16_t* dy16 = tmp16;               // [T][rows]
-    uint16_t* dyt16 = tmp16 + (int64_t) T * rows;   // [rows][T], dY's rows scaled by hr and transposed
+    // The caller's dgrad already made dY's rows for a plain LoRA: reuse them and omit their slot in tmp16.
+    uint16_t* dyt16 = tmp16 + (dy16_done != nullptr ? 0 : (int64_t) T * rows);   // [rows][T]
     uint16_t* dht16 = dyt16 + (int64_t) rows * T;   // [rank][T], dh's rows scaled by xr and transposed
     float* rsY = rsT;                    // [T] dY's own row scales
     if (dy16_done != nullptr) {   // the caller's rows of the same dY (its own dgrad read them)
@@ -310,16 +311,18 @@ void dgrad_rows_back(const float* scratch, const float* rsY, int64_t T, int64_t 
 
 void dgrad(const uint16_t* dy16, const float* rsY, const uint16_t* wt, int64_t T, int64_t N, int64_t K, float* dX,
               float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream) {
-    gemm.f16(dy16, wt, scratch, T, K, N);   // wt[K,N] holds W[N,K]'s rows: the product is dY . W, in FP32 sums
-    dgrad_rows_back(scratch, rsY, T, K, dX, accumulate, stream);
+    float* sums = accumulate ? scratch : dX;   // when overwriting, the elementwise scaling can run in place
+    gemm.f16(dy16, wt, sums, T, K, N);   // wt[K,N] holds W[N,K]'s rows: the product is dY . W, in FP32 sums
+    dgrad_rows_back(sums, rsY, T, K, dX, accumulate, stream);
 }
 
 void dgrad_rows(const uint16_t* dy16, const float* rsY, const uint16_t* w, int64_t T, int64_t N, int64_t K, float* dX,
                 float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream) {
     // dY [T][N] . W [N][K], W as it is (a batch of one: the strides are the operands' sizes, oneMKL refuses 0)
-    if (!gemm.f16_batch_ex(false, false, dy16, w, scratch, T, K, N, 1, T * N, N * K, T * K, N, K, K, 0.f))
+    float* sums = accumulate ? scratch : dX;
+    if (!gemm.f16_batch_ex(false, false, dy16, w, sums, T, K, N, 1, T * N, N * K, T * K, N, K, K, 0.f))
         throw std::runtime_error("image engine (training): a dgrad's product on the weight's rows failed");
-    dgrad_rows_back(scratch, rsY, T, K, dX, accumulate, stream);
+    dgrad_rows_back(sums, rsY, T, K, dX, accumulate, stream);
 }
 
 void wgrad(const uint16_t* dy16t, const uint16_t* x16t, int64_t T, int64_t N, int64_t K, const uint32_t* gbits,
@@ -615,12 +618,12 @@ void row_lora_bwd(const float* A, const float* B, const float* x, const float* d
 
 StageTimes::StageTimes(const char* name) : name_(name), on_(strata::env_get("TRAIN_PROFILE") != nullptr) {}
 
-AdScratch take_ad_scratch(Pool& pool, const AdSizes& s, bool y2) {
+AdScratch take_ad_scratch(Pool& pool, const AdSizes& s) {
     AdScratch sc;
     if (s.n == 0) return sc;
     sc.hf = pool.rf(s.rows * s.rank);
     sc.y1 = pool.rf(s.rows * s.n);
-    sc.y2 = y2 || !s.plain ? pool.rf(s.rows * s.n) : nullptr;
+    sc.y2 = !s.plain ? pool.rf(s.rows * s.n) : nullptr;
     sc.fa = pool.rf(s.n);
     sc.fb = pool.rf(s.n);
     sc.scratch = pool.rf(s.scratch);

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/qi_train_block.cpp - see include/strata/image/qi_train.hpp's qi_block.  One Qwen-Image-2.1 block
-// forwards with a tape and backwards through it.  Every buffer has one role and one owner (train::Pool): the tape
-// holds what the backward reads, and the gradients live beside it.
+// forwards with a tape and backwards through it. The tape holds what the backward reads; scratch whose uses do not
+// overlap shares memory on the ordered stream.
 #include "strata/image/qi_train.hpp"
 #include "strata/image/qi_kernels.hpp"
 
@@ -116,8 +116,9 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
     float *gu = tp.gu, *sw_s = tp.sw_s;
     train::AdKeep keep[kQiProducts];
     for (int i = 0; i < kQiProducts; ++i) keep[i] = tp.keep[i];
-    // the forward's own: v before its scale, the projections' outputs before their gates
-    float *yv = pool.rf(R * C), *yo = pool.rf(R * C), *ydn = pool.rf(R * C);
+    // V is dead before the output projection, and that projection is dead before the down projection.
+    float* yv = pool.rf(R * C);
+    float *yo = yv, *ydn = yv;
     auto* vamax = reinterpret_cast<uint32_t*>(pool.f(1));
     float* hsv = pool.rf(H);
 
@@ -137,7 +138,7 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
     const train::Product* prods[kQiProducts];
     for (int i = 0; i < kQiProducts; ++i) prods[i] = &P[i];
     train::AdScratch sc =
-        train::take_ad_scratch(pool, train::ad_sizes(prods, run.ad, kQiProducts, rows_of_product), true);
+        train::take_ad_scratch(pool, train::ad_sizes(prods, run.ad, kQiProducts, rows_of_product));
     bool lokr = false;
     for (const train::Adapter* a : run.ad)
         lokr = lokr || (a != nullptr && a->method == train::AdapterMethod::lokr);
@@ -228,8 +229,8 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
     uint16_t *t16 = pool.ru(RW), *t16t = pool.ru(RW), *xt = pool.ru(maxIn);
     float* trs = pool.rf(R);
     float* sums = pool.rf(maxIn + (lokr ? 4 * F * C : 0));   // a dgrad's T K (a LoKr's N K twice more)
-    float *dh1 = pool.rf(R * C), *dy = pool.rf(R * C), *dsw = pool.rf(RC * F), *dgu = pool.rf(RC * 2 * F);
-    float *dln = pool.rf(R * C), *dtmp = pool.rf(R * C);
+    float *dh1 = pool.rf(R * C), *dy = yv, *dsw = pool.rf(RC * F), *dgu = pool.rf(RC * 2 * F);
+    float *dln = pool.rf(R * C), *dtmp = dy;   // each norm's temporary is dead before dy's next use
     auto backward = [&](int i, const uint16_t* x16, const float* rs, float* dY, float* dX, bool acc, int64_t n = -1,
                         int64_t r0 = 0) {
         if (n < 0) n = R;
@@ -271,7 +272,8 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
     qi_attention_bwd(jq, jk, jv, jof, lse, jdo, R, H, hd, jdq, jdk, jdv, false, gemm, s, nt);
     train::scale_by(jdv, R * C, vs, true, s);
     mark(3);
-    float *dyq = pool.rf(R * C), *dyk = pool.rf(R * C);
+    // No QK norm weight gradients are taken here: each input pair may be replaced by its gradient.
+    float *dyq = yq, *dyk = yk;
     dit_rows::qk_rope_bwd(yq, yk, run.nq, run.nk, run.cos, run.sin, true, jdq, jdk, R, H, hd, dyq, dyk, nullptr,
                           nullptr, s, false, kEps);
     mark(4);

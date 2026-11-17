@@ -4,8 +4,7 @@
 // tape and backwards through it, made of the per-op gradients of mf_train.cpp, so a torch reference can check the whole
 // block and not only its parts.
 //
-// Every buffer has one role and one owner: the tape holds what the backward reads, and the gradients live beside it.
-// Nothing is aliased between a product's output and another one's gradient - the block is small and the GPU has room.
+// The tape holds what the backward reads. Scratch buffers whose uses do not overlap share memory on the ordered stream.
 #include "strata/image/mf_train.hpp"
 #include "strata/image/qi_kernels.hpp"
 
@@ -194,8 +193,9 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
     float* const* ym1 = T.ym1;
     float* const* gelu_s = T.gelu_s;
     float* const* ym2 = T.ym2;
-    // the forward's own: v before its scale
-    float* yv[2] = {pool.rf(Ri * C), pool.rf(Rt * C)};
+    // Unscaled V is dead before the MLP writes ym2. In the backward ym2 is read for the modulation's
+    // gradient before its storage is reused for the MLP, attention-output and V gradients.
+    float* yv[2] = {ym2[0], ym2[1]};
     uint32_t* vamax = reinterpret_cast<uint32_t*>(pool.f(1));
 
     train::Product ps[12];
@@ -210,8 +210,13 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
     auto prod = [&](const MfBlockW& W, int i) { return product_of(W, i); };
     // shared transients, sized for the largest adapted product (products run one at a time): hf is h = x A^T, y1 the
     // delta then yb/yd/dYb, y2 the second map a DoRA that trains its magnitude reads beside the first
-    train::AdScratch adsc =
-        train::take_ad_scratch(pool, train::ad_sizes(prods, ads, 12, [&](int i) { return R[i / 6]; }), true);
+    train::AdSizes sizes = train::ad_sizes(prods, ads, 12, [&](int i) { return R[i / 6]; });
+    if (backward && sizes.plain && sizes.n > 0) {
+        sizes.rows = std::max(Ri, Rt);
+        sizes.n = std::max(sizes.n, std::max(C, F));
+        if (xt) sizes.tmp = std::max(sizes.tmp, Rj * std::max(C, F));
+    }
+    train::AdScratch adsc = train::take_ad_scratch(pool, sizes);
     auto keep = [&](int st, int i) { return T.keep[st][i]; };
     // the base products: FP16, or a QLoRA's int8 base (W8A8, ai-toolkit's convrot8) with the input's int8 rows as
     // scratch, and FP16 ones where the GPU takes no int8 products
@@ -325,25 +330,61 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
         uint16_t* attn_t[2];   // the attention's FP16 rows transposed ([C][rows]) where they are read
         float *jdq = pool.rf(Rj * C), *jdk = pool.f(Rj * C), *jdv = pool.f(Rj * C), *jdo = pool.rf(Rj * C);
         for (int st = 0; st < 2; ++st) {
-            dym2[st] = pool.rf(R[st] * C);
-            dgelu[st] = pool.rf(R[st] * nmax);   // the GELU's output, then a dgrad's dx: the wider of the two
-            dym1[st] = pool.rf(R[st] * F);
+            dym2[st] = yv[st];   // the forward's unscaled V is dead
+            // Plain LoRA's y1 is only used in the forward. The two streams' backwards run in order.
+            dgelu[st] = sizes.plain && sizes.n > 0 ? adsc.y1 : pool.rf(R[st] * nmax);
+            dym1[st] = dgelu[st];   // GELU backward is elementwise, so its input gradient can replace dgelu
             dln2[st] = pool.rf(R[st] * C);
             dh1[st] = pool.rf(R[st] * C);
-            dyo[st] = pool.rf(R[st] * C);
-            dattn[st] = pool.rf(R[st] * C);
-            attn_t[st] = xt ? pool.ru(R[st] * C) : nullptr;
-            dyq[st] = pool.rf(R[st] * C);
-            dyk[st] = pool.rf(R[st] * C);
-            dyv[st] = pool.rf(R[st] * C);
-            dln1[st] = pool.rf(R[st] * C);
-            dxn1[st] = pool.rf(R[st] * C);
+            dyo[st] = dym2[st];   // the MLP output gradient is dead before the attention output's gradient
+            dattn[st] = dln2[st];  // the second norm's gradient is dead before the attention's input gradient
+            attn_t[st] = xt ? gelu_t[st] : nullptr;   // the GELU transpose is dead after the MLP backward
+            // The QK backward reads each pair before writing it. Its second pass needs the original rows only
+            // when the norm weights themselves take gradients; otherwise reuse the forward Q and K.
+            const bool qk_weights = w[st]->dnq != nullptr || w[st]->dnk != nullptr;
+            dyq[st] = qk_weights ? pool.rf(R[st] * C) : yq[st];
+            dyk[st] = qk_weights ? pool.rf(R[st] * C) : yk[st];
+            dyv[st] = yv[st];   // dym2 and dyo are dead before the attention backward
+            dln1[st] = dh1[st];
+            dxn1[st] = dattn[st];
         }
-        uint16_t *t16 = pool.ru(Rj * nmax), *t16t = xt ? pool.ru(Rj * nmax) : nullptr;
+        uint16_t *t16 = pool.ru(Rj * nmax);
+        uint16_t* t16t = xt ? (sizes.plain && sizes.n > 0 ? adsc.tmp16 : pool.ru(Rj * nmax)) : nullptr;
+        // One product's dgrad weight lives until its queued product finishes. The same ordered stream can then
+        // overwrite it for the next product; the parity harness may still supply the twelve pre-made views.
+        int64_t weight_elems = 0;
+        bool has_w8 = false;
+        for (const train::Product& p : ps) {
+            weight_elems = std::max(weight_elems, p.N * p.K);
+            has_w8 = has_w8 || p.w8 != nullptr;
+        }
+        const bool row_dgrad = gemm.f16_batch_ex_ok();
+        uint16_t* dweight = run.lazy_dgrad && (!row_dgrad || has_w8) ? pool.ru(weight_elems) : nullptr;
+        uint16_t* dweight_rows = run.lazy_dgrad && !row_dgrad && has_w8 ? pool.ru(weight_elems) : nullptr;
+        auto bwd_prod = [&](const MfBlockW& W, int i) {
+            train::Product p = prod(W, i);
+            if (!run.lazy_dgrad) return p;
+            if (row_dgrad) {
+                if (p.w8 != nullptr) train::w8_dequant_rows(p.w8, p.sw, p.N, p.K, dweight, stream);
+                p.wr = p.w8 != nullptr ? dweight : p.w;
+            } else {
+                if (p.w8 != nullptr) train::w8_dequant_t(p.w8, p.sw, p.N, p.K, dweight_rows, dweight, stream);
+                else train::transpose_f16(p.w, p.N, p.K, dweight, stream);
+                p.wt = dweight;
+            }
+            return p;
+        };
         float* trs = pool.rf(Rj);
-        // a wgrad's sums are N*K wide (at most F*C, never the square of the wider one) and a dgrad's T*K (at most
-        // rows*C or rows*F), so this is the scratch the block's eight products can actually need
-        float* sums = pool.rf(C * F + Rj * nmax);
+        // A dgrad that overwrites its output uses that output for its sums. Only a full wgrad or LoKr's two
+        // simultaneous N*K matrices need separate sums; the usual frozen-base LoRA takes none.
+        int64_t sum_elems = 0;
+        for (int i = 0; i < 12; ++i) {
+            const int64_t nk = ps[i].N * ps[i].K;
+            if (ps[i].dw != nullptr) sum_elems = std::max(sum_elems, nk);
+            if (ads[i] != nullptr && ads[i]->method == train::AdapterMethod::lokr)
+                sum_elems = std::max(sum_elems, 2 * nk);
+        }
+        float* sums = sum_elems > 0 ? pool.rf(sum_elems) : nullptr;
         for (int st = 0; st < 2; ++st) {
             const MfBlockW& W = *w[st];
             const float* mod = W.mod;
@@ -355,12 +396,12 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
                 dit_rows::gate_add_bwd(ym2[st], nullptr, dout[st], R[st], C, nullptr, W.dmod + 5 * C, stream);
             train::mul_cols(dout[st], mod + 5 * C, R[st] * C, C, dym2[st], stream);
             tape_put(slice(st, kTapeDM2), dym2[st], R[st] * C, stream);
-            train::ad_product_bwd(prod(W, 5), W.ad[5], gelu_16[st], gelu_s[st], gelu_t[st], dym2[st], dgelu[st], false,
+            train::ad_product_bwd(bwd_prod(W, 5), W.ad[5], gelu_16[st], gelu_s[st], gelu_t[st], dym2[st], dgelu[st], false,
                                   keep(st, 5), adsc, t16, trs, t16t, sums, R[st], gemm, stream);
             tape_put(slice(st, kTapeDGelu), dgelu[st], R[st] * F, stream);
             dit_rows::gelu_tanh_bwd(ym1[st], dgelu[st], R[st] * F, dym1[st], stream);
             tape_put(slice(st, kTapeDM1), dym1[st], R[st] * F, stream);
-            train::ad_product_bwd(prod(W, 4), W.ad[4], ln2_16[st], ln2_s[st], ln2_t[st], dym1[st], dln2[st], false,
+            train::ad_product_bwd(bwd_prod(W, 4), W.ad[4], ln2_16[st], ln2_s[st], ln2_t[st], dym1[st], dln2[st], false,
                                   keep(st, 4), adsc, t16, trs, t16t, sums, R[st], gemm, stream);
             tape_put(slice(st, kTapeDLn2), dln2[st], R[st] * C, stream);
             // the second norm: its input's gradient joins the residual's own
@@ -377,7 +418,7 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
             if (dIn[st] != nullptr) train::add_into(dIn[st], dh1[st], R[st] * C, stream);   // the residual's own path
             const int64_t off = st == 0 ? Rt : 0;
             if (xt) train::transpose_f16(jo + off * C, R[st], C, attn_t[st], stream);
-            train::ad_product_bwd(prod(W, 3), W.ad[3], jo + off * C, vs + 1, attn_t[st], dyo[st], dattn[st], false,
+            train::ad_product_bwd(bwd_prod(W, 3), W.ad[3], jo + off * C, vs + 1, attn_t[st], dyo[st], dattn[st], false,
                                   keep(st, 3), adsc, t16, trs, t16t, sums, R[st], gemm, stream);
             train::copy_rows(dattn[st], R[st] * C, jdo + off * C, stream);
         }
@@ -400,7 +441,7 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
                 float* dy = i == 0 ? dyq[st] : i == 1 ? dyk[st] : dyv[st];
                 tape_put(slice(st, kTapeDQ + i), dy, R[st] * C, stream);
                 float* dxv = i == 0 ? dln1[st] : dgelu[st];
-                train::ad_product_bwd(prod(W, i), W.ad[i], ln1_16[st], ln1_s[st], ln1_t[st], dy, dxv, false, keep(st,
+                train::ad_product_bwd(bwd_prod(W, i), W.ad[i], ln1_16[st], ln1_s[st], ln1_t[st], dy, dxv, false, keep(st,
                                       i), adsc, t16, trs, t16t, sums, R[st], gemm, stream);
                 if (i > 0) train::add_into(dln1[st], dgelu[st], R[st] * C, stream);
             }

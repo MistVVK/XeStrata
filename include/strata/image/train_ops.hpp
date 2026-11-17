@@ -250,7 +250,8 @@ struct AdKeep {
 
 /// The adapters' transients a block shares between its products (they run one at a time), sized for the largest:
 /// hf [T][rank]; y1 and y2 [T][N] (the delta, a DoRA's base and delta rows, a LoKr's maps); fa and fb [N] (a DoRA's
-/// row factors); scratch, lora_bwd's (T rank + T N + N rank + rank K); tmp16, 2 T N + T rank FP16; rsT [T].
+/// row factors); scratch, lora_bwd's (T rank + N rank + rank K); tmp16, T N + T rank FP16 for LoRA, twice T N for
+/// DoRA or LoKr; rsT [T].
 struct AdScratch {
     float *hf = nullptr, *y1 = nullptr, *y2 = nullptr, *fa = nullptr, *fb = nullptr, *scratch = nullptr;
     uint16_t* tmp16 = nullptr;
@@ -275,8 +276,9 @@ AdSizes ad_sizes(const Product* const* p, const Adapter* const* ad, int n, Rows 
         s.rows = std::max(s.rows, T);
         s.n = std::max(s.n, N);
         s.rank = std::max(s.rank, rk);
-        s.scratch = std::max(s.scratch, T * rk + T * N + N * rk + rk * K);
-        s.tmp = std::max(s.tmp, 2 * T * N + T * rk);
+        s.scratch = std::max(s.scratch, T * rk + N * rk + rk * K);
+        // A plain LoRA reuses the dgrad's FP16 dY rows. DoRA needs a second set after its row scaling.
+        s.tmp = std::max(s.tmp, (a->method == AdapterMethod::lora ? T * N : 2 * T * N) + T * rk);
         s.plain = s.plain && a->method == AdapterMethod::lora;
     }
     return s;
@@ -284,12 +286,10 @@ AdSizes ad_sizes(const Product* const* p, const Adapter* const* ad, int n, Rows 
 
 class Pool;
 
-/// AdSizes taken from a block's pool: every buffer null where no product is adapted.  `y2`: take the second map's
-/// transient even where the block's adapter method does not read it (DoRA's and LoKr's do).  What is taken moves the
-/// buffers after it in the arena, and Mage-Flow's trainer (its base int8) measured its eval a 1e-6 apart between the
-/// two layouts on the RX 7900 XTX (2026-11-11): the two blocks that always took it (qi's and mf's) keep taking it, so
-/// that a step's memory is where it was.
-AdScratch take_ad_scratch(Pool& pool, const AdSizes& s, bool y2);
+/// AdSizes taken from a block's pool: every buffer null where no product is adapted. A plain LoRA does not take the
+/// second map's transient. Mage-Flow's eval on the RX 7900 XTX differed by 1e-6 between layouts with the runtime's
+/// timed product selection (2026-11-11); compare with that selection fixed.
+AdScratch take_ad_scratch(Pool& pool, const AdSizes& s);
 
 /// One product's rows with its adapter (null: the product as always), the base product's sums already in y [R][N]
 /// (still divided by the input's row scales rsx, no bias yet): the scales and the bias put back and the adapter's

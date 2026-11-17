@@ -145,7 +145,7 @@ void moss_block(const MossBlockRun& run, prefill::Gemm& gemm, void* stream, trai
     const train::Product* prods[kMossProducts];
     for (int i = 0; i < kMossProducts; ++i) prods[i] = &run.p[i];
     train::AdScratch adsc =
-        train::take_ad_scratch(pool, train::ad_sizes(prods, run.ad, kMossProducts, rows_of_product), false);
+        train::take_ad_scratch(pool, train::ad_sizes(prods, run.ad, kMossProducts, rows_of_product));
     // a QLoRA's int8 base: the input's int8 rows, and FP16 ones where the GPU takes no int8 products
     const bool w8 = run.p[0].w8 != nullptr;
     int8_t* x8 = nullptr;

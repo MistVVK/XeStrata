@@ -149,7 +149,7 @@ void anima_block(const AnimaBlockRun& run, prefill::Gemm& gemm, void* stream, tr
     const train::Product* prods[kAnProducts];
     for (int i = 0; i < kAnProducts; ++i) prods[i] = &run.p[i];
     train::AdScratch adsc =
-        train::take_ad_scratch(pool, train::ad_sizes(prods, run.ad, kAnProducts, rows_of_product), false);
+        train::take_ad_scratch(pool, train::ad_sizes(prods, run.ad, kAnProducts, rows_of_product));
     // an adapter's kept rows from row r0 on (a band of the MLP's)
     auto keep_at = [&](int i, int64_t r0) {
         train::AdKeep k = keep[i];
