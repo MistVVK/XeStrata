@@ -4,8 +4,8 @@ name: Docker images
 # Run by hand only (Actions tab -> Docker images -> Run workflow). Nothing starts it on its own.
 #
 # For each flavor the job downloads the engine package from the release and checks it against the signed update feed
-# (docker/fetch-engines.py: the feed's Ed25519 signature, the archive's SHA-256, the manifest hash, the package signature,
-# every file's hash), builds the image with docker/build.sh and, only when "push" is on, pushes
+# (tools/docker/fetch-engines.py: the feed's Ed25519 signature, the archive's SHA-256, the manifest hash, the package signature,
+# every file's hash), builds the image with tools/docker/build.sh and, only when "push" is on, pushes
 #   ghcr.io/niko1221/strata:<version>-<flavor>   and   ghcr.io/niko1221/strata:latest-<flavor>
 # The first run with "push" off builds everything without publishing it (a dry run).
 
@@ -32,7 +32,7 @@ on:
         default: true
         type: boolean
       source_ref:
-        description: 'Git ref of the Dockerfile and the Terminal sources (empty: the release tag)'
+        description: 'Git ref of the tools/docker/Dockerfile.src and the Terminal sources (empty: the release tag)'
         required: false
         default: ''
         type: string
@@ -61,7 +61,7 @@ jobs:
           set -eu
           args="--release-tag $TAG --list --skip-missing"
           [ -n "$WANT" ] && args="$args --flavors $WANT"
-          python3 docker/fetch-engines.py $args > list.tsv
+          python3 tools/docker/fetch-engines.py $args > list.tsv
           cat list.tsv
           flavors=$(awk -F'\t' '$3 != "SKIP" {printf "%s\"%s\"", (n++ ? "," : ""), $1}' list.tsv)
           [ -n "$flavors" ] || { echo "the release has no engine package for any requested flavor"; exit 1; }
@@ -101,7 +101,7 @@ jobs:
           PUSH: ${{ inputs.push && '--push' || '' }}
           LATEST: ${{ !inputs.latest && '--no-latest' || '' }}
         run: |
-          docker/publish.sh --release-tag "$TAG" --flavors "$FLAVOR" --image "$IMAGE" $PUSH $LATEST
+          tools/docker/publish.sh --release-tag "$TAG" --flavors "$FLAVOR" --image "$IMAGE" $PUSH $LATEST
       - name: Summary
         if: ${{ always() }}
         run: |

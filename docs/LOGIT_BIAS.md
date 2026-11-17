@@ -46,7 +46,7 @@ Numeric pair values are also supported, for example `[[42, 2.5]]`.
 Token IDs belong to the loaded model's tokenizer; the example ID is not portable
 between arbitrary models. Leading spaces and letter case can also change token IDs.
 The four English requests were measured on ISTA IQ3_XXS; a
-[reproduction script](../tools/logit_bias_english_example.py) is included.
+[reproduction script](../terminal/tools/logit_bias_english_example.py) is included.
 
 ## Semantics and limits
 

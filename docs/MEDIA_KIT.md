@@ -32,8 +32,8 @@ establish a current default model or universal performance.
 
 | Asset | File | Suggested caption / context |
 | --- | --- | --- |
-| Logo, light background | [strata-lockup-light.svg](../apps/host/public/brand/strata-lockup-light.svg) | Strata |
-| Logo, dark background | [strata-lockup-dark.svg](../apps/host/public/brand/strata-lockup-dark.svg) | Strata |
+| Logo, light background | [strata-lockup-light.svg](../app/host/public/brand/strata-lockup-light.svg) | Strata |
+| Logo, dark background | [strata-lockup-dark.svg](../app/host/public/brand/strata-lockup-dark.svg) | Strata |
 | Desktop app | [app-chat.png](media/app-chat.png) | Chat, files and a live preview in one window. The capture shows a Gyro model; do not relabel it as an ISTA run. |
 | Terminal app | [terminal-monitor.png](media/terminal-monitor.png) | Model activity and hardware use. The capture shows a Gyro-S session; its live counters are not a standardized benchmark. |
 | Coding demo thumbnail | [pagoda-preview.webp](media/pagoda-preview.webp) | A voxel garden generated locally. |

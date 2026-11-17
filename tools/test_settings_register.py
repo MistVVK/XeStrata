@@ -1,4 +1,4 @@
-"""The settings register must list exactly the STRATA_* settings the engine reads (tools/settings_register.py, data/settings-register.json).
+"""The settings register must list exactly the STRATA_* settings the engine reads (tools/settings_register.py, terminal/data/settings-register.json).
 
 Fails when
   * the engine reads a setting that is not in the register (add it: python tools/settings_register.py, then set its status);
@@ -33,7 +33,7 @@ class SettingsRegister(unittest.TestCase):
 
     def test_engine_reads_nothing_unregistered(self):
         missing = sorted(self.engine - self.registered)
-        self.assertEqual(missing, [], "the engine reads settings that are not in data/settings-register.json "
+        self.assertEqual(missing, [], "the engine reads settings that are not in terminal/data/settings-register.json "
                                       "(run python tools/settings_register.py and give each a status): " + ", ".join(missing[:20]))
 
     def test_register_has_no_orphans(self):

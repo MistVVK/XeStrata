@@ -288,7 +288,7 @@ When the RAM cannot hold them beside the system (the experts plus about 10 GB), 
   it into locked RAM (for example 2x 16 GB GPUs with 32 GB of RAM). Run it with `--pcie-frac 0`.
 - Windows, opt-in: `STRATA_FILE_RELEASE=1` trims the file-backed pages of experts after their GPU uploads. It is a
   working-set hint, not an unmap, and it does not reduce committed memory or SSD reads
-  ([measurements and limits](../bench/results/2026-10-04-windows-mapped-release/README.md)).
+  ([measurements and limits](bench-results/2026-10-04-windows-mapped-release/README.md)).
 - Windows, opt-in: `STRATA_PIN_BY_NEED=1` (arena on one GPU) registers the profile's non-GPU-resident experts by rank up to
   `STRATA_ARENA_PIN_GIB` (29 by default on Windows) instead of the first ~30 GiB.
 - Windows CUDA keeps 640 MiB then 160 MiB of page-lockable memory free while the arena pins (`STRATA_PIN_RESERVE_MIB=N`, `0`
@@ -1468,16 +1468,16 @@ Strata itself: [MIT](../LICENSE). The model files are not part of it; their lice
 
 Dated results. They were measured on the engine version and hardware named in each row. They are evidence for the defaults
 above, not claims about the current release or other machines. Where a row says "default", the setting is now on or off as
-described in the sections above. Raw data is in [`bench/results/`](../bench/results/).
+described in the sections above. Raw data is in [`bench/results/`](bench-results/).
 
 ### Engine speed tables and tuning
 
 | Engine | Measured on | Result |
 | --- | --- | --- |
 | 0.1.5 | RTX 5070 12 GB, Q2_0, 262K | KV streaming: 50.9 -> 62.6 tok/s output (1,589 -> 3,872 experts in VRAM); about +6% at 128K |
-| 0.1.8 | Setup, `--kv q4_0` | 4-bit KV (Hadamard-rotated): about 4% faster at 128K, perplexity +8-12%. [`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md) |
-| 0.1.13 | RTX 5070 12 GB, 64 GB RAM, 32K prompt | Prompt chunks of 8,192, quantized MMQ kernels: Q2_0 572 -> 1,290 tok/s, IQ3_S 383 -> 1,208. Through the server (Q2_0, 128K context): 999 tokens 353 -> 438 tok/s, 6,927 tokens 529 -> 1,077, 28,584 tokens 584 -> 1,249. Output speed unchanged. [`bench/results/2026-09-28-prefill-speed`](../bench/results/2026-09-28-prefill-speed/README.md) |
-| 0.1.14 | RTX 5070, 4K prompt, back to back | Output 88.5 tok/s (0.1.12: 85.7). Tables before 0.1.13: [`bench/results/2026-09-24-final`](../bench/results/2026-09-24-final/matrix.md); 0.1.14: [`bench/results/2026-09-28-speed-0114`](../bench/results/2026-09-28-speed-0114/README.md) |
+| 0.1.8 | Setup, `--kv q4_0` | 4-bit KV (Hadamard-rotated): about 4% faster at 128K, perplexity +8-12%. [`bench/results/2026-09-27-kv-q4`](bench-results/2026-09-27-kv-q4/README.md) |
+| 0.1.13 | RTX 5070 12 GB, 64 GB RAM, 32K prompt | Prompt chunks of 8,192, quantized MMQ kernels: Q2_0 572 -> 1,290 tok/s, IQ3_S 383 -> 1,208. Through the server (Q2_0, 128K context): 999 tokens 353 -> 438 tok/s, 6,927 tokens 529 -> 1,077, 28,584 tokens 584 -> 1,249. Output speed unchanged. [`bench/results/2026-09-28-prefill-speed`](bench-results/2026-09-28-prefill-speed/README.md) |
+| 0.1.14 | RTX 5070, 4K prompt, back to back | Output 88.5 tok/s (0.1.12: 85.7). Tables before 0.1.13: [`bench/results/2026-09-24-final`](bench-results/2026-09-24-final/matrix.md); 0.1.14: [`bench/results/2026-09-28-speed-0114`](bench-results/2026-09-28-speed-0114/README.md) |
 | 0.1.25 | RTX 3090, Coder, 198K context, `--kv k8v4` | 99 instead of 85 tok/s output, same needle results, prompts 2-5% slower. On an RTX 2060 SUPER 8 GB at 128K: +780 expert slots over resident K8V4 |
 | 0.1.36 (#136) | RTX 5070, Q2_0, fused int8 kernels (RTX 30 and newer) | Prompt 4K 1,294 -> 1,570, 32K 2,170 -> 2,653, 128K 2,123 -> 2,468 tok/s (+16-22%), teacher-forced KL 0.009 at 32K vs 0.012 before. Decode on thread-block clusters (RTX 50, sm_90+): Q2_0 output 4K 89 -> 93.5, 128K 64.5 -> 76.4 tok/s. `STRATA_PF_FUSED=0` keeps the previous prompt kernels; `STRATA_QSA_CLUSTER=0` and `STRATA_ARGMAX_MULTI=0` turn the decode kernels off. IQ2_XS prompts with `STRATA_PF_FUSED=1`: +12% at 4K, +3% at 32K |
 | 0.1.38 | AMD RX 7900 XTX (gfx1100), ROCm 10.2 nightly, tuned hipBLASLt-100500 table ([#755](https://github.com/Niko1221/Strata/pull/755)), Ryzen 9 7900X 96 GB, IQ3_S, median of 3 | Prompt 1K 760, 4K 1,275, 32K 1,641, 64K 1,594, 128K 1,494 tok/s (32K-128K 8-28% faster than 0.1.22); output 65.1, 60.4, 64.4, 61.8, 59.2 tok/s |
@@ -1530,8 +1530,8 @@ which about doubled prompt speed on the measured card.
 | 0.1.43 | RTX 3060 12 GB, 32 GB, Linux, IQ2_XS, 20.5 GiB experts in RAM, v0.1.43 as baseline, 47 frozen Korean requests replayed in fresh engines | `STRATA_RAM_ADAPT`: decode 43.26 -> 50.40 tok/s (+16.5%); file-tier demand reads per generated token 14.15 -> 2.67. One machine, one quantization |
 | 0.2.1 (#3060) | RTX 3060 12 GB, 32 GB RAM, Linux NVMe, IQ2_XS and IQ3_XXS read in place, 20.5 GiB of experts in RAM, `--adapt-async 1`, `--spec 3`, fresh engine and dropped page cache per run, 3 interleaved runs | `STRATA_RAM_ADAPT` with the stage-buffer copy and `=1` against `=8` before it, 120 ShareGPT requests: IQ2_XS decode 48.71 -> 51.40 tok/s, prompt 137.4 -> 141.5, storage reads 408 -> 308 GB; IQ3_XXS decode 33.07 -> 38.71, prompt 97.8 -> 104.2, reads 1105 -> 717 GB (off: 37.70 and 23.24 tok/s). `standard-v1`: within noise. One machine; the author's numbers, not yet repeated here |
 | 0.1.45.3 | RTX 3060 12 GB, IQ2_XS, 20 GiB of experts in RAM, cgroup 34 GB, SATA emulated at 450 MB/s, 5 pairs | Prompt-chunk planner `8192 -> 3840`: 4,101 tokens 138.1 vs 138.2 tok/s (one chunk either way); 20,400 tokens 334.0 -> 822.3 tok/s (2.46x, drive read 26.1 -> 2.7 GB, decode after 25.4 -> 42.6); 28,887 tokens 418.8 -> 910.4 (2.17x). With a real NVMe and a 32 GB cap it picks 8192 again |
-| 2026-10-11 reports | RTX 3090 + Ryzen 5 5600X | `--adapt-async 1` on the arena: x1.07-1.11 decode, 12 of 12 prompts faster ([report](../bench/results/2026-10-11-community-rtx3090-5600x-arena-async/README.md)). `STRATA_PIN_BY_NEED=1`: prompt read +5-7% at 56K-117K tokens ([report](../bench/results/2026-10-11-community-rtx3090-5600x-arena-pin-by-need/README.md)) |
-| 2026-10-11 report | RTX 5090 / Ryzen 9 9950X, paired 4K three-prompt test | `STRATA_ADAPT_CALLBACK_WARMUP`: 142.82 -> 207.75 tok/s ([report](../bench/results/2026-10-11-rtx-5090-callback-affinity/README.md)) |
+| 2026-10-11 reports | RTX 3090 + Ryzen 5 5600X | `--adapt-async 1` on the arena: x1.07-1.11 decode, 12 of 12 prompts faster ([report](bench-results/2026-10-11-community-rtx3090-5600x-arena-async/README.md)). `STRATA_PIN_BY_NEED=1`: prompt read +5-7% at 56K-117K tokens ([report](bench-results/2026-10-11-community-rtx3090-5600x-arena-pin-by-need/README.md)) |
+| 2026-10-11 report | RTX 5090 / Ryzen 9 9950X, paired 4K three-prompt test | `STRATA_ADAPT_CALLBACK_WARMUP`: 142.82 -> 207.75 tok/s ([report](bench-results/2026-10-11-rtx-5090-callback-affinity/README.md)) |
 | 2026-10-04 report | 32 GB Windows 11 laptop, RTX 4080 Laptop + Thunderbolt RTX 3090, IQ2_XS, `--mmap-experts --layer-split 12 --trim-stage-weights` | `STRATA_FILE_RELEASE=1`: median available RAM 0.51 -> 12.19 GiB across 1K/4K/16K prompts, prefill 3.7-4.4% lower |
 | not stated | Swift 1.5 IQ3_S, RTX 5090, 64 GB RAM, Windows, ~30 swaps per verify window | `STRATA_EXCHANGE_ROTATE=1`: 164 -> 188 tok/s on one 1,500-token text, 155 -> 178 over 23 coding-agent turns ([EXCHANGE_ROTATION.md](EXCHANGE_ROTATION.md)); RTX 3060 IQ3_XXS decode 58.96 -> 62.03 tok/s (+5.2%, 5/5) |
 

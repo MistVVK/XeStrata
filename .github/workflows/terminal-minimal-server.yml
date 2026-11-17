@@ -4,25 +4,25 @@ on:
   push:
     paths:
       - .github/workflows/terminal-minimal-server.yml
-      - requirements.txt
-      - strata.py
-      - strata_cli/**
-      - strata_control/**
-      - serve/**
-      - tests/terminal/test_runtime.py
-      - tools/minimal_server_smoke.py
-      - tools/strata_tokenizer.py
+      - terminal/requirements.txt
+      - terminal/strata.py
+      - terminal/strata_cli/**
+      - terminal/strata_control/**
+      - terminal/serve/**
+      - terminal/tests/terminal/test_runtime.py
+      - terminal/tools/minimal_server_smoke.py
+      - terminal/tools/strata_tokenizer.py
   pull_request:
     paths:
       - .github/workflows/terminal-minimal-server.yml
-      - requirements.txt
-      - strata.py
-      - strata_cli/**
-      - strata_control/**
-      - serve/**
-      - tests/terminal/test_runtime.py
-      - tools/minimal_server_smoke.py
-      - tools/strata_tokenizer.py
+      - terminal/requirements.txt
+      - terminal/strata.py
+      - terminal/strata_cli/**
+      - terminal/strata_control/**
+      - terminal/serve/**
+      - terminal/tests/terminal/test_runtime.py
+      - terminal/tools/minimal_server_smoke.py
+      - terminal/tools/strata_tokenizer.py
   workflow_dispatch:
 
 permissions:
@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           python -m venv "$RUNNER_TEMP/strata-runtime-venv"
-          "$RUNNER_TEMP/strata-runtime-venv/bin/python" -m pip install -r requirements.txt
+          "$RUNNER_TEMP/strata-runtime-venv/bin/python" -m pip install -r terminal/requirements.txt
       - name: Check fake-engine serving without terminal packages
         shell: bash
         run: |
@@ -55,11 +55,11 @@ jobs:
 
           report = Path(os.environ['RUNNER_TEMP']) / 'minimal-server-smoke.json'
           python = str(Path(os.environ['RUNNER_TEMP']) / 'strata-runtime-venv' / 'bin' / 'python')
-          subprocess.run([python, 'tools/minimal_server_smoke.py',
+          subprocess.run([python, 'terminal/tools/minimal_server_smoke.py',
                           '--report', str(report)], check=True)
           print(report.read_text())
           PY
       - name: Run full server suite without terminal packages
         shell: bash
         run: |
-          "$RUNNER_TEMP/strata-runtime-venv/bin/python" -m unittest discover -s serve -p 'test_*.py'
+          "$RUNNER_TEMP/strata-runtime-venv/bin/python" -m unittest discover -s terminal/serve -p 'test_*.py'

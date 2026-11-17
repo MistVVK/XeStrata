@@ -4,8 +4,13 @@
 # Python (with venv) is installed through apt/dnf if it is missing (asks for sudo).
 # NixOS (or STRATA_UV=1) with uv installed: uv makes the project venv; every other Linux uses the standard venv.
 cd "$(dirname "$0")" || exit 1
+# the Terminal's sources and everything setup writes live in terminal/ (0.2.16 layout); an older clone's .venv moves there once
+if [ -f terminal/setup.py ]; then
+  [ -e terminal/.venv ] || { [ -x .venv/bin/python ] && mv .venv terminal/.venv; }
+  cd terminal || exit 1
+fi
 # A bundled Python runtime (the python/ folder of the terminal archive) is used when it is there: nothing to find,
-# install or download. update.sh runs this file, so it uses it too.
+# install or download. (./setup.sh --setup, --update)
 if [ -x python/bin/python3 ]; then
   PYTHONNOUSERSITE=1; export PYTHONNOUSERSITE
   unset PYTHONHOME PYTHONPATH

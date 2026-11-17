@@ -1,4 +1,4 @@
-"""bench/results/README.md lists every result folder (tools/bench_results_index.py)."""
+"""docs/bench-results/README.md lists every result folder (tools/bench_results_index.py)."""
 import os
 import sys
 import unittest

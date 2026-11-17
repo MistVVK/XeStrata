@@ -73,7 +73,7 @@ System Settings > Privacy & Security and press "Open Anyway" next to the message
 file you downloaded from the official release; a warning alone does not show that a file is safe or intact. Installs made
 with `curl ... | sh` carry no mark and need none of this. To see which kind you have: `spctl -a -vv /Applications/Strata.app`
 answers "accepted" and "Notarized Developer ID" for a notarised build. How the builds are signed is in
-[Mac packaging](../packaging/mac/README.md).
+[Mac packaging](../tools/packaging/mac/README.md).
 
 **The Linux AppImage does not open.**
 Make the downloaded file executable. It may need FUSE 2 (`libfuse2` on Ubuntu 22.04, `libfuse2t64` on newer Ubuntu;
@@ -370,5 +370,5 @@ overwrite local branches or edits just to make `git pull` succeed.
 Look through a log before you send it, and never send an API key. Include model and quantization, OS, GPU/VRAM, RAM,
 driver, install route (app, Terminal or the installer), Strata and engine versions, exact command, expected result and
 actual error. Open an [issue](https://github.com/Niko1221/Strata/issues) and attach the log. Follow
-[CONTRIBUTING.md](../CONTRIBUTING.md). The full table of error messages, with the older engine fixes, is in the
+[CONTRIBUTING.md](../.github/CONTRIBUTING.md). The full table of error messages, with the older engine fixes, is in the
 [details](DETAILS.md#troubleshooting).

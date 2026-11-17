@@ -44,7 +44,7 @@ Formats, read from the shard headers with `tools/gguf_reader.py`:
   [UD-Q4_K_XL](UNSLOTH_Q4.md) handles with `tools/iq_pack.py --compat-bf16`.
 - **The PLE table** (`per_layer_token_embd.weight`, [160, 320001536]) is **Q8_0**, in its own shard 3. A row is 5 blocks
   of 32 elements at 34 bytes, 170 bytes in all, and the whole table is 54.4 GB (UD-Q4_K_XL's IQ4_NL table is 28.8 GB).
-  The engine reads Q8_0 rows natively. The FP8 table of [tools/ple_fp8_pack.py](../tools/ple_fp8_pack.py) needs the
+  The engine reads Q8_0 rows natively. The FP8 table of [tools/ple_fp8_pack.py](../terminal/tools/ple_fp8_pack.py) needs the
   original checkpoint, which this file is not a substitute for.
 
 Q6_K gate/up costs 210 bytes per 256 elements, against Q4_K's 144, so the routed experts' share of the file grows about

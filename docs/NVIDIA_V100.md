@@ -88,7 +88,7 @@ below sm_80.
 
 **Prompt attention kernel.** Measured on: one V100-PCIE-32GB, i9-7960X, Unsloth UD-IQ4_XS, int8 KV, MTP `--spec 2`, random-word
 prompts, prompt read speed in tok/s with and without the Volta kernel (`STRATA_PROMPT_ATTN_OLD=1`). Decode was 38-51 tok/s in
-every run and is not affected. Report: [bench/results/2026-10-03-v100-prompt-attn](../bench/results/2026-10-03-v100-prompt-attn/README.md).
+every run and is not affected. Report: [bench/results/2026-10-03-v100-prompt-attn](bench-results/2026-10-03-v100-prompt-attn/README.md).
 
 | Prompt tokens | old attention path | `prompt_attn_v70_kernel` |
 | --- | ---: | ---: |
@@ -103,13 +103,13 @@ Greedy output was identical on the 28,650- and 114,338-token prompts and differe
 
 | Measured on | Result |
 | --- | --- |
-| V100-SXM2, contributor's measurement | decode kernels (`STRATA_SM70_TABLE=1`): GPU work per verify window 22.8 -> 21.2 ms ([report](../bench/results/2026-10-07-v100-decode-kernels/README.md)) |
-| V100, `STRATA_PF_WMMA=1` | prompt +10% against MMQ ([report](../bench/results/2026-10-07-v100-prompt-experts/README.md)) |
+| V100-SXM2, contributor's measurement | decode kernels (`STRATA_SM70_TABLE=1`): GPU work per verify window 22.8 -> 21.2 ms ([report](bench-results/2026-10-07-v100-decode-kernels/README.md)) |
+| V100, `STRATA_PF_WMMA=1` | prompt +10% against MMQ ([report](bench-results/2026-10-07-v100-prompt-experts/README.md)) |
 | V100, `STRATA_PF_WMMA2=1` | prompt +2.5-4.3% |
 | V100, `STRATA_ARGMAX_ROWS_SM70=1` / `STRATA_GR_NORM_FAST=1` | decode +0.7-0.8% / +0.5-0.6% |
 | V100, `STRATA_Q8_GATHER_WIDE=0` | +11% on the gather kernel |
 | V100, `STRATA_GDN_REC_WARP=2` | +6-9% on the recurrence |
 | V100, `STRATA_FUSE_DECODE=1` | 4-16 us per token saved, not visible end to end |
 | Tesla P100 alone and with an RTX 2070 SUPER as expert helper (#1069) | 30.5 tok/s alone, 35.8-38.4 with the helper |
-| Two Tesla P40, layer split (#1028) | [report](../bench/results/2026-10-05-community-2x-p40/README.md) |
+| Two Tesla P40, layer split (#1028) | [report](bench-results/2026-10-05-community-2x-p40/README.md) |
 | V100 + P100 pair (#1079) | +6-11% decode from engine 0.1.39 to 0.1.40 with the P100 as helper cache |

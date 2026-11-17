@@ -1,0 +1,176 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
+    <img src="../../app/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
+  </picture>
+</p>
+
+<h3 align="center">Une IA puissante sur votre propre ordinateur.</h3>
+<p align="center">Discutez, programmez et travaillez avec des images, en local.</p>
+
+<p align="center">
+  <a href="#modèles">Modèles</a> · <a href="#installation"><b>Installation</b></a> ·
+  <a href="#matériel">Matériel</a> · <a href="#outils">Outils</a> ·
+  <a href="#aide">Aide</a> · <a href="#soutenir-strata">Soutenir</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Télécharger Strata"></a>
+  <a href="../../LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="Licence MIT"></a>
+  <a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=fff" alt="Soutenir Strata sur GitHub Sponsors"></a>
+  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Soutenir Strata sur Buy Me a Coffee"></a>
+</p>
+
+<p align="center"><sub><a href="../../README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <b>Français</b> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
+
+**Gratuit, open source, et à vous de l'exécuter.** Utilisez Strata sur votre bureau ou avec vos outils de programmation préférés. Aucun compte nécessaire.
+
+## Modèles
+
+Nous recommandons **d'abord ISTA-DASLab**, puis **Unsloth** et d'autres fournisseurs, lorsqu'un modèle compatible tient en mémoire.
+
+<details>
+<summary><img src="../media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+
+| Fournisseur | Choix |
+| --- | --- |
+| **ISTA-DASLab · recommandé** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder : IQ1\_M](../MODELS.md#coder) pour programmer. |
+| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
+| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Utilise moins de mémoire, mais plus lent. |
+| **Autres options** | [Swift 1.5](../MODELS.md#swift-15), [NVFP4](../NVFP4.md), [OrcaRouter](../ORCA.md) |
+
+[Comparer les tailles, la mémoire nécessaire et la compatibilité](../MODELS.md).
+
+</details>
+
+<details>
+<summary><img src="../media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+
+**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. Ce sont les paquets actuellement documentés pour ce modèle.
+
+[Guide du modèle et compatibilité](../QWEN36.md).
+
+</details>
+
+<a id="the-other-sizes"></a>
+
+Vous ne savez pas ce qui tient ? [Choisir un modèle pour votre ordinateur](../MODELS.md#pick-by-memory).
+
+## Installation
+
+<a id="option-a-the-strata-app"></a>
+
+### Application de bureau
+
+**[Télécharger Strata pour Windows, Linux ou Mac →](https://github.com/Niko1221/Strata/releases/latest)**
+
+Installez l'application, choisissez un modèle et commencez à discuter. Il y a un seul installateur par système. Au premier lancement, l'application télécharge le moteur de votre carte graphique. [Aide pour l'installateur](../INSTALL.md#the-app).
+
+<sub>Fichiers: `Strata-0.2.15-windows-x64-setup.exe` · `Strata-0.2.15-linux-x86_64.AppImage` · `Strata-0.2.15-macos-arm64.dmg`</sub>
+
+<p align="center">
+  <img src="../media/app-chat.png" width="900" alt="Application de bureau Strata avec une discussion et un aperçu du code en direct côte à côte">
+  <br><sub>Discussion, fichiers et aperçu en direct dans une seule fenêtre.</sub>
+</p>
+
+<a id="option-b-the-terminal-one-line"></a>
+
+### Application Terminal
+
+Vous préférez le terminal ? Installez Strata, puis lancez **`strata launch`**.
+
+<details open>
+<summary><b>Commandes d'installation</b></summary>
+
+**Linux / Mac**
+
+```sh
+curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+```
+
+**Windows PowerShell**
+
+```powershell
+irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+```
+
+Sous Windows, ouvrez ensuite un nouveau terminal. Puis :
+
+```sh
+strata launch
+```
+
+Suivez les invites pour télécharger et démarrer un modèle. [Guide du Terminal](../TERMINAL_LAUNCH.md).
+
+</details>
+
+<p align="center">
+  <img src="../media/terminal-monitor.png" width="900" alt="Application Terminal de Strata affichant l'activité du modèle, la vitesse, la mémoire et les requêtes récentes">
+  <br><sub>Suivez votre modèle et votre matériel pendant qu'il tourne.</sub>
+</p>
+
+<a id="build-from-source"></a>
+
+[Compiler depuis les sources](../SOURCE_INSTALL.md) · [Docker](../DOCKER.md) · [Guide d'installation complet](../INSTALL.md)
+
+<a id="what-you-need"></a>
+
+## Matériel
+
+| Matériel pris en charge | Guide |
+| --- | --- |
+| **NVIDIA GeForce RTX 20 / 30 / 40 / 50** | [Installation NVIDIA](../INSTALL.md#what-you-need) |
+| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [Installation AMD](../AMD_HIP.md) |
+| **AMD Radeon RX 6800 / 6900 · expérimental** | [Installation RX 6000](../AMD_HIP.md#rdna2-gfx1030) |
+| **Intel Arc · Linux** | [Installation Intel](../INTEL_ARC.md) |
+| **Apple Silicon · M1 ou plus récent** | [Installation sur Mac](../MAC.md) |
+| **AMD Ryzen AI Max · Strix Halo** | [Installation Strix Halo](../STRIX_HALO.md) |
+
+<a id="using-it"></a>
+
+## Outils
+
+**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, et d'autres via les API compatibles OpenAI et Anthropic.
+
+Lancez **`strata connect`** pour voir la configuration de votre outil. [Guide de connexion](../TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
+
+<a id="guides"></a>
+<a id="how-fast-is-it"></a>
+<a id="how-does-it-work"></a>
+<a id="something-went-wrong"></a>
+
+## Aide
+
+[Tous les guides](..) · [Dépannage](../TROUBLESHOOTING.md) · [Signaler un bogue](https://github.com/Niko1221/Strata/issues/new/choose) ·
+[Benchmarks](../COMMUNITY_BENCHMARKS.md) · [Comment ça marche](../HOW_IT_WORKS.md) · [Contribuer](../../.github/CONTRIBUTING.md)
+
+## Soutenir Strata
+
+**Aidez à garder l'IA locale ouverte à tous.** Un parrainage sur GitHub ou un café aide à financer le développement et les tests sur davantage de matériel.
+
+<a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors : soutenir Strata" height="48"></a>
+<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee : soutenir Strata" height="48"></a>
+
+### Fidèles soutiens
+
+Merci à toutes les personnes qui soutiennent Strata.
+
+<!-- supporters:start (one line per public supporter, newest last; copy a line and change the GitHub name in all four places) -->
+<a href="https://github.com/ryan4yin"><img src="https://github.com/ryan4yin.png?size=96" width="48" height="48" alt="ryan4yin" title="ryan4yin"></a>
+<a href="https://github.com/themactep"><img src="https://github.com/themactep.png?size=96" width="48" height="48" alt="themactep" title="themactep"></a>
+<a href="https://github.com/macintog"><img src="https://github.com/macintog.png?size=96" width="48" height="48" alt="macintog" title="macintog"></a>
+<a href="https://github.com/bisonbet"><img src="https://github.com/bisonbet.png?size=96" width="48" height="48" alt="bisonbet" title="bisonbet"></a>
+<a href="https://github.com/vizv"><img src="https://github.com/vizv.png?size=96" width="48" height="48" alt="vizv" title="vizv"></a>
+<a href="https://github.com/kod88vn"><img src="https://github.com/kod88vn.png?size=96" width="48" height="48" alt="kod88vn" title="kod88vn"></a>
+<a href="https://github.com/seoulworker"><img src="https://github.com/seoulworker.png?size=96" width="48" height="48" alt="seoulworker" title="seoulworker"></a>
+<a href="https://github.com/jackyini"><img src="https://github.com/jackyini.png?size=96" width="48" height="48" alt="jackyini" title="jackyini"></a>
+<a href="https://github.com/router0mail"><img src="https://github.com/router0mail.png?size=96" width="48" height="48" alt="router0mail" title="router0mail"></a>
+<!-- supporters:end -->
+
+[Licence MIT](../../LICENSE) · [Crédits et licences des modèles](../HOW_IT_WORKS.md#credits) · [Confidentialité](../SAFETY.md)
+
+<a id="option-c-let-your-ai-set-it-up"></a>
+
+<sub>Pour les outils d'IA et les lecteurs automatiques : <a href="../../AGENTS.md">référence technique</a> · <a href="../AI_SETUP.md">instructions d'installation</a>.</sub>
+
+**Parrainages, partenariats matériel ou collaborations :** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).

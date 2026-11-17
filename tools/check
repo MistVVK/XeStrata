@@ -3,15 +3,15 @@
 
 Runs, each in its own step with its own timeout, in a scratch folder (build trees, temp files, logs):
 
-  cmake-cpu       CMake preset `cpu-check` (CMakePresets.json): configure, build, CTest. No GPU, no model, no network.
-  py-tests        pytest tests/   (without tests/snapshot, which has its own step)
-  py-serve        pytest serve/
-  py-tools        pytest tools/test_*.py
-  py-optional     tools/dflash2, tools/trellis tests; need torch and are skipped without it
-  host-typecheck  apps/host: npm run typecheck
-  host-test       apps/host: npm test (a per-test timeout, so a hang fails one test instead of the run)
-  host-build      apps/host: npm run build
-  snapshot        pytest tests/snapshot (the config snapshot of the four entry points; needs Node 24)
+  cmake-cpu       CMake preset `cpu-check` (engine/CMakePresets.json): configure, build, CTest. No GPU, no model, no network.
+  py-tests        pytest tests/   (without terminal/tests/snapshot, which has its own step)
+  py-serve        pytest terminal/serve/
+  py-tools        pytest terminal/tools/test_*.py
+  py-optional     terminal/tools/dflash2, terminal/tools/trellis tests; need torch and are skipped without it
+  host-typecheck  app/host: npm run typecheck
+  host-test       app/host: npm test (a per-test timeout, so a hang fails one test instead of the run)
+  host-build      app/host: npm run build
+  snapshot        pytest terminal/tests/snapshot (the config snapshot of the four entry points; needs Node 24)
   docs            local links in the current pages (tools/check_links.py), the release manifest, the capability table and the bench results index (--check)
 
 Prints one table: passed / failed / skipped / not run, per step, with the reason for every skip and every "not run".
@@ -40,7 +40,9 @@ import xml.etree.ElementTree as ET
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WIN = os.name == "nt"
-HOST = os.path.join(ROOT, "apps", "host")
+HOST = os.path.join(ROOT, "app", "host")
+TERMINAL = os.path.join(ROOT, "terminal")
+ENGINE = os.path.join(ROOT, "engine")
 NODE_MIN = (24, 12)
 
 # step name -> default timeout in seconds (explicit, per step; --timeout-scale multiplies them)
@@ -78,7 +80,7 @@ class Scratch:
         env = dict(os.environ)
         tmp = self.path("tmp")
         env.update({"TMP": tmp, "TEMP": tmp, "TMPDIR": tmp, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1",
-                    "PYTHONUNBUFFERED": "1"})      # CI is left as the caller has it: some code asks whether a person can answer (strata_cli/launch/cmd.py)
+                    "PYTHONUNBUFFERED": "1"})      # CI is left as the caller has it: some code asks whether a person can answer (terminal/strata_cli/launch/cmd.py)
         env.update(extra or {})
         return env
 
@@ -258,7 +260,7 @@ def step_cmake(ctx):
     t0 = time.time()
     for label, cmd in (("configure", [cmake, "--preset", "cpu-check", "-B", build]),
                        ("build", [cmake, "--build", build, "--parallel", str(ctx.jobs)])):
-        rc, _ = run_cmd(cmd, ROOT, env, max(30, t - (time.time() - t0)), log)
+        rc, _ = run_cmd(cmd, ENGINE, env, max(30, t - (time.time() - t0)), log)
         if rc is None or rc != 0:
             r.seconds = time.time() - t0
             r.failures.append("cmake " + label + (" (timed out)" if rc is None else ""))
@@ -338,9 +340,9 @@ def step_optional(ctx):
     r = Result("py-optional")
     for mod, what in (("torch", "torch"),):
         if not have_module(mod):
-            r.reason = "%s is not installed for %s (tools/dflash2 tests need torch)" % (what, sys.executable)
+            r.reason = "%s is not installed for %s (terminal/tools/dflash2 tests need torch)" % (what, sys.executable)
             return r
-    return step_pytest("py-optional", ["tools/dflash2", "tools/trellis"])(ctx)
+    return step_pytest("py-optional", ["terminal/tools/dflash2", "terminal/tools/trellis"], cwd=TERMINAL)(ctx)
 
 
 def npm_cmd():
@@ -361,7 +363,7 @@ def host_ready(ctx, r):
     log = ctx.scratch.path("npm-ci.log")
     rc, _ = run_cmd([npm_cmd(), "ci", "--no-audit", "--no-fund"], HOST, ctx.scratch.env(), 900, log)
     if rc != 0:
-        r.reason = "npm ci could not install apps/host's packages (no network?); log " + log
+        r.reason = "npm ci could not install app/host's packages (no network?); log " + log
         return False
     ctx.npm_ready = True
     return True
@@ -401,11 +403,11 @@ def step_docs(ctx):
     r.log = log
     for label, script, args in (("links", "check_links.py", ()), ("release manifest", "release_manifest.py", ("--check",)),
                                 ("capability table", "capability_table.py", ("--check",)), ("bench results index", "bench_results_index.py", ("--check",)), ("settings register", "settings_register.py", ("--check",)),
-                                ("vendored ggml and gguf-py (third_party/strata-ggml, strata-gguf-py)", "check_vendored.py", ())):
+                                ("vendored ggml and gguf-py (engine/third_party/strata-ggml, strata-gguf-py)", "check_vendored.py", ())):
         path = os.path.join(ROOT, "tools", script)
         if not os.path.exists(path):
             r.skipped += 1
-            r.skips["%s: tools/%s is not in this checkout" % (label, script)] = 1
+            r.skips["%s: terminal/tools/%s is not in this checkout" % (label, script)] = 1
             continue
         rc, secs = run_cmd([sys.executable, path, *args], ROOT, ctx.scratch.env(), ctx.timeout("docs"), log)
         r.seconds += secs
@@ -424,14 +426,14 @@ def step_docs(ctx):
 
 STEP_FUNCS = {
     "cmake-cpu": step_cmake,
-    "py-tests": step_pytest("py-tests", ["tests"], ["--ignore=" + os.path.join(ROOT, "tests", "snapshot")]),
-    "py-serve": step_pytest("py-serve", ["serve"]),
-    "py-tools": step_pytest("py-tools", ["tools/test_*.py"]),
+    "py-tests": step_pytest("py-tests", ["terminal/tests"], ["--ignore=" + os.path.join(ROOT, "terminal", "tests", "snapshot")], cwd=TERMINAL),
+    "py-serve": step_pytest("py-serve", ["terminal/serve"], cwd=TERMINAL),
+    "py-tools": step_pytest("py-tools", ["terminal/tools/test_*.py", "tools/test_*.py"], cwd=TERMINAL),
     "py-optional": step_optional,
     "host-typecheck": step_npm("host-typecheck", "typecheck"),
     "host-test": step_npm("host-test", "test"),
     "host-build": step_npm("host-build", "build"),
-    "snapshot": step_pytest("snapshot", ["tests/snapshot"], need_node=True),
+    "snapshot": step_pytest("snapshot", ["terminal/tests/snapshot"], need_node=True, cwd=TERMINAL),
     "docs": step_docs,
 }
 

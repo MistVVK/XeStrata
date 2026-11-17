@@ -90,7 +90,7 @@ GGUF files, so the GGUF folder should be on a fast SSD.
 
 ## Docker Compose
 
-Ready-made files are in [docker/compose/](../docker/compose): `docker-compose.nvidia.yml`, `docker-compose.amd.yml`,
+Ready-made files are in [docker/compose/](../tools/docker/compose): `docker-compose.nvidia.yml`, `docker-compose.amd.yml`,
 `docker-compose.intel.yml` and `.env.example`. Copy the one for your card and its `.env.example`, edit, start:
 
 ```sh
@@ -326,10 +326,10 @@ files the signed update feed names. Nothing publishes by itself: a maintainer st
    visibility, Public**, and check it is linked to the repository (the image carries the `org.opencontainers.image.source` label).
 5. Check one pull from a computer that is not logged in: `docker pull ghcr.io/niko1221/strata:0.2.7-cuda13`.
 
-For each flavor the job runs [docker/fetch-engines.py](../docker/fetch-engines.py), which reads the release's signed feed (the
+For each flavor the job runs [docker/fetch-engines.py](../tools/docker/fetch-engines.py), which reads the release's signed feed (the
 Ed25519 key in `strata_control/update_keys.json`), downloads the package, and checks the archive's size and SHA-256, the manifest
 hash, the package signature and every file's hash, exactly as `strata update` does; a package that fails stops the job before
-anything is built. [docker/build.sh](../docker/build.sh) then builds the image (and checks the package again inside the build), and
+anything is built. [docker/build.sh](../tools/docker/build.sh) then builds the image (and checks the package again inside the build), and
 the job starts the image once to see that the Terminal inside it runs.
 
 | Flavor (tag suffix) | Engine package in the release feed |

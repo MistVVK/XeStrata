@@ -3,7 +3,7 @@
 
     python tools/check_links.py                  current pages: exit 1 if a local link points at a file that is not there
     python tools/check_links.py --anchors        also fail on a #fragment that matches no heading or anchor in the target page
-    python tools/check_links.py --baseline OUT   write a report of the archived pages (history/, release notes, bench/results, ...)
+    python tools/check_links.py --baseline OUT   write a report of the archived pages (docs/history/, release notes, docs/bench-results, ...)
 
 Local links only: http(s), mailto and other schemes are not fetched.  Links inside code fences and inline code are skipped.
 Which pages are current and which are archived: tools/doc_pages.py.  Standard library only.
@@ -136,7 +136,7 @@ def main(argv=None):
         for page, n, t, why in rows:
             by.setdefault(page, []).append((n, t))
         lines = ["# Link baseline for archived pages", "",
-                 "Local links in archived pages (history/, release notes, bench/results, phaseA-tests) whose target file is missing, as of the commit that wrote this file.",
+                 "Local links in archived pages (docs/history/, release notes, docs/bench-results, phaseA-tests) whose target file is missing, as of the commit that wrote this file.",
                  "Archived pages are not fixed: they keep the links they had, and evidence they pointed to that was never published stays missing.",
                  "`python tools/check_links.py --baseline <file>` rebuilds this report. %d missing targets in %d pages." % (len(rows), len(by)), "",
                  "| Page | Missing local targets |", "| --- | ---: |"]

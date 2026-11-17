@@ -33,7 +33,7 @@ irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/
 ```
 
 More in [INSTALL.md](INSTALL.md#the-terminal). The installer needs no administrator rights and puts `strata` on your PATH.
-How far to trust a piped installer is in [SECURITY.md](../SECURITY.md). The engine (the part that talks to your graphics
+How far to trust a piped installer is in [SECURITY.md](../.github/SECURITY.md). The engine (the part that talks to your graphics
 card) comes with the first model: `strata launch` fetches the one for your card from the same release, checks its signature
 and test-starts it before using it.
 

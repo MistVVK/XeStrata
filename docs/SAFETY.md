@@ -18,7 +18,7 @@ you trust can check it. Where Strata does less than you might hope, the page say
 - **Downloads are checked.** Updates come from a signed feed. Every model file has a fixed SHA-256 and size, and an install
   stops if the pinned version of a file is gone (the details are [below](#how-downloads-are-checked)).
 - **In its default mode the coding agent asks before it changes anything**, and once per chat before its first web search or web page.
-- **The code is open.** Anyone can read it, and security problems go to [SECURITY.md](../SECURITY.md).
+- **The code is open.** Anyone can read it, and security problems go to [SECURITY.md](../.github/SECURITY.md).
 
 ## Does Strata phone home?
 
@@ -98,7 +98,7 @@ That is the full list found in the code. Some details:
   does not control what they send.
 
 The server also has browser protections (a host check, an origin check, no CORS by default). They are in
-[SECURITY.md](../SECURITY.md#what-the-server-exposes).
+[SECURITY.md](../.github/SECURITY.md#what-the-server-exposes).
 
 ## How downloads are checked
 
@@ -112,7 +112,7 @@ The server also has browser protections (a host check, an origin check, no CORS 
    then it is checked to fit your PC.
 4. The new engine is test-started before Strata switches to it. If anything fails, you keep the engine you had.
 
-Updates never replace your models or saved tuning. The full description is in [packaging/UPDATES.md](../packaging/UPDATES.md).
+Updates never replace your models or saved tuning. The full description is in [packaging/UPDATES.md](../tools/packaging/UPDATES.md).
 
 **The app.** Its updates are signed with a separate key (Tauri's minisign), and the public half is in the app
 (`apps/desktop/src-tauri/tauri.conf.json`). The updater refuses an installer whose signature does not match. The Terminal
@@ -144,7 +144,7 @@ check off, and it is never on by default.
 **The one-line install** (`curl ... | sh`, `irm ... | iex`) checks the Terminal archive's SHA-256 and the signed feed with the
 Terminal it just unpacked. The checksum and the key come from the same release as the archive, so the first install trusts
 HTTPS and the `Niko1221/Strata` release itself. What that means, and how to read the script first, is in
-[SECURITY.md](../SECURITY.md#how-far-to-trust-curl--sh-and-irm--iex). Later updates are checked against the key already on
+[SECURITY.md](../.github/SECURITY.md#how-far-to-trust-curl--sh-and-irm--iex). Later updates are checked against the key already on
 your PC.
 
 **Code signing.** The Windows installer is not code-signed yet, so Windows shows "Windows protected your PC". The signing and
@@ -195,7 +195,7 @@ Strata is MIT-licensed and the whole code is at [github.com/Niko1221/Strata](htt
 it and compare. Strata has not had an outside security audit yet.
 
 To report a security problem, use GitHub's private reporting (the repository's **Security** tab), as described in
-[SECURITY.md](../SECURITY.md). Ordinary questions and ideas can go to an
+[SECURITY.md](../.github/SECURITY.md). Ordinary questions and ideas can go to an
 [issue](https://github.com/Niko1221/Strata/issues).
 
 ## Where to check this in the code

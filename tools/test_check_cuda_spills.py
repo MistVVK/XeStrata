@@ -238,7 +238,7 @@ class BaselineFile(unittest.TestCase):
 
     def test_the_default_baseline_is_the_file_beside_the_script_and_a_missing_one_is_empty(self):
         self.assertEqual(Path(CS.BASELINE_FILE), ROOT / "tools" / "cuda_spill_baseline.json")
-        with mock.patch.object(CS, "BASELINE_FILE", str(ROOT / "tools" / "no_such_baseline.json")):
+        with mock.patch.object(CS, "BASELINE_FILE", str(ROOT / "terminal" / "tools" / "no_such_baseline.json")):
             self.assertEqual(CS.default_baseline(), {})
 
     def test_the_shipped_baseline(self):

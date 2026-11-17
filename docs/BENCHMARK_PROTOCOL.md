@@ -440,8 +440,8 @@ with the JSON; derived summaries can always be rebuilt from request records.
 
 ## Submit and review
 
-Follow [CONTRIBUTING.md](../CONTRIBUTING.md). If a log or output shows a vulnerability or a secret, report it privately as
-[SECURITY.md](../SECURITY.md) describes instead of putting it in a pull request. During the draft phase, submit pilot data clearly labelled with
+Follow [CONTRIBUTING.md](../.github/CONTRIBUTING.md). If a log or output shows a vulnerability or a secret, report it privately as
+[SECURITY.md](../.github/SECURITY.md) describes instead of putting it in a pull request. During the draft phase, submit pilot data clearly labelled with
 the draft protocol ID. Existing reports remain welcome under the [community guide](COMMUNITY_BENCHMARKS.md).
 
 1. Run one hardware/model/quant/configuration combination and retain every scheduled outcome. Add a separate

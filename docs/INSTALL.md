@@ -124,7 +124,7 @@ In a script nothing is asked: `--yes` alone never stops a model (exit 7, nothing
 and `--start-again` starts it again afterwards (exit 8 if it did not start again). The next Terminal command uses the updated
 Control component. The app, Control and engine have separate version numbers, so they can differ.
 
-Use `strata components rollback` to return to the previous engine. See [update details](../packaging/UPDATES.md).
+Use `strata components rollback` to return to the previous engine. See [update details](../tools/packaging/UPDATES.md).
 Source checkouts have a [separate update workflow](SOURCE_INSTALL.md#updating).
 
 ## Where things are stored

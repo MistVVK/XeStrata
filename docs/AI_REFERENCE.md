@@ -29,8 +29,8 @@ not additional top-level families.
 
 | Family | Availability evidence | Catalog and limits |
 | --- | --- | --- |
-| Qwen3.8-Flash-Next | Catalog entries in [setup.py](../setup.py), model guides and backend documentation | [MODELS.md](MODELS.md), [QUANTS.md](QUANTS.md), [GYRO.md](GYRO.md), [NVFP4.md](NVFP4.md), [ORCA.md](ORCA.md). <!-- cap:summary:qwen38 -->Qwen3.8-Flash-Next runs in the desktop app and in the Terminal. Hardware: NVIDIA on Windows; NVIDIA on Linux; NVIDIA DGX Spark (GB10); AMD on Windows (RX 6000, 7000 and 9000, Ryzen AI Max); AMD on Linux (RX 6000, 7000 and 9000, Radeon AI PRO R9700, Ryzen AI Max); Intel Arc on Linux (Arc A-series and B-series); Apple silicon (M1 or newer, macOS 15 or newer). Per-hardware limits and measurements: [CAPABILITIES.md](CAPABILITIES.md#qwen38).<!-- /cap --> |
-| Qwen3.6-35B-A3B | `qwen36` in `OWN_PATH_FAMILIES` in [setup.py](../setup.py) | [QWEN36.md](QWEN36.md). <!-- cap:summary:qwen36 -->Qwen3.6-35B-A3B runs in the desktop app and in the Terminal. Hardware: NVIDIA on Windows; NVIDIA on Linux; AMD on Windows; AMD on Linux. Package present but not tested: NVIDIA DGX Spark. Does not run on: Intel Arc on Linux, Apple silicon. Per-hardware limits and measurements: [CAPABILITIES.md](CAPABILITIES.md#qwen36).<!-- /cap --> |
+| Qwen3.8-Flash-Next | Catalog entries in [setup.py](../terminal/setup.py), model guides and backend documentation | [MODELS.md](MODELS.md), [QUANTS.md](QUANTS.md), [GYRO.md](GYRO.md), [NVFP4.md](NVFP4.md), [ORCA.md](ORCA.md). <!-- cap:summary:qwen38 -->Qwen3.8-Flash-Next runs in the desktop app and in the Terminal. Hardware: NVIDIA on Windows; NVIDIA on Linux; NVIDIA DGX Spark (GB10); AMD on Windows (RX 6000, 7000 and 9000, Ryzen AI Max); AMD on Linux (RX 6000, 7000 and 9000, Radeon AI PRO R9700, Ryzen AI Max); Intel Arc on Linux (Arc A-series and B-series); Apple silicon (M1 or newer, macOS 15 or newer). Per-hardware limits and measurements: [CAPABILITIES.md](CAPABILITIES.md#qwen38).<!-- /cap --> |
+| Qwen3.6-35B-A3B | `qwen36` in `OWN_PATH_FAMILIES` in [setup.py](../terminal/setup.py) | [QWEN36.md](QWEN36.md). <!-- cap:summary:qwen36 -->Qwen3.6-35B-A3B runs in the desktop app and in the Terminal. Hardware: NVIDIA on Windows; NVIDIA on Linux; AMD on Windows; AMD on Linux. Package present but not tested: NVIDIA DGX Spark. Does not run on: Intel Arc on Linux, Apple silicon. Per-hardware limits and measurements: [CAPABILITIES.md](CAPABILITIES.md#qwen36).<!-- /cap --> |
 
 A field this page does not state is
 **unknown**, not zero and not unsupported. DeepSeek Harness is a coding tool; its presence does not establish support
@@ -98,7 +98,7 @@ Default local server address: `http://127.0.0.1:8080`. The configured port and a
 | Anthropic Messages | `http://127.0.0.1:8080` | `POST /v1/messages` |
 
 Use the actual configured API key when authentication is enabled. See [API details](DETAILS.md#using-it).
-The [connection registry](../strata_cli/launch/harness.py) supplies these adapters:
+The [connection registry](../terminal/strata_cli/launch/harness.py) supplies these adapters:
 
 | Tool | `strata connect` identifier |
 | --- | --- |
@@ -125,5 +125,5 @@ See [connection instructions and limits](TERMINAL_LAUNCH.md#connect-your-apps-st
   The [standard benchmark protocol](BENCHMARK_PROTOCOL.md) remains subject to its documented activation status;
   do not label legacy commands or results as implementing it.
 - Mark missing or unverified information explicitly. Never invent measurements, test results or download links.
-- For contribution evidence, follow [CONTRIBUTING.md](../CONTRIBUTING.md). For video assets and narration,
+- For contribution evidence, follow [CONTRIBUTING.md](../.github/CONTRIBUTING.md). For video assets and narration,
   follow [MEDIA_KIT.md](MEDIA_KIT.md).
