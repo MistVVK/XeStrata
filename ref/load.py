@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """ref/load.py - P1.S4: GGUF -> FP32 tensors on demand, with LAZY per-expert dequantization.
 
 The plan is explicit: "experts are dequantized lazily per (layer, expert) - do not materialize 120B
@@ -22,11 +23,12 @@ from __future__ import annotations
 import pathlib
 import re
 import sys
+from typing import BinaryIO, cast
 
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tools"))
-from gguf_reader import GGUFFile                     # noqa: E402
+from gguf_reader import GGUFFile, TensorInfo                     # noqa: E402
 from gguf_writer import dequantize_q2_0              # noqa: E402
 
 # gguf-py names differ from our reader's names in a few places; map only what differs.
@@ -84,7 +86,7 @@ def _discover_shards(path) -> list[pathlib.Path]:
         # single unambiguous file, and REFUSE to guess otherwise.
         shards = sorted(p.glob("*-[0-9][0-9][0-9][0-9][0-9]-of-[0-9][0-9][0-9][0-9][0-9].gguf"))
         if shards:
-            totals = {re.match(r"^.*-(\d{5})-of-(\d{5})\.gguf$", s.name).group(2) for s in shards}
+            totals = {cast(re.Match[str], re.match(r"^.*-(\d{5})-of-(\d{5})\.gguf$", s.name)).group(2) for s in shards}
             if len(totals) != 1:
                 raise ValueError(f"{p}: shard files from more than one split: {sorted(totals)}")
             return shards
@@ -117,8 +119,8 @@ class Gguf:
     def __init__(self, path):
         self.paths = _discover_shards(path)
         self.path = self.paths[0]
-        self.shards: list[tuple[GGUFFile, object]] = []
-        self._by_name: dict[str, tuple[int, object]] = {}
+        self.shards: list[tuple[GGUFFile, BinaryIO]] = []
+        self._by_name: dict[str, tuple[int, TensorInfo]] = {}
         for i, sp in enumerate(self.paths):
             gf = GGUFFile(sp)
             self.shards.append((gf, sp.open("rb")))
