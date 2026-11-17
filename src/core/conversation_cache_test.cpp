@@ -161,8 +161,13 @@ int main() {
         pinned.checkpoints.back().pinned = true;
         pinned.checkpoints.back().gdn.resize(64, 1);
         cache.put(std::move(pinned));
+        const size_t pinned_bytes = cache.bytes();
         cache.put(image({9, 8, 7}));
+        // #2253: what the RAM gate may count on: everything parked but the pinned conversation
+        check(cache.evictable_bytes() == cache.bytes() - pinned_bytes && cache.evictable_bytes() == image({9, 8, 7}).bytes(),
+              "#2253: evictable_bytes leaves out the conversation that holds a pinned prefix");
         check(cache.evict_oldest() && cache.size() == 1, "the oldest unpinned conversation went (the pinned one is older)");
+        check(cache.evictable_bytes() == 0, "#2253: only a pinned one is left: nothing may go");
         check(!cache.evict_oldest() && cache.size() == 1, "only a pinned one is left: nothing more can go");
         // #879: after non-finite logits every parked conversation goes, the pinned one too
         cache.put(image({4, 5, 6}));
@@ -437,6 +442,8 @@ int main() {
         check(cache.find(sib.serial) != nullptr && cache.size() == 2 && cache.evictions() == 1 && !cache.guard_blocked(),
               "the slot limit evicts the other entry, not the guarded donor");
         check(cache.best(std::vector<int64_t>{7, 7, 7, 1}, {}, true).tokens == 0, "the other one went");
+        check(cache.evictable_bytes() == cache.bytes() - cache.find(sib.serial)->bytes(),
+              "#2253: evictable_bytes leaves out the guarded donor");
         SavedConversation rewritten = image({1, 2, 3, 4, 10, 11, 40});   // holds A's deepest checkpoint: supersedes A
         rewritten.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
         check(cache.put(std::move(rewritten)) && cache.find(sib.serial) != nullptr && cache.superseded() == 0,

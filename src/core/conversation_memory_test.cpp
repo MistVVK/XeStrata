@@ -83,6 +83,32 @@ void evict_for_ram_cases() {
         FakeRam e{4 * GiB, {}, 1.0, {}};
         check(!run(e, 4).fits && e.parked.empty(), "nothing parked: refused, nothing to evict");
     }
+    {   // #2253: short by more than every parked conversation holds: nothing is evicted, the four stay parked
+        auto run2253 = [&](FakeRam& m) {
+            return evict_for_ram([&] { return m.admit(need, floor); }, [&] { return m.last; }, [&] { return m.evict(); }, 4,
+                                 need + floor, (uint64_t) 4 * GiB);
+        };
+        FakeRam m{512 * MiB, {GiB, GiB, GiB, GiB}, 1.0, {}};   // short by 4.5 GiB, 4 GiB parked
+        const EvictForRam r = run2253(m);
+        check(!r.fits && r.evicted == 0 && r.cannot_help && r.short_by == need + floor - 512 * MiB && m.parked.size() == 4,
+              "#2253: a shortfall beyond what is parked evicts nothing");
+        // the same machine through the loop without the check (base): all four go, refused anyway
+        FakeRam old{512 * MiB, {GiB, GiB, GiB, GiB}, 1.0, {}};
+        const EvictForRam o = run(old, 4);
+        check(!o.fits && o.evicted == 4 && old.parked.empty() && !o.cannot_help, "(without the check: four evictions, an empty cache, refused)");
+        // short by exactly what is parked: the evictions can make it, so they run
+        FakeRam e{1 * GiB, {GiB, GiB, GiB, GiB}, 1.0, {}};
+        const EvictForRam x = run2253(e);
+        check(x.fits && x.evicted == 4 && !x.cannot_help, "#2253: short by exactly what is parked: all four go and it fits");
+        // already fits: the check never runs
+        FakeRam f{8 * GiB, {GiB}, 0.0, {}};
+        check(run2253(f).fits && f.parked.size() == 1, "#2253: a park that fits evicts nothing and is not refused");
+        // an unknown reading: no figure to compare, the old rule (evict, refuse) stands
+        FakeRam u{512 * MiB, {GiB}, 1.0, {}};
+        const EvictForRam ur = evict_for_ram([&] { u.last.reset(); return false; }, [&] { return u.last; }, [&] { return u.evict(); }, 4,
+                                             need + floor, (uint64_t) 1 * GiB);
+        check(!ur.cannot_help && ur.evicted == 1, "#2253: an unknown reading is not taken for a shortfall");
+    }
     {   // an unknown reading never fits and never counts as no-progress
         FakeRam m{4 * GiB, {GiB}, 1.0, {}};
         const EvictForRam r = evict_for_ram([&] { m.last.reset(); return false; }, [&] { return m.last; }, [&] { return m.evict(); }, 4);
