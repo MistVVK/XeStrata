@@ -62,7 +62,7 @@ def handle(msg: dict):
             "serverInfo": {"name": "fake", "version": "0.1"}}}
     if method == "tools/list":
         start = int(params.get("cursor") or 0)
-        page = {"tools": TOOLS[start:start + PAGE]}
+        page: dict = {"tools": TOOLS[start:start + PAGE]}
         if start + PAGE < len(TOOLS):
             page["nextCursor"] = str(start + PAGE)
         return {"jsonrpc": "2.0", "id": rid, "result": page}
@@ -125,7 +125,7 @@ class _NoLookupServer(ThreadingHTTPServer):
 def http_server(port: int = 0) -> ThreadingHTTPServer:
     """Streamable HTTP at /mcp: JSON answers, except tools/call, which answers as an event stream (a progress
     notification first); a session id from initialize is required afterwards."""
-    sessions = set()
+    sessions: set[str] = set()
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"

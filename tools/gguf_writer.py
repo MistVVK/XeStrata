@@ -164,8 +164,8 @@ class GGUFWriter:
         body += struct.pack("<I", 3)                       # GGUF v3
         body += struct.pack("<Q", len(self.tensors))
         body += struct.pack("<Q", len(self.metadata))
-        for k, (t, v) in self.metadata.items():
-            body += self._kv_bytes(k, t, v)
+        for k, (type_name, v) in self.metadata.items():
+            body += self._kv_bytes(k, type_name, v)
 
         # Tensor directory: offsets are relative to the start of the data section.
         offset = 0
