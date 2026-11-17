@@ -104,8 +104,8 @@ def main() -> int:
             off += len(raw)
     (out / "dense.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"experts.bin {NE * BLOB} B, dense.bin {off} B, {len(lines)} tensors -> {out}")
-    for l in lines:
-        print("  " + l)
+    for line in lines:
+        print("  " + line)
     return 0
 
 
