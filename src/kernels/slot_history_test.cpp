@@ -9,6 +9,7 @@
 // slot (--batch-mtp's draft) counts the first.
 #include "strata/kernels/sampler.hpp"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -30,7 +31,7 @@ std::vector<int32_t> solo_row(const std::vector<int32_t>& tail, const std::vecto
     std::vector<int32_t> window(slot_tokens.begin(), slot_tokens.begin() + t + 1);
     std::vector<int32_t> rows((size_t) window.size() * kH);
     penalty_rows(tail.data(), (int64_t) tail.size(), window.data(), (int) window.size(), kH, rows.data());
-    return std::vector<int32_t>(rows.begin() + (size_t) t * kH, rows.begin() + (size_t) (t + 1) * kH);
+    return std::vector<int32_t>(rows.begin() + (std::ptrdiff_t) t * kH, rows.begin() + (std::ptrdiff_t) (t + 1) * kH);
 }
 
 std::vector<int32_t> batch_row(const int* rows, const int32_t* tokens, int S,
@@ -40,7 +41,7 @@ std::vector<int32_t> batch_row(const int* rows, const int32_t* tokens, int S,
     for (const auto& tail : tails) { p.push_back(tail.empty() ? nullptr : tail.data()); n.push_back((int64_t) tail.size()); }
     std::vector<int32_t> out((size_t) S * kH, -7);
     slot_penalty_rows(rows, tokens, S, p.data(), n.data(), kH, out.data());
-    return std::vector<int32_t>(out.begin() + (size_t) t * kH, out.begin() + (size_t) (t + 1) * kH);
+    return std::vector<int32_t>(out.begin() + (std::ptrdiff_t) t * kH, out.begin() + (std::ptrdiff_t) (t + 1) * kH);
 }
 
 std::vector<int32_t> of(std::initializer_list<int32_t> v) { return std::vector<int32_t>(v); }

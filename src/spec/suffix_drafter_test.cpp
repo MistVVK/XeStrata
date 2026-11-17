@@ -203,9 +203,11 @@ int main(int argc, char** argv) {
             const std::vector<int32_t> ids = read_ids(argv[f]);
             if (ids.size() < 64) continue;
             const size_t half = ids.size() / 2;
-            const Sim c = simulate({ids.begin(), ids.begin() + half}, {ids.begin() + half, ids.end()}, K);
-            const size_t a = ids.size() / 3, b = 2 * ids.size() / 3;
-            const Sim p = simulate(ids, {ids.begin() + a, ids.begin() + b}, K);
+            const auto mid = ids.begin() + (std::ptrdiff_t) half;
+            const Sim c = simulate({ids.begin(), mid}, {mid, ids.end()}, K);
+            const auto third = ids.begin() + (std::ptrdiff_t) (ids.size() / 3);
+            const auto two_thirds = ids.begin() + (std::ptrdiff_t) (2 * ids.size() / 3);
+            const Sim p = simulate(ids, {third, two_thirds}, K);
             const char* name = std::strrchr(argv[f], '/') ? std::strrchr(argv[f], '/') + 1 : argv[f];
             std::printf("%-28s %8zu | %8.2f %10.1f%% %10.2f              | %8.2f %10.1f%% %10.2f\n", name, ids.size(),
                         (double) c.tokens / (double) c.steps, 100.0 * (double) c.proposals / (double) c.steps,

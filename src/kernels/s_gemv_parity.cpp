@@ -64,8 +64,8 @@ int q2_0_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, siz
     // byte i/4 bits (i%4)*2.  The two coincide as a byte layout only if you confuse them, which is exactly the
     // mistake the first version of this function made by copying 16 bytes verbatim.
     for (int b = 0; b < 16; ++b) {
-        raw[2 + b] = (uint8_t) ((codes[co + 4 * b + 0] & 3) | ((codes[co + 4 * b + 1] & 3) << 2) |
-                                ((codes[co + 4 * b + 2] & 3) << 4) | ((codes[co + 4 * b + 3] & 3) << 6));
+        raw[2 + b] = (uint8_t) ((codes[co + (size_t) 4 * b + 0] & 3) | ((codes[co + (size_t) 4 * b + 1] & 3) << 2) |
+                                ((codes[co + (size_t) 4 * b + 2] & 3) << 4) | ((codes[co + (size_t) 4 * b + 3] & 3) << 6));
     }
     return 64;
 }
@@ -197,7 +197,7 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
             }
             for (int step = 0; step < 4; ++step) {
                 for (int l = 0; l < 32; ++l) {     // elements 0..31 LOW nibbles, 32..63 HIGH
-                    const long long e0 = o * n_in + sb * 256 + step * 64 + l;
+                    const long long e0 = (long long) o * n_in + (long long) sb * 256 + (long long) step * 64 + l;
                     const long long e1 = e0 + 32;
                     blk[16 + step * 32 + l] =
                         (uint8_t) ((codes_el[(size_t) e0] & 0x0F) | (codes_el[(size_t) e1] << 4));

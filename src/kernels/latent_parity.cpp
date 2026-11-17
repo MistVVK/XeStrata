@@ -76,13 +76,13 @@ std::vector<float> layer_gpu(const lr::Fixture& f, void* s) {
         if (!same) ++g_fail;
     }
     uint8_t* dxq = dev.alloc<uint8_t>((size_t) (T * (H / 32) * 36));
-    uint8_t* dxlq = dev.alloc<uint8_t>((size_t) (T * G * (ELL / 32) * 36));
-    float* dxl = dev.alloc<float>((size_t) (T * G * ELL));
+    uint8_t* dxlq = dev.alloc<uint8_t>((size_t) T * G * (ELL / 32) * 36);
+    float* dxl = dev.alloc<float>((size_t) T * G * ELL);
     k::quantize_q8_1_rows(dx, T, H, dxq, s);
     k::iq_mmvq(f.fmt == 4 ? 2 : 8, dD, dxq, dxl, (int) H, (int) (G * ELL), T, s);
     k::latent_colscale_rows(dxl, (int64_t) T * G, (int) ELL, dinv, s);
     {   // the column scales on a fresh vector: the same float multiply, bit for bit
-        std::vector<float> probe((size_t) (T * G * ELL));
+        std::vector<float> probe((size_t) T * G * ELL);
         for (size_t i = 0; i < probe.size(); ++i) probe[i] = (float) (i % 977) * 0.01f - 4.f;
         float* dmut = dev.alloc<float>(probe.size());
         par::copy_in(dmut, probe.data(), probe.size());

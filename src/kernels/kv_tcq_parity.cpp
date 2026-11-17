@@ -79,7 +79,7 @@ void viterbi_host(const float* x, float sc, int bits, uint8_t* states) {
 // A row coded by the host at scale sc, in the pool's layout (kv_tcq.hpp)
 std::vector<uint8_t> code_row_host(const float* x, float sc, int bits) {
     uint8_t st[D];
-    for (int c = 0; c < D / k::kTcqChain; ++c) viterbi_host(x + c * k::kTcqChain, sc, bits, st + c * k::kTcqChain);
+    for (int c = 0; c < D / k::kTcqChain; ++c) viterbi_host(x + (size_t) c * k::kTcqChain, sc, bits, st + (size_t) c * k::kTcqChain);
     std::vector<uint8_t> row(k::kv_tcq_bytes_per_head(D, bits), 0);
     for (int w = 0; w < 8 * bits; ++w) {
         uint32_t word = 0;
@@ -87,7 +87,7 @@ std::vector<uint8_t> code_row_host(const float* x, float sc, int bits) {
             const int g = 32 * w + i, v = g / bits, b = g - v * bits;
             word |= (uint32_t) (((st[v] & ((1 << bits) - 1)) >> (bits - 1 - b)) & 1) << (31 - i);
         }
-        std::memcpy(row.data() + 4 * w, &word, 4);
+        std::memcpy(row.data() + (size_t) 4 * w, &word, 4);
     }
     std::memcpy(row.data() + D * bits / 8, &sc, 4);
     return row;
@@ -102,7 +102,7 @@ void decode_row_host(const uint8_t* row, int bits, float* out) {
         int st = 0;
         for (int b = std::max(end - 8, first); b < end; ++b) {
             uint32_t w;
-            std::memcpy(&w, row + 4 * (b / 32), 4);
+            std::memcpy(&w, row + (size_t) 4 * (b / 32), 4);
             st = (st << 1) | (int) ((w >> (31 - b % 32)) & 1);
         }
         out[d] = (float) code_of(bits, st) * (sc / 256.0f);

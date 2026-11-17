@@ -21,6 +21,7 @@
 #include <cmath>
 #include <limits>
 #include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -219,7 +220,7 @@ int main(int argc, char** argv) {
             if (keep != nullptr) *keep = d_l;
             return got;
         };
-        std::vector<float> l(NV * NT), bias(NV, 0.0f), adjusted;
+        std::vector<float> l((size_t) NV * NT), bias(NV, 0.0f), adjusted;
         for (int t = 0; t < NT; ++t)
             for (int v = 0; v < NV; ++v) l[t * NV + v] = float(v % 17) / 4;
         l[0] = 50;
@@ -271,7 +272,7 @@ int main(int argc, char** argv) {
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
         std::vector<int> want((size_t) NT);
-        for (int t = 0; t < NT; ++t) want[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV}, p, false);
+        for (int t = 0; t < NT; ++t) want[(size_t) t] = reference_pick({l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV}, p, false);
         bad += run("greedy argmax", l, NT, p, want);
     }
 
@@ -288,7 +289,7 @@ int main(int argc, char** argv) {
         }
         std::vector<int> want((size_t) NT), other((size_t) NT);
         for (int t = 0; t < NT; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
+            const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV);
             want[(size_t) t] = reference_pick(row, p, false);      // the SPECIFIED order
             other[(size_t) t] = reference_pick(row, p, true);      // temperature first
         }
@@ -300,7 +301,7 @@ int main(int argc, char** argv) {
         // order-SENSITIVE at the cut, which is a property of the fixture rather than of the kernel.
         int cut_spec = 0, cut_alt = 0;
         for (int t = 0; t < NT; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
+            const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV);
             cut_spec += reference_cut(row, p, false);
             cut_alt += reference_cut(row, p, true);
         }
@@ -322,7 +323,7 @@ int main(int argc, char** argv) {
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
         std::vector<int> wa((size_t) NT);
-        for (int t = 0; t < NT; ++t) wa[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV}, a, false);
+        for (int t = 0; t < NT; ++t) wa[(size_t) t] = reference_pick({l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV}, a, false);
         float* d_l = nullptr; int *d_a = nullptr, *d_b = nullptr;
         d_l = static_cast<decltype(d_l)>(strata::parity::alloc_bytes(l.size() * sizeof(float)));
         d_a = static_cast<decltype(d_a)>(strata::parity::alloc_bytes((size_t) NT * sizeof(int)));
@@ -385,8 +386,8 @@ int main(int argc, char** argv) {
         for (int t = 0; t < NT2; ++t) hist_a[(size_t) t * 4 + 0] = 0;
         std::vector<int> want_a((size_t) NT2), alt_a((size_t) NT2);
         for (int t = 0; t < NT2; ++t) {
-            const std::vector<float> row(la.begin() + (size_t) t * NV2, la.begin() + (size_t) (t + 1) * NV2);
-            const std::vector<int> h(hist_a.begin() + (size_t) t * 4, hist_a.begin() + (size_t) (t + 1) * 4);
+            const std::vector<float> row(la.begin() + (std::ptrdiff_t) t * NV2, la.begin() + (std::ptrdiff_t) (t + 1) * NV2);
+            const std::vector<int> h(hist_a.begin() + (std::ptrdiff_t) t * 4, hist_a.begin() + (std::ptrdiff_t) (t + 1) * 4);
             want_a[(size_t) t] = pick(row, h, p, false);
             alt_a[(size_t) t] = pick(row, h, p, true);      // divide unconditionally
         }
@@ -412,8 +413,8 @@ int main(int argc, char** argv) {
         strata::kernels::SamplerParams q = p; q.penalty_present = 1.5f; q.penalty_freq = 0.0f;
         std::vector<int> want_b((size_t) NT2);
         for (int t = 0; t < NT2; ++t) {
-            const std::vector<float> row(lb.begin() + (size_t) t * NV2, lb.begin() + (size_t) (t + 1) * NV2);
-            const std::vector<int> h(hist_b.begin() + (size_t) t * 4, hist_b.begin() + (size_t) (t + 1) * 4);
+            const std::vector<float> row(lb.begin() + (std::ptrdiff_t) t * NV2, lb.begin() + (std::ptrdiff_t) (t + 1) * NV2);
+            const std::vector<int> h(hist_b.begin() + (std::ptrdiff_t) t * 4, hist_b.begin() + (std::ptrdiff_t) (t + 1) * 4);
             want_b[(size_t) t] = pick(row, h, q, false);
         }
         std::printf("  %-34s want token %d (with present=1.5, token 0 goes 5.0/2 - 1.5 = 1.0 vs token 1 at "
@@ -474,8 +475,8 @@ int main(int argc, char** argv) {
         clean_p.penalty_last_n = 0; clean_p.penalty_repeat = 1.0f;
         clean_p.penalty_freq = 0.0f; clean_p.penalty_present = 0.0f;
         for (int t = 0; t < NT2; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV2, l.begin() + (size_t) (t + 1) * NV2);
-            const std::vector<int> h(hist.begin() + (size_t) t * 4, hist.begin() + (size_t) (t + 1) * 4);
+            const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV2, l.begin() + (std::ptrdiff_t) (t + 1) * NV2);
+            const std::vector<int> h(hist.begin() + (std::ptrdiff_t) t * 4, hist.begin() + (std::ptrdiff_t) (t + 1) * 4);
             want[(size_t) t] = sampled_reference(row, h, p, t);
             clean[(size_t) t] = sampled_reference(row, h, clean_p, t);
         }
@@ -503,7 +504,7 @@ int main(int argc, char** argv) {
 
         int c0 = 0, c05 = 0, c09 = 0;
         for (int t = 0; t < NT3; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV3, l.begin() + (size_t) (t + 1) * NV3);
+            const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV3, l.begin() + (std::ptrdiff_t) (t + 1) * NV3);
             strata::kernels::SamplerParams q = base; q.min_p = 0.0f;
             c0 += sampled_cut(row, {}, q);
             q.min_p = 0.5f; c05 += sampled_cut(row, {}, q);
@@ -518,7 +519,7 @@ int main(int argc, char** argv) {
             strata::kernels::SamplerParams q = base; q.min_p = mp;
             std::vector<int> want((size_t) NT3);
             for (int t = 0; t < NT3; ++t) {
-                const std::vector<float> row(l.begin() + (size_t) t * NV3, l.begin() + (size_t) (t + 1) * NV3);
+                const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV3, l.begin() + (std::ptrdiff_t) (t + 1) * NV3);
                 want[(size_t) t] = sampled_reference(row, {}, q, t);
             }
             char name[64];
@@ -626,15 +627,15 @@ int main(int argc, char** argv) {
         p.top_k = 20; p.top_p = 0.95f; p.temperature = 0.8f; p.seed = 5;
         std::vector<int> want((size_t) NT);
         for (int t = 0; t < NT; ++t)
-            want[(size_t) t] = sampled_reference({l.begin() + (size_t) t * NV,
-                                                  l.begin() + (size_t) (t + 1) * NV}, {}, p, t);
+            want[(size_t) t] = sampled_reference({l.begin() + (std::ptrdiff_t) t * NV,
+                                                  l.begin() + (std::ptrdiff_t) (t + 1) * NV}, {}, p, t);
         bad += run("stale history, last_n=0 (sampled)", l, NT, p, want, hist, 8);
 
         strata::kernels::SamplerParams gp = p; gp.greedy = true; gp.top_k = 0; gp.top_p = 1.0f;
         std::vector<int> gwant((size_t) NT);
         for (int t = 0; t < NT; ++t)
-            gwant[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV,
-                                                l.begin() + (size_t) (t + 1) * NV}, gp, false);
+            gwant[(size_t) t] = reference_pick({l.begin() + (std::ptrdiff_t) t * NV,
+                                                l.begin() + (std::ptrdiff_t) (t + 1) * NV}, gp, false);
         bad += run("stale history, last_n=0 (greedy)", l, NT, gp, gwant, hist, 8);
     }
 
@@ -681,8 +682,8 @@ int main(int argc, char** argv) {
                 sp2.counter = 77; sp2.penalty_last_n = H; sp2.penalty_present = 4.0f; sp2.penalty_repeat = 1.1f;
                 std::vector<int> gwant((size_t) T), swant((size_t) T), rows_int(rows.begin(), rows.end());
                 for (int t = 0; t < T; ++t) {
-                    const std::vector<float> lr(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
-                    const std::vector<int> own(rows.begin() + (size_t) t * H, rows.begin() + (size_t) (t + 1) * H);
+                    const std::vector<float> lr(l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV);
+                    const std::vector<int> own(rows.begin() + (std::ptrdiff_t) t * H, rows.begin() + (std::ptrdiff_t) (t + 1) * H);
                     const std::vector<int> row0(rows.begin(), rows.begin() + H);
                     gwant[(size_t) t] = greedy_pen(lr, own, gp);
                     swant[(size_t) t] = sampled_reference(lr, own, sp2, t);
@@ -728,8 +729,8 @@ int main(int argc, char** argv) {
         sp2.greedy = false; sp2.temperature = 0.8f; sp2.top_k = 20; sp2.top_p = 0.95f; sp2.seed = 13;
         std::vector<int> gwant((size_t) NT), swant((size_t) NT);
         for (int t = 0; t < NT; ++t) {
-            const std::vector<float> lr(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
-            const std::vector<int> ok(valid_only.begin() + (size_t) t * H, valid_only.begin() + (size_t) (t + 1) * H);
+            const std::vector<float> lr(l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV);
+            const std::vector<int> ok(valid_only.begin() + (std::ptrdiff_t) t * H, valid_only.begin() + (std::ptrdiff_t) (t + 1) * H);
             {   // the greedy reference with the penalty (reference_pick has none)
                 int best = 0; float bv = 0; bool first = true;
                 for (int v = 0; v < NV; ++v) {
@@ -757,7 +758,7 @@ int main(int argc, char** argv) {
         p64.top_k = 64; p64.top_p = 1.0f; p64.temperature = 1.5f; p64.seed = 14;
         std::vector<int> want((size_t) NT);
         for (int t = 0; t < NT; ++t)
-            want[(size_t) t] = sampled_reference({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV},
+            want[(size_t) t] = sampled_reference({l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV},
                                                  {}, p64, t);
         bad += run("sampled top_k=64", l, NT, p64, want);
         strata::kernels::SamplerParams p0 = p64; p0.top_k = 0;
@@ -808,7 +809,7 @@ int main(int argc, char** argv) {
     // A continuous stream and individual decode calls consume the same draw counters.
     {
         constexpr int count = 32, vocab = 16;
-        std::vector<float> uniform(count * vocab, 0.0f);
+        std::vector<float> uniform((size_t) count * vocab, 0.0f);
         float* input = nullptr;
         int* output = nullptr;
         input = static_cast<decltype(input)>(strata::parity::alloc_bytes(uniform.size() * sizeof(float)));
@@ -836,14 +837,14 @@ int main(int argc, char** argv) {
     // Mixed request parameters in one launch must match separate sampler calls, including untouched rows.
     {
         constexpr int T = 6, V = 257, H = 8;
-        std::vector<float> logits(T * V), bias(T * V, 0.0f);
-        std::vector<int> history(T * H), initial(T, -123), want(T), got(T);
-        std::vector<uint32_t> masks(T * ((V + 31) / 32), ~uint32_t(0));
+        std::vector<float> logits((size_t) T * V), bias((size_t) T * V, 0.0f);
+        std::vector<int> history((size_t) T * H), initial(T, -123), want(T), got(T);
+        std::vector<uint32_t> masks((size_t) T * ((V + 31) / 32), ~uint32_t(0));
         for (int t = 0; t < T; ++t) {
             for (int v = 0; v < V; ++v) logits[t * V + v] = float((v * 31 + t * 7) % 193) / 31.0f;
             for (int j = 0; j < H; ++j) history[t * H + j] = (t * 19 + j / 2) % V;
             bias[t * V + (t * 19) % V] = -100.0f;
-            masks[t * ((V + 31) / 32)] &= ~(1u << t);
+            masks[(size_t) t * ((V + 31) / 32)] &= ~(1u << t);
         }
         auto* dl = static_cast<float*>(strata::parity::alloc_bytes(logits.size() * sizeof(float)));
         auto* db = static_cast<float*>(strata::parity::alloc_bytes(bias.size() * sizeof(float)));
@@ -862,9 +863,9 @@ int main(int argc, char** argv) {
             p.top_k = 5 + t; p.top_p = 0.9f; p.min_p = 0.05f;
             p.seed = 23 + t; p.counter = (uint64_t(1) << 32) + t;
             p.penalty_last_n = t + 1; p.penalty_repeat = 1.2f; p.penalty_freq = 0.2f; p.penalty_present = 0.3f;
-            p.logit_bias = db + t * V; p.allowed = dm + t * ((V + 31) / 32);
+            p.logit_bias = db + (size_t) t * V; p.allowed = dm + (size_t) t * ((V + 31) / 32);
             p.gumbel = t == 3;
-            strata::kernels::sample_tokens(dl + t * V, 1, V, dh + t * H, H, p, out + t, nullptr);
+            strata::kernels::sample_tokens(dl + (size_t) t * V, 1, V, dh + (size_t) t * H, H, p, out + t, nullptr);
         }
         strata::parity::copy_bytes_out(want.data(), out, T * sizeof(int));
         params[4].penalty_last_n = -1;
