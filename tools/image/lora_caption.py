@@ -5,7 +5,8 @@ caption, `<image stem>.txt`, one line `<trigger>, <caption>`, as tools/image/mf_
 "The caption policy").
 
     python tools/image/lora_caption.py --dir DIR --kind character --trigger WORD [--keep "teal bob hair, freckles"]
-        [--style booru|natural] [--model-skill anima|magetrail] [--server http://127.0.0.1:8095] [--overwrite]
+        [--style booru|natural] [--style-words "ukiyo-e, woodblock"] [--model-skill anima|magetrail]
+        [--server http://127.0.0.1:8095] [--overwrite]
 
 The server is XeStrata's (serve), its chat model one that reads images (the config's "vision").  Each image goes to
 its /v1/chat/completions with the lora-caption skill (serve/skills/lora-caption: a character LoRA's caption writes
@@ -58,7 +59,7 @@ def picture(path: Path) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def tidy(text: str, trigger: str, kind: str) -> str:
+def tidy(text: str, trigger: str, kind: str, style_words: str = "") -> str:
     """The model's answer as one caption line: its thinking and fences out, the first line that says something, the
     trigger first."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
@@ -69,11 +70,18 @@ def tidy(text: str, trigger: str, kind: str) -> str:
         line = f"{trigger}, {line}" if line else trigger
     front, _ = skills_api.parse((skills_api.BUILTIN / "lora-caption" / "SKILL.md").read_text(encoding="utf-8"))
     prefix, content = line[:len(trigger)], line[len(trigger):]
-    patterns = front["metadata"]["reading_exclude"]
-    if kind == "style":
-        patterns = patterns + front["metadata"]["style_exclude"]
-    for pattern in patterns:
+    for pattern in front["metadata"]["reading_exclude"]:
         content = re.sub(pattern, "", content, flags=re.I)
+    if kind == "style":
+        patterns = front["metadata"]["style_exclude"] + [
+            r"(?:in (?:the )?style of )?" + re.escape(word.strip()) + r"(?: style)?"
+            for word in style_words.split(",") if word.strip()]
+        # Only remove style-only clauses at the end, not an anime poster or a watercolor in the scene.
+        while match := re.search(r",\s*([^,]+?)\s*$", content):
+            clause = match.group(1).strip().rstrip(".!?").strip()
+            if not any(re.fullmatch(pattern, clause, flags=re.I) for pattern in patterns):
+                break
+            content = content[:match.start()]
     content = re.sub(r"\b(?:reading|reads|saying)\s*(?=,|[.!?]|$)", "", content, flags=re.I)
     content = re.sub(r"\b(?:and|with)\s*,", ",", content, flags=re.I)
     content = re.sub(r"\ba showing\b", "showing", content, flags=re.I)
@@ -109,6 +117,7 @@ def main() -> int:
     ap.add_argument("--kind", required=True, choices=("character", "style", "other"))
     ap.add_argument("--trigger", required=True, help="the trigger word every caption starts with")
     ap.add_argument("--keep", default="", help="what the LoRA must learn (a character's own look), left to the trigger")
+    ap.add_argument("--style-words", default="", help="comma-separated names and features of the style to learn")
     ap.add_argument("--style", default="natural", choices=("natural", "booru"),
                     help="the trained model's prompt style: booru for Anima and MageTrail, natural for the others")
     ap.add_argument("--model-skill", default="", help="the trained model's own skill (anima, magetrail), added")
@@ -124,6 +133,8 @@ def main() -> int:
     user = f"Kind: {a.kind}. Trigger word: {a.trigger}."
     if a.keep:
         user += f" What the LoRA must learn (leave it out): {a.keep}."
+    if a.kind == "style" and a.style_words:
+        user += f" Style names and features to learn (leave them out): {a.style_words}."
     files = sorted(p for p in Path(a.dir).iterdir() if p.suffix.lower() in EXTS and p.is_file())
     if not files:
         print(f"lora_caption: no image in {a.dir}", file=sys.stderr)
@@ -138,7 +149,7 @@ def main() -> int:
             sidecar = f.with_suffix(".json")
             note = json.loads(sidecar.read_text(encoding="utf-8")).get("note", "") if sidecar.exists() else ""
             image_user = user + (f" Image notes (context only; check against the picture): {note}" if note else "")
-            line = tidy(ask(a.server, system, image_user, picture(f)), a.trigger, a.kind)
+            line = tidy(ask(a.server, system, image_user, picture(f)), a.trigger, a.kind, a.style_words)
         except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
             print(f"lora_caption: {f.name}: {e}", file=sys.stderr)
             return 1

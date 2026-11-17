@@ -160,6 +160,7 @@
   "ltw.stepN": "Schritt {n}",
   "ltw.steps": "Höchstens Schritte (n)",
   "ltw.style": "Stil",
+  "ltw.styleWords": "Zu lernende Stilnamen und Merkmale (optional, durch Kommas getrennt)",
   "ltw.title": "LoRA-Training",
   "ltw.trainBlocks": "Trainierte Blöcke (z. B. 0-5,10)",
   "ltw.training": "Training läuft",

@@ -160,6 +160,7 @@
   "ltw.stepN": "步 {n}",
   "ltw.steps": "最大步数（n）",
   "ltw.style": "风格",
+  "ltw.styleWords": "要学习的风格名称和特征（可选，用逗号分隔）",
   "ltw.title": "LoRA 训练",
   "ltw.trainBlocks": "训练的块（如 0-5,10）",
   "ltw.training": "训练中",

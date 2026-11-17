@@ -1047,6 +1047,7 @@
   "ltw.stepN": "step {n}",
   "ltw.steps": "Most steps (n)",
   "ltw.style": "Style",
+  "ltw.styleWords": "Style names and features to learn (optional, comma-separated)",
   "ltw.title": "LoRA training",
   "ltw.trainBlocks": "Train blocks (e.g. 0-5,10)",
   "ltw.training": "Training",

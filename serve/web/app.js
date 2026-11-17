@@ -5469,7 +5469,7 @@ async function ltwFetch(path, opts) {
   return j;
 }
 function ltwPanel(el) {
-  const st = {models: [], job: null, timer: null, view: "", picked: null, regName: ""};
+  const st = {models: [], job: null, timer: null, view: "", picked: null, regName: "", styleWords: null};
   let edits = Promise.resolve();
   const base = () => st.job ? `v1/lora/jobs/${st.job.id}` : "";
   const stop = () => { if (st.timer) { clearInterval(st.timer); st.timer = null; } };
@@ -5533,7 +5533,13 @@ function ltwPanel(el) {
     };
   }
   async function autoCaption() {
-    try { await saveCaptions(); st.job = await ltwFetch(`${base()}/caption`, {method: "POST", headers: headers(true), body: "{}"}); render(); poll(); }
+    try {
+      const words = el.querySelector("[data-ltw-style-words]");
+      const styleWords = words ? words.value.trim() : "";
+      await saveCaptions();
+      st.job = await ltwFetch(`${base()}/caption`, {method: "POST", headers: headers(true), body: JSON.stringify({style_words: styleWords})});
+      render(); poll();
+    }
     catch (e) { err(e); }
   }
   async function saveCaptions() {
@@ -5612,6 +5618,7 @@ function ltwPanel(el) {
         </div></div>
       <div class="ltw-chatpics" data-ltw-chatpics hidden></div>
       ${j ? `<div class="ltw-imgs">${imgs}</div>
+      ${j.kind === "style" ? `<label class="st-field"><span>${esc(tr("ltw.styleWords", "Style names and features to learn (optional, comma-separated)"))}</span><input class="st-input" data-ltw-style-words value="${esc(st.styleWords == null ? (j.style_words || "") : st.styleWords)}"${j.status !== "draft" ? " disabled" : ""}></label>` : ""}
       <div class="ltw-row">
         <button type="button" class="st-btn st-btn--secondary" data-ltw-autocap${j.status !== "draft" ? " disabled" : ""}>${esc(tr("ltw.autoCaption", "Caption automatically"))}</button>
         <span class="muted small">${esc(tr("ltw.captionHint", "One line each: the trigger word, then the description. The lora-caption rules: a character's own look stays with the trigger; a style captions the content only."))}</span>
@@ -5704,6 +5711,7 @@ function ltwPanel(el) {
       on("[data-ltw-choose]", "onclick", () => file.click());
       file.onchange = () => { addFiles(file.files); file.value = ""; };
       on("[data-ltw-fromchat]", "onclick", chatPics);
+      on("[data-ltw-style-words]", "oninput", (e) => { st.styleWords = e.target.value; });
       on("[data-ltw-autocap]", "onclick", autoCaption);
       on("[data-ltw-start]", "onclick", start);
       el.querySelectorAll("[data-ltw-delimg]").forEach((b) => {
@@ -5722,7 +5730,7 @@ function ltwPanel(el) {
       on("[data-ltw-delunsel]", "onclick", deleteUnselected);
     }
     on("[data-ltw-deljob]", "onclick", async () => {
-      try { stop(); await ltwFetch(base(), {method: "DELETE", headers: headers()}); st.job = null; st.picked = null; render(); }
+      try { stop(); await ltwFetch(base(), {method: "DELETE", headers: headers()}); st.job = null; st.picked = null; st.styleWords = null; render(); }
       catch (e) { err(e); }
     });
   }

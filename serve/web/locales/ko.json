@@ -160,6 +160,7 @@
   "ltw.stepN": "스텝 {n}",
   "ltw.steps": "최대 스텝 수(n)",
   "ltw.style": "스타일",
+  "ltw.styleWords": "학습할 스타일의 이름과 특징 (선택 사항, 쉼표로 구분)",
   "ltw.title": "LoRA 학습",
   "ltw.trainBlocks": "학습할 블록(예 0-5,10)",
   "ltw.training": "학습 중",

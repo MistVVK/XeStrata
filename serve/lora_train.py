@@ -501,7 +501,7 @@ class TrainJobs:
         d = self.root / jid
         (d / "images").mkdir(parents=True)
         rec = {"id": jid, "status": "draft", "stage": None, "model": gen.model, "family": fam,
-               "kind": kind, "name": name, "trigger": trigger, "settings": None, "images": [],
+               "kind": kind, "name": name, "trigger": trigger, "style_words": "", "settings": None, "images": [],
                "versions": [], "progress": None, "place": None, "error": None,
                "created_at": int(time.time()), "started_at": None, "completed_at": None,
                "pid": None, "pid_start": None, "registered": None}
@@ -584,11 +584,16 @@ class TrainJobs:
         return rec
 
     # ---- the auto captions (before the training; the chat's model reads the pictures)
-    def caption(self, jid: str) -> dict:
+    def caption(self, jid: str, style_words: str = "") -> dict:
         rec = self._need(jid, ("draft",))
+        if not isinstance(style_words, str):
+            raise TrainError("style_words: a comma-separated list of style names and features")
+        style_words = check_caption(style_words)
+        if style_words and rec["kind"] != "style":
+            raise TrainError("style_words: only for a style LoRA")
         if not rec["images"]:
             raise TrainError("images: none to caption")
-        rec.update(status="captioning", error=None)
+        rec.update(status="captioning", error=None, style_words=style_words)
         self._write(rec)
         self._enqueue(jid)
         return rec
@@ -600,6 +605,8 @@ class TrainJobs:
         style = "booru" if rec["family"] == "anima" or cache_tag(self._gen(rec["model"])) == "mt" else "natural"
         cmd = [sys.executable, str(tool), "--dir", str(d / "images"), "--kind", rec["kind"],
                "--trigger", rec["trigger"], "--style", style, "--server", f"http://127.0.0.1:{port}"]
+        if rec.get("style_words"):
+            cmd += ["--style-words=" + rec["style_words"]]
         model_skill = "anima" if rec["family"] == "anima" else ("magetrail" if style == "booru" else "")
         if model_skill:
             cmd += ["--model-skill", model_skill]

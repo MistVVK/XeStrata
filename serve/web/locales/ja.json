@@ -160,6 +160,7 @@
   "ltw.stepN": "step {n}",
   "ltw.steps": "最大の step 数（n）",
   "ltw.style": "画風",
+  "ltw.styleWords": "学習する画風の名前・特徴（任意、コンマ区切り）",
   "ltw.title": "LoRA の学習",
   "ltw.trainBlocks": "学習するブロック（例 0-5,10）",
   "ltw.training": "学習中",

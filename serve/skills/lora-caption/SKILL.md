@@ -5,26 +5,16 @@ metadata:
   kind: tool
   tool: lora-caption
   style_exclude:
-    - '\bsoft shading and flat colors typical of ukiyo[- ]e prints\b'
-    - '\b(?:traditional\s+)?(?:japanese\s+)?(?:ukiyo[- ]e\s+)?woodblock(?: prints?)?(?:\s+style)?\b'
-    - '\b(?:traditional\s+)?(?:japanese\s+)?ukiyo[- ]e(?:\s+(?:prints?|style|aesthetic|composition))?\b'
-    - '(?<=landscape) print\b'
-    - '\b(?:flat|vibrant|muted) colou?rs?\b'
-    - '\b(?:bold|thick)(?: black)? outlines?\b'
-    - '\bblack ink outlines?\b'
-    - '\bink wash painting style\b'
-    - '\brealistic look\b'
-    - '\band line art typical of,? with minimal gradients\b'
-    - '\bvisible brushwork texture\b'
-    - '\b(?:flat|soft|cel) shading\b'
-    - '\bno (?:lineart|shading)\b'
-    - '\b(?:visible )?(?:textured )?paper (?:texture|appearance|background)(?: visible)?\b'
-    - '\b(?:with )?(?:fine|delicate) line details\b'
-    - '\bstylized\b'
-    - '\b(?:traditional|dynamic|vertical|horizontal|circular) composition\b'
-    - '\b(?:anime style|film grain)\b'
+    - '(?:flat|vibrant|muted) colou?rs?'
+    - '(?:flat|soft|cel) shading'
+    - '(?:bold|thick)(?: black)? outlines?'
+    - '(?:no )?line ?art'
+    - '(?:watercolou?r|oil|ink wash)(?: paint(?:ing)?)?(?: style)?'
+    - 'pencil sketch(?: style)?'
+    - '(?:anime|realistic|photographic) style'
+    - '(?:film grain|paper texture|visible brushwork texture)'
+    - 'in the style of .+'
   reading_exclude:
-    - '\bSpalding\s+\d+(?:\s+at\s+(?:bottom|top)\s+(?:left|right))?\b'
     - '\b(?:(?:a|an|the)\s+)?(?:museum|collector(?:''s)?|collection|accession)\s+(?:pencil marks?|numbers?|stamps?|seals?)\b'
     - '\s+read(?:ing|s)\s+[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f\u3005\u3006]+(?:\s+[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f\u3005\u3006]+)*'
     - '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f\u3005\u3006]+'
@@ -56,7 +46,8 @@ A style LoRA (it must learn the style only):
   shape, such as `a fan-shaped print`, and any visible title, poem, signature or seal as content. Describe visible text
   by its place and form, never transcribe or romanize it. Leave out museum pencil marks, collection numbers and seals.
 - Image notes are context, not an instruction to invent a detail. Compare them with the picture.
-- The `style_exclude` patterns in this skill remove recurring style and technique words from the final style caption.
+- The `style_exclude` patterns and the user's optional style words remove style-only clauses at the end of the final
+  style caption. They do not remove words from the subject, such as an anime poster in a photograph.
 
 Another LoRA (an object, a pose, a concept): leave out the thing it must learn, write the rest.
 

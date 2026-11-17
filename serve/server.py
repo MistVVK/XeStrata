@@ -9407,7 +9407,7 @@ def make_handler(svc: Service):
                     raise lora_train_api.TrainError(f"Invalid URL (POST {path})", 404)
                 jid, action = parts[3], parts[4]
                 if action == "caption":
-                    self._json(200, jobs.caption(jid))
+                    self._json(200, jobs.caption(jid, req.get("style_words", "")))
                 elif action == "start":
                     self._json(200, jobs.start(jid, req))
                 elif action == "cancel":

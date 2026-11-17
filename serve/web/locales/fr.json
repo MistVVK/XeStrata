@@ -160,6 +160,7 @@
   "ltw.stepN": "pas {n}",
   "ltw.steps": "Nombre max de pas (n)",
   "ltw.style": "Style",
+  "ltw.styleWords": "Noms et caractéristiques du style à apprendre (facultatif, séparés par des virgules)",
   "ltw.title": "Entraînement LoRA",
   "ltw.trainBlocks": "Blocs entraînés (ex. 0-5,10)",
   "ltw.training": "Entraînement",
