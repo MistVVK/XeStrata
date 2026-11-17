@@ -46,7 +46,7 @@ test('a working chat, an unknown chat or destination, and the workspace it is al
 });
 
 /** English texts that are the same word in French (a number and its unit): the check that every key is translated lets them through there. */
-const SAME_IN_FRENCH = new Set(['30 minutes']);
+const SAME_IN_FRENCH = new Set(['30 minutes', 'code']);   // the French word for a code block's label is the same
 test('the Actions menu offers the move with the approved words, in all nine languages', async () => {
   const sidebar = await readFile(new URL('../src/app/Sidebar.tsx', import.meta.url), 'utf8');
   const en = JSON.parse(await readFile(new URL('../src/locales/guic-en.json', import.meta.url), 'utf8'));
