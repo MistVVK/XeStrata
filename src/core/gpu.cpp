@@ -225,8 +225,8 @@ bool drm_process_memory(const std::string& pci, size_t& bytes) {
     for (const auto& e : std::filesystem::directory_iterator("/proc/self/fdinfo", ec)) {
         std::ifstream in(e.path());
         std::string line, driver, device, client;
-        uint64_t vram = 0;
-        bool found = false;
+        uint64_t xe_vram = 0, amd_vram = 0;
+        bool found_xe = false, found_amd = false;
         while (std::getline(in, line)) {
             const size_t colon = line.find(':');
             if (colon == std::string::npos) continue;
@@ -236,6 +236,7 @@ bool drm_process_memory(const std::string& pci, size_t& bytes) {
             else if (key == "drm-pdev") value >> device;
             else if (key == "drm-client-id") value >> client;
             else if (key.rfind("drm-total-vram", 0) == 0 || key == "drm-memory-vram") {
+                const bool xe_field = key.rfind("drm-total-vram", 0) == 0;
                 uint64_t n = 0;
                 std::string unit;
                 if (!(value >> n)) continue;
@@ -243,11 +244,15 @@ bool drm_process_memory(const std::string& pci, size_t& bytes) {
                 if (unit == "KiB") n *= 1024;
                 else if (unit == "MiB") n *= uint64_t{1024} * 1024;
                 else if (!unit.empty() && unit != "B") continue;
-                vram += n;
-                found = true;
+                if (xe_field) { xe_vram += n; found_xe = true; }
+                else { amd_vram += n; found_amd = true; }
             }
         }
-        if (!found || device != pci || (driver != "xe" && driver != "amdgpu")) continue;
+        if (device != pci) continue;
+        // amdgpu exposes both names for the same allocations; adding them would count every byte twice.
+        if ((driver == "xe" && !found_xe) || (driver == "amdgpu" && !found_amd) ||
+            (driver != "xe" && driver != "amdgpu")) continue;
+        const uint64_t vram = driver == "xe" ? xe_vram : amd_vram;
         if (client.empty()) client = e.path().filename().string();
         clients[client] = std::max(clients[client], vram);
     }
