@@ -73,8 +73,8 @@ Windows). Hugging Face snapshot symlinks work if you pass the snapshot's file na
 
 ## The pack (by hand)
 
-Build Strata, then from the repository root, with gguf-py from the pinned llama.cpp (setup installs it;
-`STRATA_GGUF_PY` can point to its `gguf-py` folder):
+Build Strata, then from the repository root (the pack tools carry their own gguf-py;
+`STRATA_GGUF_PY` can point to another `gguf-py` folder):
 
 ```sh
 terminal/.venv/bin/python terminal/tools/iq_pack.py \

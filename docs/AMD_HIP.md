@@ -195,8 +195,6 @@ the card's name, its architecture and the build's list.
 - If CMake cannot find the HIP compiler, add `-DCMAKE_HIP_COMPILER=/path/to/rocm/llvm/bin/clang++`. Use the compiler and
   libraries from the same ROCm installation.
 - Do not enable both GPU backends in one build.
-- CMake fetches the pinned llama.cpp revision. For an offline build, point `STRATA_GGML_DIR` at a checkout of that exact
-  revision.
 - Linux engine packages: `VARIANT=rx6000 tools/packaging/build_hip_linux.sh`.
 - **A hand-built engine has no tuning table.** The packaged engines carry `tuning/<arch>-hipblaslt-<version>.txt` beside the binary
   ([Ready-made packages](#ready-made-packages) lists which); a build made with plain `cmake` and started
@@ -579,10 +577,9 @@ is not part of this build; `strata --families` lists what the binary runs. Pleas
 on the kernel's amdgpu driver. hipBLASLt is not used.
 
 ```sh
-# inside the image, with this checkout at /src and llama.cpp at the pinned commit in engine/third_party/llama.cpp
+# inside the image, with this checkout at /src
 apt-get update && apt-get install -y cmake ninja-build git python3 build-essential
 cmake -S engine -B build-906 -G Ninja -DSTRATA_HIP_GFX906=ON -DCMAKE_HIP_ARCHITECTURES=gfx906 \
-  -DSTRATA_GGML_DIR=/src/engine/third_party/llama.cpp \
   -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++
 ninja -C build-906 strata
 ```

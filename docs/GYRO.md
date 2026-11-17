@@ -91,15 +91,6 @@ time in a decode profile.
 
 If Gyro misbehaves on an RTX 50 card, update the engine.
 
-**Prompt speed and the ggml build.** The trellis prompt kernels (MMQ) are agentionai's, from their llama.cpp fork (MIT).
-Strata builds against upstream ggml, which does not have them, so it adds them at configure time.
-`cmake/strata_ggml_tq_overlay.cmake` writes a copy of the pinned ggml-cuda headers into the build folder with the
-three trellis types routed like IQ2_XS. The tile loader is the fork's (`engine/third_party/ggml-tq/`). Only Strata's own MMQ
-library sees the copy; every other type is compiled from the untouched files. The ready-made engines read Gyro prompts
-through it. If the pinned ggml changes and an anchor of the script no longer matches, the overlay switches itself off
-with a message and prompts take the slower FP16 path. A build against the fork (`-DSTRATA_GGML_DIR=<agentionai/llama.cpp>`)
-uses the fork's own instances instead.
-
 **Decode kernels.** The trellis decode kernels keep the 4 KB codebook in shared memory (`STRATA_IQ_STAGE_GRID=0` reads it
 from the global table again) and take four rows per warp. The sums are added in the same order as the unstaged kernels,
 so answers are bit for bit the same. A Tesla P100 (compute capability 6.0) runs its own variant, `STRATA_TQ_STAGE`.
@@ -189,17 +180,16 @@ Setup does these steps for you. By hand, from a [source checkout](SOURCE_INSTALL
 
 ### 1. Build
 
-For the fast prompt path, Strata's GGML dependency can be the agentionai llama.cpp fork, which has the trellis types:
+The engine build needs no llama.cpp checkout.
 
 ```sh
-git clone --depth 1 https://github.com/agentionai/llama.cpp ../agention-llama.cpp
 # NVIDIA. RTX 50 series: use CUDA 13 (CUDA 12.8 crashes the prompt path on sm_120)
 cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=120 -DSTRATA_GGML_DIR=$PWD/../agention-llama.cpp
+  -DCMAKE_CUDA_ARCHITECTURES=120
 # AMD (experimental; in a non-root container add --group-add $(getent group render | cut -d: -f3),
 # otherwise HIP finds no device)
 cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON \
-  -DCMAKE_HIP_ARCHITECTURES=gfx1201 -DSTRATA_GGML_DIR=$PWD/../agention-llama.cpp
+  -DCMAKE_HIP_ARCHITECTURES=gfx1201
 cmake --build build -j
 python3 -m venv terminal/.venv && terminal/.venv/bin/pip install -r terminal/requirements.txt
 ```

@@ -19,8 +19,7 @@ strata launch --model-path /path/to/the/gguf/folder
 ```
 
 The first launch does everything itself: it downloads the Intel engine package `linux-x86_64-sycl` from the signed feed, builds the
-pack for your model from the GGUF files (a few minutes, once; it fetches llama.cpp's `gguf-py` helper from GitHub by itself, so it needs
-internet that one time), writes the run settings and starts the server. Nothing is installed by hand.
+pack for your model from the GGUF files (a few minutes, once), writes the run settings and starts the server. Nothing is installed by hand.
 
 - **A PC with an NVIDIA or AMD card as well** uses that card by default, and `--plan` says the Intel cards exist. To use the Intel cards
   add `--backend intel` once: the choice is remembered (in the settings file) for the next launch, `strata update` and the app's engine
@@ -54,8 +53,7 @@ engine package. Otherwise [build the image yourself](DOCKER.md#build-it-yourself
   CPU kernel needs AVX-512. With that folder the engine stops with "this CPU cannot run the expert kernel", and `strata doctor`
   warns about it before the start. Building the model folder again with `strata setup` (or `terminal/tools/iq_pack.py`) fixes it.
 - For a source build without Docker: **Intel oneAPI** with the DPC++ compiler (`icpx`, **2026.1 or newer**; 2025.3 does not build the engine) and **oneMKL**
-  (about 5 GB), `cmake` 3.24+, `ninja`, `git`, Python 3. The build fetches ggml unless you point `STRATA_GGML_DIR` at a
-  llama.cpp checkout.
+  (about 5 GB), `cmake` 3.24+, `ninja`, `git`, Python 3.
 - For `./setup.sh --backend sycl`: **Docker** and the GPU driver, nothing else from the list above. `engine/sycl/setup_intel.py`
   builds and runs the engine in the `strata-sycl-dev` image from `engine/sycl/tools/Dockerfile`, which starts from a community
   llama.cpp SYCL image (`ghcr.io/snailium/...`), not an Intel or Strata image. On Ubuntu:

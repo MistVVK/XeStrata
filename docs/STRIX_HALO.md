@@ -67,8 +67,7 @@ the default is about half of the RAM) and `amd_iommu=off`. Both are host setting
 
 ## 2. The engine
 
-llama.cpp's `ggml` sources are pinned by this repository, and CMake fetches the revision it needs. For an offline build, point
-`STRATA_GGML_DIR` at a checkout of exactly that revision.
+The engine build needs no llama.cpp checkout.
 
 ```sh
 git clone https://github.com/Niko1221/Strata.git && cd Strata

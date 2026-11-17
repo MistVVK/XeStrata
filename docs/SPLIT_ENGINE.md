@@ -91,5 +91,5 @@ with two big cards, and contexts over 128K have not been run. The copy-engine ri
 
 ## Build
 
-`-DSTRATA_BUILD_SPLIT=ON -DSTRATA_GGML_DIR=<llama.cpp checkout> [-DSTRATA_SPLIT_CARDS="2;3"] [-DSTRATA_SPLIT_ARCH=86]` builds
+`-DSTRATA_BUILD_SPLIT=ON [-DSTRATA_SPLIT_CARDS="2;3"] [-DSTRATA_SPLIT_ARCH=86]` builds
 `strata-split-N` per card count; `tools/packaging/build_split_cuda.sh` does that with the release engine's toolchain rules and checks the result (`tools/packaging/build_split_hip.sh` for AMD).

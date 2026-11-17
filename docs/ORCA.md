@@ -23,7 +23,7 @@ split shards must finish downloading before packing. Pass the snapshot filename,
 
 ## Preparation
 
-Python needs numpy, regex and gguf-py from the pinned llama.cpp dependency. `STRATA_GGUF_PY` can point to its
+Python needs numpy and regex. The pack tools carry their own gguf-py; `STRATA_GGUF_PY` can point to another
 `gguf-py` directory.
 
 ```sh
