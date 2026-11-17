@@ -7,12 +7,16 @@
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <climits>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -69,8 +73,14 @@ struct Pending {
 /// the depth queues the reads and the threads wait).
 int io_threads(int dflt) {
     const char* v = strata::env_get("IO_THREADS");
-    const int n = v ? std::atoi(v) : dflt;
-    return std::clamp(n, 1, 64);
+    if (!v) return std::clamp(dflt, 1, 64);
+    errno = 0;
+    char* end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    if (end != v) while (std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end == v || *end || errno == ERANGE || n < INT_MIN || n > INT_MAX)
+        throw std::invalid_argument("XESTRATA_IO_THREADS: expected an integer");
+    return std::clamp(static_cast<int>(n), 1, 64);
 }
 #if !defined(_WIN32)
 int io_threads_linux() { return io_threads(std::clamp(4 * (int) std::thread::hardware_concurrency(), 16, 64)); }
