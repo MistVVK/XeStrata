@@ -23,7 +23,7 @@ export interface HardwareCheck {
 
 export interface ProcessorInfo { id:string; socket:string; model:string; cores:number; threads:number; arch:string; ghz:number; logicalIds?:number[] }
 export interface CpuReading { id:string; utilizationPct:number|null }
-export interface GpuReading { id:string; temperatureC:number|null; utilizationPct:number|null; memoryUsedGb:number|null; source:string; sampledAt:string; powerW?:number|null; powerLimitW?:number|null; pcieGen?:number|null; pcieGenMax?:number|null; pcieWidth?:number|null; pcieRxMbs?:number|null; fanPct?:number|null; clockMhz?:number|null }
+export interface GpuReading { id:string; temperatureC:number|null; utilizationPct:number|null; memoryUsedGb:number|null; /** The engine's own total for this device (hardware.gpus[].mem_total), when it reports one. */ memoryTotalGb?:number|null; source:string; sampledAt:string; powerW?:number|null; powerLimitW?:number|null; pcieGen?:number|null; pcieGenMax?:number|null; pcieWidth?:number|null; pcieRxMbs?:number|null; fanPct?:number|null; clockMhz?:number|null }
 
 export interface GpuInfo {
   id?: string;

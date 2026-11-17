@@ -12,7 +12,7 @@ import { Brand } from '../components/Brand';
 import { Bar, Btn, Icon, IconBtn, Select, type IconName } from '../components/ui';
 import { Screen } from '../components/layout';
 import { contextLabel, duration, tokens, tps } from '../lib/format';
-import { defaultGpuSet, gpuCapacity, gpuId, gpuMetric, gpuReported, hasReading, shortGpuName } from '../lib/monitor-hardware';
+import { defaultGpuSet, gpuCapacity, gpuId, gpuMetric, gpuReported, gpuTotalShown, hasReading, shortGpuName } from '../lib/monitor-hardware';
 import { useStore } from '../lib/store';
 import { api } from '../lib/client';
 import { useMoney } from '../lib/money';
@@ -134,7 +134,7 @@ function LegacyMonitorScreen({ native }: {
     const whose = (key: Parameters<typeof gpuMetric>[2], mode: Parameters<typeof gpuMetric>[3] = 'sum') => { const r = report(key, mode); return r.partial ? r.devices.map(d => shortGpuName(d.name)).join(' + ') : null; };
     const gpuSource = (key: Parameters<typeof gpuMetric>[2], mode: Parameters<typeof gpuMetric>[3] = 'sum') => hasReading(gpuValue(key, mode)) ? sourceLabel(readings?.find(r => r.id === gpuId(report(key, mode).devices[0] ?? selectedGpus[0]))?.source) : 'Unavailable';
     const gpuLoad = gpuValue('utilizationPct', 'mean'), vram = gpuValue('memoryUsedGb'), temperature = gpuValue('temperatureC', 'max'), power = gpuValue('powerW'), powerLimit = gpuValue('powerLimitW'), pcieRx = gpuValue('pcieRxMbs');
-    const vramTotal = gpuCapacity(report('memoryUsedGb').partial ? report('memoryUsedGb').devices : selectedGpus);
+    const vramTotal = gpuTotalShown(report('memoryUsedGb').partial ? report('memoryUsedGb').devices : selectedGpus, readings, vram);
     const singleReading = selectedGpus.length === 1 ? readings?.find(r => r.id === gpuId(selectedGpus[0])) : undefined;
     const gen = singleReading?.pcieGenMax ?? singleReading?.pcieGen, width = singleReading?.pcieWidth;
     const cpu = cpuChoice === 'all' ? data.hardware.cpuLoad : data.hardware.cpus?.find(p => p.id === cpuChoice)?.utilizationPct;

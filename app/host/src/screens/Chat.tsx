@@ -715,6 +715,7 @@ function Composer({ draft, setDraft, loaded, streaming, onSubmit, onKey, session
           </div>
         </div>
         {tr(streaming && draft.trim() && whileBusy !== 'wait' ? <p className="xs muted composer__busy-hint" role="status">{tr(whileBusy === 'queue' ? "Enter sends it when the answer is done." : "Enter stops the answer here and sends it now.")}</p> : null)}
+        {tr(!streaming && !canChat && (draft.trim() || photos.length) && draft.trim() !== '/' && timeSkipPrompt(draft) === null ? <p className="xs muted composer__busy-hint" role="status">{tr("No model is loaded. Load one in Models to send this message.")}</p> : null)}
         <ChatTelemetry session={session}/>
         </div>
       </div>
@@ -744,6 +745,7 @@ function MessageView({ message: m, isLast, onEditPrompt, onPreview, onClosePrevi
     timeSkipReal?: boolean;
     timeSkipRun?: TimeSkipRun;
 }) {
+    useStore(s => s.language);   // memo(): a live language switch changes no prop, so the message subscribes to it and draws its words again
     const streaming = useStore(s => s.streaming);
     const activeSession = useStore(s => s.activeSession);
     const hostLive = useStore(s => s.connection !== 'offline');
