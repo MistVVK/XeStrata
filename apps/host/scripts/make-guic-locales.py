@@ -268,6 +268,18 @@ add(en="The model wrote tool calls that Strata could not run, twice in a row, so
     ko="모델이 Strata가 실행할 수 없는 도구 호출을 두 번 연속으로 작성해서 Strata가 이번 차례를 멈췄습니다. 아무것도 실행되지 않았습니다. 메시지를 다시 보내거나 다른 모델을 선택하세요.",
     fr="Le modèle a écrit deux fois de suite des appels d'outil que Strata n'a pas pu exécuter, Strata a donc arrêté ce tour. Rien n'a été exécuté. Envoyez de nouveau votre message, ou choisissez un autre modèle.",
     he="המודל כתב פעמיים ברצף קריאות לכלים ש-Strata לא הצליחה להריץ, ולכן Strata עצרה את התור הזה. שום דבר לא הורץ. שלחו את ההודעה שלכם שוב, או בחרו מודל אחר.")
+# A tool call the model wrote as text that nothing ran (a <tool_call> block in the answer): one collapsed line that opens to the raw text. English given by the
+# coordinator 11-17; translations are lane drafts (he as a translation of the approved English).
+add(en="A tool call that could not run",
+    zh="未能运行的工具调用",
+    ja="実行できなかったツール呼び出し",
+    de="Ein Tool-Aufruf, der nicht ausgeführt werden konnte",
+    es="Una llamada a herramienta que no se pudo ejecutar",
+    ru="Вызов инструмента, который не удалось выполнить",
+    pt="Uma chamada de ferramenta que não pôde ser executada",
+    ko="실행되지 않은 도구 호출",
+    fr="Un appel d'outil qui n'a pas pu s'exécuter",
+    he="קריאה לכלי שלא ניתן היה להריץ")
 
 # #5529: set up without a local engine (a link on the first-run engine card and the muted line under it). English approved by the coordinator.
 add(en="Only connect to Strata on another computer",

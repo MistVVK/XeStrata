@@ -23,10 +23,11 @@
  "guic22": "Exécution de {0}…",
  "guic23": "Demande au modèle de corriger son appel d’outil…",
  "guic24": "Le modèle a écrit deux fois de suite des appels d’outil que Strata n’a pas pu exécuter, Strata a donc arrêté ce tour. Rien n’a été exécuté. Envoyez de nouveau votre message, ou choisissez un autre modèle.",
- "guic25": "Se connecter uniquement à Strata sur un autre ordinateur",
- "guic26": "Rien n’est téléchargé. Vous pourrez ajouter le moteur plus tard depuis la page Modèles.",
- "guic27": "Numéroter les citations",
- "guic28": "Quand un message cite plusieurs passages, chacun reçoit un numéro et indique qui l’a écrit, pour que l’assistant puisse les distinguer. Commencez une ligne par [1] ou [2] pour répondre à l’un d’eux.",
- "guic29": "Citation {0} · vous",
- "guic30": "Citation {0} · l’assistant"
+ "guic25": "Un appel d’outil qui n’a pas pu s’exécuter",
+ "guic26": "Se connecter uniquement à Strata sur un autre ordinateur",
+ "guic27": "Rien n’est téléchargé. Vous pourrez ajouter le moteur plus tard depuis la page Modèles.",
+ "guic28": "Numéroter les citations",
+ "guic29": "Quand un message cite plusieurs passages, chacun reçoit un numéro et indique qui l’a écrit, pour que l’assistant puisse les distinguer. Commencez une ligne par [1] ou [2] pour répondre à l’un d’eux.",
+ "guic30": "Citation {0} · vous",
+ "guic31": "Citation {0} · l’assistant"
 }
