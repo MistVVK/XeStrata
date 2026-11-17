@@ -336,8 +336,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                 std::snprintf(buf, sizeof buf,
                               "%s: a promoted tensor of %llu elements is %llu B in and %llu B out, not %llu/%llu",
                               r.name.c_str(), (unsigned long long) elems, (unsigned long long) r.src_bytes,
-                              (unsigned long long) r.dst_bytes, (unsigned long long) (elems * 4),
-                              (unsigned long long) (elems * 2));
+                              (unsigned long long) r.dst_bytes, (unsigned long long) elems * 4,
+                              (unsigned long long) elems * 2);
                 err = buf;
                 bad = true;
             }
