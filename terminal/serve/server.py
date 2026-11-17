@@ -59,6 +59,40 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END, ChatTemplate, Event, OutputParser,  # noqa: E402
+                            parser_for_template, anthropic_to_messages, anthropic_tools,
+                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                            tool_choice_of, unmark_think_literals)
+from serve.mcp import McpCancelled, hub_from_config, resolve_image_results  # noqa: E402
+from serve import runconfig  # noqa: E402
+from serve import expert_heat  # noqa: E402
+from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
+from strata_control import engine_component  # noqa: E402
+from strata_control import tls  # noqa: E402
+from strata_control.childenv import quiet_crash_env  # noqa: E402
+from strata_control import reader_room  # noqa: E402
+
+tls.install()       # #3722: image URLs and tool servers over HTTPS are checked against the operating system's certificates
+from strata_control import hipblaslt_tuning  # noqa: E402
+from strata_control import vision_reader  # noqa: E402
+from strata_control import draft_layer  # noqa: E402
+from strata_control import drafting  # noqa: E402
+from strata_control import vram_fit  # noqa: E402
+from strata_control import user_args  # noqa: E402
+from strata_control import gpu_roles  # noqa: E402
+from serve import ready as ready_file  # noqa: E402
+from serve import owner_guard  # noqa: E402
+from serve import launch_identity  # noqa: E402
+from serve import logit_bias as bias_api  # noqa: E402
+from serve import lifeline  # noqa: E402
+from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
+from serve import responses as responses_api  # noqa: E402
+from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from serve import images as images_api  # noqa: E402
+
 from serve.server_parts.anthropic_api import (  # noqa: F401  (moved unchanged, file split)
     anthropic_collect,
 )
@@ -303,41 +337,6 @@ from serve.server_parts.openai_api import (  # noqa: F401  (moved unchanged, fil
     logprob_span,
     openai_collect,
 )
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
-sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            parser_for_template, anthropic_to_messages, anthropic_tools,
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
-                            tool_choice_of, unmark_think_literals)
-from serve.mcp import McpCancelled, hub_from_config, resolve_image_results  # noqa: E402
-from serve import runconfig  # noqa: E402
-from serve import expert_heat  # noqa: E402
-from serve import commit_limit  # noqa: E402
-from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
-from strata_control import engine_component  # noqa: E402
-from strata_control import tls  # noqa: E402
-from strata_control.childenv import quiet_crash_env  # noqa: E402
-from strata_control import reader_room  # noqa: E402
-
-tls.install()       # #3722: image URLs and tool servers over HTTPS are checked against the operating system's certificates
-from strata_control import hipblaslt_tuning  # noqa: E402
-from strata_control import vision_reader  # noqa: E402
-from strata_control import draft_layer  # noqa: E402
-from strata_control import drafting  # noqa: E402
-from strata_control import vram_fit  # noqa: E402
-from strata_control import user_args  # noqa: E402
-from strata_control import gpu_roles  # noqa: E402
-from serve import ready as ready_file  # noqa: E402
-from serve import owner_guard  # noqa: E402
-from serve import launch_identity  # noqa: E402
-from serve import logit_bias as bias_api  # noqa: E402
-from serve import lifeline  # noqa: E402
-from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
-from serve import responses as responses_api  # noqa: E402
-from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
-from serve import images as images_api  # noqa: E402
 
 
 def popen(what: str, args: list, role: str = "engine", **kw):
@@ -906,13 +905,6 @@ class StrataEngine:
         if self.info.get("engine"):
             self.info["version"] = str(self.info["engine"])
         self.terminal_stages = read_engine_stage_log(log, log_start) if log else []
-        self.info.pop("commit_warning", None)           # this start only: a restart that no longer warns clears it
-        try:                                            # #1607: the engine's Windows commit-limit warning, for the Monitor and the app
-            warned = commit_limit.commit_warning(start_log_text(log, log_start)) if log else None
-            if warned:
-                self.info["commit_warning"] = warned
-        except Exception:                               # noqa: BLE001 - a note must never stop a start
-            pass
         try:                                            # which drafter runs, and in plain words why not the one that was asked for
             self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
         except Exception:                               # noqa: BLE001 - a note must never stop a start
