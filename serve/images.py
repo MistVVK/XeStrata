@@ -61,7 +61,7 @@ all of it the DiT's, at most MOSS_MAX_IDS ids), the steps asked for (default 50)
 5; the engine builds the sigmas), guidance at any scale but 1 (default 3) with negative_prompt (default empty), the
 blocks its negative pass skips (uncond_skip_layers, default [22]) and skip-layer guidance (slg_layers, slg_scale,
 slg_start, slg_stop), by its pipeline's names (moss_request).  A layout of boxes (layout: its prompt enhancer's draft,
-boxes in the image's pixels) becomes its JSON prompt (moss_layout_prompt).  It has no edits: an image is img2img's.
+boxes in the image's pixels) becomes its JSON prompt (moss_layout_prompt). Its edits use an edit adapter.
 Its text encoder is Qwen3.5-9B, read by the chat's engine when that reads the same file (text_states).
 enhance has the chat's model write the prompt out first (enhance_prompt).
 
@@ -113,7 +113,7 @@ byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt":
   lists what its DiT takes and checks a request's names); without one, "loras" beside the DiT's file
   crop_edit: false draws an edit with a mask at the output's size, without cutting the part out (plan_crop; a
   request's crop_edit overrides it)
-  MOSS-Image's edit_adapters ({name: {"lora", "format", "vision"}}, setup's chinoll, armv5 and armv6) and
+  MOSS-Image's edit_adapters ({name: {"lora", "format", "vision"}}, setup's chinoll) and
   edit_adapter (the one used; XESTRATA_MOSS_EDIT over it: moss_edit_adapter); edit_format: an edit_lora's layout
   (moss_edit_format)
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
@@ -2354,8 +2354,8 @@ def moss_edit_layout(path: Path) -> str | None:
 
 
 def moss_edit_adapters(cfg: dict) -> dict[str, dict]:
-    """The MOSS-Image edit adapters a request may name (edit_adapter): the config's "edit_adapters" (setup's chinoll,
-    armv5 and armv6: {"lora", "format", "vision", "about"}), then the LoRA folder's files moss_edit_layout knows, by
+    """The MOSS-Image edit adapters a request may name (edit_adapter): the config's "edit_adapters" (setup's chinoll:
+    {"lora", "format", "vision", "about"}), then the LoRA folder's files moss_edit_layout knows, by
     their listing's names - ai-toolkit's with the config's vision encoder (Qwen3.5-9B's mmproj; without it, not
     offered)."""
     out = {k: dict(v) for k, v in (cfg.get("edit_adapters") or {}).items()}
@@ -2785,6 +2785,8 @@ class ImageGen:
             for key in ("edit_lora", "edit_adapters", "edit_adapter", "edit_format", "edit_steps", "vision"):
                 self.cfg.pop(key, None)
             self.cfg.update(turbo_lora=str(Path(self.cfg["vae"]).with_name(_qimage().LOCAL_NAMES["moss-4-step-lora"])),
+                            edit_lora=str(Path(self.cfg["vae"]).with_name(_qimage().FILES["moss-edit-lora"][1])),
+                            edit_format="moss-image-edit", edit_steps=4, edit_cfg_scale=1.0,
                             lora_bake=False, steps=4, cfg_scale=1.0, shift=MOSS_SHIFT)
         policy = self.cfg.get("gpu_policy") or "auto"
         if policy not in POLICIES:
