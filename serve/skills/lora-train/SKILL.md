@@ -20,6 +20,9 @@ metadata:
 - The captions follow the lora-caption skill: a character's own look is left to the trigger word (write what
   changes - clothes, pose, background - and the pictures' style); a style LoRA captions the content only, never the
   style's words. Read that skill when the user asks how to caption.
+- Repeated signatures or seals can appear in a style LoRA even when captions name them. A negative prompt is not a
+  reliable remedy. Check same-seed samples on subjects outside the dataset against the base model. For a style, include
+  a present-day scene and a night scene to see whether the training era or daylight carries over.
 - The training runs on the server and shares the GPU with the chat: it goes slower while the chat is busy and
   pauses for image jobs; the panel shows its state (running, slowed, paused and why). Do not wait for it and do not
   call train_lora again for the same request.
