@@ -1577,6 +1577,32 @@ def expected_files(S, family: str, model: str, models_dir: Path, vision: bool) -
     return out
 
 
+def files_here(S, family: str, model: str, models_dir: Path, vision: bool) -> dict | None:
+    """What of an install's files is already on this computer, from the pinned sizes setup checks them against (setup.fam_pin; the picture reader's pin):
+    {"complete": every file is there whole (no .part, the pinned size), "left_gb": what is still to download, "total_gb"}.  "complete" is the cheap size check;
+    setup still hashes the files before it counts them (the check the app calls "checking files").  None when the files or their sizes cannot be named."""
+    files = expected_files(S, family, model, models_dir, vision)
+    if not files:
+        return None
+    fam = getattr(S, "FAMILIES", {}).get(family) or {}
+    total = have = 0
+    for f in files:
+        path = Path(f["path"])
+        size = f.get("bytes")
+        if size is None:
+            try:
+                size = S.fam_pin(fam, path)[0]
+            except Exception:                           # noqa: BLE001 - an unpinned file: its size is not known, so "complete" cannot be said
+                return None
+        total += size
+        try:
+            if path.is_file() and path.stat().st_size == size and not path.with_name(path.name + ".part").exists():
+                have += size
+        except OSError:
+            pass
+    return {"complete": have == total, "left_gb": round(max(0, total - have) / 1e9, 1), "total_gb": round(total / 1e9, 1)}
+
+
 def files_progress(prog: dict, job: dict, files: list) -> dict:
     """One honest download figure for a model in parts: every part counted (finished, partial, waiting), the picture reader as a part
     of its own, and a part list the screen can name ("part 2 of 4").  The finished state needs EVERY part: a first shard that is whole
@@ -2345,9 +2371,16 @@ class Tools:
             from strata_control import fit_label
             fit = fit_label.label(fit_label.files_gb(family, model, md), ram, fit_label.card_room_gb(s.engine_gpus(hw)))
         installed = (s.root / f"strata-{tag.lower()}.json").exists()
+        here = None                                     # the page's "already on this computer": the files whole, by the pinned sizes (a local folder: not asked)
+        if not gguf_dir and not arc and s.setup_module() is not None:
+            try:
+                here = files_here(s.setup_module(), family, model, target / "models", vision in ("yes", "gpu", "cpu"))
+            except Exception:                           # noqa: BLE001 - a hint for the page: never break the plan
+                here = None
         plan = {"title": f"{families[family]['title']} {model}", "family": family, "model": model,
                 "context": context, "images": vision or "no", "download_gb": md["download_gb"],
-                "partly_downloaded": partly, "ram": fit, "data_folder": str(target), "model_folder": str(have_dir),
+                "partly_downloaded": partly, "files_complete": here["complete"] if here else None,
+                "download_left_gb": here["left_gb"] if here else None, "ram": fit, "data_folder": str(target), "model_folder": str(have_dir),
                 "disk_free_gb": free,
                 "disk_needed_gb": round(need), "disk_short": short, "already_installed": installed,
                 "setup_command": ("START-HERE.bat " if WIN else "./setup.sh ") + " ".join(args),

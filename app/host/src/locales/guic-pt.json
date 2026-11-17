@@ -46,5 +46,12 @@
  "guic45": "Este ajudante está trabalhando há mais de 30 minutos.",
  "guic46": "Interrompido: atingiu o limite de tempo dos ajudantes.",
  "guic47": "O Windows está perto do limite de memória (memória mais arquivo de paginação). O Strata pode parar sem nenhuma mensagem. Aumente o arquivo de paginação do Windows ou escolha um contexto menor.",
- "guic48": "Restam {0} GB de {1} GB."
+ "guic48": "Restam {0} GB de {1} GB.",
+ "guic49": "Preparando o modelo...",
+ "guic50": "Verificando os arquivos do modelo...",
+ "guic51": "Já está neste computador",
+ "guic52": "Parte do modelo já está aqui",
+ "guic53": "O Strata verifica os arquivos primeiro.",
+ "guic54": "30 d",
+ "guic55": "7 d"
 }

@@ -46,5 +46,12 @@
  "guic45": "Cet auxiliaire travaille depuis plus de 30 minutes.",
  "guic46": "Arrêté : la durée maximale a été atteinte.",
  "guic47": "Windows approche de sa limite de mémoire (mémoire plus fichier d’échange). Strata peut s’arrêter sans aucun message. Agrandissez le fichier d’échange de Windows ou choisissez un contexte plus court.",
- "guic48": "Il reste {0} GB sur {1} GB."
+ "guic48": "Il reste {0} GB sur {1} GB.",
+ "guic49": "Préparation du modèle...",
+ "guic50": "Vérification des fichiers du modèle...",
+ "guic51": "Déjà sur cet ordinateur",
+ "guic52": "Une partie du modèle est déjà là",
+ "guic53": "Strata vérifie d’abord les fichiers.",
+ "guic54": "30 j",
+ "guic55": "7 j"
 }

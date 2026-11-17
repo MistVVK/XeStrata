@@ -46,5 +46,12 @@
  "guic45": "Dieser Helfer arbeitet seit über 30 Minuten.",
  "guic46": "Beendet: Das Zeitlimit für Helfer wurde erreicht.",
  "guic47": "Windows nähert sich seiner Speichergrenze (Arbeitsspeicher plus Auslagerungsdatei). Strata kann ohne Meldung stoppen. Vergrößern Sie die Windows-Auslagerungsdatei oder wählen Sie einen kürzeren Kontext.",
- "guic48": "Noch {0} GB von {1} GB frei."
+ "guic48": "Noch {0} GB von {1} GB frei.",
+ "guic49": "Modell wird vorbereitet...",
+ "guic50": "Modelldateien werden geprüft...",
+ "guic51": "Bereits auf diesem Computer",
+ "guic52": "Ein Teil des Modells ist bereits vorhanden",
+ "guic53": "Strata prüft zuerst die Dateien.",
+ "guic54": "30 T",
+ "guic55": "7 T"
 }

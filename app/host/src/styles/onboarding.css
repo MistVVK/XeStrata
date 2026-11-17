@@ -88,6 +88,9 @@
 .onboard-download-info{padding:18px}
 .onboard-download-counter{position:absolute;left:50%;bottom:25px;transform:translateX(-50%);display:grid;grid-template-columns:20px auto;align-items:center;gap:3px 10px;min-width:180px;padding:15px 22px;background:var(--st-surface);border:1px solid var(--st-line);border-radius:18px;box-shadow:0 12px 28px #10b98115;animation:onboard-counter-bounce 3s ease-in-out infinite}
 .onboard-download-counter>.st-icon{color:var(--st-accent-text)}.onboard-download-counter>strong{font-size:36px;line-height:1;letter-spacing:-1px;font-variant-numeric:tabular-nums}.onboard-download-counter>span{grid-column:2;font-size:11px;color:var(--st-ink-muted);white-space:nowrap}
+/* the files are already here (no number): a check mark and the words; a note under the label (part of the model is here) */
+.onboard-download-counter[data-plain]>span{grid-row:1;font-size:14px;font-weight:600;color:var(--st-ink)}
+.onboard-download-counter>small{grid-column:2;font-size:11px;color:var(--st-ink-muted);white-space:nowrap}
 .onboard-download-location{display:flex;align-items:center;gap:9px;font-size:11px;color:var(--st-ink-muted);padding-top:15px;margin-top:15px;border-top:1px solid var(--st-line-soft)}.onboard-download-location>span{flex:1;min-width:0;display:grid;gap:5px}.onboard-download-location strong{font-size:11px;font-weight:500;color:var(--st-ink-soft);overflow-wrap:anywhere}.onboard-download-location>button{padding:5px 0;border:0;background:none;color:var(--st-accent-text);font-size:11px;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
 .onboard-download-info>.onboard-download-location:first-child{padding-top:0;margin-top:0;border:0}
 .onboard-download-status{display:block;font-size:12px;line-height:1.6;margin:0 0 12px}
@@ -129,7 +132,7 @@
 .onboard-resource-honesty{font-size:11px;line-height:1.6;color:var(--st-ink-muted);margin:14px 0 16px}
 .onboard-calibration{display:flex;align-items:flex-start;gap:10px;padding:15px 17px;border:1px solid var(--st-line-soft);border-radius:12px;background:var(--st-surface-2);cursor:pointer}
 .onboard-calibration strong{font-size:11px}.onboard-calibration small{display:block;font-size:10px;line-height:1.5;color:var(--st-ink-muted);margin-top:5px}.onboard-calibration input{margin-top:2px;flex-shrink:0}.onboard-calibration-note{font-size:11px;color:var(--st-ink-muted)}
-.onboard-tune-stage:has(.onboard-tuning-status){display:grid;grid-template-columns:1fr 1fr;gap:0 20px}
+.onboard-tune-stage:has(.onboard-tuning-status){display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr;gap:0 20px}
 .onboard-tune-stage:has(.onboard-tuning-status)>.onboard-art{grid-column:1;height:180px;margin:0;border-radius:20px 20px 0 0;border-bottom:0}
 .onboard-tuning-status{grid-column:1;padding:20px;border:1px solid var(--st-line);border-top:0;border-radius:0 0 20px 20px;background:var(--st-surface)}
 .onboard-tuning-status>strong{font-size:12px;line-height:1.6;display:block;margin:8px 0;overflow-wrap:anywhere}.onboard-tuning-status>small{font-size:10px;color:var(--st-ink-muted)}.onboard-tuning-status>.onboard-pulse-dot{display:none}
@@ -260,3 +263,5 @@
 
 /* The progress bar under the words in the engine update dialog. */
 .engine-update-progress { margin-top: 12px; }
+/* the bar and its figures belong together, above the part rows (the figures used to sit under the last row, the Engine) */
+.onboard-progress-meta+.native-parts{margin-top:12px}
