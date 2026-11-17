@@ -46,6 +46,8 @@ def add_tune_auto(tune_sp: argparse._SubParsersAction) -> None:
     p.add_argument("--status-file", default=None, help="progress as JSON, rewritten at every step (for the desktop app)")
     p.add_argument("--boot-timeout", type=float, default=900.0)
     p.add_argument("--output", choices=("human", "json"), default="human")
+    rp = tune_sp.add_parser("report", help="show the account of the last tune")
+    rp.add_argument("--output", choices=("human", "json"), default="human")
 
 
 def add_presets(sp: argparse._SubParsersAction) -> None:
@@ -195,6 +197,44 @@ def _parse_goal(text: str) -> tuple[str, int]:
     raise ValueError("goal is speed, room or room:MiB")
 
 
+#: #5078 (text approved by the coordinator): the note under a tune that could not measure your settings, when an engine's log was kept
+FAILED_LOG_NOTE = "The engine's own log of the failed start is kept at {path}."
+
+
+def _keep_failed_log(session: Any) -> Path | None:
+    """#5078: the log of the last engine that failed outlives the run's own scratch folder (which goes with the run unless --work-dir keeps it):
+    `last-failed-engine.log` in the presets folder, the end of it, written privately, replaced by the next failure. None when no engine failed."""
+    src = getattr(session, "failed_log", None)
+    if not src:
+        return None
+    try:
+        from strata_control import presets
+        data = Path(src).read_bytes()[-262144:]
+        dest = presets.preset_dir() / "last-failed-engine.log"
+        presets._atomic(dest, data)
+        from strata_control import private_files
+        private_files.restrict_to_current_user(dest)       # 0600, or a DACL for this user only on Windows, as the other private files
+        return dest
+    except OSError:
+        return None
+
+
+def run_words(p: dict[str, Any]) -> str:
+    """#5232: "run 3 of 9" for a progress line (the run that is being measured, of those planned); nothing while the plan is not known."""
+    planned = int(p.get("runs_planned") or 0)
+    return f"run {min(int(p.get('runs_done') or 0) + 1, planned)} of {planned}" if planned else ""
+
+
+def report(a: argparse.Namespace) -> int:
+    """`strata tune report`: the account of the last tune, as it was saved after that tune (strata_control/tune_report.py)."""
+    from strata_control import tune_report
+    text = tune_report.read()
+    if a.output == "json":
+        return _print({"report": text}, True, "")
+    print(text if text else tune_report.NONE_YET, end="" if text else "\n")
+    return 0
+
+
 def _write_status(path: str | None, payload: dict[str, Any]) -> None:
     if not path:
         return
@@ -266,7 +306,8 @@ def auto(a: argparse.Namespace) -> int:
         state["text"] = (f"Finding the fastest settings for your PC… {minutes_text(p.get('eta_s'))}"
                          if p.get("eta_s") is not None else "Finding the fastest settings for your PC…")
         _write_status(a.status_file, state)
-        say(f"[{p.get('elapsed_s', 0) // 60:>3d}m] {p['message']}" + (f"  ({minutes_text(p['eta_s'])})" if p.get("eta_s") else ""))
+        brackets = ", ".join(x for x in (run_words(p), minutes_text(p["eta_s"]) if p.get("eta_s") else "") if x)
+        say(f"[{p.get('elapsed_s', 0) // 60:>3d}m] {p['message']}" + (f"  ({brackets})" if brackets else ""))
 
     workdir = Path(a.work_dir) if a.work_dir else Path(tempfile.mkdtemp(prefix="strata-tune-"))
     if not a.work_dir:
@@ -288,6 +329,9 @@ def auto(a: argparse.Namespace) -> int:
         cancel.set()
         result = tuner.result
         result.outcome, result.message = "cancelled", "Stopped. Your settings were not changed."
+    kept = _keep_failed_log(session)
+    if kept and result.outcome == "base_failed":
+        result.notes.append(FAILED_LOG_NOTE.format(path=kept))
     out = result.to_dict()
     choices = presets.choices_from_config(cfg, use=a.use)
     choices["goal"], choices["reserve_mib"] = goal, reserve
@@ -308,12 +352,14 @@ def auto(a: argparse.Namespace) -> int:
     autotune.Tuner.finalize(result)
     out.update({"code": result.code, "reason_code": result.reason_code, "values": result.values})
     out["values"]["preset_name"] = saved["name"] if saved else None
+    from strata_control import tune_report
+    account_saved = tune_report.save(tune_report.build(out, saved["name"] if saved else None))
     state.update({"state": "done", "result": out, "stage": "done"})
     _write_status(a.status_file, state)
     if machine:
         print(json.dumps({"schema_version": 1, "ok": True, "result": out}, ensure_ascii=False, default=str))
     else:
-        print(_human_result(out, saved))
+        print(_human_result(out, saved) + (f"\n  {tune_report.POINTER}" if account_saved else ""))
     return {"improved": 0, "default_confirmed": 0, "cancelled": 130}.get(result.outcome, 6)
 
 
@@ -444,12 +490,30 @@ def _effective(a: argparse.Namespace, machine: bool) -> int:
         was, now = tune_knobs._current(before, flag), tune_knobs._current(after, flag)
         if was != now:
             changed.append({"flag": flag, "was": was, "now": now})
+    from strata_control import arg_layers
+    where = arg_layers.sources({**cfg, "args": after}, [c["flag"] for c in changed])
     payload = {"applied": bool(info.get("applied")), "preset": info.get("preset"), "state": info.get("state"), "reasons": info.get("reasons", []),
                "why_not": info.get("why_not"), "warnings": info.get("warnings") or [], "notice": info.get("notice"),
                "args": merged.get("args"), "env": merged.get("env") or {},
-               "sampling": merged.get("sampling") or {}, "changed": changed, "per_request": info.get("per_request") or {}}
+               "sampling": merged.get("sampling") or {}, "changed": changed, "per_request": info.get("per_request") or {}, "sources": where}
     human = (f"Using your tuning '{info['preset']['name']}'" if info.get("applied") else "No saved tuning is applied; the standard settings run.")
+    human += "\n" + _sources_words(where, after)
     return _print(payload, machine, human)
+
+
+#: #5351 (text approved by the coordinator): the labels of `strata presets effective`
+SOURCE_WORDS = {"launch": "set in this start", "yours": "your own setting", "calibrated": "from your calibration", "tuned": "from your saved tuning"}
+
+
+def _sources_words(where: dict[str, str], args: list[str]) -> str:
+    from strata_control import tune_knobs
+    if not where:
+        return "Every setting is chosen automatically."
+    lines = ["Where your settings come from (everything not listed is chosen automatically):"]
+    shown = [(f"{flag} {tune_knobs._current(args, flag) or ''}".rstrip(), SOURCE_WORDS[key]) for flag, key in where.items()]
+    width = max(len(s) for s, _w in shown)
+    lines += [f"  {s.ljust(width)}  {w}" for s, w in shown]
+    return "\n".join(lines)
 
 
 def _off(a: argparse.Namespace, machine: bool) -> int:

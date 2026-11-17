@@ -458,6 +458,26 @@ class WorkerSession:
         self.chars_per_token = 4.4
         self.calibrated = False
         self.runs = 0
+        self.failed_log: Path | None = None
+        self.idle_vram_mib: int | None = None            # graphics memory in use before the first engine of this run (the desktop's own share)
+
+    GRAPHICS_BACK_SLACK_MIB = 300
+    GRAPHICS_BACK_WAIT_S = 30.0
+
+    def _wait_graphics_memory_back(self, before: int | None) -> None:
+        """#5078: the next engine starts only when the one that just ended has given its graphics memory back (up to 30 s), so a candidate is never judged
+        on memory the previous engine still held. The mark is what was in use before this run's first engine; unknown memory or no card: no wait."""
+        if self.idle_vram_mib is None:
+            self.idle_vram_mib = before
+        mark = self.idle_vram_mib
+        if mark is None:
+            return
+        deadline = time.monotonic() + self.GRAPHICS_BACK_WAIT_S
+        while True:
+            used = tune_machine.gpu_used_mib()
+            if used is None or used <= mark + self.GRAPHICS_BACK_SLACK_MIB or time.monotonic() >= deadline:
+                return
+            time.sleep(1.0)
 
     def system(self) -> dict[str, Any]:
         return {"memory": tune_machine.memory(), "gpus": tune_machine.gpus(), "cpu": tune_machine.cpu()}
@@ -530,6 +550,9 @@ class WorkerSession:
                     raise StartFailed("TIMEOUT", f"the engine was not ready within {int(self.boot_timeout_s)} s")
                 eng = WorkerEngine(self, proc, port, key, [engine_log, worker_log], time.time() - t0, before, self.log)
                 yield eng
+            except StartFailed:
+                self.failed_log = engine_log             # #5078: the log of the last engine that failed outlives the run's scratch folder
+                raise
             finally:
                 try:
                     if proc.poll() is None:
@@ -543,3 +566,4 @@ class WorkerSession:
                     wl.close()
                     # the engine gives its graphics memory back a moment after it exits
                     time.sleep(3.0)
+                    self._wait_graphics_memory_back(before)

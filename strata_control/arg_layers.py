@@ -108,6 +108,31 @@ def layer(cfg: dict, explicit: Mapping[str, Any] | None = None, prev: Mapping[st
             "explicit": sorted(explicit)}
 
 
+#: the answer of ``sources`` for a flag no layer above "Auto" holds is simply not listed
+SOURCE_LAUNCH, SOURCE_YOURS, SOURCE_CALIBRATED, SOURCE_TUNED = "launch", "yours", "calibrated", "tuned"
+
+
+def sources(cfg: Mapping[str, Any], tuned_flags: Any = ()) -> dict[str, str]:
+    """Where each non-automatic option of a run config's ``"args"`` comes from (#5351): ``"launch"`` (this command line's own values), ``"yours"`` (the person's
+    standing options: ``"user_args"``), ``"calibrated"`` (``engine calibrate --apply-result``), ``"tuned"`` (the active saved tuning, ``tuned_flags``). The
+    same order as ``layer``; an option none of them holds is the generated one and is not listed. Read-only."""
+    flags = [user_args.flag_of(g) for g in user_args.groups(cfg.get("args"))]
+    explicit = {str(f) for f in cfg.get(EXPLICIT_KEY) or []}
+    mine = {user_args.flag_of(g) for g in user_args.groups(cfg.get(user_args.USER_KEY))}
+    rec = cfg.get(CALIBRATED_KEY)
+    calibrated = {str(k) for k in (rec.get("settings") or {})} if isinstance(rec, dict) and _calibration_fits(rec, cfg) else set()
+    tuned = {str(f) for f in tuned_flags}
+    out: dict[str, str] = {}
+    for flag in flags:
+        if not flag or flag in out:
+            continue
+        for key, held in ((SOURCE_LAUNCH, explicit), (SOURCE_YOURS, mine), (SOURCE_CALIBRATED, calibrated), (SOURCE_TUNED, tuned)):
+            if flag in held:
+                out[flag] = key
+                break
+    return out
+
+
 def stamp(cfg: dict) -> None:
     """Called by the launch after its last change to ``cfg["args"]``: records them as written, so only a later hand edit differs."""
     written = [str(a) for a in cfg.get("args") or []]

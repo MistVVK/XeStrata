@@ -179,6 +179,19 @@ class StartScreenTests(Base):
             self.assertIn("No saved presets yet", text_of(app))
         self.run_app(case)
 
+    def test_the_delete_key_asks_like_d(self):
+        """#5819: Del on the preset list did nothing (only "d" was bound); it opens the same question, and Esc leaves the preset alone."""
+        store.save(S.LaunchSettings(name="Old", family="qwen", model="Q2_0", context=32768))
+
+        async def case(app, pilot, ctx):
+            await press(pilot, "delete")
+            self.assertIn("Delete the preset 'Old'?", text_of(app))
+            await press(pilot, "escape")
+            self.assertEqual([p.name for p in store.list_presets()], ["Old"])
+            await press(pilot, "delete", "enter")                    # first option: Delete it
+            self.assertEqual(store.list_presets(), [])
+        self.run_app(case)
+
     def test_delete_can_be_cancelled(self):
         store.save(S.LaunchSettings(name="Keep", family="qwen", model="Q2_0", context=32768))
 

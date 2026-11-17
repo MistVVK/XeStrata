@@ -1672,6 +1672,9 @@ def _tune(a: argparse.Namespace) -> int:
     if a.tune_command == "auto":
         return tune_commands.auto(a)
 
+    if a.tune_command == "report":
+        return tune_commands.report(a)
+
     if a.tune_command == "list":
         root = state_root()
         jobs = []

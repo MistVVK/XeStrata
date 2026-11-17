@@ -84,9 +84,34 @@ class Monitor(unittest.TestCase):
                             {"messages": [{"role": "user", "content": "Say hello."}],
                              "max_tokens": 256, **think, **kwargs})
 
+    def settled(self, count=1, state="completed"):
+        """The handler writes a request's final state in its `finally`, after the reply has gone out, so a client that reads the history the
+        moment its reply arrives can see the request one step short of done. Wait (up to 5 s) until `count` records are in `state`."""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            records = list(self.svc.api_requests)
+            if len(records) >= count and all(r["state"] == state for r in records[-count:]):
+                return
+            time.sleep(0.005)
+
     def latest(self):
         summary = self.request("/api/requests")[1]["requests"][0]
         return self.request("/api/requests?id=" + summary["id"])[1]
+
+    def test_a_request_is_completed_a_moment_after_its_reply(self):
+        """The state is written in the handler's `finally`, after the reply has gone out. With that step held for 0.3 s the history
+        read the moment the reply arrives still says the request is not done; `settled()` waits it out (the full suite's load did
+        this by chance: test_queue_wait_and_loading_are_attributed_separately failed once in 1532 runs)."""
+        real = self.svc.drop_embeddings
+
+        def slow_drop():
+            time.sleep(0.3)
+            real()
+        with mock.patch.object(self.svc, "drop_embeddings", side_effect=slow_drop):
+            self.assertEqual(self.chat()[0], 200)
+            self.assertNotEqual(self.latest()["state"], "completed")
+            self.settled()
+            self.assertEqual(self.latest()["state"], "completed")
 
     def test_output_and_reasoning_for_both_dialects_and_stream_modes(self):
         for api in ("openai", "anthropic"):
@@ -94,6 +119,7 @@ class Monitor(unittest.TestCase):
                 with self.subTest(api=api, stream=stream):
                     code, reply = self.chat(api, stream=stream)
                     self.assertEqual(code, 200)
+                    self.settled()
                     record = self.latest()
                     self.assertEqual(record["state"], "completed")
                     self.assertEqual(record["http_status"], 200)
@@ -114,11 +140,13 @@ class Monitor(unittest.TestCase):
         self.svc.fit_max_tokens = False
         self.assertEqual(self.chat(max_tokens=20000)[0], 400)
         self.svc.fit_max_tokens = True
+        self.settled(state="error")
         self.assertEqual(self.latest()["state"], "error")
         for api in ("openai", "anthropic"):
             for stream in (False, True):
                 with self.subTest(api=api, stream=stream), mock.patch.object(self.engine, "generate", side_effect=EngineDied("stopped")):
                     self.chat(api, stream=stream)
+                    self.settled(state="error")
                     record = self.latest()
                     self.assertEqual(record["state"], "error")
                     self.assertIn("stopped", record["error"]["message"])
@@ -181,6 +209,7 @@ class Monitor(unittest.TestCase):
             release.set()
             self.assertEqual(first.result()[0], 200)
             self.assertEqual(second.result()[0], 200)
+        self.settled(2)
         records = list(self.svc.api_requests)
         self.assertGreater(records[0]["load_s"], 0.02)
         self.assertGreater(records[1]["queue_s"], 0.02)

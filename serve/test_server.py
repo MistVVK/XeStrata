@@ -5961,6 +5961,28 @@ class SilentEngine(unittest.TestCase):
             engine.proc.poll.return_value = -6
             self.assertIn("a hang it caught", engine.death_note())
 
+    def test_death_note_names_a_full_graphics_card_on_an_abort(self):
+        # #5078: exit -6 after "cudaMalloc ... out of memory" is the card, not RAM: no "check dmesg" for it; the same abort without that line keeps the RAM hint
+        import tempfile
+        engine = self.bare(0.3)
+        with tempfile.TemporaryDirectory() as d:
+            engine.log_path = os.path.join(d, "e.log")
+            engine.proc.poll.return_value = -6
+            with open(engine.log_path, "w", encoding="utf-8") as f:
+                f.write("strata serve: 687 MiB of VRAM free with everything loaded\n"
+                        "ggml-cuda (strata mmq): out of memory: cudaMalloc(&p, size)\n")
+            note = engine.death_note()
+            self.assertIn("graphics card ran out of memory", note)
+            self.assertIn("cudaMalloc", note)
+            self.assertNotIn("dmesg", note)
+            with open(engine.log_path, "w", encoding="utf-8") as f:
+                f.write("terminate called after throwing an instance of 'std::bad_alloc'\n")
+            self.assertIn("running out of RAM", engine.death_note())
+            engine.proc.poll.return_value = -9                       # a kill with a full card in the log is still the OS's: the old hints stand
+            with open(engine.log_path, "w", encoding="utf-8") as f:
+                f.write("cudaMalloc: out of memory\n")
+            self.assertIn("running out of RAM", engine.death_note())
+
     def test_death_note_names_a_finite_rttime_limit_on_signal_9(self):
         # #3238: a hard RLIMIT_RTTIME of 0 (PipeWire without rtkit) kills with -9 and no OOM; say so, not "out of RAM"
         import sys

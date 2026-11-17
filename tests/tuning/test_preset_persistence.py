@@ -80,6 +80,36 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(out["changed"], [{"flag": "--kv-resident", "was": "32768", "now": "65536"}])
         self.assertEqual(out["args"][out["args"].index("--kv-resident") + 1], "65536")
 
+    def with_choices(self):
+        """The saved run config of a launch: this start set --max-context, the person's own --spec, the saved tuning's --kv-resident."""
+        self.cfg_path.write_text(json.dumps({**self.cfg, "user_args": ["--spec", "4"], "launch_set": ["--max-context"]}))
+
+    def test_effective_says_where_each_setting_comes_from(self):
+        self.with_choices()
+        out, _ = cli(self.env, "presets", "effective", str(self.cfg_path))
+        self.assertEqual(out["sources"], {"--max-context": "launch", "--spec": "yours", "--kv-resident": "tuned"})
+        human = subprocess.run([sys.executable, str(ROOT / "strata.py"), "presets", "effective", str(self.cfg_path)], capture_output=True, text=True,
+                               env=self.env, cwd=str(ROOT), timeout=120).stdout
+        self.assertIn("Where your settings come from (everything not listed is chosen automatically):", human)
+        for line in ("--max-context 65536", "set in this start", "--spec 4", "your own setting", "--kv-resident 65536", "from your saved tuning"):
+            self.assertIn(line, human)
+
+    def test_effective_without_any_own_setting_says_everything_is_automatic(self):
+        cli(self.env, "presets", "off", str(self.cfg_path))
+        out, _ = cli(self.env, "presets", "effective", str(self.cfg_path))
+        self.assertEqual(out["sources"], {})
+        human = subprocess.run([sys.executable, str(ROOT / "strata.py"), "presets", "effective", str(self.cfg_path)], capture_output=True, text=True,
+                               env=self.env, cwd=str(ROOT), timeout=120).stdout
+        self.assertIn("Every setting is chosen automatically.", human)
+
+    def test_a_calibrated_value_is_named_and_yours_beats_it(self):
+        from strata_control import arg_layers
+        cfg = {"model_name": "m", "args": ["--max-context", "65536", "--prefill", "8192", "--spec", "6"], "user_args": ["--spec", "6"],
+               "calibrated": {"settings": {"--prefill": "8192", "--spec": "5"}, "model_name": "m", "max_context": "65536", "images": False}}
+        self.assertEqual(arg_layers.sources(cfg), {"--spec": "yours", "--prefill": "calibrated"})
+        cfg["calibrated"]["model_name"] = "another model"                   # measured for another model: not this config's
+        self.assertEqual(arg_layers.sources(cfg), {"--spec": "yours"})
+
     def test_which_tuning_is_in_use_and_switching_it_off_and_on(self):
         st, _ = cli(self.env, "presets", "status", str(self.cfg_path))
         self.assertEqual(st["active"]["name"], "IQ3_S 64K – Work")
