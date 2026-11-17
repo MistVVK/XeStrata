@@ -2947,7 +2947,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             swiglu_clamp(g, u, lim);
             h[i] = canon::silu_mul(g, u);
         });
-        if (had) launch_hadamard_rows<float>(q, h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, "native_expert_grouped");
+        launch_hadamard_rows<float>(q, h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, "native_expert_grouped");
         launch_quantize_q8_1_canon(q, h, hq, nh);
     } else {
         // SwiGLU into q8_1 in one pass over [grp_start[0], grp_start[n]): the product rounded to FP32 on its own, as
