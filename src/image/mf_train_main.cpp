@@ -77,6 +77,7 @@ float sample_sigma_logit_normal(std::mt19937_64& rng) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    strata::image::train::install_stop_signals();   // stop at a boundary and unwind the GPU owners
     if (argc < 2) {
         usage();
         return 2;
@@ -308,19 +309,19 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return avg;
             };
-            eval_avg("init");
             std::vector<size_t> order(stems.size());
             for (size_t i = 0; i < order.size(); ++i) order[i] = i;
             // the VRAM control: the budget, pause/resume, the state file (the loop's micro-step, updates, rng, order)
             int micro = 0;
             auto save_loop = [&](std::ostream& os) {
-                os << micro << '\n' << updates << '\n' << nskip << '\n' << rng << '\n' << order.size() << '\n';
+                os << micro << '\n' << updates << '\n' << nskip << '\n' << acc_n << '\n' << acc_loss << '\n'
+                   << rng << '\n' << gauss << '\n' << order.size() << '\n';
                 for (size_t v : order) os << v << ' ';
                 os << '\n';
             };
             auto load_loop = [&](std::istream& is) {
                 size_t on = 0;
-                is >> micro >> updates >> nskip >> rng >> on;
+                is >> micro >> updates >> nskip >> acc_n >> acc_loss >> rng >> gauss >> on;
                 order.resize(on);
                 for (size_t& v : order) is >> v;
                 if (!is) throw std::runtime_error("the state file's loop state did not read");
@@ -329,12 +330,16 @@ int main(int argc, char** argv) {
             co.path = vram_control;
             co.budget_mib = (uint64_t) vram_budget;
             co.state = state_path.empty() ? out + ".state.bin" : state_path;
+            co.initial = strata::image::train::initial_vram(m->mrank > 0 ? "magetrail" : "mage-flow", base,
+                                                                       strata::image::mf_train_max_tokens(data), rank);
             strata::image::train::Control ctl(strata::image::mf_trainer_base(m.get()), co);
             ctl.load(resume_path, load_loop);
             ctl.report();
+            if (!ctl.boundary(true, save_loop)) return 0;   // initial eval also needs the largest cached shape's budget
+            eval_avg("init");
             for (int step = micro; step < steps; ++step) {
                 micro = step;
-                ctl.boundary(acc_n == 0, save_loop);   // save_state waits for the update's boundary (grads zero)
+                if (!ctl.boundary(acc_n == 0, save_loop)) return 0;   // the state includes any accumulated gradients
                 if ((size_t)(step % stems.size()) == 0)
                     std::shuffle(order.begin(), order.end(), rng);   // a shuffled epoch
                 strata::image::MfTrainSample smp =
@@ -396,7 +401,10 @@ int main(int argc, char** argv) {
                 strata::image::mf_trainer_adamw(m.get(), lr, 0.9f, 0.999f, adam_eps, wd, acc_n);
                 ++updates;
             }
-            ctl.boundary(true, save_loop);   // a save_state asked at the tail: written here, then the pause
+            acc_n = 0;
+            acc_loss = 0;
+            micro = steps;
+            if (!ctl.boundary(true, save_loop)) return 0;   // a save_state asked at the tail: written here, then the pause
             eval_avg("final");
             strata::image::mf_trainer_save(m.get(), out + ".final.safetensors", title, trigger, seed, lr, updates,
                                            steps, kind);

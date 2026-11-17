@@ -349,9 +349,10 @@ gradients and the optimizer's computation do not change (only the placement).
    FP32** and are read back one block ahead of the backward (`HostInputs`, on a copy queue beside the compute).
    Nothing is rounded, so the loss and the gradients **match the all-GPU FP32 form byte for byte**. Where the host
    RAM is short too, they stay on the GPU in BF16 (the last resort, which rounds; the earlier form).
-1. **The weights streamed from the host**: the blocks' weights are a resident prefix within the budget plus two
-   streaming slots (LayerStream; the prefetch covers the backward's turn too). The copy's source (the file's pages,
-   a pinned home, the relay) is measured at the start. An int8 base streams as int8.
+1. **The weights streamed from the host**: the blocks' weights are a resident prefix within the budget plus streaming
+   slots (LayerStream). Two slots prefetch the next block when the budget permits; one streams in order when it does
+   not. Prefetch also covers the backward's turn. The copy's source (the file's pages, a pinned home, the relay) is
+   measured at the start. An int8 base streams as int8.
 
 The test fixtures: `XESTRATA_TRAIN_WEIGHTS_MIB` (the resident weights' budget), `XESTRATA_TRAIN_TAPES` (the tapes
 kept), `XESTRATA_TRAIN_INPUTS16` (0: FP32 forced, 1: BF16 forced), `XESTRATA_TRAIN_INPUTS_HOST` (0: the host form
@@ -368,22 +369,34 @@ arguments --vram-budget <MiB>     the first budget (0: pause before the first st
           --state <path>          where the state is written (default <out>.state.bin)
           --resume <path>         continue from a state file (the step count, the rng, the data's order, LoRA, AdamW)
 the control file (serve writes it atomically, tmp + rename; the trainer reads its mtime and size at a step's boundary):
-          {"budget_mib": <int>, "save_state": <bool>}
+          {"budget_mib": <int>, "save_state": <bool>, "stop": <bool>}
           budget_mib 0 = pause at the step's boundary (the VRAM given back; the state kept on the host, resumed alike)
-          save_state true = write the state at the next optimizer update's boundary, then pause (a move, a full stop)
-stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib=]
+          save_state true = write the state at the next micro-step boundary, then pause (a move, a full stop)
+          stop true = exit normally at the next boundary (save the state first if save_state is also true)
+stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib= gpu_peak_mib= process_mib= process_source= min_source= need_mib= raw_min_mib= raw_min_source=]
           state saved <path>
 ```
 
-- The `vram` line comes at a step's boundary when its fields changed. The first four fields are what serve reads
-  (the key=value extras are for the log and the tests). `used` is the trainer's own accounting; `free_mib` is the
-  device's report (what the runtime still holds after a pause shows there). `min` is the least form (no resident
-  block, no tape, the inputs on the host); `peak_est` the next step's estimated peak.
+- The `vram` line comes at a step's boundary when its fields changed. Serve reads the first four fields and `need_mib`
+  (the other key=value extras are for the log and the tests). `used` is the trainer's own accounting; `free_mib` is the
+  device's report (what the runtime still holds after a pause shows there). `gpu_peak_mib` is the maximum accounted
+  GPU allocation since process start, rounded up to MiB; it excludes the runtime's own allocations. `process_mib` includes
+  the runtime. `process_source` is `fdinfo` (this Linux DRM process), `nvml` (this NVIDIA driver process), `delta` (the
+  device's free-memory difference), or `global` (the conservative device-wide value). The difference can include changes
+  by other processes and excludes runtime allocations made before the first reading. `min` estimates the least form
+  (no resident block, no tape, the inputs on the host); `peak_est` estimates the next step's peak. `min_source=estimate`
+  uses the measurement table; `step` uses the process memory with the backward's buffers still alive, less what can be
+  reclaimed. `raw_min_mib` is the value before the table; `raw_min_source` is `floor` or `step`.
+  `need_mib` is the budget needed to start, resume or continue: at least the measured least-form peak plus
+  a margin. A smaller budget pauses before the step. The samples do not guarantee the maximum at every instant.
 - The only stopping points are the micro-step's and the update's boundaries (nothing changes mid-step). A shrink
   or a grow re-plans the resident weights, the tapes and the inputs' form. A pause copies every allocation to the
   host as it is and frees it (the streamed layers' pinned homes stay); the resume takes the same values back.
   `--resume` restores the rng's whole state, so the loss column matches a run that never stopped.
-- A budget below `min` pauses. The state is written only where the gradients are zero (after an update).
+- A budget below `need_mib` pauses at the step boundary and waits for a sufficient budget. Without a control file it stops
+  with an error instead. The state includes the gradients and the accumulation count, so a run can resume between updates.
+  `stop`, SIGTERM and SIGINT exit normally at the boundary and close the GPU queues and allocations in order. A stop
+  during a step waits for that step to finish.
 - What a pause gives back may not show in the device's report on every backend (the Level Zero runtime's
   carry-over). serve checks `free_mib` and, where an image job needs more, empties the card fully with
   `save_state` and the process's end.

@@ -123,9 +123,10 @@ public:
     bool replan_due() const { return replan_; }
     /// What the trainer holds now: its own allocations, the arena, the tapes and the weights in VRAM.
     uint64_t held() const;
-    /// The least VRAM a step of `rows` can run in (no resident block, no tape, the inputs off the GPU): the fixed
-    /// allocations, two stream slots, two FP32 row buffers (`row_bytes` each), the arena's growth and the transients.
+    /// The least-form estimate (one streaming slot, no tape, host inputs): the live baseline before a step has run,
+    /// then the last step's measured process use with its reclaimable allocations removed. Not a guaranteed peak.
     uint64_t min_bytes(int64_t rows, uint64_t row_bytes, uint64_t guess_row) const;
+    bool min_measured() const { return min_rows_ > 0; }
     /// The peak a step of `rows` is estimated to take: what is held, the arena's growth and the transients' reserve.
     uint64_t est_bytes(int64_t rows, uint64_t guess_row) const;
     /// Pause at a step's boundary: every allocation of the trainer's copied to the host as it is (the values kept
@@ -138,7 +139,7 @@ public:
     /// The new address of an allocation pause() took (the model's remap hook).  A pointer that was the trainer's
     /// and is not in the map is a missed remap: it throws, not a dangling read.  A pointer it never owned comes
     /// back as it was (a weights region's, bound again at the next step).
-    void* moved(void* old) const;
+    void* moved(const void* old) const;
     /// The inputs' form this step (the VRAM report's): "fp32", "host" or "bf16".
     void set_inputs_mode(const char* m) { inputs_mode_ = m; }
     const char* inputs_mode() const { return inputs_mode_; }
@@ -148,8 +149,8 @@ public:
     bool host_inputs(int64_t slots, int64_t row_bytes);
     int64_t tapes_kept() const { return tapes_kept_; }
     /// The trained tensors as the state file holds them (train::Control writes the header and the loop's state
-    /// around this): every parameter's FP32 master, moments m and v, in the order add_param took them.  The
-    /// gradients are zero where the state is written (after an optimizer update), so they are not in it.
+    /// around this): every parameter's FP32 master, gradient and moments m and v, in add_param order.  A paused
+    /// trainer reads its saved host allocations; a running trainer reads them from the GPU.
     void save_state(std::ostream& os) const;
     void load_state(std::istream& is);
 
@@ -218,6 +219,8 @@ private:
     bool budget_stepped_ = false;
     int64_t last_rows_ = 0;
     uint64_t last_row_bytes_ = 0, guess_row_ = 0;
+    int64_t min_rows_ = 0;
+    uint64_t measured_min_ = 0;
     std::vector<std::unique_ptr<Arena>> tapes_;
     void* tape_buf_ = nullptr;
     size_t tape_cap_ = 0;

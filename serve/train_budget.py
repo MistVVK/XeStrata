@@ -16,15 +16,16 @@ Only the foundations are reused from the image/translation side: the GPU list an
 re-decided every tick, and moving cards (a state file + a restart with --resume) is weighed against shrinking and
 pausing by measured values only - with no measurements it does not move.
 
-The model table's figures are estimates until measured: open_mib is the transient room the open needs
-(the weights read, the int8 quantization, the LoRA allocation) before a budget-0 start pauses; min_mib the least
-the 1024-class step runs in (no resident block, no tape, the inputs on the host); peak_mib the whole form.
+The model table's open_mib is the process room observed during open (the weights read, the int8 quantization,
+the LoRA allocation) before a budget-0 start pauses; min_mib estimates the least form (no resident block, no tape,
+the inputs on the host); need_mib estimates its process peak with a margin, and peak_mib estimates the whole form.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -33,22 +34,63 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# model -> (open_mib, min_mib at the 1024 class, peak_mib of the whole form).  Estimates (unverified): the min
-# follows train::Trainer::min_bytes (the fixed allocations + two stream slots + two row buffers + the arena's
-# growth + 1.5 GiB of transients, 3 GiB more before the first step); the peaks are docs/LORA_TRAIN's measurements
-# (Mage-Flow bf16 about 14.5 GiB) and the 2026-11-09 LOW-VRAM design's figures (Qwen-Image-2.1 int8 about 15 GB
-# whole).  Measurements replace these estimates; the trainer's own vram line is authoritative once it runs.
-MODELS = {
-    ("qwen-image-2.1", "int8"): (3072, 7168, 15360),
-    ("qwen-image-2.1", "bf16"): (3072, 13312, 21504),
-    ("mage-flow", "int8"): (2048, 6144, 10240),
-    ("mage-flow", "bf16"): (2048, 11264, 14848),
-    ("magetrail", "int8"): (2048, 6144, 10240),
-    ("magetrail", "bf16"): (2048, 11264, 14848),
-    ("moss-image", "int8"): (2048, 6144, 12288),
-    ("moss-image", "bf16"): (2048, 10240, 16384),
-    ("anima", "bf16"): (1536, 5120, 9216),
-}
+# Rank 32: the table has open, least-form min and process peak, and whole-form peak estimate (MiB). The measured
+# classes use the greater B70 / RTX observations, rounded up; they are samples, not hard bounds. MageTrail and the
+# whole-form peaks are estimates. The trainer reports the largest cache shape's own min and need once it starts.
+# The same table is compiled into the standalone trainers. Missing or malformed data is an error.
+_table = (Path(__file__).with_name("train_vram_models.inc")).read_text(encoding="utf-8")
+_rows = re.findall(r'^TRAIN_VRAM\("([^"]+)", "([^"]+)", (\d+), (\d+), (\d+), (\d+), (\d+)\)$',
+                   _table, re.MULTILINE)
+if not _rows:
+    raise ValueError("the training VRAM table has no rows")
+MODELS = {(model, base): (int(op), int(minimum), int(whole))
+          for model, base, size, op, minimum, _, whole in _rows if int(size) == 1024}
+LEAST_FORMS = {(model, base, int(size)): (int(minimum), int(peak))
+               for model, base, size, _, minimum, peak, _ in _rows}
+
+
+def initial_vram(model: str, base: str, image_tokens: int, rank: int) -> tuple[int, int]:
+    """Least-form min and process-peak budget for the largest cache shape. Samples are not a hard bound."""
+    if image_tokens <= 0 or rank <= 0:
+        raise ValueError("training shape and rank must be positive")
+    sizes = sorted(size for m, b, size in LEAST_FORMS if (m, b) == (model, base))
+    if not sizes:
+        raise ValueError(f"no training figures for {model} ({base})")
+    size = next((n for n in sizes if n * n // 256 >= image_tokens), sizes[-1])
+    capacity = size * size // 256
+    minimum, peak = LEAST_FORMS[model, base, size]
+    numerator, denominator = max(capacity, image_tokens) * max(32, rank), capacity * 32
+    minimum = (minimum * numerator + denominator - 1) // denominator
+    peak = (peak * numerator + denominator - 1) // denominator
+    return minimum, max(minimum, peak + max(128, (peak * 2 + 99) // 100))
+
+
+def dataset_tokens(model: str, data: Path) -> int:
+    """Largest image-token count plus largest text-row count from the training cache."""
+    shapes: list[tuple[int, int]] = []
+    text_rows = 0
+    if model == "qwen-image-2.1":
+        for line in data.read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            with Path(fields[1]).open("rb") as f:
+                rows, = struct.unpack("<f", f.read(4))
+            text_rows = max(text_rows, int(rows))
+            if fields[0] != "empty":
+                with Path(fields[0]).open("rb") as f:
+                    w, h = struct.unpack("<ff", f.read(8))
+                shapes.append((int(w), int(h)))
+    else:
+        for line in (data / "manifest.tsv").read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            shapes.append((int(fields[1]), int(fields[2])))
+            text_rows = max(text_rows, int(fields[4]), int(fields[5]))
+    if not shapes or any(w <= 0 or h <= 0 for w, h in shapes):
+        raise ValueError("training cache has no valid shapes")
+    return max(w * h for w, h in shapes) + text_rows
 
 
 def figures(model: str, base: str) -> tuple[int, int, int]:
@@ -142,17 +184,22 @@ class Decider:
     """The training's placement and budget, re-decided every tick.  `st` (TrainPlace fills it):
       free: {pci: free_mib} the device reports now; chat_busy / chat_queued: the text engine's work;
       chat_eta_s: how long the chat's work is expected to last (None: unknown); image_job: an image job waiting
-      or running on the card; image_need_mib: its estimate; helper_mib: the helper cache's size on the card;
-      train: the trainer's last vram line {used_mib, peak_est_mib, min_mib, state} (None before the first);
+      or running on the card; image_need_mib: its estimate (None: unknown); device_free: the device's actual free
+      MiB, without adding the trainer's usage; proc_alive: whether the training process is still alive;
+      helper_mib: the helper cache's size on the card;
+      train: the trainer's last vram line {used_mib, peak_est_mib, min_mib, need_mib, state} (None before the first);
       current_pci: the card the trainer runs on (None before the start); step_s / reload_s: the measured step
       time and the state-restore + weights-reload time (None: not measured).
-    The action: {pci, budget_mib, save_state, reason, mode: start|run|shrunk|paused|move|refuse, return_helper}.
-    TrainPlace writes the control file from it (and restarts with --resume on a move)."""
+    The action: {pci, budget_mib, save_state, reason, mode: start|run|shrunk|paused|move|refuse, return_helper,
+    image_ready}. TrainPlace writes the control file, confirms process exit before yielding when a save was
+    requested, and restarts with --resume only after the image job ends."""
 
-    def __init__(self, cfg: dict, model: str, base: str, devices: list[dict] | None = None):
+    def __init__(self, cfg: dict, model: str, base: str, devices: list[dict] | None = None,
+                 image_tokens: int = 4096, rank: int = 32):
         self.cfg = cfg
         self.model, self.base = model, base
-        self.open_mib, self.min_mib, self.peak_mib = figures(model, base)
+        self.open_mib, _, self.peak_mib = figures(model, base)
+        self.min_mib, self.need_mib = initial_vram(model, base, image_tokens, rank)
         self.cards = candidates(cfg, devices)
 
     def _margin(self, total_mib: int) -> int:
@@ -169,35 +216,48 @@ class Decider:
         return max(0, room)
 
     def tick(self, st: dict) -> dict:
+        if st.get("image_job"):
+            card = next((c for c in self.cards if c["pci"] == st.get("current_pci")), None)
+            if card is None:
+                return {"pci": None, "budget_mib": 0, "save_state": False, "reason": "unknown training card",
+                        "mode": "refuse", "return_helper": False, "image_ready": False}
+            alive = st.get("proc_alive", True)
+            paused = (st.get("train") or {}).get("state") == "paused"
+            need = st.get("image_need_mib")
+            free = (st.get("device_free") or {}).get(card["pci"])
+            fits = need is not None and free is not None and int(free) >= int(need) + self._margin(card["total_mib"])
+            ready = (not alive and (need is None or fits)) or (alive and paused and fits)
+            save = alive and paused and not fits
+            return {"pci": card["pci"], "budget_mib": 0, "save_state": save, "reason": "image job",
+                    "mode": "paused", "return_helper": card["kind"] == "helper", "image_ready": ready}
+        return {**self._tick(st), "image_ready": False}
+
+    def _tick(self, st: dict) -> dict:
         cur = st.get("current_pci")
         card = next((c for c in self.cards if c["pci"] == cur), None)
         train = st.get("train") or {}
-        min_mib = int(train.get("min_mib") or self.min_mib)   # the trainer's own figure once it runs
-        peak = int(train.get("peak_est_mib") or self.peak_mib)
-        image = bool(st.get("image_job"))
+        need_mib = int(train.get("need_mib") or self.need_mib)
+        peak = max(need_mib, int(train.get("peak_est_mib") or self.peak_mib))
         chat = bool(st.get("chat_busy") or st.get("chat_queued"))
 
         if card is None:   # the start: the first card the least form fits on (the open's room checked by TrainPlace)
             for c in self.cards:
-                if self._room(st, c) >= min_mib:
+                if self._room(st, c) >= need_mib:
                     return {"pci": c["pci"], "budget_mib": min(peak, self._room(st, c)), "save_state": False,
                             "reason": "", "mode": "start", "return_helper": False}
-            return {"pci": None, "budget_mib": 0, "save_state": False, "reason": "no card has the least room",
+            room = max((self._room(st, c) for c in self.cards), default=0)
+            reason = f"not enough free GPU memory: need {need_mib} MiB, available {room} MiB after reserve"
+            return {"pci": None, "budget_mib": 0, "save_state": False, "reason": reason,
                     "mode": "refuse", "return_helper": False}
 
         room = self._room(st, card)
-        if image:   # an image job is never made to wait for the training: shrink to what is left, else pause
-            left = room - int(st.get("image_need_mib") or 0)
-            if left >= min_mib:
-                return self._act(card, left, "shrunk", "image job", st)
-            return self._pause_or_move(card, st, min_mib, "image job")
         if chat:   # the text model first: the training takes what is left beside it
-            if room >= min_mib:
+            if room >= need_mib:
                 return self._act(card, room, "shrunk" if room < peak else "run", "chat", st)
-            return self._pause_or_move(card, st, min_mib, "chat")
+            return self._pause_or_move(card, st, need_mib, "chat")
         # idle: grow to the whole form (the helper card's cache stays closed only while the chat is idle)
-        return self._act(card, min(peak, room) if room >= min_mib else 0,
-                         "run" if room >= min_mib else "paused", "" if room >= min_mib else "no room", st)
+        return self._act(card, min(peak, room) if room >= need_mib else 0,
+                         "run" if room >= need_mib else "paused", "" if room >= need_mib else "no room", st)
 
     def _act(self, card: dict, budget: int, mode: str, reason: str, st: dict) -> dict:
         if budget <= 0:
@@ -206,16 +266,15 @@ class Decider:
         return {"pci": card["pci"], "budget_mib": int(budget), "save_state": False, "reason": reason,
                 "mode": mode, "return_helper": False}
 
-    def _pause_or_move(self, card: dict, st: dict, min_mib: int, reason: str) -> dict:
+    def _pause_or_move(self, card: dict, st: dict, need_mib: int, reason: str) -> dict:
         """The least form does not fit beside the work: pause (the state kept).  Move only where another card has
-        the room AND the measured reload is cheaper than waiting the work out (no measurements: no move).  A
-        pause that still leaves more than the work needs (the runtime's carry-over, the edge weights) escalates
-        to a state file + exit: TrainPlace ends the process after `state saved` and starts it again later."""
+        the room AND the measured reload is cheaper than waiting the work out (no measurements: no move).
+        Image jobs take the separate image_ready path, which can escalate a pause to a state file and exit."""
         eta = st.get("chat_eta_s")
         reload_s = st.get("reload_s")
         if eta is not None and reload_s is not None and reload_s < eta:
             for c in self.cards:
-                if c["pci"] != card["pci"] and self._room(st, c) >= min_mib:
+                if c["pci"] != card["pci"] and self._room(st, c) >= need_mib:
                     return {"pci": c["pci"], "budget_mib": 0, "save_state": True, "reason": reason,
                             "mode": "move", "return_helper": card["kind"] == "helper"}
         return {"pci": card["pci"], "budget_mib": 0, "save_state": False, "reason": reason,

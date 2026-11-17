@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <istream>
 #include <ostream>
 #include <stdexcept>
@@ -23,9 +24,34 @@ namespace {
 constexpr uint64_t kTransients = uint64_t{3} << 29;   // 1.5 GiB beside a step's own buffers
 constexpr uint64_t kFirstStep = uint64_t{3} << 30;    // 3 GiB more before the first step
 
+// The allowance left after this process's runtime and other untracked device allocations. The global fallback also
+// includes other processes and is conservative; the report names the source so a shared device can be diagnosed.
+uint64_t after_untracked(uint64_t budget, uint64_t live) {
+    size_t process = 0;
+    const char* source = nullptr;
+    if (!gpu::process_memory(&process, &source))
+        throw std::runtime_error("image engine: cannot measure process GPU memory for the training budget");
+    const uint64_t other = process > live ? process - live : 0;
+    return budget > other ? budget - other : 0;
+}
+
+uint64_t process_bytes() {
+    size_t process = 0;
+    const char* source = nullptr;
+    return gpu::process_memory(&process, &source) ? process : gpu::device_held();
+}
+
+// The host form needs up to three of the boundary buffers. Leave those in the minimum estimate even when a
+// particular trainer needs only two; the other FP32 or BF16 checkpoints can be moved off the GPU.
+uint64_t excess_inputs(const char* mode, uint64_t blocks, uint64_t row_bytes) {
+    if (std::strcmp(mode, "fp32") == 0 && blocks > 2) return (blocks - 2) * row_bytes;
+    if (std::strcmp(mode, "bf16") == 0) return blocks * row_bytes / 2;
+    return 0;
+}
+
 }  // namespace
 
-Trainer::Trainer(std::string what) : what_(std::move(what)) {}
+Trainer::Trainer(std::string what) : what_(std::move(what)) { ws.allow_single_slot(); }
 
 Trainer::~Trainer() {
     if (s != nullptr) gpu::stream_sync(s);
@@ -179,12 +205,15 @@ void Trainer::set_budget(int64_t rows, uint64_t keep_row, uint64_t guess_row) {
     if (const char* e = strata::env_get("TRAIN_WEIGHTS_MIB")) {
         budget = (uint64_t) std::strtoll(e, nullptr, 10) << 20;
     } else if (budget_ > 0) {
-        // the explicit cap: what it leaves beside the trainer's own allocations and the arena, as the free
-        // memory does in the automatic form (the step's buffers already taken are in owned_bytes_; the ones
-        // this step will take are keep_row and the arena's growth)
-        const uint64_t fixed = owned_bytes_ + arena.held();
-        const uint64_t room = budget_ > fixed ? budget_ - fixed : 0;
-        const uint64_t have = room + ws.vram() + tape_cap_;
+        if (!known) throw std::runtime_error("image engine (" + what_ + "): cannot measure GPU memory for the budget");
+        const uint64_t live = gpu::device_held();
+        const uint64_t reclaim = ws.vram() + tape_cap_;
+        // Include every tracked allocation, not just the trainer's: the entry and this step have their own buffers.
+        const uint64_t fixed = live > reclaim ? live - reclaim : 0;
+        const uint64_t allowed = after_untracked(budget_, live);
+        const uint64_t room = allowed > fixed ? allowed - fixed : 0;
+        const uint64_t physical = (uint64_t) free_b + reclaim;
+        const uint64_t have = std::min(room, physical);
         const uint64_t reserve = keep_row * (uint64_t) R +
                                  scratch_growth(arena.held(), R, scratch_rows, guess_row * (uint64_t) R) +
                                  kTransients + (stepped ? 0 : kFirstStep);
@@ -211,8 +240,14 @@ bool Trainer::inputs_half(int64_t rows, uint64_t f32_bytes, uint64_t guess_row) 
     gpu::stream_sync(s);
     uint64_t have = 0;
     if (budget_ > 0) {
-        const uint64_t fixed = owned_bytes_ + arena.held();
-        have = (budget_ > fixed ? budget_ - fixed : 0) + tape_cap_;
+        if (!gpu::mem_info(&free_b, &total))
+            throw std::runtime_error("image engine (" + what_ + "): cannot measure GPU memory for the budget");
+        const uint64_t live = gpu::device_held(), pending = ws.pending_vram();
+        const uint64_t fixed = (live > tape_cap_ ? live - tape_cap_ : 0) + pending;
+        const uint64_t allowed = after_untracked(budget_, live);
+        have = allowed > fixed ? allowed - fixed : 0;
+        const uint64_t physical = (uint64_t) free_b + tape_cap_;
+        have = std::min(have, physical > pending ? physical - pending : 0);
     } else if (gpu::mem_info(&free_b, &total)) {
         have = (uint64_t) free_b + tape_cap_;
     } else {
@@ -232,19 +267,24 @@ int64_t Trainer::keep_tapes(int64_t nb, int64_t rows, size_t per, size_t step_by
         avail = (size_t) std::clamp<int64_t>(std::strtoll(e, nullptr, 10), 0, nb) * per;
     } else if (scratch_rows > 0 && rows <= scratch_rows) {
         size_t free_b = 0, total = 0;
-        uint64_t room = 0;
+        const uint64_t pending = ws.pending_vram();
+        const bool known = gpu::mem_info(&free_b, &total);
+        // configure() selects the resident prefix before begin() allocates it. Those future allocations are not
+        // in the device's free count yet, and must not also be given to tapes (RTX 4070, 512-class qi, 2026-11-17).
+        const uint64_t physical = known ? (uint64_t) free_b + tape_cap_ : UINT64_MAX;
+        uint64_t room = physical > pending ? physical - pending : 0;
         if (budget_ > 0) {
-            const uint64_t fixed = owned_bytes_ + arena.held();
-            room = budget_ > fixed ? budget_ - fixed : 0;
-        } else if (gpu::mem_info(&free_b, &total)) {
-            room = (uint64_t) free_b;
+            if (!known) throw std::runtime_error("image engine (" + what_ + "): cannot measure GPU memory for the budget");
+            const uint64_t live = gpu::device_held();
+            const uint64_t fixed = (live > tape_cap_ ? live - tape_cap_ : 0) + pending;
+            const uint64_t allowed = after_untracked(budget_, live);
+            room = std::min(room, allowed > fixed ? allowed - fixed : 0);
+        } else if (!known) {
+            room = 0;
         }
-        if (room > 0 || budget_ > 0) {
-            room += tape_cap_;
-            const size_t reserve = (size_t) scratch_growth(arena.held(), rows, scratch_rows, 0) + step_bytes +
-                                   (size_t) kTransients;
-            avail = room > reserve ? (size_t) (room - reserve) : 0;
-        }
+        const size_t reserve = (size_t) scratch_growth(arena.held(), rows, scratch_rows, 0) + step_bytes +
+                               (size_t) kTransients;
+        avail = room > reserve ? (size_t) (room - reserve) : 0;
     }
     const size_t want = std::min(avail, (size_t) nb * per);
     if (want / per > tape_cap_ / per || avail < tape_cap_) {
@@ -281,6 +321,16 @@ void Trainer::stepped_rows(int64_t rows, uint64_t row_bytes) {
     last_rows_ = rows;
     if (row_bytes > 0) last_row_bytes_ = row_bytes;
     stepped = true;
+    // The backward is synchronized and its step-local buffers are still alive here. Measure that process rather
+    // than adding a generic transient reserve to the same allocations already retained by the runtime. Subtract
+    // the weights and tapes that a least-form step releases; non-host input copies make this estimate conservative.
+    if (budget_ > 0) {
+        const uint64_t process = process_bytes();
+        const uint64_t reclaim = ws.vram() + tape_cap_ + excess_inputs(inputs_mode_, (uint64_t) ws.count(), row_bytes);
+        const uint64_t measured = (process > reclaim ? process - reclaim : 0) + ws.min_budget();
+        measured_min_ = min_rows_ == rows ? std::max(measured_min_, measured) : measured;
+        min_rows_ = rows;
+    }
 }
 
 void Trainer::drop_tapes() {
@@ -307,14 +357,19 @@ uint64_t Trainer::held() const {
 }
 
 uint64_t Trainer::min_bytes(int64_t rows, uint64_t row_bytes, uint64_t guess_row) const {
-    return owned_bytes_ + ws.min_budget() + 2 * row_bytes +
-           scratch_growth(arena.held(), rows, scratch_rows, guess_row * (uint64_t) rows) + kTransients +
-           (stepped ? 0 : kFirstStep);
+    const uint64_t process = process_bytes();
+    const uint64_t reclaim = ws.vram() + tape_cap_ + excess_inputs(inputs_mode_, (uint64_t) ws.count(), row_bytes);
+    const uint64_t floor = (process > reclaim ? process - reclaim : 0) + ws.min_budget();
+    // Before a backward has run this is only the allocations already known, not a measured minimum. A new larger
+    // shape adds the same arena-growth estimate the planner uses; the next completed step measures it again.
+    if (min_rows_ == 0) return floor + scratch_growth(arena.held(), rows, scratch_rows, guess_row * (uint64_t) rows);
+    return std::max(floor, measured_min_) +
+           scratch_growth(arena.held(), rows, scratch_rows, guess_row * (uint64_t) rows);
 }
 
 uint64_t Trainer::est_bytes(int64_t rows, uint64_t guess_row) const {
-    return held() + scratch_growth(arena.held(), rows, scratch_rows, guess_row * (uint64_t) rows) + kTransients +
-           (stepped ? 0 : kFirstStep);
+    return process_bytes() + scratch_growth(arena.held(), rows, scratch_rows, guess_row * (uint64_t) rows) +
+           kTransients + (stepped ? 0 : kFirstStep);
 }
 
 void Trainer::pause() {
@@ -394,14 +449,14 @@ void Trainer::resume() {
     replan_ = true;
 }
 
-void* Trainer::moved(void* old) const {
+void* Trainer::moved(const void* old) const {
     if (old == nullptr) return nullptr;
-    auto it = moved_.find(old);
+    auto it = moved_.find(const_cast<void*>(old));
     if (it != moved_.end()) return it->second;
     for (void* p : old_owned_)
         if (p == old)
             throw std::logic_error("image engine (" + what_ + "): a pointer not remapped after resume");
-    return old;
+    return const_cast<void*>(old);
 }
 
 void Trainer::save_state(std::ostream& os) const {
@@ -411,11 +466,19 @@ void Trainer::save_state(std::ostream& os) const {
     std::vector<float> h;
     for (const Param& p : params_) {
         os.write(reinterpret_cast<const char*>(&p.n), sizeof p.n);
-        for (const float* d : {p.w, p.m, p.v}) {
-            h.resize((size_t) p.n);
-            if (!gpu::copy(h.data(), d, (size_t) p.n * 4))
-                throw std::runtime_error("image engine (" + what_ + "): state read back");
-            os.write(reinterpret_cast<const char*>(h.data()), (std::streamsize) (p.n * 4));
+        for (const float* d : {p.w, p.g, p.m, p.v}) {
+            const size_t bytes = (size_t) p.n * sizeof(float);
+            if (paused_) {
+                const auto it = std::find_if(host_.begin(), host_.end(), [d](const Hosted& e) { return e.old == d; });
+                if (it == host_.end() || it->data.size() < bytes)
+                    throw std::runtime_error("image engine (" + what_ + "): state host allocation missing");
+                os.write(reinterpret_cast<const char*>(it->data.data()), (std::streamsize) bytes);
+            } else {
+                h.resize((size_t) p.n);
+                if (!gpu::copy(h.data(), d, bytes))
+                    throw std::runtime_error("image engine (" + what_ + "): state read back");
+                os.write(reinterpret_cast<const char*>(h.data()), (std::streamsize) bytes);
+            }
         }
     }
 }
@@ -430,14 +493,12 @@ void Trainer::load_state(std::istream& is) {
         is.read(reinterpret_cast<char*>(&pn), sizeof pn);
         if (pn != p.n) throw std::runtime_error("image engine (" + what_ + "): state: a parameter's size");
         h.resize((size_t) p.n);
-        for (float* d : {p.w, p.m, p.v}) {
+        for (float* d : {p.w, p.g, p.m, p.v}) {
             is.read(reinterpret_cast<char*>(h.data()), (std::streamsize) (p.n * 4));
             if (!is) throw std::runtime_error("image engine (" + what_ + "): state: short");
             if (!gpu::copy(d, h.data(), (size_t) p.n * 4))
                 throw std::runtime_error("image engine (" + what_ + "): state copy");
         }
-        if (!gpu::memset_async(p.g, 0, (size_t) p.n * 4, s))
-            throw std::runtime_error("image engine (" + what_ + "): state zero");
     }
     gpu::stream_sync(s);
     for (const Lora& l : loras_)

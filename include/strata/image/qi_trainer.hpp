@@ -43,6 +43,8 @@ public:
     /// A caption's text encoder states [n][4096] (host FP32, the system turn already dropped) through the DiT's text
     /// projection, kept on the GPU; returns its id for step().
     int add_text(const std::vector<float>& states, int64_t n);
+    /// Plan step buffers for the largest image and text row count in the cache, before the first step.
+    void plan_rows(int64_t rows);
 
     /// One sample's forward and backward: x0 and noise [h w][64] (host FP32, the latent's tokens: x0 the posterior's
     /// draw, normalized), `timestep` the schedule's (sigma * 1000).  The LoRAs' gradients are added into; the loss

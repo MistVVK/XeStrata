@@ -81,7 +81,7 @@ struct QiTrainer::Impl : train::Trainer {
     uint16_t *e16 = nullptr, *s16 = nullptr;
     float *temb = nullptr, *mods = nullptr, *mb = nullptr, *scale_out = nullptr, *zero = nullptr;
     uint16_t* plain0[3] = {};           // an int8 base: block 0's q, k and v rotated back (QiBlockRun::w_plain)
-    int64_t last_hw = 0;
+    int64_t last_hw = 0, planned_rows = 0;
 
     // the persistent pointers after the trainer's pause/resume (the values come back at new addresses)
     void remap() override {
@@ -424,12 +424,17 @@ int QiTrainer::add_text(const std::vector<float>& states, int64_t n) {
     return (int) m.texts.size() - 1;
 }
 
+void QiTrainer::plan_rows(int64_t rows) {
+    m_->planned_rows = rows;
+}
+
 float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, int64_t w, float timestep) {
     Impl& m = *m_;
     void* s = m.s;
     const int64_t C = m.C, hw = h * w, nt = m.texts.at((size_t) text).second, R = nt + hw;
-    m.ensure(R);
-    m.set_budget(R, 0, (uint64_t) (13 * m.F) * 4);
+    const int64_t planned = std::max(R, m.planned_rows);
+    m.ensure(planned);
+    m.set_budget(planned, 0, (uint64_t) (13 * m.F) * 4);
     m.rope(nt, h, w);
     m.modulation(timestep);
     // the noised latent's tokens, x_t = (1 - t) x0 + t noise with t = timestep / 1000 in FP32 (ai-toolkit's

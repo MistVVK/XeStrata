@@ -123,12 +123,14 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     };
     std::vector<Item> all;
     int empty = -1;
+    int64_t max_text_rows = 0;
     std::map<std::string, int> text_of;
     auto text = [&](const std::string& path) {
         auto it = text_of.find(path);
         if (it != text_of.end()) return it->second;
         int64_t n = 0;
         std::vector<float> st = qi_train_states(path, n);
+        max_text_rows = std::max(max_text_rows, n);
         return text_of[path] = tr.add_text(st, n);
     };
     for (std::string line; std::getline(items, line);) {
@@ -139,6 +141,9 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
         else all.push_back({qi_train_latent(a), text(b)});
     }
     if (all.empty() || empty < 0) throw std::runtime_error("the items file needs its \"empty\" line and an item");
+    int64_t max_hw = 0;
+    for (const Item& it : all) max_hw = std::max(max_hw, it.lat.h * it.lat.w);
+    tr.plan_rows(max_hw + max_text_rows);
     std::printf("qwen-image-2.1 lora: %zu items, rank %lld, %lld steps, lr %g, %s\n", all.size(), (long long) rank,
                 (long long) steps, (double) o.lr, opt(f, "draw", "balanced").c_str());
     std::mt19937_64 rng(seed ^ 0x9e3779b97f4a7c15ull);   // the loop's own stream, not the LoRA's first values'
@@ -150,13 +155,13 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     int64_t done = 0;   // the steps completed (the state file's; --resume continues after them)
     // the loop's state as the state file holds it (the rng's whole state, the data's order and place)
     auto save_loop = [&](std::ostream& os) {
-        os << done << '\n' << rng << '\n' << order.size() << '\n';
+        os << done << '\n' << rng << '\n' << gauss << '\n' << order.size() << '\n';
         for (size_t v : order) os << v << ' ';
         os << '\n' << next << '\n' << loss_avg << '\n';
     };
     auto load_loop = [&](std::istream& is) {
         size_t on = 0;
-        is >> done >> rng >> on;
+        is >> done >> rng >> gauss >> on;
         order.resize(on);
         for (size_t& v : order) is >> v;
         is >> next >> loss_avg;
@@ -166,6 +171,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     co.path = opt(f, "vram-control", "");
     co.budget_mib = (uint64_t) std::stoll(opt(f, "vram-budget", "0"));
     co.state = opt(f, "state", out + ".state.bin");
+    co.initial = train::initial_vram("qwen-image-2.1", base, max_hw + max_text_rows, rank);
     train::Control ctl(tr.base(), co);
     ctl.load(opt(f, "resume", ""), load_loop);
     ctl.report();
@@ -175,7 +181,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     const auto t0 = std::chrono::steady_clock::now();
     for (int64_t step = start_step; step <= steps; ++step) {
         done = step - 1;
-        ctl.boundary(true, save_loop);   // the budget, pause/resume, the state file (every step ends in an update)
+        if (!ctl.boundary(true, save_loop)) return 0;   // the budget, pause/resume, the state file (every step ends in an update)
         if (next == order.size()) {   // a new epoch: every item once, in a new order
             order.resize(all.size());
             for (size_t i = 0; i < order.size(); ++i) order[i] = i;
@@ -269,6 +275,7 @@ int check(const std::map<std::string, std::string>& f, void* s) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    strata::image::train::install_stop_signals();   // stop at a boundary and unwind the GPU owners
     if (argc < 2) {
         usage();
         return 2;

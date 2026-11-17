@@ -143,13 +143,13 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
     double loss_avg = 0.0;
     int64_t done = 0;   // the steps completed (the state file's; --resume continues after them)
     auto save_loop = [&](std::ostream& os) {
-        os << done << '\n' << rng << '\n' << order.size() << '\n';
+        os << done << '\n' << rng << '\n' << gauss << '\n' << order.size() << '\n';
         for (size_t v : order) os << v << ' ';
         os << '\n' << next << '\n' << loss_avg << '\n';
     };
     auto load_loop = [&](std::istream& is) {
         size_t on = 0;
-        is >> done >> rng >> on;
+        is >> done >> rng >> gauss >> on;
         order.resize(on);
         for (size_t& v : order) is >> v;
         is >> next >> loss_avg;
@@ -159,6 +159,8 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
     co.path = opt(f, "vram-control", "");
     co.budget_mib = (uint64_t) std::stoll(opt(f, "vram-budget", "0"));
     co.state = opt(f, "state", out + ".state.bin");
+    co.initial = train::initial_vram(kMoss ? "moss-image" : "anima", kMoss ? opt(f, "base", "int8") : "bf16",
+                                                mf_train_max_tokens(data), rank);
     train::Control ctl(tr.base(), co);
     ctl.load(opt(f, "resume", ""), load_loop);
     ctl.report();
@@ -166,7 +168,7 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
     const auto t0 = std::chrono::steady_clock::now();
     for (int64_t step = start_step; step <= steps; ++step) {
         done = step - 1;
-        ctl.boundary(true, save_loop);   // the budget, pause/resume, the state file (every step ends in an update)
+        if (!ctl.boundary(true, save_loop)) return 0;   // the budget, pause/resume, the state file (every step ends in an update)
         if (next == order.size()) {   // a new epoch: every sample once, in a new order
             order.resize(stems.size());
             for (size_t i = 0; i < order.size(); ++i) order[i] = i;
@@ -219,6 +221,7 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
 }  // namespace
 
 int main(int argc, char** argv) {
+    strata::image::train::install_stop_signals();   // stop at a boundary and unwind the GPU owners
     if (argc < 2) {
         usage();
         return 2;

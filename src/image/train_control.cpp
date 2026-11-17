@@ -6,20 +6,36 @@
 #include "strata/core/gpu.hpp"
 #include "strata/platform/env.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 namespace strata::image::train {
 
 namespace {
 
-constexpr char kMagic[8] = {'X', 'S', 'T', 'R', 'A', 'I', 'N', '1'};
+#if defined(_WIN32)
+volatile std::sig_atomic_t g_win_stop = 0;
+void stop_handler(int) { g_win_stop = 1; }
+#else
+std::atomic<bool> g_stop{false};
+#endif
+
+constexpr char kMagic[8] = {'X', 'S', 'T', 'R', 'A', 'I', 'N', '2'};
 
 double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -55,7 +71,59 @@ bool json_bool(const std::string& s, const char* key, bool& out) {
 
 }  // namespace
 
-Control::Control(Trainer& tr, Opts o) : tr_(tr), opts_(std::move(o)), budget_mib_(o.budget_mib) {
+void install_stop_signals() {
+#if defined(_WIN32)
+    if (std::signal(SIGTERM, stop_handler) == SIG_ERR || std::signal(SIGINT, stop_handler) == SIG_ERR)
+        throw std::runtime_error("image engine: cannot install training stop signals");
+#else
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0)
+        throw std::runtime_error("image engine: cannot block training stop signals");
+    std::thread([set] {
+        int sig = 0;
+        while (sigwait(&set, &sig) != 0) {}
+        g_stop.store(true, std::memory_order_relaxed);
+    }).detach();
+#endif
+}
+
+bool stop_requested() {
+#if defined(_WIN32)
+    return g_win_stop != 0;
+#else
+    return g_stop.load(std::memory_order_relaxed);
+#endif
+}
+
+InitialVram initial_vram(const std::string& model, const std::string& base, int64_t image_tokens, int64_t rank) {
+    struct Row { const char* model; const char* base; int size; uint64_t open, minimum, least_peak, whole; };
+    static constexpr Row rows[] = {
+#define TRAIN_VRAM(model, base, size, open, minimum, least_peak, whole) {model, base, size, open, minimum, least_peak, whole},
+#include "../../serve/train_vram_models.inc"
+#undef TRAIN_VRAM
+    };
+    if (image_tokens <= 0 || rank <= 0) throw std::invalid_argument("image engine: bad training shape or rank");
+    const Row* chosen = nullptr;
+    for (const Row& row : rows) {
+        if (model != row.model || base != row.base) continue;
+        const int64_t capacity = (int64_t) row.size * row.size / 256;
+        if (chosen == nullptr || (capacity >= image_tokens && row.size < chosen->size) ||
+            (image_tokens > (int64_t) chosen->size * chosen->size / 256 && row.size > chosen->size)) chosen = &row;
+    }
+    if (chosen == nullptr) throw std::invalid_argument("image engine: no training VRAM estimate for " + model + " (" + base + ")");
+    const uint64_t capacity = (uint64_t) chosen->size * (uint64_t) chosen->size / 256;
+    const uint64_t tokens = std::max(capacity, (uint64_t) image_tokens);
+    const uint64_t ranks = std::max<uint64_t>(32, (uint64_t) rank);
+    auto scaled = [&](uint64_t value) { return (value * tokens * ranks + capacity * 32 - 1) / (capacity * 32); };
+    const uint64_t peak = scaled(chosen->least_peak);
+    const uint64_t minimum = scaled(chosen->minimum);
+    return {minimum, std::max(minimum, peak + std::max<uint64_t>(128, (peak * 2 + 99) / 100))};
+}
+
+Control::Control(Trainer& tr, Opts o) : tr_(tr), opts_(std::move(o)), budget_mib_(opts_.budget_mib) {
     if (const char* e = strata::env_get("TRAIN_CONTROL_MS")) {
         const long v = std::strtol(e, nullptr, 10);
         if (v >= 10 && v <= 10000) poll_ms_ = (int) v;
@@ -82,6 +150,8 @@ void Control::read() {
     std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     int64_t b = 0;
     if (json_int(text, "budget_mib", b) && b >= 0) budget_mib_ = (uint64_t) b;
+    bool requested_stop = false;
+    if (json_bool(text, "stop", requested_stop) && requested_stop) stop_ = true;
     bool ss = false;
     if (json_bool(text, "save_state", ss)) {
         if (!ss) saved_ = false;
@@ -91,6 +161,7 @@ void Control::read() {
 
 void Control::save(const std::function<void(std::ostream&)>& save_loop) {
     std::ostringstream loop;
+    loop << std::setprecision(std::numeric_limits<double>::max_digits10);
     save_loop(loop);
     const std::string ls = loop.str();
     std::ofstream f(opts_.state, std::ios::binary | std::ios::trunc);
@@ -113,7 +184,7 @@ bool Control::load(const std::string& path, const std::function<void(std::istrea
     char magic[8];
     f.read(magic, sizeof magic);
     if (!f || std::string(magic, sizeof magic) != std::string(kMagic, sizeof kMagic))
-        throw std::runtime_error("the state file " + path + " is not a training state (XSTRAIN1)");
+        throw std::runtime_error("the state file " + path + " is not a training state (XSTRAIN2)");
     int64_t steps = 0;
     f.read(reinterpret_cast<char*>(&steps), sizeof steps);
     uint64_t len = 0;
@@ -133,55 +204,80 @@ void Control::emit(bool force) {
     const uint64_t guess = tr_.guess_row();
     size_t fb = 0, tb = 0;
     const bool known = gpu::mem_info(&fb, &tb);
+    size_t process = 0;
+    const char* source = "unknown";
+    if (!gpu::process_memory(&process, &source)) source = "unknown";
+    const uint64_t raw_min_bytes = tr_.min_bytes(rows, tr_.last_row_bytes(), guess);
+    const uint64_t min_bytes = std::max(raw_min_bytes, opts_.initial.min_mib << 20);
+    const uint64_t min_mib = tr_.paused() ? paused_min_mib_ : (min_bytes + ((uint64_t{1} << 20) - 1)) >> 20;
     char line[512];
     std::snprintf(line, sizeof line,
-                  "vram %llu %llu %llu %s budget_mib=%llu resident=%d/%d tapes=%lld inputs=%s free_mib=%llu",
+                  "vram %llu %llu %llu %s budget_mib=%llu resident=%d/%d tapes=%lld inputs=%s free_mib=%llu gpu_peak_mib=%llu process_mib=%llu process_source=%s min_source=%s need_mib=%llu raw_min_mib=%llu raw_min_source=%s",
                   (unsigned long long) (tr_.held() >> 20), (unsigned long long) (tr_.est_bytes(rows, guess) >> 20),
-                  (unsigned long long) (tr_.min_bytes(rows, tr_.last_row_bytes(), guess) >> 20),
-                  tr_.paused() ? "paused" : "running", (unsigned long long) (tr_.vram_budget() >> 20),
-                  tr_.ws.resident(), tr_.ws.count(), (long long) tr_.tapes_kept(), tr_.inputs_mode(),
-                  (unsigned long long) (known ? fb >> 20 : 0));
+                  (unsigned long long) min_mib,
+                  tr_.paused() ? "paused" : "running", (unsigned long long) budget_mib_,
+                  tr_.paused() ? 0 : tr_.ws.resident(), tr_.ws.count(), (long long) tr_.tapes_kept(), tr_.inputs_mode(),
+                  (unsigned long long) (known ? fb >> 20 : 0),
+                  (unsigned long long) ((gpu::device_peak_held() + ((size_t) 1 << 20) - 1) >> 20),
+                  (unsigned long long) ((process + ((size_t) 1 << 20) - 1) >> 20), source,
+                  tr_.min_measured() && raw_min_bytes >= (opts_.initial.min_mib << 20)
+                      ? "step" : opts_.initial.min_mib ? "estimate" : "floor",
+                  (unsigned long long) (tr_.paused() ? paused_need_mib_ : std::max(opts_.initial.need_mib, min_mib)),
+                  (unsigned long long) ((raw_min_bytes + ((uint64_t{1} << 20) - 1)) >> 20),
+                  tr_.min_measured() ? "step" : "floor");
     if (!force && last_line_ == line) return;
     last_line_ = line;
     std::printf("%s\n", line);
     std::fflush(stdout);
 }
 
-void Control::wait_resume(const std::function<void(std::ostream&)>& save_loop, bool grads_zero) {
+bool Control::wait_resume(const std::function<void(std::ostream&)>& save_loop) {
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms_));
         read();
-        if (save_state_ && !saved_ && grads_zero) {
+        if (save_state_ && !saved_) {
             save(save_loop);
             saved_ = true;
             std::printf("state saved %s\n", opts_.state.c_str());
             std::fflush(stdout);
         }
-        if (!save_state_ && budget_mib_ > 0) return;
+        if (stop_ || stop_requested()) return false;
+        if (!save_state_ && budget_mib_ >= paused_need_mib_ && budget_mib_ > 0) return true;
+        emit(false);
     }
 }
 
-void Control::boundary(bool update_done, const std::function<void(std::ostream&)>& save_loop) {
-    if (!enabled()) return;
-    read();
-    // the state is written where the gradients are zero (after an optimizer update): a save asked mid-accumulation
-    // waits for the update's boundary (a pause mid-accumulation keeps the gradients on the host, not in the file)
-    if (save_state_ && update_done && !saved_) {
+bool Control::boundary(bool, const std::function<void(std::ostream&)>& save_loop) {
+    if (!enabled() && budget_mib_ == 0) return !stop_requested();
+    if (enabled()) read();
+    // Gradients and the accumulation count are saved too, so a save can finish at any micro-step boundary.
+    if (save_state_ && !saved_) {
         save(save_loop);
         saved_ = true;
         std::printf("state saved %s\n", opts_.state.c_str());
         std::fflush(stdout);
     }
-    if (budget_mib_ == 0 || (save_state_ && saved_)) {
+    if (stop_ || stop_requested()) return false;
+    const uint64_t min_bytes = std::max(tr_.min_bytes(tr_.last_rows(), tr_.last_row_bytes(), tr_.guess_row()),
+                                        opts_.initial.min_mib << 20);
+    const uint64_t min_mib = (min_bytes + ((uint64_t{1} << 20) - 1)) >> 20;
+    const uint64_t need_mib = std::max(opts_.initial.need_mib, min_mib);
+    if (budget_mib_ == 0 || budget_mib_ < need_mib || (save_state_ && saved_)) {
+        if (!enabled())
+            throw std::runtime_error("image engine: the VRAM budget is below the required peak estimate; "
+                                     "provide --vram-control to pause and resume");
+        paused_min_mib_ = min_mib;   // pausing frees allocations: keep both running figures
+        paused_need_mib_ = need_mib;
         if (!tr_.paused()) tr_.pause();
         emit(true);
-        wait_resume(save_loop, update_done);
+        if (!wait_resume(save_loop)) return false;
         tr_.resume();
         tr_.set_vram_budget(budget_mib_ << 20);
         emit(true);
     } else {
         tr_.set_vram_budget(budget_mib_ << 20);
     }
+    return true;
 }
 
 void Control::report() {

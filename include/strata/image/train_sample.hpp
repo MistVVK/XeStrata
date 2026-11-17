@@ -26,6 +26,8 @@ struct MfTrainSample {
 
 /// Read one sample of an exported run dir by its manifest stem.
 MfTrainSample mf_trainer_sample(const std::string& dir, const std::string& stem, int64_t txt_dim);
+/// Largest image token count plus largest text-row count in an export's manifest, before the first step.
+int64_t mf_train_max_tokens(const std::string& dir);
 
 /// Qwen-Image-2.1's latent cache: the width and height, then the posterior's mean and standard deviation [64][h][w].
 struct QiTrainLatent {

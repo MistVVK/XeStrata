@@ -6,6 +6,7 @@
 
 #include "strata/kernels/f16_bits.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -76,6 +77,25 @@ MfTrainSample mf_trainer_sample(const std::string& dir, const std::string& stem,
         (int64_t) s.uncond.size() != s.uncond_rows * txt_dim)
         throw std::runtime_error("image engine (Mage-Flow training): " + stem + " is not this model's shape");
     return s;
+}
+
+int64_t mf_train_max_tokens(const std::string& dir) {
+    std::ifstream f(dir + "/manifest.tsv");
+    if (!f) throw std::runtime_error("image engine: no manifest in " + dir);
+    int64_t maximum = 0, text_rows = 0;
+    for (std::string line; std::getline(f, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        std::stringstream ls(line);
+        std::string stem;
+        int64_t w = 0, h = 0, tokens = 0, rows = 0, uncond_rows = 0;
+        if (!(ls >> stem >> w >> h >> tokens >> rows >> uncond_rows) || w <= 0 || h <= 0 || tokens != w * h ||
+            rows < 0 || uncond_rows < 0)
+            throw std::runtime_error("image engine: bad shape in " + dir + "/manifest.tsv");
+        maximum = std::max(maximum, w * h);
+        text_rows = std::max({text_rows, rows, uncond_rows});
+    }
+    if (maximum == 0) throw std::runtime_error("image engine: no samples in " + dir);
+    return maximum + text_rows;
 }
 
 QiTrainLatent qi_train_latent(const std::string& path) {

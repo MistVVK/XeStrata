@@ -319,8 +319,9 @@ python tools/image/lora_caption.py --dir DATA --kind character --trigger tsumika
 1. **ブロックの入力をホストへ**: FP32 で VRAM に置けなければ、**FP32 のまま**ピン留めのホストへ退避し、逆方向で
    1 ブロック先まで読み戻す（`HostInputs`。コピー用のキューで計算と重ねる）。値を丸めないので損失・勾配は全部 GPU の
    FP32 の形と**バイト一致**。ホストの RAM も足りなければ BF16 で GPU に持つ（値が丸まる最後の逃げ。従来の形）。
-1. **重みをホストから流す**: ブロックの重みは予算内の常駐＋2 枠の流れ込み（LayerStream。先読みは逆方向の折り返しにも
-   対応）。写し元（ファイルの頁・ピン留めの home・リレー）は起動時に測って選ぶ。int8 の土台は int8 のまま流す。
+1. **重みをホストから流す**: ブロックの重みは予算内の常駐＋流れ込み（LayerStream）。余裕があれば 2 枠で次を
+   先読みし、予算が足りなければ 1 枠で順に流す。先読みは逆方向の折り返しにも対応。写し元（ファイルの頁・
+   ピン留めの home・リレー）は起動時に測って選ぶ。int8 の土台は int8 のまま流す。
 
 試験用の固定: `XESTRATA_TRAIN_WEIGHTS_MIB`（常駐の重みの予算）・`XESTRATA_TRAIN_TAPES`（tape の本数）・
 `XESTRATA_TRAIN_INPUTS16`（0: FP32 強制・1: BF16 強制）・`XESTRATA_TRAIN_INPUTS_HOST`（0: ホスト退避を禁止）。
@@ -336,20 +337,31 @@ SSD の段は後（v1 に入れない）。
           --state <path>          状態の保存先（既定 <out>.state.bin）
           --resume <path>         状態から続ける（step 数・乱数・データの順・LoRA・AdamW を戻す）
 制御ファイル（serve が tmp+rename で原子書き込み。学習器は step の境で mtime と大きさを見て読む）:
-          {"budget_mib": <int>, "save_state": <bool>}
+          {"budget_mib": <int>, "save_state": <bool>, "stop": <bool>}
           budget_mib 0 = step の境で一時停止（VRAM を空ける。状態はホストに保ち、同じ所から再開）
-          save_state true = 次の optimizer 更新の境で状態を書いてから一時停止（カードを移る・完全に止まる準備）
-stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib=]
+          save_state true = 次のマイクロステップの境で状態を書いてから一時停止（カードを移る・完全に止まる準備）
+          stop true = 次の境で通常終了（save_state も true なら状態を先に保存）
+stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib= gpu_peak_mib= process_mib= process_source= min_source= need_mib= raw_min_mib= raw_min_source=]
           state saved <path>
 ```
 
-- `vram` 行は step の境で、欄が変わったら出す。先頭 4 欄が serve の読む形（後ろの key=value はログと試験用）。
+- `vram` 行は step の境で、欄が変わったら出す。先頭 4 欄と `need_mib` を serve が読む。
   `used` は学習器の確保の帳簿、`free_mib` は装置の報告（一時停止の後もランタイムが持つ分が見える）。
-  `min` は常駐 0・tape 0・入力ホスト退避の形の最小、`peak_est` は次の step のピークの見積もり。
+  `gpu_peak_mib` はプロセス起動後の GPU 確保の帳簿の最大（MiB に切り上げ）。ランタイム自身の確保は含まない。
+  `process_mib` はランタイムを含む使用量、`process_source` は `fdinfo`（Linux DRM の自プロセス）、
+  `nvml`（NVIDIA ドライバーの自プロセス）、`delta`（装置の空きの差）、`global`（装置全体の保守的な値）。
+  差の測定には他プロセスの増減が混ざり得る。測り始める前のランタイムの確保は含まない。
+  `min` は常駐 0・tape 0・入力ホスト退避の形の見積もり、`peak_est` は次の step のピークの見積もり。
+  `min_source=estimate` は測定表からの見積もり、`step` は後向きの作業領域を持つ時点の使用量から返せる分を
+  引いた値。`raw_min_mib` は表を足す前の値で、`raw_min_source` は `floor` または `step`。
+  `need_mib` は開始・再開・継続に要る予算で、最小の形の測定ピークに余裕を足した値以上。
+  予算がこれ未満なら step の前に止まる。測定の標本は全瞬間の最大を保証しない。
 - 止め点はマイクロステップと更新の境だけ（step の途中では変えない）。縮む・広がるときは常駐の重み・tape・
   入力の形を組み直す。一時停止は全確保をホストへバイトのまま写して返し（重みの流れ込みの home の RAM は残す）、
   再開で同じ値を取り直す。`--resume` は乱数の全状態を戻すので、損失の列が止めなかった回と一致する。
-- 予算が `min` 未満なら一時停止する。状態の保存は勾配 0 の点（更新の境）だけで行う。
+- 予算が `need_mib` 未満なら step の境で一時停止し、十分な予算まで待つ。制御ファイルがないときはエラーで止まる。
+  状態には勾配と蓄積の数も保存するので、更新の途中でも復帰できる。`stop` または SIGTERM・SIGINT は
+  境で通常終了し、GPU キューと領域を順に閉じる。step 中はその終了を待つ。
 - 一時停止で返した量は装置によって報告に出ないことがある（Level Zero のランタイムの持ち越し）。serve は
   `free_mib` で確かめ、画像の仕事に足りなければ `save_state`→プロセス終了で完全に空ける。
 
