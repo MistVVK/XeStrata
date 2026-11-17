@@ -432,7 +432,10 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
   const signature = createHash('sha256').update(patch).update(JSON.stringify(Object.entries(env).sort())).digest('hex').slice(0, 16);
   // What the agent is offered (tool groups, web search, tool servers, the person's own tools) decides whether a running agent must be
   // restarted for the next message; the routes are compared separately (a changed context size alone does not restart it).
-  const toolsSignature = createHash('sha256').update(JSON.stringify([mcp, ownRows, webRows, entries.find(e => e.id === 'preset-standard'), env.STRATA_SEARCH_KEY ?? '', mcpEnv])).digest('hex').slice(0, 16);
+  // The approval gate's own settings are in it too (the blocked folders, the search service it names, whether web needs no question): the gate reads them once, when the
+  // Harness starts, so a change in Settings -> Tools reaches the next message only if it restarts the Harness (SAFETY: a blocked folder was not enforced until the host restarted).
+  const gateEntry = entries.find(e => e.insert?.some(x => x.id === 'strata-gate')) ?? null;
+  const toolsSignature = createHash('sha256').update(JSON.stringify([mcp, ownRows, webRows, entries.find(e => e.id === 'preset-standard'), gateEntry, env.STRATA_SEARCH_KEY ?? '', mcpEnv])).digest('hex').slice(0, 16);
   return { patch, env, routes, defaultRoute, signature, toolsSignature, shapeTargets, mcpSkipped };
 }
 
