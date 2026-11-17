@@ -64,6 +64,28 @@ class ServerStart(unittest.TestCase):
         self.assertEqual(seen.get("klass"), drafting.card_class(["gfx1100"]))
 
 
+class VramFitOfTheServingCard(unittest.TestCase):
+    """#5322: a HIP config on a Strix Halo with two NVIDIA cards beside it (detect_hardware: cuda, sm_120, sm_120, gfx1151) was sized by the start-time VRAM fit as a
+    16 GB NVIDIA card and got --kv-resident 4096.  The fit takes the config's family now (the same backend as the drafter, 188aaf7bf): the Strix Halo is a
+    shared-memory chip, so no single-card figure, and nothing is added."""
+
+    def test_no_kv_window_from_the_nvidia_card(self):
+        from serve import server
+        cfg = {"backend": "hip", "gpu": 0, "parallel": 2, "model_name": "Qwen3.8-Flash-Next",
+               "args": ["--expert-cache", "24576", "--resident-experts", "--prefill", "16384", "--spec", "4", "--max-context", "262144", "--kv", "int8"]}
+        seen = []
+
+        def vram(gl, hip=False):
+            seen.append(hip)
+            return {0: 16311} if not hip else None              # an RTX 5060 Ti answers through NVML; the iGPU is never asked for one card's memory
+        with mock.patch.object(drafting, "detect_hardware", return_value=("cuda", ["sm_120", "sm_120", "gfx1151"])), \
+                mock.patch.object(server, "gpu_vram_mib", side_effect=vram), \
+                mock.patch.object(drafting, "apply", return_value=mock.Mock(note="", flags=[], vocab="", drafter="off")):
+            args = server.engine_args(cfg, announce=False)
+        self.assertNotIn("--kv-resident", args)
+        self.assertNotIn(False, seen)                            # the NVIDIA card's memory was never read for this start
+
+
 class OtherCallers(unittest.TestCase):
     """#5109-rest: every other place that reads the computer's cards for the drafter takes the config's family on a mixed computer.  Each test spies on
     drafting.hardware_for with detect_hardware answering the mixed computer, and checks what the caller passes on."""
