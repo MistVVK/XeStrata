@@ -23,7 +23,9 @@ all=("${files[@]}")
 # Other projects' files, community benchmark records and license texts are kept as received: gitleaks and reuse only.
 # XeStrata's patches in third_party are linted.
 mapfile -t files < <(printf '%s\n' "${files[@]}" | while read -r f; do
-  case "$f" in third_party/*/*/patches/*) ;; third_party/*/*/*|bench/XeStrataBenchResults/*|LICENSES/*) continue ;; esac
+  case "$f" in ""|third_party/*/*/*|bench/XeStrataBenchResults/*|LICENSES/*)
+    case "$f" in third_party/*/*/patches/*) ;; *) continue ;; esac ;;
+  esac
   echo "$f"
 done)
 
