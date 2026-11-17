@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -69,6 +70,32 @@ class ConfigureLine(unittest.TestCase):
         with self.assertRaises(SystemExit):
             B.main(["cuda13"])
         self.assertEqual(B.main(["cuda11"]), 2)
+
+
+class SourcePaths(unittest.TestCase):
+    """Every source path the recipe builds exists in the checkout, on every OS (the layout move of 0.2.16 left it naming the repository root's
+    CMakeLists.txt and packaging/: nothing in a suite ran that path, because main() only runs on Windows with the toolkit)."""
+
+    def test_the_engine_sources_and_the_scripts_it_runs_are_where_it_looks(self):
+        self.assertTrue((B.ENGINE_SRC / "CMakeLists.txt").is_file(), B.ENGINE_SRC)
+        for name in ("build_vision_windows.bat", "package_engine.py", "binary_deps.py"):
+            self.assertTrue((B.PACKAGING / name).is_file(), name)
+
+    def test_the_version_is_read_from_the_engines_cmake_file(self):
+        self.assertRegex(B.project_version(B.ENGINE_SRC), r"^\d+\.\d+")
+
+    def test_every_path_the_source_builds_from_those_two_roots_exists(self):
+        text = Path(B.__file__).read_text(encoding="utf-8")
+        found = re.findall(r'\b(ENGINE_SRC|PACKAGING)\s*/\s*"([^"]+)"', text)
+        self.assertGreaterEqual(len(found), 3)
+        for root, name in found:
+            self.assertTrue((getattr(B, root) / name).exists(), "%s / %s" % (root, name))
+        # nothing is built from the checkout root any more, and the configure line and the version read use the engine's folder
+        self.assertNotIn('src / "packaging"', text)
+        self.assertNotIn("project_version(src)", text)
+        self.assertNotIn("configure_args(src,", text)
+        self.assertIn("configure_args(ENGINE_SRC,", text)
+        self.assertIn("project_version(ENGINE_SRC)", text)
 
 
 FAKE_CMAKE = """#!/bin/sh
