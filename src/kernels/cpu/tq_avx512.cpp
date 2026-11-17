@@ -81,13 +81,13 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, fl
             const __m512i w2 = rows8<TY>(tab, qs, wr, 2), w3 = rows8<TY>(tab, qs, wr, 3);
             const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
             for (int t = 0; t < nt; ++t) {
-                const __m512i* q = (const __m512i*) (a[t]->q + 128 * i);
+                const __m512i* q = (const __m512i*) (a[t]->q + (size_t) i * 128);
                 const __m512i z = _mm512_setzero_si512();
                 const __m128i s = reduce4(_mm512_dpwssd_epi32(z, w0, _mm512_load_si512(q + 0)),
                                           _mm512_dpwssd_epi32(z, w1, _mm512_load_si512(q + 1)),
                                           _mm512_dpwssd_epi32(z, w2, _mm512_load_si512(q + 2)),
                                           _mm512_dpwssd_epi32(z, w3, _mm512_load_si512(q + 3)));
-                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + (size_t) i * 4));
                 acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), sc, acc[t]);
             }
         }

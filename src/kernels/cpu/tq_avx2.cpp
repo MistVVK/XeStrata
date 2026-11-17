@@ -71,7 +71,7 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, fl
             }
             const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
             for (int t = 0; t < nt; ++t) {
-                const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
+                const __m256i* q = (const __m256i*) (a[t]->q + (size_t) i * 128);
                 const __m256i p0 = _mm256_add_epi32(_mm256_madd_epi16(wv[0], _mm256_load_si256(q + 0)),
                                                     _mm256_madd_epi16(wv[1], _mm256_load_si256(q + 1)));
                 const __m256i p1 = _mm256_add_epi32(_mm256_madd_epi16(wv[2], _mm256_load_si256(q + 2)),
@@ -83,7 +83,7 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, fl
                 // per 128-bit lane [p0, p1, p2, p3] partial sums, then the two lanes added: S[0..3], exact
                 const __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(p0, p1), _mm256_hadd_epi32(p2, p3));
                 const __m128i s = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
-                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + (size_t) i * 4));
                 acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), sc, acc[t]);
             }
         }
