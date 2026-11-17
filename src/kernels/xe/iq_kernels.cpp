@@ -62,6 +62,9 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1376,8 +1379,19 @@ sycl::event launch_native_gu_tuned(sycl::queue& q, size_t cap_groups, const unsi
 // XESTRATA_LATENT_A_ENTRIES force a value (0/absent: the timed choice).
 using LatentAKey = std::tuple<int, int64_t, int64_t>;
 core::TimedCache<sycl::device, LatentAKey, std::pair<int, int>> g_latent_a_choices;
-int latent_a_lpr_env() { const char* v = strata::env_get("LATENT_A_LPR"); return v && *v ? std::atoi(v) : 0; }
-int latent_a_ne_env() { const char* v = strata::env_get("LATENT_A_ENTRIES"); return v && *v ? std::atoi(v) : 0; }
+int latent_a_env(const char* name) {
+    const char* v = strata::env_get(name);
+    if (!v || !*v) return 0;
+    errno = 0;
+    char* end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    if (end != v) while (std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end == v || *end || errno == ERANGE || n < INT_MIN || n > INT_MAX)
+        throw core::DeviceError(std::string("XESTRATA_") + name + ": expected an integer");
+    return static_cast<int>(n);
+}
+int latent_a_lpr_env() { return latent_a_env("LATENT_A_LPR"); }
+int latent_a_ne_env() { return latent_a_env("LATENT_A_ENTRIES"); }
 std::pair<int, int> latent_a_choice(sycl::queue& q, const NativeExpertLayout& L) {
     auto c = g_latent_a_choices.get(q.get_device(), LatentAKey{L.gu_type, L.n_embd, L.n_ff})
                  .value_or(std::pair<int, int>{GU_LPR, kEntriesPass});
