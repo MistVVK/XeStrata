@@ -951,8 +951,21 @@ button {
   font-family: inherit;
 }
 
+/* Selected text (#5073): the accent tint it used was 1.01 to 1.05:1 against the page, so a selection could not be seen. A mid-tone fill with its own
+   ink keeps the text readable on top of it, in code blocks too.
+     light  #04281b on #3fbf95 = 6.87:1 text, fill 2.31:1 against white, 2.21:1 against the page
+     dark   #ffffff on #1f7a59 = 5.27:1 text, fill 3.32:1 against #161a1d */
+:root {
+  --st-select-bg: #3fbf95;
+  --st-select-ink: #04281b;
+}
+[data-theme='dark'] {
+  --st-select-bg: #1f7a59;
+  --st-select-ink: #ffffff;
+}
 ::selection {
-  background: var(--st-accent-tint);
+  background: var(--st-select-bg);
+  color: var(--st-select-ink);
 }
 
 * {

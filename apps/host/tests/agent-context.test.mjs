@@ -137,6 +137,7 @@ test('a chat the model server refused once is not stuck: the next message compac
   // list (the agent's own questions) moved it 18 tokens over.
   const huge = await send(`SCRIPT:echo two ${dense.repeat(6600)}`);
   assert.equal(huge.at(-1).type, 'done', 'the Harness compacted after the refusal and asked again: ' + JSON.stringify(huge.at(-1)).slice(0, 200));
+  assert.match(answerOf(huge), /^two/, 'the retry answers the original message');   // PR #5777
   const small = await send('SCRIPT:echo three please');
   assert.equal(small.at(-1).type, 'done', JSON.stringify(small.at(-1)).slice(0, 300));
   assert.match(answerOf(small), /three/);
@@ -144,6 +145,7 @@ test('a chat the model server refused once is not stuck: the next message compac
   assert.equal(again.at(-1).type, 'done');
   const refused = worker.requests.filter(r => r.refused);
   assert.equal(refused.length, 1, `only the first, too large, prompt was refused: ${refused.map(r => r.refused).join(', ')}`);
+  assert.ok(worker.requests.some(r => r.summary), 'the refused request was recovered through compaction');   // PR #5777
   assert.ok(worker.requests.filter(r => r.summary).every(r => Math.round(r.promptChars / 3) < 32768 - 64), 'every summary request fitted the window');
 });
 
