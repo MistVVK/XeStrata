@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <sstream>
 
 #if defined(_WIN32)
@@ -27,7 +28,6 @@ namespace {
 
 constexpr uint64_t CHUNK = 8ull << 20;   // 8 MiB of SOURCE per staging round
 
-double now_ms() {
 bool index_header(const char* line, int& align, uint64_t& pool) {
     std::istringstream in(line);
     std::string hash, a, p, t;
@@ -36,6 +36,7 @@ bool index_header(const char* line, int& align, uint64_t& pool) {
            hash == "#" && a == "align" && p == "pool" && t == "tensors";
 }
 
+double now_ms() {
     using namespace std::chrono;
     return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
 }
@@ -241,7 +242,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     }
 
     uint8_t* dst_base = (uint8_t*) arena_base;
-    std::FILE* cur = nullptr;
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> cur(nullptr, &std::fclose);
     int cur_file = -1;
     table_.clear();
     report_ = LoadReport{};
@@ -283,17 +284,17 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             return false;
         }
         if (r.file != cur_file) {
-            if (cur) std::fclose(cur);
+            cur.reset();
             const char* fn = file_name(r.file);
             const std::string p = pack_dir + "/" + (fn ? fn : "?");
-            cur = std::fopen(p.c_str(), "rb");
+            cur.reset(std::fopen(p.c_str(), "rb"));
             if (!cur) { err = "cannot open " + p; strata::gpu::free(stage_in); strata::gpu::free(stage_out); return false; }
             cur_file = r.file;
 #if !defined(_WIN32)
             // ask for this file's remaining rows up front so their reads overlap
             for (size_t j = row_i; j < rows.size(); ++j)
                 if (rows[j].file == r.file && !skipped[j])
-                    strata::platform::advise_willneed(fileno(cur), rows[j].src_off, rows[j].src_bytes);
+                    strata::platform::advise_willneed(fileno(cur.get()), rows[j].src_off, rows[j].src_bytes);
 #endif
         }
 
@@ -375,7 +376,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                     if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; strata::gpu::free(stage_in); strata::gpu::free(stage_out); return false; }
                     n -= 1;
                 }
-                if (!read_at(cur, r.src_off + s.src_off + done, stage_in, (size_t) n, err, r.name.c_str())) {
+                if (!read_at(cur.get(), r.src_off + s.src_off + done, stage_in, (size_t) n, err, r.name.c_str())) {
                     strata::gpu::free(stage_in); strata::gpu::free(stage_out);
                     return false;
                 }
@@ -475,7 +476,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             report_.bytes_saved += r.src_bytes - r.dst_bytes;
         }
     }
-    if (cur) std::fclose(cur);
+    cur.reset();
     strata::gpu::free(stage_in);
     strata::gpu::free(stage_out);
 
