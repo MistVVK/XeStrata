@@ -62,7 +62,11 @@ def build(result: dict[str, Any], preset_name: str | None = None) -> str:
     lines: list[str] = []
     decode, prompt = _rate(base.get("decode_tok_s")), _rate(base.get("pp_tok_s"))
     if decode:
-        lines.append(f"Your settings: answers at {decode} tok/s" + (f", prompts read at {prompt} tok/s" if prompt else "") + _runs_text(noise.get("base_runs")))
+        loaded = (result.get("concurrency") or 1) > 1 and _rate(base.get("load_tok_s"))
+        # with --concurrency the tune's repeated measurements (noise.base_runs) are of the loaded rate, so they belong on the loaded line
+        lines.append(f"Your settings: answers at {decode} tok/s" + (f", prompts read at {prompt} tok/s" if prompt else "") + ("" if loaded else _runs_text(noise.get("base_runs"))))
+        if loaded:
+            lines.append(f"With {result['concurrency']} requests at once: {_rate(base.get('load_tok_s'))} tok/s in all" + _runs_text(noise.get("base_runs")))
         if noise.get("threshold_pct") is not None:
             lines.append(f"To count, a setting had to be at least +{float(noise['threshold_pct']):.1f}% faster; identical runs on this PC differed by "
                          f"{float(noise.get('aa_gap') or 0.0) * 100:.1f}%.")

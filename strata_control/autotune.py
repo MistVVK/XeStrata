@@ -70,6 +70,7 @@ class Options:
     busy_pct: float = 25.0
     wait_busy_s: float = 300.0
     check_busy: bool = True
+    concurrency: int = 1              # #4821 (opt-in): more than 1 judges every setting on this many requests decoding at once
 
     def resolved(self) -> "Options":
         o = Options(**self.__dict__)
@@ -102,6 +103,7 @@ class ArmReport:
 
 @dataclass
 class TuneResult:
+    concurrency: int = 1               # the number of requests at once the tune judged on (1: one request at a time, as always)
     outcome: str = "default_confirmed"   # improved | default_confirmed | inconclusive | base_failed | cancelled
     #: what a screen shows, one of: faster | already_fastest | busy_pc | failed | stopped  (see `finalize`)
     code: str = "already_fastest"
@@ -151,6 +153,8 @@ def metric(run: dict[str, Any] | RunResult, use: str) -> float | None:
     d = get("decode_tok_s")
     if not d:
         return None
+    if get("load_tok_s"):                     # #4821: a tune run with --concurrency judges on all the requests' tokens per second
+        return float(get("load_tok_s"))
     if use == "coding":
         p = get("pp_long_tok_s") or get("pp_tok_s")
         if p:
@@ -207,7 +211,7 @@ class Tuner:
         self.clock = clock
         self.sleep = sleep
         self.system = system or session.system
-        self.result = TuneResult(mode=self.o.mode)
+        self.result = TuneResult(mode=self.o.mode, concurrency=max(1, int(self.o.concurrency or 1)))
         self.started = 0.0
         self.run_times: list[float] = []
         self.planned_runs = 0
@@ -387,7 +391,8 @@ class Tuner:
         elif self.o.use == "coding" and self.o.mode == "thorough":
             long_tokens = min(28000, int(0.8 * self.ctx.context_tokens))
         return RequestSet(warmups=2 if self.o.mode == "thorough" else 1, decodes=5, decode_tokens=200,
-                          pp_tokens=4096 if self.ctx.context_tokens >= 6000 else 1024, long_tokens=long_tokens)
+                          pp_tokens=4096 if self.ctx.context_tokens >= 6000 else 1024, long_tokens=long_tokens,
+                          clients=max(1, int(self.o.concurrency or 1)))
 
     def _run_stages(self) -> None:
         r, o = self.result, self.o

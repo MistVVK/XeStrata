@@ -55,6 +55,8 @@ class RequestSet:
     decode_tokens: int = 200
     pp_tokens: int = 4096
     long_tokens: int = 0              # 0 = no long prompt
+    clients: int = 1                  # #4821: more than 1 adds a phase where this many requests decode at once (opt-in: `tune auto --concurrency N`)
+    load_rounds: int = 3              # ... measured this many times (the median counts)
 
 
 @dataclass
@@ -68,6 +70,8 @@ class RunResult:
     pp_cold_tok_s: float | None = None
     ttft_s: float | None = None
     pp_long_tok_s: float | None = None
+    load_tok_s: float | None = None            # #4821: all requests' tokens per second while `clients` decode at once (median of the loaded rounds); None for a solo run
+    load_runs: list[float] = field(default_factory=list)
     rss_peak_mib: float | None = None
     vram_used_mib: float | None = None         # this run's total graphics memory in use (all cards, absolute)
     vram_added_mib: float | None = None        # ... minus what was in use before the engine started
@@ -104,6 +108,7 @@ _FACTS = [
     ("chunk", re.compile(r"prompt chunk auto: (\d+) tokens"), int),
     ("avail_gib", re.compile(r"available ([\d.]+) GiB \(MemAvailable"), float),
     ("loaded_gib", re.compile(r"loaded ([\d.]+) GiB at"), float),
+    ("batch_slots", re.compile(r"batch_slots=(\d+)"), int),            # #4821: how many requests the engine really decodes together
 ]
 
 
@@ -378,6 +383,31 @@ class WorkerEngine:
                 return float(rate)
         return None
 
+    def load_once(self, clients: int, tokens: int = 200) -> float | None:
+        """#4821: `clients` requests started together, each asking for `tokens` tokens of its own prompt. All their tokens over the time until the last
+        one ends: what a person serving that many users gets. None when some request produced too little to count."""
+        counts: list[int] = [0] * clients
+        errors: list[BaseException] = []
+
+        def one(i: int) -> None:
+            try:
+                data = self.chat(DECODE_PROMPTS[i % len(DECODE_PROMPTS)], tokens)
+                counts[i] = int((data.get("timings") or {}).get("predicted_n") or 0)
+            except BaseException as e:  # noqa: BLE001 - re-raised below, in the tuner's thread
+                errors.append(e)
+        threads = [threading.Thread(target=one, args=(i,), daemon=True) for i in range(clients)]
+        t0 = time.monotonic()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        wall = time.monotonic() - t0
+        if errors:
+            raise errors[0]
+        if min(counts) < max(32, tokens // 2) or wall <= 0:
+            return None
+        return sum(counts) / wall
+
     def prompt_once(self, tokens: int) -> dict[str, float | None]:
         self.salt_n += 1
         salt = secrets.token_hex(6)
@@ -412,6 +442,18 @@ class WorkerEngine:
             res.status, res.reason = "NO_TOKENS", "the engine produced no measurable decode"
         else:
             res.decode_tok_s = round(statistics.median(runs), 3)
+        if spec.clients > 1 and runs:
+            slots = parse_facts(self.log_text()).get("batch_slots")
+            if slots is not None and slots < spec.clients:         # the engine could not hold them: this would measure a queue, not the load asked for
+                ask = f"Ask for {slots} or fewer with --concurrency, or free graphics memory." if slots >= 2 else "Tune without --concurrency, or free graphics memory."
+                raise StartFailed("NO_TOKENS", f"the engine runs {slots} request{'' if slots == 1 else 's'} at once, not the {spec.clients} asked for. {ask}")
+            self.load_once(spec.clients, 64)                       # warm the slots
+            loads = [x for x in (self.load_once(spec.clients, spec.decode_tokens) for _ in range(spec.load_rounds)) if x]
+            res.load_runs = [round(x, 3) for x in loads]
+            if loads:
+                res.load_tok_s = round(statistics.median(loads), 3)
+            else:
+                res.status, res.reason = "NO_TOKENS", f"the engine produced no measurable output with {spec.clients} requests at once"
         if spec.pp_tokens:
             cold = self.prompt_once(spec.pp_tokens)
             warm = self.prompt_once(spec.pp_tokens)

@@ -33,6 +33,10 @@ class StubEngine:
                       ttft_s=4096 / pp, rss_peak_mib=self.s.rss(self.args, self.env), vram_used_mib=self.s.vram(self.args),
                       vram_added_mib=self.s.vram(self.args) - 400, min_avail_mib=self.s.avail - self.s.rss(self.args, self.env),
                       facts=dict(self.facts), wall_s=self.s.run_s)
+        if spec.clients > 1:
+            per = self.s.load(self.args, self.env) if self.s.load else 3.0 * self.s.model(self.args, self.env, None)
+            r.load_tok_s = per * (1.0 + self.s.rng.gauss(0.0, self.s.noise))
+            r.load_runs = [r.load_tok_s]
         return r
 
 
@@ -40,8 +44,9 @@ class StubSession:
     def __init__(self, *, model: Callable[..., float], pp: Callable[..., float] | None = None, noise: float = 0.005,
                  seed: int = 1, facts: dict[str, Any] | None = None, fail: Callable[[list[str], dict], StartFailed | None] | None = None,
                  rss: Callable[..., float] | None = None, vram: Callable[..., float] | None = None, avail: float = 40000,
-                 run_s: float = 90.0, clock: Any = None) -> None:
+                 run_s: float = 90.0, clock: Any = None, load: Callable[..., float] | None = None) -> None:
         self.clock = clock
+        self.load = load            # #4821: all requests' tokens/s with `clients` decoding at once, from the flags (default: 3 x the solo speed)
         self.model = model
         self.pp = pp or (lambda a, e: 1500.0)
         self.noise = noise
