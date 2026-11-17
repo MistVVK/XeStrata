@@ -53,5 +53,19 @@
  "guic52": "Part of the model is already here",
  "guic53": "Strata checks the files first.",
  "guic54": "30d",
- "guic55": "7d"
+ "guic55": "7d",
+ "guic56": "Ran {0} commands",
+ "guic57": "Read {0} files",
+ "guic58": "Edited a file",
+ "guic59": "Searched a search",
+ "guic60": "Searched {0} searches",
+ "guic61": "Looked up a web page",
+ "guic62": "Looked up {0} web pages",
+ "guic63": "Used the browser for a browser step",
+ "guic64": "Used the browser for {0} browser steps",
+ "guic65": "Started a helper",
+ "guic66": "Started {0} helpers",
+ "guic67": "Used a tool",
+ "guic68": "Used {0} tools",
+ "guic69": "code"
 }

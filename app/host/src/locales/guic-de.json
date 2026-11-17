@@ -53,5 +53,19 @@
  "guic52": "Ein Teil des Modells ist bereits vorhanden",
  "guic53": "Strata prüft zuerst die Dateien.",
  "guic54": "30 T",
- "guic55": "7 T"
+ "guic55": "7 T",
+ "guic56": "{0} Befehle ausgeführt",
+ "guic57": "{0} Dateien gelesen",
+ "guic58": "Datei bearbeitet",
+ "guic59": "Einmal gesucht",
+ "guic60": "{0}-mal gesucht",
+ "guic61": "Webseite nachgeschlagen",
+ "guic62": "{0} Webseiten nachgeschlagen",
+ "guic63": "Browser-Schritt ausgeführt",
+ "guic64": "{0} Browser-Schritte ausgeführt",
+ "guic65": "Helfer gestartet",
+ "guic66": "{0} Helfer gestartet",
+ "guic67": "Werkzeug verwendet",
+ "guic68": "{0} Werkzeuge verwendet",
+ "guic69": "Code"
 }

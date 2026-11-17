@@ -6,15 +6,18 @@
  *   - a block too large to parse, and a file above the limit, shown as plain text.
  */
 import { memo, useEffect, useMemo, useState } from 'react';
+import { useStore } from '../lib/store';
 import { Markdown } from './Markdown';
 import { SyntaxCode } from './SyntaxCode';
 import { previewSlices, previewTier, slicesAfter, slicesAtStart, textRevision } from '../lib/preview-render';
 
 const Slice = memo(function Slice({ text, plain }: { text: string; plain: boolean }) {
+    useStore(s => s.language);   // memo(): the code label and the buttons are drawn in the language of the moment
     return plain ? <SyntaxCode text={text}/> : <Markdown text={text}/>;
 });
 
 export const PreviewMarkdown = memo(function PreviewMarkdown({ text }: { text: string }) {
+    useStore(s => s.language);
     if (previewTier(text) === 'plain')
         return <SyntaxCode text={text}/>;
     return <Sliced text={text}/>;

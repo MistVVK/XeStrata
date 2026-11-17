@@ -744,6 +744,7 @@ function MessageView({ message: m, isLast, onEditPrompt, onPreview, onClosePrevi
     timeSkipReal?: boolean;
     timeSkipRun?: TimeSkipRun;
 }) {
+    useStore(s => s.language);   // memo(): a live language switch changes no prop, so the message subscribes to it and draws its words again
     const streaming = useStore(s => s.streaming);
     const activeSession = useStore(s => s.activeSession);
     const hostLive = useStore(s => s.connection !== 'offline');

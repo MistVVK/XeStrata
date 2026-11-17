@@ -10,6 +10,7 @@ import { plainFailureText } from '../lib/plain-errors';
 import { FloatingMenu } from './FloatingMenu';
 import { CopyMenuItem } from './CopyBtn';
 import { Icon } from './ui';
+import { groupSentence } from '../lib/group-line';
 
 const problem = (title: string, e: unknown) => pushToast('error', tr(title), plainFailureText(e instanceof Error ? e.message : String(e)).message);
 
@@ -111,7 +112,7 @@ export function ActivityLine({ group, sessionId, onPreview }: { group: ActivityG
   const [open, setOpen] = useState(false);
   const picture = group.files.find(f => f.kind === 'image');
   // The host's sentence may end with the numbers ("… +225 −0"): they are drawn as figures instead.
-  const sentence = group.line.replace(/\s*\+\d+\s*[−-]\s*\d+\s*$/, '');
+  const sentence = groupSentence(group.line.replace(/\s*\+\d+\s*[−-]\s*\d+\s*$/, ''));
   // While the run is open this is the live step: the host's own words for it when it sends them, else the line it already had.
   const live = !group.closed;
   return <><div className="act" data-open={open || undefined} data-live={live || undefined}>

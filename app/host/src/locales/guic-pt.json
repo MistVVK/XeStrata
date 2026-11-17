@@ -53,5 +53,19 @@
  "guic52": "Parte do modelo já está aqui",
  "guic53": "O Strata verifica os arquivos primeiro.",
  "guic54": "30 d",
- "guic55": "7 d"
+ "guic55": "7 d",
+ "guic56": "{0} comandos executados",
+ "guic57": "{0} arquivos lidos",
+ "guic58": "Arquivo editado",
+ "guic59": "Uma pesquisa feita",
+ "guic60": "{0} pesquisas feitas",
+ "guic61": "Página da web consultada",
+ "guic62": "{0} páginas da web consultadas",
+ "guic63": "Um passo no navegador",
+ "guic64": "{0} passos no navegador",
+ "guic65": "Ajudante iniciado",
+ "guic66": "{0} ajudantes iniciados",
+ "guic67": "Ferramenta usada",
+ "guic68": "{0} ferramentas usadas",
+ "guic69": "código"
 }
