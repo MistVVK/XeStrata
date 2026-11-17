@@ -36,6 +36,14 @@ for f in files:
         d = posixpath.dirname(d)
 moved = (top(before) - top(rev)) | {"tools", "docs"}
 moved = {m for m in moved if m}
+# every path that existed before the move: a path that did, and does not now, is a hit even when its first missing name is not a moved
+# top-level name (tools/vision: tools/ still exists, with other things in it)
+bset = set(f for f in git("ls-tree", "-r", "--name-only", before).split("\n") if f)
+for f in list(bset):
+    d = posixpath.dirname(f)
+    while d and d not in bset:
+        bset.add(d)
+        d = posixpath.dirname(d)
 SKIP = ("engine/third_party/", "docs/bench-results/", "docs/history/", "tools/layout/", "app/host/node_modules/", "tools/research/")
 
 
@@ -54,11 +62,23 @@ def first_missing(p):
     return None, cur
 
 
+def check_cmake_source(v, where, line, out, what):
+    """`cmake -S <v>`: the folder must hold a CMakeLists.txt (the break the move left in build_windows.bat: -S named terminal\\, which has none)."""
+    if v is None or v.startswith(".."):
+        return
+    v = "" if v == "." else v
+    if v in dirs or v == "":
+        if (v + "/CMakeLists.txt" if v else "CMakeLists.txt") not in fset:
+            out.append("%s:%d: %s -> %s has no CMakeLists.txt (cmake -S names it)" % (where, line, what, v or "."))
+    elif v in bset:
+        out.append("%s:%d: %s -> %s does not exist (cmake -S names it)" % (where, line, what, v))
+
+
 def judge(path_, where, line, out, what):
     if path_ is None or path_.startswith("..") or path_ == ".":
         return
     miss, parent = first_missing(path_)
-    if miss and miss in moved and exists(parent):
+    if miss and ((miss in moved and exists(parent)) or (path_ in bset and path_ not in fset and path_ not in dirs)):
         out.append("%s:%d: %s -> %s (the folder or file '%s' is not in %s/)" % (where, line, what, path_, miss, parent or "."))
 
 
@@ -87,6 +107,8 @@ def eval_py(node, env, here):
         if name == "dirname" and len(node.args) == 1:
             v = eval_py(node.args[0], env, here)
             return posixpath.dirname(v) if isinstance(v, str) else None
+        if name == "str" and len(node.args) == 1:
+            return eval_py(node.args[0], env, here)
         if name == "join" and node.args:
             v = eval_py(node.args[0], env, here)
             if not isinstance(v, str):
@@ -143,6 +165,12 @@ def scan_py(f, text, out):
                             local[st.targets[0].id] = v
                 visit(child, local)
                 continue
+            if isinstance(child, (ast.List, ast.Tuple)):
+                for i, e in enumerate(child.elts[:-1]):          # ["-S", str(src), ...]: the folder cmake configures
+                    if isinstance(e, ast.Constant) and e.value == "-S":
+                        v = eval_py(child.elts[i + 1], scope, f)
+                        if isinstance(v, str):
+                            check_cmake_source(v, f, child.lineno, out, "cmake -S in a command list")
             if isinstance(child, (ast.BinOp, ast.Call)):
                 v = eval_py(child, scope, f)
                 if isinstance(v, str):               # the longest expression that is a path: its parts are not reported again
@@ -226,6 +254,11 @@ SH_VAR = re.compile(r"^\s*(?:export\s+|local\s+|readonly\s+)?([A-Za-z_]\w*)=(.+?
 
 def sh_value(expr, env, here):
     e = expr.strip().strip('"').strip("'")
+    m = re.fullmatch(r"\$\{\w+:-(.*)\}", e)              # ${REPO:-default}: the default is what a plain run gets
+    if m:
+        e = m.group(1).strip().strip('"')
+    if re.fullmatch(r"\$\(git rev-parse --show-toplevel\)", e):          # the checkout's root
+        return "."
     # $(dirname "$0") / $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) / $(CDPATH= cd -- "$here/.." && pwd -P)
     if re.search(r"dirname\s+\"?\$\{?(?:0|BASH_SOURCE(?:\[0\])?)\}?\"?", e) and "&&" in e and "cd" in e:
         base = posixpath.dirname(here)
@@ -273,6 +306,10 @@ def scan_sh(f, text, out):
                 if (n, v) not in seen:
                     seen.add((n, v))
                     judge(v, f, n, out, "$%s/%s" % (m.group(1), m.group(2)))
+        for m in re.finditer(r"\bcmake\b[^\n]*?\s-S\s+\"?\$\{?(\w+)\}?(/[A-Za-z0-9_./-]*)?\"?", l):
+            if m.group(1) in env:
+                v = posixpath.normpath(posixpath.join(env[m.group(1)], (m.group(2) or "").lstrip("/")))
+                check_cmake_source(v, f, n, out, "cmake -S $" + m.group(1) + (m.group(2) or ""))
         for m in re.finditer(r"cd\s+(?:--\s+)?\"?\$\(dirname\s+\"?\$\{?(?:0|BASH_SOURCE(?:\[0\])?)\}?\"?\)/([A-Za-z0-9_./-]+)", l):
             v = posixpath.normpath(posixpath.join(posixpath.dirname(f), m.group(1)))
             if (n, v) not in seen:
@@ -281,41 +318,58 @@ def scan_sh(f, text, out):
 
 
 # ------------------------------------------------------------------------------------------ batch / PowerShell
-BAT_SET = re.compile(r"^\s*set\s+\"?(\w+)=([^\"]*)\"?\s*$", re.I)
+# Variables: `set "SRC=%~dp0..\.."`, `for %%I in ("%~dp0..\..") do set "SRC=%%~fI"`, `if not defined X set "X=%SRC%\.venv"`, PowerShell `$root = Split-Path
+# -Parent $PSScriptRoot`, `$repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path`; then every use with UNQUOTED segments:
+# `%SRC%\tools\vision`, `$repo\terminal\setup.py`, `"$repo/x/y"`, Join-Path $repo 'a\b'.
+BAT_SET = re.compile(r"\bset\s+\"?(\w+)=([^\"&|)\r]*)\"?", re.I)
+BAT_FOR = re.compile(r"\bfor\s+%%(\w)\s+in\s+\(\s*\"([^\"]*)\"\s*\)\s+do\s+set\s+\"?(\w+)=%%~[a-z]*\1\"?", re.I)
+BAT_USE = re.compile(r"(%~dp0|%(\w+)%)((?:[\\/][A-Za-z0-9_.+-]+)+)")
 
 
 def bat_value(v, env, here):
     v = v.strip().replace("\\", "/")
     m = re.match(r"%~dp0(.*)$", v, re.I)
     if m:
-        return posixpath.normpath(posixpath.join(posixpath.dirname(here), m.group(1).strip("/"))) if m.group(1).strip("/") else posixpath.dirname(here)
+        rest = m.group(1).strip("/")
+        return posixpath.normpath(posixpath.join(posixpath.dirname(here), rest)) if rest else posixpath.dirname(here)
     m = re.match(r"%(\w+)%(.*)$", v)
-    if m and m.group(1) in env:
+    if m and m.group(1).upper() in env:
         rest = m.group(2).strip("/")
-        return posixpath.normpath(posixpath.join(env[m.group(1)], rest)) if rest else env[m.group(1)]
+        return posixpath.normpath(posixpath.join(env[m.group(1).upper()], rest)) if rest else env[m.group(1).upper()]
     return None
 
 
 def scan_bat(f, text, out):
     env = {}
-    lines = text.split("\n")
-    for n, l in enumerate(lines, 1):
-        m = BAT_SET.match(l.rstrip("\r"))
-        if m:
-            v = bat_value(m.group(2), env, f)
-            if isinstance(v, str):
-                env[m.group(1)] = v
+    lines = [l.rstrip("\r") for l in text.split("\n")]
+    for _pass in (1, 2):
+        for n, l in enumerate(lines, 1):
+            if re.match(r"\s*(rem|::)\b", l, re.I):
+                continue
+            m = BAT_FOR.search(l)
+            if m:
+                v = bat_value(m.group(2), env, f)
+                if isinstance(v, str):
+                    env[m.group(3).upper()] = v
+            for m in BAT_SET.finditer(l):
+                v = bat_value(m.group(2), env, f)
+                if isinstance(v, str) and m.group(1).upper() not in env:
+                    env[m.group(1).upper()] = v
     seen = set()
     for n, l in enumerate(lines, 1):
         if re.match(r"\s*(rem|::)\b", l, re.I):
             continue
-        for m in re.finditer(r"(%~dp0|%(\w+)%)([\\/][A-Za-z0-9_.\\/ -]*[A-Za-z0-9_.])", l):
-            base = bat_value(m.group(1), env, f) if m.group(1) != "%~dp0" else posixpath.dirname(f)
+        for m in BAT_USE.finditer(l):
+            base = posixpath.dirname(f) if m.group(1) == "%~dp0" else env.get(m.group(2).upper())
             if isinstance(base, str):
                 v = posixpath.normpath(posixpath.join(base, m.group(3).replace("\\", "/").strip("/")))
                 if (n, v) not in seen:
                     seen.add((n, v))
                     judge(v, f, n, out, m.group(0).strip()[:60])
+        for m in re.finditer(r"\bcmake\b[^\r\n]*?\s-S\s+\"?([^\"\s]+)\"?", l, re.I):
+            v = bat_value(m.group(1), env, f)
+            if isinstance(v, str):
+                check_cmake_source(v, f, n, out, "cmake -S " + m.group(1))
         for m in re.finditer(r"cd\s+/d\s+\"?%~dp0([^\"\s&]*)", l, re.I):
             v = posixpath.normpath(posixpath.join(posixpath.dirname(f), m.group(1).replace("\\", "/").strip("/"))) if m.group(1).strip("\\/") else posixpath.dirname(f)
             if (n, v) not in seen:
@@ -323,19 +377,74 @@ def scan_bat(f, text, out):
                 judge(v, f, n, out, "cd /d %~dp0" + m.group(1))
 
 
+PS_ASSIGN = re.compile(r"^\s*\$(\w+)\s*=\s*(.+?)\s*$")
+PS_USE = re.compile(r"\$(PSScriptRoot|\w+)((?:[\\/][A-Za-z0-9_.+-]+)+)")
+
+
+def ps_value(expr, env, here):
+    e = expr.strip()
+    while e.startswith("(") and e.endswith(")"):
+        e = e[1:-1].strip()
+    e = re.sub(r"\)\.Path$", ")", e)
+    e = re.sub(r"\.Path$", "", e)
+    m = re.fullmatch(r"\$(\w+)", e)
+    if m:
+        return posixpath.dirname(here) if m.group(1) == "PSScriptRoot" else env.get(m.group(1))
+    m = re.fullmatch(r"Resolve-Path\s+(.+)", e, re.I)
+    if m:
+        return ps_value(m.group(1), env, here)
+    m = re.fullmatch(r"Split-Path\s+(?:-Parent\s+)?(?:-Path\s+)?(\S.*?)(?:\s+-Parent)?", e, re.I)
+    if m:
+        v = ps_value(m.group(1), env, here)
+        return posixpath.dirname(v) if isinstance(v, str) and v else None
+    m = re.fullmatch(r"Join-Path\s+(\S+)\s+(.+)", e, re.I)
+    if m:
+        base = ps_value(m.group(1), env, here)
+        parts = re.findall(r"""(?:^|\s)(?:'([^']*)'|"([^"$]*)")""", " " + m.group(2))
+        if not isinstance(base, str) or not parts:
+            return None
+        for a, b in parts:
+            base = posixpath.normpath(posixpath.join(base, (a or b).replace("\\", "/")))
+        return base
+    m = re.fullmatch(r"[\"']\$(\w+)([\\/][^\"'$]*)?[\"']", e)
+    if m:
+        base = posixpath.dirname(here) if m.group(1) == "PSScriptRoot" else env.get(m.group(1))
+        if not isinstance(base, str):
+            return None
+        rest = (m.group(2) or "").replace("\\", "/").strip("/")
+        return posixpath.normpath(posixpath.join(base, rest)) if rest else base
+    return None
+
+
 def scan_ps1(f, text, out):
+    env = {}
+    lines = text.split("\n")
+    for _pass in (1, 2):
+        for n, l in enumerate(lines, 1):
+            m = PS_ASSIGN.match(l.rstrip("\r"))
+            if m and m.group(1) not in env:
+                v = ps_value(m.group(2), env, f)
+                if isinstance(v, str):
+                    env[m.group(1)] = v
     seen = set()
-    for n, l in enumerate(text.split("\n"), 1):
-        for m in re.finditer(r"\$PSScriptRoot([\\/][A-Za-z0-9_.\\/-]*[A-Za-z0-9_.])", l):
-            v = posixpath.normpath(posixpath.join(posixpath.dirname(f), m.group(1).replace("\\", "/").strip("/")))
-            if (n, v) not in seen:
-                seen.add((n, v))
-                judge(v, f, n, out, m.group(0)[:60])
-        for m in re.finditer(r"Join-Path\s+\$PSScriptRoot\s+['\"]([^'\"$]+)['\"]", l):
-            v = posixpath.normpath(posixpath.join(posixpath.dirname(f), m.group(1).replace("\\", "/")))
-            if (n, v) not in seen:
-                seen.add((n, v))
-                judge(v, f, n, out, "Join-Path $PSScriptRoot " + m.group(1))
+    for n, l in enumerate(lines, 1):
+        if l.lstrip().startswith("#"):
+            continue
+        for m in PS_USE.finditer(l):
+            base = posixpath.dirname(f) if m.group(1) == "PSScriptRoot" else env.get(m.group(1))
+            if isinstance(base, str):
+                v = posixpath.normpath(posixpath.join(base, m.group(2).replace("\\", "/").strip("/")))
+                if (n, v) not in seen:
+                    seen.add((n, v))
+                    judge(v, f, n, out, m.group(0)[:60])
+        for m in re.finditer(r"Join-Path\s+\$(\w+)\s+((?:'[^']*'|\"[^\"$]*\")(?:\s+(?:'[^']*'|\"[^\"$]*\"))*)", l):
+            base = posixpath.dirname(f) if m.group(1) == "PSScriptRoot" else env.get(m.group(1))
+            if isinstance(base, str):
+                for part in re.findall(r"'([^']*)'|\"([^\"$]*)\"", m.group(2)):
+                    base = posixpath.normpath(posixpath.join(base, (part[0] or part[1]).replace("\\", "/")))
+                if (n, base) not in seen:
+                    seen.add((n, base))
+                    judge(base, f, n, out, "Join-Path $" + m.group(1) + " " + m.group(2)[:40])
 
 
 # ------------------------------------------------------------------------------------------ CI workflows and Docker files: repository paths

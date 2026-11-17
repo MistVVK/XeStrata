@@ -142,7 +142,7 @@ a passing or faster result.
 
 Compare the default `bf16_gemv_fp32_mmvf_multi` path with
 `STRATA_MMVF_ROWS=1`. The latter is already implemented in
-`sycl/src/kernels/cuda/native_bf16.dp.cpp`; its selector is cached on first use.
+`engine/sycl/src/kernels/cuda/native_bf16.dp.cpp`; its selector is cached on first use.
 Run each mode in a separate process, setting the environment before any launch.
 Do not change `setenv` between measurements in one process and assume the cached
 selector will change.
@@ -280,7 +280,7 @@ The one lever that could eliminate the CPU handoff is fitting all experts in
 VRAM. A770 (16 GB) + B580 (12 GB) = 28 GB vs ~19 GB of experts. Tried all three
 SYCL multi-GPU paths:
 
-- **`--peer-device` (second expert tier): stubbed.** `sycl/src/core/peer_experts.cpp`
+- **`--peer-device` (second expert tier): stubbed.** `engine/sycl/src/core/peer_experts.cpp`
   refuses: "the second-GPU expert tier is not ported to SYCL yet" (also INTEL.md:639).
 - **`--expert-cache-remote`:** disallowed across a layer split (generate.cpp:1970).
 - **`--layer-split auto` with `ONEAPI_DEVICE_SELECTOR=level_zero:1,0`: loads, then
@@ -307,7 +307,7 @@ VRAM.
 
 ### Aligned/planar IQ kernels (llama.cpp SYCL PR idea): no safe minor win
 
-Inspected the port's IQ decode (`sycl/src/kernels/cuda/iq_kernels.dp.cpp`). The
+Inspected the port's IQ decode (`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp`). The
 `Split<>` loaders for the Coder's formats already read **words**, not bytes:
 
 - `Split<22>` (IQ2_S): `get_int_b2` for `qs` and the sign word, `qh`/`scales` as
@@ -445,7 +445,7 @@ docker run --rm -u "$(id -u):$(id -g)" -v "$PWD/..:/work" strata-sycl-dev \
    cmake --build /work/strata-v0.1.40.3/build-sycl --target strata -j 8"
 ```
 
-Use the actual `cmake --build` exit status. `sycl/tools/build.sh` from 0.2.7 on exits with it; older copies
+Use the actual `cmake --build` exit status. `engine/sycl/tools/build.sh` from 0.2.7 on exits with it; older copies
 printed `BUILD EXIT 0` but could return nonzero because their last failure-search pipeline found no failures.
 Do not chain tests behind the status of an older script.
 
@@ -687,7 +687,7 @@ a worker does nothing. Rejected as a lever.
 ### GPU utilization: the GPU is mostly IDLE during decode (major finding)
 
 `gputop` (the Xe counterpart to intel_gpu_top) CAN be read for the engine if the
-engine process is user-owned. `sycl/serve/strata-sycl.sh` runs the container as
+engine process is user-owned. `engine/sycl/serve/strata-sycl.sh` runs the container as
 root (no `--user`), so `gputop` cannot attribute it; a temporary copy adding
 `--user <uid>:<gid>` made the engine user-owned and readable. During a 700-token
 decode (240-token prompt) the A770's compute engine (ccs) sampled:

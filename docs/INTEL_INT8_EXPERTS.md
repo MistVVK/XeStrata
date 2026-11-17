@@ -1,6 +1,6 @@
 # Fused int8 DPAS expert products on Battlemage (branch f-151-b70)
 
-Behaviour note, written before the kernel (2026-10-18) and kept in step with `sycl/src/prefill/esimd_moe.dp.cpp`. The measured numbers
+Behaviour note, written before the kernel (2026-10-18) and kept in step with `engine/sycl/src/prefill/esimd_moe.dp.cpp`. The measured numbers
 are at the end.
 
 ## What it replaces
@@ -19,7 +19,7 @@ never exists and the weights are read once, compressed (2.1 MB per expert instea
   At the first layer of each expert format the engine times both chains on synthetic experts (random blobs of the layer's format and
   shape, uneven row counts like a real group) at 16, 32, 64, 128 and 256 mean rows per expert, interpolates where the FP16 chain
   becomes the faster one, flags the result "clear" when the cost ratio falls steadily and the bracketing samples are 5% away from
-  1, and keeps it in `~/.cache/strata/i8-crossover.txt` (`STRATA_CACHE_DIR` moves it; `sycl/serve/strata-sycl.sh` sets it to `.strata-cache` in the data root it mounts, since the
+  1, and keeps it in `~/.cache/strata/i8-crossover.txt` (`STRATA_CACHE_DIR` moves it; `engine/sycl/serve/strata-sycl.sh` sets it to `.strata-cache` in the data root it mounts, since the
   container's home is gone after each run) keyed by device name, driver version, the two
   ggml types and the shape. A matching key is read back instead of measured. The measurement costs ~1.2 s once, during the first
   prompt. A measurement that fails (no VRAM) falls back to 64 rows.

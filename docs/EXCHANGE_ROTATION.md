@@ -75,7 +75,7 @@ With `--adapt-async 1` a rotated round also ends one verify window sooner:
 there are no bytes for the background job to move, so the ownership flip runs
 in the tick that sees the copies in.
 
-`tests/core/exchange_storage_test.cpp` covers it without CUDA (three sizes,
+`engine/tests/core/exchange_storage_test.cpp` covers it without CUDA (three sizes,
 6,144 exchanges: bytes, aliases, a spare of another size or an expert of
 another layer refused, overlapping resident blocks refused).
 
@@ -93,7 +93,7 @@ carried extra timers).
 | Run | Rotation off | Rotation on |
 |---|---|---|
 | One 8K prompt, the same 1,500 forced tokens (`--spec-follow`), blocking tier, decode tok/s | 163.4, 165.1, 163.1, 161.6, 162.6 | 187.4, 188.7, 185.8, 184.9 |
-| `--serve`, 23 coding-agent turns (`tools/agent_turns_bench.py`'s turns, greedy, up to 400 new tokens), blocking tier, tok/s over all turns, three interleaved rounds | 147.8, 159.2, 158.4 | 175.2, 184.9, 172.8 |
+| `--serve`, 23 coding-agent turns (`terminal/tools/agent_turns_bench.py`'s turns, greedy, up to 400 new tokens), blocking tier, tok/s over all turns, three interleaved rounds | 147.8, 159.2, 158.4 | 175.2, 184.9, 172.8 |
 | The same turns with `--adapt-async 1`, one binary, two interleaved rounds | 166.0, 170.1 | 185.6, 182.5 |
 
 In the first row, two runs of each arm that sized the expert cache alike (10,681
@@ -119,7 +119,7 @@ The ownership test can run without CUDA:
 
 ```bash
 g++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-  -pthread -Iinclude tests/core/exchange_storage_test.cpp -o /tmp/exchange_storage_test
+  -pthread -Iinclude engine/tests/core/exchange_storage_test.cpp -o /tmp/exchange_storage_test
 /tmp/exchange_storage_test
 ```
 
@@ -152,7 +152,7 @@ Measured on 2026-10-04 using the clean rotation build at
 `6f32ec070f23ced9f50e704d854d775da52591ab`. The model is the standard
 GSQ-RCO **Q2_0**, with its matching IQ4_NL PLE shard. Both shards were verified
 against the publisher's SHA-256 hashes at the pinned revision in the receipt.
-The native pack uses the existing `tools/iq_pack.py`; no compatibility conversion
+The native pack uses the existing `terminal/tools/iq_pack.py`; no compatibility conversion
 or Q8 PLE reader extension is needed.
 
 Both arms used the same Release binary (GCC 13.3, CUDA 13.2), RTX PRO 6000
@@ -191,7 +191,7 @@ and both outputs. To check the token comparison without a model:
 python - <<'PY'
 import hashlib, json
 from pathlib import Path
-p = Path('bench/results')
+p = Path('docs/bench-results')
 r = json.loads((p / 'exchange-rotation-ab.json').read_text())
 raw = (p / r['token_ids_file']).read_bytes()
 assert hashlib.sha256(raw).hexdigest() == r['token_ids_file_sha256']

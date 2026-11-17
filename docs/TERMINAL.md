@@ -2,7 +2,7 @@
 
 `strata launch` (guided setup, serve and monitor) and `strata connect` (setup for your coding apps): see [TERMINAL_LAUNCH.md](TERMINAL_LAUNCH.md).
 
-For the shortest path, use the [terminal quick start](TERMINAL_QUICKSTART.md). The Terminal installs with one line (see [TERMINAL_LAUNCH.md](TERMINAL_LAUNCH.md#install-one-line)) and gives you the `strata` command; every command below is typed as `strata ...`. In a source checkout, run `python strata.py ...` from the repository root instead (use `python3` where there is no `python`).
+For the shortest path, use the [terminal quick start](TERMINAL_QUICKSTART.md). The Terminal installs with one line (see [TERMINAL_LAUNCH.md](TERMINAL_LAUNCH.md#install-one-line)) and gives you the `strata` command; every command below is typed as `strata ...`. In a source checkout, run `python terminal/strata.py ...` from the repository root instead (use `python3` where there is no `python`).
 
 Read a server, watch it and start one:
 
@@ -162,11 +162,11 @@ strata bench compare ./bench-baseline ./bench-monitored --output json
 The basic CLI and status command use Python's standard library. The interactive monitor is an optional component:
 
 ```sh
-python -m pip install -r requirements-monitor.txt
+python -m pip install -r terminal/requirements-monitor.txt
 strata monitor --url http://127.0.0.1:8095
 ```
 
-Use the same Python environment that runs Strata. Strata's runtime dependencies are listed separately in `requirements.txt`; the monitor dependency is not needed for `serve` or `status`.
+Use the same Python environment that runs Strata. Strata's runtime dependencies are listed separately in `terminal/requirements.txt`; the monitor dependency is not needed for `serve` or `status`.
 `strata doctor --output json` reports the optional monitor as missing, present at the pinned Textual version, or
 unverified when its version differs or package metadata is absent. This is a package-version check, not a terminal
 rendering test; an unverified monitor never blocks serving.
@@ -178,8 +178,8 @@ At 128 columns by 36 rows or larger, Overview switches to a visual serving dashb
 For a read-only client on another machine, build a small portable bundle from this checkout:
 
 ```sh
-python packaging/monitor_bundle.py build dist/strata-monitor.pyz
-python packaging/monitor_bundle.py verify dist/strata-monitor.pyz
+python tools/packaging/monitor_bundle.py build dist/strata-monitor.pyz
+python tools/packaging/monitor_bundle.py verify dist/strata-monitor.pyz
 python dist/strata-monitor.pyz status --url https://HOST --json
 python dist/strata-monitor.pyz monitor --url https://HOST --once --json
 python dist/strata-monitor.pyz logs --url https://HOST --output json
@@ -190,36 +190,36 @@ The `.pyz` contains only the bounded telemetry client, connection store, rendere
 Before distributing a candidate to an operator, run its standard-library smoke on each target Python and OS:
 
 ```sh
-python tools/portable_monitor_smoke.py --bundle /absolute/path/to/strata-monitor.pyz --report /absolute/path/to/new-smoke-report.json
+python terminal/tools/portable_monitor_smoke.py --bundle /absolute/path/to/strata-monitor.pyz --report /absolute/path/to/new-smoke-report.json
 ```
 
 It uses isolated `-I -S` child processes, a loopback telemetry fixture and a temporary owner directory to verify one-shot status, a digest-pinned local install and uninstall, read-only GET requests, and one structured error from deeply nested JSON. Add `--interactive` with Textual installed to check the packaged screen separately. The current r31 bundle passed both standard-library smokes on macOS with Python 3.10 and 3.11 and the optional headless interactive smoke on 3.11; real engines, GPU sensors, remote TLS, physical terminals, Windows and Linux remain open.
 
-For the source CLI, run `python tools/minimal_cli_smoke.py --report /absolute/path/to/new-report.json`. Its `-S` child processes check that help, one-shot status and monitor, missing-config serve and the missing-harness error work without Rich or Textual. It uses only a loopback telemetry fixture and does not establish that an installed inference server or engine runs without its own required dependencies.
+For the source CLI, run `python terminal/tools/minimal_cli_smoke.py --report /absolute/path/to/new-report.json`. Its `-S` child processes check that help, one-shot status and monitor, missing-config serve and the missing-harness error work without Rich or Textual. It uses only a loopback telemetry fixture and does not establish that an installed inference server or engine runs without its own required dependencies.
 
-To check source serving without the optional terminal framework, create a fresh virtual environment, install only `requirements.txt`, then run `python tools/minimal_server_smoke.py --report /absolute/path/to/new-report.json` with that environment's Python. This exercises foreground and POSIX managed serving against a fake engine. It does not install model weights or prove hardware or release-package behavior.
+To check source serving without the optional terminal framework, create a fresh virtual environment, install only `terminal/requirements.txt`, then run `python terminal/tools/minimal_server_smoke.py --report /absolute/path/to/new-report.json` with that environment's Python. This exercises foreground and POSIX managed serving against a fake engine. It does not install model weights or prove hardware or release-package behavior.
 
 To place that client in a separate local directory without changing the server, first create its parent directory, then preview and run the offline copy:
 
 ```sh
-python packaging/monitor_bundle.py install dist/strata-monitor.pyz --target /absolute/path/to/new-monitor --plan
-python packaging/monitor_bundle.py install dist/strata-monitor.pyz --target /absolute/path/to/new-monitor --if-candidate-sha256 CANDIDATE_SHA256
+python tools/packaging/monitor_bundle.py install dist/strata-monitor.pyz --target /absolute/path/to/new-monitor --plan
+python tools/packaging/monitor_bundle.py install dist/strata-monitor.pyz --target /absolute/path/to/new-monitor --if-candidate-sha256 CANDIDATE_SHA256
 python /absolute/path/to/new-monitor/strata-monitor.pyz status --url https://HOST --json
-python packaging/monitor_bundle.py update dist/next-monitor.pyz --target /absolute/path/to/new-monitor --plan
-python packaging/monitor_bundle.py update dist/next-monitor.pyz --target /absolute/path/to/new-monitor --if-current-sha256 CURRENT_SHA256 --if-candidate-sha256 CANDIDATE_SHA256
-python packaging/monitor_bundle.py rollback --target /absolute/path/to/new-monitor --plan
-python packaging/monitor_bundle.py rollback --target /absolute/path/to/new-monitor --if-active-sha256 ACTIVE_SHA256 --if-rollback-sha256 PREVIOUS_SHA256
-python packaging/monitor_bundle.py commit --target /absolute/path/to/new-monitor --plan
-python packaging/monitor_bundle.py commit --target /absolute/path/to/new-monitor --if-active-sha256 ACTIVE_SHA256 --if-previous-sha256 PREVIOUS_SHA256
-python packaging/monitor_bundle.py uninstall --target /absolute/path/to/new-monitor --plan
-python packaging/monitor_bundle.py uninstall --target /absolute/path/to/new-monitor --if-active-sha256 ACTIVE_SHA256
+python tools/packaging/monitor_bundle.py update dist/next-monitor.pyz --target /absolute/path/to/new-monitor --plan
+python tools/packaging/monitor_bundle.py update dist/next-monitor.pyz --target /absolute/path/to/new-monitor --if-current-sha256 CURRENT_SHA256 --if-candidate-sha256 CANDIDATE_SHA256
+python tools/packaging/monitor_bundle.py rollback --target /absolute/path/to/new-monitor --plan
+python tools/packaging/monitor_bundle.py rollback --target /absolute/path/to/new-monitor --if-active-sha256 ACTIVE_SHA256 --if-rollback-sha256 PREVIOUS_SHA256
+python tools/packaging/monitor_bundle.py commit --target /absolute/path/to/new-monitor --plan
+python tools/packaging/monitor_bundle.py commit --target /absolute/path/to/new-monitor --if-active-sha256 ACTIVE_SHA256 --if-previous-sha256 PREVIOUS_SHA256
+python tools/packaging/monitor_bundle.py uninstall --target /absolute/path/to/new-monitor --plan
+python tools/packaging/monitor_bundle.py uninstall --target /absolute/path/to/new-monitor --if-active-sha256 ACTIVE_SHA256
 ```
 
 Install verifies the bundle and manifest, requires the candidate SHA-256 returned by its preview, copies only those two files into a new directory and verifies the copy. A changed or missing candidate digest is refused before creating the target. Verification caps the zipapp at 1 MiB, the manifest at 64 KiB and each member at 256 KiB. The target parent must already exist and, on POSIX, belong to the caller without group/world write permission. Update requires the current and candidate hashes from its preview, promotes a verified copy and retains the old directory as `.previous`. Rollback requires its preview hashes and exchanges the two verified directories, so the replaced copy remains available. Commit removes the verified `.previous` copy after its own hash-pinned preview; perform it before another update or uninstall. Uninstall checks the active files, requires the active SHA-256 from its preview and refuses a directory with any extra content. These operations are local and do not install Textual, change `PATH`, touch the server or download anything. They do not establish publisher authenticity or qualify a Windows/Linux release installer.
 
 `serve` runs the existing API and engine in the foreground. The profile must already be prepared. Startup does not invoke setup, download model files or open a browser. `--parallel N`, `--batch-groups auto|N`, `--max-queue N` and `--queue-timeout SECONDS` apply to this run and do not rewrite the profile. `max_queue` (0–4096) and `queue_timeout` (0.1–600 seconds) may also be set in the JSON profile. The engine may reduce the requested slot count; compare `slots_requested` with `slots_effective` in telemetry. A non-loopback bind requires a configured API key. There is no automatic tunnel or remote management. This source-run entry point opts into a 30-second graceful drain on stop (`--shutdown-timeout 0..300`); a deadline cancels requests owned by that server and returns exit 8. The legacy direct server entry point keeps its prior shutdown behavior unless given that flag.
 
-`serve --output jsonl` writes one schema-versioned lifecycle event per stdout line: `starting`, `ready`, `stopping`, `draining` and `stopped`, or `failed` if startup does not reach readiness. The ready event reports the actual bound address/port, instance ID, process ID and model state, without keys or prompt content. Human server diagnostics go to stderr in this mode. `SIGTERM` with a completed drain exits 0; Ctrl-C exits 130; a drain deadline exits 8. `serve --plan --output json` remains a single read-only preview; `--plan --output jsonl` is rejected. The direct `python -m serve.server` entry point retains its legacy human output.
+`serve --output jsonl` writes one schema-versioned lifecycle event per stdout line: `starting`, `ready`, `stopping`, `draining` and `stopped`, or `failed` if startup does not reach readiness. The ready event reports the actual bound address/port, instance ID, process ID and model state, without keys or prompt content. Human server diagnostics go to stderr in this mode. `SIGTERM` with a completed drain exits 0; Ctrl-C exits 130; a drain deadline exits 8. `serve --plan --output json` remains a single read-only preview; `--plan --output jsonl` is rejected. The direct `python terminal/serve/server.py` entry point retains its legacy human output.
 
 `--json` is a shortcut for `--output json` on one-shot commands, including profile, doctor, components, models, calibration, runtime, ops, bench, saved connection and effective config commands. `serve --json` requires `--plan`; foreground serving uses `--output jsonl`. `monitor --json` requires `--once`, and `logs --json` is one-shot; follow mode uses `--output jsonl`. The standalone monitor bundle accepts the same shortcut for its saved connection and effective config commands.
 
@@ -251,11 +251,11 @@ The [schema v1 telemetry field matrix](TERMINAL_TELEMETRY_FIELDS.md) gives each 
 
 The [qualification matrix](TERMINAL_QUALIFICATION.md) is a historical record of the source-run checks made before the 0.2.0 Terminal (11 October 2026).
 
-For a repeatable client stability check, run `tools/monitor_soak.py` with an absolute new report path. `--exercise-ui` resizes the live Textual monitor across 110 x 30, 80 x 24, 60 x 16 and 40 x 12 while a synthetic server rotates an unrelated host GPU row and intermittently omits or duplicates a selected card sensor. It checks selected-card history bounds alongside reconnect, restart and read-only detach. Use `--seconds 1800 --interval 0.5 --exercise-ui` for the long soak. Its JSON is synthetic client evidence; it does not measure engine, model or GPU performance.
+For a repeatable client stability check, run `terminal/tools/monitor_soak.py` with an absolute new report path. `--exercise-ui` resizes the live Textual monitor across 110 x 30, 80 x 24, 60 x 16 and 40 x 12 while a synthetic server rotates an unrelated host GPU row and intermittently omits or duplicates a selected card sensor. It checks selected-card history bounds alongside reconnect, restart and read-only detach. Use `--seconds 1800 --interval 0.5 --exercise-ui` for the long soak. Its JSON is synthetic client evidence; it does not measure engine, model or GPU performance.
 
-For a portable client installation check, run `python3 tools/portable_monitor_smoke.py --bundle /absolute/path/to/strata-monitor.pyz --report /absolute/path/to/new-report.json`. It verifies the bundle and digest-pinned local install/removal, then reads only loopback fake telemetry with isolated `-I -S` Python. Add `--interactive` when Textual and Rich are installed in that Python environment to load the packaged one-screen Overview in a headless 110 x 30 terminal, check all six panels and detach. The interactive check uses isolated `-I` Python with site packages enabled for Textual. Both modes require a new absolute report path. Run them on each release OS; a passing fake-server check does not qualify real hardware or a physical terminal.
+For a portable client installation check, run `python3 terminal/tools/portable_monitor_smoke.py --bundle /absolute/path/to/strata-monitor.pyz --report /absolute/path/to/new-report.json`. It verifies the bundle and digest-pinned local install/removal, then reads only loopback fake telemetry with isolated `-I -S` Python. Add `--interactive` when Textual and Rich are installed in that Python environment to load the packaged one-screen Overview in a headless 110 x 30 terminal, check all six panels and detach. The interactive check uses isolated `-I` Python with site packages enabled for Textual. Both modes require a new absolute report path. Run them on each release OS; a passing fake-server check does not qualify real hardware or a physical terminal.
 
-On POSIX with Textual installed, run `python3 tools/portable_monitor_pty_smoke.py --bundle /absolute/path/to/strata-monitor.pyz --report /absolute/path/to/new-pty-report.json` to check live terminal cleanup. It opens a 110 x 30 pseudo-terminal, waits for the packaged dashboard and telemetry, detaches once with `q` and once with Ctrl-C, and compares terminal settings before, during and after each session. It also checks that the fake server remains readable. The Mac result is in the transfer packet; repeat it on Linux and still check a physical terminal/SSH session separately.
+On POSIX with Textual installed, run `python3 terminal/tools/portable_monitor_pty_smoke.py --bundle /absolute/path/to/strata-monitor.pyz --report /absolute/path/to/new-pty-report.json` to check live terminal cleanup. It opens a 110 x 30 pseudo-terminal, waits for the packaged dashboard and telemetry, detaches once with `q` and once with Ctrl-C, and compares terminal settings before, during and after each session. It also checks that the fake server remains readable. The Mac result is in the transfer packet; repeat it on Linux and still check a physical terminal/SSH session separately.
 
 - **Requested/effective slots:** the profile or command's requested concurrency versus the engine's reported actual slot count. A lower actual count can result from resource limits.
 - **In flight, occupied slots, engine waiting and pre-admission queued:** distinct reported fields; do not add them together as disjoint work. In flight includes requests waiting for an engine slot. Occupied slots counts non-idle slot states, so 12 in flight with 8/8 slots occupied and 4 engine-waiting is possible. Requests may be in transition during a poll. Admission reserved/limit includes all accepted HTTP inference calls; rejected is a server-lifetime count.

@@ -51,7 +51,7 @@ so treat it as a test. The ready-made CUDA 12 engine holds no sm_52 code; build 
 cannot compile for Maxwell):
 
 ```
-cmake -B build -G Ninja -DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=52
+cmake -S engine -B build -G Ninja -DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=52
 cmake --build build -j
 ```
 
@@ -109,7 +109,7 @@ other card or toolkit changes. Use CUDA 13.0 or newer for an RTX 50 card.
 
 ```sh
 # Linux (Windows: the same with the toolkit's nvcc.exe)
-cmake -S . -B build-cuda12 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_EXPERIMENTAL_SM60=ON \
+cmake -S engine -B build-cuda12 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_EXPERIMENTAL_SM60=ON \
       -DCMAKE_CUDA_ARCHITECTURES="61;70" -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc
 cmake --build build-cuda12 --target strata -j
 ```
@@ -158,11 +158,11 @@ GP100 (P100, PH402) is the one Pascal chip without `__dp4a`. Its dense projectio
 730, decoding K- and i-quant blocks one int at a time. Six opt-in changes, all measured on a PH402 only:
 
 - **`STRATA_Q8_SM60=1`** packs every Q8_0 dense matrix and the head into the planes of `STRATA_Q8_PACKED` and runs them on
-  `src/kernels/cuda/q8_sm60.cuh`: a warp per row, 16-byte weight loads, activations copied once per workgroup into shared memory,
+  `engine/src/kernels/cuda/q8_sm60.cuh`: a warp per row, 16-byte weight loads, activations copied once per workgroup into shared memory,
   the dot on `STRATA_DP4A`, no barrier per row. Shapes it declines keep the usual kernel. It is not bitwise the exact kernels.
   The packed copies cost their size in VRAM (Flash-Next: 2.9 GiB of dense projections over the stages and 0.6 GiB for the head).
 - The GSQ-RCO packs have no Q8_0 dense matrices, so the kernel needs a copy whose dense projections and head are Q8_0:
-  `python tools/q8_dense_gguf.py <model>-00001-of-00002.gguf <new folder>` writes one (+3.5 GiB; experts keep their offsets,
+  `python terminal/tools/q8_dense_gguf.py <model>-00001-of-00002.gguf <new folder>` writes one (+3.5 GiB; experts keep their offsets,
   so the native pack is reused). Point `--native` and `--ple-gguf` at the new folder.
 - **`STRATA_IQ_STAGE_TABLES=1`** stages IQ3_XXS and IQ3_S codebooks in shared memory in the grouped expert kernels. Bitwise the
   same output. Interleaved A/Bs on a Tesla P100 showed no end-to-end change, so it is off by default. On an RTX 3090 Ti, forced on,
@@ -176,7 +176,7 @@ GP100 (P100, PH402) is the one Pascal chip without `__dp4a`. Its dense projectio
 - **`STRATA_PATTN_SM60=1`** (prompt reading with int8 K/V, CUDA build with `STRATA_EXPERIMENTAL_SM60`, compute capability 6.x): below
   sm_70 the prompt reads each QSA layer's attention through the decode kernels, 32 queries a call, with 817 KB of partial results a
   query and a merge kernel. The switch runs a score kernel and a value kernel that merges as it folds
-  (`src/kernels/cuda/qsa_pattn.cu`), in the same scratch and with the same arithmetic in the same order, so the output matches the
+  (`engine/src/kernels/cuda/qsa_pattn.cu`), in the same scratch and with the same arithmetic in the same order, so the output matches the
   decode kernels bit for bit. If a launch fails or the shape does not fit, the usual loop runs. The author measured a 1,536-query
   chunk's attention at 43.3 -> 30.8 ms per QSA layer at 26K context on one GP100 die, and 2-3% less time on 8K-150K token prompts
   on four dies; we have not measured it here, and nobody has measured compute capability 6.1. `qsa_pattn_parity` (built with the
@@ -195,7 +195,7 @@ application clock is 759 MHz and a layer split leaves each die idle most of a wi
 (`nvidia-smi -i <dies> -ac 715,1050` as administrator). And a second engine pinned to the same logical CPUs halves this one's
 decode; keep two engines on different logical CPUs.
 
-`tools/q8_sm60_check.cu` checks the kernel against a CPU reference on these shapes (1-8 columns).
+`terminal/tools/q8_sm60_check.cu` checks the kernel against a CPU reference on these shapes (1-8 columns).
 
 ### Pascal GP100: 4-bit gate/up expert slots (opt-in, `STRATA_EXPERT_NIBBLE=1`)
 
@@ -299,7 +299,7 @@ existing code ([gemm.cu](../engine/src/prefill/gemm.cu), [qsa_select.cu](../engi
 
 ## AMD: building gfx906 and gfx1012
 
-Setup does not build these. Build by hand and run `serve/server.py` with a config, as on any other card.
+Setup does not build these. Build by hand and run `terminal/serve/server.py` with a config, as on any other card.
 
 - **gfx906** (MI50 / MI60 / Radeon VII, wave64): a separate opt-in build, `-DSTRATA_HIP_GFX906=ON
   -DCMAKE_HIP_ARCHITECTURES=gfx906` (not `STRATA_ENABLE_HIP`). Current ROCm no longer ships gfx906 libraries; the reporter used a

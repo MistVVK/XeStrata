@@ -36,7 +36,7 @@ In the run config (`strata-<model>.json`), next to the other keys:
 }
 ```
 
-or `python serve/server.py --split-serve 0,1` (prefill card first). The cards are numbered as `nvidia-smi` numbers them. The option
+or `python terminal/serve/server.py --split-serve 0,1` (prefill card first). The cards are numbered as `nvidia-smi` numbers them. The option
 replaces `gpu`; the config must not also name `replicas`, `--layer-split`, `--batch`/`--slots` or `--prompt-cache 0` (the
 server stops at start and says which).
 
@@ -123,7 +123,7 @@ Where the time goes:
 "State fingerprint" is the engine's `STRATA_STATE_HASH`: the whole session (running state, K/V of every layer, the draft layer's K/V) hashed after
 the request. The fingerprint of the prefill engine's session also equals the decode engine's right after the restore. The check ran with
 `--adapt-swaps 0 --pcie-frac 0 STRATA_IQ_MT_MIN=1`, the settings under which two fresh single engines already give the same answer
-(without them the engine is not always deterministic from run to run, with or without this option). The tool is `tools/split_serve_check.py exact`.
+(without them the engine is not always deterministic from run to run, with or without this option). The tool is `terminal/tools/split_serve_check.py exact`.
 
 On two alike cards, split serving does not pay for one request at a time. It can pay when one card is clearly better at reading
 prompts and another at making answers, as in #4000. The gain there is the prompt time the weaker card would have needed, minus the

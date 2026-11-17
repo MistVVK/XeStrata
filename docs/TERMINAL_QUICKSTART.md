@@ -4,7 +4,7 @@ This page is for people who already have a model and want to read a running serv
 To set up and serve a new model, use [`strata launch`](TERMINAL_LAUNCH.md).
 
 The commands use the `strata` command from the [Terminal install](INSTALL.md#the-terminal), which carries its own Python.
-In a source checkout, type `python strata.py` in place of `strata`, from the repository root. These commands read, prepare
+In a source checkout, type `python terminal/strata.py` in place of `strata`, from the repository root. These commands read, prepare
 and rerun a model you already have; they do not download one. All options, permissions and limits are in [TERMINAL.md](TERMINAL.md).
 
 ## Read a running server

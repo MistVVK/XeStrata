@@ -1,8 +1,8 @@
 @echo off
 rem Strata's HIP (AMD) engine for Windows, and the ready-made zip setup.py downloads (strata-windows-x64-hip.zip).
 rem
-rem   tools\hip\build_windows.bat              build strata.exe + strata-device.exe and package dist\strata-windows-x64-hip.zip
-rem   tools\hip\build_windows.bat tests        also build the HIP unit tests (ctest in build-hip-win; they need an AMD GPU)
+rem   terminal\tools\hip\build_windows.bat      build strata.exe + strata-device.exe and package dist\strata-windows-x64-hip.zip
+rem   terminal\tools\hip\build_windows.bat tests also build the HIP unit tests (ctest in build-hip-win; they need an AMD GPU)
 rem
 rem Needs: Visual Studio 2022 (or 2019) Build Tools with the C++ workload (the linker, the CRT and the Windows SDK),
 rem Python 3.10+ and git.  No admin rights and no AMD GPU: ROCm comes from AMD's TheRock Python wheels (the same
@@ -23,7 +23,7 @@ rem   STRATA_VISION_HIP_ARCHS  the GPU reader's archs (default: STRATA_HIP_ARCHS
 rem   STRATA_NO_VISION     1 = skip the two picture readers (strata-vision.exe for the CPU, strata-vision-hip.exe for the GPU)
 rem   STRATA_CMAKE_EXTRA   extra cmake configure arguments (for example -DSTRATA_WINDOW_MAX_T=8)
 setlocal EnableDelayedExpansion
-for %%I in ("%~dp0..\..") do set "SRC=%%~fI"
+for %%I in ("%~dp0..\..\..") do set "SRC=%%~fI"
 if not defined STRATA_HIP_ARCHS set "STRATA_HIP_ARCHS=gfx1100;gfx1101;gfx1102;gfx1200;gfx1201;gfx1030;gfx1031;gfx1151"
 if not defined STRATA_ROCM_VERSION set "STRATA_ROCM_VERSION=10.2.0a20260930"
 if not defined STRATA_ROCM_INDEX set "STRATA_ROCM_INDEX=https://nightly.repo.amd.com/rocm/whl-next/"
@@ -71,7 +71,7 @@ rem ---- 3. configure + build (STRATA_PORTABLE: the CPU kernels for an AVX2 base
 set "GGML="
 if defined STRATA_GGML_DIR set "GGML=-DSTRATA_GGML_DIR=%STRATA_GGML_DIR:\=/%"
 if not exist "%BUILD_DIR%\build.ninja" (
-  cmake -G Ninja -S "%SRC%" -B "%BUILD_DIR%" -DCMAKE_BUILD_TYPE=Release ^
+  cmake -G Ninja -S "%SRC%\engine" -B "%BUILD_DIR%" -DCMAKE_BUILD_TYPE=Release ^
     -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=%TESTS% ^
     -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON "-DCMAKE_HIP_ARCHITECTURES=%STRATA_HIP_ARCHS%" ^
     "-DCMAKE_C_COMPILER=%ROCM_F%/lib/llvm/bin/clang.exe" "-DCMAKE_CXX_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" ^
@@ -85,18 +85,18 @@ if "%TESTS%"=="ON" (
   cmake --build "%BUILD_DIR%" --target strata strata-device || exit /b 1
 )
 
-rem ---- 3b. the picture readers (tools/vision, Strata's own tower): strata-vision.exe on the CPU (MSVC, portable: the
+rem ---- 3b. the picture readers (terminal/tools/vision, Strata's own tower): strata-vision.exe on the CPU (MSVC, portable: the
 rem      fallback that starts on any PC) and strata-vision-hip.exe on the GPU (ROCm's clang, hipBLAS, the archs above)
 set "VISION_ARGS="
 if not defined STRATA_VISION_HIP_ARCHS set "STRATA_VISION_HIP_ARCHS=%STRATA_HIP_ARCHS%"
 if not "%STRATA_NO_VISION%"=="1" (
   if not exist "%SRC%\build-vision-cpu-win\build.ninja" (
-    cmake -G Ninja -S "%SRC%\tools\vision" -B "%SRC%\build-vision-cpu-win" -DCMAKE_BUILD_TYPE=Release ^
+    cmake -G Ninja -S "%SRC%\terminal\tools\vision" -B "%SRC%\build-vision-cpu-win" -DCMAKE_BUILD_TYPE=Release ^
       -DSTRATA_VISION_CUDA=OFF -DSTRATA_PORTABLE=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl || exit /b 1
   )
   cmake --build "%SRC%\build-vision-cpu-win" --target strata-vision || exit /b 1
   if not exist "%SRC%\build-vision-hip-win\build.ninja" (
-    cmake -G Ninja -S "%SRC%\tools\vision" -B "%SRC%\build-vision-hip-win" -DCMAKE_BUILD_TYPE=Release ^
+    cmake -G Ninja -S "%SRC%\terminal\tools\vision" -B "%SRC%\build-vision-hip-win" -DCMAKE_BUILD_TYPE=Release ^
       -DSTRATA_VISION_HIP=ON "-DSTRATA_VISION_HIP_ARCHS=%STRATA_VISION_HIP_ARCHS%" -DSTRATA_PORTABLE=ON ^
       "-DCMAKE_CXX_FLAGS=--rocm-path=%ROCM_F% --rocm-device-lib-path=%BITCODE%" ^
       "-DCMAKE_C_COMPILER=%ROCM_F%/lib/llvm/bin/clang.exe" "-DCMAKE_CXX_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" ^
@@ -108,7 +108,7 @@ if not "%STRATA_NO_VISION%"=="1" (
 )
 
 rem ---- 4. the zip: the programs, the ROCm DLLs they load (+ rocBLAS/hipBLASLt kernels for these archs), licenses
-"%ROCM_VENV%\Scripts\python.exe" "%SRC%\tools\hip\package_windows.py" --build "%BUILD_DIR%" --rocm "%ROCM%" ^
+"%ROCM_VENV%\Scripts\python.exe" "%SRC%\terminal\tools\hip\package_windows.py" --build "%BUILD_DIR%" --rocm "%ROCM%" ^
   --archs "%STRATA_HIP_ARCHS%" --rocm-version "%STRATA_ROCM_VERSION%" --out "%DIST_DIR%" !VISION_ARGS! || exit /b 1
 echo.
 echo Done: %DIST_DIR%\strata-windows-x64-hip.zip

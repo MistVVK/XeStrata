@@ -2,7 +2,7 @@
 
 `strata-split` gives every card a share of **every** layer instead of some of the layers, and the cards exchange the layer sums through
 page-locked host memory. It is built from [sFNX](https://github.com/johnfink8/sfnx) by John Fink (MIT; the licence and credit travel with the
-code in `third_party/sfnx`). Strata starts it by itself when the rule below says yes, and starts the normal layer split, with no message, when it does not.
+code in `engine/third_party/sfnx`). Strata starts it by itself when the rule below says yes, and starts the normal layer split, with no message, when it does not.
 
 ## What it is for
 
@@ -43,7 +43,7 @@ missing, the launch is a quiet layer split.
 **Ask for it:** `--split-engine on` (or `"on"` in the config) uses the same rule, but says why in one line when it cannot run. It also runs the
 cases Auto leaves out (2 or 3 R9700 cards, the IQ3_S set on AMD, other AMD cards, 3 or 4 NVIDIA cards); the line says which part has not been run.
 
-If the engine refuses or fails to start, the server says so in one line and starts the normal layer split (`serve/server.py`,
+If the engine refuses or fails to start, the server says so in one line and starts the normal layer split (`terminal/serve/server.py`,
 `start_engine_or_fallback`). A crash after it was running restarts the same engine (the fallback is for starting only).
 
 ## In the desktop app
@@ -60,24 +60,24 @@ up, the server starts the layer split itself (as above) and the load says so in 
 
 sFNX as published needs the cards to write into each other (CUDA peer access): GeForce drivers refuse that, and its start checks need the
 IOMMU in identity mode, which most Linux PCs do not have by default. Here the buffers the cards exchange sums through live in page-locked
-host memory that both cards read and write with ordinary loads and stores. No peer API is called anywhere on NVIDIA: `tests/split/test_split_engine.py`
-fails if one appears in `src/split`, and `packaging/build_split_cuda.sh` fails if the built engine can call one. The IOMMU and BAR1 start
+host memory that both cards read and write with ordinary loads and stores. No peer API is called anywhere on NVIDIA: `terminal/tests/split/test_split_engine.py`
+fails if one appears in `engine/src/split`, and `tools/packaging/build_split_cuda.sh` fails if the built engine can call one. The IOMMU and BAR1 start
 checks are removed because the path they protect no longer exists.
 
 ## AMD (Radeon AI PRO R9700, gfx1201)
 
-The same sources build for HIP (`-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1201`, `packaging/build_split_hip.sh`): gfx12 WMMA tiles, wave32, the HIP runtime through the tree's
-hip_compat shim. `AUTO_SPLIT_AMD_ARCHS`, `AUTO_SPLIT_AMD_CARD_COUNTS` and `AUTO_SPLIT_AMD_EXPERT_TYPES` in `strata_control/split_engine.py` name what Auto starts; removing an entry keeps
+The same sources build for HIP (`-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1201`, `tools/packaging/build_split_hip.sh`): gfx12 WMMA tiles, wave32, the HIP runtime through the tree's
+hip_compat shim. `AUTO_SPLIT_AMD_ARCHS`, `AUTO_SPLIT_AMD_CARD_COUNTS` and `AUTO_SPLIT_AMD_EXPERT_TYPES` in `terminal/strata_control/split_engine.py` name what Auto starts; removing an entry keeps
 the layer split there while `--split-engine on` still runs the split. It looks for `strata-split-<N>-gfx1201` beside the engine.
 
 **Other AMD cards the package has code for (gfx1100, gfx1101, gfx1102, gfx1103 and gfx1200) are opt-in:** only `--split-engine on` starts it there, and before the model loads the engine runs a
-kernel self-test on every card (`src/split/src/hip/selftest_policy.hpp`: the expert tile and the attention tile's WMMA shapes). It prints one line saying the card has not been run and asking for a report;
+kernel self-test on every card (`engine/src/split/src/hip/selftest_policy.hpp`: the expert tile and the attention tile's WMMA shapes). It prints one line saying the card has not been run and asking for a report;
 if the self-test fails, the line says so and Strata starts the normal layer split. `FNX_SELFTEST=1` runs the self-test on gfx1201 too.
 
 The cards exchange sums differently from NVIDIA here. By default (`FNX_PEER` unset) the engine probes every directed pair of cards at start (kernel stores into the peer, a full read-back
 compare, a flag round trip) and, if all pass, pushes the decode sums and the attention merge with kernel stores into the receiver's memory (never `hipMemcpyPeerAsync`); on any
-failure, or with `FNX_PEER=0`, it uses the host-memory exchange for the whole run and prints one plain line. Peer access is enabled in exactly one file (`src/split/src/hip/peer.h`), pinned by
-`tests/split/test_split_engine.py`. `FNX_PF_RCCL=1` (off by default, needs the peer push) sums the prompt chunks through RCCL, which is loaded with `dlopen` and never linked: without
+failure, or with `FNX_PEER=0`, it uses the host-memory exchange for the whole run and prints one plain line. Peer access is enabled in exactly one file (`engine/src/split/src/hip/peer.h`), pinned by
+`terminal/tests/split/test_split_engine.py`. `FNX_PF_RCCL=1` (off by default, needs the peer push) sums the prompt chunks through RCCL, which is loaded with `dlopen` and never linked: without
 `librccl.so.1`, or if its self-test fails, the engine says so in one line and keeps the host exchange (`tools/rccl_policy_test.cpp`). The numbers and open items for this path are an internal measurement; the run logs are not published.
 
 ## DFlash2 instead of the MTP draft layer (engine flag; the launcher starts it only when you choose both)
@@ -91,5 +91,5 @@ with two big cards, and contexts over 128K have not been run. The copy-engine ri
 
 ## Build
 
-`-DSTRATA_BUILD_SPLIT=ON -DSTRATA_GGML_DIR=<llama.cpp checkout> [-DSTRATA_SPLIT_CARDS="2;3"] [-DSTRATA_SPLIT_ARCH=86]` builds
-`strata-split-N` per card count; `packaging/build_split_cuda.sh` does that with the release engine's toolchain rules and checks the result (`packaging/build_split_hip.sh` for AMD).
+`-DSTRATA_BUILD_SPLIT=ON [-DSTRATA_SPLIT_CARDS="2;3"] [-DSTRATA_SPLIT_ARCH=86]` builds
+`strata-split-N` per card count; `tools/packaging/build_split_cuda.sh` does that with the release engine's toolchain rules and checks the result (`tools/packaging/build_split_hip.sh` for AMD).

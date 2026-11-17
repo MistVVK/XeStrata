@@ -14,7 +14,7 @@ Search and image generation are supplied by configured MCP servers. Strata does 
 
 ```powershell
 python -m unittest serve.test_mcp serve.test_mcp_media
-node --check serve/web/app.js
+node --check terminal/serve/web/app.js
 git diff --check
 ```
 

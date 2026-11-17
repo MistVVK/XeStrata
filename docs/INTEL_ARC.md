@@ -19,8 +19,7 @@ strata launch --model-path /path/to/the/gguf/folder
 ```
 
 The first launch does everything itself: it downloads the Intel engine package `linux-x86_64-sycl` from the signed feed, builds the
-pack for your model from the GGUF files (a few minutes, once; it fetches llama.cpp's `gguf-py` helper from GitHub by itself, so it needs
-internet that one time), writes the run settings and starts the server. Nothing is installed by hand.
+pack for your model from the GGUF files (a few minutes, once), writes the run settings and starts the server. Nothing is installed by hand.
 
 - **A PC with an NVIDIA or AMD card as well** uses that card by default, and `--plan` says the Intel cards exist. To use the Intel cards
   add `--backend intel` once: the choice is remembered (in the settings file) for the next launch, `strata update` and the app's engine
@@ -35,7 +34,7 @@ whose graphics card is made by Intel. One package serves Alchemist and Battlemag
 first start, because the A-series cards have no FP64 units. The package carries oneAPI's runtime libraries. The Level Zero
 loader and the compute runtime stay the PC's own (see [What you need](#what-you-need)), and your user must be in the `render`
 group (`strata doctor` says so). It was tested on an Arc A750 and, in 0.2.10, on two Arc Pro B65 cards. The package is built by
-`packaging/build_sycl_linux.sh`.
+`tools/packaging/build_sycl_linux.sh`.
 
 The source and container workflow ([INTEL.md](INTEL.md#setup)) still exists for building the engine yourself; the Terminal does not need it.
 
@@ -52,12 +51,11 @@ engine package. Otherwise [build the image yourself](DOCKER.md#build-it-yourself
   experts that do not fit on the card with AVX2 (measured on an A750 with a Ryzen 5 5600X, [INTEL.md](INTEL.md)). This applies to
   model folders that contain `native_experts.txt` (IQ3_XXS, IQ3_S, NVFP4, Unsloth). An older Q2_0 folder has no such file, and its
   CPU kernel needs AVX-512. With that folder the engine stops with "this CPU cannot run the expert kernel", and `strata doctor`
-  warns about it before the start. Building the model folder again with `strata setup` (or `tools/iq_pack.py`) fixes it.
+  warns about it before the start. Building the model folder again with `strata setup` (or `terminal/tools/iq_pack.py`) fixes it.
 - For a source build without Docker: **Intel oneAPI** with the DPC++ compiler (`icpx`, **2026.1 or newer**; 2025.3 does not build the engine) and **oneMKL**
-  (about 5 GB), `cmake` 3.24+, `ninja`, `git`, Python 3. The build fetches ggml unless you point `STRATA_GGML_DIR` at a
-  llama.cpp checkout.
-- For `./setup.sh --backend sycl`: **Docker** and the GPU driver, nothing else from the list above. `sycl/setup_intel.py`
-  builds and runs the engine in the `strata-sycl-dev` image from `sycl/tools/Dockerfile`, which starts from a community
+  (about 5 GB), `cmake` 3.24+, `ninja`, `git`, Python 3.
+- For `./setup.sh --backend sycl`: **Docker** and the GPU driver, nothing else from the list above. `engine/sycl/setup_intel.py`
+  builds and runs the engine in the `strata-sycl-dev` image from `engine/sycl/tools/Dockerfile`, which starts from a community
   llama.cpp SYCL image (`ghcr.io/snailium/...`), not an Intel or Strata image. On Ubuntu:
   `sudo apt install docker.io git`, then `sudo usermod -aG docker,render $USER` and log in again.
 - VRAM: the port keeps the experts on the card (`--stream-experts`). A 32 GB card holds the Coder IQ1_M or IQ2_XS. Smaller
@@ -72,15 +70,15 @@ About 10 minutes the first time. From the checkout, called `Strata` here:
 
 ```sh
 cd Strata
-docker build --pull -t strata-sycl-dev sycl/tools     # once: about 6 minutes, a 13 GB image
+docker build --pull -t strata-sycl-dev engine/sycl/tools     # once: about 6 minutes, a 13 GB image
 H=$(basename "$PWD")
 # Arc B-series: bmg-g31 (Pro B70), bmg-g21 (B580, B570, Pro B60). Arc A-series (Alchemist): leave out AOT (JIT) and use build-sycl
 docker run --rm -u $(id -u):$(id -g) -v "$PWD/..:/work" -e AOT=bmg-g31 -e REPO=/work/$H \
-    -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash sycl/tools/build.sh strata"
+    -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash engine/sycl/tools/build.sh strata"
 ```
 
 `--pull` matters: [INTEL.md](INTEL.md#how-to-build-it) says why. Then run `./setup.sh --backend sycl`. Do not run
-`python3 sycl/setup_intel.py` by hand: on Ubuntu it fails with `externally-managed-environment`; `setup.sh` runs it in its own
+`python3 engine/sycl/setup_intel.py` by hand: on Ubuntu it fails with `externally-managed-environment`; `setup.sh` runs it in its own
 `.venv`.
 
 ## Build without Docker
@@ -101,8 +99,8 @@ Build the engine through the top-level CMake option or by configuring the `sycl/
 
 ```sh
 source /opt/intel/oneapi/setvars.sh
-cmake -S . -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DSTRATA_ENABLE_SYCL=ON
-#   or: cmake -S sycl -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+cmake -S engine -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DSTRATA_ENABLE_SYCL=ON
+#   or: cmake -S engine/sycl -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 cmake --build build-sycl --target strata
 ```
 
@@ -121,7 +119,7 @@ engine is at `build-sycl/sycl/strata`, so use `-S sycl` or set `STRATA_SYCL_BIN`
 ./setup.sh --backend sycl [setup's usual options, e.g. --model IQ2_XS --context 32768]
 ```
 
-Setup continues with `sycl/setup_intel.py`, which finds the Arc in sysfs, uses the SYCL engine you built, and writes the
+Setup continues with `engine/sycl/setup_intel.py`, which finds the Arc in sysfs, uses the SYCL engine you built, and writes the
 config and `run-<model>.sh`. On a card under 12 GB or an `i915` card (the A-series) it writes the small-card config
 ([INTEL.md](INTEL.md#arc-a750-and-the-other-alchemist-cards)). It downloads and packs the model the usual way. Windows has no
 path: `setup --backend sycl` on Windows stops and points here.
@@ -149,8 +147,8 @@ Things that matter on an Arc (details in [INTEL.md](INTEL.md)):
   `100% of the experts resident` lines. Set `STRATA_MIRROR_MIB=0` there, or the pinned mirror is allocated and not used.
 - **`setvars.sh` and `set -u`:** `source /opt/intel/oneapi/setvars.sh` in a shell with `set -u` stops at
   `OCL_ICD_FILENAMES: unbound variable` (oneAPI 2026.1.1). Source it before `set -u`.
-- **Without Docker:** `sycl/serve/strata-sycl.sh` needs Docker. Natively, `source setvars.sh`, export `SYCL_CACHE_PERSISTENT=0`,
-  `ZES_ENABLE_SYSMAN=1` and `STRATA_VERIFY_DEVICE_PLAN=1`, then run `build-sycl-aot/strata` or `sycl/serve/server_intel.py`
+- **Without Docker:** `engine/sycl/serve/strata-sycl.sh` needs Docker. Natively, `source setvars.sh`, export `SYCL_CACHE_PERSISTENT=0`,
+  `ZES_ENABLE_SYSMAN=1` and `STRATA_VERIFY_DEVICE_PLAN=1`, then run `build-sycl-aot/strata` or `engine/sycl/serve/server_intel.py`
   with an `exe` that does this. A normal user is not in the `render` group on Ubuntu, and then `sycl-ls` shows only the CPU.
 - `STRATA_VERIFY_NO_HOST=1` (set by `strata-sycl.sh` unless the config's `"env"` says otherwise) is needed on `xe` cards when part
   of the experts is not in VRAM, and is left off on the `i915` A-series ([INTEL.md](INTEL.md)). The config's `"env"` block and
@@ -183,7 +181,7 @@ on the A750 (on by default, read on the CPU). See [INTEL.md](INTEL.md#pictures-o
 ## Windows
 
 There is no Windows path. `setup --backend sycl` on Windows stops and points here. oneAPI exists for Windows, but
-`sycl/CMakeLists.txt` uses GCC-style flags (`-mavx512f`, `-fp-model=precise`, `-qmkl`) and the runner is a bash/Docker script.
+`engine/sycl/CMakeLists.txt` uses GCC-style flags (`-mavx512f`, `-fp-model=precise`, `-qmkl`) and the runner is a bash/Docker script.
 Nobody has tried a native build. WSL2 with an Arc was used by one tester (the B580 row above), but setup cannot detect the card
 there, because it reads `/sys/class/drm`, which WSL2 does not have.
 

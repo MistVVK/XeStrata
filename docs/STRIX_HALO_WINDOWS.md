@@ -13,7 +13,7 @@ engines 0.1.41 to 0.1.47 with a hand-made configuration (`--mmap-experts`, a lis
 Measured on 2026-10-26 on a GMKtec NucBox EVO-X2 (Ryzen AI Max+ 395, 128 GB shared memory: a 64 GB BIOS carve-out for the graphics chip
 and 64 GB that Windows sees; Windows 11 Pro, AMD Adrenalin 26.10.1 / driver 32.0.32015.7029). Strata was the 0.2.7 release candidate
 (Terminal and engine 0.1.51 built from commit `3e468f5de`, ROCm 10.2.0a20260930). The server was started with `strata launch` and
-nothing else was set by hand; the speeds come from `tools/strata_bench.py` against the running server (three runs per test, medians,
+nothing else was set by hand; the speeds come from `terminal/tools/strata_bench.py` against the running server (three runs per test, medians,
 the engine's own timings; the model is loaded before the clock starts). The numbers can still move before the release is cut.
 
 **Qwen3.8-Flash-Next IQ3_S** (`strata launch --family qwen --model iq3_s`; 131,072 tokens of context, int8 KV, pictures on):
@@ -27,7 +27,7 @@ the engine's own timings; the model is loaded before the clock starts). The numb
 | 32K prompt | **792 tok/s** (40.6 s) |
 | Coding-agent session, 6 turns | 69% of the prompt came from the conversation cache; answers 47 tok/s; 4.5 s to the first token per turn |
 
-The prompt rows use the word-list prompt of `tools/strata_bench.py`; ordinary text is costlier for the experts and reads slower (124 to 164 tok/s on 3 to 5K-token pieces of prose). These are speed measurements. They say nothing about answer quality, and the short-chat range depends on the text. The other Qwen sizes
+The prompt rows use the word-list prompt of `terminal/tools/strata_bench.py`; ordinary text is costlier for the experts and reads slower (124 to 164 tok/s on 3 to 5K-token pieces of prose). These are speed measurements. They say nothing about answer quality, and the short-chat range depends on the text. The other Qwen sizes
 were not measured for this page.
 
 ## 2. Memory and the BIOS
@@ -125,7 +125,7 @@ What 0.2.7 does: on Windows `gfx1151` the engine no longer turns the switch on b
 
 ```
 strata launch --family qwen --model iq3_s            # then, from a source checkout:
-python tools/strata_bench.py --url http://127.0.0.1:8080 --runs 3 --long
+python terminal/tools/strata_bench.py --url http://127.0.0.1:8080 --runs 3 --long
 ```
 
 `--long` adds the 32K prompt.

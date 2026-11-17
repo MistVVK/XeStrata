@@ -83,6 +83,18 @@ A hit is a target that exists before the move and is gone after it. It exits wit
 (add it to `move_0216_edits.py`) or explained (a line in `checks/path_scan_explained.txt`, with the reason). The replay of a
 release head is done only when it reports no hit.
 
+`checks/path_scan2.py <repo> <rev> <rev before the move>` is a second, read-only scan that runs on any commit. It evaluates path
+expressions built from the file's own place or a root variable: `Path(__file__).parents[1] / "include"`, `join(HERE, ...)` in JS,
+`$here/..` and `${REPO:-$(git rev-parse --show-toplevel)}` in shell, `%~dp0`, for-loop and `set` variables in batch files
+(`%SRC%\tools\vision`), `$PSScriptRoot` and `$root` variables in PowerShell, and the repository paths in the CI workflows. It lists
+a path that does not exist when it existed before the move or its first missing folder is one the move took away, and every
+`cmake -S <folder>` whose folder has no CMakeLists.txt. It found a test that skipped silently after the move and several release build
+scripts. Dual-layout fallbacks that read both layouts on purpose show up as hits to read, not as breaks.
+
+`checks/docs_paths.py <repo> <rev> <rev before the move> [--explained checks/docs_paths_explained.txt]` reads the code spans and blocks of the user-facing pages
+(docs/*.md, README.md, AGENTS.md, .github/*.md) and lists every command or path that existed before the move, does not exist now and has a new place
+(`tools/iq_pack.py`, `.venv/bin/python`, `-m serve.server`). It reports no hit on the head of 0.2.16.
+
 Run each Windows test file in its own process. In one combined pytest run, `serve/winjob.py` and `serve/lifeline.py` keep the
 `subprocess.Popen` that an earlier test may have replaced, and 7 tests fail in both trees for that reason only.
 

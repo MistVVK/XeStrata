@@ -8,7 +8,7 @@ Strata as one of its models. It needs a [source checkout](SOURCE_INSTALL.md), no
 
 1. Set up Strata without starting it: `./setup.sh --no-start`. This writes `strata-<model>.json` in the checkout.
 2. Add an entry to llama-swap's config. The start script that setup writes (`run-<model>.sh`) fixes the port at 8080,
-   so call `serve/server.py` with llama-swap's port instead:
+   so call `terminal/serve/server.py` with llama-swap's port instead:
 
 ```yaml
 healthCheckTimeout: 300            # model loading takes minutes; give it room
@@ -16,7 +16,7 @@ healthCheckTimeout: 300            # model loading takes minutes; give it room
 models:
   strata:
     cmd: >-
-      sh -c 'cd /path/to/Strata && exec .venv/bin/python serve/server.py
+      sh -c 'cd /path/to/Strata && exec terminal/.venv/bin/python terminal/serve/server.py
       --engine strata --config strata-<model>.json --port ${PORT}'
     env: ["STRATA_ALLOWED_HOSTS=my-server"]     # the host name your clients use, see below
     checkEndpoint: /health

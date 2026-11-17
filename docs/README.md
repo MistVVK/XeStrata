@@ -61,7 +61,7 @@ does not establish support or speed on every GPU.
 - Installation steps live in [INSTALL.md](INSTALL.md), source steps in [SOURCE_INSTALL.md](SOURCE_INSTALL.md). The public READMEs stay short.
 - Check command examples against the parser and filenames against the release assets.
 - A guide describes the current release. Version history, fixed bugs and superseded settings go in a closing
-  **History / older measurements** section, in `bench/results`, or in the release notes. Do not mix them into instructions.
+  **History / older measurements** section, in `docs/bench-results`, or in the release notes. Do not mix them into instructions.
 
 Every guide page has this shape:
 

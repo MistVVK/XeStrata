@@ -22,7 +22,7 @@ strata launch --family gyro --model Gyro-S      # or Gyro-M
 ```
 
 Setup downloads the pinned revision of the file (size and SHA-256 checked) and prepares the pack
-(`tools/iq_pack.py --compat-bf16`: the Hadamard table and the dense weights, 1.5 GB). It also prepares the draft head
+(`terminal/tools/iq_pack.py --compat-bf16`: the Hadamard table and the dense weights, 1.5 GB). It also prepares the draft head
 (Strata's own MTP head, made from the original model as for every Qwen3.8-Flash-Next file) and the start script. If the
 ready-made engine is too old for the pack, setup replaces it or the app offers Update engine.
 
@@ -90,15 +90,6 @@ time in a decode profile.
 | Apple Silicon (Metal) | Runs both files. See [On a Mac](#on-a-mac). |
 
 If Gyro misbehaves on an RTX 50 card, update the engine.
-
-**Prompt speed and the ggml build.** The trellis prompt kernels (MMQ) are agentionai's, from their llama.cpp fork (MIT).
-Strata builds against upstream ggml, which does not have them, so it adds them at configure time.
-`cmake/strata_ggml_tq_overlay.cmake` writes a copy of the pinned ggml-cuda headers into the build folder with the
-three trellis types routed like IQ2_XS. The tile loader is the fork's (`third_party/ggml-tq/`). Only Strata's own MMQ
-library sees the copy; every other type is compiled from the untouched files. The ready-made engines read Gyro prompts
-through it. If the pinned ggml changes and an anchor of the script no longer matches, the overlay switches itself off
-with a message and prompts take the slower FP16 path. A build against the fork (`-DSTRATA_GGML_DIR=<agentionai/llama.cpp>`)
-uses the fork's own instances instead.
 
 **Decode kernels.** The trellis decode kernels keep the 4 KB codebook in shared memory (`STRATA_IQ_STAGE_GRID=0` reads it
 from the global table again) and take four rows per warp. The sums are added in the same order as the unstaged kernels,
@@ -173,7 +164,7 @@ about 24 GB of RAM for the expert arena.
 
 ## On a Mac
 
-Apple Silicon Macs run Gyro-S and Gyro-M with Metal kernels (`metal/kernels`), the same published files and the same
+Apple Silicon Macs run Gyro-S and Gyro-M with Metal kernels (`engine/metal/kernels`), the same published files and the same
 Hadamard-folded pack. What a Mac needs, the measured speeds on a 32 GB Mac mini and what was checked are in
 [MAC.md](MAC.md#gyro-s-and-gyro-m-agentionais-trellis-experts). Setup:
 
@@ -189,19 +180,18 @@ Setup does these steps for you. By hand, from a [source checkout](SOURCE_INSTALL
 
 ### 1. Build
 
-For the fast prompt path, Strata's GGML dependency can be the agentionai llama.cpp fork, which has the trellis types:
+The engine build needs no llama.cpp checkout.
 
 ```sh
-git clone --depth 1 https://github.com/agentionai/llama.cpp ../agention-llama.cpp
 # NVIDIA. RTX 50 series: use CUDA 13 (CUDA 12.8 crashes the prompt path on sm_120)
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=120 -DSTRATA_GGML_DIR=$PWD/../agention-llama.cpp
+cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=120
 # AMD (experimental; in a non-root container add --group-add $(getent group render | cut -d: -f3),
 # otherwise HIP finds no device)
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON \
-  -DCMAKE_HIP_ARCHITECTURES=gfx1201 -DSTRATA_GGML_DIR=$PWD/../agention-llama.cpp
+cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1201
 cmake --build build -j
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3 -m venv terminal/.venv && terminal/.venv/bin/pip install -r terminal/requirements.txt
 ```
 
 ### 2. Download and pack
@@ -210,7 +200,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/pip install huggingface_hub hf_transfer
 HF_HUB_ENABLE_HF_TRANSFER=1 .venv/bin/hf download agentionai/Qwen3.8-Flash-Next-Gyro-GGUF \
   Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf --local-dir models
-.venv/bin/python tools/iq_pack.py \
+terminal/.venv/bin/python terminal/tools/iq_pack.py \
   --gguf models/Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf --out packs/gyro-s --compat-bf16
 build/native_expert_parity --load-check packs/gyro-s models/Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf
 ```
@@ -221,10 +211,10 @@ keep it on a fast local SSD. `--load-check` must end with `0 failures`.
 ### 3. Draft head
 
 ```sh
-.venv/bin/python tools/mtp_fetch.py fetch --out mtp
-.venv/bin/python tools/mtp_pack.py --src mtp --experts q2_0 --out mtp/mtp-q2_0.gguf
-.venv/bin/python tools/mtp_rt.py --gguf mtp/mtp-q2_0.gguf --out mtp/rt
-cp data/draft_vocab.bin mtp/rt/draft_vocab.bin
+terminal/.venv/bin/python terminal/tools/mtp_fetch.py fetch --out mtp
+terminal/.venv/bin/python terminal/tools/mtp_pack.py --src mtp --experts q2_0 --out mtp/mtp-q2_0.gguf
+terminal/.venv/bin/python terminal/tools/mtp_rt.py --gguf mtp/mtp-q2_0.gguf --out mtp/rt
+cp terminal/data/draft_vocab.bin mtp/rt/draft_vocab.bin
 ```
 
 ### 4. Serve
@@ -237,7 +227,7 @@ Save as `strata-gyro-s.json` at the repository root:
   "args": [
     "--pack", "packs/gyro-s",
     "--native", "models/Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf",
-    "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto",
+    "--expert-profile", "terminal/data/expert-profile.bin", "--expert-cache", "auto",
     "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
     "--mtp", "mtp/rt", "--max-context", "131072", "--kv", "int8"
   ],
@@ -251,7 +241,7 @@ Save as `strata-gyro-s.json` at the repository root:
 ```
 
 ```sh
-.venv/bin/python -m serve.server --engine strata --config strata-gyro-s.json --port 8080
+terminal/.venv/bin/python terminal/serve/server.py --engine strata --config strata-gyro-s.json --port 8080
 ```
 
 The web interface is at `http://127.0.0.1:8080`. API clients use `http://127.0.0.1:8080/v1` (OpenAI) or `/v1/messages`
@@ -271,7 +261,7 @@ The web interface is at `http://127.0.0.1:8080`. API clients use `http://127.0.0
   each other, not with a float reference.
 - Strata's own CPU kernels for the trellis types (`src/kernels/cpu/tq_*.cpp`, AVX2 and AVX-512, picked at run time)
   take about 45% of ggml-cpu's time per expert on AVX2 and decode a block once for all the tokens of a verify window
-  (`build/tq_cpu_parity --bench` measures them on your CPU). `STRATA_NO_TQ_KERNELS=1` goes back to ggml-cpu.
+  (`build/tq_cpu_parity --bench` measures them on your CPU). `STRATA_NO_TQ_KERNELS=1` changes nothing in a default build: the trellis types always take these kernels.
   `STRATA_TQ_ISA=avx2` or `scalar` caps the instruction set.
 
 ## Known limits
@@ -290,7 +280,7 @@ The web interface is at `http://127.0.0.1:8080`. API clients use `http://127.0.0
 
 The trellis types, the Hadamard rotation, the CPU and GPU kernels and the pack step were written by Laurent Zuijdwijk
 (agentionai) in agentionai/Strata `rc2` (MIT) and ported here commit by commit with his authorship kept.
-`third_party/ggml/ggml-common-tq.h` and the MMQ instances come from agentionai/llama.cpp (MIT, the ggml authors). The
+`engine/third_party/ggml/ggml-common-tq.h` and the MMQ instances come from agentionai/llama.cpp (MIT, the ggml authors). The
 weights are agentionai's quantization of Qwen3.8-Flash-Next under the Qwen Community License 1.0
 (<https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF/blob/main/LICENSE>).
 

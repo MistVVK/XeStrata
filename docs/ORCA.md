@@ -13,7 +13,7 @@ not an installer menu entry, and there is no `--family orca` command.
 ## How it works
 
 The model has Strata's Qwen4Exp geometry. Ordinary quantization also compresses the hyperconnection, small attention
-and PLE projections, which Strata's kernels read as BF16. `tools/iq_pack.py --compat-bf16` expands only those
+and PLE projections, which Strata's kernels read as BF16. `terminal/tools/iq_pack.py --compat-bf16` expands only those
 projections, rounding to BF16 with nearest-even. This adds rounding relative to the GGUF's dequantized weights. It does
 not recover the original BF16 checkpoint or its quality.
 
@@ -23,11 +23,11 @@ split shards must finish downloading before packing. Pass the snapshot filename,
 
 ## Preparation
 
-Python needs numpy, regex and gguf-py from the pinned llama.cpp dependency. `STRATA_GGUF_PY` can point to its
+Python needs numpy and regex. The pack tools carry their own gguf-py; `STRATA_GGUF_PY` can point to another
 `gguf-py` directory.
 
 ```sh
-.venv/bin/python tools/iq_pack.py \
+terminal/.venv/bin/python terminal/tools/iq_pack.py \
   --gguf /path/to/Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf \
   --out packs/orca-iq3_xxs --compat-bf16
 ```
@@ -38,10 +38,10 @@ the Orca files to pass as one of setup's GSQ-RCO models.
 The persistent server can use the MTP runtime. It is optional: without `--mtp` the server drafts by lookup only.
 
 ```sh
-.venv/bin/python tools/mtp_fetch.py fetch --out mtp
-.venv/bin/python tools/mtp_pack.py --src mtp --experts q2_0 --out mtp/mtp-q2_0.gguf
-.venv/bin/python tools/mtp_rt.py --gguf mtp/mtp-q2_0.gguf --out mtp/rt
-cp data/draft_vocab.bin mtp/rt/draft_vocab.bin
+terminal/.venv/bin/python terminal/tools/mtp_fetch.py fetch --out mtp
+terminal/.venv/bin/python terminal/tools/mtp_pack.py --src mtp --experts q2_0 --out mtp/mtp-q2_0.gguf
+terminal/.venv/bin/python terminal/tools/mtp_rt.py --gguf mtp/mtp-q2_0.gguf --out mtp/rt
+cp terminal/data/draft_vocab.bin mtp/rt/draft_vocab.bin
 ```
 
 This uses the original model's draft head, as setup does for Swift. The target model verifies every proposal. Measure
@@ -61,7 +61,7 @@ RAM, plus draft and runtime buffers and your other applications.
     "--pack", "packs/orca-iq3_xxs",
     "--native", "/path/to/Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf",
     "--ple-gguf", "/path/to/Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf",
-    "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto",
+    "--expert-profile", "terminal/data/expert-profile.bin", "--expert-cache", "auto",
     "--prefill", "512", "--spec", "4", "--spec-min-p", "0.5",
     "--mtp", "mtp/rt", "--max-context", "32768", "--kv", "int8"
   ],
@@ -77,7 +77,7 @@ RAM, plus draft and runtime buffers and your other applications.
 Run it from the repository root:
 
 ```sh
-.venv/bin/python -m serve.server --engine strata --config strata-orca-iq3_xxs.json --port 8080
+terminal/.venv/bin/python terminal/serve/server.py --engine strata --config strata-orca-iq3_xxs.json --port 8080
 ```
 
 The web interface is at `http://127.0.0.1:8080`. API clients use `http://127.0.0.1:8080/v1`. This example is text-only;
@@ -88,7 +88,7 @@ vision is not configured.
 - IQ3_XXS is the only validated Orca quantization.
 - IQ3_M uses Q5_0 expert down matrices, which the native GPU expert path does not support.
 - The installer model menu does not list this model.
-- Packing tests: `.venv/bin/python -m unittest discover -s tools -p test_iq_pack.py`.
+- Packing tests: `terminal/.venv/bin/python -m unittest discover -s tools -p test_iq_pack.py`.
 
 ## History / older measurements
 

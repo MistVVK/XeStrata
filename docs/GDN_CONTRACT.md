@@ -1,7 +1,7 @@
 # GDN prompt-path contract (Flash-Next, CUDA reference)
 
-Audited on main `870aedd9e` (v0.2.8), `src/prefill/kernels.cu` and `src/prefill/prefill.cpp`. Everything below is read from
-that source; the harness (`gdn_harness`, `tests/gdn/gdn_fixture.hpp`) checks it against an FP64 oracle that starts from the
+Audited on main `870aedd9e` (v0.2.8), `engine/src/prefill/kernels.cu` and `engine/src/prefill/prefill.cpp`. Everything below is read from
+that source; the harness (`gdn_harness`, `engine/tests/gdn/gdn_fixture.hpp`) checks it against an FP64 oracle that starts from the
 raw inputs, so a wrong reading shows up as a failed parity case.
 
 ## Shapes
@@ -83,6 +83,6 @@ heads, tokens and state elements.
 
 ## Test hook
 
-`include/strata/prefill/gdn_probe.hpp`: a thread-local `GdnProbe` installed by a test selects/forces a path, a smaller chunked scratch
+`engine/include/strata/prefill/gdn_probe.hpp`: a thread-local `GdnProbe` installed by a test selects/forces a path, a smaller chunked scratch
 segment (`gsb`), or the SM-count bypass, and reads back `selected`, `wanted` and the fallback `reason`. With no probe installed the
 dispatch is unchanged. The engine never installs one.

@@ -10,8 +10,7 @@ refills, to avoid repeated pageable-source registrations.
 
 ## Reproduce the configuration
 
-Build instructions are in [AMD_HIP.md](AMD_HIP.md). Use the repository-pinned
-llama.cpp dependency; do not silently substitute another revision. The numbers
+Build instructions are in [AMD_HIP.md](AMD_HIP.md). The numbers
 below were measured on a build with llama.cpp's MMQ kernels (Strata 0.2.15 and earlier; that build option was
 removed in 0.2.16). To repeat them, build the v0.2.15 tag with `-DSTRATA_PREFILL_MMQ=ON -DSTRATA_MMQ=ON` and use these
 runtime variables:
@@ -53,7 +52,7 @@ The POSIX PLE path issues direct reads through a configurable worker pool.
 Use a dedicated idle server, restart it between arms, and capture its engine log:
 
 ```sh
-python3 tools/hip/bench_prefill.py \
+python3 terminal/tools/hip/bench_prefill.py \
   --model MODEL_NAME --url http://127.0.0.1:8080 \
   --engine-log /path/to/engine.log --label candidate --output candidate.json
 ```

@@ -34,7 +34,7 @@ IQ3_S (84 GB download) or the NVFP4 pack. The engine package needs glibc 2.39 or
 ```
 
 `--data-dir` must be a folder you can write (the default, next to the checkout, may be under `/home`, which a normal user cannot create).
-Setup finds the GB10, calls it unified memory, takes the engine from the feed (or compiles it with `spark/build_engine.sh` when the release
+Setup finds the GB10, calls it unified memory, takes the engine from the feed (or compiles it with `engine/spark/build_engine.sh` when the release
 has none) and writes the run config with the settings measured on this part:
 
 | Setting | Why |
@@ -54,15 +54,14 @@ Start a model with its run script (`./run-iq3_s.sh`) or `./setup.sh`.
 You need the CUDA 13.0 toolkit (`/usr/local/cuda`; DGX OS has it), cmake, ninja and Python 3.10 or newer.
 
 ```sh
-python3 -m venv .venv-build
-.venv-build/bin/pip install -r requirements.txt -r requirements-build.txt
-PATH="$PWD/.venv-build/bin:/usr/local/cuda/bin:$PATH" PYTHON="$PWD/.venv-build/bin/python" JOBS=16 sh spark/build_engine.sh
+python3 -m venv terminal/.venv-build
+.venv-build/bin/pip install -r terminal/requirements.txt -r terminal/requirements-build.txt
+PATH="$PWD/.venv-build/bin:/usr/local/cuda/bin:$PATH" PYTHON="$PWD/.venv-build/bin/python" JOBS=16 sh engine/spark/build_engine.sh
 cp -r out-spark/engine ./engine
 ```
 
-About 3 minutes for the engine (the first run also fetches llama.cpp at the
-pinned commit). `out-spark/engine/` holds `strata`, `strata-vision`, the CUDA libraries and a `BUILD.json`.
-`BUILD_VISION=0` leaves the picture reader out. `packaging/build_cuda_linux_aarch64.sh` runs this build and makes the engine package
+About 3 minutes for the engine. `out-spark/engine/` holds `strata`, `strata-vision`, the CUDA libraries and a `BUILD.json`.
+`BUILD_VISION=0` leaves the picture reader out. `tools/packaging/build_cuda_linux_aarch64.sh` runs this build and makes the engine package
 for the feed ([packaging/README.md](../tools/packaging/README.md)). A model on a Q2_0 pack cannot run: its CPU kernels need AVX-512.
 
 ## What the Spark does with its memory
@@ -83,7 +82,7 @@ decode, against 1,252 and 39 without. Leave it on the SSD (setup does).
 
 ## Speeds
 
-Measured on the release-candidate engine package of 0.2.7.1 with `tools/dgx_bench.py`: fresh 4K, 16K and 32K prompts at temperature 0, 256-token
+Measured on the release-candidate engine package of 0.2.7.1 with `terminal/tools/dgx_bench.py`: fresh 4K, 16K and 32K prompts at temperature 0, 256-token
 answers, 64K context, the model's own run config, four samples a cell in two blocks (on, off, off, on), medians. "Table off" is
 `STRATA_SM121_PERF=0`. One Spark, 27 October 2026; the figures move a few percent between sessions.
 

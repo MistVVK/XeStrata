@@ -1,0 +1,3 @@
+# page | text in the span or code line | reason   (hits of checks/docs_paths.py that are correct as written)
+.github/SECURITY.md | strata_control/update_keys.json | names the key inside an INSTALLED Strata (the installed layout has strata_control/ at its top)
+docs/SAFETY.md | strata_control/update_keys.json | names the key inside an INSTALLED Strata (the installed layout has strata_control/ at its top)

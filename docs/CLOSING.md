@@ -9,7 +9,7 @@ does not exit in time it is killed. After either, the port and the GPU memory ar
 
 | | Started by | Ends with | Stop it with |
 |---|---|---|---|
-| **Foreground** | `strata serve --profile NAME` (or `python serve/server.py`) | the terminal / the command | Ctrl+C, closing the window, `kill` |
+| **Foreground** | `strata serve --profile NAME` (or `python terminal/serve/server.py`) | the terminal / the command | Ctrl+C, closing the window, `kill` |
 | **Background service** (on purpose) | `strata runtime start --profile NAME` | nothing: it keeps serving after the terminal closes | `strata runtime stop --profile NAME` |
 | **The Desktop app's engines** | the app (profiles `app-1`, `app-2`, ...) | the app: its window, its process, its host | closing the app, or the app's unload |
 
@@ -39,7 +39,7 @@ in that order instead of the engine dying under a request.
 | The app is killed, crashes, logoff | the job object around the app ends the host, Control, the owner host, the server and the engine | the host sees its parent gone within a second, stops the engines cleanly; each owner follows the host's PID (`--die-with-pid`) | same |
 | The app's host crashes | each owner sees the host's PID gone (about a second) and stops its engine, drained | same | same |
 
-`strata_control/procs.py` is the identity rule behind every "is this still the process I started": PID **and** start time
+`terminal/strata_control/procs.py` is the identity rule behind every "is this still the process I started": PID **and** start time
 **and** command line, checked again at the moment of each signal. A PID alone is never signalled.
 
 ## Leftovers, and how they are found
@@ -70,9 +70,9 @@ the `f-split-life` stream for what it would need).
 
 ## Proving it
 
-`tests/terminal/lifecycle_matrix.py` runs every case above with a fake engine package, or a real engine
+`terminal/tests/terminal/lifecycle_matrix.py` runs every case above with a fake engine package, or a real engine
 (`--config RUN.json --components DIR --vram`), and asserts after each: no process of the tree is left, the port is free, the
-runtime lease can be taken, the GPU memory returned. `tests/terminal/test_lifecycle_matrix.py` is the pytest wrapper (the
-cases that need a console window run with `STRATA_MATRIX_CONSOLE=1`). `apps/desktop/scripts/app-close-matrix.py` drives the
+runtime lease can be taken, the GPU memory returned. `terminal/tests/terminal/test_lifecycle_matrix.py` is the pytest wrapper (the
+cases that need a console window run with `STRATA_MATRIX_CONSOLE=1`). `app/desktop/scripts/app-close-matrix.py` drives the
 installed Windows app (normal close, window X, killed app, host crash, second launch, two engines).
-`tests/terminal/ssh_disconnect.py` drops a real ssh session on a Linux box.
+`terminal/tests/terminal/ssh_disconnect.py` drops a real ssh session on a Linux box.

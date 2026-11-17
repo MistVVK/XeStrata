@@ -5,7 +5,7 @@
 The engine reads its settings from environment variables whose names start with `STRATA_`. The Terminal and the app choose what
 your hardware needs, so most people never set one. This page lists the ones meant for people: switches that are off until you
 turn them on, and switches that take a newer default back to the earlier behaviour. The other settings are for measuring and
-debugging and are kept in `data/settings-register.json`.
+debugging and are kept in `terminal/data/settings-register.json`.
 
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.

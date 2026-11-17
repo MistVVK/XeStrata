@@ -16,7 +16,7 @@ GSQ-RCO Q2_0 with the MTP draft layer, 32K context, Int8 KV.
   prompt GEMMs and prompt experts, so those fell back to hipBLAS / portable kernels. It is now in the list and
   the parity tests run on it (`hip_prefill_wmma_gemm_parity`, `hip_prompt_attn_wmma`, `hip_prefill_fused_moe`,
   `hip_prefill_fused_iq`, `qsa_*`, `hip_gemm_f16_io_parity`, `hip_prefill_mmq_parity`).
-- **A hipBLASLt table** for gfx1103 + hipBLASLt `100401`: `tools/hip/gfx1103-hipblaslt-100401.txt` (section 3).
+- **A hipBLASLt table** for gfx1103 + hipBLASLt `100401`: `terminal/tools/hip/gfx1103-hipblaslt-100401.txt` (section 3).
 - **The gfx1103 exact speed switches** (section 4), written into the config's `env` by setup for the opt-in install
   (the engine keeps gfx1103 out of its exact-switch arch defaults (the prompt set of section 5 is separate), as it does for gfx1150). Whether the chip leaves the
   `STRATA_EXPERIMENTAL_GFX1103=1` opt-in is the maintainers' call; the numbers here are what they need to make it.
@@ -31,7 +31,7 @@ the wheel route was not exercised by the numbers below - they come from a hand b
 By hand, the steps of [STRIX_HALO.md](STRIX_HALO.md) with the architecture and the paths changed:
 
 ```sh
-cmake -S . -B build-780m -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S engine -B build-780m -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
   -DCMAKE_HIP_ARCHITECTURES=gfx1103 \
   -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
@@ -42,12 +42,12 @@ ctest --test-dir build-780m
 ```
 
 `ctest` on this machine: 57 passed, 2 skipped (`hip_prefill_hcd_exact_parity`, `hip_prefill_hipblaslt_gemm` -
-they run and pass with the table set), 2 environmental failures (`ple_parity` needs the `bench/micro` fixtures,
+they run and pass with the table set), 2 environmental failures (`ple_parity` needs the `engine/bench/micro` fixtures,
 `platform_memory_test` needs a memlock limit above 8 MiB; this host's hard limit is 8 MiB).
 
-The model: a GSQ-RCO Q2_0 pack (`tools/iq_pack.py`, the experts read from the GGUF in place), the PLE table on
+The model: a GSQ-RCO Q2_0 pack (`terminal/tools/iq_pack.py`, the experts read from the GGUF in place), the PLE table on
 the SSD (`--ple-io direct`), `--mmap-experts --expert-cache 24576`, `--prefill auto`, MTP from
-`tools/mtp_fetch.py` + `mtp_pack.py` + `mtp_rt.py`. GTT must be raised for this model (`ttm.pages_limit`; setup
+`terminal/tools/mtp_fetch.py` + `mtp_pack.py` + `mtp_rt.py`. GTT must be raised for this model (`ttm.pages_limit`; setup
 changes no host setting).
 
 ## 3. The hipBLASLt table
@@ -132,14 +132,14 @@ this checkout's own documentation, 128 greedy tokens each: prefill holds ~310 to
 the average over the full read, and the last ~14K tokens at 128K depth read at ~206 tok/s with the prefix cached.
 Decode holds ~16 tok/s to 32K, then 12.1 at 64K and 9.8-9.9 at 96-128K (draft acceptance stays ~70%, so it is
 context cost, not the drafter). Memory stays flat: 38.1 of 50 GiB GTT at 131K. Raw:
-[bench/results/2026-10-12-community-gfx1103](bench-results/2026-10-12-community-gfx1103/README.md).
+[docs/bench-results/2026-10-12-community-gfx1103](bench-results/2026-10-12-community-gfx1103/README.md).
 
 ## 8. Not tested
 
 - The TheRock-wheel install for gfx1103 (the hand build above is what was measured).
 - The opt-in set beyond one round; KL of any bit-changing switch; other models; contexts past 131K.
 - CUDA and SYCL were not built here (no toolchains on this box); the added gfx1103 macros are undefined for them.
-- Reset stability looks good but is one machine: a 2 h 07 m soak (`tools/serve_load.py`, 924 requests) and the
+- Reset stability looks good but is one machine: a 2 h 07 m soak (`terminal/tools/serve_load.py`, 924 requests) and the
   reset-prone combination from 7.10 (partial expert cache + `STRATA_IO_PREFETCH=1` + the adaptive tier) both ran
   with zero `amdgpu` resets in the kernel log. The known 780M issue ([DETAILS.md](DETAILS.md)) was seen on ROCm
   7.10; with `cwsr_enable=0` and this stack it did not reproduce.

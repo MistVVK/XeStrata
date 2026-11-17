@@ -1,0 +1,32 @@
+libz.so.1: the zlib compression library
+
+This engine package carries an unmodified copy of libz.so.1 from the build machine. The oneAPI Unified Runtime loader
+libur_loader.so.0 in this package needs it, and some Linux systems (containers, minimal installs) do not have it.
+The 0.2.16 Intel Arc (SYCL) package bundles zlib 1.3 from Ubuntu 24.04 (distribution package zlib1g 1:1.3.dfsg-3.1ubuntu2.3).
+
+License: the zlib License (SPDX: Zlib). The text below is the license block of the build machine's
+/usr/share/doc/zlib1g/copyright, verbatim:
+
+ This software is provided 'as-is', without any express or implied
+ warranty.  In no event will the authors be held liable for any damages
+ arising from the use of this software.
+ .
+ Permission is granted to anyone to use this software for any purpose,
+ including commercial applications, and to alter it and redistribute it
+ freely, subject to the following restrictions:
+ .
+ 1. The origin of this software must not be misrepresented; you must not
+    claim that you wrote the original software. If you use this software
+    in a product, an acknowledgment in the product documentation would be
+    appreciated but is not required.
+ 2. Altered source versions must be plainly marked as such, and must not be
+    misrepresented as being the original software.
+ 3. This notice may not be removed or altered from any source distribution.
+ .
+ Jean-loup Gailly        Mark Adler
+ jloup@gzip.org          madler@alumni.caltech.edu
+
+Copyright: 1995-2013 Jean-loup Gailly and Mark Adler (zlib); the distribution's packaging files: 2000-2017 Mark Brown.
+
+Source code: https://zlib.net/. The exact source of this copy is the source package of the distribution package named below
+(for Debian and Ubuntu: `apt-get source` of the zlib package that built it).
