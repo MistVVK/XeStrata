@@ -626,11 +626,14 @@ class Training(unittest.TestCase):
 
     def test_distilled_models_use_full_step_base(self):
         from serve import images as img
+        self.assertNotIn("moss-image-base-4-step", lt.DISTILLED)
+        self.assertNotIn("moss-image-base-4-step-uncensored", lt.DISTILLED)
+        self.assertEqual(lt.training_model("moss-image-4-step-uncensored")[0], "moss-image-uncensored")
         cases = [("mage-flow-turbo", "mage-flow"), ("moss-image-4-step", "moss-image"),
-                 ("moss-image-base-4-step", "moss-image-base"), ("anima-turbo", "anima-base"),
+                 ("anima-turbo", "anima-base"),
                  ("qwen-image-2.1-turbo", "qwen-image-2.1")]
-        families = {"mage-flow": "mage-flow", "moss-image": "moss-image", "moss-image-base": "moss-image",
-                    "anima-base": "anima", "qwen-image-2.1": "qwen-image"}
+        families = {"mage-flow": "mage-flow", "moss-image": "moss-image", "anima-base": "anima",
+                    "qwen-image-2.1": "qwen-image"}
         for requested, base in cases:
             with self.subTest(model=requested):
                 gen = FakeGen(self.root, model=base, family=families[base])

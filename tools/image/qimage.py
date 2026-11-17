@@ -848,8 +848,7 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
 TRAINING_BASE = {"qwen-image-turbo": "qwen-image-base", "qwen-image-turbo-uncensored": "qwen-image-base-uncensored",
                  "mage-flow-turbo": "mage-flow", "mage-flow-turbo-uncensored": "mage-flow-uncensored",
                  "moss-image-4-step": "moss-image", "moss-image-4-step-uncensored": "moss-image-uncensored",
-                 "moss-image-base-4-step": "moss-image-base",
-                 "moss-image-base-4-step-uncensored": "moss-image-base-uncensored", "anima-turbo": "anima-base"}
+                 "anima-turbo": "anima-base"}
 
 DEFAULT_MODEL = "qwen-image-turbo"
 # the image models setup's question and the Windows launcher's checkboxes offer a text model set up for the first
