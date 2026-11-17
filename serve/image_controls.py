@@ -229,6 +229,13 @@ def parse_control(v: Any, cfg: dict, picture: bytes | None = None) -> dict:
     out: dict[str, Any] = {"type": kind, "image": _picture(v, picture), "mode": mode,
                            "resolution": int(_num(v, "resolution", 64, MAX_RESOLUTION, RESOLUTION)),
                            "params": _params(v, kind)}
+    lineart_input = v.get("lineart_input")
+    if lineart_input is not None and (mode != "controlnet" or kind not in ("lineart", "lineart_coarse")):
+        raise img.ImageRequestError("control.lineart_input: photo or drawing for a preprocessed ControlNet lineart")
+    if mode == "controlnet" and kind in ("lineart", "lineart_coarse"):
+        if lineart_input not in (None, "photo", "drawing"):
+            raise img.ImageRequestError("control.lineart_input: photo or drawing")
+        out["lineart_input"] = lineart_input or "photo"
     if mode == "controlnet":
         out["strength"] = _num(v, "strength", 0.0, 2.0, 1.0)
         out["start"] = _num(v, "start", 0.0, 1.0, 0.0)
@@ -326,11 +333,44 @@ def _png(rgba: bytes, w: int, h: int) -> bytes:
     return buf.getvalue()
 
 
+def _lineart_map(png: bytes, drawing: bool) -> bytes:
+    """A smooth white-on-black outline: raw HED for a photo, or the drawing itself."""
+    from PIL import Image, ImageFilter, ImageOps
+    import statistics
+
+    with Image.open(io.BytesIO(png)) as pic:
+        rgba = pic.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, "white")
+        gray = ImageOps.grayscale(Image.alpha_composite(background, rgba).convert("RGB"))
+    if drawing:
+        w, h = gray.size
+        border = [gray.getpixel((x, y)) for x in range(w) for y in (0, h - 1)]
+        border += [gray.getpixel((x, y)) for y in range(h) for x in (0, w - 1)]
+        if statistics.median(border) >= 128:
+            gray = ImageOps.invert(gray)
+    gray = gray.filter(ImageFilter.MaxFilter(3))
+    if drawing:
+        gray = gray.filter(ImageFilter.GaussianBlur(0.5))
+    out = io.BytesIO()
+    gray.convert("RGB").save(out, "PNG")
+    return out.getvalue()
+
+
 def preprocess(svc, gen, c: dict, cancel=None) -> dict:
     """The control image of the control `c` (parse_control's): the engine's CONTROL in a GPU turn of its own (its
     networks' weights image_aux's: AuxPending while they download) -> {"image": PNG bytes, "width", "height",
     "seconds", "engine_s"}; type "none": the picture as it is (a PNG)."""
     t0 = time.monotonic()
+    if c.get("lineart_input"):
+        if c["lineart_input"] == "drawing":
+            png = _lineart_map(img.as_png(c["image"]), True)
+            w, h = img.image_dims(png)
+            return {"image": png, "width": w, "height": h, "seconds": round(time.monotonic() - t0, 3),
+                    "engine_s": 0.0}
+        made = preprocess(svc, gen, {**c, "type": "hed", "params": {"safe": False}, "lineart_input": None}, cancel)
+        made["image"] = _lineart_map(made["image"], False)
+        made["seconds"] = round(time.monotonic() - t0, 3)
+        return made
     if c["type"] == "none":
         png = img.as_png(c["image"])
         w, h = img.image_dims(png)
@@ -376,7 +416,10 @@ def prepare(svc, gen, job: dict, cancel=None) -> None:
         _prepare_moss(svc, gen, job, cancel)
         return
     # every weight's download started at once (the branch's 7 GB beside the network's), then the map
-    names = weight_names(c["type"], mode) if c["type"] != "none" else weight_names("canny", mode)
+    prep_kind = "hed" if c.get("lineart_input") == "photo" else c["type"]
+    if c.get("lineart_input") == "drawing":
+        prep_kind = "canny"   # no preprocessor network; the ControlNet is still needed
+    names = weight_names(prep_kind, mode) if prep_kind != "none" else weight_names("canny", mode)
     weights(gen, names)
     made = preprocess(svc, gen, c, cancel)
     c["figures"] = {"type": c["type"], "size": f"{made['width']}x{made['height']}", "seconds": made["seconds"],
@@ -531,7 +574,7 @@ def preview_response(svc, gen, req: dict, base_url: str, cancel=None) -> dict:
     else:
         # the map alone: checked as a ControlNet's fields whatever the model (no strength applies here)
         c = parse_control({**{k: v for k, v in fields.items() if k not in ("strength", "start", "end")}},
-                          {"family": "qwen-image"}, req["picture"])
+                          gen.cfg, req["picture"])
         made = preprocess(svc, gen, c, cancel)
     entry = ({"url": f"{base_url}/v1/images/files/{gen.store(made['image'], 'png')}"}
              if req["response_format"] == "url" else {"b64_json": base64.b64encode(made["image"]).decode()})

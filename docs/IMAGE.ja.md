@@ -285,7 +285,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
    - `pose`: 人物の姿勢（YOLOX-L で人を見つけ、DWPose で体・手・顔の点を取り、OpenPose の形に描く）。`detect_body`・`detect_hands`・`detect_face`（既定はすべて `true`）。
    - `depth`: 深度（Depth Anything V2 Small。近いほど白）。
    - `canny`: 輪郭（Canny）。`low_threshold`・`high_threshold`（既定 100・200）。
-   - `lineart`・`lineart_coarse`: 線画（細い線、粗い線）。
+   - `lineart`・`lineart_coarse`: 線画。Qwen-Image-2.1 では写真から HED の丸めない輪郭を作り、3×3 で太らせます。細い線やハッチングは制御でなく図そのものとして写されやすいためです。手描きの線画には `lineart_input: "drawing"` を付けると、明るい背景を黒へ反転し、線を太らせて軽くぼかします。ほかのモデルは細い線・粗い線を使います。
    - `hed`: 柔らかい輪郭（HED。`safe` で段に丸める、既定 `true`）。`scribble_hed`: その輪郭から作る下描き。
    - `scribble`: 画像そのものの暗い線。`scribble_xdog`: 拡張したガウスの差（XDoG）で作る下描き（`threshold`、既定 12）。
    - `mlsd`: 直線（M-LSD。部屋や建物）。`score_threshold`・`distance_threshold`（既定 0.1・0.1）。

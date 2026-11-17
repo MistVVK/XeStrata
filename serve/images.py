@@ -4060,6 +4060,8 @@ TOOLS: list[dict[str, Any]] = [
          "size": {"type": "string", "description": "WxH"},
          "strength": {"type": "number"},
          "end": {"type": "number"},
+         "lineart_input": {"type": "string", "enum": ["photo", "drawing"],
+                           "description": "for ControlNet lineart: drawing for a hand-drawn sketch"},
          "seed": {"type": "integer"}},
          "required": ["prompt", "type"]}},
     {"name": "remove_background",
@@ -5098,7 +5100,8 @@ class ImageTools:
                 data = self._image(str(args.get("image") or ""))
                 if data is None:
                     raise ImageRequestError("there is no picture in the conversation to take the composition from")
-                req["control"] = {k: args[k] for k in ("type", "strength", "end") if args.get(k) not in (None, "")}
+                req["control"] = {k: args[k] for k in ("type", "strength", "end", "lineart_input")
+                                  if args.get(k) not in (None, "")}
                 job = _controls().parse_job(req, gen.cfg, picture=self.normalize(data))
             else:
                 raise ImageRequestError(f"there is no tool named {name!r}")
