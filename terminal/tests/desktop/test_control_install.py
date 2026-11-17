@@ -271,6 +271,58 @@ class InstallerServerTests(unittest.TestCase):
         # a resumed install counts what is already on disk
         self.assertGreater(self.mcp.combined_progress(dict(step5), job)["download"]["done_gb"], 0)
 
+    def test_files_here_says_complete_only_for_every_file_whole_at_its_pinned_size(self):
+        """The app's first run showed "111.3 GB to download" for files that were already in the model folder. The plan now says whether they are all there whole
+        (files_complete) and what is still to fetch (download_left_gb), from the pinned sizes: a file of another size, a .part or a missing file is not whole."""
+        class FakeSetup:
+            MODELS = {"M": {}}
+            MMPROJ = "mm.gguf"
+            FAMILIES = {"f": {"tag": "t-", "mmproj": "mm.gguf", "mmproj_sha256": (500_000_000, "x"), "sha256": {"a-1.gguf": (3_000_000_000, "x"), "a-2.gguf": (1_000_000_000, "x")}}}
+
+            @staticmethod
+            def model_shards(fam, model):
+                return 2
+
+            @staticmethod
+            def model_file(fam, model, i):
+                return f"a-{i}.gguf"
+
+            @staticmethod
+            def fam_pin(fam, path):
+                return fam["sha256"][path.name]
+
+        class Sized(FakeSetup):                          # the checks compare real sizes: shrink them to small files through the pins
+            FAMILIES = {"f": {**FakeSetup.FAMILIES["f"], "mmproj_sha256": (50, "x"), "sha256": {"a-1.gguf": (300, "x"), "a-2.gguf": (100, "x")}}}
+
+        models = self.root / "models"
+        folder = models / "t-M"
+        folder.mkdir(parents=True)
+        here = lambda vision=True: self.mcp.files_here(Sized, "f", "M", models, vision)
+        self.assertEqual(here(), {"complete": False, "left_gb": 0.0, "total_gb": 0.0})   # nothing there (the byte counts are tiny: 0.0 GB)
+        (folder / "a-1.gguf").write_bytes(b"x" * 300)
+        (folder / "a-2.gguf").write_bytes(b"x" * 100)
+        self.assertFalse(here()["complete"], "the picture reader is missing")
+        self.assertTrue(here(vision=False)["complete"])
+        (models / "mm.gguf").write_bytes(b"x" * 50)
+        self.assertTrue(here()["complete"])
+        (folder / "a-2.gguf").write_bytes(b"x" * 99)             # another size: cut short or another file
+        self.assertFalse(here()["complete"])
+        (folder / "a-2.gguf").write_bytes(b"x" * 100)
+        (folder / "a-2.gguf.part").write_bytes(b"x")             # a download under way for it
+        self.assertFalse(here()["complete"])
+        # unknown sizes (an unpinned file): nothing is claimed
+        class Unpinned(Sized):
+            @staticmethod
+            def fam_pin(fam, path):
+                raise KeyError(path.name)
+        self.assertIsNone(self.mcp.files_here(Unpinned, "f", "M", models, False))
+        # the left-to-download figure in GB, with the real pinned sizes
+        (folder / "a-2.gguf.part").unlink()
+        (folder / "a-1.gguf").unlink()
+        sizes = self.mcp.files_here(FakeSetup, "f", "M", models, False)
+        self.assertEqual(sizes, {"complete": False, "left_gb": 4.0, "total_gb": 4.0})
+        self.assertIsNone(self.mcp.files_here(object(), "f", "M", models, False), "a setup module that cannot name the files")
+
     def test_a_model_in_parts_counts_every_part_and_the_picture_reader(self):
         """QA 2026-10-18 (6): the bar stopped at 99 % while the picture reader downloaded, and a first whole part looked like a finished
         model. Every part is counted, the picture reader is a part of its own, and 'done' needs all of them."""
@@ -406,6 +458,11 @@ class DeleteModelTests(unittest.TestCase):
         self.root = base / "install"
         self.root.mkdir()
         self.data = base / "Strata-data"
+        # The data folder Control may delete from is the one the settings file names (strata_mcp.Strata.data_dir): without this a PC that has its own settings
+        # file (Windows: %APPDATA%\Strata\settings.json, the person's data_dir) made every folder of this test's fake data "outside Strata's folders".
+        isolated = mock.patch.dict(os.environ, {"STRATA_SETTINGS_FILE": str(base / "no-settings.json")})
+        isolated.start()
+        self.addCleanup(isolated.stop)
         spec = importlib.util.spec_from_file_location("strata_mcp_for_delete", ROOT / "tools" / "strata_mcp.py")
         self.mcp = importlib.util.module_from_spec(spec)
         with mock.patch.dict(os.environ, {"STRATA_CONTROL_INSTALL": "1", "STRATA_INSTALL_DIR": str(self.root)}):

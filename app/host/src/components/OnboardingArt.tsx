@@ -10,6 +10,8 @@ export function OnboardingArt({ kind = 'welcome', progress = 0, counter }: {
         value: number | undefined;
         label: string;
         key: string;
+        plain?: boolean;
+        note?: string;
     };
 }) {
     return <div className={`onboard-art onboard-art--${kind}`} aria-hidden={kind !== 'download'}>
@@ -23,7 +25,7 @@ export function OnboardingArt({ kind = 'welcome', progress = 0, counter }: {
   </> : kind === 'download' ? <>
    <div aria-hidden="true" className="onboard-data-packet packet-one"><Icon name="file" size={18}/></div><div aria-hidden="true" className="onboard-data-packet packet-two"><Icon name="image" size={18}/></div><div aria-hidden="true" className="onboard-data-packet packet-three"><Icon name="file" size={18}/></div>
    <div aria-hidden="true" className="onboard-download-core"><div className="onboard-download-ring" style={{ '--download-progress': `${Math.min(100, Math.max(0, progress))}%` } as React.CSSProperties}><Icon name="models" size={40}/></div><div className="onboard-download-stack"><i /><i /><i /></div></div>
-   {tr(counter ? <DownloadCounter key={counter.key} value={counter.value} label={tr(counter.label)}/> : null)}
+   {tr(counter ? <DownloadCounter key={counter.key} value={counter.value} label={tr(counter.label)} plain={counter.plain} note={counter.note ? tr(counter.note) : undefined}/> : null)}
   </> : <>
    <div className="onboard-chip"><div className="onboard-chip-pins"/><Icon name="cpu" size={56}/><div className="onboard-chip-light"/></div>
    <div className="onboard-float onboard-float--cpu"><Icon name="cpu" size={18}/><span>{tr("Your CPU")}<small>{tr("Finding its rhythm")}</small></span></div>
@@ -32,9 +34,13 @@ export function OnboardingArt({ kind = 'welcome', progress = 0, counter }: {
   </>)}
  </div>;
 }
-function DownloadCounter({ value, label }: {
+function DownloadCounter({ value, label, plain, note }: {
     value: number | undefined;
     label: string;
+    /** No number: a check mark and the label (the files are already here). */
+    plain?: boolean;
+    /** One more line under the label. */
+    note?: string;
 }) {
     // Reset at each shard; animate only from reported download data.
     const [shown, setShown] = useState(value), previous = useRef(value);
@@ -52,7 +58,7 @@ function DownloadCounter({ value, label }: {
         frame = requestAnimationFrame(tick);
         return () => cancelAnimationFrame(frame);
     }, [value]);
-    return <div className="onboard-download-counter" role="img" aria-label={tr(value === undefined ? label : `${value.toFixed(1)} ${label}`)}><Icon name="download" size={18}/><strong aria-hidden="true">{tr(shown === undefined ? '···' : shown.toFixed(1))}</strong><span aria-hidden="true">{tr(label)}</span></div>;
+    return <div className="onboard-download-counter" data-plain={plain || undefined} role="img" aria-label={tr(plain ? label : value === undefined ? label : `${value.toFixed(1)} ${label}${note ? ' · ' + note : ''}`)}><Icon name={plain ? 'check' : 'download'} size={18}/>{plain ? null : <strong aria-hidden="true">{tr(shown === undefined ? '···' : shown.toFixed(1))}</strong>}<span aria-hidden="true">{tr(label)}</span>{note ? <small aria-hidden="true">{note}</small> : null}</div>;
 }
 const tour = [
     { label: 'Time-skip', command: '/time-skip', prompt: 'Improve this launch plan.', title: 'Keep the stronger idea.', description: 'Type /time-skip and what you want to improve. Strata explores a revision, compares it with the original, and keeps the stronger version.', badge: '', steps: ['Save the original', 'Explore a revision', 'Compare and keep'] },
