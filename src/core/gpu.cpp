@@ -22,6 +22,13 @@
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
 
 namespace strata::gpu {
 
@@ -51,6 +58,7 @@ std::mutex g_live_mu;
 std::map<const void*, std::pair<size_t, int>> g_live;   // the block's bytes and engine device
 size_t g_live_bytes = 0;
 std::map<int, size_t> g_live_on;                        // per engine device
+std::map<int, size_t> g_live_peak;                      // high-water mark per engine device
 
 std::string refusal_state() {
     size_t held = 0, n = 0;
@@ -191,6 +199,7 @@ void* alloc_device(size_t bytes) {
         g_live[p] = {bytes, rt().ordinal()};
         g_live_bytes += bytes;
         g_live_on[rt().ordinal()] += bytes;
+        g_live_peak[rt().ordinal()] = std::max(g_live_peak[rt().ordinal()], g_live_on[rt().ordinal()]);
         return p;
     } catch (const std::exception& e) { fail("alloc_device", e); return nullptr; }
 }
@@ -199,6 +208,141 @@ size_t device_held() {
     std::lock_guard<std::mutex> lock(g_live_mu);
     const auto it = g_live_on.find(rt().ordinal());
     return it != g_live_on.end() ? it->second : 0;
+}
+
+size_t device_peak_held() {
+    std::lock_guard<std::mutex> lock(g_live_mu);
+    const auto it = g_live_peak.find(rt().ordinal());
+    return it != g_live_peak.end() ? it->second : 0;
+}
+
+namespace {
+// Linux DRM fdinfo is per client, not per fd. The runtime may hold several fds for one client; count it once.
+bool drm_process_memory(const std::string& pci, size_t& bytes) {
+#if defined(__linux__)
+    std::map<std::string, uint64_t> clients;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/proc/self/fdinfo", ec)) {
+        std::ifstream in(e.path());
+        std::string line, driver, device, client;
+        uint64_t vram = 0;
+        bool found = false;
+        while (std::getline(in, line)) {
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            const std::string key = line.substr(0, colon);
+            std::istringstream value(line.substr(colon + 1));
+            if (key == "drm-driver") value >> driver;
+            else if (key == "drm-pdev") value >> device;
+            else if (key == "drm-client-id") value >> client;
+            else if (key.rfind("drm-total-vram", 0) == 0 || key == "drm-memory-vram") {
+                uint64_t n = 0;
+                std::string unit;
+                if (!(value >> n)) continue;
+                value >> unit;
+                if (unit == "KiB") n *= 1024;
+                else if (unit == "MiB") n *= uint64_t{1024} * 1024;
+                else if (!unit.empty() && unit != "B") continue;
+                vram += n;
+                found = true;
+            }
+        }
+        if (!found || device != pci || (driver != "xe" && driver != "amdgpu")) continue;
+        if (client.empty()) client = e.path().filename().string();
+        clients[client] = std::max(clients[client], vram);
+    }
+    if (clients.empty()) return false;
+    uint64_t total = 0;
+    for (const auto& [client, n] : clients) { (void) client; total += n; }
+    bytes = (size_t) total;
+    return true;
+#else
+    (void) pci;
+    (void) bytes;
+    return false;
+#endif
+}
+// The optional contrib-llvm NVIDIA driver API reports this process directly, including its primary context and
+// runtime pools. Load it at runtime; the free build has no path through the non-free library.
+bool nvml_process_memory(const std::string& pci, size_t& bytes) {
+#if defined(__linux__) && defined(STRATA_NVML)
+    // nvmlProcessInfo_t as used by nvmlDeviceGetComputeRunningProcesses_v3 (the stable v2 record layout).
+    struct Process { unsigned int pid; unsigned long long used; unsigned int gpu_instance, compute_instance; };
+    struct Api {
+        void* lib = nullptr;
+        int (*init)() = nullptr;
+        int (*handle)(const char*, void**) = nullptr;
+        int (*processes)(void*, unsigned int*, Process*) = nullptr;
+        Api() {
+            lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
+            if (lib == nullptr) return;
+            init = reinterpret_cast<decltype(init)>(dlsym(lib, "nvmlInit_v2"));
+            handle = reinterpret_cast<decltype(handle)>(dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2"));
+            processes = reinterpret_cast<decltype(processes)>(dlsym(lib, "nvmlDeviceGetComputeRunningProcesses_v3"));
+            if (init == nullptr || handle == nullptr || processes == nullptr || init() != 0) processes = nullptr;
+        }
+    };
+    static const Api api;
+    if (api.processes == nullptr) return false;
+    void* device = nullptr;
+    if (api.handle(pci.c_str(), &device) != 0) return false;
+    unsigned int count = 0;
+    constexpr int kInsufficientSize = 7;
+    const int first = api.processes(device, &count, nullptr);
+    if (first != 0 && first != kInsufficientSize) return false;
+    if (count == 0) return false;
+    std::vector<Process> rows(count);
+    if (api.processes(device, &count, rows.data()) != 0) return false;
+    bool found = false;
+    unsigned long long total = 0;
+    for (unsigned int i = 0; i < count; ++i) {
+        if (rows[i].pid != static_cast<unsigned int>(getpid())) continue;
+        if (rows[i].used == ~0ULL || total > ~0ULL - rows[i].used) return false;
+        total += rows[i].used;
+        found = true;
+    }
+    if (!found || total > SIZE_MAX) return false;
+    bytes = static_cast<size_t>(total);
+    return true;
+#else
+    (void) pci;
+    (void) bytes;
+    return false;
+#endif
+}
+}  // namespace
+
+bool process_memory(size_t* bytes, const char** source) {
+    auto& runtime = rt();
+    const size_t live = device_held();
+    size_t reported = 0;
+    const std::string pci = core::device_info(runtime.ordinal()).pci;
+    if (drm_process_memory(pci, reported)) {
+        *bytes = std::max(reported, live);
+        *source = "fdinfo";
+        return true;
+    }
+    if (nvml_process_memory(pci, reported)) {
+        *bytes = std::max(reported, live);
+        *source = "nvml";
+        return true;
+    }
+    size_t free = 0, total = 0, short_b = 0;
+    if (!mem_info(&free, &total, &short_b)) return false;
+    if (auto before = runtime.free_before_context()) {
+        // mem_info may cap total at XESTRATA_VRAM_LIMIT_MIB; short_b restores any use above that cap.
+        const uint64_t physical = runtime.device().get_info<sycl::info::device::global_mem_size>();
+        const uint64_t occupied = (uint64_t) total - free + short_b;
+        const uint64_t now_free = physical > occupied ? physical - occupied : 0;
+        const uint64_t used = *before > now_free ? *before - now_free : 0;
+        // The report can move by a fraction of a MiB as kernels load; round the estimate up, never down.
+        *bytes = std::max(live, (size_t) ((used + ((uint64_t{1} << 20) - 1)) & ~((uint64_t{1} << 20) - 1)));
+        *source = "delta";
+        return true;
+    }
+    *bytes = std::max(live, total - free + short_b);
+    *source = "global";
+    return true;
 }
 
 namespace {
@@ -320,6 +464,7 @@ VmemSegment* vmem_map(void* va, size_t bytes) {
             g_live[va] = {bytes, rt().ordinal()};
             g_live_bytes += bytes;
             g_live_on[rt().ordinal()] += bytes;
+            g_live_peak[rt().ordinal()] = std::max(g_live_peak[rt().ordinal()], g_live_on[rt().ordinal()]);
         }
         return seg;
     } catch (const std::exception& e) { fail("vmem_map", e); return nullptr; }

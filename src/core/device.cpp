@@ -45,6 +45,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <fstream>
 #include <string>
@@ -154,6 +155,26 @@ std::string no_gpu_listed() {
            "SYCL_UR_TRACE=1 shows which adapters load";
 }
 
+// The same device/OS limit used by gpu::mem_info, before the context holds any tracked allocations. A unified-memory
+// device's changing system-RAM limit cannot be reconstructed from a single free-memory delta.
+std::optional<uint64_t> free_before_context_probe(const sycl::device& d) {
+    try {
+        if (integrated_gpu(d)) return std::nullopt;
+        uint64_t free = 0;
+        if (!device_free_memory(d, free) || free == 0) return std::nullopt;
+        const uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
+        const std::string pci = pci_of(d);
+        apply_os_budget(pci, free);
+        const uint64_t margin = unreported_vram_margin(pci, total);
+        if (margin > 0) free = std::min(free, total > margin ? total - margin : 0);
+        return free > 0 ? std::optional<uint64_t>(free) : std::nullopt;
+    } catch (const std::exception&) { return std::nullopt; }
+}
+
+// Read before the executable-kernel probe creates a context: the later process-memory delta must include that
+// probe's retained runtime allocations as well as the main context's.
+std::map<std::string, uint64_t> g_free_before_probe;
+
 // The GPUs the engine can drive, device 0 first: the GPU chosen below, then the others in the same order of
 // preference.  Read once.
 std::vector<sycl::device> find_devices() {
@@ -161,6 +182,13 @@ std::vector<sycl::device> find_devices() {
     std::string refused;
     for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
         if (!engine_backend(d)) continue;
+        try {
+            const std::string pci = pci_of(d);
+            if (const auto free = free_before_context_probe(d); pci != "?" && free)
+                g_free_before_probe.emplace(pci, *free);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "xestrata: pre-probe GPU memory unavailable: %s\n", e.what());
+        }
         if (const std::string why = unusable(d); !why.empty()) {
             refused += "; " + d.get_info<sycl::info::device::name>() + " (" + pci_of(d) + "): " + why;
             continue;
@@ -509,7 +537,19 @@ namespace {
 void settle_vram(const sycl::device& d);
 }  // namespace
 
-Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), pci_(pci_of(device)), device_(device), context_(device_),
+namespace {
+std::optional<uint64_t> measure_before_context(const sycl::device& device) {
+    try {
+        if (const auto it = g_free_before_probe.find(pci_of(device)); it != g_free_before_probe.end()) return it->second;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+}  // namespace
+
+Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), pci_(pci_of(device)), device_(device),
+    free_before_context_(measure_before_context(device_)), context_(device_),
     compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
     transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {
     uint64_t visible = 0, used = 0, vram = 0;

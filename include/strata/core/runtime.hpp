@@ -10,6 +10,7 @@
 #include <exception>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -48,6 +49,8 @@ public:
     sycl::queue& transfer() { return transfer_; }
     const sycl::device& device() const { return device_; }
     const sycl::context& context() const { return context_; }
+    /// Free device memory read immediately before this runtime created its context, where the device reports it.
+    std::optional<uint64_t> free_before_context() const { return free_before_context_; }
 
     // Engine streams: further in-order queues on this context, for the work CUDA put on its own streams.  A void*
     // stream handed to a kernel is one of these, compute() or null (compute()), or a queue of another device's
@@ -125,6 +128,7 @@ private:
     std::mutex error_mutex_;
     std::exception_ptr error_;
     sycl::device device_;
+    std::optional<uint64_t> free_before_context_;
     sycl::context context_;
     sycl::queue compute_, transfer_;
     std::mutex streams_mutex_;
