@@ -9,6 +9,8 @@ import { useStore } from '../lib/store';
 import { Num } from './Num';
 import { useNative } from '../lib/native';
 import type { Session } from '../lib/types';
+import { api } from '../lib/client';
+import { roomBeforeSummary, type CompactionModel } from '../lib/compaction-room';
 function Chip({ icon, visual, label, live, title, children }: {
     icon?: IconName;
     /** The same words with the number as a moving element (the plain `label` stays for assistive technology). */
@@ -40,6 +42,16 @@ export function ChatTelemetry({ session }: {
     const working = !!session?.messages.some(x => x.streaming);
     useEffect(() => { if (!working) return; setNow(Date.now()); const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, [working]);
     const m = chatMetrics(session, monitor, runningContext ?? (engine ? contextTokens(engine.beginner.contextLength) : undefined), now);
+    // #5091: where the assistant starts summarising older messages by itself, from the host (the figure the agent decides on), shown beside the room left.
+    const [compaction, setCompaction] = useState<CompactionModel | null>(null);
+    useEffect(() => {
+        let alive = true;
+        api.get<{ model?: CompactionModel | null }>('/api/agent/compaction').then(v => { if (alive) setCompaction(v?.model ?? null); }).catch(() => { if (alive) setCompaction(null); });
+        return () => { alive = false; };
+    }, [m.max]);
+    // The host's figure is for the local model that answers now; a chat on a cloud or API model is summarised by that route's own rules, so it gets no row.
+    const remoteChat = session?.messages.filter(x => x.role === 'assistant').at(-1)?.remoteModel === true;
+    const room = roomBeforeSummary(m.used, m.max, remoteChat ? null : compaction);
     const speed = m.speed;
     if (!m.hasReplies)
         return null;
@@ -52,6 +64,6 @@ export function ChatTelemetry({ session }: {
     return <div className="telemetry xs muted" aria-label={tr("Chat statistics")}>
     <Chip icon="gauge" label={tr("{0}{1} tok/s{2}", [approx, speed === null ? tr('—') : Math.round(speed), m.streaming ? tr('') : tr(' · last reply')])} live={around(m.streaming ? "{0}{1} tok/s" : "{0}{1} tok/s · last reply", approx, <Num value={speed} format={int}/>)} title={tr("Session statistics")}>{tr(m.estimated ? <p className="xs muted">{tr("Live estimate from response length and elapsed time. Final usage comes from the engine.")}</p> : null)}<Row label={tr("Thinking time")} value={<Num value={m.thinkMs} format={dur}/>}/><Row label={tr("Writing time")} value={<Num value={m.writeMs} format={dur}/>}/><Row label={tr("Tool time")} value={<Num value={m.toolMs} format={dur}/>}/><Row label={tr("Average time to first token")} value={m.ttft === null ? tr('Not reported') : <Num value={m.ttft} format={dur}/>}/><Row label={tr("Latest response speed")} value={speed === null ? tr('Not reported') : <>{<Num value={speed} format={int}/>}{tr(' tokens/s')}</>}/><Row label={tr("Prompt reading")} value={m.promptSpeed === null ? tr('Not reported') : <>{<Num value={m.promptSpeed} format={int}/>}{tr(' tokens/s')}</>}/><Row label={tr("Turns / tool calls")} value={<><Num value={m.turns} format={int}/> / <Num value={m.steps} format={int}/></>}/></Chip>
     <Chip icon="memory" label={tr("{0}{1} total tokens", [approx, compactTokens(m.total)])} live={around("{0}{1} total tokens", approx, <Num value={m.total} format={compactTokens}/>)} title={tr("Token usage")}><Row label={tr("Total in this chat")} value={<Num value={m.total} format={compactTokens}/>}/><Row label={tr("Input tokens")} value={<Num value={m.input} format={compactTokens}/>}/><Row label={tr("Output tokens")} value={<Num value={m.output} format={compactTokens}/>}/></Chip>
-    <Chip visual={<ContextRing percent={m.pct}/>} label={tr(m.pct === null ? '—' : `${Math.round(m.pct)}% of context`)} live={m.pct === null ? undefined : <><Num value={m.pct} format={int}/>{tr('% of context')}</>} title={tr("Context length")}><Row label={tr("Context used")} value={m.pct === null ? tr('Not reported') : <><Num value={m.pct} format={int}/>%</>}/><div className="context-meter" role="meter" aria-label={tr("Context window used")} aria-valuemin={0} aria-valuemax={100} aria-valuenow={m.pct ?? undefined}><span style={{ width: `${m.pct ?? 0}%` }}/></div><Row label={tr("Current context")} value={<Num value={m.used} format={compactTokens}/>}/><Row label={tr("Context limit")} value={<Num value={m.max} format={compactTokens}/>}/><Row label={tr("Space remaining")} value={m.used !== null && m.max !== null ? <Num value={Math.max(0, m.max - m.used)} format={compactTokens}/> : '—'}/></Chip>
+    <Chip visual={<ContextRing percent={m.pct}/>} label={tr(m.pct === null ? '—' : `${Math.round(m.pct)}% of context`)} live={m.pct === null ? undefined : <><Num value={m.pct} format={int}/>{tr('% of context')}</>} title={tr("Context length")}><Row label={tr("Context used")} value={m.pct === null ? tr('Not reported') : <><Num value={m.pct} format={int}/>%</>}/><div className="context-meter" role="meter" aria-label={tr("Context window used")} aria-valuemin={0} aria-valuemax={100} aria-valuenow={m.pct ?? undefined}><span style={{ width: `${m.pct ?? 0}%` }}/></div><Row label={tr("Current context")} value={<Num value={m.used} format={compactTokens}/>}/><Row label={tr("Context limit")} value={<Num value={m.max} format={compactTokens}/>}/><Row label={tr("Space remaining")} value={m.used !== null && m.max !== null ? <Num value={Math.max(0, m.max - m.used)} format={compactTokens}/> : '—'}/>{tr(room !== null ? <Row label={tr("Room left before older messages are summarized")} value={<Num value={room} format={compactTokens}/>}/> : null)}</Chip>
   </div>;
 }
