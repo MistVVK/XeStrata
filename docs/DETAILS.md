@@ -17,7 +17,7 @@ New here? Start with the [README](../README.md). Installing is in [INSTALL.md](I
 > [History](#history--older-measurements)
 
 **Which flags go where.** `strata launch` has its own flags (`strata launch --help`). The engine and server flags below go
-in the `"args"` list of `strata-<model>.json` (source setup writes it) or on the `serve/server.py` command line.
+in the `"args"` list of `strata-<model>.json` (source setup writes it) or on the `terminal/serve/server.py` command line.
 `START-HERE.bat`, `SETUP.bat`, `./setup.sh` and `run-<model>` exist only in a [source checkout](SOURCE_INSTALL.md). An
 installed app has none of them.
 
@@ -69,7 +69,7 @@ cached). \*\* not measured again since 0.1.14.
 | **IQ3_S** | 52.4 | 53.3 | 48.3 | 46.3 | 45.5 | - |
 | **Coder** | 58.9 | 55.1 | 54.9 | 53.2 | 43.0 | 42.8† |
 
-† not measured again since 0.1.14. Raw data: `bench/results/2026-09-29-speed-0126`.
+† not measured again since 0.1.14. Raw data: `docs/bench-results/2026-09-29-speed-0126`.
 
 - Output speed depends on the text. Speculative decoding runs faster when more drafted tokens are accepted, so a different
   answer to the same prompt moves it by several percent.
@@ -82,7 +82,7 @@ cached). \*\* not measured again since 0.1.14.
   [BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md).
 
 More VRAM matters more than a faster GPU. Every extra GB holds about 700 more experts, and every expert on the GPU is one
-the CPU does not have to compute. `tools/make_profile.py` builds an expert profile from your own prompts: run the engine
+the CPU does not have to compute. `terminal/tools/make_profile.py` builds an expert profile from your own prompts: run the engine
 once with `--dump-routing trace.bin`, then see the tool's help. The shipped profile ranks every expert pair, so a trace
 changes the order only with `--reorder` (your trace's pairs first, then the base's, then the rest).
 
@@ -132,7 +132,7 @@ released app, run its installer and open Strata from the Start menu. For the Ter
 setup plan and the startup log for what is actually chosen on your machine, and see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 if a component is missing.
 
-Terminal chat from a checkout: `.venv\Scripts\python tools\chat.py`.
+Terminal chat from a checkout: `terminal\.venv\Scripts\python terminal\tools\chat.py`.
 
 ### Tuning for your PC (`--calibrate`)
 
@@ -175,7 +175,7 @@ hint under its `loaded ... GiB at ...` line.
 
 **Large pages need a new logon.** Granting "Lock pages in memory" (`secpol.msc`, User Rights Assignment) to the account
 that runs the engine takes effect at the next logon. Log off and on after granting it. Until then the startup log says
-large pages were refused. `tools\windows\enable_large_pages.ps1` (run as Administrator) grants it to the current account.
+large pages were refused. `terminal\tools\windows\enable_large_pages.ps1` (run as Administrator) grants it to the current account.
 
 ---
 
@@ -190,7 +190,7 @@ These notes are for **source setup**. Normal installs use [the Terminal or AppIm
 Source setup offers choices for the detected machine and can install missing Debian or Ubuntu dependencies with `sudo apt`.
 It starts the server on `http://127.0.0.1:8080` unless you configure another address or port. Later runs of `./setup.sh`
 or `./run-<model>.sh` start the model directly. The options are the same as on Windows (`./setup.sh --setup`,
-`--model Q2_0 --yes`, `--gguf-dir /data/Q2_0`). Terminal chat: `.venv/bin/python tools/chat.py`. Building from git and trying a pull
+`--model Q2_0 --yes`, `--gguf-dir /data/Q2_0`). Terminal chat: `terminal/.venv/bin/python terminal/tools/chat.py`. Building from git and trying a pull
 request: [SOURCE_INSTALL.md](SOURCE_INSTALL.md#build-from-git-on-linux-to-try-a-pull-request-or-change-the-code).
 
 - **Updating:** `git pull`, then `./setup.sh`. It compiles the engine again when its source changed. If the compile
@@ -339,7 +339,7 @@ new token shows no number.
 Profiling: start the server with `STRATA_DECODE_TIMING=1` (and `STRATA_VERIFY_PROFILE=1` for the GPU side). After each request
 the engine log has a `strata decode timing:` line and a `strata decode GPU stages (ms/window):` line. The GPU profile slows
 decoding a little: use it to compare, not to measure speed. `STRATA_LOOKAHEAD_STATS=1` scores the next-layer expert
-prediction every 100 windows and costs CPU. `tools/replay_cache_policy.py` replays a `--dump-routing` trace through the
+prediction every 100 windows and costs CPU. `terminal/tools/replay_cache_policy.py` replays a `--dump-routing` trace through the
 adaptive tier's swap policy offline.
 
 In the serial serve loop the timing line lists the wall-time parts in the order they run: `adapt wait + verify +
@@ -354,7 +354,7 @@ that reads this line must accept `ms/window = adapt wait` for a serial run.
 | --- | --- |
 | `--mtp` | Use the model's MTP draft layer (setup passes it). The server also runs without it: drafts then come from the suffix and prompt-lookup drafter only, every token is still verified, and the draft layer's ~0.7-1 GiB of VRAM goes to the expert cache. |
 | `--spec N`, `--spec-min-p P` | Draft depth and the confidence needed to add a guess. Setup's default is `--spec 4 --spec-min-p 0.5`. |
-| `--draft-vocab en\|cyrillic\|fr\|latin` (setup) | The draft layer can only propose tokens from a subset of the vocabulary. The default subset includes every Chinese, Japanese and Korean token. `en` keeps the English and code subset (~110 MiB less VRAM, English 1-2% faster, CJK gets almost no drafts). `cyrillic` and `fr` add those scripts; `latin` adds German, Spanish, French and Polish together. With no choice, Strata picks `cyrillic` or `latin` by itself when the languages of this computer (display language, regional format, keyboards) are Cyrillic or Latin-script and none of them is Chinese, Japanese or Korean; the pick is made at every start and written nowhere, and a choice you make always wins. On an RTX PRO 5000 (IQ3_S), default file -> chosen file, tok/s: Russian 180.0 -> 227.6 (`cyrillic`); German 211.7 -> 233.6, Spanish 220.1 -> 244.5, French 221.9 -> 249.1, Polish 188.4 -> 203.2 (`latin`); English 265.2 with the default, 266.0 with `latin`, 266.6 with `cyrillic`; Chinese 238.4 -> 199.2 and Japanese 222.2 -> 194.4 with `latin`, which is why any Chinese, Japanese or Korean signal keeps the default. `tools/draft_vocab.py` builds and inspects subsets. |
+| `--draft-vocab en\|cyrillic\|fr\|latin` (setup) | The draft layer can only propose tokens from a subset of the vocabulary. The default subset includes every Chinese, Japanese and Korean token. `en` keeps the English and code subset (~110 MiB less VRAM, English 1-2% faster, CJK gets almost no drafts). `cyrillic` and `fr` add those scripts; `latin` adds German, Spanish, French and Polish together. With no choice, Strata picks `cyrillic` or `latin` by itself when the languages of this computer (display language, regional format, keyboards) are Cyrillic or Latin-script and none of them is Chinese, Japanese or Korean; the pick is made at every start and written nowhere, and a choice you make always wins. On an RTX PRO 5000 (IQ3_S), default file -> chosen file, tok/s: Russian 180.0 -> 227.6 (`cyrillic`); German 211.7 -> 233.6, Spanish 220.1 -> 244.5, French 221.9 -> 249.1, Polish 188.4 -> 203.2 (`latin`); English 265.2 with the default, 266.0 with `latin`, 266.6 with `cyrillic`; Chinese 238.4 -> 199.2 and Japanese 222.2 -> 194.4 with `latin`, which is why any Chinese, Japanese or Korean signal keeps the default. `terminal/tools/draft_vocab.py` builds and inspects subsets. |
 | `--lookup-chain-min M`, `--mtp-hnorm stream`, `--mtp-draft-vocab FILE` | Finer controls: the shortest context match `--lookup-chain` extends (default 3), one norm per stream, and a token subset of your own. |
 
 When the start stops with "the draft head does not fit" (a 12 GB card with a long context), the engine says how much it needs
@@ -391,7 +391,7 @@ curl -X POST -H "Content-Type: application/json" localhost:8080/unload
 Monitor shows the state. Unloading ends the engine process and the image encoder, so their VRAM and RAM return at once. The
 model files stay in the OS file cache, so loading again takes seconds while that RAM is not needed elsewhere.
 
-**Lazy start.** `serve/server.py --engine strata --config strata-<model>.json --lazy` (or `"lazy_load": true`) starts the HTTP
+**Lazy start.** `terminal/serve/server.py --engine strata --config strata-<model>.json --lazy` (or `"lazy_load": true`) starts the HTTP
 API without the engine or the vision encoder. The first generation request or `POST /load` loads them, including
 `before_load` and `min_free_vram_mib`. `POST /v1/load` and `/v1/unload` are JSON control aliases (they need the API key,
 `application/json` and no foreign browser Origin, and return **409** while a request is active or queued). `/api/health`
@@ -633,7 +633,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   `STRATA_NAN_INJECT=<n>[,<n>...]` flags the n-th checked window to test the path. The one-shot command line and the
   Intel (SYCL) port do not check.
   The Apple Metal port has no device kernel for it; after each head window it scans the window's logits rows in
-  unified memory from the host (`metal_scan_rows` in `src/core/verify.cpp`) and records the same fact. On an M1 Max
+  unified memory from the host (`metal_scan_rows` in `engine/src/core/verify.cpp`) and records the same fact. On an M1 Max
   the scan costs about 60 microseconds a decode window, 0.2% of the window.
   The origin of a real poisoning was found in the Metal port: the Mixture-of-Experts activations (`XS`, the gathered
   input, and `HS`, the gated intermediate) are fp16, and a value outside fp16's range became `inf`. The expert
@@ -641,7 +641,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   canonical NaN (`0x7fc00000`) in one token row's combined expert output. That row's residual, then every layer above
   it, then the GDN scan state went NaN, and the window's logits with them - which is why the report named a different
   layer each time, and why the magnitudes were all O(1) with no ramp. Every fp16 activation store on that path now
-  saturates to +/-65504 (`hsat` in `metal/kernels/moe_mm.metal`) and the combine drops a non-finite term instead of
+  saturates to +/-65504 (`hsat` in `engine/metal/kernels/moe_mm.metal`) and the combine drops a non-finite term instead of
   summing it; both only differ from the old result where that result was already non-finite, so finite answers are
   unchanged. Non-finite words are also cleared from the GDN scan state and conv history at every prompt chunk start,
   on checkpoint restore and on checkpoint save, because those two buffers are part of the checkpoint and the parked
@@ -857,7 +857,7 @@ settings and the API key stay in the browser.
 switch below is **off by default**; with all of them off the page behaves as it did before.
 
 - **Render math.** Equations written as `\( ... \)`, `\[ ... \]`, `$x$` or `$$ ... $$` are drawn as formulas by KaTeX 0.19.0, which
-  ships in `serve/web/vendor/katex` (MIT; `PROVENANCE.json` there lists the package and a hash of every file). The text of a
+  ships in `terminal/serve/web/vendor/katex` (MIT; `PROVENANCE.json` there lists the package and a hash of every file). The text of a
   message is never changed: copying, the Markdown export and the next request all carry what the model wrote. Code, prices
   (`$5 and $10`) and a formula still being written stay text. A formula KaTeX cannot read stays as its source. A formula can only
   draw: it cannot make a link, load a picture or run anything (`\href`, `\url`, `\includegraphics` and `\htmlClass` are shown as
@@ -891,17 +891,17 @@ while an answer is being written or an image is made.
 **Language.** About > Settings lists the page's languages: English (the default), German, Spanish, Japanese, Korean, Portuguese,
 Russian and Chinese. The Chat view, its settings and the header are translated; Monitor, Images and About are still English. A
 language is a file `serve/web/locales/<lang>.json`; the English text lives in the code next to its key, and
-`python tools/web_i18n.py` checks every file for the same keys and placeholders (`--write` rewrites `en.json`). `/?lang=de` shows a
+`python terminal/tools/web_i18n.py` checks every file for the same keys and placeholders (`--write` rewrites `en.json`). `/?lang=de` shows a
 language for one visit.
 
 Tests: `serve/test_web_*.py` and `serve/test_web_*.js` (Node), and a browser run against a stand-in server with no model:
-`WEBTEST_MODULES=<folder with puppeteer-core> node tools/webtest/browser_test.mjs`. `tools/webtest/shots.mjs` takes the page's
+`WEBTEST_MODULES=<folder with puppeteer-core> node terminal/tools/webtest/browser_test.mjs`. `terminal/tools/webtest/shots.mjs` takes the page's
 screenshots.
 
 ### API request monitor
 
 Off by default, because it keeps prompts and answers in memory. Turn it on with `"api_monitor": true` or
-`serve/server.py --api-monitor`; otherwise the two endpoints answer 404. `/api-monitor` shows the model state, load and unload
+`terminal/serve/server.py --api-monitor`; otherwise the two endpoints answer 404. `/api-monitor` shows the model state, load and unload
 controls, active and queued requests, request bodies, output, separate reasoning and response bodies, with load, queue,
 first-token and decode timings. `GET /api/requests` returns summaries and `GET /api/requests?id=<id>` one request. The
 monitor keeps the newest 100 requests in memory until restart, 262,144 characters per field, with visible truncation flags.
@@ -1016,11 +1016,11 @@ tools and add only servers you trust. If Strata is reachable from other devices,
 
 ## Manage Strata from your AI assistant (MCP server)
 
-`tools/strata_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants. Once it is
+`terminal/tools/strata_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants. Once it is
 added you can ask your assistant to install Strata, start it or check whether it is running. In Claude Code:
 
 ```bash
-claude mcp add strata -- python C:\Users\you\Strata\tools\strata_mcp.py
+claude mcp add strata -- python C:\Users\you\Strata\terminal\tools\strata_mcp.py
 ```
 
 It has tools for status, the model list, install, start, stop, logs, a speed test and connection settings. Install runs
@@ -1174,7 +1174,7 @@ sm_86 and sm_61, bit-exact. `STRATA_DEQUANT_WIDE=0` turns it off.
 `STRATA_SELECT_TWO_PASS=1` (opt-in; sm_80+, the prompt path's tensor-core block scorer): every block is scored once in
 single-pass TF32 with a per-block error bound, and again in the usual 3xTF32 only where the bound reaches the query's
 top-k cut-off (a query the bound cannot settle has its 16-query tile scored again in full), so the selected cells, their
-order and the ties are exactly the 3xTF32 scorer's (the bound and the rule: `include/strata/kernels/qsa_two_pass.hpp`).
+order and the ties are exactly the 3xTF32 scorer's (the bound and the rule: `engine/include/strata/kernels/qsa_two_pass.hpp`).
 On an RTX 3090 (sm_86, PCIe 3.0, 250 W; the v0.2.6 release defaults, 2 pairs of 2 runs) a 256K prompt read 5.2% faster
 (1,887 to 1,984 tokens/s), a 128K prompt 2.2% faster and a 32K prompt the same within 1%; decode and the answers did not
 change. Calls whose last query has `STRATA_SELECT_TWO_PASS_MIN` blocks or more take it (default 4096, 16K cells).
@@ -1341,7 +1341,7 @@ off, the output is token for token the stock model's.
 
 ## RTX 30 series (sm_86) and Tesla P100 (sm_60): bitwise decode switches on by default
 
-Switches that are bit-exact on every card are on by default per architecture (`include/strata/core/nv_defaults.hpp`, set before
+Switches that are bit-exact on every card are on by default per architecture (`engine/include/strata/core/nv_defaults.hpp`, set before
 the engine reads its switches; a switch you set yourself, to anything, is kept). The table is used when every visible card has
 that one compute capability. The identity gate (10 prompts plus exact_pp 4K/20K, fixed flags) is identical with the sets on.
 
@@ -1446,17 +1446,17 @@ Strata itself: [MIT](../LICENSE). The model files are not part of it; their lice
   [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
   Their licenses apply to the weights.
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT): the i-quant formats, the GPU dot products and dequantizers
-  transcribed in `src/kernels/cuda/iq_kernels.cu`, the CPU backend linked for the i-quant experts, and `gguf-py` used by the tools. See `third_party/ggml/LICENSE`.
+  transcribed in `engine/src/kernels/cuda/iq_kernels.cu`, the CPU backend linked for the i-quant experts, and `gguf-py` used by the tools. See `engine/third_party/ggml/LICENSE`.
 - Ideas from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen); references in the paper.
 - The DFlash2 drafter's Q4_0 selector (174 MiB less graphics memory, same drafts and same text) is nazeshinjite's idea:
   [nazeshinjite/Qwen3.8-Flash-Next-DFlash2-GGUF](https://huggingface.co/nazeshinjite/Qwen3.8-Flash-Next-DFlash2-GGUF) (Apache-2.0) stores the drafter's
-  two selector tables as Q4_0; Strata converts the checked pack on your computer (`tools/dflash2_pack.py --convert-selector`) and checks the bytes
+  two selector tables as Q4_0; Strata converts the checked pack on your computer (`terminal/tools/dflash2_pack.py --convert-selector`) and checks the bytes
   against the same pin.
 - Strata's tuned DFlash2 drafter (`data/dflash2-tuned/`, Apache-2.0, **modified by Strata**): a fine-tuned copy of the weights of [incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (revision a22a1744, Apache-2.0, Inco AI); the original notices are kept, the licence text and a notice of the change are copied next to the file when it is fetched.
-- The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `serve/web/fonts/OFL.txt`). Its
+- The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `terminal/serve/web/fonts/OFL.txt`). Its
   Monitor tab started from @code-martin's dashboard idea (PR #22).
-  Math is drawn by [KaTeX](https://katex.org) (MIT, vendored in `serve/web/vendor/katex`). The chat page's wide-window layout, svg/html preview, math, Load/Unload, saved
+  Math is drawn by [KaTeX](https://katex.org) (MIT, vendored in `terminal/serve/web/vendor/katex`). The chat page's wide-window layout, svg/html preview, math, Load/Unload, saved
   chats, edit and rewind came from PRs #3176 (@mnott), #1628 (@thoives), #2972 and #2974 (@CC-David-CC), #3550 (@sakuumomo), #1787 (@Scotty-Hudson) and
   #2615 (@uppet), and the rewind choice and sending while answering from issues #3823 and #4004 (@xvcezrqpbxtpzblrt).
 - The experimental speed projection's vector (`data/experimental-speed-projection/`): Qwen Community License 1.0, made from the model's
@@ -1468,16 +1468,16 @@ Strata itself: [MIT](../LICENSE). The model files are not part of it; their lice
 
 Dated results. They were measured on the engine version and hardware named in each row. They are evidence for the defaults
 above, not claims about the current release or other machines. Where a row says "default", the setting is now on or off as
-described in the sections above. Raw data is in [`bench/results/`](bench-results/).
+described in the sections above. Raw data is in [`docs/bench-results/`](bench-results/).
 
 ### Engine speed tables and tuning
 
 | Engine | Measured on | Result |
 | --- | --- | --- |
 | 0.1.5 | RTX 5070 12 GB, Q2_0, 262K | KV streaming: 50.9 -> 62.6 tok/s output (1,589 -> 3,872 experts in VRAM); about +6% at 128K |
-| 0.1.8 | Setup, `--kv q4_0` | 4-bit KV (Hadamard-rotated): about 4% faster at 128K, perplexity +8-12%. [`bench/results/2026-09-27-kv-q4`](bench-results/2026-09-27-kv-q4/README.md) |
-| 0.1.13 | RTX 5070 12 GB, 64 GB RAM, 32K prompt | Prompt chunks of 8,192, quantized MMQ kernels: Q2_0 572 -> 1,290 tok/s, IQ3_S 383 -> 1,208. Through the server (Q2_0, 128K context): 999 tokens 353 -> 438 tok/s, 6,927 tokens 529 -> 1,077, 28,584 tokens 584 -> 1,249. Output speed unchanged. [`bench/results/2026-09-28-prefill-speed`](bench-results/2026-09-28-prefill-speed/README.md) |
-| 0.1.14 | RTX 5070, 4K prompt, back to back | Output 88.5 tok/s (0.1.12: 85.7). Tables before 0.1.13: [`bench/results/2026-09-24-final`](bench-results/2026-09-24-final/matrix.md); 0.1.14: [`bench/results/2026-09-28-speed-0114`](bench-results/2026-09-28-speed-0114/README.md) |
+| 0.1.8 | Setup, `--kv q4_0` | 4-bit KV (Hadamard-rotated): about 4% faster at 128K, perplexity +8-12%. [`docs/bench-results/2026-09-27-kv-q4`](bench-results/2026-09-27-kv-q4/README.md) |
+| 0.1.13 | RTX 5070 12 GB, 64 GB RAM, 32K prompt | Prompt chunks of 8,192, quantized MMQ kernels: Q2_0 572 -> 1,290 tok/s, IQ3_S 383 -> 1,208. Through the server (Q2_0, 128K context): 999 tokens 353 -> 438 tok/s, 6,927 tokens 529 -> 1,077, 28,584 tokens 584 -> 1,249. Output speed unchanged. [`docs/bench-results/2026-09-28-prefill-speed`](bench-results/2026-09-28-prefill-speed/README.md) |
+| 0.1.14 | RTX 5070, 4K prompt, back to back | Output 88.5 tok/s (0.1.12: 85.7). Tables before 0.1.13: [`docs/bench-results/2026-09-24-final`](bench-results/2026-09-24-final/matrix.md); 0.1.14: [`docs/bench-results/2026-09-28-speed-0114`](bench-results/2026-09-28-speed-0114/README.md) |
 | 0.1.25 | RTX 3090, Coder, 198K context, `--kv k8v4` | 99 instead of 85 tok/s output, same needle results, prompts 2-5% slower. On an RTX 2060 SUPER 8 GB at 128K: +780 expert slots over resident K8V4 |
 | 0.1.36 (#136) | RTX 5070, Q2_0, fused int8 kernels (RTX 30 and newer) | Prompt 4K 1,294 -> 1,570, 32K 2,170 -> 2,653, 128K 2,123 -> 2,468 tok/s (+16-22%), teacher-forced KL 0.009 at 32K vs 0.012 before. Decode on thread-block clusters (RTX 50, sm_90+): Q2_0 output 4K 89 -> 93.5, 128K 64.5 -> 76.4 tok/s. `STRATA_PF_FUSED=0` keeps the previous prompt kernels; `STRATA_QSA_CLUSTER=0` and `STRATA_ARGMAX_MULTI=0` turn the decode kernels off. IQ2_XS prompts with `STRATA_PF_FUSED=1`: +12% at 4K, +3% at 32K |
 | 0.1.38 | AMD RX 7900 XTX (gfx1100), ROCm 10.2 nightly, tuned hipBLASLt-100500 table ([#755](https://github.com/Niko1221/Strata/pull/755)), Ryzen 9 7900X 96 GB, IQ3_S, median of 3 | Prompt 1K 760, 4K 1,275, 32K 1,641, 64K 1,594, 128K 1,494 tok/s (32K-128K 8-28% faster than 0.1.22); output 65.1, 60.4, 64.4, 61.8, 59.2 tok/s |
@@ -1538,7 +1538,7 @@ which about doubled prompt speed on the measured card.
 ### Expert cache over-sizing (Windows)
 
 **Measured on:** RTX 4080 SUPER 32 GB, IQ3_S, engine 0.1.39, `--max-context 1048576` (yarn factor 4), fresh 43,969 / 45,670 / 47,956-token
-prompts with 200 generated each, one engine start per row (configuration in `bench/results/2026-10-04-community-rtx-4080s-iq3s`;
+prompts with 200 generated each, one engine start per row (configuration in `docs/bench-results/2026-10-04-community-rtx-4080s-iq3s`;
 issue #781).
 
 | Expert cache | Slots | VRAM free at start | Decode tok/s |
@@ -1599,7 +1599,7 @@ with `--batch 2` at 262,144 context saw 538 MiB at the free line become 395 MiB 
 | not stated | 2x RTX 3080 20 GB at 220 W, Xeon E5-2696 v4 (24 logical CPUs, 16 workers), UD-Q4_K_XL, layer split 23, `--batch-mtp`, two slots | `--aux-cpus auto` vs off: solo decode 79.7 and 80.4 against 72.1 and 72.4 tok/s; two streams 90.8 and 90.7 against 80.8 and 82.8; prompt reads independent of the flag; host-thread context switches over ten minutes 43.8k and 42.8k off, 3.9k and 2.8k with `auto`. A/A control 0.985 and 0.990 |
 | 0.1.38 | RTX 4070 Ti 12 GB, Ryzen 9 5900X, 64 GB, NVMe ext4, IQ3_XXS, 63,025-token conversation | Session file 1.20 GB, save 0.65 s, restore 1.05 s in a new engine, next 32-token turn 1.14 s against 1.00 s without a restart; the cold first turn takes 25.5 s |
 | not stated | 2x RTX 3080 20 GB, UD-Q4_K_XL, 90 GiB container, resident RAM mode, 2 slots, 308 requests | `--memory-limit-mib 101376`: 135 parks, 0 skips. With 78000 the container sat above the cap and all 8 parking attempts were skipped while requests were served normally (median of 6 decodes 79.6 tok/s) |
-| not stated | 4-GPU split | A 9,276-token conversation restored in 51 ms and decoded exactly the tokens it does when the conversation never left (`tools/parking_test.py`) |
+| not stated | 4-GPU split | A 9,276-token conversation restored in 51 ms and decoded exactly the tokens it does when the conversation never left (`terminal/tools/parking_test.py`) |
 | not stated | 2x CMP 50HX layer split, IQ3_XXS, pi coding agent | `--prompt-cache-spread`: a 210,528-token prompt that matched the session for 204,349 tokens resumed at 9,525 and read 201,003 again (100 s); with the flag, an 82,593-token conversation with a turn ~6 steps back rewritten resumed at 73,610 tokens (10.2 s against 40.0 s) |
 | not stated | RTX 5070 Ti Laptop, Swift 1.5 IQ3_XXS, a new opencode session in a second folder | `env_to_user`: first request 14,073 tokens with 13,693 from the cache, 1.1 s, against 14,753 read, 11.9 s |
 | 0.1.40.2 | Tesla P100 | A question after a long document re-reads up to 16K tokens (55 s at 262K) without `strata_prefix` |
@@ -1631,7 +1631,7 @@ top-1 95.3% (95.0%).
 
 **Measured on:** Q2_0, fixed experts, 2,557 teacher-forced tokens of code, a document and a chat. The top-1 token changes at 10% of positions,
 mean KL from the stock model 0.063 nats (max 4.1), perplexity +15% on code, +2.3% on the document, +0.4% on the chat. Details:
-`bench/results/2026-09-27-esp/`.
+`docs/bench-results/2026-09-27-esp/`.
 
 ### Older runs of the quality checks
 

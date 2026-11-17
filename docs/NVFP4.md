@@ -29,13 +29,13 @@ of experts plus room.
 ## Getting a model by hand
 
 ```sh
-python tools/nvfp4_convert.py --model <ModelOpt NVFP4 checkpoint dir> --outfile <model>.gguf
-python tools/iq_pack.py --gguf <model>.gguf --out <pack dir>
+python terminal/tools/nvfp4_convert.py --model <ModelOpt NVFP4 checkpoint dir> --outfile <model>.gguf
+python terminal/tools/iq_pack.py --gguf <model>.gguf --out <pack dir>
 ```
 
 - `nvfp4_convert.py` runs llama.cpp's own converter (`third_party/llama.cpp`, the commit setup pins) with the type
-  policy the engine needs. The experts are repacked without loss. `tools/nvfp4_verify.py` compares them with the
-  checkpoint bit for bit, and `tools/nvfp4_verify_gguf.py` checks the GGUF.
+  policy the engine needs. The experts are repacked without loss. `terminal/tools/nvfp4_verify.py` compares them with the
+  checkpoint bit for bit, and `terminal/tools/nvfp4_verify_gguf.py` checks the GGUF.
   - The small projections the BF16 kernels read (routers, SSM gates, indexer, PLE and hyper-connection projections) are
     written as BF16.
   - Everything served natively goes to Q8_0: attention, `ssm_out`, the shared experts, the output head and the token
@@ -50,7 +50,7 @@ Run it like an IQ pack, with the GGUF as its own dense-weight source and the PLE
 ```sh
 strata --pack <pack dir> --native <model>.gguf --native-dense-gguf <model>.gguf \
        --ple-gguf <an IQ model's shard with per_layer_token_embd> --mtp <mtp/rt> \
-       --expert-profile data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 ...
+       --expert-profile terminal/data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 ...
 ```
 
 The NVFP4 checkpoints change only the routed experts. The PLE table, the MTP layer and the expert profile of the original
@@ -124,13 +124,13 @@ NVFP4's 16-value scales are applied in FP32 after every int8 step, which only Bl
 
 ## CPU experts
 
-`src/kernels/cpu/nvfp4_avx512.cpp` computes the CPU pool's NVFP4 rows in 512-bit lanes. Each 64-value block is decoded
+`engine/src/kernels/cpu/nvfp4_avx512.cpp` computes the CPU pool's NVFP4 rows in 512-bit lanes. Each 64-value block is decoded
 once for every token of a verify window: `vpdpbusd` on |E2M1| codes, with the sign moved onto the activation. The
 arithmetic is ggml-cpu's `ggml_vec_dot_nvfp4_q8_0`, with the float additions ordered differently (worst 4.5e-7 relative,
 `nvfp4_avx512_parity`). `STRATA_NO_NVFP4_512=1` falls back to ggml-cpu.
 
 A CPU without AVX-512 (Zen 1 to 3, Intel Core 4th to 10th and 12th to 14th gen, Core Ultra, Xeon E5 v3/v4) runs the same
-rows in 256-bit lanes (`src/kernels/cpu/nvfp4_avx2.cpp`): ggml's AVX2 arithmetic step for step, so every row is bit-equal
+rows in 256-bit lanes (`engine/src/kernels/cpu/nvfp4_avx2.cpp`): ggml's AVX2 arithmetic step for step, so every row is bit-equal
 to ggml-cpu's (`nvfp4_cpu_parity`, 0 of 1280x9 and 2560x9 rows differ on a Ryzen 5 5600X, a Ryzen 7 255 and a Core Ultra
 7 265). `STRATA_NO_NVFP4_256=1` falls back to ggml-cpu. An NVFP4 pack is a native pack (its folder holds
 `native_experts.txt`), so the engine starts on such a CPU. The AVX-512 requirement belongs to the canonical Q2_0 pack
@@ -183,7 +183,7 @@ HIP: the decode kernels use no CUDA-only intrinsics. The NVFP4 MMQ instance and 
 - `nvfp4_expert_gpu_parity`: the decode kernels against ggml's reference.
 - `nvfp4_avx512_parity`: the CPU rows against ggml-cpu (with `--expert`: one whole expert).
 - `mmq_nvfp4_parity`: the prompt path's products against FP64 (with `--real`: rows dumped by `STRATA_DUMP_MOE_INPUT`).
-- `tools/nvfp4_verify.py` and `tools/nvfp4_verify_gguf.py`: the conversion, bit for bit.
+- `terminal/tools/nvfp4_verify.py` and `terminal/tools/nvfp4_verify_gguf.py`: the conversion, bit for bit.
 
 ## NVIDIA's FP4-Local checkpoint
 
@@ -191,7 +191,7 @@ HIP: the decode kernels use no CUDA-only intrinsics. The NVFP4 MMQ instance and 
 safetensors, experts retrained by quantization-aware distillation. Strata reads it by converting it on the user's PC.
 Nothing of NVIDIA's weights is redistributed (licenses: NVIDIA Open Model Agreement and Qwen Community License 1.0).
 
-What the checkpoint holds, and what `tools/nvfp4_local_pack.py` does with it:
+What the checkpoint holds, and what `terminal/tools/nvfp4_local_pack.py` does with it:
 
 | In the checkpoint | Becomes |
 | --- | --- |
@@ -201,13 +201,13 @@ What the checkpoint holds, and what `tools/nvfp4_local_pack.py` does with it:
 | MTP head: NVFP4 experts, BF16 rest | A Q2_0 draft layer built with `mtp_pack.py` / `mtp_rt.py` (88.7% of drafts accepted over 225 test requests). |
 | Vision tower | Not converted. Pictures are read by the original model's picture reader (the shared `mmproj` file that setup downloads); the dense GGUF supplies the vocabulary. |
 
-`python tools/nvfp4_local_pack.py prepare --model <checkpoint> --out <dir>` runs every step (setup does this): the n-gram
+`python terminal/tools/nvfp4_local_pack.py prepare --model <checkpoint> --out <dir>` runs every step (setup does this): the n-gram
 table, the dense GGUF (no experts), the pack (experts written straight from the checkpoint) and the draft layer. It needs
 about 110 GB of free disk beside the 102 GB download, which can be deleted afterwards. On a Threadripper PRO with the
 files on NVMe it took about 12 minutes.
 
 > **Measured on:** RTX PRO 5000 72 GB (Blackwell), 128K context, int8 KV, every expert in VRAM
-> (`tools/strata_bench.py`). Strata version not recorded.
+> (`terminal/tools/strata_bench.py`). Strata version not recorded.
 
 | Measure | Result |
 | --- | --- |
@@ -216,7 +216,7 @@ files on NVMe it took about 12 minutes.
 | Agent session | 151 tok/s |
 | Memory | 69 GB of RAM beside 72 GB of VRAM |
 
-Quality (`tools/quant_quality.py`, set v1, against Unsloth's Q8_0): top-1 90.5%, mean KL 0.085, perplexity 3.95 (Q8_0:
+Quality (`terminal/tools/quant_quality.py`, set v1, against Unsloth's Q8_0): top-1 90.5%, mean KL 0.085, perplexity 3.95 (Q8_0:
 4.05). This is a retrained model, so its distance to the original's Q8_0 includes real weight changes, not only rounding.
 
 ## History / older measurements
@@ -245,7 +245,7 @@ PCIe share sweep at 262K context (decode tok/s):
 ### Measured in Strata (2026-10-13)
 
 > **Measured on:** the ready-made GPTQ pack (`--family nvfp4 --model NVFP4`), Strata 0.1.44 era. Quality on an RTX 3060
-> box with `tools/quant_quality.py`: 4,995 teacher-forced positions of code, docs, English, other languages and an agent
+> box with `terminal/tools/quant_quality.py`: 4,995 teacher-forced positions of code, docs, English, other languages and an agent
 > transcript, against Unsloth's Q8_0.
 
 | | Same top token as Q8_0 | Mean KL | KL p99 |

@@ -50,7 +50,7 @@ and test-starts it before using it.
 4. **Context** (8K to 512K, with the extra memory each costs) and the memory format (`m`: 8-bit or 4-bit).
 5. **Pictures:** only for models that can read them. They are on by default (`--vision off` or "No" turns them off). The
    reader adds about 0.9 GB. It runs on the CPU for a card under 24 GB and on the graphics card from 24 GB (about 1 to 1.4 GB kept
-   free). The rule is in `strata_control/vision_reader.py`. `--vision gpu` or `--vision cpu` overrides it per model. If the
+   free). The rule is in `terminal/strata_control/vision_reader.py`. `--vision gpu` or `--vision cpu` overrides it per model. If the
    engine package has no picture reader, pictures default to off and the screen says so.
 6. **Parallel requests:** "fit to your card" (12 GB: 1, 20: 2, 24: 3, 32 and more: 4) or a number from 1 to 8, with a warning
    if it will not fit. Check the effective slots after startup.
@@ -201,7 +201,7 @@ as the config does; OpenClaw needs Node 24.16 or newer.
 
 ## Models you already have
 
-`strata models list` looks in these places (one function, `strata_control/discovery.py`):
+`strata models list` looks in these places (one function, `terminal/strata_control/discovery.py`):
 
 - the folder you name with `--install-dir` or `STRATA_INSTALL_DIR` (then only that one)
 - the Terminal's own folder

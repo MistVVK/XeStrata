@@ -179,11 +179,11 @@ place of a projector; the replay must use the same prompt and the same chunking.
 
 ## Implementation notes
 
-- `include/strata/prefill/kva.hpp` — the plan, the environment variables and the reasons a read is turned away (`src/prefill/kva_test.cpp` tests them).
-- `src/prefill/prefill.cpp` — the chunk plan (`kva_approx`), the capture/oracle taps, the state-only layer
+- `engine/include/strata/prefill/kva.hpp` — the plan, the environment variables and the reasons a read is turned away (`engine/src/prefill/kva_test.cpp` tests them).
+- `engine/src/prefill/prefill.cpp` — the chunk plan (`kva_approx`), the capture/oracle taps, the state-only layer
   exits, the transfer-plan skip, and `give_back()` on a skipped MoE half: a layer that consumes no expert must
   still release its stream entries, or the issuer thread fills the ring and the next fully computed layer waits
   forever.
-- `src/prefill/kernels.cu` — `gdn_recurrence_state_only()`, the same recurrence dispatch without the output
+- `engine/src/prefill/kernels.cu` — `gdn_recurrence_state_only()`, the same recurrence dispatch without the output
   normalization.
 - CUDA and HIP builds (`src/`); the SYCL engine (`sycl/`) does not have the feature.

@@ -16,7 +16,7 @@ Supported: the latest release. Fixes go into the next release, not into older on
 
 ## What the server exposes
 
-Strata runs a model on your PC and serves it over HTTP (`serve/server.py`). Out of the box it is reachable from
+Strata runs a model on your PC and serves it over HTTP (`terminal/serve/server.py`). Out of the box it is reachable from
 this PC only. The details and every setting are in [docs/DETAILS.md](../docs/DETAILS.md) ("From other devices",
 "Host names", "Web pages without an API key", "Tools from MCP servers").
 
@@ -60,7 +60,7 @@ the model. The section above is about the engine's HTTP server. This is what the
   client (the Terminal) attaches to it. On macOS and Linux that is a private Unix socket in a folder only you can open. On Windows it
   is a TCP listener on `127.0.0.1` that answers only requests carrying a 256-bit token kept in an owner-only folder. That is a weaker
   guarantee than a socket other users cannot open: on Windows the token is what protects it, as with any loopback service that has a
-  token (`strata_control/owner_transport.py`). The bridge between the app shell and the host (used for the app update) is also loopback and protected by a token.
+  token (`terminal/strata_control/owner_transport.py`). The bridge between the app shell and the host (used for the app update) is also loopback and protected by a token.
 - **Starting a model and serving never download anything.** Downloads and updates are one explicit step: `strata update`, or "Update
   engine" and "Update Strata" in the app's Settings. Models and saved tuning are never replaced by an update.
 - **Updates come from a signed feed.** The release publishes `strata-feed.json` and `strata-feed.json.sig` (Ed25519). An installed

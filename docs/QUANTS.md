@@ -8,8 +8,8 @@ the Q8_0 reference. Setup and the per-file details: [UD-Q4_K_XL](UNSLOTH_Q4.md),
 
 ## What each file stores
 
-Read from the GGUF headers alone with `tools/quant_formats.py --hf unsloth/Qwen3.8-Flash-Next-GGUF 38bb39ee... <dir>`
-(HTTP range requests, nothing else is downloaded; on local shards: `tools/quant_formats.py <shard glob>`).
+Read from the GGUF headers alone with `terminal/tools/quant_formats.py --hf unsloth/Qwen3.8-Flash-Next-GGUF 38bb39ee... <dir>`
+(HTTP range requests, nothing else is downloaded; on local shards: `terminal/tools/quant_formats.py <shard glob>`).
 
 The routed experts (gate, up, down; 512 per layer, 10 used per token) are where the files differ:
 
@@ -53,7 +53,7 @@ SHA-256), so a PC that has one of them can link those two shards instead of down
 
 ## Quality: the yardstick
 
-`tools/quant_quality.py` scores a quant against Q8_0 on one fixed text set (`data/quant_quality/v1`: code, docs,
+`terminal/tools/quant_quality.py` scores a quant against Q8_0 on one fixed text set (`terminal/data/quant_quality/v1`: code, docs,
 English prose, German/French/Japanese/Chinese, an agent transcript; 5 x 1,000 tokens in `set.ids.json`). Every token
 is read through the decode windows (teacher-forced) with the experts on the CPU (one VRAM slot), no expert
 adaptation, no PCIe share, no route tail skip, FP16 K/V; per position the engine writes the log-probability of the
@@ -61,8 +61,8 @@ text's next token and its 64 most likely tokens (`STRATA_LOGPOS`, `STRATA_LOGPOS
 same most likely token as Q8_0. KL: KL(Q8_0 || quant) over Q8_0's 64 most likely tokens.
 
 ```sh
-python tools/quant_quality.py run --config strata-<quant>.json --out <quant>.tsv
-python tools/quant_quality.py compare q8_0.tsv <quant>.tsv --segments
+python terminal/tools/quant_quality.py run --config strata-<quant>.json --out <quant>.tsv
+python terminal/tools/quant_quality.py compare q8_0.tsv <quant>.tsv --segments
 ```
 
 Measured on the AMD box (EPYC 7452, R9700, HIP, engine at 0601072d; 4,995 positions; Q8_0 against itself in a second
@@ -81,7 +81,7 @@ run: byte-identical rows):
 The same file on another backend is not the same answers: UD-Q4_K_XL on an RTX A4000 (CUDA, the RAM
 budget mode of a 62 GB PC) against UD-Q4_K_XL on the R9700 is 94.5% the same top token (KL 0.038), mostly near-ties.
 
-**The prompt path:** `tools/quant_quality.py prompt` / `pcompare` score the batched prompt path the same way (20 prompts
+**The prompt path:** `terminal/tools/quant_quality.py prompt` / `pcompare` score the batched prompt path the same way (20 prompts
 of 256-1,000 tokens of the set, the full vocabulary's KL of the next token's distribution against Q8_0's): every
 quant above picks Q8_0's top token after all 20 prompts. The K-quants' MMQ kernels (`STRATA_MMQ_KQ=1`) against the FP16
 path on the R9700: UD-Q4_K_XL mean KL 0.095 / median 0.0027 (FP16: 0.081 / 0.0047), UD-Q5_K_XL 0.038 / 0.00055 (FP16:

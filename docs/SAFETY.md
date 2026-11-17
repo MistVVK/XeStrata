@@ -24,7 +24,7 @@ you trust can check it. Where Strata does less than you might hope, the page say
 
 No. A search of the app, the Terminal, the engine server and the installers found no analytics library, no crash
 reporter and no code that reports usage anywhere. The app's privacy notes say the same
-(`apps/host/src/components/PrivacyNotes.tsx`: "Strata sends no usage telemetry").
+(`app/host/src/components/PrivacyNotes.tsx`: "Strata sends no usage telemetry").
 
 Some things sound similar and stay on your PC:
 
@@ -34,7 +34,7 @@ Some things sound similar and stay on your PC:
   (on Windows, `%LOCALAPPDATA%\Strata\logs`). Nothing sends it. **Save logs**
   (Settings, Engine, Diagnostics) puts a text file in your Downloads folder, and you decide whether to attach it to a bug report.
 - The coding agent is a separate component (the DeepSeek Harness, MIT). It has its own telemetry switch, and Strata starts it
-  with that switch off (`apps/host/server/agent/harness-runtime.mjs`).
+  with that switch off (`app/host/server/agent/harness-runtime.mjs`).
 
 Like any download, each connection below shows the other side your IP address and the file you asked for.
 
@@ -67,15 +67,15 @@ That is the full list found in the code. Some details:
   keeps serving; a script is refused (exit 7) unless it passes `--stop-model`. One quiet exception, the launch monitor only:
   once a day it reads the signed update feed (a few KB, no engine, a 5 second limit, nothing shown if it fails or there is no
   connection) so it can say "a new engine is available". `STRATA_UPDATE_CHECK=0` turns it off
-  (`strata_control/engine_update.py`, `refresh_cache`).
+  (`terminal/strata_control/engine_update.py`, `refresh_cache`).
 - **Starting and serving never download.** `strata serve` and the app's load button fetch nothing. The app sets
-  `STRATA_PACKAGED=1` and `STRATA_NO_ACQUIRE=1` for its parts (`apps/desktop/src-tauri/src/main.rs`), and the downloaders
-  refuse to run under them (`strata_control/acquisition.py`, `apps/host/server/acquisition.mjs`). That is why the app
+  `STRATA_PACKAGED=1` and `STRATA_NO_ACQUIRE=1` for its parts (`app/desktop/src-tauri/src/main.rs`), and the downloaders
+  refuse to run under them (`terminal/strata_control/acquisition.py`, `app/host/server/acquisition.mjs`). That is why the app
   never downloads `cloudflared` for you while it runs.
 - **The engine itself has no network code.** The part of Strata that runs the model (`src/`, `include/`, `sycl/`, `metal/`)
   contains no networking. The app's own pages load no fonts, scripts or trackers from the internet.
 - **Building from source** reaches more places. Python from python.org or winget (`START-HERE.bat`), a standalone Python
-  from GitHub on a Mac (`setup.sh`), Python packages from PyPI (`requirements.txt`, pinned versions), NVIDIA's CUDA libraries
+  from GitHub on a Mac (`setup.sh`), Python packages from PyPI (`terminal/requirements.txt`, pinned versions), NVIDIA's CUDA libraries
   from PyPI and, on Ubuntu and Debian, NVIDIA's apt key and packages, AMD's ROCm wheels, the Vulkan SDK from LunarG, and
   llama.cpp and stable-diffusion.cpp source from GitHub. These run only while you run the setup.
 
@@ -84,13 +84,13 @@ That is the full list found in the code. Some details:
 - **Chats, prompts, attached files and pictures** are handled by the engine on your PC. The app keeps chats in its own
   storage on your disk. Models are in the folder you chose.
 - **API keys** you save for outside services are kept in a file that only your user account can open. They are not
-  encrypted. (`apps/host/server/model-providers.mjs`)
+  encrypted. (`app/host/server/model-providers.mjs`)
 - **The server listens on `127.0.0.1`**, this PC only. The app fixes that address (`STRATA_BIND=127.0.0.1`), and the engine
-  server's default is the same (`serve/server.py`, the `--host` option).
+  server's default is the same (`terminal/serve/server.py`, the `--host` option).
 - **Sharing needs a key.** The app's "Share with other devices" and the Cloudflare tunnel will not start without an API
   key, and the shared port answers only `/v1/models`, `/v1/chat/completions` and `/v1/messages`
-  (`apps/host/server/local-share.mjs`, `cloudflare.mjs`). `strata launch` makes a key for you when you pick anything wider than
-  this computer. The bare engine server (`serve/server.py`) only prints a warning if you open it to your network without a key,
+  (`app/host/server/local-share.mjs`, `cloudflare.mjs`). `strata launch` makes a key for you when you pick anything wider than
+  this computer. The bare engine server (`terminal/serve/server.py`) only prints a warning if you open it to your network without a key,
   so set one yourself in that case.
 - **When you use an outside model**, the conversation (and the instructions of skills you switched on) go to that service.
   The app says so in its privacy notes. The service's own rules then apply.
@@ -115,7 +115,7 @@ The server also has browser protections (a host check, an origin check, no CORS 
 Updates never replace your models or saved tuning. The full description is in [packaging/UPDATES.md](../tools/packaging/UPDATES.md).
 
 **The app.** Its updates are signed with a separate key (Tauri's minisign), and the public half is in the app
-(`apps/desktop/src-tauri/tauri.conf.json`). The updater refuses an installer whose signature does not match. The Terminal
+(`app/desktop/src-tauri/tauri.conf.json`). The updater refuses an installer whose signature does not match. The Terminal
 checks the same signature when you run `strata update --app`.
 
 **Model files.** Every model file that `setup.py` downloads has a fixed SHA-256 and size, written in the code, so the check
@@ -133,9 +133,9 @@ size stops it before the download starts.
   it has changed fails the check. A file without a pin is checked against the hash ModelScope publishes, and setup warns
   when it publishes none.
 - The app installs these models by running the same setup, so it has the same checks. The app's host also keeps a short
-  starter list of its own (`apps/host/server/real-model-catalog.mjs`). It is for display only. The host refuses to download
+  starter list of its own (`app/host/server/real-model-catalog.mjs`). It is for display only. The host refuses to download
   from it, because its files have no hash, and says that models come from the Models screen.
-  (`setup.py`: `REPO_PINS`, `download`, `verify_sha256`; `tools/mtp_fetch.py`; `apps/host/server/image-models.mjs`.)
+  (`setup.py`: `REPO_PINS`, `download`, `verify_sha256`; `terminal/tools/mtp_fetch.py`; `app/host/server/image-models.mjs`.)
 
 **Engine in the source route.** `setup.py` checks the engine zip against the SHA-256 that GitHub's API publishes for that
 release file. If GitHub cannot say (offline, rate limit), setup warns and installs anyway. `STRATA_SKIP_SHA256=1` switches the
@@ -157,7 +157,7 @@ cannot protect you if someone who can publish a release (or who holds the signin
 ## What the coding agent can do on your PC
 
 The app's chats run through an agent that can read files, run commands, edit files, search the web and use tools you
-connect. What it may do without asking depends on the **Mode** menu (`apps/host/server/agent/README.md`).
+connect. What it may do without asking depends on the **Mode** menu (`app/host/server/agent/README.md`).
 
 | Mode | What happens |
 | --- | --- |
@@ -202,11 +202,11 @@ To report a security problem, use GitHub's private reporting (the repository's *
 
 | Topic | Files |
 | --- | --- |
-| Model downloads and pins | `setup.py`, `tools/mtp_fetch.py`, `tools/image/qimage.py`, `apps/host/server/models.mjs`, `image-models.mjs` |
-| Update feed, signatures | `strata_control/feed.py`, `signing.py`, `transfer.py`, `update_keys.json`, `strata_cli/update_cmd.py` |
-| App updater | `apps/desktop/src-tauri/src/updater.rs`, `apps/desktop/src-tauri/tauri.conf.json` |
-| Downloads refused while running | `strata_control/acquisition.py`, `apps/host/server/acquisition.mjs` |
-| One-line installers | `packaging/install.sh`, `packaging/install.ps1` |
-| Web tools and the agent's approvals | `apps/host/server/agent/plugins/strata-gate.mjs`, `agent/profile.mjs`, `web-search-ddg.mjs`, `web-search-bing.mjs`, `web-search-keyed.mjs` |
-| Outside model services | `apps/host/server/model-providers.mjs` |
-| Sharing, tunnel | `apps/host/server/local-share.mjs`, `cloudflare.mjs`, `strata_cli/launch/access.py` |
+| Model downloads and pins | `setup.py`, `terminal/tools/mtp_fetch.py`, `terminal/tools/image/qimage.py`, `app/host/server/models.mjs`, `image-models.mjs` |
+| Update feed, signatures | `terminal/strata_control/feed.py`, `signing.py`, `transfer.py`, `update_keys.json`, `terminal/strata_cli/update_cmd.py` |
+| App updater | `app/desktop/src-tauri/src/updater.rs`, `app/desktop/src-tauri/tauri.conf.json` |
+| Downloads refused while running | `terminal/strata_control/acquisition.py`, `app/host/server/acquisition.mjs` |
+| One-line installers | `tools/packaging/install.sh`, `tools/packaging/install.ps1` |
+| Web tools and the agent's approvals | `app/host/server/agent/plugins/strata-gate.mjs`, `agent/profile.mjs`, `web-search-ddg.mjs`, `web-search-bing.mjs`, `web-search-keyed.mjs` |
+| Outside model services | `app/host/server/model-providers.mjs` |
+| Sharing, tunnel | `app/host/server/local-share.mjs`, `cloudflare.mjs`, `terminal/strata_cli/launch/access.py` |

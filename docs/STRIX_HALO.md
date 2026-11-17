@@ -32,9 +32,9 @@ On Windows, [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) has the speeds measur
   changes the 6) for any integrated GPU on Linux, a DGX Spark included.
 - **gfx11 matrix cores.** The prompt attention, the block scorer, the prompt GEMMs and the prompt experts have WMMA kernels for
   gfx1100 / 1101 / 1102 / 1103 / 1150 / 1151. A gfx11 part outside that list (gfx1152) takes the portable path.
-- **The hipBLASLt table.** `tools/hip/gfx1151-hipblaslt-100401.txt` is for ROCm 7.14.1's hipBLASLt (`100401`), including the prompt
+- **The hipBLASLt table.** `terminal/tools/hip/gfx1151-hipblaslt-100401.txt` is for ROCm 7.14.1's hipBLASLt (`100401`), including the prompt
   shapes at `--prefill 16384`. Setup's own ROCm for gfx1151 (the 7.14.0a20260608 wheels, hipBLASLt 1.4.0) takes
-  `tools/hip/gfx1151-hipblaslt-100400.txt`, calibrated against that library.
+  `terminal/tools/hip/gfx1151-hipblaslt-100400.txt`, calibrated against that library.
 - **The expert cache and the RAM budget share the RAM.** For a model with a RAM budget (UD-IQ4_XS, UD-Q4_K_XL) setup writes a number
   for `--expert-cache` (the RAM less 24 GB less the budget), not `auto`, because `auto` counts all memory the OS can give back at
   start and can take the room the OS needs. The number is in the config's `args`. An engine run by hand should pass one too.

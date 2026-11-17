@@ -53,7 +53,7 @@ numbers; see [updating](INSTALL.md#updating) and the [release notes](https://git
 **A new engine misbehaves after an update.**
 Stop the model, then use the app's rollback control or `strata components rollback`. An update keeps the engine it
 replaced (one generation, about 210 MiB). Source-checkout engines use a separate rollback workflow, in `engine\.previous`:
-`python setup.py --rollback-engine` puts the old one back and keeps the newer one there, so run it again to go forward
+`python terminal/setup.py --rollback-engine` puts the old one back and keeps the newer one there, so run it again to go forward
 (#670). It is described in [source setup](SOURCE_INSTALL.md).
 
 **On a Mac: "Strata is damaged and can't be opened", "cannot be opened", or "unidentified developer".**

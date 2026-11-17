@@ -38,7 +38,7 @@ shared document. The checkpoint at its end is pinned: never evicted, kept in the
 Copy-on-write K/V pages across `--batch` slots are NOT built: each slot keeps its own K/V (3.06 GiB at 262K, about 12 GiB
 at 1M), and admitting a branch copies the prefix K/V (3 s at 262K). The pinned prefix removes the re-read, not the copy.
 
-`tools/research_run.py` runs a document and a question list against a server with and without the field.
+`terminal/tools/research_run.py` runs a document and a question list against a server with and without the field.
 
 ## R3: expert slots against K/V blocks (P100, IQ2_XS)
 

@@ -71,7 +71,7 @@ The [details](DETAILS.md#how-it-works) explain every part and its numbers, and t
 
 ## License
 
-Strata is open source under the [MIT License](../LICENSE). A few parts carry their own licenses: `third_party/ggml`
+Strata is open source under the [MIT License](../LICENSE). A few parts carry their own licenses: `engine/third_party/ggml`
 (MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
-vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
+vector in `terminal/data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
 models are not part of this repository; each model's own license applies to its files.

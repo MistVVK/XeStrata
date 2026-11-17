@@ -53,7 +53,7 @@ The POSIX PLE path issues direct reads through a configurable worker pool.
 Use a dedicated idle server, restart it between arms, and capture its engine log:
 
 ```sh
-python3 tools/hip/bench_prefill.py \
+python3 terminal/tools/hip/bench_prefill.py \
   --model MODEL_NAME --url http://127.0.0.1:8080 \
   --engine-log /path/to/engine.log --label candidate --output candidate.json
 ```

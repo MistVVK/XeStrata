@@ -68,7 +68,7 @@ matrix cores, and hipBLASLt ships no gfx1030 kernels, so there is no tuning tabl
 `strata-device --list-devices` and skips cards the package has no code for and integrated chips, while a card of its own can
 run. `HIP_VISIBLE_DEVICES`, a `"gpu"` in the settings file or `hip_ordinal` is never overridden.
 
-**Tuning tables.** Each package carries the hipBLASLt tuning tables of `tools/hip` that match the hipBLASLt it bundles, as
+**Tuning tables.** Each package carries the hipBLASLt tuning tables of `terminal/tools/hip` that match the hipBLASLt it bundles, as
 `tuning/<arch>-hipblaslt-<version>.txt`:
 
 | Package | Table |
@@ -167,10 +167,10 @@ engine\strata-device.exe --list-devices
 engine\strata-device.exe --selftest
 ```
 
-**Building it yourself.** `tools\hip\build_windows.bat` (Visual Studio 2022 Build Tools with the C++ workload, Python, git; no
+**Building it yourself.** `terminal\tools\hip\build_windows.bat` (Visual Studio 2022 Build Tools with the C++ workload, Python, git; no
 admin, no AMD GPU) installs ROCm from AMD's TheRock wheels into `.rocm-win`, builds, and packages
 `dist\strata-windows-x64-hip.zip`. `START-HERE.bat --backend hip --prebuilt dist\` installs that one.
-`tools\hip\build_windows.bat tests` also builds the HIP tests. `STRATA_HIP_ARCHS` picks other architectures; for the RX 6000
+`terminal\tools\hip\build_windows.bat tests` also builds the HIP tests. `STRATA_HIP_ARCHS` picks other architectures; for the RX 6000
 package use `STRATA_HIP_ARCHS="gfx1030;gfx1031"` and `package_engine.py --variant rdna2`.
 
 ## Build
@@ -197,10 +197,10 @@ the card's name, its architecture and the build's list.
 - Do not enable both GPU backends in one build.
 - CMake fetches the pinned llama.cpp revision. For an offline build, point `STRATA_GGML_DIR` at a checkout of that exact
   revision.
-- Linux engine packages: `VARIANT=rx6000 packaging/build_hip_linux.sh`.
+- Linux engine packages: `VARIANT=rx6000 tools/packaging/build_hip_linux.sh`.
 - **A hand-built engine has no tuning table.** The packaged engines carry `tuning/<arch>-hipblaslt-<version>.txt` beside the binary
   ([Ready-made packages](#ready-made-packages) lists which); a build made with plain `cmake` and started
-  through `serve/server.py` has none, and the prompt GEMMs fall back to plain hipBLAS. On Strix Halo (gfx1151) that read prompts
+  through `terminal/serve/server.py` has none, and the prompt GEMMs fall back to plain hipBLAS. On Strix Halo (gfx1151) that read prompts
   20-25% slower in one report (1,043 against 826 tok/s at 8K, hipBLASLt 1.4.1, a single run per arm, not a paired A/B). Point
   `STRATA_HIPBLASLT_TUNING` at the file in `tools/hip/` (`gfx1151-hipblaslt-100401.txt` for hipBLASLt 1.4.1), or copy it into a
   `tuning/` folder next to the `strata` binary. The start log then has the line `prefill gemm: hipBLASLt tuning enabled (N rows,
@@ -218,7 +218,7 @@ ctest --test-dir build-hip --output-on-failure --timeout 60 -E '^(ple_parity|pla
 ## Model and serving configuration
 
 Prepare a supported model pack and its MTP runtime with the existing tools. For OrcaRouter IQ3_XXS, follow the
-[compatibility conversion](ORCA.md). Add `--experts-bin` to the `tools/iq_pack.py` command: mmap requires the pack's
+[compatibility conversion](ORCA.md). Add `--experts-bin` to the `terminal/tools/iq_pack.py` command: mmap requires the pack's
 `experts.bin`, which the default native packing does not emit and which uses more disk. Keep each model's pack and tokenizer
 together.
 
@@ -229,7 +229,7 @@ build-hip/strata --serve \
   --pack packs/iq3xxs \
   --native /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
   --ple-gguf /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf \
-  --mmap-experts --expert-profile data/expert-profile.bin --expert-cache auto \
+  --mmap-experts --expert-profile terminal/data/expert-profile.bin --expert-cache auto \
   --prefill 512 --spec 4 --spec-min-p 0.5 --mtp mtp/rt \
   --max-context 4096 --kv int8 --pool-workers 15 \
   --adapt-every 0 --pcie-frac 0 --vram-reserve-mib 1024
@@ -240,7 +240,7 @@ build-hip/strata --serve \
 directory:
 
 ```sh
-.venv/bin/python -m serve.server --engine strata --config strata-hip.json --port 8080
+terminal/.venv/bin/python terminal/serve/server.py --engine strata --config strata-hip.json --port 8080
 ```
 
 - Select the AMD device with `ROCR_VISIBLE_DEVICES` or `HIP_VISIBLE_DEVICES` if needed.
@@ -270,7 +270,7 @@ machine then swaps or stalls, raise it. Re-check after a ROCm update.
 | `STRATA_HIP_ADAPT_KERNEL_COPY=1` | Off | Adaptive-tier swaps copied by a kernel instead of the SDMA engine; a workaround for a gfx1030 hang with MMQ prompts and adaptive swaps (untested by the reporter) |
 
 **Why `STRATA_SH_STREAM` goes both ways.** The fork has to hide something. With experts on the CPU in the window, the shared expert forks
-off only after the doorbell is published (`STRATA_SH_FORK_LATE`, `src/core/verify.cpp`), so it runs while the GPU would otherwise wait for the
+off only after the doorbell is published (`STRATA_SH_FORK_LATE`, `engine/src/core/verify.cpp`), so it runs while the GPU would otherwise wait for the
 CPU pool. On a 16 GB card whose cache holds only part of the experts that wait is about half of a verify window (one RX 6900 XT under Linux,
 4,859 slots, `STRATA_DECODE_TIMING=1`: GPU-reach wait 20.7 of 39.1 ms per window), which is where #1272's gain comes from. When every routed
 expert is on the GPU there is no wait to fill, and the fork is two cross-stream event dependencies per layer and nothing else: 7fd67dd measured
@@ -359,7 +359,7 @@ is bitwise equal to the warp scorer. The default, short-prompt and decode paths 
 
 On one RX 7900 XTX the gain was 10-13% at about 131K tokens and 22% at 240K. Cached follow-ups and a two-task coding pilot
 showed no repeatable gain, so this is opt-in on gfx1100, not a coding-speed recommendation. Data and limits:
-[bench/results/2026-10-11-gfx1100-qsa-scores](bench-results/2026-10-11-gfx1100-qsa-scores/README.md).
+[docs/bench-results/2026-10-11-gfx1100-qsa-scores](bench-results/2026-10-11-gfx1100-qsa-scores/README.md).
 
 ### Deep contexts: the prompt's top-k selection
 
@@ -393,7 +393,7 @@ signed dot4 instruction and a 100 MHz wall clock. Switch defaults for gfx12 are 
 - **Architecture check:** a gfx1100-only build stops on a gfx1201 card at startup with a plain message.
 - **hipBLASLt:** the gfx120X wheel's hipBLASLt is 1.2.0 and no table ships for it, so Linux `rx9070` uses plain hipBLAS. A
   table calibrated for it measured within noise end to end. Tables for 1.2.2 (system ROCm 7.2.4), 1.4.1 and 1.5.0 exist in
-  `tools/hip` ([Tuning table](#tuning-table)). With ROCm 7.2.4's hipBLASLt 1.2.2 the plain path is far off, and its table
+  `terminal/tools/hip` ([Tuning table](#tuning-table)). With ROCm 7.2.4's hipBLASLt 1.2.2 the plain path is far off, and its table
   roughly doubled prompt speed.
 - **Two cards in one run (layer split):** `"backend": "hip", "gpu": [1, 0]` in the config (setup writes it with `--gpus 1,0`).
   With every expert on the GPUs the split gives the same tokens as the R9700 alone. On an R9700 plus a 9070 XT the split
@@ -418,7 +418,7 @@ signed dot4 instruction and a 100 MHz wall clock. Switch defaults for gfx12 are 
   expert rows are fetched over PCIe and how many are computed by the CPU pool. The x16 share (0.55) was measured on
   a machine where the link was the cheap side; on an R9700 with idle CPU cores it is the pool: IQ3_S, 3 rotated
   pairs, PLE direct, **8K decode 86.1 -> 94.6 tok/s at 0.15 (+9.9%), 32K 67.2 -> 84.4 (+25.6%)**, 64K 69.1 -> 72.3
-  (+4.7%), prompt speed unchanged. Under `serve/server.py` a short chat decodes 84.4 -> 93.2 (+10.4%). The CPU lane
+  (+4.7%), prompt speed unchanged. Under `terminal/serve/server.py` a short chat decodes 84.4 -> 93.2 (+10.4%). The CPU lane
   rounds a missing expert's FP32 rows differently from the GPU lane, so this changes bits: the first-token KL of 0.0
   against 0.55 is **0.0013 mean** (median 0.0011, max 0.0047, same top-1 in 12 of 12 prompts), below the engine's own
   implementation-noise scale. gfx12 native packs therefore **start** at 0.15 (`STRATA_PCIE_FRAC_DEFAULT=old` restores
@@ -566,7 +566,7 @@ On Windows, setup's ready-made engine runs an RX 6800 beside a 780M iGPU (HIP nu
 
 gfx906 is wave64 and has no WMMA and no packed byte arithmetic, so the wave32 backend refuses it. A separate opt-in build
 compiles the CUDA sources as HIP through a small compat layer (`include/strata/platform/hip_compat/`), with a CUDA warp mapped
-to a logical half of the 64-lane wavefront. Setup does not build it: build by hand and run `serve/server.py` with a config as
+to a logical half of the 64-lane wavefront. Setup does not build it: build by hand and run `terminal/serve/server.py` with a config as
 on any other card.
 
 The gfx906 build is community-tested: the maintainers have no gfx906 card, and the engine here is checked to compile for
@@ -579,10 +579,10 @@ is not part of this build; `strata --families` lists what the binary runs. Pleas
 on the kernel's amdgpu driver. hipBLASLt is not used.
 
 ```sh
-# inside the image, with this checkout at /src and llama.cpp at the pinned commit in third_party/llama.cpp
+# inside the image, with this checkout at /src and llama.cpp at the pinned commit in engine/third_party/llama.cpp
 apt-get update && apt-get install -y cmake ninja-build git python3 build-essential
 cmake -S engine -B build-906 -G Ninja -DSTRATA_HIP_GFX906=ON -DCMAKE_HIP_ARCHITECTURES=gfx906 \
-  -DSTRATA_GGML_DIR=/src/third_party/llama.cpp \
+  -DSTRATA_GGML_DIR=/src/engine/third_party/llama.cpp \
   -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++
 ninja -C build-906 strata
 ```
@@ -630,18 +630,18 @@ few minutes):
 
 ```sh
 cmake --build build-hip --target tune_hipblaslt
-CASES=$(awk 'NR>2 {printf " --case %s,%s,%s,%s,%s", $1, $5, $2, $3, $4}' tools/hip/gfx1100-hipblaslt-100200.txt)
+CASES=$(awk 'NR>2 {printf " --case %s,%s,%s,%s,%s", $1, $5, $2, $3, $4}' terminal/tools/hip/gfx1100-hipblaslt-100200.txt)
 ./build-hip/tune_hipblaslt $CASES --tuning-out table.txt
 ```
 
 The file's second line names the architecture and version (`STRATA_HIPBLASLT_TUNING_V1 gfx1201 100401`). Save it as
 `tools/hip/<arch>-hipblaslt-<version>.txt` for setup, or point `STRATA_HIPBLASLT_TUNING` at it. Compare the prompt speed with and
-without it before keeping it. For an engine package, `packaging/stage_tuning.py` (Linux) and `tools/hip/package_windows.py`
+without it before keeping it. For an engine package, `tools/packaging/stage_tuning.py` (Linux) and `terminal/tools/hip/package_windows.py`
 copy the tables that match the bundled hipBLASLt into the package's `tuning/` folder. `STRATA_HIPBLASLT_VERBOSE=1` reports
 fallbacks; look for `fallbacks=0`. The test `hip_prefill_hipblaslt_gemm` is a smoke test (it checks 2 rows), and it does not
 prove that every solution id is valid.
 
-Tables in `tools/hip`:
+Tables in `terminal/tools/hip`:
 
 | File | Card, calibrated with | Notes |
 | --- | --- | --- |
@@ -715,7 +715,7 @@ tell us. The numbers below are the contributors', not ours.
 What the exact-build rule leaves out: a table loads only when the architecture and the full rocBLAS version string of the running library match the table's header.
 So these two tables do nothing on a gfx1031 / gfx1032 / other card, on AMD's own Ubuntu ROCm 7.2.4 packages (they report `5.2.0.dabb6df2b9`), on a later TheRock nightly, on
 Windows, or on any other rocBLAS build; the engine then logs that the table was refused and rocBLAS's default kernels run. Different GEMM solutions round FP16 differently, so answers can differ in the last bits. The tables need
-`STRATA_HIP_PROMPT_F16=1` and `STRATA_ROCBLAS_TUNING` (setup sets the latter to `tools/hip` on gfx103x); an engine package that does not carry `tools/hip` has no table to load.
+`STRATA_HIP_PROMPT_F16=1` and `STRATA_ROCBLAS_TUNING` (setup sets the latter to `terminal/tools/hip` on gfx103x); an engine package that does not carry `terminal/tools/hip` has no table to load.
 
 The dot product change is device code, so the environment variable cannot undo it on a build that has it: build with `-DSTRATA_AMD_COMMUNITY_TUNING=OFF` to compile the portable loop for gfx1010
 again (`-DSTRATA_GFX1012_PORTABLE_DOT=ON` does the same, for gfx1010 and gfx1012). Other architectures compile the same code either way.

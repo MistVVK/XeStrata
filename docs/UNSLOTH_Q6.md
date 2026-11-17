@@ -32,7 +32,7 @@ Shard 1 holds only metadata. Shard 2 holds only the output head (`output.weight`
 | `Qwen3.8-Flash-Next-UD-Q6_K_XL-00005-of-00006.gguf` | 49,419,317,344 | `9948e81ae8368144b135a7403d8c0f2cf9a6c2f9f692313865855b2832e696c9` |
 | `Qwen3.8-Flash-Next-UD-Q6_K_XL-00006-of-00006.gguf` | 14,838,313,984 | `e4ae255234f42b18012f6d6eec5bf615b57479b7e0a0233c47436a321ffeec3f` |
 
-Formats, read from the shard headers with `tools/gguf_reader.py`:
+Formats, read from the shard headers with `terminal/tools/gguf_reader.py`:
 
 - **Routed experts.** `ffn_gate_exps` and `ffn_up_exps` are Q6_K in 47 of 48 layers and Q8_0 in layer 2. `ffn_down_exps`
   is Q8_0 in every layer (891.3 MB per layer at 640x2560x512, against Q6_K's 688.1 MB for gate or up). The pack's
@@ -41,7 +41,7 @@ Formats, read from the shard headers with `tools/gguf_reader.py`:
   `native_experts.txt` v4 handles shards whose boundaries cut through a layer.
 - **Everything else.** Attention and shared-expert projections, SSM, hyper-connections, the PLE key/value, the token
   embedding and the output head are Q8_0, or F32/BF16 where the engine reads floats. This is the same pattern
-  [UD-Q4_K_XL](UNSLOTH_Q4.md) handles with `tools/iq_pack.py --compat-bf16`.
+  [UD-Q4_K_XL](UNSLOTH_Q4.md) handles with `terminal/tools/iq_pack.py --compat-bf16`.
 - **The PLE table** (`per_layer_token_embd.weight`, [160, 320001536]) is **Q8_0**, in its own shard 3. A row is 5 blocks
   of 32 elements at 34 bytes, 170 bytes in all, and the whole table is 54.4 GB (UD-Q4_K_XL's IQ4_NL table is 28.8 GB).
   The engine reads Q8_0 rows natively. The FP8 table of [tools/ple_fp8_pack.py](../terminal/tools/ple_fp8_pack.py) needs the
@@ -56,7 +56,7 @@ Q6_K gate/up costs 210 bytes per 256 elements, against Q4_K's 144, so the routed
 Same workflow as [UD-Q4_K_XL](UNSLOTH_Q4.md#the-pack-by-hand), from the repository root:
 
 ```sh
-.venv/bin/python tools/iq_pack.py \
+terminal/.venv/bin/python terminal/tools/iq_pack.py \
   --gguf /path/to/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf \
   --out packs/ud-q6_k_xl --compat-bf16
 ```
@@ -65,7 +65,7 @@ Same workflow as [UD-Q4_K_XL](UNSLOTH_Q4.md#the-pack-by-hand), from the reposito
 Do not add `--experts-bin`; the experts stay in the GGUF files. The pack on the finished file has 1079 tensors indexed,
 303 served natively, 460 converted (264 exact, 196 rounded, max abs error 0.0144), 195 compat-BF16 tensors (1.20 GiB),
 an arena of 1.38 GiB, and `native_experts.txt` v4 with the per-role shard column on layers 20 and 41. The packer's tests:
-`.venv/bin/python -m unittest discover -s tools -p test_iq_pack.py`.
+`terminal/.venv/bin/python -m unittest discover -s tools -p test_iq_pack.py`.
 
 ## The server
 

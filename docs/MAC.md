@@ -120,9 +120,9 @@ API on `http://127.0.0.1:8080/v1`, the Anthropic API on `/v1/messages`, and the 
 The app and `strata launch` build nothing. The Metal engine comes ready-made as an engine component, from the update feed or
 inside the app's installer. The model install is `setup.py` in its Control mode (`STRATA_CONTROL_INSTALL=1`). It downloads, or
 uses with `--gguf-dir`, and prepares the model files, and writes a run config whose engine is `component:strata-engine`. It does
-not run `metal/setup_mac.py`, needs no Command Line Tools, and writes the same Metal flags.
+not run `engine/metal/setup_mac.py`, needs no Command Line Tools, and writes the same Metal flags.
 
-The model list and the recommendation judge a Mac by its unified memory with the rules of `strata_control/mac_fit.py`, the module
+The model list and the recommendation judge a Mac by its unified memory with the rules of `terminal/strata_control/mac_fit.py`, the module
 `setup_mac.py` uses too. Q2_0, IQ3_XXS, IQ3_S and the Gyro packs are offered. Unsloth's many-shard files need the source
 installer's repack for now. A pack that does not stay in memory is listed as "read from the SSD", and a Mac under 16 GB of unified
 memory is told the model does not fit.
@@ -142,12 +142,12 @@ deterministic: two runs give identical numbers.
 ### Gyro-S and Gyro-M (agentionai's trellis experts)
 
 The Mac engine runs [Gyro](GYRO.md). The routed experts are trellis-coded blocks (ggml types TQ2_T, TQK6, TQK7) in a
-Hadamard-rotated basis, read from the published file unchanged. The kernels are in `metal/kernels/quant.metal`, `moe.metal` and
+Hadamard-rotated basis, read from the published file unchanged. The kernels are in `engine/metal/kernels/quant.metal`, `moe.metal` and
 `moe_mm.metal`. Setup offers Gyro-S and Gyro-M next to the other sizes (`./setup.sh --family gyro --model Gyro-S`), never as the
 default, and says what the choice risks on your Mac's memory. The 28.8 GB n-gram table is inside the file and is read from the SSD
 like every other pack's, so Gyro-S needs 58.5 GB of disk and about 43 GB of memory to stay resident.
 
-Gyro-M runs on the same kernels (checked tensor by tensor) but no Mac tested here could hold it. `metal/tests/gyro_parity.sh`
+Gyro-M runs on the same kernels (checked tensor by tensor) but no Mac tested here could hold it. `engine/metal/tests/gyro_parity.sh`
 checks the decoder against the format definition and the expert kernels against a double-precision reference.
 `STRATA_METAL_GYRO_TILES=0` turns off the dense-weight tiles.
 
@@ -286,10 +286,10 @@ that answer, shows the GPU temperature from the HID sensors where it has them, a
 
 ## How it works
 
-The code is in `metal/` (the engine's side in `metal/src/engine`, the kernels in `metal/kernels`).
+The code is in `metal/` (the engine's side in `engine/metal/src/engine`, the kernels in `engine/metal/kernels`).
 
-- **Host code:** the PC host code compiles unchanged for macOS. `metal/include/metal_compat` maps the CUDA runtime calls it makes
-  onto a small Metal runtime (`metal/src/gpu`).
+- **Host code:** the PC host code compiles unchanged for macOS. `engine/metal/include/metal_compat` maps the CUDA runtime calls it makes
+  onto a small Metal runtime (`engine/metal/src/gpu`).
 - **Decode and prompt work** run in Metal kernels: one command buffer per verify window, experts read in place from the mapped
   model file, hyper-connections, GDN state and QSA attention on the GPU, and a whole MTP draft round in one command buffer.
 - **The PC builds are byte-identical** with this code present. Every shared file's change is behind `STRATA_GPU_METAL` or `__APPLE__`.
@@ -332,7 +332,7 @@ so resident packs are limited to 70% of the RAM.
 (ten experts, one token) takes 278 us at 37.5 GB/s; IQ3_XXS takes 333 us and Q2_0 166 us. The trellis decode is limited by latency
 and ALU, not by memory. The prompt kernels run 68 ms a layer against 62 ms for IQ3_XXS at 1,024 tokens.
 
-**Quality against the CUDA engine, Gyro-S file.** `tools/quant_quality.py`, teacher-forced over 4,995 positions, CUDA = RTX 3060.
+**Quality against the CUDA engine, Gyro-S file.** `terminal/tools/quant_quality.py`, teacher-forced over 4,995 positions, CUDA = RTX 3060.
 
 | Reference -> run | top-1 agreement | mean KL | KL p99 | perplexity |
 | --- | --- | --- | --- | --- |

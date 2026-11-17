@@ -88,7 +88,7 @@ below sm_80.
 
 **Prompt attention kernel.** Measured on: one V100-PCIE-32GB, i9-7960X, Unsloth UD-IQ4_XS, int8 KV, MTP `--spec 2`, random-word
 prompts, prompt read speed in tok/s with and without the Volta kernel (`STRATA_PROMPT_ATTN_OLD=1`). Decode was 38-51 tok/s in
-every run and is not affected. Report: [bench/results/2026-10-03-v100-prompt-attn](bench-results/2026-10-03-v100-prompt-attn/README.md).
+every run and is not affected. Report: [docs/bench-results/2026-10-03-v100-prompt-attn](bench-results/2026-10-03-v100-prompt-attn/README.md).
 
 | Prompt tokens | old attention path | `prompt_attn_v70_kernel` |
 | --- | ---: | ---: |

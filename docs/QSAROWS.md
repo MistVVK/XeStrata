@@ -15,7 +15,7 @@ that is 15-20 us of issue per query.
 
 ## What it changes
 
-`block_scores_rows_kernel<NQ>` (`src/kernels/cuda/qsa_select.cu`, NQ = 1..4):
+`block_scores_rows_kernel<NQ>` (`engine/src/kernels/cuda/qsa_select.cu`, NQ = 1..4):
 
 1. the NQ queries' slices (4 heads x 4 floats per lane) stay in registers for the whole kernel (44 / 63 / 78 / 94
    registers, no stack, `cuobjdump -res-usage`);

@@ -90,8 +90,8 @@ Follow [contribution validation requirements](../.github/CONTRIBUTING.md) before
 For the Terminal monitor from a checkout:
 
 ```bash
-.venv/bin/pip install -r requirements-monitor.txt
-STRATA_PYTHON="$PWD/.venv/bin/python3" bin/strata monitor --url http://127.0.0.1:8080
+.venv/bin/pip install -r terminal/requirements-monitor.txt
+STRATA_PYTHON="$PWD/.venv/bin/python3" terminal/bin/strata monitor --url http://127.0.0.1:8080
 ```
 
 ## From source: Mac

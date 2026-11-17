@@ -1,7 +1,7 @@
 # POST /v1/vram: what it does and what it answers (opt-in, one NVIDIA GPU, #533, #1034)
 
-This page is written from `serve/server.py` and the engine's `VRAM` command (`src/program/generate.cpp`,
-`src/core/expert_cache.cpp`), and the cases the unit tests in `serve/test_vram.py` pin. A line marked **(code)** is
+This page is written from `terminal/serve/server.py` and the engine's `VRAM` command (`engine/src/program/generate.cpp`,
+`engine/src/core/expert_cache.cpp`), and the cases the unit tests in `terminal/serve/test_vram.py` pin. A line marked **(code)** is
 read from the code and has no test of its own; treat it as a statement of intent, not a promise from a measurement.
 The measurements are in [DETAILS.md](DETAILS.md) (RTX 5070, Q2_0).
 
@@ -135,7 +135,7 @@ With `"vram_elastic": true` as well (opt-in) the expert cache gives the room ins
 - **`POST /v1/vram` while the encoder runs** keeps the asked reserve on top of the encoder's share; the encoder's stop
   then goes back to the asked reserve.
 - An unload of the model stops the encoder too. A picture that was encoded before (a conversation sends its pictures with every turn)
-  starts no reader. The log lines start with `[strata] images:` **(code; the unit tests in `serve/test_vision_elastic.py` pin each case)**.
+  starts no reader. The log lines start with `[strata] images:` **(code; the unit tests in `terminal/serve/test_vision_elastic.py` pin each case)**.
 
 `--vram-elastic` turns `--kv-grow` off (the engine says so at start): with both asked, the whole K/V is in VRAM.
 

@@ -11,8 +11,8 @@ excluded; so is the hashing of the model files that the runner does first (about
 Report their duration separately if measured.
 
 `strata bench run` implements this protocol from Strata 0.2.1. It sends the frozen fixtures in
-`bench/prompts/standard-v1` (corpus SHA-256 `e75eff8b9feea04f745520b392c4c17d97aefc1ba185e222aa6740efa8f68407`)
-and writes the result format below. `BENCH.bat`, `./bench.sh`, and `tools/strata_bench.py` do not implement it.
+`terminal/bench/prompts/standard-v1` (corpus SHA-256 `e75eff8b9feea04f745520b392c4c17d97aefc1ba185e222aa6740efa8f68407`)
+and writes the result format below. `tools/BENCH.bat`, `tools/bench.sh`, and `terminal/tools/strata_bench.py` do not implement it.
 They stay the quick speed check described in the [community guide](COMMUNITY_BENCHMARKS.md). Do not rename their
 output or add a protocol ID to make it appear standard. The draft becomes final only after the measured pilot in the
 [activation checklist](#activation-checklist). The approved manifest described here does not exist yet.
@@ -42,7 +42,7 @@ server that has already answered requests is not freshly loaded, and the report 
 The runner checks every fixture against the bundle manifest before it sends anything, refuses to run if one byte
 differs, and rejects flags that would change the workload (`--concurrency`, `--repeat`, `--request-timeout`).
 `strata bench report DIR` prints a saved result again and re-validates it. Output goes to
-`bench/results/<UTC-date>-standard-<gpu>-<run-id>/` when the current folder has `bench/results`, otherwise to
+`docs/bench-results/<UTC-date>-standard-<gpu>-<run-id>/` when the current folder has `docs/bench-results`, otherwise to
 `./bench-results/`. Read the folder once before you share it: home folders, user and host names, private addresses,
 and keys are replaced, but the runner cannot know everything you consider private.
 
@@ -119,7 +119,7 @@ engine dies or the user cancels. Do not retry failed requests inside a run or re
 
 ### Frozen fixtures
 
-The bundle is committed in `bench/prompts/standard-v1`: one JSON file per scheduled request (the 22 required and
+The bundle is committed in `terminal/bench/prompts/standard-v1`: one JSON file per scheduled request (the 22 required and
 the 12 optional ones) with its exact messages, tool schemas, seed, cap, expected output and frozen token count,
 plus `build.json` (how it was made) and `MANIFEST.sha256`. The SHA-256 of that manifest is
 `protocol.corpus_sha256`. `.gitattributes` marks `bench/prompts/**` as `-text`: a checkout must never convert
@@ -127,9 +127,9 @@ their line endings, and the runner refuses a bundle whose bytes differ from the 
 protocol Git commit. Changes to prompts, order, scoring, caps, or defaults require a new protocol ID; schema
 changes use a separate schema version.
 
-`python tools/build_standard_corpus.py --tokenizer PACK/tokenizer` rebuilds the bundle byte for byte. It needs the
+`python terminal/tools/build_standard_corpus.py --tokenizer PACK/tokenizer` rebuilds the bundle byte for byte. It needs the
 tokenizer files (`vocab.json`, `merges.txt`, `token_type.json`) of a Flash-Next pack and the chat template Strata
-ships (`serve/chat_template.jinja`). The frozen counts are 211 records for `prompt-4k` (4,093 tokens) and 858
+ships (`terminal/serve/chat_template.jinja`). The frozen counts are 211 records for `prompt-4k` (4,093 tokens) and 858
 records for `prompt-16k` (16,386 tokens). Besides each request's token count, the bundle stores the longest token
 prefix the request shares with any other request (`max_shared_prefix_tokens`); that is the cache reuse the
 protocol allows.
@@ -446,7 +446,7 @@ the draft protocol ID. Existing reports remain welcome under the [community guid
 
 1. Run one hardware/model/quant/configuration combination and retain every scheduled outcome. Add a separate
    run for another configuration or baseline; do not select only the best repetitions.
-2. Add `bench/results/<UTC-date>-standard-<hardware>-<run-id>/` containing `README.md`, `results.json`, sanitized
+2. Add `docs/bench-results/<UTC-date>-standard-<hardware>-<run-id>/` containing `README.md`, `results.json`, sanitized
    configuration, engine logs, and `outputs.jsonl`. Small extra provenance files are allowed. Never add model
    weights or generated packs. Inspect redaction before publishing and compute artifact hashes afterwards.
 3. The report states the protocol/status, hardware, model/quant, commit/configuration, actual duration, counts,
@@ -473,7 +473,7 @@ Each entry has the following fields; the example has placeholders, no approved r
 {
   "run_id": "<reviewed-run-id>",
   "protocol_id": "<activated-protocol-id>",
-  "results_path": "bench/results/<report-directory>/results.json",
+  "results_path": "docs/bench-results/<report-directory>/results.json",
   "results_sha256": "<sha256-of-reviewed-results-json>",
   "evidence_commit": "<full-git-commit-containing-reviewed-artifacts>",
   "review_pr": "<benchmark-pull-request-url>",
@@ -504,12 +504,12 @@ actual lengths/cache counts, and concurrency; there is no universal combined sco
 
 ## Activation checklist
 
-`tools/strata_bench.py` (behind `BENCH.bat` and `./bench.sh`) hardcodes temperature `0`, turns thinking off by default,
+`terminal/tools/strata_bench.py` (behind `tools/BENCH.bat` and `tools/bench.sh`) hardcodes temperature `0`, turns thinking off by default,
 has no twelve-case sanity suite, reads changing repository files into its agent workload, and can fall back from token
 counts to stream-chunk counts. `--think` alone does not fix those differences. `strata bench run` does not share
 them: it is the protocol's runner.
 
-Done in 0.2.1, with tests against a scripted mock server (`tests/terminal/test_bench_standard.py`) and the real
+Done in 0.2.1, with tests against a scripted mock server (`terminal/tests/terminal/test_bench_standard.py`) and the real
 API server's mock engine:
 
 - The fixtures, the profile settings, the runner, a strict result validator (`strata bench report` runs it), and the
@@ -522,7 +522,7 @@ Before removing draft status:
 
 - Verify against a real engine that the shipped chat template matches the pinned upstream behavior (tool
   formatting included), and pin the model-card and tokenizer revisions (`protocol.model_card_revision` is `null`
-  with a reason until then). The shipped `serve/chat_template.jinja` differs from the template inside the
+  with a reason until then). The shipped `terminal/serve/chat_template.jinja` differs from the template inside the
   NVFP4 pack the fixtures were counted with; the frozen token counts use the shipped one.
 - Test the cases the mock server cannot show: insufficient context, an error after a first delta on a real engine, and
   optional concurrency with queueing on a server that has fewer than four slots.

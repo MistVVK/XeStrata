@@ -23,7 +23,7 @@ START-HERE.bat --setup --images qwen-image      # Windows
 For an install that is already set up, without running the whole setup again:
 
 ```sh
-.venv/bin/python tools/image/install.py --config strata-<model>.json
+terminal/.venv/bin/python terminal/tools/image/install.py --config strata-<model>.json
 ```
 
 Then request an image:

@@ -52,7 +52,7 @@ Every card has one of three roles.
 
 The Main card is the last card in the engine's order. The first card runs the first layers and, by default, the picture reader.
 
-**Recommended roles** (the same rule in the app, `strata launch` and setup; `strata_control/gpu_roles.py`):
+**Recommended roles** (the same rule in the app, `strata launch` and setup; `terminal/strata_control/gpu_roles.py`):
 
 - The faster card is Main. Speed is multiprocessors x max clock. Cards within 5% count as the same card, and the one with more memory wins, then the lower number. Of two identical cards the highest number is Main. A card with clearly more memory beats a faster one that is at least half as fast.
 - Every other card starts as Helper, except a card with 8 GB or less when a bigger card is present (Off; with only 8 GB cards the second one is a Helper), built-in graphics beside a card with memory of its own (Off), and a card the engine cannot run (Off).
@@ -77,7 +77,7 @@ The server reads `gpu_roles`. If `gpu` was edited by hand and no longer matches,
 `"gpu": [1, 0]` shows as Main = the last card, Helper = the first, the rest Off. The recommendation is not saved, so a card you
 add later is recommended again; a card you add after choosing roles starts Off.
 
-**Which cards count** (`strata_control/gpu_fit.py` holds the memory arithmetic): not an integrated chip beside a real card; at
+**Which cards count** (`terminal/strata_control/gpu_fit.py` holds the memory arithmetic): not an integrated chip beside a real card; at
 least 4 GB of graphics memory to be listed; 8 GB or less starts Off beside a bigger card. Each extra card of a split costs an
 estimated 2 GB of its own buffers.
 
@@ -264,7 +264,7 @@ Dated numbers behind the settings above. Each row is one machine; none is a clai
 <a id="measured"></a>
 
 **Layer split, Coder model.** Measured on: RTX 5080 + RTX 3090, Ryzen 9 9950X3D, Coder, 32K context, engine 0.1.20-era
-(`bench/results/2026-09-29-layer-split/`).
+(`docs/bench-results/2026-09-29-layer-split/`).
 
 | Setup | Prompt 16K / 28K tok/s | Decode story / code tok/s |
 | --- | --- | --- |

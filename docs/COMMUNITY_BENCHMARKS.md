@@ -6,7 +6,7 @@ request workflow; a single model, GPU, or context length is enough to contribute
 There are two ways to measure. For results other people can compare with, run the **standard benchmark**: `strata bench run`
 follows the draft protocol in [BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md) (fixed prompts, thinking on, the model card's
 sampling, twelve sanity checks, about 2 to 4 minutes after the model has loaded on a fast card, more on a slow one) and writes `results.json` with
-the hardware, versions and every request. For a quick look at your own machine, [`BENCH.bat` / `./bench.sh`](#run-the-benchmark)
+the hardware, versions and every request. For a quick look at your own machine, [`tools/BENCH.bat` / `tools/bench.sh`](#run-the-benchmark)
 takes 3 to 10 minutes and writes a report in the format below.
 
 The protocol is still a draft until a pilot has run on two kinds of hardware. The reports listed below were made before
@@ -40,7 +40,7 @@ and their limits. Report what you actually measured and label estimates separate
   (`STRATA_SM70_TABLE=1`) that [NVIDIA_V100.md](NVIDIA_V100.md) asks a V100 owner to check: decode
   **+9.8% and +15.0%** in two order-swapped pairs (28.16/28.64 → 30.92/32.94 tok/s), prompt throughput
   unchanged, and the generated tokens **bit-identical** in all four runs. Also notes that
-  `tools/ab_engine.py`'s three short chats are below this machine's noise floor (the long-prompt arm
+  `terminal/tools/ab_engine.py`'s three short chats are below this machine's noise floor (the long-prompt arm
   points the same way, +5%).
 - [2026-10-08: one AMD Radeon AI PRO R9700 32 GB, two EPYC 9334 CPUs, 503 GiB RAM](bench-results/2026-10-08-community-r9700-linux/README.md):
   Linux/ROCm 7.2.3, frozen experimental 0.1.40.3 source, original Flash-Next IQ3_S fresh 1K/4K/32K/128K
@@ -95,8 +95,8 @@ a result, follow [Submit and review](BENCHMARK_PROTOCOL.md#submit-and-review) in
 
 ## Run the benchmark
 
-The simplest report is one command after setup. Windows: double-click `BENCH.bat`. Linux: `./bench.sh`. Or
-`python tools/strata_bench.py` from the Strata folder. Setup also offers it at the end of an interactive install
+The simplest report is one command after setup. Windows: double-click `tools/BENCH.bat`. Linux: `tools/bench.sh`. Or
+`python terminal/tools/strata_bench.py` from the Strata folder. Setup also offers it at the end of an interactive install
 (default no). The Terminal's `strata bench run` runs the standard benchmark (next section); its `--suite serving-smoke` and
 other serving suites ([TERMINAL.md](TERMINAL.md)) write JSON evidence for your own comparisons, not a report in this format.
 
@@ -118,7 +118,7 @@ latency are measured by the client. Thinking is off for the suite so the answers
 (`--think` leaves it on). Every prompt carries a unique tag, so the fresh-prompt tests never get help from the cache.
 Close other programs first: a browser or a game changes the numbers.
 
-The result goes to `bench/results/<date>-community-<gpu>-<model>/` (or `--out DIR`):
+The result goes to `docs/bench-results/<date>-community-<gpu>-<model>/` (or `--out DIR`):
 
 - `README.md` in the format below, with the GPU, VRAM, CPU, RAM, OS, driver, Strata and engine versions, model and
   quantization, context and your settings filled in from the machine and the server
@@ -134,12 +134,12 @@ To share it, open a pull request that adds the folder (see [Submit a report](#su
 To compare with an earlier run on the same machine (before and after an update or a setting change):
 
 ```bash
-python tools/strata_bench.py --compare bench/results/2026-10-01-community-rtx-3060-qwen3-8-flash-next
-python tools/strata_bench.py --compare OLD_FOLDER --compare-only NEW_FOLDER   # two saved runs, nothing is started
+python terminal/tools/strata_bench.py --compare docs/bench-results/2026-10-01-community-rtx-3060-qwen3-8-flash-next
+python terminal/tools/strata_bench.py --compare OLD_FOLDER --compare-only NEW_FOLDER   # two saved runs, nothing is started
 ```
 
 The tool is a speed check, not a quality test. For recall and other checks, see [Optional correctness
-checks](#optional-correctness-checks); for A/B tests of two builds use `tools/ab_engine.py`.
+checks](#optional-correctness-checks); for A/B tests of two builds use `terminal/tools/ab_engine.py`.
 
 ## What to record
 
@@ -212,12 +212,12 @@ relevant to your workload, such as a completed coding task with test results, a
 tool call followed by its result, or an image question with an expected answer.
 
 For long-context recall, the repository includes
-[`tools/needle_bench.py`](../terminal/tools/needle_bench.py). With a running local server,
+[`terminal/tools/needle_bench.py`](../terminal/tools/needle_bench.py). With a running local server,
 from the repository root:
 
 ```bash
-python tools/needle_bench.py --help
-python tools/needle_bench.py --url http://127.0.0.1:8080 --lengths 32k,128k --depths 10,50,90 --out needles.json
+python terminal/tools/needle_bench.py --help
+python terminal/tools/needle_bench.py --url http://127.0.0.1:8080 --lengths 32k,128k --depths 10,50,90 --out needles.json
 ```
 
 Choose lengths your configured context can hold. The script supports `--api-key`
@@ -228,7 +228,7 @@ successes. A needle test measures recall on those inputs, not overall model qual
 ## Submit a report
 
 1. Fork Strata and create a branch for your report.
-2. Add a folder such as `bench/results/YYYY-MM-DD-community-rtx-5090/`. Use the
+2. Add a folder such as `docs/bench-results/YYYY-MM-DD-community-rtx-5090/`. Use the
    measurement date and a short hardware label; add a suffix if the name exists.
 3. Put a `README.md` based on the template below in that folder, together with
    per-run JSON or CSV and small scripts or prompts needed to repeat it. Use your
