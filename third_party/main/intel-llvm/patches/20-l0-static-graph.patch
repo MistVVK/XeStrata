@@ -28,7 +28,7 @@ index 0550345b8b..1c3c4dd3ce 100644
  //
  //===----------------------------------------------------------------------===//
  
-@@ -768,6 +769,42 @@ ur_result_t ur_platform_handle_t_::initialize() {
+@@ -768,6 +769,41 @@ ur_result_t ur_platform_handle_t_::initialize() {
            (ZeGraphExt.zeGraphDumpContentsExp != nullptr) &&
            (ZeGraphExt.zeGraphDestroyExp != nullptr) &&
            (ZeGraphExt.zeExecutableGraphDestroyExp != nullptr);
@@ -49,9 +49,8 @@ index 0550345b8b..1c3c4dd3ce 100644
 +            ur_loader::LibLoader::loadAdapterLibrary("libze_loader.so.1");
 +#endif
 +        auto Has = [&](const char *Name) {
-+          return SystemLoader &&
-+                 ur_loader::LibLoader::getFunctionPtr(SystemLoader.get(),
-+                                                      Name) != nullptr;
++          return SystemLoader && ur_loader::LibLoader::getFunctionPtr(
++                                     SystemLoader.get(), Name) != nullptr;
 +        };
 +        for (const char *Name :
 +             {"zeCommandListBeginGraphCaptureExt",
