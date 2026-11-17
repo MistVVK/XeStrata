@@ -142,6 +142,13 @@ uint64_t LayerStream::vram() const {
     return t;
 }
 
+uint64_t LayerStream::pending_vram() const {
+    uint64_t n = 0;
+    for (int i = 0; i < resident_; ++i)
+        if (layers_[(size_t) i].d == nullptr) n += layers_[(size_t) i].bytes;
+    return n;
+}
+
 void LayerStream::drop() {
     {   // the worker's queue drained
         std::unique_lock<std::mutex> l(mu_);
@@ -175,12 +182,14 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
     const uint64_t all = total();
     int R = (int) layers_.size();
     bool streaming = false;
+    int slots = 0;
     if (all > budget) {
         streaming = true;
-        if (budget < 2 * max_bytes_)
-            throw std::runtime_error("image engine (layers): the budget is below two layers (" +
+        if (budget < min_budget())
+            throw std::runtime_error("image engine (layers): the budget is below the streaming minimum (" +
                                      std::to_string(budget >> 20) + " MiB)");
-        uint64_t used = 2 * max_bytes_;
+        slots = budget >= 2 * max_bytes_ ? 2 : 1;
+        uint64_t used = (uint64_t) slots * max_bytes_;
         R = 0;
         while (R < (int) layers_.size() && used + layers_[(size_t) R].bytes <= budget) used += layers_[(size_t) R++].bytes;
     }
@@ -204,17 +213,15 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
     // alone and the prepared bytes as they are, not from the file's pages again (MOSS-Image's text encoder on the RX
     // 9060 XT: its pages pushed out of the page cache between prompts, read from the disk at about 90 ms a layer,
     // 3 to 4 s of a 30-token prompt's encode, 2026-11-07); drop_homes gives their RAM back
-    if (!streaming) {
-        for (Slot& s : slots_) {
+    for (int k = 0; k < 2; ++k) {
+        Slot& s = slots_[k];
+        if (k >= slots) {
             if (s.d != nullptr) gpu::free(s.d);
             if (s.ready != nullptr) gpu::event_destroy(s.ready);
             if (s.used != nullptr) gpu::event_destroy(s.used);
             s = Slot{};
-        }
-        if (relay_[1] != nullptr) gpu::free(relay_[1]);
-        relay_[1] = nullptr;
-    } else {
-        for (Slot& s : slots_) {
+            if (k == 1 && relay_[k] != nullptr) { gpu::free(relay_[k]); relay_[k] = nullptr; }
+        } else {
             if (s.d == nullptr) check(gpu::alloc_device(&s.d, max_bytes_), "a slot");
             if (s.ready == nullptr) check(gpu::event_create(&s.ready), "an event");
             if (s.used == nullptr) {
@@ -225,7 +232,10 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
             s.issued = false;
         }
     }
-    for (int k = 0; k < (streaming ? 2 : 1); ++k) {
+    slot_count_ = slots;
+    next_slot_ = 0;
+    in_use_ = -1;
+    for (int k = 0; k < (streaming ? slots : 1); ++k) {
         if (relay_[k] == nullptr && (streaming || R > 0)) check(gpu::alloc_host(&relay_[k], max_bytes_), "the relay");
         if (relay_free_[k] == nullptr) {
             check(gpu::event_create(&relay_free_[k]), "an event");
@@ -413,9 +423,9 @@ void LayerStream::request(int i) {
     if (slot_of(i) >= 0) return;
     // the slot not holding the layer in use (the one begun last): the two alternate on a walk one way, and a walk that
     // turns back (a training step's backward after its forward) asks again for a layer whose slot is in use
-    if (in_use_ >= 0 && slots_[next_slot_].layer == in_use_) next_slot_ ^= 1;
+    if (slot_count_ == 2 && in_use_ >= 0 && slots_[next_slot_].layer == in_use_) next_slot_ ^= 1;
     Slot& s = slots_[next_slot_];
-    next_slot_ ^= 1;
+    if (slot_count_ == 2) next_slot_ ^= 1;
     s.layer = i;
     s.issued = false;
     s.prepared = false;
@@ -505,7 +515,7 @@ const uint8_t* LayerStream::begin(int i) {
 
 const uint8_t* LayerStream::begin(int i, int j) {
     if (i < resident_) {
-        if (j >= resident_ && j < (int) layers_.size()) request(j);   // a streamed one after a resident one
+        if (slot_count_ == 2 && j >= resident_ && j < (int) layers_.size()) request(j);   // a streamed one after a resident one
         Layer& l = layers_[(size_t) i];
         if (!l.loaded) load_resident(i);
         return l.d;
@@ -562,7 +572,7 @@ const uint8_t* LayerStream::begin(int i, int j) {
             }
         }
     }
-    if (j != i && j >= resident_ && j < (int) layers_.size()) request(j);
+    if (slot_count_ == 2 && j != i && j >= resident_ && j < (int) layers_.size()) request(j);
     return s->d;
 }
 

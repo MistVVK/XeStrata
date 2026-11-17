@@ -63,15 +63,19 @@ public:
     uint64_t bytes(int i) const { return layers_[(size_t) i].bytes; }
     uint64_t total() const;
     int count() const { return (int) layers_.size(); }
-    /// The least budget configure takes when not every layer fits: two slots of the largest layer.
-    uint64_t min_budget() const { return 2 * max_bytes_; }
+    /// The least budget configure takes when not every layer fits. One slot streams without a next-layer prefetch.
+    uint64_t min_budget() const { return (uint64_t) min_slots_ * max_bytes_; }
+    /// Allow a single slot under pressure. Set before configure; the default keeps the two-slot inference policy.
+    void allow_single_slot() { min_slots_ = 1; }
 
-    /// Sets the VRAM the layers may take (their resident prefix and, when not all fit, the two slots): a layer resident
+    /// Sets the VRAM the layers may take (their resident prefix and, when not all fit, the slots): a layer resident
     /// before and past the new prefix is freed.  `compute` is the stream the layers are used on.
     void configure(uint64_t budget, gpu::Stream compute);
     /// The layers that stay in VRAM (a prefix), and whether the rest are streamed.
     int resident() const { return resident_; }
     uint64_t vram() const;   // what the layers take now
+    /// The configured resident layers' device bytes not yet allocated by begin().
+    uint64_t pending_vram() const;
 
     /// The device region of layer i for work about to be queued on the compute stream (which is made to wait for its
     /// copy), and the next streamed layer's copy started.
@@ -128,6 +132,7 @@ private:
     std::vector<Layer> layers_;
     uint64_t budget_ = 0, max_bytes_ = 0;
     int resident_ = 0;
+    int min_slots_ = 2, slot_count_ = 0;
     bool streaming_ = false;
     Source source_ = Source::relay;
     uint64_t home_headroom_ = 0;            // the RAM a home leaves beside it (take_home)
