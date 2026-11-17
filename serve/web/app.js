@@ -132,6 +132,7 @@ async function loadHealth() {
 
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
+  {key: "model", label: "Model", icon: "info", unit: ""},
   {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
   // #5484: what the load is (NVML, amdgpu and the Mac report time busy, not compute in use)
   {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100,
@@ -144,20 +145,20 @@ const METRICS = [
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
-  <div class="st-card metric-card"><div class="st-metric">
-    <span class="st-metric__label"${m.hint ? ` title="${esc(m.hint)}"` : ""}>${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
+  <div class="st-card metric-card${m.key === "model" ? " model-card" : ""}"><div class="st-metric">
+    <span class="st-metric__label" id="ml-${m.key}"${m.hint ? ` title="${esc(m.hint)}"` : ""}>${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     ${m.key === "speed" ? `<div class="speed-values">
-      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
-      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
-    </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
-    <span class="st-metric__sub" id="ms-${m.key}"></span>`}
-    <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
+      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span><span class="st-metric__sub speed-range" id="sr-speed"></span></div>
+      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span><span class="st-metric__sub speed-range" id="sr-prefill"></span></div>
+    </div>` : m.key === "model" ? `<span class="st-metric__value model-card__name" id="mv-model">–</span>
+    <span class="st-metric__sub" id="ms-model"></span>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
+    <span class="st-metric__sub" id="ms-${m.key}"></span>${m.key === "temp" || m.key === "power" ? `<span class="st-metric__sub speed-range" id="sr-${m.key}"></span>` : ""}`}
+    ${m.key === "model" ? `<div class="model-card__facts" id="model-facts"></div>` : `<svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
       <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
       stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
       ${m.key === "speed" ? `<g id="sp-prefill" class="speed-prefill"><path class="area" fill="currentColor" opacity=".12"/>
-        <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
-        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
-  </div></div>`).join("");
+      <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
+      stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>`}</div></div>`).join("");
 
 function spark(id, values, max) {
   const svg = $(id);
@@ -432,6 +433,88 @@ function pcieLink(hw) {
   return { gen: hw.gpu_pcie_gen_max || hw.gpu_pcie_gen || null, cur: hw.gpu_pcie_gen || null, width: hw.gpu_pcie_width || null, card: null };
 }
 
+// The Speed card's min and max (#4968, from PR #4968 by noahark): the slowest and the fastest of the newest SPEED_KEPT requests, the same
+// window the server keeps (GET /metrics?requests=all, newest last in its deque of 500). The page adds every polled request to its own
+// map and drops the oldest past SPEED_KEPT, so an extreme the server has let go of is gone here too. A new totals window (a server
+// restart) starts the map afresh from one full pull.
+const SPEED_KEPT = 500;
+let speedWin = new Map(), speedWinSince = null;
+function keepNewest(map, cap) {
+  if (map.size <= cap) return map;
+  const rows = [...map.values()].sort((a, b) => (a.time || 0) - (b.time || 0));
+  return new Map(rows.slice(-cap).map((r) => [r.id, r]));
+}
+const prefillOf = (r) => (r.prompt_ms > 0 && r.prompt_tokens != null && r.prompt_tokens - (r.reused || 0) > 0
+                          ? (r.prompt_tokens - (r.reused || 0)) / (r.prompt_ms / 1000) : null);
+function speedRange(rows) {
+  const out = {};
+  for (const [key, get] of [["decode", (r) => r.decode_tok_s], ["prefill", prefillOf]]) {
+    const v = rows.map(get).filter((x) => x != null && x > 0);
+    out[key] = v.length ? {min: Math.min(...v), max: Math.max(...v), n: v.length} : null;
+  }
+  return out;
+}
+async function pullSpeedWindow() {
+  try {
+    const r = await fetch("metrics?requests=all", {headers: headers()});
+    if (r.ok) for (const q of ((await r.json()).requests || [])) if (q.id != null) speedWin.set(q.id, q);
+    speedWin = keepNewest(speedWin, SPEED_KEPT);
+    fillSpeedRange();
+  } catch { /* the window stays as it is; the next polls add to it */ }
+}
+function fillSpeedRange() {
+  const range = speedRange([...speedWin.values()]);
+  for (const [id, key, d] of [["sr-speed", "decode", 1], ["sr-prefill", "prefill", 0]]) {
+    const r = range[key], el = $(id);
+    el.textContent = r ? `min ${fmt(r.min, d)} · max ${fmt(r.max, d)}` : "";
+    el.title = r ? `The slowest and the fastest of the last ${fmt(r.n)} requests. The server keeps up to 500.` : "";
+  }
+}
+// Power and temperature averages (#4968): a sample is taken at each poll while the server is working (queued, reading or generating;
+// idle time is left out) and weighs the seconds since the poll before it, at most HW_GAP_S, so a page that polled less often (a
+// background tab, another tab of this page) neither drops that time nor lets one sample stand for minutes. A new totals window or
+// another model starts the averages afresh. They cover what this page has watched, and their tooltip says how long that was.
+const HW_GAP_S = 2;
+let hwWin = [], hwKey = null, hwLast = null;
+function hwAverages(samples) {
+  let secs = 0, pw = 0, ps = 0;
+  const cols = samples.reduce((n, s) => Math.max(n, s.t.length), 0), tw = Array(cols).fill(0), ts = Array(cols).fill(0);
+  for (const s of samples) {
+    secs += s.w;
+    if (s.p != null) { pw += s.w; ps += s.w * s.p; }
+    s.t.forEach((x, c) => { if (x != null) { tw[c] += s.w; ts[c] += s.w * x; } });
+  }
+  return {seconds: secs, power: pw ? ps / pw : null, temps: tw.map((w, c) => (w ? ts[c] / w : null))};
+}
+function hwSample(win, last, now, hw, working) {
+  const w = last == null ? 1 : Math.min(Math.max(now - last, 0), HW_GAP_S);
+  if (!working || !w) return win;
+  const g = [...(hw.gpus || [])].sort((a, b) => (a.index || 0) - (b.index || 0));
+  if (!g.length && hw.gpu_power == null) return win;
+  win.push({w, t: g.map((x) => x.temp), p: hw.gpu_power, names: g.map((x) => x.name)});
+  return win.length > 21600 ? win.slice(-18000) : win;
+}
+const spanText = (s) => (s < 90 ? `${fmt(s)} s` : s < 5400 ? `${fmt(s / 60)} min` : `${fmt(s / 3600, 1)} h`);
+function sampleHw(hw, working, key) {
+  const now = Date.now() / 1000;
+  if (hwKey !== key) { hwWin = []; hwKey = key; hwLast = null; }
+  hwWin = hwSample(hwWin, hwLast, now, hw, working);
+  hwLast = now;
+  const avg = hwAverages(hwWin), span = spanText(avg.seconds);
+  const pe = $("sr-power");
+  if (pe) {
+    pe.textContent = avg.power != null ? `avg ${fmt(avg.power)} W` : "";
+    pe.title = avg.power != null ? `Average power while the server was working, over the ${span} this page has watched. Idle time is left out.` : "";
+  }
+  const te = $("sr-temp");
+  if (te) {
+    const any = avg.temps.some((x) => x != null);
+    te.textContent = any ? `avg ${avg.temps.map((x) => (x == null ? "–" : fmt(x))).join(" / ")}` : "";
+    const names = hwWin.length ? hwWin[hwWin.length - 1].names : [];
+    const detail = avg.temps.map((x, i) => (x == null || !names[i] ? null : `${names[i]}: ${fmt(x)} °C`)).filter(Boolean).join(" · ");
+    te.title = any ? `${detail ? detail + "\n" : ""}Average temperature of each card while the server was working, over the ${span} this page has watched. Idle time is left out.` : "";
+  }
+}
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // model state
   // A local turn keeps metrics on "unloaded" for the whole engine start.
@@ -497,6 +580,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : avgPrefill != null ? "Prefill · run average" : last ? "Prefill last request" : "Prefill");
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
+  if (speedWinSince !== (totals && totals.since)) { speedWin = new Map(); speedWinSince = totals && totals.since; pullSpeedWindow(); }
+  for (const r of requests) if (r.id != null) speedWin.set(r.id, r);
+  speedWin = keepNewest(speedWin, SPEED_KEPT);
+  fillSpeedRange();
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
@@ -552,6 +639,35 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
               hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
   }
   spark("sp-disk", h.disk_read_mb);
+  // power and temperature averages (#4968); after the cards block above so that block stays self-contained
+  sampleHw(hw, !!live.state && live.state !== "idle" && live.state !== "unloaded", `${totals && totals.since}|${eng.model || ""}`);
+
+  // the model card (#4968, from PR #4968 by noahark): which model this is (the name appears nowhere else on this tab) and the averages of
+  // the server's own totals since it started. Tooltips are plain title= text, like the rest of this tab.
+  $("ml-model").title = "Which model this server runs. Apps ask for it by this exact name.";
+  $("mv-model").textContent = eng.model || "–";
+  $("mv-model").title = eng.model || "";
+  $("ms-model").textContent = [eng.max_context ? `${ctxfmt(eng.max_context)} context` : null,
+                               eng.version ? `engine v${eng.version}` : null].filter(Boolean).join(" · ");
+  $("ms-model").title = "The context window this model runs with, and the engine's version.";
+  const avg = [];
+  if (totals && totals.requests) {
+    const read = totals.prompt_tokens - totals.reused;
+    avg.push(["Decode avg", totals.decode_ms > 0 && totals.output_tokens ? `${fmt(totals.output_tokens / (totals.decode_ms / 1000), 1)} t/s` : "–",
+              "Average answer speed since the server started: answer tokens divided by the time spent writing them. Waiting in the queue and reading the prompt are not counted."]);
+    avg.push(["Prefill avg", totals.prompt_ms > 0 && read > 0 ? `${fmt(read / (totals.prompt_ms / 1000))} t/s` : "–",
+              "Average prompt speed since the server started, counting only the tokens that were really read. What came from the cache is left out."]);
+    avg.push(["Per request", `${fmt(totals.prompt_tokens / totals.requests)} in · ${fmt(totals.output_tokens / totals.requests, 1)} out`,
+              "The average prompt and answer length of one request."]);
+    avg.push(["Prompt reused", totals.prompt_tokens ? `${fmt((100 * totals.reused) / totals.prompt_tokens)}%` : "–",
+              "How much of each prompt came from the engine's cache instead of being read again. High means follow-ups are fast."]);
+    const t0 = new Date(totals.since * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+    avg.push(["Since", `${t0} · ${fmt(totals.requests)} requests`,
+              "When this server began counting, and how many requests it has served. Loading or unloading the model does not reset it."]);
+  }
+  $("model-facts").innerHTML = avg.length
+    ? avg.map(([k, v, tip]) => `<span class="mf-k" title="${esc(tip)}">${esc(k)}</span><span class="mf-v">${esc(v)}</span>`).join("")
+    : `<span class="mf-k mf-k--wide">Averages start with the first request.</span>`;
 
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;
