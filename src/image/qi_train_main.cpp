@@ -212,8 +212,8 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const double own = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
         std::printf("step %lld loss %.5f (avg %.5f) t %.1f grad %.3f %lldx%lld %.2f s (%.2f s/step)\n",
-                    (long long) step, (double) loss, loss_avg, (double) timestep, norm, (long long) (w * 16),
-                    (long long) (h * 16), own, secs / (double) (step - start_step + 1));
+                    (long long) step, (double) loss, loss_avg, (double) timestep, norm, (long long) w * 16,
+                    (long long) h * 16, own, secs / (double) (step - start_step + 1));
         std::fflush(stdout);
         ctl.report();
         if ((save_every > 0 && step % save_every == 0) || step == steps) {
