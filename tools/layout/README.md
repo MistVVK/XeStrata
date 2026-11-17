@@ -91,6 +91,10 @@ a path that does not exist when it existed before the move or its first missing 
 `cmake -S <folder>` whose folder has no CMakeLists.txt. It found a test that skipped silently after the move and several release build
 scripts. Dual-layout fallbacks that read both layouts on purpose show up as hits to read, not as breaks.
 
+`checks/docs_paths.py <repo> <rev> <rev before the move> [--explained checks/docs_paths_explained.txt]` reads the code spans and blocks of the user-facing pages
+(docs/*.md, README.md, AGENTS.md, .github/*.md) and lists every command or path that existed before the move, does not exist now and has a new place
+(`tools/iq_pack.py`, `.venv/bin/python`, `-m serve.server`). It reports no hit on the head of 0.2.16.
+
 Run each Windows test file in its own process. In one combined pytest run, `serve/winjob.py` and `serve/lifeline.py` keep the
 `subprocess.Popen` that an earlier test may have replaced, and 7 tests fail in both trees for that reason only.
 

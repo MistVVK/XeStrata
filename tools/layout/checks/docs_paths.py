@@ -13,6 +13,8 @@ Also reported: commands that start a moved program from the repository root as b
 Prints one line per hit: page:line: token -> new path   [context]. Exit 1 while a hit is left.
 --fix-list FILE writes "page<TAB>line<TAB>old<TAB>new<TAB>context" for the hits whose context is a command (a block or a span that starts like a command);
 --fix-all FILE writes it for every hit.
+--explained FILE: lines "page | text | reason" for hits that are correct as written. A bare file name in a sentence (setup.py, strata.py) is not a hit: it matters
+only as the program of a command.
 """
 import posixpath
 import re
@@ -22,6 +24,13 @@ import sys
 repo, rev, before = sys.argv[1:4]
 fix_list = sys.argv[sys.argv.index("--fix-list") + 1] if "--fix-list" in sys.argv else None
 fix_all = sys.argv[sys.argv.index("--fix-all") + 1] if "--fix-all" in sys.argv else None
+explained_file = sys.argv[sys.argv.index("--explained") + 1] if "--explained" in sys.argv else None
+EXPLAINED = []       # (page, text in the span or line, reason): a hit that is correct as written (checks/docs_paths_explained.txt)
+if explained_file:
+    for _l in open(explained_file, encoding="utf-8"):
+        _p = [x.strip() for x in _l.rstrip("\n").split("|", 2)]
+        if len(_p) == 3 and _p[0] and not _p[0].startswith("#"):
+            EXPLAINED.append((_p[0], _p[1], _p[2]))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
@@ -123,6 +132,10 @@ for page in pages:
                 if tok in old_tree or tok in old_dirs:
                     nw = new_path(tok)
                     if nw and nw != tok and (nw in tree or nw in dirs):
+                        if tok in ("setup.py", "strata.py") and not re.search(r"(?:python3?(?:\.exe)?|py -3|[/\\]python(?:\.exe)?)\s+(?:-\S+\s+)*" + re.escape(tok), body):
+                            continue                  # the name of one file in a sentence does not mislead; it matters as a command's program
+                        if any(p == page and t in body for p, t, _why in EXPLAINED):
+                            continue
                         hits.append((page, n, tok, nw, "command" if (is_cmd or block) else "prose"))
             # the commands that start moved programs from the root
             if is_cmd:
