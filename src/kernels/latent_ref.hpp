@@ -138,8 +138,8 @@ struct Fixture {
             std::iota(perm.begin(), perm.end(), 0);
             std::shuffle(perm.begin(), perm.end(), rng);
             for (int j = 0; j < K; ++j) {
-                ids[(size_t) (t * K + j)] = perm[(size_t) j];
-                w[(size_t) (t * K + j)] = 0.05f + 0.1f * uni(rng) / 2.f;
+                ids[(size_t) t * (size_t) K + (size_t) j] = perm[(size_t) j];
+                w[(size_t) t * (size_t) K + (size_t) j] = 0.05f + 0.1f * uni(rng) / 2.f;
             }
         }
         const ggml_type dt = fmt == 4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
@@ -189,7 +189,7 @@ inline std::vector<float> layer_ref(const Fixture& f, bool int_du) {
     const size_t xq_row = (size_t) (H / 32) * 36, lq_row = (size_t) (ELL / 32) * 36;
     std::vector<uint8_t> xq((size_t) (T * H / 32) * 36);
     q8_1_quant(f.x.data(), T, H, xq.data());
-    std::vector<float> xl((size_t) (T * G * ELL));
+    std::vector<float> xl((size_t) T * G * ELL);
     for (int t = 0; t < T; ++t) {
         const auto xd = q8_1_dequant(xq.data() + (size_t) t * xq_row, H);
         for (int g = 0; g < G; ++g) {
@@ -205,7 +205,7 @@ inline std::vector<float> layer_ref(const Fixture& f, bool int_du) {
             }
         }
     }
-    std::vector<uint8_t> xlq((size_t) (T * G * ELL / 32) * 36);
+    std::vector<uint8_t> xlq(((size_t) T * G * ELL / 32) * 36);
     q8_1_quant(xl.data(), (int64_t) T * G, ELL, xlq.data());
     std::vector<float> yl((size_t) (f.cap * ELL));
     std::vector<uint8_t> hq((size_t) (I / 32) * 36);

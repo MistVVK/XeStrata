@@ -40,11 +40,14 @@ void check(bool ok, const char* label) {
 constexpr uint64_t MiB = 1ull << 20;
 constexpr uint64_t GiB = 1ull << 30;
 
+std::string fixture_name() {
+    static int n = 0;
+    return "strata_memory_guard_" + std::to_string((long) process_id()) + "_" + std::to_string(n++);
+}
+
 struct Fixture {
     fs::path dir;
-    Fixture() {
-        static int n = 0;
-        dir = fs::temp_directory_path() / ("strata_memory_guard_" + std::to_string((long) process_id()) + "_" + std::to_string(n++));
+    Fixture() : dir(fs::temp_directory_path() / fixture_name()) {
         fs::remove_all(dir);
         fs::create_directories(dir / "cgroup");
     }

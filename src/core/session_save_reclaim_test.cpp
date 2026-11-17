@@ -46,6 +46,7 @@ int main() {
     // Every selected position, first-tie preference, and explicit pins (a pin can be shallower).
     for (size_t selected = 0; selected < 4; ++selected) for (bool pin : {false, true}) {
         std::vector<ConversationCheckpoint> chain;
+        chain.reserve(4);
         for (size_t i = 0; i < 4; ++i) chain.push_back(checkpoint(i == selected ? 300 : 100, pin && i == selected));
         if (pin) chain[(selected + 1) % 4].ids.resize(500); // deeper, unpinned
         auto before = *session_deepest_checkpoint(chain);

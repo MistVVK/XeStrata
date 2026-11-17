@@ -198,7 +198,7 @@ int main(int argc, char** argv) try {
 
     for (const Case& cs : cases) {
         const long long n_in = 512, n_out = 64;   // 2 Q8_K blocks wide, small enough for a host reference
-        std::mt19937 rng(2024);
+        std::mt19937 rng(2024);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::normal_distribution<float> g(0.0f, 1.0f);
         std::vector<float> xf((size_t) n_in);
         for (auto& v : xf) v = g(rng);

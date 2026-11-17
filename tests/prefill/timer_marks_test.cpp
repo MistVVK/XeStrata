@@ -66,12 +66,14 @@ int main() {
 
     // alternating phases: nothing is skipped
     std::vector<Mark> alt;
+    alt.reserve(10);
     for (int i = 0; i < 10; ++i) alt.push_back({i % 2 ? kGemm : kDequant, (double) i});
     record(alt, &skipped);
     CHECK(skipped == 0);
 
     // the same phase for the whole run: one record plus the closing mark
     std::vector<Mark> same;
+    same.reserve(101);
     for (int i = 0; i < 100; ++i) same.push_back({kDequant, (double) i});
     same.push_back({kIdle, 100.0});
     const std::vector<Mark> k2 = record(same, &skipped);
