@@ -174,6 +174,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     co.initial = train::initial_vram("qwen-image-2.1", base, max_hw + max_text_rows, rank);
     train::Control ctl(tr.base(), co);
     ctl.load(opt(f, "resume", ""), load_loop);
+    train::log_training_plan(tr.base(), o.lr);
     ctl.report();
     const int64_t start_step = done + 1;
     std::map<std::pair<int64_t, int64_t>, train::Schedule> sched;

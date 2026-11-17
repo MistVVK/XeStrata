@@ -45,6 +45,9 @@ bool stop_requested();
 struct InitialVram { uint64_t min_mib, need_mib; };
 InitialVram initial_vram(const std::string& model, const std::string& base, int64_t image_tokens, int64_t rank);
 
+/// The learning-rate policy, current layer residency and actual GEMM choices as the training run encounters them.
+void log_training_plan(Trainer& tr, float lr, int warmup_updates = 0);
+
 class Control {
 public:
     struct Opts {
@@ -84,6 +87,7 @@ private:
     std::streamoff size_ = -1;
     double last_read_ = 0;
     int poll_ms_ = 200;
+    int last_resident_ = -1;
     std::string last_line_;
 };
 

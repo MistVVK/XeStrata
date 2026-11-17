@@ -334,6 +334,7 @@ int main(int argc, char** argv) {
                                                                        strata::image::mf_train_max_tokens(data), rank);
             strata::image::train::Control ctl(strata::image::mf_trainer_base(m.get()), co);
             ctl.load(resume_path, load_loop);
+            strata::image::train::log_training_plan(strata::image::mf_trainer_base(m.get()), lr, std::max(0, warmup));
             ctl.report();
             if (!ctl.boundary(true, save_loop)) return 0;   // initial eval also needs the largest cached shape's budget
             eval_avg("init");

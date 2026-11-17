@@ -163,6 +163,7 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
                                                 mf_train_max_tokens(data), rank);
     train::Control ctl(tr.base(), co);
     ctl.load(opt(f, "resume", ""), load_loop);
+    train::log_training_plan(tr.base(), o.lr);
     ctl.report();
     const int64_t start_step = done + 1;
     const auto t0 = std::chrono::steady_clock::now();

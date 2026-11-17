@@ -126,6 +126,16 @@ InitialVram initial_vram(const std::string& model, const std::string& base, int6
     return {minimum, std::max(minimum, peak + std::max<uint64_t>(128, (peak * 2 + 99) / 100))};
 }
 
+void log_training_plan(Trainer& tr, float lr, int warmup_updates) {
+    prefill::Gemm::trace_training();
+    const char* no_blas = strata::env_get("NO_BLAS"), *blas = strata::env_get("BLAS");
+    std::printf("training plan: gemm=%s NO_BLAS=%s BLAS=%s; lr=%g warmup_updates=%d then constant (partial tail at base); "
+                "resident=%d/%d (dynamic; see vram or residency); shared gemm shapes follow as used\n",
+                prefill::Gemm::path(), no_blas ? no_blas : "unset", blas ? blas : "unset", (double) lr,
+                warmup_updates, tr.ws.resident(), tr.ws.count());
+    std::fflush(stdout);
+}
+
 Control::Control(Trainer& tr, Opts o) : tr_(tr), opts_(std::move(o)), budget_mib_(opts_.budget_mib) {
     if (const char* e = strata::env_get("TRAIN_CONTROL_MS")) {
         const long v = std::strtol(e, nullptr, 10);
@@ -289,7 +299,13 @@ bool Control::boundary(bool, const std::function<void(std::ostream&)>& save_loop
 }
 
 void Control::report() {
-    if (enabled()) emit(false);
+    if (enabled()) {
+        emit(false);
+    } else if (tr_.ws.resident() != last_resident_) {
+        last_resident_ = tr_.ws.resident();
+        std::printf("training residency: %d/%d\n", last_resident_, tr_.ws.count());
+        std::fflush(stdout);
+    }
 }
 
 }  // namespace strata::image::train
