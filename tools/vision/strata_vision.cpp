@@ -16,6 +16,7 @@
 #include "own_reader.h"
 #ifdef STRATA_VIT_GPU
 #include "vit_gpu.h"
+#include "../../include/strata/core/kpack_path.hpp"   // #5060 (header only)
 #endif
 
 #include <algorithm>
@@ -48,6 +49,9 @@ int main(int argc, char** argv) {
             if (GetFileAttributesW(rocm.c_str()) != INVALID_FILE_ATTRIBUTES) SetDllDirectoryW(rocm.c_str());
         }
     }
+#endif
+#if defined(STRATA_VISION_HIP) && !defined(_WIN32)
+    strata::core::kpack_path::apply(strata::core::kpack_path::exe_dir());   // #5060: the package's kpack archives for hipBLAS / rocBLAS
 #endif
     strata_vit::OwnReaderOptions o;
     // STRATA_VISION_TOWER=mtmd came from the "Picture reader" setting removed in 0.2.16; a run config that still carries it keeps working, the name is no

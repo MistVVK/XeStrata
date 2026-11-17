@@ -24,6 +24,7 @@
 #include "strata/core/residency_trim.hpp"
 #include "strata/core/kfd_settle.hpp"
 #include "strata/core/kfd_quiet.hpp"
+#include "strata/core/kpack_path.hpp"
 #include "strata/core/device_error_exit.hpp"
 #if defined(STRATA_USE_HIP) && defined(__linux__)
 #include "strata/kernels/fused_gr.hpp"   // fused_gr_check, called early on an integrated gfx11 (kfd_quiet.hpp, LOAD)
@@ -3630,6 +3631,11 @@ int main(int argc, char** argv) {
             if (std::getenv("STRATA_TRACE") != nullptr)
                 std::fprintf(stderr, "strata trace: kfd quiet: GPU_PINNED_MIN_XFER_SIZE=%s (pageable copies staged by the runtime)\n", v);
         }
+    }
+    {   // #5060: a package built against a kpack ROCm carries rocBLAS's device code in <exe folder>/kpack; point the kpack loader at it
+        // (kpack_path.hpp).  No such folder (every release package) = nothing set; a value the caller set wins.
+        const std::string kp = strata::core::kpack_path::apply(strata::core::kpack_path::exe_dir());
+        if (!kp.empty() && std::getenv("STRATA_TRACE") != nullptr) std::fprintf(stderr, "strata trace: ROCM_KPACK_PATH=%s\n", kp.c_str());
     }
 #endif
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the

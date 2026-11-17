@@ -98,6 +98,22 @@ for b in "${BINS[@]}"; do
   chk $? "collected for $(basename "$b")"
   DATA=()                                              # the kernel data once
 done
+# #5060: a ROCm whose rocBLAS / hipBLASLt keep their device code in kpack archives (ROCm 10.x: <rocm>/.kpack, found by the libraries at ../.kpack
+# from their own folder, which is outside the package): the blas_lib archives of these archs go to kpack/ in the package, and the engine and the GPU
+# reader name them in ROCM_KPACK_PATH (include/strata/core/kpack_path.hpp).  rocSOLVER's solver_lib is left out (Strata launches none of its kernels;
+# tools/hip/package_windows.py does the same).  TheRock's wheels (the release builds) embed the device code: no .kpack, nothing copied.
+KPDIRS=()
+for r in "$(dirname "$(readlink -f "$LIBW/lib/librocblas.so.5" 2>/dev/null || echo "$LIBW/lib/x")")/.." "$HP" "$CORE" "$LIBW"; do
+  [ -d "$r/.kpack" ] && KPDIRS+=("$(readlink -f "$r/.kpack")")
+done
+if [ ${#KPDIRS[@]} -gt 0 ]; then
+  mkdir -p "$STAGE/kpack"; nkp=0
+  for a in $ARCHLIST; do
+    f=""; for d in "${KPDIRS[@]}"; do [ -f "$d/blas_lib_$a.kpack" ] && { f="$d/blas_lib_$a.kpack"; break; }; done
+    if [ -n "$f" ]; then cp "$f" "$STAGE/kpack/"; nkp=$((nkp+1)); else st "kpack: no blas_lib_$a.kpack in ${KPDIRS[0]}"; fi
+  done
+  st "kpack: $nkp blas_lib archives copied to kpack/ from ${KPDIRS[0]}"
+fi
 cp "$OUT/b/strata" "$OUT/bv/bin/strata-vision" "$OUT/bh/bin/strata-vision-hip" "$STAGE/"
 # the all-cards split engines (packaging/build_split_hip.sh: strata-split-2/3/4-amd, RUNPATH $ORIGIN) ride in the package when SPLIT_DIR names the folder holding them (--tree takes them)
 [ -n "${SPLIT_DIR:-}" ] && cp "$SPLIT_DIR"/strata-split-*-amd "$STAGE/"
