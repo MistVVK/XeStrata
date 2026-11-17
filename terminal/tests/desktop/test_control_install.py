@@ -406,6 +406,11 @@ class DeleteModelTests(unittest.TestCase):
         self.root = base / "install"
         self.root.mkdir()
         self.data = base / "Strata-data"
+        # The data folder Control may delete from is the one the settings file names (strata_mcp.Strata.data_dir): without this a PC that has its own settings
+        # file (Windows: %APPDATA%\Strata\settings.json, the person's data_dir) made every folder of this test's fake data "outside Strata's folders".
+        isolated = mock.patch.dict(os.environ, {"STRATA_SETTINGS_FILE": str(base / "no-settings.json")})
+        isolated.start()
+        self.addCleanup(isolated.stop)
         spec = importlib.util.spec_from_file_location("strata_mcp_for_delete", ROOT / "tools" / "strata_mcp.py")
         self.mcp = importlib.util.module_from_spec(spec)
         with mock.patch.dict(os.environ, {"STRATA_CONTROL_INSTALL": "1", "STRATA_INSTALL_DIR": str(self.root)}):
