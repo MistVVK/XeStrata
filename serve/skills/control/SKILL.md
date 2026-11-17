@@ -14,6 +14,7 @@ metadata:
 - The prompt describes the whole new image, nothing about the control. A person who must stay (their face, their
   clothes) in another pose: edit_image with references instead.
 - ControlNet (Qwen-Image-2.1): `strength` (0 to 2) 1, 0.5 to 0.8 departs more; `end` (the share of the steps it
-  follows) 1, 0.6 to 0.8 frees the details. `size` the picture's shape by default.
+  follows) 1, 0.6 to 0.8 frees the details. For depth when the new subject differs from the map, use `strength` 0.6
+  and `end` 1. `size` the picture's shape by default.
 - MOSS-Image: `color` and `depth` by its adapter (`end` the share of the steps: 0.5 from a 3D mannequin).
   Other models take the map as a reference image.

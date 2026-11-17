@@ -283,7 +283,7 @@ A map of another picture (`control.image`) - its pose, outlines, depth and the l
 - `control` is `{"type": ..., "image": ...}`. `image` is a data: URL, base64 or an http(s) URL; an edit's multipart form can send it as the `control_image` file (the other fields then go in `control` as JSON, or as fields named with `control_` before them: `control_type`, `control_strength`...).
 - `type` is the map's kind.
    - `pose`: people's poses (YOLOX-L finds the people, DWPose their body's, hands' and face's points, drawn as OpenPose's). `detect_body`, `detect_hands`, `detect_face` (all `true` by default).
-   - `depth`: depth (Depth Anything V2 Small; near white).
+   - `depth`: depth (Depth Anything V2 Small; near white). With Qwen-Image-2.1, try `strength: 0.6` to draw something different from the map.
    - `canny`: outlines (Canny). `low_threshold`, `high_threshold` (100 and 200 by default).
    - `lineart`, `lineart_coarse`: line art. Qwen-Image-2.1 makes unrounded HED outlines from a photo and thickens them with a 3×3 filter. Thin lines and hatching can be copied as an image rather than followed as a control. For a hand drawing set `lineart_input: "drawing"`: a light background is inverted to black, then the lines are thickened and lightly blurred. Other models use fine or rough lines.
    - `hed`: soft outlines (HED; `safe` rounds them to steps, `true` by default). `scribble_hed`: a sketch made from them.
