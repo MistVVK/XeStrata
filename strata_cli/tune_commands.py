@@ -469,12 +469,30 @@ def _effective(a: argparse.Namespace, machine: bool) -> int:
         was, now = tune_knobs._current(before, flag), tune_knobs._current(after, flag)
         if was != now:
             changed.append({"flag": flag, "was": was, "now": now})
+    from strata_control import arg_layers
+    where = arg_layers.sources({**cfg, "args": after}, [c["flag"] for c in changed])
     payload = {"applied": bool(info.get("applied")), "preset": info.get("preset"), "state": info.get("state"), "reasons": info.get("reasons", []),
                "why_not": info.get("why_not"), "warnings": info.get("warnings") or [], "notice": info.get("notice"),
                "args": merged.get("args"), "env": merged.get("env") or {},
-               "sampling": merged.get("sampling") or {}, "changed": changed, "per_request": info.get("per_request") or {}}
+               "sampling": merged.get("sampling") or {}, "changed": changed, "per_request": info.get("per_request") or {}, "sources": where}
     human = (f"Using your tuning '{info['preset']['name']}'" if info.get("applied") else "No saved tuning is applied; the standard settings run.")
+    human += "\n" + _sources_words(where, after)
     return _print(payload, machine, human)
+
+
+#: #5351 (text approved by the coordinator): the labels of `strata presets effective`
+SOURCE_WORDS = {"launch": "set in this start", "yours": "your own setting", "calibrated": "from your calibration", "tuned": "from your saved tuning"}
+
+
+def _sources_words(where: dict[str, str], args: list[str]) -> str:
+    from strata_control import tune_knobs
+    if not where:
+        return "Every setting is chosen automatically."
+    lines = ["Where your settings come from (everything not listed is chosen automatically):"]
+    shown = [(f"{flag} {tune_knobs._current(args, flag) or ''}".rstrip(), SOURCE_WORDS[key]) for flag, key in where.items()]
+    width = max(len(s) for s, _w in shown)
+    lines += [f"  {s.ljust(width)}  {w}" for s, w in shown]
+    return "\n".join(lines)
 
 
 def _off(a: argparse.Namespace, machine: bool) -> int:
