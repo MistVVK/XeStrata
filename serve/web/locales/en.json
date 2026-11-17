@@ -14,6 +14,9 @@
   "chat.deleted": "Chat deleted",
   "chat.empty": "Ask anything",
   "chat.emptyModel": "{model} runs on this PC. Nothing leaves it.",
+  "chat.finishFromThinking": "Answer from this thinking",
+  "chat.finishFromThinkingTitle": "Write an answer from what the model worked out before you stopped it. It doesn't think any further.",
+  "chat.fromStoppedThinking": "answer from the stopped thinking",
   "chat.image": "image",
   "chat.interrupted": "Interrupted",
   "chat.interruptedLower": "interrupted",
@@ -24,7 +27,10 @@
   "chat.projectionOn": "projection on",
   "chat.stopped": "Stopped",
   "chat.stoppedLower": "stopped",
-  "chat.tokens": "{n} tokens",
+  "chat.tokens": {
+    "one": "{n} token",
+    "other": "{n} tokens"
+  },
   "chat.toolCalls": {
     "one": "{n} tool call",
     "other": "{n} tool calls"
@@ -223,6 +229,10 @@
     "one": "{n} chat · kept in this browser",
     "other": "{n} chats · kept in this browser"
   },
+  "sidebar.import": "Bring back a saved chat",
+  "sidebar.importFailed": "Nothing to bring back",
+  "sidebar.importFailedText": "This file has no chat turns in it. Choose a file saved with “Save this chat as Markdown”.",
+  "sidebar.imported": "Chat brought back",
   "sidebar.nameFor": "Name for this chat",
   "sidebar.noMatch": "No chat matches",
   "sidebar.none": "No chats yet",

@@ -73,10 +73,13 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 });
 
 let tab = "chat";
+const bootHash = location.hash;                       // the tab asked for in the address, kept for a tab that shows later (Experts)
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "monitor", "experts", "about"].includes(name) ? name : "chat";
+  if (tab === "experts" && $("tab-btn-experts").hidden) tab = "chat";          // only when the model saves its expert profile (#5723)
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "experts", "about"]) $(`view-${v}`).hidden = v !== tab;
+  if (tab === "experts") StrataExperts.start($("view-experts")); else StrataExperts.stop();
   if (tab === "images") $("img-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
@@ -120,6 +123,8 @@ async function loadHealth() {
     renderEmptyChat();
     $("tab-btn-images").hidden = !health.image_generation;
     if (location.hash === "#images" && health.image_generation) showTab("images");
+    StrataExperts.init({headers, timeStr});
+    StrataExperts.probe().then((on) => { $("tab-btn-experts").hidden = !on; if (on && bootHash === "#experts" && tab === "chat") showTab("experts"); fitHeader(); });
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
@@ -889,6 +894,9 @@ function msgEl(m, i) {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
       `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
       `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
+      `<button class="st-btn st-btn--secondary msg-finish" type="button" data-msg-finish hidden ` +
+      `title="${esc(tr("chat.finishFromThinkingTitle", "Write an answer from what the model worked out before you stopped it. It doesn't think any further."))}">` +
+      `${esc(tr("chat.finishFromThinking", "Answer from this thinking"))}</button>` +
       `<button class="st-btn st-btn--icon" data-msg-copy aria-label="${esc(tr("chat.copyAnswer", "Copy the answer"))}" title="${esc(tr("chat.copy", "Copy"))}">${icon("copy")}</button></div>`;
     updateAssistant(el, m, false);
   }
@@ -986,7 +994,7 @@ function updateAssistant(el, m, streaming) {
   const det = el.querySelector("details.think");
   if (m.reasoning) {
     det.hidden = false;
-    const thinkingNow = streaming && !m.text;
+    const thinkingNow = streaming && !m.text && !m.fromThinking;   // finishing a stopped reply thinks no further (#5508)
     el.querySelector(".think-title").textContent = thinkingNow ? tr("think.now", "Thinking…") :
       m.thinkSecs != null ? tr("think.for", "Thought for {s} s", {s: fmt(m.thinkSecs, 1)}) : tr("think.done", "Thoughts");
     const body = el.querySelector(".thinking");
@@ -1010,6 +1018,8 @@ function updateAssistant(el, m, streaming) {
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? tr("chat.stopped", "Stopped") : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
+  const finish = el.querySelector("[data-msg-finish]");
+  if (finish) finish.hidden = streaming || !canFinishFromThinking(m);
 }
 function renderChat() {
   const chat = $("chat");
@@ -1078,6 +1088,8 @@ $("chat").addEventListener("click", (e) => {
   }
   const mc = e.target.closest("[data-msg-copy]");
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
+  const mf = e.target.closest("[data-msg-finish]");
+  if (mf) { const m = messages[+mf.closest(".st-msg").dataset.i]; if (m) finishFromThinking(m); return; }
   // a tool block: its open state lives in the message (the answer is rebuilt while it streams), so the click sets it
   const sum = e.target.closest(".tool-call > summary");
   if (sum) {
@@ -1251,10 +1263,21 @@ async function send(payload) {
   }
   return generateReply();
 }
-// an answer for the messages as they are: the last one is a user turn
-async function generateReply() {
-  const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
-  messages.push(m);
+// #5508: Stop stays a plain stop. When it left thinking but no answer, the reply offers "Answer from this thinking": one new request,
+// with thinking off, that hands the model what it worked out and asks for the answer only (history.js finishTurn).
+const canFinishFromThinking = (m) => StrataHistory.canFinishFromThinking(messages, m, !!busy);
+const finishMessages = (m) => [...apiMessages(), StrataHistory.finishTurn(m.reasoning)];
+function finishFromThinking(m) {
+  if (!canFinishFromThinking(m)) return;
+  clearUndo();
+  return generateReply({into: m});
+}
+// an answer for the messages as they are: the last one is a user turn (opts.into: the stopped reply to finish, see finishFromThinking)
+async function generateReply(opts = {}) {
+  const finishing = !!opts.into;
+  const m = opts.into || {role: "assistant", text: "", reasoning: "", time: Date.now()};
+  if (finishing) { delete m.stopped; delete m.meta; m.fromThinking = true; }
+  else messages.push(m);
   renderChat();
   const el = $("chat").lastElementChild;
   const controller = new AbortController();
@@ -1262,8 +1285,8 @@ async function generateReply() {
   setBusy(true);
   paintLive();
 
-  const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
+  const body = {model: health.model, messages: finishing ? finishMessages(m) : apiMessages(), stream: true,
+                reasoning_effort: finishing ? "none" : settings.thinking};
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
   } else if (!samplingUntouched(settings)) {
@@ -1271,6 +1294,10 @@ async function generateReply() {
   }
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
+  if (finishing) {                                     // low and fixed: the answer is read off what was worked out (#5508)
+    body.temperature = 0.2;
+    delete body.top_p; delete body.top_k;
+  }
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
@@ -1335,7 +1362,7 @@ async function generateReply() {
   const ended = cut ? tr("chat.interruptedLower", "interrupted") : tr("chat.stoppedLower", "stopped");
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    m.meta = tr("chat.tokens", "{n} tokens", {n: fmt(n)}) + (secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : "") + (m.stopped ? ` · ${ended}` : "") +
+    m.meta = tr("chat.tokens", {one: "{n} token", other: "{n} tokens"}, {n: fmt(n), count: n}) + (secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : "") + (m.stopped ? ` · ${ended}` : "") +
              (projectionLoaded() ? (settings.esp ? ` · ${tr("chat.projectionOn", "projection on")}` : ` · ${tr("chat.projectionOff", "projection off")}`) : "");
   } else if (m.stopped) {
     m.meta = cut ? tr("chat.interrupted", "Interrupted") : tr("chat.stopped", "Stopped");
@@ -1344,6 +1371,7 @@ async function generateReply() {
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
   if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${tr("chat.toolCalls", {one: "{n} tool call", other: "{n} tool calls"}, {n: ran})}`;
   if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "stopped at the limit of {n} tool rounds (mcp.max_rounds)", {n: m.limit})}`;
+  if (m.fromThinking) m.meta = `${m.meta ? `${m.meta} · ` : ""}${tr("chat.fromStoppedThinking", "answer from the stopped thinking")}`;
   busy = null;
   setBusy(false);
   paintLive();

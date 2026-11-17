@@ -24,7 +24,7 @@
   "chat.projectionOn": "проекция включена",
   "chat.stopped": "Остановлено",
   "chat.stoppedLower": "остановлено",
-  "chat.tokens": "{n} токенов",
+  "chat.tokens": {"one": "{n} токен", "few": "{n} токена", "many": "{n} токенов", "other": "{n} токена"},
   "chat.toolCalls": {"one": "{n} вызов инструмента", "few": "{n} вызова инструмента", "many": "{n} вызовов инструмента", "other": "{n} вызова инструмента"},
   "chat.toolLimit": "остановлено на пределе в {n} раундов инструментов (mcp.max_rounds)",
   "chat.untitled": "Новый чат",
@@ -246,5 +246,12 @@
   "tool.running": "Выполняется",
   "tool.skipped": "Не выполнен",
   "tool.writing": "Пишется",
-  "undo": "Отменить"
+  "undo": "Отменить",
+  "sidebar.import": "Вернуть сохранённый чат",
+  "sidebar.imported": "Чат возвращён",
+  "sidebar.importFailed": "Возвращать нечего",
+  "sidebar.importFailedText": "В этом файле нет сообщений чата. Выберите файл, сохранённый через «Сохранить этот чат как Markdown».",
+  "chat.finishFromThinking": "Ответить по этим рассуждениям",
+  "chat.finishFromThinkingTitle": "Пишет ответ по тому, что модель успела продумать до остановки. Дальше она не рассуждает.",
+  "chat.fromStoppedThinking": "ответ по остановленным рассуждениям"
 }

@@ -24,7 +24,7 @@
   "chat.projectionOn": "projection activée",
   "chat.stopped": "Arrêtée",
   "chat.stoppedLower": "arrêtée",
-  "chat.tokens": "{n} tokens",
+  "chat.tokens": {"one": "{n} token", "other": "{n} tokens"},
   "chat.toolCalls": {
     "one": "{n} appel d’outil",
     "other": "{n} appels d’outils"
@@ -261,5 +261,12 @@
   "tool.running": "En cours",
   "tool.skipped": "Non exécuté",
   "tool.writing": "Écriture",
-  "undo": "Annuler"
+  "undo": "Annuler",
+  "sidebar.import": "Récupérer une conversation enregistrée",
+  "sidebar.imported": "Conversation récupérée",
+  "sidebar.importFailed": "Rien à récupérer",
+  "sidebar.importFailedText": "Ce fichier ne contient aucun échange de conversation. Choisissez un fichier enregistré avec « Enregistrer cette conversation en Markdown ».",
+  "chat.finishFromThinking": "Répondre à partir de cette réflexion",
+  "chat.finishFromThinkingTitle": "Rédige une réponse à partir de ce que le modèle avait trouvé avant que vous ne l’arrêtiez. Il ne réfléchit pas davantage.",
+  "chat.fromStoppedThinking": "réponse tirée de la réflexion arrêtée"
 }

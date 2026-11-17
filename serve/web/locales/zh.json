@@ -24,7 +24,7 @@
   "chat.projectionOn": "投影开启",
   "chat.stopped": "已停止",
   "chat.stoppedLower": "已停止",
-  "chat.tokens": "{n} 个 token",
+  "chat.tokens": {"other": "{n} 个 token"},
   "chat.toolCalls": {"other": "{n} 次工具调用"},
   "chat.toolLimit": "已在 {n} 轮工具调用的上限处停止 (mcp.max_rounds)",
   "chat.untitled": "新聊天",
@@ -246,5 +246,12 @@
   "tool.running": "运行中",
   "tool.skipped": "未运行",
   "tool.writing": "正在写入",
-  "undo": "撤销"
+  "undo": "撤销",
+  "sidebar.import": "恢复已保存的对话",
+  "sidebar.imported": "对话已恢复",
+  "sidebar.importFailed": "没有可恢复的内容",
+  "sidebar.importFailedText": "此文件中没有聊天内容。请选择用“将此聊天保存为 Markdown”保存的文件。",
+  "chat.finishFromThinking": "根据这段思考作答",
+  "chat.finishFromThinkingTitle": "根据你停止前模型已想出的内容写出回答。它不会继续思考。",
+  "chat.fromStoppedThinking": "根据已停止的思考作答"
 }

@@ -19,7 +19,7 @@ const modes: {
 }[] = [
     { value: 'manual', label: 'Manual', hint: 'Ask before making changes' },
     { value: 'plan', label: 'Plan', hint: 'Create a plan before making changes' },
-    { value: 'bypass', label: 'Bypass permissions', hint: 'Skip permission prompts' },
+    { value: 'bypass', label: 'Bypass permissions', hint: 'Skip permission prompts. Does not give administrator rights.' },
 ];
 const efforts = ['Off', 'Low', 'Medium', 'High', 'Max'];
 /** The most tokens a reply may spend thinking (the server's reasoning_budget_tokens); 0 = no limit. */
