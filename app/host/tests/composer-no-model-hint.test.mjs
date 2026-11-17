@@ -9,10 +9,7 @@ const LANGS = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
 
 test('the hint shows only for typed text or a picture, no model, no running answer, and not for the command menu or /time-skip', () => {
   const line = chat.split('\n').find(l => l.includes(HINT)) ?? '';
-  assert.ok(line.includes('!streaming && !canChat'), 'no model and nothing streaming');
-  assert.ok(line.includes('(draft.trim() || photos.length)'), 'something to send');
-  assert.ok(line.includes("draft.trim() !== '/'"), 'not the bare slash');
-  assert.ok(line.includes('timeSkipPrompt(draft) === null'), 'a /time-skip works without a model');
+  assert.ok(line.includes("showNoModelHint({ streaming, canChat, hasText: !!draft.trim(), hasPhotos: photos.length > 0, bareSlash: draft.trim() === '/', isTimeSkip: timeSkipPrompt(draft) !== null })"), 'the shared condition (tests/remote-model-chip.test.mjs runs it)');
   assert.ok(line.includes('role="status"'), 'announced politely');
 });
 
