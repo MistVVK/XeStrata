@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import strata_bench  # noqa: E402
 
-KEY = "qatui-bench-key-0213-xyz"
+KEY = "qatui-bench-key-0213-xyz"  # gitleaks:allow -- synthetic credential for redaction testing
 
 
 class UsableKey(unittest.TestCase):
