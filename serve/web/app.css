@@ -801,8 +801,8 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 }
 
 /* ------------------------------------------------------------------ LoRA training panel (ltw, app.js) */
-.st-bubble .ltw { width: 100%; min-width: 0; }   /* the chat's tool card: the bubble's width, no overflow */
 .ltw { border: 1px solid var(--st-border); border-radius: 10px; padding: 0.9rem; margin-top: 0.6rem; display: grid; gap: 0.6rem; }
+.st-bubble .ltw { width: 100%; min-width: 0; }   /* the chat's tool card: the bubble's width, no overflow */
 .ltw-head { font-weight: 600; }
 .ltw-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.5rem; }
 .ltw-wide { grid-column: 1 / -1; }
