@@ -4,6 +4,7 @@ import { DEFAULT_CONTENT_FS, DEFAULT_UI_SCALE, SIZE_DEFAULTS_VERSION, savedSizes
 import { detectLanguage } from './language-detect';
 import { validWhileBusy, type WhileBusy } from './while-busy';
 import { validReplyWidth, type ReplyWidth } from './reply-width';
+import { repairSession } from './session-repair';
 import { addToQuotes, takeQuoteSources, type Quote } from './quotes';
 import { readAsk, type AgentAnswer, type AgentAsk } from './agent-ask';
 import { chatFailure, plainFailureText } from './plain-errors';
@@ -269,7 +270,8 @@ const browserStorage: StorageLike = {
   get length() { return localStorage.length; },
 };
 /** A chat as the page works with it: a reply that was streaming when the page went away is marked interrupted, not left running. */
-function fixSession(session: Session): Session {
+function fixSession(raw: Session): Session {
+  const session = repairSession(raw);   // a damaged or older chat file must never take the page down (missing date, title, message text)
   return {
     ...session,
     ...(session.showcase && !session.showcaseAgentStates ? {agents:SHOWCASE_AGENTS,showcaseAgentStates:true}:{}),
