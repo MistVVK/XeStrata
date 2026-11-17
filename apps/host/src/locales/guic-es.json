@@ -29,5 +29,7 @@
  "guic28": "Numerar las citas",
  "guic29": "Cuando un mensaje cita varios pasajes, cada uno recibe un número e indica quién lo escribió, para que el asistente pueda distinguirlos. Empieza una línea con [1] o [2] para responder a uno de ellos.",
  "guic30": "Cita {0} · tú",
- "guic31": "Cita {0} · el asistente"
+ "guic31": "Cita {0} · el asistente",
+ "guic32": "Imagen no añadida",
+ "guic33": "Strata sigue ocupado con este chat. Vuelve a añadir la imagen cuando termine."
 }

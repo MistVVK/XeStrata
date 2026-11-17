@@ -29,5 +29,7 @@
  "guic28": "Numéroter les citations",
  "guic29": "Quand un message cite plusieurs passages, chacun reçoit un numéro et indique qui l’a écrit, pour que l’assistant puisse les distinguer. Commencez une ligne par [1] ou [2] pour répondre à l’un d’eux.",
  "guic30": "Citation {0} · vous",
- "guic31": "Citation {0} · l’assistant"
+ "guic31": "Citation {0} · l’assistant",
+ "guic32": "Image non ajoutée",
+ "guic33": "Strata est encore occupé avec cette conversation. Ajoutez de nouveau l’image quand elle sera terminée."
 }
