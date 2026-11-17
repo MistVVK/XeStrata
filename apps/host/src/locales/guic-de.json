@@ -22,5 +22,9 @@
  "guic21": "Datei {0} wird geschrieben…",
  "guic22": "{0} läuft…",
  "guic23": "Nur mit Strata auf einem anderen Computer verbinden",
- "guic24": "Es wird nichts heruntergeladen. Sie können die Engine später auf der Seite „Modelle“ hinzufügen."
+ "guic24": "Es wird nichts heruntergeladen. Sie können die Engine später auf der Seite „Modelle“ hinzufügen.",
+ "guic25": "Zitate nummerieren",
+ "guic26": "Wenn eine Nachricht mehrere Textstellen zitiert, erhält jede eine Nummer und den Hinweis, wer sie geschrieben hat, damit der Assistent sie auseinanderhalten kann. Beginnen Sie eine Zeile mit [1] oder [2], um auf eine davon zu antworten.",
+ "guic27": "Zitat {0} · Sie",
+ "guic28": "Zitat {0} · der Assistent"
 }

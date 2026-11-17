@@ -331,6 +331,8 @@ export interface ChatMessage {
   /** The person's message is written with Markdown (a task handover: bold headings and lists), so the bubble draws it as such. */
   markdown?: boolean;
   photos?:import('./chat-photos').ChatPhoto[];
+  /** #5993: where each numbered quote of this message came from ([1], [2] ...), so the transcript can label it and jump to it. */
+  quotes?: import('./quotes').QuoteSource[];
   /** Reply came from a saved API connection, rather than the local engine. */
   remoteModel?: boolean;
   timeSkipId?: string;

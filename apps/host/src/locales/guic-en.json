@@ -22,5 +22,9 @@
  "guic21": "Writing file {0}…",
  "guic22": "Running {0}…",
  "guic23": "Only connect to Strata on another computer",
- "guic24": "Nothing is downloaded. You can add the engine later from the Models page."
+ "guic24": "Nothing is downloaded. You can add the engine later from the Models page.",
+ "guic25": "Number quotes",
+ "guic26": "When one message quotes several passages, each gets a number and says who wrote it, so the assistant can tell them apart. Start a line with [1] or [2] to answer one of them.",
+ "guic27": "Quote {0} · you",
+ "guic28": "Quote {0} · the assistant"
 }

@@ -3,7 +3,7 @@ import { api } from '../lib/client';
 import { useImeKeys } from '../lib/ime-keys';
 import { tr } from '../lib/i18n';
 import { askNotificationPermission, playDoneSound } from '../lib/attention';
-import { setApprovalNotify, setDoneSound, useStore } from '../lib/store';
+import { setApprovalNotify, setDoneSound, setNumberQuotes, useStore } from '../lib/store';
 import { Btn } from './ui';
 
 /** What the host says about the desktop shell (GET /api/shell): null in a browser or while it loads. */
@@ -45,6 +45,12 @@ export function ApprovalNotifySetting() {
     const on = useStore(s => s.approvalNotify);
     return <button className="st-toggle" role="switch" aria-checked={on} aria-label={tr("Notify me when Strata needs an answer")}
         onClick={() => { if (!on) void askNotificationPermission(); setApprovalNotify(!on); }}/>;
+}
+
+/** Settings > General > Number quotes (#5993): off by default; on, a message that quotes several passages numbers them. */
+export function NumberQuotesSetting() {
+    const on = useStore(s => s.numberQuotes);
+    return <button className="st-toggle" role="switch" aria-checked={on} aria-label={tr("Number quotes")} onClick={() => setNumberQuotes(!on)}/>;
 }
 
 /** Keep the app running in the tray when its window is closed (#3477). Desktop app on Windows and macOS only. */

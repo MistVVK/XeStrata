@@ -22,5 +22,9 @@
  "guic21": "Escribiendo el archivo {0}…",
  "guic22": "Ejecutando {0}…",
  "guic23": "Conectarse solo a Strata en otro equipo",
- "guic24": "No se descarga nada. Puedes añadir el motor más tarde desde la página Modelos."
+ "guic24": "No se descarga nada. Puedes añadir el motor más tarde desde la página Modelos.",
+ "guic25": "Numerar las citas",
+ "guic26": "Cuando un mensaje cita varios pasajes, cada uno recibe un número e indica quién lo escribió, para que el asistente pueda distinguirlos. Empieza una línea con [1] o [2] para responder a uno de ellos.",
+ "guic27": "Cita {0} · tú",
+ "guic28": "Cita {0} · el asistente"
 }

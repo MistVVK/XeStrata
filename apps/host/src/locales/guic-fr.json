@@ -22,5 +22,9 @@
  "guic21": "Écriture du fichier {0}…",
  "guic22": "Exécution de {0}…",
  "guic23": "Se connecter uniquement à Strata sur un autre ordinateur",
- "guic24": "Rien n’est téléchargé. Vous pourrez ajouter le moteur plus tard depuis la page Modèles."
+ "guic24": "Rien n’est téléchargé. Vous pourrez ajouter le moteur plus tard depuis la page Modèles.",
+ "guic25": "Numéroter les citations",
+ "guic26": "Quand un message cite plusieurs passages, chacun reçoit un numéro et indique qui l’a écrit, pour que l’assistant puisse les distinguer. Commencez une ligne par [1] ou [2] pour répondre à l’un d’eux.",
+ "guic27": "Citation {0} · vous",
+ "guic28": "Citation {0} · l’assistant"
 }
