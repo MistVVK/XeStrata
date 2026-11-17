@@ -109,14 +109,6 @@ main { flex: 1; min-height: 0; display: flex; }
 .model-card__facts .mf-v { text-align: right; font-variant-numeric: tabular-nums; }
 .model-card__facts .mf-k--wide { grid-column: 1 / -1; }
 
-/* the tooltip box (app.js shows it for every [data-tip]): a card in miniature - same border, radius and shadow -
-   with the card surface at 70 % and a blur under it, so the panel behind stays readable through it */
-#st-tip { position: fixed; z-index: 60; max-width: min(340px, 86vw); padding: var(--st-s-3) var(--st-s-4);
-          border: 1px solid var(--st-line); border-radius: var(--st-r-md); box-shadow: var(--st-sh-pop);
-          background: color-mix(in srgb, var(--st-surface) 70%, transparent);
-          backdrop-filter: blur(8px) saturate(1.2); -webkit-backdrop-filter: blur(8px) saturate(1.2);
-          font-size: var(--st-fs-sm); line-height: 1.55; color: var(--st-ink); overflow-wrap: anywhere;
-          pointer-events: none; }
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
 .st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em; }
 .st-metric__spark { display: block; overflow: visible; }
