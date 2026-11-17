@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -32,12 +33,23 @@ const uint16_t kScales[] = {0x3C00, 0x3800, 0x3400, 0x3000, 0x2C00, 0x2800, 0x20
 
 }  // namespace
 
+// A malformed argument must be an error, not a silently accepted zero.
+static bool parse_i64(const char* s, long long& out) {
+    char* end = nullptr;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return false;
+    out = v;
+    return true;
+}
+
 int main(int argc, char** argv) {
     long long n_blocks = 200000;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
-        else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) n_blocks = std::atoll(argv[++i]);
+        else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
+            if (!parse_i64(argv[++i], n_blocks)) { std::fprintf(stderr, "dequant_s2_parity: invalid --blocks value\n"); return 2; }
+        }
         else {
             std::fprintf(stderr, "usage: dequant_s2_parity [--selftest] [--blocks N]\n");
             return 2;

@@ -185,7 +185,16 @@ void unit_tests() {
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--simulate") == 0) {
         int K = 8, first = 2;
-        if (argc > 3 && std::strcmp(argv[2], "--k") == 0) { K = std::atoi(argv[3]); first = 4; }
+        if (argc > 3 && std::strcmp(argv[2], "--k") == 0) {
+            char* end = nullptr;
+            const long long n = std::strtoll(argv[3], &end, 10);
+            if (end == argv[3] || *end != '\0' || n < 1 || (long long) (int) n != n) {
+                std::fprintf(stderr, "suffix_drafter_test: invalid --k value '%s'\n", argv[3]);
+                return 2;
+            }
+            K = (int) n;
+            first = 4;
+        }
         std::printf("%-28s %8s | %-44s | %-44s\n", "prompt", "tokens", "continue: tok/step  proposals  acc/proposal",
                     "copy: tok/step  proposals  acc/proposal");
         for (int f = first; f < argc; ++f) {

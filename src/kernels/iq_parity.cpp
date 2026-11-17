@@ -54,7 +54,13 @@ int main(int argc, char** argv) try {
         std::FILE* g = std::fopen((dir + "/" + nm + ".f32").c_str(), "rb");
         if (!f || !g) { std::printf("%-8s missing fixture\n", nm); ++failures; continue; }
         int hdr[3];
-        std::fread(hdr, 4, 3, f);
+        if (std::fread(hdr, 4, 3, f) != 3) {
+            std::printf("%-8s bad fixture header\n", nm);
+            std::fclose(f);
+            std::fclose(g);
+            ++failures;
+            continue;
+        }
         const int type = hdr[0], rows = hdr[1], cols = hdr[2];
         std::vector<uint8_t> raw;
         { uint8_t buf[1 << 16]; size_t n; while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) raw.insert(raw.end(), buf, buf + n); }

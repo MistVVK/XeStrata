@@ -55,6 +55,15 @@ double now_ms() {
 
 }  // namespace
 
+// A malformed argument must be an error, not a silently accepted zero.
+static bool parse_i64(const char* s, long long& out) {
+    char* end = nullptr;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return false;
+    out = v;
+    return true;
+}
+
 int main(int argc, char** argv) {
     bool selftest = false;
     const char* path = "pack/full/experts.bin";
@@ -64,7 +73,9 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--file" && i + 1 < argc) { path = argv[++i]; path_given = true; }
-        else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
+        else if (a == "--layer" && i + 1 < argc) {
+            if (!parse_i64(argv[++i], layer)) { std::fprintf(stderr, "pool_test: invalid --layer value\n"); return 2; }
+        }
         else { std::fprintf(stderr, "usage: pool_test [--selftest] [--file P] [--layer N]\n"); return 2; }
     }
 

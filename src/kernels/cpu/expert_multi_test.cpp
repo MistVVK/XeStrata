@@ -57,7 +57,19 @@ int main(int argc, char** argv) {
     }
     std::mt19937 rng(9);  // NOLINT(bugprone-random-generator-seed): a fixed fixture
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
-    const int E = bench ? (argc > 2 ? std::atoi(argv[2]) : 256) : 4;
+    int E = 4;
+    if (bench) {
+        E = 256;
+        if (argc > 2) {
+            char* end = nullptr;
+            const long long n = std::strtoll(argv[2], &end, 10);
+            if (end == argv[2] || *end != '\0' || n < 1 || (long long) (int) n != n) {
+                std::fprintf(stderr, "expert_multi_test: invalid expert count '%s'\n", argv[2]);
+                return 2;
+            }
+            E = (int) n;
+        }
+    }
     std::vector<uint8_t> blobs((size_t) E * c::BLOB);
     for (int e = 0; e < E; ++e) make_blob(&blobs[(size_t) e * c::BLOB], rng);
     std::normal_distribution<float> nd(0.f, 1.f);

@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <random>
@@ -449,6 +450,15 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     }
 }
 
+// A malformed argument must be an error, not a silently accepted zero.
+static bool parse_i64(const char* s, long long& out) {
+    char* end = nullptr;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return false;
+    out = v;
+    return true;
+}
+
 int main(int argc, char** argv) {
     long long n_in = 2560;
     long long n_out = 128;
@@ -463,9 +473,20 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--bench") bench = true;
-        else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
-        else if (a == "--n-in" && i + 1 < argc) n_in = std::atoll(argv[++i]);
-        else if (a == "--n-out" && i + 1 < argc) n_out = std::atoll(argv[++i]);
+        else if (a == "--iters" && i + 1 < argc) {
+            long long n = 0;
+            if (!parse_i64(argv[++i], n) || n < 1 || (long long) (int) n != n) {
+                std::fprintf(stderr, "s_gemv_parity: invalid --iters value\n");
+                return 2;
+            }
+            iters = (int) n;
+        }
+        else if (a == "--n-in" && i + 1 < argc) {
+            if (!parse_i64(argv[++i], n_in)) { std::fprintf(stderr, "s_gemv_parity: invalid --n-in value\n"); return 2; }
+        }
+        else if (a == "--n-out" && i + 1 < argc) {
+            if (!parse_i64(argv[++i], n_out)) { std::fprintf(stderr, "s_gemv_parity: invalid --n-out value\n"); return 2; }
+        }
         else {
             std::fprintf(stderr, "usage: s_gemv_parity [--selftest] [--n-in N] [--n-out N]\n");
             return 2;

@@ -25,7 +25,15 @@
 namespace cpu = strata::kernels::cpu;
 
 int main(int argc, char** argv) {
-    const double seconds = argc > 1 ? std::atof(argv[1]) : 20.0;
+    double seconds = 20.0;
+    if (argc > 1) {
+        char* end = nullptr;
+        seconds = std::strtod(argv[1], &end);
+        if (end == argv[1] || *end != '\0' || !(seconds > 0.0)) {
+            std::fprintf(stderr, "pool_stress: invalid seconds '%s'\n", argv[1]);
+            return 2;
+        }
+    }
     const cpu::CpuFeatures feat = cpu::cpu_features();
     if (!feat.usable()) {
         std::printf("CPU lacks %s: pool_stress SKIPPED\n", feat.reason());

@@ -114,7 +114,15 @@ int video_mode(int argc, char** argv) {
         si::Sam3 sam(argv[2]);
         // STRATA_PROBE_REPEAT: the clip run that many times, each one's times printed (the last warm)
         const char* rep = strata::env_get("PROBE_REPEAT");
-        const int repeat = rep != nullptr ? std::max(1, std::atoi(rep)) : 1;
+        int repeat = 1;
+        if (rep != nullptr) {
+            char* end = nullptr;
+            const long n = std::strtol(rep, &end, 10);
+            if (end == rep || *end != '\0' || n < 1 || (long) (int) n != n)
+                std::fprintf(stderr, "sam3_track_probe: invalid PROBE_REPEAT '%s': using 1\n", rep);
+            else
+                repeat = (int) n;
+        }
         for (int r = 0; r < repeat; ++r) {
             si::Sam3Video vs(sam, info.width, info.height, info.frames, words, clicks);
             strata::video::Reader rd(argv[3], info);
