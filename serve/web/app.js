@@ -5686,6 +5686,7 @@ function ltwPanel(el) {
                   cancelled: tr("ltw.cancelledNote", "Cancelled. The versions saved so far are here to pick."),
                   interrupted: tr("ltw.interruptedNote", "The server stopped mid-job. Resume it, or pick a version saved so far."),
                   completed: tr("ltw.completedNote", "Registered. The LoRA is in the model's list.")}[j.status] || "";
+    const canContinue = ["awaiting_choice", "completed"].includes(j.status) && j.state_bytes && j.settings.steps < 100000;
     const cards = j.versions.map((v) =>
       `<label class="ltw-ver${v.registered ? " ltw-ver--reg" : ""}">
         <input type="radio" name="ltw-ver-${esc(j.id)}" data-ltw-ver="${v.step}"${st.picked === v.step || (st.picked == null && v === j.versions.at(-1)) ? " checked" : ""}${v.registered ? " disabled" : ""}>
@@ -5696,6 +5697,10 @@ function ltwPanel(el) {
       ${j.error ? `<div class="msg-error">${esc(j.error.message || "")}</div>` : ""}
       <div class="muted small">${esc(note)}</div>
       <div class="ltw-vers">${cards}</div>
+      ${canContinue ? `<div class="ltw-row"><label class="st-field"><span>${esc(tr("ltw.continueTotal", "New total steps"))}</span>
+        <input class="st-input" type="number" min="${j.settings.steps + 1}" max="100000" value="${Math.min(100000, j.settings.steps + j.settings.save_every)}" data-ltw-continue-total></label>
+        <button type="button" class="st-btn st-btn--secondary" data-ltw-continue>${esc(tr("ltw.continue", "Continue training"))}</button>
+        <span class="muted small">${esc(tr("ltw.continueState", "The latest continuation state uses {size} MiB; earlier versions do not have a separate state.", {size: fmt(j.state_bytes / 1048576, 1)}))}</span></div>` : ""}
       <div class="ltw-row">
         <input class="st-input" data-ltw-regname placeholder="${esc(j.name)}" aria-label="${esc(tr("ltw.name", "Name"))}">
         <button type="button" class="st-btn" data-ltw-register${j.registered || !j.versions.length ? " disabled" : ""}>${esc(tr("ltw.register", "Register the picked version"))}</button>
@@ -5737,6 +5742,10 @@ function ltwPanel(el) {
       el.querySelectorAll("[data-ltw-ver]").forEach((r) => { r.onchange = () => { st.picked = +r.dataset.ltwVer; }; });
       on("[data-ltw-register]", "onclick", register);
       on("[data-ltw-resume]", "onclick", () => act("resume"));
+      on("[data-ltw-continue]", "onclick", () => {
+        st.picked = null;
+        act("resume", {steps: Number(q("[data-ltw-continue-total]").value)});
+      });
       on("[data-ltw-delunsel]", "onclick", deleteUnselected);
     }
     on("[data-ltw-deljob]", "onclick", async () => {

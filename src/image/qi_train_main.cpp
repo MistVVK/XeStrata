@@ -234,7 +234,9 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
             std::printf("saved %s\n", path.c_str());
         }
         ctl.progress(step, steps, loss);
+        done = step;
     }
+    ctl.save(save_loop);
     return 0;
 }
 

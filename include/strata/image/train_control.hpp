@@ -5,14 +5,15 @@
 //
 //   --vram-budget <MiB>    the first budget (0: pause before the first step; the open still needs its room)
 //   --vram-control <path>  the control file serve writes (tmp + rename): {"budget_mib": N, "save_state": bool, "stop": bool}
-//   --state <path>         where save_state writes the continuation state (default <out>.state.bin)
+//   --state <path>         where save_state and normal completion write the continuation state (default <out>.state.bin)
 //   --resume <path>        continue from a state file (the step count, the loop's rng and order, the LoRA, AdamW)
 //
 // The trainer reads the file at every micro-step's boundary (its mtime and size; a paused run polls it every
 // XESTRATA_TRAIN_CONTROL_MS, 200 ms).  budget_mib 0 pauses there: the trainer's allocations go to the host as they
 // are and the VRAM is given back (Trainer::pause); a budget above 0 resumes at the same values.  save_state true
 // writes the state file at the next micro-step boundary (including accumulated gradients) and then pauses; serve
-// may then stop the process and start it on another card with --resume. stop true ends normally at the next boundary
+// may then stop the process and start it on another card with --resume. Normal completion also saves the last state.
+// stop true ends normally at the next boundary
 // (after a requested save). SIGTERM and SIGINT request the same stop, without an asynchronous GPU teardown.
 // The stdout lines:
 //
@@ -69,13 +70,14 @@ public:
     void report();
     /// One machine-readable line after each optimizer update and any checkpoint for it.
     void progress(int64_t step, int64_t total, double loss) const;
+    /// Save the completed step, the loop state, the LoRA and the optimizer; publish only a whole file.
+    void save(const std::function<void(std::ostream&)>& save_loop);
     /// --resume: the state file into the trainer and the loop (`load_loop` reads what save_loop wrote).  The
     /// completed step count comes back through the loop's own state.  False where the path is empty.
     bool load(const std::string& path, const std::function<void(std::istream&)>& load_loop);
 
 private:
     void read();                 // the control file, when its mtime/size changed (or a second passed)
-    void save(const std::function<void(std::ostream&)>& save_loop);
     bool wait_resume(const std::function<void(std::ostream&)>& save_loop);
     void emit(bool force);
     Trainer& tr_;

@@ -218,7 +218,9 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
             std::printf("saved %s\n", path.c_str());
         }
         ctl.progress(step, steps, loss);
+        done = step;
     }
+    ctl.save(save_loop);
     return 0;
 }
 

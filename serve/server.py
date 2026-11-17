@@ -9414,7 +9414,7 @@ def make_handler(svc: Service):
                 elif action == "cancel":
                     self._json(200, jobs.cancel(jid))
                 elif action == "resume":
-                    self._json(200, jobs.resume(jid))
+                    self._json(200, jobs.resume(jid, req.get("steps")))
                 elif action == "register":
                     step = req.get("step")
                     if step is not None:

@@ -408,6 +408,7 @@ int main(int argc, char** argv) {
             eval_avg("final");
             strata::image::mf_trainer_save(m.get(), out + ".final.safetensors", title, trigger, seed, lr, updates,
                                            steps, kind);
+            ctl.save(save_loop);
             std::printf("done: saved %s (skipped %d non-finite micro-steps)\n",
                         (out + ".final.safetensors").c_str(), nskip);
         } catch (const std::exception& e) {

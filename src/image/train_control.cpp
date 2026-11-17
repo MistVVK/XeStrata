@@ -20,7 +20,12 @@
 #include <stdexcept>
 #include <thread>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <pthread.h>
 #endif
 
@@ -177,17 +182,35 @@ void Control::save(const std::function<void(std::ostream&)>& save_loop) {
     loop << std::setprecision(std::numeric_limits<double>::max_digits10);
     save_loop(loop);
     const std::string ls = loop.str();
-    std::ofstream f(opts_.state, std::ios::binary | std::ios::trunc);
-    if (!f) throw std::runtime_error("cannot write the state file " + opts_.state);
-    f.write(kMagic, sizeof kMagic);
-    const int64_t steps = tr_.steps;
-    f.write(reinterpret_cast<const char*>(&steps), sizeof steps);
-    const uint64_t len = ls.size();
-    f.write(reinterpret_cast<const char*>(&len), sizeof len);
-    f.write(ls.data(), (std::streamsize) len);
-    tr_.save_state(f);
-    f.flush();
-    if (!f) throw std::runtime_error("the state file " + opts_.state + " did not write whole");
+    const std::filesystem::path path(std::u8string(opts_.state.begin(), opts_.state.end()));
+    std::filesystem::path tmp = path;
+    tmp += ".tmp";
+    try {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) throw std::runtime_error("cannot write the state file " + opts_.state + ".tmp");
+        f.write(kMagic, sizeof kMagic);
+        const int64_t steps = tr_.steps;
+        f.write(reinterpret_cast<const char*>(&steps), sizeof steps);
+        const uint64_t len = ls.size();
+        f.write(reinterpret_cast<const char*>(&len), sizeof len);
+        f.write(ls.data(), (std::streamsize) len);
+        tr_.save_state(f);
+        f.close();
+        if (!f) throw std::runtime_error("the state file " + opts_.state + ".tmp did not write whole");
+#if defined(_WIN32)
+        if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            throw std::runtime_error("cannot replace the state file " + opts_.state + ": " +
+                                     std::to_string(GetLastError()));
+#else
+        std::filesystem::rename(tmp, path);
+#endif
+    } catch (...) {
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        throw;
+    }
+    std::printf("state saved %s\n", opts_.state.c_str());
+    std::fflush(stdout);
 }
 
 bool Control::load(const std::string& path, const std::function<void(std::istream&)>& load_loop) {
@@ -256,8 +279,6 @@ bool Control::wait_resume(const std::function<void(std::ostream&)>& save_loop) {
         if (save_state_ && !saved_) {
             save(save_loop);
             saved_ = true;
-            std::printf("state saved %s\n", opts_.state.c_str());
-            std::fflush(stdout);
         }
         if (stop_ || stop_requested()) return false;
         if (!save_state_ && budget_mib_ >= paused_need_mib_ && budget_mib_ > 0) return true;
@@ -272,8 +293,6 @@ bool Control::boundary(bool, const std::function<void(std::ostream&)>& save_loop
     if (save_state_ && !saved_) {
         save(save_loop);
         saved_ = true;
-        std::printf("state saved %s\n", opts_.state.c_str());
-        std::fflush(stdout);
     }
     if (stop_ || stop_requested()) return false;
     const uint64_t min_bytes = std::max(tr_.min_bytes(tr_.last_rows(), tr_.last_row_bytes(), tr_.guess_row()),

@@ -37,11 +37,13 @@ save_state and the process is ended after `state saved` (its exit returns every 
 from __future__ import annotations
 
 import contextlib
+import filecmp
 import json
 import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -429,6 +431,7 @@ class TrainJobs:
         self.svc = svc
         self.lock = threading.Lock()
         self.record_lock = threading.Lock()
+        self.mutation_lock = threading.Lock()   # serialize register, delete and continue
         self.queue: list[str] = []
         self.cancels: dict[str, threading.Event] = {}
         self.worker: threading.Thread | None = None
@@ -760,20 +763,63 @@ class TrainJobs:
         self.wake.set()
         return rec
 
-    def resume(self, jid: str) -> dict:
-        rec = self._need(jid, ("interrupted", "cancelled", "awaiting_choice"))
-        if rec["status"] == "awaiting_choice":
-            return rec                          # its versions are already here to pick
+    def resume(self, jid: str, steps: int | None = None) -> dict:
+        with self.mutation_lock:
+            return self._resume(jid, steps)
+
+    def _resume(self, jid: str, steps: int | None = None) -> dict:
+        rec = self._need(jid, ("interrupted", "cancelled", "awaiting_choice", "completed"))
         if rec["model"] in DISTILLED:
             raise TrainError("this older job uses a distilled model: create a new job with the base model")
         if not rec.get("settings"):
             raise TrainError("the job was never started: start it")
-        rec.update(status="queued", error=None)
+        if rec["status"] in ("awaiting_choice", "completed"):
+            old_steps = rec["settings"]["steps"]
+            if isinstance(steps, bool) or not isinstance(steps, int) or not old_steps < steps <= STEPS_MAX:
+                raise TrainError(f"steps: choose a new total greater than {old_steps} and at most {STEPS_MAX}")
+            path = self.dir_of(jid) / "state.bin"
+            try:
+                with path.open("rb") as f:
+                    magic, count = f.read(8), struct.unpack("<q", f.read(8))[0]
+                size = path.stat().st_size
+            except (OSError, struct.error):
+                raise TrainError("the completed training has no readable continuation state") from None
+            if magic != b"XSTRAIN2" or count != (rec.get("progress") or {}).get("step"):
+                raise TrainError("the continuation state does not match the last completed update")
+            if shutil.disk_usage(self.root).free < size + JOB_DISK_MARGIN:
+                raise TrainError("the disk has too little room to save the next continuation state")
+            # Mage-Flow writes every run's last version to the same name. Give the old one its step name before
+            # another run can overwrite it. Keep the source until the record is written, including after a crash.
+            for version in rec["versions"]:
+                if version["file"] == "lora.final.safetensors":
+                    src = self.dir_of(jid) / "out" / version["file"]
+                    dst = src.with_name(f"lora.{version['step']}.safetensors")
+                    if dst.exists():
+                        if not filecmp.cmp(src, dst, shallow=False):
+                            raise TrainError("the saved final version conflicts with its step file")
+                    else:
+                        tmp = dst.with_suffix(".part")
+                        try:
+                            shutil.copyfile(src, tmp)
+                            os.replace(tmp, dst)
+                        finally:
+                            with contextlib.suppress(OSError):
+                                tmp.unlink()
+                    version["file"] = dst.name
+            rec["settings"]["steps"] = steps
+            rec.update(resume_state=True, registered=None, state_bytes=size)
+        elif steps is not None:
+            raise TrainError("steps: a new total is only for a completed training")
+        rec.update(status="queued", error=None, completed_at=None)
         self._write(rec)
         self._enqueue(jid)
         return rec
 
     def delete(self, jid: str) -> dict:
+        with self.mutation_lock:
+            return self._delete(jid)
+
+    def _delete(self, jid: str) -> dict:
         rec = self.get(jid)
         if rec is None:
             raise TrainError(f"{jid}: no such job", 404)
@@ -792,6 +838,10 @@ class TrainJobs:
         return {"id": jid, "deleted": True}
 
     def delete_version(self, jid: str, step: int) -> dict:
+        with self.mutation_lock:
+            return self._delete_version(jid, step)
+
+    def _delete_version(self, jid: str, step: int) -> dict:
         rec = self._need(jid, ("awaiting_choice", "cancelled", "interrupted", "completed"))
         v = next((v for v in rec["versions"] if v["step"] == step), None)
         if v is None:
@@ -809,6 +859,10 @@ class TrainJobs:
         return rec
 
     def register(self, jid: str, step: int | None, name: str | None) -> dict:
+        with self.mutation_lock:
+            return self._register(jid, step, name)
+
+    def _register(self, jid: str, step: int | None, name: str | None) -> dict:
         rec = self._need(jid, ("awaiting_choice", "cancelled", "interrupted", "completed"))
         if not rec["versions"]:
             raise TrainError("versions: none saved yet")
@@ -961,7 +1015,7 @@ class TrainJobs:
                 argv += [flag, s[key]]
         argv += ["--vram-budget", str(int(budget)), "--vram-control", str(d / "vram.json"),
                  "--state", str(d / "state.bin")]
-        if resume and (d / "state.bin").is_file():
+        if resume:
             argv += ["--resume", str(d / "state.bin")]
         return argv
 
@@ -1039,6 +1093,8 @@ class TrainJobs:
             self.wake.clear()
         if cancel.is_set():
             raise _Cancelled()
+        if resume and not (self.dir_of(rec["id"]) / "state.bin").is_file():
+            raise TrainError("the continuation state is missing")
         env = card_env(self.svc, pci)
         self._write_control(self.dir_of(rec["id"]), budget, False)
         proc = subprocess.Popen(self.train_argv(rec, budget, resume), stdout=subprocess.PIPE,
@@ -1151,6 +1207,11 @@ class TrainJobs:
                 raise TrainError(f"the trainer failed (exit {proc.returncode}): {tail}", 500)
             if not rec["versions"]:
                 raise TrainError("the trainer saved no version", 500)
+            state_path = d / "state.bin"
+            rec["state_bytes"] = (state_path.stat().st_size if self._state_saved.is_set() and state_path.is_file()
+                                  else None)
+            rec["resume_state"] = bool(rec["state_bytes"])
+            self._write(rec)
         finally:
             if proc is not None and proc.poll() is None:
                 self._stop_trainer(rec, proc, save_state=pending is not None)
