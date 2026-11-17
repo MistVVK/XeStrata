@@ -154,7 +154,10 @@ test('a message that cannot fit even after the summary ends in a plain sentence,
   const { worker, send } = await rig(t, { noCount: true });
   assert.equal((await send(`SCRIPT:echo one ${dense.repeat(300)}`)).at(-1).type, 'done');
   const before = worker.requests.length;
-  const huge = await send(`SCRIPT:echo two ${dense.repeat(7000)}`);
+  // 8,000 repetitions, clearly past the edge: about 3.3 tokens a repetition (6,600 leave about 1,300 tokens to spare, 7,000 are 18 over the 32,704 the server
+  // accepts: GUI-D's numbers), so this is about 3,300 tokens over it. At 7,000 the test sat on the edge and flipped with the length of the paths in the request
+  // (the host test runner's scratch profile, the checkout's own path), passing run alone and failing under the runner; tens of tokens of path can no longer matter.
+  const huge = await send(`SCRIPT:echo two ${dense.repeat(8000)}`);
   const end = huge.at(-1);
   assert.equal(end.type, 'error');
   assert.equal(end.code, 'CONTEXT_WINDOW_EXCEEDED');
