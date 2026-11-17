@@ -9,7 +9,7 @@ Run it on a Windows PC with Visual Studio 2022 Build Tools (C++ workload), CMake
 vendored third_party trees: nothing is downloaded. The package lands in OUT (default <repo>\\out-engine-win-<variant>). Nothing is uploaded.
 
 The steps are the release's: the engine configure line below, `strata` (+ `strata_kq` when the build tree has it), the picture reader for the
-same architectures (packaging\\build_vision_windows.bat), BUILD.json, then packaging/package_engine.py (which copies the CUDA DLLs strata.exe
+same architectures (tools\\packaging\\build_vision_windows.bat), BUILD.json, then tools/packaging/package_engine.py (which copies the CUDA DLLs strata.exe
 imports from the toolkit), --verify and binary_deps.py.
 
 Settings (environment, all optional):
@@ -32,6 +32,8 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+ENGINE_SRC = REPO / "engine"                      # the engine's sources: CMakeLists.txt is here since the 0.2.16 layout (the repository root has none)
+PACKAGING = REPO / "tools" / "packaging"          # the scripts this one runs: build_vision_windows.bat, package_engine.py, binary_deps.py
 VARIANTS = {
     # variant: (CUDA version, archs, min driver, extra configure arguments)
     "cuda13": ("13.0", (75, 86, 89, 120), "580.65", []),
@@ -152,7 +154,7 @@ def main(argv: list[str]) -> int:
         return 2
     variant = argv[0]
     if os.name != "nt":
-        fail("this builds the Windows engine; on Linux use packaging/build_cuda_linux.sh")
+        fail("this builds the Windows engine; on Linux use tools/packaging/build_cuda_linux.sh")
     cu, archs, mindriver, _ = VARIANTS[variant]
     if os.environ.get("ARCHS"):
         archs = parse_archs(os.environ["ARCHS"])
@@ -162,14 +164,14 @@ def main(argv: list[str]) -> int:
     out = Path(os.environ.get("OUT") or src / ("out-engine-win-" + variant))
     jobs = os.environ.get("BUILD_JOBS") or "6"
     extra = (os.environ.get("STRATA_CMAKE_EXTRA") or "").split()
-    version, commit = project_version(src), source_commit(src)
+    version, commit = project_version(ENGINE_SRC), source_commit(src)
     cuda = find_cuda(variant)
     env = msvc_env()
     env["CUDA_PATH"] = str(cuda)                         # package_engine.py copies the DLLs strata.exe imports from here
     env["PATH"] = str(cuda / "bin") + os.pathsep + env.get("PATH", "")
     cmake = shutil.which("cmake", path=env["PATH"]) or fail("cmake not found")
 
-    run([cmake, *configure_args(src, build, variant, cuda, extra, os.environ.get("STRATA_GGML_DIR", ""), archs)], env)
+    run([cmake, *configure_args(ENGINE_SRC, build, variant, cuda, extra, os.environ.get("STRATA_GGML_DIR", ""), archs)], env)
     targets = engine_targets(cmake, build, env)
     print("engine targets: " + " ".join(targets), flush=True)
     run([cmake, "--build", str(build), "-j", jobs, "--target", *targets], env)
@@ -185,10 +187,10 @@ def main(argv: list[str]) -> int:
                                                       "archs": list(archs), "ptx": True, "cuda": cu, "vision": "gpu-cuda" + cu.split(".")[0],
                                                       "portable": True}, indent=1), encoding="utf-8")
         venv = dict(env, VISION_BUILD_DIR=str(vision_dir), BUILD_JOBS=jobs, VISION_ARCHS=";".join(str(a) for a in archs))
-        run(["cmd", "/d", "/c", str(src / "packaging" / "build_vision_windows.bat"), variant, str(stage)], venv)   # writes vision_archs
+        run(["cmd", "/d", "/c", str(PACKAGING / "build_vision_windows.bat"), variant, str(stage)], venv)   # writes vision_archs
         out.mkdir(parents=True, exist_ok=True)
         py = sys.executable
-        cmd = [py, str(src / "packaging" / "package_engine.py"), "--src", str(stage), "--backend", "cuda", "--version", version, "--out", str(out),
+        cmd = [py, str(PACKAGING / "package_engine.py"), "--src", str(stage), "--backend", "cuda", "--version", version, "--out", str(out),
                *[x for a in archs for x in ("--arch", "sm_%d" % a)], "--arch", "compute_%d" % archs[-1], "--min-driver", "nvidia=" + mindriver,
                "--variant", variant, "--platform", "windows-x86_64", "--build-id", "%s+cuda%s" % (commit[:12], cu),
                "--include", "strata-vision.exe", "--include", "strata_kq.dll"]
@@ -196,8 +198,8 @@ def main(argv: list[str]) -> int:
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     folder = out / ("%s-windows-x86_64-cuda-%s" % (version, variant))
-    run([sys.executable, str(src / "packaging" / "package_engine.py"), "--verify", str(folder)], env)
-    run([sys.executable, str(src / "packaging" / "binary_deps.py"), str(folder)], env)
+    run([sys.executable, str(PACKAGING / "package_engine.py"), "--verify", str(folder)], env)
+    run([sys.executable, str(PACKAGING / "binary_deps.py"), str(folder)], env)
     print("built: %s" % folder)
     return 0
 
