@@ -260,7 +260,9 @@ class StartScreen(Base):
     help_text = ("Pick a saved preset to start it at once, or set up from the beginning. A preset remembers the model, "
                  "context size, parallel requests, tuned settings and who can reach it.")
 
-    BINDINGS = Base.BINDINGS + [Binding("e", "edit", "Edit", show=False), Binding("d", "delete", "Delete", show=False)]
+    # the Delete key asks the same question as "d" (#5819: a person who pressed Del on a preset got no answer at all)
+    BINDINGS = Base.BINDINGS + [Binding("e", "edit", "Edit", show=False), Binding("d", "delete", "Delete", show=False),
+                                Binding("delete", "delete", show=False)]
 
     def body(self) -> ComposeResult:
         yield Static("", id="intro", markup=False)
