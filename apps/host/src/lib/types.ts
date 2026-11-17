@@ -445,6 +445,8 @@ export interface SessionAgent {
   tokens: number;
   /** Time the latest duration measurement was received. */
   updatedAt?: number;
+  /** What the helper did, newest last (at most 20, short): a tool it used ({ verb, target }) or words it wrote ({ said }). Shown by View log (#5254). */
+  steps?: { verb?: string; target?: string; said?: string }[];
 }
 
 export type ChatMode = 'auto' | 'manual' | 'accept-edits' | 'plan' | 'bypass';

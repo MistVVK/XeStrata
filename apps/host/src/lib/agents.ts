@@ -3,6 +3,19 @@ import type { SessionAgent } from './types';
 const statuses = new Set(['working', 'completed', 'failed', 'queued', 'cancelled']);
 const metric = (value: unknown, fallback = 0) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
 
+/** The steps of a helper as the log shows them: only well-formed ones, at most 20, each short. A frame without steps keeps the ones the row had. */
+export const MAX_STEPS = 20;
+const short = (value: unknown, max: number) => typeof value === 'string' && value.trim() ? value.slice(0, max) : undefined;
+export function stepsOf(value: unknown): { steps?: NonNullable<SessionAgent['steps']> } {
+  if (!Array.isArray(value)) return {};
+  const steps = value.flatMap((item): NonNullable<SessionAgent['steps']> => {
+    if (!item || typeof item !== 'object') return [];
+    const o = item as Record<string, unknown>, said = short(o.said, 400), verb = short(o.verb, 40), target = short(o.target, 160);
+    return said ? [{ said }] : verb || target ? [{ ...(verb ? { verb } : {}), ...(target ? { target } : {}) }] : [];
+  }).slice(-MAX_STEPS);
+  return steps.length ? { steps } : {};
+}
+
 /** Merge partial agent frames without replacing other agents or their readings. */
 export function updateAgent(agents: SessionAgent[], frame: unknown, now = Date.now()): SessionAgent[] {
   if (!frame || typeof frame !== 'object') return agents;
@@ -20,6 +33,7 @@ export function updateAgent(agents: SessionAgent[], frame: unknown, now = Date.n
     durationMs: metric(next.durationMs, previousDuration),
     tokens: metric(next.tokens, previous?.tokens),
     updatedAt: at,
+    ...stepsOf(next.steps ?? previous?.steps),
   };
   return previous ? agents.map(a => a.id === agent.id ? agent : a) : [...agents, agent];
 }
