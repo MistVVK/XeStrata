@@ -7,13 +7,16 @@ CALL = "<tool_call>\n<function=mcp__files__read>\n<parameter=path>\n123\n</param
 TOOLS = [{"name": "mcp__files.read", "parameters": {"properties": {"path": {"type": "string"}}}}]
 
 class NativeTools(unittest.TestCase):
-    def test_a_large_streamed_string_does_not_keep_one_growing_buffer(self):
+    def test_a_large_streamed_string_with_literal_closers_streams_whole(self):
+        # (was: ..._does_not_keep_one_growing_buffer, which asserted that text of the OPEN value moved into _scan_parts.  That compaction
+        # cut the value's start out of the buffer the closer search walks from and lost the parameters after a value over 4 KB;
+        # the open value now stays in the buffer - 400 KB streamed in pieces of 4 characters takes about a second - and only text before it
+        # is compacted: serve/test_parser_compaction.py)
         tools = [{"name": "write", "parameters": {"properties": {"content": {"type": "string"}}}}]
         value = ("x" * 5000 + " literal </parameter> and </function> and </tool_call> " + "y" * 5000)
         parser = OutputParser(thinking=False, tools=tools, stream_tools=True, recover=True)
         opening = "<tool_call><function=write><parameter=content>\n"
         events = parser.feed(opening + value)
-        self.assertTrue(parser._scan_parts)       # consumed text is chunked instead of recopied on every next token
         self.assertFalse(parser.clean)
         closing = "\n</parameter></function></tool_call>"
         for i in range(0, len(closing), 3):
