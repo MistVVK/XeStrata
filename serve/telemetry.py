@@ -958,7 +958,9 @@ class _Intel:
                 continue
             if not cid:
                 continue
-            key = (f.split("/fdinfo/")[0], cid)
+            # one client per (process, client id), however many descriptors hold it: the process is the folder above fdinfo, read
+            # with os.path (glob joins with the platform's separator, so a split on "/fdinfo/" kept the descriptor on Windows)
+            key = (os.path.basename(os.path.dirname(os.path.dirname(f))), cid)
             drivers[key] = drv
             if total:
                 now[key] = (busy, total)

@@ -43,6 +43,8 @@
 #define NOMINMAX   // std::numeric_limits<T>::max() below
 #endif
 #include <windows.h>
+
+#include "strata/platform/commit.hpp"   // after windows.h: it keeps WIN32_LEAN_AND_MEAN (#5742)
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -249,7 +251,10 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     status.dwLength = sizeof(status);
     if (!GlobalMemoryStatusEx(&status)) return false;
     m.available = (uint64_t) status.ullAvailPhys;
-    m.commit = (uint64_t) status.ullAvailPageFile;
+    // #5742: with the room the page files may still grow by (as src/core/expert_source.cpp); the clamp of a RAM budget and
+    // the arena read this
+    m.commit = strata::platform::commit_available((uint64_t) status.ullAvailPageFile,
+                                                  strata::platform::commit_growth((uint64_t) status.ullTotalPhys));
     return m.available > 0;
 #elif defined(__linux__)
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
@@ -363,9 +368,10 @@ void log_complement_memory(const char* stage, uint64_t requested) {
         return;
     }
     std::fprintf(stderr, "FileExpertSource: %s: requested %.2f GiB, available RAM %.2f GiB, available commit %.2f GiB "
-                         "(limit %.2f GiB), available virtual address space %.2f GiB\n",
+                         "(limit %.2f GiB; the page files may grow by %.2f GiB more), available virtual address space %.2f GiB\n",
                  stage, (double) requested / 1073741824.0, (double) status.ullAvailPhys / 1073741824.0,
                  (double) status.ullAvailPageFile / 1073741824.0, (double) status.ullTotalPageFile / 1073741824.0,
+                 (double) strata::platform::commit_growth((uint64_t) status.ullTotalPhys) / 1073741824.0,
                  (double) status.ullAvailVirtual / 1073741824.0);
 #else
     (void) stage;

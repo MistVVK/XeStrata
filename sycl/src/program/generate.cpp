@@ -103,6 +103,8 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include <windows.h>
 #include <psapi.h>
 #include <io.h>
+
+#include "strata/platform/commit.hpp"   // #5742: commit_available / commit_growth (after windows.h)
 #else
 #include <unistd.h>
 #include <cerrno>
@@ -5066,13 +5068,18 @@ int main(int argc, char **argv) try {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
                 // so with a small page file the cache's one big cudaMalloc fails while the VRAM is free.  An auto
                 // cache then tries three quarters of the size, a few times, instead of stopping the engine.
-                char commit[96] = "";
+                char commit[160] = "";
 #if defined(_WIN32)
                 MEMORYSTATUSEX ms{};
                 ms.dwLength = sizeof ms;
-                if (GlobalMemoryStatusEx(&ms))
-                    std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file)",
-                                  (double) ms.ullAvailPageFile / 1073741824.0);
+                if (GlobalMemoryStatusEx(&ms)) {
+                    // #5742: a page file still below its maximum grows when more is committed: that room counts too
+                    const uint64_t grow = strata::platform::commit_growth((uint64_t) ms.ullTotalPhys);
+                    std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file, of which the "
+                                                         "page files may still grow by %.1f GiB)",
+                                  (double) strata::platform::commit_available((uint64_t) ms.ullAvailPageFile, grow) / 1073741824.0,
+                                  (double) grow / 1073741824.0);
+                }
 #endif
                 if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
                     ++failed;
