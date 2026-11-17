@@ -246,6 +246,29 @@ add(en="Running {0}…",
     ko="{0} 실행 중…",
     fr="Exécution de {0}…",
     he="מריץ את {0}…")
+# TOOLCALL-B (lane GUI-D-1116): an agent turn whose tool call could not run asks the model again (status line), and ends with this sentence after
+# two corrections in a row. English approved by the coordinator 11-16; translations are lane drafts (he added 11-17 on the coordinator's word: GUI-B adds Hebrew to the guic family).
+add(en="Asking the model to fix its tool call…",
+    zh="正在请模型修正它的工具调用…",
+    ja="モデルにツール呼び出しの修正を依頼しています…",
+    de="Das Modell wird gebeten, seinen Tool-Aufruf zu korrigieren…",
+    es="Pidiendo al modelo que corrija su llamada a la herramienta…",
+    ru="Просим модель исправить вызов инструмента…",
+    pt="Pedindo ao modelo que corrija a chamada de ferramenta…",
+    ko="모델에게 도구 호출을 고치도록 요청하는 중…",
+    fr="Demande au modèle de corriger son appel d'outil…",
+    he="מבקש מהמודל לתקן את קריאת הכלי שלו…")
+add(en="The model wrote tool calls that Strata could not run, twice in a row, so Strata stopped this turn. Nothing was run. Send your message again, or choose another model.",
+    zh="模型连续两次写出了 Strata 无法运行的工具调用，所以 Strata 停止了这一轮。没有运行任何内容。请重新发送你的消息，或选择其他模型。",
+    ja="モデルが Strata で実行できないツール呼び出しを 2 回続けて書いたため、Strata はこのターンを止めました。何も実行されていません。メッセージをもう一度送るか、別のモデルを選んでください。",
+    de="Das Modell hat zweimal hintereinander Tool-Aufrufe geschrieben, die Strata nicht ausführen konnte, deshalb hat Strata diese Runde beendet. Es wurde nichts ausgeführt. Senden Sie Ihre Nachricht erneut, oder wählen Sie ein anderes Modell.",
+    es="El modelo escribió dos veces seguidas llamadas a herramientas que Strata no pudo ejecutar, así que Strata detuvo este turno. No se ejecutó nada. Envía tu mensaje de nuevo o elige otro modelo.",
+    ru="Модель дважды подряд написала вызовы инструментов, которые Strata не смогла выполнить, поэтому Strata остановила этот ход. Ничего не было выполнено. Отправьте сообщение ещё раз или выберите другую модель.",
+    pt="O modelo escreveu duas vezes seguidas chamadas de ferramenta que o Strata não conseguiu executar, então o Strata interrompeu este turno. Nada foi executado. Envie sua mensagem de novo ou escolha outro modelo.",
+    ko="모델이 Strata가 실행할 수 없는 도구 호출을 두 번 연속으로 작성해서 Strata가 이번 차례를 멈췄습니다. 아무것도 실행되지 않았습니다. 메시지를 다시 보내거나 다른 모델을 선택하세요.",
+    fr="Le modèle a écrit deux fois de suite des appels d'outil que Strata n'a pas pu exécuter, Strata a donc arrêté ce tour. Rien n'a été exécuté. Envoyez de nouveau votre message, ou choisissez un autre modèle.",
+    he="המודל כתב פעמיים ברצף קריאות לכלים ש-Strata לא הצליחה להריץ, ולכן Strata עצרה את התור הזה. שום דבר לא הורץ. שלחו את ההודעה שלכם שוב, או בחרו מודל אחר.")
+
 here = APP / "src" / "locales"
 NBSP = " "
 

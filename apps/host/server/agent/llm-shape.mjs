@@ -2,10 +2,12 @@
  * Response settings for agent turns.
  *
  * The chat's own path sends the Expert sampling (temperature, top-p, top-k, repeat penalty, seed) and the composer's thinking budget with
- * every request. The agent's requests are made by the Harness, which has no place for either, so they never reached the model. When a
- * person has changed one of them, the agent's model route goes through the small forwarding endpoint below (on this computer only), which
- * adds exactly the fields that differ from the defaults and passes everything else through untouched. With every setting at its default the
- * agent talks to the model directly, byte for byte as before.
+ * every request. The agent's requests are made by the Harness, which has no place for either, so they never reached the model. The agent's
+ * model route goes through the small forwarding endpoint below (on this computer only), which adds exactly the fields that differ from the
+ * defaults and passes everything else through untouched; with every setting at its default the request and the reply pass byte for byte.
+ * Since TOOLCALL-B (0.2.16) the route is forwarded always, not only while a setting differs: the endpoint also reads, without changing
+ * anything, whether the reply carries a tool call the server could not run (`strata_rejected_tool_calls`, `strata_unread_tool_markup`), so
+ * the agent bridge can tell the model and let it go on (tool-fix.mjs). `STRATA_AGENT_FORWARD=0` restores the older choice (agent-bridge.mjs).
  *
  * Only a local model, or an OpenAI-style server on this computer or this network, is shaped: a cloud service would reject fields it does not know.
  */
@@ -78,11 +80,81 @@ export function isPrivateHost(url) {
 
 const HOP = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'keep-alive', 'upgrade', 'proxy-connection']);
 
+/** The two fields the Strata server adds to a reply whose tool call could not run (serve/server.py; RESULTS-SERVE-1116 "Interface"). */
+export const MARKER_FIELDS = Object.freeze(['strata_rejected_tool_calls', 'strata_unread_tool_markup']);
+const MARKER_HINT = /strata_(?:rejected_tool_calls|unread_tool_markup)/;
+
+/** The two fields of one reply object, wherever the server puts them: top level (chat chunk or body, Anthropic message_delta or message), or the response object (/v1/responses). */
+export function markersOf(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const o of [obj, obj.response, obj.message]) {
+    if (!o || typeof o !== 'object') continue;
+    const rejected = Array.isArray(o.strata_rejected_tool_calls) && o.strata_rejected_tool_calls.length ? o.strata_rejected_tool_calls : null;
+    const unread = o.strata_unread_tool_markup && typeof o.strata_unread_tool_markup === 'object' ? o.strata_unread_tool_markup : null;
+    if (rejected || unread) return { rejected, unread };
+  }
+  return null;
+}
+
+/** The text of a chat message's content (a string, or text parts). */
+const contentText = c => (typeof c === 'string' ? c : Array.isArray(c) ? c.map(p => (typeof p?.text === 'string' ? p.text : '')).join('') : '');
+
+/** What a request asked: its user-role texts (newest last) and the tool names it declared. Read only when a reply carried a marker. */
+export function requestFacts(body) {
+  let doc;
+  try { doc = JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : String(body ?? '')); } catch { return { users: [], declared: [] }; }
+  const users = (Array.isArray(doc?.messages) ? doc.messages : []).filter(m => m?.role === 'user').map(m => contentText(m.content));
+  if (Array.isArray(doc?.input)) for (const m of doc.input) if (m?.role === 'user') users.push(contentText(m.content));
+  const declared = (Array.isArray(doc?.tools) ? doc.tools : []).map(t => t?.function?.name ?? t?.name).filter(n => typeof n === 'string' && n);
+  return { users, declared };
+}
+
+/**
+ * Reads a reply as it passes, without changing it: SSE lines (`data: {...}`) or one JSON body. Only a line that names one of the two fields is
+ * parsed, so an ordinary reply costs a substring search per line. `found(markers)` is called the moment a marker is read (before those bytes are
+ * passed on), at most once per reply.
+ */
+export class MarkerTap {
+  constructor({ found, sse = true, limit = 8 << 20 }) {
+    this.found = found; this.sse = sse; this.limit = limit;
+    this.decoder = new TextDecoder('utf-8'); this.line = ''; this.body = ''; this.done = false; this.overflow = false;
+  }
+  #take(text) {
+    if (this.done || !MARKER_HINT.test(text)) return;
+    let obj = null;
+    try { obj = JSON.parse(text); } catch { return; }
+    const m = markersOf(obj);
+    if (m) { this.done = true; this.found(m); }
+  }
+  push(chunk) {
+    if (this.done) return;
+    const text = this.decoder.decode(chunk, { stream: true });
+    if (!this.sse) { if (!this.overflow) { this.body += text; if (this.body.length > this.limit) { this.overflow = true; this.body = ''; } } return; }
+    this.line += text;
+    let at;
+    while ((at = this.line.indexOf('\n')) >= 0) {
+      const one = this.line.slice(0, at).replace(/\r$/, '');
+      this.line = this.line.slice(at + 1);
+      if (one.startsWith('data:')) this.#take(one.slice(5).trim());
+    }
+    if (this.line.length > this.limit) this.line = '';
+  }
+  end() {
+    if (this.done) return;
+    const rest = this.decoder.decode();
+    if (!this.sse) { if (!this.overflow) this.#take(this.body + rest); return; }
+    const one = (this.line + rest).replace(/\r$/, '');
+    if (one.startsWith('data:')) this.#take(one.slice(5).trim());
+  }
+}
+
 /**
  * The forwarding endpoint. `targetOf(key)` gives the real base address of a shaped route (or null), `samplingNow()` the Expert fields that
  * differ from the defaults right now. Called for `/api/internal/agent-llm/<key>/<path>`; this computer's own address only.
+ * `onMarker({key, at, users, declared, rejected, unread})` hears of a reply whose tool call could not run (the agent bridge turns it into a tool
+ * error for the model, TOOLCALL-B). The reply's bytes are passed on unchanged either way.
  */
-export function createLlmProxy({ targetOf, samplingNow }) {
+export function createLlmProxy({ targetOf, samplingNow, onMarker = null }) {
   return function handle(req, res, key, rest) {
     const remote = req.socket?.remoteAddress ?? '';
     if (!/^(::1|127\.|::ffff:127\.)/.test(remote)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'This endpoint is for the assistant on this computer only.' })); return; }
@@ -93,9 +165,12 @@ export function createLlmProxy({ targetOf, samplingNow }) {
     req.on('error', () => res.destroy());
     req.on('end', () => {
       let body = Buffer.concat(chunks);
+      const sent = body;
       const budget = nearestBudget(req.headers['x-strata-budget']);
-      if (req.method === 'POST' && /\/chat\/completions\/?$/.test(rest) && body.length) {
-        try { body = Buffer.from(JSON.stringify(shapeBody(JSON.parse(body.toString('utf8')), { sampling: samplingNow(), budget }))); } catch { /* not JSON: pass it on untouched */ }
+      const sampling = samplingNow();
+      // Nothing to add (every setting at its default): the request goes on byte for byte as the assistant wrote it.
+      if (req.method === 'POST' && /\/chat\/completions\/?$/.test(rest) && body.length && (budget || sampling)) {
+        try { body = Buffer.from(JSON.stringify(shapeBody(JSON.parse(body.toString('utf8')), { sampling, budget }))); } catch { /* not JSON: pass it on untouched */ }
       }
       // The route's address is the model's own base (it ends in /v1): the assistant's /v1 is that same prefix.
       const target = new URL(base.replace(/\/+$/, '') + rest.replace(/^\/v1(?=\/|$|\?)/, ''));
@@ -106,6 +181,16 @@ export function createLlmProxy({ targetOf, samplingNow }) {
       const upstream = lib.request(target, { method: req.method, headers }, reply => {
         const out = { ...reply.headers }; delete out['transfer-encoding']; delete out.connection;
         res.writeHead(reply.statusCode ?? 502, out);
+        // Read the reply for the two markers as it passes (this listener runs before pipe's own, so a marker is known before the assistant
+        // has the reply's end). An encoded body (gzip) is not read.
+        const type = String(reply.headers['content-type'] ?? '');
+        if (onMarker && req.method === 'POST' && !reply.headers['content-encoding'] && (reply.statusCode ?? 0) < 300 && /event-stream|json/i.test(type)) {
+          const tap = new MarkerTap({ sse: /event-stream/i.test(type), found: m => {
+            try { onMarker({ key, at: Date.now(), ...requestFacts(sent), ...m }); } catch { /* the reply goes on regardless */ }
+          } });
+          reply.on('data', c => tap.push(c));
+          reply.on('end', () => tap.end());
+        }
         reply.pipe(res);
         reply.on('error', () => res.destroy());
       });

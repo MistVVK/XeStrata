@@ -31,7 +31,18 @@ import { SkillsUsed, skillInfoFrom } from './skills-used.mjs';
 import { turnEngineSpeed } from './engine-speed.mjs';
 import { TurnGuard, GoalGuard, guardNote, GUARD_NOTES } from './turn-guard.mjs';
 import { cutNotice, cutNudge } from './reply-cut.mjs';
+import { MarkerStore, MAX_TOOL_FIXES, FIXING_STATUS, correctionText, endNote } from './tool-fix.mjs';
 import { watchForWake } from './wake-watch.mjs';
+
+/**
+ * Which provider a turn talks to. A route the app can forward (a local model, or an OpenAI-style server on this computer or network) goes
+ * through the host's forwarding endpoint: always, so the endpoint can read whether a tool call could not run (TOOLCALL-B), and so the person's
+ * Response settings can be added. `STRATA_AGENT_FORWARD=0` (a rollback; nobody needs it) goes back to forwarding only while a setting differs.
+ * A cloud route is never forwarded.
+ */
+export function agentProvider(route, { budget = 0, sampling = null, forwardAlways = true } = {}) {
+  return route.shaped && (forwardAlways || budget || sampling) ? route.shaped[budget] ?? route.route : route.route;
+}
 
 /** How often one turn asks the agent to carry on after a reply the length limit cut (each time in smaller pieces). */
 export const MAX_CUT_RETRIES = 2;
@@ -197,6 +208,10 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     return profile;
   }
   const llmTarget = key => shapeTargets[key] ?? null;
+  /** TOOLCALL-B: replies whose tool call could not run, as the forwarding endpoint read them, until a turn takes one (tool-fix.mjs). */
+  const toolMarkers = new MarkerStore();
+  const forwardAlways = env.STRATA_AGENT_FORWARD !== '0';
+  const noteToolMarker = marker => toolMarkers.add(marker);
 
   function harnessInfo() { return resolveHarness({ env, componentsDir, bundledDir }); }
   /** Where the agent component is (the browser tool server lives inside it), or null. */
@@ -407,6 +422,9 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     signal?.addEventListener('abort', () => { send = () => {}; attached = false; }, { once: true });
     // What the assistant itself wrote in this run (not our own step lines): a plan turn reads its plan from it, a step reads its summary.
     const written = { all: '', step: '', reasoning: '' };
+    // TOOLCALL-B: the texts this turn sent the assistant (a marker whose request carries one is this turn's), the time of its newest own event
+    // (a marker from before it is not about the reply that just ended), and the corrections asked for in a row.
+    const fix = { texts: new Set(), since: Date.now(), count: 0, total: 0, waiting: false, ended: false };
     // The frame that closed the turn, kept with the turn's text for a page that comes back after it ended (attach).
     let terminal = null;
     // The turn guard (turn-guard.mjs): counts failing searches, searches, plan rewrites and a nearly full context. Set up once the route is known.
@@ -424,6 +442,9 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       if (frame.own) { const { own, ...rest } = frame; frame = rest; }
       if (frame.type === 'delta' && frame.text) groups.text();
       if (frame.type === 'agent-tool' && frame.tool) {
+        // A tool card: an earlier reply's marker is no longer this turn's last word, and a call that runs starts the correction count again.
+        fix.since = Date.now();
+        if (['running', 'done', 'error'].includes(frame.tool.state)) fix.count = 0;
         if (['done', 'error'].includes(frame.tool.state) && !['read', 'read_image', 'glob', 'grep', 'web_fetch', 'web_search'].includes(frame.tool.name)) toolsRan = true;
         let made = null;
         if (frame.tool.state === 'done' && (frame.tool.name === 'write' || frame.tool.name === 'edit')) { try { made = tracker.check(frame.tool.args?.file_path ?? frame.tool.args?.path, { explicit: true }); } catch { made = null; } }
@@ -454,7 +475,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     // endpoint, on a copy of the route; with every setting at its default the route is used directly, as before.
     const budget = level === 'off' ? 0 : nearestBudget(thinkingBudget);
     const sampling = proxyBase && route.shaped ? expertSampling() : null;
-    const provider = route.shaped && (budget || sampling) ? route.shaped[budget] : route.route;
+    const provider = agentProvider(route, { budget, sampling, forwardAlways });
     const wanted = `${provider}/${route.modelId}/${level ?? ''}`;
     if (c.route !== wanted || c.routeGeneration !== runtime.generation) {
       const select = effort => runtime.gw.rpc('session/selectModel', { request: { sessionId, provider, model: route.modelId, ...(effort ? { reasoningEffort: effort } : {}) } });
@@ -503,7 +524,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       // Helper agents (subagents) the Harness started for this chat, and the state of the run around them.
       children: new Map(), subagentCalls: new Map(), parentOpen: false, stopping: false, settleTimer: null, mode: appliedMode,
       plan: null, advancing: false, goalRun: false, lastActivity: Date.now(), heard: Date.now(), engineMark: null, watchdog: null,
-      research: researchTopic ? { phase: 'gather', nudged: false, waitingStart: false } : null, wake: !!adopt,
+      research: researchTopic ? { phase: 'gather', nudged: false, waitingStart: false } : null, wake: !!adopt, fix,
     };
     c.turn = turn;
     if (adopt) { log(`agent · ${chatId}: the agent started a turn by itself (a background job finished); following it as ${requestId}`); onWake(chatId, requestId); }
@@ -564,6 +585,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       try { extra.push(...settlePlan(failure)); } catch { /* a plan frame must never break the end of a turn */ }
       // The turn guard: a turn the app stopped, or one that ended with no words, always ends with one plain message (a plan card carries it itself).
       let noteReason = turn.guard ?? null;
+      // TOOLCALL-B: the model wrote calls that could not run after two corrections in a row: one plain sentence, nothing else added.
+      if (fix.ended && !noteReason && !failure) { noteReason = 'tool-calls'; extra.push(endNote()); }
       // A reply the length limit cut ends with a sentence that says so (and what was lost), never with silence (AGENT-LOST).
       const cutEnd = !failure && !turn.stopping && projector.ended?.kind === 'max-tokens';
       if (cutEnd && !noteReason) {
@@ -697,6 +720,7 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
           turn.parentOpen = true;
           if (turn.research) turn.research.waitingStart = false;
           turn.cutWaiting = false;
+          fix.waiting = false;
           clearTimeout(turn.settleTimer);
           // After Stop, a helper's report would start a new turn that nobody asked for.
           if (turn.stopping) void runtime.gw.rpc('session/cancel', { request: { sessionId } }).catch(() => {});
@@ -728,6 +752,8 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
           if (d.source?.kind === 'goal' && Number.isInteger(d.source.round)) { turn.goalRound = d.source.round; void announceGoal(); }
         // falls through
         case 'agent/inbox/spliced': {
+          // a notice the Harness put into the conversation (a helper's report): a marker from before it is not about the parent's next reply
+          if (e.type === 'agent/inbox/spliced') fix.since = Date.now();
           const hit = JSON.stringify(d);
           if (!/Background subagent/.test(hit)) break;
           for (const child of turn.children.values()) if (hit.includes(child.id)) child.noticed = true;
@@ -821,6 +847,7 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
         if (!list.length) queues.delete(chatId);
         onQueue(chatId, queueView(chatId));
         emit({ type: 'queued-message', state: 'delivered', message: { id: item.id, text: item.text, at: item.at, deliverAt: item.deliverAt }, afterStep, queue: queueView(chatId) });
+        fix.texts.add(item.text); fix.since = Date.now();
         try { await runtime.gw.rpc('session/prompt', { request: { requestId: `queued-${randomUUID()}`, sessionId, mode: 'queue', content: [{ type: 'text', text: item.text }] } }); }
         catch { emit({ type: 'queued-release', messages: [{ id: item.id, text: item.text }] }); continue; }
         // Wait for the answer: the parent opens a turn for it and closes it again.
@@ -848,6 +875,34 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
           const current = await goalGet();
           if (turn.finished || turn.parentOpen) return;
           if (current && current.phase === 'active' && current.activation === 'armed') { turn.settleTimer = after(700, armSettle); return; }
+          // TOOLCALL-B: the reply that ended the turn carried a tool call that could not run (an undeclared name, or markup cut off). The model
+          // gets a tool error and goes on, twice in a row at most; the third time the turn ends with one plain sentence. Nothing guessed runs.
+          if (fix.waiting) { turn.settleTimer = after(300, armSettle); return; }
+          if (!turn.goalRun && !turn.stopping && projector.ended?.kind === 'completed') {
+            const others = [...chats.values()].map(x => x.turn).filter(t => t && t !== turn && !t.finished && t.fix).map(t => ({ texts: t.fix.texts, since: t.fix.since }));
+            const got = toolMarkers.take({ texts: fix.texts, since: fix.since }, others);
+            if (got?.ambiguous) log(`agent · ${chatId}: a tool-call marker fits more than one running chat; acted on by none (${got.ambiguous.key})`);
+            else if (got?.marker) {
+              const m = got.marker;
+              const what = [...(m.rejected ?? []).map(r => `rejected ${String(r?.name ?? '?').slice(0, 40)}`), ...(m.unread ? [`unread ${m.unread.reason ?? '?'}`] : [])].join(', ');
+              if (fix.count >= MAX_TOOL_FIXES) {
+                fix.ended = true;
+                log(`agent · ${chatId}: tool call could not run (${what}) after ${fix.count} corrections in a row; the turn ends`);
+                finishTurn(null);
+                return;
+              } else {
+                fix.count += 1; fix.total += 1;
+                const text = correctionText(m);
+                log(`agent · ${chatId}: tool call could not run (${what}); correction ${fix.count} of ${MAX_TOOL_FIXES}`);
+                reporter.set({ phase: 'waiting', code: 'fixing-tool-call', text: FIXING_STATUS, key: FIXING_STATUS, values: [], urgent: true });
+                fix.texts.add(text); fix.since = Date.now(); fix.waiting = true;
+                try { await runtime.gw.rpc('session/prompt', { request: { requestId: `toolfix-${randomUUID()}`, sessionId, mode: 'queue', content: [{ type: 'text', text }] } }); }
+                catch { fix.waiting = false; finishTurn(null); return; }
+                turn.settleTimer = after(500, armSettle);
+                return;
+              }
+            }
+          }
           // A reply the length limit cut (AGENT-LOST): the agent lost what it was writing. Say so in the chat and ask it to carry on in smaller pieces, twice at most.
           if (turn.cutWaiting) { turn.settleTimer = after(300, armSettle); return; }
           if (projector.ended?.kind === 'max-tokens' && !turn.goalRun && !turn.stopping && (turn.cuts ?? 0) < MAX_CUT_RETRIES) {
@@ -861,7 +916,9 @@ ${note.text}
 `, key: note.key, values: note.values, noteReason: 'cut' });
             for (const f of projector.clearCut()) emit(f);
             turn.cutWaiting = true;
-            try { await runtime.gw.rpc('session/prompt', { request: { requestId: `cut-${randomUUID()}`, sessionId, mode: 'queue', content: [{ type: 'text', text: cutNudge(cut) }] } }); }
+            const nudge = cutNudge(cut);
+            fix.texts.add(nudge); fix.since = Date.now();
+            try { await runtime.gw.rpc('session/prompt', { request: { requestId: `cut-${randomUUID()}`, sessionId, mode: 'queue', content: [{ type: 'text', text: nudge }] } }); }
             catch { turn.cutWaiting = false; finishTurn(null); return; }
             turn.settleTimer = after(500, armSettle);
             return;
@@ -875,6 +932,7 @@ ${note.text}
             if (prompt) {
               if (prompt !== RESEARCH_NUDGE) { r.phase = 'write'; hideDeltas = false; written.all = ''; reporter.set({ phase: 'waiting', code: 'research-writing', text: 'Writing the answer…', key: 'Writing the answer…', values: [], args: {} }); } else r.nudged = true;
               r.waitingStart = true;
+              fix.texts.add(prompt); fix.since = Date.now();
               try { await runtime.gw.rpc('session/prompt', { request: { requestId: `research-${randomUUID()}`, sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] } }); }
               catch { r.waitingStart = false; hideDeltas = false; finishTurn(null); return; }
               turn.settleTimer = after(500, armSettle);
@@ -943,6 +1001,7 @@ ${note.text}
     } else {
       let prompt = message;
       if (fresh && history.length) prompt = withEarlierConversation(history, message);
+      fix.texts.add(prompt); fix.since = Date.now();
       try {
         await runtime.gw.rpc('session/prompt', { request: { requestId, sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }, ...imageParts(images)] } });
       } catch (e) {
@@ -1532,7 +1591,7 @@ ${note.text}
   /** Let go of a chat's Harness session mapping (a task starts every run in a session of its own). */
   function forget(chatId) { if (chats.get(chatId)?.turn) return; chats.get(chatId)?.wake?.close(); delete sessionMap[chatId]; chats.delete(chatId); persist(); }
 
-  return { compactCommand, messageHelper, answerQuestion, goalState, goalControl, harnessDir, status, turnOf, runningTurns, wokenTurns, attach, runTurn, goalCommand, planCommand, researchCommand, llmTarget, setPlanBriefing, resetSession, reopenPlan, skipStep, planGoal, planControl, planState, queueMessage, cancelQueued, takeQueue, forget, approve, setMode, stop, pendingFor, pendingAll, close, sessionOf: chatId => sessionMap[chatId]?.sessionId ?? null, workingFolder: chatId => sessionMap[chatId]?.cwd ?? null, isRunning: chatId => !!chats.get(chatId)?.turn, _debug: () => ({ rt, sessionMap }) };
+  return { compactCommand, messageHelper, answerQuestion, goalState, goalControl, harnessDir, status, turnOf, runningTurns, wokenTurns, attach, runTurn, goalCommand, planCommand, researchCommand, llmTarget, noteToolMarker, setPlanBriefing, resetSession, reopenPlan, skipStep, planGoal, planControl, planState, queueMessage, cancelQueued, takeQueue, forget, approve, setMode, stop, pendingFor, pendingAll, close, sessionOf: chatId => sessionMap[chatId]?.sessionId ?? null, workingFolder: chatId => sessionMap[chatId]?.cwd ?? null, isRunning: chatId => !!chats.get(chatId)?.turn, _debug: () => ({ rt, sessionMap }) };
 }
 
 /** A goal that stopped by itself, in words. */

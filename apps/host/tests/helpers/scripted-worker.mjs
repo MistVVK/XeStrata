@@ -29,6 +29,8 @@
  *   SCRIPT:multi <json>             {"calls":[[tool,args],...],"say":"final text"}: all the calls in one reply, then the text once their results are in
  *   SCRIPT:searchloop               a model that never stops: every reply rewrites a numbered plan and calls web_search again with a new query
  *   SCRIPT:bloat <prompt tokens>    a reply that is only thinking (no answer text), with usage reporting that many prompt tokens (a context at 100%)
+ *   SCRIPT:badseq <steps> <file>    tool calls the Strata server could not run, as it marks them (strata_rejected_tool_calls /
+ *                                   strata_unread_tool_markup), then a proper call: steps rej:NAME[>HINT], cut, junk, read, say (see below)
  *
  * A request whose last message is a tool result is answered with a text that quotes the result.
  */
@@ -99,8 +101,8 @@ export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model =
     const id = `chatcmpl-${requests.length}`;
     const send = (delta, finish = null, extra = {}) => res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: 0, model: body.model, choices: [{ index: 0, delta, finish_reason: finish }], ...extra })}\n\n`);
     let promptTokens = counted || 100 + messages.length;
-    const finish = (reason, tokens = 10) => {
-      send({}, reason);
+    const finish = (reason, tokens = 10, extra = {}) => {
+      send({}, reason, extra);
       res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: 0, model: body.model, choices: [], usage: { prompt_tokens: promptTokens, completion_tokens: tokens, total_tokens: promptTokens + tokens } })}\n\n`);
       res.write('data: [DONE]\n\n'); res.end();
     };
@@ -151,6 +153,29 @@ export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model =
       const argsJson = JSON.stringify({ queries: [`topic search number ${n}`] });
       send({ tool_calls: [{ index: 0, id: `call_${requests.length}`, type: 'function', function: { name: 'web_search', arguments: argsJson } }] });
       return finish('tool_calls', 60);
+    }
+    if (directive?.[1] === 'badseq') {
+      // TOOLCALL-B: a model whose tool calls the Strata server could not run. The steps are taken in order, one per reply after the prompt:
+      //   rej:NAME / rej:NAME>HINT   a call to an undeclared tool, as text, with strata_rejected_tool_calls on the finish chunk (HINT = closest_declared)
+      //   cut                        a call cut off inside its markup, with strata_unread_tool_markup {reason: "cut_off"}
+      //   junk                       a closed block that reads as no call, with strata_unread_tool_markup {reason: "unreadable"}
+      //   read                       a proper call of the declared `read` tool on <file>
+      //   say                        a plain answer (also what comes after the last step)
+      // a request without tools (the session title) is never marked by the server
+      if (!(body.tools ?? []).length) return say(['Scripted title']);
+      const [pattern = '', file = 'x.txt'] = (directive[2] ?? '').trim().split(/\s+/);
+      const steps = pattern.split(',').filter(Boolean);
+      const step = steps[messages.slice(promptAt + 1).filter(m => m.role === 'assistant').length] ?? 'say';
+      const markup = (text, extra) => { send({ role: 'assistant', content: '' }); send({ content: text }); return finish('stop', 25, extra); };
+      if (step.startsWith('rej:')) {
+        const [name, hint] = step.slice(4).split('>');
+        return markup(`I will run it.\n<tool_call>\n<function=${name}>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>`,
+          { strata_rejected_tool_calls: [{ name, reason: 'undeclared', ...(hint ? { closest_declared: hint } : {}) }] });
+      }
+      if (step === 'cut') { const tail = '<tool_call>\n<function=read>\n<parameter=file_path>\n'; return markup(`Reading it.\n${tail}`, { strata_unread_tool_markup: { reason: 'cut_off', chars: tail.length } }); }
+      if (step === 'junk') { const tail = '<tool_call>\n<=true>\n</tool_call>'; return markup(`Reading it.\n${tail}`, { strata_unread_tool_markup: { reason: 'unreadable', chars: tail.length } }); }
+      if (step === 'read') return toolCall('read', { file_path: file });
+      return say(['All done after the tool step.']);
     }
     if (directive?.[1] === 'cutwrite' || directive?.[1] === 'cutalways') {
       // A reply the length limit cuts inside a tool call (AGENT-LOST): some words, then `write` arguments that never close, finish "length".
