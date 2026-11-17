@@ -44,5 +44,7 @@
  "guic43": "1 hora",
  "guic44": "2 horas",
  "guic45": "Este ayudante lleva más de 30 minutos trabajando.",
- "guic46": "Detenido: alcanzó el límite de tiempo de los ayudantes."
+ "guic46": "Detenido: alcanzó el límite de tiempo de los ayudantes.",
+ "guic47": "Windows está cerca de su límite de memoria (memoria más archivo de paginación). Strata puede detenerse sin mostrar ningún mensaje. Aumenta el archivo de paginación de Windows o elige un contexto más corto.",
+ "guic48": "Quedan {0} GB de {1} GB."
 }

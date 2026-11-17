@@ -44,5 +44,7 @@
  "guic43": "1 hour",
  "guic44": "2 hours",
  "guic45": "This helper has been working for over 30 minutes.",
- "guic46": "Stopped: it reached the helper time limit."
+ "guic46": "Stopped: it reached the helper time limit.",
+ "guic47": "Windows is close to its memory limit (memory plus page file). Strata may stop without a message. Make the Windows page file larger, or choose a shorter context.",
+ "guic48": "{0} GB of {1} GB are left."
 }

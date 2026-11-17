@@ -498,6 +498,27 @@ add(en="Stopped: it reached the helper time limit.",
     ko="중지됨: 도우미 시간 제한에 도달했습니다.",
     fr="Arrêté : la durée maximale a été atteinte.",
     he="נעצר: הגיע למגבלת הזמן של העוזרים.")
+# #1607: the model card's notice when the engine reports that the Windows commit limit (memory plus page file) is close, and its numbers line. English approved by the coordinator 11-17.
+add(en="Windows is close to its memory limit (memory plus page file). Strata may stop without a message. Make the Windows page file larger, or choose a shorter context.",
+    zh="Windows 的内存上限（内存加页面文件）快要用完了。Strata 可能会在没有任何提示的情况下停止。请增大 Windows 页面文件，或选择较短的上下文。",
+    ja="Windows のメモリ上限（メモリとページファイル）に近づいています。Strata がメッセージなしで停止することがあります。Windows のページファイルを大きくするか、コンテキストを短くしてください。",
+    de="Windows nähert sich seiner Speichergrenze (Arbeitsspeicher plus Auslagerungsdatei). Strata kann ohne Meldung stoppen. Vergrößern Sie die Windows-Auslagerungsdatei oder wählen Sie einen kürzeren Kontext.",
+    es="Windows está cerca de su límite de memoria (memoria más archivo de paginación). Strata puede detenerse sin mostrar ningún mensaje. Aumenta el archivo de paginación de Windows o elige un contexto más corto.",
+    ru="Windows близка к пределу памяти (память плюс файл подкачки). Strata может остановиться без сообщения. Увеличьте файл подкачки Windows или выберите более короткий контекст.",
+    pt="O Windows está perto do limite de memória (memória mais arquivo de paginação). O Strata pode parar sem nenhuma mensagem. Aumente o arquivo de paginação do Windows ou escolha um contexto menor.",
+    ko="Windows가 메모리 한도(메모리와 페이지 파일)에 가까워졌습니다. Strata가 메시지 없이 멈출 수 있습니다. Windows 페이지 파일을 늘리거나 더 짧은 컨텍스트를 선택하세요.",
+    fr="Windows approche de sa limite de mémoire (mémoire plus fichier d'échange). Strata peut s'arrêter sans aucun message. Agrandissez le fichier d'échange de Windows ou choisissez un contexte plus court.",
+    he="Windows קרוב למגבלת הזיכרון שלו (זיכרון בתוספת קובץ הדפדוף). ייתכן ש-Strata ייעצר בלי הודעה. הגדילו את קובץ הדפדוף של Windows או בחרו הקשר קצר יותר.")
+add(en="{0} GB of {1} GB are left.",
+    zh="还剩 {0} GB（共 {1} GB）。",
+    ja="{1} GB のうち残りは {0} GB です。",
+    de="Noch {0} GB von {1} GB frei.",
+    es="Quedan {0} GB de {1} GB.",
+    ru="Осталось {0} GB из {1} GB.",
+    pt="Restam {0} GB de {1} GB.",
+    ko="{1} GB 중 {0} GB가 남았습니다.",
+    fr="Il reste {0} GB sur {1} GB.",
+    he="נותרו {0} GB מתוך {1} GB.")
 here = APP / "src" / "locales"
 NBSP = " "
 

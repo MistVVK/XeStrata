@@ -7683,3 +7683,8 @@ button.sent-quote__label { text-decoration: underline; text-underline-offset: 2p
    (the default) is the 56ch above and needs no rule. */
 :root[data-measure='wide'] { --st-measure: 72ch; }
 :root[data-measure='full'] { --st-measure: 400ch; }
+
+/* The model card's notice that the engine says the Windows commit limit is close (#1607): the sentence with its warning sign, and the numbers under it. */
+.native-commit-note { display: flex; flex-direction: column; gap: 2px; margin: 6px 0; }
+.native-commit-note p { margin: 0; display: flex; gap: 6px; align-items: flex-start; }
+.native-commit-note .st-icon { flex: none; margin-top: 2px; }
