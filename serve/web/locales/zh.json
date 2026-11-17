@@ -165,6 +165,7 @@
   "ltw.trainBlocks": "训练的块（如 0-5,10）",
   "ltw.training": "训练中",
   "ltw.trigger": "触发词",
+  "ltw.triggerHint": "请使用简短的自造词，不要使用已知名称：已知词语可能改变画面主题。训练前，请在不使用 LoRA 且种子相同的情况下，对比一两组含有和不含该词的图像。",
   "terms.agreed": "你同意的时间",
   "terms.by": "作者",
   "terms.card": "模型卡",

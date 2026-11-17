@@ -8,15 +8,25 @@ metadata:
 
 - Use a LoRA only when the user names it, or asks for the character or the style it adds (its name, kind and trigger
   in `lora` say which). None otherwise.
-- Write its trigger words in the prompt.
-- A character LoRA (kind `character`, or a person's or creature's name): `scale` 1, and `blocks` `"character"` where
-  `blocks` lists it (else leave `blocks` out). A lower strength takes the character away before the LoRA's style:
-  keep 1. Write the style the picture should have, in the model's prompt style (the user's, else the model's own:
-  `watercolor`, `photo`, `anime coloring`), so the LoRA brings the character and not its pictures' style.
-- A style LoRA (kind `style`): `blocks` `"style"` where `blocks` lists it, else leave `blocks` out; `scale` 1.
-  Describe the subject as the user asked. For a modern scene or night, say so in plain words, such as present-day
-  cars and clothes, a dark night sky, and streetlights. A style trained on old pictures can bring their era and light.
+- Put its trigger words at the start of the prompt.
+- Use these starting points. The combination is a guide from one Qwen-Image-2.1 Turbo print-style comparison, not a
+  guarantee for every LoRA. Leave `blocks` out for all layers.
+
+  | LoRAs | Strength | Blocks |
+  | --- | --- | --- |
+  | Character only | 1 | `character` where offered; otherwise all |
+  | Style only | 1 | `style` where offered; otherwise all |
+  | Character and style | character 0.8, style 1.0 | all for both |
+
+- With a character alone, write the desired style in the model's prompt style (the user's, else the model's own:
+  `watercolor`, `photo`, `anime coloring`) so the LoRA brings the character and not its pictures' style.
+- With both, try the style at 0.8 to 1.2 if the starting point does not fit. Describe the subject as requested.
+  For a modern scene or night, say so in plain words, such as present-day cars and clothes, a dark night sky, and
+  streetlights. A style trained on old pictures can bring their era and light.
+- A strong style LoRA can add text or seals. Try `no text, no seal` in the negative prompt or lower its strength.
+  Qwen-Image-2.1 Turbo at CFG 1 does not use the negative prompt; at higher CFG it did not remove every seal in the
+  print-style comparison.
 - A kind not given: judge it by its name and trigger. A character's name (a person, a creature, a series'
   character) is a character LoRA; an artist's or a look's name, a style LoRA. When still unsure, leave `blocks` out.
 - The user's own strength or block weights are used as they give them.
-- A character LoRA with a style LoRA: both, the style's words left to the style LoRA.
+- With a character and a style LoRA, leave the style's words to the style LoRA.

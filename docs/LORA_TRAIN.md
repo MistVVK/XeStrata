@@ -422,6 +422,10 @@ are `xestrata-device --bench` (one card at a time, cached per device).
 
 The CLI's preprocess and trainers, usable end to end from the web chat (`serve/lora_train.py`, the panel in `serve/web/app.js`).
 
+For a character or style, use a short invented trigger rather than a real word or an artist's or character's name. The panel suggests one; you can edit it. Before training, compare one or two images with and without the candidate, with no LoRA and the same seed. If the word alone changes the subject or style, choose another. In one print-style comparison, the artist's name changed the era in the base and displaced the character; an invented word kept the character.
+
+For a character and a style LoRA together, start with all layers at character 0.8 and style 1.0. If that does not fit, try style 0.8 to 1.2. This is a guide from one seed of a character and print-style comparison on Qwen-Image-2.1 Turbo. A strong style can add text or seals. Try `no text, no seal` in the negative prompt or lower the strength. Qwen-Image-2.1 Turbo at CFG 1 does not use the negative prompt; a higher CFG does not guarantee that seals disappear.
+
 Training defaults to caption dropout 0. Change it in the browser's settings or with the CLI's `--caption-dropout`. Without the flag, Mage-Flow's CLI uses each image's rate in the preprocessing manifest (preprocessing defaults to 0). Zero is not necessarily optimal for other models or datasets.
 
 Prepare the training bases with setup, for example `--images qwen-image-turbo --image-lora-training`. With several image models it fetches each one's base. The interactive setup and launcher offer the same choice. Without it there are no extra training downloads.

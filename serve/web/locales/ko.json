@@ -165,6 +165,7 @@
   "ltw.trainBlocks": "학습할 블록(예 0-5,10)",
   "ltw.training": "학습 중",
   "ltw.trigger": "트리거 단어",
+  "ltw.triggerHint": "알려진 이름 대신 짧은 조어를 쓰세요. 알려진 단어는 주제를 바꿀 수 있습니다. 학습 전에 LoRA 없이 같은 시드로 단어가 있을 때와 없을 때의 이미지 한두 쌍을 비교하세요.",
   "terms.agreed": "동의한 일시",
   "terms.by": "만든 사람",
   "terms.card": "모델 카드",

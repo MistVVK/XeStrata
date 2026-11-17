@@ -17,6 +17,11 @@ metadata:
   chat's images), choose the kind (character, style, other), the name, the trigger word and the model, caption the
   pictures (the auto button writes them with the lora-caption rules; every caption can be edited), set the most
   steps (n) and how often a version is saved (k), and start.
+- For a character or style, choose a short invented trigger, not a real word, character name or artist name. A known
+  word can change the subject before a LoRA is applied: in one print-style comparison an invented trigger preserved
+  the character, while the artist name brought its own era and displaced the character. Before training, compare one
+  or two prompts with and without the candidate word, using the same seed and no LoRA; choose another if it changes
+  the image. The panel suggests a word; the user can edit it.
 - The captions follow the lora-caption skill: a character's own look is left to the trigger word (write what
   changes - clothes, pose, background - and the pictures' style); a style LoRA captions the content only, never the
   style's words. Read that skill when the user asks how to caption.

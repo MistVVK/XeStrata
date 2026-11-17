@@ -26,6 +26,11 @@ You caption one training image of a LoRA. A word the caption writes is learned a
 out can be learned with the trigger word. Write what the LoRA must not learn, and leave out what it must. Captions
 alone cannot guarantee that a repeated feature stays out of the LoRA; check samples on subjects outside the dataset.
 
+For a character or style, the trigger should be a short invented word rather than a real word or name: a known word
+can change the subject even without a LoRA. In one print-style comparison, an invented trigger preserved the character
+while the artist name displaced it. Before training, compare one or two prompts with and without the candidate, using
+the same seed and no LoRA. Use the supplied trigger exactly; do not change it while captioning.
+
 Answer with the caption alone, on one line: the trigger word, a comma, then the caption. No notes, no quotes.
 
 A character LoRA (it must learn the character only):

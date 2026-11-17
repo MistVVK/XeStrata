@@ -165,6 +165,7 @@
   "ltw.trainBlocks": "Trainierte Blöcke (z. B. 0-5,10)",
   "ltw.training": "Training läuft",
   "ltw.trigger": "Triggerwort",
+  "ltw.triggerHint": "Nimm ein kurzes Kunstwort statt eines bekannten Namens: Bekannte Wörter können das Motiv ändern. Vergleiche vor dem Training ein oder zwei Bilder mit und ohne Wort, ohne LoRA und mit demselben Seed.",
   "terms.agreed": "Zugestimmt am",
   "terms.by": "Von",
   "terms.card": "Die Modellkarte",

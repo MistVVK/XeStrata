@@ -165,6 +165,7 @@
   "ltw.trainBlocks": "学習するブロック（例 0-5,10）",
   "ltw.training": "学習中",
   "ltw.trigger": "呼び出し語",
+  "ltw.triggerHint": "実在する語や名前ではなく短い造語を使います。既知の語は題材を変えることがあります。学習前に LoRA なし・同じ seed で、語ありとなしの画像を 1〜2 組比べてください。",
   "terms.agreed": "同意した日時",
   "terms.by": "作った人",
   "terms.card": "モデルカード",

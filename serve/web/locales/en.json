@@ -1051,5 +1051,6 @@
   "ltw.title": "LoRA training",
   "ltw.trainBlocks": "Train blocks (e.g. 0-5,10)",
   "ltw.training": "Training",
-  "ltw.trigger": "Trigger word"
+  "ltw.trigger": "Trigger word",
+  "ltw.triggerHint": "Use a short invented word, not a known name: known words can change the subject. Before training, compare one or two images with and without the word, no LoRA, using the same seed."
 }

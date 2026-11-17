@@ -165,6 +165,7 @@
   "ltw.trainBlocks": "Bloques a entrenar (ej. 0-5,10)",
   "ltw.training": "Entrenando",
   "ltw.trigger": "Palabra disparadora",
+  "ltw.triggerHint": "Usa una palabra inventada corta, no un nombre conocido: las palabras conocidas pueden cambiar el tema. Antes de entrenar, compara una o dos imágenes con y sin la palabra, sin LoRA y con la misma semilla.",
   "terms.agreed": "Lo aceptaste",
   "terms.by": "Por",
   "terms.card": "La ficha del modelo",

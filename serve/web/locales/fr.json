@@ -165,6 +165,7 @@
   "ltw.trainBlocks": "Blocs entraînés (ex. 0-5,10)",
   "ltw.training": "Entraînement",
   "ltw.trigger": "Mot déclencheur",
+  "ltw.triggerHint": "Utilisez un mot court inventé plutôt qu’un nom connu : un mot connu peut modifier le sujet. Avant l’entraînement, comparez une ou deux images avec et sans ce mot, sans LoRA et avec la même graine.",
   "terms.agreed": "Vous l'avez accepté",
   "terms.by": "Par",
   "terms.card": "La fiche du modèle",

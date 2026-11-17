@@ -5470,8 +5470,12 @@ async function ltwFetch(path, opts) {
   if (!r.ok) throw new Error((j && j.error && (j.error.message || j.error)) || `HTTP ${r.status}`);
   return j;
 }
+function ltwTrigger() {
+  const letters = "bcdfghjklmnpqrstvwxyz";
+  return [...crypto.getRandomValues(new Uint8Array(8))].map((n) => letters[n % letters.length]).join("");
+}
 function ltwPanel(el) {
-  const st = {models: [], job: null, timer: null, view: "", picked: null, regName: "", styleWords: null};
+  const st = {models: [], job: null, timer: null, view: "", picked: null, regName: "", styleWords: null, trigger: ltwTrigger()};
   let edits = Promise.resolve();
   const base = () => st.job ? `v1/lora/jobs/${st.job.id}` : "";
   const stop = () => { if (st.timer) { clearInterval(st.timer); st.timer = null; } };
@@ -5612,8 +5616,9 @@ function ltwPanel(el) {
           <option value="style"${kind === "style" ? " selected" : ""}>${esc(tr("ltw.style", "Style"))}</option>
           <option value="other"${kind === "other" ? " selected" : ""}>${esc(tr("ltw.other", "Other"))}</option></select></label>
         <label class="st-field"><span>${esc(tr("ltw.name", "Name"))}</span><input class="st-input" data-ltw-name value="${esc(j ? j.name : "")}"${j ? " disabled" : ""}></label>
-        <label class="st-field"><span>${esc(tr("ltw.trigger", "Trigger word"))}</span><input class="st-input" data-ltw-trigger value="${esc(j ? j.trigger : "")}"${j ? " disabled" : ""}></label>
+        <label class="st-field"><span>${esc(tr("ltw.trigger", "Trigger word"))}</span><input class="st-input" data-ltw-trigger value="${esc(j ? j.trigger : st.trigger)}"${j ? " disabled" : ""}></label>
       </div>
+      <div class="muted small">${esc(tr("ltw.triggerHint", "Use a short invented word, not a known name: known words can change the subject. Before training, compare one or two images with and without the word, no LoRA, using the same seed."))}</div>
       <div class="ltw-drop" data-ltw-drop tabindex="0">${esc(tr("ltw.drop", "Drop the training pictures here (several at once)"))}
         <div class="ltw-row">
           <button type="button" class="st-btn st-btn--secondary" data-ltw-choose>${esc(tr("ltw.choose", "Choose files…"))}</button>
@@ -5715,6 +5720,7 @@ function ltwPanel(el) {
       on("[data-ltw-choose]", "onclick", () => file.click());
       file.onchange = () => { addFiles(file.files); file.value = ""; };
       on("[data-ltw-fromchat]", "onclick", chatPics);
+      on("[data-ltw-trigger]", "oninput", (e) => { st.trigger = e.target.value; });
       on("[data-ltw-style-words]", "oninput", (e) => { st.styleWords = e.target.value; });
       on("[data-ltw-autocap]", "onclick", autoCaption);
       on("[data-ltw-start]", "onclick", start);
@@ -5734,7 +5740,7 @@ function ltwPanel(el) {
       on("[data-ltw-delunsel]", "onclick", deleteUnselected);
     }
     on("[data-ltw-deljob]", "onclick", async () => {
-      try { stop(); await ltwFetch(base(), {method: "DELETE", headers: headers()}); st.job = null; st.picked = null; st.styleWords = null; render(); }
+      try { stop(); await ltwFetch(base(), {method: "DELETE", headers: headers()}); st.job = null; st.picked = null; st.styleWords = null; st.trigger = ltwTrigger(); render(); }
       catch (e) { err(e); }
     });
   }
