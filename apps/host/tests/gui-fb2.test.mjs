@@ -13,7 +13,7 @@ async function bundle(file) {
 }
 globalThis.window ??= globalThis; globalThis.localStorage ??= { getItem: () => null, setItem: () => {} };
 const { COMPACT_FILES_FROM, deliveryFolder, dirOf, rootOf } = await bundle('deliverables.ts');
-const LANGS = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+const LANGS = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
 
 test('1: Read pictures is a plain checkmark: no explanation, no download button; Load does the rest', () => {
   const models = src('src/components/NativeModels.tsx');

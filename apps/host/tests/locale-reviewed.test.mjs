@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const APP = join(here, '..', 'src', 'locales');
 const WEB = join(here, '..', '..', '..', 'serve', 'web', 'locales');
-const LANGS = ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+const LANGS = ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
 
 // family name -> { lang -> file } for the app catalogs (main = en.json, family = <fam>-en.json), plus the web page's catalogs
 function families() {

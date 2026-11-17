@@ -14,7 +14,7 @@ import { parseNvidiaReadings } from '../server/device-probes.mjs';
 
 const compiled = await build({ stdin: { contents: "export * from './src/lib/attention'; export * from './src/lib/i18n';", resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'node', loader: { '.json': 'json' } });
 const A = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString('base64')}`);
-for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) await A.loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
+for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) await A.loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
 
 test('temperatures: the hottest processor and drive sensor, nothing invented', () => {
   assert.deepEqual(pickTemperatures([{ name: 'coretemp', temps: [51000, 56000] }, { name: 'nvme', temps: [41850] }, { name: 'amdgpu', temps: [70000] }]), { cpuTempC: 56, ssdTempC: 42 });
@@ -144,7 +144,7 @@ test('approval notifications: shell first, the page second, nothing when off or 
 });
 
 test('every new string exists in all eight languages with the same slots, and does not collide with another catalog', async () => {
-  const languages = ['en', 'zh', 'ja', 'de', 'fr', 'es', 'ru', 'pt', 'ko'];
+  const languages = ['en', 'zh', 'ja', 'de', 'fr', 'es', 'ru', 'pt', 'ko', 'he'];
   const read = async name => JSON.parse(readFileSync(new URL(`../src/locales/${name}.json`, import.meta.url), 'utf8'));
   const withFrench = languages;
   const gh = Object.fromEntries(await Promise.all(withFrench.map(async l => [l, await read(`gh-${l}`)])));

@@ -79,7 +79,7 @@ test('DL99: an install that ended with every file in, for a model the missing en
   const en = JSON.parse(readFileSync(new URL('../src/locales/engine-en.json', import.meta.url), 'utf8'));
   const key = Object.keys(en).find(k => en[k] === NOT_READY);
   assert.ok(key, 'in the English catalog');
-  for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     const t = JSON.parse(readFileSync(new URL(`../src/locales/engine-${l}.json`, import.meta.url), 'utf8'))[key];
     assert.ok(t && t !== NOT_READY && t.includes('>'), `${l}: ${t}`);
   }

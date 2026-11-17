@@ -334,7 +334,7 @@ test('the hint of the Drafting setting and the Models screen say what Auto is on
   const en = JSON.parse(read('../src/locales/df2-en.json'));
   const ids = Object.entries(en).filter(([, v]) => /all-cards split engine/.test(v)).map(([k]) => k);
   assert.equal(ids.length, 2);
-  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     const cat = JSON.parse(read(`../src/locales/df2-${lang}.json`));
     for (const id of ids) assert.ok(cat[id] && cat[id] !== en[id], `${id} in ${lang}`);
     assert.equal((cat[ids[0]].match(/\{0\}/g) ?? []).length, 1, `the size slot in ${lang}`);

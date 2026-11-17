@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const root = resolve(import.meta.dirname, '..');
-const languages = ['en', 'de', 'es', 'fr', 'ja', 'ko', 'pt', 'ru', 'zh'];
+const languages = ['en', 'de', 'es', 'fr', 'ja', 'ko', 'pt', 'ru', 'zh', 'he'];
 const catalog = Object.fromEntries(languages.map(l => [l, JSON.parse(readFileSync(resolve(root, 'src/locales', `${l}.json`), 'utf8'))]));
 const idOf = text => Object.entries(catalog.en).find(([, v]) => v === text)?.[0];
 

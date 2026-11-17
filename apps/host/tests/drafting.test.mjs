@@ -82,7 +82,7 @@ test('a load fetches the drafter first, never stops for it, and says what ran', 
 });
 
 test('every sentence of the Drafting choice is in the catalog in all nine languages, with the same slots', () => {
-  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
   const catalogs = Object.fromEntries(langs.map(l => [l, { ...JSON.parse(read(`../src/locales/${l}.json`)), ...JSON.parse(read(`../src/locales/df2-${l}.json`)) }]));
   const idOf = text => Object.entries(catalogs.en).find(([, v]) => v === text)?.[0];
   const sentences = ['Drafting', 'Auto (recommended)', 'MTP', 'DFlash2',

@@ -6,12 +6,12 @@ import json
 import re
 from pathlib import Path
 
-LANGS = ["en", "zh", "ja", "de", "es", "ru", "pt", "ko", "fr"]
+LANGS = ["en", "zh", "ja", "de", "es", "ru", "pt", "ko", "fr", "he"]
 S = []
 
 
-def add(en, zh, ja, de, es, ru, pt, ko, fr):
-    S.append(dict(en=en, zh=zh, ja=ja, de=de, es=es, ru=ru, pt=pt, ko=ko, fr=fr))
+def add(en, zh, ja, de, es, ru, pt, ko, fr, he):
+    S.append(dict(en=en, zh=zh, ja=ja, de=de, es=es, ru=ru, pt=pt, ko=ko, fr=fr, he=he))
 
 
 add("Unreadable chats",
@@ -22,7 +22,8 @@ add("Unreadable chats",
     "Нечитаемые чаты",
     "Chats ilegíveis",
     "읽을 수 없는 채팅",
-    "Conversations illisibles")
+    "Conversations illisibles",
+    he="צ'אטים שלא ניתן לקרוא")
 # dmg02 and dmg09: English as the coordinator approved it (11-16); the eight translations are GUI-1116 drafts for the release review.
 add("Strata could not read these chat files. You can delete them here.",
     "Strata 无法读取这些聊天文件。你可以在这里删除它们。",
@@ -32,7 +33,8 @@ add("Strata could not read these chat files. You can delete them here.",
     "Strata не смогла прочитать эти файлы чатов. Их можно удалить здесь.",
     "O Strata não conseguiu ler estes arquivos de chat. Você pode excluí-los aqui.",
     "Strata가 이 채팅 파일들을 읽지 못했습니다. 여기에서 삭제할 수 있습니다.",
-    "Strata n’a pas pu lire ces fichiers de conversation. Vous pouvez les supprimer ici.")
+    "Strata n’a pas pu lire ces fichiers de conversation. Vous pouvez les supprimer ici.",
+    he="Strata לא הצליחה לקרוא את קובצי הצ'אט האלה. אפשר למחוק אותם כאן.")
 add("Strata could not read this chat file, so its messages are not shown.",
     "Strata 无法读取此聊天文件，因此不显示其消息。",
     "Strataはこのチャットファイルを読み込めなかったため、メッセージは表示されません。",
@@ -41,7 +43,8 @@ add("Strata could not read this chat file, so its messages are not shown.",
     "Strata не смогла прочитать этот файл чата, поэтому его сообщения не показаны.",
     "O Strata não conseguiu ler este arquivo de chat, então as mensagens dele não são exibidas.",
     "Strata가 이 채팅 파일을 읽지 못해 메시지를 표시하지 않습니다.",
-    "Strata n’a pas pu lire ce fichier de conversation ; ses messages ne sont donc pas affichés.")
+    "Strata n’a pas pu lire ce fichier de conversation ; ses messages ne sont donc pas affichés.",
+    he="Strata לא הצליחה לקרוא את קובץ הצ'אט הזה, ולכן ההודעות שלו לא מוצגות.")
 add("Delete chat file",
     "删除聊天文件",
     "チャットファイルを削除",
@@ -50,7 +53,8 @@ add("Delete chat file",
     "Удалить файл чата",
     "Excluir arquivo de chat",
     "채팅 파일 삭제",
-    "Supprimer le fichier de conversation")
+    "Supprimer le fichier de conversation",
+    he="מחיקת קובץ הצ'אט")
 add("Delete {0}.json",
     "删除 {0}.json",
     "{0}.json を削除",
@@ -59,7 +63,8 @@ add("Delete {0}.json",
     "Удалить {0}.json",
     "Excluir {0}.json",
     "{0}.json 삭제",
-    "Supprimer {0}.json")
+    "Supprimer {0}.json",
+    he="מחיקת {0}.json")
 add("Delete this chat file?",
     "删除此聊天文件？",
     "このチャットファイルを削除しますか？",
@@ -68,7 +73,8 @@ add("Delete this chat file?",
     "Удалить этот файл чата?",
     "Excluir este arquivo de chat?",
     "이 채팅 파일을 삭제할까요?",
-    "Supprimer ce fichier de conversation ?")
+    "Supprimer ce fichier de conversation ?",
+    he="למחוק את קובץ הצ'אט הזה?")
 add("Keep file",
     "保留文件",
     "ファイルを残す",
@@ -77,7 +83,8 @@ add("Keep file",
     "Оставить файл",
     "Manter arquivo",
     "파일 유지",
-    "Garder le fichier")
+    "Garder le fichier",
+    he="השארת הקובץ")
 add("Delete file",
     "删除文件",
     "ファイルを削除",
@@ -86,7 +93,8 @@ add("Delete file",
     "Удалить файл",
     "Excluir arquivo",
     "파일 삭제",
-    "Supprimer le fichier")
+    "Supprimer le fichier",
+    he="מחיקת הקובץ")
 add("{0} was deleted. Your other chats are not affected.",
     "{0} 已删除。你的其他聊天不受影响。",
     "{0} を削除しました。ほかのチャットには影響しません。",
@@ -95,7 +103,8 @@ add("{0} was deleted. Your other chats are not affected.",
     "Файл {0} удалён. Другие ваши чаты не затронуты.",
     "{0} foi excluído. Seus outros chats não foram afetados.",
     "{0}을(를) 삭제했습니다. 다른 채팅에는 영향이 없습니다.",
-    "{0} a été supprimé. Vos autres conversations ne sont pas concernées.")
+    "{0} a été supprimé. Vos autres conversations ne sont pas concernées.",
+    he="{0} נמחק. הצ'אטים האחרים שלכם לא הושפעו.")
 add("The chat file could not be deleted",
     "无法删除聊天文件",
     "チャットファイルを削除できませんでした",
@@ -104,7 +113,8 @@ add("The chat file could not be deleted",
     "Не удалось удалить файл чата",
     "Não foi possível excluir o arquivo de chat",
     "채팅 파일을 삭제하지 못했습니다",
-    "Le fichier de conversation n’a pas pu être supprimé")
+    "Le fichier de conversation n’a pas pu être supprimé",
+    he="לא ניתן היה למחוק את קובץ הצ'אט")
 # dmg11 (coordinator 11-16): a chat file of a newer Strata is not damaged and is never offered for deletion.
 add("This chat was saved by a newer version of Strata. Update Strata to open it.",
     "此聊天由较新版本的 Strata 保存。请先更新 Strata 再打开。",
@@ -114,7 +124,8 @@ add("This chat was saved by a newer version of Strata. Update Strata to open it.
     "Этот чат сохранён более новой версией Strata. Обновите Strata, чтобы открыть его.",
     "Este chat foi salvo por uma versão mais recente do Strata. Atualize o Strata para abri-lo.",
     "이 채팅은 더 새 버전의 Strata에서 저장되었습니다. 열려면 Strata를 업데이트하세요.",
-    "Cette conversation a été enregistrée par une version plus récente de Strata. Mettez Strata à jour pour l’ouvrir.")
+    "Cette conversation a été enregistrée par une version plus récente de Strata. Mettez Strata à jour pour l’ouvrir.",
+    he="הצ'אט הזה נשמר בגרסה חדשה יותר של Strata. יש לעדכן את Strata כדי לפתוח אותו.")
 
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
 NBSP = " "

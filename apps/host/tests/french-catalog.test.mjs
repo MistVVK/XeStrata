@@ -9,13 +9,13 @@ const names = [['en', 'fr'], ['fix-en', 'fix-fr'], ['tune-en', 'tune-fr'], ['too
 const read = async name => JSON.parse(await readFile(`src/locales/${name}.json`, 'utf8'));
 const compiled = await build({ stdin: { contents: "export * from './src/lib/i18n';", resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'node', loader: { '.json': 'json' } });
 const { tr, setTranslationLanguage, localeTag, currentLanguage, LANGUAGES, validLanguage, loadCatalog } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString('base64')}`);
-for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) await loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
+for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) await loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
 
 test('French is in the language picker under its own name', () => {
   const entry = LANGUAGES.find(item => item.value === 'fr');
   assert.equal(entry?.label, 'Français');
   assert.ok(validLanguage('fr'));
-  assert.equal(LANGUAGES.length, 9);
+  assert.equal(LANGUAGES.length, 10);
   setTranslationLanguage('fr');
   assert.equal(currentLanguage(), 'fr');
   assert.equal(localeTag(), 'fr');

@@ -396,7 +396,7 @@ test('the Models page sends a plain Load, not the installer, when the only gap i
 });
 
 test('every sentence the Load of the picture files can say is in the catalog in all nine languages', async () => {
-  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
   const catalogs = Object.fromEntries(langs.map(l => [l, JSON.parse(read(`../src/locales/pic-${l}.json`))]));
   const english = Object.values(catalogs.en);
   const host = read('../server/native-control.mjs');

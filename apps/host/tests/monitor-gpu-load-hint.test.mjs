@@ -14,7 +14,7 @@ test('the app Monitor gives the GPU load label its tooltip, translated', async (
 });
 
 test('the sentence is in all nine catalogs, translated in eight', async () => {
-  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+  const langs = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
   const ids = new Set();
   for (const lang of langs) {
     const cat = JSON.parse(await read(`../src/locales/${lang}.json`));
