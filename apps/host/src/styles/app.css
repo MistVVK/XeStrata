@@ -2500,7 +2500,19 @@ textarea.st-input {
   color: var(--st-ink-muted);
 }
 .md-failedcall > summary::-webkit-details-marker { display: none; }
-.md-failedcall__raw {
+/* The sign that the line opens: a small chevron that points right and turns down when it is open (no words, the colour of the line). */
+.md-failedcall > summary::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin: 0 9px 2px 1px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform var(--st-t-control) var(--st-ease-standard);
+}
+.md-failedcall[open] > summary::before { transform: rotate(45deg); }.md-failedcall__raw {
   margin: 0;
   padding: 8px 12px;
   border-top: 1px solid var(--st-line-soft);
