@@ -32,7 +32,7 @@
 #      staples it, spctl -a -t open --context context:primary-signature -vv;
 #   7. Terminal archive: signs every Mach-O inside, re-zips, notarises the zip (a zip cannot be stapled: see the note at the end).
 #   7b. --engine FOLDER.tar.gz (an engine package of the Mac that Control installs from the feed, a tar of one folder: its program, its
-#      engine/metal/ sources and engine-component.json): signs every Mach-O in it like the engine inside the app (hardened runtime, timestamp, no entitlements),
+#      metal/ kernel sources and engine-component.json): signs every Mach-O in it like the engine inside the app (hardened runtime, timestamp, no entitlements),
 #      writes the signed files' SHA-256 and size into engine-component.json, codesign --verify --strict on each, checks that the signed
 #      program starts, notarises a zip of the folder, and packs it again as <component>-<version>-<platform>-<backend>-folder.tar.gz (modes
 #      kept). Sign the folder with the feed key AFTER this step, on the PC: signing changes the program, so the manifest changes with it.
@@ -718,7 +718,7 @@ process_terminal() {
 }
 
 # ----------------------------------------------------------------------------------------------------------------- an engine package folder
-# A Mac engine package that Control installs from the update feed (a model shape's engine: its program, its engine/metal/ sources,
+# A Mac engine package that Control installs from the update feed (a model shape's engine: its program, its metal/ kernel sources,
 # engine-component.json) as a .tar.gz of ONE folder. The Qwen engine gets its Developer ID signature as a nested program of the signed
 # app; this does the same for a package outside the app. Same identity and options as every nested program above; no entitlements.
 process_engine() {

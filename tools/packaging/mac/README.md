@@ -54,9 +54,9 @@ unpacks it again in a scratch folder and runs `codesign --verify --deep --strict
 updater key** here: that key never goes near the Mac, and the Mac needs no node. Copy `Strata.app.tar.gz` to the release PC and, there:
 
        npx tauri signer sign -f <path to tauri-updater.key> Strata.app.tar.gz
-       python packaging/feed_tool.py set-app-platform --app-json RELEASE/tauri-latest.json --target darwin-aarch64 --version V --archive Strata.app.tar.gz --sig Strata.app.tar.gz.sig
+       python tools/packaging/feed_tool.py set-app-platform --app-json RELEASE/tauri-latest.json --target darwin-aarch64 --version V --archive Strata.app.tar.gz --sig Strata.app.tar.gz.sig
 
-`set-app-platform` refuses a signature that does not verify for these exact bytes, then records the url, signature, SHA-256 and size. Full release order: `packaging/UPDATES.md`, "Releasing".
+`set-app-platform` refuses a signature that does not verify for these exact bytes, then records the url, signature, SHA-256 and size. Full release order: `tools/packaging/UPDATES.md`, "Releasing".
 
 ## What it does
 
@@ -70,7 +70,7 @@ updater key** here: that key never goes near the Mac, and the Mac needs no node.
    the signed node, the bundled python (numpy, PIL, ctypes callbacks), the engine's and the picture reader's `--version` (no model is loaded), and Control's own
    check of the engine manifest. A signing mistake shows up here, not on a tester's Mac.
 6. Notarises the `.app`, staples it, rebuilds the dmg (the app, an Applications link, the volume icon, as in
-   `apps/desktop/scripts/make-dmg.sh`), signs the dmg, notarises and staples it, then `spctl -a -t open --context context:primary-signature -vv`.
+   `app/desktop/scripts/make-dmg.sh`), signs the dmg, notarises and staples it, then `spctl -a -t open --context context:primary-signature -vv`.
 7. Terminal archive: signs every Mach-O inside, packs it again in the format it came in (`.zip` or `.tar.gz`), and notarises it.
    A finished file is written to `signed/` only after every step for it has passed.
 
