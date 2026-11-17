@@ -68,8 +68,8 @@
  "fx79": "Désactivé (recommandé)",
  "fx82": "Réponses plus rapides sur les cartes NVIDIA de 12 Go",
  "fx83": "Privilégie les parties du modèle déjà présentes sur la carte graphique, ce qui accélère les réponses sur les cartes de 12 Go. Désactivé par défaut : dans de longues sessions d’agent, le modèle peut se répéter et donner de moins bons résultats. Activez-le si vous discutez surtout et voulez la vitesse.",
- "fx84": "Le fichier est téléchargé. « Continuer » relance l’installation.",
- "fx85": "Ouvrez « Détails » pour voir la raison.",
+ "fx84": "Le fichier est téléchargé. « Continuer » relance l’installation.",
+ "fx85": "Ouvrez « Détails » pour voir la raison.",
  "fxec1": "Un moteur plus récent est disponible pour cet ordinateur. Vos modèles et vos réglages ne changent pas.",
  "fxec2": "Déchargez d’abord vos modèles en cours d’exécution.",
   "fx86": "Résumer les anciens messages pour que la conversation soit plus rapide et retrouve de la place"

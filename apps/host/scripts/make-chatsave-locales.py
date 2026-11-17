@@ -46,7 +46,7 @@ add("Copy unsaved chats",
     he="העתקת הצ'אטים שלא נשמרו")
 
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
-NBSP = " "
+NBSP = "\u00a0"
 
 
 def french(text):

@@ -27,7 +27,7 @@ add("Waiting for {0} to answer ({1} s so far)",
     he="ממתין לתשובה מ-{0} (עברו {1} שניות)")
 
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
-NBSP = " "
+NBSP = "\u00a0"
 
 
 def french(text):

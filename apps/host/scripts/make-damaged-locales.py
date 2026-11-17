@@ -128,7 +128,7 @@ add("This chat was saved by a newer version of Strata. Update Strata to open it.
     he="הצ'אט הזה נשמר בגרסה חדשה יותר של Strata. יש לעדכן את Strata כדי לפתוח אותו.")
 
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
-NBSP = " "
+NBSP = "\u00a0"
 
 
 def french(text):
