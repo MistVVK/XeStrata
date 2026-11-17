@@ -67,6 +67,23 @@ class StopOnAClosedPipe(unittest.TestCase):
             e.proc.stdin.write = write
         self.run_case(broken)
 
+    def test_restart_does_not_stop_the_successor(self):
+        """#5573: a restart on another thread replaced `proc` (and the line queue) while the consumer left: the STOP belongs to
+        the engine the request ran on, never to the successor, whose own request it would end."""
+        e = engine()
+        e.lines.put("T 7")
+        with mock.patch.object(server.bias_api, "validate_request", lambda *a, **k: None), \
+                mock.patch.object(server, "refuse_for_split", lambda *a, **k: None), \
+                mock.patch.object(server, "ENGINE_STALL_S", 0):
+            gen = e.generate([1, 2, 3], 8, {}, threading.Event())
+            self.assertEqual(next(gen), 7)
+            old_lines = e.lines
+            successor = FakeProc()
+            e.proc, e.lines = successor, queue.Queue()      # the restart: a new process and a new line queue
+            old_lines.put(None)                              # the old engine's output ended
+            gen.close()
+        self.assertEqual(successor.stdin.getvalue(), "")     # nothing was written to the successor
+
     def test_open_pipe_gets_the_stop(self):
         e = engine()
         e.lines.put("T 7")
