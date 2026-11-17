@@ -37,5 +37,12 @@
  "guic36": "Largeur des réponses",
  "guic37": "Largeur maximale du texte d’une réponse. Les tableaux et le code utilisent toujours toute la largeur.",
  "guic38": "Large",
- "guic39": "Pleine largeur"
+ "guic39": "Pleine largeur",
+ "guic40": "Durée maximale d’un auxiliaire",
+ "guic41": "Arrête un auxiliaire qui travaille plus longtemps que cette durée. Désactivé le laisse travailler aussi longtemps qu’il en a besoin.",
+ "guic42": "30 minutes",
+ "guic43": "1 heure",
+ "guic44": "2 heures",
+ "guic45": "Cet auxiliaire travaille depuis plus de 30 minutes.",
+ "guic46": "Arrêté : la durée maximale a été atteinte."
 }

@@ -365,6 +365,7 @@ overwrite local branches or edits just to make `git pull` succeed.
 - **Linux app crash:** if the window crashes or will not open, run the AppImage with `--save-logs` in a terminal; it writes
   the crash log and the other logs to one file in Downloads.
 - **Installer or source checkout:** `strata-<model>.log` from the Strata folder.
+- **Developer tools:** To open the developer tools in the app window on Windows or Linux, start the app with `STRATA_DEVTOOLS=1`.
 
 Look through a log before you send it, and never send an API key. Include model and quantization, OS, GPU/VRAM, RAM,
 driver, install route (app, Terminal or the installer), Strata and engine versions, exact command, expected result and

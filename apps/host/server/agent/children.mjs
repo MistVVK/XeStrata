@@ -24,6 +24,13 @@ const clip = (value, max) => {
 /** The steps one helper's row keeps for "View log" (#5254): the newest ones, short, so the parent's saved chat stays small. */
 export const MAX_STEPS = 20;
 
+/** The helper time limit the person may choose in Settings (#5996), in minutes; null is Off (the default). Anything else is not a choice. */
+export const HELPER_LIMITS = Object.freeze([30, 60, 120]);
+export const helperLimitMin = value => {
+  const n = typeof value === 'number' ? value : typeof value === 'string' && /^[0-9]+$/.test(value) ? Number(value) : NaN;
+  return HELPER_LIMITS.includes(n) ? n : null;
+};
+
 /** What a helper is doing, in words (shown as the row's description while it works). */
 export function activityOf(name, args = {}) {
   const scope = toolScope(name);
@@ -51,6 +58,8 @@ export class ChildProjector {
     this.sawUsage = false;
     this.activity = null;
     this.closing = '';              // the helper's last words, shown once it finished
+    this.workStartedAt = null;      // when it first went to working: the helper time limit counts from here (not from its wait for a turn)
+    this.limitReached = false;      // the time limit stopped it
     this.steps = [];                // what it did, newest last: { verb, target } for a tool, { said } for its own words (View log)
     this.failure = null;
     this.endedAt = null;
@@ -68,7 +77,7 @@ export class ChildProjector {
     if (this.status === 'working' && this.activity) description = this.activity;
     if (this.status === 'completed') description = this.closing ? clip(this.closing, 140) : 'Finished.';
     if (this.status === 'failed') description = this.failure ?? 'Stopped because something went wrong.';
-    if (this.status === 'cancelled') description = 'Stopped.';
+    if (this.status === 'cancelled') description = this.limitReached ? 'Stopped: it reached the helper time limit.' : 'Stopped.';
     return {
       id: this.id, name: this.name, description, status: this.status,
       durationMs: Math.max(0, (done ? this.endedAt : at) - this.startedAt), tokens: this.tokens, updatedAt: at,
@@ -97,7 +106,10 @@ export class ChildProjector {
   consume(item) {
     const frames = [];
     let row = false;
-    const set = (status) => { if (this.status !== status) { this.status = status; row = true; } };
+    const set = (status) => {
+      if (this.status !== status) { this.status = status; row = true; }
+      if (status === 'working' && !this.workStartedAt) this.workStartedAt = this.now();
+    };
 
     if (item.type === 'assistant-stream') {
       const f = item.frame;
@@ -118,7 +130,7 @@ export class ChildProjector {
       case 'turn/start':
         // A request was sent. Whether the engine has room for it yet is told by its first word: until then the helper is waiting for its turn.
         // A helper that had finished and got a new message starts over as waiting.
-        if (this.finished) { this.endedAt = null; this.failure = null; set('queued'); }
+        if (this.finished) { this.endedAt = null; this.failure = null; this.workStartedAt = null; this.limitReached = false; set('queued'); }
         break;
       case 'assistant/message': {
         const text = (d.message?.content ?? []).filter(p => p.type === 'text').map(p => p.text).join('').trim();

@@ -37,5 +37,12 @@
  "guic36": "Ancho de las respuestas",
  "guic37": "Qué tan ancho puede ser el texto de una respuesta. Las tablas y el código siempre usan todo el ancho.",
  "guic38": "Ancho",
- "guic39": "Ancho completo"
+ "guic39": "Ancho completo",
+ "guic40": "Límite de tiempo de los ayudantes",
+ "guic41": "Detiene a un ayudante que sigue trabajando más tiempo que este. Con Desactivado, los ayudantes pueden trabajar todo el tiempo que necesiten.",
+ "guic42": "30 minutos",
+ "guic43": "1 hora",
+ "guic44": "2 horas",
+ "guic45": "Este ayudante lleva más de 30 minutos trabajando.",
+ "guic46": "Detenido: alcanzó el límite de tiempo de los ayudantes."
 }

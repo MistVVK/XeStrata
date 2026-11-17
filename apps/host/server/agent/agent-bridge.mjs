@@ -143,7 +143,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
  * @param {string} [options.nodePath]                   the Node runtime that runs the Harness
  * @param {(line:string)=>void} [options.log]
  */
-export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
+export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, helperLimitMs = () => 0, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
   const root = join(dataDir, 'agent');
   const home = join(root, 'home');
   const sessionsFile = join(root, 'sessions.json');
@@ -549,6 +549,15 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
      */
     turn.watchdog = setInterval(() => {
       if (turn.finished || turn.stopping) return;
+      // #5996: a helper that has worked longer than the person's time limit is stopped (that helper only; the chat goes on and gets its report).
+      const helperLimit = Number(helperLimitMs()) || 0;
+      if (helperLimit > 0) {
+        for (const h of turn.children.values()) {
+          if (h.done || h.limitHit || h.cp.status !== 'working' || !h.cp.workStartedAt || Date.now() - h.cp.workStartedAt < helperLimit) continue;
+          h.limitHit = true; h.cp.limitReached = true;
+          void runtime.gw.rpc('subagents/interruptByParent', { childSessionId: h.id, parentSessionId: sessionId, mode: 'continuable' }).catch(() => {});
+        }
+      }
       const toolRunning = [...projector.tools.values()].some(x => x.card?.state === 'running' || x.card?.state === 'proposed') || pending.size > 0 && pendingFor(chatId).length > 0;
       const limit = toolRunning ? stallToolMs : stallMs;
       // A local engine reading a long prompt sends the Harness nothing for minutes (#3623). Its /metrics progress counts as activity,
@@ -694,7 +703,7 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
         const { frames, row } = cp.consume(item);
         for (const f of frames) emit(f);
         if (item.type === 'event' && item.event.type === 'turn/end') { child.done = true; child.endedAt = Date.now(); emitRow(child, true); armSettle(); return; }
-        if (item.type === 'event' && child.done && cp.status === 'working') { child.done = false; }
+        if (item.type === 'event' && child.done && cp.status === 'working') { child.done = false; child.limitHit = false; }
         if (row) emitRow(child);
       };
       child.follow = runtime.gw.openStream('session/follow', {

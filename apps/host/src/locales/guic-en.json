@@ -37,5 +37,12 @@
  "guic36": "Reply width",
  "guic37": "How wide the text of an answer can be. Tables and code always use the whole width.",
  "guic38": "Wide",
- "guic39": "Full width"
+ "guic39": "Full width",
+ "guic40": "Helper time limit",
+ "guic41": "Stops a helper that keeps working longer than this. Off lets helpers run as long as they need.",
+ "guic42": "30 minutes",
+ "guic43": "1 hour",
+ "guic44": "2 hours",
+ "guic45": "This helper has been working for over 30 minutes.",
+ "guic46": "Stopped: it reached the helper time limit."
 }

@@ -37,5 +37,12 @@
  "guic36": "Largura da resposta",
  "guic37": "Qual a largura máxima do texto de uma resposta. Tabelas e código sempre usam toda a largura.",
  "guic38": "Largo",
- "guic39": "Largura total"
+ "guic39": "Largura total",
+ "guic40": "Limite de tempo dos ajudantes",
+ "guic41": "Interrompe um ajudante que continua trabalhando por mais tempo que este. Desativado deixa os ajudantes trabalharem o tempo que precisarem.",
+ "guic42": "30 minutos",
+ "guic43": "1 hora",
+ "guic44": "2 horas",
+ "guic45": "Este ajudante está trabalhando há mais de 30 minutos.",
+ "guic46": "Interrompido: atingiu o limite de tempo dos ajudantes."
 }
