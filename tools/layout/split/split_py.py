@@ -295,7 +295,11 @@ for m, items in sorted(by_mod.items()):
 cut = set()
 for m, s, e, names, node in moved_nodes:
     cut.update(range(s, e + 1))
-last_import = max((n.end_lineno for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom)) and n.lineno < (order[0][0] if order else 10 ** 9)), default=0)
+# Where the re-export block goes: after the LAST statement that stands before the first function or class and stays in the file (imports, but also
+# `sys.path.insert(0, str(ROOT))`: a file that also runs as a script must make its package importable first; the 0.2.16 split of serve/server.py put the
+# block above that line and broke `python serve/server.py`).
+first_def = min([min([n.lineno] + [d.lineno for d in n.decorator_list]) for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))] or [10 ** 9])
+last_import = max((n.end_lineno for n in tree.body if n.end_lineno < first_def and not any(k in cut for k in range(n.lineno, n.end_lineno + 1))), default=0)
 reexp = []
 for m in sorted(by_mod):
     ns = sorted({n for s, e, names, node in by_mod[m] for n in names})
