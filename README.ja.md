@@ -409,6 +409,9 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:
    - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。Gyro の形式は agentionai の llama.cpp のフォーク（MIT）から。
+   - [Edge0 の Strata フォーク](https://github.com/Edge0-AI/Edge0)（Strata の MIT と Edge0 の Apache-2.0）: latent MoE の対応。モデルの重みのライセンスは別です（[NOTICE](NOTICE)）。
+   - [YASAKANI](https://github.com/yasakani-dev/yasakani)（Apache-2.0）: Gumbel 抽選、K/V のトレリス符号、固定小数点の和、静的な下書き表（[NOTICE](NOTICE)）。
+   - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)（Apache-2.0）: 画像の検出・動画の分割・色補正の実装（[NOTICE](NOTICE)）。
    - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（MIT）: server のループ対策（`serve/loop_guard.py`）。
    - Ostris の [ai-toolkit](https://github.com/ostris/ai-toolkit)（MIT）: LoRA の学習の時刻の重み（Anima の既定の weighted、`src/image/flow_weighting.cpp`）。
    - Secret Labs AB・Fredrik Lundh・Jeffrey A. Clark と寄稿者の [Pillow](https://github.com/python-pillow/Pillow)（MIT-CMU）: 画像のエンジンがホストで行う Pillow と同じバイトのリサイズ（`src/image/img_crop.cpp` の `pillow_resize_planes`、`libImaging/Resample.c` から）。
@@ -424,14 +427,14 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
      [CUTLASS](https://github.com/NVIDIA/cutlass)（BSD-3-Clause）、AMD の GPU の int8 の積に [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen)（Apache-2.0）。参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。
    - [quantscope](https://github.com/1872183316/quantscope)（MIT か Apache-2.0）: `setup.py --inspect` が GGUF の中身を確かめるのに使います。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
-   - チャットの数式を描く [KaTeX](https://katex.org/)（MIT）。
+   - チャットの数式を描く [KaTeX](https://katex.org/)（MIT）と、フローチャートを描く [mermaid](https://mermaid.js.org/)（MIT、同梱する部品のライセンスは [NOTICE](NOTICE)）。
 - **参考にした考え方**:
    - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
    - Neroued による [ninfer](https://github.com/Neroued/ninfer)。
    - syv.ai と HyperQwen の貢献者による [HyperQwen](https://github.com/syv-ai/HyperQwen)。
    - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、SSD から読むエキスパートを順位で飛ばすやり方）。
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方）。
-   - alibaba-pai による [VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun)（Qwen-Image-2.1 の Fun ControlNet Union の作り）と、Fannovel16 による [comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux)（制御の図の種類と既定値。出力を比べただけで、コードは写していません）。
+   - alibaba-pai による [VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun)（Qwen-Image-2.1 の Fun ControlNet Union の作り）と、Fannovel16 による [comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux)（制御の図の種類と既定値。設定の既定値と上限は Apache-2.0 で保持します）。
    - Jonseed による [ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon) と、その元の muerrilla による [sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon)（画像のサンプリングで、モデルに渡す sigma を表で小さくするやり方）。
 - 部品の一覧は [third_party/main/README.md](third_party/main/README.md)、詳しくは [docs/DETAILS.ja.md](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
 
@@ -463,7 +466,7 @@ XeStrata は自由ソフトウェアです。MistVVK と XeStrata の貢献者�
      どちらも Qwen Community License 1.0 です。
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。
 - **パッケージに入れているほかのもの**: intel/llvm の SYCL の実行時（Apache-2.0 WITH LLVM-exception）、llama.cpp の gguf-py（MIT）、
-  oneMath（Apache-2.0）、oneDNN（Apache-2.0）、AOTriton のライブラリとカーネル（MIT。中のカーネルは aiter（MIT）、FlyDSL（Apache-2.0）、Triton（MIT）の一部を含むことがあります）を、それぞれのライセンスの文書と一緒に入れています。
+  oneMath（Apache-2.0）、oneDNN（Apache-2.0）、AOTriton のライブラリとカーネル（MIT。Windows のライブラリは XZ Utils の liblzma（0BSD）を含む。中のカーネルは aiter（MIT）、FlyDSL（Apache-2.0）、Triton（MIT）の一部を含むことがあります）を、それぞれのライセンスの文書と一緒に入れています。
   AMD の GPU 向けのコードは ROCm のデバイスライブラリ（NCSA）の一部を、画像のエンジンは stb_image（MIT）と、contrib-llvm の版では cuDNN Frontend（Apache-2.0、一部 MIT）を含むので、そのライセンスの文書も入れています。
   contrib-llvm の版の NVIDIA の GPU 向けのコードは、NVIDIA の libdevice の一部を含むことがあり、その部分は NVIDIA の CUDA Toolkit の使用許諾契約に従います。
   そのほかの自由ソフトウェアでないもの（oneMKL、cuBLAS、cuDNN、NVIDIA のドライバー）は入れていません。

@@ -429,6 +429,9 @@ permission under GPL section 7, what goes in, and how to report).
   Each model's own license applies to its files.
 - **Parts it uses:**
    - parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT); Gyro's formats from agentionai's fork of llama.cpp (MIT);
+   - [Edge0's Strata fork](https://github.com/Edge0-AI/Edge0) (Strata's MIT and Edge0's Apache-2.0): latent MoE support. The model weights have separate licenses ([NOTICE](NOTICE)).
+   - [YASAKANI](https://github.com/yasakani-dev/yasakani) (Apache-2.0): Gumbel sampling, trellis-coded K/V, fixed-point sums and the static draft table ([NOTICE](NOTICE)).
+   - [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (Apache-2.0): image detection, video segmentation and color correction ([NOTICE](NOTICE)).
    - [Project Maya](https://github.com/mw00/project-maya), by Peasant Smith and the Project Maya contributors (MIT): the
      server's loop guard (`serve/loop_guard.py`);
    - [ai-toolkit](https://github.com/ostris/ai-toolkit), by Ostris (MIT): the LoRA trainer's timestep weights (Anima's
@@ -451,7 +454,7 @@ permission under GPL section 7, what goes in, and how to report).
      [CUTLASS](https://github.com/NVIDIA/cutlass) (BSD-3-Clause), on AMD GPUs [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) (Apache-2.0); for reading reference images, [stb_image](https://github.com/nothings/stb) (MIT or the Unlicense);
    - [quantscope](https://github.com/1872183316/quantscope) (MIT or Apache-2.0): what `setup.py --inspect` reads a GGUF's contents with;
    - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1);
-   - [KaTeX](https://katex.org/) (MIT), which draws the math in the chat.
+   - [KaTeX](https://katex.org/) (MIT), which draws math in the chat, and [mermaid](https://mermaid.js.org/) (MIT), which draws flowcharts (bundled parts: [NOTICE](NOTICE)).
 - **Ideas from:**
    - [Splash](https://github.com/incoai/splash), by Inco AI and the Splash contributors;
    - [ninfer](https://github.com/Neroued/ninfer), by Neroued;
@@ -463,7 +466,7 @@ permission under GPL section 7, what goes in, and how to report).
      models merges);
    - [VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun), by alibaba-pai (how Qwen-Image-2.1's Fun ControlNet Union
      is built), and [comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux), by Fannovel16 (the
-     control maps' kinds and defaults; only its outputs were compared with, none of its code is copied);
+     control maps' kinds and defaults; the settings' defaults and limits remain under Apache-2.0);
    - [ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon), by Jonseed, after
      [sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon), by muerrilla (the image sampling's
      sigma given to the model made smaller by a schedule).
@@ -500,7 +503,7 @@ comes from Strata and ggml / llama.cpp (MIT) and the components listed below.
      speed projection's vector, both under the Qwen Community License 1.0.
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs. The packages leave it out.
 - **What else the packages carry:** intel/llvm's SYCL runtime (Apache-2.0 WITH LLVM-exception), llama.cpp's gguf-py
-  (MIT), oneMath (Apache-2.0), oneDNN (Apache-2.0), and AOTriton's library and kernels (MIT; the kernels can carry parts of aiter (MIT), FlyDSL (Apache-2.0) and Triton (MIT)), each with its license text.
+  (MIT), oneMath (Apache-2.0), oneDNN (Apache-2.0), and AOTriton's library and kernels (MIT; its Windows library includes XZ Utils liblzma under 0BSD; the kernels can carry parts of aiter (MIT), FlyDSL (Apache-2.0) and Triton (MIT)), each with its license text.
   The code for AMD GPUs carries parts of ROCm's device libraries (NCSA), and the image engine stb_image (MIT) and, in the contrib-llvm packages, cuDNN Frontend (Apache-2.0, parts MIT), so their license texts are there too.
   In the contrib-llvm packages the code for NVIDIA GPUs can contain parts of NVIDIA's libdevice, which are under the NVIDIA CUDA Toolkit End User License Agreement.
   Nothing else that is not free software (oneMKL, cuBLAS, cuDNN, NVIDIA's driver) is in them.

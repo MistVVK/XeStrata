@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """The low-RAM mode's copy of the experts (the Q2_0 AVX-512 pack) is checked for room where it is written - the data
 folder's packs folder - and a refusal names that folder (upstream 16904848b).
 

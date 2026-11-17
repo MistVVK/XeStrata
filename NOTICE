@@ -183,7 +183,8 @@ intel/llvm (Apache-2.0 WITH LLVM-exception) built with XeStrata's fixes, llama.c
 carries (NCSA, Copyright (c) 2014-2016 Advanced Micro Devices, Inc.), stb_image's (MIT, Copyright (c) 2017 Sean
 Barrett), which the image engine is compiled with, oneDNN's library for Intel GPUs (Apache-2.0, Copyright Intel
 Corporation, with the third-party programs its THIRD-PARTY-PROGRAMS lists), AOTriton's library and kernels' images for
-AMD GPUs (MIT, Copyright Advanced Micro Devices, Inc.; the images can carry parts of AMD's aiter (MIT), FlyDSL's kernels
+AMD GPUs (MIT, Copyright Advanced Micro Devices, Inc.; on Windows its library statically links XZ Utils liblzma
+(0BSD, third_party/main/xz/COPYING.0BSD); the images can carry parts of AMD's aiter (MIT), FlyDSL's kernels
 (Apache-2.0) and Triton (MIT)), and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's changes, cuDNN
 Frontend (Apache-2.0, parts MIT, Copyright NVIDIA CORPORATION & AFFILIATES), which the image engine is compiled with,
 and CUTLASS (BSD-3-Clause, Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES), which the engine's int8

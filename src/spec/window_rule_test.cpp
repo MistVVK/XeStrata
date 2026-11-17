@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/spec/window_rule_test.cpp - the verify window's width by the active drafter (window_rule.hpp).
 #include "strata/spec/window_rule.hpp"
 

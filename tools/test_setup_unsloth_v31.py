@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """The catalog's Unsloth v3.1 set UD-IQ1_M (upstream 9ed3c7789, 199fbc7a4): offered with its three pinned shards whose
 names and sizes are the fingerprint file's, its own GGUF accepted, UD-IQ1_S still refused with the reason.
 

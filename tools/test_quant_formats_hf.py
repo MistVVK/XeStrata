@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """quant_formats.py --hf reads each shard's header over HTTP range requests with gguf_reader's bounds checks (#5075):
 the header knows the file's size from the Hugging Face tree, so a complete header parses and a cut one is refused with a
 ValueError that names the file.  Over a minimal GGUF v3 header written here (no network, no model).
