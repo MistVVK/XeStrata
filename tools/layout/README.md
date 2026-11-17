@@ -15,7 +15,7 @@ renames and path edits.
 | `tools/` | the repository's own checks (`tools/check` and the docs and binary checks), `packaging`, `docker`, `research`, `nix`, `BENCH.bat`, `bench.sh`, this folder |
 | `.github/` | CI, `CONTRIBUTING.md`, `SECURITY.md` |
 
-Root files: `README.md`, `LICENSE`, `AGENTS.md`, `setup.sh`, `START-HERE.bat`, `.gitignore`, `.gitattributes`. `SETUP.bat`,
+Root files: `README.md`, `SUPPORTERS.md`, `LICENSE`, `AGENTS.md`, `setup.sh`, `START-HERE.bat`, `.gitignore`, `.gitattributes`. `SETUP.bat`,
 `UPDATE.bat` and `update.sh` are removed: `setup.py --update` now does the git pull itself, and the first run in the new layout
 carries an old clone's state into `terminal/` (`.venv` by `START-HERE.bat` / `setup.sh`, the rest by `setup.py`).
 

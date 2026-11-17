@@ -168,6 +168,8 @@ Dziękujemy wszystkim, którzy wspierają Stratę.
 <a href="https://github.com/router0mail"><img src="https://github.com/router0mail.png?size=96" width="48" height="48" alt="router0mail" title="router0mail"></a>
 <!-- supporters:end -->
 
+Wszyscy wspierający i jak wesprzeć Stratę: [SUPPORTERS.md](../../SUPPORTERS.md)
+
 [Licencja MIT](../../LICENSE) · [Podziękowania i licencje modeli](../HOW_IT_WORKS.md#credits) · [Prywatność](../SAFETY.md)
 
 <a id="option-c-let-your-ai-set-it-up"></a>

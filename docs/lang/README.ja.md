@@ -167,6 +167,8 @@ Strata を支えてくださるすべての方に感謝します。
 <a href="https://github.com/router0mail"><img src="https://github.com/router0mail.png?size=96" width="48" height="48" alt="router0mail" title="router0mail"></a>
 <!-- supporters:end -->
 
+すべての支援者と Strata の支援方法は [SUPPORTERS.md](../../SUPPORTERS.md) をご覧ください。
+
 [MIT ライセンス](../../LICENSE) · [クレジットとモデルのライセンス](../HOW_IT_WORKS.md#credits) · [プライバシー](../SAFETY.md)
 
 <a id="option-c-let-your-ai-set-it-up"></a>

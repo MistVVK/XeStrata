@@ -167,6 +167,8 @@ Obrigado a todas as pessoas que apoiam o Strata.
 <a href="https://github.com/router0mail"><img src="https://github.com/router0mail.png?size=96" width="48" height="48" alt="router0mail" title="router0mail"></a>
 <!-- supporters:end -->
 
+Todos os apoiadores e como apoiar o Strata: [SUPPORTERS.md](../../SUPPORTERS.md)
+
 [Licença MIT](../../LICENSE) · [Créditos e licenças dos modelos](../HOW_IT_WORKS.md#credits) · [Privacidade](../SAFETY.md)
 
 <a id="option-c-let-your-ai-set-it-up"></a>

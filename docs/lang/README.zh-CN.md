@@ -167,6 +167,8 @@ strata launch
 <a href="https://github.com/router0mail"><img src="https://github.com/router0mail.png?size=96" width="48" height="48" alt="router0mail" title="router0mail"></a>
 <!-- supporters:end -->
 
+所有支持者以及如何支持 Strata：[SUPPORTERS.md](../../SUPPORTERS.md)
+
 [MIT 许可证](../../LICENSE) · [致谢和模型许可证](../HOW_IT_WORKS.md#credits) · [隐私](../SAFETY.md)
 
 <a id="option-c-let-your-ai-set-it-up"></a>
