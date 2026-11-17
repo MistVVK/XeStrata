@@ -27,8 +27,9 @@ def with_hold(script: str, says_holdb: bool = True) -> str:
     s = swap(s, '        ids = f[-1].split(",")\n',
              '        ids = f[-1].split(",")\n'
              '        hold = next(((int(x[5:].split(":")[0]), int(x[5:].split(":")[1])) for x in f if x.startswith("hold=")), None)\n')
-    s = swap(s, 'log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\\n"); log.flush()',
-             'log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)} hold={hold[0] if hold else None}:{hold[1] if hold else None}\\n"); log.flush()')
+    s = swap(s, 'log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}" + (" sr" if "slot_read=1" in f else "") + "\\n"); log.flush()',
+             'log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}" + (" sr" if "slot_read=1" in f else "") + '
+             'f" hold={hold[0] if hold else None}:{hold[1] if hold else None}\\n"); log.flush()')
     s = swap(s, "        out = 0\n        for t in toks[:n]:\n            if stop.is_set():\n                break\n            print(f\"T {t}\", flush=True)\n            out += 1\n            time.sleep(STEP)\n"
                 "        fin = \"stop\" if out and toks[out - 1] == 257 else (\"cancel\" if stop.is_set() else \"length\")\n",
              "        out = 0\n        hold_on = hold is not None\n        for t in toks[:n]:\n            if stop.is_set():\n                break\n"
@@ -38,9 +39,11 @@ def with_hold(script: str, says_holdb: bool = True) -> str:
              "\"hold\" if hold_on and out >= hold[0] and (out < n or slot is not None) else \"length\")\n")
     s = swap(s, "                active[slot] = [toks[1:], max_new, 1]\n", "                active[slot] = [toks[1:], max_new, 1, hold, hold_on]\n")
     s = swap(s, "        left, max_new, produced = active[b]\n", "        left, max_new, produced, hold, hold_on = active[b]\n")
-    s = swap(s, "        print(f\"BT {b} {t}\", flush=True)\n        if t == 257 or produced >= max_new:\n"
+    s = swap(s, "        print(f\"BT {b} {t}\", flush=True)\n        if b in meta:\n            meta[b][1].append(t)\n"
+                "        if t == 257 or produced >= max_new:\n"
                 "            fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'\n",
-             "        print(f\"BT {b} {t}\", flush=True)\n        if hold_on and t == hold[1]:\n            hold_on = False\n"
+             "        print(f\"BT {b} {t}\", flush=True)\n        if b in meta:\n            meta[b][1].append(t)\n"
+             "        if hold_on and t == hold[1]:\n            hold_on = False\n"
              "        if t == 257 or produced >= max_new or (hold_on and produced >= hold[0]):\n"
              "            fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length' if produced >= max_new else 'hold'\n")
     s = swap(s, "            active[b] = [left, max_new, produced]\n", "            active[b] = [left, max_new, produced, hold, hold_on]\n")

@@ -7,7 +7,9 @@
 //   4. a number or `auto` given explicitly is honoured, with or without those features;
 //   5. no layer split: the number given (1) stays;
 //   6. STRATA_PIPE_ADAPT_EVERY: off unless a positive number; a round is due after N group windows, never with the tier
-//      off, beside --adapt-async, while a prompt is read or while the last round's copies are in flight.
+//      off, beside --adapt-async, while a prompt is read or while the last round's copies are in flight;
+//   7. STRATA_PIPE_ADAPT_EVERY=auto: starts at kPipeAdaptStart; a round that moved nearly all it may halves the
+//      interval, one that moved little doubles it, both within kPipeAdaptMin..kPipeAdaptMax.
 #include "strata/program/batch_groups.hpp"
 
 #include <cstdio>
@@ -242,6 +244,21 @@ int main() {
         q.swaps_pending = true;
         check(!bg::pipe_adapt_due(q), "pipe adapt: never while the last round's copies are in flight");
     }
+
+    // STRATA_PIPE_ADAPT_EVERY=auto
+    check(bg::pipe_adapt_auto("auto") && !bg::pipe_adapt_auto("64") && !bg::pipe_adapt_auto(nullptr) && !bg::pipe_adapt_auto(""),
+          "pipe adapt auto: only the word auto");
+    check(bg::pipe_adapt_every("auto") == bg::kPipeAdaptStart, "pipe adapt auto: starts at its first interval");
+    check(bg::pipe_adapt_next(128, 96, 96) == 64 && bg::pipe_adapt_next(128, 72, 96) == 64,
+          "pipe adapt auto: a round that moved three quarters of its swaps halves the interval");
+    check(bg::pipe_adapt_next(64, 24, 96) == 128 && bg::pipe_adapt_next(64, 0, 96) == 128,
+          "pipe adapt auto: a round that moved a quarter or less doubles it");
+    check(bg::pipe_adapt_next(64, 48, 96) == 64 && bg::pipe_adapt_next(64, 71, 96) == 64 && bg::pipe_adapt_next(64, 25, 96) == 64,
+          "pipe adapt auto: in between it stays");
+    check(bg::pipe_adapt_next(bg::kPipeAdaptMin, 96, 96) == bg::kPipeAdaptMin &&
+          bg::pipe_adapt_next(bg::kPipeAdaptMax, 0, 96) == bg::kPipeAdaptMax, "pipe adapt auto: within its bounds");
+    check(bg::pipe_adapt_next(0, 96, 96) == 0 && bg::pipe_adapt_next(32, 96, 0) == 32,
+          "pipe adapt auto: nothing to adjust when the rounds or the swaps are off");
 
     std::printf("%s\n", g_fail == 0 ? "batch_groups_test: all passed" : "batch_groups_test: FAILED");
     return g_fail == 0 ? 0 : 1;

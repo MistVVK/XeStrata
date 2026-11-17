@@ -173,6 +173,14 @@ int main() {
               "6,000 past the resume, within max_suffix 8192, but the resume point is under half: parks");
         check(rewind_keep(long_live.data(), 10000, long_prompt.data(), 8000, 4096),
               "2,000 past the resume and the prefix is the bulk: skips");
+        // (a batch slot holding 5,000 tokens of which the request shares a 2,000-token system prompt: the suffix is within
+        // the cap but the shared prefix is not the bulk, so the slot is parked before its overwrite)
+        std::vector<int32_t> slot_live(5000, 7);
+        std::vector<int64_t> slot_prompt(5000, 7);
+        check(!rewind_keep(slot_live.data(), 5000, slot_prompt.data(), 2000, 4096), "5K slot sharing a 2K prefix: parks");
+        check(rewind_keep(slot_live.data(), 5000, slot_prompt.data(), 4500, 4096), "5K slot, 500 past the resume: skips");
+        slot_prompt[3000] = 8;   // equal up to 3,000 only: the resume point 4,500 is not a shared prefix
+        check(!rewind_keep(slot_live.data(), 5000, slot_prompt.data(), 4500, 4096), "the slot's tokens differ below the resume: parks");
         check(!rewind_keep(live.data(), 200, prompt.data(), 200, 4096), "resume at the end: parked (strict bound)");
         check(!rewind_keep(live.data(), 0, prompt.data(), 0, 4096), "empty live session: never skips");
     }

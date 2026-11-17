@@ -2584,6 +2584,34 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_BATCH_SLOT_RUNS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/core/verify.cpp",
+     "line": 1383,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1 runs a batch slot's rows of one window (its token and its proposals) as one launch per layer (K/V append, indexer step, block scores, top-k, resolve, attention); unset, a launch per row.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_BATCH_TELEMETRY",
    "backends": [
     "cuda-hip"
@@ -15630,6 +15658,34 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_KV_COPY_RESIDENT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/core/conversation_snapshot.cpp",
+     "line": 440,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1 lets a direct K/V copy between a batch slot and the main sessions carry the streamed K/V's VRAM pages and map along; unset, the target's residency is reset.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_KV_GROW",
    "backends": [
     "cuda-hip",
@@ -27823,6 +27879,34 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PIPED_LOOKUP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 7508,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1, with STRATA_PIPED_MTP and the prompt lookup (--suffix-draft): a slot's window in the pipelined groups may carry the lookup's drafts instead of the draft layer's; unset, the draft layer's only.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PIPED_MTP",
    "backends": [
     "cuda-hip"
@@ -37063,6 +37147,34 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_SLOT_CKPT_KV_DIRECT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 16007,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1, with STRATA_SLOT_COPY_DIRECT=1: the hand-back of a turn checkpoint copies the K/V straight from the slot's pools; unset, through a host image.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_SLOT_CKPT_MOVE",
    "backends": [
     "cuda-hip"
@@ -37216,6 +37328,97 @@
    "status": "default",
    "owner": "program",
    "note": "the engine's own default (the parallel-request stack, bit-exact, QUAL-PAR): on with 2 or more batch slots on Linux CUDA (arch_defaults.cpp parallel_default_env_cuda, applied in generate.cpp) and on Windows gfx1151; NAME=0 turns it off; a value you set is kept",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SLOT_RAM_RESERVE_GIB",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 7612,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "8.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864: =<GiB> carves only the batch slots that leave that much RAM free beside their pinned K/V, the experts' arena and an explicit --conversation-cache-mib; 0: no check; unset, the slots are carved as asked and a warning names the shortfall (8 GiB).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SLOT_READ",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 15302,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [
+    "serve/server.py"
+   ],
+   "launch_sets": [],
+   "launch_reads": [
+    {
+     "file": "serve/server.py",
+     "line": 2286
+    }
+   ],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default until the two-card measurement): =1, with STRATA_PIPED_MTP: the next turn of a conversation is read in the batch slot that holds it, in the slot's own windows; unset, through the main sessions.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SLOT_READ_MAX",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 16513,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864: with STRATA_SLOT_READ, the most new tokens of a turn read in its slot (default 1024); a longer turn takes the usual path.",
    "retire_after": "",
    "retired_in": ""
   },

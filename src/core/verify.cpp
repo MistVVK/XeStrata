@@ -1375,6 +1375,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
     const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    // A batch window's rows that belong to one slot (its token, then its proposals: --batch-mtp, the pipelined groups'
+    // drafts) take the solo window's launches over that run: the K/V and indexer appends, the block scores, the top-k,
+    // a streamed K/V's resolve and the attention once per run instead of once per row.  They are the same kernels with
+    // n rows instead of 1, as the solo window runs them over its rows.  Opt-in (#5864, off until the two-card
+    // measurement): STRATA_BATCH_SLOT_RUNS=1; unset, row by row, as before.
+    static const bool slot_runs_env = [] { const char* v = std::getenv("STRATA_BATCH_SLOT_RUNS"); return v != nullptr && std::atoi(v) != 0; }();
+    const bool slot_runs = batch_rec_ && dec_batch && slot_runs_env;
+    // the end of the run of rows of row `first`'s slot in [first, end) (one row when the runs are off)
+    auto run_end = [&](int first, int end, bool on) {
+        int t = first + 1;
+        while (on && t < end && brow_[t] == brow_[first]) ++t;
+        return t;
+    };
     // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
     const int side_mixer_mode = g_side_mixer();
     const bool side_mixer = side_mixer_mode >= 1;
@@ -1904,12 +1917,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                         n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                         rope_scaling(), ns);
                     } else {
-                        for (int t = tb; t < te; ++t) {
-                            const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        for (int t = tb; t < te;) {
+                            const int first = t;
+                            t = run_end(first, te, slot_runs && !g_no_batch_kv);
+                            const QsaState& sx = slot_ss(first).qsa_states[qi];
                             const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                                      (const float*) wikn->data, EPS, ib, s, sx.max_cells,
-                                                      rope_scaling(), ns);
+                            if (t - first > 1)   // a slot's rows: one launch (slot_runs)
+                                native_qsa_indexer_append_steps(idx_raw + first * ID, step_ + first * kStepCount + kStepPos,
+                                                                kStepCount, t - first, 0, (const float*) wikn->data, EPS,
+                                                                ib, s, sx.max_cells, rope_scaling(), ns);
+                            else
+                                native_qsa_indexer_append(idx_raw + first * ID, step_ + first * kStepCount + kStepPos, 0,
+                                                          (const float*) wikn->data, EPS, ib, s, sx.max_cells,
+                                                          rope_scaling(), ns);
                         }
                     }
                 };
@@ -2037,25 +2057,39 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
                                            kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
                 } else
-                for (int t = tb; t < te; ++t) {
-                    const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
-                    const int32_t* step_t = step_ + t * kStepCount;
+                for (int t = tb; t < te;) {
+                    const int first = t;
+                    const QsaState& st = slot_ss(first).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
+                    // a slot's rows in one launch per pool (slot_runs), where the pool's kind has the launch
+                    t = run_end(first, te, slot_runs && !g_no_batch_kv && (st.kv_hybrid || st.kv_q4 || st.kv_int8));
+                    const int m = t - first;
+                    const int32_t* step_t = step_ + first * kStepCount;
+                    const float* kc = kcur_ + first * NKV * HD;
+                    const float* vc = vcur_ + first * NKV * HD;
                     if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
                         const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
                         const bool mirror = st.host.present();   // streamed: the host copy too
-                        kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, mirror ? &hk : nullptr);
-                        kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
-                    } else if (st.kv_q4)
-                        kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, &st.host);
-                    else if (st.kv_int8)
-                        kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
-                    else
-                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                       vcur_ + t * NKV * HD, s, cs, &st.host);
+                        if (m > 1) {
+                            kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t, kStepCount,
+                                               kc, kc, (int) (NKV * HD), m, s, cs, mirror ? &hk : nullptr);
+                            kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_t, kStepCount, m, vc, vc, s, cs,
+                                               mirror ? &hv : nullptr);
+                        } else {
+                            kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t, kc, kc, s, cs,
+                                              mirror ? &hk : nullptr);
+                            kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vc, vc, s, cs,
+                                              mirror ? &hv : nullptr);
+                        }
+                    } else if (st.kv_q4) {
+                        if (m > 1) kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_t, kStepCount, m, kc, vc, s, cs, &st.host);
+                        else kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kc, vc, s, cs, &st.host);
+                    } else if (st.kv_int8) {
+                        if (m > 1)
+                            kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t, kStepCount, kc,
+                                               vc, (int) (NKV * HD), m, s, cs, &st.host);
+                        else kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t, kc, vc, s, cs, &st.host);
+                    } else
+                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kc, vc, s, cs, &st.host);
                 }
                 if (!sidem) idx_append(cs);
                 stamp(l, 9, grp);
@@ -2131,18 +2165,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                       attn_scratch_ + (size_t) t * attn_scratch_floats_,
                                                       attn_ + t * NH * HD, 1, cs);
                     }
-                } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
-                    for (int t = tb; t < te; ++t) {
-                        const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
-                                         max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
-                        qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
-                                       sel_ + (size_t) t * cap_, cs);
-                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
+                } else if (batch_rec_) {   // each slot's rows select and attend over its own K/V (slot_runs: a launch per run)
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        t = run_end(first, te, slot_runs);
+                        const int m = t - first;
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + first * IQ * ID, step_ + first * kStepCount, m,
+                                         max_blocks_, s, scores_ + (size_t) first * max_blocks_, cs);
+                        qsa_block_topk(scores_ + (size_t) first * max_blocks_, step_ + first * kStepCount, m, max_blocks_,
+                                       cap_, s, sel_ + (size_t) first * cap_, cs);
+                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) first * cap_, step_ + first * kStepCount, m, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
-                        qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
-                                              cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
-                                              attn_ + t * NH * HD, 1, cs);
+                        qsa_decode_attn_batch(qcur_ + first * NH * HD, px, sel_ + (size_t) first * cap_,
+                                              step_ + first * kStepCount, cap_, s,
+                                              attn_scratch_ + (size_t) first * attn_scratch_floats_,
+                                              attn_ + first * NH * HD, m, cs);
                     }
                 } else {
                 if (!sidem) idx_select(cs);
@@ -4628,6 +4666,7 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // (into a local: what a failed instantiate leaves in the output is not specified, and `ex` is a member that
     // capture() reads as "captured" when it is not null)
     capture_oom_ = false;
+    graphs_made_counter().fetch_add(1, std::memory_order_relaxed);
     cudaGraphExec_t got = nullptr;
     cudaError_t ie = cudaGraphInstantiate(&got, graph, flags);
     int freed = 0;
