@@ -268,7 +268,8 @@ class Decider:
         card = next((c for c in self.cards if c["pci"] == cur), None)
         train = st.get("train") or {}
         need_mib = int(train.get("need_mib") or self.need_mib)
-        peak = max(need_mib, int(train.get("peak_est_mib") or self.peak_mib))
+        # The trainer's estimate follows its current plan, not the whole form; using it here creates feedback.
+        peak = max(self.peak_mib, need_mib)
         chat = bool(st.get("chat_busy") or st.get("chat_queued"))
 
         if card is None:   # the start: the first card the least form fits on (the open's room checked by TrainPlace)
