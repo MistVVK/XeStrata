@@ -21,6 +21,7 @@
 
 using strata::program::conv_cache::eviction_victim;
 using strata::program::conv_cache::restore_fits;
+using strata::program::conv_cache::rewind_keep;
 using strata::program::conv_cache::spread_victim;
 
 namespace {
@@ -150,6 +151,38 @@ int main() {
         check(restore_fits(nullptr, none, 2, need) && restore_fits(full, nullptr, 2, need) && restore_fits(full, none, 0, need) &&
                   restore_fits(full, none, 2, 0),
               "no sample, no cards, no need: do not refuse");
+    }
+    {   // --conversation-cache-rewind-keep: a short private suffix skips the park; a different conversation parks
+        std::vector<int32_t> live(200, 7);
+        std::vector<int64_t> prompt(200, 7);
+        check(rewind_keep(live.data(), 200, prompt.data(), 198, 4096),
+              "198 of 200 live: the rewind keeps the conversation, no park");
+        check(!rewind_keep(live.data(), 200, prompt.data(), 198, 0), "max_suffix 0: never skips");
+        check(!rewind_keep(live.data(), 200, prompt.data(), 198, 1), "2 past the resume with max_suffix 1: parks");
+        prompt[100] = 8;
+        check(!rewind_keep(live.data(), 200, prompt.data(), 198, 4096),
+              "a different conversation (diverges before resume): parks");
+        prompt[100] = 7;
+        std::vector<int32_t> long_live(10000, 7);
+        std::vector<int64_t> long_prompt(10000, 7);
+        check(!rewind_keep(long_live.data(), 10000, long_prompt.data(), 100, 4096),
+              "9,900 past the resume (max_suffix; also under half): parks");
+        check(!rewind_keep(long_live.data(), 10000, long_prompt.data(), 2000, 4096),
+              "8,000 tokens past the resume: parks (max_suffix)");
+        check(!rewind_keep(long_live.data(), 10000, long_prompt.data(), 4000, 8192),
+              "6,000 past the resume, within max_suffix 8192, but the resume point is under half: parks");
+        check(rewind_keep(long_live.data(), 10000, long_prompt.data(), 8000, 4096),
+              "2,000 past the resume and the prefix is the bulk: skips");
+        // (a batch slot holding 5,000 tokens of which the request shares a 2,000-token system prompt: the suffix is within
+        // the cap but the shared prefix is not the bulk, so the slot is parked before its overwrite)
+        std::vector<int32_t> slot_live(5000, 7);
+        std::vector<int64_t> slot_prompt(5000, 7);
+        check(!rewind_keep(slot_live.data(), 5000, slot_prompt.data(), 2000, 4096), "5K slot sharing a 2K prefix: parks");
+        check(rewind_keep(slot_live.data(), 5000, slot_prompt.data(), 4500, 4096), "5K slot, 500 past the resume: skips");
+        slot_prompt[3000] = 8;   // equal up to 3,000 only: the resume point 4,500 is not a shared prefix
+        check(!rewind_keep(slot_live.data(), 5000, slot_prompt.data(), 4500, 4096), "the slot's tokens differ below the resume: parks");
+        check(!rewind_keep(live.data(), 200, prompt.data(), 200, 4096), "resume at the end: parked (strict bound)");
+        check(!rewind_keep(live.data(), 0, prompt.data(), 0, 4096), "empty live session: never skips");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

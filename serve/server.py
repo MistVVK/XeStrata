@@ -1404,9 +1404,10 @@ class StrataEngine:
         self.slot_groups = groups
         # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
         # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
-        # conversation cache - see pick_slot
+        # conversation cache - see pick_slot.  Not an engine that reads a conversation's next turn in its slot (INFO
+        # slot_read=1): its windows leave an idle slot alone, so every slot keeps its conversation as elsewhere.
         groups_run = int(self.info.get("batch_groups") or groups)
-        self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+        self.slot_gs = gs if groups > 1 and groups_run > 1 and not self.info.get("slot_read") else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
@@ -1965,6 +1966,13 @@ class StrataEngine:
             self.last = {**self.last, "finish": f[3],
                          "decode_ms": admission_ms + float(f[4]) if admission_ms is not None else None,
                          "generated": int(f[2]) if f[2].isdigit() else None}
+            for tok in f[5:]:                                # read=<ms>: the turn's read in the slot itself (slot_read)
+                key, eq, value = tok.partition("=")
+                if eq and key == "read":
+                    try:
+                        self.last["prompt_ms"] = (self.last.get("prompt_ms") or 0.0) + float(value)
+                    except ValueError:
+                        pass
 
     def _raise_if_fatal_gpu(self, line: str) -> None:
         """#4350: the engine's ERR line "fatal GPU error: ..." means it is ending (its GPU context is gone).  The request in flight fails
@@ -2258,8 +2266,44 @@ class StrataEngine:
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
                 not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
             return False
+        if self.slot_read and self._several_chats():        # its next turn is read in this slot: it stays
+            return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
+
+    # INFO slot_read=1: the engine reads the next turn of a conversation in the slot that holds it - no copy to its
+    # main sessions and back, no other slot stopped (BGEN ... slot_read=1; it answers DONE and BADM without a token).
+    # While several conversations are going on - requests in two or more slots within PARALLEL_STICKY_S seconds
+    # (STRATA_PARALLEL_STICKY_S, default 20; 0: never) - a conversation stays in its slot: its next turn goes there
+    # even when no other request runs at that moment, and a request left alone in its slot does not move to the solo
+    # path.  Each move between the two is a copy of the whole conversation's K/V (0.3 s at 178K tokens on 2x RTX 3090,
+    # with every slot stopped), and the request that arrives next stops the solo one to put it back in a slot.  A slot
+    # that decodes alone is slower than the solo path, though (one group's windows, no overlap between the cards),
+    # so the time is short: once the other conversations have been quiet that long, the next turn is the solo path's.
+    PARALLEL_STICKY_S = float(os.environ.get("STRATA_PARALLEL_STICKY_S", "20") or 0)
+
+    @property
+    def slot_read(self) -> bool:
+        return bool((self.info or {}).get("slot_read")) and os.environ.get("STRATA_SLOT_READ") != "0"
+
+    def _several_chats(self) -> bool:
+        """Requests ran in two or more slots within the last PARALLEL_STICKY_S seconds."""
+        if self.PARALLEL_STICKY_S <= 0:
+            return False
+        now = time.time()
+        with self.slot_cv:
+            return sum(1 for b in range(self.batch)
+                       if self.slot_busy[b] or now - self.slot_used[b] <= self.PARALLEL_STICKY_S) >= 2
+
+    def _turn_in_slot(self, prompt: list[int]) -> bool:
+        """This prompt is the next turn of a conversation a free slot holds, and several conversations are going on:
+        it is read in that slot (slot_read) instead of on the solo path."""
+        if not self.slot_read or not self._several_chats():
+            return False
+        with self.slot_cv:
+            agreed = {}
+            return any(not self.slot_busy[b] and self._slot_prefix(b, prompt, agreed) >= self.SLOT_PREFIX_MIN
+                       for b in range(self.batch))
 
     def _shorter_waiting(self, plen: int) -> bool:
         """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
@@ -2329,7 +2373,7 @@ class StrataEngine:
                     lines_q, sq = self.lines, self.slot_q           # (it holds no slot of the engine before: nothing to lose)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                if alone and left > 1 and not (not embeddings and self._turn_in_slot(prompt)):
                     pf = self.pen_from_key(orig_len, len(prompt))
                     head = f"GENI {left}{leg_keys()}{pf} {embeddings}" if embeddings else f"GEN {left}{leg_keys()}{pf}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
@@ -2465,7 +2509,9 @@ class StrataEngine:
                     while not sq[slot].empty():
                         sq[slot].get_nowait()
                     pf = self.pen_from_key(orig_len, len(prompt))
-                    head = f"BGENI {slot} {left}{leg_keys()}{pf} {embeddings}" if embeddings else f"BGEN {slot} {left}{leg_keys()}{pf}"
+                    sr = " slot_read=1" if self.slot_read else ""    # (the engine may answer without a token: adm_from)
+                    head = (f"BGENI {slot} {left}{leg_keys()}{pf} {embeddings}" if embeddings
+                            else f"BGEN {slot} {left}{leg_keys()}{pf}{sr}")
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
                             "started": time.time(), "first_token": None}
@@ -2483,6 +2529,7 @@ class StrataEngine:
                     if started is not None:
                         started()
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    adm_from = len(out)                     # (the admission's own token comes after these)
                     admission_pending, admission_before = True, self.last
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
@@ -2549,8 +2596,11 @@ class StrataEngine:
                 holding = False
                 if not cont:
                     return
-                live.update(state="decoding", first_token=time.time(), generated=len(out))
-                gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
+                # slot_read: a turn read in the slot itself has no admission token - the slot's first BT is the reply's first
+                adm_tok = len(out) > adm_from
+                live.update(state="decoding" if adm_tok else "reading", first_token=time.time() if adm_tok else None,
+                            generated=len(out))
+                gen0 = len(out) - 1 if adm_tok else len(out)   # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
                     try:
@@ -2571,6 +2621,8 @@ class StrataEngine:
                         t = int(line.split()[2])
                         out.append(t)
                         live["generated"] = len(out)
+                        if live["first_token"] is None:
+                            live.update(state="decoding", first_token=time.time())
                         if cancel.is_set():
                             if not stop_sent:
                                 self._send_for(born, f"BSTOP {slot}")
@@ -2695,6 +2747,56 @@ class StrataEngine:
     BRANCH_BOUNDARY_MIN = 8192   # the engine's message-boundary checkpoint (STRATA_CACHE_MESSAGE_BOUNDARY) starts at this many tokens
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
+    def _slot_agree(self, b: int, prompt: list[int], agreed: dict) -> int:
+        """How many leading tokens slot b's held stream and the prompt share (slice compares: streams reach 100k
+        tokens); `agreed` keeps the answers of one decision."""
+        if b not in agreed:
+            h = self.slot_held[b]
+            lo, hi = 0, min(len(h), len(prompt))
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if h[:mid] == prompt[:mid]:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            agreed[b] = lo
+        return agreed[b]
+
+    def _slot_prefix(self, b: int, prompt: list[int], agreed: dict) -> int:
+        """What of `prompt` slot b's cache serves (the caller holds slot_cv): the slot's whole held stream (the prompt
+        and what it decoded) when this prompt continues it, else its turn checkpoint - the engine takes one at the
+        last <|im_start|> of a prompt (the next request of the chat renders the history again, but not the reply it
+        decoded or the assistant header), so a prompt that agrees with the held tokens up to there is that chat's
+        next turn too (#2518: it was only found by the engine's own source search, after pick_slot had sent it to
+        another slot and the request in that slot had overwritten the chat whose cache the next one needed)."""
+        h = self.slot_held[b]
+        if not h:
+            return 0
+        if len(h) < len(prompt) and prompt[:len(h)] == h:
+            return len(h)
+        if self.TURN_ID not in h:
+            return 0
+        lo = self._slot_agree(b, prompt, agreed)
+        last = len(h) - 1 - h[::-1].index(self.TURN_ID)
+        if 0 < last < len(prompt) and last <= lo:
+            return last
+        # a branch: the same history with the last question replaced agrees with the held stream only up to an
+        # EARLIER message boundary, where the engine may hold a checkpoint of this chat
+        # (STRATA_CACHE_MESSAGE_BOUNDARY, prefixes of at least BRANCH_BOUNDARY_MIN tokens).  The engine finds that
+        # source itself but copies it into the slot chosen here, so another chat's slot would be overwritten (#2518).
+        i = min(lo, len(prompt) - 1, last - 1)
+        if i < self.BRANCH_BOUNDARY_MIN:
+            return 0
+        window = h[self.BRANCH_BOUNDARY_MIN:i + 1]
+        if self.TURN_ID not in window:
+            return 0
+        i -= window[::-1].index(self.TURN_ID)
+        # a boundary every other held conversation shares as well (the system prompt and tools of one client) says
+        # nothing about whose it is: the old order (an empty slot, then the least recent one) keeps all chats
+        if not any(self._slot_agree(c, prompt, agreed) < i for c in range(self.batch) if c != b and self.slot_held[c]):
+            return 0
+        return i
+
     def pick_slot(self, prompt: list[int]) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
@@ -2714,53 +2816,7 @@ class StrataEngine:
                 return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
             return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
         agreed = {}
-        def agree(b):
-            # how many leading tokens slot b's held stream and the prompt share (slice compares: streams reach 100k tokens)
-            if b not in agreed:
-                h = self.slot_held[b]
-                lo, hi = 0, min(len(h), len(prompt))
-                while lo < hi:
-                    mid = (lo + hi + 1) // 2
-                    if h[:mid] == prompt[:mid]:
-                        lo = mid
-                    else:
-                        hi = mid - 1
-                agreed[b] = lo
-            return agreed[b]
-        def held_prefix(b):
-            # what of `prompt` the slot's cache serves: the slot's whole held stream (the prompt and what it decoded)
-            # when this prompt continues it, else its turn checkpoint - the engine takes one at the last <|im_start|> of
-            # a prompt (the next request of the chat renders the history again, but not the reply it decoded or the
-            # assistant header), so a prompt that agrees with the held tokens up to there is that chat's next turn
-            # too (#2518: it was only found by the engine's own source search, after pick_slot had sent it to another
-            # slot and the request in that slot had overwritten the chat whose cache the next one needed)
-            h = self.slot_held[b]
-            if not h:
-                return 0
-            if len(h) < len(prompt) and prompt[:len(h)] == h:
-                return len(h)
-            if self.TURN_ID not in h:
-                return 0
-            lo = agree(b)
-            last = len(h) - 1 - h[::-1].index(self.TURN_ID)
-            if 0 < last < len(prompt) and last <= lo:
-                return last
-            # a branch: the same history with the last question replaced agrees with the held stream only up to an
-            # EARLIER message boundary, where the engine may hold a checkpoint of this chat
-            # (STRATA_CACHE_MESSAGE_BOUNDARY, prefixes of at least BRANCH_BOUNDARY_MIN tokens).  The engine finds that
-            # source itself but copies it into the slot chosen here, so another chat's slot would be overwritten (#2518).
-            i = min(lo, len(prompt) - 1, last - 1)
-            if i < self.BRANCH_BOUNDARY_MIN:
-                return 0
-            window = h[self.BRANCH_BOUNDARY_MIN:i + 1]
-            if self.TURN_ID not in window:
-                return 0
-            i -= window[::-1].index(self.TURN_ID)
-            # a boundary every other held conversation shares as well (the system prompt and tools of one client) says
-            # nothing about whose it is: the old order (an empty slot, then the least recent one) keeps all chats
-            if not any(agree(c) < i for c in range(self.batch) if c != b and self.slot_held[c]):
-                return 0
-            return i
+        held_prefix = lambda b: self._slot_prefix(b, prompt, agreed)
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):

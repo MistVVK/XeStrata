@@ -422,6 +422,53 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
     error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
     return false;
 }
+
+// A direct copy between two streamed states that are carved alike on one device (a batch slot's and the solo
+// session's) can take the source's residency with it: the VRAM slots' pages and the map, device to device.  The
+// reset above empties them, and the copied conversation then reads every block it attends to from the host copy
+// again, a page at a time: measured on 2x RTX 3090 (1M context, 32K cells in VRAM, a 35K-token conversation), the
+// windows behind an admission took 23 + 19 ms where the same windows take 12 + 10 once their blocks are in, and a
+// solo request behind a slot's hand-back read 11% of 175K block reads from RAM (0.4% in a session that was never
+// copied).  The pages are the source's view of the same bytes the host copy just received: a writer updates the
+// host copy always and a slot's page when its block is resident, on either state, so a page copied here says what
+// its block says in the target's host copy for every cell the conversation holds.  The call counters stay the
+// target's.  Opt-in (#5864, off until the two-card measurement): STRATA_KV_COPY_RESIDENT=1; unset, the reset, as
+// before.  False: not applicable (the caller resets).
+bool copy_residency(const QsaState& from, const QsaState& to, const ModelGeometry& g, bool queued, bool& copied,
+                    std::string& error) {
+    copied = false;
+    static const bool on = [] { const char* e = std::getenv("STRATA_KV_COPY_RESIDENT"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
+    const auto& mf = from.map;
+    const auto& mt = to.map;
+    if (!on || from.kv_mode != 1 || to.kv_mode != 1 || from.n_slots != to.n_slots || mf.n_slots != mt.n_slots ||
+        mf.n_blocks != mt.n_blocks || mf.n_slots <= 0 || !mf.page_table || !mt.page_table || !mf.slot_block ||
+        !mt.slot_block || !mf.slot_stamp || !mt.slot_stamp || !mf.slot_ref || !mt.slot_ref || !mf.ctl || !mt.ctl)
+        return true;
+    const auto s = strata::kernels::qsa_real_shapes();
+    Layout lr{};
+    if (!layout(from, g, from.n_slots * s.page_size, false, lr, error)) return false;   // the slots' pages: n_slots pages a pool
+    const auto src = pools(from, true);
+    const auto dst = pools(to, true);
+    const std::array<size_t,4> sizes = {lr.data, lr.value_data, lr.scales, lr.value_scales};
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && (!src[i] || !dst[i])) return true;   // (a pool this format does not have in VRAM: the reset)
+    auto put = [&](void* d, const void* f, size_t bytes) {
+        const cudaError_t e = conversation_detail::copy_nonblocking(d, f, bytes, queued);
+        if (e == cudaSuccess) return true;
+        error = std::string("conversation snapshot residency copy: ") + cudaGetErrorString(e);
+        return false;
+    };
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && !put(dst[i], src[i], sizes[i])) return false;
+    const size_t per_slot = (size_t) mf.n_slots * sizeof(int32_t);
+    if (!put(mt.page_table, mf.page_table, (size_t) mf.n_blocks * sizeof(int32_t)) ||
+        !put(mt.slot_block, mf.slot_block, per_slot) || !put(mt.slot_stamp, mf.slot_stamp, per_slot) ||
+        !put(mt.slot_ref, mf.slot_ref, per_slot) ||
+        !put(mt.ctl, mf.ctl, 4 * sizeof(int32_t)))   // the epoch, the clock hand, the last call's misses and overflow
+        return false;
+    copied = true;
+    return true;
+}
 } // namespace
 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
@@ -451,6 +498,14 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     if (queued && to.kv_mode != 0) {
         const cudaError_t e = conversation_detail::order_after_queued();
         if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+    }
+    bool resident = false;
+    if (!copy_residency(from, to, g, queued, resident, error)) return false;
+    if (resident) {
+        const auto status = cudaGetLastError();
+        if (status == cudaSuccess) return true;
+        error = std::string("conversation snapshot residency copy: ") + cudaGetErrorString(status);
+        return false;
     }
     return refresh_residency(to, g, upto, error);
 }

@@ -17,16 +17,36 @@
 // Pure (no GPU, no environment read): generate.cpp passes in what it knows.
 #pragma once
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata::program::batch_groups {
 
+/// STRATA_PIPE_ADAPT_EVERY=auto: the interval follows what the rounds find (pipe_adapt_next), from kPipeAdaptStart.
+/// (The floor is where a fixed interval measured best on 2x RTX 3090 with two conversations whose experts do not all
+/// fit beside the slots, so every round came back full: 16 lost to 32 by the rounds' own time, 64 was 3% behind.)
+inline constexpr int kPipeAdaptStart = 32, kPipeAdaptMin = 32, kPipeAdaptMax = 256;
+inline bool pipe_adapt_auto(const char* value) { return value != nullptr && std::strcmp(value, "auto") == 0; }
+
 /// STRATA_PIPE_ADAPT_EVERY's value -> the interval in group windows; 0 (off: the pipelined path adapts nothing, as before)
-/// when unset, empty, not a number, 0 or negative.
+/// when unset, empty, not a number, 0 or negative.  `auto`: the interval it starts from.
 inline int pipe_adapt_every(const char* value) {
     if (value == nullptr) return 0;
+    if (pipe_adapt_auto(value)) return kPipeAdaptStart;
     const int n = std::atoi(value);
     return n > 0 ? n : 0;
+}
+
+/// `auto`: the interval after a round that moved `swaps` experts of the `cap` a round may move (--adapt-swaps).  A
+/// round that came back nearly full says the text has moved and the tier is behind: half the interval, down to
+/// kPipeAdaptMin.  One that found little to move says the tier has caught up, and every round empties the pipeline:
+/// twice the interval, up to kPipeAdaptMax.  In between it stays.
+inline int pipe_adapt_next(int every, long long swaps, int cap) {
+    if (every <= 0 || cap <= 0) return every;
+    if (swaps * 4 >= (long long) cap * 3) return std::max(kPipeAdaptMin, every / 2);
+    if (swaps * 4 <= (long long) cap) return std::min(kPipeAdaptMax, every * 2);
+    return every;
 }
 
 /// What the pipelined loop knows when it decides on a round.

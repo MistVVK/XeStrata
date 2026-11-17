@@ -262,6 +262,10 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    /// How many graphs every verifier of the process has instantiated so far (a window, a commit, a batch layout: each on
+    /// its first use, and again after an eviction).  A round timed across a change of this number held a capture, tens
+    /// of milliseconds that are not the round's cost: the pipelined slot groups' draft policy leaves such times out.
+    static uint64_t graphs_made() { return graphs_made_counter().load(std::memory_order_relaxed); }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -527,6 +531,10 @@ private:
     /// again when it is next used.
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,
                               std::string& err, int keep_t = -1, unsigned long long flags = 0);
+    static std::atomic<uint64_t>& graphs_made_counter() {   // graphs_made(): one count for the process
+        static std::atomic<uint64_t> n{0};
+        return n;
+    }
     /// Free the graph of the largest window size other than `keep_t` (and the prelaunched one); `evicted`: there was one.
     bool evict_window_graph(int keep_t, bool& evicted, std::string& err);
     bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another
