@@ -4,7 +4,7 @@
 //
 //   strata-image-qi-train train --dit <F16 GGUF> --data <items file> --out <prefix> [--rank 32] [--steps 3000]
 //                               [--lr 1e-4] [--seed 42] [--draw balanced|content|style] [--save-every 250]
-//                               [--caption-dropout 0.05] [--base bf16|int8] [--train-blocks 0-5,10]
+//                               [--caption-dropout 0] [--base bf16|int8] [--train-blocks 0-5,10]
 //                               [--only-if-contains attn] [--ignore-if-contains img_mlp] [--kind character|style|other]
 //   strata-image-qi-train check --dit <F16 GGUF> --dir <dir> [--blocks N] [--base bf16|int8]
 //
@@ -98,7 +98,8 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     const int64_t rank = std::stoll(opt(f, "rank", "32")), steps = std::stoll(opt(f, "steps", "3000"));
     const int64_t save_every = std::stoll(opt(f, "save-every", "250"));
     const uint64_t seed = std::stoull(opt(f, "seed", "42"));
-    const float dropout = std::stof(opt(f, "caption-dropout", "0.05"));
+    const std::string dropout_arg = opt(f, "caption-dropout", "");
+    const float dropout = dropout_arg.empty() ? train::caption_dropout : std::stof(dropout_arg);
     train::AdamW o;
     o.lr = std::stof(opt(f, "lr", "1e-4"));
     train::IndexDraw draw;

@@ -14,6 +14,11 @@
 
 namespace strata::image::train {
 
+// The same defaults the browser and preprocessing read; one table for every training entry.
+#define TRAIN_DEFAULT(name, value) inline constexpr float name = value;
+#include "../../../serve/train_defaults.inc"
+#undef TRAIN_DEFAULT
+
 /// A training schedule: 1000 timesteps (sigma * 1000, FP32, from 1000 down), ai-toolkit's set_train_timesteps.
 struct Schedule {
     std::vector<float> t;   // [1000] timesteps; sigma = t / 1000

@@ -89,7 +89,8 @@ int main(int argc, char** argv) {
     std::string train_blocks, only_if, ignore_if, kind;   // train::Targets' values, and the metadata's kind
     // ai-toolkit's Mage-Flow defaults (its mageflow model's job): linear timesteps, rank 32 with alpha = rank,
     // AdamW lr 1e-4 eps 1e-6 weight decay 1e-4 at a constant rate, batch 1, 3,000 steps, a save every 250, the
-    // caption dropped 5% of the time.  "logit-normal" and "shifted" are the earlier SPEC's draws.
+    // caption dropout from the manifest (the preprocessing default is the shared 0). "logit-normal" and "shifted"
+    // are the earlier SPEC's draws.
     std::string timesteps = "linear";
     float sigma = 0.5f, lr = 1e-4f, alpha = 0.f, sigma_max = 0.f, adam_eps = 1e-6f, wd = 1e-4f, dropout = -1.f;
     int rank = 32, steps = 3000, accum = 1, checkpoint = 250, seed = 12345, warmup = 0;
@@ -255,11 +256,6 @@ int main(int argc, char** argv) {
             if (dropout >= 0.f) {   // the flag decides for every sample over the manifest's column
                 if (dropout > 1.f) throw std::runtime_error("--caption-dropout out of [0,1]");
                 for (float& d : drop_rates) d = dropout;
-            } else {
-                bool all0 = true;
-                for (float d : drop_rates) all0 = all0 && d == 0.f;
-                if (all0)   // data exported before the dropout column carried a rate: ai-toolkit's 5%
-                    for (float& d : drop_rates) d = 0.05f;
             }
             // ai-toolkit's linear timesteps: torch.linspace(1000, 1, 1000)[randint(0, 999)], sigma = t / 1000
             const strata::image::train::Schedule lin = strata::image::train::schedule_linear();

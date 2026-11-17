@@ -384,6 +384,8 @@ stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib=
 
 CLI の前処理と学習器を、Web のチャットから最後まで使えるようにしたものです（`serve/lora_train.py`・`serve/web/app.js` の作成パネル）。
 
+学習の既定は caption dropout 0 です。ブラウザの設定や CLI の `--caption-dropout` で変更できます。Mage-Flow の CLI は指定がなければ、前処理の manifest にある画像ごとの値（前処理の既定は 0）を使います。ほかの模型やデータでも 0 が最適とは限りません。
+
 学習の土台は setup の `--images qwen-image-turbo --image-lora-training` のように用意します。画像モデルを複数選ぶと、それぞれの土台を取得します。対話とランチャーでも同じ選択ができます。指定しなければ学習用の追加ダウンロードはありません。
 
 蒸留モデルは学習の一覧に出ません。Qwen-Image-2.1 Turbo は Qwen-Image-2.1 の F16、Mage-Flow Turbo は `mage-flow`（RL）、MOSS-Image 4-step は `moss-image`（SFT）、Anima Turbo は `anima-base` を使います。Anima Base は作者の学習向けの選択であり、Turbo の教師と断定するものではありません。MageTrail は独立して学習し、Mage-Flow の LoRA との互換性は未検証です。蒸留モデルを API やチャットで指定すると土台に切り替え、その事実を返します。できた LoRA は対応する蒸留モデルにも使えます。

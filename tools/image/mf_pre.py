@@ -64,6 +64,7 @@ for _p in (ROOT, ROOT / "tools", ROOT / "tools" / "image"):
 
 from serve.images import DROP as GENERATION_DROP  # noqa: E402  (the generation prompt's system turn)
 from serve.images import PROMPT_HEAD, PROMPT_TAIL, anima_tokens, load_tokenizer, prompt_ids  # noqa: E402
+from serve.train_defaults import CAPTION_DROPOUT  # noqa: E402
 
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".gif")      # what third_party/main/stb reads, so what the engine reads
 LATENT_TAG = "_mf.npz"
@@ -585,7 +586,8 @@ def main() -> int:
                     help="the pixel budgets' sides, comma separated: a latent a budget's bucket (ai-toolkit's "
                          "Mage-Flow resolutions 512, 768, 1024)")
     ap.add_argument("--step", type=int, default=16, help="the bucket step (ai-toolkit's Mage-Flow: 16)")
-    ap.add_argument("--dropout", type=float, default=0.0, help="v1's caption_dropout_rate, recorded in the cache")
+    ap.add_argument("--dropout", type=float, default=CAPTION_DROPOUT,
+                    help="v1's caption_dropout_rate, recorded in the cache")
     ap.add_argument("--neg", default="", help="the unconditional prompt (empty, as SPEC pins it)")
     ap.add_argument("--scratch", help="where the engine's dumps go")
     ap.add_argument("--check", action="store_true", help="only verify the caches already beside the images")

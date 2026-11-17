@@ -422,6 +422,8 @@ are `xestrata-device --bench` (one card at a time, cached per device).
 
 The CLI's preprocess and trainers, usable end to end from the web chat (`serve/lora_train.py`, the panel in `serve/web/app.js`).
 
+Training defaults to caption dropout 0. Change it in the browser's settings or with the CLI's `--caption-dropout`. Without the flag, Mage-Flow's CLI uses each image's rate in the preprocessing manifest (preprocessing defaults to 0). Zero is not necessarily optimal for other models or datasets.
+
 Prepare the training bases with setup, for example `--images qwen-image-turbo --image-lora-training`. With several image models it fetches each one's base. The interactive setup and launcher offer the same choice. Without it there are no extra training downloads.
 
 Distilled models are not in the training list. Qwen-Image-2.1 Turbo uses Qwen-Image-2.1 F16, Mage-Flow Turbo uses `mage-flow` (RL), MOSS-Image 4-step uses `moss-image` (SFT), and Anima Turbo uses `anima-base`. Anima Base is the author's choice for training; it is not claimed to be Turbo's teacher. MageTrail is trained separately; its compatibility with Mage-Flow LoRAs is unverified. An API or chat request for a distilled model switches to its base and reports the switch. The resulting LoRA can also be used with the corresponding distilled model.

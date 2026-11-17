@@ -250,6 +250,9 @@ class Training(unittest.TestCase):
 
     # ---- the checks
     def test_fields(self):
+        for family in lt.FAMILIES:
+            self.assertEqual(lt.PRESETS[family]["dropout"], 0.0)
+            self.assertEqual(lt.check_settings({}, family)["dropout"], 0.0)
         self.assertEqual(lt.check_name("../../etc/passwd"), "passwd")   # folders taken off, as loras.file_name
         self.assertEqual(lt.check_name("a/b\\c d"), "c d")
         with self.assertRaises(lt.TrainError):

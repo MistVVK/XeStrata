@@ -6,7 +6,7 @@
 // The executable's model is STRATA_TRAIN_MODEL ("moss-image" or "anima"), set by CMake.
 //
 // ai-toolkit's defaults for both: rank 32 with alpha = rank, AdamW lr 1e-4 (eps 1e-6, weight decay 1e-4) at a constant
-// rate after torch's clip at 1, batch 1, 3,000 steps, a save every 250, the caption dropped 5% of the time, an index
+// rate after torch's clip at 1, batch 1, 3,000 steps, a save every 250, and an index
 // drawn uniform, randint(0, 999), into the model's timesteps.  The models' own:
 //   MOSS-Image: its flow-match scheduler's timesteps with a static shift of 5, the base quantized (convrot8, int8
 //               here), layers.22 left out (the block guidance's negative branch skips);
@@ -14,7 +14,7 @@
 //               ai-toolkit's weight of the index), the base unquantized.
 //
 //   train --dit DIT --data EXPORT --out PREFIX [--rank 32] [--steps 3000] [--save-every 250] [--lr 1e-4] [--seed 42]
-//         [--caption-dropout 0.05] [--train-blocks 0-5,10] [--only-if-contains PARTS] [--ignore-if-contains PARTS]
+//         [--caption-dropout 0] [--train-blocks 0-5,10] [--only-if-contains PARTS] [--ignore-if-contains PARTS]
 //         [--kind character|style|other] [--vram-budget MIB] [--vram-control FILE] [--state FILE] [--resume FILE]
 //         MOSS-Image also [--base int8|bf16] [--skip 22] [--shift 5]
 //   (the weights trained: train::Targets, every one by default; --skip the blocks left out besides; --kind what the
@@ -24,6 +24,7 @@
 #include "strata/image/anima_trainer.hpp"
 #include "strata/image/moss_trainer.hpp"
 #include "strata/image/train_control.hpp"
+#include "strata/image/train_loop.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -122,7 +123,8 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
         return 0;
     }
     const int64_t steps = std::stoll(opt(f, "steps", "3000")), save_every = std::stoll(opt(f, "save-every", "250"));
-    const float dropout = std::stof(opt(f, "caption-dropout", "0.05"));
+    const std::string dropout_arg = opt(f, "caption-dropout", "");
+    const float dropout = dropout_arg.empty() ? train::caption_dropout : std::stof(dropout_arg);
     train::AdamW o;
     o.lr = std::stof(opt(f, "lr", "1e-4"));
     const std::string out = need(f, "out");

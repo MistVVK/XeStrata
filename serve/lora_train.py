@@ -53,6 +53,7 @@ from typing import Any
 from serve import envvars
 from serve import loras as lora_api
 from serve.model_terms import _qimage
+from serve.train_defaults import CAPTION_DROPOUT
 
 MAX_IMAGES = 200                  # the most training images one job takes
 MAX_IMAGE_BYTES = 32 << 20        # the largest one image
@@ -71,18 +72,19 @@ IMAGE_YIELD_WAIT_S = 60.0
 OPEN_WAIT_S = 600.0               # the longest wait for open_mib of temporary room before a trainer starts
 DEVICES_CACHE_S = 5.0             # xestrata-device --list-devices is a subprocess; not one every tick
 
-# The one place of the training defaults (LORAWEB DESIGN §3): the trainers' current defaults (ai-toolkit's job, which
-# LORA2 ran) until the comparison after REC decides the values.  peak_mib: the training's peak VRAM at the 1024 class
+# The one place of the browser's training defaults (LORAWEB DESIGN §3). Caption dropout is off by default;
+# Qwen-Image's print-style comparison favored 0 over 0.2 for that dataset. Other models can set it explicitly.
+# peak_mib: the training's peak VRAM at the 1024 class
 # (Mage-Flow measured, docs/LORA_TRAIN; Qwen-Image the user's number; MOSS-Image and Anima estimates, unverified).
 # The least budget and the open's room are train_budget.py's (min_mib / open_mib, TRAINVRAM's measurements).
 PRESETS: dict[str, dict] = {
-    "qwen-image": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 42, "dropout": 0.05,
+    "qwen-image": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 42, "dropout": CAPTION_DROPOUT,
                    "base": "bf16", "peak_mib": 15360},
-    "mage-flow": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 12345, "dropout": 0.05,
+    "mage-flow": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 12345, "dropout": CAPTION_DROPOUT,
                   "accum": 1, "base": "int8", "method": "lora", "peak_mib": 14848},
-    "moss-image": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 42, "dropout": 0.05,
+    "moss-image": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 42, "dropout": CAPTION_DROPOUT,
                    "base": "int8", "peak_mib": 16384},
-    "anima": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 42, "dropout": 0.05,
+    "anima": {"steps": 3000, "save_every": 250, "rank": 32, "lr": 1e-4, "seed": 42, "dropout": CAPTION_DROPOUT,
               "peak_mib": 12288},
 }
 # The sample pictures of every version (the same seed and prompts across versions): a subject the data does not have
