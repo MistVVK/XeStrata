@@ -14,6 +14,7 @@ import { ElectricityPrice } from '../components/ElectricityPrice';
 import { ApprovalNotifySetting, DoneSoundSetting, PortSetting, TraySetting, useShellState } from '../components/ShellSettings';
 import { LANGUAGES } from '../lib/i18n';
 import { setLanguage, setWhileBusy } from '../lib/store';
+import { UserRulesSetting } from '../components/UserRules';
 import { CONTENT_FONT_RANGE, setContentFontSize, setDensity, setFocus, setMotion, setShortcuts, setTheme, setTransparency, setUiScale, UI_SCALES, useStore, setSettingsSection } from '../lib/store';
 const PANELS = [{ name: 'Appearance', icon: 'sun', sections: ['General', 'Reading & focus'] }, { name: 'Models', icon: 'models', sections: [] }, { name: 'Tools', icon: 'tool', sections: [] }, { name: 'Storage', icon: 'disk', sections: ['Storage'] }, { name: 'Engine', icon: 'engine', sections: [] }, { name: 'About', icon: 'info', sections: ['About', 'Update', 'Privacy'] }] as const;
 export function SettingsScreen() {
@@ -34,6 +35,7 @@ export function SettingsScreen() {
         { section: 'General', label: 'Notify me when Strata needs an answer', hint: 'In Manual mode, shows a desktop notification when the assistant waits for your approval and Strata is in the background.', aliases: 'approval permission alert notification manual', control: <ApprovalNotifySetting /> },
         ...(shell?.tray ? [{ section: 'General', label: 'Minimise to tray', hint: 'Closing the window keeps Strata running in the tray, next to the clock. Choose Quit in the tray menu to stop it. Applies the next time Strata starts.', aliases: 'tray background close notification area', control: <TraySetting shell={shell} save={saveShell} /> }] : []),
         ...(shell?.desktop ? [{ section: 'General', label: 'App port', hint: 'The port Strata’s window and local address use. Leave it empty to let Strata choose (47831 when it is free). Applies the next time Strata starts.', aliases: 'network address 47831 localhost api', control: <PortSetting shell={shell} save={saveShell} /> }] : []),
+        { section: 'General', label: 'Your rules', hint: 'Rules the assistant follows in every chat, for example "Answer in German" or "Keep answers short". New answers use them right away.', aliases: 'instructions system prompt agents.md custom global always', control: <UserRulesSetting /> },
         { section: 'General', label: 'Electricity price', hint: 'Price of one kilowatt-hour. The Monitor then shows what your graphics card has cost since Strata started. Leave it empty to hide the cost.', aliases: 'cost power energy kwh currency money', control: <ElectricityPrice /> },
         { section: 'Reading & focus', label: 'Font', hint: 'Choose an installed font for the interface and conversations.', control: <FontChoice /> },
         { section: 'General', label: 'Keyboard shortcuts', hint: 'Set the key combinations that feel natural to you.', aliases: 'command keys hotkeys', control: <Btn size="sm" onClick={() => setShortcuts(true)}>{tr("Edit shortcuts")}</Btn> },

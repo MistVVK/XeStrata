@@ -1,4 +1,4 @@
-import { workspaceIdForSession } from './session-workspace';
+import { moveSessionToWorkspace, workspaceIdForSession } from './session-workspace';
 import { shortTitle } from './title-text';
 import { DEFAULT_CONTENT_FS, DEFAULT_UI_SCALE, SIZE_DEFAULTS_VERSION, savedSizes } from './default-sizes';
 import { detectLanguage } from './language-detect';
@@ -1499,6 +1499,17 @@ export function deleteSession(id: string) {
   const sessions = state.sessions.filter((s) => s.id !== id);
   persistSessions(sessions);
   set({ sessions, activeSession: state.activeSession === id ? (sessions[0]?.id ?? null) : state.activeSession });
+}
+
+/** Move a chat to another workspace (#6051). False when it was not moved (it is working, or it is already there). */
+export function moveSession(id: string, workspaceId: string): boolean {
+  const result = moveSessionToWorkspace(state.sessions, id, state.workspaces, workspaceId, new Set(liveChatIds()));
+  if (result.refused) return false;
+  persistSessions(result.sessions);
+  const follow = state.activeSession === id && state.activeWorkspace !== workspaceId;
+  set(follow ? { sessions: result.sessions, activeWorkspace: workspaceId } : { sessions: result.sessions });
+  if (follow) void loadWorkspaceFiles();
+  return true;
 }
 
 export function renameSession(id: string, title: string) {

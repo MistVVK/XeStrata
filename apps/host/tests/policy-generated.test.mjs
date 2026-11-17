@@ -10,7 +10,7 @@ import * as S from '../server/native-settings.mjs';
 test('the speed switches of the settings are the generated table, with the Speed group added where the table names none', () => {
   assert.deepEqual(S.SPEED_SWITCHES.map(({ group, ...rest }) => rest), SPEED_SWITCH_TABLE.map(({ group, ...rest }) => rest));
   assert.ok(S.SPEED_SWITCHES.every(s => s.group === (SPEED_SWITCH_TABLE.find(t => t.id === s.id).group ?? 'Speed')));
-  assert.deepEqual(SPEED_SWITCH_TABLE.map(s => s.id), ['faster_long_prompts', 'faster_12gb_nvidia', 'faster_radeon_9000']);
+  assert.deepEqual(SPEED_SWITCH_TABLE.map(s => s.id), ['faster_long_prompts', 'faster_12gb_nvidia', 'faster_radeon_9000', 'route_tail_skip']);
 });
 
 test('the drafting families and the model-name rule are the generated ones', () => {

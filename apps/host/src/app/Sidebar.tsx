@@ -17,9 +17,10 @@ import { recentChats, recentChatDescription } from '../lib/recent-chats';
 import type { Session } from '../lib/types';
 import { MOD, runCommand } from '../lib/commands';
 import { bindingFor, bindingKeys, useBindings } from '../lib/shortcut-bindings';
-import { Btn, Dialog, Icon, IconBtn, type IconName } from '../components/ui';
+import { Btn, Dialog, Icon, IconBtn, Select, type IconName } from '../components/ui';
+import { workspaceIdForSession } from '../lib/session-workspace';
 import { Brand } from '../components/Brand';
-import { addWorkspace, deleteDamagedChat, deleteSession, go, isUnread, liveChatIds, pickWorkspace, renameSession, removeWorkspace, renameWorkspace, selectSession, setActiveWorkspace, setNavOpen, togglePin, toggleRail, setTheme, useStore } from '../lib/store';
+import { addWorkspace, deleteDamagedChat, deleteSession, go, isUnread, liveChatIds, moveSession, pickWorkspace, renameSession, removeWorkspace, renameWorkspace, selectSession, setActiveWorkspace, setNavOpen, togglePin, toggleRail, setTheme, useStore } from '../lib/store';
 export function Sidebar({ containerRef }: {
     containerRef: RefObject<HTMLElement | null>;
 }) {
@@ -60,6 +61,8 @@ export function Sidebar({ containerRef }: {
     const [renameWsId, setRenameWsId] = useState<string | null>(null), [wsName, setWsName] = useState('');
     const [name, setName] = useState('');
     const [deleteId, setDeleteId] = useState<string | null>(null);
+    // Move a chat to another workspace (#6051): the chat and the workspace picked in the dialog.
+    const [moveId, setMoveId] = useState<string | null>(null), [moveTo, setMoveTo] = useState('');
     const [deleteDamagedId, setDeleteDamagedId] = useState<string | null>(null);
     const [folders, setFolders] = useState<Record<string, boolean>>({});
     const menuTrigger = useRef<HTMLElement | null>(null);
@@ -134,6 +137,7 @@ export function Sidebar({ containerRef }: {
     {tr(menuId && menuSession ? <FloatingMenu anchor={menuTrigger.current} title={tr("Actions for {0}", [sessionTitle(menuSession)])} onClose={closeMenu}>
       <button role="menuitem" className="menu__item" onClick={() => { setName(sessionTitle(menuSession)); setNavOpen(false); setRenameId(menuId); setMenuId(null); }}><Icon name="pencil"/>{tr("Rename")}</button>
       <button role="menuitem" className="menu__item" onClick={() => { togglePin(menuId); closeMenu(); }}><Icon name="pin"/>{tr(menuSession.pinned ? 'Unpin' : 'Pin')}</button>
+      {tr(workspaces.length > 1 ? <button role="menuitem" className="menu__item" disabled={working.has(menuId)} title={working.has(menuId) ? tr("This chat is still working. Stop it or wait for it to finish, then move it.") : undefined} onClick={() => { const from = workspaceIdForSession(workspaces, menuSession); setMoveTo(workspaces.find(w => w.id !== from)?.id ?? ''); setNavOpen(false); setMoveId(menuId); setMenuId(null); }}><Icon name="folder"/>{tr("Move to workspace…")}</button> : null)}
       <button role="menuitem" className="menu__item menu__item--danger" onClick={() => { setNavOpen(false); setDeleteId(menuId); setMenuId(null); }}><Icon name="trash"/>{tr("Delete chat")}</button>
     </FloatingMenu> : null)}
     <Dialog open={!!renameId} compact title={tr("Rename chat")} onClose={() => setRenameId(null)} actions={<><Btn onClick={() => setRenameId(null)}>{tr("Cancel")}</Btn><Btn variant="primary" disabled={!name.trim()} onClick={() => {
@@ -141,6 +145,10 @@ export function Sidebar({ containerRef }: {
                     renameSession(renameId, name.trim());
                 setRenameId(null);
             }}>{tr("Save name")}</Btn></>}><label className="input-field" htmlFor="chat-name"><span>{tr("Chat name")}</span><input className="st-input" id="chat-name" value={name} onFocus={e => e.currentTarget.select()} onChange={e => setName(e.target.value)}/></label></Dialog>
+    {tr(moveId ? <Dialog open compact title={tr("Move chat to another workspace")} onClose={() => setMoveId(null)} actions={<><Btn onClick={() => setMoveId(null)}>{tr("Cancel")}</Btn><Btn variant="primary" disabled={!moveTo || working.has(moveId)} onClick={() => {
+                moveSession(moveId, moveTo);
+                setMoveId(null);
+            }}>{tr("Move chat")}</Btn></>}><div className="input-field"><span>{tr("Workspace")}</span><Select ariaLabel={tr("Workspace")} translateLabels={false} value={moveTo} options={workspaces.filter(w => w.id !== workspaceIdForSession(workspaces, sessions.find(s => s.id === moveId))).map(w => ({ value: w.id, label: w.name, title: w.path }))} onChange={setMoveTo}/></div><p className="small muted">{tr(working.has(moveId) ? "This chat is still working. Stop it or wait for it to finish, then move it." : "The chat is listed under this workspace. Its next answer works in that workspace’s folder, unless you chose a folder for this chat.")}</p></Dialog> : null)}
     <Dialog open={!!renameWsId} compact title={tr("Rename workspace")} onClose={() => setRenameWsId(null)} actions={<><Btn onClick={() => setRenameWsId(null)}>{tr("Cancel")}</Btn><Btn variant="primary" disabled={!wsName.trim()} onClick={() => {
                 if (renameWsId)
                     void renameWorkspace(renameWsId, wsName.trim());

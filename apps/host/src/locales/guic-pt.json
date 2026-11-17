@@ -1,0 +1,20 @@
+{
+ "guic01": "Mover para espaço de trabalho…",
+ "guic02": "Mover o chat para outro espaço de trabalho",
+ "guic03": "Espaço de trabalho",
+ "guic04": "O chat passa a aparecer neste espaço de trabalho. A próxima resposta trabalha na pasta desse espaço de trabalho, a menos que você tenha escolhido uma pasta para este chat.",
+ "guic05": "Mover chat",
+ "guic06": "Este chat ainda está trabalhando. Pare-o ou espere ele terminar e depois mova-o.",
+ "guic07": "Suas regras",
+ "guic08": "Regras que o assistente segue em todos os chats, por exemplo “Responda em alemão” ou “Dê respostas curtas”. As novas respostas já as usam.",
+ "guic09": "Editar regras",
+ "guic10": "Escreva uma regra por linha.",
+ "guic11": "{0} de 64 KB usados",
+ "guic12": "Salvar regras",
+ "guic13": "Estas regras são longas demais. Deixe-as com menos de 64 KB e salve de novo.",
+ "guic14": "As regras foram alteradas em outra janela. Feche isto e abra-as de novo para ver a versão mais recente.",
+ "guic15": "Pular partes do modelo pouco usadas",
+ "guic16": "Respostas mais rápidas: as partes do modelo que menos importam para uma palavra são puladas quando ainda não estão na placa de vídeo. As respostas podem mudar um pouco. Ligado por padrão onde ajuda.",
+ "guic17": "Automático (recomendado)",
+ "guic18": "Números menores pulam mais partes e são mais rápidos; as respostas podem mudar mais. Só o 7 foi medido."
+}
