@@ -130,7 +130,7 @@ class _Cancelled(Exception):
 
 
 def budget_mod():
-    """TRAINVRAM's decisions (serve/train_budget.py: candidates, open_mib, min_mib, Decider).  One place; not
+    """TRAINVRAM's decisions (serve/train_budget.py: figures, Decider).  One place; not
     duplicated here.  The tests replace this with a fake of the same shape."""
     from serve import train_budget
     return train_budget
@@ -370,6 +370,7 @@ class TrainJobs:
         self.root.mkdir(parents=True, exist_ok=True)
         self.svc = svc
         self.lock = threading.Lock()
+        self.record_lock = threading.Lock()
         self.queue: list[str] = []
         self.cancels: dict[str, threading.Event] = {}
         self.worker: threading.Thread | None = None
@@ -383,6 +384,7 @@ class TrainJobs:
         self._state_saved = threading.Event()    # the trainer wrote its state (state saved line)
         self._decider: Any = None
         self._log: Any = None
+        self._reader: threading.Thread | None = None
         for d in self.root.iterdir():
             rec = self._read(d.name)
             if rec and rec.get("status") in ("queued", "preprocessing", "training", "sampling", "captioning"):
@@ -408,8 +410,9 @@ class TrainJobs:
     def _write(self, rec: dict) -> None:
         d = self.dir_of(rec["id"])
         tmp = d / "record.json.tmp"
-        tmp.write_text(json.dumps(rec), encoding="utf-8")
-        os.replace(tmp, d / "record.json")
+        with self.record_lock:
+            tmp.write_text(json.dumps(rec), encoding="utf-8")
+            os.replace(tmp, d / "record.json")
 
     def get(self, jid: str) -> dict | None:
         try:
@@ -839,15 +842,29 @@ class TrainJobs:
         return argv
 
     def _state(self, rec: dict) -> dict:
-        """The Decider's input (TRAINVRAM DESIGN §3): the reports, the ledger, the work that comes first, the
-        trainer's last vram line.  The measured values are train_budget's own (its bench cache)."""
-        pcis, helper, held = text_placement(self.svc)
-        return {"devices": devices(self.svc), "cfg": run_config(self.svc), "text_pcis": pcis,
-                "helper_pci": helper, "held": held, "chat_busy": self._chat_busy(),
-                "image_waiting": self.image_waiting, "trainer": dict(self._train_state),
-                "model": rec["family"], "peak_mib": PRESETS[rec["family"]]["peak_mib"],
-                "current_card": (self.place or {}).get("pci"),
-                "proc_alive": self._proc is not None and self._proc.poll() is None}
+        """The current device room and trainer report in train_budget.Decider's input format."""
+        reports = devices(self.svc)
+        current = str((self.place or {}).get("pci") or "")
+        free = {str(d["pci"]).lower(): int(d.get("free_bytes") or 0) >> 20 for d in reports}
+        # The device's free count already excludes this trainer. Its budget can reuse what it holds.
+        if current in free:
+            free[current] += int(self._train_state.get("used_mib", 0))
+        _, helper, held = text_placement(self.svc)
+        status = getattr(self.svc, "status", {})
+        train = dict(self._train_state)
+        return {"free": free, "chat_busy": self._chat_busy(), "chat_queued": bool(status.get("queued")),
+                "chat_eta_s": None, "image_job": self.image_waiting > 0,
+                # The image job's need is not known here: pause rather than guess and overcommit.
+                "image_need_mib": free.get(current, 0) if self.image_waiting else 0,
+                "helper_mib": held.get(helper, 0), "train": train, "current_pci": current,
+                "step_s": (rec.get("progress") or {}).get("s_per_step"), "reload_s": None}
+
+    def _budget_model(self, rec: dict) -> tuple[str, str]:
+        fam = rec["family"]
+        model = "qwen-image-2.1" if fam == "qwen-image" else fam
+        if fam == "mage-flow" and cache_tag(self._gen(rec["model"])) == "mt":
+            model = "magetrail"
+        return model, rec["settings"].get("base", "bf16")
 
     def _chat_busy(self) -> bool:
         svc = self.svc
@@ -866,8 +883,7 @@ class TrainJobs:
         """Start the trainer on the card, after open_mib of temporary room is free (the open reads and quantizes the
         weights even when the budget starts at 0 - TRAINVRAM's note 1)."""
         tb = budget_mod()
-        base, _ = train_base(self._gen(rec["model"]))
-        need = int(tb.open_mib(rec["family"], str(base)))
+        need = int(tb.figures(*self._budget_model(rec))[0])
         waited = 0.0
         while free_mib(self.svc, pci) < need:
             if waited >= OPEN_WAIT_S:
@@ -884,27 +900,29 @@ class TrainJobs:
         from serve.vram_ledger import process_start
         rec.update(pid=proc.pid, pid_start=process_start(proc.pid))
         self._write(rec)
-        threading.Thread(target=self._read_train, args=(rec, proc), daemon=True).start()
+        self._reader = threading.Thread(target=self._read_train, args=(rec, proc), daemon=True)
+        self._reader.start()
         return proc
 
     def _train_stage(self, rec: dict, cancel: threading.Event) -> None:
         from serve import images as img
         from serve.vram_ledger import Ledger
         tb = budget_mod()
-        self._decider = tb.Decider()
+        self._decider = tb.Decider(run_config(self.svc), *self._budget_model(rec), devices=devices(self.svc))
         d = self.dir_of(rec["id"])
         act = self._decider.tick(self._state(rec))
-        if not act or not act.get("card"):
+        if not act or not act.get("pci"):
             raise TrainError("no GPU can take the training now (the least VRAM is not free anywhere)", 503)
-        pci = str(act["card"]).lower()
+        pci = str(act["pci"]).lower()
         self.place = {"pci": pci, "budget_mib": int(act.get("budget_mib", 0)),
                       "mode": self._mode(rec, act), "reason": str(act.get("reason", ""))}
-        proc = self._spawn(rec, pci, int(act.get("budget_mib", 0)), resume=bool(rec.get("resume_state")))
-        led = Ledger(img.gpu_key(card_env(self.svc, pci)))
-        stopping = False
         log = open(d / "train.log", "a", encoding="utf-8")
         self._log = log
+        proc = None
         try:
+            proc = self._spawn(rec, pci, int(act.get("budget_mib", 0)), resume=bool(rec.get("resume_state")))
+            led = Ledger(img.gpu_key(card_env(self.svc, pci)))
+            stopping = False
             while True:
                 if cancel.is_set():
                     self._terminate(proc)
@@ -913,11 +931,11 @@ class TrainJobs:
                     break
                 act = self._decider.tick(self._state(rec)) or {}
                 budget = int(act.get("budget_mib", 0))
-                card = str(act.get("card") or pci).lower()
+                card = str(act.get("pci") or pci).lower()
                 self.place = {"pci": pci, "budget_mib": budget, "mode": self._mode(rec, act),
                               "reason": str(act.get("reason", "")), "name": self._device_name(pci)}
                 self._write_control(d, budget, bool(act.get("save_state")))
-                led.hold("train", max(budget, int(self._train_state.get("used", 0))), proc.pid,
+                led.hold("train", max(budget, int(self._train_state.get("used_mib", 0))), proc.pid,
                          exact=False, whole=True)
                 rec["place"] = self.place
                 self._write(rec)
@@ -929,10 +947,13 @@ class TrainJobs:
                     stopping = True
                     if self._state_saved.wait(OPEN_WAIT_S):
                         self._terminate(proc)
+                        assert self._reader is not None
+                        self._reader.join()
                         self._scan_versions(rec)
                         if card != pci:
                             pci = card
                             led = Ledger(img.gpu_key(card_env(self.svc, pci)))
+                        self.place["pci"] = pci
                         proc = self._spawn(rec, pci, 0, resume=True)
                         rec["resume_state"] = True
                         self._write(rec)
@@ -941,6 +962,8 @@ class TrainJobs:
                         stopping = False    # the state did not come in time: ask again at the next tick
                 self.wake.wait(1.0)
                 self.wake.clear()
+            assert self._reader is not None
+            self._reader.join()
             self._scan_versions(rec)
             if cancel.is_set():
                 raise _Cancelled()
@@ -950,7 +973,13 @@ class TrainJobs:
             if not rec["versions"]:
                 raise TrainError("the trainer saved no version", 500)
         finally:
+            if proc is not None and proc.poll() is None:
+                self._terminate(proc)
+            if self._reader is not None:
+                self._reader.join()
+                self._reader = None
             log.close()
+            self._log = None
             self._proc = None
 
     def _mode(self, rec: dict, act: dict) -> str:
@@ -991,7 +1020,7 @@ class TrainJobs:
             tok = line.split()
             if tok and tok[0] == "vram" and len(tok) >= 5 and tok[4] in ("running", "paused"):
                 with contextlib.suppress(ValueError):
-                    self._train_state = {"used": int(tok[1]), "peak": int(tok[2]), "min": int(tok[3]),
+                    self._train_state = {"used_mib": int(tok[1]), "peak_est_mib": int(tok[2]), "min_mib": int(tok[3]),
                                          "state": tok[4]}
                     self.wake.set()
                 continue
@@ -1089,7 +1118,11 @@ class TrainJobs:
             self.image_waiting += 1
         self.yielded.clear()
         self.wake.set()
-        self.yielded.wait(IMAGE_YIELD_WAIT_S)
+        if not self.yielded.wait(IMAGE_YIELD_WAIT_S):
+            with self.lock:
+                self.image_waiting -= 1
+            self.wake.set()
+            raise TrainError("the training did not release the GPU for the image in time", 503)
 
     def image_end(self) -> None:
         with self.lock:

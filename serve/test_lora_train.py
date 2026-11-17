@@ -123,7 +123,7 @@ class FakeSvc:
 
 
 class FakeBudget:
-    """train_budget's shape (candidates / open_mib / min_mib / Decider), scripted by the test through `mode`."""
+    """train_budget's figures and Decider contract, scripted by the test through `mode`."""
 
     def __init__(self):
         self.mode = "run"
@@ -131,13 +131,10 @@ class FakeBudget:
         self.move_to = "0000:00:03.0"
         self.moved = False
 
-    def open_mib(self, model, base):
-        return 0
+    def figures(self, model, base):
+        return 0, 8192, 14848
 
-    def min_mib(self, model, rows_peak):
-        return 8192
-
-    def Decider(self):
+    def Decider(self, cfg, model, base, devices=None):
         return self.DeciderCls(self)
 
     class DeciderCls:
@@ -146,15 +143,15 @@ class FakeBudget:
 
         def tick(self, st):
             o = self.outer
-            if st["image_waiting"] > 0:
-                return {"card": o.card, "budget_mib": 0, "save_state": False, "reason": "an image job goes first"}
+            if st["image_job"]:
+                return {"pci": o.card, "budget_mib": 0, "save_state": False, "reason": "an image job goes first"}
             if o.mode == "pause":
-                return {"card": o.card, "budget_mib": 0, "save_state": False, "reason": "the chat goes first"}
+                return {"pci": o.card, "budget_mib": 0, "save_state": False, "reason": "the chat goes first"}
             if o.mode == "move" and not o.moved:
                 o.moved = True
-                return {"card": o.move_to, "budget_mib": 0, "save_state": True, "reason": "a move is cheaper"}
+                return {"pci": o.move_to, "budget_mib": 0, "save_state": True, "reason": "a move is cheaper"}
             card = o.move_to if o.moved else o.card
-            return {"card": card, "budget_mib": st["peak_mib"], "save_state": False, "reason": "a card of its own"}
+            return {"pci": card, "budget_mib": 14848, "save_state": False, "reason": "a card of its own"}
 
 
 def wait_for(pred, timeout=30.0, what="the condition"):
@@ -423,8 +420,8 @@ class Training(unittest.TestCase):
         self._start(rec, steps=60, save_every=20)
         wait_for(lambda: self.jobs._train_state.get("state") == "running", what="a vram line")
         st = self.jobs._train_state
-        self.assertEqual(st["used"], 100)          # the trailing budget_mib= field ignored
-        self.assertEqual(st["peak"], 14848)
+        self.assertEqual(st["used_mib"], 100)          # the trailing budget_mib= field ignored
+        self.assertEqual(st["peak_est_mib"], 14848)
         wait_for(lambda: self.jobs.get(rec["id"])["status"] == "awaiting_choice", what="the end")
 
     # ---- the models row and the status
