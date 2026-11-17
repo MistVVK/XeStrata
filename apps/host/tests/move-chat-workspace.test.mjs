@@ -45,6 +45,8 @@ test('a working chat, an unknown chat or destination, and the workspace it is al
   }
 });
 
+/** English texts that are the same word in French (a number and its unit): the check that every key is translated lets them through there. */
+const SAME_IN_FRENCH = new Set(['30 minutes']);
 test('the Actions menu offers the move with the approved words, in all nine languages', async () => {
   const sidebar = await readFile(new URL('../src/app/Sidebar.tsx', import.meta.url), 'utf8');
   const en = JSON.parse(await readFile(new URL('../src/locales/guic-en.json', import.meta.url), 'utf8'));
@@ -57,6 +59,6 @@ test('the Actions menu offers the move with the approved words, in all nine lang
   assert.match(sidebar, /moveSession\(moveId, moveTo\)/);
   for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
     const cat = JSON.parse(await readFile(new URL(`../src/locales/guic-${lang}.json`, import.meta.url), 'utf8'));
-    for (const key of Object.keys(en)) assert.ok(cat[key] && cat[key] !== en[key] || key === 'guic03' && cat[key], `${lang} ${key}`);
+    for (const key of Object.keys(en)) assert.ok(cat[key] && (cat[key] !== en[key] || key === 'guic03' || SAME_IN_FRENCH.has(en[key]) && lang === 'fr'), `${lang} ${key}`);
   }
 });

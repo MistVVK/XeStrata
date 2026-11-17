@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { engineProgressMark } from './agent/engine-progress.mjs';
+import { helperLimitMin } from './agent/children.mjs';
 import './system-ca.mjs';        // #3722: the operating system's certificates, before any HTTPS request
 import { createCloudflare } from './cloudflare.mjs';
 import { createConnectorInstaller } from './cloudflared-install.mjs';
@@ -206,6 +207,8 @@ const agent = createAgentBridge({
   expertSampling: () => samplingFromExpert(store.get().expert),
   // How far a local engine has got (the 2 s /metrics poll), for the agent's stall watchdog: it moves while a long prompt is read.
   engineProgress: instanceId => engineProgressMark(native.readyInstances().find(i => i.id === instanceId)),
+  // #5996: the person's helper time limit (Settings), read when the watchdog looks, so a change applies to helpers already running.
+  helperLimitMs: () => (helperLimitMin(store.get().agentChat?.helperLimitMin) ?? 0) * 60_000,
   onPlan: (chatId, event, plan) => hub.send('plan', { chatId, event, plan }),
   onQueue: (chatId, queue) => hub.send('queue', { chatId, queue }),
   onWake: (chatId, requestId) => hub.send('chat-wake', { chatId, requestId }),
@@ -1969,6 +1972,14 @@ async function api(req, res, path, method, url) {
   // When the assistant summarises an old part of a chat (Settings -> Chat). null puts a name back to automatic;
   // the running assistant picks the new number up on its next message (it is part of the profile's signature).
   if (path === '/api/agent/compaction' && method === 'GET') return json(res, 200, compactionView());
+  if (path === '/api/agent/helper-limit' && method === 'GET') return json(res, 200, { helperLimitMin: helperLimitMin(store.get().agentChat?.helperLimitMin) });
+  if (path === '/api/agent/helper-limit' && method === 'POST') {
+    const body = await readBody(req);
+    const value = body?.helperLimitMin ?? null;
+    if (value !== null && helperLimitMin(value) === null) return error(res, 400, 'helperLimitMin is 30, 60 or 120 (minutes), or null for Off.');
+    store.update({ agentChat: { ...(store.get().agentChat ?? {}), helperLimitMin: helperLimitMin(value) } });
+    return json(res, 200, { helperLimitMin: helperLimitMin(value) });
+  }
   if (path === '/api/agent/compaction' && method === 'POST') {
     const body = await readBody(req);
     const saved = store.get().agentChat ?? {};
