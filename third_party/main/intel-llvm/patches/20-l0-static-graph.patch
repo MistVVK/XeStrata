@@ -24,7 +24,7 @@ index 0550345b8b..1c3c4dd3ce 100644
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM
  // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: the static loader's graph functions only when the system's loader has them (l0-static-graph)
++// Modified 2026 by MistVVK and the XeStrata contributors: Level Zero loader.
  //
  //===----------------------------------------------------------------------===//
  

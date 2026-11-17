@@ -19,7 +19,7 @@ index e7079661b0..bb0f3df0f6 100644
  // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  // Modified 2026 by MistVVK and the XeStrata contributors: the HIP adapter is handed the device image too (hip-bundle-arch)
-+// Modified 2026 by MistVVK and the XeStrata contributors: the free memory is the queried device's (hip-mem-free-device)
++// Modified 2026 by MistVVK and the XeStrata contributors: HIP free memory.
  //
  //===----------------------------------------------------------------------===//
  
