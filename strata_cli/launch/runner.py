@@ -1791,7 +1791,8 @@ class Runner:
                 "data_dir": drafting.data_dir_of(args) or (Path(self.s.data_dir) if self.s.data_dir else None),
                 "backend": backend, "archs": archs, "mtp_here": drafting.mtp_ready(args) if cfg else None,
                 "blocked": drafting.blocked_by(args, split=split, slots=int(self.s.parallel or 0), named=drafting.normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts),
-                "slots_none": drafting.slots_draft_nothing(drafting.merged_args(cfg), int(self.s.parallel or 0))}
+                "slots_none": drafting.slots_draft_nothing(drafting.merged_args(cfg), int(self.s.parallel or 0)),
+                "mtp_dropped": drafting.batch_mtp_dropped(drafting.merged_args(cfg), int(self.s.parallel or 0), len(self.s.gpus) if split else 1)}
 
     def drafting_signals(self, cfg: dict, want: dict) -> dict:
         """The two signals drafting.tuned_applies reads besides the backend and the card: the arguments (--expert-cache and the others the confidence reads, with the person's own

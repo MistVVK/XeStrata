@@ -249,10 +249,50 @@ class TheStart(unittest.TestCase):
         self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_HERE))
         self.assertIn("--batch-mtp", c["args"])
 
-    def plan_by_command(self, parallel, args=None, **env) -> str:
+    def test_batch_mtp_on_a_layer_split_with_pipelined_groups_says_none_in_parallel_slots(self):
+        """--batch-mtp on two or more cards: the engine pipelines the slots in groups by default and drops --batch-mtp (batch_groups.hpp resolve: mtp_dropped; an explicit group
+        count above 1 carries no slot drafts either), so the slots draft nothing and the line says so, in the same words as for slots with no --batch-mtp."""
+        flag = ["--batch-mtp"]
+        f = drafting.batch_mtp_dropped
+        self.assertTrue(f(flag, 4, 2) and f(flag, 2, 2) and f(flag, 6, 3) and f([*flag, "--batch-groups", "2"], 4, 2) and f([*flag, "--batch-groups", "auto"], 4, 2))
+        self.assertTrue(f(["--batch", "4", *flag], 0, 2), "the number can be in the arguments")
+        self.assertFalse(f(flag, 3, 2), "3 slots on 2 cards do not divide into groups: one serial group, with drafts")
+        self.assertFalse(f([*flag, "--batch-groups", "1"], 4, 2), "one group: the serial windows draft")
+        self.assertFalse(f(flag, 4, 1) or f(flag, 4, 0), "one card: no layer split")
+        self.assertFalse(f(flag, 1, 2) or f(flag, 0, 2), "one request at a time")
+        self.assertFalse(f([], 4, 2), "no --batch-mtp: not this line")
+        self.assertFalse(f([*flag, "--pipeline-windows", "2"], 4, 2))
+        self.assertFalse(f([*flag, "--adapt-async", "1"], 4, 2), "--adapt-async 1 keeps the serial windows")
+        for name in ("STRATA_BATCH_MTP_SERIAL", "STRATA_PIPED_MTP"):
+            with mock.patch.dict(os.environ, {name: "1"}):
+                self.assertFalse(f(flag, 4, 2), name)
+        with mock.patch.dict(os.environ, {"STRATA_BATCH_MTP": "1"}):
+            self.assertTrue(f([], 4, 2), "STRATA_BATCH_MTP is --batch-mtp")
+        self.pack()
+        none = drafting.NONE_IN_SLOTS
+        for kw in ({}, {"drafting": "mtp"}):
+            c = self.cfg(args=[*self.args, *flag], **kw)
+            d = self.apply(c, slots=4, stages=2)
+            self.assertEqual((d.drafter, d.note), ("mtp", none), kw)
+            self.assertIn("--batch-mtp", c["args"], "nothing is taken out here: the engine decides")
+        d = self.apply(self.cfg(args=[*self.args, *flag]), slots=3, stages=2)
+        self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_HERE), "3 slots: serial windows with drafts, the line that was always there")
+        d = self.apply(self.cfg(args=[*self.args, *flag]), slots=4, stages=1)
+        self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_HERE), "one card: unchanged")
+        # the server, the plan command and the Terminal's plan say the same
+        gpus = [0, 1]
+        said = self.lines(self.cfg(parallel=4, args=[*self.args, *flag], gpu=gpus))
+        self.assertEqual(said, ["[strata] " + drafting.line("mtp", none)])
+        for how in (self.plan_by_command, self.plan_by_launch):
+            self.assertEqual("[strata] " + how(4, args=[*self.args, *flag], gpus=gpus), said[0], how.__name__)
+        old = ["[strata] Drafting: MTP (DFlash2 isn't available in this mode)"]
+        self.assertEqual(self.lines(self.cfg(parallel=4, args=[*self.args, *flag, "--batch-groups", "1"], gpu=gpus)), old, "one group: the serial windows draft")
+        self.assertEqual(self.lines(self.cfg(parallel=4, args=[*self.args, *flag])), old, "one card")
+
+    def plan_by_command(self, parallel, args=None, gpus=None, **env) -> str:
         """The plan line `strata drafting plan` shows for this config (strata_cli/drafting_cmd.py: _inputs, then decide)."""
         from strata_cli import drafting_cmd
-        cfg = {**self.cfg(), **({} if parallel is None else {"parallel": parallel}), "args": list(args if args is not None else self.args)}
+        cfg = {**self.cfg(), **({} if parallel is None else {"parallel": parallel}), **({"gpu": gpus} if gpus else {}), "args": list(args if args is not None else self.args)}
         path = self.data / "plan.json"
         path.write_text(__import__("json").dumps(cfg), encoding="utf-8")
         a = SimpleNamespace(config=str(path), data_dir=str(self.data), mode=None, family="qwen", model=None, no_split=True, engines_unloading=False, drafting_command="plan")
@@ -262,14 +302,14 @@ class TheStart(unittest.TestCase):
             sig = drafting_cmd._signals(a, want)
             return drafting.summary_line(drafting.decide(**want, **sig))
 
-    def plan_by_launch(self, parallel, args=None, **env) -> str:
+    def plan_by_launch(self, parallel, args=None, gpus=None, **env) -> str:
         """The plan line the Terminal's `strata launch --plan` shows (runner.drafting_plan_line) for an installed config like this one."""
         from strata_cli.launch import settings as S
         from strata_cli.launch.runner import Runner
         from tests.terminal.launch_support import HW_12, Home, catalog
         cfg = {**self.cfg(), "args": list(args if args is not None else self.args)}
         with Home():
-            runner = Runner(S.LaunchSettings(family="qwen", model="IQ3_S", context=32768, vision="off", parallel=parallel), catalog=catalog(HW_12))
+            runner = Runner(S.LaunchSettings(family="qwen", model="IQ3_S", context=32768, vision="off", parallel=parallel, **({"gpus": gpus} if gpus else {})), catalog=catalog(HW_12))
             runner._split_expected = False
             with mock.patch.object(Runner, "installed_state", return_value=(None, cfg)), mock.patch.object(drafting, "detect_hardware", return_value=("cuda", ["sm_120"])), \
                     mock.patch.object(drafting, "card_vram_mib", return_value=PRO5000), mock.patch.object(drafting, "data_dir_of", return_value=self.data), mock.patch.dict(os.environ, env):
