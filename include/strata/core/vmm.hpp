@@ -4,7 +4,7 @@
 // include/strata/core/vmm.hpp - virtual memory for the elastic K/V (--kv-grow, upstream 9e3dbfe7): an address range
 // reserved once, whose physical memory is mapped and unmapped in chunks of the device's granularity.  The K/V pools
 // grow with the context by taking chunks the expert cache gives up, and neither moves: every captured graph and stored
-// pointer stays valid.  Over strata::gpu's chunk calls (sycl_ext_oneapi_virtual_mem: the Level Zero and CUDA adapters).
+// pointer stays valid.  Over strata::gpu's chunk calls (sycl_ext_oneapi_virtual_mem: gpu.hpp names the adapters).
 #pragma once
 
 #include <cstdint>
@@ -15,7 +15,7 @@ namespace strata::core {
 /// A physical chunk: strata::gpu's segment (its pointer); 0 = none.
 using VmmChunk = unsigned long long;
 
-/// The current device supports it.
+/// The current device has it and maps a range again right (gpu::vmem_usable, checked the first time this is asked).
 bool vmm_available();
 /// The chunk size (0 when not available).
 uint64_t vmm_granularity();

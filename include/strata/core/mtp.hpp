@@ -95,7 +95,7 @@ public:
     void set_parkable_head(bool on) { parkable_head_ = on; }
     bool head_can_park() const { return subset_ && subset_->can_park(); }
     uint64_t parkable_head_bytes() const { return subset_ ? subset_->bytes() : 0; }
-    bool park_head(std::string& err) { return subset_ && subset_->park(err); }
+    bool park_head(std::string& err, bool* returned = nullptr) { return subset_ && subset_->park(err, returned); }
     bool restore_head(std::string& err) { return subset_ && subset_->restore(err); }
 
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)

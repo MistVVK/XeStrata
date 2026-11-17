@@ -145,7 +145,7 @@ bool DraftSubset::load(const std::string& path, int64_t n_vocab, const void* hea
     return true;
 }
 
-bool DraftSubset::park(std::string& err) {
+bool DraftSubset::park(std::string& err, bool* returned) {
     if (mapping_ == nullptr) { err = "draft head: not mapped"; return false; }
     if (saved_rows_ == nullptr && !gpu::alloc_host(&saved_rows_, mapping_bytes_)) {
         err = "draft head: pinned memory allocation failed"; return false;
@@ -153,7 +153,8 @@ bool DraftSubset::park(std::string& err) {
     if (!gpu::copy(saved_rows_, rows_, mapping_bytes_) || !gpu::device_sync()) {
         err = "draft head: copy to host failed"; return false;
     }
-    if (!gpu::vmem_unmap(rows_, mapping_bytes_, mapping_)) {
+    if (!(returned != nullptr ? gpu::vmem_unmap_returns(rows_, mapping_bytes_, mapping_, returned)
+                              : gpu::vmem_unmap(rows_, mapping_bytes_, mapping_))) {
         err = std::string("draft head: unmap failed: ") + gpu::last_error(); return false;
     }
     mapping_ = nullptr;

@@ -45,7 +45,9 @@ public:
     const std::vector<int32_t>& ids() const { return ids_; }
     uint64_t bytes() const { return bytes_; }
     bool can_park() const { return mapping_ != nullptr; }
-    bool park(std::string& err);
+    /// The rows to pinned memory and their VRAM given up; `returned` (when given): whether the device has that VRAM
+    /// again (gpu::vmem_unmap_returns), without which parking makes no room.
+    bool park(std::string& err, bool* returned = nullptr);
     bool restore(std::string& err);
 
 private:

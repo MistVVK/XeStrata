@@ -43,7 +43,7 @@ strata::gpu::VmemSegment* seg(VmmChunk h) { return reinterpret_cast<strata::gpu:
 
 }  // namespace
 
-bool vmm_available() { return api().ok; }
+bool vmm_available() { return api().ok && strata::gpu::vmem_usable(); }
 uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
 bool vmm_large_pages() { return api().ok && api().device_gran >= kMinChunk; }
 

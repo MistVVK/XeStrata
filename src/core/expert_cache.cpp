@@ -165,9 +165,9 @@ ExpertCache::~ExpertCache() { close(); }
 // ---- #533: the segmented arena (--vram-elastic): one address range for the whole arena, backed by physical
 // segments, the tail's segments unmapped and mapped again later.  Nothing here runs unless a segment size was set.
 bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
-    if (!strata::gpu::vmem_supported()) {
+    if (!strata::gpu::vmem_usable()) {
         err = "ExpertCache: --vram-elastic needs virtual memory (sycl_ext_oneapi_virtual_mem), which this GPU's "
-              "runtime does not offer";
+              "runtime does not offer or does not map again right";
         return false;
     }
     const uint64_t gran = (uint64_t) strata::gpu::vmem_granularity();
@@ -210,17 +210,17 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
         mapped_segs_ = (int64_t) i + 1;
     }
     // whether the runtime gives an unmapped segment's VRAM back, not only keeps it for this process (ROCm 7.1 and
-    // 7.2's HIP kept it until the whole range was freed, 2026-11-02): the last segment unmapped, the device's free
-    // memory read before and after, and mapped again.  Half a segment more free is taken for given back.
+    // 7.2's HIP kept it until the whole range was freed, 2026-11-02): the last segment unmapped, with the device's
+    // free memory read before and after (gpu::vmem_unmap_returns), and mapped again.
     returns_vram_ = true;
-    size_t before = 0, after = 0, total_b = 0;
-    if (segs_.size() >= 2 && strata::gpu::device_sync() && strata::gpu::mem_info(&before, &total_b)) {
+    size_t free_b = 0, total_b = 0;
+    if (segs_.size() >= 2 && strata::gpu::device_sync() && strata::gpu::mem_info(&free_b, &total_b)) {
         const size_t last = segs_.size() - 1;
-        strata::gpu::vmem_unmap(base_ + last * (size_t) seg_, (size_t) seg_size_[last], segs_[last]);
+        bool back = false;
+        strata::gpu::vmem_unmap_returns(base_ + last * (size_t) seg_, (size_t) seg_size_[last], segs_[last], &back);
         segs_[last] = nullptr;
         mapped_segs_ = (int64_t) last;
-        returns_vram_ = strata::gpu::device_sync() && strata::gpu::mem_info(&after, &total_b) &&
-                        after >= before + (size_t) seg_size_[last] / 2;
+        returns_vram_ = back;
         for (int tries = 0; tries < 50 && segs_[last] == nullptr; ++tries) {
             segs_[last] = strata::gpu::vmem_map(base_ + last * (size_t) seg_, (size_t) seg_size_[last]);
             if (segs_[last] == nullptr) std::this_thread::sleep_for(std::chrono::milliseconds(100));

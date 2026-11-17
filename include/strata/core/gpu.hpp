@@ -116,12 +116,19 @@ bool memset_async(void* dst, int value, size_t bytes, Stream s);
 /// memory reads 0.
 bool mem_info(size_t* free_bytes, size_t* total_bytes, size_t* short_bytes = nullptr);
 
-/// Virtual memory (sycl_ext_oneapi_virtual_mem; the Level Zero and CUDA adapters, not HIP in intel/llvm 7.1.1): one
-/// address range reserved once and backed by physical segments that can be given back to the driver and taken again,
-/// every address staying the same (#533).  vmem_supported is the device's report; the sizes are multiples of
-/// vmem_granularity().
+/// Virtual memory (sycl_ext_oneapi_virtual_mem; the Level Zero and CUDA adapters, and HIP's with the hip-virtual-mem
+/// patches of third_party/main/intel-llvm: intel/llvm's own implementation and XeStrata's fixes to it): one address
+/// range reserved once and backed by physical segments that can be given back to the driver and taken again, every
+/// address staying the same (#533).
+/// vmem_supported is the device's report; the sizes are multiples of vmem_granularity().  A range mapped again after
+/// an unmap must reach its new memory from every engine, the copies' as the kernels': on AMD GPUs that is the patch
+/// hip-virtual-mem-unmap's doing (Linux leaves the old translations in the GPU's TLB).  vmem_usable is the report and
+/// that check, made with a small range the first time a device is asked and kept (a line on stderr says so when it
+/// fails): what uses virtual memory (the expert cache's segments, the elastic K/V's ranges, the parked draft head)
+/// asks it first.
 struct VmemSegment;
 bool vmem_supported();
+bool vmem_usable();
 size_t vmem_granularity();
 void* vmem_reserve(size_t bytes);
 void vmem_free(void* va, size_t bytes);
@@ -129,6 +136,11 @@ void vmem_free(void* va, size_t bytes);
 VmemSegment* vmem_map(void* va, size_t bytes);
 /// Unmaps `seg` from `va` and gives its memory back (the device must not be using it).
 bool vmem_unmap(void* va, size_t bytes, VmemSegment* seg);
+/// vmem_unmap, and in `returned` whether the device has the memory again, not only this process: the device drained,
+/// its free memory read before and after, half the segment more free taken for given back (false as well where the
+/// free memory cannot be read).  ROCm 7.1 and 7.2 kept it until the range was freed, which hip-virtual-mem-release
+/// mends; what gives VRAM up by unmapping (the expert cache's segments, the parked draft head) measures it once.
+bool vmem_unmap_returns(void* va, size_t bytes, VmemSegment* seg, bool* returned);
 /// The chunk form (the elastic K/V, vmm.hpp): a physical segment of `bytes` not mapped anywhere (null: no memory),
 /// mapped read-write at a reserved `va`, unmapped from it (it keeps its bytes and can be mapped elsewhere), freed.
 VmemSegment* vmem_new(size_t bytes);

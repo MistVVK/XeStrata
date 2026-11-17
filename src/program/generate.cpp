@@ -5428,7 +5428,7 @@ int main(int argc, char** argv) {
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.resident_cpu_experts || o.resident_gib != 0 ? "the resident low-RAM mode"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64"
-                        : !strata::gpu::vmem_supported() ? "this GPU's runtime has no virtual memory" : nullptr;
+                        : !strata::gpu::vmem_usable() ? "this GPU's runtime has no virtual memory it can use" : nullptr;
         if (why != nullptr) {
             std::fprintf(stderr, "xestrata generate: --vram-elastic is off: %s\n", why);
             o.vram_elastic = false;
@@ -7977,7 +7977,7 @@ int main(int argc, char** argv) {
         bool park_head = !small_card_final && !kvg.on && g.n_expert > 0 &&
                          strata::kernels::cpu::expert_layout().max_blob > 0 && use_mtp && o.prefill_auto && o.batch <= 0 && !multi_gpu && !pipe && !df2_loaded &&
                          !df2_deferred && drive.d.remote_count == 0 && lend_first >= 0 &&
-                         o.prefill_chunk < o.max_context && strata::gpu::vmem_supported();
+                         o.prefill_chunk < o.max_context && strata::gpu::vmem_usable();
         if (park_head) {
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             const int64_t slots = xcache.slots() + (int64_t) (draft_reserve / (uint64_t) blob);
@@ -8008,12 +8008,18 @@ int main(int argc, char** argv) {
         double head_park_ms = 0.0;
         if (park_head && mtp.head_can_park()) {
             const auto t0 = Clock::now();
-            if (!mtp.park_head(err) || !mtp.restore_head(err)) {
+            bool back = false;   // the parked head's VRAM reached the device again: else parking makes no room
+            if (!mtp.park_head(err, &back) || !mtp.restore_head(err)) {
                 std::fprintf(stderr, "xestrata serve: draft head parking: %s\n", err.c_str());
                 return 1;
             }
-            head_park_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            std::fprintf(stderr, "xestrata serve: draft head parking and restore: %.1f ms\n", head_park_ms);
+            if (back) {
+                head_park_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                std::fprintf(stderr, "xestrata serve: draft head parking and restore: %.1f ms\n", head_park_ms);
+            } else {
+                std::fprintf(stderr, "xestrata serve: the draft head is not parked for a prompt: this GPU's runtime "
+                                     "keeps the VRAM of an unmapped range in the process\n");
+            }
         }
         if (df2_loaded) {
             // auto: the MTP's gathered draft head is the same bytes (the same vocabulary file): share it

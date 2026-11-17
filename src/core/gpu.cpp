@@ -435,9 +435,109 @@ void free(const void* p) {
     (owner ? *owner : rt()).free(const_cast<void*>(p));
 }
 
+namespace {
+
+// Whether a range mapped again reaches its new memory on the current device, from the copies as from the kernels.
+// On AMD GPUs Linux leaves a range's old translations in the GPU's TLB after an unmap (intel/llvm's patch
+// hip-virtual-mem-unmap drops them): a copy into the range mapped again lands in the memory it had, which is
+// another's by then, and a kernel reads that memory or the new one, by what its TLB still holds.
+// Segment A is mapped at a range, written by a copy and read by a kernel, so both have reached the range; A moves to
+// a second range and segment B takes its place; a copy into the first range must then be read from it by a kernel,
+// and A must still hold its bytes.  Everything is allocated before the unmap: an allocation is a mapping of the
+// driver's own, which drops the stale translations and would hide them.
+bool vmem_remaps(std::string& why) {
+    auto& runtime = rt();
+    auto& queue = runtime.compute();
+    const size_t gran = vmem_granularity();
+    if (gran == 0) { why = "no granularity: " + g_error; return false; }
+    const size_t bytes = (65536 + gran - 1) / gran * gran, words = bytes / 4;
+    void* v0 = vmem_reserve(bytes);
+    void* v1 = vmem_reserve(bytes);
+    VmemSegment* a = vmem_new(bytes);
+    VmemSegment* b = vmem_new(bytes);
+    auto* host = static_cast<uint32_t*>(host_usm(2 * bytes));   // the pattern to write, what was read
+    auto* dev = static_cast<uint32_t*>(alloc_device(bytes));
+    bool at0 = false, at1 = false;
+    auto pattern = [](size_t i, uint32_t salt) { return (uint32_t) i * 2654435761u ^ salt; };
+    // what a kernel reads at `va`: every word the pattern of `salt`
+    auto reads = [&](const void* va, uint32_t salt) {
+        const auto* src = static_cast<const uint32_t*>(va);
+        uint32_t* dst = dev;
+        runtime.wait(queue.parallel_for(sycl::range<1>(words), [=](sycl::id<1> i) { dst[i] = src[i]; }),
+                     "virtual memory check");
+        if (!copy(host + words, dev, bytes)) return false;
+        for (size_t i = 0; i < words; ++i)
+            if (host[words + i] != pattern(i, salt)) return false;
+        return true;
+    };
+    auto writes = [&](void* va, uint32_t salt) {
+        for (size_t i = 0; i < words; ++i) host[i] = pattern(i, salt);
+        return copy(va, host, bytes);
+    };
+    // A to the second range, B in its place
+    auto moves = [&] {
+        if (!device_sync() || !vmem_detach(v0, bytes)) return false;
+        at0 = false;
+        at1 = vmem_attach(a, v1, bytes);
+        if (at1) at0 = vmem_attach(b, v0, bytes);
+        return at0;
+    };
+    bool ok = false;
+    try {
+        if (v0 != nullptr && v1 != nullptr && a != nullptr && b != nullptr && host != nullptr && dev != nullptr)
+            at0 = vmem_attach(a, v0, bytes);
+        if (!at0) {
+            why = "its memory or its mapping was refused: " + g_error;
+        } else if (!writes(v0, 1) || !reads(v0, 1)) {
+            why = "a mapped range does not read back what a copy wrote: " + g_error;
+        } else if (!moves()) {
+            why = "a range was not mapped again: " + g_error;
+        } else if (!writes(v0, 2) || !reads(v0, 2) || !reads(v1, 1)) {
+            why = "a range mapped again is still reached through the mapping it had (on an AMD GPU: the SYCL runtime "
+                  "lacks tools/intel_llvm_build.py's fix hip-virtual-mem-unmap)";
+        } else {
+            ok = true;
+        }
+        device_sync();
+    } catch (const std::exception& e) { why = e.what(); }
+    if (at0) vmem_detach(v0, bytes);
+    if (at1) vmem_detach(v1, bytes);
+    vmem_delete(a);
+    vmem_delete(b);
+    if (v0 != nullptr) vmem_free(v0, bytes);
+    if (v1 != nullptr) vmem_free(v1, bytes);
+    if (host != nullptr) runtime.free(host);
+    if (dev != nullptr) free(dev);
+    return ok;
+}
+
+std::mutex g_vmem_mu;
+std::map<int, bool> g_vmem_ok;   // per engine device: vmem_usable's answer, found once
+
+}  // namespace
+
 bool vmem_supported() {
     try { return rt().device().has(sycl::aspect::ext_oneapi_virtual_mem); }
     catch (const std::exception& e) { return fail("vmem_supported", e); }
+}
+
+bool vmem_usable() {
+    try {
+        auto& runtime = rt();
+        std::lock_guard<std::mutex> lock(g_vmem_mu);
+        if (const auto it = g_vmem_ok.find(runtime.ordinal()); it != g_vmem_ok.end()) return it->second;
+        bool ok = runtime.device().has(sycl::aspect::ext_oneapi_virtual_mem);
+        if (ok) {
+            std::string why;
+            ok = vmem_remaps(why);
+            if (!ok)
+                std::fprintf(stderr, "xestrata: virtual memory is not used on %s: %s. --vram-elastic, --kv-grow and "
+                                     "the draft head parked for a prompt do without it\n",
+                             runtime.device().get_info<sycl::info::device::name>().c_str(), why.c_str());
+        }
+        g_vmem_ok[runtime.ordinal()] = ok;
+        return ok;
+    } catch (const std::exception& e) { return fail("vmem_usable", e); }
 }
 
 size_t vmem_granularity() {
@@ -487,6 +587,14 @@ bool vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
         }
     }
     delete seg;
+    return true;
+}
+
+bool vmem_unmap_returns(void* va, size_t bytes, VmemSegment* seg, bool* returned) {
+    size_t before = 0, after = 0, total = 0;
+    const bool read = device_sync() && mem_info(&before, &total);
+    if (!vmem_unmap(va, bytes, seg)) return false;
+    *returned = read && device_sync() && mem_info(&after, &total) && after >= before + bytes / 2;
     return true;
 }
 

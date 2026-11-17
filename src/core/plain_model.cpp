@@ -1383,7 +1383,7 @@ bool PlainModel::load_qwen(std::string& err) {
                         : opt_.batch_slots > 0 ? "--batch"
                         : opt_.encoder ? "an encoder"
                         : kv_stream_slots_ > 0 ? "KV streaming keeps the K/V's VRAM fixed (the ring)"
-                        : !vmm_available() || !strata::gpu::vmem_supported() ? "no virtual memory on this GPU"
+                        : !vmm_available() ? "no virtual memory it can use on this GPU"
                         : opt_.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
         const bool grow = asked && why == nullptr;
         if (opt_.kv_grow > 0 && !grow) std::fprintf(stderr, "xestrata plain: --kv-grow is off: %s\n", why);
@@ -1941,7 +1941,7 @@ bool PlainModel::open_experts(std::string& err) {
     if (opt_.vram_elastic) {   // #533: in segments, as generate.cpp's cache; one GPU only (a split has a tier per GPU)
         const char* why = !(first() && last()) ? "a layer split has a tier per GPU"
                         : opt_.vram_segment_mib < 64 ? "--vram-segment-mib is below 64"
-                        : !strata::gpu::vmem_supported() ? "this GPU's runtime has no virtual memory" : nullptr;
+                        : !strata::gpu::vmem_usable() ? "this GPU's runtime has no virtual memory it can use" : nullptr;
         if (why != nullptr) {
             std::fprintf(stderr, "xestrata plain: --vram-elastic is off: %s\n", why);
             opt_.vram_elastic = false;
