@@ -13,6 +13,25 @@ export function gpuMetric(devices:GpuInfo[],readings:GpuReading[]|undefined,key:
   return mode==='max'?Math.max(...values):values.reduce((n,v)=>n+v,0)/(mode==='mean'?values.length:1);
 }
 
+/**
+ * The total next to the VRAM reading: the larger of what the host's probe says for the selected cards and what the engine reports for the same cards
+ * (the Windows probe can report less than the card has, a Strix Halo with a 96 GB carve-out read as 64 GB), and none at all when the reading is still
+ * above it: a figure above its own total is wrong whichever number is. Both are written to the debug console when they change, so a run on the
+ * real machine can say which one is right.
+ */
+let lastTotals='';
+export function gpuTotalShown(devices:GpuInfo[],readings:GpuReading[]|undefined,used:number|null):number {
+  const host=gpuCapacity(devices);
+  const engineValues=devices.map(device=>readings?.find(reading=>reading.id===gpuId(device))?.memoryTotalGb);
+  const engine=engineValues.length&&engineValues.every(hasReading)
+    ?devices.filter(d=>!d.unified).reduce((n,d)=>n+(readings?.find(r=>r.id===gpuId(d))?.memoryTotalGb as number),0)+Math.max(0,...devices.filter(d=>d.unified).map(d=>readings?.find(r=>r.id===gpuId(d))?.memoryTotalGb as number))
+    :NaN;
+  const total=Math.max(host,hasReading(engine)?engine:0);
+  const signature=`${host}|${hasReading(engine)?engine:'-'}`;
+  if(signature!==lastTotals){lastTotals=signature;try{console.debug('[monitor] GPU memory total, GB: host probe',host,'engine',hasReading(engine)?Math.round(engine*10)/10:'not reported','shown',total);}catch{/* no console */}}
+  return hasReading(used)&&used>total+0.05?NaN:total;
+}
+
 /** The card's name without its maker: "NVIDIA GeForce RTX 5070" -> "RTX 5070". */
 export const shortGpuName=(name:string)=>String(name??'').replace(/^(NVIDIA|AMD|Intel)(\(R\)|\(TM\))?\s+/i,'').replace(/^(GeForce|Radeon|Arc)(\(TM\))?\s+/i,'').trim()||String(name??'');
 
