@@ -16,6 +16,7 @@ Prints PASS / FAIL and the reused token counts.  Exit status 0 on PASS.
 """
 
 import json
+from typing import Any, cast
 import os
 import queue
 import sys
@@ -32,7 +33,7 @@ from serve.server import StrataEngine, child_env  # noqa: E402
 cfg = json.load(open(sys.argv[1]))
 tp = Path(cfg["tokenizer"])
 vocab = json.loads((tp / "vocab.json").read_text())
-toks = [None] * len(vocab)
+toks = cast(list[str], [None] * len(vocab))
 for t, i in vocab.items():
     toks[i] = t
 tok = ST.Tokenizer(toks, (tp / "merges.txt").read_text().split("\n"), json.loads((tp / "token_type.json").read_text()))
@@ -60,8 +61,8 @@ def run(ids, max_new=200):
 
 def run_cancelled(ids):
     """GEN, then STOP once the engine has said RESUME (the restore is done, the prompt is not read yet)."""
-    eng.proc.stdin.write("GEN 200 " + ",".join(str(int(t)) for t in ids) + "\n")
-    eng.proc.stdin.flush()
+    cast(Any, eng.proc).stdin.write("GEN 200 " + ",".join(str(int(t)) for t in ids) + "\n")
+    cast(Any, eng.proc).stdin.flush()
     stopped, reused, fin = False, None, None
     deadline = time.time() + 600
     while time.time() < deadline:
@@ -73,8 +74,8 @@ def run_cancelled(ids):
             raise SystemExit("FAIL: the engine died")
         if line.startswith("RESUME "):
             reused = int(line.split()[1])
-            eng.proc.stdin.write("STOP\n")
-            eng.proc.stdin.flush()
+            cast(Any, eng.proc).stdin.write("STOP\n")
+            cast(Any, eng.proc).stdin.flush()
             stopped = True
         elif line.startswith("DONE "):
             fin = line.split()[5] if len(line.split()) > 5 else "?"
@@ -101,11 +102,11 @@ print(
     f"A3: prompt {len(A3)} tokens, reused {reused3} (A + its answer = {len(A1) + len(outA)}; need >= {want})",
     flush=True,
 )
-eng.proc.stdin.close()
+cast(Any, eng.proc).stdin.close()
 try:
-    eng.proc.wait(60)
+    cast(Any, eng.proc).wait(60)
 except Exception:
-    eng.proc.kill()
+    cast(Any, eng.proc).kill()
 ok = fin2 == "cancel" and reused3 >= want
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

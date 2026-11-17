@@ -5,6 +5,7 @@
 
 import argparse
 import json
+from typing import cast
 from pathlib import Path
 import sys
 import urllib.request
@@ -30,7 +31,7 @@ args = [x for x in args if x != "--conversation-cache-disk-only"]
 cfg["args"] = args
 tp = Path(cfg["tokenizer"])
 vocab = json.loads((tp / "vocab.json").read_text())
-tokens = [None] * len(vocab)
+tokens = cast(list[str], [None] * len(vocab))
 for token, index in vocab.items():
     tokens[index] = token
 tok = ST.Tokenizer(
