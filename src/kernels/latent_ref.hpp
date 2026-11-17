@@ -138,8 +138,8 @@ struct Fixture {
             std::iota(perm.begin(), perm.end(), 0);
             std::shuffle(perm.begin(), perm.end(), rng);
             for (int j = 0; j < K; ++j) {
-                ids[(size_t) (t * K + j)] = perm[(size_t) j];
-                w[(size_t) (t * K + j)] = 0.05f + 0.1f * uni(rng) / 2.f;
+                ids[(size_t) t * (size_t) K + (size_t) j] = perm[(size_t) j];
+                w[(size_t) t * (size_t) K + (size_t) j] = 0.05f + 0.1f * uni(rng) / 2.f;
             }
         }
         const ggml_type dt = fmt == 4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;

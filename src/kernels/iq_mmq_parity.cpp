@@ -257,7 +257,7 @@ int check_fx(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& coun
     const bool ok = act_diff == 0 && diff1 == 0 && diff8 == 0;
     std::printf("  %-8s fixed-point, K %4lld, %d experts of up to %3lld rows: activations %zu differ, outputs %zu (1 a "
                 "call) and %zu (8 a call) of %lld differ  %s\n",
-                ggml_type_name(t), (long long) K, n, (long long) max_rows, act_diff, diff1, diff8, (long long) (R * N),
+                ggml_type_name(t), (long long) K, n, (long long) max_rows, act_diff, diff1, diff8, (long long) R * N,
                 ok ? "ok" : "*** FAIL ***");
     return ok ? 0 : 1;
 }
@@ -347,7 +347,7 @@ int check_fx_down(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>&
     const bool ok = scale_diff == 0 && diff == 0;
     std::printf("  %-8s fixed-point down, K %4lld, %d experts of up to %3lld rows: scales %zu differ, outputs %zu of "
                 "%lld differ  %s\n",
-                ggml_type_name(t), (long long) K, n, (long long) max_rows, scale_diff, diff, (long long) (R * N),
+                ggml_type_name(t), (long long) K, n, (long long) max_rows, scale_diff, diff, (long long) R * N,
                 ok ? "ok" : "*** FAIL ***");
     return ok ? 0 : 1;
 }
@@ -428,7 +428,7 @@ int check_fx_q20_gu(int64_t N, int64_t FF, const std::vector<int32_t>& counts) {
     const bool ok = diff == 0;
     std::printf("  q2_0     fixed-point gate/up, K %4lld, %d experts of up to %3lld rows: SwiGLU %zu of %lld differ"
                 "  %s\n",
-                (long long) N, n, (long long) max_rows, diff, (long long) (R * FF), ok ? "ok" : "*** FAIL ***");
+                (long long) N, n, (long long) max_rows, diff, (long long) R * FF, ok ? "ok" : "*** FAIL ***");
     return ok ? 0 : 1;
 }
 

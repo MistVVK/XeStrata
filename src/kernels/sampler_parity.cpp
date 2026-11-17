@@ -545,7 +545,7 @@ int main(int argc, char** argv) {
             int best = 0; float bv = 0; bool first = true;
             for (int v = 0; v < NV4; ++v) {
                 int c = 0;
-                for (int i = 0; i < (clamp ? 4 : 8); ++i) if (hist[(size_t) (8 - (clamp ? 4 : 8) + i)] == v) ++c;
+                for (int i = 0; i < (clamp ? 4 : 8); ++i) if (hist[(size_t) (8 - (clamp ? 4 : 8)) + (size_t) i] == v) ++c;
                 float logit = l[(size_t) v];
                 if (c > 0) { logit = logit <= 0.0f ? logit * p.penalty_repeat : logit / p.penalty_repeat;
                              logit -= (float) c * p.penalty_freq + p.penalty_present; }
@@ -786,14 +786,14 @@ int main(int argc, char** argv) {
                         seq.insert(seq.end(), window.begin(), window.begin() + t + 1);
                         std::vector<int32_t> expect((size_t) h, -1);
                         const int take = (int) std::min<size_t>((size_t) h, seq.size());
-                        for (int j = 0; j < take; ++j) expect[(size_t) (h - take + j)] = seq[seq.size() - take + j];
-                        if (!std::equal(expect.begin(), expect.end(), rows.begin() + (size_t) t * h)) ++wrong;
+                        for (int j = 0; j < take; ++j) expect[(size_t) (h - take) + (size_t) j] = seq[seq.size() - take + j];
+                        if (!std::equal(expect.begin(), expect.end(), rows.begin() + (std::ptrdiff_t) t * h)) ++wrong;
                         ++cases;
                     }
                     // row 0 = the old single-row staging: consumed tail, then the fed-back head last
                     std::vector<int32_t> old((size_t) h, -1);
                     const int take0 = (int) std::min<int64_t>(h, (int64_t) n_tail + 1);
-                    for (int j = 0; j < take0 - 1; ++j) old[(size_t) (h - take0 + j)] = tail[(size_t) (n_tail - (take0 - 1) + j)];
+                    for (int j = 0; j < take0 - 1; ++j) old[(size_t) (h - take0) + (size_t) j] = tail[(size_t) (n_tail - (take0 - 1)) + (size_t) j];
                     old[(size_t) (h - 1)] = window[0];
                     if (!std::equal(old.begin(), old.end(), rows.begin())) ++wrong;
                     ++cases;

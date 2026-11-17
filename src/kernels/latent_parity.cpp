@@ -52,8 +52,8 @@ std::vector<float> layer_gpu(const lr::Fixture& f, void* s) {
     const unsigned long long* dptr = dev.upload(ptrs);
     // the plan: the routes in expert order, one group an expert
     std::vector<int32_t> order((size_t) f.cap), start((size_t) (f.E + 1), 0);
-    for (int64_t r = 0; r < f.cap; ++r) start[(size_t) (f.ids[(size_t) r] + 1)]++;
-    for (int e = 0; e < f.E; ++e) start[(size_t) (e + 1)] += start[(size_t) e];
+    for (int64_t r = 0; r < f.cap; ++r) start[(size_t) f.ids[(size_t) r] + 1]++;
+    for (int e = 0; e < f.E; ++e) start[(size_t) e + 1] += start[(size_t) e];
     {
         std::vector<int32_t> pos(start.begin(), start.end() - 1);
         for (int64_t r = 0; r < f.cap; ++r) order[(size_t) pos[(size_t) f.ids[(size_t) r]]++] = (int32_t) r;
