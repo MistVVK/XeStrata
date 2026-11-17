@@ -52,7 +52,13 @@ int main(int argc, char** argv) try {
     for (const char* nm : names) {
         std::FILE* f = std::fopen((dir + "/" + nm + ".bin").c_str(), "rb");
         std::FILE* g = std::fopen((dir + "/" + nm + ".f32").c_str(), "rb");
-        if (!f || !g) { std::printf("%-8s missing fixture\n", nm); ++failures; continue; }
+        if (!f || !g) {
+            if (f) std::fclose(f);
+            if (g) std::fclose(g);
+            std::printf("%-8s missing fixture\n", nm);
+            ++failures;
+            continue;
+        }
         int hdr[3];
         if (std::fread(hdr, 4, 3, f) != 3) {
             std::printf("%-8s bad fixture header\n", nm);
@@ -63,7 +69,15 @@ int main(int argc, char** argv) try {
         }
         const int type = hdr[0], rows = hdr[1], cols = hdr[2];
         std::vector<uint8_t> raw;
-        { uint8_t buf[1 << 16]; size_t n; while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) raw.insert(raw.end(), buf, buf + n); }
+        {   uint8_t buf[1 << 16];
+            for (;;) {
+                const size_t n = std::fread(buf, 1, sizeof buf, f);
+                if (n == 0) break;
+                raw.insert(raw.end(), buf, buf + n);
+                if (n < sizeof buf) break;   // a short read ends the fixture
+            }
+            if (std::ferror(f)) { std::printf("%-8s fixture read failed\n", nm); ++failures; }
+        }
         std::vector<float> ref((size_t) rows * cols);
         std::fread(ref.data(), 4, ref.size(), g);
         std::fclose(f);
