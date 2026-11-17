@@ -161,7 +161,7 @@ Before committing, run `tools/lint/run.sh` from the repository root (no argument
 | C++, Python, F#, shell, documents, web | `tools/lint/upstream_name.py` |
 | the repository | `reuse lint` |
 
-- Other projects' files in `third_party/<area>/<project>/` (not XeStrata's `patches/`) get only gitleaks and `reuse lint`.
+- Other projects' files in `third_party/<area>/<project>/` (not XeStrata's `patches/`), community records in `bench/XeStrataBenchResults/`, and license texts in `LICENSES/` are kept as received and get only gitleaks and `reuse lint`.
 - Then run the existing tests the change can affect: CTest in the build folder, as many at once as the CPU has threads and without the slow ones (`ctest -j$(nproc) -LE slow`: the GPUs' tests run side by side as the CPU's do; the ones labelled slow take half a minute or more), and all of them (`ctest -j$(nproc)`) when work goes into dev and for a release; `python -m unittest` for `serve/` and `tools/` (the data folder's venv), `dotnet test launcher/Tests` and `python tools/launcher_i18n.py` for the launchers (the window headless; on a screen only at milestones).
 - For memory and undefined-behavior bugs, build in a folder of its own with `-DSTRATA_SANITIZE=address,undefined` and run CTest there (host code only; not under SDE).
 - Do not reformat code with clang-format or the like: the code is formatted by hand, and a reformat would make upstream's changes hard to carry over. Match the surrounding style.

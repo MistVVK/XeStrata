@@ -20,10 +20,10 @@ else
 fi
 [ ${#files[@]} -gt 0 ] || { echo "nothing to lint"; exit 0; }
 all=("${files[@]}")
-# another project's files in third_party/<area>/<project>/, kept as that project wrote them: gitleaks and reuse only
-# (XeStrata's patches there are linted as usual)
+# Other projects' files, community benchmark records and license texts are kept as received: gitleaks and reuse only.
+# XeStrata's patches in third_party are linted.
 mapfile -t files < <(printf '%s\n' "${files[@]}" | while read -r f; do
-  case "$f" in third_party/*/*/patches/*) ;; third_party/*/*/*) continue ;; esac
+  case "$f" in third_party/*/*/patches/*) ;; third_party/*/*/*|bench/XeStrataBenchResults/*|LICENSES/*) continue ;; esac
   echo "$f"
 done)
 
@@ -120,11 +120,13 @@ for f in "${all[@]}"; do
     || { echo "== gitleaks: a possible secret in $f (gitleaks detect --no-git --redact --source $f)"; status=1; }
 done
 # upstream's name where a user reads XeStrata's (messages, environment variables, programs, documents)
-echo "== upstream's name"
-python3 "$C/upstream_name.py" "${files[@]}" || status=1
-# each file's SPDX header against where its code comes from (AGENTS.md, Licenses)
-echo "== license classes"
-python3 tools/license_class.py "${all[@]}" || status=1
+if [ ${#files[@]} -gt 0 ]; then
+  echo "== upstream's name"
+  python3 "$C/upstream_name.py" "${files[@]}" || status=1
+  # Each file's SPDX header against where its code comes from (AGENTS.md, Licenses).
+  echo "== license classes"
+  python3 tools/license_class.py "${files[@]}" || status=1
+fi
 REUSE=$(command -v reuse || echo .lint/venv/bin/reuse)
 run reuse "$REUSE" lint --quiet
 exit $status
