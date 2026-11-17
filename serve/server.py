@@ -4861,6 +4861,22 @@ def batch_slots_on(engine) -> bool:
 NO_LINE = object()                                   # StrataEngine.generate: no line held after a token
 
 
+def token_limit(value, name: str):
+    """#4037: a reply's token limit (max_tokens, max_completion_tokens) is a whole number: 1 or more, or -1 / 0 for no cap
+    (docs/DETAILS.md).  None (absent or null) stays None.  A whole number written as a float (4096.0) or as a string of
+    digits with an optional sign ("1024": clients rely on it, as int() always took it) is converted.  A boolean, a fraction
+    (2.5, "2.5"), any other string or any other type is refused: int() used to turn true into 1 and 2.5 into 2.
+    ValueError = a 400."""
+    if value is None:
+        return None
+    if isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value):
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (isinstance(value, float) and not value.is_integer()) \
+            or value < -1:
+        raise ValueError(f"{name} must be a whole number, 1 or more, or -1 or 0 for no cap")
+    return int(value)
+
+
 def stop_strings(req: dict) -> list[str]:
     """The request's stop strings: OpenAI's `stop` (a string or a list of up to 4) or Anthropic's `stop_sequences`
     (a list).  Empty strings are left out.  A bad value is a ValueError, so a 400 before anything is generated."""
@@ -8778,7 +8794,9 @@ def make_handler(svc: Service):
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            limit_new = token_limit(req.get("max_completion_tokens"), "max_completion_tokens")
+            limit_old = token_limit(req.get("max_tokens"), "max_tokens")      # (both checked, whichever is used)
+            max_req = max_new = limit_new or limit_old or 0                   # 0/-1: the rest
             # No cap of our own on the reply's length when logprobs are asked for: the reply is already bounded by
             # max_tokens (by the rest of the context when it is not sent), which is the only bound OpenAI and vLLM
             # put on it either.  A reply that is not streamed does hold every entry (its token, bytes and up to 20
@@ -9007,13 +9025,13 @@ def make_handler(svc: Service):
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
             try:
                 try:
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, int(req.get("max_output_tokens") or 0), req=req,
                                                           cancel=cancel)
                 except ValueError:
                     if shown is tools:
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, int(req.get("max_output_tokens") or 0), req=req,
                                                           cancel=cancel)
             except ResponsesError:
                 raise
@@ -9047,7 +9065,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = callable_tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools, callable_tools))   # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            max_new = token_limit(req.get("max_tokens"), "max_tokens") or 0   # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
