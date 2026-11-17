@@ -515,6 +515,49 @@ function sampleHw(hw, working, key) {
     te.title = any ? `${detail ? detail + "\n" : ""}Average temperature of each card while the server was working, over the ${span} this page has watched. Idle time is left out.` : "";
   }
 }
+
+// The Context fill gauge (#4636, from PR #4636 by thisisspartan): the window split into what the engine already had cached, what is
+// being read, the answer so far and what is free. While a request runs it reads the live row (reused is the RESUME prefix; prompt_read
+// counts the reused part too); idle, the last request's prompt and answer show as cached, but only while that request's engine
+// process is the one running now (after a restart the cache is gone). A request larger than the window scales the parts down and turns
+// the percent red; 85 % and above is amber. `on` is the Model-state key: reading and generating light their row, a queued request says so.
+function contextParts(live, eng, last, on) {
+  const ctx = eng.max_context || 0;
+  let cached = 0, read = 0, answer = 0;
+  if (live.state === "reading" || live.state === "generating") {
+    const p = live.prompt_tokens || 0;
+    cached = Math.min(live.reused || 0, p);
+    read = live.state === "generating" ? p - cached
+         : Math.min(Math.max(0, (live.prompt_read || 0) - cached), p - cached);
+    answer = live.state === "generating" ? Math.max(0, live.generated || 0) : 0;
+  } else if (live.state === "idle" && last && !(eng.gen != null && last.gen != null && last.gen !== eng.gen)) {
+    cached = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+  }
+  const used = cached + read + answer, scale = ctx > 0 && used > ctx ? ctx / used : 1;
+  const pct = ctx ? Math.round(Math.min(1, used / ctx) * 100) : null;
+  return {ctx, cached, read, answer, used, free: Math.max(0, ctx - used), scale, pct,
+          tone: ctx > 0 && used > ctx ? "danger" : pct != null && pct >= 85 ? "warn" : "",
+          now: on === "reading" ? "read" : on === "generating" ? "answer" : null, queued: on === "queued"};
+}
+function renderContext(live, eng, last, on) {
+  const c = contextParts(live, eng, last, on), ARC = 235.6;
+  let at = 0;
+  for (const k of ["cached", "read", "answer"]) {
+    const len = c.ctx ? ARC * c[k] * c.scale / c.ctx : 0, el = $(`ctx-seg-${k}`);
+    el.setAttribute("stroke-dasharray", `${len.toFixed(1)} 314.2`);
+    el.setAttribute("stroke-dashoffset", `${(-at).toFixed(1)}`);
+    el.style.opacity = len >= 1 ? "1" : "0";
+    at += len;
+  }
+  $("ctx-pct").textContent = c.pct == null ? "–" : `${c.pct}%`;
+  $("ctx-pct").dataset.tone = c.tone;
+  $("ctx-sub").textContent = c.ctx ? `${kfmt(c.used)} / ${ctxfmt(c.ctx)}` : "–";
+  for (const k of ["cached", "read", "answer", "free"]) {
+    $(`ctx-leg-${k}`).textContent = c.ctx || k !== "free" ? kfmt(c[k]) : "–";
+    $(`ctx-row-${k}`).classList.toggle("is-now", c.now === k);
+  }
+  $("ctx-note").hidden = !c.queued;
+}
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // model state
   // A local turn keeps metrics on "unloaded" for the whole engine start.
@@ -669,16 +712,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     ? avg.map(([k, v, tip]) => `<span class="mf-k" title="${esc(tip)}">${esc(k)}</span><span class="mf-v">${esc(v)}</span>`).join("")
     : `<span class="mf-k mf-k--wide">Averages start with the first request.</span>`;
 
-  // context fill: the running request, else the last one
-  const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  const frac = ctx ? Math.min(1, used / ctx) : 0;
-  $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
-  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
-  $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  // context fill (#4636): the running request in its parts, else the last one
+  renderContext(live, eng, last, on);
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
