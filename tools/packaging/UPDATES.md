@@ -42,9 +42,9 @@ Comments are for this document only; actual feed files must be strict JSON.
   "control": {"version": "0.1.62", "packages": [{"platform": "linux-x86_64", "format": "tar.gz", "url": "control/...tar.gz",
                                                   "size": 0, "sha256": "...", "installed_bytes": 0, "entry": "strata.py"}]},
   "engine": {"packages": [{
-    "version": "0.1.61", "platform": "linux-x86_64", "backend": "cuda", "variant": "cuda13",
+    "version": "0.1.62", "platform": "linux-x86_64", "backend": "cuda", "variant": "cuda13",
     "archs": ["sm_75", "sm_86", "sm_89", "sm_120", "compute_120"], "min_driver": {"nvidia": "580.65"}, "min_runtime": null,
-    "build_id": "be885026f96a-cuda13.0", "format": "tar.gz", "url": "engine/strata-engine-0.1.61-linux-x86_64-cuda-cuda13.tar.gz",
+    "build_id": "be885026f96a-cuda13.0", "format": "tar.gz", "url": "engine/strata-engine-0.1.62-linux-x86_64-cuda-cuda13.tar.gz",
     "size": 505568970,                      // bytes of the archive
     "sha256": "...",                        // of the archive
     "manifest_sha256": "...",               // of the package's engine-component.json (it holds every file's hash)
@@ -63,7 +63,7 @@ separate component, picked by the model, and never in place of the Strata engine
 
 ```jsonc
 "shape_engines": {"packages": [{            // the same entry as "engine" (pack-engine writes it), plus the shape = the geometry's name the engine was compiled for
-  "shape": "q4_lite", "version": "0.1.61", "platform": "linux-x86_64", "backend": "cuda", "variant": "cuda13", "archs": ["sm_120"], "min_driver": {"nvidia": "580.65"},
+  "shape": "q4_lite", "version": "0.1.62", "platform": "linux-x86_64", "backend": "cuda", "variant": "cuda13", "archs": ["sm_120"], "min_driver": {"nvidia": "580.65"},
   "min_runtime": "0.1.58", "build_id": "...", "format": "tar.gz", "url": "strata-q4-lite-0.1.58-linux-x86_64-cuda-cuda13.tar.gz", "size": 0, "sha256": "...", "manifest_sha256": "...", "installed_bytes": 0}]},
 "models": {"packages": [{"id": "qwen4-lite", "family": "qwen4exp_q4_lite", ...}]}     // the family names the shape: qwen4exp_<shape>
 ```

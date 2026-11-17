@@ -1,6 +1,6 @@
 # Strata reference for AI tools and automated readers
 
-Last reviewed: 7 November 2026 against the 0.2.16 release tree (app and Terminal 0.2.16; Control 0.1.62, engines 0.1.61).
+Last reviewed: 7 November 2026 against the 0.2.16 release tree (app and Terminal 0.2.16; Control 0.1.62, engines 0.1.62).
 App, Control and engine versions differ; use the release notes and the installed component information. This page
 holds the technical context behind the short [README](../README.md). Use [AI_SETUP.md](AI_SETUP.md) to install Strata for a user,
 [AGENTS.md](../AGENTS.md) for repository work, and [MEDIA_KIT.md](MEDIA_KIT.md) for articles or videos.

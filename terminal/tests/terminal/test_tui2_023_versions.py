@@ -34,11 +34,11 @@ class VersionBump(unittest.TestCase):
         # 0.2.13.1 (Control-only, Linux x86_64: the app on an Intel Arc card, ARCFIX): the Terminal is 0.2.13.1 and Control 0.1.59.1 (the CMake project version); the app stays 0.2.13 and every engine package 0.1.59 (as 0.2.8.1 and 0.2.3.1 did).
         # 0.2.14.1 (Control-only: the drafter fixes of the Terminal and Control): the Terminal is 0.2.14.1 and Control 0.1.60.1; the app stays 0.2.14 and every engine package 0.1.60.
         # 0.2.15 (an app + Control fix release): the app and the Terminal are 0.2.15 and Control 0.1.61; every engine package stays 0.1.60 (the v0.2.14 files).
-        # 0.2.16 (the layout, own-stack and GUI / TUI release): the app and the Terminal are 0.2.16, Control 0.1.62 (0.1.61 went out with 0.2.15) and the engine packages 0.1.61.
+        # 0.2.16 (the layout, own-stack and GUI / TUI release): the app and the Terminal are 0.2.16, Control and the engine packages 0.1.62 (0.1.61 went out as Control with 0.2.15 and is skipped as an engine number).
         self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.16")
         self.assertEqual(strata_cli.version(), "0.1.62")              # the CMake project version: Control
         self.assertEqual(first("../engine/CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.62")
-        self.assertIn('STRATA_VERSION="0.1.61-metal"', (ROOT.parent / "engine" / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
+        self.assertIn('STRATA_VERSION="0.1.62-metal"', (ROOT.parent / "engine" / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
 
     def test_every_place_the_app_version_lives_says_0_2_3(self):
         self.assertEqual(first("../app/desktop/src-tauri/Cargo.toml", r'^version = "([^"]+)"'), "0.2.16")
@@ -51,7 +51,7 @@ class VersionBump(unittest.TestCase):
         self.assertEqual((locked["version"], locked["packages"][""]["version"]), ("0.2.16", "0.2.16"))
 
     def test_the_documents_that_state_the_current_version_agree(self):
-        self.assertIn("Version 0.2.16, engine 0.1.61.", (ROOT.parent / "AGENTS.md").read_text(encoding="utf-8"))
+        self.assertIn("Version 0.2.16, engine 0.1.62.", (ROOT.parent / "AGENTS.md").read_text(encoding="utf-8"))
         for name in ("README.md", "docs/lang/README.de.md", "docs/lang/README.es.md", "docs/lang/README.fr.md", "docs/lang/README.ja.md", "docs/lang/README.pl.md", "docs/lang/README.pt-BR.md", "docs/lang/README.zh-CN.md"):
             text = (ROOT.parent / name).read_text(encoding="utf-8")
             self.assertRegex(text, r"Strata-0[.]2[.][0-9]+-", name)       # (the restyled READMEs state the app version through the download buttons; their owner moves them to the release)

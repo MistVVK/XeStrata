@@ -61,6 +61,7 @@ class ReleaseManifest(unittest.TestCase):
         m = copy.deepcopy(rm.load())
         m["engines_from"] = "v0.2.14"
         m["control_version"], m["engine_version"] = "0.1.61", "0.1.60"
+        m["assets"] = [a for a in m["assets"] if not a.startswith("strata-engine-")] + ["strata-engine-0.1.60-linux-x86_64-cuda-cuda13.tar.gz"]   # the live list's engines are this release's own
         cmake = {"CMakeLists.txt (engine)": ("0.1.61", "engine_version"), "CMakeLists.txt (Control)": ("0.1.61", "control_version")}
         real = rm.code_versions
         try:

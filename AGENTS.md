@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Version 0.2.16, engine 0.1.61. The public model families are
+Version 0.2.16, engine 0.1.62. The public model families are
 Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs, hardware limits and
 source-backed claims. Articles and videos should use **[docs/MEDIA_KIT.md](docs/MEDIA_KIT.md)**.
 
