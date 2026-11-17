@@ -158,7 +158,7 @@ int main() {
         check(rewind_keep(live.data(), 200, prompt.data(), 198, 4096),
               "198 of 200 live: the rewind keeps the conversation, no park");
         check(!rewind_keep(live.data(), 200, prompt.data(), 198, 0), "max_suffix 0: never skips");
-        check(!rewind_keep(live.data(), 200, prompt.data(), 198, 1), "198 past the resume with max_suffix 1: parks");
+        check(!rewind_keep(live.data(), 200, prompt.data(), 198, 1), "2 past the resume with max_suffix 1: parks");
         prompt[100] = 8;
         check(!rewind_keep(live.data(), 200, prompt.data(), 198, 4096),
               "a different conversation (diverges before resume): parks");
@@ -166,9 +166,11 @@ int main() {
         std::vector<int32_t> long_live(10000, 7);
         std::vector<int64_t> long_prompt(10000, 7);
         check(!rewind_keep(long_live.data(), 10000, long_prompt.data(), 100, 4096),
-              "the resume point is under half the live tokens: parks");
+              "9,900 past the resume (max_suffix; also under half): parks");
         check(!rewind_keep(long_live.data(), 10000, long_prompt.data(), 2000, 4096),
               "8,000 tokens past the resume: parks (max_suffix)");
+        check(!rewind_keep(long_live.data(), 10000, long_prompt.data(), 4000, 8192),
+              "6,000 past the resume, within max_suffix 8192, but the resume point is under half: parks");
         check(rewind_keep(long_live.data(), 10000, long_prompt.data(), 8000, 4096),
               "2,000 past the resume and the prefix is the bulk: skips");
         check(!rewind_keep(live.data(), 200, prompt.data(), 200, 4096), "resume at the end: parked (strict bound)");
