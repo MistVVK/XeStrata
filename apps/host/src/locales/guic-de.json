@@ -16,5 +16,9 @@
  "guic15": "Selten genutzte Teile des Modells überspringen",
  "guic16": "Schnellere Antworten: Teile des Modells, die für ein Wort am wenigsten zählen, werden übersprungen, wenn sie noch nicht auf der Grafikkarte sind. Antworten können sich leicht ändern. Standardmäßig an, wo es hilft.",
  "guic17": "Automatisch (empfohlen)",
- "guic18": "Kleinere Zahlen überspringen mehr Teile und sind schneller; Antworten können sich stärker ändern. Nur 7 wurde gemessen."
+ "guic18": "Kleinere Zahlen überspringen mehr Teile und sind schneller; Antworten können sich stärker ändern. Nur 7 wurde gemessen.",
+ "guic19": "Warten auf das Modell…",
+ "guic20": "{0} wird aufgerufen…",
+ "guic21": "Datei {0} wird geschrieben…",
+ "guic22": "{0} läuft…"
 }

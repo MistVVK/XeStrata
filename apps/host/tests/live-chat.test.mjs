@@ -30,18 +30,16 @@ test('item 1: only the newest status frame is kept, and idle, a missing phase or
   assert.equal(status.statusOf(chat), null, 'done and error clear it too');
 });
 
-test('item 1: playful words only while it thinks; a running tool always shows the real action', () => {
+test('item 1 (0.2.16, owner): the line says what the model does now - no playful words rotate; a running tool always shows the real action', () => {
   const frame = (phase, code, args) => ({ seq: 1, phase, code, text: `${phase}…`, args, elapsedMs: 0, receivedAt: 0 });
-  const words = Array.from({ length: 12 }, (_, i) => status.statusWords(frame('thinking', 'thinking'), i));
-  assert.equal(new Set(words).size, 12, 'a tasteful list of twelve');
-  assert.equal(words[0], 'Thinking…');
-  assert.ok(words.includes('Cooking up an answer…') && words.includes('Pondering…'));
-  assert.equal(status.statusWords(frame('thinking', 'thinking'), 13), words[1], 'it rotates round');
-  assert.equal(status.statusWords(frame('waiting', 'model-working'), 2), words[2]);
+  for (const r of [0, 1, 5, 13]) assert.equal(status.statusWords(frame('thinking', 'thinking'), r), 'Thinking…', 'the same words at every turn of the old rotation');
+  assert.equal(status.statusWords(frame('waiting', 'model-working'), 2), 'Waiting for the model…');
   assert.equal(status.statusWords(frame('waiting', 'reading-prompt'), 5), 'Reading your message…', 'what is really happening is said plainly');
-  assert.equal(status.statusWords(frame('preparing', 'preparing-tool', { verb: 'Writing a file', target: 'pagoda.html' }), 5), 'Writing a file · pagoda.html…');
+  assert.equal(status.statusWords(frame('preparing', 'preparing-tool', { tool: 'write', verb: 'Writing a file', target: 'pagoda.html' }), 5), 'Writing file pagoda.html…');
+  assert.equal(status.statusWords(frame('preparing', 'preparing-tool', { verb: 'Writing a file', target: 'pagoda.html' }), 5), 'Writing a file · pagoda.html…', 'a frame without the tool name keeps its verb');
   assert.equal(status.statusWords(frame('tool', 'tool', { verb: 'Searching the web' }), 9), 'Searching the web…');
   assert.equal(status.statusWords(frame('goal', 'goal-step', { round: 2 }), 7), 'Working on the goal…');
+  assert.equal(status.isPlayful(frame('thinking', 'thinking')), false);
   assert.equal(status.isPlayful(frame('tool', 'tool')), false);
   assert.equal(status.elapsedText(0, 14_000), '14s'); assert.equal(status.elapsedText(0, 64_000), '1m 04s');
 });

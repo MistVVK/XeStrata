@@ -16,5 +16,9 @@
  "guic15": "Skip rarely used parts of the model",
  "guic16": "Faster answers: parts of the model that matter least for a word are skipped when they are not on the graphics card yet. Answers can change slightly. On by default where it helps.",
  "guic17": "Automatic (recommended)",
- "guic18": "Lower numbers skip more parts and are faster; answers can change more. Only 7 has been measured."
+ "guic18": "Lower numbers skip more parts and are faster; answers can change more. Only 7 has been measured.",
+ "guic19": "Waiting for the model…",
+ "guic20": "Calling {0}…",
+ "guic21": "Writing file {0}…",
+ "guic22": "Running {0}…"
 }

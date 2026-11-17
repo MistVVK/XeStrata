@@ -16,5 +16,9 @@
  "guic15": "Omitir partes del modelo que casi no se usan",
  "guic16": "Respuestas más rápidas: las partes del modelo que menos importan para una palabra se omiten cuando aún no están en la tarjeta gráfica. Las respuestas pueden cambiar un poco. Activado por defecto donde ayuda.",
  "guic17": "Automático (recomendado)",
- "guic18": "Los números más bajos omiten más partes y son más rápidos; las respuestas pueden cambiar más. Solo se ha medido el 7."
+ "guic18": "Los números más bajos omiten más partes y son más rápidos; las respuestas pueden cambiar más. Solo se ha medido el 7.",
+ "guic19": "Esperando al modelo…",
+ "guic20": "Llamando a {0}…",
+ "guic21": "Escribiendo el archivo {0}…",
+ "guic22": "Ejecutando {0}…"
 }

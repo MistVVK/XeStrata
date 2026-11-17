@@ -16,5 +16,9 @@
  "guic15": "Ignorer les parties du modèle peu utilisées",
  "guic16": "Réponses plus rapides : les parties du modèle qui comptent le moins pour un mot sont ignorées quand elles ne sont pas encore sur la carte graphique. Les réponses peuvent légèrement changer. Activé par défaut là où cela aide.",
  "guic17": "Automatique (recommandé)",
- "guic18": "Les petits nombres ignorent plus de parties et sont plus rapides ; les réponses peuvent changer davantage. Seul 7 a été mesuré."
+ "guic18": "Les petits nombres ignorent plus de parties et sont plus rapides ; les réponses peuvent changer davantage. Seul 7 a été mesuré.",
+ "guic19": "En attente du modèle…",
+ "guic20": "Appel de {0}…",
+ "guic21": "Écriture du fichier {0}…",
+ "guic22": "Exécution de {0}…"
 }

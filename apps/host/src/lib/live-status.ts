@@ -57,16 +57,33 @@ export const PLAYFUL_VERBS = [
   'Sketching it out…', 'Weighing the options…', 'Reading between the lines…', 'Brewing a reply…', 'Putting it together…', 'Following a hunch…',
 ] as const;
 
-/** Phases where the model is working things out and nothing concrete can be named: the playful words rotate here and only here. */
-export function isPlayful(frame: StatusFrame): boolean {
-  return frame.phase === 'thinking' || (frame.phase === 'waiting' && frame.code === 'model-working');
+/** Phases where the playful words rotated. Since 0.2.16 (owner) the line always says what the model does now, so nothing rotates any more;
+ *  the words stay in the catalog. */
+export function isPlayful(_frame: StatusFrame): boolean {
+  return false;
 }
+
+/** A tool's name as the person reads it: an MCP tool without its "mcp__server__" prefix. */
+export const shortToolName = (name: unknown): string => String(name ?? '').replace(/^mcp__[^_]+(?:_[^_]+)*?__/, '') || String(name ?? '');
+const fileName = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+const FILE_WRITERS = new Set(['write', 'edit']);
+const SHELLS = new Set(['pwsh', 'bash']);
 
 /** The words for a frame. `rotation` counts how many times the playful word has advanced (the page advances it every few seconds). */
 export function statusWords(frame: StatusFrame, rotation = 0): string {
   if (isPlayful(frame)) return tr(PLAYFUL_VERBS[((rotation % PLAYFUL_VERBS.length) + PLAYFUL_VERBS.length) % PLAYFUL_VERBS.length]);
   const a = frame.args ?? {};
   const target = typeof a.target === 'string' && a.target ? a.target : '';
+  const tool = typeof a.tool === 'string' ? a.tool : '';
+  // 0.2.16 (owner): what the model does now, in place of the playful words
+  if (frame.phase === 'thinking') return tr('Thinking…');
+  if (frame.phase === 'waiting' && frame.code === 'model-working') return tr('Waiting for the model…');
+  // the model is writing a tool call: the tool's name, or the file it is writing
+  if (frame.code === 'preparing-tool' && tool) return FILE_WRITERS.has(tool) && target ? tr('Writing file {0}…', [fileName(target)]) : tr('Calling {0}…', [shortToolName(tool)]);
+  // a file tool runs (or waits for your answer): the file's name, not its whole path
+  if (frame.code === 'tool' && FILE_WRITERS.has(tool) && target) return tr('Writing file {0}…', [fileName(target)]);
+  // a tool runs: a command tool, a tool without words of its own and a tool its server runs say its name
+  if (frame.code === 'tool' && tool && (SHELLS.has(tool) || !a.verb || a.verb === 'Using a tool')) return tr('Running {0}…', [shortToolName(tool)]);
   switch (frame.code) {
     case 'starting': return tr('Starting…');
     case 'reading-prompt': return tr('Reading your message…');
