@@ -7613,3 +7613,5 @@ html[data-motion='reduced'] .native-progress__bar[data-indeterminate] > i { anim
 .askq__acts { display: flex; gap: 8px; justify-content: flex-end; position: sticky; bottom: 0; margin: 0; padding: 8px 14px 0 44px; background: var(--st-surface); }
 .approvaldock:has(.askq) { max-height: 56vh; }
 @media (max-width: 560px) { .askq__opts, .askq__own, .askq__problem { margin-left: 0; } .askq__acts { padding-left: 14px; } .askq__own { width: 100%; } .askq__item { padding-right: 0; } }
+/* #6060: in a right-to-left language the send arrow points the way the text runs */
+[dir="rtl"] .st-icon:has(> use[href$="#i-send"]) { transform: scaleX(-1); }
