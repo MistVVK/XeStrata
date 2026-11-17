@@ -131,7 +131,11 @@ test('a chat the model server refused once is not stuck: the next message compac
   // could go through, because the summary request carried the same history and was refused for its size too.
   const { worker, send } = await rig(t, { noCount: true });
   assert.equal((await send(`SCRIPT:echo one ${dense.repeat(300)}`)).at(-1).type, 'done');
-  const huge = await send(`SCRIPT:echo two ${dense.repeat(7000)}`);
+  // 6,600 repetitions: refused (about 700 tokens over the window) and, after the summary, sent again with about 1,300 tokens to spare. The message
+  // itself must leave room: at 7,000 the system prompt, the tools and this one message are 32,722 tokens by the server's count against the 32,704 it
+  // accepts, so the retry is refused whatever the summary holds (nothing older is left to shorten). That size sat on the edge, and the 0.2.16 tool
+  // list (the agent's own questions) moved it 18 tokens over.
+  const huge = await send(`SCRIPT:echo two ${dense.repeat(6600)}`);
   assert.equal(huge.at(-1).type, 'done', 'the Harness compacted after the refusal and asked again: ' + JSON.stringify(huge.at(-1)).slice(0, 200));
   const small = await send('SCRIPT:echo three please');
   assert.equal(small.at(-1).type, 'done', JSON.stringify(small.at(-1)).slice(0, 300));
@@ -141,6 +145,21 @@ test('a chat the model server refused once is not stuck: the next message compac
   const refused = worker.requests.filter(r => r.refused);
   assert.equal(refused.length, 1, `only the first, too large, prompt was refused: ${refused.map(r => r.refused).join(', ')}`);
   assert.ok(worker.requests.filter(r => r.summary).every(r => Math.round(r.promptChars / 3) < 32768 - 64), 'every summary request fitted the window');
+});
+
+test('a message that cannot fit even after the summary ends in a plain sentence, no loop, and the chat takes the next message', { skip }, async (t) => {
+  // The engine cannot count ahead (noCount) and the one message, with the system prompt and the tools, leaves less than the server's floor: no summary helps.
+  const { worker, send } = await rig(t, { noCount: true });
+  assert.equal((await send(`SCRIPT:echo one ${dense.repeat(300)}`)).at(-1).type, 'done');
+  const before = worker.requests.length;
+  const huge = await send(`SCRIPT:echo two ${dense.repeat(7000)}`);
+  const end = huge.at(-1);
+  assert.equal(end.type, 'error');
+  assert.equal(end.code, 'CONTEXT_WINDOW_EXCEEDED');
+  assert.equal(end.key, FIT_TEXT.full, 'the person is told in plain words: ' + end.message);
+  assert.ok(worker.requests.length - before <= 6, `no retry loop: ${worker.requests.length - before} requests for the one message`);
+  const small = await send('SCRIPT:echo three please');
+  assert.equal(small.at(-1).type, 'done', 'the chat takes the next message: ' + JSON.stringify(small.at(-1)).slice(0, 300));
 });
 
 // ------------------------------------------------------------------------------------------------ the message is checked before it is sent
