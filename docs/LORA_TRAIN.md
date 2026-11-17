@@ -388,7 +388,8 @@ stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib=
   uses the measurement table; `step` uses the process memory with the backward's buffers still alive, less what can be
   reclaimed. `raw_min_mib` is the value before the table; `raw_min_source` is `floor` or `step`.
   `need_mib` is the budget needed to start, resume or continue: at least the measured least-form peak plus
-  a margin. A smaller budget pauses before the step. The samples do not guarantee the maximum at every instant.
+  a margin. A smaller budget pauses before the step. The table uses the largest image and text rows of its 768- and
+  1024-class samples and scales up larger shapes or ranks. The samples do not guarantee the maximum at every instant.
 - The only stopping points are the micro-step's and the update's boundaries (nothing changes mid-step). A shrink
   or a grow re-plans the resident weights, the tapes and the inputs' form. A pause copies every allocation to the
   host as it is and frees it (the streamed layers' pinned homes stay); the resume takes the same values back.

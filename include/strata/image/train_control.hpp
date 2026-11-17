@@ -35,7 +35,7 @@
 
 namespace strata::image::train {
 
-/// Initial least-form estimate from the shared 1024-class table, scaled up for larger shapes and ranks.
+/// Initial least-form estimate from the shared size-class table, scaled up for larger shapes and ranks.
 /// These observations are estimates, not a hard bound on a new device or workload.
 /// Install before starting any thread: SIGTERM/SIGINT request a normal stop at the next step or pause boundary.
 void install_stop_signals();

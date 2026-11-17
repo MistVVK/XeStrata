@@ -34,19 +34,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Rank 32: the table has open, least-form min and process peak, and whole-form peak estimate (MiB). The measured
-# classes use the greater B70 / RTX observations, rounded up; they are samples, not hard bounds. MageTrail and the
-# whole-form peaks are estimates. The trainer reports the largest cache shape's own min and need once it starts.
-# The same table is compiled into the standalone trainers. Missing or malformed data is an error.
-_table = (Path(__file__).with_name("train_vram_models.inc")).read_text(encoding="utf-8")
-_rows = re.findall(r'^TRAIN_VRAM\("([^"]+)", "([^"]+)", (\d+), (\d+), (\d+), (\d+), (\d+)\)$',
+# Rank 32: the table has reference image+text rows, text rows, open, least-form min and process peak, and the
+# whole-form peak estimate (MiB). The measured classes use the greatest B70 / RTX 4070 / RX 9060 XT observations;
+# they are samples, not hard bounds. MageTrail and the whole-form peaks are estimates.
+_table = Path(__file__).with_name("train_vram_models.inc").read_text(encoding="utf-8")
+_rows = re.findall(r'^TRAIN_VRAM\("([^"]+)", "([^"]+)", (\d+), (\d+), (\d+), (\d+), (\d+), (\d+), (\d+)\)$',
                    _table, re.MULTILINE)
 if not _rows:
     raise ValueError("the training VRAM table has no rows")
 MODELS = {(model, base): (int(op), int(minimum), int(whole))
-          for model, base, size, op, minimum, _, whole in _rows if int(size) == 1024}
-LEAST_FORMS = {(model, base, int(size)): (int(minimum), int(peak))
-               for model, base, size, _, minimum, peak, _ in _rows}
+          for model, base, size, _, _, op, minimum, _, whole in _rows if int(size) == 1024}
+LEAST_FORMS = {(model, base, int(size)): (int(reference), int(text), int(minimum), int(peak))
+               for model, base, size, reference, text, _, minimum, peak, _ in _rows}
 
 
 def initial_vram(model: str, base: str, image_tokens: int, rank: int) -> tuple[int, int]:
@@ -56,10 +55,9 @@ def initial_vram(model: str, base: str, image_tokens: int, rank: int) -> tuple[i
     sizes = sorted(size for m, b, size in LEAST_FORMS if (m, b) == (model, base))
     if not sizes:
         raise ValueError(f"no training figures for {model} ({base})")
-    size = next((n for n in sizes if n * n // 256 >= image_tokens), sizes[-1])
-    capacity = size * size // 256
-    minimum, peak = LEAST_FORMS[model, base, size]
-    numerator, denominator = max(capacity, image_tokens) * max(32, rank), capacity * 32
+    size = next((n for n in sizes if n * n // 256 + LEAST_FORMS[model, base, n][1] >= image_tokens), sizes[-1])
+    reference, _, minimum, peak = LEAST_FORMS[model, base, size]
+    numerator, denominator = max(reference, image_tokens) * max(32, rank), reference * 32
     minimum = (minimum * numerator + denominator - 1) // denominator
     peak = (peak * numerator + denominator - 1) // denominator
     return minimum, max(minimum, peak + max(128, (peak * 2 + 99) // 100))

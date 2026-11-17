@@ -99,25 +99,28 @@ bool stop_requested() {
 }
 
 InitialVram initial_vram(const std::string& model, const std::string& base, int64_t image_tokens, int64_t rank) {
-    struct Row { const char* model; const char* base; int size; uint64_t open, minimum, least_peak, whole; };
+    struct Row { const char* model; const char* base; int size; uint64_t reference, text, open, minimum, least_peak, whole; };
     static constexpr Row rows[] = {
-#define TRAIN_VRAM(model, base, size, open, minimum, least_peak, whole) {model, base, size, open, minimum, least_peak, whole},
+#define TRAIN_VRAM(model, base, size, reference, text, open, minimum, least_peak, whole) \
+    {model, base, size, reference, text, open, minimum, least_peak, whole},
 #include "../../serve/train_vram_models.inc"
 #undef TRAIN_VRAM
     };
     if (image_tokens <= 0 || rank <= 0) throw std::invalid_argument("image engine: bad training shape or rank");
+    auto capacity = [](const Row& r) { return (int64_t) r.size * r.size / 256 + (int64_t) r.text; };
     const Row* chosen = nullptr;
     for (const Row& row : rows) {
         if (model != row.model || base != row.base) continue;
-        const int64_t capacity = (int64_t) row.size * row.size / 256;
-        if (chosen == nullptr || (capacity >= image_tokens && row.size < chosen->size) ||
-            (image_tokens > (int64_t) chosen->size * chosen->size / 256 && row.size > chosen->size)) chosen = &row;
+        if (chosen == nullptr || (image_tokens <= capacity(row) &&
+                                  (image_tokens > capacity(*chosen) || capacity(row) < capacity(*chosen))) ||
+            (image_tokens > capacity(row) && image_tokens > capacity(*chosen) && capacity(row) > capacity(*chosen)))
+            chosen = &row;
     }
     if (chosen == nullptr) throw std::invalid_argument("image engine: no training VRAM estimate for " + model + " (" + base + ")");
-    const uint64_t capacity = (uint64_t) chosen->size * (uint64_t) chosen->size / 256;
-    const uint64_t tokens = std::max(capacity, (uint64_t) image_tokens);
+    const uint64_t reference = chosen->reference;
+    const uint64_t tokens = std::max(reference, (uint64_t) image_tokens);
     const uint64_t ranks = std::max<uint64_t>(32, (uint64_t) rank);
-    auto scaled = [&](uint64_t value) { return (value * tokens * ranks + capacity * 32 - 1) / (capacity * 32); };
+    auto scaled = [&](uint64_t value) { return (value * tokens * ranks + reference * 32 - 1) / (reference * 32); };
     const uint64_t peak = scaled(chosen->least_peak);
     const uint64_t minimum = scaled(chosen->minimum);
     return {minimum, std::max(minimum, peak + std::max<uint64_t>(128, (peak * 2 + 99) / 100))};
