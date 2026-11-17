@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.8-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.13.1-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.13.1-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -29,6 +29,45 @@ A smaller card is checked by making the B70 look like one.
 `XESTRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `XESTRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `XESTRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.2.13.1
+
+The changes of upstream Strata v0.2.8 through v0.2.13.1 (`628f74955a56fcba092495b800dd02af75373a0f`) are integrated.
+
+- DFlash2 drafting and MTP are measured at startup and selected automatically. The conversation cache, long-context processing, setup and serve are also updated.
+- XeStrata adds Edge0's latent MoE and NVFP4 and MXFP4, weight streaming for small cards, and per-layer weights for image LoRA. The D/U quantization format is chosen from the available slots.
+- Serve handles tool-call closing tags, code fences, namespaces and Anthropic tool search. It also fixes request stopping, cleanup after errors and CPU fallback when the image reader cannot run.
+- Setup and tools retry the download range probe and verify pinned files by hash. They check free space at the pack's destination and read GGUF integer tensors.
+- The engine returns freed RAM when evicting conversation cache entries and fixes the shared expert arena and PLE locking. Batch sampling, drafting windows and long contexts gain support as well.
+- XeStrata's shared parts add trellis-coded K/V, fixed-point products, per-layer VRAM budgets and streaming. The DeltaNet chunk scan is selected with `XESTRATA_GDN_CHUNKED=1`.
+- Upstream's app, terminal, Mac and Metal are outside XeStrata's targets and are not taken. Its CUDA and HIP kernels are not carried over as they stand: shared SYCL parts are used instead.
+
+Edge0-120B-NVFP4 prefill / decode (tok/s). Small configurations use a VRAM limit. “Before” marks a measurement before the temporary-region change. The RX equivalent to 8192 MiB uses serve with matching cache sizes before and after; the others use the CLI.
+When conditions permit, the CLI prepares the draft head just before decode and uses its space for prompt scratch until then. Serve releases the head’s physical memory only for prefill and restores it afterwards, leaving room for a larger prompt chunk.
+
+| GPU | Configuration | 1K: D/U, prefill / decode | 32K: D/U, prefill / decode |
+| --- | --- | --- | --- |
+| B70 | Resident | Q8_0, 944.66 / 54.97 | Q8_0, 1525.93 / 56.85 (before) |
+| B70 | 9700 MiB | Q4_0, 593.93 / 31.94 | Q4_0, 641.76 / 27.51 |
+| B70 | 7700 MiB | Q4_0, 618.95 / 15.36 (before) | Q4_0, 608.19 / 15.92 (before) |
+| RTX 4070 | Resident | Q4_0, 239.26 / 46.36 | Q4_0, 1181.88 / 46.93 (before) |
+| RTX 4070 | 8192 MiB | Q4_0, 215.98 / 35.21 | Q4_0, 219.31 / 20.86 |
+| RTX 4070 | 6144 MiB | Q4_0, 200.77 / 6.48 (before) | Q4_0, 119.46 / 6.88 (before) |
+| RX 9060 XT | Resident | Q8_0, 520.39 / 38.39 (before) | Q8_0, 914.24 / 42.56 (before) |
+| RX 9060 XT | Equivalent to 8192 MiB | Q4_0, 432.5 / 29.1 | Q4_0, 436.6 / 26.7 |
+| RX 9060 XT | Equivalent to 6144 MiB | Q4_0, 186.00 / 18.74 (before) | Q4_0, 182.43 / 19.38 (before) |
+
+The answers differ between resident Q8_0 and the small configurations' Q4_0 because their D/U formats differ.
+
+A correction to round the integer product's scales to nearest on the B70 changed the answer md5s below. KL is the mean / maximum over the rows before the answers diverge.
+
+| Model and context | Before → after (md5 prefix) | KL mean / maximum | Rows compared |
+| --- | --- | --- | --- |
+| Ornith-1.5 1K | bb6bcf6a → 0d11bf5f | 0.00274 / 0.00813 | 10 |
+| Ornith-1.5 32K | 05bae7b1 → 2d2230e0 | 0.0362 / 0.0708 | 3 |
+| Qwen3.6-35B-A3B 1K | d10297b3 → 098361d3 | 0.0645 / 0.0645 | 1 |
+| Qwen3.6-35B-A3B 32K | da7576c6 → 57c0f759 | 0.00827 / 0.0729 | 25 |
+| llm-jp-4.1-32b-a3b-thinking 1K | ab799775 → 42eb1b00 | 0.00473 / 0.00965 | 7 |
 
 ## Integration through Strata 0.2.8
 
