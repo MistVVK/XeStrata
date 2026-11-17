@@ -50,8 +50,8 @@ void native_qsa_score(const float* pooled, const float* query, const float* bias
         throw std::invalid_argument("native QSA score requires128dim/4heads/4cells/2048budget, exact capacities and explicit stream");
     if (!stream) throw core::DeviceError("native QSA score requires an explicit stream");
     auto& queue = core::Runtime::get().stream(stream);
-    const Span spans[] = {{pooled, size_t(max_blocks) * D * 4}, {query, HEADS * D * 4},
-        {step, kStepCount * 4}, {cells, size_t(max_cells) * 4}, {bias, bias ? size_t(max_blocks) * 4 : 0}};
+    const Span spans[] = {{pooled, size_t(max_blocks) * D * 4}, {query, size_t{HEADS} * D * 4},
+        {step, size_t{kStepCount} * 4}, {cells, size_t(max_cells) * 4}, {bias, bias ? size_t(max_blocks) * 4 : 0}};
     const int count = bias ? 5 : 4;
     for (int i = 0; i < count; ++i) validate(spans[i]);
     for (int i = 0; i < count; ++i)
