@@ -683,7 +683,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 - Florence-2（large と base）の重みと `tokenizer.json` は Microsoft の [Florence-2](https://huggingface.co/microsoft/Florence-2-large) で、MIT です。
 - 背景を消す BiRefNet の 7 つの版の重みは、Peng Zheng の [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) で、MIT です。
 - 構図の制御の Fun ControlNet Union（Qwen-Image-2.1 用）は alibaba-pai の [Qwen-Image-2.1-Fun-Controlnet-Union](https://huggingface.co/alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union) で、Qwen-Image-2.1 と同じく Qwen Research License です。自由なソフトウェアのライセンスではないので、商用に使う前にそのライセンスを読んでください。
-- MOSS-Image の色と深度のアダプターは darask0 の [MOSS-Image-color-depth-control](https://huggingface.co/darask0/MOSS-Image-color-depth-control) で、Apache 2.0 です。
+- MOSS-Image の色と深度のアダプターは darask0 の作品で、Apache 2.0 です。[Comfy-Org の再配布](https://huggingface.co/Comfy-Org/MOSS-Image)から取ります。
 - 構図の制御の図を作る網の重み:
    - 深度の Depth Anything V2 Small（Lihe Yang ほか）は [Depth-Anything-V2-Small-hf](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf) で、Apache 2.0 です（Base より大きいものは非商用なので使いません）。
    - 姿勢の DWPose（Zhendong Yang ほか）は [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) で、Apache 2.0 です。人を見つける YOLOX-L は Megvii の [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) のリリースと同じファイル（[kadirnar/yolox_l-v0.1.1](https://huggingface.co/kadirnar/yolox_l-v0.1.1)）で、Apache 2.0 です。

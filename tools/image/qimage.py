@@ -112,7 +112,7 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "depth-anything/Depth-Anything-V2-Small-hf": "5426e4f0f36572d16453bbda7a8389317b1bef99",     # 2026-11-08
     "yzd-v/DWPose": "1a7144101628d69ee7a3768d1ee3a094070dc388",                                  # 2026-11-08
     "kadirnar/yolox_l-v0.1.1": "f63e87ffbded0e30713d32dba22501f56fe5007e",                       # 2026-11-08
-    "darask0/MOSS-Image-color-depth-control": "357d7cc1eefd746de28ed74741c79464e3d82daa",        # 2026-11-08
+    "Comfy-Org/MOSS-Image": "2929efe3cdd506c0a430bcfca70a9a8d805cc095",                           # 2026-11-18
     "darask0/MOSS-Image_4-step_adapter_lora": "c88f33bcb3251eb39943d0635e74b650732977c8",        # 2026-11-08
     "ZhengPeng7/BiRefNet_lite": "aa62cd87eafb9cc43056d08ef3615a14628b831d",                        # 2026-11-07
     "ZhengPeng7/BiRefNet_lite-2K": "3f789d2ba403e2ee59ce08ee9250d4c1c590b418",                     # 2026-11-07
@@ -449,9 +449,15 @@ TERMS: dict[str, dict] = {
              "0ec3668d3274bcf29e8a29e9576d5a2cd96fc78d3c5bec4387355a796e5d9088"),
         ],
     },
-    "darask0/MOSS-Image-color-depth-control": {
+    "Comfy-Org/MOSS-Image": {
         "license": "Apache-2.0",
-        "texts": [],
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Comfy-Org/MOSS-Image", "2929efe3cdd506c0a430bcfca70a9a8d805cc095", "README.md", 6347,
+             "c8e01a41149e8e07eee29cd0c4403361688e1fe48e7bf4958c10c7f1d3caff06"),
+            ("hf:OpenMOSS-Team/MOSS-Image-SFT", "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9", "LICENSE", 11358,
+             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
+        ],
     },
     "darask0/MOSS-Image_4-step_adapter_lora": {
         "license": "Apache-2.0",
@@ -547,7 +553,7 @@ _CN = "alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union"
 _DA = "depth-anything/Depth-Anything-V2-Small-hf"   # the Small one: the larger ones are non-commercial
 _DW = "yzd-v/DWPose"
 _YX = "kadirnar/yolox_l-v0.1.1"   # Megvii's YOLOX-L release file (v0.1.1rc0's yolox_l.pth, the same bytes)
-_MC = "darask0/MOSS-Image-color-depth-control"   # MOSS-Image's color and depth control adapter
+_MC = "Comfy-Org/MOSS-Image"                    # darask0's color and depth adapter, repackaged
 _M4 = "darask0/MOSS-Image_4-step_adapter_lora"    # MOSS-Image's 4-step adapter (DMAD: a LoRA, a time path, a sampler's)
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
 FILES = {
@@ -780,7 +786,7 @@ FILES = {
                     "0d9408b13cd863c4e95a149dd31232f88f2a12aa6cf8964ed74d7d97748c7a07"),
     "cnet-yolox": (_YX, "yolox_l.pth", 434_357_141,
                    "1e6b7fa6240375370b2a8a8eab9066b3cdd43fd1d0bfa8d2027fd3a51def2917"),
-    "moss-control": (_MC, "moss-control.safetensors", 313_063_368,
+    "moss-control": (_MC, "loras/moss_image_color_depth_control.safetensors", 313_063_368,
                      "e5c0c3efd05e4269207a39de6005798f14c90c6687c89c54eaffe4b76c43a763"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
@@ -919,6 +925,7 @@ LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-
                "moss-4-step-lora": "moss-image-4-step-lora.safetensors",
                "moss-4-step-time-path": "moss-image-4-step-time-path.safetensors",
                "moss-4-step-dataspace": "moss-image-4-step-dataspace.safetensors",
+               "moss-control": "moss-control.safetensors",
                "anima-t5-tokenizer": "t5-tokenizer.json"}
 # the image tools the server offers for every model (serve/images.py TOOLS), for setup --describe
 IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image", "upscale_video", "segment_video",
@@ -951,7 +958,7 @@ _LINEART_LICENSE = ("MIT, Caroline Chan's Informative Drawings line art models, 
 _MLSD_LICENSE = "Apache-2.0, NAVER's M-LSD, https://github.com/navervision/mlsd"
 _DWPOSE_LICENSE = "Apache-2.0, DWPose (Zhendong Yang et al.), https://github.com/IDEA-Research/DWPose"
 _YOLOX_LICENSE = "Apache-2.0, Megvii's YOLOX, https://github.com/Megvii-BaseDetection/YOLOX"
-_MOSS_CONTROL_LICENSE = (f"Apache-2.0, darask0's MOSS-Image color and depth control adapter, "
+_MOSS_CONTROL_LICENSE = (f"Apache-2.0, darask0's MOSS-Image color and depth control adapter, repackaged by Comfy-Org, "
                          f"https://huggingface.co/{_MC}")
 AUX = {
     "yolo-face": {"file": "yolo-face", "convert": "yolo", "out": "face_yolov8m.safetensors", "license": _YOLO_LICENSE},
@@ -1305,7 +1312,7 @@ def file_url(name: str, endpoint: str = "https://huggingface.co") -> str:
 
 def local_path(models_dir: Path, name: str) -> Path:
     if name in AUX:
-        return Path(models_dir) / AUX_DIR / Path(FILES[name][1]).name
+        return Path(models_dir) / AUX_DIR / LOCAL_NAMES.get(name, Path(FILES[name][1]).name)
     if name.startswith("hunyuanimage3-"):
         folder = HUNYUANIMAGE3_DIR
     elif name.startswith("moss-sft-") or name.startswith("moss-base-"):   # a DiT's transformer folder, its own

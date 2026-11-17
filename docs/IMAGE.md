@@ -683,7 +683,7 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
 - Florence-2's weights (large and base) and `tokenizer.json` are Microsoft's [Florence-2](https://huggingface.co/microsoft/Florence-2-large), under MIT.
 - The background remover's seven BiRefNet versions are Peng Zheng's [BiRefNet](https://github.com/ZhengPeng7/BiRefNet), under MIT.
 - The composition control's Fun ControlNet Union (for Qwen-Image-2.1) is alibaba-pai's [Qwen-Image-2.1-Fun-Controlnet-Union](https://huggingface.co/alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union), under the Qwen Research License as Qwen-Image-2.1 is. It is not a free software license: read it before you use the images commercially.
-- MOSS-Image's color and depth adapter is darask0's [MOSS-Image-color-depth-control](https://huggingface.co/darask0/MOSS-Image-color-depth-control), under Apache 2.0.
+- MOSS-Image's color and depth adapter is darask0's, under Apache 2.0, fetched from [Comfy-Org's repackaging](https://huggingface.co/Comfy-Org/MOSS-Image).
 - The weights of the networks that make the control maps:
    - The depth's Depth Anything V2 Small (Lihe Yang et al.) is [Depth-Anything-V2-Small-hf](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf), under Apache 2.0 (the ones from Base up are non-commercial and not used).
    - The pose's DWPose (Zhendong Yang et al.) is [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose), under Apache 2.0. YOLOX-L, which finds the people, is the same file as Megvii's [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) release ([kadirnar/yolox_l-v0.1.1](https://huggingface.co/kadirnar/yolox_l-v0.1.1)), under Apache 2.0.
