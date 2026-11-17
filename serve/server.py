@@ -7146,6 +7146,12 @@ class Service:
                 said = {e["name"] for e in rejected}
                 if not said.intersection(markup_names(text[tail_markup[0]:])):
                     done["unread_tool_markup"] = {"reason": tail_markup[1], "chars": len(text) - tail_markup[0]}
+            if "unread_tool_markup" not in done and hold.started - hold.finished and finish != "cancel" and not cancel.is_set():
+                # a call the model had started (tool_start and argument pieces were sent) and the output ended inside - max tokens, or a
+                # stop in the middle of it: no tool_call follows and no markup is in the answer's text to find above.  The client still
+                # hears that the call was cut (chars 0: it is not in the text); the server's own retry (finish "stop", no call started)
+                # never ran for it, and a cut by max tokens would only meet the same cap again.
+                done["unread_tool_markup"] = {"reason": "cut_off", "chars": 0}
         yield "done", done
 
 
@@ -7239,6 +7245,8 @@ class ToolMarkupHold:
         self.prev = ""                                  # the last characters sent (a line start at the reply's start)
         self.fences = 0                                 # ``` marks sent so far
         self.calls = False                              # a tool call came out: the reply does not end in dead markup
+        self.started: set = set()                       # the ids of calls announced (tool_start) ...
+        self.finished: set = set()                      # ... and of those whose final tool_call came
 
     def _send(self, ev: Event) -> Event:
         if ev.text:
@@ -7260,6 +7268,7 @@ class ToolMarkupHold:
             if ev.kind != "content":
                 if ev.kind in ("tool_start", "tool_call"):
                     self.calls = True
+                    (self.started if ev.kind == "tool_start" else self.finished).add(ev.call.id)
                 out += self.release()
                 out.append(ev)
                 continue
