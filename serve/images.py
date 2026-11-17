@@ -2970,10 +2970,12 @@ class ImageGen:
         p = self.dir / name
         return p if p.is_file() else None
 
-    def _ready(self) -> None:
+    def _ready(self, start: bool = True) -> None:
         if self.tok is None:
             self.tok = load_tokenizer(self._tokenizer_path(), self.family)
         if not self.engine.alive():
+            if not start:
+                raise ImageJobFailed("the image engine is not running")
             self.engine.start()
             self._enter_ledger()
 
@@ -3238,7 +3240,7 @@ class ImageGen:
                 f",{job['width']},{job['height']}" if job.get("tiles") else "")
         return words
 
-    def need(self, job: dict) -> dict:
+    def need(self, job: dict, *, start: bool = True) -> dict:
         """What the image needs, from the engine (started when it is not running): least_mib, full_mib (every layer
         resident), held_mib (what it holds now), free_mib (the device's free VRAM), cap_mib (the most the engine could
         have) and host_mib (the prefix cache in pinned RAM at cap_mib).  An upscale without a drawing (ups_only): its
@@ -3247,14 +3249,14 @@ class ImageGen:
         if job.get("aux"):
             a = job["aux"]
             with self.lock:
-                self._ready()
+                self._ready(start=start)
                 return self.engine.ask(f"AUXNEED {a['kind']} {a['path']} {job['width']} {job['height']}"
                                        + "".join(f" {v}" for v in a.get("need_args") or ()), "NEED", 600)
         if job.get("video"):   # a video's upscale (serve/videos.py): its upscaler's on the source's frames
             src = job["source"]
             u = job["upscaler"]
             with self.lock:
-                self._ready()
+                self._ready(start=start)
                 return self.engine.ask(f"UPSVNEED {job['width']} {job['height']} {src['width']} {src['height']} "
                                        f"{self._ups_spec(job)}" + (f" COLOR:{u['color']}" if u.get("color") else ""),
                                        "NEED", 600)
@@ -3262,11 +3264,11 @@ class ImageGen:
             w0, h0 = image_dims(job["init"])
             u = job["upscaler"]
             with self.lock:
-                self._ready()
+                self._ready(start=start)
                 return self.engine.ask(f"UPSNEED {job['width']} {job['height']} {w0} {h0} {self._ups_spec(job)}"
                                        + (f" COLOR:{u['color']}" if u.get("color") else ""), "NEED", 600)
         with self.lock:
-            self._ready()
+            self._ready(start=start)
             w, h = made_size(job)
             self.stage(job)
             n, neg = self._need_counts(job)
@@ -5710,14 +5712,21 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
     shrinks or pauses at a micro-step boundary so the image goes first (the wait is a micro-step's seconds plus the
     release, never the training's end)."""
     lt = getattr(svc, "lora_jobs", None)
-    if lt is not None:
-        lt.image_begin()
+    need = None
+    if lt is not None and lt.current is not None and lt.place is not None and gen.engine.alive():
+        try:
+            need = int(gen.need(job, start=False)["least_mib"])
+            if need <= 0:
+                need = None
+        except (ImageJobFailed, OSError, KeyError, TypeError, ValueError):
+            need = None
+    waiting = lt.image_begin(need) if lt is not None else None
     try:
         with _gpu_turn(svc, gen, job, cancel) as policy:
             yield policy
     finally:
-        if lt is not None:
-            lt.image_end()
+        if lt is not None and waiting:
+            lt.image_end(waiting)
 
 
 @contextlib.contextmanager

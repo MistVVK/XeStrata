@@ -377,6 +377,8 @@ class TrainJobs:
         self.current: str | None = None          # the job running now
         self.place: dict | None = None           # its place now (the panel and /v1/status show it)
         self.image_waiting = 0                   # image jobs waiting for the training's yield (gpu_turn)
+        self.image_needs: dict[str, int | None] = {}
+        self.image_seq = 0                      # a decision is valid only for the needs it saw
         self.wake = threading.Event()            # the policy tick's immediate wake (a chat/image signal)
         self.yielded = threading.Event()         # the training made room for the image jobs
         self._proc: subprocess.Popen | None = None
@@ -846,16 +848,22 @@ class TrainJobs:
         reports = devices(self.svc)
         current = str((self.place or {}).get("pci") or "")
         free = {str(d["pci"]).lower(): int(d.get("free_bytes") or 0) >> 20 for d in reports}
+        device_free = dict(free)
         # The device's free count already excludes this trainer. Its budget can reuse what it holds.
         if current in free:
             free[current] += int(self._train_state.get("used_mib", 0))
         _, helper, held = text_placement(self.svc)
         status = getattr(self.svc, "status", {})
         train = dict(self._train_state)
-        return {"free": free, "chat_busy": self._chat_busy(), "chat_queued": bool(status.get("queued")),
-                "chat_eta_s": None, "image_job": self.image_waiting > 0,
-                # The image job's need is not known here: pause rather than guess and overcommit.
-                "image_need_mib": free.get(current, 0) if self.image_waiting else 0,
+        with self.lock:
+            needs = list(self.image_needs.values())
+            image_seq = self.image_seq
+        known = [n for n in needs if n is not None]
+        image_need = max(known) if needs and len(known) == len(needs) else None
+        return {"free": free, "device_free": device_free,
+                "proc_alive": self._proc is not None and self._proc.poll() is None,
+                "chat_busy": self._chat_busy(), "chat_queued": bool(status.get("queued")),
+                "chat_eta_s": None, "image_job": bool(needs), "image_need_mib": image_need, "image_seq": image_seq,
                 "helper_mib": held.get(helper, 0), "train": train, "current_pci": current,
                 "step_s": (rec.get("progress") or {}).get("s_per_step"), "reload_s": None}
 
@@ -879,17 +887,26 @@ class TrainJobs:
         tmp.write_text(json.dumps({"budget_mib": int(budget), "save_state": bool(save_state)}), encoding="utf-8")
         os.replace(tmp, d / "vram.json")
 
-    def _spawn(self, rec: dict, pci: str, budget: int, resume: bool) -> subprocess.Popen:
+    def _spawn(self, rec: dict, pci: str, budget: int, resume: bool, cancel: threading.Event) -> subprocess.Popen:
         """Start the trainer on the card, after open_mib of temporary room is free (the open reads and quantizes the
         weights even when the budget starts at 0 - TRAINVRAM's note 1)."""
         tb = budget_mod()
         need = int(tb.figures(*self._budget_model(rec))[0])
         waited = 0.0
-        while free_mib(self.svc, pci) < need:
-            if waited >= OPEN_WAIT_S:
-                raise TrainError(f"the card {pci} has no {need} MiB of temporary room for the trainer's open", 503)
-            time.sleep(1.0)
-            waited += 1.0
+        while self.image_waiting or free_mib(self.svc, pci) < need:
+            if cancel.is_set():
+                raise _Cancelled()
+            if self.image_waiting:
+                state = self._state(rec)
+                self._accept_yield(self._decider.tick(state), state)
+            else:
+                if waited >= OPEN_WAIT_S:
+                    raise TrainError(f"the card {pci} has no {need} MiB of temporary room for the trainer's open", 503)
+                waited += 1.0
+            self.wake.wait(1.0)
+            self.wake.clear()
+        if cancel.is_set():
+            raise _Cancelled()
         env = card_env(self.svc, pci)
         self._write_control(self.dir_of(rec["id"]), budget, False)
         proc = subprocess.Popen(self.train_argv(rec, budget, resume), stdout=subprocess.PIPE,
@@ -920,46 +937,66 @@ class TrainJobs:
         self._log = log
         proc = None
         try:
-            proc = self._spawn(rec, pci, int(act.get("budget_mib", 0)), resume=bool(rec.get("resume_state")))
+            proc = self._spawn(rec, pci, int(act.get("budget_mib", 0)),
+                               resume=bool(rec.get("resume_state")), cancel=cancel)
             led = Ledger(img.gpu_key(card_env(self.svc, pci)))
-            stopping = False
+            pending = None
+            deadline = 0.0
             while True:
                 if cancel.is_set():
-                    self._terminate(proc)
                     raise _Cancelled()
-                if proc.poll() is not None:
+                if proc is not None and proc.poll() is not None:
                     break
-                act = self._decider.tick(self._state(rec)) or {}
-                budget = int(act.get("budget_mib", 0))
-                card = str(act.get("pci") or pci).lower()
-                self.place = {"pci": pci, "budget_mib": budget, "mode": self._mode(rec, act),
-                              "reason": str(act.get("reason", "")), "name": self._device_name(pci)}
-                self._write_control(d, budget, bool(act.get("save_state")))
-                led.hold("train", max(budget, int(self._train_state.get("used_mib", 0))), proc.pid,
-                         exact=False, whole=True)
-                rec["place"] = self.place
-                self._write(rec)
-                self._signal_yield()
-                if act.get("save_state") and not stopping:
-                    # a move, or a pause whose used still exceeds what the other work needs (Level Zero keeps
-                    # allocations while the process lives): the state is written at an update's boundary, then the
-                    # process ends (its exit returns every allocation) and starts again with --resume
-                    stopping = True
-                    if self._state_saved.wait(OPEN_WAIT_S):
-                        self._terminate(proc)
-                        assert self._reader is not None
-                        self._reader.join()
-                        self._scan_versions(rec)
-                        if card != pci:
-                            pci = card
-                            led = Ledger(img.gpu_key(card_env(self.svc, pci)))
-                        self.place["pci"] = pci
-                        proc = self._spawn(rec, pci, 0, resume=True)
-                        rec["resume_state"] = True
-                        self._write(rec)
-                        stopping = False
+                if proc is None:
+                    if self.image_waiting:
+                        # The policy also checks the device's actual free room after the process exits.
+                        state = self._state(rec)
+                        self._accept_yield(self._decider.tick(state), state)
                     else:
-                        stopping = False    # the state did not come in time: ask again at the next tick
+                        act = self._decider.tick(self._state(rec)) or {}
+                        card = str(act.get("pci") or pci).lower()
+                        budget = int(act.get("budget_mib", 0))
+                        if budget > 0 and not act.get("save_state"):
+                            pci = card
+                            self.place["pci"] = pci
+                            led = Ledger(img.gpu_key(card_env(self.svc, pci)))
+                            proc = self._spawn(rec, pci, budget, resume=True, cancel=cancel)
+                else:
+                    state = self._state(rec)
+                    act = pending or self._decider.tick(state) or {}
+                    budget = int(act.get("budget_mib", 0))
+                    card = str(act.get("pci") or pci).lower()
+                    self.place = {"pci": pci, "budget_mib": budget, "mode": self._mode(rec, act),
+                                  "reason": str(act.get("reason", "")), "name": self._device_name(pci)}
+                    self._write_control(d, budget, bool(act.get("save_state")))
+                    led.hold("train", max(budget, int(self._train_state.get("used_mib", 0))), proc.pid,
+                             exact=False, whole=True)
+                    rec["place"] = self.place
+                    self._write(rec)
+                    if act.get("save_state"):
+                        if pending is None:
+                            pending, deadline = act, time.monotonic() + OPEN_WAIT_S
+                        if self._state_saved.is_set():
+                            self._terminate(proc)
+                            assert self._reader is not None
+                            self._reader.join()
+                            self._reader = None
+                            self._proc = None
+                            self._train_state = {}
+                            _DEV_CACHE.clear()  # process exit can return runtime-held VRAM
+                            self._scan_versions(rec)
+                            pci = card
+                            self.place["pci"] = pci
+                            proc = None
+                            pending = None
+                            rec["resume_state"] = True
+                            self._write(rec)
+                        elif time.monotonic() >= deadline:
+                            raise TrainError("the trainer did not save its state in time", 503)
+                    elif self.image_waiting and act.get("image_ready") is True and \
+                            self._train_state.get("state") == "paused":
+                        # Only the policy can certify the paused process left enough memory.
+                        self._accept_yield(act, state)
                 self.wake.wait(1.0)
                 self.wake.clear()
             assert self._reader is not None
@@ -981,6 +1018,18 @@ class TrainJobs:
             log.close()
             self._log = None
             self._proc = None
+            _DEV_CACHE.clear()
+            if self.image_waiting:
+                state = self._state(rec)
+                self._accept_yield(self._decider.tick(state), state)
+            with self.lock:
+                self.place = None
+
+    def _accept_yield(self, act: dict, state: dict) -> None:
+        if act.get("image_ready") is True:
+            with self.lock:
+                if self.image_needs and self.image_seq == state["image_seq"]:
+                    self.yielded.set()
 
     def _mode(self, rec: dict, act: dict) -> str:
         budget = int(act.get("budget_mib", 0))
@@ -991,12 +1040,6 @@ class TrainJobs:
     def _device_name(self, pci: str) -> str:
         d = next((d for d in devices(self.svc) if str(d["pci"]).lower() == pci), None)
         return str(d.get("name") or pci) if d else pci
-
-    def _signal_yield(self) -> None:
-        st = self._train_state
-        if self.image_waiting > 0 and (st.get("state") == "paused" or self._proc is None
-                                       or self._proc.poll() is not None):
-            self.yielded.set()
 
     def _read_train(self, rec: dict, proc: subprocess.Popen) -> None:
         """The trainer's stdout: the progress lines, the vram reports (the trailing key=value fields ignored), the
@@ -1020,6 +1063,7 @@ class TrainJobs:
             tok = line.split()
             if tok and tok[0] == "vram" and len(tok) >= 5 and tok[4] in ("running", "paused"):
                 with contextlib.suppress(ValueError):
+                    _DEV_CACHE.clear()  # the pause/grow changed free VRAM; the policy needs a fresh report
                     self._train_state = {"used_mib": int(tok[1]), "peak_est_mib": int(tok[2]), "min_mib": int(tok[3]),
                                          "state": tok[4]}
                     self.wake.set()
@@ -1109,24 +1153,28 @@ class TrainJobs:
             self._write(rec)
 
     # ---- the image jobs' yield (images.gpu_turn calls these)
-    def image_begin(self) -> None:
-        """An image job starts: the training shrinks or pauses first (a micro-step's seconds plus the release; never
-        the training's end).  The counter stays up while the image job runs (image_end)."""
-        if self.current is None or self._proc is None:
-            return
+    def image_begin(self, need_mib: int | None = None) -> str | None:
+        """Register an image's need until image_end; unknown need requires the Decider's safe stop."""
         with self.lock:
-            self.image_waiting += 1
-        self.yielded.clear()
+            if self.current is None or self.place is None:
+                return None
+            token = uuid.uuid4().hex
+            self.image_needs[token] = need_mib
+            self.image_seq += 1
+            self.image_waiting = len(self.image_needs)
+            self.yielded.clear()
         self.wake.set()
         if not self.yielded.wait(IMAGE_YIELD_WAIT_S):
-            with self.lock:
-                self.image_waiting -= 1
-            self.wake.set()
+            self.image_end(token)
             raise TrainError("the training did not release the GPU for the image in time", 503)
+        return token
 
-    def image_end(self) -> None:
+    def image_end(self, token: str) -> None:
         with self.lock:
-            self.image_waiting = max(0, self.image_waiting - 1)
+            if token in self.image_needs:
+                del self.image_needs[token]
+                self.image_seq += 1
+            self.image_waiting = len(self.image_needs)
         self.wake.set()
 
 

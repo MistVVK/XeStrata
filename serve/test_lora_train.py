@@ -69,7 +69,15 @@ for step in range(1, steps + 1):
                 break
     if b <= 0:
         print(f"vram 0 {peak} {least} paused", flush=True)
-        while budget()[0] <= 0:
+        while True:
+            b, ss = budget()
+            if ss:
+                open(state, "wb").write(b"XSTRAIN1")
+                print(f"state saved {state}", flush=True)
+                while budget()[1]:
+                    time.sleep(0.05)
+            if b > 0:
+                break
             time.sleep(0.05)
         print(f"vram 100 {peak} {least} running", flush=True)
     if mf:
@@ -144,7 +152,14 @@ class FakeBudget:
         def tick(self, st):
             o = self.outer
             if st["image_job"]:
-                return {"pci": o.card, "budget_mib": 0, "save_state": False, "reason": "an image job goes first"}
+                paused = st["train"].get("state") == "paused"
+                if o.mode == "image-unconfirmed":
+                    return {"pci": o.card, "budget_mib": 0, "save_state": False, "image_ready": False}
+                known = st["image_need_mib"] is not None
+                assert st["device_free"][o.card] == 20 * 1024
+                alive = st["proc_alive"]
+                return {"pci": o.card, "budget_mib": 0, "save_state": alive and paused and not known,
+                        "image_ready": not alive or (paused and known), "reason": "an image job goes first"}
             if o.mode == "pause":
                 return {"pci": o.card, "budget_mib": 0, "save_state": False, "reason": "the chat goes first"}
             if o.mode == "move" and not o.moved:
@@ -396,13 +411,87 @@ class Training(unittest.TestCase):
         self._start(rec, steps=300, save_every=50)
         wait_for(lambda: (self.jobs.get(rec["id"])["progress"] or {}).get("step", 0) >= 3, what="some steps")
         t0 = time.monotonic()
-        self.jobs.image_begin()          # the decider pauses the training for the image
+        token = self.jobs.image_begin()  # unknown image need: pause, save and exit
         self.assertLess(time.monotonic() - t0, lt.IMAGE_YIELD_WAIT_S)
-        self.assertEqual(self.jobs._train_state.get("state"), "paused")
-        self.jobs.image_end()
+        self.assertIsNone(self.jobs._proc)   # the unknown image need required a state save and process exit
+        self.assertTrue((self.jobs.dir_of(rec["id"]) / "state.bin").exists())
+        self.assertFalse((self.jobs.dir_of(rec["id"]) / "out" / "lora.resumed").exists())
+        token2 = self.jobs.image_begin(4096)
+        self.jobs.image_end(token)
+        self.assertEqual(self.jobs.image_waiting, 1)
+        self.assertIsNone(self.jobs._proc)  # the second image still holds the turn
+        self.jobs.image_end(token2)
+        wait_for(lambda: (self.jobs.dir_of(rec["id"]) / "out" / "lora.resumed").exists(), what="resume after image")
         wait_for(lambda: self.jobs._train_state.get("state") == "running", what="the training back")
         self.jobs.cancel(rec["id"])
         wait_for(lambda: self.jobs.get(rec["id"])["status"] == "cancelled", what="the cancel")
+
+    def test_image_does_not_pass_on_pause_without_decider_approval(self):
+        rec = self._draft()
+        self._start(rec, steps=300, save_every=50)
+        wait_for(lambda: (self.jobs.get(rec["id"])["progress"] or {}).get("step", 0) >= 3, what="some steps")
+        self.tb.mode = "image-unconfirmed"
+        with mock.patch.object(lt, "IMAGE_YIELD_WAIT_S", 2.0):
+            with self.assertRaises(lt.TrainError):
+                self.jobs.image_begin(4096)
+        self.assertEqual(self.jobs.image_waiting, 0)
+        self.assertIsNotNone(self.jobs._proc)
+        self.jobs.cancel(rec["id"])
+        wait_for(lambda: self.jobs.get(rec["id"])["status"] == "cancelled", what="the cancel")
+
+    def test_known_image_need_can_keep_the_paused_process(self):
+        rec = self._draft()
+        self._start(rec, steps=300, save_every=50)
+        wait_for(lambda: (self.jobs.get(rec["id"])["progress"] or {}).get("step", 0) >= 3, what="some steps")
+        proc = self.jobs._proc
+        token = self.jobs.image_begin(4096)
+        self.assertIs(self.jobs._proc, proc)
+        self.assertIsNone(proc.poll())
+        self.assertEqual(self.jobs._train_state.get("state"), "paused")
+        self.jobs.image_end(token)
+        wait_for(lambda: self.jobs._train_state.get("state") == "running", what="resume after image")
+        self.jobs.cancel(rec["id"])
+        wait_for(lambda: self.jobs.get(rec["id"])["status"] == "cancelled", what="the cancel")
+
+    def test_old_image_decision_does_not_release_a_new_request(self):
+        self.jobs.image_needs["first"] = 4096
+        self.jobs.image_seq = 1
+        old = {"image_seq": 1}
+        self.jobs.image_needs["second"] = None
+        self.jobs.image_seq = 2
+        self.jobs._accept_yield({"image_ready": True}, old)
+        self.assertFalse(self.jobs.yielded.is_set())
+        self.jobs._accept_yield({"image_ready": True}, {"image_seq": 2})
+        self.assertTrue(self.jobs.yielded.is_set())
+        self.jobs.image_needs.clear()
+
+    def test_image_need_only_queries_an_engine_already_running(self):
+        from contextlib import nullcontext
+        from serve import images
+        gen = mock.Mock()
+        gen.need.return_value = {"least_mib": 4096}
+        jobs = mock.Mock(current="lora_job", place={"pci": "a"})
+        jobs.image_begin.return_value = "token"
+        svc = mock.Mock(lora_jobs=jobs)
+        with mock.patch.object(images, "_gpu_turn", return_value=nullcontext("ok")):
+            gen.engine.alive.return_value = False
+            with images.gpu_turn(svc, gen, {}) as value:
+                self.assertEqual(value, "ok")
+            gen.need.assert_not_called()
+            jobs.image_begin.assert_called_with(None)
+            jobs.image_end.assert_called_with("token")
+            gen.engine.alive.return_value = True
+            with images.gpu_turn(svc, gen, {}):
+                pass
+            gen.need.assert_called_once_with({}, start=False)
+            jobs.image_begin.assert_called_with(4096)
+        idle = images.ImageGen.__new__(images.ImageGen)
+        idle.tok = object()
+        idle.engine = mock.Mock()
+        idle.engine.alive.return_value = False
+        with self.assertRaises(images.ImageJobFailed):
+            idle._ready(start=False)
+        idle.engine.start.assert_not_called()
 
     def test_move_saves_state_and_restarts(self):
         rec = self._draft()
@@ -440,7 +529,7 @@ class Training(unittest.TestCase):
         self.assertIsNone(lt.status_row(self.svc))
         rec = self._draft()
         self._start(rec, steps=60, save_every=20)
-        row = wait_for(lambda: lt.status_row(self.svc), what="the status row")
+        row = wait_for(lambda: (r := lt.status_row(self.svc)) and r.get("place") and r, what="the status row")
         self.assertEqual(row["id"], rec["id"])
         self.assertIn(row["place"]["mode"], ("run", "shrunk", "paused"))
         wait_for(lambda: self.jobs.get(rec["id"])["status"] == "awaiting_choice", what="the end")
