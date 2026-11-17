@@ -18,6 +18,7 @@
 // HC read and the LM head on the LAST row only (the decode kernels: gr_norm / gr_down / gr_up, GEMV, argmax).
 // Left out: the PLE path and the MTP draft.
 #include "coop_probe.h"
+#include "moe_tiles.h"
 #include "gguf_lite.h"
 #include "mtl_rt.h"
 #include "ref_quant.h"
@@ -44,12 +45,11 @@ struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
 struct GdnArgs { uint32_t h_k, h_v, channels, commit; float eps; uint32_t plane; };
 struct GdnPArgs { uint32_t n_tok, h_k, h_v, channels; float eps; uint32_t f32; };
 struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
-struct MmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
+struct MmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks, gu_gx, dn_gx; };
 struct MmArgs { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
 struct ArgArgs { uint32_t n_vocab, parts; };
 
 double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
-bool fmt_unit32(int t) { return t == ref::IQ4_XS || t == ref::IQ4_NL; }   // mm_gu2 needs a K chunk >= 32
 int unit_of(int t) { return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 ? 16 : 32; }
 
 }  // namespace
@@ -202,8 +202,8 @@ int main(int argc, char** argv) {
             ref::dequant(te.type, (const uint8_t*)f.map + te.offset + id * rb, E.data() + t * N, N);
         }
     }
-    meta.as<uint32_t>()[2] = gu_v3 ? NFF / (gu3[1] * gu3[3]) : NFF / 64;
-    meta.as<uint32_t>()[5] = dn_v3 ? N / (dn3[1] * dn3[3]) : N / 64;
+    // meta[2] and meta[5] are mm_scan's now, from the plan below: the v2 tiles are the engine's own (moe_tiles.h),
+    // and this harness used to run a TN-64 tile for every type where the engine runs the K-quants' TN-16 one
 
     // ---- the chunk's dispatches
     std::vector<mtl::Dispatch> ds;
@@ -412,7 +412,11 @@ int main(int argc, char** argv) {
             D(P(lib, "route_topk"), {mtl::Arg::B(logits), mtl::Arg::B(ids), mtl::Arg::B(wts), mtl::Arg::V(nt), mtl::Arg::V((uint32_t)NEXP)}, (T + 7) / 8, 1,
               256, "router");
             const int nent = T * TOPK, nblk = (nent + 1023) / 1024;
-            MmPlanArgs pa{(uint32_t)nent, TOPK, NEXP, (uint32_t)TM, (uint32_t)nblk};
+            const strata::metal_engine::MoeTile gu_t = strata::metal_engine::gu2_tile(eg.type);
+            const strata::metal_engine::MoeTile dn_t = strata::metal_engine::dn2_tile(ed.type);
+            MmPlanArgs pa{(uint32_t)nent, TOPK, NEXP, (uint32_t)TM, (uint32_t)nblk,
+                          (uint32_t)(gu_v3 ? NFF / (gu3[1] * gu3[3]) : strata::metal_engine::moe_grid_x(NFF, gu_t.tn)),
+                          (uint32_t)(dn_v3 ? N / (dn3[1] * dn3[3]) : strata::metal_engine::moe_grid_x(N, dn_t.tn))};
             const uint32_t nclr = maxrows;
             D(P(lib, "mm_clear"), {mtl::Arg::B(stok), mtl::Arg::V(nclr)}, (maxrows + 255) / 256, 1, 256, "experts");
             D(P(lib, "mm_hist"), {mtl::Arg::B(ids), mtl::Arg::B(bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024, "experts");
@@ -434,8 +438,7 @@ int main(int argc, char** argv) {
             push(g, "experts");
             mtl::Dispatch gu;
             gu.p = gu_v3 ? P(lib, "mm_gu3_" + std::to_string(eg.type) + "_" + gu3_for(eg.type), mtl::Constants().b(7, k4))
-                         : P(lib, "mm_gu2_" + std::to_string(eg.type) + (fmt_unit32(eg.type) ? "_16_64_32_2" : "_16_64_16_2"),
-                             mtl::Constants().i(5, 0));
+                         : P(lib, "mm_gu2_" + std::to_string(eg.type) + gu_t.name, mtl::Constants().i(5, 0));
             gu.args = {mtl::Arg::B(W), mtl::Arg::B(XS), mtl::Arg::B(HS), mtl::Arg::B(tiles), mtl::Arg::V(ma)};
             gu.tg[0] = gu_v3 ? 32 * gu3[3] : 64;
             gu.indirect = &meta;
@@ -443,7 +446,7 @@ int main(int argc, char** argv) {
             push(gu, "experts gu");
             mtl::Dispatch dn;
             dn.p = dn_v3 ? P(lib, "mm_down3_" + std::to_string(ed.type) + "_" + tl3(dn3), mtl::Constants().b(7, k4))
-                         : P(lib, "mm_down2_" + std::to_string(ed.type) + (ed.type == ref::IQ4_NL ? "_16_64_32_2" : "_16_64_16_2"));
+                         : P(lib, "mm_down2_" + std::to_string(ed.type) + dn_t.name);
             dn.args = {mtl::Arg::B(W), mtl::Arg::B(HS), mtl::Arg::B(YE), mtl::Arg::B(tiles), mtl::Arg::V(ma)};
             dn.tg[0] = dn_v3 ? 32 * dn3[3] : 64;
             dn.indirect = &meta;
