@@ -285,6 +285,24 @@ test('/compact summarises the older messages with the real figures, and says so 
   assert.ok([FIT_TEXT.nothingToSummarize, FIT_TEXT.nothingFull, FIT_TEXT.summarized].includes(again.find(f => f.type === 'delta').key), 'a second /compact is answered in plain words');
 });
 
+test('/compact leaves the chat free: the next message goes through at once, and a /compact right after another is answered, not "still working"', { skip }, async (t) => {
+  // The Harness runs /compact as turn events on an idle session; the idle watch (#6070) took them for a turn the agent started by itself, followed it,
+  // and the chat stayed "still working" (over 80 s in a test run): the person's next message was refused and a second /compact answered "still working".
+  const { worker, bridge, ws, send } = await rig(t);
+  const run = async (line) => { const frames = []; await bridge.compactCommand({ chatId: 'c', message: line, workspacePath: ws, mode: 'bypass', choice: null, onFrame: f => frames.push(f) }); return frames; };
+  for (let i = 0; i < 3; i++) assert.equal((await send(`SCRIPT:echo r${i} ${dense.repeat(700)}`)).at(-1).type, 'done');
+  const first = await run('/compact');
+  assert.equal(first.find(f => f.type === 'delta').key, FIT_TEXT.summarized);
+  const second = await run('/compact');
+  assert.notEqual(second.find(f => f.type === 'delta').key, FIT_TEXT.compactBusy, 'a second /compact straight after the first is not told the chat is still working');
+  const before = worker.requests.length;
+  const next = await send('SCRIPT:echo after please');
+  assert.equal(next.at(-1).type, 'done', 'the next message goes through: ' + JSON.stringify(next.at(-1)).slice(0, 300));
+  assert.match(answerOf(next), /after/);
+  assert.ok(worker.requests.length > before, 'the model was asked');
+  assert.equal(bridge.turnOf('c'), null, 'nothing is left running');
+});
+
 test('the summary request asks for the language of the conversation and leaves the original messages alone (#4750)', () => {
   const asked = [{ role: 'user', content: 'hi' }, { role: 'user', content: [{ type: 'text', text: 'Summarise. Write concise English engineering prose.' }] }];
   const out = withSummaryLanguage(asked);
