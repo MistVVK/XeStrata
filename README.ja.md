@@ -418,7 +418,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: 密な行列積（contrib-llvm、free では AMD の GPU）。
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラ。
-     XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。
+     XeStrata の修正と、このリリースより後の intel/llvm 自身のコミット 1 つ（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。
    - AMD による [ROCm のデバイスライブラリ](https://github.com/ROCm/llvm-project/tree/f30ae3e6b680ad23dcf522e668c6d4c5c90838d0/amd/device-libs)（University of Illinois/NCSA）:
      intel/llvm と一緒にビルドし、AMD の GPU 向けのコードがリンクします。
      そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat）の `debian/rules` から写しました。
@@ -454,7 +454,7 @@ XeStrata は自由ソフトウェアです。MistVVK と XeStrata の貢献者�
   XeStrata の変更とファイル全体が LGPL です（ヘッダーは `LGPL-3.0-or-later AND MIT`）。著作権表示と許諾表示は [NOTICE](NOTICE) にあります。
   Debian の rocm-llvm のパッケージ（Expat）から `tools/intel_llvm_build.py` に写した部分も同じです。
 - **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
-   - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
+   - intel/llvm に当てるパッチ（XeStrata の修正と、リリースより後の intel/llvm 自身のコミット。`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
    - oneMath への XeStrata の変更（フォーク、`third_party/main/oneMath/`）: Apache-2.0。
    - oneDNN に当てる、oneDNN の pull request を取り込んだパッチ（`third_party/main/oneDNN/`）: Apache-2.0。
    - AOTriton を Windows 向けにビルドするための XeStrata のパッチ（`third_party/main/aotriton/`）: AOTriton のライセンス（MIT）。

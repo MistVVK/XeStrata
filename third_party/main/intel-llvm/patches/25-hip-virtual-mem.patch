@@ -1,59 +1,82 @@
 SPDX-FileCopyrightText: The LLVM project contributors
-SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-hip-virtual-mem: an addition to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
+hip-virtual-mem: a commit of intel/llvm that v7.2.0 does not have, applied by tools/intel_llvm_build.py.
 
-The HIP adapter answered every virtual memory call (urVirtualMem*, urPhysicalMem*) with
+It is intel/llvm's c13ad6c7e3899094734cd664dfcabc069256bf96, "[UR][HIP] Implement virtual and physical
+memory management" (pull request 22671, 2026-08-03), as it is: the commit's diff without a change, which
+applies to v7.2.0 with the patches before this one.  This patch goes when intel/llvm is raised to a release
+that has the commit.
+
+v7.2.0's HIP adapter answered every virtual memory call (urVirtualMem*, urPhysicalMem*) with
 UNSUPPORTED_FEATURE and reported no virtual memory support, so SYCL's ext_oneapi_virtual_mem was not there
 on AMD GPUs: XeStrata's --vram-elastic (the expert cache in segments it gives back for an image job and maps
-again after it) and the elastic K/V (--kv-grow) fell back to one allocation.  HIP has the same virtual memory
-management as CUDA (hipMemAddressReserve, hipMemCreate, hipMemMap, hipMemSetAccess and the others), so the
-calls are implemented with it as the CUDA adapter implements them with CUDA's, and the device reports the
-support HIP's hipDeviceAttributeVirtualMemoryManagementSupported says it has.
+again after it) and the elastic K/V (--kv-grow) fell back to one allocation.  The commit implements the calls
+with HIP's virtual memory management (hipMemAddressReserve, hipMemCreate, hipMemMap, hipMemSetAccess and the
+others), as the CUDA adapter implements them with CUDA's, and the device reports the support HIP's
+hipDeviceAttributeVirtualMemoryManagementSupported says it has.
+
+XeStrata's changes to it are patches of their own, after this one: hip-virtual-mem-unmap,
+hip-virtual-mem-release and hip-physical-mem-device.
 ---
+diff --git a/sycl/test-e2e/VirtualMem/vector_with_virtual_mem.cpp b/sycl/test-e2e/VirtualMem/vector_with_virtual_mem.cpp
+index 154932d719ba6..05959a0e0fecd 100644
+--- a/sycl/test-e2e/VirtualMem/vector_with_virtual_mem.cpp
++++ b/sycl/test-e2e/VirtualMem/vector_with_virtual_mem.cpp
+@@ -188,13 +188,14 @@ int main() {
+     // Copy back the values and verify.
+     int *CopyBack = sycl::malloc_shared<int>(NewVecSize, Q);
+ 
+-    // TODO: Level-zero (excluding on PVC) does not currently allow copy across
+-    //       virtual memory ranges, even if they are consequtive.
++    // TODO: Level-zero (excluding on PVC) and HIP do not currently allow copy
++    //       across virtual memory ranges, even if they are consequtive.
+     syclext::architecture DevArch =
+         Q.get_device().get_info<syclext::info::device::architecture>();
+-    if (Q.get_backend() == sycl::backend::ext_oneapi_level_zero &&
+-        DevArch != syclext::architecture::intel_gpu_pvc &&
+-        DevArch != syclext::architecture::intel_gpu_pvc_vg) {
++    if ((Q.get_backend() == sycl::backend::ext_oneapi_level_zero &&
++         DevArch != syclext::architecture::intel_gpu_pvc &&
++         DevArch != syclext::architecture::intel_gpu_pvc_vg) ||
++        Q.get_backend() == sycl::backend::ext_oneapi_hip) {
+       Q.parallel_for(sycl::range<1>{NewVecSize}, [=](sycl::id<1> Idx) {
+          CopyBack[Idx] = VecDataPtr[Idx];
+        }).wait_and_throw();
 diff --git a/unified-runtime/source/adapters/hip/device.cpp b/unified-runtime/source/adapters/hip/device.cpp
+index 42ed5cbeaae2c..9c37b80e572a8 100644
 --- a/unified-runtime/source/adapters/hip/device.cpp
 +++ b/unified-runtime/source/adapters/hip/device.cpp
-@@ -983,7 +983,11 @@
+@@ -978,8 +978,11 @@ UR_APIEXPORT ur_result_t UR_APICALL urDeviceGetInfo(ur_device_handle_t hDevice,
+   }
    case UR_DEVICE_INFO_HOST_PIPE_READ_WRITE_SUPPORT:
      return ReturnValue(ur_bool_t{false});
-   case UR_DEVICE_INFO_VIRTUAL_MEMORY_SUPPORT:
+-  case UR_DEVICE_INFO_VIRTUAL_MEMORY_SUPPORT:
 -    return ReturnValue(ur_bool_t{false});
-+    // HIP's virtual memory management (virtual_mem.cpp), where the device and
-+    // its driver have it
-+    return ReturnValue(ur_bool_t{
-+        getAttribute(hDevice,
-+                     hipDeviceAttributeVirtualMemoryManagementSupported) != 0});
++  case UR_DEVICE_INFO_VIRTUAL_MEMORY_SUPPORT: {
++    int VirtualMemSupport = getAttribute(
++        hDevice, hipDeviceAttributeVirtualMemoryManagementSupported);
++    return ReturnValue(static_cast<ur_bool_t>(VirtualMemSupport));
++  }
    case UR_DEVICE_INFO_ESIMD_SUPPORT:
      return ReturnValue(ur_bool_t{false});
    case UR_DEVICE_INFO_TIMESTAMP_RECORDING_SUPPORT_EXP:
 diff --git a/unified-runtime/source/adapters/hip/physical_mem.cpp b/unified-runtime/source/adapters/hip/physical_mem.cpp
+index 457ee9de99850..6b9d56bbb6a1c 100644
 --- a/unified-runtime/source/adapters/hip/physical_mem.cpp
 +++ b/unified-runtime/source/adapters/hip/physical_mem.cpp
-@@ -5,6 +5,10 @@
- // Exceptions. See https://llvm.org/LICENSE.txt for license information.
- // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
- //
-+// Modified 2026 by MistVVK and the XeStrata contributors: the functions
-+// implemented with HIP's hipMemCreate and hipMemRelease, as the CUDA adapter
-+// implements them with CUDA's.
-+//
- //===----------------------------------------------------------------------===//
- 
- #include "physical_mem.hpp"
-@@ -12,24 +16,90 @@
+@@ -12,24 +12,83 @@
  #include "context.hpp"
  #include "event.hpp"
  
-+#include <memory>
++#include <cassert>
 +
  UR_APIEXPORT ur_result_t UR_APICALL urPhysicalMemCreate(
 -    ur_context_handle_t, ur_device_handle_t, size_t,
 -    const ur_physical_mem_properties_t *, ur_physical_mem_handle_t *) {
 -  return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
 +    ur_context_handle_t hContext, ur_device_handle_t hDevice, size_t size,
-+    const ur_physical_mem_properties_t *pProperties,
++    [[maybe_unused]] const ur_physical_mem_properties_t *pProperties,
 +    ur_physical_mem_handle_t *phPhysicalMem) {
 +  hipMemAllocationProp AllocProps = {};
 +  AllocProps.location.type = hipMemLocationTypeDevice;
@@ -61,26 +84,19 @@ diff --git a/unified-runtime/source/adapters/hip/physical_mem.cpp b/unified-runt
 +  AllocProps.location.id = hDevice->getIndex();
 +
 +  hipMemGenericAllocationHandle_t ResHandle;
-+  try {
-+    ScopedDevice Active(hDevice);
-+    switch (auto Result = hipMemCreate(&ResHandle, size, &AllocProps, 0)) {
-+    case hipErrorInvalidValue:
-+      return UR_RESULT_ERROR_INVALID_SIZE;
-+    default:
-+      UR_CHECK_ERROR(Result);
-+    }
-+  } catch (ur_result_t Err) {
-+    return Err;
++  switch (auto Result = hipMemCreate(&ResHandle, size, &AllocProps, 0)) {
++  case hipErrorInvalidValue:
++    return UR_RESULT_ERROR_INVALID_SIZE;
++  default:
++    UR_CHECK_ERROR(Result);
 +  }
 +  try {
 +    *phPhysicalMem = new ur_physical_mem_handle_t_(
 +        ResHandle, hContext, hDevice, size,
 +        pProperties ? *pProperties : ur_physical_mem_properties_t{});
 +  } catch (std::bad_alloc &) {
-+    hipMemRelease(ResHandle);
 +    return UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
 +  } catch (...) {
-+    hipMemRelease(ResHandle);
 +    return UR_RESULT_ERROR_UNKNOWN;
 +  }
 +  return UR_RESULT_SUCCESS;
@@ -145,28 +161,15 @@ diff --git a/unified-runtime/source/adapters/hip/physical_mem.cpp b/unified-runt
 +  }
  }
 diff --git a/unified-runtime/source/adapters/hip/physical_mem.hpp b/unified-runtime/source/adapters/hip/physical_mem.hpp
+index e2fade322ebe7..d172ca621d10f 100644
 --- a/unified-runtime/source/adapters/hip/physical_mem.hpp
 +++ b/unified-runtime/source/adapters/hip/physical_mem.hpp
-@@ -5,6 +5,10 @@
- // Exceptions. See https://llvm.org/LICENSE.txt for license information.
- // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
- //
-+// Modified 2026 by MistVVK and the XeStrata contributors: the handle holds a
-+// physical allocation of HIP's virtual memory management (hipMemCreate), as
-+// the CUDA adapter's holds CUDA's.
-+//
- //===----------------------------------------------------------------------===//
- #pragma once
+@@ -15,10 +15,36 @@
  
-@@ -13,12 +17,36 @@
- #include "device.hpp"
- #include "platform.hpp"
- 
--/// UR queue mapping on physical memory allocations used in virtual memory
--/// management.
+ /// UR queue mapping on physical memory allocations used in virtual memory
+ /// management.
 -/// TODO: Implement.
--///
-+/// A physical allocation used in virtual memory management.
+ ///
  struct ur_physical_mem_handle_t_ : ur::hip::handle_base {
 +  using native_type = hipMemGenericAllocationHandle_t;
 +
@@ -201,197 +204,158 @@ diff --git a/unified-runtime/source/adapters/hip/physical_mem.hpp b/unified-runt
 +  }
  };
 diff --git a/unified-runtime/source/adapters/hip/virtual_mem.cpp b/unified-runtime/source/adapters/hip/virtual_mem.cpp
+index aa9c92c7f5106..c2c64ee3f8e7d 100644
 --- a/unified-runtime/source/adapters/hip/virtual_mem.cpp
 +++ b/unified-runtime/source/adapters/hip/virtual_mem.cpp
-@@ -5,6 +5,10 @@
- // Exceptions. See https://llvm.org/LICENSE.txt for license information.
- // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
- //
-+// Modified 2026 by MistVVK and the XeStrata contributors: the functions
-+// implemented with HIP's virtual memory management (hipMemAddressReserve,
-+// hipMemMap and the others), as the CUDA adapter implements them with CUDA's.
-+//
- //===----------------------------------------------------------------------===//
- 
- #include "common.hpp"
-@@ -13,42 +17,145 @@
+@@ -12,43 +12,126 @@
+ #include "event.hpp"
  #include "physical_mem.hpp"
  
++#include <cassert>
++
  UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemGranularityGetInfo(
 -    ur_context_handle_t, ur_device_handle_t, size_t,
 -    ur_virtual_mem_granularity_info_t, size_t, void *, size_t *) {
--  return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
--}
--
--UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemReserve(ur_context_handle_t,
--                                                        const void *, size_t,
--                                                        void **) {
 -  return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
 +    ur_context_handle_t, ur_device_handle_t hDevice,
 +    [[maybe_unused]] size_t allocationSize,
 +    ur_virtual_mem_granularity_info_t propName, size_t propSize,
 +    void *pPropValue, size_t *pPropSizeRet) {
 +  UrReturnHelper ReturnValue(propSize, pPropValue, pPropSizeRet);
-+  try {
-+    ScopedDevice Active(hDevice);
-+    switch (propName) {
-+    case UR_VIRTUAL_MEM_GRANULARITY_INFO_MINIMUM:
-+    case UR_VIRTUAL_MEM_GRANULARITY_INFO_RECOMMENDED: {
-+      hipMemAllocationGranularity_flags Flags =
-+          propName == UR_VIRTUAL_MEM_GRANULARITY_INFO_MINIMUM
-+              ? hipMemAllocationGranularityMinimum
-+              : hipMemAllocationGranularityRecommended;
-+      hipMemAllocationProp AllocProps = {};
-+      AllocProps.location.type = hipMemLocationTypeDevice;
-+      AllocProps.type = hipMemAllocationTypePinned;
-+      AllocProps.location.id = hDevice->getIndex();
 +
-+      size_t Granularity;
-+      UR_CHECK_ERROR(
-+          hipMemGetAllocationGranularity(&Granularity, &AllocProps, Flags));
-+      return ReturnValue(Granularity);
-+    }
-+    default:
-+      return UR_RESULT_ERROR_UNSUPPORTED_ENUMERATION;
-+    }
-+  } catch (ur_result_t Err) {
-+    return Err;
++  ScopedDevice Active(hDevice);
++  switch (propName) {
++  case UR_VIRTUAL_MEM_GRANULARITY_INFO_MINIMUM:
++  case UR_VIRTUAL_MEM_GRANULARITY_INFO_RECOMMENDED: {
++    hipMemAllocationGranularity_flags Flags =
++        propName == UR_VIRTUAL_MEM_GRANULARITY_INFO_MINIMUM
++            ? hipMemAllocationGranularityMinimum
++            : hipMemAllocationGranularityRecommended;
++    hipMemAllocationProp AllocProps = {};
++    AllocProps.location.type = hipMemLocationTypeDevice;
++    AllocProps.type = hipMemAllocationTypePinned;
++    AllocProps.location.id = hDevice->getIndex();
++
++    size_t Granularity;
++    UR_CHECK_ERROR(
++        hipMemGetAllocationGranularity(&Granularity, &AllocProps, Flags));
++    return ReturnValue(Granularity);
 +  }
-+}
++  default:
++    return UR_RESULT_ERROR_UNSUPPORTED_ENUMERATION;
++  }
 +
++  return UR_RESULT_SUCCESS;
+ }
+ 
+-UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemReserve(ur_context_handle_t,
+-                                                        const void *, size_t,
+-                                                        void **) {
+-  return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
 +UR_APIEXPORT ur_result_t UR_APICALL
 +urVirtualMemReserve(ur_context_handle_t hContext, const void *pStart,
 +                    size_t size, void **ppStart) {
-+  // Reserve the virtual mem. Only need to do once for arbitrary context
-+  try {
-+    ScopedDevice Active(hContext->getDevices()[0]);
-+    UR_CHECK_ERROR(
-+        hipMemAddressReserve(ppStart, size, 0, const_cast<void *>(pStart), 0));
-+  } catch (ur_result_t Err) {
-+    return Err;
-+  }
++  // Reserve the virtual mem. Only need to do once for arbitrary device
++  ScopedDevice Active(hContext->getDevices()[0]);
++  UR_CHECK_ERROR(
++      hipMemAddressReserve(ppStart, size, 0, const_cast<void *>(pStart), 0));
 +  return UR_RESULT_SUCCESS;
  }
  
  UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemFree(ur_context_handle_t,
 -                                                     const void *, size_t) {
 -  return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
--}
--
++                                                     const void *pStart,
++                                                     size_t size) {
++  UR_CHECK_ERROR(hipMemAddressFree(const_cast<void *>(pStart), size));
++  return UR_RESULT_SUCCESS;
+ }
+ 
 -UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemSetAccess(
 -    ur_context_handle_t, const void *, size_t, ur_virtual_mem_access_flags_t) {
 -  return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
--}
--
++UR_APIEXPORT ur_result_t UR_APICALL
++urVirtualMemSetAccess(ur_context_handle_t hContext, const void *pStart,
++                      size_t size, ur_virtual_mem_access_flags_t flags) {
++  // Set access for every device in the context
++  for (auto &Device : hContext->getDevices()) {
++    hipMemAccessDesc AccessDesc = {};
++    if (flags & UR_VIRTUAL_MEM_ACCESS_FLAG_READ_WRITE)
++      AccessDesc.flags = hipMemAccessFlagsProtReadWrite;
++    else if (flags & UR_VIRTUAL_MEM_ACCESS_FLAG_READ_ONLY)
++      AccessDesc.flags = hipMemAccessFlagsProtRead;
++    else
++      AccessDesc.flags = hipMemAccessFlagsProtNone;
++    AccessDesc.location.type = hipMemLocationTypeDevice;
++    AccessDesc.location.id = Device->getIndex();
++    ScopedDevice Active(Device);
++    UR_CHECK_ERROR(
++        hipMemSetAccess(const_cast<void *>(pStart), size, &AccessDesc, 1));
++  }
++  return UR_RESULT_SUCCESS;
+ }
+ 
 -UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemMap(
 -    ur_context_handle_t, const void *, size_t, ur_physical_mem_handle_t, size_t,
 -    ur_virtual_mem_access_flags_t) {
 -  return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
--}
--
++UR_APIEXPORT ur_result_t UR_APICALL
++urVirtualMemMap(ur_context_handle_t hContext, const void *pStart, size_t size,
++                ur_physical_mem_handle_t hPhysicalMem, size_t offset,
++                ur_virtual_mem_access_flags_t flags) {
++  // Map the virtual mem. Only need to do once for arbitrary device
++  ScopedDevice Active(hContext->getDevices()[0]);
++  UR_CHECK_ERROR(hipMemMap(const_cast<void *>(pStart), size, offset,
++                           hPhysicalMem->get(), 0));
++  if (flags)
++    UR_CHECK_ERROR(urVirtualMemSetAccess(hContext, pStart, size, flags));
++  return UR_RESULT_SUCCESS;
+ }
+ 
 -UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemUnmap(ur_context_handle_t,
 -                                                      const void *, size_t) {
 -  return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
--}
--
++UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemUnmap(
++    ur_context_handle_t hContext, const void *pStart, size_t size) {
++  // Unmap the virtual mem. Only need to do once for arbitrary device
++  ScopedDevice Active(hContext->getDevices()[0]);
++  UR_CHECK_ERROR(hipMemUnmap(const_cast<void *>(pStart), size));
++  return UR_RESULT_SUCCESS;
+ }
+ 
 -UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemGetInfo(ur_context_handle_t,
 -                                                        const void *, size_t,
 -                                                        ur_virtual_mem_info_t,
 -                                                        size_t, void *,
 -                                                        size_t *) {
 -  return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
-+                                                     const void *pStart,
-+                                                     size_t size) {
-+  try {
-+    UR_CHECK_ERROR(hipMemAddressFree(const_cast<void *>(pStart), size));
-+  } catch (ur_result_t Err) {
-+    return Err;
-+  }
-+  return UR_RESULT_SUCCESS;
-+}
-+
-+UR_APIEXPORT ur_result_t UR_APICALL
-+urVirtualMemSetAccess(ur_context_handle_t hContext, const void *pStart,
-+                      size_t size, ur_virtual_mem_access_flags_t flags) {
-+  // Set access for every device in the context
-+  try {
-+    for (auto &Device : hContext->getDevices()) {
-+      hipMemAccessDesc AccessDesc = {};
-+      if (flags & UR_VIRTUAL_MEM_ACCESS_FLAG_READ_WRITE)
-+        AccessDesc.flags = hipMemAccessFlagsProtReadWrite;
-+      else if (flags & UR_VIRTUAL_MEM_ACCESS_FLAG_READ_ONLY)
-+        AccessDesc.flags = hipMemAccessFlagsProtRead;
-+      else
-+        AccessDesc.flags = hipMemAccessFlagsProtNone;
-+      AccessDesc.location.type = hipMemLocationTypeDevice;
-+      AccessDesc.location.id = Device->getIndex();
-+      ScopedDevice Active(Device);
-+      UR_CHECK_ERROR(
-+          hipMemSetAccess(const_cast<void *>(pStart), size, &AccessDesc, 1));
-+    }
-+  } catch (ur_result_t Err) {
-+    return Err;
-+  }
-+  return UR_RESULT_SUCCESS;
-+}
-+
-+UR_APIEXPORT ur_result_t UR_APICALL
-+urVirtualMemMap(ur_context_handle_t hContext, const void *pStart, size_t size,
-+                ur_physical_mem_handle_t hPhysicalMem, size_t offset,
-+                ur_virtual_mem_access_flags_t flags) {
-+  // Map the virtual mem. Only need to do once for arbitrary context
-+  try {
-+    ScopedDevice Active(hContext->getDevices()[0]);
-+    UR_CHECK_ERROR(hipMemMap(const_cast<void *>(pStart), size, offset,
-+                             hPhysicalMem->get(), 0));
-+  } catch (ur_result_t Err) {
-+    return Err;
-+  }
-+  if (flags)
-+    return urVirtualMemSetAccess(hContext, pStart, size, flags);
-+  return UR_RESULT_SUCCESS;
-+}
-+
-+UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemUnmap(
-+    ur_context_handle_t hContext, const void *pStart, size_t size) {
-+  // Unmap the virtual mem. Only need to do once for arbitrary context
-+  try {
-+    ScopedDevice Active(hContext->getDevices()[0]);
-+    UR_CHECK_ERROR(hipMemUnmap(const_cast<void *>(pStart), size));
-+  } catch (ur_result_t Err) {
-+    return Err;
-+  }
-+  return UR_RESULT_SUCCESS;
-+}
-+
 +UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemGetInfo(
 +    ur_context_handle_t hContext, const void *pStart,
 +    [[maybe_unused]] size_t size, ur_virtual_mem_info_t propName,
 +    size_t propSize, void *pPropValue, size_t *pPropSizeRet) {
 +  UrReturnHelper ReturnValue(propSize, pPropValue, pPropSizeRet);
-+  try {
-+    ScopedDevice Active(hContext->getDevices()[0]);
-+    switch (propName) {
-+    case UR_VIRTUAL_MEM_INFO_ACCESS_MODE: {
-+      hipMemLocation MemLocation = {};
-+      MemLocation.type = hipMemLocationTypeDevice;
-+      MemLocation.id = hContext->getDevices()[0]->getIndex();
 +
-+      unsigned long long HipAccessFlags;
-+      UR_CHECK_ERROR(hipMemGetAccess(&HipAccessFlags, &MemLocation,
-+                                     const_cast<void *>(pStart)));
++  // Set arbitrary device
++  ScopedDevice Active(hContext->getDevices()[0]);
++  switch (propName) {
++  case UR_VIRTUAL_MEM_INFO_ACCESS_MODE: {
++    hipMemLocation MemLocation = {};
++    MemLocation.type = hipMemLocationTypeDevice;
++    MemLocation.id = hContext->getDevices()[0]->getIndex();
 +
-+      ur_virtual_mem_access_flags_t UrAccessFlags = 0;
-+      if (HipAccessFlags == hipMemAccessFlagsProtReadWrite)
-+        UrAccessFlags = UR_VIRTUAL_MEM_ACCESS_FLAG_READ_WRITE;
-+      else if (HipAccessFlags == hipMemAccessFlagsProtRead)
-+        UrAccessFlags = UR_VIRTUAL_MEM_ACCESS_FLAG_READ_ONLY;
-+      return ReturnValue(UrAccessFlags);
-+    }
-+    default:
-+      return UR_RESULT_ERROR_UNSUPPORTED_ENUMERATION;
-+    }
-+  } catch (ur_result_t Err) {
-+    return Err;
++    unsigned long long HipAccessFlags;
++    UR_CHECK_ERROR(hipMemGetAccess(&HipAccessFlags, &MemLocation,
++                                   const_cast<void *>(pStart)));
++
++    ur_virtual_mem_access_flags_t UrAccessFlags = 0;
++    if (HipAccessFlags == hipMemAccessFlagsProtReadWrite)
++      UrAccessFlags = UR_VIRTUAL_MEM_ACCESS_FLAG_READ_WRITE;
++    else if (HipAccessFlags == hipMemAccessFlagsProtRead)
++      UrAccessFlags = UR_VIRTUAL_MEM_ACCESS_FLAG_READ_ONLY;
++    return ReturnValue(UrAccessFlags);
 +  }
++  default:
++    return UR_RESULT_ERROR_UNSUPPORTED_ENUMERATION;
++  }
++  return UR_RESULT_SUCCESS;
  }

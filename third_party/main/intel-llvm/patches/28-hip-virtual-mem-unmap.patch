@@ -1,0 +1,107 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-virtual-mem-unmap: a fix to intel/llvm's virtual memory of the HIP adapter (hip-virtual-mem, intel/llvm's
+c13ad6c7e3 on v7.2.0), applied by tools/intel_llvm_build.py.
+
+On Linux, a range unmapped with hipMemUnmap and mapped again on other physical memory was still reached
+through its old translation by the GPU's engines that had reached it before: the copy engine wrote a copy
+into the range to the physical memory that had been given back, and a kernel read what was there before.
+On the RX 9060 XT (ROCm 7.1.1 and 10.1, Linux 7.2) a copy read back right and a kernel read other bytes, or
+both read the old physical memory: XeStrata's --vram-elastic (segments given back for an image job and
+mapped again), the elastic K/V (--kv-grow) and the draft head parked for a prompt wrote into memory they no
+longer held.
+
+ROCm unmaps virtual memory with the DRM driver's GEM_VA call.  For an address space of compute queues whose
+page tables amdgpu writes from the CPU (its default where all of the VRAM is visible to the CPU), that call
+clears the page table entries and flushes no TLB: amdgpu_vm_tlb_flush returns before it makes the flush, as
+the page table update left no fence (fixed in Linux by "drm/amdgpu: fix TLB invalidation fence handling",
+566ed98e48be, which flushes in the background; ROCm 7.1.1 does not wait for it).  The flush comes with the
+next mapping KFD itself makes on the device (its map and unmap calls flush when the page tables changed since
+their last flush).  Fixed, urVirtualMemUnmap has KFD make one: on each of the context's devices it allocates
+and frees device memory larger than the 2 MiB blocks ROCr serves smaller allocations from without a call
+(4 MiB, as ROCm's own replay tool does after hipMemUnmap); where a device has no memory for it, pinned host
+memory of that size, which KFD maps to every GPU.  It costs about 0.1 ms an unmap (2.5 ms with the host
+memory).
+---
+diff --git a/unified-runtime/source/adapters/hip/virtual_mem.cpp b/unified-runtime/source/adapters/hip/virtual_mem.cpp
+--- a/unified-runtime/source/adapters/hip/virtual_mem.cpp
++++ b/unified-runtime/source/adapters/hip/virtual_mem.cpp
+@@ -5,6 +5,9 @@
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
++// Modified 2026 by MistVVK and the XeStrata contributors: the GPU's
++// translations of an unmapped range dropped (dropStaleTranslations).
++//
+ //===----------------------------------------------------------------------===//
+ 
+ #include "common.hpp"
+@@ -14,6 +17,52 @@
+ 
+ #include <cassert>
+ 
++namespace {
++
++// Makes the GPUs' engines forget the translations of a range that was just
++// unmapped.
++//
++// On Linux, ROCm unmaps virtual memory with the DRM driver's GEM_VA call. For
++// an address space of compute queues whose page tables amdgpu writes from the
++// CPU (its default where all of the VRAM is visible to the CPU), that call
++// clears the page table entries and flushes no TLB (amdgpu_vm_tlb_flush returns
++// before it makes the flush, as the page table update left no fence; seen with
++// ROCm 7.1.1 and 10.1 on Linux 7.2). The copy engine and the kernels that
++// reached the range before go on reaching its old physical memory, also after
++// other physical memory is mapped there: a copy into the range lands in memory
++// that was given back, and a kernel reads what was there before. The flush
++// comes with the next mapping KFD itself makes on the device (its map and
++// unmap calls flush when the page tables changed since their last flush).
++// Linux's fix ("drm/amdgpu: fix TLB invalidation fence handling", 566ed98e48be)
++// flushes in the background, and a ROCm that does not wait for it (7.1.1) can
++// still be ahead of it.
++//
++// So KFD is made to map: a device allocation on each of the context's devices,
++// larger than the 2 MiB blocks ROCr serves smaller ones from without a call
++// (ROCm's own replay tool does the same after hipMemUnmap); where a device has
++// no memory for one, pinned host memory of that size, which KFD maps to every
++// GPU.
++void dropStaleTranslations([[maybe_unused]] ur_context_handle_t hContext) {
++#if defined(__linux__)
++  constexpr size_t Size = size_t{4} << 20;
++  void *Mem = nullptr;
++  bool Flushed = true;
++  for (auto &Device : hContext->getDevices()) {
++    ScopedDevice Active(Device);
++    if (hipMalloc(&Mem, Size) == hipSuccess)
++      UR_CHECK_ERROR(hipFree(Mem));
++    else
++      Flushed = false;
++  }
++  if (Flushed)
++    return;
++  UR_CHECK_ERROR(hipHostMalloc(&Mem, Size, hipHostMallocDefault));
++  UR_CHECK_ERROR(hipHostFree(Mem));
++#endif
++}
++
++} // namespace
++
+ UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemGranularityGetInfo(
+     ur_context_handle_t, ur_device_handle_t hDevice,
+     [[maybe_unused]] size_t allocationSize,
+@@ -100,8 +149,11 @@
+ UR_APIEXPORT ur_result_t UR_APICALL urVirtualMemUnmap(
+     ur_context_handle_t hContext, const void *pStart, size_t size) {
+   // Unmap the virtual mem. Only need to do once for arbitrary device
+-  ScopedDevice Active(hContext->getDevices()[0]);
+-  UR_CHECK_ERROR(hipMemUnmap(const_cast<void *>(pStart), size));
++  {
++    ScopedDevice Active(hContext->getDevices()[0]);
++    UR_CHECK_ERROR(hipMemUnmap(const_cast<void *>(pStart), size));
++  }
++  dropStaleTranslations(hContext);
+   return UR_RESULT_SUCCESS;
+ }
+ 

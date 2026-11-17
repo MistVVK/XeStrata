@@ -443,7 +443,8 @@ permission under GPL section 7, what goes in, and how to report).
      and the free mode for AMD GPUs), which CMake fetches from XeStrata's fork with XeStrata's
      changes ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), under the same license);
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm
-     modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);
+     modes' compiler, built with XeStrata's fixes and one commit of intel/llvm's own from after the release
+     (`third_party/main/intel-llvm/patches/`, under the same license);
      the packages carry its SYCL runtime;
    - [ROCm's device libraries](https://github.com/ROCm/llvm-project/tree/f30ae3e6b680ad23dcf522e668c6d4c5c90838d0/amd/device-libs), by AMD
      (University of Illinois/NCSA): built with intel/llvm, and linked into the code for AMD GPUs; the target features
@@ -491,7 +492,8 @@ comes from Strata and ggml / llama.cpp (MIT) and the components listed below.
   the LGPL (its header says `LGPL-3.0-or-later AND MIT`). The copyright and permission notices are in [NOTICE](NOTICE).
   So is what `tools/intel_llvm_build.py` transcribes from Debian's rocm-llvm package (Expat).
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
-   - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
+   - The patches to intel/llvm (XeStrata's fixes and a commit of intel/llvm's own from after the release;
+     `third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
    - XeStrata's changes to oneMath (its fork, `third_party/main/oneMath/`): Apache-2.0.
    - The patches to oneDNN, its pull requests backported (`third_party/main/oneDNN/`): Apache-2.0.
    - XeStrata's patch for building AOTriton for Windows (`third_party/main/aotriton/`): AOTriton's license (MIT).

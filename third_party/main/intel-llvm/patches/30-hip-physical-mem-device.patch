@@ -1,0 +1,36 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-physical-mem-device: a fix to intel/llvm's virtual memory of the HIP adapter (hip-virtual-mem, intel/llvm's
+c13ad6c7e3 on v7.2.0), applied by tools/intel_llvm_build.py.
+
+urPhysicalMemCreate called hipMemCreate without making its device current, where the adapter's other calls
+that depend on the current device do.  hipMemCreate takes the memory from the current device (ROCm 7.1.1 and
+10.1: hip::getCurrentDevice()'s context), whatever device its properties name, so on a PC with two AMD GPUs a
+thread whose current device was the other one would get that one's memory.  Fixed, the device is made
+current first.  Read in ROCm's source; not run on two AMD GPUs.
+---
+diff --git a/unified-runtime/source/adapters/hip/physical_mem.cpp b/unified-runtime/source/adapters/hip/physical_mem.cpp
+--- a/unified-runtime/source/adapters/hip/physical_mem.cpp
++++ b/unified-runtime/source/adapters/hip/physical_mem.cpp
+@@ -5,6 +5,9 @@
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
++// Modified 2026 by MistVVK and the XeStrata contributors: the device made
++// current in urPhysicalMemCreate.
++//
+ //===----------------------------------------------------------------------===//
+ 
+ #include "physical_mem.hpp"
+@@ -24,6 +27,9 @@
+   AllocProps.location.id = hDevice->getIndex();
+ 
+   hipMemGenericAllocationHandle_t ResHandle;
++  // hipMemCreate takes the memory from the current device, whatever device
++  // the properties name
++  ScopedDevice Active(hDevice);
+   switch (auto Result = hipMemCreate(&ResHandle, size, &AllocProps, 0)) {
+   case hipErrorInvalidValue:
+     return UR_RESULT_ERROR_INVALID_SIZE;

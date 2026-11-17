@@ -270,7 +270,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     }
     if (!returns_vram_) {
         err = "this GPU's runtime keeps the VRAM of an unmapped segment in the process (it does not reach another "
-              "program; ROCm 10.1 gives it back): the expert cache cannot give VRAM back";
+              "program): the expert cache cannot give VRAM back";
         return false;
     }
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes

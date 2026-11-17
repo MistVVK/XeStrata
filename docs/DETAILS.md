@@ -863,7 +863,7 @@ The experts of the pieces given back are computed on the CPU: the same answers, 
 A reserve that cannot be met (the cache at its smallest size, or no VRAM from the driver for the next segment) still answers `200`: compare the answer's `vram_free_mib` with your `reserve_mib` (upstream #1034).
 While a request runs or waits, it waits up to 300 s, then answers `409`.
 Where the GPU's runtime has no virtual memory it is off and the cache stays as it started (Intel's Level Zero and NVIDIA's CUDA have it; AMD's HIP has it with XeStrata's intel/llvm patch `hip-virtual-mem`).
-At start the engine gives its last piece back and checks that the GPU's free memory grows. A runtime where it does not (ROCm 7.1 and 7.2's HIP keep an unmapped piece's VRAM in the process; ROCm 10.1 gives it back) refuses to free VRAM, and `GET /v1/status`'s `"vram"` and INFO's `vram_elastic` say 0. The server then never picks `shrink` for an image job, and starts a GPU encoder before the model.
+At start the engine gives its last piece back and checks that the GPU's free memory grows. A runtime where it does not (one that keeps an unmapped piece's VRAM in the process: ROCm 7.1 and 7.2's HIP did, give it back with XeStrata's intel/llvm patch `hip-virtual-mem-release`, and ROCm 10.1 gave it back from the start) refuses to free VRAM, and `GET /v1/status`'s `"vram"` and INFO's `vram_elastic` say 0. The server then never picks `shrink` for an image job, and starts a GPU encoder before the model.
 
 ### Leaving RAM for other programs
 

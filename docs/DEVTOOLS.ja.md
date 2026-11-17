@@ -164,7 +164,8 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   shuffle を使う AMD 向けのプログラムはどれもリンクで止まっていました（「undefined symbol: __spirv_GroupNonUniformShuffleXor(int, float, unsigned int)」）。
   修正後は、AMD 向けの libspirv がスカラーの型について 4 つの GroupNonUniform の shuffle を SubgroupShuffle*INTEL で定義します（`hip-group-shuffle`）。
   18 番目: HIP のアダプタは仮想メモリの呼び出し（`urVirtualMem*`・`urPhysicalMem*`）に全部 UNSUPPORTED を返し、対応なしと報告していたので、AMD の GPU では SYCL の `ext_oneapi_virtual_mem` がなく、`--vram-elastic` と `--kv-grow` が 1 つの割り当てに戻っていました。
-  修正後は、CUDA のアダプタが CUDA の仮想メモリで実装するのと同じく HIP の仮想メモリ（`hipMemAddressReserve`・`hipMemCreate`・`hipMemMap` など）で実装し、対応の有無は HIP の `hipDeviceAttributeVirtualMemoryManagementSupported` のとおりに報告します（`hip-virtual-mem`）。
+  intel/llvm はリリースの後にこれを実装しました（コミット c13ad6c7e3「[UR][HIP] Implement virtual and physical memory management」、pull request 22671）: CUDA のアダプタが CUDA の仮想メモリで実装するのと同じく HIP の仮想メモリ（`hipMemAddressReserve`・`hipMemCreate`・`hipMemMap` など）で実装し、対応の有無は HIP の `hipDeviceAttributeVirtualMemoryManagementSupported` のとおりに報告します。
+  パッチはそのコミットの差分をそのまま v7.2.0 に当てます（`hip-virtual-mem`。XeStrata の変更はなく、intel/llvm をこのコミットを含む版に上げたら外します）。
   19 番目: グローバルな ID を使う SYCL のカーネルは `__spirv_BuiltInGlobalOffset` を呼び、GlobalOffset のパスがそれをコード生成の段で（`_with_offset` の複製の引数か 0 に）置き換えます。
   AMDGPU の属性推論はその前に走り、この呼び出しを中身の分からない関数と見なしたので、そうしたカーネルはどれも暗黙の引数を全部、hostcall のバッファーも含めて持っていました（XeStrata 0.2.2 の AMD 向けのカーネル 32,556 のうち 14,304。v7.1.1 では 48,084 のうち 0）。
   HIP は、PCIe の atomic 操作が通らない GPU（仮想マシンに渡した GPU、チップセットの先のスロットの GPU）では hostcall のバッファーを持つカーネルを起動しないので、最初のカーネルが `hipErrorIllegalState` で止まっていました（XeStrata の issue #40 と #54）。
@@ -172,6 +173,20 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   20 番目: RDC なし（`-fno-sycl-rdc`）のリンクでは、静的ライブラリのデバイスコードはライブラリの中のオブジェクトごとに `sycl-post-link` を通り、その出力はファイルの表のリストになります。
   SPIR-V の経路は表ごとにコードの列を取り出してリストと表をまとめますが、NVIDIA と AMD の経路はリストそのものからコードの列を取り出そうとしたので、NVIDIA か AMD の GPU 向けの SYCL のコードを持つ静的ライブラリを使うプログラムは、どれもリンクが「column not found Code」で止まっていました。
   修正後は、その経路も SPIR-V の経路と同じく取り出してまとめます（`offload-nordc-archive`）。
+  21 番目: Linux では、`hipMemUnmap` で外した範囲に別の物理メモリを付け直しても、その範囲に前に届いていた GPU のエンジンは古い変換のまま届いていました。
+  コピーのエンジンは範囲へのコピーを、返した後の物理メモリに書き、カーネルは前の中身を読みます（RX 9060 XT、ROCm 7.1.1、Linux 7.2 で、`--vram-elastic`・`--kv-grow`・prefill の間の下書き頭の退避が当たります）。
+  ROCm は仮想メモリを DRM ドライバーの GEM_VA の呼び出しで外しますが、amdgpu は、ページ表を CPU から書く compute のアドレス空間（VRAM の全部が CPU から見えるときの既定）ではページ表の項目を消すだけで、TLB を flush しません。
+  flush は、KFD 自身が次に行うマップのときに出ます。
+  修正後は、`urVirtualMemUnmap` が外した直後に、コンテキストの各デバイスで 4 MiB のデバイスメモリを確保して解放し、KFD にマップさせます（ROCr が KFD を呼ばずに小さな確保を切り出す 2 MiB のブロックより大きい大きさ。デバイスに空きがなければ、同じ大きさのピン留めのホストメモリ）。
+  1 回の unmap に約 0.1 ms です（`hip-virtual-mem-unmap`。`vmm_test` が確かめます）。
+  22 番目: 外した範囲に自分のマッピングを残す ROCr では、`hipMemUnmap` で外した範囲の物理メモリが `hipMemRelease` の後も確保されたままでした（デバイスの空きが増えず、他のプログラムにも、このプロセスの別の確保にも使えません。RX 9060 XT の ROCm 7.1.1 で確かめました）。
+  `--vram-elastic` は画像の仕事に VRAM を貸せず（エンジンが起動時に見て断ります）、prefill の間の下書き頭の退避も場所を空けませんでした。
+  ROCr は物理メモリを GPU にマップするとき、同じ範囲に CPU 側のアクセスできないマッピング（DRM デバイスのマッピング）も張ります。ROCm 7.1.1 の ROCr は unmap でそれを外さず、範囲を付け直すか解くまで物理メモリが残ります。ROCm 10.1 の ROCr は範囲を匿名のマッピングに戻します。
+  修正後は、`urVirtualMemUnmap` が最初の unmap の後に `/proc/self/maps` でその範囲を見て、DRM デバイスのマッピングが残っていれば、以後は外した範囲を予約のときと同じ匿名のアクセスできないマッピングに戻します。物理メモリは解放と同時に返ります（`hip-virtual-mem-release`）。
+  匿名に戻っていれば（行が見つからないときと、他のファイルのマッピングのときも）何もしません。ROCm の版でなく実際の振る舞いで選び、どちらだったかは `UR_LOG_HIP=level:info` で出ます。
+  23 番目: intel/llvm の `urPhysicalMemCreate`（18 番目のコミット）は、自分のデバイスを今のデバイスにしないまま `hipMemCreate` を呼びます。
+  `hipMemCreate` は、プロパティーがどのデバイスを指していても今のデバイスからメモリを取る（ROCm 7.1.1・10.1）ので、AMD の GPU が 2 枚ある PC では、今のデバイスがもう 1 枚のスレッドがそちらのメモリを取ります。
+  修正後は、先に自分のデバイスを今のデバイスにします（`hip-physical-mem-device`）。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正と `amdgpu-global-offset-hostcall` は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
   `offload-bundle-arch`・`l0-static-graph`・`offload-nordc-archive` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。

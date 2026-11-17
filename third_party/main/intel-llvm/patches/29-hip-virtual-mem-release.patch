@@ -1,0 +1,124 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-virtual-mem-release: a fix to intel/llvm's virtual memory of the HIP adapter (hip-virtual-mem, intel/llvm's
+c13ad6c7e3 on v7.2.0), applied by tools/intel_llvm_build.py.
+
+With a ROCr that leaves its own mapping at an unmapped range, the physical memory of a range unmapped with
+hipMemUnmap stayed allocated after hipMemRelease: the device's free memory did not grow, another program
+could not take it, and another allocation of this process took other memory (ROCm 7.1.1 on the RX 9060 XT:
+4 GiB mapped, unmapped and released left the driver's used VRAM at 4334 MiB of the 238 MiB before; ROCm 10.1
+went back to 238 MiB).  XeStrata's --vram-elastic could not lend its segments to an image job there (the
+engine sees it at start and refuses), and the draft head parked for a prompt made no room.
+
+ROCr maps the physical memory to the CPU at the range, inaccessible, when it maps it to the GPU, a mapping of
+the DRM device.  ROCm 7.1.1's ROCr does not take it away at the unmap, and it holds the memory until the
+range is mapped again or freed; ROCm 10.1's makes the range an anonymous mapping again.  Fixed,
+urVirtualMemUnmap looks, after the first unmap, at what /proc/self/maps shows at the range: where it is still
+the DRM device's, it makes every unmapped range the reservation it was, the anonymous inaccessible mapping
+ROCr reserves a range with, and the memory goes back when it is released; where it is anonymous (or the line
+is not found, or is of another file) it does nothing.  What the runtime does decides, not its version, and
+UR_LOG_HIP=level:info says which it was.
+---
+diff --git a/unified-runtime/source/adapters/hip/virtual_mem.cpp b/unified-runtime/source/adapters/hip/virtual_mem.cpp
+--- a/unified-runtime/source/adapters/hip/virtual_mem.cpp
++++ b/unified-runtime/source/adapters/hip/virtual_mem.cpp
+@@ -6,19 +6,80 @@
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
+ // Modified 2026 by MistVVK and the XeStrata contributors: the GPU's
+-// translations of an unmapped range dropped (dropStaleTranslations).
++// translations of an unmapped range dropped (dropStaleTranslations); an
++// unmapped range made a reservation again where the runtime leaves its mapping
++// there (leavesCpuMapping).
+ //
+ //===----------------------------------------------------------------------===//
+ 
+ #include "common.hpp"
+ #include "context.hpp"
+ #include "event.hpp"
++#include "logger/ur_logger.hpp"
+ #include "physical_mem.hpp"
+ 
+ #include <cassert>
+ 
++#if defined(__linux__)
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <sys/mman.h>
++#endif
++
+ namespace {
+ 
++#if defined(__linux__)
++// Whether hipMemUnmap leaves ROCr's mapping of the physical memory at the
++// range, by what the first unmapped range shows.
++//
++// ROCr maps the physical memory to the CPU at the range, inaccessible, when it
++// maps it to the GPU. A ROCr that does not take that mapping away at the unmap
++// (ROCm 7.1.1's; 10.1's does) keeps the physical memory allocated after
++// hipMemRelease, until the range is mapped again or freed: the device's free
++// memory does not grow, and another allocation takes other memory. The mapping
++// shows in /proc/self/maps as one of the DRM device (/dev/dri/...), where a
++// reservation is anonymous. It is looked up after the first unmap and kept, as
++// a runtime does one or the other. A range whose line is not found, or is of
++// another file, is left alone: what is there is not known to be ROCr's to
++// replace, and all that is lost is the memory's return.
++bool leavesCpuMapping(const void *pStart) {
++  static std::atomic<int> Leaves{-1};
++  int Known = Leaves.load(std::memory_order_relaxed);
++  if (Known >= 0)
++    return Known != 0;
++  Known = 0;
++  const char *What = "not found in /proc/self/maps: left as it is";
++  if (std::FILE *Maps = std::fopen("/proc/self/maps", "r")) {
++    const unsigned long Addr = reinterpret_cast<unsigned long>(pStart);
++    char Line[512];
++    while (std::fgets(Line, sizeof Line, Maps)) {
++      unsigned long Lo = 0, Hi = 0, Inode = 0;
++      int PathAt = 0;
++      if (std::sscanf(Line, "%lx-%lx %*4s %*x %*x:%*x %lu %n", &Lo, &Hi,
++                      &Inode, &PathAt) < 3 ||
++          Addr < Lo || Addr >= Hi)
++        continue;
++      if (Inode == 0) {
++        What = "anonymous: the runtime made it a reservation again";
++      } else if (PathAt > 0 &&
++                 std::strncmp(Line + PathAt, "/dev/dri/", 9) == 0) {
++        Known = 1;
++        What = "still mapped to the DRM device: unmapped ranges are made "
++               "reservations again";
++      } else {
++        What = "mapped to another file: left as it is";
++      }
++      break;
++    }
++    std::fclose(Maps);
++  }
++  UR_LOG(INFO, "A range unmapped with hipMemUnmap is {}", What);
++  Leaves.store(Known, std::memory_order_relaxed);
++  return Known != 0;
++}
++#endif
++
+ // Makes the GPUs' engines forget the translations of a range that was just
+ // unmapped.
+ //
+@@ -153,6 +214,15 @@
+     ScopedDevice Active(hContext->getDevices()[0]);
+     UR_CHECK_ERROR(hipMemUnmap(const_cast<void *>(pStart), size));
+   }
++#if defined(__linux__)
++  // the reservation the range was: the anonymous, inaccessible mapping ROCr
++  // reserves a range with
++  if (leavesCpuMapping(pStart) &&
++      mmap(const_cast<void *>(pStart), size, PROT_NONE,
++           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1,
++           0) == MAP_FAILED)
++    return UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
++#endif
+   dropStaleTranslations(hContext);
+   return UR_RESULT_SUCCESS;
+ }

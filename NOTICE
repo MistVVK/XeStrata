@@ -156,7 +156,8 @@ Every copyright holder whose work is in this repository, its license and where t
   (https://github.com/MistVVK/oneMath, branch xestrata), whose tag CMakeLists.txt fetches for the dense matrix products. oneMath
   itself is not in this repository - third_party/main/oneMath/LICENSE, LICENSES/Apache-2.0.txt
 - Copyright the LLVM project contributors; changes Copyright 2026 MistVVK and the XeStrata contributors
-  Apache-2.0 WITH LLVM-exception - XeStrata's fixes to intel/llvm (https://github.com/intel/llvm), in
+  Apache-2.0 WITH LLVM-exception - XeStrata's fixes to intel/llvm (https://github.com/intel/llvm), and intel/llvm's
+  own commit c13ad6c7e3 (pull request 22671, the HIP adapter's virtual memory) backported to the release, in
   third_party/main/intel-llvm/patches/, which tools/intel_llvm_build.py applies to the release it builds. intel/llvm
   itself is not in this repository - third_party/main/intel-llvm/LICENSE.TXT, LICENSES/Apache-2.0.txt,
   LICENSES/LLVM-exception.txt
