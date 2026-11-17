@@ -33,5 +33,9 @@
  "guic32": "Bild nicht hinzugefügt",
  "guic33": "Strata ist mit diesem Chat noch beschäftigt. Fügen Sie das Bild erneut hinzu, wenn er fertig ist.",
  "guic34": "Neuer Chat in {0}",
- "guic35": "Verbleibender Platz bis zur Zusammenfassung älterer Nachrichten"
+ "guic35": "Verbleibender Platz bis zur Zusammenfassung älterer Nachrichten",
+ "guic36": "Antwortbreite",
+ "guic37": "Wie breit der Text einer Antwort sein darf. Tabellen und Code nutzen immer die volle Breite.",
+ "guic38": "Breit",
+ "guic39": "Volle Breite"
 }

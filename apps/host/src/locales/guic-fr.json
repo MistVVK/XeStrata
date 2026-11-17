@@ -33,5 +33,9 @@
  "guic32": "Image non ajoutée",
  "guic33": "Strata est encore occupé avec cette conversation. Ajoutez de nouveau l’image quand elle sera terminée.",
  "guic34": "Nouvelle conversation dans {0}",
- "guic35": "Espace restant avant le résumé des anciens messages"
+ "guic35": "Espace restant avant le résumé des anciens messages",
+ "guic36": "Largeur des réponses",
+ "guic37": "Largeur maximale du texte d’une réponse. Les tableaux et le code utilisent toujours toute la largeur.",
+ "guic38": "Large",
+ "guic39": "Pleine largeur"
 }

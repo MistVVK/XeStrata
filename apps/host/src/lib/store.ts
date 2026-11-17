@@ -3,6 +3,7 @@ import { shortTitle } from './title-text';
 import { DEFAULT_CONTENT_FS, DEFAULT_UI_SCALE, SIZE_DEFAULTS_VERSION, savedSizes } from './default-sizes';
 import { detectLanguage } from './language-detect';
 import { validWhileBusy, type WhileBusy } from './while-busy';
+import { validReplyWidth, type ReplyWidth } from './reply-width';
 import { addToQuotes, takeQuoteSources, type Quote } from './quotes';
 import { readAsk, type AgentAnswer, type AgentAsk } from './agent-ask';
 import { chatFailure, plainFailureText } from './plain-errors';
@@ -91,6 +92,8 @@ export interface AppState {
   /** Conversation prose size in px, 10–22. Does not touch the UI chrome. */
   contentFontSize: number;
   density: 'comfortable' | 'compact';
+  /** How wide the text of an answer may run (#5066). */
+  replyWidth: ReplyWidth;
   motion: 'system' | 'full' | 'reduced';
   /** Translucent materials, or flat surfaces for anyone who prefers them. */
   transparency: 'translucent' | 'opaque';
@@ -183,6 +186,8 @@ export interface Prefs {
   focus: boolean;
   contentFontSize: number;
   density: 'comfortable' | 'compact';
+  /** How wide the text of an answer may run (#5066). */
+  replyWidth: ReplyWidth;
   motion: 'system' | 'full' | 'reduced';
   transparency: 'translucent' | 'opaque';
   uiScale: number;
@@ -237,6 +242,7 @@ const PREFS_DEFAULTS: Prefs = {
   focus: false,
   contentFontSize: DEFAULT_CONTENT_FS,
   density: 'comfortable',
+  replyWidth: 'comfortable',
   motion: 'system',
   transparency: 'translucent',
   uiScale: DEFAULT_UI_SCALE,
@@ -314,6 +320,7 @@ function loadPrefs(): Prefs {
         approvalNotify: parsed.approvalNotify === true,
         numberQuotes: parsed.numberQuotes === true,
         whileBusy: validWhileBusy(parsed.whileBusy) ? parsed.whileBusy : 'wait',
+        replyWidth: validReplyWidth(parsed.replyWidth),
         chatDefaults: validChatDefaults(parsed.chatDefaults),
       };
     } catch {
@@ -346,6 +353,7 @@ let state: AppState = {
   focus: prefs.focus,
   contentFontSize: prefs.contentFontSize,
   density: prefs.density,
+  replyWidth: prefs.replyWidth,
   motion: prefs.motion,
   transparency: prefs.transparency,
   uiScale: prefs.uiScale,
@@ -553,6 +561,7 @@ function applyPrefs() {
   document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute('content', root.dataset.theme === 'dark' ? '#0e1113' : '#f9fafb');
   root.dataset.contrast = state.contrast;
   root.dataset.density = state.density;
+  root.dataset.measure = state.replyWidth;
   root.style.setProperty('--st-content-fs', `${state.contentFontSize}px`);
   // The interface size (#3970): the whole page is scaled, so every text, button, menu and dialog follows, not only the parts that were
   // written with the scale token. The token stays at 1 so nothing is scaled twice. The reading size stays separate: someone who needs
@@ -584,6 +593,7 @@ function savePrefs() {
     focus: state.focus,
     contentFontSize: state.contentFontSize,
     density: state.density,
+    replyWidth: state.replyWidth,
     motion: state.motion,
     transparency: state.transparency,
     uiScale: state.uiScale,
@@ -662,6 +672,7 @@ export function resetAppearance() {
     contrast: PREFS_DEFAULTS.contrast,
     contentFontSize: PREFS_DEFAULTS.contentFontSize,
     density: PREFS_DEFAULTS.density,
+    replyWidth: PREFS_DEFAULTS.replyWidth,
     motion: PREFS_DEFAULTS.motion,
     transparency: PREFS_DEFAULTS.transparency,
     uiScale: PREFS_DEFAULTS.uiScale,
@@ -690,6 +701,11 @@ export function setContentFontSize(px: number) {
 
 export function setDensity(density: 'comfortable' | 'compact') {
   set({ density });
+  savePrefs();
+}
+
+export function setReplyWidth(replyWidth: ReplyWidth) {
+  set({ replyWidth: validReplyWidth(replyWidth) });
   savePrefs();
 }
 

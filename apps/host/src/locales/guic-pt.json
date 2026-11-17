@@ -33,5 +33,9 @@
  "guic32": "Imagem não adicionada",
  "guic33": "O Strata ainda está ocupado com este chat. Adicione a imagem novamente quando ele terminar.",
  "guic34": "Novo chat em {0}",
- "guic35": "Espaço restante antes de resumir mensagens antigas"
+ "guic35": "Espaço restante antes de resumir mensagens antigas",
+ "guic36": "Largura da resposta",
+ "guic37": "Qual a largura máxima do texto de uma resposta. Tabelas e código sempre usam toda a largura.",
+ "guic38": "Largo",
+ "guic39": "Largura total"
 }

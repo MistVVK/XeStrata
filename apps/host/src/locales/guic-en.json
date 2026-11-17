@@ -33,5 +33,9 @@
  "guic32": "Picture not added",
  "guic33": "Strata is still busy with this chat. Add the picture again when it is done.",
  "guic34": "New chat in {0}",
- "guic35": "Room left before older messages are summarized"
+ "guic35": "Room left before older messages are summarized",
+ "guic36": "Reply width",
+ "guic37": "How wide the text of an answer can be. Tables and code always use the whole width.",
+ "guic38": "Wide",
+ "guic39": "Full width"
 }

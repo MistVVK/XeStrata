@@ -33,5 +33,9 @@
  "guic32": "Imagen no añadida",
  "guic33": "Strata sigue ocupado con este chat. Vuelve a añadir la imagen cuando termine.",
  "guic34": "Nuevo chat en {0}",
- "guic35": "Espacio restante antes de resumir los mensajes anteriores"
+ "guic35": "Espacio restante antes de resumir los mensajes anteriores",
+ "guic36": "Ancho de las respuestas",
+ "guic37": "Qué tan ancho puede ser el texto de una respuesta. Las tablas y el código siempre usan todo el ancho.",
+ "guic38": "Ancho",
+ "guic39": "Ancho completo"
 }

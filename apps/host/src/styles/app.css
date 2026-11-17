@@ -7678,3 +7678,8 @@ button.sent-quote__label { text-decoration: underline; text-underline-offset: 2p
 .subagent-log__step { color: var(--st-ink-soft); }
 .subagent-log__step strong { color: var(--st-ink); font-weight: 600; }
 .subagent-log__said { padding: 6px 10px; border-radius: var(--st-r-md); background: var(--st-surface-2); color: var(--st-ink); }
+
+/* Reply width (#5066, Settings > Reading & focus): the one token that caps the text of an answer, and the column Focus reading builds from it. Comfortable
+   (the default) is the 56ch above and needs no rule. */
+:root[data-measure='wide'] { --st-measure: 72ch; }
+:root[data-measure='full'] { --st-measure: 400ch; }
