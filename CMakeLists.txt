@@ -6,8 +6,8 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
   message(FATAL_ERROR "XeStrata builds for Linux and Windows")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.2.8")
-set(STRATA_UPSTREAM_COMMIT "870aedd")
+set(STRATA_UPSTREAM_VERSION "0.2.13.1")
+set(STRATA_UPSTREAM_COMMIT "628f749")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
 # XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does, and the
 # version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
@@ -592,7 +592,8 @@ if(STRATA_ENABLE_XE)
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
                                    src/core/latent.cpp
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
-                                   src/core/mtp.cpp src/core/dflash2.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
+                                   src/core/mtp.cpp src/core/dflash2.cpp src/core/conversation_snapshot.cpp
+                                   src/core/conversation_state.cpp
                                    src/core/draft_ring_log.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/control_vector.cpp
@@ -952,7 +953,8 @@ if(STRATA_ENABLE_XE)
                            src/image/hunyuanimage3_vision.cpp
                            src/image/qi_sdpa_ex.cpp src/image/aux_kernels.cpp src/image/image_depthwise.cpp
                            src/image/aux_attn.cpp src/image/aux_net.cpp
-                           src/image/sam3.cpp src/image/sam3_track.cpp src/image/sam3_video.cpp src/image/birefnet.cpp src/image/florence2.cpp)
+                           src/image/sam3.cpp src/image/sam3_track.cpp src/image/sam3_video.cpp
+                           src/image/birefnet.cpp src/image/florence2.cpp)
   target_include_directories(strata_image PUBLIC include)
   # The image attention's vendors' kernels (src/kernels/xe/image_sdpa.cpp), the engine's own kernel where none
   # takes it.
