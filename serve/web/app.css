@@ -73,6 +73,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-composer { max-width: min(100%, 1100px); margin: 0 auto; }
 .st-composer textarea { max-height: 40vh; }
 .st-btn--send { width: 42px; padding: 0; }
+[dir="rtl"] .st-btn--send .st-icon { transform: scaleX(-1); }   /* #6060: the send arrow points the way the text runs */
 .composer-hint { font-size: var(--st-fs-xs); color: var(--st-ink-muted); margin-right: var(--st-s-2); font-variant-numeric: tabular-nums; }
 .attachments { display: flex; flex-wrap: wrap; gap: var(--st-s-2); padding: 2px 4px 0; }
 .st-composer.dragging { outline: 2px dashed var(--st-accent); outline-offset: 3px; }

@@ -12,7 +12,7 @@ const compiled = await build({
   bundle: true, write: false, platform: 'node', format: 'esm',
 });
 const lib = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString('base64')}`);
-for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) await lib.loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
+for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) await lib.loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
 
 const job = (progress, state = 'running') => ({ id: 'j1', kind: 'install', state, startedAt: '', summary: '', error: null, result: { install: progress } });
 const stateWith = (jobs, extra = {}) => ({ available: true, repo: '', summary: '', error: null, catalog: null, installed: null, hardware: null, instances: [], jobs, ...extra });
@@ -116,7 +116,7 @@ test('the three NVFP4 versions have clear names and one line that tells them apa
   assert.match(lines[2], /faster on short prompts/);
   assert.equal(lib.versionNote('IQ3_S'), '');
   assert.equal(lib.nativeShortName('nvfp4-nvfp4-nvidia'), 'NVFP4 (NVIDIA’s version)');
-  for (const language of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const language of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     lib.setTranslationLanguage(language);
     const local = ['NVFP4', 'NVFP4-NVIDIA', 'NVFP4-QAD'].map(m => lib.nativeVersionLabel(m));
     assert.equal(new Set(local).size, 3, `${language}: three different names`);

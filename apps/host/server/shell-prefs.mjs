@@ -12,7 +12,7 @@ import { dirname, join } from 'node:path';
 import { componentsDirectory } from './control-runtime.mjs';
 
 export const DEFAULT_PORT = 47831;
-export const LANGUAGES = ['en', 'zh', 'ja', 'de', 'fr', 'es', 'ru', 'pt', 'ko'];
+export const LANGUAGES = ['en', 'zh', 'ja', 'de', 'fr', 'es', 'ru', 'pt', 'ko', 'he'];
 export const DEFAULTS = Object.freeze({ port: 0, tray: false, language: 'en' });
 
 export const validPort = value => Number.isInteger(value) && value >= 1024 && value <= 65535;

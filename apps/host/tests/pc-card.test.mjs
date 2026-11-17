@@ -64,7 +64,7 @@ test('the numbers come from the host\'s readings, polled while the page is open 
 
 test('the new words are in all nine languages', () => {
   const en = JSON.parse(readFileSync(fileURLToPath(new URL('../src/locales/pick-en.json', import.meta.url)), 'utf8'));
-  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     const cat = JSON.parse(readFileSync(fileURLToPath(new URL(`../src/locales/pick-${lang}.json`, import.meta.url)), 'utf8'));
     for (const id of Object.keys(en)) {
       assert.ok(cat[id], `${lang} ${id}`);

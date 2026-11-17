@@ -147,7 +147,7 @@ test('the engine in use has no Delete button; every other row has Use this (when
 });
 
 test('the engine catalogs: same keys and placeholders in nine languages, none still English, none in another catalog, and every sentence of the host is in them', () => {
-  const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+  const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
   const en = json('engine-en');
   const slots = text => [...text.matchAll(/\{\d+\}/g)].map(m => m[0]).sort();
   const others = new Set();

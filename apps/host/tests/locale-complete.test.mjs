@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const APP = join(here, '..', 'src', 'locales');
 const WEB = join(here, '..', '..', '..', 'serve', 'web', 'locales');
-const LANGS = ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+const LANGS = ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
 const load = file => JSON.parse(readFileSync(file, 'utf8'));
 
 /** family -> { lang -> parsed catalog }: app:main (en.json ...), app:<fam> (<fam>-en.json ...), web (serve/web/locales). */
@@ -64,7 +64,7 @@ test('the helpers', () => {
   assert.deepEqual([...integerCategories('fr').get('one')], [0, 1]);
 });
 
-test('every catalog family has all nine languages with exactly the keys of its English catalog', () => {
+test('every catalog family has every language with exactly the keys of its English catalog', () => {
   const fams = catalogs();
   assert.ok(fams.size >= 10, `catalog families found (${fams.size})`);
   const wrong = [];

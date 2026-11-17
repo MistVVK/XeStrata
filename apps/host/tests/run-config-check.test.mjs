@@ -117,10 +117,10 @@ test('the text editor: Notepad on Windows, text mode on a Mac, the system text-f
 });
 
 test('every issue sentence exists in all nine languages and keeps its slots', async () => {
-  const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
+  const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he'];
   const compiled = await build({ stdin: { contents: "export * from './src/lib/run-config-issues'; export * from './src/lib/i18n';", resolveDir: process.cwd() }, bundle: true, write: false, platform: 'node', format: 'esm' });
   const { issueText, setTranslationLanguage, loadCatalog } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString('base64')}`);
-  for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) await loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
+  for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) await loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
   const samples = [
     { code: 'json', line: 3, params: { line: 3 } }, { code: 'json', line: null, params: { line: 0 } }, { code: 'not-object', params: {} },
     { code: 'unknown-key-near', params: { key: 'paralel', near: 'parallel' } }, { code: 'unknown-key', params: { key: 'zzz' } },

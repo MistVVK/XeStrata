@@ -7,7 +7,7 @@ import { createTaskService } from '../server/tasks.mjs';
 
 const compiled = await build({ stdin: { contents: "export * from './src/lib/task-handover'; export * from './src/lib/i18n';", resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'node', loader: { '.json': 'json' } });
 const { splitTaskOutput, taskHandoverMessage, taskHandoverTitle, setTranslationLanguage, loadCatalog } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString('base64')}`);
-for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) await loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
+for (const l of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) await loadCatalog(l);  // the non-English catalogs load on first use (src/lib/i18n.ts loadCatalog); load them before the first tr()
 
 const OUTPUT = 'Two things need your attention.\n\n- Disk space is low.\n- The card ran hot twice.\n\n---\n\n**What it did**\n\n- Read the temperature log\n- Checked free space on C: and D:\n\n> This task wanted to change something and needed a yes. Nothing was changed.';
 const task = { id: 't', title: 'Hardware check', prompt: 'Check it', frequency: 'daily', at: '08:00', weekday: 1, timeZone: 'UTC', enabled: true, lastRunAt: '2026-10-18T06:00:00.000Z', output: OUTPUT,

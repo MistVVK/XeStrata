@@ -28,7 +28,7 @@ import dmg_en from '../locales/dmg-en.json';
 /* The 0.2.16 new-UI features of lane GUI-C: moving a chat to another workspace, ... (guic-<lang>.json, scripts/make-guic-locales.py). */
 import guic_en from '../locales/guic-en.json';
 
-export const LANGUAGES=[{value:'en',label:'English'},{value:'zh',label:'中文（简体）'},{value:'ja',label:'日本語'},{value:'de',label:'Deutsch'},{value:'fr',label:'Français'},{value:'es',label:'Español'},{value:'ru',label:'Русский'},{value:'pt',label:'Português'},{value:'ko',label:'한국어'}] as const;
+export const LANGUAGES=[{value:'en',label:'English'},{value:'zh',label:'中文（简体）'},{value:'ja',label:'日本語'},{value:'de',label:'Deutsch'},{value:'fr',label:'Français'},{value:'es',label:'Español'},{value:'ru',label:'Русский'},{value:'pt',label:'Português'},{value:'ko',label:'한국어'},{value:'he',label:'עברית'}] as const;
 export type Language=typeof LANGUAGES[number]['value'];
 /* The Tune model dialog's strings live in tune-<lang>.json (apps/host/scripts/make-tune-locales.py) so other interface work does not collide with them. */
 /* The tool-server, picture and agent-result strings of the tools and images fixes live in tools-<lang>.json for the same reason. */
@@ -37,7 +37,7 @@ const english:Record<string,string>={...baseEnglish,...tune_en,...tools_en,...fi
 /* English is the key of every string, so it stays in the main file. The other eight languages are one file each, fetched the first time a language is used
    (the saved language before the first screen is drawn, a language picked later when it is picked): most people read one of the nine. */
 type Catalog=Record<string,string>;
-const loaders:Record<Exclude<Language,'en'>,()=>Promise<{default:Catalog}>>={zh:()=>import('./catalog-zh'),ja:()=>import('./catalog-ja'),de:()=>import('./catalog-de'),fr:()=>import('./catalog-fr'),es:()=>import('./catalog-es'),ru:()=>import('./catalog-ru'),pt:()=>import('./catalog-pt'),ko:()=>import('./catalog-ko')};
+const loaders:Record<Exclude<Language,'en'>,()=>Promise<{default:Catalog}>>={zh:()=>import('./catalog-zh'),ja:()=>import('./catalog-ja'),de:()=>import('./catalog-de'),fr:()=>import('./catalog-fr'),es:()=>import('./catalog-es'),ru:()=>import('./catalog-ru'),pt:()=>import('./catalog-pt'),ko:()=>import('./catalog-ko'),he:()=>import('./catalog-he')};
 const catalogs:Partial<Record<Language,Catalog>>={en:english};
 const loading=new Map<Language,Promise<void>>();
 export const catalogLoaded=(value:Language)=>!!catalogs[value];

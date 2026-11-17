@@ -47,7 +47,7 @@ test('the Use dialog (owner 11-09): a shape group says "{model} runs on engine {
   assert.ok(key, 'in the English catalog');
   const title = engineGroupTitle({ family: 'shape:q4_lite', shape: 'q4_lite', title: null, engines: [] }, [{ family: 'qwen4exp_q4_lite', title: 'Qwen4' }]);
   assert.equal(en[key].replace('{0}', title).replace('{1}', '0.1.60'), 'Qwen4 runs on engine 0.1.60 from its next start. Your models and settings stay as they are. You can switch back at any time.');
-  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
+  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr', 'he']) {
     const t = JSON.parse(read(new URL(`../src/locales/engine-${lang}.json`, import.meta.url), 'utf8'))[key];
     assert.ok(t && t.includes('{0}') && t.includes('{1}'), lang);
     // only the first sentence is new: the reassurance is the existing translation of the Strata engine's sentence, word for word
