@@ -25,7 +25,7 @@ fi
 
 # #4634: every Mach-O in the app (the app itself, its Python, Node and the engine in engine-bundle) must start on the app's
 # minimum macOS. The 0.2.14 / 0.2.15 dmgs carried an engine that needed macOS 27.2 (no deployment target was set).
-python3 "$DESKTOP/../../packaging/binary_deps.py" --mac-min-os "$APP"
+python3 "$DESKTOP/../../tools/packaging/binary_deps.py" --mac-min-os "$APP"
 
 WORK="$(mktemp -d -t strata-dmg)"
 trap 'rm -rf "$WORK"' EXIT
