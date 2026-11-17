@@ -3498,6 +3498,15 @@ $("img-lora-add").onchange = () => {
   }
   imgLoraDraw(list);
 };
+// MOSS-Image's 4-step LoRA needs more steps for larger images (the server chooses the same defaults).
+function imgDefaultSteps(d) {
+  if (!d.moss_turbo) return d.steps || 1;
+  let [w, h] = $("img-size").value === "custom" ? [+$("img-w").value, +$("img-h").value]
+    : ($("img-size").value === "auto" ? "1024x1024" : $("img-size").value).split("x").map(Number);
+  w = Math.ceil((w || 1024) / 16) * 16;
+  h = Math.ceil((h || 1024) / 16) * 16;
+  return w * h <= 1024 ** 2 ? 4 : w * h <= 1536 ** 2 ? 6 : 8;
+}
 // the count: up to max_n, and as many as take budget_s at the speed the server measured (its rates; before it has
 // made an image, 4), with the time the images chosen take (the server refuses more, ImageGen.check_n)
 function imgEstimate(n) {
@@ -3513,7 +3522,7 @@ function imgEstimate(n) {
     const r = h / w;
     [w, h] = d.buckets.reduce((a, b) => Math.abs(b[1] / b[0] - r) < Math.abs(a[1] / a[0] - r) ? b : a);
   }
-  let steps = d.steps_fixed ? d.steps : (+$("img-steps").value || (edit ? d.edit_steps : d.steps) || 1);
+  let steps = d.steps_fixed ? d.steps : (+$("img-steps").value || (edit ? d.edit_steps : imgDefaultSteps(d)) || 1);
   if (refs) {   // a strength runs part of the schedule (the server's strength_run)
     const s = $("img-strength").value !== "" ? Number($("img-strength").value) : imgStrength(d, steps);
     if (s > 0 && s < 1) steps -= Math.floor(Math.max(steps - steps * s, 0));
@@ -3624,12 +3633,13 @@ function imgStrength(d, steps) {
 }
 function imgStrengthHint() {
   const d = imgModel().defaults || {};
-  const steps = d.steps_fixed ? d.steps : (+$("img-steps").value || d.steps || 1);
+  const steps = d.steps_fixed ? d.steps : (+$("img-steps").value || imgDefaultSteps(d));
   $("img-strength").placeholder = String(+imgStrength(d, steps).toFixed(2));
 }
 function imgCount() {
   imgStrengthHint();
   const d = imgModel().defaults || {}, n = $("img-n"), was = +n.value || 1;
+  if (d.moss_turbo) $("img-steps").placeholder = String(imgDefaultSteps(d));
   const maxN = d.max_n || 16, budget = d.budget_s || 600, one = imgEstimate(1);
   const most = one == null ? Math.min(maxN, 4) : Math.max(1, Math.min(maxN, Math.floor(budget / one)));
   if (n.options.length !== most)

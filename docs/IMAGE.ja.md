@@ -29,7 +29,7 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
 | `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent の大きな MoE のモデル（80B）。いちばん細かく描け、いちばん遅い。プロンプトを自分で読むので文の読み手が要らず、ディスクと RAM をいちばん多く使う（約 52 GB）。編集は参照画像 3 枚まで（透明な背景はない） |
 | `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50（CFG） | OpenMOSS の 5B のモデル。画像の中の文字と、枠で決めた配置（`layout`）に向く。プロンプトの書き広げ（`enhance`）も使える。編集は chinoll の編集の LoRA（Moss-Image-Edit）で、参照画像 4 枚まで（img2img とマスクも使える） |
 | `moss-image-base` | [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | 50（CFG） | 調整の前の元のモデル |
-| `moss-image-4-step` | MOSS-Image と darask0 の [4 ステップのアダプター](https://huggingface.co/darask0/MOSS-Image_4-step_adapter_lora) | 4 | MOSS-Image を 4 ステップ（CFG なし）で描く。通常の MOSS-Image の約 10 倍速い。編集はない。描き込みと多様さは 50 ステップに少し届かない |
+| `moss-image-4-step` | SFT と akhaliq の [4 ステップ LoRA](https://huggingface.co/akhaliq/MOSS-Image-SFT-4-steps) | 4〜8 | 通常の Euler で描く。1024² 以下は 4、より大きい画像は 6 または 8 ステップ。CFG と negative prompt は使わない。編集はない |
 | `moss-image-uncensored`、`moss-image-base-uncensored`、`moss-image-4-step-uncensored` | 上の 3 つ | 上と同じ | 文の読み手を HauhauCS の拒否を外した Qwen3.5-9B にした組み合わせ |
 | `anima-base` | [Anima](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | CircleStone Labs の 2B のモデル。Danbooru のタグと文で描くアニメ調のイラスト向け。編集はできない（img2img とマスクは使える） |
 | `anima-aesthetic` | [Anima-Aesthetic](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | 決まった整った画風に調整した版 |
@@ -295,7 +295,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 - `resolution` は図を作るときの画像の短い辺です（既定 512、64〜2048）。
 - 大きさを付けない生成では、`control.image` の形で約 1024x1024 にします。図は描く大きさに合わせて引き伸ばします。
 - Qwen-Image-2.1: alibaba-pai の Fun ControlNet Union で描きます。`strength`（既定 1、0〜2）、効かせる範囲の `start`・`end`（ステップの割合。既定 0 と 1。`end` を 0.6〜0.8 にすると構図を保ったまま細部が自由になる）、マスクのある編集では塗った部分も ControlNet に渡します（`inpaint: false` で渡さない）。
-- MOSS-Image の `color` と `depth`（`moss-image-4-step` でも使える。4 ステップでは `end` を短め（0.3）にし、マネキンの質感が残るなら通常のステップ数の MOSS-Image で）: darask0 の色と深度のアダプター（MOSS-Image の入力の層を広げ、LoRA を足したもの）で描きます。`control` を 2 つの配列にすると色と深度を両方使えます。`strength` はアダプターの LoRA の強さ（既定 1）、`end` はその図を使うステップの割合（既定 1。3D のマネキンなどから作った図は 0.5 がよい）です。`start` は学習されていないので受けません。人や物の位置と大きさを決めたいときに使い、プロンプトには物ごとの説明を書きます。
+- MOSS-Image の `color` と `depth`: darask0 の色と深度のアダプター（MOSS-Image の入力の層を広げ、LoRA を足したもの）で描きます。`control` を 2 つの配列にすると色と深度を両方使えます。`strength` はアダプターの LoRA の強さ（既定 1）、`end` はその図を使うステップの割合（既定 1。3D のマネキンなどから作った図は 0.5 がよい）です。`start` は学習されていないので受けません。人や物の位置と大きさを決めたいときに使い、プロンプトには物ごとの説明を書きます。
 - ControlNet のないモデル（Mage-Flow の編集、HunyuanImage 3.0、編集のある MOSS-Image のほかの種類）: 図を参照の画像の 1 枚として渡し、プロンプトの最後に「その図の姿勢に沿う」などの頼みを足します。姿勢はよく効きますが、輪郭と深度では元の画像の人物まで写すことがあります。`strength`・`start`・`end` は受けません。
 - 編集のないモデル（MageTrail、Anima、編集のない MOSS-Image の色と深度以外）は `control` を受けません。
 - 重み（Fun ControlNet Union、前処理の網、MOSS-Image のアダプター）は、初めて使うときにサーバーが取ります（取っている間は 503 で、進み具合を返します）。
@@ -667,7 +667,8 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
   使い方の許諾の範囲（Acceptable Use Policy）も含めて、使う前に [Tencent のライセンス](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE) を読んでください。
   量子化したファイルは PedroMarinhoDev が単一ファイルとして公開しているものです。
 - MOSS-Image（SFT と Base）の重みは Apache 2.0 で、OpenMOSS（MOSI. AI）が公開しています。VAE は MOSS-Image のリポジトリにあるものです。
-  `moss-image-4-step` の 4 ステップのアダプター（LoRA、時刻の経路、サンプラーの表）は darask0 の [MOSS-Image_4-step_adapter_lora](https://huggingface.co/darask0/MOSS-Image_4-step_adapter_lora) で、Apache 2.0 です。
+  4 ステップの LoRA は akhaliq の [MOSS-Image-SFT-4-steps](https://huggingface.co/akhaliq/MOSS-Image-SFT-4-steps) で、Apache 2.0 です。強さ 1 で焼き込まずに当てます。ステップ数の指定は 4〜8 です。
+  以前の 4 ステップ設定も、新しい LoRA があれば自動で読み替えます。新しいファイルがなければ setup で `moss-image-4-step` を選び直してください。古い 3 ファイルは自動では消しません。
   編集の LoRA は 3 つで、setup はすべてを取ります。既定は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit)（PedroMarinhoDev が単一ファイルに直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)、GPL-3.0）、ほかの 2 つは akhaliq の [MOSS-Image-Edit-HQ](https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ) の armV5 と armV6（Apache 2.0）です。この 2 つのために、Unsloth の Qwen3.5-9B の画像の読み手（mmproj、Apache 2.0）も取ります。
 - Anima（Base、Aesthetic、Turbo）の重みは CircleStone Labs の非商用のライセンスと、土台の Cosmos-Predict2 の NVIDIA Open Model License です。モデルを商用に使うことはできません（作った画像は使えます）。使う前に [Anima のページ](https://huggingface.co/circlestone-labs/Anima) を読んでください。
   Anima-2.9B（Gazingstars123）と派生モデルには、それぞれの公開元のライセンスが適用されます。

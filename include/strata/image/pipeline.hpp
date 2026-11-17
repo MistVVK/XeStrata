@@ -119,10 +119,6 @@ struct QiRequest {
     std::string mctl;
     QiRef mctl_color, mctl_depth;
     float mctl_color_end = 1.0f, mctl_depth_end = 1.0f;
-    // MOSS-Image's few-step adapter (darask0's 4-step DMAD; strata_image's TIMEPATH: and DATASPACE: words): its time
-    // path's file (moss_dit.hpp's set_time_path; its LoRA the request's LORA: applies, not baked) and its data-space
-    // file (latent_mix.Q and step_codes: the sampler's), the steps then at most its codes.
-    std::string time_path, dataspace;
     // the adapters the DiT's products add (image_lora.hpp), each file read once with the strength its delta is scaled
     // by, applied in this order: a set that changes starts the context again (the prefix's K and V were the other
     // set's).  A model that applies none refuses the request rather than make another image.

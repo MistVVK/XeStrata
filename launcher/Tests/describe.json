@@ -2375,11 +2375,11 @@
   {
    "id": "moss-image-4-step",
    "title": "MOSS-Image 4-step",
-   "about": "MOSS-Image with darask0's 4-step adapter: about ten times as fast, 4 steps without guidance; no edits",
-   "download_gb": 21.2,
-   "ram_gb": 13.9,
+   "about": "MOSS-Image SFT with akhaliq's 4-step LoRA, without guidance; no edits",
+   "download_gb": 21.1,
+   "ram_gb": 23.1,
    "edits": false,
-   "license": "MOSS-Image 4-step is MOSS-Image (SFT), under the Apache 2.0 license: https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT, with darask0's 4-step adapter, under Apache 2.0 too: https://huggingface.co/darask0/MOSS-Image_4-step_adapter_lora; its text encoder, Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well)",
+   "license": "MOSS-Image 4-step is under the Apache 2.0 license: https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT, with akhaliq's 4-step LoRA, under Apache 2.0 too: https://huggingface.co/akhaliq/MOSS-Image-SFT-4-steps; its text encoder, Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well)",
    "tools": [
     "generate_image",
     "edit_image",
@@ -2395,33 +2395,33 @@
    ],
    "uncensored": true,
    "quants": [
-    "int8",
-    "bf16"
+    "bf16",
+    "int8"
    ],
    "family": "MOSS-Image (5B)",
    "origin": "Original files, quantized by XeStrata when read",
-   "version": "4-step (darask0)",
+   "version": "SFT 4-step",
    "sizes": [
     {
      "id": "bf16",
-     "download_gb": 21.2,
-     "ram_gb": 23.2
+     "download_gb": 21.1,
+     "ram_gb": 23.1
     },
     {
      "id": "int8",
-     "download_gb": 21.2,
+     "download_gb": 21.1,
      "ram_gb": 13.9
     }
    ],
    "uncensored_sizes": [
     {
      "id": "bf16",
-     "download_gb": 21.2,
-     "ram_gb": 23.2
+     "download_gb": 21.1,
+     "ram_gb": 23.1
     },
     {
      "id": "int8",
-     "download_gb": 21.2,
+     "download_gb": 21.1,
      "ram_gb": 13.9
     }
    ],

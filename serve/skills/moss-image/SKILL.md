@@ -12,4 +12,5 @@ metadata:
   `caption` how it looks. `bbox` [x_min, y_min, x_max, y_max] in the image's pixels from its top-left corner: where it
   is, not a frame to draw; a text box large enough to read; `\n` breaks its line.
 - `summary.caption` the whole image; `summary.canvas` `multi_panel` for panels, `collage` for pictures put together.
-- moss-image-4-step: 4 steps without guidance, no negative prompt, no edits.
+- moss-image-4-step: no guidance, negative prompt or edits. Use 4 steps up to 1024²,
+  6 above that, or 8 above 1536².

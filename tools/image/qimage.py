@@ -113,7 +113,7 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "yzd-v/DWPose": "1a7144101628d69ee7a3768d1ee3a094070dc388",                                  # 2026-11-08
     "kadirnar/yolox_l-v0.1.1": "f63e87ffbded0e30713d32dba22501f56fe5007e",                       # 2026-11-08
     "Comfy-Org/MOSS-Image": "2929efe3cdd506c0a430bcfca70a9a8d805cc095",                           # 2026-11-18
-    "darask0/MOSS-Image_4-step_adapter_lora": "c88f33bcb3251eb39943d0635e74b650732977c8",        # 2026-11-08
+    "akhaliq/MOSS-Image-SFT-4-steps": "2ded95c37a029360245926fe72e475e30039bbfb",                  # 2026-11-18
     "ZhengPeng7/BiRefNet_lite": "aa62cd87eafb9cc43056d08ef3615a14628b831d",                        # 2026-11-07
     "ZhengPeng7/BiRefNet_lite-2K": "3f789d2ba403e2ee59ce08ee9250d4c1c590b418",                     # 2026-11-07
     "ZhengPeng7/BiRefNet-portrait": "b6561965a70070d9143fd9e558f6ca3c481510db",                    # 2026-11-07
@@ -459,9 +459,15 @@ TERMS: dict[str, dict] = {
              "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
         ],
     },
-    "darask0/MOSS-Image_4-step_adapter_lora": {
+    "akhaliq/MOSS-Image-SFT-4-steps": {
         "license": "Apache-2.0",
-        "texts": [],
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:akhaliq/MOSS-Image-SFT-4-steps", "2ded95c37a029360245926fe72e475e30039bbfb", "README.md", 18182,
+             "20ff4b703bf7104e012e2cafb96c1b15257650438cc2f7eedd9839ab6fc7e893"),
+            ("hf:OpenMOSS-Team/MOSS-Image-SFT", "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9", "LICENSE", 11358,
+             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
+        ],
     },
     "ZhengPeng7/BiRefNet_lite": {
         "license": "MIT License",
@@ -554,7 +560,7 @@ _DA = "depth-anything/Depth-Anything-V2-Small-hf"   # the Small one: the larger 
 _DW = "yzd-v/DWPose"
 _YX = "kadirnar/yolox_l-v0.1.1"   # Megvii's YOLOX-L release file (v0.1.1rc0's yolox_l.pth, the same bytes)
 _MC = "Comfy-Org/MOSS-Image"                    # darask0's color and depth adapter, repackaged
-_M4 = "darask0/MOSS-Image_4-step_adapter_lora"    # MOSS-Image's 4-step adapter (DMAD: a LoRA, a time path, a sampler's)
+_M4 = "akhaliq/MOSS-Image-SFT-4-steps"           # MOSS-Image's Euler-native 4-step LoRA
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
 FILES = {
     # the DiTs, "<dit>-<QUANTS>"
@@ -672,14 +678,9 @@ FILES = {
     "moss-vae": (_MS, "vae/diffusion_pytorch_model.safetensors", 249_521_372,
                  "c3bdf94dc67ec69b30ea9fe1fa8340085679cae64d019f7c7e4a9921f1a7f17a"),
     # its edit adapter (trained on the SFT model, taken by the base model too)
-    # the 4-step adapter (moss-image-4-step): its LoRA, its time path (the time embedding and the modulations' biases)
-    # and its sampler's data space (latent_mix.Q, step_codes)
-    "moss-4-step-lora": (_M4, "lora.safetensors", 1_189_176_832,
-                         "4a4c8e2d6244a0fcdc2822b87b3435226ae57c289aef99fc2ac54edeab9e09bb"),
-    "moss-4-step-time-path": (_M4, "time_embedding.safetensors", 41_017_896,
-                              "2ebabc91e2a9e68c00e948dd80b05235a826e808817b5b2600b441457570d244"),
-    "moss-4-step-dataspace": (_M4, "dataspace.safetensors", 65_784,
-                              "d19f0e695bb26886cfce57441fd412f358e159d6eec8555ec1a71daaf30a7968"),
+    # Euler-native 4-step LoRA: FP32 file, applied unmerged
+    "moss-4-step-lora": (_M4, "lora.safetensors", 1_189_176_752,
+                         "154c7f1455c3bf9925945c2f1ea2e4f09d0d0c67256081384a094b2b585f913f"),
     "moss-edit-lora": (_ME, "moss_image_edit_lora_bf16.safetensors", 297_419_000,
                        "f4bf2905dd40ae490ffda37d6be717f3361a4a723225cf0bf1f3b941eb03315d"),
     "moss-edit-armv5": (_MEHQ, "weights/armV5/armV5.safetensors", 495_514_936,
@@ -862,7 +863,7 @@ IMAGE_FAMILIES = (
      (("mage-flow-turbo", "Turbo"), ("mage-flow", "Instruct"), ("mage-flow-base", "Base"))),
     ("MageTrail (2.9B)", "Original files, quantized by XeStrata when read", (("magetrail", "MageTrail"),)),
     ("MOSS-Image (5B)", "Original files, quantized by XeStrata when read",
-     (("moss-image", "SFT"), ("moss-image-base", "Base"), ("moss-image-4-step", "4-step (darask0)"))),
+     (("moss-image", "SFT"), ("moss-image-base", "Base"), ("moss-image-4-step", "SFT 4-step"))),
     ("Anima (2B)", "Original files, quantized by XeStrata when read",
      (("anima-base", "Anima"), ("anima-aesthetic", "Aesthetic"), ("anima-turbo", "Turbo"),
       ("anima-2.9b", "2.9B (preview)"))),
@@ -883,8 +884,7 @@ ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
          "moss-image": "OpenMOSS's 5B model: text in images and a layout of boxes in the prompt, 50 steps with "
                        "guidance; edits with up to four reference images (its edit adapter, fetched with it)",
          "moss-image-base": "MOSS-Image's base model, before its fine-tuning, 50 steps with guidance",
-         "moss-image-4-step": "MOSS-Image with darask0's 4-step adapter: about ten times as fast, 4 steps without "
-                              "guidance; no edits",
+         "moss-image-4-step": "MOSS-Image SFT with akhaliq's 4-step LoRA, without guidance; no edits",
          "anima-base": "Anima (2B), anime illustrations from Danbooru tags and sentences, 30 steps with guidance; the "
                        "model to train LoRAs on",
          "anima-aesthetic": "Anima tuned to a consistent, polished default style, 30 steps with guidance",
@@ -907,7 +907,7 @@ DITS = {"turbo": ("Qwen-Image-2.1-Turbo", 8, "Qwen/Qwen-Image-2.1-Turbo"),
         # shift 5), the same for both
         "moss-sft": ("MOSS-Image", 50, "OpenMOSS-Team/MOSS-Image-SFT"),
         "moss-base": ("MOSS-Image-Base", 50, "OpenMOSS-Team/MOSS-Image-Base"),
-        # MOSS-Image (SFT) with darask0's 4-step adapter: its card's 4 steps, no guidance, its own sampler
+        # MOSS-Image with akhaliq's LoRA: 4 steps at 1024², no guidance, ordinary Euler
         "moss-sft-4-step": ("MOSS-Image 4-step", 4, "OpenMOSS-Team/MOSS-Image-SFT"),
         # Anima's: the model card's 30 steps with guidance 4 (Turbo 8 to 12 at guidance 1), on shift 3
         "anima-base": ("Anima", 30, "circlestone-labs/Anima"),
@@ -922,9 +922,7 @@ MF_VAE = {"mf-trail": "mf-trail-vae"}   # a DiT's VAE where it is not Mage-VAE (
 LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-image-vae.safetensors",
                "moss-edit-armv5": "armV5-ai-toolkit.safetensors", "moss-edit-armv6": "armV6-ai-toolkit.safetensors",
                "moss-mmproj": "Qwen3.5-9B-mmproj-F16.gguf",
-               "moss-4-step-lora": "moss-image-4-step-lora.safetensors",
-               "moss-4-step-time-path": "moss-image-4-step-time-path.safetensors",
-               "moss-4-step-dataspace": "moss-image-4-step-dataspace.safetensors",
+               "moss-4-step-lora": "moss-image-akhaliq-4-step-lora.safetensors",
                "moss-control": "moss-control.safetensors",
                "anima-t5-tokenizer": "t5-tokenizer.json"}
 # the image tools the server offers for every model (serve/images.py TOOLS), for setup --describe
@@ -1211,8 +1209,8 @@ def license_note(dit: str) -> str:
                 "text: the web app's About > Model terms).  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are "
                 "under Apache 2.0")
     if dit in MOSS_FEW_STEP:
-        return (f"{name} is MOSS-Image (SFT), under the Apache 2.0 license: https://huggingface.co/{repo}, with "
-                f"darask0's 4-step adapter, under Apache 2.0 too: https://huggingface.co/{_M4}; its text encoder, "
+        return (f"{name} is under the Apache 2.0 license: https://huggingface.co/{repo}, with "
+                f"akhaliq's 4-step LoRA, under Apache 2.0 too: https://huggingface.co/{_M4}; its text encoder, "
                 "Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well)")
     if is_moss(dit):
         return (f"{name} is under the Apache 2.0 license: https://huggingface.co/{repo}; its text encoder, Qwen3.5-9B, "
@@ -1242,10 +1240,10 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
     if is_hunyuanimage3(dit):
         return (f"hunyuanimage3-{quant}", "hunyuanimage3-vae", "hunyuanimage3-tokenizer",
                 "hunyuanimage3-system-prompt", "hunyuanimage3-vision")
-    if dit in MOSS_FEW_STEP:   # the shards of its DiT, the VAE, the adapter's three files (no edit adapter)
+    if dit in MOSS_FEW_STEP:   # the shards, VAE and LoRA (no edit adapter)
         sh = moss_shards(dit)
         return (f"{sh}-1", f"{sh}-2", f"{sh}-3", f"{sh}-config", "moss-vae", "moss-4-step-lora",
-                "moss-4-step-time-path", "moss-4-step-dataspace", text_file(text_encoder, text_quant))
+                text_file(text_encoder, text_quant))
     if is_moss(dit):
         return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", "moss-edit-lora", "moss-edit-armv5",
                 "moss-edit-armv6", "moss-mmproj", text_file(text_encoder, text_quant))
@@ -1465,15 +1463,13 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))),
                 "t5_tokenizer": str(local_path(models_dir, "anima-t5-tokenizer")), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
-    if dit in MOSS_FEW_STEP:   # the 4-step adapter: no guidance, its sampler's files (few_step), no edit adapter
+    if dit in MOSS_FEW_STEP:   # the 4-step LoRA: no guidance or edit adapter, never baked into the weights
         q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}
         return {**q8, "model_name": name, "family": "moss-image", "exe": str(exe), "quant": "bf16", **loras,
                 "diffusion_model": str(local_path(models_dir, f"{moss_shards(dit)}-1").parent),
                 "steps": DITS[dit][1], "schedule": "moss", "cfg_scale": 1.0, "transparency": False,
                 "vae": str(local_path(models_dir, "moss-vae")),
-                "few_step": {"lora": str(local_path(models_dir, "moss-4-step-lora")),
-                             "time_path": str(local_path(models_dir, "moss-4-step-time-path")),
-                             "dataspace": str(local_path(models_dir, "moss-4-step-dataspace"))},
+                "turbo_lora": str(local_path(models_dir, "moss-4-step-lora")), "lora_bake": False,
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_moss(dit):
