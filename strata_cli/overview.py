@@ -23,6 +23,7 @@ from rich.text import Text
 
 from strata_cli import nav
 from strata_cli.client import card_link
+from strata_cli.render import short_gpu          # noqa: F401 - the name stays importable from here (it moved to the stdlib-only module)
 
 GIB = 2 ** 30
 BLUE = "#5aa9ff"
@@ -266,16 +267,6 @@ def bar(frac: float | None, width: int, glyphs: str, color: str, empty: str = GR
     t.append(full * n, style=color)
     t.append(hollow * (width - n), style=empty)
     return t
-
-
-def short_gpu(name: str | None) -> str:
-    """The card's name without the maker prefixes that eat a tile's width ("NVIDIA GeForce RTX 5070" -> "RTX 5070")."""
-    if not name:
-        return "graphics card"
-    for prefix in ("NVIDIA GeForce ", "NVIDIA ", "AMD Radeon ", "AMD ", "Intel(R) ", "Intel "):
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-    return name
 
 
 def fmt(v: float | None, digits: int = 0, unit: str = "") -> str:

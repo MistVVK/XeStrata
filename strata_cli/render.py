@@ -226,6 +226,17 @@ def activity_label(row: dict, width: int) -> str:
     return _line(f"#{number(row.get('seq')):<6} {clock}  {field(row.get('request_id'), 12)}  {label}", width)
 
 
+def short_gpu(name: str | None) -> str:
+    """The card's name without the maker prefixes that eat a tile's width ("NVIDIA GeForce RTX 5070" -> "RTX 5070"). Here, not in overview.py: this module
+    is the plain-text one that `strata status` runs on stdlib alone, and overview.py needs rich (it imports this name from here)."""
+    if not name:
+        return "graphics card"
+    for prefix in ("NVIDIA GeForce ", "NVIDIA ", "AMD Radeon ", "AMD ", "Intel(R) ", "Intel "):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    return name
+
+
 def _device(row: dict, width: int) -> str:
     idx = row.get("index")
     label = f"GPU {idx if idx is not None else '?'}"
@@ -233,7 +244,6 @@ def _device(row: dict, width: int) -> str:
     mem = f"{number(used / 2**30 if isinstance(used, (int, float)) else None, '', 1)}/{number(total / 2**30 if isinstance(total, (int, float)) else None, ' GiB', 1)}"
     if width < 80:
         return _line(f"{label:<7} {mem:<17} util {number(row.get('util'), '%')}", width)
-    from strata_cli.overview import short_gpu              # "NVIDIA GeForce RTX 3090" -> "RTX 3090": the maker's prefix used to cut the model off
     name = short_gpu(row.get("name")) if row.get("name") else None
     link = card_link(row)      # each card trains its own PCIe link: show that card's, not one card's for the run
     base = (f"{label:<7} {field(name, 20)} {mem:<17} {number(row.get('util'), '%'):>5}  {number(row.get('temp'), ' C'):>6}"
