@@ -109,8 +109,8 @@ void unit_tests() {
     {   // bounded memory: appending beyond the nominal capacity does not crash and still works
         SuffixDrafter d(3, 32, 1024);
         std::vector<int32_t> doc;
-        for (int i = 0; i < 5000; ++i) doc.push_back(i % 997);
         doc.reserve(5000);
+        for (int i = 0; i < 5000; ++i) doc.push_back(i % 997);
         d.append(doc.data(), doc.size());
         int32_t out[4];
         check(d.propose(4, out) > 0, "propose after overflow of nominal capacity");
