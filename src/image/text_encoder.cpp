@@ -12,6 +12,7 @@
 #include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -139,8 +140,14 @@ bool TextEncoder::set_loras(const std::vector<LoraUse>& loras, std::string& err)
             if (name.rfind("layers.", 0) == 0) {
                 const size_t dot = name.find('.', 7);
                 if (dot != std::string::npos) {
-                    layer = std::atoll(name.substr(7, dot - 7).c_str());
-                    rest = name.c_str() + dot + 1;
+                    const char* first = name.c_str() + 7;
+                    char* end = nullptr;
+                    errno = 0;
+                    const long long n = std::strtoll(first, &end, 10);
+                    if (end != first && end == name.c_str() + dot && errno != ERANGE) {
+                        layer = static_cast<int64_t>(n);
+                        rest = name.c_str() + dot + 1;
+                    }
                 }
             }
             const auto* hit = rest == nullptr ? nullptr
