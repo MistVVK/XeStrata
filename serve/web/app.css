@@ -124,7 +124,19 @@ main { flex: 1; min-height: 0; display: flex; }
 .ctx-card { display: flex; flex-direction: column; gap: var(--st-s-2); }
 .ctx-gauge { position: relative; width: 150px; max-width: 100%; aspect-ratio: 1; height: auto; margin: var(--st-s-2) auto var(--st-s-3); }
 .ctx-gauge .st-gauge { width: 100%; height: 100%; }
-.ctx-gauge .st-gauge__fill { transition: stroke-dasharray 400ms var(--st-ease); }
+.ctx-gauge .st-gauge__fill { transition: stroke-dasharray 400ms var(--st-ease), stroke-dashoffset 400ms var(--st-ease); }
+/* #4636: the fill in three parts, in the page's own colours (the prefill tone is the Speed card's) */
+.ctx-seg--read, .ctx-key--read { stroke: color-mix(in srgb, var(--st-accent) 65%, black); background: color-mix(in srgb, var(--st-accent) 65%, black); }
+.ctx-seg--answer, .ctx-key--answer { stroke: var(--st-info); background: var(--st-info); }
+.ctx-key--cached { background: var(--st-accent); }
+.ctx-key--free { background: var(--st-surface-2); box-shadow: inset 0 0 0 1px var(--st-line); }
+.ctx-legend { list-style: none; margin: 0 0 var(--st-s-2); padding: 0; display: grid; gap: 2px; font-size: var(--st-fs-sm); }
+.ctx-legend li { display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: var(--st-s-2); font-variant-numeric: tabular-nums; }
+.ctx-legend li.is-now { font-weight: var(--st-fw-bold); }
+.ctx-key { width: 10px; height: 10px; border-radius: 2px; }
+.ctx-gauge__pct[data-tone="warn"] { color: var(--st-warn-text); }
+.ctx-gauge__pct[data-tone="danger"] { color: var(--st-danger-text); }
+.ctx-note { margin: 0; text-align: center; }
 .ctx-gauge__label { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
                     font-size: var(--st-fs-xs); }
 .ctx-gauge__pct { font-weight: var(--st-fw-black); font-size: var(--st-fs-xl); line-height: 1.1; font-variant-numeric: tabular-nums; }

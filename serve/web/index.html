@@ -148,11 +148,23 @@
             <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
               <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
                       stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
-              <circle class="st-gauge__fill" id="ctx-fill" cx="60" cy="60" r="50" fill="none" stroke-width="10"
-                      stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+              <circle class="st-gauge__fill ctx-seg ctx-seg--cached" id="ctx-seg-cached" cx="60" cy="60" r="50" fill="none" stroke-width="10"
+                      stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+              <circle class="st-gauge__fill ctx-seg ctx-seg--read" id="ctx-seg-read" cx="60" cy="60" r="50" fill="none" stroke-width="10"
+                      stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+              <circle class="st-gauge__fill ctx-seg ctx-seg--answer" id="ctx-seg-answer" cx="60" cy="60" r="50" fill="none" stroke-width="10"
+                      stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
             </svg>
             <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
           </div>
+          <!-- #4636: what fills the context window, in words as well as colour; the row of what the server does now is bold -->
+          <ul class="ctx-legend">
+            <li id="ctx-row-cached" title="Prompt tokens the engine already had in its cache, so they were not read again."><span class="ctx-key ctx-key--cached"></span><span>Cached</span><span class="muted" id="ctx-leg-cached">&ndash;</span></li>
+            <li id="ctx-row-read" title="Prompt tokens being read now."><span class="ctx-key ctx-key--read"></span><span>Reading</span><span class="muted" id="ctx-leg-read">&ndash;</span></li>
+            <li id="ctx-row-answer" title="Tokens of the answer written so far."><span class="ctx-key ctx-key--answer"></span><span>Answer</span><span class="muted" id="ctx-leg-answer">&ndash;</span></li>
+            <li id="ctx-row-free" title="Room left in this model&rsquo;s context window."><span class="ctx-key ctx-key--free"></span><span>Free</span><span class="muted" id="ctx-leg-free">&ndash;</span></li>
+          </ul>
+          <p class="small muted ctx-note" id="ctx-note" hidden>Waiting in the queue</p>
           <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
           <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
           <div class="bar-row"><span>System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
