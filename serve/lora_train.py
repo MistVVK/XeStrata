@@ -881,9 +881,6 @@ class TrainJobs:
         current = str((self.place or {}).get("pci") or "")
         free = {str(d["pci"]).lower(): int(d.get("free_bytes") or 0) >> 20 for d in reports}
         device_free = dict(free)
-        # The device's free count already excludes this trainer. Its budget can reuse what it holds.
-        if current in free:
-            free[current] += int(self._train_state.get("used_mib", 0))
         _, helper, held = text_placement(self.svc)
         status = getattr(self.svc, "status", {})
         train = dict(self._train_state)
@@ -1112,9 +1109,12 @@ class TrainJobs:
             if tok and tok[0] == "vram" and len(tok) >= 5 and tok[4] in ("running", "paused"):
                 with contextlib.suppress(ValueError):
                     _DEV_CACHE.clear()  # the pause/grow changed free VRAM; the policy needs a fresh report
-                    need = next((int(t.split("=", 1)[1]) for t in tok[5:] if t.startswith("need_mib=")), None)
+                    extra = dict(t.split("=", 1) for t in tok[5:] if "=" in t)
+                    need = int(extra["need_mib"]) if "need_mib" in extra else None
+                    process = int(extra["process_mib"]) if "process_mib" in extra else None
                     self._train_state = {"used_mib": int(tok[1]), "peak_est_mib": int(tok[2]), "min_mib": int(tok[3]),
-                                         "need_mib": need, "state": tok[4]}
+                                         "need_mib": need, "process_mib": process,
+                                         "process_source": extra.get("process_source"), "state": tok[4]}
                     self.wake.set()
                 continue
             if tok and tok[0] == "state" and len(tok) >= 3 and tok[1] == "saved":

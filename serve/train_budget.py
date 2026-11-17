@@ -180,12 +180,13 @@ def run_bench(exe: str, pci: str, env: dict | None = None) -> dict | None:
 
 class Decider:
     """The training's placement and budget, re-decided every tick.  `st` (TrainPlace fills it):
-      free: {pci: free_mib} the device reports now; chat_busy / chat_queued: the text engine's work;
+      free: {pci: free_mib} the device reports now, excluding the trainer; chat_busy / chat_queued: the text work;
       chat_eta_s: how long the chat's work is expected to last (None: unknown); image_job: an image job waiting
       or running on the card; image_need_mib: its estimate (None: unknown); device_free: the device's actual free
       MiB, without adding the trainer's usage; proc_alive: whether the training process is still alive;
       helper_mib: the helper cache's size on the card;
-      train: the trainer's last vram line {used_mib, peak_est_mib, min_mib, need_mib, state} (None before the first);
+      train: the trainer's last vram line {used_mib, process_mib, process_source, peak_est_mib, min_mib,
+        need_mib, state} (None before the first);
       current_pci: the card the trainer runs on (None before the start); step_s / reload_s: the measured step
       time and the state-restore + weights-reload time (None: not measured).
     The action: {pci, budget_mib, save_state, reason, mode: start|run|shrunk|paused|move|refuse, return_helper,
@@ -208,6 +209,11 @@ class Decider:
         """What a training may take on the card now: the report's free, less the margin, less the helper cache
         where the chat needs it (the helper is not closed for the training while the chat runs)."""
         free = int((st.get("free") or {}).get(card["pci"], 0))
+        if card["pci"] == st.get("current_pci") and st.get("proc_alive"):
+            train = st.get("train") or {}
+            # fdinfo and NVML name this process; delta can include other processes and global is the whole device.
+            held = train.get("process_mib") if train.get("process_source") in ("fdinfo", "nvml") else None
+            free += int(held if held is not None else train.get("used_mib") or 0)
         room = free - self._margin(card["total_mib"])
         if card["kind"] == "helper" and (st.get("chat_busy") or st.get("chat_queued")):
             room -= int(st.get("helper_mib") or 0)
