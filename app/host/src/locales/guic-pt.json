@@ -68,5 +68,14 @@
  "guic67": "Ferramenta usada",
  "guic68": "{0} ferramentas usadas",
  "guic69": "código",
- "guic70": "Nenhum modelo está carregado. Carregue um em Modelos para enviar esta mensagem."
+ "guic70": "Nenhum modelo está carregado. Carregue um em Modelos para enviar esta mensagem.",
+ "guic71": "Camada de rascunho (MTP)",
+ "guic72": "A camada de rascunho adivinha várias palavras à frente, o que deixa as respostas mais rápidas, e usa cerca de 1 GB de memória gráfica e um pouco de RAM. Desative-a se o modelo parar ao iniciar ou se a placa for pequena: o cache de especialistas recupera essa memória, mas as respostas ficam mais lentas. O padrão é ativada.",
+ "guic73": "MTP por solicitação",
+ "guic74": "Cada solicitação simultânea usa a camada de rascunho. Se você não mexer, o Strata a ativa para uma placa gráfica de 24 GB ou mais e várias solicitações ao mesmo tempo, e a desativa nos outros casos; escolha ativada ou desativada aqui para decidir por conta própria.",
+ "guic75": "Recuperação",
+ "guic76": "GPU e memória",
+ "guic77": "Qual rascunhador adivinha palavras à frente para deixar as respostas mais rápidas, um de cada vez. Automático (recomendado) é DFlash2 para o Qwen3.8-Flash-Next onde o motor o tem, e MTP nos demais casos; com duas ou mais placas gráficas idênticas que o motor de divisão em todas as placas assume, é esse motor com a camada de rascunho MTP. O DFlash2 baixa uma vez um rascunhador de {0} GB, e o MTP baixa uma vez a sua camada de rascunho. Com Automático, várias solicitações ao mesmo tempo usam o MTP. Se você escolher o DFlash2 por conta própria, ele roda com o número de solicitações que você definir. Se o DFlash2 não puder rodar, só o MTP é usado e Detalhes explica o motivo. Desativado desliga o rascunhador.",
+ "guic78": "Último: {0} tokens a {1} tok/s",
+ "guic79": "Último: {0} tokens"
 }
