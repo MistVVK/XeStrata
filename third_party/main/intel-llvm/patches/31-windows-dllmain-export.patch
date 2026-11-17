@@ -1,0 +1,25 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+windows-dllmain-export: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
+
+DllMain is the Windows loader's entry point, not an API for another DLL to import. Exporting it puts it in
+sycl9.lib and sycl.lib; lld-link warns that it skips the imported DllMain on every link. Keep the entry point
+and its address for isLinkedStatically, but do not export it. Windows execution is unverified.
+---
+diff --git a/sycl/source/detail/global_handler.cpp b/sycl/source/detail/global_handler.cpp
+--- a/sycl/source/detail/global_handler.cpp
++++ b/sycl/source/detail/global_handler.cpp
+@@ -379,9 +379,8 @@ void GlobalHandler::shutdown() {
+ }
+ 
+ #ifdef _WIN32
+-extern "C" __SYCL_EXPORT BOOL WINAPI DllMain(HINSTANCE hinstDLL,
+-                                             DWORD fdwReason,
+-                                             LPVOID lpReserved) {
++extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason,
++                               LPVOID lpReserved) {
+   bool PrintUrTrace = false;
+   try {
+     PrintUrTrace =
