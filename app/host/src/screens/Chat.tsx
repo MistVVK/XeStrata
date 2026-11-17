@@ -715,6 +715,7 @@ function Composer({ draft, setDraft, loaded, streaming, onSubmit, onKey, session
           </div>
         </div>
         {tr(streaming && draft.trim() && whileBusy !== 'wait' ? <p className="xs muted composer__busy-hint" role="status">{tr(whileBusy === 'queue' ? "Enter sends it when the answer is done." : "Enter stops the answer here and sends it now.")}</p> : null)}
+        {tr(!streaming && !canChat && (draft.trim() || photos.length) && draft.trim() !== '/' && timeSkipPrompt(draft) === null ? <p className="xs muted composer__busy-hint" role="status">{tr("No model is loaded. Load one in Models to send this message.")}</p> : null)}
         <ChatTelemetry session={session}/>
         </div>
       </div>

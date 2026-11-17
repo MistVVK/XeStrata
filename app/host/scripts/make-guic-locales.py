@@ -732,6 +732,17 @@ add(en='code',
     ko='코드',
     fr='code',
     he='קוד')
+# the composer's hint when text is typed and no model is loaded (GUI-VIS-1117 finding 6); lane draft until the owner says yes.
+add(en="No model is loaded. Load one in Models to send this message.",
+    zh="尚未加载模型。请在“模型”中加载一个，然后发送此消息。",
+    ja="モデルが読み込まれていません。「モデル」で読み込むと、このメッセージを送信できます。",
+    de="Es ist kein Modell geladen. Laden Sie unter Modelle eines, um diese Nachricht zu senden.",
+    es="No hay ningún modelo cargado. Carga uno en Modelos para enviar este mensaje.",
+    ru="Модель не загружена. Загрузите её в разделе «Модели», чтобы отправить это сообщение.",
+    pt="Nenhum modelo está carregado. Carregue um em Modelos para enviar esta mensagem.",
+    ko="불러온 모델이 없습니다. 모델 화면에서 하나를 불러오면 이 메시지를 보낼 수 있습니다.",
+    fr="Aucun modèle n’est chargé. Chargez-en un dans Modèles pour envoyer ce message.",
+    he="לא נטען מודל. טענו מודל במסך המודלים כדי לשלוח את ההודעה.")
 here = APP / "src" / "locales"
 NBSP = " "
 

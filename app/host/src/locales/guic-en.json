@@ -67,5 +67,6 @@
  "guic66": "Started {0} helpers",
  "guic67": "Used a tool",
  "guic68": "Used {0} tools",
- "guic69": "code"
+ "guic69": "code",
+ "guic70": "No model is loaded. Load one in Models to send this message."
 }

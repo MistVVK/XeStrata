@@ -67,5 +67,6 @@
  "guic66": "{0} auxiliaires lancés",
  "guic67": "Outil utilisé",
  "guic68": "{0} outils utilisés",
- "guic69": "code"
+ "guic69": "code",
+ "guic70": "Aucun modèle n’est chargé. Chargez-en un dans Modèles pour envoyer ce message."
 }

@@ -67,5 +67,6 @@
  "guic66": "{0} Helfer gestartet",
  "guic67": "Werkzeug verwendet",
  "guic68": "{0} Werkzeuge verwendet",
- "guic69": "Code"
+ "guic69": "Code",
+ "guic70": "Es ist kein Modell geladen. Laden Sie unter Modelle eines, um diese Nachricht zu senden."
 }

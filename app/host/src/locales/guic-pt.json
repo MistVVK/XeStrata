@@ -67,5 +67,6 @@
  "guic66": "{0} ajudantes iniciados",
  "guic67": "Ferramenta usada",
  "guic68": "{0} ferramentas usadas",
- "guic69": "código"
+ "guic69": "código",
+ "guic70": "Nenhum modelo está carregado. Carregue um em Modelos para enviar esta mensagem."
 }
