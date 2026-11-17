@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < cpu::H; ++i) {
             const float a = ref[(size_t) e * cpu::H + i], b = got[(size_t) e * cpu::H + i];
             if (b == SENTINEL) { ++not_run; continue; }
-            if (std::memcmp(&a, &b, 4) != 0) ++diff;
+            if (std::memcmp(&a, &b, 4) != 0) ++diff;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
             worst = std::fmax(worst, std::fabs(a - b));
         }
     std::printf("  %-44s %s (%lld of %d outputs untouched)\n", "every job ran exactly once",
@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
             pool.run(jobs.data(), NEXP);
             for (int e = 0; e < NEXP && !repeats_bad; ++e)
                 for (int i = 0; i < cpu::H; ++i)
-                    if (std::memcmp(&ref[(size_t) e * cpu::H + i], &got[(size_t) e * cpu::H + i], 4) != 0) {
+                    if (std::memcmp(&ref[(size_t) e * cpu::H + i], &got[(size_t) e * cpu::H + i], 4) != 0) {  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                         ++repeats_bad;
                         break;
                     }
@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
             pool.run(jobs.data(), n);
             for (int e = 0; e < n && !size_bad; ++e)
                 for (int i = 0; i < cpu::H; ++i)
-                    if (std::memcmp(&ref[(size_t) e * cpu::H + i], &got[(size_t) e * cpu::H + i], 4) != 0) {
+                    if (std::memcmp(&ref[(size_t) e * cpu::H + i], &got[(size_t) e * cpu::H + i], 4) != 0) {  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                         ++size_bad;
                         break;
                     }

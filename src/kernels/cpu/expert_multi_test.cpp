@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
                 c::s2_expert_vnni_multi(blob, a1, n, outs, wsm);
                 for (int t = 0; t < n; ++t) {
                     c::s2_expert_vnni_q(blob, acts[t], out_single, ws);
-                    if (std::memcmp(out_single, out_multi[t], sizeof out_single) != 0) {
+                    if (std::memcmp(out_single, out_multi[t], sizeof out_single) != 0) {  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                         std::fprintf(stderr, "FAIL expert %d n=%d token %d differs\n", e, n, t);
                         ++fail;
                     }

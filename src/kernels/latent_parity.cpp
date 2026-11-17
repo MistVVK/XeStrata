@@ -92,7 +92,7 @@ std::vector<float> layer_gpu(const lr::Fixture& f, void* s) {
         bool same = true;
         for (size_t i = 0; i < probe.size(); ++i) {
             const float w = probe[i] * f.inv[i % (size_t) ELL];
-            same = same && std::memcmp(&got[i], &w, 4) == 0;
+            same = same && std::memcmp(&got[i], &w, 4) == 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
         }
         std::printf("  %-72s %s\n", "latent_colscale_rows: bit for bit", same ? "ok" : "FAIL");
         if (!same) ++g_fail;

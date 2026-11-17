@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < cpu.size(); ++i) {
         // bit comparison, not a tolerance: S2's decode is exact integer-to-float arithmetic, so ANY
         // difference is a bug and a tolerance would only hide which one
-        if (std::memcmp(&cpu[i], &gpu[i], sizeof(float)) != 0) {
+        if (std::memcmp(&cpu[i], &gpu[i], sizeof(float)) != 0) {  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
             if (first_bad < 0) first_bad = (long long) i;
             ++bad;
         }

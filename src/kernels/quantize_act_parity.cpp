@@ -84,7 +84,7 @@ int run_case(const char* name, const std::vector<float>& x, bool check_bytes) {
         std::vector<float> rt((size_t) n);
         strata::parity::copy_bytes_out(rt.data(), d_x, (size_t) n * sizeof(float));
         long long diff = 0;
-        for (long long i = 0; i < n; ++i) if (std::memcmp(&rt[(size_t) i], &x[(size_t) i], 4) != 0) ++diff;
+        for (long long i = 0; i < n; ++i) if (std::memcmp(&rt[(size_t) i], &x[(size_t) i], 4) != 0) ++diff;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
         if (diff) std::printf("    PROBE: device x differs from host x in %lld of %lld elements\n", diff, n);
     }
     strata::kernels::quantize_q8_0(d_x, d_b, n, nullptr);
@@ -99,7 +99,7 @@ int run_case(const char* name, const std::vector<float>& x, bool check_bytes) {
     for (long long i = 0; i < n; ++i) {
         const float a = r_back[(size_t) i], b = g_back[(size_t) i];
         // the round trip is `q * d16`: both sides use the SAME fp16 d, so this is exact when q agrees
-        if (std::memcmp(&a, &b, sizeof(float)) != 0) ++val_bad;
+        if (std::memcmp(&a, &b, sizeof(float)) != 0) ++val_bad;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
     }
     if (byte_bad && check_bytes) {
         for (size_t i = 0; i < g_blocks.size(); ++i) {
@@ -191,7 +191,7 @@ int run_case_k(const char* name, const std::vector<float>& x, bool check_bytes, 
         for (size_t i = 0; i < g_blocks.size(); ++i)
             if (g_blocks[i] != r_blocks[i]) { if (first_bad < 0) first_bad = (long long) i; ++byte_bad; }
     for (long long i = 0; i < n; ++i)
-        if (std::memcmp(&r_back[(size_t) i], &g_back[(size_t) i], 4) != 0) ++val_bad;
+        if (std::memcmp(&r_back[(size_t) i], &g_back[(size_t) i], 4) != 0) ++val_bad;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
     std::printf("  %-26s blocks %s (%lld bad bytes)   round trip %s (%lld differ)\n", name,
                 !check_bytes ? "not compared" : (byte_bad ? "*** WRONG ***" : "byte-exact"), byte_bad,
                 val_bad ? "*** WRONG ***" : "bit-exact", val_bad);

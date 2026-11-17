@@ -224,7 +224,7 @@ int check_fx(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& coun
         const auto* ds = reinterpret_cast<const float*>(a);
         const auto* v = reinterpret_cast<const int8_t*>(a + qs_off);
         for (int64_t i = 0; i < K; ++i) act_diff += v[i] != gx8[r * K + i];
-        for (int64_t b = 0; b < K / 32; ++b) act_diff += std::memcmp(&ds[b / 8], &gxs[r * (K / 32) + b], 4) != 0;
+        for (int64_t b = 0; b < K / 32; ++b) act_diff += std::memcmp(&ds[b / 8], &gxs[r * (K / 32) + b], 4) != 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
     }
     size_t diff1 = 0, diff8 = 0;
     std::vector<float> yc((size_t) N), yc8((size_t) (8 * N));
@@ -248,8 +248,8 @@ int check_fx(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& coun
                 cpu::iq256_canon_rows((int) t, we, rb, (int) K, &xv[j], &xd[j], 1, out1, 0, (int) N);
                 const float* g = y.data() + (r0 + j) * N;
                 for (int64_t o = 0; o < N; ++o) {
-                    diff1 += std::memcmp(&yc[(size_t) o], &g[o], 4) != 0;
-                    diff8 += std::memcmp(&yc8[(size_t) j * (size_t) N + (size_t) o], &g[o], 4) != 0;
+                    diff1 += std::memcmp(&yc[(size_t) o], &g[o], 4) != 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
+                    diff8 += std::memcmp(&yc8[(size_t) j * (size_t) N + (size_t) o], &g[o], 4) != 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                 }
             }
         }
@@ -322,7 +322,7 @@ int check_fx_down(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>&
     for (int64_t r = 0; r < R; ++r) {
         cpu::native_quant_h(f, h.data() + r * K, act[(size_t) r].bytes);
         const auto* ds = reinterpret_cast<const float*>(act[(size_t) r].bytes);   // canon_quant's: the scales first
-        for (int64_t b = 0; b < K / 32; ++b) scale_diff += std::memcmp(&ds[b], &gxs[r * (K / 32) + b], 4) != 0;
+        for (int64_t b = 0; b < K / 32; ++b) scale_diff += std::memcmp(&ds[b], &gxs[r * (K / 32) + b], 4) != 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
     }
     std::vector<uint8_t> blob(f.bytes, 0);
     size_t diff = 0;
@@ -340,7 +340,7 @@ int check_fx_down(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>&
             cpu::native_down_rows(f, blob.data(), hq, nt, out, 0, (int) N);
             for (int j = 0; j < nt; ++j)
                 for (int64_t o = 0; o < N; ++o)
-                    diff += std::memcmp(&yc[(size_t) j * (size_t) N + (size_t) o], &y[(size_t) ((r0 + j) * N + o)],
+                    diff += std::memcmp(&yc[(size_t) j * (size_t) N + (size_t) o], &y[(size_t) ((r0 + j) * N + o)],  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                                         4) != 0;
         }
     }
@@ -422,7 +422,7 @@ int check_fx_q20_gu(int64_t N, int64_t FF, const std::vector<int32_t>& counts) {
                 for (int64_t o = 0; o < FF; ++o) {
                     const float* g = y.data() + (r0 + j) * 2 * FF;
                     const float h = strata::kernels::canon::silu_mul(g[o], g[FF + o]);
-                    diff += std::memcmp(&ff[(size_t) j * (size_t) FF + (size_t) o], &h, 4) != 0;
+                    diff += std::memcmp(&ff[(size_t) j * (size_t) FF + (size_t) o], &h, 4) != 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                 }
         }
     const bool ok = diff == 0;
