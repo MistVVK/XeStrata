@@ -2,13 +2,15 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // The elastic K/V's VMM ranges (vmm.hpp): chunks map readable and writable, a chunk unmapped from one range and mapped
-// into another keeps its bytes (what the expert cache hands the K/V), and a range releases what it holds.
+// into another keeps its bytes (what the expert cache hands the K/V), a place mapped again reaches its new chunk, and
+// a range releases what it holds.
 #include "strata/core/vmm.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -59,6 +61,28 @@ int main() {
     CHECK(same);
     CHECK(a.map_range(3, 7, [] { return (VmmChunk) 0; }) && a.mapped_count() == 7);
     CHECK(strata::gpu::memset(a.base() + 4 * G, 7, 3 * G) && strata::gpu::device_sync());
+    // a place mapped again reaches its new chunk, not the one it had: a's chunk 0 moves to b's chunk 2 and a new one
+    // takes its place; a copy into the new one must leave the old one's bytes alone.  On AMD GPUs Linux leaves the
+    // old translation in the GPU's TLB after an unmap, and the copy landed in the old chunk (intel/llvm's patch
+    // hip-virtual-mem-unmap).  The copies go through pinned memory allocated before the copy engine reads the place:
+    // an allocation is a mapping of the driver's own, which flushes that TLB, as the pinning of a pageable copy is.
+    uint8_t* pin = nullptr;
+    CHECK(strata::gpu::alloc_host(&pin, (size_t) G));
+    if (pin != nullptr) {
+        CHECK(strata::gpu::copy(pin, a.base(), G) && std::memcmp(pin, h.data(), G) == 0);
+        CHECK(strata::gpu::device_sync());
+        const VmmChunk c0 = a.unmap(0);
+        CHECK(c0 != 0 && b.map_range(2, 3, [&] { return c0; }));
+        CHECK(a.map_range(0, 1, [] { return (VmmChunk) 0; }));
+        for (uint64_t i = 0; i < G; ++i) pin[i] = (uint8_t) ~h[i];
+        CHECK(strata::gpu::copy(a.base(), pin, G));
+        CHECK(strata::gpu::copy(pin, b.base() + 2 * G, G) && std::memcmp(pin, h.data(), G) == 0);   // the old chunk
+        CHECK(strata::gpu::copy(pin, a.base(), G));
+        same = true;
+        for (uint64_t i = 0; i < G; ++i) same = same && pin[i] == (uint8_t) ~h[i];
+        CHECK(same);   // the new one
+        strata::gpu::free(pin);
+    }
     size_t f0 = 0, f1 = 0, t = 0;
     // the free-memory readout as a witness of the release: only where it follows an ordinary allocation of the same
     // size (the B70's Level Zero report did not move for 1 GiB allocated and written)
