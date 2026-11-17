@@ -735,7 +735,8 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
     if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
     opt_.gpu_layers = head + reserve > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
     std::fprintf(stderr, "xestrata plain: %.2f GiB of VRAM free, the head and a reserve %.2f GiB, the blocks %.2f GiB: %s\n",
-                 free_b / 1073741824.0, (head + reserve) / 1073741824.0, total / 1073741824.0,
+                 static_cast<double>(free_b) / 1073741824.0, static_cast<double>(head + reserve) / 1073741824.0,
+                 static_cast<double>(total) / 1073741824.0,
                  opt_.gpu_layers == 0 ? "the CPU alone" : ("the first " + std::to_string(fit) + " blocks on the GPU").c_str());
     return true;
 }
@@ -1280,7 +1281,7 @@ bool PlainModel::load_qwen(std::string& err) {
         if (pages < n_pages_) ring_pages_ = pages;
         if (ring_pages_ > 0 && first())
             std::fprintf(stderr, "xestrata plain: the sliding-window layers' K/V in a ring of %lld cells (window %lld)\n",
-                         (long long) (ring_pages_ * qs.page_size), (long long) s.swa_window);
+                         (long long) ring_pages_ * qs.page_size, (long long) s.swa_window);
     }
     // --kv-resident: resolve auto/off/N, then plan the streamed layers' ring (the trailing cells in VRAM, the rest in
     // the host copy). The sliding-window layers keep their own ring; the MTP layer's attention streams too. The ring
@@ -1321,7 +1322,7 @@ bool PlainModel::load_qwen(std::string& err) {
                                      : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
             const uint64_t tier_b = std::min<uint64_t>(lay.total + lay.max_blob, free_b / 2);
             const uint64_t kv_room = free_b > reserve + tier_b ? free_b - reserve - tier_b : 0;
-            const int hd = qs.head_dim;
+            const int hd = static_cast<int>(qs.head_dim);
             auto kv_row = [&](bool i8, int q4, int tcq) -> uint64_t {
                 const uint64_t i8_row = (uint64_t) hd + (uint64_t) hd / k::KV_Q8_GROUP * 2;
                 if (tcq != 0) return 2 * k::kv_tcq_bytes_per_head(hd, tcq);
@@ -2803,7 +2804,7 @@ bool PlainModel::alloc_kv_host(size_t a, std::string& err) {
     // One pinned block a layer, the pools its slices (Qwen3.8-Flash-Next's layer.cpp, the same form).
     const size_t bytes = (opt_.kv_q4 == 1 ? 2 * q4
                         : opt_.kv_q4 == 2 ? codes + scales + q4
-                        : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes) + 4 * 256;
+                        : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes) + size_t{4} * 256;
     void* hp = nullptr;
     void* dp = nullptr;
     if (!mapped(bytes, &hp, &dp)) { err = "plain model: no RAM for the streamed K/V host copy"; return false; }
