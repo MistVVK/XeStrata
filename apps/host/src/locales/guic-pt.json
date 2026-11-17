@@ -16,5 +16,9 @@
  "guic15": "Pular partes do modelo pouco usadas",
  "guic16": "Respostas mais rápidas: as partes do modelo que menos importam para uma palavra são puladas quando ainda não estão na placa de vídeo. As respostas podem mudar um pouco. Ligado por padrão onde ajuda.",
  "guic17": "Automático (recomendado)",
- "guic18": "Números menores pulam mais partes e são mais rápidos; as respostas podem mudar mais. Só o 7 foi medido."
+ "guic18": "Números menores pulam mais partes e são mais rápidos; as respostas podem mudar mais. Só o 7 foi medido.",
+ "guic19": "Aguardando o modelo…",
+ "guic20": "Chamando {0}…",
+ "guic21": "Escrevendo o arquivo {0}…",
+ "guic22": "Executando {0}…"
 }

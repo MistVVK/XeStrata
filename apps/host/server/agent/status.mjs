@@ -150,6 +150,13 @@ export function withPlainStatus(write, options = {}) {
       case 'start': reporter.set({ phase: 'waiting', code: 'reading-prompt', text: 'Reading your message…' }); break;
       case 'reasoning': reasoning.add(f.text ?? ''); reporter.set({ phase: 'thinking', code: 'thinking', text: `Thinking… ${fmtTokens(reasoning.tokens)} tokens`, key: 'Thinking… {0} tokens', values: [fmtTokens(reasoning.tokens)], tokens: reasoning.tokens, args: { tokens: reasoning.tokens } }); break;
       case 'delta': reporter.set({ phase: 'answering', code: 'answering', text: 'Writing the answer…' }); break;
+      // 0.2.16 (owner): a local model's server runs one of its own tools (strata_mcp): the line names it, then waits for the model again
+      case 'native-tool': {
+        const name = String(f.event?.name ?? '').replace(/^mcp__[^_]+(?:_[^_]+)*?__/, '') || String(f.event?.name ?? '');
+        if (f.event?.event === 'call' && name) reporter.set({ phase: 'tool', code: 'tool', text: `Running ${name}…`, key: 'Running {0}…', values: [name], args: { tool: name } });
+        else if (f.event?.event !== 'call') reporter.set({ phase: 'waiting', code: 'model-working', text: 'Waiting for the model…' });
+        break;
+      }
       case 'done': case 'error': reporter.clear(); break;
       default: break;
     }
