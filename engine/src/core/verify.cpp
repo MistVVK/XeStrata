@@ -3362,6 +3362,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     note_nonfinite(T, nullptr);
     const uint32_t nf_scan = nan_guard_on() && last_stage() ? metal_scan_rows(metal_, T, n_vocab_) : 0u;
     metal_fold_nf(nf_mask_, nf_scan, T, nullptr, pos0, nf_mask_, nf_row_, nf_pos_);
+    progress_at("decode");   // (as the CUDA / HIP path's end of run(): a finished window is progress for the serve watchdog)
+    progress_beat();
     return true;
 #endif
     using namespace strata::kernels;
@@ -4844,6 +4846,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     note_nonfinite(S, last_pos_b_);
     const uint32_t nf_scan = nan_guard_on() && last_stage() ? metal_scan_rows(metal_, S, n_vocab_) : 0u;
     metal_fold_nf(nf_mask_, nf_scan, S, last_pos_b_, 0, nf_mask_, nf_row_, nf_pos_);
+    // the serve watchdog (issue #29): a finished batch window is progress, as in the CUDA / HIP path below.  Without it a Metal --batch
+    // decode with no admission for 60 s was ended as "no progress" (both slots mid-decode at 53 tok/s)
+    progress_at("decode");
+    progress_beat();
     return true;
 #endif
     using namespace strata::kernels;
