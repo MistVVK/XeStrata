@@ -375,6 +375,17 @@ add(en="New chat in {0}",
     ko="{0}에 새 채팅",
     fr="Nouvelle conversation dans {0}",
     he="שיחה חדשה ב־{0}")
+# #5091: a row of the chat's context popover: the room left before the assistant summarizes older messages by itself. English approved by the coordinator 11-17.
+add(en="Room left before older messages are summarized",
+    zh="较早的消息被总结前的剩余空间",
+    ja="古いメッセージが要約されるまでの残り容量",
+    de="Verbleibender Platz bis zur Zusammenfassung älterer Nachrichten",
+    es="Espacio restante antes de resumir los mensajes anteriores",
+    ru="Осталось места до сжатия старых сообщений",
+    pt="Espaço restante antes de resumir mensagens antigas",
+    ko="이전 메시지가 요약되기 전까지 남은 공간",
+    fr="Espace restant avant le résumé des anciens messages",
+    he="מקום שנותר לפני סיכום הודעות ישנות")
 here = APP / "src" / "locales"
 NBSP = " "
 

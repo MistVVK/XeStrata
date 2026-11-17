@@ -32,5 +32,6 @@
  "guic31": "Quote {0} · the assistant",
  "guic32": "Picture not added",
  "guic33": "Strata is still busy with this chat. Add the picture again when it is done.",
- "guic34": "New chat in {0}"
+ "guic34": "New chat in {0}",
+ "guic35": "Room left before older messages are summarized"
 }
