@@ -45,6 +45,7 @@ import { Markdown } from '../components/Markdown';
 import { Btn, Icon, IconBtn, ErrorNotice, type IconName } from '../components/ui';
 import { composerCap, scrollBehavior } from '../lib/responsive';
 import { relTime, cx, duration, tokens, tps } from '../lib/format';
+import { chosenRemote, hasModelToChat, showNoModelHint } from '../lib/composer-model';
 import { addQuote, clearQuotes, removeQuote, createSubagentExample, parkMessage, takeParked, pushToast, setPreviewTabClosed, setPreviewPanelClosed, branchFrom, continueLast, markRead, retryLast, selectSession, rewindTo, sendMessage, stopStreaming, useStore, } from '../lib/store';
 import { CopyBtn, CopyMenuItem, MenuCloseContext } from '../components/CopyBtn';
 import { KEYS_UP, PILL_DISTANCE, distanceFromBottom, followAfterScroll, wheelLeavesBottom } from '../lib/follow-scroll';
@@ -333,7 +334,7 @@ export function ChatScreen() {
     }, [session?.id, session?.messages.length === 0]);
     const textarea = useRef<HTMLTextAreaElement>(null);
     const remote = useStore(s => s.remoteModel), providers = useStore(s => s.providers);
-    const apiModel = providers?.connections.find(c => c.id === remote?.connectionId)?.models.find(m => m.id === remote?.modelId);
+    const apiModel = chosenRemote(providers, remote)?.model;
     const loaded = apiModel ?? library?.variants.find((v) => v.id === library.loaded) ?? null;
     /**
      * Follow the stream only when the reader is already at the bottom. Scrolling
@@ -624,7 +625,8 @@ function Composer({ draft, setDraft, loaded, streaming, onSubmit, onKey, session
 }) {
     const clearDraft = useCallback(() => setDraft(''), [setDraft]);
     const photos = useChatPhotos(session?.id), native = useNative();
-    const canChat = loaded || native?.instances.some(i => i.status === 'ready');
+    const remotePick = useStore(s => s.remoteModel), remoteProviders = useStore(s => s.providers);
+    const canChat = hasModelToChat({ remote: chosenRemote(remoteProviders, remotePick), localLoaded: loaded, nativeReady: !!native?.instances.some(i => i.status === 'ready') });
     const whileBusy = useStore(s => s.whileBusy), parkedList = useStore(s => (session ? s.parked[session.id] : undefined)) ?? NO_PARKED;
     const quoteList = useStore(s => (session ? s.quotes[session.id] : undefined)) ?? NO_QUOTES;
     // A command that runs at once (/compact, /website) clears only the "/..." the person typed to find it, never a message they were writing
@@ -715,7 +717,7 @@ function Composer({ draft, setDraft, loaded, streaming, onSubmit, onKey, session
           </div>
         </div>
         {tr(streaming && draft.trim() && whileBusy !== 'wait' ? <p className="xs muted composer__busy-hint" role="status">{tr(whileBusy === 'queue' ? "Enter sends it when the answer is done." : "Enter stops the answer here and sends it now.")}</p> : null)}
-        {tr(!streaming && !canChat && (draft.trim() || photos.length) && draft.trim() !== '/' && timeSkipPrompt(draft) === null ? <p className="xs muted composer__busy-hint" role="status">{tr("No model is loaded. Load one in Models to send this message.")}</p> : null)}
+        {tr(showNoModelHint({ streaming, canChat, hasText: !!draft.trim(), hasPhotos: photos.length > 0, bareSlash: draft.trim() === '/', isTimeSkip: timeSkipPrompt(draft) !== null }) ? <p className="xs muted composer__busy-hint" role="status">{tr("No model is loaded. Load one in Models to send this message.")}</p> : null)}
         <ChatTelemetry session={session}/>
         </div>
       </div>

@@ -115,7 +115,7 @@ export async function engineFirstRun({ control, gpus = [] }) {
     report = await control.updateCheck({});
   } catch (error) {
     const plain = plainUpdateError(error, 'Strata');
-    return { status: looksOffline(error) || /update server|No internet/.test(plain.headline ?? '') ? 'offline' : 'error', gpus: cards, message: plain.message, details: plain.details };
+    return { status: looksOffline(error) || /update server|No internet/.test(plain.headline ?? '') ? 'offline' : 'error', gpus: cards, message: plain.headline, details: plain.details };
   }
   const engine = report.engine ?? {};
   const hardware = report.hardware ?? {};

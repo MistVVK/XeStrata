@@ -169,6 +169,7 @@ export function EngineFirstRun({ onDone }: { onDone: () => void }) {
         const found = card ? <p>{tr("Strata found your graphics card:")}<br/><strong>{card}</strong>{cards > 1 ? <><br/><span className="small muted">{tr("{0} cards found. Strata uses the first one for the engine; change it later in Settings.", [cards])}</span></> : null}</p>
             : <p>{tr("Strata did not recognise a supported graphics card.")}</p>;
         let main, actions;
+        const withoutEngine = <button type="button" className="onboard-continue-anyway" onClick={onDone}>{tr("Continue without an engine")}</button>;
         if (info.status === 'offer' && info.offer) {
             main = <>{found}<p>{tr("To run models on it, Strata needs one download:")}<br/><strong>{tr("The engine for this card")}: {mb(info.offer.bytes + (info.control?.bytes ?? 0))} MB{info.control ? tr(WITH_CONTROL) : null}</strong></p>
                 {info.freeBytes !== undefined && info.freeBytes < info.offer.bytes * 2.5 ? <p className="small inline-error">{tr("The engine needs about {0} GB of free space on this drive and only {1} GB is free. Free some space, then continue.", [Math.ceil(info.offer.bytes * 2.5 / 1e9), (info.freeBytes / 1e9).toFixed(1)])}</p> : null}
@@ -177,7 +178,12 @@ export function EngineFirstRun({ onDone }: { onDone: () => void }) {
         }
         else if (info.status === 'offline') {
             main = <>{found}<p>{tr("Strata could not reach github.com. Check your connection and try again, or download the engine file on another PC and choose it here.")}</p></>;
-            actions = <><Btn variant="primary" disabled={busy} onClick={look}>{tr("Try again")}</Btn>{pick("Choose a downloaded file…")}</>;
+            actions = <><Btn variant="primary" disabled={busy} onClick={look}>{tr("Try again")}</Btn>{pick("Choose a downloaded file…")}{withoutEngine}</>;
+        }
+        else if (info.status === 'error') {
+            // The list could not be read (not "no internet", which has its own card above): a first run is not an update, so no word of updates or Settings; the raw reason stays behind Details.
+            main = <>{found}<p>{tr("Strata couldn’t read its download list, so it can’t pick an engine yet. Press Try again, or choose another way below.")}</p>{info.details ? <details className="error-detail"><summary className="small">{tr('Details')}</summary><pre className="small muted">{info.details}</pre></details> : null}</>;
+            actions = <><Btn variant="primary" disabled={busy} onClick={look}>{tr("Try again")}</Btn>{pick("Choose a downloaded file…")}{withoutEngine}</>;
         }
         else if (info.status === 'wrong-make') {
             main = <>{found}<p>{info.message ?? tr("The engine installed here is for another make of graphics card.")}</p></>;

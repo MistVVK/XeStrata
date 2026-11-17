@@ -77,5 +77,8 @@
  "guic76": "GPU y memoria",
  "guic77": "Qué borrador adivina palabras por adelantado para acelerar las respuestas, de uno en uno. Automático (recomendado) es DFlash2 para Qwen3.8-Flash-Next donde el motor lo tiene, y MTP en los demás casos; con dos o más tarjetas gráficas idénticas que toma el motor de división en todas las tarjetas, es ese motor con la capa de borrador MTP. DFlash2 descarga una vez un borrador de {0} GB, y MTP su capa de borrador una vez. Con Automático, varias solicitudes a la vez usan MTP. Si eliges DFlash2 tú mismo, funciona con el número de solicitudes que establezcas. Si DFlash2 no puede ejecutarse, se usa solo MTP y Detalles explica por qué. Desactivado apaga el borrador.",
  "guic78": "Último: {0} tokens a {1} tok/s",
- "guic79": "Último: {0} tokens"
+ "guic79": "Último: {0} tokens",
+ "guic80": "Strata no pudo leer su lista de descargas, así que todavía no puede elegir un motor. Pulsa Volver a intentarlo o elige otra opción más abajo.",
+ "guic81": "Las tareas se ejecutan con un modelo cargado en este equipo. Carga uno en Modelos.",
+ "guic82": "La parte en segundo plano de Strata se ha detenido. Cierra Strata y ábrelo de nuevo."
 }

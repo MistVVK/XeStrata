@@ -3704,8 +3704,13 @@ textarea.st-input {
   background: currentColor;
 }
 .connbar__text {
-  flex: 1;
+  flex: 1 1 220px;
   min-width: 0;
+}
+.connbar__stopped {
+  flex-basis: 100%;
+  margin: 0 0 0 18px;
+  font-weight: 600;
 }
 
 /* The recommended model carries one step more weight than the rest.
@@ -4909,7 +4914,8 @@ textarea.config-editor.st-input {
   flex-basis: 100%;
   margin-inline-start: 24px;
 }
-.connectionbar {
+.connectionbar,
+.connbar {
   flex-wrap: wrap;
 }
 

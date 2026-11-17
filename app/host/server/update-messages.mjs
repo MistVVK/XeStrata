@@ -19,7 +19,7 @@ export const UPDATE_WAITING_FOR_LOCK = 'Waiting for the update check to finishâ€
 /** True when the failure looks like a computer with no internet (no DNS, no route, refused), not a slow or broken server. */
 export function looksOffline(error) {
   const text = [error?.message, error?.cause?.message, error?.cause?.code, error?.code, error].filter(x => typeof x === 'string').join(' ');
-  return /ENOTFOUND|EAI_AGAIN|ENETUNREACH|ENETDOWN|EHOSTUNREACH|ECONNREFUSED|getaddrinfo|fetch failed|network is unreachable|name or service not known|temporary failure in name resolution|nodename nor servname|No address associated|URLError/i.test(text);
+  return /ENOTFOUND|EAI_AGAIN|ENETUNREACH|ENETDOWN|EHOSTUNREACH|ECONNREFUSED|getaddrinfo|fetch failed|network is unreachable|name or service not known|temporary failure in name resolution|nodename nor servname|No address associated|URLError|it looks offline|could not connect to/i.test(text);
 }
 export const OFFLINE_MESSAGE = "No internet connection. Try again when you're online.";
 
@@ -45,7 +45,7 @@ export function plainUpdateError(error, subject = 'engine', retry = undefined) {
   } else if (looksOffline(error) || looksOffline(raw)) {
     message = 'No internet connection.';
     next = "Try again when you're online.";
-  } else if (/could not be read|interrupted|timed out|timeout|ECONN|ENOTFOUND|fetch failed|could not reach|server answered|not answer within/i.test(raw)) {
+  } else if (/could not be read|interrupted|timed out|timeout|ECONN|ENOTFOUND|fetch failed|could not reach|server answered|not answer within|did not answer/i.test(raw)) {
     message = "Couldn't reach the update server.";
     next = `Check your internet connection, then press ${button} in Settings.`;
   } else if (/free space|not enough|no space left|disk is full/i.test(raw)) {

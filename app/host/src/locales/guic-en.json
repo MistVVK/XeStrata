@@ -77,5 +77,8 @@
  "guic76": "GPU & memory",
  "guic77": "Which drafter guesses words ahead to make answers faster, one at a time. Auto (recommended) is DFlash2 for Qwen3.8-Flash-Next where the engine has it, the MTP otherwise; on two or more identical graphics cards that the all-cards split engine takes, it is that engine with the MTP draft layer. DFlash2 downloads a {0} GB drafter once, the MTP its draft layer once. With Auto, several requests at once use the MTP. If you choose DFlash2 yourself, it runs with the number of requests you set. If DFlash2 cannot run, the MTP is used alone and Details says why. Off turns the drafter off.",
  "guic78": "Last: {0} tokens at {1} tok/s",
- "guic79": "Last: {0} tokens"
+ "guic79": "Last: {0} tokens",
+ "guic80": "Strata couldn’t read its download list, so it can’t pick an engine yet. Press Try again, or choose another way below.",
+ "guic81": "Tasks run on a model loaded on this computer. Load one in Models.",
+ "guic82": "Strata’s background part has stopped. Close Strata and open it again."
 }
