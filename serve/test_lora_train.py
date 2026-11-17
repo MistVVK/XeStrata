@@ -79,6 +79,7 @@ for step in range(1, steps + 1):
               flush=True)
     if step % k == 0:
         save(step)
+    print(f"progress step={step} total={steps} loss=0.1", flush=True)
     time.sleep(sleep)
 save(steps)
 if mf:

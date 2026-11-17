@@ -214,6 +214,7 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
             tr.save(path, train::lora_meta(meta));
             std::printf("saved %s\n", path.c_str());
         }
+        ctl.progress(step, steps, loss);
     }
     return 0;
 }

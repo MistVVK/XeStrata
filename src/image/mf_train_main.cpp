@@ -387,6 +387,7 @@ int main(int argc, char** argv) {
                 ++updates;
                 const float lrw = warmup > 0 ? lr * std::min(1.f, (float) updates / (float) warmup) : lr;
                 strata::image::mf_trainer_adamw(m.get(), lrw, 0.9f, 0.999f, adam_eps, wd, accum);
+                const double update_loss = acc_loss / accum;
                 if (updates % 10 == 0 || updates == 1) {
                     std::printf("step %5d loss %.6f lr %.1e\n", updates, acc_loss / accum, (double) lrw);
                     std::fflush(stdout);
@@ -396,10 +397,12 @@ int main(int argc, char** argv) {
                 if (updates % checkpoint == 0)
                     strata::image::mf_trainer_save(m.get(), out + "." + std::to_string(updates) + ".safetensors",
                                                    title, trigger, seed, lr, updates, steps, kind);
+                ctl.progress(updates, (steps + accum - 1) / accum, update_loss);
             }
             if (acc_n > 0) {   // the tail micro-steps' gradients, averaged over what ran
                 strata::image::mf_trainer_adamw(m.get(), lr, 0.9f, 0.999f, adam_eps, wd, acc_n);
                 ++updates;
+                ctl.progress(updates, (steps + accum - 1) / accum, acc_loss / acc_n);
             }
             acc_n = 0;
             acc_loss = 0;

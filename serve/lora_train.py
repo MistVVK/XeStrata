@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -101,19 +102,13 @@ SAMPLE_SIZE = (1024, 1024)
 # step ("_N" = <prefix>_<step>.safetensors, ".N" = <prefix>.<step>.safetensors and <prefix>.final.safetensors).
 TRAINERS: dict[str, dict] = {
     "qwen-image": {"exe": "xestrata-image-qi-train", "save_flag": "--save-every", "ckpt": "_N", "cache": "qi",
-                   "elastic": True,
-                   "progress": re.compile(r"^step (\d+) loss ([\d.eE+-]+) \(avg ([\d.eE+-]+)\).*"
-                                          r"\(([\d.]+) s/step\)")},
+                   "elastic": True},
     "mage-flow": {"exe": "xestrata-image-mf-train", "save_flag": "--checkpoint", "ckpt": ".N", "cache": "mf",
-                  "elastic": True, "progress": re.compile(r"^step\s+(\d+) loss ([\d.eE+-]+) lr")},
+                  "elastic": True},
     "moss-image": {"exe": "xestrata-image-moss-train", "save_flag": "--save-every", "ckpt": "_N", "cache": "ms",
-                   "elastic": True,
-                   "progress": re.compile(r"^step (\d+) loss ([\d.eE+-]+) \(avg ([\d.eE+-]+)\).*"
-                                          r"\(([\d.]+) s/step\)")},
+                   "elastic": True},
     "anima": {"exe": "xestrata-image-anima-train", "save_flag": "--save-every", "ckpt": "_N", "cache": "an",
-              "elastic": True,
-              "progress": re.compile(r"^step (\d+) loss ([\d.eE+-]+) \(avg ([\d.eE+-]+)\).*"
-                                     r"\(([\d.]+) s/step\)")},
+              "elastic": True},
 }
 
 
@@ -775,10 +770,10 @@ class TrainJobs:
                 elif rec["status"] == "queued":
                     self._run(rec, cancel)
             except _Cancelled:
-                rec.update(status="cancelled", completed_at=int(time.time()), error=None)
+                rec.update(status="cancelled", completed_at=int(time.time()), error=None, place=None)
                 self._write(rec)          # its versions stay, to pick and register
             except Exception as e:   # noqa: BLE001 - the job's failure, said in its record
-                rec.update(status="failed", completed_at=int(time.time()),
+                rec.update(status="failed", completed_at=int(time.time()), place=None,
                            error={"code": "train_failed", "message": str(e)})
                 self._write(rec)
             finally:
@@ -803,7 +798,7 @@ class TrainJobs:
         self._train_stage(rec, cancel)
         if cancel.is_set():
             raise _Cancelled()
-        rec.update(status="sampling", stage="samples")
+        rec.update(status="sampling", stage="samples", place=None)
         self._write(rec)
         self._samples(rec, cancel)
         rec.update(status="awaiting_choice", stage=None, completed_at=int(time.time()))
@@ -1095,28 +1090,28 @@ class TrainJobs:
     def _read_train(self, rec: dict, proc: subprocess.Popen) -> None:
         """The trainer's stdout: the progress lines, the vram reports (the trailing key=value fields ignored), the
         state saved line, the versions as they appear."""
-        t = TRAINERS[rec["family"]]
         log = getattr(self, "_log", None)
         assert proc.stdout is not None
         for line in proc.stdout:
             if log is not None:
                 log.write(line)
                 log.flush()
-            m = t["progress"].match(line)
-            if m:
-                g = m.groups()
-                step = int(g[0])
-                now = time.monotonic()
-                speed = float(g[3]) if len(g) > 3 else None
-                if not speed and self._step_clock and step > self._step_clock[0]:
-                    speed = (now - self._step_clock[1]) / (step - self._step_clock[0])
-                self._step_clock = step, now
-                rec["progress"] = {"step": step, "total": rec["settings"]["steps"], "loss": float(g[1]),
-                                   "s_per_step": speed, "eta_s": self._eta(rec, step)}
-                self._scan_versions(rec)
-                self._write(rec)
-                continue
             tok = line.split()
+            if tok and tok[0] == "progress":
+                with contextlib.suppress(ValueError, KeyError):
+                    fields = dict(t.split("=", 1) for t in tok[1:] if "=" in t)
+                    step, total, loss = int(fields["step"]), int(fields["total"]), float(fields["loss"])
+                    if not 0 < step <= total or not math.isfinite(loss):
+                        continue
+                    now = time.monotonic()
+                    speed = ((now - self._step_clock[1]) / (step - self._step_clock[0])
+                             if self._step_clock and step > self._step_clock[0] else None)
+                    self._step_clock = step, now
+                    rec["progress"] = {"step": step, "total": total, "loss": loss, "s_per_step": speed,
+                                       "eta_s": int(speed * (total - step)) if speed else None}
+                    self._scan_versions(rec)
+                    self._write(rec)
+                continue
             if tok and tok[0] == "vram" and len(tok) >= 5 and tok[4] in ("running", "paused"):
                 with contextlib.suppress(ValueError):
                     _DEV_CACHE.clear()  # the pause/grow changed free VRAM; the policy needs a fresh report
@@ -1134,13 +1129,6 @@ class TrainJobs:
         with contextlib.suppress(Exception):
             proc.stdout.close()
         self._scan_versions(rec)
-
-    def _eta(self, rec: dict, step: int) -> int | None:
-        sp = (rec.get("progress") or {}).get("s_per_step")
-        if not sp:
-            started = rec.get("started_at") or int(time.time())
-            sp = (time.time() - started) / step if step else None
-        return int(sp * (rec["settings"]["steps"] - step)) if sp else None
 
     def _scan_versions(self, rec: dict) -> None:
         """New checkpoint files in out/, kept only once their header reads (a cancel mid-save leaves a broken one)."""

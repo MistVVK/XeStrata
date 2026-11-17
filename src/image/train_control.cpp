@@ -202,6 +202,11 @@ bool Control::load(const std::string& path, const std::function<void(std::istrea
     return true;
 }
 
+void Control::progress(int64_t step, int64_t total, double loss) const {
+    std::printf("progress step=%lld total=%lld loss=%.9g\n", (long long) step, (long long) total, loss);
+    std::fflush(stdout);
+}
+
 void Control::emit(bool force) {
     const int64_t rows = tr_.last_rows();
     const uint64_t guess = tr_.guess_row();

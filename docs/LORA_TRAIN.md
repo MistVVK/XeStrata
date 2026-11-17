@@ -375,11 +375,13 @@ the control file (serve writes it atomically, tmp + rename; the trainer reads it
           save_state true = write the state at the next micro-step boundary, then pause (a move, a full stop)
           stop true = exit normally at the next boundary (save the state first if save_state is also true)
 stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib= gpu_peak_mib= process_mib= process_source= min_source= need_mib= raw_min_mib= raw_min_source=]
+          progress step=<update> total=<updates> loss=<loss>
           state saved <path>
 ```
 
-- The `vram` line comes at a step's boundary when its fields changed. Serve reads the first four fields and `need_mib`
-  (the other key=value extras are for the log and the tests). `used` is the trainer's own accounting; `free_mib` is the
+- The `progress` line comes after each update and its checkpoint. Serve uses it for progress, not the human step line.
+- The `vram` line comes at a step's boundary when its fields changed. Serve reads its first four fields, `need_mib`,
+  `process_mib` and `process_source`. `used` is the trainer's own accounting; `free_mib` is the
   device's report (what the runtime still holds after a pause shows there). `gpu_peak_mib` is the maximum accounted
   GPU allocation since process start, rounded up to MiB; it excludes the runtime's own allocations. `process_mib` includes
   the runtime. `process_source` is `fdinfo` (this Linux DRM process), `nvml` (this NVIDIA driver process), `delta` (the

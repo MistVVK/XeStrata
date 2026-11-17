@@ -17,10 +17,11 @@
 // The stdout lines:
 //
 //   vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib= need_mib=]
+//   progress step=<update> total=<updates> loss=<loss>
 //   state saved <path>
 //
-// The first four fields are the form serve reads; the key=value extras are for the log and the tests.  The vram
-// line comes when its figures change (every step's boundary, and at a pause/resume). used is the trainer's own
+// Serve reads the first four vram fields, need_mib, process_mib and process_source. The vram line comes when its
+// figures change (every step's boundary, and at a pause/resume). used is the trainer's own
 // allocation accounting; process_mib includes the runtime, from process_source. need_mib is the estimated
 // least-form process peak plus a sampling margin; the run starts or resumes only when the budget reaches it.
 #pragma once
@@ -63,6 +64,8 @@ public:
     bool boundary(bool update_done, const std::function<void(std::ostream&)>& save_loop);
     /// The vram line, when its figures changed (after a step, and at a pause/resume).
     void report();
+    /// One machine-readable line after each optimizer update and any checkpoint for it.
+    void progress(int64_t step, int64_t total, double loss) const;
     /// --resume: the state file into the trainer and the loop (`load_loop` reads what save_loop wrote).  The
     /// completed step count comes back through the loop's own state.  False where the path is empty.
     bool load(const std::string& path, const std::function<void(std::istream&)>& load_loop);

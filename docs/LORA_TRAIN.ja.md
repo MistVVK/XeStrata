@@ -343,10 +343,12 @@ SSD の段は後（v1 に入れない）。
           save_state true = 次のマイクロステップの境で状態を書いてから一時停止（カードを移る・完全に止まる準備）
           stop true = 次の境で通常終了（save_state も true なら状態を先に保存）
 stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib= gpu_peak_mib= process_mib= process_source= min_source= need_mib= raw_min_mib= raw_min_source=]
+          progress step=<更新数> total=<更新の総数> loss=<損失>
           state saved <path>
 ```
 
-- `vram` 行は step の境で、欄が変わったら出す。先頭 4 欄と `need_mib` を serve が読む。
+- `progress` 行は各更新とその checkpoint の保存の後に出す。serve は人向けの step 行でなくこの行を進捗に使う。
+- `vram` 行は step の境で、欄が変わったら出す。先頭 4 欄と `need_mib`・`process_mib`・`process_source` を serve が読む。
   `used` は学習器の確保の帳簿、`free_mib` は装置の報告（一時停止の後もランタイムが持つ分が見える）。
   `gpu_peak_mib` はプロセス起動後の GPU 確保の帳簿の最大（MiB に切り上げ）。ランタイム自身の確保は含まない。
   `process_mib` はランタイムを含む使用量、`process_source` は `fdinfo`（Linux DRM の自プロセス）、

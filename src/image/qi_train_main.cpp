@@ -231,6 +231,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
             tr.save(path, train::lora_meta(meta));
             std::printf("saved %s\n", path.c_str());
         }
+        ctl.progress(step, steps, loss);
     }
     return 0;
 }
