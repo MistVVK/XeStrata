@@ -18609,9 +18609,9 @@ int main(int argc, char** argv) {
                 slot_source < 0 && lent_slot < 0 && req_imgs.empty() &&
                 strata::program::conv_cache::rewind_keep(live.data(), (int64_t) live.size(), ids.data(), resume,
                                                          o.conversation_cache_rewind_keep);
-            // (#5864's STRATA_SLOT_PARK_SKIP - skipping this park where a batch slot holds the conversation, and the park of a
-            // slot's reply before its own next turn - is not in 0.2.16: on two cards the turn after the skipped park read a
-            // different K/V and changed a token against the park as before; see RESULTS-SERVE-1116.md)
+            // (a batch slot that holds this conversation does not make the park unneeded: with the park skipped on two cards
+            // - #5864's STRATA_SLOT_PARK_SKIP - the turn after it read the slot's K/V instead of the parked image and one
+            // token differed from the park as before)
             const bool keep_branch = pin_sibling || rewind_skip;
             if (rewind_skip)
                 std::fprintf(stderr,
