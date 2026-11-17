@@ -14,8 +14,8 @@ index f75018597d..ccb4ec4cf9 100644
 @@ -4,6 +4,7 @@
  // See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
- // Modified 2026 by MistVVK and the XeStrata contributors: the CUDA adapter is handed the device image itself (cuda-binary-to-adapter)
-+// Modified 2026 by MistVVK and the XeStrata contributors: the CUDA adapter is handed every NVIDIA image (cuda-binaries-to-adapter)
+ // Modified 2026 by MistVVK and the XeStrata contributors: CUDA image input.
++// Modified 2026 by MistVVK and the XeStrata contributors: CUDA image list.
  //
  //===----------------------------------------------------------------------===//
  
