@@ -7671,3 +7671,10 @@ button.sent-quote__label { text-decoration: underline; text-underline-offset: 2p
 @media (max-width: 560px) { .askq__opts, .askq__own, .askq__problem { margin-left: 0; } .askq__acts { padding-left: 14px; } .askq__own { width: 100%; } .askq__item { padding-right: 0; } }
 /* #6060: in a right-to-left language the send arrow points the way the text runs */
 [dir="rtl"] .st-icon:has(> use[href$="#i-send"]) { transform: scaleX(-1); }
+
+/* A helper's log (View log, #5254): what it did, oldest first, in a list that scrolls inside the dialog. */
+.subagent-log { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 46vh; overflow-y: auto; }
+.subagent-log li { font-size: var(--st-fs-sm); line-height: 1.45; overflow-wrap: anywhere; }
+.subagent-log__step { color: var(--st-ink-soft); }
+.subagent-log__step strong { color: var(--st-ink); font-weight: 600; }
+.subagent-log__said { padding: 6px 10px; border-radius: var(--st-r-md); background: var(--st-surface-2); color: var(--st-ink); }

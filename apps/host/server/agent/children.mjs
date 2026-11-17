@@ -21,6 +21,9 @@ const clip = (value, max) => {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 };
 
+/** The steps one helper's row keeps for "View log" (#5254): the newest ones, short, so the parent's saved chat stays small. */
+export const MAX_STEPS = 20;
+
 /** What a helper is doing, in words (shown as the row's description while it works). */
 export function activityOf(name, args = {}) {
   const scope = toolScope(name);
@@ -48,6 +51,7 @@ export class ChildProjector {
     this.sawUsage = false;
     this.activity = null;
     this.closing = '';              // the helper's last words, shown once it finished
+    this.steps = [];                // what it did, newest last: { verb, target } for a tool, { said } for its own words (View log)
     this.failure = null;
     this.endedAt = null;
     this.tools = new Map();         // callId -> { card, calledAt, asked }
@@ -68,10 +72,16 @@ export class ChildProjector {
     return {
       id: this.id, name: this.name, description, status: this.status,
       durationMs: Math.max(0, (done ? this.endedAt : at) - this.startedAt), tokens: this.tokens, updatedAt: at,
+      ...(this.steps.length ? { steps: this.steps.slice(-MAX_STEPS) } : {}),
     };
   }
 
   #cardId(callId) { return `${this.id}:${callId}`; }
+
+  #step(step) {
+    this.steps.push(step);
+    if (this.steps.length > MAX_STEPS) this.steps.splice(0, this.steps.length - MAX_STEPS);
+  }
 
   #card(callId, patch) {
     const entry = this.tools.get(callId);
@@ -112,7 +122,7 @@ export class ChildProjector {
         break;
       case 'assistant/message': {
         const text = (d.message?.content ?? []).filter(p => p.type === 'text').map(p => p.text).join('').trim();
-        if (text) this.closing = text;
+        if (text) { this.closing = text; this.#step({ said: clip(text, 400) }); row = true; }
         break;
       }
       case 'tool/call': {
@@ -120,6 +130,7 @@ export class ChildProjector {
         const card = { ...presentTool({ callId: this.#cardId(d.callId), name: d.name, args }), state: 'running', agentName: this.name };
         this.tools.set(d.callId, { card, calledAt: e.time, asked: false });
         this.activity = activityOf(d.name, args);
+        this.#step({ verb: clip(card.verb, 40), target: clip(card.target, 160) });
         set('working');
         row = true;
         break;
