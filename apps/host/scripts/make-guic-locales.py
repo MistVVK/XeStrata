@@ -246,6 +246,27 @@ add(en="Running {0}…",
     ko="{0} 실행 중…",
     fr="Exécution de {0}…",
     he="מריץ את {0}…")
+# #5529: set up without a local engine (a link on the first-run engine card and the muted line under it). English approved by the coordinator.
+add(en="Only connect to Strata on another computer",
+    zh="只连接到另一台电脑上的 Strata",
+    ja="別のコンピューターの Strata にだけ接続する",
+    de="Nur mit Strata auf einem anderen Computer verbinden",
+    es="Conectarse solo a Strata en otro equipo",
+    ru="Только подключиться к Strata на другом компьютере",
+    pt="Apenas conectar ao Strata em outro computador",
+    ko="다른 컴퓨터의 Strata에만 연결",
+    fr="Se connecter uniquement à Strata sur un autre ordinateur",
+    he="להתחבר רק ל-Strata במחשב אחר")
+add(en="Nothing is downloaded. You can add the engine later from the Models page.",
+    zh="不会下载任何内容。你之后可以在模型页面添加引擎。",
+    ja="何もダウンロードされません。エンジンは後で「モデル」ページから追加できます。",
+    de="Es wird nichts heruntergeladen. Sie können die Engine später auf der Seite „Modelle“ hinzufügen.",
+    es="No se descarga nada. Puedes añadir el motor más tarde desde la página Modelos.",
+    ru="Ничего не загружается. Движок можно добавить позже на странице «Модели».",
+    pt="Nada é baixado. Você pode adicionar o mecanismo depois, na página Modelos.",
+    ko="아무것도 다운로드되지 않습니다. 엔진은 나중에 모델 페이지에서 추가할 수 있습니다.",
+    fr="Rien n’est téléchargé. Vous pourrez ajouter le moteur plus tard depuis la page Modèles.",
+    he="שום דבר לא יורד. אפשר להוסיף את המנוע מאוחר יותר מעמוד המודלים.")
 here = APP / "src" / "locales"
 NBSP = " "
 

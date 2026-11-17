@@ -20,5 +20,7 @@
  "guic19": "Warten auf das Modell…",
  "guic20": "{0} wird aufgerufen…",
  "guic21": "Datei {0} wird geschrieben…",
- "guic22": "{0} läuft…"
+ "guic22": "{0} läuft…",
+ "guic23": "Nur mit Strata auf einem anderen Computer verbinden",
+ "guic24": "Es wird nichts heruntergeladen. Sie können die Engine später auf der Seite „Modelle“ hinzufügen."
 }

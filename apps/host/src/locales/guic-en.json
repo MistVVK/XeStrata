@@ -20,5 +20,7 @@
  "guic19": "Waiting for the model…",
  "guic20": "Calling {0}…",
  "guic21": "Writing file {0}…",
- "guic22": "Running {0}…"
+ "guic22": "Running {0}…",
+ "guic23": "Only connect to Strata on another computer",
+ "guic24": "Nothing is downloaded. You can add the engine later from the Models page."
 }

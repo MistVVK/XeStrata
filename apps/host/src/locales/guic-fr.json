@@ -20,5 +20,7 @@
  "guic19": "En attente du modèle…",
  "guic20": "Appel de {0}…",
  "guic21": "Écriture du fichier {0}…",
- "guic22": "Exécution de {0}…"
+ "guic22": "Exécution de {0}…",
+ "guic23": "Se connecter uniquement à Strata sur un autre ordinateur",
+ "guic24": "Rien n’est téléchargé. Vous pourrez ajouter le moteur plus tard depuis la page Modèles."
 }

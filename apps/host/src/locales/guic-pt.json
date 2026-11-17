@@ -20,5 +20,7 @@
  "guic19": "Aguardando o modelo…",
  "guic20": "Chamando {0}…",
  "guic21": "Escrevendo o arquivo {0}…",
- "guic22": "Executando {0}…"
+ "guic22": "Executando {0}…",
+ "guic23": "Apenas conectar ao Strata em outro computador",
+ "guic24": "Nada é baixado. Você pode adicionar o mecanismo depois, na página Modelos."
 }
