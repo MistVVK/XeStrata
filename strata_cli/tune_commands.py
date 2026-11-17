@@ -195,6 +195,28 @@ def _parse_goal(text: str) -> tuple[str, int]:
     raise ValueError("goal is speed, room or room:MiB")
 
 
+#: #5078 (text approved by the coordinator): the note under a tune that could not measure your settings, when an engine's log was kept
+FAILED_LOG_NOTE = "The engine's own log of the failed start is kept at {path}."
+
+
+def _keep_failed_log(session: Any) -> Path | None:
+    """#5078: the log of the last engine that failed outlives the run's own scratch folder (which goes with the run unless --work-dir keeps it):
+    `last-failed-engine.log` in the presets folder, the end of it, written privately, replaced by the next failure. None when no engine failed."""
+    src = getattr(session, "failed_log", None)
+    if not src:
+        return None
+    try:
+        from strata_control import presets
+        data = Path(src).read_bytes()[-262144:]
+        dest = presets.preset_dir() / "last-failed-engine.log"
+        presets._atomic(dest, data)
+        from strata_control import private_files
+        private_files.restrict_to_current_user(dest)       # 0600, or a DACL for this user only on Windows, as the other private files
+        return dest
+    except OSError:
+        return None
+
+
 def _write_status(path: str | None, payload: dict[str, Any]) -> None:
     if not path:
         return
@@ -288,6 +310,9 @@ def auto(a: argparse.Namespace) -> int:
         cancel.set()
         result = tuner.result
         result.outcome, result.message = "cancelled", "Stopped. Your settings were not changed."
+    kept = _keep_failed_log(session)
+    if kept and result.outcome == "base_failed":
+        result.notes.append(FAILED_LOG_NOTE.format(path=kept))
     out = result.to_dict()
     choices = presets.choices_from_config(cfg, use=a.use)
     choices["goal"], choices["reserve_mib"] = goal, reserve

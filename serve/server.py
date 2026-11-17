@@ -1521,6 +1521,12 @@ class StrataEngine:
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
             return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
                     "report it at github.com/Niko1221/Strata/issues with the log.")
+        card = next((x.strip() for x in reversed(tail.splitlines())
+                     if re.search(r"out of memory", x, re.I) and re.search(r"cuda|hip|vram|gpu|graphics", x, re.I)), "")
+        if card and rc != -9:                             # #5078: the engine aborted on a card that was full: not a RAM story, and no dmesg to read
+            return ("The engine stopped because the graphics card ran out of memory (its log says: " + card[:200] + "). Close other programs "
+                    "that use the graphics card and try again. If it keeps happening, keep more graphics memory free: "
+                    "strata launch --set vram-reserve-mib=2048.")
         rt_note = rttime_limit_note() if rc == -9 else ""
         if rt_note:                                       # #3238: the kernel killed it, but not for RAM
             return ("The engine was ended by signal 9. " + rt_note + " If dmesg (sudo dmesg | grep -i -E 'killed "

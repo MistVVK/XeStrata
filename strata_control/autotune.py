@@ -37,7 +37,11 @@ EARLY_DROP = 0.05                  # a candidate this much slower than its own r
 STAGE_GAP_NOISY = 0.04             # an A/A gap above this: the machine is noisy (6.5)
 
 
-STAGNANT_WAIT_S = 60.0          # free memory that has not grown by STAGNANT_MIB after this long is not going to
+#: #5078 (text approved by the coordinator): appended to "Your current settings could not be measured: ..." when the graphics card ran out of memory
+GRAPHICS_MEMORY_HINT = ("The graphics card ran out of memory. Other programs, such as the desktop, may be using part of it. "
+                        "Close them, or leave more room and tune again with --goal room:2048.")
+
+STAGNANT_WAIT_S = 60.0         # free memory that has not grown by STAGNANT_MIB after this long is not going to
 STAGNANT_MIB = 512
 
 
@@ -413,6 +417,8 @@ class Tuner:
             r.outcome = "base_failed"
             r.reason_code = "start_failed"
             r.message = "Your current settings could not be measured: " + (base1.reason or base1.status)
+            if base1.status == "OOM" and self.ctx.backend in ("cuda", "hip") and self.ctx.family == "flash-next":
+                r.message += " " + GRAPHICS_MEMORY_HINT      # #5078: a graphics-memory failure points at the reserve, not at RAM
             return
         r.base = base1.to_dict()
         r.facts = dict(base1.facts)
