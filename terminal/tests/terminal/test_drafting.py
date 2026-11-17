@@ -414,7 +414,8 @@ class EngineArguments(unittest.TestCase):
             self.assertIn(args[args.index("--draft-conf") + 1], ("0.7", "0.35"))
             args = engine_args(self.cfg(drafting="dflash2", args=[*self.args, "--expert-cache", "1000"]))
             self.assertEqual(args[args.index("--draft-conf") + 1], "0.8", "the cache the person asked for decides, not the card")
-        with mock.patch.object(drafting, "ENGINE_SERVES_DFLASH2", False):
+        # no card memory known (as in the first block): an 8 GB card on the box that runs the test would add --kv-resident here (vram_fit.fit_start)
+        with mock.patch.object(drafting, "ENGINE_SERVES_DFLASH2", False), mock.patch("serve.server.drafting_vram_mib", return_value=None):
             self.assertEqual(engine_args(self.cfg()), self.args, "the engine cannot serve it: nothing changes")
             off = engine_args(self.cfg(drafting="off"))
             self.assertNotIn("--mtp", off)
