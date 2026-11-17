@@ -33,6 +33,7 @@ import { useStore } from '../lib/store';
 import { NativePresets } from './NativePresets';
 import { NativeTune } from './NativeTune';
 import { NativeTuneBadge } from './NativeTuneBadge';
+import { commitWarning } from '../lib/commit-warning';
 import { nativeCatalogModels, catalogVersionLabel, fetchesPictures, hasKvChoice } from '../lib/native-catalog';
 export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine }: {
     onOtherModels: () => void;
@@ -92,6 +93,7 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
     // What a running job works on, by its name in the list: "Qwen3.8-Flash-Next · Gyro · Smallest".
     const jobLabel = (j: NativeJob) => { const v = allSizes.find(s => s.id === j.model || (s.model === j.model && (!j.family || s.sourceFamily === j.family))); const f = v && families.find(x => x.sizes.includes(v)); return v ? [f?.title, catalogVersionLabel(v)].filter(Boolean).join(' · ') : ''; };
     const loadedSelected = native?.instances.find(i => i.model === selectedSize?.id && i.status === 'ready');
+    const loadedCommit = commitWarning(loadedSelected?.metrics?.engine);   // #1607: the engine says the Windows commit limit is close
     // What the running model was really started with is what the page shows: after Load the highlight must still be the profile that was applied.
     useEffect(() => { if (loadedSelected?.resourceProfile)
         setResourceProfile(loadedSelected.resourceProfile); }, [loadedSelected?.id, loadedSelected?.resourceProfile]);
@@ -263,6 +265,7 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
       </div>
       {tr(contextIsTight(fitHardware.vram_gb, context, kv, selectedSize?.context_fit) ? <p className="small muted native-spill-note"><Icon name="warning" size={16}/>{tr("This much context takes about {0} GB of graphics memory and leaves little room for the model on this card. Strata will try it; if it does not start, choose a shorter context.", [contextCacheGb(context, kv, selectedSize?.context_fit).toFixed(1)])}</p> : null)}
       {tr(loadedSelected?.metrics?.engine?.drafting_note ? <p className="small muted native-spill-note">{tr(String(loadedSelected.metrics.engine.drafting_note))}</p> : null)}
+      {tr(loadedCommit ? <div className="native-commit-note" role="status"><p className="small"><Icon name="warning" size={16}/>{tr("Windows is close to its memory limit (memory plus page file). Strata may stop without a message. Make the Windows page file larger, or choose a shorter context.")}</p><p className="small muted">{tr("{0} GB of {1} GB are left.", [loadedCommit.left, loadedCommit.limit])}</p></div> : null)}
       {roleCards.length > 1 ? <GpuRoles cards={roleCards} roles={effectiveRoles} custom={customRoles} recommendedRoles={recommended.roles} vendor={engineVendor} disabled={!!active} onChange={changeRoles} onBack={() => setRoles(null)} memoryGb={selectedSize ? memoryNeeded(selectedSize) || null : null} ramGb={pcRam} spillGb={selectedSize ? fitOn(selectedSize, fitHardware).spillGb : 0} usedBy={i => usedBy([i])}/> : null}
       {tr(roleCards.length > 1 && (native?.hardware?.gpus ?? []).length > roleCards.length ? <p className="small muted native-cards__note">{tr('Not used: {0} (another make of graphics card than this engine drives).', [(native?.hardware?.gpus ?? []).filter(g => !roleCards.some(r => r.index === g.index && r.vendor === g.vendor)).map(g => g.name).join(', ')])}</p> : null)}
       {tr(selectedSize?.images || noReader ? <><div className="native-image-reading"><label title={noReader ? tr("Needs an engine update") : undefined}><input type="checkbox" checked={!noReader && vision !== 'no'} disabled={noReader || !!active} onChange={e => pickVision(e.target.checked ? 'yes' : 'no')}/><span><strong>{tr("Read pictures")}</strong></span></label>{tr(expert && vision !== 'no' ? <Select ariaLabel={tr("Image encoder device")} value={vision === 'yes' ? 'yes' : vision} options={[{ value: 'yes', label: 'Automatic' }, { value: 'gpu', label: 'GPU' }, { value: 'cpu', label: 'CPU' }]} onChange={pickVision}/> : null)}</div>{tr(vision !== 'no' && !noReader && !active && loadedSelected?.picturesNote ? <p className="small muted native-vision-note" role="status">{tr(loadedSelected.picturesNote)}</p> : null)}</> : null)}

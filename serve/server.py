@@ -69,6 +69,7 @@ from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_EN
 from serve.mcp import McpCancelled, hub_from_config, resolve_image_results  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import expert_heat  # noqa: E402
+from serve import commit_limit  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -1375,6 +1376,13 @@ class StrataEngine:
         if self.info.get("engine"):
             self.info["version"] = str(self.info["engine"])
         self.terminal_stages = read_engine_stage_log(log, log_start) if log else []
+        self.info.pop("commit_warning", None)           # this start only: a restart that no longer warns clears it
+        try:                                            # #1607: the engine's Windows commit-limit warning, for the Monitor and the app
+            warned = commit_limit.commit_warning(start_log_text(log, log_start)) if log else None
+            if warned:
+                self.info["commit_warning"] = warned
+        except Exception:                               # noqa: BLE001 - a note must never stop a start
+            pass
         try:                                            # which drafter runs, and in plain words why not the one that was asked for
             self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
         except Exception:                               # noqa: BLE001 - a note must never stop a start

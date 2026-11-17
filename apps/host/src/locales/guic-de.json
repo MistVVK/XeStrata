@@ -44,5 +44,7 @@
  "guic43": "1 Stunde",
  "guic44": "2 Stunden",
  "guic45": "Dieser Helfer arbeitet seit über 30 Minuten.",
- "guic46": "Beendet: Das Zeitlimit für Helfer wurde erreicht."
+ "guic46": "Beendet: Das Zeitlimit für Helfer wurde erreicht.",
+ "guic47": "Windows nähert sich seiner Speichergrenze (Arbeitsspeicher plus Auslagerungsdatei). Strata kann ohne Meldung stoppen. Vergrößern Sie die Windows-Auslagerungsdatei oder wählen Sie einen kürzeren Kontext.",
+ "guic48": "Noch {0} GB von {1} GB frei."
 }
