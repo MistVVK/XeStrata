@@ -53,7 +53,7 @@ inline void quant_block(const sycl::sub_group& sg, float v, int blk, int col, in
     const float d = amax / 127.0f;
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
     const int q = (int) sycl::rint(v * inv);
-    xq[(size_t) col * K + blk * 32 + lane] = (int8_t) q;
+    xq[(size_t) col * K + (size_t) blk * 32 + lane] = (int8_t) q;
     if (lane == 0) xd[(size_t) col * (K / 32) + blk] = d;
 }
 
@@ -83,7 +83,7 @@ void df2_conv(const float* x, const float* dyn, int dyn_stride, const float* bas
 #pragma unroll
         for (int o = 0; o < 2; ++o) {
             if (b - o < 0) continue;
-            const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + o * groups + c / group];
+            const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + (size_t) o * groups + c / group];
             acc = sycl::fma(k, x[(size_t) (b - o) * H + c], acc);
         }
         out[i] = resid ? resid[i] + acc : acc;
@@ -173,7 +173,7 @@ sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring
     return qu.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 2> Qs({8, HD}, h), Ks({32, HD}, h);
         sycl::local_accessor<float, 2> Ps({32, 8}, h);
-        h.parallel_for(sycl::nd_range<3>({(size_t) kDf2PartChunks, (size_t) kDf2Kv, (Rows / 2) * WARP}, {1, 1, WARP}),
+        h.parallel_for(sycl::nd_range<3>({(size_t) kDf2PartChunks, (size_t) kDf2Kv, size_t{Rows / 2} * WARP}, {1, 1, WARP}),
                        [=](nd_item<3> it) DF2_SG32 {
             const sycl::sub_group sg = it.get_sub_group();
             const int chunk = (int) it.get_group(0), kvh = (int) it.get_group(1), qg = (int) it.get_group(2);
@@ -184,7 +184,7 @@ sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring
             const int nkeys = nctx + Rows;
             const int k_begin = chunk * CK;
             const int64_t ep = tag != nullptr ? ((int64_t) *epoch_ptr << 32) : 0;
-            float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * (Rows * 4) + qg * 8) * 130;
+            float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * (size_t{Rows} * 4) + (size_t) qg * 8) * 130;
             if (k_begin >= nkeys) {
                 for (int i = lane; i < 8 * 130; i += WARP) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
                 return;
@@ -193,7 +193,7 @@ sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring
             for (int i = lane; i < 8 * HD; i += WARP) {   // the group's 8 queries, scaled once
                 const int ql = i / HD, d = i % HD;
                 const int qi = qg * 8 + ql, row = qi >> 2, g = qi & 3;
-                Qs[ql][d] = q[((size_t) row * 32 + kvh * kDf2Gqa + g) * HD + d] * scale;
+                Qs[ql][d] = q[((size_t) row * 32 + (size_t) kvh * kDf2Gqa + g) * HD + d] * scale;
             }
             float m[8], l[8], O[8][4];
 #pragma unroll
@@ -274,7 +274,7 @@ sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring
             sycl::group_barrier(it.get_group());
 #pragma unroll
             for (int qi = 0; qi < 8; ++qi) {
-                if (lane == 0) { pbase[qi * 130] = m[qi]; pbase[qi * 130 + 1] = l[qi]; }
+                if (lane == 0) { pbase[(size_t) qi * 130] = m[qi]; pbase[(size_t) qi * 130 + 1] = l[qi]; }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) pbase[qi * 130 + 2 + lane * 4 + j] = O[qi][j];
             }
@@ -303,7 +303,7 @@ sycl::event df2_attention_v2(sycl::queue& qu, const float* q, const float* kring
             const int nkeys = nctx + kDf2Rows;
             const int k_begin = chunk * CK;
             const int64_t ep = tag != nullptr ? ((int64_t) *epoch_ptr << 32) : 0;
-            float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32 + qg * 4) * 130;
+            float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32 + (size_t) qg * 4) * 130;
             if (k_begin >= nkeys) {
                 for (int i = tid; i < 4 * 130; i += 256) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
                 return;
@@ -312,7 +312,7 @@ sycl::event df2_attention_v2(sycl::queue& qu, const float* q, const float* kring
             for (int i = tid; i < 32 * HD; i += 256) {   // the group's 32 queries, scaled once
                 const int ql = i / HD, d = i % HD;
                 const int row = ql >> 2, g = ql & 3;
-                Qs[ql][d] = q[((size_t) row * 32 + kvh * kDf2Gqa + g) * HD + d] * scale;
+                Qs[ql][d] = q[((size_t) row * 32 + (size_t) kvh * kDf2Gqa + g) * HD + d] * scale;
             }
             float m[4], l[4], O[4][4];
 #pragma unroll
@@ -392,7 +392,7 @@ sycl::event df2_attention_v2(sycl::queue& qu, const float* q, const float* kring
             sycl::group_barrier(it.get_group());
 #pragma unroll
             for (int qi = 0; qi < 4; ++qi) {
-                if (lane == 0) { pbase[qi * 130] = m[qi]; pbase[qi * 130 + 1] = l[qi]; }
+                if (lane == 0) { pbase[(size_t) qi * 130] = m[qi]; pbase[(size_t) qi * 130 + 1] = l[qi]; }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) pbase[qi * 130 + 2 + lane * 4 + j] = O[qi][j];
             }
@@ -403,15 +403,15 @@ sycl::event df2_attention_v2(sycl::queue& qu, const float* q, const float* kring
 // the combine: one work-group of 128 per (K/V head, query), a sub-group per 32-value output block
 template <int Rows>
 sycl::event df2_attention_combine(sycl::queue& qu, const float* part, void* xq, float* xd) {
-    return qu.parallel_for(sycl::nd_range<1>((size_t) kDf2Kv * (Rows * 4) * HD, HD), [=](nd_item<1> it) DF2_SG32 {
+    return qu.parallel_for(sycl::nd_range<1>((size_t) kDf2Kv * (size_t{Rows} * 4) * HD, HD), [=](nd_item<1> it) DF2_SG32 {
         const sycl::sub_group sg = it.get_sub_group();
         const int a = (int) it.get_group(0);
         const int kvh = a / (Rows * 4), qi = a % (Rows * 4), d = (int) it.get_local_id(0);
         float M = -INFINITY;
-        for (int c = 0; c < kDf2PartChunks; ++c) M = sycl::fmax(M, part[(((size_t) c * kDf2Kv + kvh) * (Rows * 4) + qi) * 130]);
+        for (int c = 0; c < kDf2PartChunks; ++c) M = sycl::fmax(M, part[(((size_t) c * kDf2Kv + kvh) * (size_t{Rows} * 4) + qi) * 130]);
         float L = 0.0f, o = 0.0f;
         for (int c = 0; c < kDf2PartChunks; ++c) {
-            const float* p = part + (((size_t) c * kDf2Kv + kvh) * (Rows * 4) + qi) * 130;
+            const float* p = part + (((size_t) c * kDf2Kv + kvh) * (size_t{Rows} * 4) + qi) * 130;
             const float w = (p[0] == -INFINITY) ? 0.0f : sycl::exp(p[0] - M);
             L += p[1] * w;
             o = sycl::fma(p[2 + d], w, o);
@@ -436,7 +436,7 @@ bool df2_attn_256_pays(sycl::queue& qu, const float* q, const float* kring, cons
     sycl::queue own(qu.get_context(), qu.get_device(), sycl::property::queue::in_order{});
     const bool recording = qu.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;
     sycl::queue& pq = recording ? own : qu;
-    constexpr size_t NQ = 32 * HD;   // the quantized rows: int8 values + their fp32 block scales
+    constexpr size_t NQ = size_t{32} * HD;   // the quantized rows: int8 values + their fp32 block scales
     const size_t nxq = NQ, nxd = (size_t) 32 * HD / 32;
     std::vector<int8_t> b0(nxq), b1(nxq);
     std::vector<float> d0(nxd), d1(nxd);
@@ -453,7 +453,8 @@ bool df2_attn_256_pays(sycl::queue& qu, const float* q, const float* kring, cons
     trial(true);
     pq.memcpy(b1.data(), xq, nxq).wait_and_throw();
     pq.memcpy(d1.data(), xd, nxd * sizeof(float)).wait_and_throw();
-    const bool same = std::memcmp(b0.data(), b1.data(), nxq) == 0 && std::memcmp(d0.data(), d1.data(), nxd * sizeof(float)) == 0;
+    // The tuning paths must produce identical bytes, including the FP32 scale representations.
+    const bool same = std::memcmp(b0.data(), b1.data(), nxq) == 0 && std::memcmp(d0.data(), d1.data(), nxd * sizeof(float)) == 0; // NOLINT(bugprone-suspicious-memory-comparison)
     bool two = false;
     if (same) {
         static core::TimedCache<sycl::device, int, bool> warmed;
@@ -518,7 +519,7 @@ void df2_attention_f32(const float* q, const float* kring, const float* vring, c
             value = sycl::fma(p[2 + d], weight, value);
         }
         const int row = qi >> 2, head = kvh * kDf2Gqa + (qi & 3);
-        out[(size_t) row * 32 * HD + head * HD + d] = sum > 0.0f ? value / sum : 0.0f;
+        out[(size_t) row * 32 * HD + (size_t) head * HD + d] = sum > 0.0f ? value / sum : 0.0f;
     });
 }
 
@@ -545,13 +546,13 @@ void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, 
         const sycl::sub_group sg = it.get_sub_group();
         const int row = (int) it.get_group(0), lane = (int) it.get_local_id(0);
         const int g = row / 8, r = row % 8;
-        const uint16_t* wd = dpl + (size_t) g * 8 * nb + r * 16 + (lane >> 1);
+        const uint16_t* wd = dpl + (size_t) g * 8 * nb + (size_t) r * 16 + (lane >> 1);
         const sycl::int4* xv = reinterpret_cast<const sycl::int4*>(xq) + lane;
         float acc[NC];
 #pragma unroll
         for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
         if constexpr (Q4) {
-            const sycl::uint2* wq = reinterpret_cast<const sycl::uint2*>(w) + (size_t) g * (n_in / 2) + r * 32 + lane;
+            const sycl::uint2* wq = reinterpret_cast<const sycl::uint2*>(w) + (size_t) g * (n_in / 2) + (size_t) r * 32 + lane;
             for (int st = 0; st < steps; ++st) {
                 const sycl::uint2 raw = wq[(size_t) st * 256];
                 // bytewise (q - 8) for q = 0..15: ((q | 0x80) - 8) ^ 0x80, no borrow across bytes
@@ -562,28 +563,28 @@ void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, 
                 const float dw = (float) sycl::bit_cast<sycl::half>(wd[(size_t) st * 128]);
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
-                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + st * 32];
+                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + (size_t) st * 32];
                     int isum = xe::dp4a(w0, x.x(), 0);
                     isum = xe::dp4a(w1, x.y(), isum);
                     isum = xe::dp4a(w2, x.z(), isum);
                     isum = xe::dp4a(w3, x.w(), isum);
-                    const float xs = xd[(size_t) c * nb + st * 16 + (lane >> 1)];
+                    const float xs = xd[(size_t) c * nb + (size_t) st * 16 + (lane >> 1)];
                     acc[c] = sycl::fma(dw * xs, (float) isum, acc[c]);
                 }
             }
         } else {
-            const sycl::int4* wq = reinterpret_cast<const sycl::int4*>(w) + (size_t) g * (n_in / 2) + r * 32 + lane;
+            const sycl::int4* wq = reinterpret_cast<const sycl::int4*>(w) + (size_t) g * (n_in / 2) + (size_t) r * 32 + lane;
             for (int st = 0; st < steps; ++st) {
                 const sycl::int4 raw = wq[(size_t) st * 256];
                 const float dw = (float) sycl::bit_cast<sycl::half>(wd[(size_t) st * 128]);
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
-                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + st * 32];
+                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + (size_t) st * 32];
                     int isum = xe::dp4a(raw.x(), x.x(), 0);
                     isum = xe::dp4a(raw.y(), x.y(), isum);
                     isum = xe::dp4a(raw.z(), x.z(), isum);
                     isum = xe::dp4a(raw.w(), x.w(), isum);
-                    const float xs = xd[(size_t) c * nb + st * 16 + (lane >> 1)];
+                    const float xs = xd[(size_t) c * nb + (size_t) st * 16 + (lane >> 1)];
                     acc[c] = sycl::fma(dw * xs, (float) isum, acc[c]);
                 }
             }
@@ -689,7 +690,7 @@ void df2_quant_rows(const float* x, int K, int ncols, void* xq, float* xd, void*
         const int col = (int) it.get_group(0), blk = (int) it.get_group(1) * 8 + (int) (it.get_local_id(1) >> 5);
         const int lane = (int) sg.get_local_linear_id();
         if (blk * 32 >= K) return;
-        quant_block(sg, x[(size_t) col * K + blk * 32 + lane], blk, col, K, xqi, xd);
+        quant_block(sg, x[(size_t) col * K + (size_t) blk * 32 + lane], blk, col, K, xqi, xd);
     });
 }
 
@@ -734,7 +735,7 @@ void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const floa
 #pragma unroll
         for (int o = 0; o < 2; ++o) {
             if (b - o < 0) continue;
-            const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + o * groups + c / group];
+            const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + (size_t) o * groups + c / group];
             acc = sycl::fma(k, x[(size_t) (b - o) * H + c], acc);
         }
         quant_block(sg, acc, blk, b, H, xqi, xd);
@@ -768,7 +769,7 @@ void conv_rms_quant_launch(const float* x, const float* dyn, int dyn_stride, con
 #pragma unroll
                     for (int o = 0; o < 2; ++o) {
                         if (b - o < 0) continue;
-                        const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + o * groups + c / group];
+                        const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + (size_t) o * groups + c / group];
                         acc = sycl::fma(k, x[(size_t) (b - o) * H + c], acc);
                     }
                     v[j] = h[(size_t) b * H + c] + acc;
@@ -815,7 +816,7 @@ void df2_swiglu_quant(const float* gate, const float* up, int rows, int I, void*
         const int b = (int) it.get_group(0), blk = (int) it.get_group(1) * 8 + (int) (it.get_local_id(1) >> 5);
         const int lane = (int) sg.get_local_linear_id();
         if (blk * 32 >= I) return;
-        const size_t i = (size_t) b * I + blk * 32 + lane;
+        const size_t i = (size_t) b * I + (size_t) blk * 32 + lane;
         const float g = gate[i];
         quant_block(sg, g / (1.0f + sycl::exp(-g)) * up[i], blk, b, I, xqi, xd);
     });
@@ -834,8 +835,8 @@ void df2_q8_tile(const void* blocks_, void* qs_, void* dpl_, int n_in, int64_t c
         const int64_t g = row / 8;
         const int r = (int) (row % 8), st = blk / 16, bi = blk % 16;
         const uint8_t* src = blocks + b * 34;
-        dpl[(g * 8 * nb) + (int64_t) st * 128 + r * 16 + bi] = (uint16_t) src[0] | ((uint16_t) src[1] << 8);
-        uint8_t* o = qs + g * 8 * n_in + (int64_t) st * 4096 + r * 512 + bi * 32;
+        dpl[(g * 8 * nb) + (int64_t) st * 128 + (int64_t) r * 16 + bi] = (uint16_t) src[0] | ((uint16_t) src[1] << 8);
+        uint8_t* o = qs + g * 8 * n_in + (int64_t) st * 4096 + (int64_t) r * 512 + (int64_t) bi * 32;
         for (int i = 0; i < 32; ++i) o[i] = src[2 + i];
     });
 }
@@ -853,7 +854,7 @@ void df2_q4_tile(const void* blocks_, void* qs_, void* dpl_, int n_in, int64_t c
         const int64_t g = row / 8;
         const int r = (int) (row % 8), st = blk / 16, bi = blk % 16;
         const uint8_t* src = blocks + b * 18;
-        dpl[(g * 8 * nb) + (int64_t) st * 128 + r * 16 + bi] = (uint16_t) src[0] | ((uint16_t) src[1] << 8);
+        dpl[(g * 8 * nb) + (int64_t) st * 128 + (int64_t) r * 16 + bi] = (uint16_t) src[0] | ((uint16_t) src[1] << 8);
 #pragma unroll
         for (int half = 0; half < 2; ++half) {   // values half * 16 .. +15 of the block
             uint32_t wd[2];
@@ -868,7 +869,7 @@ void df2_q4_tile(const void* blocks_, void* qs_, void* dpl_, int n_in, int64_t c
                 }
                 wd[w] = v;
             }
-            uint8_t* o = qs + g * 8 * (n_in / 2) + (int64_t) st * 2048 + r * 256 + (bi * 2 + half) * 8;
+            uint8_t* o = qs + g * 8 * (n_in / 2) + (int64_t) st * 2048 + (int64_t) r * 256 + (int64_t) (bi * 2 + half) * 8;
             for (int i = 0; i < 4; ++i) { o[i] = (uint8_t) (wd[0] >> (8 * i)); o[4 + i] = (uint8_t) (wd[1] >> (8 * i)); }
         }
     });
@@ -967,7 +968,7 @@ inline float cb_val(const uint16_t* cb, int64_t row, int v, int rank, bool q4) {
     if (!q4) return bf16f(cb[row * rank + v]);
     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(cb);
     const int b = v / 32, j = v % 32;
-    const uint8_t* blk = bytes + row * (rank / 32) * 18 + b * 18;
+    const uint8_t* blk = bytes + row * (rank / 32) * 18 + (int64_t) b * 18;
     const uint16_t dbits = (uint16_t) ((uint16_t) blk[0] | (uint16_t) ((uint16_t) blk[1] << 8));
     const float d = (float) sycl::bit_cast<sycl::half>(dbits);
     const uint8_t byte = blk[2 + (j & 15)];
