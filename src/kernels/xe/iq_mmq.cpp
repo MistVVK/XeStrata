@@ -1864,7 +1864,7 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
         if constexpr (fx_form<TY>())                                                            \
             if (fx_split()) {                                                                   \
                 if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(1, 2, DP4A, TAIL, IS); \
-                if (takes_work_group<Kernel<TY, 1, 4, DP4A, TAIL, IS>>(q))                      \
+                if (takes_work_group<Kernel<TY, 1, 4, DP4A, TAIL, (IS)>>(q))                      \
                     return STRATA_MMQ_LAUNCH(1, 4, DP4A, TAIL, IS);                             \
             }                                                                                   \
         if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, DP4A, TAIL, IS);  \
@@ -2045,7 +2045,7 @@ bool iq_mmq_type_sums(int t) { return t == 7 || t == 12 || t == 13; }   // has_m
 bool iq_mmq_type_ok(int t) {
     switch (t) {
         case 2: case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
-        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 40: case 42: return true;
+        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 40: case 42:
         case kIqMmqFx + 16: case kIqMmqFx + 17: case kIqMmqFx + 18: case kIqMmqFx + 20: case kIqMmqFx + 21:
         case kIqMmqFx + 22: case kIqMmqFx + 42: return true;
         default: return false;
