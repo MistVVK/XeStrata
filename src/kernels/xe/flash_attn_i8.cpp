@@ -398,7 +398,7 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, std::type_identity_t<const Src
                         for (int u = 0; u < 4; ++u)
                             wd |= (uint32_t) (uint8_t) (int8_t) sycl::rint(vk[4 * w + u] / ck) << (8 * u);
                         const int64_t g = (int64_t) lane * (U / 4) + w;
-                        *reinterpret_cast<uint32_t*>(k8 + (((int64_t) hd * nc + t / CH) * (HD / 4) + g) * (CH * 4) +
+                        *reinterpret_cast<uint32_t*>(k8 + (((int64_t) hd * nc + t / CH) * (HD / 4) + g) * (int64_t{CH} * 4) +
                                                      (t % CH) * 4) = wd;
                     }
                 } else if (with_kv && !nv) {
@@ -451,7 +451,7 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, std::type_identity_t<const Src
                 }
                 const int64_t key = t0 + tt;
                 const int64_t at =
-                    packed ? (((int64_t) hd * nc + key / CH) * (CH / 4) + key % CH / 4) * (HD * 4) + (int64_t) d * 4
+                    packed ? (((int64_t) hd * nc + key / CH) * (CH / 4) + key % CH / 4) * (int64_t{HD} * 4) + (int64_t) d * 4
                            : (((int64_t) hd * nc + key / CH) * HD + d) * CH + key % CH;
                 *reinterpret_cast<uint32_t*>(vt + at) = w;
             }
