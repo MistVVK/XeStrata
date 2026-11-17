@@ -64,6 +64,16 @@ else()
   target_sources(tqp_parity PRIVATE ${STRATA_ROOT}/ref/tqp/tqp_ref_c.c)
 endif()
 
+enable_testing()
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME prompt_workspace_growth
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prompt_workspace.py"
+      --cxx "${CMAKE_OBJCXX_COMPILER}" --runtime "$<TARGET_FILE:mtl_rt>"
+      --build-dir "${CMAKE_BINARY_DIR}/prompt-workspace-test")
+  set_tests_properties(prompt_workspace_growth PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+endif()
+
 # ---- the device runtime and the engine (mac-design) ---------------------------------------------------------------
 set(METAL_CPP_DIR "" CACHE PATH "metal-cpp headers (https://developer.apple.com/metal/cpp/), e.g. metal-cpp_26")
 if(NOT EXISTS "${METAL_CPP_DIR}/Metal/Metal.hpp")

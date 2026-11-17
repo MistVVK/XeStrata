@@ -11997,6 +11997,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_HEAD_ALIAS_TEST_MOVE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 17353,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "d4c732f6a0",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "d4c732f6a0",
+   "last_date": "2026-11-16",
+   "status": "research",
+   "owner": "program",
+   "note": "tests only (#5188): =1 holds a head-sized spacer while --prefill-head-alias reloads the output head, so the head comes back at another address on a large card; users never set it",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_HEAD_HOST",
    "backends": [
     "cuda-hip"
@@ -12423,7 +12456,7 @@
    "last_date": "2026-11-12",
    "status": "default",
    "owner": "prefill",
-   "note": "[auto] on by default for a Radeon 780M (gfx1103, integrated, Linux) only (include/strata/core/arch_defaults.hpp:82 prompt_f16_resolve, used by prompt_f16() in src/prefill/gemm.cu); opt-in elsewhere (=1); =0 turns it off. [docs/AMD_HIP.md:512]",
+   "note": "on by default for a Radeon 780M (gfx1103, integrated, Linux) and for the discrete RX 6000 cards (gfx1030 / gfx1031 / gfx1032, #5151) (include/strata/core/arch_defaults.hpp prompt_f16_resolve, used by prompt_f16() in src/prefill/gemm.cu); opt-in elsewhere (=1); =0 turns it off (the way back). [docs/AMD_HIP.md:512]",
    "retire_after": "",
    "retired_in": ""
   },
@@ -19484,6 +19517,45 @@
    "retired_in": "0.2.13"
   },
   {
+   "name": "STRATA_METAL_WRAP_PLE",
+   "backends": [
+    "metal"
+   ],
+   "reads": [
+    {
+     "file": "metal/src/engine/window.cpp",
+     "line": 753,
+     "backend": "metal",
+     "fn": "getenv"
+    },
+    {
+     "file": "metal/src/engine/window.cpp",
+     "line": 753,
+     "backend": "metal",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "8baf901707",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "8baf901707",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "metal/engine",
+   "note": "1 = wrap the whole Gyro file including the PLE table, the behaviour before #6024 (8baf90170). Read by metal/src/engine/window.cpp.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_METAL_WRAP_SPLIT",
    "backends": [
     "metal"
@@ -25553,6 +25625,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_FUSED_SM75_KQ",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2447,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "042f91a3ff",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "042f91a3ff",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "prefill",
+   "note": "On a Turing card (sm_75) the K-quant and Q8_0 prompt-expert pairs (Q4_K / Q5_K gate/up with a Q5_1 or Q8_0 down, Q6_K or Q8_0 gate/up with a Q8_0 down: the UD-Q4_K_XL / UD-Q6_K_XL sets and Qwen3.6's UD sets) run on the fused kernels by default (#6066). Not set: on. 0: off, those layers go back to the int8 dp4a kernels (a rollback for bug reports; users never set it).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_FUSED_SM86",
    "backends": [
     "cuda-hip"
@@ -27047,7 +27152,7 @@
    "last_date": null,
    "status": "default",
    "owner": "prefill",
-   "note": "on by default on the RX 7000 cards (gfx1100 / gfx1101 / gfx1102) in a build without llama.cpp's MMQ: the fused prompt kernels take Gyro-S's and Gyro-M's trellis experts instead of the dequantize + FP16 path (#6067; include/strata/prefill/fused_tq_hip.hpp kG11DefaultOn); =0 turns it off; nothing on other devices; for A/B runs only, not for users",
+   "note": "on by default on the RX 7000 cards (gfx1100 / gfx1101 / gfx1102) in a build without llama.cpp's MMQ: the fused prompt kernels take Gyro-S's and Gyro-M's trellis experts instead of the dequantize + FP16 path (#6067; include/strata/prefill/fused_tq_hip.hpp kG11DefaultOn); =0 turns it off; =1 also takes the Radeon 780M (gfx1103: opt-in only, never by default); nothing on other devices; for A/B runs only, not for users",
    "retire_after": "",
    "retired_in": ""
   },

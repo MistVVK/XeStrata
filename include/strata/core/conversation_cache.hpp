@@ -153,7 +153,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         for (size_t k = 0; k < stages; ++k) {
             auto& dst = out.parts[k][w];
             auto& src = c.stage_parts[k];
-            dst.gdn = std::move(src.gdn); dst.ple = std::move(src.ple);
+            dst.gdn = std::move(src.gdn); dst.dev_tag = src.dev_tag; dst.ple = std::move(src.ple);
             dst.tails = std::move(src.tails); dst.dead = std::move(src.dead);
             dst.block_pos = std::move(src.block_pos);
         }
@@ -461,6 +461,15 @@ public:
         for (size_t i = 0; i < entries_.size(); ++i)
             if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) return entries_[i].bytes();
         return 0;
+    }
+    /// #2253 (PR by alanthinker, from Arthur031221's #1394): what evict_oldest() could give back in all - every parked entry
+    /// that may go (the same rule as oldest_evictable_bytes: no pinned shared prefix, not the guarded donor).  The RAM gate
+    /// evicts nothing when even all of it would leave the park short.
+    size_t evictable_bytes() const {
+        size_t n = 0;
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) n += entries_[i].bytes();
+        return n;
     }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them

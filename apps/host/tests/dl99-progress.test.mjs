@@ -85,6 +85,6 @@ test('DL99: an install that ended with every file in, for a model the missing en
   }
   await lib.loadCatalog('de');
   lib.setTranslationLanguage('de');
-  assert.match(lib.tr(NOT_READY), /^Dein Modell ist heruntergeladen/);
+  assert.match(lib.tr(NOT_READY), /^Ihr Modell ist heruntergeladen/);
   lib.setTranslationLanguage('en');
 });

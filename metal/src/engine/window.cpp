@@ -227,6 +227,8 @@ struct PromptBufs {
         kcur, vcur, iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta,
         stok, sw, pos, XS, HS, YE, yr, gsh, ush, hh, ys, sgv, WD, WU, Wqkv, Wz, Wal, Wbe, Wout, Wq, Wk, Wv, Wiq, Wik, Wr,
         Wsg, Wshg, Wshu, Wshd, yf, Wcat, pemb, pembh, pkey, pval, keyn, qn, gated, normW, Wpk, Wpv, mixr;
+    // Buffer has no releasing destructor. Keep each allocation once for workspace growth.
+    std::vector<mtl::Buffer> owned;
 };
 
 // The vision path (--vision, GENI requests), from the shared host code: the image rows of the prompt being read
@@ -737,34 +739,47 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         st_ = std::make_unique<ExpertStream>();
         if (!st_->open(f_, err)) return false;
     } else {
-        {   // read ahead the weights, not the n-gram table: in a Gyro file it is 28.8 GB in the middle of the one file, read by the host from
-            // the SSD a few rows at a time (src/ngram/ple_reader.cpp), and must not fill the page cache
-            const gguf::Tensor* ple = f_.find("per_layer_token_embd.weight");
-            if (ple == nullptr) {
-                madvise(f_.map, f_.map_bytes, MADV_WILLNEED);
-            } else {
-                const size_t page = 16384;
-                const size_t lo = (size_t) ple->offset / page * page, hi = ((size_t) (ple->offset + ple->bytes) + page - 1) / page * page;
-                if (lo > 0) madvise(f_.map, lo, MADV_WILLNEED);
-                if (hi < f_.map_bytes) madvise((uint8_t*) f_.map + hi, f_.map_bytes - hi, MADV_WILLNEED);
+        // a Gyro file holds the PLE table (54 GB of the 92) in the same GGUF: the host code reads it with direct I/O,
+        // no kernel touches it, so it is neither wrapped nor read ahead (it would take its 54 GB of file pages and
+        // wired GPU residency); the rest is wrapped as the ranges around it
+        const gguf::Tensor* ple = f_.find("per_layer_token_embd.weight");
+        const size_t pg = 16384, maxlen = (size_t) cx_->max_buffer_length() / pg * pg;
+        std::vector<std::pair<size_t, size_t>> ranges;
+        size_t head = 0, tail = 0;
+        if (ple && ple->bytes > 0) {
+            head = std::min<size_t>(ple->offset / pg * pg, f_.map_bytes);
+            tail = std::min<size_t>((ple->offset + ple->bytes + pg - 1) / pg * pg, f_.map_bytes);
+            if (head > 0) ranges.push_back({0, head});
+            if (tail < f_.map_bytes) ranges.push_back({tail, f_.map_bytes});
+        }
+        bool split = !ranges.empty() && !(std::getenv("STRATA_METAL_WRAP_PLE") && std::string(std::getenv("STRATA_METAL_WRAP_PLE")) == "1");
+        for (const auto& rg : ranges)
+            if (rg.second - rg.first > maxlen) split = false;
+        if (split) {
+            for (const auto& rg : ranges) madvise((uint8_t*) f_.map + rg.first, rg.second - rg.first, MADV_WILLNEED);
+            // pages of the table the header parse or an earlier run left in the mapping: not wanted
+            madvise((uint8_t*) f_.map + head, tail - head, MADV_RANDOM);
+            W_ = cx_->wrap_ranges(f_.map, ranges);
+        } else {
+            madvise(f_.map, f_.map_bytes, MADV_WILLNEED);
+            // the chunks of a model bigger than one Metal buffer overlap by the largest range bound at one offset: a tensor,
+            // or a layer's routed experts (gate, up and down, bound together at the first of them: moe_rebase)
+            size_t span = 0;
+            // (the PLE table is read from the file by the shared host code, never by a kernel: a Gyro file holds it in the same
+            // GGUF - 54 GB, more than a chunk can overlap by - so it does not set the span)
+            for (const auto& kv : f_.tensors)
+                if (kv.first != "per_layer_token_embd.weight") span = std::max<size_t>(span, kv.second.bytes);
+            for (int l = 0; l < G_NL; ++l) {
+                const std::string b = "blk." + std::to_string(l) + ".";
+                const gguf::Tensor *g = f_.find(b + "ffn_gate_exps.weight"), *u = f_.find(b + "ffn_up_exps.weight"),
+                                   *d = f_.find(b + "ffn_down_exps.weight");
+                if (!g || !u || !d) continue;
+                const uint64_t lo = std::min({g->offset, u->offset, d->offset});
+                const uint64_t hi = std::max({g->offset + g->bytes, u->offset + u->bytes, d->offset + d->bytes});
+                span = std::max<size_t>(span, hi - lo);
             }
+            W_ = cx_->wrap(f_.map, f_.map_bytes, span);
         }
-        // the chunks of a model bigger than one Metal buffer overlap by the largest range bound at one offset: a tensor,
-        // or a layer's routed experts (gate, up and down, bound together at the first of them: moe_rebase)
-        size_t span = 0;
-        // (not the n-gram table: the host reads it from the SSD, the GPU never binds it - in a Gyro file it is 28.8 GB of the one file)
-        for (const auto& kv : f_.tensors)
-            if (kv.first != "per_layer_token_embd.weight") span = std::max<size_t>(span, kv.second.bytes);
-        for (int l = 0; l < G_NL; ++l) {
-            const std::string b = "blk." + std::to_string(l) + ".";
-            const gguf::Tensor *g = f_.find(b + "ffn_gate_exps.weight"), *u = f_.find(b + "ffn_up_exps.weight"),
-                               *d = f_.find(b + "ffn_down_exps.weight");
-            if (!g || !u || !d) continue;
-            const uint64_t lo = std::min({g->offset, u->offset, d->offset});
-            const uint64_t hi = std::max({g->offset + g->bytes, u->offset + u->bytes, d->offset + d->bytes});
-            span = std::max<size_t>(span, hi - lo);
-        }
-        W_ = cx_->wrap(f_.map, f_.map_bytes, span);
         if (W_.handle == nullptr) { err = "metal window: cannot wrap " + shard1 + " as a Metal buffer"; return false; }
     }
     n_vocab_ = (int64_t) T("output.weight").shape[1];

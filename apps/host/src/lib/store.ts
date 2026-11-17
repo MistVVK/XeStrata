@@ -1,4 +1,4 @@
-import { workspaceIdForSession } from './session-workspace';
+import { moveSessionToWorkspace, workspaceIdForSession } from './session-workspace';
 import { shortTitle } from './title-text';
 import { DEFAULT_CONTENT_FS, DEFAULT_UI_SCALE, SIZE_DEFAULTS_VERSION, savedSizes } from './default-sizes';
 import { detectLanguage } from './language-detect';
@@ -57,6 +57,7 @@ import type {
   MonitorState,
   ServingState,
   Session,
+  ChatMode,
   SetupState,
   Skill,
   WorkspaceFile,
@@ -104,6 +105,8 @@ export interface AppState {
   approvalNotify: boolean;
   /** What Enter does while an answer is being written: wait, send after, or interrupt (#4783). */
   whileBusy: WhileBusy;
+  /** What a new conversation starts with (Settings → General): mode, reasoning effort, thinking limit. */
+  chatDefaults: ChatDefaults;
   /** Governs anonymous usage reporting. Nothing is sent in this build; the
    *  choice is recorded so a version that does offer it starts from it. */
   shareTelemetry: boolean;
@@ -187,9 +190,39 @@ export interface Prefs {
   approvalNotify: boolean;
   /** What Enter does while an answer is being written: wait, send after, or interrupt (#4783). */
   whileBusy: WhileBusy;
+  /** What a new conversation starts with: its mode, reasoning effort and thinking limit. */
+  chatDefaults: ChatDefaults;
   /** Governs anonymous usage reporting. Nothing is sent in this build; the
    *  choice is recorded so a version that does offer it starts from it. */
   shareTelemetry: boolean;
+}
+
+/** What a new conversation starts with, before the person changes it in that chat's own composer.
+ *  These are the values a chat with no preference falls back to today, so leaving them untouched
+ *  keeps a new chat exactly as it was. */
+export interface ChatDefaults {
+  mode: ChatMode;
+  /** The reasoning effort name the composer shows ('Off' … 'Max'). */
+  thinking: string;
+  /** The most tokens one reply may spend thinking; 0 = no limit. */
+  thinkingBudget: number;
+}
+
+export const CHAT_MODE_CHOICES: ChatMode[] = ['manual', 'plan', 'bypass'];
+export const CHAT_EFFORT_CHOICES = ['Off', 'Low', 'Medium', 'High', 'Max'];
+export const CHAT_BUDGET_CHOICES: number[] = [0, 2048, 8192, 32768];
+
+export const CHAT_DEFAULTS: ChatDefaults = { mode: 'manual', thinking: 'Medium', thinkingBudget: 0 };
+
+/** Keep only what the composer can actually offer: a hand-edited or older stored value must not leave a chat showing a choice that does nothing. */
+function validChatDefaults(value: unknown): ChatDefaults {
+  const raw = (value ?? {}) as Partial<ChatDefaults>;
+  const thinking = typeof raw.thinking === 'string' && CHAT_EFFORT_CHOICES.includes(raw.thinking) ? raw.thinking : CHAT_DEFAULTS.thinking;
+  return {
+    mode: CHAT_MODE_CHOICES.includes(raw.mode as ChatMode) ? raw.mode as ChatMode : CHAT_DEFAULTS.mode,
+    thinking,
+    thinkingBudget: CHAT_BUDGET_CHOICES.includes(Number(raw.thinkingBudget)) ? Number(raw.thinkingBudget) : CHAT_DEFAULTS.thinkingBudget,
+  };
 }
 
 const PREFS_DEFAULTS: Prefs = {
@@ -209,6 +242,7 @@ const PREFS_DEFAULTS: Prefs = {
   doneSound: false,
   approvalNotify: false,
   whileBusy: 'wait',
+  chatDefaults: CHAT_DEFAULTS,
   shareTelemetry: false,
 };
 
@@ -275,6 +309,7 @@ function loadPrefs(): Prefs {
         doneSound: parsed.doneSound === true,
         approvalNotify: parsed.approvalNotify === true,
         whileBusy: validWhileBusy(parsed.whileBusy) ? parsed.whileBusy : 'wait',
+        chatDefaults: validChatDefaults(parsed.chatDefaults),
       };
     } catch {
       /* fall through to the next key */
@@ -317,6 +352,7 @@ let state: AppState = {
   parked: {},
   quotes: {},
   agentAsks: {},
+  chatDefaults: prefs.chatDefaults,
   paletteOpen: false,
   shortcutsOpen: false,
   settingsSection: 'Appearance',
@@ -549,6 +585,7 @@ function savePrefs() {
     doneSound: state.doneSound,
     approvalNotify: state.approvalNotify,
     whileBusy: state.whileBusy,
+    chatDefaults: state.chatDefaults,
     shareTelemetry: state.shareTelemetry,
   };
   try {
@@ -740,6 +777,12 @@ export function setDoneSound(doneSound: boolean) {
 
 export function setApprovalNotify(approvalNotify: boolean) {
   set({ approvalNotify });
+  savePrefs();
+}
+
+/** Change what a new conversation starts with. Existing chats keep what they already have. */
+export function setChatDefaults(patch: Partial<ChatDefaults>) {
+  set({ chatDefaults: validChatDefaults({ ...state.chatDefaults, ...patch }) });
   savePrefs();
 }
 
@@ -1405,8 +1448,12 @@ export function newSession(): Session {
     workspace: state.workspaces.find(w => w.id === state.activeWorkspace)?.path ?? state.workspacePath,
     tokensIn: 0,
     tokensOut: 0,
-    // A new chat starts on the model the composer shows: the open chat's model, or the choice made before any chat was open.
-    ...(state.remoteModel ? { preferences: { remoteModel: state.remoteModel } } : {}),
+    // A new chat starts from what the person set in Settings (#4847; with the stored defaults untouched these are the very values a
+    // chat with no preference showed before), on the model the composer shows: the open chat's model, or the choice made before any chat was open.
+    preferences: {
+      ...state.chatDefaults,
+      ...(state.remoteModel ? { remoteModel: state.remoteModel } : {}),
+    },
   };
   const sessions = [session, ...state.sessions];
   persistSessions(sessions);
@@ -1499,6 +1546,19 @@ export function deleteSession(id: string) {
   const sessions = state.sessions.filter((s) => s.id !== id);
   persistSessions(sessions);
   set({ sessions, activeSession: state.activeSession === id ? (sessions[0]?.id ?? null) : state.activeSession });
+  // Tell the host too: its agent keeps a Harness session per chat id, and nothing else drops it.
+  void api.post('/api/agent/chat/forget', { chatId: id }).catch(() => undefined);
+}
+
+/** Move a chat to another workspace (#6051). False when it was not moved (it is working, or it is already there). */
+export function moveSession(id: string, workspaceId: string): boolean {
+  const result = moveSessionToWorkspace(state.sessions, id, state.workspaces, workspaceId, new Set(liveChatIds()));
+  if (result.refused) return false;
+  persistSessions(result.sessions);
+  const follow = state.activeSession === id && state.activeWorkspace !== workspaceId;
+  set(follow ? { sessions: result.sessions, activeWorkspace: workspaceId } : { sessions: result.sessions });
+  if (follow) void loadWorkspaceFiles();
+  return true;
 }
 
 export function renameSession(id: string, title: string) {

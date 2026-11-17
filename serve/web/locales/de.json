@@ -24,7 +24,7 @@
   "chat.projectionOn": "Projektion an",
   "chat.stopped": "Gestoppt",
   "chat.stoppedLower": "gestoppt",
-  "chat.tokens": "{n} Tokens",
+  "chat.tokens": {"one": "{n} Token", "other": "{n} Tokens"},
   "chat.toolCalls": {"one": "{n} Werkzeugaufruf", "other": "{n} Werkzeugaufrufe"},
   "chat.toolLimit": "bei der Grenze von {n} Werkzeugrunden gestoppt (mcp.max_rounds)",
   "chat.untitled": "Neuer Chat",
@@ -164,7 +164,7 @@
   "model.unloading": "Entlädt…",
   "model.unloadingTitle": "Das Modell wird entladen",
   "model.unsupported": "Entladen ist nicht verfügbar",
-  "model.waiting": "Warte auf den Server",
+  "model.waiting": "Warten auf den Server",
   "pending.afterTool": "Wartet, bis das Werkzeug fertig ist, dann wird gesendet: „{text}“",
   "pending.cutting": "Die Antwort wird gestoppt, dann wird gesendet: „{text}“",
   "pending.one": "Eine Nachricht wartet bereits",
@@ -246,5 +246,12 @@
   "tool.running": "Läuft",
   "tool.skipped": "Nicht ausgeführt",
   "tool.writing": "Schreibt",
-  "undo": "Rückgängig"
+  "undo": "Rückgängig",
+  "sidebar.import": "Gespeicherten Chat zurückholen",
+  "sidebar.imported": "Chat zurückgeholt",
+  "sidebar.importFailed": "Nichts zurückzuholen",
+  "sidebar.importFailedText": "Diese Datei enthält keine Chat-Beiträge. Wählen Sie eine Datei, die mit „Diesen Chat als Markdown speichern“ gespeichert wurde.",
+  "chat.finishFromThinking": "Aus diesen Überlegungen antworten",
+  "chat.finishFromThinkingTitle": "Schreibt eine Antwort aus dem, was das Modell erarbeitet hatte, bevor Sie es gestoppt haben. Es denkt nicht weiter.",
+  "chat.fromStoppedThinking": "Antwort aus den gestoppten Überlegungen"
 }

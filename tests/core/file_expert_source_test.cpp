@@ -6,6 +6,7 @@
 #if defined(STRATA_NATIVE_EXPERTS)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/quant/types.hpp"   // the type ids (Strata's table, no ggml.h)
+#include "strata/platform/commit.hpp"   // #5742: commit_available
 #endif
 
 #include <cuda_runtime.h>
@@ -503,6 +504,15 @@ void test_resident_memory_budget() {
     require(clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin - 1, headroom) == 0 &&
                 clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin, headroom) == 0,
             "subtracting the clamping margin underflowed");
+    {
+        // #5742: --resident-budget-gib 24 on 40 GB with a page file at 8 of its 32 GB: 32.25 GiB of RAM and 21.67 GiB of
+        // commit free.  Counting only the commit left cut it to 17.42 GiB; with the page file's 24 GiB of room it stays.
+        const uint64_t phys = 32250ull * GiB / 1000, left = 21670ull * GiB / 1000;
+        require(clamp_resident_budget(24 * GiB, phys, left, headroom) == left - headroom - margin,
+                "the reporter's clamp without the page file's room changed");
+        require(clamp_resident_budget(24 * GiB, phys, strata::platform::commit_available(left, 24 * GiB), headroom) == 24 * GiB,
+                "a budget the page file's room to grow covers was clamped");
+    }
 }
 
 void test_cgroup_memory_budget() {
@@ -651,12 +661,16 @@ void test_host_memory() {
     auto probe = [&](const std::string& self) {
         put("cgroup", self);
         m.commit = 0;
-        const bool ok = host_available_memory(m, mi, cg, root);
+        const bool ok = host_available_memory(m, mi, cg, root, (t.path / "arcstats").string());   // (#5519: the fixture's, never the real one)
         require(m.commit == ~0ull, "Linux memory probe retained a commit limit");
         return ok;
     };
     // no cgroup line at all: MemAvailable alone (before #633: "cannot determine")
     require(probe("") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "no cgroup: MemAvailable alone");
+    // #5519: a ZFS host: the ARC above its floor (20 GiB of 24, floor 4) is available too; then gone again for the cases below
+    put("arcstats", "name type data\nc_min 4 " + std::to_string(4 * GiB) + "\nsize 4 " + std::to_string(24 * GiB) + "\n");
+    require(probe("") && m.available == 120 * GiB, "ZFS: MemAvailable + the ARC above its floor");
+    fs::remove(t.path / "arcstats");
     // v2, a 48 GiB limit with 16 GiB charged, 4 GiB of it clean cache
     put("fs/cgroup.controllers", "memory\n");
     put("fs/box/memory.max", std::to_string(48 * GiB) + "\n");

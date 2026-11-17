@@ -103,20 +103,20 @@ class HipPackageForAnotherCard(unittest.TestCase):
 
     def test_a_package_without_the_cards_arch_is_not_chosen_and_one_with_it_is(self):
         from strata_control import engine_component as ec
-        from tests.terminal.test_engine_component import make_package, rewrite
+        from tests.terminal.test_engine_component import PC, make_package, rewrite
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             folder = make_package(root, backend="hip")
             rewrite(folder, schema_version=2, archs=["gfx1200", "gfx1201"], build_id="test")
             with mock.patch.object(ec, "hip_archs_present", return_value=["gfx1103"]):
                 with self.assertRaises(ec.EngineMissing) as ctx:
-                    ec.resolve(root, backend="hip")
+                    ec.resolve(root, backend="hip", target=PC)      # a HIP package is only ever read on a PC that takes HIP
             self.assertIn("gfx1103", str(ctx.exception))
             self.assertIn("gfx1201", str(ctx.exception))
             with mock.patch.object(ec, "hip_archs_present", return_value=["gfx1201"]):
-                self.assertEqual(ec.resolve(root, backend="hip").backend, "hip")
+                self.assertEqual(ec.resolve(root, backend="hip", target=PC).backend, "hip")
             with mock.patch.object(ec, "hip_archs_present", return_value=[]):      # cannot tell: not a refusal
-                self.assertEqual(ec.resolve(root, backend="hip").backend, "hip")
+                self.assertEqual(ec.resolve(root, backend="hip", target=PC).backend, "hip")
 
 
 class DeviceAccess(unittest.TestCase):

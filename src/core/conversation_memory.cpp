@@ -18,6 +18,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+#include "strata/platform/commit.hpp"
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -319,6 +321,38 @@ const char* memory_source_name(MemorySource source) {
     }
 }
 
+uint64_t zfs_arc_reclaimable_from_text(const std::string& arcstats) {
+    std::istringstream in(arcstats);
+    std::string line;
+    std::optional<uint64_t> size, c_min;
+    while (std::getline(in, line)) {
+        std::istringstream f(line);
+        std::string name, type, data;
+        if (!(f >> name >> type >> data) || (name != "size" && name != "c_min")) continue;
+        uint64_t v = 0;
+        const auto r = std::from_chars(data.data(), data.data() + data.size(), v);
+        if (r.ec != std::errc{} || r.ptr != data.data() + data.size()) return 0;   // a malformed number: no credit
+        (name == "size" ? size : c_min) = v;
+    }
+    if (!size || !c_min || *size <= *c_min) return 0;
+    return *size - *c_min;
+}
+
+uint64_t zfs_arc_reclaimable_bytes(const std::string& path) {
+    // the file is read on every system: only Linux has it (no file: 0), and memory_guard_test's fixture gives its own path
+    // on Windows too (a Linux-only read failed that test there)
+    std::ifstream in(path);
+    if (!in) return 0;
+    std::ostringstream text;
+    text << in.rdbuf();
+    const uint64_t b = zfs_arc_reclaimable_from_text(text.str());
+    static std::atomic<bool> said{false};
+    if (b >= (uint64_t(1) << 30) && !said.exchange(true))
+        std::fprintf(stderr, "[strata] memory: %.1f GiB of the ZFS ARC is counted as available RAM (ZFS gives it back when "
+                             "programs need it; #5519)\n", (double) b / (double) (uint64_t(1) << 30));
+    return b;
+}
+
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
     return meminfo_kb_bytes(meminfo, "MemAvailable:");
 }
@@ -329,8 +363,10 @@ uint64_t memory_limit_bytes() { return g_memory_limit_bytes.load(std::memory_ord
 std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& paths, uint64_t explicit_limit) {
     std::ifstream avail_file(paths.meminfo);
     if (!avail_file) return {};
-    const std::optional<uint64_t> available = conversation_mem_available(avail_file);
+    std::optional<uint64_t> available = conversation_mem_available(avail_file);
     if (!available) return {};
+    if (const uint64_t arc = zfs_arc_reclaimable_bytes(paths.zfs_arcstats); arc > 0)   // #5519: the ZFS ARC gives its share back
+        available = *available > std::numeric_limits<uint64_t>::max() - arc ? std::numeric_limits<uint64_t>::max() : *available + arc;
     std::ifstream total_file(paths.meminfo);
     std::optional<uint64_t> total;
     if (total_file) total = meminfo_kb_bytes(total_file, "MemTotal:");
@@ -363,7 +399,11 @@ std::optional<HostMemoryReading> sample_host_memory() {
     status.dwLength = sizeof status;
     // #1607: the commit limit (RAM + page file) refuses an allocation while physical RAM is still free
     if (!GlobalMemoryStatusEx(&status)) return {};
-    return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes(), true, std::nullopt);
+    // #5742: the commit with the room the page files may still grow by (a page file set to 8 GB initial and 32 GB
+    // maximum read as 8 GB turned the automatic conversation cache off on a 40 GB machine)
+    const uint64_t commit = strata::platform::commit_available((uint64_t) status.ullAvailPageFile,
+                                                               strata::platform::commit_growth((uint64_t) status.ullTotalPhys));
+    return combine(std::min<uint64_t>(status.ullAvailPhys, commit), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes(), true, std::nullopt);
 #elif defined(__linux__)
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
 #elif defined(__APPLE__)

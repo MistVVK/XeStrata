@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import sys
 import unittest
 from unittest import mock
 
@@ -58,6 +59,7 @@ class AmdSmiProbe(unittest.TestCase):
         self.cmds.start()
         self.addCleanup(self.cmds.stop)
 
+    @unittest.skipIf(sys.platform == "darwin", "an AMD Linux PC's amd-smi / ROCm probe; a Mac reports its own chip")
     def test_names_both_cards_with_their_vram(self):
         cards, driver = bf.other_gpus()
         self.assertEqual([c["name"] for c in cards], ["AMD Radeon AI PRO R9700", "AMD Radeon Graphics"])
@@ -70,6 +72,7 @@ class AmdSmiProbe(unittest.TestCase):
         _, driver = bf.other_gpus()
         self.assertIsNone(driver)
 
+    @unittest.skipIf(sys.platform == "darwin", "an AMD Linux PC's amd-smi / ROCm probe; a Mac reports its own chip")
     def test_an_asic_without_a_market_name_is_skipped(self):
         blank = {"gpu_data": [{"gpu": 0, "asic": {"market_name": ""}},
                               {"gpu": 1, "asic": {"market_name": "AMD Radeon AI PRO R9700"}}]}
@@ -124,6 +127,7 @@ class ServedName(unittest.TestCase):
         self.assertEqual([c["name"] for c in block["gpus"]], ["AMD Radeon RX 7900 XTX"])
         self.assertIsNone(block["gpus"][0]["memory_bytes"])
 
+    @unittest.skipIf(sys.platform == "darwin", "an AMD Linux PC's amd-smi / ROCm probe; a Mac reports its own chip")
     def test_the_rocm_runtime_reaches_the_report(self):
         why = bf.Why()
         with mock.patch.object(bf, "nvidia_gpus", lambda: ([], None, None)), \

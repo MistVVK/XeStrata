@@ -216,6 +216,7 @@ class StartNeverAcquiresTests(unittest.TestCase):
                 code = e
         return code, out.getvalue(), started
 
+    @unittest.skipIf(sys.platform == "darwin", 'a plain start on a Mac is metal/setup_mac.py by design')
     def test_a_start_with_an_old_engine_makes_no_request_and_runs_no_installer(self):
         rec = _Recorder()
         code, text, started = self.run_setup(rec, "--yes", "--no-browser")
@@ -226,7 +227,7 @@ class StartNeverAcquiresTests(unittest.TestCase):
         self.assertIn("server.py", " ".join(started[0]))
         self.assertEqual(self.env_of_start, "1")                         # the server is told, too
         self.assertIn("is older than this Strata expects", text)
-        self.assertTrue("UPDATE" in text or "update.sh" in text, text)     # UPDATE.bat on Windows, ./update.sh elsewhere
+        self.assertIn("--update", text)                                 # START-HERE.bat --update on Windows, ./setup.sh --update elsewhere
 
     def test_a_start_moves_copies_and_creates_nothing(self):
         before = sorted(p.relative_to(self.tmp.name).as_posix() for p in Path(self.tmp.name).rglob("*"))
@@ -241,6 +242,7 @@ class StartNeverAcquiresTests(unittest.TestCase):
             if p != self.cfg:                                          # a start touches the config (most recently used)
                 self.assertEqual(p.stat().st_mtime_ns, ns, p)
 
+    @unittest.skipIf(sys.platform == "darwin", 'a plain start on a Mac is metal/setup_mac.py by design')
     def test_a_card_the_engine_has_no_code_for_is_a_typed_error_naming_the_command(self):
         rec = _Recorder()
         card = {"index": 0, "name": "RTX 5090", "arch": "120", "vram_gb": 32.0, "driver": "580.0"}
@@ -322,7 +324,9 @@ class CliServeIsOfflineTests(unittest.TestCase):
             stem = Path(argv[0]).stem.lower()
             return stem in probes or (stem in ("powershell", "pwsh") and any("Get-CimInstance" in a for a in argv))
         self.assertEqual(rec.network, [])
-        self.assertEqual([a for a in rec.programs if not read_only(a)], [])
+        ioreg = [a for a in rec.programs if Path(a[0]).name == "ioreg"]
+        self.assertLessEqual(len(ioreg), 1, "a Mac: at most one read-only GPU probe (the IOKit registry) for a plan (M2)")
+        self.assertEqual([a for a in rec.programs if not read_only(a) and Path(a[0]).name != "ioreg"], [])
         self.assertNotIn("setup", sys.modules.get("strata_cli.cli").__dict__.get("__name__", ""))
 
     def test_strata_install_without_the_installer_is_a_typed_error(self):

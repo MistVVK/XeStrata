@@ -197,7 +197,7 @@ def parser() -> argparse.ArgumentParser:
         "install",
         help="the explicit installer: engine, models, Python packages (starting and serving never do this)")
     install.add_argument("--update", action="store_true",
-                         help="update an existing install (what UPDATE.bat / update.sh run) instead of setting one up")
+                         help="update an existing install (what START-HERE.bat --update / ./setup.sh --update run) instead of setting one up")
     install.add_argument("setup_args", nargs=argparse.REMAINDER,
                          help="options passed to setup.py, e.g. --family qwen --model Q2_0 --yes")
     runtime = sp.add_parser(
@@ -2090,7 +2090,7 @@ def _install(a: argparse.Namespace) -> int:
     installer = Path(os.environ.get("STRATA_INSTALL_DIR") or ROOT) / "setup.py"
     if not installer.is_file():
         return _error("this folder has no installer (setup.py). Engines, models and updates are installed from a "
-                      "full Strata folder with SETUP.bat / ./setup.sh and UPDATE.bat / ./update.sh; "
+                      "full Strata folder with START-HERE.bat / ./setup.sh (with --update to update); "
                       "set STRATA_INSTALL_DIR to that folder to run it from here. To update the engine and Control "
                       "from the signed update feed, run `strata update`", 5)
     extra = [x for x in a.setup_args if x != "--"]
@@ -2154,7 +2154,7 @@ def _run(a: argparse.Namespace) -> int:
             return _components_backends(a)
         if a.command == "components" and a.components_command == "engine":
             return _components_engine(a)
-        if a.command == "update" or (a.command == "components" and a.components_command in ("update", "rollback", "install-file", "engines", "use", "remove")):
+        if a.command == "update" or (a.command == "components" and a.components_command in ("update", "rollback", "install-file", "engines", "use", "remove", "add-build")):
             from strata_cli import update_cmd
             return update_cmd.run(a)
         if a.command in ("doctor", "components"):

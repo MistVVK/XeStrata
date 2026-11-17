@@ -8,6 +8,7 @@ x the MTP layer here or not. Only "tuned only, under the line" changes against t
 from __future__ import annotations
 
 import json
+import sys
 import unittest
 from unittest import mock
 
@@ -78,6 +79,7 @@ class FetchReadsTheStartedConfig(unittest.TestCase):
         with mock.patch.object(drafting, "card_vram_mib", return_value=32607):
             return runner.card_signals(cfg, None, {"backend": cfg.get("backend"), "archs": ["sm_120"]})
 
+    @unittest.skipIf(sys.platform == "darwin", "a Mac never raises the reserve for the picture reader (serve.server.vision_on_demand_by_default)")
     def test_a_reserve_the_start_raises_is_the_one_the_fetch_reads(self):
         from serve import server
         vision = {"gpu": True, "exe": "component:strata-vision", "cpu_exe": "component:strata-vision"}

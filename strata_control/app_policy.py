@@ -37,6 +37,9 @@ def table() -> list[dict]:
             row["group"] = s.group
         if s.words:
             row["words"] = _entries(s.words)
+        if s.choices:
+            row["choices"] = [[v, w] for v, w in s.choices]
+            row["choiceNote"] = s.choice_note
         out.append(row)
     return out
 

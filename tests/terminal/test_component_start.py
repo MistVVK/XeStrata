@@ -22,6 +22,12 @@ from strata_cli.cli import main
 from strata_control import components, engine_component as ec, profiles, runtime
 
 WINDOWS = os.name == "nt"
+MAC = components.host_platform().startswith("macos")
+#: the engine family this machine takes: a stub package for a family it refuses is dropped by the resolver before the
+#: start under test happens (a Mac takes Metal, and the published feed's Mac engine is `metal` / archs ["apple-gpu"])
+FAMILY, VARIANT = ("metal", "") if MAC else ("cuda", "cuda13")
+ARCHS = ("apple-gpu",) if MAC else ("sm_86", "compute_89")
+LIBRARY = "libggml-metal.dylib" if MAC else ("cudart64_13.dll" if WINDOWS else "libcudart.so.13")
 FAKE_ENGINE = (
     "import sys, os\nfrom pathlib import Path\n"
     "Path(os.environ['FAKE_ENGINE_MARK']).write_text(os.path.abspath(__file__) + '\\n' + ' '.join(sys.argv[1:]))\n"
@@ -36,7 +42,7 @@ FAKE_ENGINE = (
 
 
 def install_fake_engine(components_dir: Path) -> Path:
-    folder = components_dir / "engine" / f"0.1.45-{components.host_platform()}-cuda"
+    folder = components_dir / "engine" / f"0.1.45-{components.host_platform()}-{FAMILY}"
     folder.mkdir(parents=True)
     (folder / "engine_main.py").write_text(FAKE_ENGINE, encoding="utf-8")
     if WINDOWS:
@@ -50,7 +56,7 @@ def install_fake_engine(components_dir: Path) -> Path:
               "bytes": (folder / name).stat().st_size} for name in (entry, "engine_main.py")]
     (folder / ec.MANIFEST).write_text(json.dumps({
         "schema_version": 1, "id": "strata-engine", "version": "0.1.45", "platform": components.host_platform(),
-        "backend": "cuda", "entrypoint": entry, "files": files}), encoding="utf-8")
+        "backend": FAMILY, "entrypoint": entry, "files": files}), encoding="utf-8")
     return folder
 
 
@@ -64,7 +70,7 @@ class ComponentStart(unittest.TestCase):
         self.components.mkdir()
         env = mock.patch.dict(os.environ, {
             "STRATA_PROFILE_DIR": str(self.root / "profiles"), "STRATA_RUNTIME_DIR": str(self.root / "runtime"),
-            "STRATA_COMPONENTS_DIR": str(self.components), "STRATA_ENGINE_BACKEND": "cuda",
+            "STRATA_COMPONENTS_DIR": str(self.components), "STRATA_ENGINE_BACKEND": FAMILY,
             "STRATA_NO_ACQUIRE": "1", "FAKE_ENGINE_MARK": str(self.root / "ran.txt")})
         env.start()
         self.addCleanup(env.stop)
@@ -77,7 +83,7 @@ class ComponentStart(unittest.TestCase):
         (tokenizer / "merges.txt").write_text("a b")
         (tokenizer / "token_type.json").write_text(json.dumps([0] * 257 + [3, 3, 3]))
         self.config = self.root / "run.json"
-        self.config.write_text(json.dumps({"exe": "component:strata-engine", "backend": "cuda",
+        self.config.write_text(json.dumps({"exe": "component:strata-engine", "backend": FAMILY,
                                             "tokenizer": str(tokenizer), "args": [], "cwd": str(self.root),
                                             "model_name": "fake", "host": "127.0.0.1", "port": 0}), encoding="utf-8")
         profiles.create("app", str(self.config))
@@ -124,18 +130,23 @@ class ComponentStart(unittest.TestCase):
         if WINDOWS:
             entry = "strata.cmd"
             (src / entry).write_bytes(f'@echo off\r\n"{sys.executable}" "%~dp0engine_main.py" %*\r\n'.encode())
-            library = "cudart64_13.dll"
+            library = LIBRARY
         else:
             entry = "strata"
             (src / entry).write_text(f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/engine_main.py" "$@"\n')
-            library = "libcudart.so.13"
+            library = LIBRARY
         (src / library).write_bytes(b"a runtime library the stub never loads " * 200)
+        if MAC:
+            # package_engine.py refuses a macOS package with no picture reader (#3697), so the stub carries one
+            reader = src / "strata-vision"
+            reader.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/engine_main.py" "$@"\n')
+            reader.chmod(0o755)
         (src / "BUILD.json").write_text(json.dumps({"version": "0.1.45"}))
         out = self.components / "engine"
         out.mkdir()
-        folder = package_engine.build(src, "cuda", "0.1.45", components.host_platform(), out, entry=entry,
-                                      archs=("sm_86", "compute_89"), min_driver={"nvidia": "580.65"},
-                                      build_id="stub-1", variant="cuda13", include=["engine_main.py"])
+        folder = package_engine.build(src, FAMILY, "0.1.45", components.host_platform(), out, entry=entry,
+                                      archs=ARCHS, min_driver={} if MAC else {"nvidia": "580.65"},
+                                      build_id="stub-1", variant=VARIANT, include=["engine_main.py"])
         patches = (mock.patch.object(ec, "cuda_archs_present", return_value=["sm_86"]),
                    mock.patch.object(ec, "nvidia_driver_version", return_value="610.47"))
         for item in patches:
@@ -187,7 +198,7 @@ class ComponentStart(unittest.TestCase):
     def test_the_package_folder_is_first_on_the_library_path(self):
         from serve import server
         folder = install_fake_engine(self.components)
-        cfg = server.with_component_engine({"exe": "component:strata-engine", "backend": "cuda", "lib_dirs": ["/other"]})
+        cfg = server.with_component_engine({"exe": "component:strata-engine", "backend": FAMILY, "lib_dirs": ["/other"]})
         self.assertEqual(Path(cfg["exe"]).parent.resolve(), folder.resolve())
         self.assertEqual(cfg["lib_dirs"][0], str(folder / ("engine.cmd" if WINDOWS else "engine")).rsplit(os.sep, 1)[0])
         self.assertEqual(cfg["lib_dirs"][1:], ["/other"])
@@ -199,7 +210,7 @@ class ComponentStart(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             for entry in (folder / "engine.cmd", folder / "engine"):
                 entry.unlink(missing_ok=True)
-            server.with_component_engine({"exe": "component:strata-engine", "backend": "cuda"})
+            server.with_component_engine({"exe": "component:strata-engine", "backend": FAMILY})
         self.assertEqual(caught.exception.code, 5)
 
     def test_a_picture_reader_path_from_an_older_engine_folder_follows_the_installed_package(self):
@@ -209,14 +220,14 @@ class ComponentStart(unittest.TestCase):
         reader = folder / "strata-vision"
         reader.write_text("x", encoding="utf-8")
         gone = str(self.components / "engine" / "0.0.1-old" / "strata-vision")
-        cfg = server.with_component_engine({"exe": "component:strata-engine", "backend": "cuda",
+        cfg = server.with_component_engine({"exe": "component:strata-engine", "backend": FAMILY,
                                             "vision": {"exe": gone, "cpu_exe": gone, "mmproj": "/m.gguf"}})
         self.assertEqual(cfg["vision"]["exe"], str(reader))
         self.assertEqual(cfg["vision"]["cpu_exe"], str(reader))
         self.assertEqual(cfg["vision"]["mmproj"], "/m.gguf")
-        ok = {"exe": "component:strata-engine", "backend": "cuda", "vision": {"exe": str(reader)}}
+        ok = {"exe": "component:strata-engine", "backend": FAMILY, "vision": {"exe": str(reader)}}
         self.assertEqual(server.with_component_engine(ok)["vision"], {"exe": str(reader)})
-        none = server.with_component_engine({"exe": "component:strata-engine", "backend": "cuda", "vision": {"exe": gone.replace("strata-vision", "other")}})
+        none = server.with_component_engine({"exe": "component:strata-engine", "backend": FAMILY, "vision": {"exe": gone.replace("strata-vision", "other")}})
         self.assertTrue(none["vision"]["exe"].endswith("other"))        # no such file in the package: left as it is
 
     def test_the_build_json_lib_dirs_follow_the_package_folder(self):
@@ -225,7 +236,7 @@ class ComponentStart(unittest.TestCase):
         folder = install_fake_engine(self.components)
         (folder / "rocm" / "bin").mkdir(parents=True)
         (folder / "BUILD.json").write_text(json.dumps({"lib_dirs": ["rocm/bin", "../escape", "missing", "/abs"]}), encoding="utf-8")
-        cfg = server.with_component_engine({"exe": "component:strata-engine", "backend": "cuda", "lib_dirs": ["/other"]})
+        cfg = server.with_component_engine({"exe": "component:strata-engine", "backend": FAMILY, "lib_dirs": ["/other"]})
         self.assertEqual(cfg["lib_dirs"], [str(folder), str(folder / "rocm" / "bin"), "/other"])
         env = server.child_env(cfg)
         var = "PATH" if WINDOWS else "LD_LIBRARY_PATH"

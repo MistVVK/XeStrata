@@ -30,6 +30,7 @@ public:
     bool loaded() const { return weights_ != nullptr; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
     const void* weights() const { return weights_; }
+    const void* scratch() const { return scratch_; }   ///< the activation scratch the head's GEMV reads (captured with the weights)
     int type() const { return type_; }
     /// The device whose memory holds the weights (the one current when `load` ran; -1 before).
     int device() const { return device_; }

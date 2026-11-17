@@ -7,9 +7,11 @@ import base64
 import hashlib
 import json
 import os
+import platform
 import re
 import sys
 import threading
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -21,6 +23,18 @@ import package_engine  # noqa: E402
 from strata_control import components, signing  # noqa: E402
 
 WINDOWS = os.name == "nt"
+
+def local_family() -> dict:
+    """The engine family the machine this call runs on takes, so a stub package is one the resolver will actually pick.
+    A stub built for a family this platform refuses is dropped before the test reaches what it is about ("cuda is not a
+    supported combination on macos-arm64"). Read at call time, because `fx.cuda_pc` names the machine per case. The Mac
+    row is the published feed's own: `backend metal`, `variant ""`, `archs ["apple-gpu"]`, `min_driver {}`
+    (strata-feed.json, release 0.2.4.2)."""
+    if components.host_platform().startswith("macos"):
+        return {"backend": "metal", "variant": "", "archs": ("apple-gpu",), "min_driver": {},
+                "library": "libggml-metal.dylib"}
+    return {"backend": "cuda", "variant": "cuda13", "archs": ("sm_86", "compute_89"), "min_driver": {"nvidia": "580.65"},
+            "library": "cudart64_13.dll" if WINDOWS else "libcudart.so.13"}
 
 GOOD_ENGINE = (
     "import sys, os\nfrom pathlib import Path\n"
@@ -45,28 +59,55 @@ def trusted_of(key: dict) -> dict:
     return {key["key_id"]: base64.b64decode(key["public"])}
 
 
+def cuda_pc(case):
+    """Name this machine a Linux PC with an NVIDIA card for the length of one test case.
+
+    A test that is about the CUDA path builds a CUDA engine package, and `engine_component.resolve` refuses a CUDA
+    package on a platform that does not take one — on a Mac that is the first thing it says, and the test never reaches
+    what it is about. `host_platform()` reads `platform.system()` and `platform.machine()` every time it is called, so
+    naming them here gives the packager, the resolver and the feed one and the same machine. The card itself is already
+    a stand-in in these tests: `cuda_archs_present` and `nvidia_driver_version` are mocked the same way."""
+    first = mock.patch.object(platform, "system", lambda: "Linux")
+    second = mock.patch.object(platform, "machine", lambda: "x86_64")
+    first.start()
+    second.start()
+    case.addCleanup(second.stop)
+    case.addCleanup(first.stop)
+
+
 def build_package(parent: Path, version: str, *, engine_source: str = GOOD_ENGINE, key: dict | None = None,
-                  backend: str = "cuda", variant: str = "cuda13", build_id: str | None = None, archs=("sm_86", "compute_89"),
-                  min_driver=None, padding: int = 0) -> Path:
+                  backend: str | None = None, variant: str | None = None, build_id: str | None = None,
+                  archs: tuple[str, ...] | None = None, min_driver=None, padding: int = 0) -> Path:
     """A schema-2 package made by the real packager (a stub engine behind a manifest-declared entrypoint). `padding` bytes of
-    an incompressible 'library' make the archive big enough for a transfer to be cut part-way."""
-    src = parent / f"src-{version}-{variant}"
+    an incompressible 'library' make the archive big enough for a transfer to be cut part-way. The family defaults to what
+    this machine takes (`local_family()`); a test that is about another family says so, and `cuda_pc` names the platform it is for."""
+    family = local_family()
+    backend = backend or family["backend"]
+    variant = family["variant"] if variant is None else variant
+    archs = family["archs"] if archs is None else archs
+    min_driver = family["min_driver"] if min_driver is None else min_driver
+    src = parent / f"src-{version}-{variant or backend}"
     src.mkdir(parents=True)
     (src / "engine_main.py").write_text(engine_source, encoding="utf-8")
     if WINDOWS:
         entry = "strata.cmd"
         (src / entry).write_bytes(f'@echo off\r\n"{sys.executable}" "%~dp0engine_main.py" %*\r\n'.encode())
-        library = "cudart64_13.dll"
+        library = "cudart64_13.dll" if backend == "cuda" else family["library"]
     else:
         entry = "strata"
         (src / entry).write_text(f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/engine_main.py" "$@"\n')
         (src / entry).chmod(0o755)
-        library = "libcudart.so.13"
+        library = "libcudart.so.13" if backend == "cuda" else family["library"]
+    if not WINDOWS and backend == "metal":
+        # package_engine.py refuses a macOS package with no picture reader (#3697), so a Mac stub carries one
+        reader = src / "strata-vision"
+        reader.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/engine_main.py" "$@"\n')
+        reader.chmod(0o755)
     (src / library).write_bytes(os.urandom(padding) if padding else b"a runtime library the stub never loads " * 50)
     out = parent / "built"
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     folder = package_engine.build(src, backend, version, components.host_platform(), out, entry=entry, archs=tuple(archs),
-                                  min_driver=min_driver or {"nvidia": "580.65"}, build_id=build_id or f"stub-{version}",
+                                  min_driver=min_driver, build_id=build_id or f"stub-{version}",
                                   variant=variant, include=["engine_main.py"])
     if key is not None:
         feed_tool.sign_package(folder, key)

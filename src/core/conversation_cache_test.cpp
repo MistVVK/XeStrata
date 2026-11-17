@@ -161,8 +161,13 @@ int main() {
         pinned.checkpoints.back().pinned = true;
         pinned.checkpoints.back().gdn.resize(64, 1);
         cache.put(std::move(pinned));
+        const size_t pinned_bytes = cache.bytes();
         cache.put(image({9, 8, 7}));
+        // #2253: what the RAM gate may count on: everything parked but the pinned conversation
+        check(cache.evictable_bytes() == cache.bytes() - pinned_bytes && cache.evictable_bytes() == image({9, 8, 7}).bytes(),
+              "#2253: evictable_bytes leaves out the conversation that holds a pinned prefix");
         check(cache.evict_oldest() && cache.size() == 1, "the oldest unpinned conversation went (the pinned one is older)");
+        check(cache.evictable_bytes() == 0, "#2253: only a pinned one is left: nothing may go");
         check(!cache.evict_oldest() && cache.size() == 1, "only a pinned one is left: nothing more can go");
         // #879: after non-finite logits every parked conversation goes, the pinned one too
         cache.put(image({4, 5, 6}));
@@ -437,6 +442,8 @@ int main() {
         check(cache.find(sib.serial) != nullptr && cache.size() == 2 && cache.evictions() == 1 && !cache.guard_blocked(),
               "the slot limit evicts the other entry, not the guarded donor");
         check(cache.best(std::vector<int64_t>{7, 7, 7, 1}, {}, true).tokens == 0, "the other one went");
+        check(cache.evictable_bytes() == cache.bytes() - cache.find(sib.serial)->bytes(),
+              "#2253: evictable_bytes leaves out the guarded donor");
         SavedConversation rewritten = image({1, 2, 3, 4, 10, 11, 40});   // holds A's deepest checkpoint: supersedes A
         rewritten.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
         check(cache.put(std::move(rewritten)) && cache.find(sib.serial) != nullptr && cache.superseded() == 0,
@@ -558,6 +565,7 @@ int main() {
             for (size_t k = 0; k < parts; ++k) {
                 ConversationCheckpoint p;
                 p.gdn.assign(128, uint8_t(salt + 10 + k));
+                p.dev_tag = uint64_t(salt) * 100 + k + 1;
                 c.stage_parts.push_back(std::move(p));
             }
             return c;
@@ -575,6 +583,8 @@ int main() {
         check(split.stage0[0].stage_parts.empty() && split.parts[1][1].ids == original[2].ids &&
               split.parts[1][1].used == original[2].used && split.parts[0][0].gdn == original[0].stage_parts[0].gdn,
               "split: every stage part carries its checkpoint's ids and LRU stamp");
+        check(split.parts[0][0].dev_tag == 301 && split.parts[1][1].dev_tag == 702,
+              "split: each stage part keeps the tag of its device copy");
         check(split.stage0[0].gdn.data() == gdn0 && split.parts[1][1].gdn.data() == part1,
               "split moves the running state (same buffers, no copy)");
         std::vector<ConversationCheckpoint> back;
@@ -585,7 +595,8 @@ int main() {
                    back[j].tails == original[j].tails && back[j].used == original[j].used &&
                    back[j].stage_parts.size() == original[j].stage_parts.size();
             for (size_t k = 0; same && k < back[j].stage_parts.size(); ++k)
-                same = back[j].stage_parts[k].gdn == original[j].stage_parts[k].gdn;
+                same = back[j].stage_parts[k].gdn == original[j].stage_parts[k].gdn &&
+                       back[j].stage_parts[k].dev_tag == original[j].stage_parts[k].dev_tag;
         }
         check(same, "merge(split(x)) == x, in the original order");
         check(back[0].gdn.data() == gdn0 && back[2].stage_parts[1].gdn.data() == part1, "merge moves them back too");

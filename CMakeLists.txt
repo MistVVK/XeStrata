@@ -400,6 +400,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(q36_context_fit_test tests/program/q36_context_fit_test.cpp)
   target_include_directories(q36_context_fit_test PRIVATE include)
   add_test(NAME q36_context_fit_test COMMAND q36_context_fit_test)
+  # #5012: the qwen35moe engine's INFO line for the Monitor's expert cache (strata/qwen35/expert_info.hpp; no GPU)
+  add_executable(q36_expert_info_test tests/program/q36_expert_info_test.cpp)
+  target_include_directories(q36_expert_info_test PRIVATE include)
+  add_test(NAME q36_expert_info_test COMMAND q36_expert_info_test)
 
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)

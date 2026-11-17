@@ -21,6 +21,9 @@ import package_engine  # noqa: E402
 
 WINDOWS = os.name == "nt"
 HERE = components.host_platform()
+#: the PC the fake engine packages below are built for: a CUDA package is only read on a PC that takes CUDA, and a Mac
+#: takes Metal, so the start tests speak about a Linux PC instead of the machine running them.
+PC = "linux-x86_64" if HERE == "macos-arm64" else HERE
 EXE = "strata.exe" if WINDOWS else "strata"
 LIB = "cudart64_13.dll" if WINDOWS else "libcudart.so.13"
 
@@ -245,8 +248,12 @@ class Start(unittest.TestCase):
         self.root = Path(self.dir.name)
         self.out = self.root / "engine"
         self.out.mkdir()
-        self.folder = package_engine.build(make_source(self.root / "src"), "cuda", "0.1.45", HERE, self.out,
+        self.folder = package_engine.build(make_source(self.root / "src"), "cuda", "0.1.45", PC, self.out,
                                            archs=("sm_86",), min_driver={"nvidia": "580.65"}, build_id="b1")
+        if PC != HERE:      # a start asks this machine which family it takes: point that probe at the PC above
+            probe = mock.patch.object(ec, "host_platform", return_value=PC)
+            probe.start()
+            self.addCleanup(probe.stop)
         self.addCleanup(ec.register_signature_verifier, None)
         patch = mock.patch.object(signing, "BUILTIN_KEYS", self.root / "no-shipped-keys.json")   # a build with no shipped key; the real file: test_release_keys
         patch.start()
@@ -285,9 +292,9 @@ class Start(unittest.TestCase):
 
     def test_two_builds_of_one_version_prefer_the_newer_driver_when_both_fit(self):
         other = make_source(self.root / "src3")
-        old = package_engine.build(other, "cuda", "0.1.45", HERE, self.out, archs=("sm_60", "sm_86"),
+        old = package_engine.build(other, "cuda", "0.1.45", PC, self.out, archs=("sm_60", "sm_86"),
                                    min_driver={"nvidia": "575.51"}, build_id="b-12", variant="cuda12")
-        self.assertEqual(old.name, f"0.1.45-{HERE}-cuda-cuda12")
+        self.assertEqual(old.name, f"0.1.45-{PC}-cuda-cuda12")
         self.assertEqual(ec.read_manifest(old).variant, "cuda12")
         self.assertEqual(Path(self.start(driver="610.0")).parent.resolve(), self.folder.resolve())    # 580.65 build wins
         self.assertEqual(Path(self.start(driver="576.0")).parent.resolve(), old.resolve())            # only the CUDA 12 one fits
@@ -296,13 +303,13 @@ class Start(unittest.TestCase):
         """#3503: the Linux cuda12 package shipped with 0.2.1 had sm_75/86/89 only; P100 containers restarted in a loop."""
         other = make_source(self.root / "src4")
         with self.assertRaises(SystemExit) as caught:
-            package_engine.build(other, "cuda", "0.1.45", HERE, self.out, archs=("sm_75", "sm_86", "sm_89", "compute_89"),
+            package_engine.build(other, "cuda", "0.1.45", PC, self.out, archs=("sm_75", "sm_86", "sm_89", "compute_89"),
                                  min_driver={"nvidia": "575.51"}, build_id="b-12", variant="cuda12")
         self.assertIn("sm_60", str(caught.exception))
-        package_engine.build(other, "cuda", "0.1.45", HERE, self.out, archs=("sm_70", "sm_86"), build_id="b-13", variant="cuda12")
+        package_engine.build(other, "cuda", "0.1.45", PC, self.out, archs=("sm_70", "sm_86"), build_id="b-13", variant="cuda12")
 
     def test_a_good_package_does_not_hide_a_tampered_one(self):
-        newer = package_engine.build(make_source(self.root / "src2"), "cuda", "0.1.46", HERE, self.out,
+        newer = package_engine.build(make_source(self.root / "src2"), "cuda", "0.1.46", PC, self.out,
                                      archs=("sm_86",), build_id="b2")
         (newer / LIB).write_bytes(b"y" * (newer / LIB).stat().st_size)
         self.assertEqual(ec.read_manifest(Path(self.start()).parent).version, "0.1.45")

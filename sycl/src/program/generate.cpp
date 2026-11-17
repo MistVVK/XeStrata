@@ -103,6 +103,8 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include <windows.h>
 #include <psapi.h>
 #include <io.h>
+
+#include "strata/platform/commit.hpp"   // #5742: commit_available / commit_growth (after windows.h)
 #else
 #include <unistd.h>
 #include <cerrno>
@@ -3074,8 +3076,18 @@ int main(int argc, char **argv) try {
     */
     if (const dpct::err0 ce =
             DPCT_CHECK_ERROR(arena = (void *)strata::malloc_device_guarded(
-                                 pool_bytes, dpct::get_in_order_queue()));
-        ce != 0) {
+                                 pool_bytes, dpct::get_in_order_queue(), "weight arena"));
+        ce != 0 || arena == nullptr) {   // #5557: Level Zero answers a too-large allocation with null, not an exception
+        if (const uint64_t max_alloc = strata::device_max_alloc(dpct::get_in_order_queue());
+            arena == nullptr && max_alloc && pool_bytes > max_alloc) {
+            // the arena is one allocation (a segmented arena is not built yet), so this GPU's limit, not its free memory, stops
+            // the start; the guard above has said both sizes (wording approved by the coordinator 11-16; it can reach the app)
+            std::fprintf(stderr, "strata generate: this model's GPU weights (%.2f GiB) must fit in one GPU allocation, and this "
+                                 "GPU allows at most %.2f GiB in one: it cannot run this model yet. Choose a smaller model in "
+                                 "Strata, or use a GPU with more memory.\n",
+                         (double) pool_bytes / 1073741824.0, (double) max_alloc / 1073741824.0);
+            return 1;
+        }
         // #486: the arena is the first large allocation and its size does not depend on the context, so what is
         // missing is held by something else: say how much was free
         /*
@@ -5021,6 +5033,18 @@ int main(int argc, char **argv) try {
             for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
             return b;
         };
+        // #5578: the cache is one allocation (no segmented cache on Level Zero yet), so an auto cache larger than the GPU's
+        // largest single allocation cannot be had: size it to that limit at once and say so, instead of two failed tries
+        // ending at three quarters of three quarters of it ("cudaMalloc(7.06 GiB) failed: no error" on a 16 GB A770)
+        if (auto_cache && !o.vram_elastic) {
+            const uint64_t max_alloc = strata::device_max_alloc(dpct::get_in_order_queue());
+            const int64_t before = cache_bytes();
+            if (max_alloc > (64ull << 20) && before > (int64_t) max_alloc && shrink_to((int64_t) max_alloc - (32ll << 20)))
+                std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB would fit, but this GPU allows at most %.2f GiB "
+                                     "in one allocation: %d slots (%.2f GiB)\n",
+                             (double) before / 1073741824.0, (double) max_alloc / 1073741824.0, o.expert_cache,
+                             (double) cache_bytes() / 1073741824.0);
+        }
         // With `--expert-cache auto` the reserve must still be free once the slots are WRITTEN: under WDDM an
         // allocation is not resident until it is touched, and the free figure read before it can be ~1 GB too
         // high.  A cache sized from it filled the card to 0 MiB, the driver then paged, and a request that needed a
@@ -5044,13 +5068,18 @@ int main(int argc, char **argv) try {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
                 // so with a small page file the cache's one big cudaMalloc fails while the VRAM is free.  An auto
                 // cache then tries three quarters of the size, a few times, instead of stopping the engine.
-                char commit[96] = "";
+                char commit[160] = "";
 #if defined(_WIN32)
                 MEMORYSTATUSEX ms{};
                 ms.dwLength = sizeof ms;
-                if (GlobalMemoryStatusEx(&ms))
-                    std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file)",
-                                  (double) ms.ullAvailPageFile / 1073741824.0);
+                if (GlobalMemoryStatusEx(&ms)) {
+                    // #5742: a page file still below its maximum grows when more is committed: that room counts too
+                    const uint64_t grow = strata::platform::commit_growth((uint64_t) ms.ullTotalPhys);
+                    std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file, of which the "
+                                                         "page files may still grow by %.1f GiB)",
+                                  (double) strata::platform::commit_available((uint64_t) ms.ullAvailPageFile, grow) / 1073741824.0,
+                                  (double) grow / 1073741824.0);
+                }
 #endif
                 if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
                     ++failed;
@@ -9190,7 +9219,9 @@ int main(int argc, char **argv) try {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+            // experts= (#5012): every routed layer-expert pair the cache could hold (n_layers x n_expert, the MTP block not
+            // counted: 48 x 512 = 24576 on Qwen3.8-Flash-Next), so the Monitor shows expert_slots / experts
+            std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld experts=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
@@ -9198,7 +9229,7 @@ int main(int argc, char **argv) try {
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
-                        (long long) slots_all, (long long) mib_all,
+                        (long long) slots_all, (long long) g.n_layers * (long long) g.n_expert, (long long) mib_all,
                         (long long) slots_primary, (long long) mib_primary,
                         o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),

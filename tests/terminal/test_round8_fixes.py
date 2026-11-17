@@ -121,6 +121,7 @@ class SetupArguments(unittest.TestCase):
         path.write_text(json.dumps({"exe": "x", "args": [], **cfg}), encoding="utf-8")
         return path
 
+    @unittest.skipIf(sys.platform == "darwin", "a Mac's setup takes no --gpu / --gpu-roles")
     def test_a_context_change_forwards_the_installed_roles(self):
         # F3: 0=main,1=helper came back from a 32k to 16k change as 0=helper,1=main
         with Home() as h:
@@ -130,6 +131,7 @@ class SetupArguments(unittest.TestCase):
                 a = r.setup_args()
             self.assertEqual(a[a.index("--gpu-roles") + 1], "0=main,1=helper")
 
+    @unittest.skipIf(sys.platform == "darwin", "a Mac's setup takes no --gpu / --gpu-roles")
     def test_installed_cards_are_forwarded_and_the_automatic_pick_is_not(self):
         with Home() as h:
             path = self.installed(h, gpu=[1, 0], gpus_asked=True)
@@ -142,6 +144,7 @@ class SetupArguments(unittest.TestCase):
             self.assertNotIn("--gpus", a)
             self.assertNotIn("--gpu", a)
 
+    @unittest.skipIf(sys.platform == "darwin", "a Mac's setup takes no --gpu / --gpu-roles")
     def test_cards_named_on_the_command_line_win_over_the_installed_ones(self):
         with Home() as h:
             path = self.installed(h, gpu=[1, 0], gpus_asked=True, gpu_roles={"0": "main", "1": "helper"})

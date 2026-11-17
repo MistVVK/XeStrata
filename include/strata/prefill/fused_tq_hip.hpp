@@ -50,4 +50,8 @@ constexpr bool g11_on(bool g11, bool tq_on, int sw, bool default_on) {
     return default_on;
 }
 
+// The Radeon 780M (gfx1103, the same gfx11 code of the kernel): only with STRATA_PF_TQ_G11=1 (opt-in; the trellis pairs' values were checked there, the speed
+// was not measured), never by default
+constexpr bool g1103_on(bool g1103, bool tq_on, int sw) { return g1103 && tq_on && sw == 1; }
+
 }  // namespace strata::prefill::fused_tq_hip

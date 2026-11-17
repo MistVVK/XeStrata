@@ -834,6 +834,10 @@ def card_vram_mib(cfg: dict[str, Any], backend: str | None, archs: Any = None) -
         reader = gpu_reader((indices or [0])[0], amd=(backend == "hip"))
         if not reader.ok():
             return None
+        from serve import telemetry as _tm
+        if isinstance(reader, _tm._Metal):                   # (M2) a Mac's total is the Metal working set: no live registry read for it
+            total = _tm.metal_working_set()
+            return float(int(total) >> 20) if total else None
         total = reader.read().get("mem_total")
         return float(int(total) >> 20) if total else None
     except Exception:                                    # noqa: BLE001 - an unreadable card means "not known to be resident"
@@ -1136,6 +1140,18 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0, named: b
     return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel")))
 
 
+def _sycl_host_path(value: str) -> Path:
+    """#5395: an Intel (SYCL) run config written by sycl/setup_intel.py names the engine's container paths: the folder above the
+    Strata checkout (or STRATA_SYCL_ROOT) is mounted at /work (setup_intel.MOUNT, strata-sycl.sh). A check made here on the host
+    looks at the same file through that mount; any other path, or a /work path that exists on this computer, is taken as it is.
+    Only for checks: the engine's own arguments keep the container's paths."""
+    folder = Path(value)
+    if value.startswith("/work/") and not folder.exists():
+        root = os.environ.get("STRATA_SYCL_ROOT") or str(Path(__file__).resolve().parents[1].parent)
+        return Path(root) / value[len("/work/"):]
+    return folder
+
+
 def mtp_ready(args: list[Any]) -> bool | None:
     """Is the MTP layer this start would load on this computer? ``--mtp <folder>`` with its ``experts.bin`` (or, on a Mac, ``mtp-q2_0.gguf`` beside the folder).
     None (not known, taken as there) when the arguments name no layer at all (an Intel route, or a layer switched off) or a draft depth instead of a folder (Qwen3.6's
@@ -1146,7 +1162,7 @@ def mtp_ready(args: list[Any]) -> bool | None:
     value = _flag_value(args, "--mtp")
     if value is None or value.isdigit():
         return None
-    folder = Path(value)
+    folder = _sycl_host_path(value)
     try:
         return (folder / "experts.bin").is_file() or (folder.parent / "mtp-q2_0.gguf").is_file()
     except OSError:

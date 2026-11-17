@@ -49,6 +49,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-msg { min-width: 0; }
 .st-msg__meta .st-btn--icon { width: 28px; height: 28px; }
 .st-msg__meta .st-btn--icon .st-icon { width: 16px; height: 16px; }
+.st-msg__meta .msg-finish { min-height: 28px; padding: 2px 10px; font-size: var(--st-fs-xs); }   /* #5508: "Answer from this thinking" under a reply Stop left empty */
 .cursor::after { content: ""; display: inline-block; width: 8px; height: 1.1em; margin-left: 2px; vertical-align: -3px;
                  border-radius: 2px; background: var(--st-accent); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
@@ -81,7 +82,13 @@ main { flex: 1; min-height: 0; display: flex; }
 .chip .st-btn--icon .st-icon { width: 14px; height: 14px; }
 
 /* ---------------------------------------------------------------- monitor */
-.view--monitor, .view--about { overflow-y: auto; }
+.view--monitor, .view--about, .view--experts { overflow-y: auto; }
+/* #5723: the Experts view, a grid of the learned expert ranks (experts.js) */
+.experts { width: 100%; max-width: 1200px; margin: 0 auto; padding: 16px; box-sizing: border-box; }
+.experts-card { display: flex; flex-direction: column; gap: 8px; }
+.experts-grid-wrap { width: 100%; overflow: hidden; }
+#experts-grid { display: block; border-radius: 4px; background: var(--st-surface-2, transparent); }
+.experts-tip { min-height: 1.4em; font-variant-numeric: tabular-nums; }
 .monitor, .about { max-width: min(100%, 1920px); width: 100%; margin: 0 auto; padding: var(--st-s-6); display: flex; flex-direction: column;
                    gap: var(--st-s-5); }
 .state-card { display: flex; flex-direction: column; gap: var(--st-s-3); }

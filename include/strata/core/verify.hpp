@@ -325,6 +325,10 @@ public:
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
+    /// #5188 (--prefill-head-alias): every captured window graph is destroyed, so the next window of each size captures
+    /// again and reads the buffers where they are now (the output head came back at another address).  Refuses (false)
+    /// while a prelaunched window is pending.  `dropped`: how many graphs were destroyed.
+    bool drop_window_graphs(int& dropped, std::string& err);
 
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
     // stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window as `run`, driven

@@ -60,7 +60,7 @@ class ModelCase(UpdaterCase):
     # ------------------------------------------------------------------ a real loaded model
     def start_model(self, profile=PROFILE, name=NAME, port=None):
         cfg = json.loads(self.config.read_text())
-        cfg.update(exe=ec.REFERENCE_PREFIX + ec.COMPONENT_ID, backend="cuda", host="127.0.0.1", port=port or free_port(), model_name=name,
+        cfg.update(exe=ec.REFERENCE_PREFIX + ec.COMPONENT_ID, backend=self.family["backend"], host="127.0.0.1", port=port or free_port(), model_name=name,
                    log=str(self.root / f"{profile}.engine.log"))
         cfg.pop("lib_dirs", None)
         path = self.root / f"run-{profile}.json"
@@ -123,7 +123,7 @@ class WithAModel(ModelCase):
         self.assertEqual(archives_when_stopped, [1], "the new engine was downloaded while the model kept serving; it was stopped after")
         self.assertEqual(self.state(), "ready", "the model is serving again")
         self.assertEqual(self.resolved(), "0.1.46")
-        self.assertEqual(self.engine_of_last_start(), f"0.1.46-{PLATFORM}-cuda-cuda13", "the restarted model runs on the NEW engine")
+        self.assertEqual(self.engine_of_last_start(), f"0.1.46-{self.platform}-{self.tag}", "the restarted model runs on the NEW engine")
         # the warning came first, named the model, and said what would happen
         first, second = self.script.asked
         self.assertIn(NAME, first[0])
@@ -143,7 +143,7 @@ class WithAModel(ModelCase):
         self.update(self.gate(True, True))
         after = (profiles.load(PROFILE)[0], Path(profiles.load(PROFILE)[0]["source_config"]).read_bytes())
         self.assertEqual(before, after, "the model's profile and run config are exactly what they were")
-        self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-cuda-cuda13", f"0.1.46-{PLATFORM}-cuda-cuda13"])
+        self.assertEqual(self.engine_folders(), [f"0.1.45-{self.platform}-{self.tag}", f"0.1.46-{self.platform}-{self.tag}"])
 
     # ---- yes, but do not start it again
     def test_yes_and_no_to_start_again_leaves_it_stopped_and_says_how_to_start_it(self):
@@ -172,9 +172,9 @@ class WithAModel(ModelCase):
         self.assertEqual(out["exit_code"], 6, out)
         self.assertEqual(out["results"][0]["status"], "failed")
         self.assertEqual(self.resolved(), "0.1.45", "the old engine is still the one in use")
-        self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-cuda-cuda13"], "the engine that failed is not installed")
+        self.assertEqual(self.engine_folders(), [f"0.1.45-{self.platform}-{self.tag}"], "the engine that failed is not installed")
         self.assertEqual(self.state(), "ready", "the model was started again on the old engine")
-        self.assertEqual(self.engine_of_last_start(), f"0.1.45-{PLATFORM}-cuda-cuda13")
+        self.assertEqual(self.engine_of_last_start(), f"0.1.45-{self.platform}-{self.tag}")
         question = self.script.asked[1][0]
         self.assertIn("old engine is unchanged", question)
         self.assertIn(NAME, question)
@@ -236,7 +236,7 @@ class WithAModel(ModelCase):
         out = self.update(gate)
         self.assertEqual(out["exit_code"], 0)
         self.assertEqual(self.state(), "ready")
-        self.assertEqual(self.engine_of_last_start(), f"0.1.46-{PLATFORM}-cuda-cuda13")
+        self.assertEqual(self.engine_of_last_start(), f"0.1.46-{self.platform}-{self.tag}")
         self.assertEqual(self.script.asked, [])
 
     def test_start_again_after_a_failed_update_puts_the_model_back_on_the_old_engine(self):

@@ -17,7 +17,7 @@ import { materializeSkills, parseSkillFile, skillSlug, writeCreatedSkill } from 
 import { systemFonts } from './fonts.mjs';
 import { tuningDir } from './platform-paths.mjs';
 import { createAgentBridge, plainTurnFailure } from './agent/agent-bridge.mjs';
-import { mcpSkippedNotices } from './agent/profile.mjs';
+import { mcpSkippedNotices, setCompactionChoice, compactionNumber, thresholdRatio, headroomFraction, compactionThreshold, localOutputBudget, DEFAULT_THRESHOLD_RATIO, DEFAULT_HEADROOM_FRACTION } from './agent/profile.mjs';
 import { createAgentTools } from './agent/tools-settings.mjs';
 import { withPlainStatus } from './agent/status.mjs';
 import { findBrowser, findPlaywrightMcp } from './agent/browser-probe.mjs';
@@ -63,6 +63,7 @@ import { createModelProviders } from './model-providers.mjs';
 import { createForkTimeskip } from './timeskip-fork.mjs';
 import { prepareOversized } from './oversize.mjs';
 import { createChatFolders, chatRootOf, openFile, resolveChatFile, previewFile, rawFile, createAttachments, withAttachments } from './chat-files.mjs';
+import { createUserRules, rulesFile } from './user-rules.mjs';
 import { createLlmProxy, samplingFromExpert } from './agent/llm-shape.mjs';
 import { checkUpdates, checkComponentUpdates, engineFirstRun } from './updates.mjs';
 import { plainNoModel } from './no-model-text.mjs';
@@ -226,6 +227,32 @@ const agent = createAgentBridge({
   connections: () => modelProviders.withSecrets().map(c => ({ ...c, models: c.models.map(m => ({ ...m, vision: readsPicturesByDefault(m, visionProbe.known(c, m.id)), reasoning: m.reasoning ?? visionProbe.knownThinks(c, m.id) ?? null })) })),
   log: line => console.log(line),
 });
+// The person's choice of when the assistant summarises an old part of a chat, before the first profile is written.
+setCompactionChoice(store.get().agentChat);
+/** Where compaction starts on the model the chat would use now, for the Settings line that says it in tokens. */
+function compactionModelLine() {
+  const list = native.readyInstances();
+  const inst = list.find(i => i.id === native.defaultInstanceId()) ?? list[0] ?? null;
+  const context = inst?.metrics?.engine?.max_context ?? inst?.context ?? 0;
+  if (!inst || !(context > 0)) return null;
+  const thresholdTokens = compactionThreshold(context, localOutputBudget(context));
+  return { name: inst.label || inst.apiModelId, context, thresholdTokens, percent: Math.round((thresholdTokens / context) * 100) };
+}
+/** What Settings -> Chat shows about the summarising point: the saved choice, what answers now, and where it came from. */
+function compactionView() {
+  const saved = store.get().agentChat ?? {};
+  const fromEnv = name => { const v = Number.parseFloat(process.env[name]); return Number.isFinite(v) ? v : null; };
+  const validRatio = v => compactionNumber(v, 0.1, 0.99) !== null;
+  const validFraction = v => compactionNumber(v, 0, 0.5) !== null;
+  const sourceOf = (savedValue, envName, valid) => (valid(savedValue) ? 'setting' : (valid(fromEnv(envName)) ? 'environment' : 'default'));
+  return {
+    choice: { thresholdRatio: validRatio(saved.thresholdRatio) ? saved.thresholdRatio : null, headroomFraction: validFraction(saved.headroomFraction) ? saved.headroomFraction : null },
+    effective: { thresholdRatio: thresholdRatio(), headroomFraction: headroomFraction() },
+    defaults: { thresholdRatio: DEFAULT_THRESHOLD_RATIO, headroomFraction: DEFAULT_HEADROOM_FRACTION },
+    source: { thresholdRatio: sourceOf(saved.thresholdRatio, 'STRATA_COMPACTION_THRESHOLD_RATIO', validRatio), headroomFraction: sourceOf(saved.headroomFraction, 'STRATA_COMPACTION_HEADROOM_FRACTION', validFraction) },
+    model: compactionModelLine(),
+  };
+}
 let storageChanging = false;
 let modelOperations = 0;
 const requestQueue = new RequestQueue(n => monitor.queueWaiting(n));
@@ -497,6 +524,8 @@ const nativeDrops = createNativeDrops();
 const uploads = createUploads({ dir: join(store.DATA_DIR, 'uploads'), folderOf: chatId => chatRoot(chatId), attachments: chatAttachments });
 try { uploads.sweep(); } catch { /* best effort */ }
 const chatFolders = createChatFolders({ file: join(store.DATA_DIR, 'chat-folders.json') });
+/* The person's own rules for every answer (#5084): the AGENTS.md the Harness reads in agent mode, added to the plain chat paths' prompt too. */
+const userRules = createUserRules({ file: rulesFile(store.DATA_DIR) });
 /** Where a chat's files are: its chosen folder, else the folder its agent worked in, else the default workspace (chat-files.mjs). One source for every file route. */
 const chatRoot = chatId => chatRootOf({ chosen: chatFolders.get(chatId), used: agent.workingFolder?.(chatId), fallback: workspaces[0]?.path ?? WORKSPACE });
 
@@ -570,7 +599,7 @@ async function runRemoteTurn({ selection, message, history, images = [], thinkin
     const appliedSkills = selectSkills(skillState, message, workspaceId);
     entry = serving.open({ client: 'Strata chat', endpoint: connection.protocol === 'anthropic' ? '/messages' : connection.protocol === 'openai-responses' ? '/responses' : '/chat/completions', model: `${connection.name} · ${model.name}`, cancel: () => controller.abort(new DOMException('Cancelled by the user', 'AbortError')) });
     serving.mark(entry.id, { state: 'generating' });
-    const result = await modelProviders.stream({ selection, message, history, images, thinking, signal: requestSignal, systemPrompt: ['You are Strata, a helpful assistant. Answer clearly. Do not claim to have read files or performed actions unless their results are included in the conversation.', skillInstructions(appliedSkills)].filter(Boolean).join('\n\n'), onFrame: frame => {
+    const result = await modelProviders.stream({ selection, message, history, images, thinking, signal: requestSignal, systemPrompt: ['You are Strata, a helpful assistant. Answer clearly. Do not claim to have read files or performed actions unless their results are included in the conversation.', userRules.promptBlock(), skillInstructions(appliedSkills)].filter(Boolean).join('\n\n'), onFrame: frame => {
       if (frame.type === 'start') noteSkillUse(appliedSkills);
       if (frame.type === 'done') serving.mark(entry.id, { tokensIn: frame.tokensIn, tokensOut: frame.tokensOut, usageSource: frame.usageSource });
       onFrame({ ...frame, requestId: entry.id, model: model.name, contextMax: model.contextMax, remoteModel: true, ...(frame.type === 'start' ? { skills: appliedSkills.map(s => s.name) } : {}) });
@@ -637,7 +666,7 @@ async function runTurn({ message, history = [], onFrame, signal, client, workspa
   if(native.hasLive()||nativeModelId){
     let instance;try{instance=native.resolveInstance(nativeModelId??native.state().defaultId);}catch(e){const message=plainNoModel(e.message);onFrame({type:'error',message});return {error:message};}const started=Date.now(),cancel=new AbortController();
     const entry=serving.open({client:client??'Strata chat',endpoint:'/chat/completions',model:instance.apiModelId,instanceId:instance.id,gpuIds:instance.gpus.map(String),cancel:()=>cancel.abort()});
-    try{serving.mark(entry.id,{state:'generating'});const applied=selectSkills(skillState,message,workspaceId);const result=await proxyCompletion({baseUrl:`http://127.0.0.1:${instance.port}/v1`,modelId:instance.apiModelId,authorization:instance.key,message,history,images,extra:{strata_mcp:useTools===true,...(thinkingBudget>0&&String(thinking).toLowerCase()!=='off'?{reasoning_budget_tokens:thinkingBudget}:{}),reasoning_effort:({off:'none',max:'high'}[String(thinking).toLowerCase()]??String(thinking).toLowerCase())},systemPrompt:[SYSTEM_PROMPT,skillInstructions(applied)].filter(Boolean).join('\n\n'),signal:signal?AbortSignal.any([signal,cancel.signal]):cancel.signal,onFrame:frame=>onFrame({...frame,requestId:entry.id,model:instance.label,contextMax:instance.metrics?.engine?.max_context??instance.context,skills:applied.map(s=>s.name)})});serving.mark(entry.id,{...result,usageSource:result.usageSource});serving.finish(entry.id,{tokensOut:result.tokensOut,durationMs:Date.now()-started});return result;}catch(e){serving.finish(entry.id,{durationMs:Date.now()-started,error:e.message});onFrame({type:'error',message:e.message,requestId:entry.id});return {error:e.message};}
+    try{serving.mark(entry.id,{state:'generating'});const applied=selectSkills(skillState,message,workspaceId);const result=await proxyCompletion({baseUrl:`http://127.0.0.1:${instance.port}/v1`,modelId:instance.apiModelId,authorization:instance.key,message,history,images,extra:{strata_mcp:useTools===true,...(thinkingBudget>0&&String(thinking).toLowerCase()!=='off'?{reasoning_budget_tokens:thinkingBudget}:{}),reasoning_effort:({off:'none',max:'high'}[String(thinking).toLowerCase()]??String(thinking).toLowerCase())},systemPrompt:[SYSTEM_PROMPT,userRules.promptBlock(),skillInstructions(applied)].filter(Boolean).join('\n\n'),signal:signal?AbortSignal.any([signal,cancel.signal]):cancel.signal,onFrame:frame=>onFrame({...frame,requestId:entry.id,model:instance.label,contextMax:instance.metrics?.engine?.max_context??instance.context,skills:applied.map(s=>s.name)})});serving.mark(entry.id,{...result,usageSource:result.usageSource});serving.finish(entry.id,{tokensOut:result.tokensOut,durationMs:Date.now()-started});return result;}catch(e){serving.finish(entry.id,{durationMs:Date.now()-started,error:e.message});onFrame({type:'error',message:e.message,requestId:entry.id});return {error:e.message};}
   }
   runtimeState();
   let instance;
@@ -667,7 +696,7 @@ async function runTurn({ message, history = [], onFrame, signal, client, workspa
       // Scope is resolved again at dispatch: a disabled skill never stays active
       // merely because the request waited in the queue.
       const appliedSkills = selectSkills(skillState, message, workspaceId);
-      const systemPrompt = [SYSTEM_PROMPT, skillInstructions(appliedSkills)].filter(Boolean).join('\n\n');
+      const systemPrompt = [SYSTEM_PROMPT, userRules.promptBlock(), skillInstructions(appliedSkills)].filter(Boolean).join('\n\n');
       serving.mark(entry.id, { state: 'generating' });
       const contextMax = instance.memory.context;
       const modelMonitor=models.REAL?monitor:{
@@ -1764,6 +1793,13 @@ async function api(req, res, path, method, url) {
     return json(res, 200, { path: rel, text, sizeKb: st.size / 1024, updatedAt: st.mtime.toISOString() });
   }
 
+  // The person's own rules for every answer (#5084). A save names the revision it read; another window's newer save is never overwritten.
+  if (path === '/api/rules' && method === 'GET') return json(res, 200, userRules.read());
+  if (path === '/api/rules' && method === 'PUT') {
+    const body = await readBody(req);
+    try { return json(res, 200, userRules.write(body.text, body.revision)); } catch (e) { return error(res, e.status ?? 400, e.message, e.code ? { code: e.code } : {}); }
+  }
+
   // The folder a chat works in, and opening its files by path (notes-split-agent8.md).
   if (path === '/api/chat/folder' && method === 'GET') {
     const id = url.searchParams.get('sessionId') ?? '';
@@ -1922,6 +1958,32 @@ async function api(req, res, path, method, url) {
 
   // --- agent --------------------------------------------------------------
   if (path === '/api/agent/status' && method === 'GET') return json(res, 200, agent.status());
+  // A chat the person deleted in the app: drop its Harness session and the host's entry for it, so the two registries
+  // do not grow with every chat of every day (the app's memory climbed until the WebView2 renderer OOMed).
+  if (path === '/api/agent/chat/forget' && method === 'POST') {
+    const body = await readBody(req);
+    if (typeof body.chatId !== 'string' || !body.chatId) return error(res, 400, 'chatId is required');
+    agent.forget(body.chatId);
+    return json(res, 200, { ok: true });
+  }
+  // When the assistant summarises an old part of a chat (Settings -> Chat). null puts a name back to automatic;
+  // the running assistant picks the new number up on its next message (it is part of the profile's signature).
+  if (path === '/api/agent/compaction' && method === 'GET') return json(res, 200, compactionView());
+  if (path === '/api/agent/compaction' && method === 'POST') {
+    const body = await readBody(req);
+    const saved = store.get().agentChat ?? {};
+    const next = { ...saved };
+    for (const [name, min, max] of [['thresholdRatio', 0.1, 0.99], ['headroomFraction', 0, 0.5]]) {
+      if (!Object.hasOwn(body, name)) continue;
+      if (body[name] === null) { next[name] = null; continue; }
+      const value = compactionNumber(body[name], min, max);
+      if (value === null) return error(res, 400, `${name} is a fraction between ${min} and ${max}, or null for automatic.`);
+      next[name] = value;
+    }
+    store.update({ agentChat: next });
+    setCompactionChoice(next);
+    return json(res, 200, compactionView());
+  }
   // The assistant's model requests, with the person's Response settings added (llm-shape.mjs). This computer only.
   const llmRoute = /^\/api\/internal\/agent-llm\/([A-Za-z0-9_.~-]+)(\/.*)$/.exec(path);
   if (llmRoute) { llmProxy(req, res, llmRoute[1], llmRoute[2] + (url.search ?? '')); return undefined; }

@@ -24,7 +24,7 @@
   "chat.projectionOn": "projeção ativada",
   "chat.stopped": "Parada",
   "chat.stoppedLower": "parada",
-  "chat.tokens": "{n} tokens",
+  "chat.tokens": {"one": "{n} token", "other": "{n} tokens"},
   "chat.toolCalls": {"one": "{n} chamada de ferramenta", "other": "{n} chamadas de ferramenta"},
   "chat.toolLimit": "parada no limite de {n} rodadas de ferramentas (mcp.max_rounds)",
   "chat.untitled": "Novo chat",
@@ -246,5 +246,12 @@
   "tool.running": "Em execução",
   "tool.skipped": "Não executada",
   "tool.writing": "Escrevendo",
-  "undo": "Desfazer"
+  "undo": "Desfazer",
+  "sidebar.import": "Recuperar uma conversa salva",
+  "sidebar.imported": "Conversa recuperada",
+  "sidebar.importFailed": "Nada a recuperar",
+  "sidebar.importFailedText": "Este arquivo não tem mensagens de chat. Escolha um arquivo salvo com “Salvar este chat como Markdown”.",
+  "chat.finishFromThinking": "Responder a partir deste raciocínio",
+  "chat.finishFromThinkingTitle": "Escreve uma resposta com o que o modelo tinha descoberto antes de você pará-lo. Ele não pensa mais.",
+  "chat.fromStoppedThinking": "resposta a partir do raciocínio interrompido"
 }

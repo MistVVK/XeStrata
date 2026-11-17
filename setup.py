@@ -4008,7 +4008,7 @@ def ensure_nvfp4_local_packages() -> None:
         return
     if CONTROL:
         fail("preparing NVIDIA's FP4-Local checkpoint needs PyTorch and transformers, which the app does not include",
-             "install this model from the source download (SETUP.bat on Windows, ./setup.sh on Linux), or pick another version in the app")
+             "install this model from the source download (START-HERE.bat --setup on Windows, ./setup.sh --setup on Linux), or pick another version in the app")
     pkgs = nvfp4_local_packages()
     if not pkgs:
         fail("requirements-nvfp4-local.txt is missing", "update Strata, or run: python -m pip install torch transformers safetensors")
@@ -5972,7 +5972,7 @@ def engine_update_note() -> None:
         if old:
             warn(f"the installed engine ({meta.get('version') or 'unknown version'}) is older than this Strata expects: "
                  "starting it as it is. Starting never updates anything; run "
-                 + ("UPDATE.bat" if WIN else "./update.sh") + " (or `strata install --update`) to update it")
+                 + ("START-HERE.bat --update" if WIN else "./setup.sh --update") + " (or `strata install --update`) to update it")
 
 
 def update_installed_engine(url_base, toolkit=None) -> None:
@@ -7708,8 +7708,172 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
+# ---------------------------------------------------------------------------------------------- 0.2.16: source updates and the layout move
+PULLED_ENV = "STRATA_UPDATE_PULLED"             # set for the setup.py a pull started: it does not pull again
+
+
+def source_checkout() -> Path | None:
+    """The git clone this Strata's sources are in, or None (an installed Terminal, a zip download).  Before 0.2.16 the clone's root
+    is ROOT; from 0.2.16 ROOT is the clone's terminal/ folder (the engine's sources are in ../engine)."""
+    if (ROOT / ".git").exists():
+        return ROOT
+    if ROOT.name == "terminal" and (ROOT.parent / ".git").exists() and (ROOT.parent / "engine" / "CMakeLists.txt").is_file():
+        return ROOT.parent
+    return None
+
+
+def source_download() -> bool:
+    """A source folder that is not a git clone (GitHub's main.zip unpacked): it has the engine's sources beside setup.py, or in ../engine."""
+    return (ROOT / "CMakeLists.txt").is_file() or (ROOT.name == "terminal" and (ROOT.parent / "engine" / "CMakeLists.txt").is_file())
+
+
+def git_out(git: str, repo: Path, *args) -> str:
+    r = subprocess.run([git, "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def pull_onto_new_history(git: str, repo: Path) -> int:
+    """`git pull --ff-only` failed. A clone made before the history was rewritten on 2026-10-06 (#1276) has no commit in common with
+    origin/main: it is moved to the new history when nothing tracked was changed, its old commits kept in a backup branch.  Any other
+    failure stops the update (0 = moved, 1 = stopped)."""
+    run = lambda *a: subprocess.run([git, "-C", str(repo), *a], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if git_out(git, repo, "rev-parse", "--is-shallow-repository") == "true" or run("merge-base", "HEAD", "origin/main").returncode == 0:
+        say()
+        say("  git pull did not succeed (the reason is above): nothing was updated. Files you changed here can stop it:")
+        say('  "git status" lists them.')
+        return 1
+    again = "START-HERE.bat --update" if WIN else "./setup.sh --update"
+    say()
+    say("  This clone is on the repository's old history (cleaned up on 2026-10-06): it has no commit in common")
+    say("  with origin/main, so it cannot be updated by git pull.")
+    if git_out(git, repo, "status", "--porcelain", "--untracked-files=no"):
+        say("  You have local changes to tracked files here, so nothing was touched. To move to the new history")
+        say("  yourself (your untracked files, models and settings stay where they are):")
+        say("    git branch pre-cleanup-backup && git stash push   # keeps the old commits and your edits")
+        say("    git checkout -B main origin/main")
+        say(f"  then run {again} again.")
+        return 1
+    bk = "pre-cleanup-backup"
+    if run("rev-parse", "--verify", "-q", "refs/heads/" + bk).returncode == 0:
+        bk = "pre-cleanup-backup-" + time.strftime("%Y%m%d%H%M%S")
+    branch = git_out(git, repo, "symbolic-ref", "--short", "-q", "HEAD") or "main"
+    if run("branch", bk, "HEAD").returncode == 0 and run("checkout", "-q", "-B", branch, "origin/main").returncode == 0:
+        say(f"  Moved to the new history. Your old commits are kept in the branch {bk}.")
+        say("  Untracked files (models, settings, the engine) were not touched.")
+        return 0
+    run("branch", "-D", bk)                     # the backup branch made a moment ago would make the by-hand step below fail
+    say("  Could not move to the new history (the reason is above): nothing was updated. By hand:")
+    say("    git branch pre-cleanup-backup")
+    say("    git checkout -B main origin/main")
+    return 1
+
+
+def update_pull(argv: list) -> int | None:
+    """`setup.py --update` (START-HERE.bat --update, ./setup.sh --update) first gets the newest code, as UPDATE.bat / update.sh did
+    before 0.2.16 (MAP-0215 Q6: those two files go with the 0.2.16 layout).  None: go on with this run (nothing new, not a clone, or
+    already pulled).  An exit code: the pull could not be done, or it brought new code and the update ran in the NEW setup.py
+    (this process has the old one in memory; after the 0.2.16 move that file is terminal/setup.py)."""
+    if os.environ.get(PULLED_ENV) == "1" or CONTROL:
+        return None
+    repo = source_checkout()
+    if repo is None:
+        if source_download():
+            say("  This copy of Strata was not made with git, so it cannot fetch new files itself. Download the newest one:")
+            say("    https://github.com/Niko1221/Strata/archive/refs/heads/main.zip")
+            say(f"  unzip it anywhere and run {'START-HERE.bat' if WIN else './setup.sh'} in it: it finds the model files in Strata-data")
+            say("  and sets itself up the same way - nothing big is downloaded again.")
+            say("  Checking this copy's engine and settings meanwhile ...")
+        return None
+    git = shutil.which("git")
+    if not git:
+        say("  This folder is a git clone, but git is not installed: install it ("
+            + ("winget install Git.Git" if WIN else "sudo apt install git") + ") or run")
+        say(f'  "git pull" here yourself, then run {"START-HERE.bat --update" if WIN else "./setup.sh --update"} again.')
+        return 1
+    before = git_out(git, repo, "rev-parse", "HEAD")
+    say("  Getting the newest Strata (git pull) ...")
+    if subprocess.run([git, "-C", str(repo), "pull", "--ff-only"]).returncode != 0 and pull_onto_new_history(git, repo):
+        return 1
+    if git_out(git, repo, "rev-parse", "HEAD") == before:
+        return None
+    here = Path(__file__).resolve()
+    new = here if here.is_file() else repo / "terminal" / "setup.py"
+    return subprocess.call([sys.executable, str(new), *argv], cwd=str(new.parent), env={**os.environ, PULLED_ENV: "1"})
+
+
+#: what setup writes into the folder it runs in: a clone made before 0.2.16 has these at its root; from 0.2.16 they are in terminal/
+OLD_LAYOUT_FILES = ("strata-*.json", "strata-*.log", "run-*.bat", "run-*.sh", "build-strata*.bat")
+OLD_LAYOUT_DIRS = ("models", "packs", "mtp", ".strata-mcp", "engine-sycl", "engine-cuda12", ".rocm-win")
+#: engine/ of a 0.2.16 clone is the engine's source; anything else in it is the engine an older setup downloaded or compiled there
+ENGINE_SOURCE_ENTRIES = {"src", "include", "cmake", "metal", "sycl", "spark", "third_party", "tests", "bench", "CMakeLists.txt",
+                         "CMakePresets.json"}
+#: the Terminal's own files, which a run config or run script of the old layout names at the clone's root
+TERMINAL_ENTRIES = ("strata.py", "setup.py", "serve", "strata_cli", "strata_control", "tools", "data", "ref", "bin", ".venv")
+
+
+def move_over_old_layout() -> list:
+    """MAP-0215 Q7: the first run of a clone after its pull to the 0.2.16 layout carries setup's state from the clone's root into
+    terminal/, once: the run configs, logs and run scripts, the model and pack folders, the MCP state, and the engine that setup put
+    in engine/ (which is the engine's source folder now; its source entries stay).  The paths inside the moved run configs and run
+    scripts are changed to the new places.  Nothing is moved when terminal/ has a run config of its own, and nothing is replaced.
+    START-HERE.bat / setup.sh move .venv before Python starts.  Returns the (old, new) pairs moved."""
+    old = ROOT.parent
+    if ROOT.name != "terminal" or not (old / "engine" / "CMakeLists.txt").is_file() or any(ROOT.glob("strata-*.json")):
+        return []
+    pairs = []
+    for pat in OLD_LAYOUT_FILES:
+        pairs += [(f, ROOT / f.name) for f in sorted(old.glob(pat)) if f.is_file()]
+    pairs += [(old / d, ROOT / d) for d in OLD_LAYOUT_DIRS if (old / d).is_dir()]
+    eng = old / "engine"
+    if not (ROOT / "engine").exists():
+        pairs += [(e, ROOT / "engine" / e.name) for e in sorted(eng.iterdir())
+                  if e.name not in ENGINE_SOURCE_ENTRIES and not e.name.startswith(("build", "."))]
+    moved = []
+    for src, dst in pairs:
+        if dst.exists():
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            # a rename only, never a copy: models/ and packs/ hold hundreds of GB. A rename that fails (another disk, files in use)
+            # leaves the entry where it is, with the warning; the old place keeps working for the files a config names.
+            os.rename(src, dst)
+            moved.append((src, dst))
+        except OSError as e:
+            warn(f"{src} could not be moved to {dst}: {e}")
+    if not moved:
+        return []
+    swaps = sorted({(str(a), str(b)) for a, b in moved} | {(str(old / n), str(ROOT / n)) for n in TERMINAL_ENTRIES}
+                   | ({(str(eng), str(ROOT / "engine"))} if any(a.parent == eng for a, _ in moved) else set()),
+                   key=lambda ab: -len(ab[0]))
+
+    def rebase(text: str) -> str:
+        for a, b in swaps:
+            for sa, sb in ((a, b), (a.replace("\\", "/"), b.replace("\\", "/"))):
+                text = re.sub(re.escape(sa) + r"(?=$|[\\/\"'\s;,])", lambda _m, sb=sb: sb, text)
+        return text
+
+    def walk(v):
+        return rebase(v) if isinstance(v, str) else [walk(x) for x in v] if isinstance(v, list) else \
+            {k: walk(x) for k, x in v.items()} if isinstance(v, dict) else v
+    for _, dst in moved:
+        if dst.is_file() and dst.name.startswith("strata-") and dst.suffix == ".json":
+            try:
+                data = json.loads(dst.read_text(encoding="utf-8-sig"))
+                dst.write_text(json.dumps(walk(data), indent=2) + "\n", encoding="utf-8")
+            except (OSError, ValueError) as e:
+                warn(f"{dst}: the paths in it could not be updated: {e}")
+        elif dst.is_file() and dst.name.startswith("run-"):
+            try:
+                dst.write_bytes(rebase(dst.read_bytes().decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape"))
+            except OSError as e:
+                warn(f"{dst}: the paths in it could not be updated: {e}")
+    say(f"  Strata's folders were rearranged in this version: your settings and engine moved from {old} into {ROOT}.")
+    return moved
+
+
+
 def update_install(have: list, a) -> int:
-    """#475: `setup.py --update` (UPDATE.bat / update.sh, after their git pull): what a plain START-HERE.bat does to
+    """#475: `setup.py --update` (START-HERE.bat --update, ./setup.sh --update, after update_pull): what a plain START-HERE.bat does to
     an install before it starts the model, without starting it - the Python packages, the ready-made engine when this
     setup needs a newer one (MIN_ENGINE; a compiled engine when its source changed), each installed model's config
     upgrades and its draft subset.  No question is asked and the model files are not touched; a model still running
@@ -7737,7 +7901,7 @@ def update_install(have: list, a) -> int:
     if any(ver) and tuple(ver) < MIN_ENGINE:             # #3653: the engine step failed above; "updated" would be untrue
         warn(f"Strata's files are updated, but the engine was NOT: it is still {'.'.join(map(str, ver))} and this Strata wants "
              f"{'.'.join(map(str, MIN_ENGINE))} or newer. The model still starts with the old engine.")
-        say(f"  Next step: check the internet connection (and that the model window is closed), then run {'UPDATE.bat' if WIN else './update.sh'} again; "
+        say(f"  Next step: check the internet connection (and that the model window is closed), then run {'START-HERE.bat --update' if WIN else './setup.sh --update'} again; "
             "the line above this one says why the engine was not fetched.")
         return 0
     ok("Strata is updated" + (f" (engine {'.'.join(map(str, ver))})" if any(ver) else "") +
@@ -9485,8 +9649,6 @@ def main() -> int:
         _pf.adopt_user_defaults()
     except Exception:
         pass
-    if sys.platform == "darwin" and not CONTROL:       # a Mac: metal/setup_mac.py (the Metal engine); the app (Control mode) goes on below
-        return mac_setup(sys.argv[1:])
     _peek = lambda flag: next((v.split("=", 1)[1] if v.startswith(flag + "=") else sys.argv[i + 2] if i + 2 < len(sys.argv) else None   # noqa: E731
                                for i, v in enumerate(sys.argv[1:]) if v == flag or v.startswith(flag + "=")), None)
     from strata_control import retired
@@ -9494,6 +9656,8 @@ def main() -> int:
                                               and (not _peek("--family") or retired.is_name(_peek("--family")))):
         say("  " + retired.NOT_OFFERED)                # DeepSeek: no longer offered (strata_control/retired.py)
         return 2
+    if sys.platform == "darwin" and not CONTROL:       # a Mac: metal/setup_mac.py (the Metal engine); the app (Control mode) goes on below.
+        return mac_setup(sys.argv[1:])                 # (after the retired names above, so a Mac gets the same sentence and exit 2, M1 11-16)
     if (_peek("--family") and _peek("--family") not in {**FAMILIES, **OWN_PATH_FAMILIES}) \
             or (_peek("--model") and not _peek("--family") and model_alias(_peek("--model")) not in MODELS
                 and not any(model_alias(_peek("--model")) in f["models"] for f in OWN_PATH_FAMILIES.values())):
@@ -9586,7 +9750,7 @@ def main() -> int:
                          "a model; the usual text goes to stderr. Use it with --yes --no-start")
     ap.add_argument("--update", action="store_true",
                     help="update the installed engine, Python packages and model settings as a start would, without "
-                         "starting the model (UPDATE.bat / update.sh run it after a git pull)")
+                         "starting the model; in a git clone it gets the newest code first (git pull)")
     ap.add_argument("--rollback-engine", action="store_true",
                     help="put back the engine an update replaced (kept in engine/.previous), and keep the current one there")
     ap.add_argument("--build", action="store_true", help="compile the engine instead of using the ready-made one")
@@ -9660,6 +9824,11 @@ def main() -> int:
     a = ap.parse_args()
     if a.output == "jsonl":
         jsonl_start()
+    move_over_old_layout()                             # a clone's first run after its pull to the 0.2.16 layout (Q7)
+    if a.update:                                       # Q6: the newest code first (UPDATE.bat / update.sh did the git pull before 0.2.16)
+        pulled = update_pull(sys.argv[1:])
+        if pulled is not None:
+            return pulled
     if getattr(a, "gguf_dir", None):                   # the person's own files: their finish marks go to Strata's marks/, never beside them
         own_files_in(a.gguf_dir)
     if getattr(a, "dsv41_package", None):              # DeepSeek's engine package: no longer offered (strata_control/retired.py)
@@ -9736,7 +9905,7 @@ def main() -> int:
         return rollback_engine(12 if a.cuda == "12" else 13)
 
     # ---- 0. already installed: just start it
-    if a.update:                                       # #475: UPDATE.bat / update.sh - never starts the model
+    if a.update:                                       # #475: START-HERE.bat --update / ./setup.sh --update - never starts the model
         return update_install(have, a)
     explicit = a.setup or a.model or a.family or a.check or a.no_start
     adopted = None                                     # #629: the earlier install this copy is set up like

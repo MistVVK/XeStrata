@@ -87,7 +87,18 @@ test('the tuning plan comes from the engine binary and excludes what it cannot a
   const dir = await mkdtemp(join(tmpdir(), 'strata-tune-stub-'));
   // A Python stub, run by Strata Control as [python, stub.py] on every OS (a #! script is WinError 193 on Windows).
   const engine = join(dir, 'strata-stub.py');
-  await writeFile(engine, 'import sys\nfor line in ("usage:", "  --kv KV", "  --ple-io MODE"):\n    print(line, file=sys.stderr)\n');
+  // Like the engine's parser, it names an argument it does not know ("unknown argument: --x"): the tuner asks the binary about
+  // every flag its --help does not list (#4652), and a stub that answered every call with its usage "accepted" them all.
+  await writeFile(engine, [
+    'import sys',
+    'for a in sys.argv[1:]:',
+    '    if a not in ("--help", "--kv", "--ple-io"):',
+    '        print("unknown argument: " + a, file=sys.stderr)',
+    '        sys.exit(1)',
+    'for line in ("usage:", "  --kv KV", "  --ple-io MODE"):',
+    '    print(line, file=sys.stderr)',
+    '',
+  ].join('\n'));
 
   const { child, base } = await startHost();
   try {

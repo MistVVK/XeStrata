@@ -36,7 +36,7 @@ print("STRATA-IMAGE PASS")
 class RunStrataImage(unittest.TestCase):
     def test_runs_and_records(self):
         with tempfile.TemporaryDirectory() as td:
-            t = Path(td)
+            t = Path(td).resolve()                          # (macOS: /var is a link to /private/var, and the runner resolves its folders)
             exe = t / "fake-strata-image"
             exe.write_text(STAND_IN)
             exe.chmod(0o755)

@@ -7,7 +7,10 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SPEED_SWITCHES, speedSwitchApplies, speedSwitchIsSet, speedSwitchIsOn, speedSwitchRows, setSpeedSwitch, validateNativeSettings, publicNativeEnv, restoreNativeEnv } from '../server/native-settings.mjs';
+import { SPEED_SWITCHES as ALL_SWITCHES, speedSwitchApplies, speedSwitchIsSet, speedSwitchIsOn, speedSwitchRows as allRows, setSpeedSwitch, validateNativeSettings, publicNativeEnv, restoreNativeEnv } from '../server/native-settings.mjs';
+/* 0.2.16: the route tail skip is a choice (Automatic / Off / 1-9), not an On / Off switch; tail-skip-choice.test.mjs tests it. These tests are the two-state rows. */
+const SPEED_SWITCHES = ALL_SWITCHES.filter(s => !s.choices);
+const speedSwitchRows = (env, context) => allRows(env, context).filter(s => !s.choices);
 import { nativeFixture } from './helpers/native-fixture.mjs';
 
 const read = rel => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8').replace(/\r\n/g, '\n');
@@ -17,7 +20,7 @@ const ENV = {      // what each switch writes outside its default
   faster_radeon_9000: { STRATA_PCIE_FRAC_DEFAULT: 'old' },
 };
 /* (0.2.16: the picture reader row is gone with llama.cpp's reader, so every row is a Speed row.) */
-const speed = rows => rows;
+const speed = rows => rows.filter(s => !s.choices);
 const DEFAULT = { faster_long_prompts: 'off', faster_12gb_nvidia: 'off', faster_radeon_9000: 'on' };
 const RTX3060 = { index: 0, name: 'NVIDIA GeForce RTX 3060', vendor: 'nvidia', arch: '86', vram_gb: 12 };
 const R9700 = { index: 0, name: 'AMD Radeon AI PRO R9700', vendor: 'amd', arch: 'gfx1201', vram_gb: 32 };
@@ -206,8 +209,8 @@ test('through the host: Qwen3.6-35B-A3B (its run config has an arch) gets no Fas
     setConfig(f, 'iq2_xs', { backend: 'cuda' });
     setConfig(f, 'iq3_s', { backend: 'cuda', arch: 'qwen35moe', model_name: 'qwen3.6-35b-a3b-ud-q4_k_xl' });
     await f.control.refresh();
-    assert.deepEqual(f.control.settings('iq2_xs').speedSwitches.map(s => s.id), ['faster_long_prompts']);
-    assert.deepEqual(f.control.settings('iq3_s').speedSwitches.map(s => s.id), []);
+    assert.deepEqual(speed(f.control.settings('iq2_xs').speedSwitches).map(s => s.id), ['faster_long_prompts']);
+    assert.deepEqual(speed(f.control.settings('iq3_s').speedSwitches).map(s => s.id), []);
   } finally { await f.cleanup(); }
 });
 

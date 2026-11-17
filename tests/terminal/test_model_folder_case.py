@@ -33,6 +33,7 @@ class StubCatalog:
     tables = lambda self: ({}, {"qwen": {"tag": ""}}, None, None)          # noqa: E731
     tag_of = Catalog.tag_of
     model_folder = Catalog.model_folder
+    model_folder_trace = Catalog.model_folder_trace          # (#4887: model_folder returns the lookup's pick)
 
     def __init__(self, data: Path):
         self._data = data

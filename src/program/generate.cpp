@@ -169,6 +169,8 @@
 #include <tlhelp32.h>
 #include <dbghelp.h>
 #include <io.h>
+
+#include "strata/platform/commit.hpp"
 #else
 #include <unistd.h>
 #include <cerrno>
@@ -7943,7 +7945,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     bool prefill_head_alias_bound = false;
-    const void* prefill_head_alias_at = nullptr;   // where the head came back the first time
+    const void* prefill_head_alias_at = nullptr;   // where the head came back the first time (or after the last move, #5188)
+    const void* prefill_head_alias_scratch = nullptr;   // and its scratch
     if (o.prefill_head_alias) {
         const char* why = !o.serve ? "it needs --serve"
                         : multi_gpu || !stages.empty() ? "it supports one GPU only"
@@ -11542,10 +11545,15 @@ int main(int argc, char** argv) {
             if (GlobalMemoryStatusEx(&cs)) {
                 const uint64_t planned = (o.prompt_cache > 0 ? (uint64_t) std::max<int64_t>(o.conversation_cache_mib, 0) << 20 : 0) +
                                          (2ull << 30);   // checkpoints and prompt staging
-                const auto cv = strata::platform::host_limits::commit_verdict((uint64_t) cs.ullAvailPageFile,
-                                                                              (uint64_t) cs.ullTotalPageFile, planned, 4ull << 30);
-                std::fprintf(stderr, "strata serve: Windows commit: %.1f GiB left of a %.1f GiB limit (RAM + page file)\n",
+                // #5742: a page file still below its maximum grows when more is committed: that room counts too
+                const uint64_t grow = strata::platform::commit_growth((uint64_t) cs.ullTotalPhys);
+                const auto cv = strata::platform::host_limits::commit_verdict(
+                    strata::platform::commit_available((uint64_t) cs.ullAvailPageFile, grow),
+                    strata::platform::commit_available((uint64_t) cs.ullTotalPageFile, grow), planned, 4ull << 30);
+                std::fprintf(stderr, "strata serve: Windows commit: %.1f GiB left of a %.1f GiB limit (RAM + page file)",
                              (double) cs.ullAvailPageFile / 1073741824.0, (double) cs.ullTotalPageFile / 1073741824.0);
+                if (grow > 0) std::fprintf(stderr, "; the page files may grow by %.1f GiB more", (double) grow / 1073741824.0);
+                std::fputc('\n', stderr);
                 if (cv.warn) std::fprintf(stderr, "strata serve: %s\n", cv.text.c_str());
             }
         }
@@ -11989,7 +11997,10 @@ int main(int argc, char** argv) {
         } else if (o.prefill_auto && d_res == nullptr) {
             o.prefill_chunk = 1024;       // #85: no expert cache at all (a full 8 GB card): small buffers of its own
         }
-        if (o.prefill_head_alias) {
+        // pf_parts is empty when there is no VRAM expert tier (no --expert-profile, or no VRAM left for it): the alias has
+        // nothing to borrow then, and the verifier below stops the start with its own "--expert-profile" error.  It read
+        // pf_parts[0] before and ended in a SIGSEGV instead (found on p2003 with #5188's gate).
+        if (o.prefill_head_alias && !pf_parts.empty()) {
             for (PfPart& p : pf_parts) {
                 p.first = p.cache->slots() > 1 ? 1 : -1;
                 p.first_now = p.first;
@@ -13509,6 +13520,7 @@ int main(int argc, char** argv) {
                 // An evicted image's segments go back to the segment pool as idle (resident) memory: given back to the
                 // OS at once, or the reading could never show them.
                 bool no_progress = false;
+                std::string cannot_help_note;   // #2253: the refusal line's note when no eviction could have made room
                 if (!fits) {
                     const strata::core::EvictForRam r = strata::core::evict_for_ram(
                         admit, [&] { return mem ? std::optional<uint64_t>(mem->available) : std::nullopt; },
@@ -13522,16 +13534,26 @@ int main(int argc, char** argv) {
                             if (pools_budget.idle_bytes() > 0) pools_budget.shrink((size_t) -1);
                             return b;
                         },
-                        conversations.slots());
+                        conversations.slots(),
+                        // #2253: short by more than every parked conversation that may go holds: none is evicted
+                        (uint64_t) additional > UINT64_MAX - floor ? UINT64_MAX : (uint64_t) additional + floor,
+                        (uint64_t) conversations.evictable_bytes());
                     fits = r.fits;
                     evicted = r.evicted;
                     no_progress = r.no_progress;
+                    if (r.cannot_help) {
+                        char note[160];
+                        std::snprintf(note, sizeof note, "; short by %llu MiB, more than the %zu parked hold (%zu MiB), so none was evicted",
+                                      (unsigned long long) (r.short_by >> 20), conversations.size(), conversations.evictable_bytes() >> 20);
+                        cannot_help_note = note;
+                    }
                 }
                 if (!fits) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s)\n",
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s%s)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  evicted, conversations.size(),
-                                 no_progress ? "; the last eviction gave no memory back, so the rest stay parked" : "");
+                                 no_progress ? "; the last eviction gave no memory back, so the rest stay parked" : "",
+                                 cannot_help_note.c_str());
                     return true;
                 }
                 if (evicted)
@@ -15232,7 +15254,8 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+            // (#5012: experts = every routed (layer, expert) pair, so the Monitor shows "slots / experts" as a share)
+            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld experts=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
@@ -15242,7 +15265,7 @@ int main(int argc, char** argv) {
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
-                        (long long) slots_all, (long long) mib_all,
+                        (long long) slots_all, (long long) (g.n_layers * g.n_expert), (long long) mib_all,
                         (long long) slots_primary, (long long) mib_primary,
                         o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
@@ -15955,6 +15978,16 @@ int main(int argc, char** argv) {
                                      "conversation holds checkpoints the slot does not; it stays)\n", b);
                 return;
             }
+#if defined(STRATA_GPU_METAL)
+            // #5401: a Metal batch slot's running state and K/V live in the decode window (its slot set), not in the slot's
+            // SessionState, whose own device buffers the window never writes (and a streamed start gives back): parking it here
+            // would copy those buffers (the streamed engine aborted on the given-back one).  Parking through the window is a later step.
+            // (the slot is overwritten as after the other skips: each caller resets it, and nothing reaches the cache or its SSD tier;
+            // the wording is the sibling returns', not "skip parking (": serve's #6081 counters read that as a refused park)
+            std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (a Metal batch slot's state "
+                                 "lives in the decode window, not in its sessions; #5401)\n", b);
+            return;
+#endif
             if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu tokens "
                                      "have no per-slot draft K/V without --batch-mtp)\n", b, sl.ids.size());
@@ -17562,16 +17595,38 @@ int main(int argc, char** argv) {
                 if (!o.prefill_head_alias || native_head.loaded()) return 0;
                 sp.reset();
                 const auto head_t0 = Clock::now();
-                if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+                // STRATA_HEAD_ALIAS_TEST_MOVE=1 (tests only): a spacer as large as the head is held while it loads, so it lands at
+                // another address than last time (#5188's case on a large card)
+                void* move_spacer = nullptr;
+                static const bool test_move = std::getenv("STRATA_HEAD_ALIAS_TEST_MOVE") != nullptr;
+                if (test_move && cudaMalloc(&move_spacer, (size_t) native_head.weight_bytes()) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    move_spacer = nullptr;
+                }
+                const bool head_ok = native_head.load(o.native_head_shards, g.n_embd, n_vocab, err);
+                if (move_spacer != nullptr) (void) cudaFree(move_spacer);
+                if (!head_ok) {
                     std::printf("ERR restoring the native output head failed: %s\n", err.c_str());
                     return 1;
                 }
-                // the verify windows' captured graphs read the head at the address of their capture
-                if (prefill_head_alias_at == nullptr) prefill_head_alias_at = native_head.weights();
-                if (native_head.weights() != prefill_head_alias_at) {
-                    std::printf("ERR --prefill-head-alias: the output head was reloaded at another address, so the "
-                                "captured verify graphs would read freed memory\n");
-                    return 1;
+                // the verify windows' captured graphs read the head (and its scratch) at the address of their capture.
+                // #5188: on an 8 GB card the head came back elsewhere at every second request and the engine stopped; the
+                // window graphs are dropped instead, and each size captures again at its next window
+                if (prefill_head_alias_at == nullptr) {
+                    prefill_head_alias_at = native_head.weights();
+                    prefill_head_alias_scratch = native_head.scratch();
+                }
+                if (native_head.weights() != prefill_head_alias_at || native_head.scratch() != prefill_head_alias_scratch) {
+                    int dropped = 0;
+                    if (!ver.drop_window_graphs(dropped, err)) {
+                        std::printf("ERR --prefill-head-alias: the output head came back at another address and the "
+                                    "captured verify graphs could not be dropped: %s\n", err.c_str());
+                        return 1;
+                    }
+                    prefill_head_alias_at = native_head.weights();
+                    prefill_head_alias_scratch = native_head.scratch();
+                    std::fprintf(stderr, "strata serve: --prefill-head-alias: the output head came back at another address: "
+                                         "%d window graphs dropped, each is captured again at its next window\n", dropped);
                 }
                 std::fprintf(stderr, "strata serve: --prefill-head-alias: output head restored in %.1f ms before decode\n",
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());

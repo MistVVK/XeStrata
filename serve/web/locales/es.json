@@ -24,7 +24,7 @@
   "chat.projectionOn": "proyección activada",
   "chat.stopped": "Detenida",
   "chat.stoppedLower": "detenida",
-  "chat.tokens": "{n} tokens",
+  "chat.tokens": {"one": "{n} token", "other": "{n} tokens"},
   "chat.toolCalls": {"one": "{n} llamada a herramienta", "other": "{n} llamadas a herramientas"},
   "chat.toolLimit": "detenida en el límite de {n} rondas de herramientas (mcp.max_rounds)",
   "chat.untitled": "Nuevo chat",
@@ -246,5 +246,12 @@
   "tool.running": "En marcha",
   "tool.skipped": "No ejecutada",
   "tool.writing": "Escribiendo",
-  "undo": "Deshacer"
+  "undo": "Deshacer",
+  "sidebar.import": "Recuperar un chat guardado",
+  "sidebar.imported": "Chat recuperado",
+  "sidebar.importFailed": "Nada que recuperar",
+  "sidebar.importFailedText": "Este archivo no contiene turnos de chat. Elige un archivo guardado con «Guardar este chat como Markdown».",
+  "chat.finishFromThinking": "Responder a partir de este razonamiento",
+  "chat.finishFromThinkingTitle": "Escribe una respuesta con lo que el modelo había resuelto antes de que lo detuvieras. No sigue pensando.",
+  "chat.fromStoppedThinking": "respuesta a partir del razonamiento detenido"
 }

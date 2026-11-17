@@ -65,7 +65,7 @@ test('the new slash-command, Time-skip and Tools words are translated in every l
   setTranslationLanguage('de');
   assert.equal(tr('Revision {0}', [2]), 'Überarbeitung 2');
   assert.equal(tr('every {0} minutes', [10]), 'alle 10 Minuten');
-  assert.equal(tr('Time-skip stopped. The model rejected the credentials. Your files were not changed.'), 'Time-skip wurde gestoppt. The model rejected the credentials. Deine Dateien wurden nicht geändert.');
+  assert.equal(tr('Time-skip stopped. The model rejected the credentials. Your files were not changed.'), 'Time-skip wurde gestoppt. The model rejected the credentials. Ihre Dateien wurden nicht geändert.');
   setTranslationLanguage('en');
   assert.equal(tr('Keep the update'), 'Keep the update');
 });

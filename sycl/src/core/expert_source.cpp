@@ -4,6 +4,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/conversation_memory.hpp"   // #5519: zfs_arc_reclaimable_bytes (the shared reader)
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -42,6 +43,8 @@
 #define NOMINMAX   // std::numeric_limits<T>::max() below
 #endif
 #include <windows.h>
+
+#include "strata/platform/commit.hpp"   // after windows.h: it keeps WIN32_LEAN_AND_MEAN (#5742)
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -240,15 +243,18 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
 namespace detail {
 
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
-                           const std::string& cgroup_root) {
+                           const std::string& cgroup_root, const std::string& zfs_arcstats) {
     m = HostMemory{};
 #if defined(_WIN32)
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
+    (void) meminfo; (void) self_cgroup; (void) cgroup_root; (void) zfs_arcstats;
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
     if (!GlobalMemoryStatusEx(&status)) return false;
     m.available = (uint64_t) status.ullAvailPhys;
-    m.commit = (uint64_t) status.ullAvailPageFile;
+    // #5742: with the room the page files may still grow by (as src/core/expert_source.cpp); the clamp of a RAM budget and
+    // the arena read this
+    m.commit = strata::platform::commit_available((uint64_t) status.ullAvailPageFile,
+                                                  strata::platform::commit_growth((uint64_t) status.ullTotalPhys));
     return m.available > 0;
 #elif defined(__linux__)
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
@@ -263,6 +269,9 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
     }
     if (bytes == 0) return false;
+    // #5519: the ZFS ARC's share above its floor, which MemAvailable leaves out (the cgroup room below still bounds a container)
+    if (const uint64_t arc = strata::core::zfs_arc_reclaimable_bytes(zfs_arcstats); arc > 0)
+        bytes = bytes > std::numeric_limits<uint64_t>::max() - arc ? std::numeric_limits<uint64_t>::max() : bytes + arc;
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
     std::ifstream groups(self_cgroup);
@@ -328,7 +337,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     m.available = bytes;
     return true;
 #else
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
+    (void) meminfo; (void) self_cgroup; (void) cgroup_root; (void) zfs_arcstats;
     const long pages = sysconf(_SC_AVPHYS_PAGES);
     const long page_bytes = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_bytes <= 0 ||
@@ -359,9 +368,10 @@ void log_complement_memory(const char* stage, uint64_t requested) {
         return;
     }
     std::fprintf(stderr, "FileExpertSource: %s: requested %.2f GiB, available RAM %.2f GiB, available commit %.2f GiB "
-                         "(limit %.2f GiB), available virtual address space %.2f GiB\n",
+                         "(limit %.2f GiB; the page files may grow by %.2f GiB more), available virtual address space %.2f GiB\n",
                  stage, (double) requested / 1073741824.0, (double) status.ullAvailPhys / 1073741824.0,
                  (double) status.ullAvailPageFile / 1073741824.0, (double) status.ullTotalPageFile / 1073741824.0,
+                 (double) strata::platform::commit_growth((uint64_t) status.ullTotalPhys) / 1073741824.0,
                  (double) status.ullAvailVirtual / 1073741824.0);
 #else
     (void) stage;

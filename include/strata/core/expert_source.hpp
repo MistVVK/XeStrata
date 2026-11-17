@@ -90,10 +90,12 @@ struct HostMemory {
 /// Linux reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
 /// defaults are the real files).  cgroup v2 as before (an unreadable limit of a group that has one fails); cgroup v1's
 /// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
-/// MemAvailable alone.  False when the RAM cannot be determined.
+/// MemAvailable alone.  False when the RAM cannot be determined.  #5519: MemAvailable plus the ZFS ARC's share above its floor
+/// (`zfs_arcstats`; no ZFS: nothing), which MemAvailable leaves out though ZFS gives it back.
 bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",
                            const std::string& self_cgroup = "/proc/self/cgroup",
-                           const std::string& cgroup_root = "/sys/fs/cgroup");
+                           const std::string& cgroup_root = "/sys/fs/cgroup",
+                           const std::string& zfs_arcstats = "/proc/spl/kstat/zfs/arcstats");
 
 /// #4051: wait for the RAM an arena needs to come back.  An engine that was still exiting (or a program that was ending)
 /// holds memory a few seconds longer than its process; loading into that shortfall sent a 60 GiB host into reclaim for

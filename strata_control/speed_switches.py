@@ -35,6 +35,11 @@ class Switch:
     group: str = "Speed"          # the app's group of Expert settings the row is shown in
     words: tuple[tuple[str, str], ...] = ()   # ("on", ...), ("off", ...): the app's two option names instead of On / Off (the default one says "(recommended)")
     terminal_default: str = ""    # the Terminal's Default cell for the row, when "on" / "off" would not say it
+    # A switch with a value to choose instead of on / off (STRATA_ROUTE_TAIL_SKIP): (value, the app's word) for each choice besides the default, which is
+    # no entry at all (words' "on" word names it).  The app shows them as one dropdown, the Terminal's sentence lists them (env_words).
+    choices: tuple[tuple[str, str], ...] = ()
+    choice_note: str = ""         # shown under the dropdown while a choice whose word is its own value (a number) is picked
+    choice_sets: str = ""         # the Terminal sentence's "set ..." part in words, when the one built from the choices would not read well
 
 
 SWITCHES: tuple[Switch, ...] = (
@@ -48,6 +53,17 @@ SWITCHES: tuple[Switch, ...] = (
            "Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. "
            "Turn off to go back to the previous setting, which is slower.",
            (("STRATA_PCIE_FRAC_DEFAULT", "old"),), "qwen-radeon-9000"),
+    # 0.2.16 (owner): the route tail skip as a choice.  Unset is the engine's own rule (rank 7 on CUDA and gfx1200/gfx1201 where it helps; off with every
+    # expert in VRAM, 90 % or more cached, --batch slots, a peer or helper GPU, NVFP4 experts); 0 is off; 1-9 is that rank (src/core/expert_source.cpp
+    # tail_skip_rank()).  Only 7 is measured (docs/DETAILS.md, QUANTS.md).  Setup's own "0" (some UD-Q4_K_XL configs) reads as Off.
+    Switch("route_tail_skip", "Skip rarely used parts of the model",
+           "Faster answers: parts of the model that matter least for a word are skipped when they are not on the graphics card yet. "
+           "Answers can change slightly. On by default where it helps.",
+           (("STRATA_ROUTE_TAIL_SKIP", "0"),), "tail-skip", default="on",
+           words=(("on", "Automatic (recommended)"), ("off", "Off")),
+           choices=(("0", "Off"),) + tuple((str(r), str(r)) for r in range(1, 10)),
+           choice_note="Lower numbers skip more parts and are faster; answers can change more. Only 7 has been measured.",
+           choice_sets="set 0 to turn it off, or 1 to 9 to choose how much is skipped", terminal_default="auto"),
     # (0.2.16: the "Picture reader" row, STRATA_VISION_TOWER=mtmd for llama.cpp's reader, is gone with llama.cpp's reader itself: Strata's own reader is the
     # only one.  A run config that still carries the entry starts as before; strata-vision no longer reads the name.)
     # Troubleshooting only, in the Terminal's Advanced table and nowhere else: every Qwen 0.2.7 default back to its 0.2.6 behaviour.
@@ -105,6 +121,9 @@ def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[
         return not (cfg or {}).get("arch") and backend == "cuda" and _small_nvidia(gpus)
     if sw.only == "qwen-radeon-9000":
         return backend == "hip" and _radeon_9000(gpus)
+    if sw.only == "tail-skip":
+        # the engine reads STRATA_ROUTE_TAIL_SKIP on CUDA builds and on HIP gfx1200/gfx1201 only
+        return backend == "cuda" or (backend == "hip" and _radeon_9000(gpus))
     return False
 
 
@@ -158,6 +177,16 @@ def env_words(name: str) -> str:
     sw = env_names()[name]
     value = dict(sw.env)[name]
     together = f"; all {len(sw.env)} speed-up rows go together" if len(sw.env) > 1 else ""
+    if sw.choices:
+        # "(automatic by default; set 0 for off, or 1 to 9 for that number)": the choices named by a word, then the ones that are their own number
+        default_word = dict(sw.words).get(sw.default, sw.default).replace(" (recommended)", "").lower()
+        named = [f"{v} for {w.lower()}" for v, w in sw.choices if w != v]
+        numbers = [v for v, w in sw.choices if w == v]
+        if numbers:
+            named.append(f"{numbers[0]} to {numbers[-1]} for that number" if len(numbers) > 1 else f"{numbers[0]} for that number")
+        sets = sw.choice_sets or ("set " + ", ".join(named[:-1]) + (", or " if len(named) > 1 else "") + named[-1])
+        note = f" {sw.choice_note}" if sw.choice_note else ""
+        return f"{sw.label} ({default_word} by default; {sets}). {sw.effect}{note}"
     if sw.words:
         names = {state: word.replace(" (recommended)", "") for state, word in sw.words}
         other = "off" if sw.default == "on" else "on"

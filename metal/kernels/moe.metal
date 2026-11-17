@@ -447,6 +447,7 @@ GU_SET(T_IQ2_XS)
 GU_SET(T_IQ2_S)
 GU_SET(T_IQ3_S)
 GU_SET(T_IQ4_XS)   // the IQ3_S pack's gate/up in one layer
+GU_SET(T_IQ1_M)    // IQ1_M's expert gate/up in the GSQ packs (ported from the 0.1.45 line)
 GU_SET(T_Q4_K) GU_SET(T_Q5_K) GU_SET(T_Q6_K) GU_SET(T_Q8_0)   // the UD-Q4/5/6_K_XL packs
 DN_SET(T_Q5_1) DN_SET(T_Q8_0)
 DN_SET(T_Q5_0)   // the UD-IQ2_XS / Q2_K_XL / Q3_K_XL / IQ4_XS packs' down experts (generic Dec: d * (code - 16))

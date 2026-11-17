@@ -6,6 +6,7 @@ import { tr } from '../lib/i18n';
  * the ones the other Settings panels use. The host owns the truth (GET/PUT /api/agent/tools); a change applies from the next message.
  */
 import { useEffect, useState } from 'react';
+import { useImeKeys } from '../lib/ime-keys';
 import { api } from '../lib/client';
 import { pushToast } from '../lib/store';
 import { Btn, Dialog, ErrorNotice, Field, Icon, Select } from './ui';
@@ -38,6 +39,10 @@ export interface ToolsState {
   /** Skip the once-per-chat question before the first web search or page in Manual mode. Off unless the person turned it on. */
   webWithoutAsking: boolean;
   browser: { enabled: boolean; found: boolean; name: string | null; missing?: 'component' };
+  /** #5968: Run as administrator, Windows only (`available`). Off unless the person turned it on. */
+  runAsAdmin?: { enabled: boolean; available: boolean };
+  /** #5737: the folders the assistant may not touch, as the person entered them (the server cleans them). */
+  blockedFolders?: string[];
   custom: CustomTool[];
 }
 
@@ -79,6 +84,8 @@ export function SettingsTools({ preview }: { preview?: ToolsState }) {
   const [formError, setFormError] = useState('');
   const [remove, setRemove] = useState<CustomTool | null>(null);
   const [busy, setBusy] = useState(false);
+  const [blockedDraft, setBlockedDraft] = useState('');
+  const ime = useImeKeys();
 
   async function load() {
     try { setState(await api.get<ToolsState>('/api/agent/tools')); setError(''); }
@@ -116,6 +123,12 @@ export function SettingsTools({ preview }: { preview?: ToolsState }) {
 
   if (!state) return <div className="stack stack--lg settings-models">{error ? <ErrorNotice message={tr(error)} onRetry={() => void load()} /> : <p className="small muted">{tr('Loading the tool list…')}</p>}</div>;
   const keyed = state.search.provider !== 'builtin';
+  // #5737: blocked folders. A full path only (a drive, a folder on one, a network share; from / elsewhere): the server checks it again.
+  const blockedList = state.blockedFolders ?? [];
+  const isWindowsPath = state.runAsAdmin?.available === true;
+  const blockedText = blockedDraft.trim().replace(/^"(.*)"$/, '$1');
+  const blockedOk = isWindowsPath ? /^([A-Za-z]:([\\/].*)?|\\\\[^\\]+\\[^\\]+.*)$/.test(blockedText) : blockedText.startsWith('/');
+  const addBlocked = async () => { await save({ blockedFolders: { add: blockedText } }); setBlockedDraft(''); };
 
   return <div className="stack stack--lg settings-tools">
     <div><h2 className="h3">{tr('Tools')}</h2><p className="small muted settings-models__intro">{tr('Choose what the assistant may use in your chats. A change applies from your next message. In Manual mode, anything that changes your computer still asks you first.')}</p></div>
@@ -153,6 +166,30 @@ export function SettingsTools({ preview }: { preview?: ToolsState }) {
         <Field label={tr('Use a web browser')} hint={state.browser.found ? tr('The assistant can open pages, click and type in {0}. In Manual mode every action asks first.', [state.browser.name ?? tr('your browser')]) : tr(state.browser.missing === 'component' ? 'The browser tool is not part of this installation.' : 'Chrome or Edge was not found on this computer. Install one, then come back and turn this on.')}>
           <button className="st-toggle" role="switch" aria-checked={state.browser.enabled && state.browser.found} aria-label={tr('Use a web browser')} disabled={busy || !state.browser.found} onClick={() => void save({ browser: { enabled: !state.browser.enabled } })} />
         </Field>
+      </div>
+    </section>
+
+    {state.runAsAdmin?.available ? <section className="settings-section">
+      <h2 className="h4" style={{ marginBottom: 10 }}>{tr('Run as administrator')}</h2>
+      <div className="st-card st-card--flush">
+        <Field label={tr('Run as administrator')} hint={tr('Lets the assistant run one command with administrator rights. Windows asks you each time; nothing runs if you choose No.')}>
+          <button className="st-toggle" role="switch" aria-checked={state.runAsAdmin.enabled} aria-label={tr('Run as administrator')} disabled={busy} onClick={() => void save({ runAsAdmin: { enabled: !state.runAsAdmin?.enabled } })} />
+        </Field>
+      </div>
+    </section> : null}
+
+    <section className="settings-section">
+      <h2 className="h4" style={{ marginBottom: 10 }}>{tr('Blocked folders')}</h2>
+      <p className="small muted" style={{ marginBottom: 10 }}>{tr('Strata refuses any request from the assistant that names a file or folder inside these folders, in every mode, until you remove them here. A program the assistant starts could still reach them without naming them, because Strata doesn\'t change Windows permissions.')}</p>
+      <div className="st-card st-card--flush">
+        {blockedList.length ? blockedList.map(f => <Field key={f} label={<code className="blocked-folder">{f}</code>}>
+          <Btn size="sm" disabled={busy} onClick={() => void save({ blockedFolders: { remove: f } })}>{tr('Remove')}</Btn>
+        </Field>) : <p className="small muted" style={{ padding: '12px 16px' }}>{tr('No folders are blocked.')}</p>}
+      </div>
+      <div className="row" style={{ marginTop: 12 }}>
+        <input className="st-input" style={{ flex: 1 }} aria-label={tr('Add folder')} spellCheck={false} placeholder={isWindowsPath ? 'D:\\Private' : '/home/you/private'} value={blockedDraft} onChange={e => setBlockedDraft(e.target.value)} {...ime.events}
+          onKeyDown={e => { if (ime.owns(e)) return; if (e.key === 'Enter' && blockedOk) void addBlocked(); }} />
+        <Btn size="sm" icon="plus" disabled={busy || !blockedOk} onClick={() => void addBlocked()}>{tr('Add folder')}</Btn>
       </div>
     </section>
 

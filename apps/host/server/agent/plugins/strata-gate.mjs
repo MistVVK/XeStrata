@@ -32,6 +32,8 @@ export const PLAN_PRESET = 'strata-plan';
 const LOOK_ONLY_SERVER = 'mcp__strata-instructions__';
 /** The tools a person wrote as commands (Settings -> Tools): the card says which one runs and with what text. */
 const COMMANDS_SERVER = 'mcp__strata-commands__';
+/** Run as administrator (#5968, admin-tool-mcp.mjs): Manual asks first, and Windows asks again for every call; Plan refuses it. */
+const ADMIN_TOOL = 'mcp__strata-admin__run_as_administrator';
 /** The browser tool server's name in the agent (Settings -> Tools). Looking at the page does not ask; acting on it does. */
 const BROWSER_SERVER = 'mcp__browser__';
 const BROWSER_LOOKING = new Set(['browser_snapshot', 'browser_take_screenshot', 'browser_console_messages', 'browser_network_requests', 'browser_wait_for']);
@@ -344,6 +346,7 @@ export function manualDecision(exec, options = {}) {
   if (tool === 'job_kill') return { kind: 'ask', reason: 'Stop a background task' };
   if (tool.startsWith(LOOK_ONLY_SERVER)) return null;
   if (tool.startsWith(BROWSER_SERVER)) return browserDecision(tool.slice(BROWSER_SERVER.length), args);
+  if (tool === ADMIN_TOOL) return { kind: 'ask', reason: `Run as administrator (Windows will ask too): ${clip(args.command, 160)}${args.reason ? ` (${clip(args.reason, 120)})` : ''}` };
   if (tool.startsWith(COMMANDS_SERVER)) return { kind: 'ask', reason: `Run your tool “${tool.slice(COMMANDS_SERVER.length).replace(/_/g, ' ')}”${args.input ? ` with: ${clip(args.input, 120)}` : ''}` };
   if (tool.startsWith('mcp__')) return { kind: 'ask', reason: `Use the connected tool ${tool.split('__').slice(1).join(' / ')}` };
   return { kind: 'ask', reason: `Use the tool ${tool}` };
@@ -373,8 +376,51 @@ export function planDecision(exec) {
 }
 
 /**
+ * Blocked folders (#5737, Settings -> Tools): every tool call that names a file or folder inside one is refused, in every mode and for
+ * helpers too, before anything runs. `blocked` comes from the host (profile.mjs blockedForms): per folder the name the person sees and
+ * the spellings that reach the same place (lower case, forward slashes: the real path, the Windows short name, ~ / %USERPROFILE% /
+ * $HOME forms, /mnt/d and /d forms). Every string argument is searched, so a command that names the folder is refused too. A program the
+ * assistant starts could still reach a folder without naming it; Strata does not change Windows permissions (Settings says so).
+ */
+export const BLOCKED_REASON = 'This folder is blocked in Settings → Tools. Do not try to reach it another way; tell the person it is blocked.';
+/** A string as the matcher reads it: lower case, forward slashes, no doubled slashes, no "/./", "dir/../" folded once per level. */
+export function pathForm(text) {
+  let s = String(text).toLowerCase().replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/\/\.(?=\/|$)/g, '');
+  for (let i = 0; i < 20 && /\/[^/]+\/\.\.(?=\/|$)/.test(s); i++) s = s.replace(/\/(?!\.\.\/)[^/]+\/\.\.(?=\/|$)/, '');
+  return s;
+}
+const strings = (value, out = [], depth = 0) => {
+  if (typeof value === 'string') out.push(value);
+  else if (value && typeof value === 'object' && depth < 6) for (const v of Object.values(value)) strings(v, out, depth + 1);
+  return out;
+};
+/** The blocked folder a call names, or null. A spelling matches at a word start and ends at the end, a slash, a quote, a space or a `;`. */
+export function blockedFolderIn(exec, blocked = []) {
+  if (!Array.isArray(blocked) || !blocked.length) return null;
+  const texts = strings(exec?.arguments).map(pathForm);
+  for (const folder of blocked) {
+    for (const form of folder?.forms ?? []) {
+      if (!form) continue;
+      for (const t of texts) {
+        let at = t.indexOf(form);
+        while (at >= 0) {
+          const before = at === 0 ? '' : t[at - 1], after = t[at + form.length] ?? '';
+          if (!/[a-z0-9_]/.test(before) && (after === '' || /[/\s"'`;,|)>]/.test(after))) return folder.shown ?? form;
+          at = t.indexOf(form, at + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+export function blockedDecision(exec, blocked) {
+  const shown = blockedFolderIn(exec, blocked);
+  return shown ? { kind: 'deny', reason: `${BLOCKED_REASON} (${shown})` } : null;
+}
+
+/**
  * @param {object} ctx
- * @param {{web?: {provider?: string, skipAsk?: boolean}}} [config] `web.provider`: the search service's name for the question;
+ * @param {{web?: {provider?: string, skipAsk?: boolean}, blocked?: {shown: string, forms: string[]}[]}} [config] `web.provider`: the search service's name for the question;
  *        `web.skipAsk`: the person's switch in Settings -> Tools, "search the web without asking" (off unless they turned it on)
  */
 export function apply(ctx, config = {}) {
@@ -418,6 +464,9 @@ export function apply(ctx, config = {}) {
 
   ctx.on('tools/pre-execute', async (exec, next) => {
     const agent = exec.agent;
+    // Blocked folders hold in every mode, for every tool (run_code included) and for helpers, before anything else decides.
+    const blocked = blockedDecision(exec, config.blocked);
+    if (blocked) return blocked;
     if (!agent || exec.name === 'run_code') return next();
     // Fail closed (T4): a session whose preset cannot be read (a reset in progress, a helper whose chat is gone) is treated as Manual, so
     // anything this file cannot prove is read-only still asks. It used to run unasked.

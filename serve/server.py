@@ -68,6 +68,7 @@ from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_EN
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config, resolve_image_results  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import expert_heat  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -4709,7 +4710,7 @@ def engine_arch_note(cfg: dict, cards: dict[int, int] | None = None, built: dict
             return None
         names = ", ".join(f"sm_{m}" for m in miss)
         return (f"[strata] this engine was built for {', '.join(f'sm_{a}' for a in archs)}, but a graphics card in use is {names}: long prompts "
-                "can stop with \"unspecified launch failure\". Update the engine (./update.sh, or `strata update`) so it is built for every card in this PC.")
+                "can stop with \"unspecified launch failure\". Update the engine (./setup.sh --update, or `strata update`) so it is built for every card in this PC.")
     except Exception:
         return None
 
@@ -8572,6 +8573,14 @@ def make_handler(svc: Service):
                                {"error": {"message": "request no longer retained"}} if records is None else
                                records if request_id else {"requests": records, "retention": 100, "persistent": False,
                                                           "loaded": svc.loaded(), "auto_load": hasattr(svc.engine, "restart")})
+                return
+            if path == "/api/expert-heat":                   # #5723: the web page's Experts view (serve/expert_heat.py)
+                if self._authorized():
+                    try:
+                        cfg = runconfig.load(svc.config_path) if svc.config_path else None
+                    except (OSError, ValueError):
+                        cfg = None
+                    self._json(*expert_heat.view(cfg))
                 return
             if path == "/settings":
                 if self._authorized():
