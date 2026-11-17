@@ -364,6 +364,17 @@ add(en="Strata is still busy with this chat. Add the picture again when it is do
     ko="Strata가 아직 이 채팅을 처리 중입니다. 완료되면 이미지를 다시 추가해 주세요.",
     fr="Strata est encore occupé avec cette conversation. Ajoutez de nouveau l'image quand elle sera terminée.",
     he="Strata עדיין עסוק בצ'אט הזה. הוסיפו את התמונה שוב כשהוא יסיים.")
+# #4913: the New chat button on each workspace row of the sidebar ({0} = the workspace's name). English approved by the coordinator 11-17.
+add(en="New chat in {0}",
+    zh="在 {0} 中新建聊天",
+    ja="{0} で新しいチャット",
+    de="Neuer Chat in {0}",
+    es="Nuevo chat en {0}",
+    ru="Новый чат в {0}",
+    pt="Novo chat em {0}",
+    ko="{0}에 새 채팅",
+    fr="Nouvelle conversation dans {0}",
+    he="שיחה חדשה ב־{0}")
 here = APP / "src" / "locales"
 NBSP = " "
 

@@ -677,6 +677,10 @@ body {
 .ws__row > .st-btn--icon:nth-last-child(2) {
   right: 30px;
 }
+/* a third action (New chat in this workspace, #4913) on a row that also has Rename and Remove */
+.ws__row > .st-btn--icon:nth-last-child(3) {
+  right: 58px;
+}
 .ws__row:hover > .st-btn--icon,
 .ws__row:focus-within > .st-btn--icon {
   opacity: 1;

@@ -31,5 +31,6 @@
  "guic30": "Cita {0} · tú",
  "guic31": "Cita {0} · el asistente",
  "guic32": "Imagen no añadida",
- "guic33": "Strata sigue ocupado con este chat. Vuelve a añadir la imagen cuando termine."
+ "guic33": "Strata sigue ocupado con este chat. Vuelve a añadir la imagen cuando termine.",
+ "guic34": "Nuevo chat en {0}"
 }

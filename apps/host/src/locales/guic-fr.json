@@ -31,5 +31,6 @@
  "guic30": "Citation {0} · vous",
  "guic31": "Citation {0} · l’assistant",
  "guic32": "Image non ajoutée",
- "guic33": "Strata est encore occupé avec cette conversation. Ajoutez de nouveau l’image quand elle sera terminée."
+ "guic33": "Strata est encore occupé avec cette conversation. Ajoutez de nouveau l’image quand elle sera terminée.",
+ "guic34": "Nouvelle conversation dans {0}"
 }
