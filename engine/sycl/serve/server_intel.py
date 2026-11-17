@@ -25,8 +25,9 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
+ROOT = HERE.parent.parent                                # engine/
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent / "terminal"))        # serve/ (server.py, telemetry.py) is the Terminal's
 sys.path.insert(0, str(HERE))
 
 import serve.server as S  # noqa: E402

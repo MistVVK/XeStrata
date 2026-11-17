@@ -32,8 +32,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent          # engine/
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent / "terminal"))        # setup.py, strata_control and serve are the Terminal's
 import setup as S  # noqa: E402
 from strata_control import intel_spec, vram_fit  # noqa: E402
 

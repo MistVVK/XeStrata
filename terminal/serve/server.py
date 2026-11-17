@@ -59,6 +59,9 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.server_parts.anthropic_api import (  # noqa: F401  (moved unchanged, file split)
     anthropic_collect,
 )
@@ -303,10 +306,6 @@ from serve.server_parts.openai_api import (  # noqa: F401  (moved unchanged, fil
     logprob_span,
     openai_collect,
 )
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
-sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END, ChatTemplate, Event, OutputParser,  # noqa: E402
                             parser_for_template, anthropic_to_messages, anthropic_tools,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,

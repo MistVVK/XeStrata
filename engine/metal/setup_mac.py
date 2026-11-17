@@ -29,8 +29,9 @@ import sys
 import zipfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent          # engine/
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent / "terminal"))        # setup.py, strata_control and the tools are the Terminal's
 import setup as S  # noqa: E402
 from strata_control import mac_fit as _fit  # noqa: E402
 from strata_control.mac_fit import (  # noqa: E402,F401  (re-exported: the tests and callers use these names here)

@@ -60,4 +60,18 @@ if others:
     sys.exit(3)
 r = run([os.path.join(here, "post_split_server.py"), root, str(left), str(moved)])
 print(r.stdout.strip() or r.stderr.strip())
-sys.exit(r.returncode)
+if r.returncode:
+    sys.exit(r.returncode)
+# the split file must still run AS A SCRIPT (setup.py starts the server as `python serve/server.py ...`): --help from a folder that is not the Terminal's,
+# no PYTHONPATH. The 0.2.16 split broke exactly this, and every module-mode test passed.
+import tempfile  # noqa: E402
+
+env = {k: v for k, v in os.environ.items() if k.upper() not in ("PYTHONPATH", "PYTHONHOME")}
+with tempfile.TemporaryDirectory() as d:
+    smoke = subprocess.run([sys.executable, os.path.join(root, "serve", "server.py"), "--help"], cwd=d, env=env, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=120)
+if smoke.returncode != 0 or "usage:" not in smoke.stdout:
+    print("SCRIPT-MODE SMOKE FAILED (python serve/server.py --help):", smoke.stderr.strip()[-600:])
+    sys.exit(4)
+print("script-mode smoke: python serve/server.py --help runs")
+sys.exit(0)
