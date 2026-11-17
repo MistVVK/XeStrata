@@ -442,6 +442,24 @@ def notice(preset: dict[str, Any]) -> str:
     return tune_knobs.ANSWER_NOTICE.get(a.get("class", "exact"), "")
 
 
+def start_requests(cfg: dict[str, Any]) -> int:
+    """How many requests a start of this run config decodes together: its "parallel", else its --batch / --slots, else one."""
+    n = cfg.get("parallel")
+    if isinstance(n, int) and not isinstance(n, bool) and n >= 1:
+        return n
+    args = [str(a) for a in cfg.get("args") or []]
+    for flag in ("--batch", "--slots"):
+        if flag in args and args.index(flag) + 1 < len(args) and args[args.index(flag) + 1].isdigit():
+            return int(args[args.index(flag) + 1])
+    return 1
+
+
+def _tuned_for_load(preset: dict[str, Any], cfg: dict[str, Any]) -> int | None:
+    """N when the preset was tuned on N >= 2 requests at once (`strata tune auto --concurrency N`) and this start runs fewer than two."""
+    n = (preset.get("choices") or {}).get("concurrency")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 1 and start_requests(cfg) < 2 else None
+
+
 def overlay(cfg: dict[str, Any], *, now: dict[str, Any] | None = None, use: str = "chat") -> tuple[dict[str, Any], dict[str, Any]]:
     """The run configuration with the active preset for its choices put on top, and what was done.
 
@@ -460,6 +478,20 @@ def overlay(cfg: dict[str, Any], *, now: dict[str, Any] | None = None, use: str 
         if not isinstance(entry, dict) or not entry.get("active"):
             return cfg, info
         preset = load(entry["active"])
+        tuned_for = _tuned_for_load(preset, cfg)
+        if tuned_for:
+            # #4821: a tune judged on N requests at once is not applied to a start that runs one at a time; the solo preset it replaced stands in, if there is one
+            stand_in = None
+            if preset.get("previous"):
+                try:
+                    stand_in = load(preset["previous"])
+                except Exception:  # noqa: BLE001 - a missing old preset is "none"
+                    stand_in = None
+            if stand_in is None or _tuned_for_load(stand_in, cfg):
+                info.update({"preset": {"id": preset["id"], "name": preset["name"]},
+                             "why_not": f"not applied: it was tuned for {tuned_for} requests at once, and this start runs one request at a time"})
+                return cfg, info
+            preset = stand_in
         stale = staleness(preset, now)
         info.update({"preset": {"id": preset["id"], "name": preset["name"]}, "state": stale["state"], "reasons": stale["reasons"]})
         if stale["state"] == "hard":

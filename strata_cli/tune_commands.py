@@ -32,6 +32,8 @@ def add_tune_auto(tune_sp: argparse._SubParsersAction) -> None:
                                                    "(leave that much graphics memory free)")
     p.add_argument("--leave-ram", type=int, default=0, metavar="PERCENT", help="leave this share of system memory free (0-50)")
     p.add_argument("--use", choices=("chat", "coding"), default="chat", help="coding judges long-prompt speed as well")
+    p.add_argument("--concurrency", type=int, default=1, metavar="N",
+                   help="judge every setting on N requests at once (2 to 8), not one at a time; for a model that serves several people or agents together")
     p.add_argument("--allow-small-differences", action="store_true",
                    help="also try settings that can change answers slightly (expert cache split, speculative window)")
     p.add_argument("--allow-not-repeatable", action="store_true", help="also try settings whose answers are not repeatable")
@@ -274,6 +276,10 @@ def auto(a: argparse.Namespace) -> int:
         return _fail("--leave-ram is a percentage from 0 to 50", 2, machine)
     if a.leave_ram and goal == "speed":
         goal = "room"
+    concurrency = getattr(a, "concurrency", 1)
+    concurrency = 1 if concurrency is None else int(concurrency)
+    if concurrency != 1 and not 2 <= concurrency <= 8:
+        return _fail("--concurrency is a number of requests from 2 to 8", 2, machine)
     exe = _engine_exe(cfg)
     if not Path(exe).exists():
         return _fail(f"no engine was found at {exe}", 5, machine)
@@ -282,7 +288,7 @@ def auto(a: argparse.Namespace) -> int:
     flags = tuning.engine_flag_inventory(Path(exe), wanted=tuning.dimension_flags() | tune_knobs.arm_flags())
     opts = autotune.Options(mode=a.mode, goal=goal, reserve_mib=reserve, ram_wish_pct=a.leave_ram, use=a.use,
                             allow_placement=a.allow_small_differences, allow_nonrepeatable=a.allow_not_repeatable,
-                            budget_s=(a.minutes * 60.0 if a.minutes else None), check_busy=not a.no_quiet_check)
+                            budget_s=(a.minutes * 60.0 if a.minutes else None), check_busy=not a.no_quiet_check, concurrency=concurrency)
     ctx = autotune.context_from_config(cfg, engine_backend=backend, opts=opts, engine_flags=flags)
     hw = _hw_hash(identity)
     digest = (identity.get("model") or {}).get("sha256_shard1")
@@ -312,7 +318,8 @@ def auto(a: argparse.Namespace) -> int:
     workdir = Path(a.work_dir) if a.work_dir else Path(tempfile.mkdtemp(prefix="strata-tune-"))
     if not a.work_dir:
         atexit.register(shutil.rmtree, workdir, True)       # its own scratch folder goes with the run (--work-dir keeps the logs)
-    session = WorkerSession(base_config=cfg, python=sys.executable, serve_dir=_serve_dir(a), workdir=workdir,
+    worker_cfg = {**cfg, "parallel": concurrency} if concurrency > 1 else cfg      # #4821: the worker holds as many request slots as the tune asks for
+    session = WorkerSession(base_config=worker_cfg, python=sys.executable, serve_dir=_serve_dir(a), workdir=workdir,
                             boot_timeout_s=a.boot_timeout, lock=_lock_factory(a, say), log=say)
     base_args = [str(x) for x in cfg.get("args") or []]
     # the wish becomes part of the base: leave-room asks the engine for the reserve if the configuration has none yet
@@ -335,6 +342,8 @@ def auto(a: argparse.Namespace) -> int:
     out = result.to_dict()
     choices = presets.choices_from_config(cfg, use=a.use)
     choices["goal"], choices["reserve_mib"] = goal, reserve
+    if concurrency > 1:
+        choices["concurrency"] = concurrency            # presets.overlay applies such a preset only to a start that runs requests together
     if a.leave_ram:
         choices["leave_ram_pct"] = a.leave_ram
     saved = None
@@ -388,6 +397,8 @@ def _human_result(r: dict[str, Any], saved: dict[str, Any] | None) -> str:
         s = r["settings"]
         shown = {**{k: v for k, v in s["args"].items()}, **s["env"], **{f"per request {k}": v for k, v in s["per_request"].items()}}
         lines.append("  Changed: " + ", ".join(f"{k} {v}" for k, v in shown.items()))
+        if (r.get("concurrency") or 1) > 1:
+            lines.append(f"  Measured with {r['concurrency']} requests at once.")
         lines.append(f"  Measured: {r['base'].get('decode_tok_s')} -> {r['chosen'].get('decode_tok_s')} tok/s "
                      f"({r['faster_pairs']} of {r['pairs']} pairs faster)")
         from strata_control.tune_knobs import ANSWER_NOTICE
@@ -497,6 +508,8 @@ def _effective(a: argparse.Namespace, machine: bool) -> int:
                "args": merged.get("args"), "env": merged.get("env") or {},
                "sampling": merged.get("sampling") or {}, "changed": changed, "per_request": info.get("per_request") or {}, "sources": where}
     human = (f"Using your tuning '{info['preset']['name']}'" if info.get("applied") else "No saved tuning is applied; the standard settings run.")
+    if not info.get("applied") and info.get("why_not"):
+        human += f"\n  {info['why_not']}"                    # #4821: a tuning that was not applied says why (the sentence was in the JSON only)
     human += "\n" + _sources_words(where, after)
     return _print(payload, machine, human)
 
