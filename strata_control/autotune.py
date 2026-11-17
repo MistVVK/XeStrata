@@ -531,6 +531,7 @@ class Tuner:
         r.noise = {"aa_gap": round(aa, 4), "drift": round(drift, 4), "spread": round(spread, 4),
                    "base_runs": [round(x, 2) for x in mb], "noisy": spread > STAGE_GAP_NOISY}
         threshold = accept_threshold(o.margin, aa, drift)
+        r.noise["threshold_pct"] = round((threshold - 1.0) * 100.0, 1)      # the bar a setting had to clear (shown by `strata tune report`)
 
         # ---- evaluate the candidates
         winners: list[ArmReport] = []

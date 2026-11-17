@@ -46,6 +46,8 @@ def add_tune_auto(tune_sp: argparse._SubParsersAction) -> None:
     p.add_argument("--status-file", default=None, help="progress as JSON, rewritten at every step (for the desktop app)")
     p.add_argument("--boot-timeout", type=float, default=900.0)
     p.add_argument("--output", choices=("human", "json"), default="human")
+    rp = tune_sp.add_parser("report", help="show the account of the last tune")
+    rp.add_argument("--output", choices=("human", "json"), default="human")
 
 
 def add_presets(sp: argparse._SubParsersAction) -> None:
@@ -217,6 +219,22 @@ def _keep_failed_log(session: Any) -> Path | None:
         return None
 
 
+def run_words(p: dict[str, Any]) -> str:
+    """#5232: "run 3 of 9" for a progress line (the run that is being measured, of those planned); nothing while the plan is not known."""
+    planned = int(p.get("runs_planned") or 0)
+    return f"run {min(int(p.get('runs_done') or 0) + 1, planned)} of {planned}" if planned else ""
+
+
+def report(a: argparse.Namespace) -> int:
+    """`strata tune report`: the account of the last tune, as it was saved after that tune (strata_control/tune_report.py)."""
+    from strata_control import tune_report
+    text = tune_report.read()
+    if a.output == "json":
+        return _print({"report": text}, True, "")
+    print(text if text else tune_report.NONE_YET, end="" if text else "\n")
+    return 0
+
+
 def _write_status(path: str | None, payload: dict[str, Any]) -> None:
     if not path:
         return
@@ -288,7 +306,8 @@ def auto(a: argparse.Namespace) -> int:
         state["text"] = (f"Finding the fastest settings for your PC… {minutes_text(p.get('eta_s'))}"
                          if p.get("eta_s") is not None else "Finding the fastest settings for your PC…")
         _write_status(a.status_file, state)
-        say(f"[{p.get('elapsed_s', 0) // 60:>3d}m] {p['message']}" + (f"  ({minutes_text(p['eta_s'])})" if p.get("eta_s") else ""))
+        brackets = ", ".join(x for x in (run_words(p), minutes_text(p["eta_s"]) if p.get("eta_s") else "") if x)
+        say(f"[{p.get('elapsed_s', 0) // 60:>3d}m] {p['message']}" + (f"  ({brackets})" if brackets else ""))
 
     workdir = Path(a.work_dir) if a.work_dir else Path(tempfile.mkdtemp(prefix="strata-tune-"))
     if not a.work_dir:
@@ -333,12 +352,14 @@ def auto(a: argparse.Namespace) -> int:
     autotune.Tuner.finalize(result)
     out.update({"code": result.code, "reason_code": result.reason_code, "values": result.values})
     out["values"]["preset_name"] = saved["name"] if saved else None
+    from strata_control import tune_report
+    account_saved = tune_report.save(tune_report.build(out, saved["name"] if saved else None))
     state.update({"state": "done", "result": out, "stage": "done"})
     _write_status(a.status_file, state)
     if machine:
         print(json.dumps({"schema_version": 1, "ok": True, "result": out}, ensure_ascii=False, default=str))
     else:
-        print(_human_result(out, saved))
+        print(_human_result(out, saved) + (f"\n  {tune_report.POINTER}" if account_saved else ""))
     return {"improved": 0, "default_confirmed": 0, "cancelled": 130}.get(result.outcome, 6)
 
 
