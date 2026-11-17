@@ -30,7 +30,8 @@ class FakeEngine:
         self.adapt_bonus = (adapt or {}).get(CAL.arg_value(args, "--adapt-swaps"), 1.0)
         w = CAL.arg_value(args, "--pool-workers")
         self.workers = int(w) if w else info_workers
-        self.info = {"pool_workers": info_workers, "pcie_frac": 0.55, "spec_min_p": float(CAL.arg_value(args, "--spec-min-p") or 0)}
+        self.info = {"pool_workers": info_workers, "pcie_frac": 0.55,
+                     "spec_min_p": float(CAL.arg_value(args, "--spec-min-p") or 0)}
         self.speed = speed
         self.last = {}
         self.proc = None
@@ -234,7 +235,8 @@ class SetupIntegration(unittest.TestCase):
         cfg_path = Path(self.tmp.name) / "xestrata-q2_0.json"
         cfg = {"exe": "x", "args": list(BASE), "model_name": "qwen3.8-flash-next-q2_0"}
         cfg_path.write_text(json.dumps(cfg))
-        CAL.run = lambda c, say=print, start_engine=None: {"settings": {"--pcie-frac": "0.20"}, "report": {"tok_s": 61.2}}
+        CAL.run = lambda c, say=print, start_engine=None: {"settings": {"--pcie-frac": "0.20"},
+                                                           "report": {"tok_s": 61.2}}
         self.assertTrue(self.S.calibrate_config(cfg_path))
         written = json.loads(cfg_path.read_text())
         self.assertEqual(CAL.arg_value(written["args"], "--pcie-frac"), "0.20")

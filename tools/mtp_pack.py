@@ -148,7 +148,8 @@ def main() -> int:
     w.add_string("strata.mtp.source_sha256", hashlib.sha256(
         json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
     w.add_string("strata.mtp.expert_format", a.experts)
-    w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
+    w.add_string("strata.mtp.expert_quantizer",
+                 "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
     report = []
     for t in sorted(manifest, key=lambda t: t["name"]):
         name, shape = t["name"], t["shape"]

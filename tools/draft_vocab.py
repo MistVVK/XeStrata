@@ -10,7 +10,8 @@ Chinese drafted almost nothing (#137).  This adds whole scripts to a subset:
     python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab.bin --add cjk \
         --out data/draft_vocab.bin
 
---add takes han, kana, hangul, cjk_punct, cjk (those four) or cyrillic.  The base ids keep their order; the added ones follow in
+--add takes han, kana, hangul, cjk_punct, cjk (those four) or cyrillic.
+The base ids keep their order; the added ones follow in
 id order.  --stats prints what a subset holds.
 
 A language written in a script the base already holds (French, Spanish, German... in Latin letters) needs specific
