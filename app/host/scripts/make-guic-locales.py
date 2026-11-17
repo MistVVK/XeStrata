@@ -835,6 +835,17 @@ add(en='Last: {0} tokens',
     ko='마지막: 토큰 {0}개',
     fr='Dernier : {0} jetons',
     he='אחרון: {0} טוקנים')
+# the first-run engine card when the download list could not be read (not "no internet", which has its own card): GUI-VIS-1117 A10; lane draft, the owner is asked.
+add(en="Strata couldn’t read its download list, so it can’t pick an engine yet. Press Try again, or choose another way below.",
+    zh="Strata 无法读取其下载列表，所以暂时无法选择引擎。请点击“重试”，或选择下面的其他方式。",
+    ja="Strata はダウンロード一覧を読み取れなかったため、まだエンジンを選べません。「もう一度試す」を押すか、下の別の方法を選んでください。",
+    de="Strata konnte seine Downloadliste nicht lesen und kann deshalb noch keine Engine auswählen. Klicken Sie auf „Erneut versuchen“ oder wählen Sie unten eine andere Möglichkeit.",
+    es="Strata no pudo leer su lista de descargas, así que todavía no puede elegir un motor. Pulsa Volver a intentarlo o elige otra opción más abajo.",
+    ru="Strata не смогла прочитать список загрузок и пока не может выбрать движок. Нажмите «Попробовать снова» или выберите другой вариант ниже.",
+    pt="O Strata não conseguiu ler a lista de downloads e ainda não pode escolher um motor. Clique em Tentar novamente ou escolha outra opção abaixo.",
+    ko="Strata가 다운로드 목록을 읽지 못해 아직 엔진을 고를 수 없습니다. 다시 시도를 누르거나 아래의 다른 방법을 선택하세요.",
+    fr="Strata n’a pas pu lire sa liste de téléchargements et ne peut pas encore choisir de moteur. Cliquez sur Réessayer ou choisissez une autre option ci-dessous.",
+    he="Strata לא הצליחה לקרוא את רשימת ההורדות שלה ולכן עדיין לא יכולה לבחור מנוע. יש ללחוץ על \"נסו שוב\" או לבחור אפשרות אחרת למטה.")
 here = APP / "src" / "locales"
 NBSP = " "
 

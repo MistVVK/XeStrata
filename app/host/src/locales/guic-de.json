@@ -77,5 +77,6 @@
  "guic76": "GPU & Speicher",
  "guic77": "Welcher Drafter Wörter vorausrät, damit Antworten schneller kommen, immer nur einer. Automatisch (empfohlen) ist DFlash2 für Qwen3.8-Flash-Next, wo die Engine es hat, sonst MTP; bei zwei oder mehr gleichen Grafikkarten, die die All-Karten-Split-Engine übernimmt, ist es diese Engine mit der MTP-Entwurfsschicht. DFlash2 lädt einmalig einen Drafter von {0} GB herunter, MTP einmalig seine Entwurfsschicht. Bei Automatisch nutzen mehrere gleichzeitige Anfragen MTP. Wenn Sie DFlash2 selbst wählen, läuft es mit der Anzahl an Anfragen, die Sie einstellen. Wenn DFlash2 nicht laufen kann, wird MTP allein verwendet und Details nennt den Grund. Aus schaltet den Drafter aus.",
  "guic78": "Zuletzt: {0} Token mit {1} tok/s",
- "guic79": "Zuletzt: {0} Token"
+ "guic79": "Zuletzt: {0} Token",
+ "guic80": "Strata konnte seine Downloadliste nicht lesen und kann deshalb noch keine Engine auswählen. Klicken Sie auf „Erneut versuchen“ oder wählen Sie unten eine andere Möglichkeit."
 }
