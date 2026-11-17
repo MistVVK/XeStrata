@@ -29,5 +29,8 @@
  "guic28": "Zitate nummerieren",
  "guic29": "Wenn eine Nachricht mehrere Textstellen zitiert, erhält jede eine Nummer und den Hinweis, wer sie geschrieben hat, damit der Assistent sie auseinanderhalten kann. Beginnen Sie eine Zeile mit [1] oder [2], um auf eine davon zu antworten.",
  "guic30": "Zitat {0} · Sie",
- "guic31": "Zitat {0} · der Assistent"
+ "guic31": "Zitat {0} · der Assistent",
+ "guic32": "Bild nicht hinzugefügt",
+ "guic33": "Strata ist mit diesem Chat noch beschäftigt. Fügen Sie das Bild erneut hinzu, wenn er fertig ist.",
+ "guic34": "Neuer Chat in {0}"
 }

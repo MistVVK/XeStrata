@@ -29,5 +29,8 @@
  "guic28": "Number quotes",
  "guic29": "When one message quotes several passages, each gets a number and says who wrote it, so the assistant can tell them apart. Start a line with [1] or [2] to answer one of them.",
  "guic30": "Quote {0} · you",
- "guic31": "Quote {0} · the assistant"
+ "guic31": "Quote {0} · the assistant",
+ "guic32": "Picture not added",
+ "guic33": "Strata is still busy with this chat. Add the picture again when it is done.",
+ "guic34": "New chat in {0}"
 }
