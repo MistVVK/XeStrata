@@ -56,6 +56,11 @@ int main() {
     { AdaptAsyncAuto a = good(); a.peer = true; CHECK(!strata::core::adapt_async_self_decides(a)); }
     { AdaptAsyncAuto a = good(); a.remote_opt = true; CHECK(!strata::core::adapt_async_self_decides(a)); }
     { AdaptAsyncAuto a = good(); a.adapt_overlap = true; CHECK(!strata::core::adapt_async_self_decides(a)); }
+    // #5814: STRATA_ADAPT_FETCH (the PCIe share's admissions into the VRAM tier) keeps the self-choice off, as serve keeps the admissions
+    // off under an explicit --adapt-async
+    { AdaptAsyncAuto a = good(); a.fetch = 1; CHECK(!strata::core::adapt_async_self_decides(a, &why)); CHECK(why && std::strstr(why, "STRATA_ADAPT_FETCH")); }
+    { AdaptAsyncAuto a = good(); a.fetch = 2; CHECK(!strata::core::adapt_async_self_decides(a, &why)); CHECK(why && std::strstr(why, "STRATA_ADAPT_FETCH")); }
+    { AdaptAsyncAuto a = good(); a.fetch = 0; CHECK(strata::core::adapt_async_self_decides(a)); }
     CHECK(!strata::core::adapt_async_self_decides(AdaptAsyncAuto{}));
 
     // ---- the state machine
