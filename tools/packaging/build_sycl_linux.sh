@@ -59,7 +59,7 @@ code=${aot:+AOT $aot}; code=${code:-JIT from SPIR-V}
 echo "{\"version\": \"$ver\", \"source\": \"tools/packaging/build_sycl_linux.sh\", \"sycl\": \"oneAPI DPC++ $iccver ($code)\", \"portable\": false}" > "$stage/BUILD.json"
 # libsycl and the MKL SYCL libraries come through ldd; the Unified Runtime adapters (level zero, opencl) are dlopen'd, so they are named
 "$py" tools/packaging/collect_libs.py --binary "$build/strata" --search "$oneapi/compiler/latest/lib" --search "$oneapi/mkl/latest/lib" \
-    --also 'libur_adapter_level_zero*.so*' --also 'libur_adapter_opencl*.so*' --out "$stage"
+    --also 'libur_adapter_level_zero*.so*' --also 'libur_adapter_opencl*.so*' --bundle-system 'libz.so.1' --out "$stage"
 # RUNPATH $ORIGIN on the engine and on every bundled library (the same way tools/packaging/build_hip_linux.sh does it)
 for f in "$stage/strata" "$stage"/*.so "$stage"/*.so.*; do
   [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f"
@@ -72,7 +72,7 @@ if [ -n "$aot" ]; then arch_args=$(echo "$aot" | tr ',' '\n' | sed 's/^/--arch /
 mkdir -p "$out"
 # shellcheck disable=SC2086
 "$py" tools/packaging/package_engine.py --src "$stage" --backend sycl --version "$ver" --out "$out" $arch_args \
-    --platform linux-x86_64 --build-id "${commit}-oneapi${iccver}" --include SYSTEM-LIBS.txt $shape_pkg
+    --platform linux-x86_64 --build-id "${commit}-oneapi${iccver}" --include SYSTEM-LIBS.txt --include 'licenses/*' $shape_pkg
 for d in "$out"/*/; do
   "$py" tools/packaging/package_engine.py --verify "$d"; "$py" tools/packaging/binary_deps.py "$d"
   env -i "$d/strata" --version > /dev/null || { echo "build_sycl_linux.sh: env -i $d/strata --version does not run" >&2; exit 1; }
