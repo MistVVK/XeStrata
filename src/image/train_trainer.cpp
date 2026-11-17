@@ -191,7 +191,10 @@ void Trainer::dgrad_weights(Product* p, int n) {
 }
 
 void Trainer::set_budget(int64_t rows, uint64_t keep_row, uint64_t guess_row) {
-    if (rows <= budget_rows_ && budget_stepped_ == stepped && ws.vram() > 0 && !replan_) return;
+    // A step can grow the retained process allocations without changing the shape or budget. Replan before the
+    // next step when the reported peak estimate no longer fits, so the resident weights give that room back.
+    if (rows <= budget_rows_ && budget_stepped_ == stepped && ws.vram() > 0 && !replan_ &&
+        (budget_ == 0 || est_bytes(rows, guess_row) <= budget_)) return;
     budget_rows_ = std::max(budget_rows_, rows);
     budget_stepped_ = stepped;
     replan_ = false;
