@@ -25,8 +25,6 @@ struct MmPlanArgs {
     uint n_expert;
     uint tm;         // the tile height (rows of one expert)
     uint n_blocks;   // ceil(n_ent / 1024)
-    uint gu_gx;      // the gate/up GEMM's indirect grid x: its tile's output width divided by that tile's TN
-    uint dn_gx;      // the down GEMM's, likewise
 };
 
 // counts per block: bcnt[block * n_expert + e]
@@ -46,10 +44,7 @@ kernel void mm_hist(device const int* ids [[buffer(0)]], device uint* bcnt [[buf
 // one threadgroup of n_expert (<= 1024) threads.  boff[block][e] = expert e's rows before this block (within e);
 // eoff[e] = expert e's first padded row; tiles[i] = (expert, row0); meta[0] = n_tiles, meta[1] = padded rows;
 // indirect grids: meta[2..4] = (gx_gu, n_tiles, 1) for the gate/up GEMM, meta[5..7] = (gx_down, n_tiles, 1) for the
-// down GEMM, meta[8..10] = (rows, 1, 1) for mm_gather.  Every one of them is written here, one layer's worth per
-// call: gx_gu and gx_down come in the plan because only the host knows which tile the dispatch picked, and the tile
-// and its grid have to agree (src/moe_tiles.h).  They were the host's to write once, and the gate/up grid stayed at
-// NFF / 64 while the K-quant tile writes 16 columns per threadgroup.
+// down GEMM (gx_gu in meta[2], gx_down in meta[5] written by the host once), meta[8..10] = (rows, 1, 1) for mm_gather.
 kernel void mm_scan(device const uint* bcnt [[buffer(0)]], device uint* boff [[buffer(1)]],
                     device uint* eoff [[buffer(2)]], device int2* tiles [[buffer(3)]], device uint* meta [[buffer(4)]],
                     constant MmPlanArgs& a [[buffer(5)]],
@@ -84,11 +79,9 @@ kernel void mm_scan(device const uint* bcnt [[buffer(0)]], device uint* boff [[b
     if (tid == 0) {
         meta[0] = all_tiles;
         meta[1] = all_rows;
-        meta[2] = a.gu_gx;     // indirect grid of the gate/up GEMM: (gx, tiles, 1)
-        meta[3] = all_tiles;
+        meta[3] = all_tiles;   // indirect grid of the gate/up GEMM: (meta[2] given, tiles, 1)
         meta[4] = 1;
-        meta[5] = a.dn_gx;     // of the down GEMM: (gx, tiles, 1)
-        meta[6] = all_tiles;
+        meta[6] = all_tiles;   // of the down GEMM: (meta[5] given, tiles, 1)
         meta[7] = 1;
         meta[8] = all_rows;    // of the gather: (rows, 1, 1)
         meta[9] = 1;
@@ -1320,10 +1313,8 @@ kernel void mm_scan6(device const uint* bcnt [[buffer(0)]], device uint* boff [[
     if (tid == 0) {
         meta[0] = all_tiles;
         meta[1] = all_rows;
-        meta[2] = a.gu_gx;     // the grids x as mm_scan's (#4141: the plan carries them, the host no longer writes them)
         meta[3] = all_tiles;
         meta[4] = 1;
-        meta[5] = a.dn_gx;
         meta[6] = all_tiles;
         meta[7] = 1;
         meta[8] = all_rows;

@@ -5,7 +5,6 @@
 //   moe_mm_parity [--gu Q2_0] [--dn Q2_0] [--T 256] [--tile 32,64,64,4]          parity (64 experts)
 //   moe_mm_parity --bench [--gu ..] [--dn ..] [--T 2048] [--tile ..]            per-layer time, 512 experts
 #include "coop_probe.h"
-#include "moe_tiles.h"
 #include "mtl_rt.h"
 #include "ref_quant.h"
 #include "engine/geo.h"
@@ -22,7 +21,7 @@
 namespace {
 int N_EMBD = strata_metal::geo::N, N_FF = strata_metal::geo::NFF;   // the shape this build is compiled for (engine/geo.h); --embd / --ff change them (Q4-KQ: expert widths 512 and 1024)
 constexpr int TOPK = strata_metal::geo::TOPK;
-struct MmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks, gu_gx, dn_gx; };
+struct MmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
 struct MmArgs { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
 double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
 int type_of(const std::string& s) {
@@ -35,7 +34,7 @@ float h16(float v) { return ref::f16_to_f32(ref::f32_to_f16(v)); }
 
 int main(int argc, char** argv) {
     int gu = ref::Q2_0, dn = ref::Q2_0, T = 256, TM = 16, TN = 64, TK = 64, SG = 2, DTN = -1, DTK = -1, DSG = -1;
-    bool bench = false, v2 = false, v3 = false, v4 = false, v5 = false, v6 = false, tile_given = false;
+    bool bench = false, v2 = false, v3 = false, v4 = false, v5 = false, v6 = false;
     int MS = 1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -44,7 +43,7 @@ int main(int argc, char** argv) {
         else if (a == "--T") T = std::atoi(argv[++i]);
         else if (a == "--ff") N_FF = std::atoi(argv[++i]);
         else if (a == "--embd") N_EMBD = std::atoi(argv[++i]);
-        else if (a == "--tile") { std::sscanf(argv[++i], "%d,%d,%d,%d", &TM, &TN, &TK, &SG); tile_given = true; }
+        else if (a == "--tile") std::sscanf(argv[++i], "%d,%d,%d,%d", &TM, &TN, &TK, &SG);
         else if (a == "--dtile") std::sscanf(argv[++i], "%d,%d,%d", &DTN, &DTK, &DSG);   // the down kernel's TN,TK,SG
         else if (a == "--bench") bench = true;
         else if (a == "--v2") v2 = true;
@@ -59,22 +58,6 @@ int main(int argc, char** argv) {
     if (!v2 && gu == ref::IQ4_XS) { v2 = true; std::printf("note: IQ4_XS gate/up has no v1 kernel (the engine does not use v1): running v2\n"); }
     if (v4) TM = 16 * MS;   // the plan's tile height; mm_gu4's name carries MS instead
     if (v6) TM = 16;   // ragged tiles: the padding is 16 rows, the group size is MS
-    // plain --v2 without --tile: the tile the engine picks for these two types, so this run covers what the engine
-    // actually dispatches.  It did not, and the engine's gate/up grid was the constant N_FF / 64 while the K-quants'
-    // tile writes 16 columns per threadgroup: a parity run over the real pairing is what was missing (src/moe_tiles.h).
-    if (v2 && !v3 && !tile_given) {
-        const strata::metal_engine::MoeTile gt = strata::metal_engine::gu2_tile(gu);
-        const strata::metal_engine::MoeTile dt = strata::metal_engine::dn2_tile(dn);
-        int tm = 0, tn = 0, tk = 0, sg = 0, dtm = 0, dtn = 0, dtk = 0, dsg = 0;
-        if (std::sscanf(gt.name, "_%d_%d_%d_%d", &tm, &tn, &tk, &sg) != 4 || tn != gt.tn ||
-            std::sscanf(dt.name, "_%d_%d_%d_%d", &dtm, &dtn, &dtk, &dsg) != 4 || dtn != dt.tn) {
-            std::fprintf(stderr, "moe_mm_parity: tile names and their TNs disagree (%s/%d, %s/%d)\n",
-                         gt.name, gt.tn, dt.name, dt.tn);
-            return 2;
-        }
-        TM = tm; TN = tn; TK = tk; SG = sg;
-        if (DTN < 0) { DTN = dtn; DTK = dtk; DSG = dsg; }   // an explicit --dtile stays
-    }
     mtl::Context cx;
     // the host defines STRATA_KQ_DOWN only for a model whose downs are K-quant / IQ4_XS / IQ3_S (window.cpp kq_down_prelude)
     const bool kq_dn = dn == ref::Q3_K || dn == ref::Q4_K || dn == ref::Q5_K || dn == ref::Q6_K || dn == ref::IQ3_S || dn == ref::IQ4_XS;
@@ -141,16 +124,13 @@ int main(int argc, char** argv) {
                   pdn = v6 ? cx.pipeline(lib, v6_dn, mtl::Constants().b(7, k4)) : v3 ? cx.pipeline(lib, "mm_down3_" + std::to_string(dn) + "_" + dtl, mtl::Constants().b(7, k4))
                            : cx.pipeline(lib, (v2 ? "mm_down2_" : "mm_down_") + std::to_string(dn) + "_" + (v2 ? dtl : tl)),
                   pgat = cx.pipeline(lib, "mm_gather");
-    // the two grids mm_scan publishes for the GEMMs of one layer: the tile's TN (and, for v3, its SG) decides them
-    MmPlanArgs pa{(uint32_t)nent, TOPK, (uint32_t)NE, (uint32_t)(v6 ? MS : TM), (uint32_t)nblk,
-                  (uint32_t)(N_FF / (v3 ? TN * SG : TN)),
-                  (uint32_t)(N_EMBD / (v3 ? DTN * DSG : v2 ? DTN : TN))};
+    MmPlanArgs pa{(uint32_t)nent, TOPK, (uint32_t)NE, (uint32_t)(v6 ? MS : TM), (uint32_t)nblk};
     auto encode = [&](int layer, std::vector<mtl::Dispatch>& ds, bool plan, bool gemm) {
         if (plan) {
             const uint32_t nclr = maxrows;
             mtl::Dispatch c; c.p = &pclear; c.args = {mtl::Arg::B(stok), mtl::Arg::V(nclr)}; c.grid[0] = (maxrows + 255) / 256; c.tg[0] = 256; ds.push_back(c);
             mtl::Dispatch h; h.p = &phist; h.args = {mtl::Arg::B(ids), mtl::Arg::B(bcnt), mtl::Arg::V(pa)}; h.grid[0] = nblk; h.tg[0] = 1024; ds.push_back(h);
-            // meta[2] (the gate/up grid) and meta[5] (the down grid) are mm_scan's now, from pa: nothing to set here
+            meta.as<uint32_t>()[2] = N_FF / TN;
             mtl::Dispatch sc; sc.p = &pscan; sc.args = {mtl::Arg::B(bcnt), mtl::Arg::B(boff), mtl::Arg::B(eoff), mtl::Arg::B(tiles), mtl::Arg::B(meta), mtl::Arg::V(pa)}; sc.tg[0] = NE; ds.push_back(sc);
             mtl::Dispatch pl; pl.p = &pplace; pl.args = {mtl::Arg::B(ids), mtl::Arg::B(w), mtl::Arg::B(boff), mtl::Arg::B(eoff), mtl::Arg::B(stok), mtl::Arg::B(sw), mtl::Arg::B(pos), mtl::Arg::V(pa)}; pl.grid[0] = nblk; pl.tg[0] = 1024; ds.push_back(pl);
         }

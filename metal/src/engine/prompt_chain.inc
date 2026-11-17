@@ -16,7 +16,7 @@ struct PcDqArgs { uint32_t n_in, n_out, row_bytes, perm; };
 struct PcGemmArgs { int M, N, K, pad; };
 struct PcEpiArgs { uint32_t n_tok, n_embd, hc, hc_lr; };
 struct PcGdnPArgs { uint32_t n_tok, h_k, h_v, channels; float eps; uint32_t f32; };
-struct PcMmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks, gu_gx, dn_gx; };   // moe_mm.metal's MmPlanArgs
+struct PcMmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
 struct PcMmArgs { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
 int pc_unit_of(int t) {
     return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 || t == 18 || t == 16 || t == 17 || t == 22 ? 16 : 32;
@@ -144,8 +144,8 @@ bool Window::pc_setup(int C) {
     b.qn = F32(MT * G_HCD); b.gated = F32(MT * G_HCD); b.normW = F32(MT * G_HCD);
     if (had_on_) b.mixr = F32(MT * N);
     b.Wpk = F16((size_t) G_HCD * N); b.Wpv = F16((size_t) N * N);
-    // b.meta's gate/up and down grids are mm_scan's to write, one layer's worth per layer, from the plan (pc_chunk):
-    // the v2 tile is the layer's quant type's, so one grid for the whole chunk cannot be right (src/moe_tiles.h)
+    b.meta.as<uint32_t>()[2] = b.v3e ? NFF / (b.gu3[1] * b.gu3[3]) : NFF / 64;
+    b.meta.as<uint32_t>()[5] = b.v3e ? N / (b.dn3[1] * b.dn3[3]) : N / 64;
     std::fprintf(stderr, "strata metal: prompt kernels (mac-kern's prompt chain) for chunks of %d rows, %s, ready in %.0f ms\n",
                  C, b.k4 ? "matrix-unit register operands (COOP_K4)" : "the older expert / attention kernels (no M5 layout)",
                  now_ms() - t0);
@@ -434,11 +434,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         const uint32_t nt = (uint32_t) nT;
         D(P_(b.lib, "route_topk"), {mtl::Arg::B(b.logits), mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::V(nt), mtl::Arg::V((uint32_t) nexp_)}, (nT + 7) / 8, 1, 256);
         const int nent = nT * TOPK, nblk = (nent + 1023) / 1024;
-        // this layer's tiles and the grid x each one is dispatched over, computed together (src/moe_tiles.h)
-        const MoeTile gu2 = gu2_tile(eg.type), dn2 = dn2_tile(ed.type);
-        PcMmPlanArgs pa{(uint32_t) nent, TOPK, (uint32_t) nexp_, (uint32_t) (b.v6 ? b.ms : b.tm), (uint32_t) nblk,
-                        (uint32_t) (b.v3e ? moe_grid_x(NFF, b.gu3[1], b.gu3[3]) : moe_grid_x(NFF, gu2.tn)),
-                        (uint32_t) (b.v3e ? moe_grid_x(N, b.dn3[1], b.dn3[3]) : moe_grid_x(N, dn2.tn))};
+        PcMmPlanArgs pa{(uint32_t) nent, TOPK, (uint32_t) nexp_, (uint32_t) (b.v6 ? b.ms : b.tm), (uint32_t) nblk};
         const uint32_t nclr = (uint32_t) b.maxrows;
         D(P_(b.lib, "mm_clear"), {mtl::Arg::B(b.stok), mtl::Arg::V(nclr)}, (b.maxrows + 255) / 256, 1, 256);
         D(P_(b.lib, "mm_hist"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
@@ -469,7 +465,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                                         : "mm_gu3_" + std::to_string(eg.type) + "_" + tl3(b.gu3);
             gu.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
         } else {
-            const std::string fn = "mm_gu2_" + std::to_string(eg.type) + gu2.name;
+            const std::string fn = "mm_gu2_" + std::to_string(eg.type) + gu2_tile(eg.type);
             gu.p = P_(b.lib, fn, mtl::Constants().i(5, 0), fn + "#p0");
         }
         gu.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.XS), mtl::Arg::B(b.HS), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
@@ -485,7 +481,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                                         : "mm_down3_" + std::to_string(ed.type) + "_" + tl3(b.dn3);
             dn.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
         } else {
-            dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2.name);
+            dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2_tile(ed.type));
         }
         dn.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.HS), mtl::Arg::B(b.YE), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
         dn.tg[0] = b.v3e ? 32 * b.dn3[3] : 64;
