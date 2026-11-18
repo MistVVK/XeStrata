@@ -2017,6 +2017,7 @@ struct LatentTab {
     int lat_G = 8, lat_E = 0, lat_fmt = 8;
     bool latent = false;
     std::string path;   // the D/U file open now
+    std::string expert_path, labels_path;
     bool q4_fallback = false;   // Q8_0 by default, and the pack's Q4_0 beside it where Q8_0 leaves too small a cache
     // detect the latent layout, open the D/U file and read the labels (host side, no device yet)
     bool open(const strata::core::ModelGeometry& g, std::string& err) {
@@ -2056,7 +2057,8 @@ struct LatentTab {
             err = "the latent layout needs XESTRATA_LATENT_A=<experts.bin>";
             return false;
         }
-        const std::string labels_path = strata::core::latent_labels_path(apack);
+        expert_path = apack;
+        labels_path = strata::core::latent_labels_path(expert_path);
         if (!strata::core::latent_labels_read(labels_path, g.n_layers, g.n_expert, lat_G, labels, err)) {
             err = "latent dense: " + err;
             return false;
@@ -8303,6 +8305,11 @@ int main(int argc, char** argv) {
             identity("head", o.native_head_gguf);
             for (const auto& d : o.native_dense_gguf) identity("dense", d);
             identity("mtp", o.mtp);
+            if (lat_tab.latent) {
+                identity("latent_dense", lat_tab.path);
+                identity("latent_experts", lat_tab.expert_path);
+                identity("latent_labels", lat_tab.labels_path);
+            }
             for (const auto& [path, scale] : o.cvec_files) {
                 identity("cvec", path);
                 fp += " scale=" + std::to_string(scale);
@@ -8377,6 +8384,11 @@ int main(int argc, char** argv) {
                 in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
                 if (srcp != nullptr) in.experts = srcp->model_inputs();
                 std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
+                if (lat_tab.latent) {
+                    files.push_back({"latent dense", lat_tab.path});
+                    files.push_back({"latent experts", lat_tab.expert_path});
+                    files.push_back({"latent labels", lat_tab.labels_path});
+                }
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
                 if (!o.pack.empty()) {
                     for (const char* n : {"index.txt", "dense.bin"}) files.push_back({std::string("pack ") + n, o.pack + "/" + n});
