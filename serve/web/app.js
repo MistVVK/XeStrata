@@ -2509,7 +2509,8 @@ async function generateReply(opts = {}) {
   keepToolCopies(m).then((got) => { if (got && msgs.includes(m)) saveChatOf(home); });
   if (shown()) paintCtxRing();
   if (!shown()) {                                    // its queue goes on when the chat is opened again (showChat)
-    if (!m.stopped && !m.error && queueOf(home.id).length) queueOf(home.id).go = true;
+    const q = queueOf(home.id);
+    if (q.length && (!m.error || m.stopped)) q.go = m.stopped ? "cut" : "done";   // an interjection needs the cut
     return;
   }
   scrollDown();

@@ -180,7 +180,11 @@ function showChat(c) {
   renderChat();
   setBusy(!!busy);
   const q = queueOf();
-  if (!busy && q.go) { q.go = false; settlePending(false, true); }   // its answer ended while it was not open
+  if (!busy && q.go) {                                // its answer ended while it was not open
+    const cut = q.go === "cut";
+    q.go = false;
+    settlePending(cut, !cut);                        // a message sent to interrupt goes after a cut
+  }
 }
 // another chat, while an answer may be written in this one: that answer goes on, in its own chat
 function openChat(id) {
