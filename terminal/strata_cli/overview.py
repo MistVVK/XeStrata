@@ -23,7 +23,7 @@ from rich.text import Text
 
 from strata_cli import nav
 from strata_cli.client import card_link
-from strata_cli.render import short_gpu          # noqa: F401 - the name stays importable from here (it moved to the stdlib-only module)
+from strata_cli.render import short_gpu, shares_memory          # noqa: F401 - the names stay importable from here (they live in the stdlib-only module; the Hardware tab uses shares_memory too)
 
 GIB = 2 ** 30
 BLUE = "#5aa9ff"
@@ -201,13 +201,6 @@ def build(metrics: dict | None) -> dict | None:
     return model
 
 
-def shares_memory(name: object) -> bool:
-    """A graphics chip with no memory of its own: Apple silicon, the NVIDIA GB10 of a DGX Spark, a Ryzen AI Max (Strix Halo). Its memory is the
-    computer's, so the "VRAM" tile shows the system memory and the PCIe link tile has nothing to say (T19)."""
-    low = str(name or "").lower()
-    return any(k in low for k in ("apple", "gb10", "strix halo", "8060s", "8050s", "8040s", "gfx1151"))
-
-
 # ------------------------------------------------------------------------------------------------ drawing
 
 def solid_spark(values: list, width: int, lo: float | None, hi: float | None) -> Text:
@@ -318,10 +311,11 @@ def _cards_strip(cards: list[dict], glyphs: str, accent: str, ascii_mode: bool, 
     for c, name in zip(shown, names):                          # the line's two text runs, the bar goes between them
         util, used, total = c["util"], c["mem_used"], c["mem_total"]
         heads.append(f"GPU {c['index'] if c['index'] is not None else '?'}  {name[:pad]:<{pad}}  ")
-        mem = f"{fmt(used, 1)} / {fmt(total, 0)} GB" if used is not None and total is not None else "-- GB"
+        mem = (f"{fmt(used, 1)} / {fmt(total, 0)} GB" if used is not None and total is not None else
+               "shared memory" if shares_memory(c.get("name")) else "-- GB")                     # S8: no "-- GB" for a chip that has no memory of its own
         temp = f"{fmt(c['temp'])} {'C' if ascii_mode else '°C'}"
         tails.append(f"  {fmt(util):>3} %   {mem:<14}  {temp:>6}   {fmt(c['power']):>4} W")
-    links = [card_link(c) for c in shown]          # "" for a card whose link the server does not report
+    links = ["" if shares_memory(c.get("name")) else card_link(c) for c in shown]          # "" for a card whose link the server does not report (and for a chip whose link means nothing)
     col = max((len(x) for x in links), default=0)  # no column at all when no server reports one: the line stays as it was
     # the strip's line is cropped, never wrapped, so a link too long for the terminal gets cut mid-word ("Gen5 x8 o"):
     # the column steps down a number at a time - the ceiling, then the generation, then nothing - so whatever is left
@@ -368,15 +362,37 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
 
     # ---- heading, tabs, rule
     head = Text(no_wrap=True, overflow="crop")
-    head.append(f"STRATA  {view_label}   ", style=f"bold {accent}")
-    head.append(connection + "   ", style=f"bold {accent}")
-    label = f"{model.get('model') or ''} {k(ctx_max) if ctx_max else ''}".strip()
-    head.append(label, style="bold")
     right = Text()
     right.append((bullet + " " if not ascii_mode else "* ") + model["phase_text"] + (f" {dot} {pct}%" if pct is not None and state in ("Reading", "Generating") else ""),
                  style=state_color if state != "Idle" else "dim")
     right.append("   ")
     right.append(f"[{marker}]", style=f"bold {accent}" if marker == "LIVE" else "bold yellow")
+    label = f"{model.get('model') or ''} {k(ctx_max) if ctx_max else ''}".strip()
+    # S2: the state and its marker are the part nobody may lose ("... 64K  ● Wai" at 80 columns): the model's name gives way first (it ends with an
+    # ellipsis, the context size stays), then the address. Wide windows are as before.
+    prefix = f"STRATA  {view_label}   "
+    room = width - len(right.plain) - 2 - len(prefix)             # what the address and the model name may take
+    ellipsis = "." if ascii_mode else "…"
+    if len(connection) + 3 + len(label) > room:                   # first the state's long words ("Waiting for a request") become its name ("Idle")
+        right = Text()
+        right.append((bullet + " " if not ascii_mode else "* ") + state + (f" {dot} {pct}%" if pct is not None and state in ("Reading", "Generating") else ""),
+                     style=state_color if state != "Idle" else "dim")
+        right.append("   ")
+        right.append(f"[{marker}]", style=f"bold {accent}" if marker == "LIVE" else "bold yellow")
+        room = width - len(right.plain) - 2 - len(prefix)
+    if len(connection) + 3 + len(label) > room:
+        ctx_tail = k(ctx_max) if ctx_max else ""
+        name = str(model.get("model") or "")
+        keep = room - len(connection) - 3 - len(ctx_tail) - 2     # the name's share, with its ellipsis and the space before the context size
+        if name and keep >= 6:
+            label = name[:keep] + ellipsis + (" " + ctx_tail if ctx_tail else "")
+        else:
+            label = ""
+            if len(connection) > room:
+                connection = connection[:max(8, room - 1)] + ellipsis
+    head.append(prefix, style=f"bold {accent}")
+    head.append(connection + ("   " if label else ""), style=f"bold {accent}")
+    head.append(label, style="bold")
     pad = max(2, width - len(head.plain) - len(right.plain))
     head.append(" " * pad)
     head.append_text(right)

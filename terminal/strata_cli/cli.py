@@ -37,8 +37,30 @@ class _VersionAction(argparse.Action):
         parser.exit()
 
 
+class _StrataParser(argparse.ArgumentParser):
+    """The parser of `strata` and of every command with sub-commands. One change to argparse's behaviour (S10): a command that needs a
+    sub-command (`strata components`, `strata drafting`) and got none lists its sub-commands in a few short lines, instead of ending with a
+    usage error that names an internal word ("the following arguments are required: components_command"). The exit code stays 2."""
+
+    def error(self, message: str):
+        if re.search(r"required: \w+_command$", message) and self._subcommand_lines():
+            print(f"{self.prog} needs one of these:")
+            print("\n".join(self._subcommand_lines()))
+            print(f"Add --help to one of them to see what it takes, for example: {self.prog} {self._subcommand_lines()[0].split()[0]} --help")
+            raise SystemExit(2)
+        super().error(message)
+
+    def _subcommand_lines(self) -> list[str]:
+        lines: list[str] = []
+        for action in self._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                width = max((len(a.dest) for a in action._choices_actions), default=0)
+                lines += [f"  {a.dest:<{width}}  {a.help or ''}".rstrip() for a in action._choices_actions]
+        return lines
+
+
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="strata", description="Strata serving and terminal clients")
+    ap = _StrataParser(prog="strata", description="Strata serving and terminal clients")
     ap.add_argument("--version", action=_VersionAction, nargs=0,
                     help="print the version and the interpreter this terminal runs on")
     sp = ap.add_subparsers(dest="command", required=True)
