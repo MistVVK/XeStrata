@@ -6888,6 +6888,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     the rounds after a tool ran are the model's own."""
     max_rounds = int(hub.settings["max_rounds"])
     total, rounds, free_rounds = 0, 0, 0
+    # rounds counts against max_rounds and goes back by one for a skill read; the number sent with a tool call must
+    # still tell the rounds apart, or the page groups two of them into one assistant message
+    round_id = 0
     done: dict = {}
     finalizing = False   # PR #3741 (upstream e0469a585): the round after the limit answers with no tools
     messages = list(messages)
@@ -6920,6 +6923,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                               "chars": 0, "truncated": False, "ms": 0}
             break
         rounds += 1
+        round_id += 1
         force = None
         # a chart of the plan a call carries (an image tool's `plan`, combine-tools): put into the reply before the
         # calls run, as a ```mermaid block the web page draws - a model that writes no text beside its calls gives it so
@@ -6944,7 +6948,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         def call_event(c):
             s, tool = routes.get(c.name, (None, c.name))
             return {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None, "tool": tool,
-                    "arguments": c.arguments, "round": rounds}
+                    "arguments": c.arguments, "round": round_id}
 
         def finished(c, r):
             """A call's result: logged (and kept beside the debug log) -> (the client's event, what the model reads)."""
@@ -6961,7 +6965,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                         made.append(log.picture(f.read_bytes(), f.suffix[1:]) if f is not None else u)
                     except OSError:
                         made.append(u)
-                dbg["tools"].append({"round": rounds, "name": c.name, "arguments": c.arguments, "ok": r["ok"],
+                dbg["tools"].append({"round": round_id, "name": c.name, "arguments": c.arguments, "ok": r["ok"],
                                      "ms": r["ms"], "result": r.get("model_content", r["text"]),
                                      **({"images": made} if made else {}),
                                      **({"image": r["image"]} if r.get("image") else {})})

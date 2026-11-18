@@ -1993,8 +1993,16 @@ function assistantMessages(m, partial) {
   }
   const out = [];
   let pos = 0, rpos = 0;
-  for (const r of [...new Set(ran.map((t) => t.round))]) {
-    const calls = ran.filter((t) => t.round === r), endCall = calls[calls.length - 1];
+  // a request's rounds start at 1 again after the page's own tools: group the calls that follow one another, so two
+  // rounds with the same number on either side of a page tool stay two assistant turns in the history
+  const groups = [];
+  for (const t of ran) {
+    const last = groups[groups.length - 1];
+    if (last && last[0].round === t.round) last.push(t);
+    else groups.push([t]);
+  }
+  for (const calls of groups) {
+    const endCall = calls[calls.length - 1];
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
     const rat = Math.min(Math.max(rpos, calls[0].rat || 0), reasoning.length);
     const msg = {role: "assistant", content: words(m.text.slice(pos, at)),
