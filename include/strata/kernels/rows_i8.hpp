@@ -52,7 +52,7 @@ template<class Op, int W, int G = 4> struct RowsI8Of {
     // through scalar reads W values apart kept the L1 busy at 44% of the memory's bandwidth (2026-11-05)
     static constexpr bool kVec = W > 1 && requires(const Op& o, float* p) {
         o.template raw_w<W>(int64_t{}, int64_t{}, p);
-    } && (!Op::kKeep || requires(const Op& o, const float* p) { o.template keep_w<W>(int64_t{}, int64_t{}, p); });
+    } && (!Op::kKeep || requires(const Op& o, float* p) { o.template keep_w<W>(int64_t{}, int64_t{}, p); });
     static constexpr bool kVecOut = W > 1 && requires(const Op& o, float* p) {
         o.template out_w<W>(int64_t{}, int64_t{}, p, 1.f);
     };

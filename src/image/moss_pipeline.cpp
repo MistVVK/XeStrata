@@ -52,6 +52,7 @@ bool in_stream(QiRefLayout l) { return l == QiRefLayout::AitkNoKv || l == QiRefL
 }  // namespace
 
 std::vector<float> moss_sigmas(int n, float shift) {
+    if (n == 1) return {1.f, 0.f};
     constexpr int kTrain = 1000;
     // torch.linspace(1, end, count) in float32 on an AVX2 CPU: from the start below the middle, from the end past it,
     // each value one fused multiply-add (the reference's grid, 2.11)
@@ -195,8 +196,17 @@ void MossPipeline::use_loras(const QiRequest& r) {
     std::vector<LoraUse> dit;
     lora_split(r.loras, dit, te_loras_);
     dit_->set_lora_bake(lora_bake_);
-    if (!dit_->set_loras(dit, err)) throw LoraRejected(err);
-    if (te_ && !te_->set_loras(te_loras_, err)) throw LoraRejected(err);
+    if (!dit_->set_loras(dit, err)) {
+        ctx_states_[0].clear();
+        ctx_states_[1].clear();
+        throw LoraRejected(err);
+    }
+    if (te_ && !te_->set_loras(te_loras_, err)) {
+        ctx_states_[0].clear();
+        ctx_states_[1].clear();
+        te_loras_now(te_->lora_key());
+        throw LoraRejected(err);
+    }
     te_loras_now(lora_key_of(te_loras_));   // the states kept were the encoder's with the other adapters
     if (dit_->lora_key() != before) {   // the contexts' text rows were made with the other adapters' weights
         ctx_states_[0].clear();
@@ -368,7 +378,7 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
                                   [&](int64_t rows) { return d.activation_bytes(hw, n, max_text, rows, kept); });
     if (avail < p.activations + dit_min) plan_too_small(p);
     uint64_t te_fixed = te_ ? text_fixed() : 0;
-    const uint64_t te_min = te_ ? te_->layer_min() : 0;
+    uint64_t te_min = te_ ? te_->layer_min() : 0;
     // the encoder stays only beside every block of the DiT: a streamed block costs every step (the RTX 4070's link at
     // x4: 67 s for 50 steps resident, 73 streamed past 15 blocks), opening the encoder again a second or two a prompt
     if (te_ && avail < p.activations + d.block_bytes() + te_fixed + te_min) {   // it goes: its states are made
@@ -376,6 +386,7 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
         te_.reset();
         te_set_ = 0;
         te_fixed = 0;
+        te_min = 0;
     }
     p.blocks = clampu(avail - p.activations - te_fixed - te_min, dit_min, d.block_bytes());
     plan_blocks(d, p.blocks);
@@ -462,8 +473,9 @@ void MossPipeline::encode(const std::vector<int32_t>& ids, std::vector<float>& o
     fit_text();
     const uint64_t before = free_vram() + te_->layers_vram();
     std::string err;
-    out = te_->encode(ids, err, pictures);
-    if (out.empty()) throw std::runtime_error(err);
+    auto states = te_->encode(ids, err, pictures);
+    if (states.empty()) throw std::runtime_error(err);
+    out = std::move(states);
     // the prompt's buffers, made by the first open's first encode, are the encoder's fixed part too
     if (te_measure_ == 1) {
         const uint64_t after = free_vram() + te_->layers_vram();
@@ -723,6 +735,26 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         p = plan(h * w, n, std::max(rows0, rows1));
     }
     p.text_cached = cached;
+    if (!r.mctl.empty()) {
+        if (control_maps == 0)
+            throw std::invalid_argument("image engine: MCTL: needs a color map (MCOLOR:) or a depth map (MDEPTH:)");
+        // The encoder and control projection open after planning.  The previous request's VAE scratch, activations,
+        // blocks and text layers give way before these allocations, including the maps kept for sampling.
+        const uint64_t enc = vae_->encode_scratch_bytes(h, w) + (uint64_t) (3 * HW) * 4 + control_work_ +
+                             (vae_->has_encoder() ? 0 : vae_size_->encoder_bytes()) +
+                             (d.control_path() == r.mctl ? 0 : d.control_weight_bytes()) + stage_slack();
+        const auto room = [&] {
+            const uint64_t b = budget(), used = held();
+            return std::min(free_vram(), b > used ? b - used : 0);
+        };
+        if (room() < enc) vae_->drop_scratch();
+        if (room() < enc) d.drop_activations();
+        if (room() < enc) { d.drop_blocks(); dit_set_ = 0; mlp_set_ = -1; }
+        if (room() < enc && te_) { te_.reset(); te_set_ = 0; }
+        if (room() < enc)
+            throw std::runtime_error("image engine: not enough GPU memory to encode the MOSS-Image control maps");
+    }
+    d.set_control(r.mctl);
     // the references' keys and values through the adapted blocks, once a request
     if (!r.refs.empty()) {
         std::vector<float*> z;
@@ -770,26 +802,6 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             gpu::free(depth);
         }
     } maps{d};
-    if (!r.mctl.empty()) {
-        if (control_maps == 0)
-            throw std::invalid_argument("image engine: MCTL: needs a color map (MCOLOR:) or a depth map (MDEPTH:)");
-        // The encoder and control projection open after planning.  The previous request's VAE scratch, activations,
-        // blocks and text layers give way before these allocations, including the maps kept for sampling.
-        const uint64_t enc = vae_->encode_scratch_bytes(h, w) + (uint64_t) (3 * HW) * 4 + control_work_ +
-                             (vae_->has_encoder() ? 0 : vae_size_->encoder_bytes()) +
-                             (d.control_path() == r.mctl ? 0 : d.control_weight_bytes()) + stage_slack();
-        const auto room = [&] {
-            const uint64_t b = budget(), used = held();
-            return std::min(free_vram(), b > used ? b - used : 0);
-        };
-        if (room() < enc) vae_->drop_scratch();
-        if (room() < enc) d.drop_activations();
-        if (room() < enc) { d.drop_blocks(); dit_set_ = 0; mlp_set_ = -1; }
-        if (room() < enc && te_) { te_.reset(); te_set_ = 0; }
-        if (room() < enc)
-            throw std::runtime_error("image engine: not enough GPU memory to encode the MOSS-Image control maps");
-    }
-    d.set_control(r.mctl);
     if (!r.mctl.empty()) {
         const auto encode_map = [&](const QiRef& m) -> float* {
             if (m.rgba.empty()) return nullptr;

@@ -87,7 +87,7 @@ struct RmsI8 {
         if (add.C > 0) {
             float a[W];
             add.at_w<W>(t, c, a);
-            const Packed<float, W> gv = *reinterpret_cast<const Packed<float, W>*>(gate + c);
+            const Packed<float, W> gv = *reinterpret_cast<const Packed<float, W>*>(gate + c + rr.at(t));
             for (int p = 0; p < W; ++p) v[p] = resid(xv.v[p]) + gv.v[p] * a[p];
         } else {
             for (int p = 0; p < W; ++p) v[p] = resid(xv.v[p]);
@@ -102,11 +102,11 @@ struct RmsI8 {
         }
         *reinterpret_cast<Packed<uint16_t, W>*>(x + t * C + c) = o;
     }
-    template<int W> void out_w(int64_t, int64_t c, float* v, float inv) const {
+    template<int W> void out_w(int64_t t, int64_t c, float* v, float inv) const {
         const Packed<float, W> wv = *reinterpret_cast<const Packed<float, W>*>(w + c);
         if (scale != nullptr) {
-            const Packed<float, W> sc = *reinterpret_cast<const Packed<float, W>*>(scale + c),
-                                   sh = *reinterpret_cast<const Packed<float, W>*>(shift + c);
+            const Packed<float, W> sc = *reinterpret_cast<const Packed<float, W>*>(scale + c + rr.at(t)),
+                                   sh = *reinterpret_cast<const Packed<float, W>*>(shift + c + rr.at(t));
             for (int p = 0; p < W; ++p) v[p] = v[p] * inv * wv.v[p] * (1.f + sc.v[p]) + sh.v[p];
         } else {
             for (int p = 0; p < W; ++p) v[p] = v[p] * inv * wv.v[p];
@@ -549,6 +549,7 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
 }
 
 void MossDit::drop_activations() {
+    pend_ = {};
     gpu::stream_sync(s_);
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) gu_, (void*) h16_, (void*) rs_,
                     (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) prod_.in.q, (void*) pend_sw_,
@@ -963,7 +964,10 @@ void tokens(const float* x, const float* color, const float* depth, int64_t rows
 }  // namespace moss_ctl_k
 
 void MossDit::set_control(const std::string& path) {
-    if (path == ctl_path_) return;
+    if (path == ctl_path_) {
+        ctl_w0_.lora = vin_.lora;
+        return;
+    }
     gpu::stream_sync(s_);
     for (void* p : ctl_allocs_) gpu::free(p);
     ctl_allocs_.clear();
@@ -1047,6 +1051,7 @@ void MossDit::input_projection(const float* x, int64_t rows, float* y) {
 }
 
 void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int n, float* out) {
+    pend_ = {};
     const int64_t HW = h * w, C = C_, J = stream_rows_;
     int64_t maxL = 0;
     std::vector<int64_t> off((size_t) n + 1, 0);
@@ -1131,6 +1136,7 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
     ref_rows_ = stream_rows_ = 0;
     stream_t0_ = false;
     ref_shapes_.clear();
+    for (Ctx& c : ctx_) c.rope_rows = -1;
     int64_t R = 0;
     for (const RefLatent& f : refs) {
         R += f.h * f.w;
