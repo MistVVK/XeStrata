@@ -155,20 +155,40 @@ def fetch(name: str, root: Path, say: Callable[[str], None] | None = None) -> di
     return status(name, root)
 
 
-def setup_names(vram_mib: int, ram_mib: int, root: Path) -> list[str]:
-    """The weights setup fetches ahead (--image-tools), the main editing tools' as each takes them by default: the
-    upscale's (SeedVR2's 7B in 8 bits where it fits the VRAM and the RAM together, else its 3B in 8 bits, its VAE, and
-    RealESRGAN for auto's fallback), the parts' fix detectors, the finder of a region in words (Florence-2 large, and
-    SAM 3 where its license was agreed to in `root`) and the background's remover (BiRefNet general).  Not the control
-    tool's: they differ by image model and one is not free software.
+def setup_names(vram_mib: int, ram_mib: int, root: Path, families=(), versions: bool = False) -> list[str]:
+    """The weights setup fetches ahead (--image-tools): those the editing tools take by default or fall back to on their
+    own, for the image models of `families` (their configs' "family"); with `versions` (--image-tools all) also the
+    versions a request chooses.
+    - the upscale: SeedVR2's 7B in 8 bits where it fits the VRAM and the RAM together, else its 3B in 8 bits, its VAE,
+      and RealESRGAN for auto's fallback; `versions`: the 7B sharp in 8 bits too, where the 7B fits.
+    - the parts' fix: the face, hand and person detectors.
+    - a region in words: Florence-2 large and base, and SAM 3 and CLIP's tokenizer once its license was agreed to in
+      `root`.
+    - the background's removal: BiRefNet general and lite (the smaller one it falls back to); `versions`: the others.
+    - the control, where a model of `families` takes one: every control image's networks (CNET_KINDS), and the
+      model's own (Qwen-Image's ControlNet Union, MOSS-Image's adapter and control LoRAs).
     serve/images.py seedvr2_file takes the 7B's 8-bit file when it is here and fits, so the server uses these; it would
     fetch the 3B's FP16 file instead only with 10 GiB of VRAM beside less than 2 GiB of RAM."""
     q = _qimage()
-    seedvr2 = "seedvr2-7b-int8" if vram_mib + ram_mib >= (q.FILES["seedvr2-7b-int8"][2] >> 20) + SEEDVR2_WORK_MIB \
-        else "seedvr2-3b-int8"
-    sam3 = [] if needs_consent("sam3", root) else ["sam3"]
-    return [seedvr2, "seedvr2-vae", "realesrgan", "yolo-face", "yolo-hand", "yolo-person", *sam3, "clip-tokenizer",
-            "florence-2-large", "florence-2-tokenizer", "birefnet-general"]
+    fits_7b = vram_mib + ram_mib >= (q.FILES["seedvr2-7b-int8"][2] >> 20) + SEEDVR2_WORK_MIB
+    out = ["seedvr2-7b-int8" if fits_7b else "seedvr2-3b-int8", "seedvr2-vae", "realesrgan"]
+    if versions and fits_7b:
+        out.append("seedvr2-7b-sharp-int8")
+    out += ["yolo-face", "yolo-hand", "yolo-person"]
+    if not needs_consent("sam3", root):
+        out += ["sam3", "clip-tokenizer"]
+    out += ["florence-2-large", "florence-2-base", "florence-2-tokenizer", "birefnet-general", "birefnet-lite"]
+    if versions:
+        out += [f"birefnet-{v}" for v in q.BIREFNET_VERSIONS if v not in ("general", "lite")]
+    caps = [q.family_capabilities(f) for f in families]
+    if any(c.get("control") or c.get("control_reference") or c.get("control_loras") for c in caps):
+        out += [w for ws in q.CNET_KINDS.values() for w in ws]
+    if any(c.get("control") == "controlnet" for c in caps):
+        out.append("cnet-union")
+    if any(c.get("control") == "moss" for c in caps):
+        out.append("moss-control")
+    out += [f"moss-control-{k}" for c in caps for k in sorted(set((c.get("control_loras") or {}).values()))]
+    return list(dict.fromkeys(out))
 
 
 def every() -> list[dict]:

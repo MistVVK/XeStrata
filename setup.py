@@ -5987,7 +5987,6 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
            f"{QI.local_path(models_dir, 'hunyuanimage3-system-prompt').name}")
         write_ratio_head(QI, models_dir)
     ask_sam3_license(a, models_dir / QI.AUX_DIR)
-    fetch_image_tools(a, gpu, models_dir / QI.AUX_DIR)
     cfgs = []
     for p in plans:
         cfg = QI.image_config(p["quant"], exe, models_dir, model=p["choice"],
@@ -6006,29 +6005,37 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
         ok(f"image generation: {cfg['model_name']} {p['quant']}"
            + (f", text encoder {p['tquant']}" if p['tquant'] else "")
            + f", GPU policy {cfg['gpu_policy']}" + ("" if p is plans[0] else " (a request names it by \"model\")"))
+    fetch_image_tools(a, gpu, models_dir / QI.AUX_DIR, [c.get("family") for c in cfgs])
     return cfgs[0], cfgs[1:]
 
 
-def fetch_image_tools(a, gpu: dict | None, aux: Path) -> None:
-    """The image tools' weights fetched now (serve/image_aux.py setup_names: the main editing tools', the upscale's for
-    this GPU's VRAM and the RAM among them), for --image-tools yes (asked when not given, yes by default and with
-    --yes).  Without them the server fetches each the first time a tool needs it, and the tool waits for it.  One
-    that fails is a warning: the server fetches it then."""
+def fetch_image_tools(a, gpu: dict | None, aux: Path, families: list) -> None:
+    """The image tools' weights fetched now (serve/image_aux.py setup_names: what the editing tools take by default
+    and fall back to, for this GPU's VRAM, the RAM and the image models of `families`), for --image-tools yes, and the
+    versions a request chooses as well for all (asked when not given, yes by default and with --yes).  Without them
+    the server fetches each the first time a tool needs it, and the tool waits for it.  One that fails is a warning:
+    the server fetches it then."""
     from serve import image_aux
     QI = _qimage()
     vram = 0 if (gpu or {}).get("integrated") else int((gpu or {}).get("vram_gb", 0) * 1024)
-    names = [n for n in image_aux.setup_names(vram, int(usable_ram_gb(a) * 1024), aux) if not image_aux.ready(n, aux)]
-    if not names:
-        return
+    ram = int(usable_ram_gb(a) * 1024)
+
+    def missing(versions: bool) -> list:
+        return [n for n in image_aux.setup_names(vram, ram, aux, families, versions) if not image_aux.ready(n, aux)]
+
+    def gb(names: list) -> float:
+        return sum(QI.FILES[QI.AUX[n]["file"]][2] for n in names) / 1e9
     want = getattr(a, "image_tools", None)
     if want is None:
+        if not missing(True):
+            return
         if not a.yes:
-            gb = sum(QI.FILES[QI.AUX[n]["file"]][2] for n in names) / 1e9
             say()
-            say(f"  The image tools' weights: {gb:.1f} GB ({', '.join(names)})")
+            say(f"  The image tools' weights: yes {gb(missing(False)):.1f} GB, all {gb(missing(True)):.1f} GB")
         want = ask_option("image-tools", a.yes)
-    if want != "yes":
+    if want == "no":
         return
+    names = missing(want == "all")
     for name in names:
         got = image_aux.fetch(name, aux, lambda m: say(f"  {m}"))
         if got["status"] == "ready":
@@ -9351,15 +9358,20 @@ OPTIONS = [
             choices=[["auto", "Auto: a GPU the text model does not use, else the text model's"],
                      ["same", "The text model's GPU"]],
             default="auto", gpu_choices="pci", when=["images"], cli={"metavar": "auto|same|PCI"}),
-    _option("image-tools", "Download the image editing tools' weights now (upscale, fix parts, find a region, remove "
-            "the background); else each on its first use",
-            "yes (default): download now the weights of the upscale (SeedVR2 for this GPU and RAM, RealESRGAN), the "
-            "parts' fix (the face, hand and person detectors), the finding of a region (Florence-2, SAM 3 once its "
-            "license is agreed to) and the background's removal (BiRefNet); no: the server downloads each the first "
-            "time a tool needs it, and that tool waits for it; asked when not given, yes with --yes",
-            kind="flag", place="images", values=["yes", "no"], default=True, when=["images"],
-            question="  Download the image tools' weights now?",
-            cli={"choices": ["yes", "no"]}),
+    _option("image-tools", "Download the image tools' weights now (upscale, fix parts, find a region, remove the "
+            "background, control); else each on its first use",
+            "yes (default): download now the weights the editing tools take by default or fall back to: the "
+            "upscale's (SeedVR2 for this GPU and RAM, RealESRGAN), the parts' fix detectors, the region finders "
+            "(Florence-2, SAM 3 once its license is agreed to), the background's removers (BiRefNet general and "
+            "lite) and the control's (every control image's networks, the image models' own control weights); all: "
+            "the versions a request chooses as well (SeedVR2 7B sharp, the other BiRefNets); no: the server "
+            "downloads each the first time a tool needs it, and that tool waits for it; asked when not given, yes "
+            "with --yes",
+            place="images",
+            choices=[["yes", "Yes: what the tools take by default"],
+                     ["all", "All: the versions a request chooses as well"],
+                     ["no", "No: each on its first use"]],
+            default="yes", when=["images"], question="  Download the image tools' weights now?"),
     _option("image-sam3-license", "Agree to Meta's SAM License, so that SAM 3.1 finds a part of a picture by words "
             "(find_region, edit_region); without it Florence-2 (MIT) finds the parts",
             "agree: agree to Meta's SAM License for SAM 3.1 (find_region and edit_region find a part of a picture by "
