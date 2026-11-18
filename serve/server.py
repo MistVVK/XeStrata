@@ -9269,12 +9269,15 @@ def make_handler(svc: Service):
                 src = src.get("image_url") or src.get("url")
             if isinstance(src, dict):
                 src = src.get("url")
-            if picture is None and isinstance(src, str) and not src.startswith("data:") and \
-                    (src.startswith(("http://", "https://", "/", "file:")) or "." in src[-6:]):
-                self._no_local_sources([src])
-                picture = self._load_image_source(src)
-                if isinstance(c, dict):
-                    c.pop("image", None)
+            if picture is None and isinstance(src, str) and not src.startswith("data:"):
+                # bare base64 is an inline picture (JPEG's always starts with /9j/), not the path it resembles
+                inline = src.startswith("/9j/") or not src.startswith("/") and \
+                    re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", src) is not None
+                if not inline and (src.startswith(("http://", "https://", "/", "file:")) or "." in src[-6:]):
+                    self._no_local_sources([src])
+                    picture = self._load_image_source(src)
+                    if isinstance(c, dict):
+                        c.pop("image", None)
             return Vision.normalize(picture) if picture else None
 
         def _images_edit(self):

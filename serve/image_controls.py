@@ -136,6 +136,10 @@ def decode_image(v) -> bytes:
 def _picture(v: dict, picture: bytes | None) -> bytes:
     if picture is None and v.get("image") is not None:
         picture = decode_image(v["image"])
+        # the same pass a multipart file, an http(s) URL or a path gets from the server: WebP to PNG and EXIF's
+        # orientation.  A data: URL or bare base64 must not reach the engine as unnormalised bytes
+        from serve.server import Vision
+        picture = Vision.normalize(picture)
     if not picture:
         raise img.ImageRequestError("control.image: the picture to take the composition from")
     try:
