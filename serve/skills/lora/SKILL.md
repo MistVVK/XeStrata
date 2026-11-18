@@ -1,6 +1,6 @@
 ---
 name: lora
-description: Choosing LoRAs for generate_image and edit_image - which, how strong, and their block weights.
+description: Choosing LoRAs for generate_image, edit_image and control - which, how strong, and their block weights.
 metadata:
   kind: tool
   tool: lora
@@ -19,3 +19,5 @@ metadata:
   character) is a character LoRA; an artist's or a look's name, a style LoRA. When still unsure, leave `blocks` out.
 - The user's own strength or block weights are used as they give them.
 - A character LoRA with a style LoRA: both, the style's words left to the style LoRA.
+
+- To keep a picture's composition while applying a style LoRA, use `control` with `depth` or `canny` and the LoRA.

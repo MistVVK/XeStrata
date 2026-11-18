@@ -4463,7 +4463,8 @@ class ImageTools:
                             "required": ["label", "caption", "bbox"]}}},
                     "required": ["items"]}}
                 t["parameters"] = params
-            if t["name"] in ("generate_image", "edit_image") and self._lora_lines(gens):   # the models' LoRAs
+            # the models' LoRAs
+            if t["name"] in ("generate_image", "edit_image", "control") and self._lora_lines(gens):
                 t = self._with_lora(t, gens)
             params = dict(t["parameters"])   # the plan's step and group (combine-tools), every tool's
             params["properties"] = {**params["properties"], **PLAN_ARGS}
@@ -4494,9 +4495,9 @@ class ImageTools:
         return lines
 
     def _with_lora(self, t: dict, gens: list) -> dict:
-        """generate_image's or edit_image's `lora` argument: the models' LoRAs by name, a strength and the block
-        weights (BLOCK_PRESETS' names for the models' families, or a number each block with commas); the lora skill
-        says how to choose them."""
+        """The `lora` argument of generate_image, edit_image or control: the models' LoRAs by name, a strength and
+        the block weights (BLOCK_PRESETS' names for the models' families, or a number each block with commas);
+        the lora skill says how to choose them."""
         # each name with the models whose family has it: a model without the name refuses it (a call wasted on the
         # first try, 2026-11-16: Mage-Flow's character LoRA asked "character", then again without it)
         has: dict[str, list[str]] = {}
@@ -4580,7 +4581,7 @@ class ImageTools:
             if want in tools and want not in CORE_TOOLS and not self.all_tools:
                 continue   # its tool's stub carries its line, and its call answers with the skill (_stub_answer)
             if want == "lora":   # with the LoRA argument only: a model lists LoRAs
-                if {"generate_image", "edit_image"} & set(tools) and self._lora_lines(self._gens()):
+                if {"generate_image", "edit_image", "control"} & set(tools) and self._lora_lines(self._gens()):
                     out.append((s.name, "tool", s.description))
                 continue
             if (want in tools or want == "*" and len(tools) > 1
@@ -5027,7 +5028,7 @@ class ImageTools:
                 req["refine"] = args["refine"]
             if name in ("generate_image", "edit_image") and args.get("guidance") not in (None, "", []):
                 req["guidance"] = args["guidance"]
-            if name in ("generate_image", "edit_image") and args.get("lora") not in (None, "", []):
+            if name in ("generate_image", "edit_image", "control") and args.get("lora") not in (None, "", []):
                 req["lora"] = args["lora"]   # serve/loras.py's field: the model's names, strengths, block weights
             if name in ("edit_image", "edit_region", "fix_image") and (args.get("crop_upscale") or args.get("variant")):
                 req["crop_upscale"] = {k: v for k, v in (("method", args.get("crop_upscale")),
