@@ -14,8 +14,12 @@ metadata:
   the pose picture in `references`.
   Describe the pose and say to keep the face, hair and clothes. The edit's pose defaults to strength 0.7 and end 0.8.
 - `mask`: a mask's link (white changes): find_region's, or the one the user painted (set by itself).
-- `strength` 1 redraws (the default; img2img's 0.87); 0.5 to 0.7 keeps the shapes. A face made into another person's: that person's picture as a
-  reference, not fix_image.
+- `strength` 1 redraws (the default; img2img's 0.87); 0.5 to 0.7 keeps the shapes.
+- A part taken from another picture (a face swap; the hair, clothes, shoes, a bag, the feet or hands of image 2) is
+  two steps, not fix_image: find_region on image 1 for where it goes (`face`, `the shirt`, `feet` for new shoes; one
+  person of several: say which), then edit_image with that mask and the other picture in `references`, naming the part
+  ("the red sneakers from image 2"). A small part (a face, hands, shoes): `crop_upscale` seedvr2. Clothes that cover
+  more than the old ones (a long dress for shorts): mask the body they will cover (`the woman's legs and skirt`).
 - For an edit combining two or more reference images, tell the user and use Qwen-Image-2.1 even when
   MOSS-Image is selected.
 - MOSS-Image with a mask and references: first without `refine`; `refine` true only when the part comes out poor

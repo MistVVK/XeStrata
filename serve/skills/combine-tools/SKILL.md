@@ -27,6 +27,8 @@ Recipes:
   Describe the pose too. A new person in an attached picture's pose: control `pose`.
 - One part (hair, clothes, sky): edit_region; or find_region, then edit_image with its mask. A control on the cropped
   edit_region is not available: say so, rather than claiming that a separate control changed the crop.
+- A part from another picture (a face, hair, clothes, shoes, feet, hands, a bag): find_region on the picture for
+  where it goes, then edit_image with its mask and the other picture in `references` (edit-image has more).
 - Another background: edit_image ("on a beach"); a cut-out: remove_background.
 - A full-body picture: generate_image, fix_image, then upscale_image.
 - A large final image with a part changed: upscale_image first, then edit_region.
