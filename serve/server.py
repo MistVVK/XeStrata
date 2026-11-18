@@ -8372,12 +8372,16 @@ def make_handler(svc: Service):
             self.end_headers()
             self.wfile.write(body)
 
-        def _authorized(self) -> bool:
+        def _has_key(self) -> bool:
+            """Whether this request carries the server's key, without answering a 401 (an open /health)."""
             if not svc.api_key:
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if key_matches(given, svc.api_key):
+            return key_matches(given, svc.api_key)
+
+        def _authorized(self) -> bool:
+            if self._has_key():
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -8548,6 +8552,10 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
+                tr_status = svc.translation.status() if svc.translation is not None else None
+                if tr_status is not None and tr_status.get("error") and not self._has_key():
+                    # the start failure holds the engine's log path and its last lines: for the key holder only
+                    tr_status = {**tr_status, "error": "the translation model did not start"}
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
@@ -8567,7 +8575,7 @@ def make_handler(svc: Service):
                                  # a streamed chat reply can be kept past its connection (xestrata_reply)
                                  "kept_replies": True,
                                  "debug_chat_log": svc.debug_log is not None,
-                                 "translation": svc.translation.status() if svc.translation is not None else None,
+                                 "translation": tr_status,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/licenses/"):   # a tool's weights' license to agree to (SAM 3's)
                 if not self._authorized():
