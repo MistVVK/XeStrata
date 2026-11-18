@@ -199,7 +199,21 @@ struct Seedvr2Dit::File {
         if (t == nullptr) throw std::runtime_error("image engine (SeedVR2 DiT): no " + name);
         return *t;
     }
-    const uint8_t* raw(const image::SafeTensor& t) const { return map.data() + st.data_base() + t.begin; }
+    const uint8_t* raw(const image::SafeTensor& t) const {
+        const uint64_t base = st.data_base();
+        const uint64_t item = t.dtype == "F32" ? 4 : t.dtype == "F16" || t.dtype == "BF16" ? 2 :
+                              t.dtype == "I8" || t.dtype == "U8" ? 1 : 0;
+        uint64_t elements = 1;
+        for (int64_t d : t.shape) {
+            if (d < 0 || (d > 0 && elements > UINT64_MAX / (uint64_t) d))
+                throw std::runtime_error("image engine (SeedVR2 DiT): invalid tensor shape");
+            elements *= (uint64_t) d;
+        }
+        if (item == 0 || elements > UINT64_MAX / item || t.end < t.begin || base > map.size() ||
+            t.end > map.size() - base || t.end - t.begin != elements * item)
+            throw std::runtime_error("image engine (SeedVR2 DiT): invalid tensor data");
+        return map.data() + base + t.begin;
+    }
 };
 
 Seedvr2Dit::Seedvr2Dit() = default;
