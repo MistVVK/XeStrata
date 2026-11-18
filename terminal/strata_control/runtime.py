@@ -16,7 +16,7 @@ child is still there.
 from __future__ import annotations
 
 from strata_control.private_files import private_mkdir as _private_mkdir
-from strata_control.childenv import quiet_crash_env
+from strata_control.childenv import arena_env, limit_own_arenas, quiet_crash_env
 import argparse
 import errno
 import hashlib
@@ -690,7 +690,7 @@ def _start_once(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
                       if WINDOWS else {"start_new_session": True})
             proc = subprocess.Popen(command,
                                     cwd=ROOT, stdin=subprocess.DEVNULL, stdout=stream,
-                                    stderr=subprocess.STDOUT, close_fds=True, **detach)
+                                    stderr=subprocess.STDOUT, close_fds=True, env=arena_env(os.environ.copy()), **detach)
         _STARTED_HOSTS[name] = proc
         deadline = time.monotonic() + max(5.0, wait)
         while _read_state(name, pending_ok=True) is None and proc.poll() is None and time.monotonic() < deadline:
@@ -1020,7 +1020,7 @@ class Host:
                        "--owner-fd", "0" if WINDOWS else str(reader)]
         attestation_key = secrets.token_bytes(32)
         expected_attestation = launch_identity.attestation(attestation_key, source_bytes, server_args)
-        child_env = quiet_crash_env(os.environ.copy())   # the server's engine and reader start no debugger on a user's machine
+        child_env = arena_env(quiet_crash_env(os.environ.copy()))   # no debugger on a user's machine for the server's engine and reader; glibc arenas capped (childenv)
         child_env["STRATA_OWNER_ATTEST_KEY"] = attestation_key.hex()
         child_env["STRATA_NO_ACQUIRE"] = "1"      # a managed server never installs or downloads (acquisition.py)
         child_env["STRATA_RUNTIME_PROFILE"] = self.name   # the records of its engine say which profile they belong to
@@ -1616,6 +1616,7 @@ class Host:
 
 def main(argv: list[str] | None = None) -> int:
     quiet_crash_env()                                   # the host's children inherit it (strata_control/childenv.py)
+    limit_own_arenas()                                  # a host started by hand has no MALLOC_ARENA_MAX from its starter
     parser = argparse.ArgumentParser(prog="strata-runtime-host")
     parser.add_argument("--host", required=True)
     parser.add_argument("--shutdown-timeout", type=float, default=30)
