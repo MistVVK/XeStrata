@@ -27,7 +27,7 @@
     "--context",
     "131072",
     "--vision",
-    "cpu",
+    "no",
     "--drafter",
     "dflash2",
     "--data-dir",

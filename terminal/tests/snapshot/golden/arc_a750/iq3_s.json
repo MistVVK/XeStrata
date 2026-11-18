@@ -27,7 +27,7 @@
     "--context",
     "131072",
     "--vision",
-    "cpu",
+    "no",
     "--experimental-speed-projection",
     "off",
     "--drafter",
