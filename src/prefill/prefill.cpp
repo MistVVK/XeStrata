@@ -3586,13 +3586,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gu.type = up_type; gu.xq = up_xq2 ? hs.xq2 : hs.xq; gu.dst = hs.gu + ff; gu.woff = hf.up_off;
                                 }
                                 hs.ctx->run(gu, q);
-                                mmq::swiglu(hs.gu, hs.hh, rows_help, ff, /*interleaved=*/false, q);
-                                mmq::quantize(hs.hh, nullptr, hs.hq, hf.d_type, ff, ff, rows_help, q);
                                 mmq::Product dn;
                                 dn.type = hf.d_type; dn.w_rows = N; dn.w_cols = ff; dn.n = (int) ne; dn.xq = hs.hq;
                                 dn.bounds = d_bounds; dn.ids = d_ident; dn.total_rows = rows_help; dn.max_rows = maxr;
                                 dn.rows = rows_help; dn.dst = hs.d; dn.ld_dst = N; dn.wtab = hs.wtab; dn.woff = hf.down_off;
+                                // NVFP4: the experts' tail scales (s_gate / s_up into the SwiGLU, s_down on the down
+                                // rows), as the main path's: without them the helper's rows combine unscaled
+                                const bool nv_tail = hf.tail_off != 0;
+                                const mmq::TailAt tails = mmq::tails_of(dn, mmq::matrix_bytes(hf.d_type, N, ff));
+                                if (nv_tail) mmq::swiglu_tails(hs.gu, hs.hh, rows_help, ff, d_bounds, (int) ne, tails, q);
+                                else mmq::swiglu(hs.gu, hs.hh, rows_help, ff, /*interleaved=*/false, q);
+                                mmq::quantize(hs.hh, nullptr, hs.hq, hf.d_type, ff, ff, rows_help, q);
                                 hs.ctx->run(dn, q);
+                                if (nv_tail) mmq::scale_rows_tails(hs.d, N, N, rows_help, d_bounds, (int) ne, tails, q);
                                 if (!strata::gpu::copy_async(hs.d_ex, hs.d, (size_t) rows_help * N * sizeof(float), q)) {
                                     err = std::string("prefill: the helper's results: ") + strata::gpu::last_error();
                                     return false;
