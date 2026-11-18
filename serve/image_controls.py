@@ -784,11 +784,15 @@ def preview_response(svc, gen, req: dict, base_url: str, cancel=None) -> dict:
     kind = ALIASES.get(kind, kind)
     if kind in ("", "none"):
         raise img.ImageRequestError("type: one of " + ", ".join(KINDS + ("color",)))
-    if kind == "color":   # MOSS-Image's color map (SAM 3's)
+    c: dict[str, Any] = {"type": kind, "image": _picture({}, req["picture"])}
+    made: dict[str, Any]
+    if kind == "color" and fields.get("preprocess") is False:   # a ready map: show it, do not paint it again
+        w, h = img.image_dims(c["image"])
+        made = {"image": img.as_png(c["image"]), "width": w, "height": h, "seconds": 0.0, "engine_s": 0.0}
+    elif kind == "color":   # MOSS-Image's color map (SAM 3's)
         if image_aux.needs_consent("sam3", image_aux.aux_dir(gen.cfg)):
             from serve import image_regions
             raise img.ImageRequestError("type color: its map is SAM 3's, and " + image_regions.sam3_consent_words())
-        c: dict[str, Any] = {"type": "color", "image": _picture({}, req["picture"])}
         made = color_map(svc, gen, c["image"], cancel)
     else:
         # the map alone: checked as a ControlNet's fields whatever the model (no strength applies here)

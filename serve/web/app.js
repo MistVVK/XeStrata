@@ -3922,6 +3922,7 @@ async function imgCtrlFields() {
   if (k === "canny") { num("img-ctrl-low", "low_threshold"); num("img-ctrl-high", "high_threshold"); }
   if (k === "pose") Object.assign(c, {detect_body: $("img-ctrl-body-on").checked, detect_hands: $("img-ctrl-hands").checked, detect_face: $("img-ctrl-face").checked});
   if (!$("img-ctrl-drawing-f").hidden && $("img-ctrl-drawing").checked) c.lineart_input = "drawing";
+  if (!$("img-ctrl-regions-f").hidden && $("img-ctrl-color-map").checked) c.preprocess = false;
   return c;
 }
 async function imgCtrlBody(body) {
@@ -3934,7 +3935,6 @@ async function imgCtrlBody(body) {
     Object.assign(c, ["moss", "lora"].includes(imgCtrlMode()) ? {preprocess: false, image: imgCtrlMap} : {type: "none", image: imgCtrlMap});
   }
   if (!$("img-ctrl-regions-f").hidden) {
-    if ($("img-ctrl-color-map").checked) c.preprocess = false;
     const lines = $("img-ctrl-regions").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
     if (lines.length) {
       const regions = lines.map(x => x.match(/^(#[0-9a-fA-F]{6})\s*:\s*(\S.*)$/));
