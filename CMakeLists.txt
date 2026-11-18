@@ -870,6 +870,13 @@ if(STRATA_ENABLE_XE)
       target_compile_options(onemath_blas_cublas_obj PRIVATE ${_strata_cuda_base_opts})
       target_link_options(onemath_blas_cublas PRIVATE ${_strata_cuda_base_opts})
     endif()
+    # oneMKL 2026.2 deprecates its SYCL buffer API and gemmt, which oneMath's specification still offers and its
+    # oneMKL backend forwards; XeStrata calls only the USM gemm.  The warnings are in oneMath's sources, so they are
+    # turned off for that backend alone.  Drop this when oneMath moves off the deprecated calls, or when oneMKL removes
+    # them (then the backend no longer builds and needs oneMath's change instead).
+    if(TARGET onemath_blas_mklgpu_obj)
+      target_compile_options(onemath_blas_mklgpu_obj PRIVATE -Wno-deprecated-declarations)
+    endif()
     unset(BUILD_SHARED_LIBS)
     if(_strata_libcuda_stubs)
       list(REMOVE_ITEM CMAKE_LIBRARY_PATH "${_strata_libcuda_stubs}")
@@ -1833,6 +1840,16 @@ if(STRATA_NATIVE_EXPERTS)
       FetchContent_Populate(strata_llamacpp)
     endif()
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+  endif()
+  # ggml's own C sources, built by clang for the MSVC ABI, redefine static_assert as a macro and use anonymous
+  # structs in unions on purpose (ggml-common.h, ggml-impl.h); clang warns of both there and nowhere else.  ggml's
+  # targets alone, on Windows alone, so XeStrata's files keep the warnings
+  if(WIN32)
+    foreach(_t ggml-base ggml-cpu ggml)
+      if(TARGET ${_t})
+        target_compile_options(${_t} PRIVATE -Wno-keyword-macro -Wno-gnu-anonymous-struct -Wno-nested-anon-types)
+      endif()
+    endforeach()
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
