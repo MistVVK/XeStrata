@@ -185,6 +185,12 @@ class Extend(unittest.TestCase):
 
 
 class AuxiliaryMemory(unittest.TestCase):
+    def test_auxiliary_budget_refusal_suggests_a_smaller_model(self):
+        with self.assertRaises(images.ImageRequestError) as caught:
+            images.check_room({"least_mib": 8300, "cap_mib": 8192}, None, {"aux": {"kind": "birefnet"}})
+        self.assertIn("smaller auxiliary model", str(caught.exception))
+        self.assertNotIn("reference images", str(caught.exception))
+
     def test_allocation_refusal_is_a_memory_shortage(self):
         from serve import image_regions
 

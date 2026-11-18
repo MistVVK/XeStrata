@@ -5530,7 +5530,9 @@ def check_room(need: dict, ram_mib: int | None, job: dict | None = None) -> None
     prefix cache would not fit the free RAM (`ram_mib`, None: not known): refused before the job, not shrunk (the
     user's decision, 2026-10-21).  The hint is the job's: an upscale's (`job`) is its scale and upscaler."""
     least, cap, host = (int(need.get(k) or 0) for k in ("least_mib", "cap_mib", "host_mib"))
-    hint = ("use a smaller scale, or SeedVR2's 3B or RealESRGAN" if job and (job.get("ups_only") or job.get("upscale"))
+    hint = ("try a smaller auxiliary model or a lower operating resolution" if job and job.get("aux")
+            else "use a smaller scale, or SeedVR2's 3B or RealESRGAN"
+            if job and (job.get("ups_only") or job.get("upscale"))
             else "use fewer or smaller reference images, or a smaller size")
     if cap and least > cap:
         raise ImageRequestError(f"this image needs at least {least / 1024:.1f} GiB of VRAM and the GPU has "
