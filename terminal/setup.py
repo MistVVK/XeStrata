@@ -8457,6 +8457,47 @@ def mtp_corrupt(mtp: Path, env=None) -> bool:
     return r.returncode == 3
 
 
+def auto_drafter(a, family: str, fam: dict, model: str, hip: bool, gpu: dict, mtp_here: bool) -> str | None:
+    """P14 (0.2.16): the drafter a fresh setup uses when the person named none (no --drafter, no --mtp): the Terminal's Auto rule
+    (strata_control/drafting.py choice_of, the one `strata launch` and the app use), not a copy of it. "dflash2" when Auto means DFlash2 on this
+    computer and the MTP layer is not on disk yet, so the ~5 GB MTP download is skipped and the 1.2 GB DFlash2 drafter is fetched instead (a P100 got the
+    5 GB layer from setup while the Terminal's Auto picks DFlash2 there). None in every other case: the MTP layer is already here (nothing to save), a
+    drafter was named, or Auto means the MTP; setup then goes on as before. Never raises."""
+    if getattr(a, "drafter", None) or a.mtp is not None or mtp_here:
+        return None
+    try:
+        from strata_control import drafting
+        backend, archs = drafting.hardware_for("hip" if hip else "cuda")
+        pick = drafting.choice_of("auto", model_name=f"{fam['name']}-{model.lower()}", family=family, backend=backend, archs=archs,
+                                  vram_mib=float(gpu.get("vram_gb") or 0) * 1024 or None)
+        return "dflash2" if pick == "dflash2" else None
+    except Exception:                                  # noqa: BLE001 - a rule that cannot be read leaves setup as it was
+        return None
+
+
+def fetch_dflash2_drafter(data: Path, fam: dict, model: str, hip: bool, gpu: dict) -> bool:
+    """Make the DFlash2 drafter (about 1.2 GB, resumable, checked) exist under `data`, as `strata drafting fetch` does (drafting_fetch.ensure_for).
+    True when it is there; False (with the reason said) when it could not be had: the caller then fetches the MTP layer as before."""
+    try:
+        from strata_control import drafting, drafting_fetch
+        backend, archs = drafting.hardware_for("hip" if hip else "cuda")
+
+        def show(step, done, total):
+            if total:
+                print(f"\r  {step} {done / 1e9:.2f} of {total / 1e9:.2f} GB", end="", flush=True)
+        out = drafting_fetch.ensure_for(data, model_name=f"{fam['name']}-{model.lower()}", backend=backend, archs=archs, progress=show,
+                                        vram_mib=float(gpu.get("vram_gb") or 0) * 1024 or None)
+        say()
+        if out is None:
+            warn("the DFlash2 drafter could not be fetched (no answer from the network): fetching the MTP draft layer instead")
+            return False
+        return True
+    except Exception as e:                             # noqa: BLE001 - offline, refused, a failed check: the MTP layer is the fallback, never a stop
+        say()
+        warn(f"the DFlash2 drafter could not be fetched ({e}): fetching the MTP draft layer instead")
+        return False
+
+
 def provide_dflash2_vocab(data: Path, choice: str = "cjk") -> None:
     """A DFlash2-only install has no MTP folder to hold the draft vocabulary: it is kept beside the DFlash2 pack (strata_control/drafting.py provide_vocab), as the subset the person chose
     in setup (--draft-vocab, saved in the model's config; the default file when none)."""
@@ -10564,6 +10605,8 @@ def main() -> int:
     pack_now = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
     pack_bin = ready or ((pack_now / "experts.bin").exists() and (pack_now / "index.txt").exists())   # ready: in the download
     mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
+    if not ready and (picked := auto_drafter(a, family, fam, model, hip, gpu, mtp_have)):      # P14: the Terminal's Auto rule, not always the 5 GB layer
+        a.drafter, a.drafter_auto = picked, True
     q2_avx = model == "Q2_0" and avx512 and family == "qwen"
     prep_gb = MODELS[model].get("prepare_gb", 0.0) if ready and MODELS[model].get("prepare") and \
         not prepared_done(model, models_dir) else 0.0
@@ -10710,6 +10753,8 @@ def main() -> int:
     if corrupt:
         warn("some MTP tensors are not the checkpoint's (a download mirror that ignored range requests, #327): "
              "fetching them again and rebuilding the draft layer")
+    if getattr(a, "drafter_auto", False) and not (rt / "experts.bin").exists() and not fetch_dflash2_drafter(data, fam, model, hip, gpu):
+        a.drafter = None                               # P14: the DFlash2 drafter could not be had: the MTP layer, as before (never no drafter)
     if a.mtp == "off" and not (rt / "experts.bin").exists():
         ok("the draft layer (MTP) is off: its ~5 GB are not downloaded (`--mtp on` fetches it later)")   # round 8, N3
     elif getattr(a, "drafter", None) == "dflash2" and not (rt / "experts.bin").exists():
