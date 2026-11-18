@@ -17,7 +17,9 @@ class StrixQ4(unittest.TestCase):
 
     def test_warns_for_the_one_model_on_the_one_chip_and_never_otherwise(self):
         note = gpu_fit.strix_q4_stall_note("ud-q4_k_xl", [self.STRIX])
-        self.assertIn("7 of 30", note)
+        self.assertIn("older engines", note)
+        self.assertNotIn("7 of 30", note)
+        self.assertIn("0.1.62", note)
         self.assertIn("UD-IQ4_XS", note)
         self.assertIsNone(gpu_fit.strix_q4_stall_note("UD-IQ4_XS", [self.STRIX]))
         self.assertIsNone(gpu_fit.strix_q4_stall_note("UD-Q4_K_XL", [NV]))
@@ -29,8 +31,8 @@ class StrixQ4(unittest.TestCase):
         with Home():
             cat = catalog({**HW_12, "gpus": [self.STRIX]})
             s, notes = cmd.apply_defaults(S.LaunchSettings(family="qwen", model="UD-Q4_K_XL"), cat)
-            self.assertTrue([n for n in notes if "7 of 30" in n.text], [n.text for n in notes])
-            self.assertTrue(all(n.level == "warn" for n in notes if "7 of 30" in n.text))
+            self.assertTrue([n for n in notes if "older engines" in n.text], [n.text for n in notes])
+            self.assertTrue(all(n.level == "warn" for n in notes if "older engines" in n.text))
 
 
 if __name__ == "__main__":

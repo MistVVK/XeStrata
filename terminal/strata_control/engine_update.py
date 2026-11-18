@@ -48,7 +48,9 @@ def notice(root=None) -> dict | None:
     if not engine:
         return None
     have = _installed_words(root)
-    head = "A new " + f"engine {engine}" + (f" (you have {have['engine']})" if have["engine"] else "") + " is available"
+    if not have["engine"]:                  # no engine yet: the launch installs the newest one itself, so there is nothing to update first
+        return None
+    head ="A new " + f"engine {engine}" + (f" (you have {have['engine']})" if have["engine"] else "") + " is available"
     return {"engine": engine, "have": have, "line": head}
 
 
