@@ -4334,15 +4334,19 @@ const imgJxl = new Promise(ok => {
   i.src = "data:image/jxl;base64,/woAEBAJCAABABgASxiLFYIB";
 });
 let imgJxlOK = false;
-imgJxl.then(ok => { imgJxlOK = ok; imgFormat(); });
+imgJxl.then(ok => { imgJxlOK = ok; imgFormat(); toolFormat(); });
 const IMG_FMT_NAMES = {png: "PNG", jpeg: "JPEG", webp: "WebP", jxl: "JPEG XL"};
 // the format: the server's (/health's formats) that this browser shows; the one chosen last, else JPEG XL (lossless)
 // where it can, else PNG.  JPEG, WebP and JPEG XL take a quality (JPEG XL's 100: lossless), kept per format; a
 // transparent background has no JPEG (no alpha channel)
-function imgFormat() {
+// the formats the server makes (/health's) that this browser shows: the Images tab's choices, the Tools tab's too
+function imgFormats() {
   const d = imgModel().defaults || {};
+  return (d.formats || ["png", "jpeg", "webp"]).filter(x => x !== "jxl" || imgJxlOK);
+}
+function imgFormat() {
   const f = $("img-fmt"), bg = $("img-bg").checked && !$("img-bg-f").hidden;
-  const fmts = (d.formats || ["png", "jpeg", "webp"]).filter(x => x !== "jxl" || imgJxlOK);
+  const fmts = imgFormats();
   const was = store.get("img_fmt", fmts.includes("jxl") ? "jxl" : "png");
   if ([...f.options].map(o => o.value).join() !== fmts.join())
     f.replaceChildren(...fmts.map(x => new Option(IMG_FMT_NAMES[x] || x, x)));
@@ -4353,8 +4357,31 @@ function imgFormat() {
   $("img-q").value = String(store.get("img_q_" + f.value, f.value === "jxl" ? 100 : 90));
   $("img-q-f").title = f.value === "jxl" ? tr("img.lossless", "100: lossless") : "";
 }
-$("img-fmt").onchange = () => { store.set("img_fmt", $("img-fmt").value); imgFormat(); };
+$("img-fmt").onchange = () => { store.set("img_fmt", $("img-fmt").value); imgFormat(); toolFormat(); };
 $("img-q").onchange = () => store.set("img_q_" + $("img-fmt").value, +$("img-q").value);
+// the Tools tab's format: the Images tab's choices (imgFormats), its own choice kept apart (the Images tab's at first),
+// the quality per format as the Images tab keeps it; JPEG not where the cut-out keeps a transparent background
+function toolFormat() {
+  const f = $("tool-fmt"), fmts = imgFormats();
+  const clear = toolKind === "rembg" && !$("tool-bg-color-on").checked && !$("tool-bg-mask").checked;
+  if ([...f.options].map(o => o.value).join() !== fmts.join())
+    f.replaceChildren(...fmts.map(x => new Option(IMG_FMT_NAMES[x] || x, x)));
+  const was = store.get("tool_fmt", store.get("img_fmt", fmts.includes("jxl") ? "jxl" : "png"));
+  f.value = fmts.includes(was) ? was : "png";
+  for (const o of f.options) o.disabled = clear && o.value === "jpeg";
+  if (clear && f.value === "jpeg") f.value = "png";
+  $("tool-q-f").hidden = f.value === "png";
+  $("tool-q").value = String(store.get("img_q_" + f.value, f.value === "jxl" ? 100 : 90));
+  $("tool-q-f").title = f.value === "jxl" ? tr("img.lossless", "100: lossless") : "";
+}
+$("tool-fmt").onchange = () => { store.set("tool_fmt", $("tool-fmt").value); toolFormat(); };
+$("tool-q").onchange = () => store.set("img_q_" + $("tool-fmt").value, +$("tool-q").value);
+for (const id of ["tool-bg-color-on", "tool-bg-mask"]) $(id).addEventListener("change", toolFormat);
+// the picture's format and quality in a tool's request
+function toolFormatBody() {
+  const output_format = $("tool-fmt").value || "png";
+  return {output_format, ...(output_format !== "png" && {output_compression: Math.max(0, Math.min(100, +$("tool-q").value || 0))})};
+}
 $("img-bg").onchange = imgFormat;
 $("img-partial").checked = store.get("img_partial", false);
 $("img-partial").onchange = () => store.set("img_partial", $("img-partial").checked);
@@ -4703,6 +4730,7 @@ function toolShow() {
     : tr("tool.promptRedraw", "What the picture shows (the redraw's prompt)");
   $("tool-model-f").hidden = $("tool-model").options.length < 2 || (k === "upscale" && !redraw);
   $("tool-seed-f").hidden = k === "upscale" && !redraw;
+  toolFormat();
   toolUpSize();
 }
 for (const b of $("tool-kind").children)
@@ -4764,12 +4792,13 @@ function toolRequest() {
       Object.assign(body, {prompt, ...(seed != null && {seed})});
     }
     if (Object.keys(extra).length) body.extra_params = extra;
-    return ["v1/images/upscale", {...body, response_format: "b64_json"}];
+    return ["v1/images/upscale", {...body, ...toolFormatBody(), response_format: "b64_json"}];
   }
   if (k === "fix") {
     const parts = [...document.querySelectorAll("[name=tool-part]:checked")].map(x => x.value);
     const req = {images: [{image_url: toolSrc.url}], fix: {parts, ...(num("tool-fix-strength") != null && {strength: num("tool-fix-strength")})}};
-    return ["v1/images/edits", {...req, ...(prompt && {prompt}), ...(model && {model}), ...(seed != null && {seed}), response_format: "b64_json"}];
+    return ["v1/images/edits", {...req, ...(prompt && {prompt}), ...(model && {model}), ...(seed != null && {seed}), ...toolFormatBody(),
+            response_format: "b64_json"}];
   }
   if (k === "segment") {
     const m = $("tool-seg-model").value;
@@ -4782,7 +4811,7 @@ function toolRequest() {
           refine_foreground: $("tool-bg-refine").checked, mask_only: $("tool-bg-mask").checked,
           ...($("tool-bg-color-on").checked && {background_color: $("tool-bg-color").value}),
           ...(num("tool-bg-grow") != null && {mask_grow: num("tool-bg-grow")}), ...(num("tool-bg-blur") != null && {mask_blur: num("tool-bg-blur")}),
-          output_format: $("tool-bg-fmt").value, response_format: "b64_json"}];
+          ...toolFormatBody(), response_format: "b64_json"}];
 }
 // the result: the new picture over the image (a divider to compare them), or the parts found drawn over it
 function toolResult(r) {

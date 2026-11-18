@@ -511,8 +511,13 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <label class="st-field img-sl"><span class="img-sl__head"><span data-info="bgBlur" data-i18n="tool.bgBlur">Soften the edge (pixels)</span>
             <input class="st-input" id="tool-bg-blur" type="number" min="0" max="32" step="0.5" placeholder="0"></span>
             <input class="img-sl__range" type="range" data-for="tool-bg-blur" tabindex="-1" aria-hidden="true"></label>
+        </div>
+        <!-- the picture's format and quality (the Images tab's choices): the tools that make a picture -->
+        <div class="tool-fields" data-tool="upscale fix rembg">
           <label class="st-field"><span data-i18n="img.format">Format</span>
-            <select class="st-input" id="tool-bg-fmt"><option>png</option><option>webp</option></select></label>
+            <select class="st-input" id="tool-fmt"></select></label>
+          <label class="st-field" id="tool-q-f" hidden><span data-i18n="img.quality">Quality</span>
+            <input class="st-input" id="tool-q" type="number" min="0" max="100" step="1" value="90" aria-label="Quality, 0 to 100" data-i18n-label="img.qualityLabel"></label>
         </div>
       </div>
 
