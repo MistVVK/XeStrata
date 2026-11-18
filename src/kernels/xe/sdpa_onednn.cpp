@@ -8,6 +8,7 @@
 
 #include "strata/kernels/onednn.hpp"
 
+#include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "strata/platform/downgrade.hpp"
@@ -276,6 +277,7 @@ sycl::half* band_mask(Sdpa& d, sycl::queue& q, int64_t rows, int64_t keys, int64
         }
     if (d.masks.size() >= 4) {
         q.wait();
+        core::graph_epoch_bump();
         sycl::free(d.masks.back().second, q);
         d.masks.pop_back();
     }

@@ -9,6 +9,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/platform/env.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -78,6 +79,7 @@ struct Bufs {
     int64_t cap_t = 0, cap_c = 0, cap_qt = 0, cap_qc = 0, cap_h = 0;
     size_t held = 0;   // the bytes held now (given back before the larger ones are taken)
     void release() {
+        if (q != nullptr) core::graph_epoch_bump();
         for (void* p : {(void*) q, (void*) k, (void*) vt, (void*) sq, (void*) sk, (void*) sv, (void*) mean, (void*) part,
                         (void*) sw})
             if (p != nullptr) strata::gpu::free(p);
