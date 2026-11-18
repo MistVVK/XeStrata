@@ -1293,11 +1293,8 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
     if not isinstance(v, dict) or not set(v) <= {"scale", "strength", "method", "redraw", "color", "variant"}:
         raise ImageRequestError('upscale: {"scale": 1.5 or 2, "method": "auto", "redraw": true, "strength": 0.35, '
                                 '"color": "lab", "variant": "7b"} (or the scale alone)')
-    try:
-        scale = float(v.get("scale", 2))
-    except (TypeError, ValueError):
-        raise ImageRequestError("upscale.scale: a number") from None
-    if not 1.0 < scale <= UPSCALE_MAX_SCALE:
+    scale = parse_number(v.get("scale"), "upscale.scale", 1.0, UPSCALE_MAX_SCALE, 2.0)
+    if scale <= 1.0:
         raise ImageRequestError(f"upscale.scale: above 1, at most {UPSCALE_MAX_SCALE:g}")
     method = v.get("method") or "auto"
     if method not in UPSCALE_METHODS:
@@ -1904,9 +1901,17 @@ def parse_extend(v, w: int, h: int, side: int) -> tuple[int, int, int, int]:
         if set(v) != {"aspect"}:
             raise ImageRequestError("extend: the aspect alone, or the pixels a side")
         m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[:x/]\s*(\d+(?:\.\d+)?)\s*", str(v["aspect"]))
-        if not m or float(m.group(1)) <= 0 or float(m.group(2)) <= 0:
+        if not m:
             raise ImageRequestError('extend.aspect: "W:H", e.g. "16:9"')
-        a = float(m.group(1)) / float(m.group(2))
+        try:
+            wide, high = (parse_number(x, "extend.aspect", 0, math.inf) for x in m.groups())
+        except ImageRequestError:
+            raise ImageRequestError('extend.aspect: "W:H", e.g. "16:9"') from None
+        if wide <= 0 or high <= 0:
+            raise ImageRequestError('extend.aspect: "W:H", e.g. "16:9"')
+        a = wide / high
+        if not math.isfinite(a) or h * a > side or w / a > side:
+            raise ImageRequestError(f"extend: the canvas would pass {side} pixels a side (max_side)")
         nw, nh = max(w, round(h * a)), max(h, round(w / a))
         pads = ((nw - w) // 2, (nh - h) // 2, nw - w - (nw - w) // 2, nh - h - (nh - h) // 2)
     else:
@@ -1914,7 +1919,7 @@ def parse_extend(v, w: int, h: int, side: int) -> tuple[int, int, int, int]:
             raise ImageRequestError('extend: "left", "top", "right" and "bottom" in pixels')
         try:
             px = [int(v.get(k) or 0) for k in ("left", "top", "right", "bottom")]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ImageRequestError("extend: whole pixels") from None
         pads = (px[0], px[1], px[2], px[3])
         if min(pads) < 0:
