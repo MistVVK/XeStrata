@@ -2313,30 +2313,36 @@ def strix_halo_notes(gpu, ram) -> list:
     return notes
 
 
-def rocm_roots() -> list:
+def rocm_roots(opt: Path = Path("/opt")) -> list:
     """AMD's ROCm tree the build takes, as one ([] without one), so that two installed versions are not mixed: /opt/rocm
     where it holds lib/ or include/ (ROCm 7.2's alternatives link to /opt/rocm-<version>, or ROCm 7.14's links into
     /opt/rocm/core-7.14 that its amdrocm-core packages make), else /opt/rocm/core (their alternatives link), else the
     newest /opt/rocm/core-<version> (ROCm 7.14's packages without amdrocm-core: nothing of /opt/rocm's own), else the
-    newest /opt/rocm-<version>.  The newest by the version's numbers: core-10.1 after core-7.14."""
+    newest /opt/rocm-<version>.  The newest by the version's numbers: core-10.1 after core-7.14.  `opt` is a seam for
+    the tests (a tree that stands for /opt)."""
     def newest(paths):
         return sorted(paths, key=lambda p: [int(n) for n in re.findall(r"\d+", p.name)], reverse=True)
-    opt = Path("/opt/rocm")
-    for root in [opt, opt / "core", *newest(opt.glob("core-*")), *newest(Path("/opt").glob("rocm-*"))]:
+    for root in [opt / "rocm", opt / "rocm" / "core", *newest((opt / "rocm").glob("core-*")),
+                 *newest(opt.glob("rocm-*"))]:
         if (root / "lib").is_dir() or (root / "include").is_dir():
             return [root.resolve() if root.is_symlink() else root]
     return []
+
+
+def ldconfig_print() -> str:
+    """`ldconfig -p`'s output, the loader's cache, "" when it cannot be run (a seam for the tests: the cache a fresh
+    machine reports is substituted with it)."""
+    try:
+        return subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace").stdout
+    except OSError:
+        return ""
 
 
 def rocm_lib_dirs() -> list:
     """The folders of AMD's ROCm libraries the engine needs on its library path: none where the loader finds
     libamdhip64 (a distribution's, or a ROCm that installs an ld.so.conf); ROCm 7.14's packages install none, and the
     SYCL runtime's HIP adapter then did not load (no GPU listed) until its lib/ was on LD_LIBRARY_PATH."""
-    try:
-        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace").stdout
-    except OSError:
-        cached = ""
-    if "libamdhip64.so" in cached:
+    if "libamdhip64.so" in ldconfig_print():
         return []
     return [str(r / "lib") for r in rocm_roots() if any((r / "lib").glob("libamdhip64.so*"))][:1]
 
@@ -2349,6 +2355,87 @@ def rocblas_archs() -> set | None:
     if not dirs:
         return None
     return {m.group(0) for d in dirs for f in d.iterdir() if (m := re.search(r"gfx[0-9a-f]+", f.name))}
+
+
+#: the ROCm libraries the engine's files link, by their ELF names' starts: the HIP runtime, rocBLAS, hipBLASLt
+AMD_ROCM_LIBS = ("libamdhip64", "librocblas", "libhipblaslt")
+
+
+def elf_needed(path) -> list:
+    """The DT_NEEDED library names of an ELF file, parsed here (no binutils run): the names a ROCm tree must have are
+    the ones the engine links, which its build decides (a distribution's rocBLAS can be a .so.4 another's is not).
+    [] when the file is no 64-bit little-endian ELF or cannot be read."""
+    try:
+        with Path(path).open("rb") as f:
+            head = f.read(64)
+            if head[:6] != b"\x7fELF\x02\x01":
+                return []
+            phoff, = struct.unpack_from("<Q", head, 0x20)
+            phentsize, phnum = struct.unpack_from("<HH", head, 0x36)
+            loads, dyn = [], None
+            f.seek(phoff)
+            for _ in range(phnum):
+                ph = f.read(phentsize)
+                p_type, = struct.unpack_from("<I", ph, 0)
+                p_offset, p_vaddr, p_filesz = (struct.unpack_from("<Q", ph, o)[0] for o in (8, 16, 32))
+                if p_type == 1:                     # PT_LOAD: the vaddr the string table's address names
+                    loads.append((p_vaddr, p_filesz, p_offset))
+                elif p_type == 2:                   # PT_DYNAMIC
+                    dyn = (p_offset, p_filesz)
+            if dyn is None:
+                return []
+            f.seek(dyn[0])
+            entries = [struct.unpack_from("<QQ", f.read(16)) for _ in range(dyn[1] // 16)]
+            strtab = next((v for t, v in entries if t == 5), None)   # DT_STRTAB: a vaddr
+            if strtab is None:
+                return []
+            off = next((o + (strtab - v) for v, fs, o in loads if v <= strtab < v + fs), None)
+            if off is None:
+                return []
+            f.seek(off)
+            blob = f.read()                                   # the string table, to the file's end
+            names = []
+            for t, v in entries:
+                if t == 1 and v < len(blob):                  # DT_NEEDED: an offset into the table
+                    end = blob.find(b"\0", v)
+                    if end > 0:
+                        names.append(blob[v:end].decode("ascii", "replace"))
+            return names
+    except (OSError, struct.error):
+        return []
+
+
+def engine_files(eng: Path) -> list:
+    """The engine's executables and the libraries bundled beside it (the engine folder's lib/), whose linked names
+    say what the GPU makers' runtimes must provide."""
+    out = [p for p in (eng / EXE, eng / IMAGE_EXE, eng / VISION_EXE) if p.is_file()]
+    out += sorted(p for p in (eng / "lib").glob("*.so*") if p.is_file()) if (eng / "lib").is_dir() else []
+    return out
+
+
+def amd_needed(eng: Path) -> list:
+    """The ROCm libraries' names the engine links (its files' DT_NEEDED: libamdhip64.so.7, librocblas.so.5,
+    libhipblaslt.so.1 on every build today - the engine's build decides them, not this code), [] when it links
+    none."""
+    return sorted({n for f in engine_files(eng) for n in elf_needed(f) if n.startswith(AMD_ROCM_LIBS)})
+
+
+def amd_rocm_usable(needed: list, gfx: set | list, roots=None) -> Path | None:
+    """The first of AMD's ROCm trees (rocm_roots(), the newest first) that can run this engine on the GPUs of `gfx`:
+    every library of `needed` in its lib/ under its own name (the loader's rule: another soname, a distribution's
+    .so.4 against AMD's .so.5, does not satisfy it), and rocBLAS's and hipBLASLt's code for every arch in `gfx`
+    (their kernel files' names).  None without one: the distribution's ROCm is asked for then, as before.  `roots` is
+    a seam for the tests."""
+    gfx = set(gfx)
+    for root in (rocm_roots() if roots is None else roots):
+        lib = root / "lib"
+        if not needed or not all((lib / n).exists() for n in needed):
+            continue
+        have = [{m.group(0) for f in d.iterdir() if (m := re.search(r"gfx[0-9a-f]+", f.name))}
+                for d in (lib / "rocblas/library", lib / "hipblaslt/library") if d.is_dir()]
+        if gfx and len(have) == 2 and all(gfx <= h for h in have):
+            return root
+    return None
 
 
 def distro_id() -> str:
@@ -2571,20 +2658,35 @@ def amd_libs_loadable() -> bool:
     """Whether the loader finds the HIP runtime, rocBLAS and hipBLASLt the engine links, whoever installed them: AMD's
     own packages (the Podman image's ROCm, container/install.sh) are not the distribution's that BUILD.json's runtime
     names."""
-    try:
-        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace").stdout
-    except OSError:
-        return False
-    return all(f"{lib}.so" in cached for lib in ("libamdhip64", "librocblas", "libhipblaslt"))
+    return all(f"{lib}.so" in ldconfig_print() for lib in ("libamdhip64", "librocblas", "libhipblaslt"))
 
 
-def runtime_missing(makers: set) -> tuple:
+def amd_rocm_line(rocm: Path | None) -> str:
+    """The one line setup says about which ROCm runs the engine: AMD's tree (with its path, which names the version),
+    else the distribution's (the loader's)."""
+    if rocm is not None:
+        return f"AMD: ROCm at {rocm} (ahead of the distribution's on the engine's library path)"
+    return "AMD: the distribution's ROCm (the loader's)"
+
+
+def amd_runtime_ok(gfx: set | list) -> bool:
+    """Whether the AMD GPUs of `gfx` have their runtime: the loader's (amd_libs_loadable) or a complete AMD ROCm
+    (amd_rocm_usable: the engine's linked names and the GPUs' archs), which the engine's library path is then pointed
+    at, ahead of the distribution's (prepare_engine).  AMD's packages install no ld.so.conf, so the loader sees nothing
+    of them and the distribution's was asked for; the user's own ROCm runs the engine when it can."""
+    if amd_libs_loadable():
+        return True
+    return amd_rocm_usable(amd_needed(packaged_engine_dir()), set(gfx)) is not None
+
+
+def runtime_missing(makers: set, gfx: set | None = None) -> tuple:
     """For the package's engine: the GPU makers' packages (BUILD.json's runtime) that the GPUs of `makers` need and
-    are not installed, those that would make them faster (OpenCL, which oneDNN's attention runs on; oneMKL, cuBLAS:
-    contrib; pip's are linux_nvidia_libs'), and the commands that add the repositories those come from.  Empty for an
-    engine without the record."""
+    are not installed (`gfx`: their AMD archs, this PC's without a name), those that would make them faster (OpenCL,
+    which oneDNN's attention runs on; oneMKL, cuBLAS: contrib; pip's are linux_nvidia_libs'), and the commands that
+    add the repositories those come from.  Empty for an engine without the record."""
     rt = packaged_engine().get("runtime") or {}
-    need = [n for m in ("intel", "amd") if m in makers and not (m == "amd" and amd_libs_loadable())
+    amd = "amd" in makers and not amd_runtime_ok(gfx if gfx is not None else amd_archs())
+    need = [n for m in ("intel", "amd") if m in makers and not (m == "amd" and amd)
             for n in rt.get(m, []) if not pkg_installed(n)]
     fast = [n for m, k in (("intel", "onednn"), ("intel", "onemkl"), ("nvidia", "cublas")) if m in makers
             for n in rt.get(k, []) if not pkg_installed(n)]
@@ -3054,7 +3156,7 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
     check_pdf()
     check_jsonschema()
     check_ffmpeg()
-    need, fast, repos = runtime_missing(makers)
+    need, fast, repos = runtime_missing(makers, gfx)
     if not need and not fast:
         return
     lines = runtime_commands(need, fast, repos)
@@ -8636,6 +8738,14 @@ def prepare_engine(a, gpu: dict) -> tuple[Path, Path, list]:
             lib_dirs.append(str(Path(mkl) / "lib"))
         if meta.get("license") == "contrib" and not WIN:
             lib_dirs += nvidia_lib_dirs(data_folder_path(a.data_dir, load_settings()))
+        if not WIN and (gfx := amd_archs()):
+            # AMD's own ROCm, when it can run this engine: ahead of the distribution's on the engine's library path
+            # (LD_LIBRARY_PATH wins over the loader's cache), also where the loader already finds it through an
+            # ld.so.conf of its own - the user's ROCm 10 over the distribution's 7 then
+            rocm = amd_rocm_usable(amd_needed(eng), gfx)
+            if rocm is not None:
+                lib_dirs.insert(1, str(rocm / "lib"))
+            ok(amd_rocm_line(rocm))
         ok(f"engine: {eng / EXE} ({meta.get('package', 'package')})")
     else:
         llama = get_llama_cpp()

@@ -71,6 +71,7 @@ GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコー�
 
 AMD の GPU では、prefill の密な行列積をディストリビューションの ROCm の rocBLAS と hipBLASLt で計算します。
 そのため、XeStrata が動くのは、ディストリビューションの rocBLAS がコードを持っている GPU だけです。
+AMD 自身の ROCm（amdrocm のパッケージ、`/opt/rocm/core-<版>`）が入っていて、エンジンのリンクする 3 つのライブラリと使う GPU のコードが揃っていれば、setup はディストリビューションの ROCm を求めずにそちらを使います（エンジンのライブラリの道をそちらに向けます）。
 
 | GPU | gfx | Ubuntu 26.04 | Fedora 44 と Windows |
 | --- | --- | :-: | :-: |

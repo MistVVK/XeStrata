@@ -73,6 +73,9 @@ The models, the install, the app and the API are much the same as Strata's.
 
 On AMD GPUs, prefill's dense matrix products run in the distribution's ROCm rocBLAS and hipBLASLt.
 So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
+When AMD's own ROCm is installed (the amdrocm packages, `/opt/rocm/core-<version>`) and holds the three libraries the
+engine links and the code of the GPUs in use, setup uses that one instead and does not ask for the distribution's (the
+engine's library path is pointed at it).
 
 | GPU | gfx | Ubuntu 26.04 | Fedora 44 and Windows |
 | --- | --- | :-: | :-: |

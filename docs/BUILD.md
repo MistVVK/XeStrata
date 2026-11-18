@@ -491,6 +491,7 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
   and Fedora's own repositories), and carries the adapter. The AMD code the engine has is recorded in `BUILD.json`
   (`hip_archs`), from which setup decides whether a GPU can be used.
 - The makers' packages the package recommends or suggests are recorded in `BUILD.json` too, by maker (`runtime`). setup asks apt or dnf which of those of the GPUs it uses are missing, and shows how to install them (adding a repository first where needed). Without the GPU's runtime it stops; without oneMKL or cuBLAS it only shows them and goes on.
+  With AMD's own ROCm installed from AMD's packages (amdrocm, `/opt/rocm/core-<version>`), the tree holding the libraries the engine links (its executables' NEEDED) and the code of the GPUs in use, the distribution's ROCm is not asked for: the engine's library path is pointed at that tree.
 - `third_party/nonfree/` is not packaged: the chat template is the one setup writes into the model's pack.
   The experimental speed projection's vector is downloaded by setup from the version's tag on GitHub when it is turned on.
 - The Python files are compiled when the package is built, and `xestrata` runs with `PYTHONDONTWRITEBYTECODE=1`: nothing is written
