@@ -9,7 +9,8 @@ macro(strata_quant_layer)
   endif()
   set(_sq ${STRATA_QUANT_ROOT})
   set(_strata_quant_srcs ${_sq}/src/quant/types.cpp ${_sq}/src/quant/isa.cpp ${_sq}/src/quant/dispatch.cpp ${_sq}/src/quant/selfcheck.cpp
-                         ${_sq}/src/quant/act_ref.cpp ${_sq}/src/quant/dot_generic.cpp ${_sq}/src/quant/dequant.cpp)
+                         ${_sq}/src/quant/act_ref.cpp ${_sq}/src/quant/dot_generic.cpp ${_sq}/src/quant/dequant.cpp
+                         ${_sq}/src/quant/sk_codecs.cpp)
   add_library(strata_quant STATIC ${_strata_quant_srcs})
   target_include_directories(strata_quant PUBLIC ${_sq}/include PRIVATE ${_sq}/src/quant)
   if(NOT MSVC)
