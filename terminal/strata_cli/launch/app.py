@@ -55,6 +55,36 @@ class Ctx:
     _help: str | None = None
     _help_exe: str | None = None             # the engine whose --help _help is: read once per engine, not again on every edit (#5940)
     _cmd: tuple | None = None                # (the choices and base config it was worked out for, the engine command): see command_text
+    probe_offline: bool = False              # S6: ask once, in the background, whether the download hosts answer (only the real launch screens turn this on)
+    offline: bool | None = None              # None: not asked yet (or not asked at all)
+    _probing: bool = False
+
+    def check_offline(self, on_done=None) -> None:
+        """S6: is this computer offline? One short HEAD request to each of the two hosts Strata downloads from (the download's own opener: same
+        certificates and proxy settings, strata_control/drafting_fetch.online), in a thread of its own; offline only when neither answers. The answer
+        is kept, so the Save screen says what is missing instead of "will download". Never raises, never blocks a screen."""
+        import os
+        if not self.probe_offline or self.offline is not None or self._probing:
+            return
+        if self.feed or os.environ.get("STRATA_UPDATE_FEED") or os.environ.get("HF_ENDPOINT"):
+            return                                           # an update source or mirror of the person's own: these two hosts say nothing about it
+        self._probing = True
+
+        def run() -> None:
+            try:
+                from strata_control import drafting_fetch
+                self.offline = not any(drafting_fetch.online(url, timeout=4.0) for url in ("https://huggingface.co/", "https://github.com/"))
+            except Exception:                                # noqa: BLE001 - not knowing counts as online: the download itself says what is wrong
+                self.offline = False
+            finally:
+                self._probing = False
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:                            # noqa: BLE001
+                    pass
+        import threading
+        threading.Thread(target=run, daemon=True, name="offline-check").start()
 
     def download_plan(self) -> dict | None:
         """What this launch would download (Runner.download_plan: the model's missing files, the draft layer, the picture reader, the DFlash2 drafter,
@@ -76,6 +106,15 @@ class Ctx:
         if key is not None:
             self._plan = (key, plan)
         return plan
+
+    def refresh_disk(self) -> None:
+        """Mark the Model list's disk verdicts again for the files in use: the model in the person's own folder needs no download (N1); every other
+        row counts only what it would download. Called when the own folder is chosen or the choice goes back to the list."""
+        s = self.settings
+        try:
+            self.catalog.apply_disk(self.rows, self.computer.raw, own=(s.family, s.model) if s.model_path and s.family and s.model else None)
+        except Exception:                                    # noqa: BLE001 - a mark in a list is never a reason to stop the screens
+            pass
 
     def computer_line(self) -> str:
         """The computer's one line (the header of the start screen, the model list) with the free disk read again now: it was read once when the
@@ -147,10 +186,13 @@ class Ctx:
         out += [n.line() for n in S.check_parallel(s, vram_gb=self.computer.main_vram_gb or None)]
         out += [n.line() for n in S.check_context(s)]
         r = next((x for x in self.rows if (x.family, x.model) == (s.family, s.model)), None)
-        if r is not None and r.verdict == "disk" and s.data_dir:         # the Folder step named another drive: its own free space decides
-            other = self.catalog.disk_free(s.data_dir)
-            if other is not None and other >= r.disk_need_gb:
-                r = None
+        if r is not None and r.verdict == "disk":
+            if s.model_path:                                             # N1: the files are the person's own, used where they are: no download to make room for
+                r = r.without_disk()
+            elif s.data_dir:                                             # the Folder step named another drive: its own free space decides
+                other = self.catalog.disk_free(s.data_dir)
+                if other is not None and other >= r.disk_need_gb:
+                    r = r.without_disk()
         if r is not None and r.verdict != "fits":
             out.append(f"{r.title}: {r.sentence}.")
         if self.computer.other_vendor_note:
@@ -575,7 +617,7 @@ def run_tui(settings: S.LaunchSettings | None, *, catalog: Catalog | None = None
     catalog = catalog or Catalog()
     print("Looking at this computer…", flush=True)
     computer = catalog.computer()
-    rows = catalog.rows(computer.raw)
+    rows = catalog.rows(computer.raw, own=(settings.family, settings.model) if settings is not None and settings.model_path and settings.family and settings.model else None)
     from strata_cli.launch.cmd import apply_defaults
     s = settings or S.LaunchSettings()
     notes: list[S.Notice] = []
@@ -585,7 +627,8 @@ def run_tui(settings: S.LaunchSettings | None, *, catalog: Catalog | None = None
             s.name = f"{s.model or 'model'} {S.context_label(s.context)}"
         if save:
             store.save(s, s.name)
-    ctx = Ctx(catalog=catalog, computer=computer, rows=rows, settings=s, glyphs=Glyphs(), feed=feed, move_data=move_data, retune=retune, restart=restart)
+    ctx = Ctx(catalog=catalog, computer=computer, rows=rows, settings=s, glyphs=Glyphs(), feed=feed, move_data=move_data, retune=retune, restart=restart,
+              probe_offline=True)
     app = LaunchApp(ctx, auto_run=auto_run)
     result = app.run()
     if getattr(app, "return_code", 0) not in (0, None) or getattr(app, "_exception", None) is not None:

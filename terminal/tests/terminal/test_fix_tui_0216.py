@@ -83,22 +83,10 @@ class T4ModelList(Base):
 
 
 class T7StepCounter(Base):
-    def test_no_total_on_the_model_step_where_the_model_decides_the_steps(self):
-        hw = mock.Mock(can_run=True)
-        with mock.patch("strata_control.drafting.hardware_support", return_value=hw), mock.patch("strata_control.drafting.ENGINE_SERVES_DFLASH2", True):
-            self.assertTrue(screens.total_depends_on_model(make_ctx()))
-
-            async def case(app, pilot, ctx):
-                await press(pilot, "enter")
-                t = text_of(app)
-                self.assertIn("Step 1: Model", t)
-                self.assertNotIn("Step 1 of", t)
-            self.run_app(case)
+    """T7 first took the total off the Model step ("Step 1: Model"); S1 (round 2) puts it back, counted for the model under the cursor (test_fix2_tui_0216.py)."""
 
     def test_the_total_stays_where_nothing_changes_it(self):
         with mock.patch("strata_control.drafting.ENGINE_SERVES_DFLASH2", False):
-            self.assertFalse(screens.total_depends_on_model(make_ctx()))
-
             async def case(app, pilot, ctx):
                 await press(pilot, "enter")
                 self.assertIn("Step 1 of 9: Model", text_of(app))

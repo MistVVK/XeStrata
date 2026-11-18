@@ -369,17 +369,19 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
         _q4 = _gf.strix_q4_stall_note(s.model, comp.gpus)       # REMOVE with the Strix stall fix (gpu_fit.STRIX_Q4_NOTE)
         if _q4:
             notices.append(S.Notice("warn", _q4, ""))
-        rows = [r for r in catalog.rows(hw) if r.family == s.family and r.model == s.model]
+        rows = [r for r in catalog.rows(hw, own=(s.family, s.model) if s.model_path else None) if r.family == s.family and r.model == s.model]
         if rows:
             r = rows[0]
+            if r.verdict == "disk":
+                other = catalog.disk_free(s.data_dir) if s.data_dir else None      # --data-dir names another drive: its free space decides
+                if other is not None and other >= r.disk_need_gb:
+                    r = r.without_disk()
             if r.verdict == "no":
                 notices.append(S.Notice("warn", f"{r.title} does not fit this computer.", "It can still start; expect it to be slow or to run out of memory."))
             elif r.verdict == "slower":
                 notices.append(S.Notice("warn", f"{r.title}: {r.words}.", ""))
             elif r.verdict == "disk":
-                other = catalog.disk_free(s.data_dir) if s.data_dir else None      # --data-dir names another drive: its free space decides
-                if not s.model_path and not (other is not None and other >= r.disk_need_gb):   # (own files are used where they are: no download)
-                    notices.append(S.Notice("warn", f"{r.title}: {r.sentence}.", "It can still start, but the download is likely to stop; free some space first."))
+                notices.append(S.Notice("warn", f"{r.title}: {r.sentence}.", "It can still start, but the download is likely to stop; free some space first."))
             elif r.verdict == "tight" and s.model_path and "disk space" in r.words:
                 pass                                         # the files are already here ("used where they are"): there is no download to make room for
             elif r.verdict == "tight":
