@@ -15005,7 +15005,7 @@ int main(int argc, char** argv) {
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
-                if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
+                if (k > 0 && ((!use_mtp && !use_df2) || sbuf[0] == drafts[0])) {
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
@@ -15304,7 +15304,7 @@ int main(int argc, char** argv) {
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
                         drive.d.pcie_num);
         (void) pool_ms0;
-        if (use_mtp && rounds > 0)
+        if (use_mtp && mtp.rounds > 0)
             std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",
                         mtp.ms_draft / (double) mtp.rounds, (long long) mtp.rounds, mtp.ms_prefill,
                         (double) mtp.vram_bytes() / 1048576.0);
