@@ -285,18 +285,21 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
    - `pose`: 人物の姿勢（YOLOX-L で人を見つけ、DWPose で体・手・顔の点を取り、OpenPose の形に描く）。`detect_body`・`detect_hands`・`detect_face`（既定はすべて `true`）。
    - `depth`: 深度（Depth Anything V2 Small。近いほど白）。Qwen-Image-2.1 で元の図と違う物を描くときは、`strength: 0.6` が目安です。
    - `canny`: 輪郭（Canny）。`low_threshold`・`high_threshold`（既定 100・200）。
-   - `lineart`・`lineart_coarse`: 線画。Qwen-Image-2.1 では写真から HED の丸めない輪郭を作り、3×3 で太らせます。細い線やハッチングは制御でなく図そのものとして写されやすいためです。手描きの線画には `lineart_input: "drawing"` を付けると、明るい背景を黒へ反転し、線を太らせて軽くぼかします。ほかのモデルは細い線・粗い線を使います。
+   - `lineart`・`lineart_coarse`: 線画。Qwen-Image-2.1 では写真から HED の丸めない輪郭を作り、3×3 で太らせます。細い線やハッチングは制御でなく図そのものとして写されやすいためです。手描きの線画には `lineart_input: "drawing"` を付けると、明るい背景を黒へ反転し、線を太らせて軽くぼかします。MOSS-Image は学習時の細い線・粗い線を使います。
    - `hed`: 柔らかい輪郭（HED。`safe` で段に丸める、既定 `true`）。`scribble_hed`: その輪郭から作る下描き。
    - `scribble`: 画像そのものの暗い線。`scribble_xdog`: 拡張したガウスの差（XDoG）で作る下描き（`threshold`、既定 12）。
    - `mlsd`: 直線（M-LSD。部屋や建物）。`score_threshold`・`distance_threshold`（既定 0.1・0.1）。
+   - `normal`: 面の向き（BAE 法線）。MOSS-Image では図の色分布を制御 LoRA の例に合わせ、細部を滑らかにします。全身やアップなどの構図をプロンプトに書きます。
+   - `segmentation`: 物体や背景の領域（UniFormer、ADE20K の 150 種）。全身やアップ、人の位置などの構図をプロンプトに書きます。MOSS-Image と参照画像を使うモデルで使えます。
    - `gray`: 陰影（グレー）。
    - `color`（MOSS-Image だけ）: 物体ごとの色の地図（SAM 3 で人・物・空・床などを見つけ、1 つずつ別の色で塗り、ほかは黒）。SAM License に同意していないと使えません。
-   - `none`: 画像がすでに制御の図（`preprocess: false` と同じ）。
+   - `none`: 画像がすでに制御の図。加工せずに渡します。種類を選んだまま `preprocess: false` を付けても加工せずに渡します。
 - `resolution` は図を作るときの画像の短い辺です（既定 512、64〜2048）。
 - 大きさを付けない生成では、`control.image` の形で約 1024x1024 にします。図は描く大きさに合わせて引き伸ばします。
 - Qwen-Image-2.1: alibaba-pai の Fun ControlNet Union で描きます。`strength`（既定 1、0〜2）、効かせる範囲の `start`・`end`（ステップの割合。既定 0 と 1。`end` を 0.6〜0.8 にすると構図を保ったまま細部が自由になる）、マスクのある編集では塗った部分も ControlNet に渡します（`inpaint: false` で渡さない）。
 - MOSS-Image の `color` と `depth`: darask0 の色と深度のアダプター（MOSS-Image の入力の層を広げ、LoRA を足したもの）で描きます。`control` を 2 つの配列にすると色と深度を両方使えます。`strength` はアダプターの LoRA の強さ（既定 1）、`end` はその図を使うステップの割合（既定 1。3D のマネキンなどから作った図は 0.5 がよい）です。`start` は学習されていないので受けません。人や物の位置と大きさを決めたいときに使い、プロンプトには物ごとの説明を書きます。
-- ControlNet のないモデル（Mage-Flow の編集、HunyuanImage 3.0、編集のある MOSS-Image のほかの種類）: 図を参照の画像の 1 枚として渡し、プロンプトの最後に「その図の姿勢に沿う」などの頼みを足します。姿勢はよく効きますが、輪郭と深度では元の画像の人物まで写すことがあります。`strength`・`start`・`end` は受けません。
+- MOSS-Image SFT の `canny`・`pose`・`normal`・`segmentation`・`lineart`・`lineart_coarse`・`hed` と下描きは、thedeoxen の種類に合う制御 LoRA を使います。図は ai-toolkit 形式の参照画像として渡します。`strength` は LoRA の強さ（既定 1）です。`depth` に `backend: "lora"` を付けると、darask0 の代わりに thedeoxen の深度 LoRA を使います。LoRA の `start`・`end` は 0・1 だけを受けます。
+- ControlNet のないモデル（Mage-Flow の編集、HunyuanImage 3.0、MOSS-Image のその他の種類）: 図を参照の画像の 1 枚として渡し、プロンプトの最後に「その図の姿勢に沿う」などの頼みを足します。`strength`・`start`・`end` は受けません。
 - 編集のないモデル（MageTrail、Anima、編集のない MOSS-Image の色と深度以外）は `control` を受けません。
 - 重み（Fun ControlNet Union、前処理の網、MOSS-Image のアダプター）は、初めて使うときにサーバーが取ります（取っている間は 503 で、進み具合を返します）。
 - 応答の `xestrata-engine` には、作った図の大きさと秒数が入ります。
@@ -685,6 +688,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 - 背景を消す BiRefNet の 7 つの版の重みは、Peng Zheng の [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) で、MIT です。
 - 構図の制御の Fun ControlNet Union（Qwen-Image-2.1 用）は alibaba-pai の [Qwen-Image-2.1-Fun-Controlnet-Union](https://huggingface.co/alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union) で、Qwen-Image-2.1 と同じく Qwen Research License です。自由なソフトウェアのライセンスではないので、商用に使う前にそのライセンスを読んでください。
 - MOSS-Image の色と深度のアダプターは darask0 の作品で、Apache 2.0 です。[Comfy-Org の再配布](https://huggingface.co/Comfy-Org/MOSS-Image)から取ります。
+- MOSS-Image の種類ごとの制御 LoRA は [thedeoxen](https://huggingface.co/thedeoxen/MOSS-Image-canny-control-lora) の作品で、Apache 2.0 です。
 - 構図の制御の図を作る網の重み:
    - 深度の Depth Anything V2 Small（Lihe Yang ほか）は [Depth-Anything-V2-Small-hf](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf) で、Apache 2.0 です（Base より大きいものは非商用なので使いません）。
    - 姿勢の DWPose（Zhendong Yang ほか）は [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) で、Apache 2.0 です。人を見つける YOLOX-L は Megvii の [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) のリリースと同じファイル（[kadirnar/yolox_l-v0.1.1](https://huggingface.co/kadirnar/yolox_l-v0.1.1)）で、Apache 2.0 です。

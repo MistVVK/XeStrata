@@ -29,10 +29,13 @@ turn of its own (the engine's AUXNEED control, then CONTROL), before the drawing
 from __future__ import annotations
 
 import base64
+import bisect
 import contextlib
 import io
+import struct
 import tempfile
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +44,7 @@ from serve import images as img
 from serve import loras as lora_api
 
 KINDS = ("canny", "depth", "pose", "lineart", "lineart_coarse", "hed", "scribble_hed", "scribble", "scribble_xdog",
-         "mlsd", "gray")
+         "mlsd", "gray", "normal", "segmentation")
 MOSS_KINDS = ("color", "depth")   # MOSS-Image's own control (its adapter)
 MOSS_CONTROL = "moss-control"     # image_aux's name of darask0's adapter
 # the color map's concepts, as the adapter's training maps had them (COCO panoptic's things and its main stuff): SAM 3
@@ -69,7 +72,8 @@ FOLLOW = {"pose": "the pose of the person in image {i}", "depth": "the compositi
           "lineart_coarse": "the line drawing of image {i}", "hed": "the outlines of image {i}",
           "scribble_hed": "the sketch in image {i}", "scribble": "the sketch in image {i}",
           "scribble_xdog": "the sketch in image {i}", "mlsd": "the straight lines and layout of image {i}",
-          "gray": "the shading and composition of image {i}", "none": "the structure of image {i}"}
+          "gray": "the shading and composition of image {i}", "normal": "the surface orientation of image {i}",
+          "segmentation": "the objects and their layout in image {i}", "none": "the structure of image {i}"}
 
 
 def mode_of(cfg: dict, kind: str) -> str | None:
@@ -77,9 +81,11 @@ def mode_of(cfg: dict, kind: str) -> str | None:
     None."""
     caps = img._qimage().family_capabilities(cfg.get("family"))
     if caps.get("control") == "controlnet":
-        return "controlnet" if kind != "color" else None
+        return "controlnet" if kind not in ("color", "normal", "segmentation") else None
     if caps.get("control") == "moss" and kind in MOSS_KINDS:
         return "moss"
+    if kind in caps.get("control_loras", {}) and img.can_edit(cfg):
+        return "lora"
     if caps.get("control_reference") and img.can_edit(cfg) and kind != "color":
         return "reference"
     return None
@@ -101,7 +107,9 @@ def weight_names(kind: str, mode: str | None) -> list[str]:
     """image_aux's weights a control of `kind` reaches the model of `mode` through: the kind's networks (W:, W2:),
     then the ControlNet."""
     q = image_aux._qimage()
-    return list(q.CNET_KINDS.get(kind, ())) + ([UNION] if mode == "controlnet" else [])
+    extra = ([UNION] if mode == "controlnet" else
+             [f"moss-control-{q.family_capabilities('moss-image')['control_loras'][kind]}"] if mode == "lora" else [])
+    return list(q.CNET_KINDS.get(kind, ())) + extra
 
 
 def _num(v: dict, key: str, lo: float, hi: float, default: float) -> float:
@@ -174,6 +182,8 @@ def _moss(items: list, cfg: dict, picture: bytes | None) -> dict:
         if not isinstance(v, dict):
             raise img.ImageRequestError("control: an object {type, image, strength, end, ...}, or a list of them")
         kind = _kind(v)
+        if v.get("backend") not in (None, "moss"):
+            raise img.ImageRequestError("control.backend: color and depth together need the moss backend")
         if kind not in MOSS_KINDS:
             raise img.ImageRequestError(f"control.type: MOSS-Image's control takes color and depth together (a list); "
                                         f"{kind!r} goes alone (a reference image)")
@@ -218,25 +228,39 @@ def parse_control(v: Any, cfg: dict, picture: bytes | None = None) -> dict:
     if kind != "none" and kind not in KINDS + MOSS_KINDS:
         raise img.ImageRequestError(f"control.type: one of {', '.join(kinds_for(cfg))} or none (the image a map "
                                     "already)")
-    mode = mode_of(cfg, kind if kind != "none" else "canny")
+    mode = mode_of(cfg, kind)
+    backend = v.get("backend")
+    if backend is not None:
+        if kind != "depth" or mode != "moss" or backend not in ("moss", "lora"):
+            raise img.ImageRequestError("control.backend: moss or lora, for MOSS-Image depth only")
+        if backend == "lora":
+            if not img.can_edit(cfg):
+                raise img.ImageRequestError("control.backend lora: this MOSS-Image model has no edit adapter")
+            mode = "lora"
     if mode is None:
         raise img.ImageRequestError(f"control.type {kind}: not this image model's (it takes "
                                     f"{', '.join(kinds_for(cfg)) or 'none'})")
     if mode == "moss":
         return _moss([v], cfg, picture)
-    if v.get("preprocess") is False:
+    as_map = v.get("preprocess") is False
+    if as_map and mode != "lora":
         kind = "none"
-    out: dict[str, Any] = {"type": kind, "image": _picture(v, picture), "mode": mode,
+    out: dict[str, Any] = {"type": kind, "image": _picture(v, picture), "mode": mode, "as_map": as_map,
                            "resolution": int(_num(v, "resolution", 64, MAX_RESOLUTION, RESOLUTION)),
                            "params": _params(v, kind)}
     lineart_input = v.get("lineart_input")
-    if lineart_input is not None and (mode != "controlnet" or kind not in ("lineart", "lineart_coarse")):
+    if lineart_input is not None and (mode != "controlnet" or kind not in ("lineart", "lineart_coarse") or as_map):
         raise img.ImageRequestError("control.lineart_input: photo or drawing for a preprocessed ControlNet lineart")
     if mode == "controlnet" and kind in ("lineart", "lineart_coarse"):
         if lineart_input not in (None, "photo", "drawing"):
             raise img.ImageRequestError("control.lineart_input: photo or drawing")
         out["lineart_input"] = lineart_input or "photo"
-    if mode == "controlnet":
+    if mode == "lora":
+        out["strength"] = _num(v, "strength", 0.0, 2.0, 1.0)
+        for key, default in (("start", 0.0), ("end", 1.0)):
+            if v.get(key) is not None and _num(v, key, 0.0, 1.0, default) != default:
+                raise img.ImageRequestError(f"control.{key}: scheduled control LoRA is not available")
+    elif mode == "controlnet":
         out["strength"] = _num(v, "strength", 0.0, 2.0, 1.0)
         out["start"] = _num(v, "start", 0.0, 1.0, 0.0)
         out["end"] = _num(v, "end", 0.0, 1.0, 1.0)
@@ -284,15 +308,28 @@ def parse_job(req: dict, cfg: dict, files: list[bytes] | None = None, mask: byte
     c = parse_control(req.get("control"), cfg, picture)
     r = {k: v for k, v in req.items() if k not in ("control", "control_image")}
     files = list(files or [])
+    if not files and r.get("size") in (None, "", "auto"):
+        r["size"] = "{}x{}".format(*img.ref_size(*img.image_dims(c["image"])))
     if c["mode"] == "moss" and r.get("strength") is not None and not files:
         raise img.ImageRequestError("strength: an edit's or img2img's; the control's strength is control.strength")
-    if c["mode"] == "reference":
+    if c["mode"] == "lora":
+        if files or mask is not None or r.get("edit_adapter") not in (None, ""):
+            raise img.ImageRequestError("control: a control LoRA with another edit adapter or mask is not available")
+        if str(cfg.get("model_name") or "").startswith("moss-image-base"):
+            raise img.ImageRequestError("control: the control LoRA has not been checked with MOSS-Image Base")
+        if not cfg.get("vision"):
+            raise img.ImageRequestError("control: the MOSS-Image vision encoder is required (run setup again)")
+        if r.get("steps") is None and r.get("num_inference_steps") is None:
+            r["steps"] = 30
+        if r.get("guidance_scale") is None and r.get("true_cfg_scale") is None:
+            r["guidance_scale"] = 4.0
+        r.setdefault("uncond_skip_layers", [])
+        job = img.parse_edit_request(r, [c["image"]], {**cfg, "edit_format": "ai-toolkit"})
+    elif c["mode"] == "reference":
         job = img.parse_edit_request(r, files + [c["image"]], cfg, mask)
     elif edit or files:
         job = img.parse_edit_request(r, files, cfg, mask)
     else:
-        if r.get("size") in (None, "", "auto"):
-            r["size"] = "{}x{}".format(*img.ref_size(*img.image_dims(c["image"])))
         job = img.parse_request(r, cfg)
     job["control"] = c
     return job
@@ -356,6 +393,54 @@ def _lineart_map(png: bytes, drawing: bool) -> bytes:
     return out.getvalue()
 
 
+# RGB histograms of the leftmost control in thedeoxen's normal card images/figure.jpg, revision
+# fd4eb2c19e31a606d97bab5b9e59cad8426dcfd8 (350 x 512 crop).  Matching and smoothing kept both a full-body
+# composition and a close-up in RTX 4070 checks; BAE alone and matching without smoothing did not.
+_NORMAL_TARGET = (
+    'c-rmOcWh2k7{~E*->RybEv-^iC_$*I5ix=q31ZLI$g7Aw6I5G!HKbIHNbHCh2{nRHn<84HViS}`qAg;Di19snf8ve5{7c;AljrVx'
+    '?itTH#{Ajlz@=DBe7s^wlt38-AyBcrVikm-6lx+EHMCy`%}^f=(E#<(86D6QT@ZtKbV6V0gWhP3e(0g&Ug(DL7=|S6564{0z-Wxb'
+    'EKI@##Y8L>yFVW(NWf$yW1h~B!V0X?H&*MJ1euLAq+^L}!Y*XtD7NB0G8J#)i>)8WQ{kTo;lwx$Qk;bp48$B9!x|bW$k&+1#raQv'
+    'W4_WT2WWs?Vjc~Xjf3Ub4>e{>gfY*fj9J*inAcQ(SK_)x##F6sOyw|RmRB&QJ<qlZFs7X!b<TT>Xy_`4<2xbvz&H0|3RYklrmH;t'
+    'F<93IV2HR;SJ&)u6q+IgF^E8{<N4nP2-Q9IdMOl87w_;E5Ah9mk%RL%h*Q{!1K5MjIF5~K$89>lUgvC^Ey7~8rERkXY9o7nt<Eh|'
+    '+uF9Df)VOd3F>nL)gMP{e}Jyr{uZa>SjFz@zizZal={EjZ>sSS4w}kDNT|k8pvIYF{+`X{71gbcpYn&VatB@0RM4^AryHBH$}Rq0'
+    '$7NIprFAX9>wddmQ7Y-aFx6Xa)p1+pmi}s|aT<41Dbz~5!$t}kMPHAnfX#WaKLy)QVwxC9&Z3dhNI01^+D8&wJ|DkHVtc{I-4w`8'
+    'EZ~RI`N18;44yB<9UMgjKiH7>p5^^P#6)~UKIiAb!6f8yt}!tf)7cM4UF7iGY>dMgM4}^VArNmV`+e-j5+q>+ViAod=!ANB!@v3w'
+    'cM=a{17<3}BqJU@(M{vfj=}HLRV`u|eC_k_!Do%jLVQ3zZr~~|YD{J+zh!EC+A(|@=dc}nb>AgqXk6R-FX%nzHNJP_h-Aw#+{P^w'
+    ';Rzn;`KS8UHC#uY?tP9Ec&vAx(Kk-&xvPpcf4syMeal|Itg_^YEz1MlZ?ErDe$P^wuB(1*xe8R4uf~(#ZBBD}<w4sQdtm|+u?M%2'
+    'j|`-%t<oG%4t#|Th}Jmp`EBn0zy06-h0XC=i~d}Dy0l)jIliUViO03(%G5latF>3O^4SfIRh!G6+4ZH?Rl$xYClqR2Hqu&VI7(_g'
+    '5`<<L>UiEa7JW4qt5KL~#8l<a)i{AyHb=UCd8E7>E|EyaA>2a?eylnc;tVds%@037D)Ye>26+;5OEweZd*+@1ets}(xFROA4lGU<'
+    'x92-dc$cbC?#ir7m=FtC&$VN&>c_-+ig_xR$?*quCHz1'
+)
+
+
+def _normal_map(data: bytes) -> bytes:
+    """Match the control LoRA's example's RGB distributions, then soften details at the map's own scale."""
+    from PIL import Image, ImageFilter
+
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    source = im.histogram()
+    target = struct.unpack("<768I", zlib.decompress(base64.b85decode(_NORMAL_TARGET)))
+    pixels = im.width * im.height
+    lut = []
+    for channel in range(3):
+        src = source[channel * 256:(channel + 1) * 256]
+        dst = target[channel * 256:(channel + 1) * 256]
+        total = sum(dst)
+        cumulative = []
+        n = 0
+        for count in dst:
+            n += count
+            cumulative.append(n * pixels)
+        n = 0
+        for count in src:
+            n += count
+            lut.append(min(255, bisect.bisect_left(cumulative, n * total)))
+    im = im.point(lut).filter(ImageFilter.GaussianBlur(2 * min(im.size) / 512))
+    out = io.BytesIO()
+    im.save(out, "PNG")
+    return out.getvalue()
+
+
 def preprocess(svc, gen, c: dict, cancel=None) -> dict:
     """The control image of the control `c` (parse_control's): the engine's CONTROL in a GPU turn of its own (its
     networks' weights image_aux's: AuxPending while they download) -> {"image": PNG bytes, "width", "height",
@@ -400,6 +485,8 @@ def preprocess(svc, gen, c: dict, cancel=None) -> dict:
             with contextlib.suppress(OSError):
                 work.rmdir()
     gen.end(None)
+    if c["type"] == "normal" and c.get("mode") == "lora":
+        png = _normal_map(png)
     return {"image": png, "width": w, "height": h, "seconds": round(time.monotonic() - t0, 3),
             "engine_s": float(got.get("control_s") or 0.0)}
 
@@ -420,14 +507,20 @@ def prepare(svc, gen, job: dict, cancel=None) -> None:
     if c.get("lineart_input") == "drawing":
         prep_kind = "canny"   # no preprocessor network; the ControlNet is still needed
     names = weight_names(prep_kind, mode) if prep_kind != "none" else weight_names("canny", mode)
-    weights(gen, names)
-    made = preprocess(svc, gen, c, cancel)
+    if c.get("as_map") and mode == "lora":
+        names = names[-1:]
+    paths = weights(gen, names)
+    made = preprocess(svc, gen, {**c, "type": "none"} if c.get("as_map") else c, cancel)
     c["figures"] = {"type": c["type"], "size": f"{made['width']}x{made['height']}", "seconds": made["seconds"],
                     "engine_s": made["engine_s"], "mode": mode}
     c["map_png"] = made["image"]   # the chat's control links it, so another call takes it as it is (type none)
     if mode == "controlnet":
         c["net"] = weights(gen, [UNION])[0]
         c["map"] = made["image"]
+    elif mode == "lora":
+        job["refs"] = [img.moss_ref(made["image"], img.MOSS_AITK_REF_PIXELS, grow=False)]
+        job["edit_lora"] = None
+        job["loras"] = list(job.get("loras") or []) + [{"name": names[-1], "path": paths[-1], "scale": c["strength"]}]
     else:   # the edit's last reference (parse_job's place for it) becomes the map
         refs = list(job.get("refs") or [])
         if not refs:
@@ -575,7 +668,7 @@ def preview_response(svc, gen, req: dict, base_url: str, cancel=None) -> dict:
         # the map alone: checked as a ControlNet's fields whatever the model (no strength applies here)
         c = parse_control({**{k: v for k, v in fields.items() if k not in ("strength", "start", "end")}},
                           gen.cfg, req["picture"])
-        made = preprocess(svc, gen, c, cancel)
+        made = preprocess(svc, gen, {**c, "type": "none"} if c.get("as_map") else c, cancel)
     entry = ({"url": f"{base_url}/v1/images/files/{gen.store(made['image'], 'png')}"}
              if req["response_format"] == "url" else {"b64_json": base64.b64encode(made["image"]).decode()})
     return {"created": int(time.time()), "type": c["type"], "width": made["width"], "height": made["height"],

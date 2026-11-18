@@ -4054,12 +4054,15 @@ TOOLS: list[dict[str, Any]] = [
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "the whole new image"},
          "type": {"type": "string", "enum": ["canny", "depth", "pose", "lineart", "lineart_coarse", "hed",
-                                             "scribble_hed", "scribble", "scribble_xdog", "mlsd", "gray", "color",
+                                             "scribble_hed", "scribble", "scribble_xdog", "mlsd", "gray", "normal",
+                                             "segmentation", "color",
                                              "none"]},
          "image": IMAGE_ARG,
          "size": {"type": "string", "description": "WxH"},
          "strength": {"type": "number"},
+         "start": {"type": "number"},
          "end": {"type": "number"},
+         "backend": {"type": "string", "enum": ["moss", "lora"]},
          "lineart_input": {"type": "string", "enum": ["photo", "drawing"],
                            "description": "for ControlNet lineart: drawing for a hand-drawn sketch"},
          "seed": {"type": "integer"}},
@@ -5100,7 +5103,7 @@ class ImageTools:
                 data = self._image(str(args.get("image") or ""))
                 if data is None:
                     raise ImageRequestError("there is no picture in the conversation to take the composition from")
-                req["control"] = {k: args[k] for k in ("type", "strength", "end", "lineart_input")
+                req["control"] = {k: args[k] for k in ("type", "strength", "start", "end", "backend", "lineart_input")
                                   if args.get(k) not in (None, "")}
                 job = _controls().parse_job(req, gen.cfg, picture=self.normalize(data))
             else:
@@ -5151,6 +5154,7 @@ class ImageTools:
                 text += (f" control took the picture's {job['control']['type']} map ({cf.get('size', '?')}) "
                          + ("through ControlNet." if cf.get("mode") == "controlnet" else
                             "through MOSS-Image's color and depth adapter." if cf.get("mode") == "moss" else
+                            "through a MOSS-Image control LoRA." if cf.get("mode") == "lora" else
                             "as a reference image (this model has no ControlNet)."))
                 made_map = job["control"].get("map_png")
                 if made_map is not None and job["control"]["type"] != "none":

@@ -77,6 +77,36 @@ from pathlib import Path
 # would be 130 characters
 _HY_C_SHA = "b57626bc1840b64b47cb8d885a61298b352acf79"
 
+# thedeoxen's MOSS-Image control LoRAs: kind -> (revision, bytes, SHA-256, card bytes, card SHA-256)
+MOSS_CONTROL_LORAS = {
+    "canny": ("ecf3dc63cc2cbeb2147dac428181ad4c1db476b9", 290_254_336,
+              "1c4408155e563f6822b7afc856860068e90fb606d183b3fb5ed1ff81b812d977", 4355,
+              "fcc43e3bb3549a5e4b54944164defcfbe186623f1f53553d258ee06e6a061d9b"),
+    "depth": ("a955f9662e967736e15edd528c19b2dd79a18b61", 290_254_336,
+              "e27db7c8e707cd1f2ff2e1335f3cefd7c56fda7efdd000af5e5fe2beb67d4078", 4227,
+              "53b8209d310dec710d818d6ff9aae84b85f3922969ac6c4da2f5f2f8eec09a82"),
+    "pose": ("95021788ef0c22f0baa64c0a95d7c17a3b7c1d0a", 290_254_336,
+             "2063c9bff0563d256cadf4bd02c185a2622aa2746ca60e1fc2daa40457d9c732", 4508,
+             "11fc6733f12689c7302a0549b08c31d2a9c367eecf03d7c76475d505dcc659f2"),
+    "normal": ("fd4eb2c19e31a606d97bab5b9e59cad8426dcfd8", 290_254_336,
+               "7743e87a75cd45c0a0f046e2d1c3f484c0b29c3083c94d91b402d93b2b5004e8", 4327,
+               "b36e4a5575ddea3860eb356c9c6ad0b7d23f1ab367111398692c18a0b18dc44e"),
+    "lineart": ("0367cdce8d04dabd4335eca898238dad2ab7efae", 290_254_336,
+                "c32aa35e0ca1adb1a9c284ff81c84a848d50282368eca647dd15bce0c113878a", 4375,
+                "955346a31722fed6f642d890e1b6a13e0e785051d440508fcdcf3dc772b7eeed"),
+    "scribble": ("f9a6a551cd26a843b068cfcfcb1ca5ef6447fae2", 290_254_344,
+                 "9266ebfb485788f3f1d55d1ae7dc46a152c425d06d995b15fc17fb849125c0a5", 4332,
+                 "82ef17ed88a086462443adf9d152a24f1dfb020baae46b63cac310da7556e0b2"),
+    "segmentation": ("4ac8b849f30cacded71718c5912f5decc11209ef", 290_254_328,
+                     "63ddb98dd1be0ee6cac57b476139b7e1207d79df665107add0426ff535d661a2", 4615,
+                     "4cf2e53403e7441a7fedaa0cdaa36698d1ec7deae0fa63745de6cde8026ef0a7"),
+}
+
+
+def moss_control_repo(kind: str) -> str:
+    return f"thedeoxen/MOSS-Image-{kind}-control-lora"
+
+
 REVISIONS = {                                       # the `sha` of https://huggingface.co/api/models/<repo>, 2026-10-12
     "unsloth/Qwen-Image-2.1-Turbo-GGUF": "5d1f9f759ea877ae556cda88dbec958b62ad3809",
     "unsloth/Qwen-Image-2.1-FP8": "bb21a8ba7f0371c19ad1f72c82a5e8fc10f39939",
@@ -112,6 +142,9 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "depth-anything/Depth-Anything-V2-Small-hf": "5426e4f0f36572d16453bbda7a8389317b1bef99",     # 2026-11-08
     "yzd-v/DWPose": "1a7144101628d69ee7a3768d1ee3a094070dc388",                                  # 2026-11-08
     "kadirnar/yolox_l-v0.1.1": "f63e87ffbded0e30713d32dba22501f56fe5007e",                       # 2026-11-08
+    **{moss_control_repo(k): v[0] for k, v in MOSS_CONTROL_LORAS.items()},  # 2026-11-18
+    "imaginairy/imaginairy-normal-uncertainty-map": "912c5e1a1091371210f178fde95d62ecfe8e9e31",  # 2026-11-18
+    "Andy1621/uniformer": "375d5e867daabf0e360ff4d912b39fd58ad5ae27",  # 2026-11-18
     "Comfy-Org/MOSS-Image": "2929efe3cdd506c0a430bcfca70a9a8d805cc095",                           # 2026-11-18
     "akhaliq/MOSS-Image-SFT-4-steps": "2ded95c37a029360245926fe72e475e30039bbfb",                  # 2026-11-18
     "ZhengPeng7/BiRefNet_lite": "aa62cd87eafb9cc43056d08ef3615a14628b831d",                        # 2026-11-07
@@ -449,6 +482,27 @@ TERMS: dict[str, dict] = {
              "0ec3668d3274bcf29e8a29e9576d5a2cd96fc78d3c5bec4387355a796e5d9088"),
         ],
     },
+    "imaginairy/imaginairy-normal-uncertainty-map": {
+        "license": "MIT", "card": "mit", "texts": [
+            ("hf:imaginairy/imaginairy-normal-uncertainty-map", "912c5e1a1091371210f178fde95d62ecfe8e9e31",
+             "README.md", 21, "3e0e15fa0c5cc81675bd69af8eb469d128a725c1a7bfc71f03b7877b7b650567"),
+            ("gh:baegwangbin/surface_normal_uncertainty", "fe2b9f1e8a4cac1c73475b023f6454bd23827a48",
+             "LICENSE", 1069, "e8e7f72709b868721f23fe399e3165871b24d272cccd43daae313b0d288dd3a2"),
+        ],
+    },
+    "Andy1621/uniformer": {
+        "license": "MIT (weights), Apache-2.0 (source)", "card": "mit", "texts": [
+            ("hf:Andy1621/uniformer", "375d5e867daabf0e360ff4d912b39fd58ad5ae27", "README.md", 218,
+             "25ac963f52752b3c1a910b3533ee1ab9dda449e1f09a22d027e2cc66c45822b8"),
+            ("gh:Sense-X/UniFormer", "52a0415e4e0dda880fab8ffbc710e4d8e171149d", "LICENSE", 11400,
+             "a3bae0ae5b5df47101f0eaa3d562bd99ca6d3588cae266b27bb6b3783fef1011"),
+        ],
+    },
+    **{moss_control_repo(k): {"license": "Apache-2.0", "card": "apache-2.0", "texts": [
+        (f"hf:{moss_control_repo(k)}", v[0], "README.md", v[3], v[4]),
+        ("hf:OpenMOSS-Team/MOSS-Image-SFT", "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9", "LICENSE", 11358,
+         "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
+    ]} for k, v in MOSS_CONTROL_LORAS.items()},
     "Comfy-Org/MOSS-Image": {
         "license": "Apache-2.0",
         "card": "apache-2.0",
@@ -787,6 +841,12 @@ FILES = {
                     "0d9408b13cd863c4e95a149dd31232f88f2a12aa6cf8964ed74d7d97748c7a07"),
     "cnet-yolox": (_YX, "yolox_l.pth", 434_357_141,
                    "1e6b7fa6240375370b2a8a8eab9066b3cdd43fd1d0bfa8d2027fd3a51def2917"),
+    "cnet-normal": ("imaginairy/imaginairy-normal-uncertainty-map", "scannet.pt", 290_767_728,
+                    "03dbf1600c51ee3d45c29f77b77bf1a3b7a24c3452dba62a4ae658f37330c209"),
+    "cnet-segmentation": ("Andy1621/uniformer", "upernet_global_small.pth", 206_313_115,
+                          "bebfa1264c10381e389d8065056baaadbdadee8ddc6e36770d1ec339dc84d970"),
+    **{f"moss-control-{k}": (moss_control_repo(k), f"moss_image_sft_{k}_control_lora.safetensors", v[1], v[2])
+       for k, v in MOSS_CONTROL_LORAS.items()},
     "moss-control": (_MC, "loras/moss_image_color_depth_control.safetensors", 313_063_368,
                      "e5c0c3efd05e4269207a39de6005798f14c90c6687c89c54eaffe4b76c43a763"),
 }
@@ -1000,6 +1060,17 @@ AUX = {
     "cnet-dwpose": {"file": "cnet-dwpose", "convert": "state", "out": "dw-ll_ucoco_384.safetensors",
                     "license": _DWPOSE_LICENSE},
     "cnet-yolox": {"file": "cnet-yolox", "convert": "state", "out": "yolox_l.safetensors", "license": _YOLOX_LICENSE},
+    "cnet-normal": {"file": "cnet-normal", "convert": "state", "out": "bae-scannet.safetensors",
+                    "license": "MIT, BAE normal (Gwangbin Bae), "
+                               "https://github.com/baegwangbin/surface_normal_uncertainty"},
+    "cnet-segmentation": {"file": "cnet-segmentation", "convert": "state", "out": "uniformer-upernet.safetensors",
+                          "license": "MIT weights, Apache-2.0 source, UniFormer, https://github.com/Sense-X/UniFormer"},
+    # MOSS-Image's control LoRAs are fetched only when the corresponding control is used.
+    **{f"moss-control-{k}": {"file": f"moss-control-{k}", "convert": None,
+                             "out": f"moss-image-{k}-control-lora.safetensors",
+                             "license": f"Apache-2.0, thedeoxen's MOSS-Image control LoRA, "
+                                        f"https://huggingface.co/{moss_control_repo(k)}"}
+       for k in MOSS_CONTROL_LORAS},
     # MOSS-Image's color and depth control (its LoRA and its widened input projection in one file)
     "moss-control": {"file": "moss-control", "convert": None, "out": "moss-color-depth-control.safetensors",
                      "license": _MOSS_CONTROL_LICENSE},
@@ -1007,13 +1078,18 @@ AUX = {
 # the control images (xestrata-image's CONTROL kinds) and the AUX weights each needs, in the order the engine's W:, W2:
 CNET_KINDS = {"canny": (), "gray": (), "scribble": (), "scribble_xdog": (), "scribble_hed": ("cnet-hed",),
               "hed": ("cnet-hed",), "lineart": ("cnet-lineart",), "lineart_coarse": ("cnet-lineart-coarse",),
-              "mlsd": ("cnet-mlsd",), "depth": ("cnet-depth",), "pose": ("cnet-yolox", "cnet-dwpose")}
+              "mlsd": ("cnet-mlsd",), "depth": ("cnet-depth",), "pose": ("cnet-yolox", "cnet-dwpose"),
+              "normal": ("cnet-normal",), "segmentation": ("cnet-segmentation",)}
 # Capabilities used by setup and the server, independent of the installed model's name.
 FAMILY_CAPABILITIES: dict[str, dict[str, object]] = {
     "qwen-image": {"pipeline": "qwen", "control": "controlnet"},
     "mage-flow": {"pipeline": "flow", "max_refs": 3, "control_reference": True, "guidance_methods": True},
     "hunyuan-image-3": {"pipeline": "guided_token", "max_refs": HUNYUANIMAGE3_MAX_REFS, "control_reference": True},
     "moss-image": {"pipeline": "latent_chat", "max_refs": 4, "control": "moss", "control_reference": True,
+                   "control_loras": {"canny": "canny", "depth": "depth", "pose": "pose", "lineart": "lineart",
+                                     "lineart_coarse": "lineart", "hed": "scribble", "scribble_hed": "scribble",
+                                     "scribble": "scribble", "scribble_xdog": "scribble", "normal": "normal",
+                                     "segmentation": "segmentation"},
                    "chat_text_states": True, "control_ref_resize": True},
     "anima": {"pipeline": "dual_tokenizer"},
 }
@@ -1193,7 +1269,8 @@ def aux_note() -> str:
             f"Union for Qwen-Image-2.1, under {CNET_UNION_LICENSE}, and its control images' networks: Depth Anything "
             f"V2 Small, {_DEPTH_LICENSE}; HED, {_HED_LICENSE}; line art, {_LINEART_LICENSE}; M-LSD, {_MLSD_LICENSE}; "
             f"DWPose, {_DWPOSE_LICENSE}, with YOLOX-L, {_YOLOX_LICENSE}; MOSS-Image's color and depth control, "
-            f"{_MOSS_CONTROL_LICENSE}")
+            f"{_MOSS_CONTROL_LICENSE}; thedeoxen's MOSS-Image control LoRAs, Apache-2.0 "
+            f"(https://huggingface.co/{moss_control_repo('canny')})")
 
 
 def license_note(dit: str) -> str:
@@ -1313,7 +1390,7 @@ def local_path(models_dir: Path, name: str) -> Path:
         return Path(models_dir) / AUX_DIR / LOCAL_NAMES.get(name, Path(FILES[name][1]).name)
     if name.startswith("hunyuanimage3-"):
         folder = HUNYUANIMAGE3_DIR
-    elif name.startswith("moss-sft-") or name.startswith("moss-base-"):   # a DiT's transformer folder, its own
+    elif name.startswith(("moss-sft-", "moss-base-")):   # a DiT's transformer folder, its own
         return Path(models_dir) / MOSS_DIR / name.split("-")[1] / Path(FILES[name][1]).name
     elif name.startswith(("moss-", "llm-moss-")):
         folder = MOSS_DIR
