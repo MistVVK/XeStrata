@@ -28,7 +28,7 @@ test('the page draws the status line before the Connect block, with a live regio
   assert.match(w, /<\/> : catalogLoading\(native\) \? <div className="onboard-engine-connect" role="status"/);
   assert.ok(w.indexOf('catalogLoading(native)') < w.indexOf('tr("Connect your Strata installation")'), 'the loading line comes before the Connect block');
   assert.match(w, /\{tr\("Checking what your computer can run…"\)\}/);
-  assert.match(w, /\{tr\("This takes a few seconds\."\)\}/);
+  assert.match(w, /: tr\("This takes a few seconds\."\)\}/);   // after 12 s the same slot says it is still working (FIX2-APP A9)
 });
 
 test('the words of this lane (A1, A2, A3) are in the catalog in all ten languages', () => {
