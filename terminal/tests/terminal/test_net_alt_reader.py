@@ -148,11 +148,14 @@ class NotAccepted(Base):
         self.assertEqual(said, NOTE.format(path=self.own / ALT) + "\n")
         self.assertEqual(len(hashed), before)
 
-    def test_another_name_is_never_looked_at(self):
-        (self.own / "mmproj-BF16.gguf").write_bytes(GOOD)
-        (self.own / "mmproj-Q8_0.gguf").write_bytes(GOOD)
+    def test_another_name_with_other_content_is_never_taken(self):
+        # (0.2.17 item 4: another name is looked at by CONTENT now, see test_plat_0217_reader_by_content.py; a file whose bytes are not the pinned
+        # reader's is still never taken, and the person's file is never changed)
+        (self.own / "mmproj-BF16.gguf").write_bytes(BAD)
+        (self.own / "mmproj-Q8_0.gguf").write_bytes(BAD)
         self.assertEqual(self.start()[0], "fetch")
         self.assertFalse(self.plan()[0])
+        self.assertEqual((self.own / "mmproj-BF16.gguf").read_bytes(), BAD)
 
     def test_the_pinned_file_always_wins(self):
         (self.own / ALT).write_bytes(GOOD)

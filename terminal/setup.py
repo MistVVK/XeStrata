@@ -7446,23 +7446,7 @@ def accepted_alt_reader(pinned: str, places, *, start: bool = True):
                 continue                                   # absent, another name or another size: ignored exactly as before
         except OSError:
             continue
-        digest = None
-        kept = _alt_reader_mark(p)
-        try:
-            found = _ALT_MARK.match(kept.read_text(encoding="utf-8", errors="replace")) if kept is not None and kept.exists() else None
-            digest = found.group(1) if found else None
-        except OSError:
-            digest = None
-        if digest is None:
-            if start:
-                say(f"  checking {p.name} (SHA-256, {size / 1e9:.1f} GB) ...")
-            digest = _hash_file(p, size)
-            if start and kept is not None:
-                try:
-                    kept.parent.mkdir(parents=True, exist_ok=True)
-                    kept.write_text(f"alt-reader sha256 {digest}\n", encoding="utf-8")
-                except OSError:
-                    pass                                   # (not remembered: the next run hashes again; nothing else changes)
+        digest = _reader_digest(p, size, start)
         if digest == sha:
             return p
         if start:
@@ -7471,10 +7455,70 @@ def accepted_alt_reader(pinned: str, places, *, start: bool = True):
     return None
 
 
-def resolve_reader(pinned: str, mmproj: Path, models_dir, roots, gguf_dir, size):
+def _reader_digest(p: Path, size: int, start: bool) -> str:
+    """The SHA-256 of a picture-reader file, from the mark in Strata's own marks/ folder when this very file (real path, size, modification time,
+    change time) was hashed before, else by hashing it (a few seconds); start=True says so and writes the mark, start=False says and writes nothing."""
+    digest = None
+    kept = _alt_reader_mark(p)
+    try:
+        found = _ALT_MARK.match(kept.read_text(encoding="utf-8", errors="replace")) if kept is not None and kept.exists() else None
+        digest = found.group(1) if found else None
+    except OSError:
+        digest = None
+    if digest is None:
+        if start:
+            say(f"  checking {p.name} (SHA-256, {size / 1e9:.1f} GB) ...")
+        digest = _hash_file(p, size)
+        if start and kept is not None:
+            try:
+                kept.parent.mkdir(parents=True, exist_ok=True)
+                kept.write_text(f"alt-reader sha256 {digest}\n", encoding="utf-8")
+            except OSError:
+                pass                                       # (not remembered: the next run hashes again; nothing else changes)
+    return digest
+
+
+def own_reader_by_content(gguf_dir, pinned: str, size: int | None = None, sha: str | None = None, *, start: bool = True):
+    """(kind, path) of a picture reader in the person's own folder under ANOTHER name (q38-mmproj-BF16.gguf), or None. Item 4 of 0.2.17: the name says
+    nothing, the content does. A .gguf file in the folder itself, the folder above it or that folder's models/ is taken only when its size AND its
+    SHA-256 are the pinned reader's (`size`, `sha`: the feed's / ISTA_FILES' pin, kind "near"), or the verified Unsloth F16 alternative's
+    (ALT_READERS, kind "alt"). A file of another size is not even read; a file of the same size and other bytes (a reader of another model) is
+    never taken. Files named like the pinned or the alternative file are left to mmproj_beside / accepted_alt_reader (their rules are unchanged).
+    Nothing is written beside the person's file (the hash is remembered in marks/)."""
+    if not gguf_dir:
+        return None
+    wanted = []                                            # (kind, size, sha)
+    if size and sha:
+        wanted.append(("near", int(size), str(sha)))
+    alt = ALT_READERS.get(pinned)
+    if alt is not None:
+        wanted.append(("alt", alt[1], alt[2]))
+    if not wanted:
+        return None
+    base = Path(gguf_dir)
+    skip = {pinned.lower()} | ({alt[0].lower()} if alt is not None else set())
+    for folder in (base, base.parent, base.parent / "models"):
+        try:
+            files = sorted(p for p in folder.iterdir() if p.suffix.lower() == ".gguf" and p.name.lower() not in skip and p.is_file())
+        except OSError:
+            continue
+        for p in files:
+            try:
+                have = p.stat().st_size
+            except OSError:
+                continue
+            for kind, want_size, want_sha in wanted:
+                if have == want_size and _reader_digest(p, have, start) == want_sha:
+                    return kind, p
+    return None
+
+
+def resolve_reader(pinned: str, mmproj: Path, models_dir, roots, gguf_dir, size, sha=None):
     """Which picture reader this run uses: (kind, path). `mmproj` is where the pinned file would be (the data folder's models/, or an earlier
     install's copy when there is one). kind "fetch": the pinned file at `mmproj` (it exists, or it is downloaded); "near": the pinned file in the
-    person's own folder (mmproj_beside); "alt": a verified Unsloth mmproj-F16.gguf the person already has (only when no pinned file is anywhere)."""
+    person's own folder (mmproj_beside); "renamed": the same bytes under another name there (own_reader_by_content, needs the pinned `sha`; already
+    verified by content, so the caller does not hash it again); "alt": a verified Unsloth mmproj-F16.gguf the person already has (only when no pinned
+    file is anywhere), also under another name in their folder."""
     if mmproj.exists():
         return "fetch", mmproj
     near = mmproj_beside(gguf_dir, pinned, size)
@@ -7483,6 +7527,9 @@ def resolve_reader(pinned: str, mmproj: Path, models_dir, roots, gguf_dir, size)
     alt = accepted_alt_reader(pinned, alt_reader_places(pinned, models_dir, roots, gguf_dir), start=True)
     if alt is not None:
         return "alt", alt
+    renamed = own_reader_by_content(gguf_dir, pinned, size, sha, start=True)
+    if renamed is not None:
+        return ("renamed", renamed[1]) if renamed[0] == "near" else renamed
     return "fetch", mmproj
 
 
@@ -9689,12 +9736,13 @@ def mac_control_setup(a) -> int:
         mmproj = Path(models_root) / fam["mmproj"]
         if not mmproj.exists():                        # an earlier install's copy (the same file for every family)
             mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
-        kind, mmproj = resolve_reader(fam["mmproj"], mmproj, models_root, roots, a.gguf_dir, (ISTA_FILES.get(fam["mmproj"]) or (None,))[0])
+        pin = ISTA_FILES.get(fam["mmproj"]) or (None, None)
+        kind, mmproj = resolve_reader(fam["mmproj"], mmproj, models_root, roots, a.gguf_dir, pin[0], pin[1])
         if kind == "fetch" and not (mmproj.exists() and done(mmproj)):
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
-        if fam["mmproj"] in ISTA_FILES and kind != "alt":       # (a verified Unsloth F16 file was checked against its own pin)
+        if fam["mmproj"] in ISTA_FILES and kind not in ("alt", "renamed"):       # (a verified Unsloth F16 file was checked against its own pin; a renamed file by content)
             verify_sha256(mmproj, *ISTA_FILES[fam["mmproj"]])
-        ok(f"vision encoder: {mmproj}" + (" (Unsloth's mmproj-F16.gguf, SHA-256 checked)" if kind == "alt" else ""))
+        ok(f"vision encoder: {mmproj}" + (" (Unsloth's mmproj-F16.gguf, SHA-256 checked)" if kind == "alt" else " (SHA-256 checked)" if kind == "renamed" else ""))
 
     step(6, "preparing the model for Strata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
@@ -10767,13 +10815,13 @@ def main() -> int:
     if vision != "none":
         # the person's own folder (or the one above it) has the pinned picture file: used where it is ('near'); a verified Unsloth mmproj-F16.gguf they
         # already have is used when no pinned file is anywhere ('alt'); else the pinned file is downloaded
-        kind, mmproj = resolve_reader(fam["mmproj"], mmproj, a.models_dir, roots, a.gguf_dir,
-                                      (fam.get("mmproj_sha256") or ISTA_FILES.get(fam["mmproj"]) or (None,))[0])
+        pin = fam.get("mmproj_sha256") or ISTA_FILES.get(fam["mmproj"]) or (None, None)
+        kind, mmproj = resolve_reader(fam["mmproj"], mmproj, a.models_dir, roots, a.gguf_dir, pin[0], pin[1])
         if kind == "fetch":
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
-        if fam.get("mmproj_sha256") and kind != "alt":   # the NVFP4 family pins it by size and SHA-256 too
+        if fam.get("mmproj_sha256") and kind not in ("alt", "renamed"):   # the NVFP4 family pins it by size and SHA-256 too
             verify_sha256(mmproj, *fam["mmproj_sha256"])
-        ok(f"vision encoder: {mmproj}" + (" (Unsloth's mmproj-F16.gguf, SHA-256 checked)" if kind == "alt" else ""))
+        ok(f"vision encoder: {mmproj}" + (" (Unsloth's mmproj-F16.gguf, SHA-256 checked)" if kind == "alt" else " (SHA-256 checked)" if kind == "renamed" else ""))
         if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
                 "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
