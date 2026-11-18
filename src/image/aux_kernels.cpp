@@ -360,10 +360,9 @@ void aux_channel_split(const float* qkv, int64_t N, int64_t C, int64_t G, float 
         // i over [G][Cg][N]: the transposed operands' writes in order
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t t = i % N, gc = i / N, g = gc / Cg, c = gc - g * Cg;
-        const float* row = qkv + t * 3 * C;
-        qT16[i] = f16_from_f32(row[g * Cg + c] * scale);
-        kT16[i] = f16_from_f32(row[C + g * Cg + c]);
-        v16[(g * N + t) * Cg + c] = f16_from_f32(row[2 * C + g * Cg + c]);
+        qT16[i] = f16_from_f32(qkv[(t * 3) * C + g * Cg + c] * scale);
+        kT16[i] = f16_from_f32(qkv[(t * 3 + 1) * C + g * Cg + c]);
+        v16[(g * N + t) * Cg + c] = f16_from_f32(qkv[(t * 3 + 2) * C + g * Cg + c]);
     });
     finish(stream, e, "aux_channel_split");
 }
@@ -656,16 +655,18 @@ void rope2d_split16(const In* qkv, const float* bias, int64_t N, int64_t heads, 
         const int ti = (li * hf + p) * 2;   // the table: grid^2 x half pairs, far below 2^31
         const float cs = tab[ti], sn = tab[ti + 1];
         const int p2 = 2 * p;   // the pair's first value: 32-bit, as the device counts
-        const In* row = qkv + t * 3 * C + h * hd + p2;
         const int64_t o = t * C + h * hd + p2, c0 = h * hd + p2;
-        auto at = [&](int64_t j) { return value_of(row[j]) + (bias != nullptr ? bias[c0 + j] : 0.f); };
-        const float q0 = at(0), q1 = at(1), k0 = at(C), k1 = at(C + 1);
+        auto at = [&](int64_t part, int64_t j) {
+            return value_of(qkv[(t * 3 + part) * C + c0 + j]) +
+                   (bias != nullptr ? bias[part * C + c0 + j] : 0.f);
+        };
+        const float q0 = at(0, 0), q1 = at(0, 1), k0 = at(1, 0), k1 = at(1, 1);
         q16[o] = f16_from_f32(q0 * cs - q1 * sn);
         q16[o + 1] = f16_from_f32(q1 * cs + q0 * sn);
         k16[o] = f16_from_f32(k0 * cs - k1 * sn);
         k16[o + 1] = f16_from_f32(k1 * cs + k0 * sn);
-        v16[o] = f16_from_f32(at(2 * C));
-        v16[o + 1] = f16_from_f32(at(2 * C + 1));
+        v16[o] = f16_from_f32(at(2, 0));
+        v16[o + 1] = f16_from_f32(at(2, 1));
     });
     finish(stream, e, "aux_rope2d_split16");
 }
