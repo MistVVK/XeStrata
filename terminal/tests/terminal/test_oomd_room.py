@@ -32,6 +32,9 @@ class MakeRoom(unittest.TestCase):
         (self.d / "pack" / "t1.bin").write_bytes(b"y" * 500)
         (self.d / "pack" / "t2.bin").write_bytes(b"z" * 500)
         self.said, self.dropped = [], []
+        patch = mock.patch.object(op, "_DONTNEED", 4)             # Windows has no posix_fadvise: the decisions are what is tested here, the drop is injected
+        patch.start()
+        self.addCleanup(patch.stop)
         self.cache = [14 * GIB]
 
     def room(self, *, cache=None, free=None, env=None, found=APPLICABLE, sizes=None, args=None):
