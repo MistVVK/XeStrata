@@ -16,6 +16,11 @@ export const PHASE_TEXT = {
 /** The job line while an update waits for Control's update lock (another update or the app's own check holds it). Wording awaits the owner (lane APP-LIN item 4). */
 export const UPDATE_WAITING_FOR_LOCK = 'Waiting for the update check to finish…';
 
+/** The app window's updater has not been handed to the host (yet). Said in a finished update's summary only when it is all the person asked for (nothing else changed). */
+export const APP_UPDATER_NOT_READY = 'The app updater is not ready yet. Try again in a moment.';
+/** The shell's own check for a new app version did not work (feed unreachable...). Same rule; Settings shows the same sentence after every finished update. */
+export const APP_CHECK_FAILED = "Strata couldn't check for a new version of the app itself. Try again later.";
+
 /** True when the failure looks like a computer with no internet (no DNS, no route, refused), not a slow or broken server. */
 export function looksOffline(error) {
   const text = [error?.message, error?.cause?.message, error?.cause?.code, error?.code, error].filter(x => typeof x === 'string').join(' ');
