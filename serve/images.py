@@ -353,8 +353,9 @@ class LoraRejected(ImageJobFailed):
     engine's `ERROR lora:` line): the request's own fault (400); the message says why."""
 
 
-def parse_size(value, max_side: int) -> tuple[int, int]:
-    """OpenAI's size, "1024x1024" (or "auto": 1024x1024) -> (width, height); each side from 256 to max_side."""
+def parse_size(value, max_side: int, min_side: int = MIN_SIDE) -> tuple[int, int]:
+    """OpenAI's size, "1024x1024" (or "auto": 1024x1024) -> (width, height); each side from min_side (256 for a
+    model's, SIZE_STEP for an upscale that draws nothing) to max_side."""
     if value is None or value == "auto":
         return 1024, 1024
     if not isinstance(value, str):
@@ -364,8 +365,8 @@ def parse_size(value, max_side: int) -> tuple[int, int]:
         raise ImageRequestError(f"size: WIDTHxHEIGHT, e.g. \"1024x1024\", not {value!r}")
     w, h = int(m.group(1)), int(m.group(2))
     for side in (w, h):
-        if side < MIN_SIDE or side > max_side:
-            raise ImageRequestError(f"size {w}x{h}: each side from {MIN_SIDE} to {max_side}")
+        if side < min_side or side > max_side:
+            raise ImageRequestError(f"size {w}x{h}: each side from {min_side} to {max_side}")
     return w, h
 
 
@@ -563,7 +564,7 @@ def output_formats() -> list[str]:
     return ["png", "jpeg", "webp"] + (["jxl"] if cjxl() else [])
 
 
-def parse_request(req: dict, cfg: dict) -> dict:
+def parse_request(req: dict, cfg: dict, min_side: int = MIN_SIDE) -> dict:
     """The fields of one /v1/images/generations request, checked.  output_format png, jpeg, webp or jxl (where
     output_formats has it; output_compression 0-100, the quality jpeg, webp and jxl are written at, jxl's 100
     lossless); quality low, medium or high (the base model's
@@ -623,7 +624,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
         raise ImageRequestError("background transparent: png, webp or jxl (jpeg has no alpha channel)")
     if background == "transparent" and cfg.get("transparency") is False:
         raise ImageRequestError("background transparent: this image model does not make transparent images")
-    w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
+    w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048), min_side)
     bucket = None
     requested: dict = {}
     if _pipeline(cfg.get("family")) == "guided_token":    # its own table: the bucket nearest the shape asked for
@@ -1356,7 +1357,7 @@ def ups_only_job(req: dict, cfg: dict, w: int, h: int, upscaler: dict) -> dict:
     base fields of `req` (its prompt, seed, answer's format) at the model's size at most (max_side: no image model
     runs, the upscaler makes w x h), one output -> the job with job["ups_only"] and `upscaler` (upscaler_of)."""
     side = int(cfg.get("max_side") or 2048)
-    job = parse_request({**req, "n": 1, "size": f"{min(w, side)}x{min(h, side)}"}, cfg)
+    job = parse_request({**req, "n": 1, "size": f"{min(w, side)}x{min(h, side)}"}, cfg, SIZE_STEP)
     job.pop("bucket", None)
     job.update(width=w, height=h, ups_only=True, upscaler=upscaler, n=1)
     return job
