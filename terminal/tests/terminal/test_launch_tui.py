@@ -544,18 +544,25 @@ class PicturesParallelTuning(Base):
             self.assertIn("Skip", t)
             self.assertIn("[ ] Allow settings that change answers very slightly", t)
             line = next(l for l in t.splitlines() if "›" in l)
-            self.assertIn("Quick", line)                              # a first setup recommends tuning
+            self.assertIn("Skip", line)                               # T5: a first setup starts on Skip, so Enter all the way does not wait 20 minutes
+            self.assertIn("strata launch --tune quick", flat(app))          # and says how to tune later
             await press(pilot, "a")
             self.assertIn("[x] Allow settings", text_of(app))
             self.assertTrue(ctx.settings.tune_allow_small)
-            await press(pilot, "down", "enter")
+            await press(pilot, "up", "enter")
             self.assertEqual(ctx.settings.tune, "thorough")
         self.run_app(case)
 
     def test_tuning_skip(self):
         async def case(app, pilot, ctx):
-            await press(pilot, *self.reach_pictures(), "enter", "enter", "down", "down", "enter")
+            await press(pilot, *self.reach_pictures(), "enter", "enter", "enter")
             self.assertEqual(ctx.settings.tune, "skip")
+        self.run_app(case)
+
+    def test_tuning_quick_is_one_key_up(self):
+        async def case(app, pilot, ctx):
+            await press(pilot, *self.reach_pictures(), "enter", "enter", "up", "up", "enter")
+            self.assertEqual(ctx.settings.tune, "quick")
         self.run_app(case)
 
 
@@ -603,7 +610,7 @@ class AdvancedStep(Base):
             idx = names.index("--prefill")
             for _ in range(idx):
                 await press(pilot, "down")
-            await press(pilot, "enter")
+            await press(pilot, "e")                                   # T6: e edits, Enter goes on like on every other step
             self.assertIn("Type the value for --prefill", text_of(app))
             await typed(pilot, "65536")
             await press(pilot, "enter")
@@ -613,6 +620,18 @@ class AdvancedStep(Base):
             await press(pilot, "delete")
             self.assertEqual(ctx.settings.extra, {})
             self.assertIn("back to the tuned value", text_of(app))
+        self.run_app(case, ctx=ctx)
+
+    def test_enter_goes_on_like_every_other_step(self):
+        ctx = self.ctx_with_engine()
+
+        async def case(app, pilot, ctx):
+            await press(pilot, *self.reach())
+            self.assertIn("Step 7 of 9: Advanced", text_of(app))
+            self.assertIn("Enter next", text_of(app))
+            await press(pilot, "enter")
+            self.assertIn("Step 8 of 9: Access", text_of(app))
+            self.assertEqual(ctx.settings.extra, {})                  # nothing was opened for editing
         self.run_app(case, ctx=ctx)
 
     def test_add_by_name_warns_about_an_unknown_flag_but_keeps_it(self):
@@ -802,7 +821,9 @@ class SaveAndRun(Base):
             self.assertIn("Save as preset, then launch", t)
             self.assertIn("Qwen3.8-Flash-Next IQ3_S", t)
             self.assertIn("128K, memory int8", t)
-            self.assertIn("quick (about 20 min)", t)
+            self.assertIn("skipped", t)                               # T5: Tuning starts on Skip
+            self.assertIn("Download  the engine for your graphics card", t)      # T2: the list of downloads, with sizes
+            self.assertIn("the model, 84 GB", t)
             self.assertIn("This computer only, port 8080", t)
             await press(pilot, "enter")                               # Save as a preset and launch
             await pilot.pause(0.8)

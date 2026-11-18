@@ -201,6 +201,13 @@ def build(metrics: dict | None) -> dict | None:
     return model
 
 
+def shares_memory(name: object) -> bool:
+    """A graphics chip with no memory of its own: Apple silicon, the NVIDIA GB10 of a DGX Spark, a Ryzen AI Max (Strix Halo). Its memory is the
+    computer's, so the "VRAM" tile shows the system memory and the PCIe link tile has nothing to say (T19)."""
+    low = str(name or "").lower()
+    return any(k in low for k in ("apple", "gb10", "strix halo", "8060s", "8050s", "8040s", "gfx1151"))
+
+
 # ------------------------------------------------------------------------------------------------ drawing
 
 def solid_spark(values: list, width: int, lo: float | None, hi: float | None) -> Text:
@@ -398,6 +405,7 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     ncards = len(cards)
     tile_w = max(18, (min(width, 110) - 3) // 4)
     inner = tile_w - 4
+    unified = shares_memory(g.get("name"))                 # T19: no card of its own: no VRAM figure and no PCIe link to show
     spd, spd_note, spd_hist = model["speed"]
     util_scale = dict(lo=0, hi=100)
     tiles1 = [
@@ -405,10 +413,12 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
         _tile("GPU load", f"{fmt(g['util'])} %", f"busiest of {ncards} cards" if ncards else
               short_gpu(g["name"]) if g["count"] in (None, 1) else f"{short_gpu(g['name'])} +{int(g['count']) - 1}",
               spark(g["util_hist"], inner, glyphs, **util_scale), tile_w, accent=accent, box_style=box_style),
-        _tile("VRAM", f"{fmt(g['vram_used'], 1)} / {fmt(g['vram_total'], 0)} GB",
-              (f"all {ncards} cards" if ncards else
-               f"{int(model['experts']['slots']):,} experts cached" if model["experts"]["slots"] is not None else "graphics memory"),
-              spark(g["vram_hist"], inner, glyphs, lo=0, hi=g["vram_total"]), tile_w, accent=accent, box_style=box_style),
+        (_tile("Memory", f"{fmt(model['ram'][0], 1)} / {fmt(model['ram'][1], 0)} GB", "shared with graphics", spark([], inner, glyphs, lo=0),
+               tile_w, accent=accent, box_style=box_style) if unified and g["vram_total"] is None else
+         _tile("VRAM", f"{fmt(g['vram_used'], 1)} / {fmt(g['vram_total'], 0)} GB",
+               (f"all {ncards} cards" if ncards else
+                f"{int(model['experts']['slots']):,} experts cached" if model["experts"]["slots"] is not None else "graphics memory"),
+               spark(g["vram_hist"], inner, glyphs, lo=0, hi=g["vram_total"]), tile_w, accent=accent, box_style=box_style)),
         _tile("GPU temp", f"{fmt(g['temp'])} °C" if not ascii_mode else f"{fmt(g['temp'])} C", "hottest card" if ncards else "",
               spark(g["temp_hist"], inner, glyphs, lo=20, hi=100), tile_w, accent=plain(AMBER) if color else "default", box_style=box_style),
     ]
@@ -433,9 +443,11 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     tiles2 = [
         _tile("Power", f"{fmt(g['power'])} W", power_sub, spark(g["power_hist"], inner, glyphs, lo=0),
               tile_w, accent=accent, box_style=box_style),
-        _tile("PCIe", link, f"slowest of {ncards} cards" if ncards else
-              (f"to GPU {fmt(g['pcie_rx'])} MB/s" if g["pcie_rx"] is not None else "to GPU --"),
-              spark(g["pcie_hist"], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style),
+        (_tile("PCIe", "not used", "memory is shared", spark([], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style)
+         if unified else
+         _tile("PCIe", link, f"slowest of {ncards} cards" if ncards else
+               (f"to GPU {fmt(g['pcie_rx'])} MB/s" if g["pcie_rx"] is not None else "to GPU --"),
+               spark(g["pcie_hist"], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style)),
         _tile("CPU", f"{fmt(c['load'])} %", cpu_sub, spark(c["hist"], inner, glyphs, lo=0, hi=100), tile_w, accent=accent, box_style=box_style),
         _tile("Disk read", f"{fmt(d['read'], 1)} MB/s", f"write {fmt(d['write'], 1)} MB/s" if d["write"] is not None else "write --",
               spark(d["hist"], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style),

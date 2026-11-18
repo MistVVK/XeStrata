@@ -90,9 +90,9 @@ def _short_name(c: dict, vendor: str) -> str:
 # REMOVE this block, its three callers (setup.py "size:", strata_cli/launch/cmd.py apply_defaults, tests/terminal/test_strix_q4_note.py) when the
 # stall is fixed in the engine (STRIX-2Q). The numbers are the 0.2.9 release notes'.
 STRIX_Q4_MODEL = "UD-Q4_K_XL"
-STRIX_Q4_NOTE = ("UD-Q4_K_XL on a Ryzen AI Max (Strix Halo) can stop on the first request after a start, with no CPU or disk activity: 7 of 30 "
-                 "starts did on the 0.1.55 engine and 2 of 5 on 0.1.54. If it happens, stop the engine and start it again. UD-IQ4_XS ran 99 "
-                 "starts in the same setup without stopping; choose it if you want to be sure. Nothing is refused.")
+STRIX_Q4_NOTE = ("UD-Q4_K_XL on a Ryzen AI Max (Strix Halo) sometimes stopped on the first request after a start in our tests of older engines. "
+                 "Engine 0.1.62 did not in our tests (an 8-hour chat run and several starts), but that is too few starts to be sure. If it "
+                 "happens, stop the engine and start it again. UD-IQ4_XS is the choice if you want to be sure. Nothing is refused.")
 
 
 def is_strix_halo_card(card: dict) -> bool:

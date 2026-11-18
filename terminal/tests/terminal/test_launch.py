@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -438,9 +439,11 @@ class SetupArgs(unittest.TestCase):
             for hw, want in ((NV, "cpu"), (amd, "cpu"), (intel, "cpu"), (card("NVIDIA GeForce RTX 4090", 24.0, "nvidia"), "gpu"),
                              (card("AMD Radeon AI PRO R9700", 32.0, "amd"), "gpu")):
                 cat = catalog(hw)
-                r = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768), catalog=cat)
-                self.assertEqual(r.setup_args()[r.setup_args().index("--vision") + 1], want, hw["gpus"][0]["vendor"])
-                self.assertEqual(r.s.vision, want)
+                # T14: an Arc whose engine is not installed yet (picture reader unknown) gets no pictures on Linux; one whose engine carries the reader does
+                with mock.patch.object(type(cat), "reader_state", lambda self: "present") if hw is intel else contextlib.nullcontext():
+                    r = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768), catalog=cat)
+                    self.assertEqual(r.setup_args()[r.setup_args().index("--vision") + 1], want, hw["gpus"][0]["vendor"])
+                    self.assertEqual(r.s.vision, want)
             off = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768, vision="off"), catalog=catalog(NV))
             self.assertEqual(off.setup_args()[off.setup_args().index("--vision") + 1], "no")
 

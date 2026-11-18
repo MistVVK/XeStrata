@@ -48,10 +48,10 @@ class ModelState:
         """One plain sentence for the size line of the Folder step."""
         if self.own_files:
             if not self.parts:
-                return "Your model files are used where they are. Nothing needs to be downloaded."
+                return "Your model files are used where they are. The model itself needs no download."
             return f"Your model files are used where they are. Strata still needs to fetch {self._names()}."
         if self.installed and not self.parts:
-            return f"Already downloaded ({self.total_gb:.0f} GB on this computer). Nothing more to download."
+            return f"Already downloaded ({self.total_gb:.0f} GB on this computer). The model needs nothing more."
         if self.installed and self.only_helpers:
             first = self.parts[0]
             if len(self.parts) == 1:

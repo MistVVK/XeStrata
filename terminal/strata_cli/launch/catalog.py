@@ -61,6 +61,8 @@ def fit_on(v: dict, ram_gb: float | None, vram_gb: float | None) -> dict[str, An
 
 # --- the verdict words ---------------------------------------------------------------------------------------------------
 FITS, SLOWER, TIGHT, NO = "fits", "slower", "tight", "no"
+DISK = "disk"                    # fits the memory, but the download does not fit the free disk (T10)
+DISK_ROOM_GB = 8.0               # working room beside the download (the Folder step asks for the same)
 
 
 def verdict(on_this_pc: str | None) -> tuple[str, str]:
@@ -102,10 +104,20 @@ class ModelRow:
     mem_total: bool = False
     memory_gb: float = 0.0        # the placement estimate (experts + dense), for the cards
     fit_gb: float = 0.0           # the files without the lookup table: the "Needs" column and the fit label
+    disk_need_gb: float = 0.0     # verdict "disk": the disk the download and its working room need ...
+    disk_free_gb: float | None = None   # ... and what is free in the data folder's drive
 
     @property
     def title(self) -> str:
         return f"{self.family_title} {self.model}"
+
+    @property
+    def sentence(self) -> str:
+        """The verdict in words for a line under the list or a warning (the disk verdict says the two figures and the way out)."""
+        if self.verdict == DISK and self.disk_free_gb is not None:
+            return (f"Not enough disk space: about {self.disk_need_gb:.0f} GB needed, {self.disk_free_gb:.0f} GB free. "
+                    "Pick a bigger drive on the Folder step, or a smaller model")
+        return self.words
 
 
 @dataclass
@@ -423,7 +435,35 @@ class Catalog:
                     installed=bool(size.get("installed")) or self.installed_config(str(size["id"])) is not None, mem_total=bool(size.get("mem_total")),
                     memory_gb=float(size.get("memory_gb") or 0), fit_gb=float(size.get("fit_gb") or size.get("memory_gb") or 0),
                     recommended=(rec.get("family") == fam["family"] and rec.get("model") == size["model"])))
+        self.apply_disk(out, hw)
         return out
+
+    def apply_disk(self, rows: list[ModelRow], hw: dict) -> None:
+        """T10: "fits" said nothing about the disk. A model that is not on this computer yet and whose download (what is still missing, plus room
+        to work) is more than the free space of the data folder's drive gets the verdict `disk`. Only a verdict that was "fits" or "tight" changes:
+        a model that is too big for the memory keeps its own words. Never a block: the person can still try, as with every verdict."""
+        free = hw.get("disk_free_gb")
+        if free is None:
+            return
+        try:
+            base = Path(self.data_dir())
+        except Exception:                                  # noqa: BLE001
+            base = None
+        for r in rows:
+            if r.installed or r.verdict not in (FITS, TIGHT):
+                continue
+            got = 0.0
+            if base is not None:
+                try:
+                    got = sum(f.stat().st_size for f in self.model_folder(base, r.family, r.model).glob("*.gguf")
+                              if not f.name.lower().startswith("mmproj")) / 1e9
+                except OSError:
+                    got = 0.0
+            need = max(r.download_gb - got, 0.0) + DISK_ROOM_GB
+            if need > float(free):
+                r.verdict = DISK
+                r.words = "not enough disk space"
+                r.disk_need_gb, r.disk_free_gb = need, float(free)
 
     def unavailable(self, hw: dict | None = None) -> list[tuple[str, str]]:
         """(title, the plain reason) of each model of the signed feed that this engine does not run: nothing for a feed without such a model. The model list
@@ -547,13 +587,24 @@ class Catalog:
         reader the one rule of strata_control/vision_reader.py gives: the CPU reader under 24 GB of graphics memory, the GPU reader from 24 GB,
         on every make of card (owner decision 2026-10-18); on a Mac the Metal reader (unified memory). Without a usable graphics card there is nothing to read on: the CPU reader."""
         from strata_control import vision_reader as VR
-        if not images or self.reader_state() == "missing":
+        if not images or self.reader_state() == "missing" or self.pictures_not_on_card():
             return "off"
         if self.is_mac():
             return VR.default_mode(None, unified=True)           # a Mac (unified memory): the Metal reader, nothing to keep free for a card
         comp = self.computer()
         vram = comp.main_vram_gb
         return VR.default_mode(vram, "intel" if comp.engine_vendor == "intel" else "") if vram > 0 else "cpu"      # no usable card: nothing to read on, the CPU reader
+
+    def pictures_not_on_card(self) -> bool:
+        """T14: an Intel Arc card on Linux whose engine does not carry the picture reader (the engine route that builds the model's pack from the files itself
+        fetches none) starts the engine text-only, so offering "Yes" would say "Pictures on" and then answer "I don't see a picture" (USERTEST-LIN, A750).
+        An engine that carries the reader (reader_state "present", the B-series decision of 2026-10-22) keeps pictures on."""
+        if not sys.platform.startswith("linux"):
+            return False
+        try:
+            return self.engine_backend() == "sycl" and self.reader_state() != "present"
+        except Exception:                                    # noqa: BLE001
+            return False
 
     def is_mac(self) -> bool:
         """An Apple Silicon Mac: the chip's memory is the system's (the Metal engine; strata_control/vision_reader.py)."""

@@ -161,6 +161,31 @@ def closest(word: str, options: list[str]) -> str | None:
     return next(o for o in options if o.lower() == hit[0])
 
 
+def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """Whether something answers on host:port (the check the launch makes before it starts: Runner.check_port_free)."""
+    import socket
+    try:
+        with socket.create_connection((host, int(port)), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def next_free_port(port: int, host: str = "127.0.0.1", tries: int = 50) -> int | None:
+    """The first port after `port` that nothing answers on (and that a server could take), or None within `tries` ports (T11)."""
+    import socket
+    for p in range(int(port) + 1, min(65535, int(port) + tries) + 1):
+        if port_in_use(p, host):
+            continue
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((host if host not in ("", "0.0.0.0") else "127.0.0.1", p))
+        except OSError:
+            continue
+        return p
+    return None
+
+
 def check_port(port: Any) -> Notice | None:
     try:
         p = int(port)

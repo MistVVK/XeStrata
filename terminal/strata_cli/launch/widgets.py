@@ -167,14 +167,24 @@ class Menu(Static):
         self.top = max(0, min(self.top, max(0, len(self.items) - win)))
         self.update(self.build())
 
+    def fit(self, text: str, width: int, more: bool = True) -> str:
+        """`text` in a column of `width` cells (0 = the rest of the line). Text that fills the column is cut with an ellipsis and a space, so it never
+        runs into the next column ("UD-IQ4_XS-v3194 GB", T4). `more`: some later column of the row has text (else nothing can be run into)."""
+        if not width:
+            return text
+        if len(text) < width or not more:
+            return text.ljust(width)
+        dots = "…" if self.g.unicode else "."
+        return text[:max(0, width - 2)] + dots + " "
+
     def build(self) -> Text:
         out = Text(no_wrap=True, overflow="crop")
         pad = "  "
         widths = [w for _t, w in self.columns]
         if self.show_header:
             out.append(pad)
-            for (title, w) in self.columns:
-                out.append(title.ljust(w) if w else title, style="bold")
+            for k, (title, w) in enumerate(self.columns):
+                out.append(self.fit(title, w, any(t for t, _w in self.columns[k + 1:])), style="bold")
             out.append("\n")
         win = self.window or len(self.items)
         rows = self.items[self.top:self.top + win]
@@ -185,7 +195,7 @@ class Menu(Static):
             for k, c in enumerate(it.cells):
                 c = cell(c)
                 w = widths[k] if k < len(widths) else 0
-                txt = c.text.ljust(w) if w else c.text
+                txt = self.fit(c.text, w, any(cell(x).text for x in it.cells[k + 1:]))
                 style = c.style if not selected else (c.style if c.style and not selected else "")
                 if selected:
                     style = f"bold {self.palette.accent}" if c.style in ("", None) else c.style

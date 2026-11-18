@@ -129,7 +129,7 @@ class StoragePath(Base):
                     rows = [r for r in shown.split("\n") if "Storage" in r]
                     self.assertEqual(len(rows), 1, (n, shown))
                     row = rows[0].strip()
-                    self.assertTrue(row.startswith("Storage   /home/ana/"), (n, row))
+                    self.assertIn("Storage /home/ana/", row, (n, row))                 # (80x24 holds the short form of the summary: one line "Access ... Storage <path>")
                     self.assertTrue(row.endswith("/Strata-data"), (n, row))
                     self.assertLessEqual(len(rows[0]), 80, (n, row))
                     if n <= 60:
@@ -200,7 +200,7 @@ class AdvancedLayout(Base):
                 self.assertGreaterEqual(box.region.y, body.region.y, size)
                 self.assertLessEqual(box.region.bottom, body.region.bottom, size)                # the preview never leaves the body
                 self.assertGreaterEqual(box.region.height, 3, size)
-                self.assertIn("n next", flat(app), size)                                           # the key hints wrap instead of being cut off
+                self.assertIn("Enter next", flat(app), size)                                         # the key hints wrap instead of being cut off
                 self.assertIn("Command that will run", text_of(app), size)
         self.run_app(case, ctx)
 
@@ -238,7 +238,7 @@ class HintsWrap(Base):
                 await pilot.pause(0.25)
                 hints = app.screen.query_one("#hints")
                 self.assertGreaterEqual(hints.region.height, 1)
-                self.assertIn("n next", flat(app), width)
+                self.assertIn("Enter next", flat(app), width)
         ctx = make_ctx()
         ctx.settings.family, ctx.settings.model = "qwen", "IQ3_XXS"
         self.run_app(case, ctx)
@@ -293,10 +293,11 @@ class InstalledModelFolder(Base):
             await press(pilot, "enter", "up", "enter")                 # up: IQ3_XXS (IQ3_S is pre-selected)
             shown = flat(app)
             self.assertIn("Already downloaded", shown)
-            self.assertIn("Nothing more to download", shown)
-            # and the final screen does not warn about a download
+            self.assertIn("The model needs nothing more", shown)
+            # and the final screen lists no model download (the engine is still to come in this test home)
             await press(pilot, *("enter",) * 5, "n", "enter")
-            self.assertIn("Nothing needs to be downloaded", flat(app))
+            self.assertNotIn("the model, ", flat(app))
+            self.assertIn("Download the engine for your graphics card", flat(app))
         self.run_app(case, ctx)
 
 

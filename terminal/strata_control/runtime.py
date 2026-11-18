@@ -54,6 +54,27 @@ ROOT = Path(__file__).resolve().parents[1]
 WINDOWS = os.name == "nt"
 _STARTED_HOSTS: dict[str, subprocess.Popen] = {}
 
+#: what a person reads when the helper process that owns the engine is gone (T21); the launch adds the next step (strata_cli/launch/runner.py)
+HELPER_GONE = "The helper program that runs this model stopped by itself, or does not answer."
+
+
+def _note_host_gone(name: str, exc: ProfileError) -> None:
+    """The start lost its host: put the reason into the host log (it is empty when the host died without a word) - what the launcher saw, and the
+    host's exit code when this process started it. Never raises."""
+    if HELPER_GONE not in str(exc):
+        return
+    try:
+        proc = _STARTED_HOSTS.get(name)
+        code = proc.poll() if proc is not None else None
+        seen = (f"the host process {proc.pid} ended with exit code {code}" if code is not None else
+                f"the host process {proc.pid} was still running" if proc is not None else "the host process is not one this launcher started")
+        _, _, log_path = _paths(name)
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [strata runtime] profile {name}: the launcher lost the host while the model started "
+                         f"({seen}; its address did not answer). No other line before this one means the host ended without writing one.\n")
+    except Exception:                                   # noqa: BLE001 - a note in a log never changes the outcome
+        pass
+
 
 def _is_private(details: os.stat_result, path: Path) -> bool:
     """Owner-only: POSIX owner and no group/other bits; Windows an ACL that shuts out every other account."""
@@ -437,7 +458,7 @@ def _rpc(name: str, command: str, *, timeout: float = 5, params: dict | None = N
     try:
         client = owner_transport.connect(state["socket"], timeout=timeout)
     except OSError:      # nothing listens there any more (a lost owner), or it did not answer in time
-        raise ProfileError("runtime control is unavailable; inspect the private host log", 3) from None
+        raise ProfileError(HELPER_GONE, 3) from None
     try:
         try:
             client.sendall(raw)
@@ -452,7 +473,7 @@ def _rpc(name: str, command: str, *, timeout: float = 5, params: dict | None = N
         except socket.timeout:
             raise ProfileError("runtime operation wait expired; inspect runtime status", 8) from None
         except OSError:
-            raise ProfileError("runtime control is unavailable; inspect the private host log", 3) from None
+            raise ProfileError(HELPER_GONE, 3) from None
     finally:
         client.close()
     if len(answer) > MAX_MESSAGE:
@@ -727,6 +748,7 @@ def _await_start(name: str, wait: float, on_status=None) -> dict:
             # missed answer is not a failed start: keep asking until the wait is over, as long as the owner is still alive. A lost
             # owner (its lease is free, or nothing listens any more) is a failure now.
             if exc.exit_code not in (3, 8) or not _owner_alive(name):
+                _note_host_gone(name, exc)
                 raise
             result = {**result, "state": "starting", "phase": result.get("phase") or "owner_not_answering"}
             time.sleep(0.2)
@@ -1621,6 +1643,11 @@ class Host:
 
 def main(argv: list[str] | None = None) -> int:
     quiet_crash_env()                                   # the host's children inherit it (strata_control/childenv.py)
+    try:                                                # a native death (an access violation) names its Python line in the host log (stderr is that file)
+        import faulthandler
+        faulthandler.enable(all_threads=True)
+    except Exception:                                   # noqa: BLE001 - no stderr to write to: nothing to arm
+        pass
     parser = argparse.ArgumentParser(prog="strata-runtime-host")
     parser.add_argument("--host", required=True)
     parser.add_argument("--shutdown-timeout", type=float, default=30)

@@ -8,6 +8,7 @@ of key hints. Esc goes back, Enter goes on, q leaves (and says what is kept). Ch
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from rich.text import Text
@@ -59,6 +60,17 @@ def drafting_choice_available(ctx) -> bool:
         return False
     catalog = getattr(ctx, "catalog", None)
     backend, archs = drafting.hardware_for(catalog.installed_backend() if catalog is not None else None)   # #5109: the installed engine's family
+    return drafting.hardware_support(backend, archs).can_run
+
+
+def total_depends_on_model(ctx) -> bool:
+    """Whether the number of steps changes with the model picked on the first step: only the Drafting step comes and goes with the model, and it can
+    exist only on a computer whose engine runs DFlash2. There "Step 1 of 11" turned into "Step 2 of 10" after a model was chosen (T7)."""
+    from strata_control import drafting
+    if not drafting.ENGINE_SERVES_DFLASH2:
+        return False
+    catalog = getattr(ctx, "catalog", None)
+    backend, archs = drafting.hardware_for(catalog.installed_backend() if catalog is not None else None)
     return drafting.hardware_support(backend, archs).can_run
 
 
@@ -148,7 +160,9 @@ class Base(Screen):
         if self.step_id in flow:
             labels = STEP_LABELS
             n = flow.index(self.step_id)
-            if self.width() >= 118:
+            if self.step_id == "model" and total_depends_on_model(self.ctx):      # T7: the model decides whether a Drafting step exists, so no total yet
+                out.append(f"   Step 1: {labels[self.step_id]}", style="")
+            elif self.width() >= 118:
                 out.append("   ")
                 for i, sid in enumerate(flow):
                     mark = f"[{i + 1} {labels[sid]}]" if i == n else f"{i + 1} {labels[sid]}"
@@ -307,13 +321,13 @@ class StartScreen(Base):
 
     def explain(self) -> Text:
         c = self.ctx.computer
-        return Text(f"This computer: {c.line()}.  " + ("Preset: model, context, parallel requests, tuned settings, access. "
+        return Text(f"This computer: {self.ctx.computer_line()}.  " + ("Preset: model, context, parallel requests, tuned settings, access. "
                     "Shared with the Strata app." if self.presets else "Choose how to begin."), style=MUTE)
 
     def head_text(self) -> Text:
         out = Text(no_wrap=True, overflow="crop")
         out.append("STRATA  Launch", style=f"bold {ACCENT}")
-        info = self.ctx.computer.line()
+        info = self.ctx.computer_line()
         gap = max(2, self.width() - len("STRATA  Launch") - len(info))
         out.append(" " * gap + info, style=MUTE)
         return out
@@ -429,9 +443,10 @@ class ModelScreen(Base):
 
     def widths(self) -> list[tuple[str, int]]:
         w = self.width()
+        longest = max((len(r.title) for r in getattr(self, "rows", [])), default=0) + 2      # T4: the longest name and a gap, so name and size never touch
         if w >= 100:
-            return [("Model", 42), ("Download", 10), ("Needs (RAM + VRAM)", 20), ("On this computer", 0)]
-        return [("Model", 41), ("Size", 8), ("Needs", 7), ("Fits?", 0)]      # 80 columns: the verdict column keeps room (the long words are below the list)
+            return [("Model", min(max(42, longest), 52)), ("Download", 10), ("Needs (RAM + VRAM)", 20), ("On this computer", 0)]
+        return [("Model", min(max(41, longest), 43)), ("Size", 8), ("Needs", 7), ("Fits?", 0)]      # 80 columns: the verdict column keeps room (the long words are below the list)
 
     def build_menu(self, initial: bool = False) -> None:
         s = self.ctx.settings
@@ -442,13 +457,15 @@ class ModelScreen(Base):
         items: list[Item] = []
         sel = 0
         for i, r in enumerate(self.rows):
-            col = {"fits": "", "slower": WARN, "tight": WARN, "no": BAD}[r.verdict]
+            col = {"fits": "", "slower": WARN, "tight": WARN, "no": BAD, "disk": WARN}[r.verdict]
             tag = (" (recommended)" if r.recommended else "") + (" (installed)" if r.installed else "") + (" [experimental]" if r.experimental else "")
             need = f"{r.fit_gb:.0f} GB" if r.fit_gb else "-"
             verdict = r.words + tag
             if self.width() < 100:                           # a short verdict that fits the column; the full sentence is shown under the list
                 extra = " (recommended)" if r.recommended else " (installed)" if r.installed else " [experimental]" if r.experimental else ""
-                verdict = {"fits": "fits", "slower": "may run slower", "tight": "tight", "no": "too big"}[r.verdict] + extra
+                if r.verdict == "disk":                      # 18 cells: "no disk (rec.)" keeps the recommendation visible
+                    extra = " (rec.)" if r.recommended else extra
+                verdict = {"fits": "fits", "slower": "may run slower", "tight": "tight", "no": "too big", "disk": "no disk"}[r.verdict] + extra
             items.append(Item([r.title, f"{r.download_gb:.0f} GB", need, Cell(verdict, col)], key=(r.family, r.model)))
             if (s.family, s.model) == (r.family, r.model):
                 sel = i
@@ -470,7 +487,7 @@ class ModelScreen(Base):
         if s.model_path:
             q.append(f"   your files: {s.model_path}", style=MUTE)
         else:
-            info = "This computer: " + self.ctx.computer.line()
+            info = "This computer: " + self.ctx.computer_line()
             if len("Which model?") + len(info) + 3 <= self.width():
                 q.append(" " * (self.width() - len("Which model?") - len(info)) + info, style=MUTE)
         self.query_one("#question", Static).update(q)
@@ -484,7 +501,7 @@ class ModelScreen(Base):
             if r:
                 out.append(f"{r.title}: {r.about}.\n", style=FG)
                 if r.verdict != "fits":
-                    out.append(f"{r.words}. ", style=BAD if r.verdict == "no" else WARN)
+                    out.append(f"{r.sentence}. ", style=BAD if r.verdict == "no" else WARN)
         out.append("The n-gram table stays on your SSD and is not counted above.", style=MUTE)
         for title, why in self.unavailable_lines():
             out.append(f"\n{title}: {why}", style=MUTE)
@@ -1012,12 +1029,15 @@ class PicturesScreen(Base):
         s = self.ctx.settings
         r = self.row()
         self.supported = True if r is None else r.images
+        self.not_on_card = self.ctx.catalog.pictures_not_on_card()
         items = [Item(["No pictures"], key="off")]
-        if self.supported:
+        if self.supported and self.not_on_card:              # T14: an Intel Arc card starts text-only for now: do not offer what does not work
+            items.append(Item([Cell("Yes, read pictures: not available on Intel Arc cards yet", MUTE)], key="on", enabled=False))
+        elif self.supported:
             items.append(Item(["Yes, read pictures" + ("  (this engine has no picture reader)" if self.reader() == "missing" else "")], key="on"))
         else:
             items.append(Item([Cell("Yes, read pictures: not available for this model yet", MUTE)], key="on", enabled=False))
-        sel = 1 if s.vision != "off" and self.supported and self.reader() != "missing" else 0       # pictures are on unless someone said off
+        sel = 1 if s.vision != "off" and self.supported and not self.not_on_card and self.reader() != "missing" else 0       # pictures are on unless someone said off
         self.query_one(Menu).set_items(items, sel)
         self.paint()
 
@@ -1033,16 +1053,18 @@ class PicturesScreen(Base):
                  "taken from the graphics card.")
         if not self.supported:
             return Text("This model cannot read pictures yet, so pictures stay off. Pick another model if you need them.", style=WARN)
+        if getattr(self, "not_on_card", False):
+            return Text("Intel Arc cards cannot read pictures with Strata yet, so pictures stay off and the model answers text only. "
+                        "Pictures work on NVIDIA and AMD cards and on a Mac.", style=WARN)
         out = Text("Pictures are on by default. They add " + extra + " Say No if you only chat in text.", style=MUTE)
         if self.reader() == "missing":
             out.append("\nHeads up: the engine installed here does not carry the picture reader, so the model would answer text only. "
                        "Update the engine, or say No.", style=WARN)
         return out
-        return out
 
     def commit(self) -> None:
         key = self.menu().current.key
-        if key == "on":                                      # yes: the reader on the card (NVIDIA, AMD) or the CPU, as the default says
+        if key == "on":                                    # yes: the reader on the card (NVIDIA, AMD) or the CPU, as the default says
             device = self.ctx.catalog.picture_default(True)
             key = device if device != "off" else "on"
         self.ctx.settings.vision = key
@@ -1125,7 +1147,8 @@ class ParallelScreen(Base):
         vram = self.ctx.computer.main_vram_gb
         self.fit = S.fit_parallel(vram) if vram else 1
         s = self.ctx.settings
-        items = [Item([f"Fit to my graphics card ({self.fit})", Cell("recommended", "")], key=None)]
+        shared = not vram and bool(self.ctx.computer.usable_gpus)
+        items = [Item([f"Fit to this computer ({self.fit})" if shared else f"Fit to my graphics card ({self.fit})", Cell("recommended", "")], key=None)]
         for n in (1, 2, 3, 4):
             note, style = "", ""
             if n > self.fit:
@@ -1138,7 +1161,12 @@ class ParallelScreen(Base):
 
     def explain(self) -> Text:
         vram = self.ctx.computer.main_vram_gb
-        return Text(f"Your card has {vram:.0f} GB of graphics memory, which fits {self.fit} at once by Strata's rule "
+        if not vram and self.ctx.computer.usable_gpus:      # T3: a Mac or a Strix Halo PC has a chip whose memory is the computer's own, not a card with a size
+            return Text("This computer's graphics use the same memory as everything else, so Strata cannot count graphics memory to say how many "
+                        "requests fit. 1 is the safe choice; more at once need more of that memory. One person: pick 1. A team or several coding "
+                        "agents: more.", style=MUTE)
+        many = len(self.ctx.computer.usable_gpus) > 1
+        return Text(f"Your {'biggest card has' if many else 'card has'} {vram:.0f} GB of graphics memory, which fits {self.fit} at once by Strata's rule "
                     "(12 GB: 1, 20 GB: 2, 24 GB: 3, 32 GB or more: 4). One person: pick 1. A team or several coding agents: more. "
                     "More than fits still starts, only slower." if vram else
                     "No graphics card was found, so Strata cannot say how many fit. 1 is the safe choice.", style=MUTE)
@@ -1164,13 +1192,11 @@ class TuningScreen(Base):
 
     def on_mount(self) -> None:
         s = self.ctx.settings
-        first = self.ctx.fresh_setup and not s.is_tuned
-        items = [Item(["Quick", "about 20 minutes", "checks the most likely gains" + ("; suggested the first time" if first else "")], key="quick"),
+        items = [Item(["Quick", "about 20 minutes", "checks the most likely gains"], key="quick"),
                  Item(["Thorough", "up to 2 hours", "tries more settings, measures each one several times"], key="thorough"),
                  Item(["Skip", "", "use the default settings (already good on most computers)"], key="skip")]
-        if not self.ctx.tune_chosen and s.tune == "skip" and not s.is_tuned and self.ctx.fresh_setup:
-            s.tune = "quick"
-        self.query_one(Menu).set_items(items, {"quick": 0, "thorough": 1, "skip": 2}.get(s.tune, 0))
+        # T5: a first setup starts on Skip (the default of s.tune): Quick is one key down and a person who presses Enter all the way does not wait 20 minutes
+        self.query_one(Menu).set_items(items, {"quick": 0, "thorough": 1, "skip": 2}.get(s.tune, 2))
         self.paint()
 
     def refresh_body(self) -> None:
@@ -1179,8 +1205,11 @@ class TuningScreen(Base):
             f"\n  [{'x' if on else ' '}] Allow settings that change answers very slightly (same quality)   press a to change", style=MUTE))
 
     def explain(self) -> Text:
+        later = ""
+        if self.ctx.fresh_setup and not self.ctx.settings.is_tuned:
+            later = " Skip lets you start sooner; you can tune any time later with: strata launch --tune quick."
         return Text("Tuning is optional: it keeps only real gains, and the result is a preset the Strata app can use too. Close other heavy "
-                    "programs while it measures. The command line skips tuning unless you add --tune.", style=MUTE)
+                    "programs while it measures." + later, style=MUTE)
 
     def action_allow(self) -> None:
         self.ctx.settings.tune_allow_small = not self.ctx.settings.tune_allow_small
@@ -1195,19 +1224,19 @@ class TuningScreen(Base):
 
 class AdvancedScreen(Base):
     step_id = "advanced"
-    hints = "n next   ↑↓ choose   Enter edit   Esc back   Del reset   x experimental   / filter   a add by name   c copy command   Tab scroll command"
+    hints = "Enter next   ↑↓ choose   e edit   Esc back   Del reset   x experimental   / filter   a add by name   c copy command   Tab scroll command"
     help_text = ("Every engine setting with its default, the value the tuner chose and your own value. You never have to touch this. "
                  "A name the engine does not list gets a warning, not a refusal.")
 
-    BINDINGS = [b for b in Base.BINDINGS if b.key != "enter"] + [
-        Binding("enter", "edit", show=False), Binding("delete", "reset", show=False), Binding("backspace", "reset", show=False),
+    BINDINGS = Base.BINDINGS + [
+        Binding("e", "edit", show=False), Binding("delete", "reset", show=False), Binding("backspace", "reset", show=False),
         Binding("x", "experimental", show=False), Binding("slash", "filter", show=False), Binding("a", "add", show=False),
         Binding("c", "copy", show=False), Binding("n", "go_next", show=False), Binding("right", "go_next", show=False),
         Binding("tab", "scroll_command", show=False)]
 
     def body(self) -> ComposeResult:
         yield Static("", id="advhead", markup=False)
-        yield Menu([("Setting", 24), ("Default", 11), ("Tuned", 13), ("Yours", 10), ("What it does", 0)], id="menu", window=8)
+        yield Menu([("Setting", 26), ("Default", 11), ("Tuned", 13), ("Yours", 10), ("What it does", 0)], id="menu", window=8)
         with VerticalScroll(id="cmdbox"):                    # the long command has its own scroll area (Tab, then the arrows) instead of running off the screen
             yield Static("", id="cmdline", markup=False)
         yield Input(id="edit", classes="field", disabled=True)
@@ -1264,14 +1293,14 @@ class AdvancedScreen(Base):
         out = Text()
         out.append("Command that will run (your choices above are in it)\n", style=f"bold {ACCENT}")
         out.append("  " + cmd + "\n")
-        out.append("  Same as: " + S.flags_text(s) + "\n", style=MUTE)
+        out.append("  Same as: " + self.ctx.flags_line() + "\n", style=MUTE)
         if eng:
             out.append("  " + eng, style=WARN)
         self.query_one("#cmdline", Static).update(out)
 
     def hints_text(self) -> str:
         if (self.size.width or 80) < 60:
-            return "n next  Enter edit  Esc back  Tab command"
+            return "Enter next  e edit  Esc back  Tab command"
         return super().hints_text()
 
     def explain(self) -> Text:
@@ -1283,7 +1312,7 @@ class AdvancedScreen(Base):
             r = next((x for x in self.rows if x.name == cur.key), None)
             if r:
                 return Text(f"{r.name}: {r.description}" + (" This one is experimental: it may change answers or not work on every card." if r.experimental else ""), style=MUTE)
-        return Text("Press Enter on a row to set your own value; Del puts the tuned value back. You can go on without touching anything: n.", style=MUTE)
+        return Text("Press e on a row to set your own value; Del puts the tuned value back. You can go on without touching anything: Enter.", style=MUTE)
 
     # ---- editing
     def action_edit(self) -> None:
@@ -1365,7 +1394,7 @@ class AdvancedScreen(Base):
     def action_copy(self) -> None:
         if self.mode:
             return
-        text = self.ctx.command_text() + "\n" + S.flags_text(self.ctx.settings)
+        text = self.ctx.command_text() + "\n" + self.ctx.flags_line()
         try:
             self.app.copy_to_clipboard(text)
             self.say("Copied the command to the clipboard (if your terminal allows it).")
@@ -1387,7 +1416,7 @@ class AdvancedScreen(Base):
         self.app.advance()           # type: ignore[attr-defined]
 
     def action_next(self) -> None:
-        self.action_edit()
+        self.action_go_next()
 
     def action_back(self) -> None:
         if self.mode:
@@ -1612,7 +1641,9 @@ class SaveScreen(Base):
         from strata_cli.launch import modelstate
         from strata_cli.launch.runner import fit_parallel_for
         r = next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
+        cards = self.ctx.cards_line()
         lines = [("Model", (r.title if r else (s.model or "?")) + (" (your files)" if s.model_path else "")),
+                 *([("Cards", cards)] if cards else []),                       # T8: Main / Helper / Off of each card
                  ("Context", S.context_label(s.context) + f", memory {s.kv or 'int8'}"),
                  ("Pictures", "on" if s.vision != "off" else "off"),
                  *([("Drafting", dict(DraftingScreen.CHOICES).get(s.drafting or ("off" if modelstate.layer_off_without_choice(self.ctx.base_config()) else "auto"), "Auto (recommended)"))] if drafting_choice_available(self.ctx) else []),
@@ -1622,7 +1653,31 @@ class SaveScreen(Base):
                  ("Storage", s.data_dir or str(self.ctx.default_folder()))]
         if s.extra:
             lines.append(("Advanced", ", ".join(f"{k}={v}" for k, v in s.extra.items())))
+        for n, text in enumerate(self.download_lines()):                       # T2: everything that will be downloaded, with its size
+            lines.append(("Download" if n == 0 else "", text))
         return lines
+
+    def download_lines(self, short: bool = False) -> list[str]:
+        """One line per thing the launch will download, with its size ("the model, 66 GB"), or the one line "nothing: ..." when everything is here.
+        The engine's size is not known before the update source is read, so it is listed without one. `short`: the words for a small window
+        ("model 66 GB")."""
+        plan = self.ctx.download_plan()
+        if plan is None:
+            return []
+        out = []
+        if not plan.get("engine_usable", True):
+            out.append("engine" if short else "the engine for your graphics card (its size is shown when it starts)")
+        for p in plan.get("parts") or []:
+            gb = float(p["gb"])
+            size = f"{gb:.2f} GB" if gb < 1 else f"{gb:.0f} GB" if gb >= 10 else f"{gb:.1f} GB"
+            out.append(f"{p['label'].removeprefix('the ')} {size}" if short else f"{p['label']}, {size}")
+        return out or ["nothing: everything is on this computer"]
+
+    def compact_download(self) -> str:
+        """The Download row of the small-window summary: one line (cut at the end where the window is narrow, so it never wraps over the choices)."""
+        text = "Download " + ", ".join(self.download_lines(short=True))
+        room = max(20, self.width() - 6)
+        return text if len(text) <= room else text[:room - 1] + ("…" if self.g.unicode else ".")
 
     def refresh_body(self) -> None:
         """The summary, the name and the three choices. When the body is too short for all of it (a small window), the summary shrinks to a
@@ -1641,9 +1696,11 @@ class SaveScreen(Base):
             model = dict(lines)["Model"].replace("Qwen3.8-Flash-Next ", "")
             rows = [f"{model} \u00b7 {S.context_label(s.context)} \u00b7 memory {s.kv or 'int8'}",
                     f"Pictures {'on' if s.vision != 'off' else 'off'} \u00b7 Parallel {s.parallel or 'auto'} \u00b7 Tuning {s.tune}",
-                    f"Access {s.access}, port {s.port}" + (f" \u00b7 Storage {s.data_dir}" if s.data_dir else "")]
+                    self.compact_download(),                                                   # T2: also in a small window
+                    f"Access {s.access}, port {s.port}" + (" \u00b7 Storage " + middle_shorten(s.data_dir, max(20, self.width() - 36), "\u2026" if self.g.unicode else "...")
+                                                           if s.data_dir else "")]
             t.append("Save, then launch   name:\n" if tiny else "Save as preset, then launch   name:\n", style=f"bold {ACCENT}")
-            for ln in rows[:2 if tiny else 3]:
+            for ln in rows[:2 if tiny else 3 if body_h < 12 else 4]:
                 t.append("  " + ln + "\n")
             if warnings and not tiny:
                 t.append(f"  ! {warnings[0]}" + (f"  (+{len(warnings) - 1} more)" if len(warnings) > 1 else "") + "\n", style=WARN)
@@ -1668,13 +1725,15 @@ class SaveScreen(Base):
     def explain(self) -> Text:
         if (self.size.height or 30) < 20:
             return Text("")                                  # a small window: the choices matter more than the sentence
-        st = self.ctx.model_state()
-        if st.remaining_gb < 0.05:
-            fetch = "Nothing needs to be downloaded."
-        elif st.only_helpers:
-            fetch = "The model is already downloaded; Strata fetches " + st._names() + "."        # noqa: SLF001
+        plan = self.ctx.download_plan()
+        if plan is not None:                                 # T2: the same list as under Download above
+            if plan.get("engine_usable", True) and float(plan.get("gb") or 0) < 0.05:
+                fetch = "Nothing needs to be downloaded."
+            else:
+                fetch = "Strata downloads what is listed under Download first."
         else:
-            fetch = f"Strata downloads about {st.remaining_gb:.0f} GB first."
+            st = self.ctx.model_state()
+            fetch = "Nothing needs to be downloaded." if st.remaining_gb < 0.05 else f"Strata downloads about {st.remaining_gb:.0f} GB first."
         tune = " It tunes first." if self.ctx.settings.tune != "skip" else ""
         return Text(f"Press Enter on the first choice to save and start. {fetch}{tune} The Strata monitor opens in this window when it is serving; "
                     "no web page opens by itself.", style=MUTE)
@@ -1721,7 +1780,7 @@ class RunScreen(Base):
     title_line = "Launch"
     hints = "s stop   q quit"
     BINDINGS = [Binding("s", "stop_run", show=False), Binding("q", "stop_run", show=False), Binding("escape", "stop_run", show=False),
-                Binding("r", "retry", show=False)]
+                Binding("r", "retry", show=False), Binding("u", "use_port", show=False)]
 
     STAGE_WORDS = (("engine", "Engine"), ("model", "Model"), ("config", "Settings"), ("tune", "Tuning"), ("start", "Starting"),
                    ("access", "Access"))
@@ -1734,6 +1793,7 @@ class RunScreen(Base):
         super().__init__()
         self.state: dict[str, dict] = {k: {"text": "", "pct": None, "status": "wait"} for k, _ in self.STAGE_WORDS}
         self.failed: str | None = None
+        self.free_port: int | None = None
         self.tune_info: dict = {}
 
     def on_mount(self) -> None:
@@ -1767,7 +1827,20 @@ class RunScreen(Base):
 
     def on_failure(self, text: str) -> None:
         self.failed = text
+        self.free_port = None
+        busy = re.search(r"Port (\d+) is already in use", text)
+        if busy:                                             # T11: the screen offers the next free port itself, no walk back through seven screens
+            s = self.ctx.settings
+            host = s.listen if s.access == "address" and s.listen else "127.0.0.1"
+            self.free_port = S.next_free_port(int(busy.group(1)), host)
         self.paint()
+
+    def action_use_port(self) -> None:
+        """u: start again on the next free port (the choice is kept in this launch's settings, and in the preset when it is saved)."""
+        if self.failed and self.free_port:
+            self.ctx.settings.port = self.free_port
+            self.free_port = None
+            self.app.run_launch()          # type: ignore[attr-defined]
 
     def on_finished(self) -> None:
         for k, st in self.state.items():
@@ -1793,6 +1866,8 @@ class RunScreen(Base):
             t.append((st["text"] or "") + "\n", style=FG if st["status"] == "run" else MUTE)
         if self.failed:
             t.append("\n  " + self.failed + "\n", style=BAD)
+            if self.free_port:
+                t.append(f"  Press u to use port {self.free_port} (the next free one) and start. ", style=ACCENT)
             t.append("  Press r to try again, Esc to go back to the screens, q to quit.\n", style=MUTE)
         try:
             self.query_one("#stages", Static).update(t)

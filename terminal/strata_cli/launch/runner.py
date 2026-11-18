@@ -111,6 +111,14 @@ class LaunchError(RuntimeError):
         self.text, self.next, self.code = text, next, code
 
 
+#: said on a Mac's first start (the engine kernels are built on the first answer; measured 9.5 s on an M5 Max, 0.8 s later)
+MAC_FIRST_ANSWER = " The first answer on this Mac takes about 10 seconds longer, because it prepares its graphics code once."
+
+#: appended when the picture reader is what could not be fetched (an offline start with Pictures on and every model file already here)
+PICTURES_WAY_ON = (" To start now without it, turn pictures off (the Pictures step, or --vision off). "
+                   "Or put the picture reader file (mmproj) next to your model files.")
+
+
 def setup_failure(lines: list[str], err: str, hint: str, details: str | None, own_files: bool) -> LaunchError:
     """The error for a setup.py run that exited non-zero. setup.py's own `[X]` line (err) is the message when there is one; when it
     stopped with a Python error instead, that error's last line is (#3613, #3467: a file missing from the Terminal's tools/ ended every
@@ -134,10 +142,11 @@ def setup_failure(lines: list[str], err: str, hint: str, details: str | None, ow
                                "Pick a folder you own for the model files (the Folder step, or --data-dir D:\\Strata-models) and start again. "
                                "Nothing was downloaded." + where, 6)
         return LaunchError(f"The model could not be installed. Setup stopped with an error ({crashed}).", "Run it again." + where, 6)
+    way_on = PICTURES_WAY_ON if "picture reader" in err.lower() else ""
     return LaunchError("The model could not be installed." + (f" {capital(err.rstrip('.'))}." if err else ""),
                        (hint or ("Run it again: finished steps are skipped." if own_files else
                                  "Run it again: finished steps are skipped and a download continues where it stopped."))
-                       + (f" Details: {details}" if details else ""), 6)
+                       + way_on + (f" Details: {details}" if details else ""), 6)
 
 
 class Cancelled(LaunchError):
@@ -757,6 +766,43 @@ def download_text(dl: dict, already: bool, label: str | None = None) -> str:
     return f"{label}: {dl['done_gb']:.1f} of {dl['total_gb']:.1f} GB" if label else f"Downloading {dl['done_gb']:.1f} of {dl['total_gb']:.1f} GB"
 
 
+class DownloadPace:
+    """How fast a download goes over the last minute, and the sentence for its end (T12). A big download's last pieces can crawl at under 1 MB/s for
+    ten minutes while the bar sits at 98 %: nothing on the screen said so. Near the end the line now says what is left and the speed."""
+
+    WINDOW_S = 90.0
+    END_GB = 1.0                 # "near the end": this much or less is left ...
+    END_FRACTION = 0.05          # ... or this share of the whole
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.samples: list[tuple[float, float]] = []
+
+    def add(self, done_gb: float) -> None:
+        now = self.clock()
+        self.samples.append((now, float(done_gb)))
+        self.samples = [s for s in self.samples if now - s[0] <= self.WINDOW_S]
+
+    def mb_per_s(self) -> float | None:
+        now = self.clock()
+        recent = [s for s in self.samples if now - s[0] <= self.WINDOW_S]      # (a stall: the figure falls as the silence grows)
+        if not recent or now - recent[0][0] < 5.0:
+            return None
+        (t0, d0), d1 = recent[0], recent[-1][1]
+        return max(0.0, (d1 - d0) * 1000.0 / (now - t0))
+
+    def finishing(self, dl: dict) -> str:
+        """" Finishing the last pieces (310 MB left, 0.4 MB/s)." near the end of a download, else ""."""
+        total, done = float(dl.get("total_gb") or 0), float(dl.get("done_gb") or 0)
+        left = total - done
+        if total <= 0 or left <= 0 or not (left <= self.END_GB or left <= total * self.END_FRACTION) or float(dl.get("percent") or 0) < 90:
+            return ""
+        speed = self.mb_per_s()
+        pace = "" if speed is None else (f", {speed:.1f} MB/s" if speed >= 0.05 else ", waiting for data")
+        size = f"{left * 1000:.0f} MB" if left < 10 else f"{left:.1f} GB"
+        return f" Finishing the last pieces ({size} left{pace})."
+
+
 _END = object()
 
 
@@ -783,6 +829,7 @@ class Runner:
         self.confirm = confirm                # asked (title, text) before a model is downloaded with no engine; True = go on
         self.assume_yes = assume_yes          # --yes: no questions
         self.engine_problem: str | None = None
+        self.engine_fresh = False             # the engine was fetched by this run
         self.key_written_notice: str | None = None   # the sentence "a new API key was made", held by the command until the run config that holds the key is on disk
         self.key_written = False
         self._catalog = catalog
@@ -959,6 +1006,7 @@ class Runner:
             why = capital(why)                         # (joined after a sentence: "the update feed could not be read ..." starts a new one)
             raise LaunchError("The engine could not be installed." + (f" {why}" if why else ""),
                               "Check your internet connection, or point Strata at an update source with --feed, then try again.", 6)
+        self.engine_fresh = True                             # fetched in this run: a Mac builds its graphics code on the first answer (T22)
         self.emit("engine", "The engine is installed.", 100)
 
     def stale_update_blocked(self, stale: str) -> str | None:
@@ -1468,6 +1516,7 @@ class Runner:
         lines: list[str] = []
         already: bool | None = None                          # all the model's files were on disk before this run wrote anything
         job = self.progress_job()
+        pace, last_dl = DownloadPace(), None                 # T12: the last pieces of a big download crawl; say so
         step_seen, step_since, quiet_since, said = None, time.monotonic(), time.monotonic(), None
         for line in self._read_lines(p):
             if self.cancel.is_set():
@@ -1477,7 +1526,8 @@ class Runner:
             if line is None:                                 # nothing printed for a while: the long steps (packing, converting) are silent
                 if said and time.monotonic() - quiet_since >= self.HEARTBEAT_S:     # (the download phase too: a server that does not answer is silent)
                     quiet_since = time.monotonic()
-                    self.emit("model", f"{said[0]} (still working, {_elapsed(time.monotonic() - step_since)} so far)", None, step=step_seen)
+                    ending = pace.finishing(last_dl) if last_dl is not None and said[1] == "download" else ""
+                    self.emit("model", f"{said[0]} (still working, {_elapsed(time.monotonic() - step_since)} so far)" + ending, None, step=step_seen)
                 continue
             quiet_since = time.monotonic()
             line = line.rstrip()
@@ -1497,6 +1547,10 @@ class Runner:
                 if phase == "download" and already is None:
                     already = float(dl["percent"]) >= 99.5
                 text = download_text(dl, bool(already) and phase == "download", label)
+                if phase == "download" and not already:
+                    pace.add(float(dl.get("done_gb") or 0))
+                    last_dl = dl
+                    text += pace.finishing(dl)
                 self.emit("model", text, float(dl["percent"]), step=prog.get("step"))
             elif label:
                 self.emit("model", label, None, step=prog.get("step"))
@@ -2315,7 +2369,7 @@ class Runner:
             self.emit("start", f"Loading the model… {int(time.monotonic() - t0)} s", None)
         if "e" in box:
             self.end_failed_start()
-            raise LaunchError(f"The server could not start: {box['e']}", _log_hint(self.config_path, box["e"]), 6)
+            raise LaunchError(f"The server could not start: {box['e']}", self.helper_gone_next(box["e"]) or _log_hint(self.config_path, box["e"]), 6)
         r = box["r"]
         if r.get("engine_fallback"):                        # #5400: the new engine could not start the model; the previous one was used again
             self.emit("start", str(r.get("note") or ""), None, level="warn")
@@ -2324,7 +2378,7 @@ class Runner:
                                             shared_memory=self.shares_memory())
             self.end_failed_start()
             raise LaunchError(text, nxt, 6)
-        self.emit("start", "The model is loaded and answering.", 100)
+        self.emit("start", "The model is loaded and answering." + (MAC_FIRST_ANSWER if self.mac_first_start() else ""), 100)
         self.report_drafting()
 
     _marks: dict | None = None
@@ -2335,6 +2389,24 @@ class Runner:
             return uses_integrated_gpu(self.catalog.computer(), self.s)
         except Exception:                                    # noqa: BLE001 - an explanation only
             return False
+
+    def helper_gone_next(self, error: object) -> str | None:
+        """The next step when the helper process that owns the engine was lost (T21), else None. The engine's log has nothing to say then."""
+        from strata_control import runtime
+        if runtime.HELPER_GONE not in str(error):
+            return None
+        try:
+            log = str(runtime._paths(self.profile)[2])      # noqa: SLF001 - the host log's own path
+        except Exception:                                    # noqa: BLE001
+            log = "the host log"
+        return (f"Run `strata launch` again. If it stops again, run `strata doctor` and send what it prints, together with the file {log}, "
+                "when you ask for help. Nothing was changed on your computer.")
+
+    def mac_first_start(self) -> bool:
+        """A Mac on the first start of a fresh engine (T22): the first answer builds the graphics code and takes about 10 seconds longer."""
+        if not (getattr(self, "engine_fresh", False) and sys.platform == "darwin"):
+            return False
+        return True
 
     def server_log_path(self) -> Path | None:
         try:
