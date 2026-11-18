@@ -4,6 +4,7 @@
 // src/kernels/cpu/hadamard.cpp - see include/strata/kernels/cpu/hadamard.hpp.
 #include "strata/kernels/cpu/hadamard.hpp"
 
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -37,7 +38,9 @@ bool hadamard_parse(const std::string& path, int64_t n_layers, HadamardSpec& h, 
             if (line.compare(0, sizeof tag - 1, tag) == 0) {
                 std::istringstream version(line.substr(sizeof tag - 1));
                 int n = 0;
-                if (!(version >> n) || n != 1 || !(version >> std::ws).eof()) {
+                if (!(version >> n) || n != 1 ||
+                    (version.peek() != std::char_traits<char>::eof() && version.peek() != ':' &&
+                     !std::isspace(static_cast<unsigned char>(version.peek())))) {
                     err = path + ": an unknown hadamard.txt version (this engine reads v1)";
                     return false;
                 }
