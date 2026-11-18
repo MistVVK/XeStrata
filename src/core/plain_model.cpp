@@ -3785,7 +3785,7 @@ bool PlainModel::reset(std::string& err) {
 }
 
 void PlainModel::pool_fn(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                         int64_t layer) {
+                         int64_t tb, int64_t layer) {
     PlainModel* m = (PlainModel*) user;
     // --batch-groups: the stages' threads take the pool (and its dispatch's buffers and helpers) one at a time
     std::unique_lock<std::mutex> turn(m->root_->pool_mu_, std::defer_lock);
@@ -3795,6 +3795,7 @@ void PlainModel::pool_fn(void* user, const float* x_f, const int32_t* ids, int64
         if (ids[i] >= 0 && ids[i] < E) m->heat_[(size_t) (layer * E + ids[i])] += 1.0;
     m->dump_routes(layer, ids, n_tok, k);
     m->disp_.layers = layer;
+    m->disp_.lat_tb = tb;
     expert_pool_dispatch_multi(m->disp_, x_f, ids, n_tok, k, out);
 }
 

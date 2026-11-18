@@ -3063,10 +3063,12 @@ static void latent_cpu_run(ExpertDispatch& d, const int32_t* ids, int64_t n_tok,
     act.assign(ent_t.size() * act_row, 0);
     if (act_gpu) {
         for (size_t j = 0; j < ent_t.size(); ++j)
-            std::memcpy(act.data() + j * act_row, d.lat_act0 + ((size_t) ent_t[j] * G + ent_g[j]) * act_row, act_row);
+            std::memcpy(act.data() + j * act_row,
+                        d.lat_act0 + (((size_t) ent_t[j] + (size_t) d.lat_tb) * G + ent_g[j]) * act_row, act_row);
     } else {
         for (size_t j = 0; j < ent_t.size(); ++j)
-            native_quant_act(f_nr, xl + ((size_t) ent_t[j] * G + ent_g[j]) * ELL, act.data() + j * act_row);
+            native_quant_act(f_nr, xl + (((size_t) ent_t[j] + (size_t) d.lat_tb) * G + ent_g[j]) * ELL,
+                             act.data() + j * act_row);
     }
     // A: one job per expert, its entries together, on the pool's native row phases
     static thread_local std::vector<float> lh;

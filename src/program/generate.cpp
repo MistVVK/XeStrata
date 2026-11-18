@@ -953,9 +953,10 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 
 /// Plan v0.3 P6: the pool for a verify window.
 void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+                      int64_t tb, int64_t layer) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
+    t->d.lat_tb = tb;
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
@@ -993,7 +994,7 @@ struct SplitDrive {
     const uint8_t* lat_act0[kMax] = {};           ///< its q8_0 activation rows
 };
 void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+                      int64_t tb, int64_t layer) {
     SplitDrive* s = (SplitDrive*) user;
     int st = 0;
     while (st + 1 < s->n && layer >= s->end[st]) ++st;
@@ -1005,7 +1006,7 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     d.d.lat_xl = s->lat_xl[st];
     d.d.lat_xlseq = s->lat_xlseq[st];
     d.d.lat_act0 = s->lat_act0[st];
-    drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
+    drive_pool_multi(s->base, x_f, ids, n_tok, k, out, tb, layer);
 }
 
 /// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an

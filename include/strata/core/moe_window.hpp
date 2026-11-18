@@ -41,9 +41,10 @@ namespace strata::prefill::mmq { class Context; }
 namespace strata::core {
 
 /// The CPU pool for one ring: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), the GPU's rows zeroed;
-/// `layer` is the MoE layer (the expert layout's index).  Fills the plan through the window's sink (`sink()`).
+/// `layer` is the MoE layer (the expert layout's index), `tb` the group's first token in the window (the latent D
+/// rows are the whole window's).  Fills the plan through the window's sink (`sink()`).
 using MoePoolFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                           int64_t layer);
+                           int64_t tb, int64_t layer);
 
 struct MoeWindowShape {
     int64_t n_embd = 0;

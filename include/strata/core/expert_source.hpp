@@ -460,6 +460,7 @@ struct ExpertDispatch {
     const float* lat_xl = nullptr;         ///< mapped: the D stage's f32 rows (row t*G + g)
     const uint32_t* lat_xlseq = nullptr;   ///< mapped: the D stage's doorbell (layer + 1)
     const uint8_t* lat_act0 = nullptr;     ///< mapped: the D rows as Q8_0, GPU-made (nullptr: host quantizes)
+    int64_t lat_tb = 0;                    ///< the group's first token in the window (the D rows are the window's)
     const strata::core::LatentDense* lat_dense = nullptr;   ///< the D/U file, mapped (the CPU U reads it)
     /// Plan v0.3 P6 verify window: one quantized activation per token, the multi-token jobs, and the expert ->
     /// job map (reset after every layer).
