@@ -8546,7 +8546,7 @@ def fetch_dflash2_drafter(data: Path, fam: dict, model: str, hip: bool, gpu: dic
         backend, archs = drafting.hardware_for("hip" if hip else "cuda")
 
         def show(step, done, total):
-            if total:
+            if total > 1:                              # a drafter that was already here reports 1 of 1 byte: no sizes then, not "0.00 of 0.00 GB"
                 print(f"\r  {step} {done / 1e9:.2f} of {total / 1e9:.2f} GB", end="", flush=True)
         out = drafting_fetch.ensure_for(data, model_name=f"{fam['name']}-{model.lower()}", backend=backend, archs=archs, progress=show,
                                         vram_mib=float(gpu.get("vram_gb") or 0) * 1024 or None)

@@ -9,6 +9,8 @@ MTP layer is not on disk, setup fetches the DFlash2 drafter instead of the layer
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -101,6 +103,28 @@ class FetchDrafter(unittest.TestCase):
         got, _ = self.call(side_effect=drafting_fetch.DraftingError("checksum differs"))
         self.assertFalse(got)
         self.assertEqual(len(self.warned), 2)
+
+    def test_a_drafter_that_is_already_there_prints_no_sizes(self):
+        # 0.2.16 retest F4: "The DFlash2 drafter is ready. 0.00 of 0.00 GB" (the ready line reports 1 of 1 byte).
+        def present(data, progress=None, **_):
+            progress("The DFlash2 drafter is ready.", 1, 1)
+            return Path("pack")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            got, _ = self.call(side_effect=present)
+        self.assertTrue(got)
+        self.assertNotIn("GB", out.getvalue())
+        self.assertNotIn("0.00", out.getvalue())
+
+    def test_a_real_download_still_shows_its_sizes(self):
+        def download(data, progress=None, **_):
+            progress("Downloading the DFlash2 drafter", 340_000_000, 522_000_000)
+            return Path("pack")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            got, _ = self.call(side_effect=download)
+        self.assertTrue(got)
+        self.assertIn("0.34 of 0.52 GB", out.getvalue())
 
 
 class Wiring(unittest.TestCase):
