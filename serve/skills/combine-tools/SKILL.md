@@ -20,16 +20,13 @@ flowchart LR
   rest of it. `use_text_gpu` true lends them the chat model's GPU: only when the user wants it fast, or two heavy
   steps of different image models stand side by side.
 
-Recipes:
+Recipes of several tools (the one tool for a request: image-tools' list):
 
-- A pose in words: edit_image. Keep a person and take another picture's pose: Qwen-Image-2.1 edit_image with the
-  person as `image` and the other picture as `control.image`, type `pose`; do not add it to `references`.
-  Describe the pose too. A new person in an attached picture's pose: control `pose`.
-- One part (hair, clothes, sky): edit_region; or find_region, then edit_image with its mask. A control on the cropped
-  edit_region is not available: say so, rather than claiming that a separate control changed the crop.
-- A part from another picture (a face, hair, clothes, shoes, feet, hands, a bag): find_region on the picture for
-  where it goes, then edit_image with its mask and the other picture in `references` (edit-image has more).
-- Another background: edit_image ("on a beach"); a cut-out: remove_background.
-- A full-body picture: generate_image, fix_image, then upscale_image.
-- A large final image with a part changed: upscale_image first, then edit_region.
+- Each step takes the link the step before it returned as its `image`.
+- A full-body picture: generate_image, then fix_image `{"parts": ["face", "hands"]}`; upscale_image only when asked.
+- A large final image with a part changed: upscale_image first, then edit_region on its result.
+- A cut-out on a wider or taller canvas: remove_background, then extend_image. On a drawn background (a beach):
+  edit_image alone ("on a beach").
+- A part from another picture, then more: image-tools' find_region and edit_image first, the rest on their result.
+- edit_region cannot take a control map: say so, rather than claiming a separate control changed its part.
 - Following things in a video: segment_video.

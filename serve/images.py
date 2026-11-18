@@ -4095,9 +4095,10 @@ TOOLS: list[dict[str, Any]] = [
      "description": "Change a whole image, or make a new one from it; the user sees it. Not for: one part only (her "
                     "hair, the clothes, the sky: edit_region), larger or finer (upscale_image), wider, taller or "
                     "another shape (extend_image keeps the picture; this redraws it), a cut-out or plain background "
-                    "(remove_background), faces or hands (fix_image), a new subject in a picture's pose (control). "
-                    "The same person in another picture's pose: image attached:1, control.image attached:2, not a "
-                    "reference. A model "
+                    "(remove_background), faces or hands (fix_image), a new image in a picture's pose, sketch, "
+                    "composition or depth (control). A part taken from another picture (a face, clothes, shoes): "
+                    "find_region first, then this with its mask and the picture in references. The same person in "
+                    "another picture's pose: image attached:1, control.image attached:2, not a reference. A model "
                     "without edits draws over it (img2img): the prompt then says the whole picture.",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "the change"},
