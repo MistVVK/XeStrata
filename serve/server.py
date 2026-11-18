@@ -10511,6 +10511,9 @@ def make_handler(svc: Service):
             rid = reply_id(req)
             if rid is None:                                  # a kept reply is cancelled by its own cancel alone
                 self._watch_client(cancel)                   # #430 #431 (#1999: before prepare, which can take long)
+            # prepare writes the resolved prefix back into req, or {} when it cannot mark one. Keep the words the
+            # request gave: a later choice prepares again and must not read that result as a new request.
+            prefix_spec = req.get("strata_prefix")
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             form = getattr(svc.template, "call_form", "qwen")
             # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py): one
@@ -10536,6 +10539,8 @@ def make_handler(svc: Service):
                     # each choice its own run of the same prompt (the conversation cache holds it after the first);
                     # a request's seed gives each choice its own, seed + k
                     sub = {**req, "seed": req["seed"] + k} if k and type(req.get("seed")) is int else req
+                    if k and prefix_spec is not None:
+                        sub = {**sub, "strata_prefix": prefix_spec}
                     got = first if k == 0 else svc.prepare(messages, tools, kw, max_req, force=force, req=sub,
                                                            cancel=cancel)
                     c = openai_chunks(svc, sub, *got[:2], tools, got[2], cancel, force=force)
