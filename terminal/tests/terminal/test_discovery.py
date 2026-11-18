@@ -279,7 +279,7 @@ class GuiLayout(unittest.TestCase):
         self.assertTrue(st.installed)
         self.assertEqual(st.remaining_gb, 0.0)
         self.assertIn("Already downloaded", st.headline())
-        self.assertIn("Nothing more to download", st.headline())
+        self.assertIn("The model needs nothing more", st.headline())
 
     def test_only_the_draft_layer_missing_says_so_with_its_size(self):
         (self.docs / "mtp" / "rt" / "experts.bin").unlink()

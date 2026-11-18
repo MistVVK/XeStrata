@@ -118,7 +118,7 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                         "then AMD, then Intel). Your choice is remembered for the next launch, update and app; 'auto' forgets it")
     g.add_argument("--gpu-roles", metavar="LIST", help="a role for each graphics card: main, helper or off, e.g. 1=main,0=helper (cards you do not name are off). "
                    "Main does the last steps of every answer; a helper holds part of the model")
-    g.add_argument("--tune", type=_choice("a tuning mode", S.TUNE_MODES), metavar="quick|thorough|skip", help="find the fastest settings first (default: skip here; the guided screens suggest quick the first time)")
+    g.add_argument("--tune", type=_choice("a tuning mode", S.TUNE_MODES), metavar="quick|thorough|skip", help="find the fastest settings first (default: skip)")
     g.add_argument("--tune-allow-small", action="store_true", help="let the tuner also try settings that can change answers very slightly")
     g.add_argument("--dspark", metavar="WORD", help=argparse.SUPPRESS)               # DeepSeek (no longer run): accepted, answered in plain words
     g.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -376,6 +376,10 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
                 notices.append(S.Notice("warn", f"{r.title} does not fit this computer.", "It can still start; expect it to be slow or to run out of memory."))
             elif r.verdict == "slower":
                 notices.append(S.Notice("warn", f"{r.title}: {r.words}.", ""))
+            elif r.verdict == "disk":
+                other = catalog.disk_free(s.data_dir) if s.data_dir else None      # --data-dir names another drive: its free space decides
+                if not s.model_path and not (other is not None and other >= r.disk_need_gb):   # (own files are used where they are: no download)
+                    notices.append(S.Notice("warn", f"{r.title}: {r.sentence}.", "It can still start, but the download is likely to stop; free some space first."))
             elif r.verdict == "tight" and s.model_path and "disk space" in r.words:
                 pass                                         # the files are already here ("used where they are"): there is no download to make room for
             elif r.verdict == "tight":
@@ -545,6 +549,17 @@ def _stop_all(name: str | None) -> int:
     if not stopped and not failed:                           # zero targets only: a failed stop already said so and must not be followed by "nothing"
         _say("Nothing from `strata launch` is running.")
     return 1 if failed else 0                                # any failed stop is a nonzero exit, also when another one succeeded
+
+
+def no_screens_words(platform: str | None = None) -> str:
+    """The sentence for a window that cannot show the screens, in the words of the computer's own system (Git Bash is Windows-only)."""
+    platform = platform or sys.platform
+    if platform.startswith("win"):
+        return ("This window cannot show Strata's screens (Git Bash and similar windows do not pass the keyboard through). "
+                "For the screens, open Windows Terminal, PowerShell or cmd, or run `winpty strata launch`. Going on with plain questions.")
+    app = "the Terminal app (or iTerm)" if platform == "darwin" else "a normal terminal window"
+    return ("This window cannot show Strata's screens (it does not pass the keyboard through, as a script or an editor panel does not). "
+            f"For the screens, open {app} and run `strata launch` there. Going on with plain questions.")
 
 
 def _can_ask() -> bool:
@@ -834,8 +849,7 @@ def run_launch(a: argparse.Namespace) -> int:
             # Git Bash, mintty and some editor panels cannot show the screens although a person is typing: go on in plain lines, and ask first
             plain_questions = True
             if no_screens_package is None:
-                _say("This window cannot show Strata's screens (Git Bash and similar windows do not pass the keyboard through). "
-                     "For the screens, open Windows Terminal, PowerShell or cmd, or run `winpty strata launch`. Going on with plain questions.")
+                _say(no_screens_words())
         if interactive and not have_choices:
             if catalog is None:
                 return fail("This Terminal does not carry the model list, so the screens cannot open. Install it again with the one-line installer.", 5)

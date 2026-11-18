@@ -56,6 +56,79 @@ class Ctx:
     _help_exe: str | None = None             # the engine whose --help _help is: read once per engine, not again on every edit (#5940)
     _cmd: tuple | None = None                # (the choices and base config it was worked out for, the engine command): see command_text
 
+    def download_plan(self) -> dict | None:
+        """What this launch would download (Runner.download_plan: the model's missing files, the draft layer, the picture reader, the DFlash2 drafter,
+        the engine), worked out once per set of choices. None when it cannot be worked out. The Save screen lists it (T2)."""
+        import dataclasses
+        import json
+        try:
+            key = json.dumps(dataclasses.asdict(self.settings), sort_keys=True, default=str)
+        except Exception:                                    # noqa: BLE001
+            key = None
+        cached = getattr(self, "_plan", None)
+        if key is not None and cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            from strata_cli.launch.runner import Runner as PlanRunner
+            plan = PlanRunner(self.settings, catalog=self.catalog).download_plan()
+        except Exception:                                    # noqa: BLE001 - a line of information, never a reason to stop the screens
+            plan = None
+        if key is not None:
+            self._plan = (key, plan)
+        return plan
+
+    def computer_line(self) -> str:
+        """The computer's one line (the header of the start screen, the model list) with the free disk read again now: it was read once when the
+        screens opened and stayed "88 GB free" after a download left 26 GB (T9). A statvfs call; nothing else is asked again."""
+        try:
+            free = self.catalog.disk_free(self.settings.data_dir or self.catalog.data_dir())
+            if free is not None:
+                self.computer.disk_free_gb = free
+        except Exception:                                    # noqa: BLE001 - the old figure is better than none
+            pass
+        return self.computer.line()
+
+    def card_roles(self) -> tuple[dict[int, str], list[dict]] | None:
+        """The role of every card this launch will use (named here, else the installed model's own, else the recommendation) with the cards, or None
+        on a computer with fewer than two usable cards. The Cards step shows the same; the Save and Advanced screens did not (T8)."""
+        c = self.computer
+        if len(c.usable_gpus) < 2:
+            return None
+        try:
+            from strata_control import gpu_roles
+            from strata_cli.launch.runner import installed_cards
+            cards = gpu_roles.rows(c.gpus, c.engine_vendor)
+            s = self.settings
+            if s.gpu_roles:
+                return gpu_roles.normalize({int(k): v for k, v in s.gpu_roles.items()}, cards), cards
+            if s.gpus:
+                return gpu_roles.from_legacy(list(s.gpus), cards, "as_given"), cards
+            try:
+                inst = installed_cards(self.base_config(), c.usable_gpus)
+            except Exception:                                # noqa: BLE001
+                inst = None
+            if inst:
+                return gpu_roles.from_legacy(inst, cards, "as_given"), cards
+            return dict(gpu_roles.recommend(cards, c.engine_vendor)["roles"]), cards
+        except Exception:                                    # noqa: BLE001 - a summary line never stops the screens
+            return None
+
+    def cards_line(self) -> str | None:
+        """`Main: GPU 1 RTX 4090. Helper: GPU 2 RTX 4090.` for a computer with two or more cards, else None."""
+        found = self.card_roles()
+        if found is None:
+            return None
+        from strata_control import gpu_roles
+        return gpu_roles.describe(found[0], found[1]) or None
+
+    def flags_line(self) -> str:
+        """strata launch ... with the card roles in it, also when nobody changed them (the recommendation is what runs, so the copied line says it)."""
+        line = S.flags_text(self.settings)
+        found = self.card_roles()
+        if found is not None and not self.settings.gpu_roles and not self.settings.gpus:
+            line += " --gpu-roles " + ",".join(f"{k}={v}" for k, v in sorted(found[0].items()))
+        return line
+
     # ---- names and warnings
     def default_name(self) -> str:
         s = self.settings
@@ -74,8 +147,12 @@ class Ctx:
         out += [n.line() for n in S.check_parallel(s, vram_gb=self.computer.main_vram_gb or None)]
         out += [n.line() for n in S.check_context(s)]
         r = next((x for x in self.rows if (x.family, x.model) == (s.family, s.model)), None)
+        if r is not None and r.verdict == "disk" and s.data_dir:         # the Folder step named another drive: its own free space decides
+            other = self.catalog.disk_free(s.data_dir)
+            if other is not None and other >= r.disk_need_gb:
+                r = None
         if r is not None and r.verdict != "fits":
-            out.append(f"{r.title}: {r.words}.")
+            out.append(f"{r.title}: {r.sentence}.")
         if self.computer.other_vendor_note:
             out.append(self.computer.other_vendor_note)
         missing = acc.missing_helper(s.access)
@@ -312,15 +389,29 @@ class LaunchApp(App):
             room = (f" There is {free:,.0f} GB free in the folder." if free is not None else "")
             warn = (" That is less than the download needs; it will probably stop part way." if free is not None and free < gb + 8 else "")
 
+            kinds = self.optional_parts()
+
             def done(choice: str | None) -> None:
                 if choice == "go":
+                    self.run_launch(confirmed=True)
+                elif choice == "skip":                       # T16: "Not now" for an extra file starts the model without it, it does not go back
+                    if "mtp" in kinds:
+                        s.mtp = "off"
+                    if "mmproj" in kinds:
+                        s.vision = "off"
                     self.run_launch(confirmed=True)
 
             asker = getattr(self.runner, "download_question", None)
             title, text = asker() if asker else (f"Download about {gb:.0f} GB?",
                                                  f"This model is not on this computer yet. Strata will download about {gb:.0f} GB now; "
                                                  "an interrupted download continues where it stopped.")
-            self.push_screen(ConfirmScreen(title, text + room + warn, [("go", "Download and start"), ("no", "Not now")]), done)
+            if kinds:
+                what = ("the draft layer" if kinds == {"mtp"} else "pictures" if kinds == {"mmproj"} else "them")
+                options = [("go", "Download and start"), ("skip", f"Start without {what}")]
+                text += " Or start now without it: answers are a little slower or text only, and you can add it later."
+            else:
+                options = [("go", "Download and start"), ("no", "Not now")]
+            self.push_screen(ConfirmScreen(title, text + room + warn, options), done)
             return
         screen = RunScreen()
         self.run_screen = screen
@@ -328,6 +419,16 @@ class LaunchApp(App):
         self.show(screen)
         self.running = True
         threading.Thread(target=self._work, daemon=True).start()
+
+    def optional_parts(self) -> set[str]:
+        """The kinds of file ("mtp" the draft layer, "mmproj" the picture reader) when they are ALL that is missing: the model itself is here, so
+        the launch can go on without them. Empty when the model has to be downloaded or the runner cannot say."""
+        try:
+            st = self.runner.model_state()                   # type: ignore[union-attr]
+            kinds = {p.kind for p in st.parts}
+            return kinds if st.only_helpers and kinds <= {"mtp", "mmproj"} else set()
+        except Exception:                                    # noqa: BLE001
+            return set()
 
     def _save_pending(self) -> None:
         name, self.ctx.pending_save = self.ctx.pending_save, None

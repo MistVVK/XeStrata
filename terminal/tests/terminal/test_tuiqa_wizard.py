@@ -293,7 +293,7 @@ class InstalledModelFolder(Base):
             await press(pilot, "enter", "up", "enter")                 # up: IQ3_XXS (IQ3_S is pre-selected)
             shown = flat(app)
             self.assertIn("Already downloaded", shown)
-            self.assertIn("Nothing more to download", shown)
+            self.assertIn("The model needs nothing more", shown)
             # and the final screen does not warn about a download
             await press(pilot, *("enter",) * 5, "n", "enter")
             self.assertIn("Nothing needs to be downloaded", flat(app))

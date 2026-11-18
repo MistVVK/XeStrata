@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-HW_12 = {"ram_gb": 64.0, "os": "Test OS", "cpu": {"avx2": True, "name": "test cpu"},
+HW_12 = {"ram_gb": 64.0, "os": "Test OS", "disk_free_gb": 5000.0, "cpu": {"avx2": True, "name": "test cpu"},
          "gpus": [{"index": 0, "name": "NVIDIA GeForce RTX 5070", "vram_gb": 12.0, "usable": True, "vendor": "nvidia"}]}
 HW_24 = {**HW_12, "gpus": [{"index": 0, "name": "NVIDIA GeForce RTX 4090", "vram_gb": 24.0, "usable": True, "vendor": "nvidia"}]}
 HW_2X16 = {**HW_12, "gpus": [{"index": 0, "name": "NVIDIA RTX A4000", "vram_gb": 16.0, "usable": True, "vendor": "nvidia"},
