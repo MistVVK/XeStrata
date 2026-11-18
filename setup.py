@@ -2810,7 +2810,7 @@ def check_compaction(makers: set) -> None:
              (", on the host (a container shares the host's setting):" if in_container else ":"))
         say("  echo 'vm.compact_unevictable_allowed = 0' | sudo tee /etc/sysctl.d/90-xestrata.conf")
         say("  sudo sysctl --system")
-    if memlock_gib() != float("inf"):
+    if memlock_gib() < 4:                              # the arena's lock the engine asks for (as in check_ram)
         warn(f"this user may lock only {memlock_gib():.2f} GiB of RAM (ulimit -l), too little to keep the expert arena "
              "in place for the Intel GPU: raise the memlock limit for your user (memlock in /etc/security/limits.conf, "
              "or DefaultLimitMEMLOCK in systemd's user.conf) and log in again" +
