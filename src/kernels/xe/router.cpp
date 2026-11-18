@@ -259,7 +259,10 @@ void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_
         int idl[10];
         for (int r = 0; r < 10; ++r) idl[r] = id[r];
         float l[NPL];
-        bool cand[NPL];   // resident and not among the 10
+        // the resident candidates (not among the 10) are a bit mask, not a private array stored back at the
+        // butterfly's picked index: IGC 2.38.2 drops every store of a kernel of that form (#45, Arc Pro B70), as
+        // top10_token's picked rows above.  The candidates, the swaps and their order are the same.
+        int cand = 0;
         float mx = -INFINITY;
         for (int i = 0; i < NPL; ++i) {
             const int e = lane + 32 * i;
@@ -267,7 +270,7 @@ void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_
             mx = sycl::fmax(mx, l[i]);
             bool picked = false;
             for (int r = 0; r < 10; ++r) picked |= idl[r] == e;
-            cand[i] = !picked && res_layer[e] >= 0;
+            if (!picked && res_layer[e] >= 0) cand |= 1 << i;
         }
         for (int m = 16; m; m >>= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, m));
         float z = 0.0f;
@@ -282,7 +285,7 @@ void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_
             float best = -FLT_MAX;
             int be = 1 << 30;
             for (int i = 0; i < NPL; ++i)
-                if (cand[i] && l[i] > best) { best = l[i]; be = lane + 32 * i; }
+                if (((cand >> i) & 1) != 0 && l[i] > best) { best = l[i]; be = lane + 32 * i; }
             for (int m = 16; m; m >>= 1) {
                 const float ob = sycl::permute_group_by_xor(sg, best, m);
                 const int oe = sycl::permute_group_by_xor(sg, be, m);
@@ -292,7 +295,7 @@ void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_
             if (be >= (1 << 30) || !(best + lambda > le)) break;
             dropped += sycl::exp(le - mx) / z;
             idl[r] = be;
-            if ((be & 31) == lane) cand[be >> 5] = false;
+            if ((be & 31) == lane) cand &= ~(1 << (be >> 5));
             ++swaps;
         }
         if (stats != nullptr && lane == 0) {
