@@ -10199,6 +10199,10 @@ int main(int argc, char** argv) {
             // before it), every other row anything
             bool gmask = false;
             for (int a = 0; a < A; ++a) gmask = gmask || bgram[(size_t) active[a]].active();
+            if (!gmask && !ver.set_allowed(nullptr, 0, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
             if (gmask) {
                 size_t words = 0;
                 for (int a = 0; a < A && words == 0; ++a)
