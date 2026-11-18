@@ -73,20 +73,17 @@ def device_margin_mib(total_mib: int) -> int:
 def process_start(pid: int) -> float | None:
     """When process `pid` started (seconds since some fixed point, the same for every reading of one process), None
     when there is no such process."""
-    try:
-        import psutil
-        return float(psutil.Process(pid).create_time())
-    except ImportError:
-        pass
-    except Exception:   # psutil's NoSuchProcess, AccessDenied
-        return None
     if sys.platform.startswith("linux"):
         try:
             stat = Path(f"/proc/{pid}/stat").read_text()
-            return float(stat.rsplit(")", 1)[1].split()[19])   # field 22: starttime, in clock ticks since boot
+            return float(stat.rsplit(")", 1)[1].split()[19])   # field 22: clock ticks since boot
         except (OSError, IndexError, ValueError):
             return None
-    return None
+    try:
+        import psutil
+        return float(psutil.Process(pid).create_time())
+    except Exception:   # ImportError, NoSuchProcess, AccessDenied
+        return None
 
 
 def drm_process_memory_mib(pid: int, pci: str, proc: Path = Path("/proc")) -> int | None:
