@@ -60,6 +60,7 @@ struct Owned {
 // are set to the block's region as it is used (bind).
 struct Model : MfTrainModel, train::Trainer {
     Model() : Trainer("Mage-Flow training") {}
+    void sync_loaded_views() override;
     std::vector<std::array<uint64_t, 12>> woff;
     bool int8 = false;
 
@@ -932,7 +933,6 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
 void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, float eps, float wd,
                       int64_t accum_n) {
     Model* m = static_cast<Model*>(base);
-    void* s = m->stream;
     train::AdamW o;
     o.lr = lr;
     o.beta1 = beta1;
@@ -944,6 +944,12 @@ void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, fl
     const double gnorm = m->update(o, gscale);
     std::fprintf(stderr, "adamw: update %lld global-norm %.4f clip %.4f (accum %lld)\n", (long long) m->steps, gnorm,
                  std::min(1.0, 1.0 / (gnorm + 1e-6)), (long long) accum_n);
+    m->sync_loaded_views();
+}
+
+void Model::sync_loaded_views() {
+    Model* m = this;
+    void* s = stream;
     // the FP16 working copies follow the masters
     for (int64_t b = 0; b < m->nblk; ++b) {
         MfTrainAdapter* az = m->blk[(size_t) b].adap;

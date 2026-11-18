@@ -507,6 +507,7 @@ void Trainer::load_state(std::istream& is) {
     gpu::stream_sync(s);
     for (const Lora& l : loras_)
         if (l.views) sync_views(l.ad, l.A, l.B, l.N, l.K);
+    sync_loaded_views();
     gpu::stream_sync(s);
     replan_ = true;
 }
