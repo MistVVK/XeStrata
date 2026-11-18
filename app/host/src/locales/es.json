@@ -3522,7 +3522,7 @@
   "s9030": "Descargando el predictor de DFlash2…",
   "s9031": "Preparando el predictor de DFlash2 para el motor…",
   "s9032": "El predictor de DFlash2 está listo.",
-  "s9033": "No se pudo descargar el predictor de DFlash2, así que el modelo arranca con MTP. Cargando el modelo…",
+  "s9033": "No se pudo descargar el predictor de DFlash2. El modelo arranca con la capa de borrador en su lugar. Cargando el modelo…",
   "s9034": "Cargando el modelo…",
   "s9035": "Faltan estos archivos del modelo: {0}.",
   "s9036": "Pulse de nuevo «Descargar y cargar» para obtenerlos. Los archivos que ya están se conservan. Si vuelven a aparecer los mismos archivos, abra los detalles y compártalos cuando pida ayuda.",

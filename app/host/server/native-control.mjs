@@ -428,7 +428,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
    if(job.state==='running'){drafterDownloadStart(job,drafts);emit();}
    await control.draftingFetch({configPath:probe,mode:cfg.drafting??'auto',...(noSplit?{noSplit:true}:{}),...(unloadsRunning(args)?{unloading:true}:{}),signal:job.engineAbort.signal,onEvent:drafterProgress(job,emit)});
    if(job.state==='running'){job.summary='Loading the model…';job.details=undefined;emit();}
-  }catch(error){if(job.state==='running'){job.drafterNote=error.message;job.summary=drafts.mtp_here===false?'The DFlash2 drafter could not be downloaded, so the model starts without a drafter. Loading the model…':'The DFlash2 drafter could not be downloaded, so the model starts with the MTP. Loading the model…';emit();}}
+  }catch(error){if(job.state==='running'){job.drafterNote=error.message;job.summary=drafts.mtp_here===false?'The DFlash2 drafter could not be downloaded, so the model starts without a drafter. Loading the model…':'The DFlash2 drafter could not be downloaded. The model starts with the draft layer instead. Loading the model…';emit();}}
   finally{try{rmSync(probe,{force:true});}catch{/* best effort */}}
  }
  /* One key of a model's settings file, set or removed (the Drafting choice): written like the Settings screen writes it, to be there for the next load. */

@@ -3522,7 +3522,7 @@
   "s9030": "Downloading the DFlash2 drafter…",
   "s9031": "Packing the DFlash2 drafter for the engine…",
   "s9032": "The DFlash2 drafter is ready.",
-  "s9033": "The DFlash2 drafter could not be downloaded, so the model starts with the MTP. Loading the model…",
+  "s9033": "The DFlash2 drafter could not be downloaded. The model starts with the draft layer instead. Loading the model…",
   "s9034": "Loading the model…",
   "s9035": "These model files are missing: {0}.",
   "s9036": "Press Download & load again to fetch them. Files that are already there are kept. If the same files are listed again, open Details and share them when you ask for help.",

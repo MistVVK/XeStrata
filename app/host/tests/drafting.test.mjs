@@ -91,7 +91,7 @@ test('every sentence of the Drafting choice is in the catalog in all nine langua
     'Choosing DFlash2 downloads its drafter: about {0} GB, once.', 'Choosing MTP downloads its drafter: about {0} GB, once.', 'Drafting: off (no drafter is downloaded yet)', "Drafting: DFlash2 (the MTP drafter isn't downloaded yet)",
     'The DFlash2 drafter could not be downloaded, so the model starts without a drafter. Loading the model…', 'Downloading the MTP drafter…', 'The MTP drafter could not be downloaded.',
     'Downloading the DFlash2 drafter…', 'Packing the DFlash2 drafter for the engine…', 'The DFlash2 drafter is ready.',
-    'The DFlash2 drafter could not be downloaded, so the model starts with the MTP. Loading the model…', 'Loading the model…',
+    'The DFlash2 drafter could not be downloaded. The model starts with the draft layer instead. Loading the model…', 'Loading the model…',
     // the DFlash2 option (df2-<lang>.json): the paragraph under the dropdown, the lines about the card, the two new notes
     "Drafting: MTP (DFlash2 isn't available on this graphics card)", "There is no internet connection, so the DFlash2 drafter can't be downloaded now.",
     'On graphics cards like yours, DFlash2 was faster than MTP on some kinds of text and slower on others in our tests.',

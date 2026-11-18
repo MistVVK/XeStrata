@@ -3522,7 +3522,7 @@
   "s9030": "Baixando o preditor do DFlash2…",
   "s9031": "Preparando o preditor do DFlash2 para o motor…",
   "s9032": "O preditor do DFlash2 está pronto.",
-  "s9033": "Não foi possível baixar o preditor do DFlash2, então o modelo inicia com o MTP. Carregando o modelo…",
+  "s9033": "Não foi possível baixar o preditor do DFlash2. O modelo inicia com a camada de rascunho em vez dele. Carregando o modelo…",
   "s9034": "Carregando o modelo…",
   "s9035": "Estes arquivos do modelo estão faltando: {0}.",
   "s9036": "Pressione Baixar e carregar de novo para buscá-los. Os arquivos que já estão aí são mantidos. Se os mesmos arquivos aparecerem de novo, abra os Detalhes e compartilhe-os ao pedir ajuda.",
