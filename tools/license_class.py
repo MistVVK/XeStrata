@@ -35,14 +35,14 @@ STRATA = "2026 Niko1221 and the Strata contributors"
 # all of them MIT (Expat)
 PERMISSIVE = ("Niko1221 and the Strata contributors", "The ggml authors", "Debian's rocm-llvm packaging",
               "Peasant Smith and the Project Maya contributors", "Sahand Ahmadian", "Jonseed", "ZhengPeng",
-              "Ostris, LLC")
+              "Ostris, LLC", "Gwangbin Bae", "SenseTime X-Lab")
 # the same for the projects under another permissive license: a copyright holder's words -> its license
 PERMISSIVE_OTHER = {"contributors to the vLLM-Omni project": "Apache-2.0", "The HuggingFace Inc. team": "Apache-2.0",
                     "SageAttention team": "Apache-2.0", "(comfy-kitchen)": "Apache-2.0",
                     "the comfyui_controlnet_aux contributors": "Apache-2.0",
                     "the ComfyUI-SeedVR2_VideoUpscaler contributors": "Apache-2.0",
                     "the YASAKANI authors": "Apache-2.0",
-                    "Edge0": "Apache-2.0",
+                    "Edge0": "Apache-2.0", "OpenMMLab": "Apache-2.0", "SenseTime X-Lab": "Apache-2.0",
                     "Secret Labs AB": "MIT-CMU", "Fredrik Lundh and contributors": "MIT-CMU",
                     "Jeffrey A. Clark and contributors": "MIT-CMU"}
 OWN = "LGPL-3.0-or-later"

@@ -44,6 +44,57 @@ private:
     int resize_kind_[4] = {0, 0, 0, 0};   // 1: transposed (kernel = stride), -1: a convolution of stride 2, 0: none
 };
 
+/// BAE surface normals (Bae et al. 2021): an EfficientNet-B5 encoder and a progressively refined decoder.  The
+/// output is a camera-space normal map, RGB8, at the picture's size.
+class BaeNormal : public AuxMapNet {
+public:
+    explicit BaeNormal(const std::string& path) : AuxMapNet(path, "BAE normal") {}
+    std::vector<uint8_t> run(const std::vector<uint8_t>& rgb, int64_t W, int64_t H);
+    uint64_t need_bytes(int64_t W, int64_t H) const;
+
+protected:
+    void load_weights() override;
+
+private:
+    struct Block {
+        MConv expand, depthwise, reduce, gate, project;
+        bool has_expand = false, residual = false, same_pad = false;
+    };
+    struct Up { MConv first, second; };
+    MConv stem_, head_, bottleneck_, initial_;
+    std::vector<Block> blocks_[7];
+    Up up_[4];
+    MConv refine_[3][4];
+};
+
+/// UniFormer Small with UPerNet (Li et al. 2022): ADE20K's 150 classes as an RGB8 color map.
+class UniformerSeg : public AuxMapNet {
+public:
+    explicit UniformerSeg(const std::string& path) : AuxMapNet(path, "UniFormer segmentation") {}
+    std::vector<uint8_t> run(const std::vector<uint8_t>& rgb, int64_t W, int64_t H);
+    uint64_t need_bytes(int64_t W, int64_t H) const;
+
+protected:
+    void load_weights() override;
+
+private:
+    struct Batch { const float* scale = nullptr; const float* bias = nullptr; };
+    struct Block {
+        MConv pos, conv1, depthwise, conv2, fc1, fc2;
+        Batch bn1, bn2;
+        Norm norm1, norm2;
+        Lin qkv;
+    };
+    struct Stage {
+        MConv patch;
+        Norm patch_norm, output_norm;
+        std::vector<Block> blocks;
+    };
+    Stage stages_[4];
+    MConv psp_[4], bottleneck_, lateral_[3], fpn_[3], fpn_bottleneck_, classes_;
+    const float* palette_ = nullptr;
+};
+
 /// HED's soft edges (Xie and Tu 2015; the ControlNet 1.1 annotator's ControlNetHED weights: five VGG-like blocks,
 /// each a side output): an RGB8 picture [H][W][3] to its edges [H][W], 8 bits.  `safe` quantizes them to four steps;
 /// `scribble` thins them into strokes.

@@ -25,6 +25,8 @@
 namespace strata::image {
 
 class DepthAnything2;
+class BaeNormal;
+class UniformerSeg;
 class HedNet;
 class LineartNet;
 class MlsdNet;
@@ -49,6 +51,8 @@ struct ControlKind {
 /// The networks a run may use, opened by the caller (strata_image's auxiliary models), null where not given.
 struct ControlNets {
     DepthAnything2* depth = nullptr;
+    BaeNormal* normal = nullptr;
+    UniformerSeg* segmentation = nullptr;
     HedNet* hed = nullptr;
     LineartNet* lineart = nullptr;
     MlsdNet* mlsd = nullptr;

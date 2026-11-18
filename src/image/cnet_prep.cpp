@@ -341,7 +341,8 @@ const std::vector<ControlKind>& ControlPrep::kinds() {
     static const std::vector<ControlKind> all = {
         {"canny", ""},          {"gray", ""},      {"scribble", ""},       {"scribble_xdog", ""},
         {"scribble_hed", "hed"}, {"hed", "hed"},    {"lineart", "lineart"}, {"lineart_coarse", "lineart_coarse"},
-        {"mlsd", "mlsd"},       {"depth", "depth"}, {"pose", "pose"}};
+        {"mlsd", "mlsd"},       {"depth", "depth"}, {"pose", "pose"},       {"normal", "normal"},
+        {"segmentation", "segmentation"}};
     return all;
 }
 
@@ -415,6 +416,10 @@ QiRef ControlPrep::run(const std::string& kind, const QiRef& img, const ControlP
         gpu::copy(d, m.data(), m.size());
         return to_rgba(d, pw, ph, c3);
     };
+    if (kind == "normal")
+        return from_host(need(nets.normal, "BAE normal")->run(host_pic(), pw, ph), true);
+    if (kind == "segmentation")
+        return from_host(need(nets.segmentation, "UniFormer segmentation")->run(host_pic(), pw, ph), true);
     if (kind == "hed" || kind == "scribble_hed")
         return from_host(need(nets.hed, "HED")->run(host_pic(), pw, ph, p.safe, kind != "hed"), false);
     if (kind == "lineart" || kind == "lineart_coarse")

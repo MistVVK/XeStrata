@@ -1197,6 +1197,12 @@ uint64_t control_plan(AuxNets& aux, const std::string& kind, int64_t width, int6
     if (net == "depth") {
         auto& m = aux.get<si::DepthAnything2>(weights);
         nets.depth = take(m, m.need_bytes(width, height));
+    } else if (net == "normal") {
+        auto& m = aux.get<si::BaeNormal>(weights);
+        nets.normal = take(m, m.need_bytes(pw, ph));
+    } else if (net == "segmentation") {
+        auto& m = aux.get<si::UniformerSeg>(weights);
+        nets.segmentation = take(m, m.need_bytes(pw, ph));
     } else if (net == "hed") {
         auto& m = aux.get<si::HedNet>(weights);
         nets.hed = take(m, m.need_bytes(pw, ph));
