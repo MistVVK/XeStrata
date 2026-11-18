@@ -7060,7 +7060,11 @@ def choices_from_config(cfg_path: Path) -> dict:
                  key=lambda f: len(FAMILIES[f]["tag"]), default="qwen")
     # the size as the tables name it (unsloth-ud-iq4_xs: UD-IQ4_XS; gyro-gyro-m: Gyro-M, which upper() lost)
     model = tag[len(FAMILIES[family]["tag"]):]
-    model = next((m for m in FAMILIES[family].get("models", MODELS) if m.lower() == model.lower()), model.upper())
+    # Edge0's config is named after the model itself (xestrata-edge0-145b-q3k.json): the tag is the size, not a prefix
+    # of it.  The other families' tags are a prefix (qwen-iq3_xxs), so the whole tag matches no size and the old answer
+    # stays.
+    model = next((m for m in FAMILIES[family].get("models", MODELS)
+                  if m.lower() in (model.lower(), tag.lower())), model.upper())
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
@@ -9559,6 +9563,9 @@ def describe() -> dict:
     room = room_of(ram, [gpu] if gpu else [])
     families = []
     for f, fam in FAMILIES.items():
+        if fam.get("edge0"):
+            # Edge0 is installed by --family edge0 alone: its sizes are EDGE0_MODELS, not TIERS/MODELS
+            continue
         models = []
         names = family_sizes(f)
         # the recommendation of each quantization's sizes (Ornith-1.5 has two), and of the family's

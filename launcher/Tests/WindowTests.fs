@@ -584,6 +584,19 @@ let ``a measurement checks its options`` () =
     Assert.True(contains [ "--bench-temperature"; "0.5" ] args, sprintf "%A" args)
 
 [<AvaloniaFact>]
+let ``an installed model setup cannot name does not break the pages`` () =
+    // setup names an Edge0 config after its model; a config it cannot name must not reach ArgumentList as null
+    english ()
+    let installed = described.Value.Installed[0]
+    let d = { described.Value with Installed = [| { installed with Model = null } |] }
+    let setup = FakeSetup(d, none)
+    let w = open' setup
+    click w "Measure ..."
+    click w "Measure"
+    Assert.DoesNotContain("--model", setup.Last.Args)
+    Assert.DoesNotContain("--family", setup.Last.Args)
+
+[<AvaloniaFact>]
 let ``upstream's benchmark mode takes its own options`` () =
     english ()
     let setup = FakeSetup(described.Value, none)

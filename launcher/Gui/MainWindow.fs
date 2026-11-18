@@ -840,7 +840,7 @@ type MainWindow(setup: Setup.Access) as this =
         compat.IsCheckedChanged.Add(fun _ -> refresh ())
         refresh ()
         let problem = coloured failBrush ""
-        let which = [ "--model"; m.Model; "--family"; m.Family ]
+        let which = [ "--model"; m.Model; "--family"; m.Family ] |> fun a -> if String.IsNullOrEmpty m.Model then [] else a
         let start () =
             let args =
                 if compat.IsChecked = Nullable true then
