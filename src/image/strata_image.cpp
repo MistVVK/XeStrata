@@ -1936,10 +1936,11 @@ int serve(si::ImagePipeline& p) {
                     const int64_t iw = lr.init.width > 0 ? lr.init.width : w, ih = lr.init.height > 0 ? lr.init.height : h;
                     const int64_t ow = lr.upscale ? lr.width : w, oh = lr.upscale ? lr.height : h;
                     const su::ColorFix c = lr.upscaler_color.empty() ? m.info().color : su::parse_color(lr.upscaler_color);
-                    // its weights stay beside the drawing's
-                    nd.least = std::max(nd.least + m.weight_bytes(), su::UpscaleRunner::least_bytes(m, iw, ih, ow, oh, c));
-                    nd.full = std::max(nd.full + m.weight_bytes(),
-                                       nd.held + su::UpscaleRunner::full_bytes(m, iw, ih, ow, oh, c));
+                    // its weights stay beside the drawing's where upscale_base keeps them (RealESRGAN's); SeedVR2's,
+                    // past kUpsReserve, are let go before the drawing
+                    const uint64_t kept = m.weight_bytes() > kUpsReserve ? 0 : m.weight_bytes();
+                    nd.least = std::max(nd.least + kept, su::UpscaleRunner::least_bytes(m, iw, ih, ow, oh, c));
+                    nd.full = std::max(nd.full + kept, nd.held + su::UpscaleRunner::full_bytes(m, iw, ih, ow, oh, c));
                 }
                 if (!lr.control_net.empty()) {
                     const auto [least, full] = p.control_need(lr.control_net, w, h);
