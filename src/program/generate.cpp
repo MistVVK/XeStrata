@@ -13798,16 +13798,22 @@ int main(int argc, char** argv) {
                         drafts[(size_t) i] = dd[i];
                         dprob[(size_t) i] = pp[i];
                     }
-                    df2.note_rows(outv.data(), a + 1, p);
+                    // the committed rows are the window's inputs: position p + i holds window[i] (outv[i] is the
+                    // token of p + i + 1, the next row)
+                    df2.note_rows(window.data(), a + 1, p);
                 } else if (!drafted && req_mtp) {
                     drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
                     // --draft auto: keep the idle DFlash2 ring current with this window's accepted rows (not in the
                     // start's measurement: its MTP arm is timed as the MTP alone runs)
                     if (drafted && df2_loaded && !req_df2 && req_probe == -2) {
-                        if (df2.context_async(ver.tap_dev(), a + 1, p, err)) df2.note_rows(outv.data(), a + 1, p);
+                        if (df2.context_async(ver.tap_dev(), a + 1, p, err)) df2.note_rows(window.data(), a + 1, p);
                     }
                 } else if (!drafted) {
                     drafted = true;
+                } else if (df2_loaded && (req_df2 || req_probe == -2)) {
+                    // the request's last window (stop or length): no draft follows it, but its committed rows are
+                    // the next turn's history - note them as plain's loop does, with their context for the log
+                    if (df2.context_async(ver.tap_dev(), a + 1, p, err)) df2.note_rows(window.data(), a + 1, p);
                 }
                 {
                     const Clock::time_point tw3 = Clock::now();
@@ -15185,7 +15191,7 @@ int main(int argc, char** argv) {
                     drafts[(size_t) i] = dd[i];
                     dprob[(size_t) i] = pp[i];
                 }
-                df2.note_rows(outv.data(), a + 1, p);
+                df2.note_rows(window.data(), a + 1, p);
             } else if (!drafted && use_mtp) {
                 drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
             } else if (!drafted) {
