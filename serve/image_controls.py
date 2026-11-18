@@ -121,6 +121,12 @@ def _flag(v: dict, key: str, default: bool) -> bool:
     return img.parse_flag(v.get(key), f"control.{key}", default)
 
 
+def _as_map(v: dict, default: bool) -> bool:
+    """preprocess false means the picture is already the map; a form's "false" says the same as JSON's False."""
+    flag = img.parse_flag(v.get("preprocess"), "control.preprocess", None)
+    return default if flag is None else not flag
+
+
 def decode_image(v) -> bytes:
     """A control image given inline: base64, or a data: URL of it."""
     if isinstance(v, (bytes, bytearray)):
@@ -281,7 +287,8 @@ def _moss(items: list, cfg: dict, picture: bytes | None) -> dict:
                                         f"{kind!r} goes alone (a reference image)")
         if any(m["type"] == kind for m in maps):
             raise img.ImageRequestError(f"control: {kind} twice")
-        if v.get("start") not in (None, 0, 0.0):
+        start = img.parse_number(v.get("start"), "control.start", 0.0, 1.0, 0.0)
+        if start != 0:
             raise img.ImageRequestError("control.start: MOSS-Image's control adapter is trained from the first step "
                                         "only (an end is taken)")
         if v.get("strength") is not None:
@@ -290,8 +297,7 @@ def _moss(items: list, cfg: dict, picture: bytes | None) -> dict:
                 raise img.ImageRequestError("control.strength: one for the adapter (color and depth share it)")
             strength = s
         image = _picture(v, picture if i == 0 else None)
-        as_map = (v["preprocess"] is False if v.get("preprocess") is not None else
-                  kind == "color" and _color_map(image))
+        as_map = _as_map(v, kind == "color" and _color_map(image))
         maps.append({"type": kind, "image": image,
                      "end": _num(v, "end", 0.0, 1.0, 1.0), "as_map": as_map,
                      "resolution": int(_num(v, "resolution", 64, MAX_RESOLUTION, RESOLUTION))})
@@ -339,7 +345,7 @@ def parse_control(v: Any, cfg: dict, picture: bytes | None = None) -> dict:
         return _moss([v], cfg, picture)
     if v.get("regions") is not None:
         raise img.ImageRequestError("control.regions: MOSS-Image's color map only")
-    as_map = v.get("preprocess") is False
+    as_map = _as_map(v, False)
     if as_map and mode != "lora":
         kind = "none"
     out: dict[str, Any] = {"type": kind, "image": _picture(v, picture), "mode": mode, "as_map": as_map,
