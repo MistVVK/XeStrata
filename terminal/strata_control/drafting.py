@@ -802,6 +802,10 @@ def pack_path(data_dir: str | Path, engine: str | os.PathLike[str] | None = None
     for name in (PACK_NAME, LEGACY_PACK_NAME):
         if _here(Path(data_dir) / FOLDER / name):
             return Path(data_dir) / FOLDER / name
+    # D1 (0.2.16 retest): only the smaller prepared file was copied in (an offline computer).  For an engine that reads it, it is a complete
+    # drafter: the 522 MB file beside it is not needed.  (With `engine` given the line above already chose it.)
+    if engine is None and converted_ok(data_dir) and engine_has_selector_q4():
+        return converted_path(data_dir)
     return target_path(data_dir)
 
 

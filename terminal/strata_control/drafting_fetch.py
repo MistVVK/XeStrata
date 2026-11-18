@@ -32,7 +32,32 @@ class DraftingError(RuntimeError):
 
 
 class OfflineError(DraftingError):
-    """The download address did not answer (no internet, or a host that is down). Setup skips this one silently: the model keeps the MTP (strata-offline-users)."""
+    """The download address did not answer (no internet, or a host that is down). Setup skips this one silently: the model keeps the MTP (strata-offline-users).
+    `files_note`: when known, the exact file(s) to copy in by hand, by name and size (offline_files_note); the message itself stays the one the app's texts carry."""
+    files_note: str = ""
+
+
+def _mb(size: int) -> str:
+    return f"{size / 1e6:.0f} MB"
+
+
+def offline_files_note(data_dir: str | Path | None, *, tuned: bool = False, variant: str | None = None, engine_reads_q4: bool | None = None) -> str:
+    """D1 (0.2.16 retest): what to put in place when the computer cannot download the drafter, by file name and size.  Without internet the drafter works from
+    ONE of two files copied into the model data folder's dflash2 folder (from another computer's Strata): the Q4_0 pack, or - for an engine that reads it
+    (CUDA, AMD, Metal) - the smaller prepared file.  A set with a tuned drafter has its own file (`tuned`, `variant`).  Plain words, no jargon."""
+    folder = (Path(data_dir) / drafting.FOLDER) if data_dir else Path(drafting.FOLDER)
+    if tuned:
+        pin = drafting.tuned_pack(variant)
+        files = [(pin.name, pin.size)]
+    else:
+        files = [(drafting.PACK_NAME, drafting.PACK_BYTES)]
+        if (drafting.engine_has_selector_q4() if engine_reads_q4 is None else engine_reads_q4):
+            files.append((drafting.CONVERTED_NAME, drafting.CONVERTED_BYTES))
+    if len(files) == 1:
+        what = f"this file: {files[0][0]} ({_mb(files[0][1])})"
+    else:
+        what = f"one of these files: {files[0][0]} ({_mb(files[0][1])}), or the smaller {files[1][0]} ({_mb(files[1][1])})"
+    return f"To use it without internet, copy {what} into the folder {folder} (from a computer that has it) and start again."
 
 
 def plan(data_dir: str | Path, engine: str | os.PathLike[str] | None = None, *, model_name: str | None = None, backend: str | None = None, archs=None,
@@ -347,7 +372,9 @@ def ensure(data_dir: str | Path, *, progress: Progress | None = None, cancel: th
     spec = tuple(files if files is not None else drafting.FILES)
     have = _present([src, *(_hub_snapshots() if files is None else [])], spec)       # already here and checked: used where it is, never fetched again
     if len(have) < len(spec) and not online(base_url or drafting.base_url()):
-        raise OfflineError("There is no internet connection, so the DFlash2 drafter can't be downloaded now.")
+        offline = OfflineError("There is no internet connection, so the DFlash2 drafter can't be downloaded now.")
+        offline.files_note = offline_files_note(data_dir)
+        raise offline
     src.mkdir(parents=True, exist_ok=True)
     total = sum(size for _n, size, _h in spec)
     done_before = 0
