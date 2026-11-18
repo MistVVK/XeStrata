@@ -9745,6 +9745,12 @@ def setup_edge0(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     models_dir = Path(a.models_dir)
     pack = models_dir / model
     rev, repo, files = EDGE0_REVISIONS[model], d["repo"], EDGE0_FILES[model]
+    # Without a pin download_file marks a file done as soon as it is renamed, before verify_sha256 reads it: a run
+    # stopped in the middle of a 50 GB hash would leave a broken file that no later run checks again.  The pack's
+    # own sizes and hashes are the pins for its repository's files.
+    for m, md in EDGE0_MODELS.items():
+        REPO_PINS.setdefault(md["repo"], {}).update(
+            {path.rsplit("/", 1)[-1]: size_sha for path, size_sha in EDGE0_FILES[m].items()})
     step(5, f"downloading {model}")
     say(f"  The model files go in {pack} (a file another Edge0 model here has too is hardlinked from it;")
     say("  a different filesystem downloads its own copy)")
@@ -9828,7 +9834,7 @@ def main() -> int:
     ap.add_argument("--quantizer", choices=list(QUANTIZERS),
                     help="whose quantization of that version (default: the first setup lists)")
     plain_models = [m for f in PLAIN_FAMILIES.values() for m in f["models"]]
-    models = list(dict.fromkeys([*MODELS, *plain_models]))
+    models = list(dict.fromkeys([*MODELS, *plain_models, *EDGE0_MODELS]))
     ap.add_argument("--model", metavar="{" + ",".join(models) + ",custom-NAME}",
                     help="the size; custom-NAME: a model installed with --gguf --name NAME")
     ap.add_argument("--context", type=int)
