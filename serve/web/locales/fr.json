@@ -911,6 +911,8 @@
   "img.ctrlScribble": "Les traits d'un croquis",
   "img.ctrlXdog": "Croquis (XDoG)",
   "img.ctrlMlsd": "Lignes droites (M-LSD)",
+  "img.ctrlNormal": "Normales de surface (BAE)",
+  "img.ctrlSegmentation": "Régions des objets (UniFormer)",
   "img.ctrlGray": "Ombrage (gris)",
   "img.ctrlNone": "L'image est déjà une carte",
   "img.ctrlPicture": "L'image",

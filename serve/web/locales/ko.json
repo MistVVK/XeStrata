@@ -896,6 +896,8 @@
   "img.ctrlScribble": "스케치의 선 그대로",
   "img.ctrlXdog": "스케치 (XDoG)",
   "img.ctrlMlsd": "직선 (M-LSD)",
+  "img.ctrlNormal": "표면 법선 (BAE)",
+  "img.ctrlSegmentation": "객체 영역 (UniFormer)",
   "img.ctrlGray": "음영 (회색)",
   "img.ctrlNone": "이미지가 이미 제어 맵",
   "img.ctrlPicture": "이미지",

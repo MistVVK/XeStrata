@@ -896,6 +896,8 @@
   "img.ctrlScribble": "Линии самого наброска",
   "img.ctrlXdog": "Набросок (XDoG)",
   "img.ctrlMlsd": "Прямые линии (M-LSD)",
+  "img.ctrlNormal": "Нормали поверхности (BAE)",
+  "img.ctrlSegmentation": "Области объектов (UniFormer)",
   "img.ctrlGray": "Светотень (серый)",
   "img.ctrlNone": "Картинка уже карта",
   "img.ctrlPicture": "Картинка",

@@ -920,6 +920,8 @@
   "img.ctrlScribble": "A sketch's own lines",
   "img.ctrlXdog": "Sketch (XDoG)",
   "img.ctrlMlsd": "Straight lines (M-LSD)",
+  "img.ctrlNormal": "Surface normals (BAE)",
+  "img.ctrlSegmentation": "Object regions (UniFormer)",
   "img.ctrlGray": "Shading (gray)",
   "img.ctrlNone": "The picture is a map already",
   "img.ctrlPicture": "The picture",

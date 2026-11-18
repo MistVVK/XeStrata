@@ -896,6 +896,8 @@
   "img.ctrlScribble": "下描きの線そのまま",
   "img.ctrlXdog": "下描き（XDoG）",
   "img.ctrlMlsd": "直線（M-LSD）",
+  "img.ctrlNormal": "面の向き（BAE 法線）",
+  "img.ctrlSegmentation": "物体の領域（UniFormer）",
   "img.ctrlGray": "陰影（グレー）",
   "img.ctrlNone": "画像がすでに制御の図",
   "img.ctrlPicture": "画像",

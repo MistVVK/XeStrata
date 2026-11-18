@@ -896,6 +896,8 @@
   "img.ctrlScribble": "Las líneas de un boceto",
   "img.ctrlXdog": "Boceto (XDoG)",
   "img.ctrlMlsd": "Líneas rectas (M-LSD)",
+  "img.ctrlNormal": "Normales de superficie (BAE)",
+  "img.ctrlSegmentation": "Regiones de objetos (UniFormer)",
   "img.ctrlGray": "Sombreado (gris)",
   "img.ctrlNone": "La imagen ya es un mapa",
   "img.ctrlPicture": "La imagen",

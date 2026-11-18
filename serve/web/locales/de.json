@@ -896,6 +896,8 @@
   "img.ctrlScribble": "Die Linien einer Skizze",
   "img.ctrlXdog": "Skizze (XDoG)",
   "img.ctrlMlsd": "Gerade Linien (M-LSD)",
+  "img.ctrlNormal": "Oberflächennormalen (BAE)",
+  "img.ctrlSegmentation": "Objektbereiche (UniFormer)",
   "img.ctrlGray": "Schattierung (Grau)",
   "img.ctrlNone": "Das Bild ist schon eine Karte",
   "img.ctrlPicture": "Das Bild",

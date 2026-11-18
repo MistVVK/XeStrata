@@ -896,6 +896,8 @@
   "img.ctrlScribble": "草图本身的线条",
   "img.ctrlXdog": "草图（XDoG）",
   "img.ctrlMlsd": "直线（M-LSD）",
+  "img.ctrlNormal": "表面法线（BAE）",
+  "img.ctrlSegmentation": "物体区域（UniFormer）",
   "img.ctrlGray": "明暗（灰度）",
   "img.ctrlNone": "图片已是控制图",
   "img.ctrlPicture": "图片",
