@@ -604,6 +604,8 @@
   "img.gpuImage": "{name} (la GPU de imágenes)",
   "img.gpuMovedTitle": "Hecho en {name}",
   "img.gpuMoved": "Un trabajo de vídeo ocupaba {busy} (unos {left} s más), así que esto se hizo en {name}, la GPU del modelo de chat; el chat esperó mientras tanto.",
+  "img.gpuMovedVram": "{busy} tenía {free} MiB libres y esto necesitaba {need} MiB, así que se hizo en {name}, la GPU del modelo de chat; el chat esperó mientras tanto.",
+  "img.gpuMovedServer": "Un trabajo de imagen de otro servidor de XeStrata ocupaba {busy}, así que se hizo en {name}, la GPU del modelo de chat; el chat esperó mientras tanto.",
   "img.nOf": "imagen {i} de {n}",
   "img.partOf": "parte {i} de {n}",
   "img.tileOf": "mosaico {i} de {n}",

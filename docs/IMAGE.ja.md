@@ -624,7 +624,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - 画像の API（`/v1/images/generations`、`/v1/images/edits`、`/v1/images/upscale`、`/v1/images/segmentations`、`/v1/images/remove-background`、`/v1/images/controls`）は `gpu`（または `extra_params` の `gpu`）、動画の API（`/v1/videos`、`/v1/videos/sync`、`/v1/videos/segmentations`）はフォームの `gpu`、チャットの道具は `xestrata_images` の `gpu` で受けます。
 - 値は `auto`（既定）、`image`（画像の GPU）、`text`（文章のモデルの GPU）、または Monitor の GPU の番号か PCI の住所です。選べる GPU は `/health` の `image_gpus` に出ます。
 - `text` では、1 枚の GPU を分け合うときと同じく、文章のモデルが場所を空け（`--image-gpu-policy`）、終わると元に戻します。その間、チャットの要求は待ちます。
-- `auto` は画像の GPU で作ります。動画のジョブが画像の GPU を使っている間は、画像（生成、編集、拡大、道具）を文章のモデルの GPU で作り、結果にそう書きます（API の応答の `xestrata.gpu`）。文章のモデルの GPU を使えないときと `image` を選んだときは、503 で断り、残りのおよその秒数を返します。
+- `auto` は画像の GPU で作ります。動画のジョブか別の XeStrata のサーバーの画像の仕事が画像の GPU を使っている間と、その仕事が要る VRAM が画像の GPU に空いていないとき（XeStrata 以外のプログラムが使っているときなど。GPU の番を取ってエンジンが見積もってから決めます）は、画像（生成、編集、拡大、道具）を文章のモデルの GPU で作り、結果にそう書きます（API の応答の `xestrata.gpu`）。文章のモデルの GPU を使えないときと `image` を選んだときは、動画のジョブなら 503 で断って残りのおよその秒数を返し、別のサーバーの画像の仕事ならその終わりを待ちます（待つ間は Monitor と道具の進み具合にそう出ます）。
 - Web のページでは、Images・Tools・Video のタブの「作る GPU」と、チャットの設定の「チャットの画像と動画を作る GPU」で選べます。選んだものはブラウザーだけが覚え、サーバーの設定は変わりません。
 - Monitor では、文章のモデルの GPU で画像を作っている間、その GPU のタブに Image の印が付き、速さの欄は 1 ステップの秒数になります。
 

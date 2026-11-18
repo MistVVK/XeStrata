@@ -1760,21 +1760,76 @@ def place(svc, gen: ImageGen, gpu) -> tuple[ImageGen, dict | None]:
     if card == "auto" and lend:
         state = models.long_job
         left = job_left(state)
+        moved = {"card": "text", "pci": models.lend_pci, "name": card_name(svc, models.lend_pci),
+                 "busy_name": card_name(svc, models.gpu_pci)}
+        AUTO_LEND.set(None)
         if left is not None and state is not None and state.get("thread") != threading.get_ident():
-            return models.lent().gens[gen.model], {
-                "card": "text", "pci": models.lend_pci, "name": card_name(svc, models.lend_pci), "busy": "video",
-                "busy_name": card_name(svc, models.gpu_pci), "left_s": left}
+            return models.lent().gens[gen.model], {**moved, "busy": "video", "left_s": left}
+        if models.gpu.held_elsewhere():   # another server's image job: its end is not waited for
+            return models.lent().gens[gen.model], {**moved, "busy": "server"}
+        AUTO_LEND.set(moved)              # whether the job's VRAM is there: separate_turn, once its NEED is known
+        return gen, None
+    AUTO_LEND.set(None)
     return gen, None
+
+
+# "auto" on a card the text model's GPU can stand in for: what place said of the image GPU (the card's words for the
+# answer), read by separate_turn once the job's NEED is known; and whether the entry running the job can take it to
+# the text model's GPU (on_free_gpu), so that separate_turn may give it up there instead of waiting or failing
+AUTO_LEND: contextvars.ContextVar[dict | None] = contextvars.ContextVar("xestrata_auto_lend", default=None)
+LEND_RETRY: contextvars.ContextVar[bool] = contextvars.ContextVar("xestrata_lend_retry", default=False)
+
+
+class ImageGpuTaken(ImageJobFailed):
+    """The image GPU cannot give an "auto" job the VRAM it needs (other programs, or other engines, hold it): the
+    entry (on_free_gpu) runs it on the text model's GPU instead.  `why`: the answer's words of it."""
+
+    def __init__(self, why: dict):
+        self.why = why
+        super().__init__(f"the image GPU has {why.get('free_mib')} MiB for this job, which needs {why.get('need_mib')}")
+
+
+def on_free_gpu(fn):
+    """An image job's entry (make_images, image_regions' segment and matte): with "auto" on the image GPU (AUTO_LEND),
+    run where the job's VRAM is (the user's decision, 2026-11-19: the text model's GPU, as one GPU, rather than a wait
+    or a failure while the image GPU's memory is taken) - on the image GPU when its NEED fits there, else again on the
+    text model's GPU, the answer saying so (its figures' or result's "gpu")."""
+    @functools.wraps(fn)
+    def run(svc, gen, *a, **kw):
+        lend = AUTO_LEND.get()
+        if lend is None or getattr(gen, "owner", None) is not getattr(svc, "images", None):
+            return fn(svc, gen, *a, **kw)
+        token = LEND_RETRY.set(True)
+        try:
+            return fn(svc, gen, *a, **kw)
+        except ImageGpuTaken as e:
+            why = e.why
+        finally:
+            LEND_RETRY.reset(token)
+        AUTO_LEND.set(None)
+        moved = {**lend, **why}
+        gen._say(f"image job: {lend['busy_name']} has {why['free_mib']} MiB for it, it needs {why['need_mib']}: "
+                 f"on {lend['name']}, the text model's GPU, instead")
+        got = fn(svc, svc.images.lent().gens[gen.model], *a, **kw)
+        if isinstance(got, tuple) and len(got) == 3 and isinstance(got[1], dict):
+            got[1]["gpu"] = moved
+        elif isinstance(got, dict):
+            got["gpu"] = moved
+        return got
+    return run
 
 
 def place_words(moved: dict | None) -> str:
     """What a tool's result says of place's card (the chat's model tells the user)."""
     if not moved:
         return ""
-    if moved.get("busy"):
-        return (f" A video job has {moved['busy_name']}, the image GPU, for about {moved['left_s']} s more, so this "
-                f"was made on {moved['name']}, the chat model's GPU, instead (the chat waited meanwhile): tell the "
-                "user so in a few words.")
+    why = {"video": lambda: f"A video job has {moved['busy_name']}, the image GPU, for about {moved['left_s']} s more",
+           "server": lambda: f"Another XeStrata server's image job has {moved['busy_name']}, the image GPU",
+           "vram": lambda: f"{moved['busy_name']}, the image GPU, has {moved['free_mib']} MiB free for this job, which "
+                           f"needs {moved['need_mib']}"}.get(moved.get("busy") or "")
+    if why is not None:
+        return (f" {why()}, so this was made on {moved['name']}, the chat model's GPU, instead (the chat waited "
+                "meanwhile): tell the user so in a few words.")
     return f" Made on {moved['name']}, the chat model's GPU, as asked (the chat waited meanwhile)."
 
 
@@ -2722,6 +2777,24 @@ class GpuTurn:
                 raise ImageJobFailed("cancelled while another server's image job had the GPU")
             time.sleep(0.25)
         self.f = f
+
+    def held_elsewhere(self) -> bool:
+        """Whether another server's job has the GPU's turn now (a try that lets go at once; False while this one holds
+        it, or when the lock cannot be read)."""
+        if self.f is not None:
+            return False
+        try:
+            f = open(self.lock_path, "a+b")
+        except OSError:
+            return False
+        try:
+            if self._try(f):
+                with contextlib.suppress(OSError):
+                    file_lock.release(f)
+                return False
+            return True
+        finally:
+            f.close()
 
     def release(self) -> None:
         f, self.f = self.f, None
@@ -3973,7 +4046,8 @@ class ImageGen:
                     "upscale": "Upscaling", "upscale-video": "Upscaling a video",
                     "segment-video": "Finding objects in a video", "segment": "Finding the region",
                     "matte": "Removing the background", "control": "Making the control image",
-                    "detect": "Finding the parts", "load": "Loading the weights"}
+                    "detect": "Finding the parts", "load": "Loading the weights",
+                    "gpu-turn": "Waiting for another server's image job on this GPU"}
 
     def begin(self, job: dict) -> None:
         """The job has the GPU's turn (gpu_turn): from here it is the running job (again, after make_images gave the
@@ -5349,7 +5423,7 @@ class ImageTools:
                         f"{got['seconds']:.1f} s"
                         + (f"; {got['fallback']}" if got.get("fallback") else "")
                         + f") and the user sees it: {url}.")
-            text += place_words(moved)
+            text += place_words(moved or got.get("gpu"))
             if name != "find_region":   # the marked picture shown to the user is not the source of the next tool
                 self.made.append(url.rsplit("/", 1)[1])
             urls = [url]
@@ -5556,7 +5630,7 @@ class ImageTools:
                 text += f" The original image was reduced to {job['extend_scale']:.1%} before extending it."
             if switched_from:
                 text += f" Changed image model from {switched_from} to {gen.model}: it takes this control."
-            text += place_words(moved)
+            text += place_words(moved or figures.get("gpu"))
             if found is not None:   # where edit_region drew, and its mask (another tool may take it)
                 mask_url = f"/v1/images/files/{gen.store(mask_to_bw(job['mask']), 'png')}"
                 text += (f" edit_region redrew {len(found['instances'])} {args['region']!r} region(s) that "
@@ -5883,6 +5957,7 @@ def _controls():
     return image_controls
 
 
+@on_free_gpu
 def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None,
                 preview=None) -> tuple[list[bytes], dict, str]:
     """`job`'s images in the GPU's turn (gpu_turn) -> (the PNG files' bytes, figures, the policy used).  When a request
@@ -6216,6 +6291,8 @@ def _gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = No
             if isinstance(models, ImageModels):   # every server's image jobs on this GPU in turn
                 def waiting():
                     gen._say("image job: waiting for another server's image job on this GPU")
+                    gen.begin(job)                    # the Monitor and the tools' bars say why it waits
+                    gen._live(stage="gpu-turn")
                     with svc.status_lock:
                         svc.status["phase"] = "waiting for another server's image job"
                 models.gpu.acquire(cancel, waiting)
@@ -6380,10 +6457,12 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
     the chat's engine (text_states) takes the service's turn for that read alone."""
     models: ImageModels = getattr(gen, "owner", None) or svc.images
     error: str | None = None
-    held = False
+    held = moved_on = False
     try:
         def waiting():
             gen._say("image job: waiting for another server's image job on this GPU")
+            gen.begin(job)                            # the Monitor and the tools' bars say why it waits
+            gen._live(stage="gpu-turn")
         models.gpu.acquire(cancel, waiting)
         held = True
         models.activate(gen)
@@ -6402,6 +6481,11 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
                 gen.totals["failed"] += 1
                 raise
             check_room(need, ram_available_mib(), job)
+            if LEND_RETRY.get() and AUTO_LEND.get() is not None:   # "auto": the job's VRAM here, else the text GPU
+                room = int(need.get("free_mib") or 0) + int(need.get("held_mib") or 0) - gen.reserve
+                if int(need.get("least_mib") or 0) > room:
+                    raise ImageGpuTaken({"busy": "vram", "free_mib": max(0, room),
+                                         "need_mib": int(need.get("least_mib") or 0)})
             try:
                 budget = ledger_fit(gen, need, job)
                 gen._say(f"image job: separate, the image engine's budget {budget} MiB on its own GPU (the DiT "
@@ -6416,11 +6500,14 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
                 helper_return_later(svc, models, lambda m: gen._say("image jobs done: " + m))
     except BaseException as e:
         error = str(e) or type(e).__name__
+        moved_on = isinstance(e, ImageGpuTaken)
         raise
     finally:
         if held:
             models.gpu.release()
-        if error is not None:                     # a job that ends well: make_images ends it, after its last image
+        if moved_on:                              # it goes on on the text model's GPU (on_free_gpu): not a failure
+            gen.job = None
+        elif error is not None:                   # a job that ends well: make_images ends it, after its last image
             gen.end(error, cancelled=cancel is not None and cancel.is_set())
 
 

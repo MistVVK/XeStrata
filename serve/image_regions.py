@@ -192,6 +192,7 @@ def _ask(gen, line: str, want: str) -> dict:
         raise
 
 
+@img.on_free_gpu
 def segment(svc, gen, picture: bytes, prompt: str, task: str = "mask", model: str | None = None,
             score_threshold: float = 0.5, mask_threshold: float = 0.5, cancel=None) -> dict:
     """The instances of `prompt` in `picture` (an image the engine reads: PNG, JPEG...) -> {"model", "width",
@@ -512,6 +513,7 @@ def birefnet_version(model: str | None) -> str:
     return v
 
 
+@img.on_free_gpu
 def matte(svc, gen, picture: bytes, version: str = "general", resolution: str | None = None, refine: bool = True,
           cancel=None) -> dict:
     """BiRefNet on `picture` -> {"version", "size": [w, h] it ran at, "alpha": uint8 [H][W], "foreground": uint8
@@ -681,7 +683,8 @@ def segmentation_response(svc, gen, fields: dict, picture: bytes, cancel=None) -
         data.append(one)
     return {"created": int(time.time()), "model": got["model"], "width": got["width"], "height": got["height"],
             "mask_format": fmt, "task": got["task"], "data": data,
-            "xestrata": {"seconds": got["seconds"], "engine_s": got["engine_s"],
+            "xestrata": {**({"gpu": got["gpu"]} if got.get("gpu") else {}),
+                         "seconds": got["seconds"], "engine_s": got["engine_s"],
                          **({"fallback": got["fallback"]} if got.get("fallback") else {})}}
 
 
@@ -729,7 +732,8 @@ def remove_background_response(svc, gen, req: dict, picture: bytes, base_url: st
         data.append({**entry, **({"role": "mask"} if i == 1 else {})})
     return {"created": int(time.time()), "model": f"birefnet-{got['version']}", "width": im.width, "height": im.height,
             "output_format": req["format"], "data": data,
-            "xestrata": {"seconds": got["seconds"], "operating_resolution": "{}x{}".format(*got["size"]),
+            "xestrata": {**({"gpu": got["gpu"]} if got.get("gpu") else {}),
+                         "seconds": got["seconds"], "operating_resolution": "{}x{}".format(*got["size"]),
                          **got["engine"], **({"fallback": got["fallback"]} if got.get("fallback") else {})}}
 
 

@@ -604,6 +604,8 @@
   "img.gpuImage": "{name}（画像の GPU）",
   "img.gpuMovedTitle": "{name} で作りました",
   "img.gpuMoved": "動画の仕事が {busy} を使っていた（あと約 {left} 秒）ので、チャットのモデルの GPU の {name} で作りました。その間、チャットは待ちました。",
+  "img.gpuMovedVram": "{busy} の空きが {free} MiB で、これには {need} MiB 要るので、チャットのモデルの GPU の {name} で作りました。その間、チャットは待ちました。",
+  "img.gpuMovedServer": "別の XeStrata のサーバーの画像の仕事が {busy} を使っていたので、チャットのモデルの GPU の {name} で作りました。その間、チャットは待ちました。",
   "img.nOf": "{n} 枚中 {i} 枚目",
   "img.partOf": "部分 {n} 個中 {i} 個目",
   "img.tileOf": "タイル {n} 個中 {i} 個目",

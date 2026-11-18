@@ -3559,9 +3559,11 @@ function gpuBody() {
 function gpuMoved(fig) {
   const g = fig && fig.gpu;
   if (!g || !g.busy) return;
+  const vars = {busy: g.busy_name, left: g.left_s, name: g.name, free: fmt(g.free_mib || 0), need: fmt(g.need_mib || 0)};
   toast("info", tr("img.gpuMovedTitle", "Made on {name}", {name: g.name}),
-        tr("img.gpuMoved", "A video job had {busy} (about {left} s more), so this was made on {name}, the chat model's GPU; the chat waited meanwhile.",
-           {busy: g.busy_name, left: g.left_s, name: g.name}), 10000);
+        g.busy === "server" ? tr("img.gpuMovedServer", "Another XeStrata server's image job had {busy}, so this was made on {name}, the chat model's GPU; the chat waited meanwhile.", vars)
+        : g.busy === "vram" ? tr("img.gpuMovedVram", "{busy} had {free} MiB free for this and it needed {need} MiB, so it was made on {name}, the chat model's GPU; the chat waited meanwhile.", vars)
+        : tr("img.gpuMoved", "A video job had {busy} (about {left} s more), so this was made on {name}, the chat model's GPU; the chat waited meanwhile.", vars), 10000);
 }
 function imgModels() {
   chatImages();

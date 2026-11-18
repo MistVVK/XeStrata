@@ -604,6 +604,8 @@
   "img.gpuImage": "{name}(이미지 GPU)",
   "img.gpuMovedTitle": "{name}에서 만들었습니다",
   "img.gpuMoved": "동영상 작업이 {busy}를 쓰고 있어(약 {left}초 남음) 채팅 모델의 GPU인 {name}에서 만들었습니다. 그동안 채팅은 기다렸습니다.",
+  "img.gpuMovedVram": "{busy}의 여유가 {free} MiB이고 이 작업에는 {need} MiB가 필요해서 채팅 모델의 GPU인 {name}에서 만들었습니다. 그동안 채팅은 기다렸습니다.",
+  "img.gpuMovedServer": "다른 XeStrata 서버의 이미지 작업이 {busy}를 쓰고 있어서 채팅 모델의 GPU인 {name}에서 만들었습니다. 그동안 채팅은 기다렸습니다.",
   "img.nOf": "{n}장 중 {i}번째",
   "img.partOf": "부분 {n}개 중 {i}번째",
   "img.tileOf": "타일 {n}개 중 {i}번째",

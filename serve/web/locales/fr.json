@@ -616,6 +616,8 @@
   "img.gpuImage": "{name} (le GPU des images)",
   "img.gpuMovedTitle": "Fait sur {name}",
   "img.gpuMoved": "Une tâche vidéo occupait {busy} (encore environ {left} s) : ceci a donc été fait sur {name}, le GPU du modèle de chat ; le chat a attendu pendant ce temps.",
+  "img.gpuMovedVram": "{busy} avait {free} Mio libres et il en fallait {need} Mio : elle a été faite sur {name}, le GPU du modèle de chat ; le chat a attendu entre-temps.",
+  "img.gpuMovedServer": "Une tâche d’image d’un autre serveur XeStrata occupait {busy} : elle a été faite sur {name}, le GPU du modèle de chat ; le chat a attendu entre-temps.",
   "img.nOf": "image {i} sur {n}",
   "img.partOf": "partie {i} sur {n}",
   "img.tileOf": "tuile {i} sur {n}",

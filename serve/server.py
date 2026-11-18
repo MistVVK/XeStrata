@@ -9929,8 +9929,10 @@ def make_handler(svc: Service):
                 print(f"[xestrata] image: no such LoRA {', '.join(job['lora_unknown'])} in this model's folder: "
                       "left out of the prompt", flush=True)
             if moved:
+                why = {"video": "has a video job",
+                       "server": "has another server's image job"}.get(moved.get("busy") or "")
                 print(f"[xestrata] image: on {moved['name']}, the text model's GPU"
-                      + (f" ({moved['busy_name']} has a video job)" if moved.get("busy") else ""), flush=True)
+                      + (f" ({moved['busy_name']} {why})" if why else ""), flush=True)
             if stream:
                 return self._image_stream(gen, job, cancel, edit, moved)
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
