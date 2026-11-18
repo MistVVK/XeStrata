@@ -5765,14 +5765,17 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
     release, never the training's end)."""
     lt = getattr(svc, "lora_jobs", None)
     need = None
-    if lt is not None and lt.current is not None and lt.place is not None and gen.engine.alive():
+    pci = envvars.get("GPU_PCI", env=gen.engine.env)
+    same_card = not pci or not lt or not lt.place or not lt.place.get("pci") or \
+        pci.lower() == str(lt.place["pci"]).lower()
+    if lt is not None and lt.current is not None and lt.place is not None and same_card and gen.engine.alive():
         try:
             need = int(gen.need(job, start=False)["least_mib"])
             if need <= 0:
                 need = None
         except (ImageJobFailed, OSError, KeyError, TypeError, ValueError):
             need = None
-    waiting = lt.image_begin(need) if lt is not None else None
+    waiting = lt.image_begin(need, pci) if lt is not None else None
     try:
         with _gpu_turn(svc, gen, job, cancel) as policy:
             yield policy

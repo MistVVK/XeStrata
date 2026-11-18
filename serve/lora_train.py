@@ -463,6 +463,8 @@ class TrainJobs:
         for d in self.root.iterdir():
             rec = self._read(d.name)
             if rec and rec.get("status") in ("queued", "preprocessing", "training", "sampling", "captioning"):
+                if self._owner_alive(rec):
+                    continue
                 self._stop_orphan(rec)
                 if rec.get("settings"):
                     rec.update(status="interrupted", error={"code": "server_restarted",
@@ -470,6 +472,24 @@ class TrainJobs:
                 else:
                     rec.update(status="draft", error=None)
                 self._write(rec)
+
+    @staticmethod
+    def _owner_alive(rec: dict) -> bool:
+        from serve.vram_ledger import process_start
+        pid, start = rec.get("owner_pid"), rec.get("owner_start")
+        if not pid or start is None:
+            return False
+        current = process_start(int(pid))
+        return current is not None and abs(current - float(start)) < 1e-3
+
+    @staticmethod
+    def _claim(rec: dict) -> None:
+        from serve.vram_ledger import process_start
+        pid = os.getpid()
+        start = process_start(pid)
+        if start is None:
+            raise TrainError("cannot identify this server process", 503)
+        rec.update(owner_pid=pid, owner_start=start)
 
     # ---- the record
     def dir_of(self, jid: str) -> Path:
@@ -681,6 +701,7 @@ class TrainJobs:
             raise TrainError("style_words: only for a style LoRA")
         if not rec["images"]:
             raise TrainError("images: none to caption")
+        self._claim(rec)
         rec.update(status="captioning", error=None, style_words=style_words)
         self._write(rec)
         self._enqueue(jid)
@@ -701,6 +722,9 @@ class TrainJobs:
         with tempfile.TemporaryFile(mode="w+b") as output:
             proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT, text=True)
             self._proc = proc
+            from serve.vram_ledger import process_start
+            rec.update(pid=proc.pid, pid_start=process_start(proc.pid))
+            self._write(rec)
             try:
                 while proc.poll() is None:
                     if cancel.is_set():
@@ -713,6 +737,8 @@ class TrainJobs:
                 out = output.read().decode("utf-8", errors="replace")
             finally:
                 self._proc = None
+                rec.update(pid=None, pid_start=None)
+                self._write(rec)
         if proc.returncode != 0:
             raise TrainError(f"the captions failed: {(out or '').strip()[-800:]}", 500)
         for item in rec["images"]:
@@ -757,6 +783,7 @@ class TrainJobs:
             raise TrainError(f"captions: {len(missing)} image(s) have none ({missing[0]}...): caption them first")
         if not any(i["caption"].startswith(rec["trigger"]) for i in rec["images"]):
             raise TrainError(f"captions: none starts with the trigger word {rec['trigger']!r}")
+        self._claim(rec)
         rec.update(settings=check_settings(fields, fam, rec["kind"]), status="queued", stage=None, error=None,
                    started_at=int(time.time()))
         self._write(rec)
@@ -828,6 +855,7 @@ class TrainJobs:
             rec.update(resume_state=True, registered=None, state_bytes=size)
         elif steps is not None:
             raise TrainError("steps: a new total is only for a completed training")
+        self._claim(rec)
         rec.update(status="queued", error=None, completed_at=None)
         self._write(rec)
         self._enqueue(jid)
@@ -1392,10 +1420,13 @@ class TrainJobs:
             self._write(rec)
 
     # ---- the image jobs' yield (images.gpu_turn calls these)
-    def image_begin(self, need_mib: int | None = None) -> str | None:
+    def image_begin(self, need_mib: int | None = None, pci: str | None = None) -> str | None:
         """Register an image's need until image_end; unknown need requires the Decider's safe stop."""
         with self.lock:
             if self.current is None or self.place is None:
+                return None
+            train_pci = str(self.place.get("pci") or "").lower()
+            if pci and train_pci and pci.lower() != train_pci:
                 return None
             token = uuid.uuid4().hex
             self.image_needs[token] = need_mib

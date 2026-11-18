@@ -369,7 +369,7 @@ class Training(unittest.TestCase):
         self.jobs.cancel(rec["id"])
         wait_for(lambda: self.jobs.get(rec["id"])["status"] == "cancelled", what="the cancel")
         r = self.jobs.get(rec["id"])
-        r.update(status="training", pid=999999, pid_start=0.0)
+        r.update(status="training", pid=999999, pid_start=0.0, owner_pid=999999, owner_start=0.0)
         self.jobs._write(r)
         jobs2 = lt.TrainJobs(self.root / "lora-jobs", self.svc)
         jobs2.preprocess_argv = self.jobs.preprocess_argv
@@ -567,6 +567,7 @@ class Training(unittest.TestCase):
         from contextlib import nullcontext
         from serve import images
         gen = mock.Mock()
+        gen.engine.env = {}
         gen.need.return_value = {"least_mib": 4096}
         jobs = mock.Mock(current="lora_job", place={"pci": "a"})
         jobs.image_begin.return_value = "token"
@@ -576,13 +577,13 @@ class Training(unittest.TestCase):
             with images.gpu_turn(svc, gen, {}) as value:
                 self.assertEqual(value, "ok")
             gen.need.assert_not_called()
-            jobs.image_begin.assert_called_with(None)
+            jobs.image_begin.assert_called_with(None, None)
             jobs.image_end.assert_called_with("token")
             gen.engine.alive.return_value = True
             with images.gpu_turn(svc, gen, {}):
                 pass
             gen.need.assert_called_once_with({}, start=False)
-            jobs.image_begin.assert_called_with(4096)
+            jobs.image_begin.assert_called_with(4096, None)
         idle = images.ImageGen.__new__(images.ImageGen)
         idle.cfg = {}
         idle.tok = object()
