@@ -27,7 +27,8 @@ class UploadName(unittest.TestCase):
         self.assertEqual(videos.safe_suffix("clip.2024 final"), ".2024final")
         self.assertEqual(videos.safe_suffix("x.a\nSHUTDOWN\nX"), ".aSHUTDOWNX")
         self.assertEqual(videos.safe_suffix("noext"), "")
-        self.assertEqual(videos.safe_suffix("clip."), ".")
+        self.assertEqual(videos.safe_suffix("clip."), "")
+        self.assertEqual(videos.safe_suffix("x.a b"), ".ab")
 
     def test_the_written_path_is_one_word(self):
         body = (b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.a\nSHUTDOWN\nX\"\r\n"

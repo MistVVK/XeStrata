@@ -72,7 +72,8 @@ def safe_suffix(name: str) -> str:
     and digits after the dot.  A multipart header's filename can hold spaces and bare newlines; either would split
     the engine's UPSV/SEGV line into commands (a name like x.a\\nSHUTDOWN\\nX stops the image daemon)."""
     suffix = Path(name).suffix[:16]
-    return "." + "".join(c for c in suffix[1:] if c.isascii() and c.isalnum()) if suffix.startswith(".") else ""
+    letters = "".join(c for c in suffix[1:] if c.isascii() and c.isalnum()) if suffix.startswith(".") else ""
+    return "." + letters if letters else ""
 
 
 def stream_multipart(rfile, ctype: str, length: int, dest: Path, max_file: int) -> tuple[dict, list[dict]]:
