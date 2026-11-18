@@ -195,6 +195,14 @@ void Dflash2Drafter::set_capacity_rows(int rows) {
 bool Dflash2Drafter::load(const std::string& path, int device, std::string& err) {
     device_ = device;
     capacity_rows_ = requested_capacity_rows_;
+    // a failure below must not leave what it took: the caller's drop releases only a loaded drafter, so return
+    // the pack's VRAM, the work buffers and the stream here on any error past this point
+    bool loaded = false;
+    struct OnFail {
+        Dflash2Drafter* d;
+        bool* ok;
+        ~OnFail() { if (!*ok) d->release(); }
+    } on_fail{this, &loaded};
     const OnDevice on_device(device_);
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> f(std::fopen(path.c_str(), "rb"), &std::fclose);
     if (f == nullptr) { err = "dflash2: cannot open " + path; return false; }
@@ -306,7 +314,8 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
     std::fprintf(stderr, "xestrata dflash2: %s pack, %d layers, taps", sel_q4_ ? "Q4_0 + Q4_0 selector" : "Q4_0/Q8_0", L_);
     for (int l : taps_) std::fprintf(stderr, " %d", l);
     std::fprintf(stderr, ", window %d\n", window_);
-    return alloc(err);
+    loaded = alloc(err);
+    return loaded;
 }
 
 bool Dflash2Drafter::alloc(std::string& err) {
