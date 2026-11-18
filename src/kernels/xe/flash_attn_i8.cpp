@@ -175,6 +175,7 @@ int jm_kind(const sycl::device& d) {
 }
 
 int kind_of(sycl::queue& q) {
+    if (no_xmx()) return kDotKind;
     static core::PerDevice<int> of;
     return of.get(q.get_device(), [&q] {
         const sycl::device d = q.get_device();
