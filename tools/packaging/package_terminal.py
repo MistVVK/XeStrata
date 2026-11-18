@@ -22,7 +22,7 @@ What goes in
 * the read-only tooling under `tools/` that the terminal paths import. Everything else under `tools/` is engine
   installation and preparation work and is deliberately excluded: the serving import graph must not pull it in
   (tests/terminal/test_no_acquisition.py checks that);
-* launchers: `bin/strata.cmd` and `bin/strata.ps1` (Windows), `bin/strata` (Linux, macOS).
+* launchers: `bin/strata.cmd` and `bin/strata-direct.ps1` (Windows; the PowerShell one is not called strata.ps1, which PowerShell would run before strata.cmd), `bin/strata` (Linux, macOS).
 
 What does NOT go in
 -------------------
@@ -489,7 +489,7 @@ def main() -> int:
 
         bin_dir = root / "bin"
         bin_dir.mkdir(exist_ok=True)
-        launchers = ["strata.cmd", "strata.ps1"] if target.startswith("windows") else ["strata"]
+        launchers = ["strata.cmd", "strata-direct.ps1"] if target.startswith("windows") else ["strata"]
         for launcher in launchers:
             shutil.copy2(ROOT / "bin" / launcher, bin_dir / launcher)
             if launcher == "strata":
