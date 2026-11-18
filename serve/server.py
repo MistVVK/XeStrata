@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import collections
 import base64
 import hashlib
@@ -5417,7 +5418,8 @@ class Service:
         if job is not None:   # a video job (videos.py): its frames, the seconds left, and whether the chat's requests
             # run at its chunks' ends or are refused (it has the GPU the text engine gave up)
             live["video"] = {"done": job["done"], "total": job["total"], "left_s": images_api.long_job_left(self),
-                             "chat": "refused" if job.get("policy") == "unload" else "between_chunks"}
+                             "chat": "refused" if job.get("policy") == "unload" else "between_chunks",
+                             "client": job.get("client")}
         # the image jobs that ended beside the chat's requests, newest first (the Monitor's Requests table); the
         # conversation cache counts the chat's only
         rows = sorted(hist + (self.images.recent() if self.images is not None else []), key=lambda r: r["time"])
@@ -8966,6 +8968,10 @@ def make_handler(svc: Service):
                 self.wfile.flush()
 
         def do_POST(self):
+            # the page's mark of its own job (images.CLIENT_JOB), a short token or none: per request, since a
+            # connection's requests share its thread
+            mark = self.headers.get("X-XeStrata-Job") or ""
+            images_api.CLIENT_JOB.set(mark if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", mark) else None)
             try:
                 self._post()
             except BadBody as e:                              # #893: a malformed or oversized chunked body
@@ -9929,7 +9935,7 @@ def make_handler(svc: Service):
                     result["error"] = e
                 finally:
                     events.put(None)
-            worker = threading.Thread(target=work, daemon=True)
+            worker = threading.Thread(target=contextvars.copy_context().run, args=(work,), daemon=True)   # its mark
             worker.start()
             self._sse()
 

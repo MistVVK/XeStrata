@@ -132,6 +132,7 @@ from __future__ import annotations
 import base64
 import collections
 import contextlib
+import contextvars
 import functools
 import hashlib
 import json
@@ -1606,6 +1607,11 @@ def refuse_during_long_job(svc) -> None:
     left = long_job_left(svc)
     if left is not None:
         raise LongJobBusy(f"a video job has the image engine for about {left} s more: ask again then", left)
+
+
+# The request's mark of the page that sent it (the web app's X-XeStrata-Job header, serve/server.py), kept with the
+# job it starts: the page shows the progress of its own job only, not another page's or the API's
+CLIENT_JOB: contextvars.ContextVar[str | None] = contextvars.ContextVar("xestrata_client_job", default=None)
 
 
 class EngineLock:
@@ -3801,7 +3807,7 @@ class ImageGen:
         self.job = {"started": time.time(), "t0": time.monotonic(), "stage": "waiting", "image": 1, "images": job["n"],
                     "step": 0, "steps": job.get("steps_run", job["steps"]), "size": f"{job['width']}x{job['height']}",
                     "refs": len(job.get("refs") or ()), "edit": bool(job.get("refs")), "sampling_at": None,
-                    "part": 0.0, "piece": 0, "pieces": 0, "piece_kind": None}
+                    "part": 0.0, "piece": 0, "pieces": 0, "piece_kind": None, "client": CLIENT_JOB.get()}
 
     def _live(self, **kw) -> None:
         if self.job is not None:
@@ -3855,6 +3861,7 @@ class ImageGen:
         return {"stage": stage, "label": self.STAGE_LABELS.get(stage, stage), "step": done, "steps": j["steps"],
                 "image": j["image"], "images": j["images"], "size": j["size"], "refs": j["refs"], "edit": j["edit"],
                 "piece": j.get("piece", 0), "pieces": pieces, "piece_kind": j.get("piece_kind"),
+                "client": j.get("client"),
                 "elapsed_s": round(now - j["t0"], 1), "step_s": step_s, "progress": round(min(1.0, frac), 3)}
 
     def end(self, error: str | None, cancelled: bool = False) -> None:

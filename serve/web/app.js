@@ -4749,7 +4749,14 @@ function leftEstimator() {
     return Math.round((1 - p) * (t - ta) / (p - pa));
   };
 }
-// running: the button is Interrupt with the seconds so far; an image job's progress (the metrics' live.image) beside
+// A request's mark (the X-XeStrata-Job header): the server keeps it with the job it starts (live.image's and
+// live.video's client), so that a tab's bar shows its own job, not another page's or the API's
+function jobMark() {
+  return Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
+}
+let toolMark = null;
+// running: the button is Interrupt with the seconds so far; this page's image job's progress (the metrics' live.image
+// whose client is toolMark) beside
 function toolBusy(t0) {
   clearInterval(toolTimer);
   $("tool-go").classList.toggle("is-busy", t0 != null);
@@ -4761,7 +4768,7 @@ function toolBusy(t0) {
   toolTimer = setInterval(() => {
     const s = (performance.now() - t0) / 1000, live = lastMetrics && lastMetrics.live && lastMetrics.live.image;
     $("tool-go-time").textContent = tr("img.elapsed", "{n} s", {n: Math.round(s)});
-    if (!live) return;
+    if (!live || live.client !== toolMark) return;
     const p = live.progress || 0;
     $("tool-progress").hidden = false;
     $("tool-bar").style.width = `${Math.round(100 * p)}%`;
@@ -4783,6 +4790,7 @@ $("tool-form").onsubmit = async (ev) => {
   if (!$("tool-prompt-f").hidden && toolKind !== "fix" && !body.prompt) { $("tool-prompt").focus(); return; }
   if (toolKind === "fix" && !body.fix.parts.length) { toast("warn", tr("tool.fix", "Fix parts"), tr("tool.noParts", "Tick a part to find."), 5000); return; }
   toolAbort = new AbortController();
+  toolMark = jobMark();
   imageBusy = true;
   paintLive();
   let t0 = performance.now();
@@ -4791,7 +4799,8 @@ $("tool-form").onsubmit = async (ev) => {
   try {
     let r, j;
     for (;;) {
-      r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body), signal: toolAbort.signal});
+      r = await fetch(url, {method: "POST", headers: {...headers(true), "X-XeStrata-Job": toolMark}, body: JSON.stringify(body),
+                            signal: toolAbort.signal});
       j = await r.json();
       if (r.ok || !j.error || j.error.code !== "weights_downloading") break;
       await auxWait(j.error, toolAbort.signal, (p, words) => {
@@ -4967,12 +4976,13 @@ function vidForm(req, field = "input_references") {
   return fd;
 }
 // a POST of the form with its upload's progress (fetch tells none): {status, headers(name), body: a Blob}
-function vidPost(url, fd, signal, uploaded) {
+function vidPost(url, fd, signal, uploaded, mark = null) {
   return new Promise((ok, no) => {
     const x = new XMLHttpRequest();
     x.open("POST", url);
     for (const [k, v] of Object.entries(headers(false))) x.setRequestHeader(k, v);
     x.setRequestHeader("X-XeStrata-Upload", "1");   // the server's mark of its own page's form (_foreign_page)
+    if (mark) x.setRequestHeader("X-XeStrata-Job", mark);   // the job's (jobMark): the bar shows this page's
     x.responseType = "blob";
     x.upload.onprogress = (e) => { if (e.lengthComputable) uploaded(e.loaded / e.total); };
     x.onload = () => ok({status: x.status, header: (n) => x.getResponseHeader(n), body: x.response});
@@ -5008,7 +5018,10 @@ function vidBusy(t0) {
       p = run.upload;
       cap = tr("vid.uploading", "Sending the video · {pct}%", {pct: Math.round(100 * p)});
     } else {
-      const v = (lastMetrics && lastMetrics.live && lastMetrics.live.video) || (vidJob && vidJob.rec && {done: vidJob.rec.frames_done || 0, total: (vidJob.rec.source || {}).frames || 0});
+      // this page's: the running video job its request started (live.video's client), or its job's record
+      const lv = lastMetrics && lastMetrics.live && lastMetrics.live.video;
+      const v = (lv && run && lv.client === run.mark ? lv : null) ||
+                (vidJob && vidJob.rec && {done: vidJob.rec.frames_done || 0, total: (vidJob.rec.source || {}).frames || 0});
       if (v && v.total) {
         p = Math.min(1, v.done / v.total);
         cap = tr("vid.frameOf", "Frame {i} of {n}", {i: v.done, n: v.total}) + (v.left_s ? " · " + tr("tool.left", "about {n} s left", {n: v.left_s}) : "");
@@ -5042,7 +5055,7 @@ $("vid-form").onsubmit = async (ev) => {
     toast("error", tr("tool.upscale", "Upscale"), tr("vid.tooLarge", "The video is larger than the server takes ({n} MiB: video.max_upload_mib).", {n: v.max_upload_mib}), 10000);
     return;
   }
-  vidAbort = {ctl: new AbortController(), upload: 0};
+  vidAbort = {ctl: new AbortController(), upload: 0, mark: jobMark()};
   imageBusy = true;
   paintLive();
   let t0 = performance.now();
@@ -5052,7 +5065,8 @@ $("vid-form").onsubmit = async (ev) => {
   try {
     let r;
     for (;;) {
-      r = await vidPost(path, vidForm(req, seg ? "video" : "input_references"), vidAbort.ctl.signal, (p) => { vidAbort.upload = p; });
+      r = await vidPost(path, vidForm(req, seg ? "video" : "input_references"), vidAbort.ctl.signal, (p) => { vidAbort.upload = p; },
+                        vidAbort.mark);
       vidAbort.upload = 1;
       if (r.status === 200) break;
       const e = await vidErrorBody(r);

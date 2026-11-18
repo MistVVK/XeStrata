@@ -441,7 +441,7 @@ def segment(svc, gen, job: dict, source: Path, stem: Path, model: str, progress:
     t0 = time.monotonic()
     with img.gpu_turn(svc, gen, job, cancel) as policy:
         state = {"started": time.monotonic(), "done": 0, "total": int(job["source"]["frames"]), "policy": policy,
-                 "thread": threading.get_ident()}
+                 "thread": threading.get_ident(), "client": img.CLIENT_JOB.get()}
 
         def told(done: int, total: int) -> None:
             state.update(done=done, total=total)
@@ -732,7 +732,7 @@ def upscale(svc, gen, job: dict, source: Path, stem: Path, progress: Callable[[i
         # the long job (images.long_job_left): other image requests, and the chat's when its engine made way, are
         # refused at once with the seconds left; under the other policies the chat's run at the chunks' ends
         state = {"started": time.monotonic(), "done": 0, "total": int(job["source"]["frames"]), "policy": policy,
-                 "thread": threading.get_ident()}
+                 "thread": threading.get_ident(), "client": img.CLIENT_JOB.get()}
 
         def told(done: int, total: int) -> None:
             state.update(done=done, total=total)
