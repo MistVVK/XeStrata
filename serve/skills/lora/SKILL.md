@@ -8,7 +8,8 @@ metadata:
 
 - Use a LoRA only when the user names it, or asks for the character or the style it adds (its name, kind and trigger
   in `lora` say which). None otherwise.
-- Write its trigger words in the prompt.
+- Write its trigger words in the prompt. Set `model` to one listed for that LoRA; the default model can reject it.
+  Tell the user if this changes the default model.
 - A character LoRA (kind `character`, or a person's or creature's name): `scale` 1, and `blocks` `"character"` where
   `blocks` lists it (else leave `blocks` out). A lower strength takes the character away before the LoRA's style:
   keep 1. Write the style the picture should have, in the model's prompt style (the user's, else the model's own:

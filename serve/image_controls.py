@@ -228,6 +228,32 @@ def region_prompt(png: bytes, regions: list[dict]) -> str:
                     for position, i in zip(positions, order))
 
 
+def _picture_samples(data: bytes):
+    """Bounded, unfiltered samples: interpolation would invent colors along a map's boundaries."""
+    import numpy as np
+    from PIL import Image
+    with Image.open(io.BytesIO(data)) as im:
+        im = im.convert("RGB")
+        im.thumbnail((256, 256), Image.Resampling.NEAREST)
+        return np.asarray(im).reshape(-1, 3)
+
+
+def _drawing(data: bytes) -> bool:
+    """A mostly white, neutral image with a small amount of dark ink; uncertain pictures stay photos."""
+    import numpy as np
+    a = _picture_samples(data).astype(np.int16)
+    lo, hi = a.min(axis=1), a.max(axis=1)
+    return bool((lo >= 240).mean() >= 0.75 and 0.005 <= (hi < 160).mean() <= 0.25
+                and (hi - lo <= 12).mean() >= 0.98)
+
+
+def _color_map(data: bytes) -> bool:
+    """A few exact flat colors cover almost all pixels; photographs go through the preprocessor."""
+    import numpy as np
+    _, counts = np.unique(_picture_samples(data), axis=0, return_counts=True)
+    return bool(2 <= len(counts) and np.sort(counts)[-8:].sum() >= counts.sum() * 0.995)
+
+
 def _moss(items: list, cfg: dict, picture: bytes | None) -> dict:
     """MOSS-Image's color and depth: one control or a list of the two (each its own picture; the multipart
     control_image the first's), the adapter's strength (the first's, or the only one given) -> {"type": "color",
@@ -259,8 +285,11 @@ def _moss(items: list, cfg: dict, picture: bytes | None) -> dict:
             if strength is not None and s != strength:
                 raise img.ImageRequestError("control.strength: one for the adapter (color and depth share it)")
             strength = s
-        maps.append({"type": kind, "image": _picture(v, picture if i == 0 else None),
-                     "end": _num(v, "end", 0.0, 1.0, 1.0), "as_map": v.get("preprocess") is False,
+        image = _picture(v, picture if i == 0 else None)
+        as_map = (v["preprocess"] is False if v.get("preprocess") is not None else
+                  kind == "color" and _color_map(image))
+        maps.append({"type": kind, "image": image,
+                     "end": _num(v, "end", 0.0, 1.0, 1.0), "as_map": as_map,
                      "resolution": int(_num(v, "resolution", 64, MAX_RESOLUTION, RESOLUTION))})
     return {"type": "+".join(m["type"] for m in maps), "mode": "moss", "maps": maps,
             "strength": 1.0 if strength is None else strength, "image": maps[0]["image"], "regions": regions}
@@ -318,7 +347,7 @@ def parse_control(v: Any, cfg: dict, picture: bytes | None = None) -> dict:
     if mode == "controlnet" and kind in ("lineart", "lineart_coarse"):
         if lineart_input not in (None, "photo", "drawing"):
             raise img.ImageRequestError("control.lineart_input: photo or drawing")
-        out["lineart_input"] = lineart_input or "photo"
+        out["lineart_input"] = lineart_input or ("drawing" if _drawing(out["image"]) else "photo")
     if mode == "lora":
         out["strength"] = _num(v, "strength", 0.0, 2.0, 1.0)
         for key, default in (("start", 0.0), ("end", 1.0)):
@@ -386,7 +415,9 @@ def parse_job(req: dict, cfg: dict, files: list[bytes] | None = None, mask: byte
         raise img.ImageRequestError("strength: an edit's or img2img's; the control's strength is control.strength")
     if c["mode"] == "lora":
         if files or mask is not None or r.get("edit_adapter") not in (None, ""):
-            raise img.ImageRequestError("control: a control LoRA with another edit adapter or mask is not available")
+            raise img.ImageRequestError("control: a control LoRA with another edit adapter or mask is not available; "
+                                        "call control with the picture to make a new controlled image, or remove "
+                                        "control to edit the original")
         if str(cfg.get("model_name") or "").startswith("moss-image-base"):
             raise img.ImageRequestError("control: the control LoRA has not been checked with MOSS-Image Base")
         if not cfg.get("vision"):

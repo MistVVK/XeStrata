@@ -3949,11 +3949,22 @@ class ImageModels:
 OPTION_KEYS = ("size", "quality", "output_format", "output_compression", "background")
 FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))")
 # an image tool's picture: a kept image's link (a tool's result, or the conversation's), else the conversation's last
-IMAGE_ARG = {"type": "string", "description": "a link a result gave; left out: the last image (an attached one too)"}
+IMAGE_ARG = {"type": "string", "description": "attached:N (the user's Nth picture), or a link a tool returned; "
+                                              "left out: the last image. Do not invent URLs."}
 # how the masked edit enlarges the part it cuts out before it is drawn (crop_upscale), and SeedVR2's version for it
 CROP_UPSCALE = ("auto", "lanczos", "realesrgan", "seedvr2")
 CROP_ARGS: dict[str, Any] = {"crop_upscale": {"type": "string", "enum": list(CROP_UPSCALE)},
                              "variant": {"type": "string", "enum": ["7b", "7b-sharp"]}}
+# The enum is constrained as well as described: the chat sees each meaning beside its value.
+CONTROL_TYPES = {
+    "canny": "edges", "depth": "depth and composition", "pose": "pose skeleton",
+    "lineart": "finished line drawing", "lineart_coarse": "coarse line drawing", "hed": "soft edges",
+    "scribble_hed": "rough sketch with HED", "scribble": "rough sketch or scribble", "scribble_xdog": "XDoG sketch",
+    "mlsd": "straight lines and architecture", "gray": "grayscale shading", "normal": "surface orientation",
+    "segmentation": "object regions and layout", "color": "flat color map with regions", "none": "ready map",
+}
+CONTROL_TYPE = {"type": "string", "enum": list(CONTROL_TYPES),
+                "oneOf": [{"const": k, "description": v} for k, v in CONTROL_TYPES.items()]}
 # what every image and video tool takes besides its own: the plan's step it does (the chart's box), and the group of
 # calls run side by side that one failure stops (server.py run_with_mcp)
 PLAN_ARGS: dict[str, Any] = {"step": {"type": "string"}, "group": {"type": "string"},
@@ -3973,7 +3984,8 @@ TOOLS: list[dict[str, Any]] = [
                     "hair, the clothes, the sky: edit_region), larger or finer (upscale_image), wider, taller or "
                     "another shape (extend_image keeps the picture; this redraws it), a cut-out or plain background "
                     "(remove_background), faces or hands (fix_image), a new subject in a picture's pose (control). "
-                    "The same person in another picture's pose: that picture in control, not references. A model "
+                    "The same person in another picture's pose: image attached:1, control.image attached:2, not a "
+                    "reference. A model "
                     "without edits draws over it (img2img): the prompt then says the whole picture.",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "the change"},
@@ -3982,9 +3994,11 @@ TOOLS: list[dict[str, Any]] = [
          "strength": {"type": "number", "description": "0 to 1"},
          "references": {"type": "array", "items": {"type": "string"}, "description": "links: images 2, 3, ..."},
          "control": {"type": "object", "description": "a different picture's pose or composition; not a reference",
-                     "properties": {"type": {"type": "string", "enum": ["pose", "depth", "canny", "lineart", "hed"]},
-                                    "image": IMAGE_ARG, "strength": {"type": "number"}, "end": {"type": "number"}},
-                     "required": ["type", "image"]},
+                     "properties": {"type": CONTROL_TYPE, "image": IMAGE_ARG, "strength": {"type": "number"},
+                                    "end": {"type": "number"},
+                                    "lineart_input": {"type": "string", "enum": ["photo", "drawing"]},
+                                    "preprocess": {"type": "boolean"}},
+                     "required": ["type"]},
          "mask": {"type": "string", "description": "a mask's link (white changes)"},
          "refine": {"type": "boolean", "description": "MOSS-Image: the masked part again, finer"},
          **CROP_ARGS, "seed": {"type": "integer"}},
@@ -4054,20 +4068,19 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "control",
      "description": "Make a new image whose composition follows a picture's (pose, outlines, depth); the user sees it. "
                     "Nothing of the picture's people but their pose is kept: to keep a given person (their face, "
-                    "their clothes), edit_image with the pose's picture in control, not references.",
+                    "their clothes), edit_image with the pose's picture in control, not references. For ControlNet, "
+                    "choose a Qwen-Image-2.1 model that takes the type; for color choose MOSS-Image. Set model to one "
+                    "that takes the control and any named LoRA; tell the user if it changes the default.",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "the whole new image"},
-         "type": {"type": "string", "enum": ["canny", "depth", "pose", "lineart", "lineart_coarse", "hed",
-                                             "scribble_hed", "scribble", "scribble_xdog", "mlsd", "gray", "normal",
-                                             "segmentation", "color",
-                                             "none"]},
+         "type": CONTROL_TYPE,
          "image": IMAGE_ARG,
          "size": {"type": "string", "description": "WxH"},
          "strength": {"type": "number"},
          "start": {"type": "number"},
          "end": {"type": "number"},
          "backend": {"type": "string", "enum": ["moss", "lora"]},
-         "preprocess": {"type": "boolean", "description": "false when image is the color map already"},
+         "preprocess": {"type": "boolean", "description": "false for a ready color map; keep type color with regions"},
          "regions": {"type": "array", "description": "MOSS-Image color map: one description per exact map color",
                      "items": {"type": "object", "properties": {
                          "color": {"type": "string", "description": "the map color as #rrggbb"},
@@ -4509,7 +4522,7 @@ class ImageTools:
         names = list(dict.fromkeys(e["name"] for g in gens if g.loras.takes for e in g.loras.listing()))
         params = dict(t["parameters"])
         params["properties"] = {**params["properties"], "lora": {
-            "type": "array", "description": "LoRAs: " + "; ".join(self._lora_lines(gens)),
+            "type": "array", "description": "Choose a model listed for the LoRA: " + "; ".join(self._lora_lines(gens)),
             "items": {
                 "type": "object",
                 "properties": {
@@ -4707,6 +4720,35 @@ class ImageTools:
                             out.add(tool_of[n])
         return out
 
+    def _control_choice(self, name: str, args: dict) -> tuple[list, Any, str | None]:
+        """Choose only a model that can take the requested control; report an automatic switch."""
+        gens = self._gens(name in EDIT_TOOLS)
+        control = args if name == "control" else args.get("control") if name == "edit_image" else None
+        kind = str(control.get("type") or "canny") if isinstance(control, dict) else None
+        asked = args.get("model")
+        if name == "control":
+            capable = [g for g in gens if _controls().mode_of(g.cfg, kind or "")]
+        elif kind == "pose" and asked in (None, ""):
+            capable = [g for g in gens if can_edit(g.cfg) and _controls().mode_of(g.cfg, kind) == "controlnet"] or gens
+        else:
+            capable = gens
+        if kind in ("normal", "segmentation"):
+            capable = [g for g in gens if _controls().mode_of(g.cfg, kind or "")]
+            # A MOSS control LoRA needs its vision encoder and is trained for SFT, not Base.
+            capable = [g for g in capable if _controls().mode_of(g.cfg, kind) != "lora" or
+                       g.cfg.get("vision") and not str(g.cfg.get("model_name") or "").startswith("moss-image-base")]
+            original = next((g for g in gens if g.model == asked), None) if asked else gens[0] if gens else None
+            if original is not None and original not in capable:
+                preferred = [g for g in capable if _controls().mode_of(g.cfg, kind) == "lora"]
+                capable = preferred + [g for g in capable if g not in preferred]
+                if not capable:
+                    raise ImageRequestError(f"control.type {kind}: no configured model takes it")
+                return capable, capable[0], original.model
+        gen = next((g for g in capable if g.model == asked), capable[0] if capable else self.gen)
+        if asked not in (None, "") and gen.model != asked:
+            raise ImageRequestError(f"model: one of {', '.join(g.model for g in capable)}, not {asked!r}")
+        return capable, gen, None
+
     def lane(self, name: str, args: dict) -> tuple[str, str, bool]:
         """Where a call of the reply runs beside the others (serve/tool_parallel.py) -> ("now": no GPU job to wait
         for, or "images": the image GPU's lane; the image model it takes; whether it may run on the text model's GPU,
@@ -4718,18 +4760,15 @@ class ImageTools:
         if name in ("find_region", "remove_background"):
             gens = self._gens()
             return "images", gens[0].model if gens else self.gen.model, False
-        gens = self._gens(name in EDIT_TOOLS)
-        if name == "control":
-            gens = [g for g in gens if _controls().mode_of(g.cfg, str(args.get("type") or "canny"))]
         if args.get("layout") not in (None, "", {}):
+            gens = self._gens(name in EDIT_TOOLS)
             gens = [g for g in gens if _pipeline(g.family) == "latent_chat"] or gens
-        asked = args.get("model")
-        if name == "edit_image" and asked in (None, "") and isinstance(args.get("control"), dict):
-            kind = args["control"].get("type")
-            if kind == "pose":
-                capable = [g for g in gens if can_edit(g.cfg) and _controls().mode_of(g.cfg, kind) == "controlnet"]
-                gens = capable or gens
-        gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
+            gen = next((g for g in gens if g.model == args.get("model")), gens[0] if gens else self.gen)
+        else:
+            try:
+                _, gen, _ = self._control_choice(name, args)
+            except ImageRequestError:   # call reports the error; planning must not abort the conversation
+                gen = self.gen
         return "images", gen.model, self.may_lend(args)
 
     def _can_lend(self) -> bool:
@@ -5043,18 +5082,7 @@ class ImageTools:
                 req["extend"] = ({"aspect": args["aspect"]} if args.get("aspect") not in (None, "") else
                                  {k: args[k] for k in ("left", "top", "right", "bottom")
                                   if args.get(k) not in (None, "")})
-            gens = self._gens(name in EDIT_TOOLS)
-            if name == "control":
-                gens = [g for g in gens if _controls().mode_of(g.cfg, str(args.get("type") or "canny"))]
-            asked = args.get("model")
-            if name == "edit_image" and asked in (None, "") and isinstance(args.get("control"), dict):
-                kind = args["control"].get("type")
-                if kind == "pose":
-                    capable = [g for g in gens if can_edit(g.cfg) and _controls().mode_of(g.cfg, kind) == "controlnet"]
-                    gens = capable or gens
-            gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
-            if asked not in (None, "") and gen.model != asked:
-                raise ImageRequestError(f"model: one of {', '.join(g.model for g in gens)}, not {asked!r}")
+            gens, gen, switched_from = self._control_choice(name, args)
             if lend:   # the same model's engine on the text model's GPU (ImageModels.lent)
                 gen = self.svc.images.lent().gens[gen.model]
             if merged:
@@ -5086,9 +5114,10 @@ class ImageTools:
                 control = args.get("control")
                 control_image = None
                 if control is not None:
-                    if not isinstance(control, dict) or not isinstance(control.get("image"), str):
-                        raise ImageRequestError("control: an object with type and an image link")
-                    control_image = self._linked(control["image"], "control.image")
+                    if not isinstance(control, dict) or not control.get("type"):
+                        raise ImageRequestError("control: an object with type and an optional image link")
+                    control_image = (self._linked(control["image"], "control.image")
+                                     if control.get("image") else data)
                     req["control"] = {**control, "image": self.normalize(control_image)}
                 if args.get("mask") not in (None, ""):   # a mask a tool made (find_region's, edit_region's)
                     if mask is not None:
@@ -5152,6 +5181,8 @@ class ImageTools:
             by = f" with {gen.model}" if len(self._gens()) > 1 else ""
             text = (f"The image is made{by} ({job['width']}x{job['height']}, seed {job['seed']}, "
                     f"{figures['seconds']:.0f} s) and the user sees it: {urls[0]}. This step is done.")
+            if switched_from:
+                text += f" Changed image model from {switched_from} to {gen.model}: it takes this control."
             if found is not None:   # where edit_region drew, and its mask (another tool may take it)
                 mask_url = f"/v1/images/files/{gen.store(mask_to_bw(job['mask']), 'png')}"
                 text += (f" edit_region redrew {len(found['instances'])} {args['region']!r} region(s) that "

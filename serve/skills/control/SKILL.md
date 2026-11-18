@@ -6,13 +6,29 @@ metadata:
   tool: control
 ---
 
-- `type`: `pose` (people's pose, nothing else kept), `depth` (composition), `canny` (every outline), `lineart` (a
-  drawing's lines; `lineart_coarse` rough ones), `hed` (soft outlines), `scribble` (a sketch), `mlsd` (a room's
-  straight lines), `normal` (surface orientation), `segmentation` (regions of objects and background),
-  `gray` (shading), `none` (the image is a map already, one control returned).
+Choose `control` when the user asks to follow a map or a picture's pose or layout in a new image, not `edit_image`
+without a control. Choose the `type` the user asks for:
+
+| User's words | `type` |
+| --- | --- |
+| Rough sketch, scribble or doodle | `scribble` |
+| A finished line drawing to color | `lineart` |
+| A straight-line or architectural line map | `mlsd` |
+| Object or background regions, segmentation | `segmentation` |
+| A color-coded map with a description for each color | `color` |
+| Pose / depth or composition / outlines / surface orientation | `pose` / `depth` / `canny` / `normal` |
+
+- Select a model that takes the requested control: Qwen-Image-2.1 uses ControlNet, MOSS-Image uses its color and depth
+  adapter (and has other control LoRAs where offered). A map given as a reference is an approximation, not ControlNet.
+  Set `model` to the compatible model when it is offered; tell the user if switching from the default. If no model
+  takes the requested control directly, say what is available rather than claiming it was applied.
+- `type: "color"` with `regions` stays `color` even when the map is already made: set `preprocess: false`, not
+  `type: "none"`. Use the exact `#rrggbb` colors from the map.
+- `hed` is soft outlines, `lineart_coarse` rough outlines, `gray` shading; `none` passes a map without regions as is.
 - With `normal` or `segmentation`, describe the composition in the prompt: full body or close-up, and where people are.
-- Qwen-Image-2.1 has no normal or segmentation ControlNet: use depth for 3D shape or object placement. For
-  MOSS-Image's straight lines or shading, prefer canny or depth; its M-LSD and gray maps are reference images.
+- Qwen-Image-2.1 has no normal or segmentation ControlNet. Do not silently replace a requested `normal` or
+  `segmentation` with `depth`: name a model that takes it, or explain the available reference-map alternative.
+  MOSS-Image's M-LSD and gray maps are references; choose a model with direct control when one is offered.
 - For Qwen-Image-2.1 lineart from a hand drawing, set `lineart_input: "drawing"`; for a photo leave it unset.
   Thin lines and hatching can otherwise be copied rather than followed. `none` passes a map without processing.
 - The prompt describes the whole new image, nothing about the control. A person who must stay (their face, their
