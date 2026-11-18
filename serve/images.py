@@ -2046,6 +2046,15 @@ def made_size(job: dict) -> tuple[int, int]:
     return up(job["width"]), up(job["height"])
 
 
+def tile_count(job: dict) -> int:
+    """The tiles the engine draws for an upscale's redraw (strata_image.cpp's upscale_tiles: nx * ny), else 1."""
+    tiles = job.get("tiles")
+    if not tiles:
+        return 1
+    tile = max(1, int(tiles["tile"]))
+    return -(-int(job["width"]) // tile) * -(-int(job["height"]) // tile)
+
+
 def as_png(data: bytes) -> bytes:
     """An image (PNG, JPEG, GIF or BMP) as an RGBA PNG, as png_rgba writes one."""
     import io
@@ -2897,7 +2906,10 @@ class ImageGen:
         """One image's engine figures (its IMAGE line) into the rates of its size, a running mean that follows the
         latest; the eight sizes made last are kept."""
         steps, mp = self._work(job)
-        rate = [r.get("sampling_s", 0) / steps, r.get("text_s", 0) + r.get("decode_s", 0)]
+        # the engine sums every tile's times into one IMAGE line; the rates are for a tile of made_size's pixels
+        tiles = tile_count(job)
+        rate = [r.get("sampling_s", 0) / (steps * tiles),
+                (r.get("text_s", 0) + r.get("decode_s", 0)) / tiles]
         pts = self.rates.setdefault("edit" if job.get("refs") else "generate", {})
         was = pts.pop(mp, None)
         pts[mp] = rate if was is None else [round((a + b) / 2, 4) for a, b in zip(was, rate)]
@@ -2915,7 +2927,8 @@ class ImageGen:
         near = min(pts, key=lambda p: abs(math.log(mp / p)))
         step_s, rest_s = pts[near]
         scale = mp / near
-        return job["n"] * (steps * step_s * scale ** (SIZE_EXP if scale > 1 else 1) + rest_s * scale)
+        return job["n"] * tile_count(job) * (steps * step_s * scale ** (SIZE_EXP if scale > 1 else 1)
+                                             + rest_s * scale)
 
     def check_n(self, job: dict) -> None:
         """Refuse more images than budget_s allows at the speed measured (before it is measured, UNMEASURED_N)."""
