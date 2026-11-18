@@ -22,8 +22,9 @@ flowchart LR
 
 Recipes:
 
-- A pose in words: edit_image. Another picture's pose: edit_image with that picture in `references` ("the person
-  in image 1 in the pose of image 2"). A new image in an attached picture's pose: control `pose`.
+- A pose in words: edit_image. Keep a person and take another picture's pose: Qwen-Image-2.1 edit_image with the
+  person as `image` and the other picture as `control.image`, type `pose`; do not add it to `references`.
+  Describe the pose too. A new person in an attached picture's pose: control `pose`.
 - One part (hair, clothes, sky): edit_region; or find_region, then edit_image with its mask.
 - Another background: edit_image ("on a beach"); a cut-out: remove_background.
 - A full-body picture: generate_image, fix_image, then upscale_image.

@@ -3973,14 +3973,18 @@ TOOLS: list[dict[str, Any]] = [
                     "hair, the clothes, the sky: edit_region), larger or finer (upscale_image), wider, taller or "
                     "another shape (extend_image keeps the picture; this redraws it), a cut-out or plain background "
                     "(remove_background), faces or hands (fix_image), a new subject in a picture's pose (control). "
-                    "The same person in another picture's pose: that picture in references. A model without edits "
-                    "draws over it (img2img): the prompt then says the whole picture.",
+                    "The same person in another picture's pose: that picture in control, not references. A model "
+                    "without edits draws over it (img2img): the prompt then says the whole picture.",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "the change"},
          "image": IMAGE_ARG,
          "size": {"type": "string", "description": "WxH; left out: the image's shape (another shape: extend_image)"},
          "strength": {"type": "number", "description": "0 to 1"},
          "references": {"type": "array", "items": {"type": "string"}, "description": "links: images 2, 3, ..."},
+         "control": {"type": "object", "description": "a different picture's pose or composition; not a reference",
+                     "properties": {"type": {"type": "string", "enum": ["pose", "depth", "canny", "lineart", "hed"]},
+                                    "image": IMAGE_ARG, "strength": {"type": "number"}, "end": {"type": "number"}},
+                     "required": ["type", "image"]},
          "mask": {"type": "string", "description": "a mask's link (white changes)"},
          "refine": {"type": "boolean", "description": "MOSS-Image: the masked part again, finer"},
          **CROP_ARGS, "seed": {"type": "integer"}},
@@ -4050,7 +4054,7 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "control",
      "description": "Make a new image whose composition follows a picture's (pose, outlines, depth); the user sees it. "
                     "Nothing of the picture's people but their pose is kept: to keep a given person (their face, "
-                    "their clothes), edit_image with the pose's picture in references.",
+                    "their clothes), edit_image with the pose's picture in control, not references.",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "the whole new image"},
          "type": {"type": "string", "enum": ["canny", "depth", "pose", "lineart", "lineart_coarse", "hed",
@@ -4398,7 +4402,7 @@ class ImageTools:
             if t["name"] == "edit_image" and self.attached():
                 t["description"] += ("\n\nWithout references, the pictures the user attached to their last message "
                                      "go with the edit after the image it edits: images 2, 3 and so on, in the order "
-                                     "attached.")
+                                     "attached. A control image is not included as a reference.")
             if t["name"] == "generate_image" and self.attached() and "control" in self.allowed:
                 t["description"] += (" The user attached a picture: a new image in its pose or layout is "
                                      "control's, a change of it edit_image's.")
@@ -4719,6 +4723,11 @@ class ImageTools:
         if args.get("layout") not in (None, "", {}):
             gens = [g for g in gens if _pipeline(g.family) == "latent_chat"] or gens
         asked = args.get("model")
+        if name == "edit_image" and asked in (None, "") and isinstance(args.get("control"), dict):
+            kind = args["control"].get("type")
+            if kind == "pose":
+                capable = [g for g in gens if can_edit(g.cfg) and _controls().mode_of(g.cfg, kind) == "controlnet"]
+                gens = capable or gens
         gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
         return "images", gen.model, self.may_lend(args)
 
@@ -5037,6 +5046,11 @@ class ImageTools:
             if name == "control":
                 gens = [g for g in gens if _controls().mode_of(g.cfg, str(args.get("type") or "canny"))]
             asked = args.get("model")
+            if name == "edit_image" and asked in (None, "") and isinstance(args.get("control"), dict):
+                kind = args["control"].get("type")
+                if kind == "pose":
+                    capable = [g for g in gens if can_edit(g.cfg) and _controls().mode_of(g.cfg, kind) == "controlnet"]
+                    gens = capable or gens
             gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
             if asked not in (None, "") and gen.model != asked:
                 raise ImageRequestError(f"model: one of {', '.join(g.model for g in gens)}, not {asked!r}")
@@ -5068,6 +5082,13 @@ class ImageTools:
                 if data is None:
                     raise ImageRequestError("there is no image in the conversation to edit")
                 images = [self.normalize(data)]
+                control = args.get("control")
+                control_image = None
+                if control is not None:
+                    if not isinstance(control, dict) or not isinstance(control.get("image"), str):
+                        raise ImageRequestError("control: an object with type and an image link")
+                    control_image = self._linked(control["image"], "control.image")
+                    req["control"] = {**control, "image": self.normalize(control_image)}
                 if args.get("mask") not in (None, ""):   # a mask a tool made (find_region's, edit_region's)
                     if mask is not None:
                         raise ImageRequestError("mask: the user painted this edit's mask already; leave mask out")
@@ -5085,11 +5106,12 @@ class ImageTools:
                 if can_edit(gen.cfg):   # the references named, else the user's attached pictures (attached)
                     limit = refs_limit(gen.cfg)
                     more = ([self.normalize(self._linked(r, "references")) for r in refs] if refs else
-                            [self.normalize(p) for p in self.attached() if p != data])
+                            [self.normalize(p) for p in self.attached() if p != data and p != control_image])
                     if refs and len(more) > limit - 1:
                         raise ImageRequestError(f"references: {gen.model} takes at most {limit - 1}")
                     images += more[:max(0, limit - 1)]
-                job = parse_edit_request(req, images, gen.cfg, mask)
+                job = (_controls().parse_job(req, gen.cfg, images, mask, edit=True) if control is not None else
+                       parse_edit_request(req, images, gen.cfg, mask))
             elif name == "edit_region":   # the words' mask (image_regions: SAM 3 or Florence-2), then a masked edit
                 data = self._image(str(args.get("image") or ""))
                 if data is None:

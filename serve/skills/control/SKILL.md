@@ -16,7 +16,8 @@ metadata:
 - For Qwen-Image-2.1 lineart from a hand drawing, set `lineart_input: "drawing"`; for a photo leave it unset.
   Thin lines and hatching can otherwise be copied rather than followed. `none` passes a map without processing.
 - The prompt describes the whole new image, nothing about the control. A person who must stay (their face, their
-  clothes) in another pose: edit_image with references instead.
+  clothes) in another pose: Qwen-Image-2.1 edit_image with `control: {"type":"pose", "image":<pose picture>}`.
+  Keep the pose picture out of references; the edit's pose defaults are strength 0.7 and end 0.8.
 - ControlNet (Qwen-Image-2.1): `strength` (0 to 2) 1, 0.5 to 0.8 departs more; `end` (the share of the steps it
   follows) 1, 0.6 to 0.8 frees the details. For depth when the new subject differs from the map, use `strength` 0.6
   and `end` 1. `size` the picture's shape by default.

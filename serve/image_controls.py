@@ -369,7 +369,15 @@ def parse_job(req: dict, cfg: dict, files: list[bytes] | None = None, mask: byte
     image draws an edit: the request's images, then the control picture in the map's place (prepare puts the map
     there); its size by default the first image's shape.  ControlNet's generation without a size takes the control
     picture's shape at about 1024 x 1024."""
-    c = parse_control(req.get("control"), cfg, picture)
+    value = req.get("control")
+    if ((edit or files) and isinstance(value, dict) and _kind(value) == "pose"
+            and mode_of(cfg, "pose") == "controlnet"):
+        value = dict(value)
+        if value.get("strength") is None:
+            value["strength"] = 0.7
+        if value.get("end") is None:
+            value["end"] = 0.8
+    c = parse_control(value, cfg, picture)
     r = {k: v for k, v in req.items() if k not in ("control", "control_image")}
     files = list(files or [])
     if not files and r.get("size") in (None, "", "auto"):

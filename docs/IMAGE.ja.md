@@ -297,6 +297,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 - `resolution` は図を作るときの画像の短い辺です（既定 512、64〜2048）。
 - 大きさを付けない生成では、`control.image` の形で約 1024x1024 にします。図は描く大きさに合わせて引き伸ばします。
 - Qwen-Image-2.1: alibaba-pai の Fun ControlNet Union で描きます。`strength`（既定 1、0〜2）、効かせる範囲の `start`・`end`（ステップの割合。既定 0 と 1。`end` を 0.6〜0.8 にすると構図を保ったまま細部が自由になる）、マスクのある編集では塗った部分も ControlNet に渡します（`inpaint: false` で渡さない）。
+- Qwen-Image-2.1 の編集で別の写真の姿勢を使うときは、残す人物を参照画像に、姿勢の写真を `control.image`・`type: "pose"` にします。姿勢の写真は参照に入れず、姿勢をプロンプトにも書きます。この編集の pose は既定で `strength: 0.7`・`end: 0.8` です。
 - MOSS-Image の `color` と `depth`: darask0 の色と深度のアダプター（MOSS-Image の入力の層を広げ、LoRA を足したもの）で描きます。`control` を 2 つの配列にすると色と深度を両方使えます。`strength` はアダプターの LoRA の強さ（既定 1）、`end` はその図を使うステップの割合（既定 1。3D のマネキンなどから作った図は 0.5 がよい）です。`start` は学習されていないので受けません。人や物の位置と大きさを決めたいときに使い、プロンプトには物ごとの説明を書きます。
 - 色の地図の `control.regions` に `[{"color":"#rrggbb","prompt":"その領域に描くもの"}, ...]` を付けると、色ごとに中身を指定できます。色は地図の画素と完全に一致させます。地図をそのまま渡すときは `preprocess: false` にします。サーバーは色の重心から左右か上下の位置を求め、色名を文に入れずに説明を足します。色そのものと説明を結ぶ attention ではありません。位置の重心が近すぎる領域、地図にない色は断ります。`layout` やプロンプトの書き広げとは併用できません。Web の色の地図では、各行に `#rrggbb: 説明` と書きます。
 - MOSS-Image SFT の `canny`・`pose`・`normal`・`segmentation`・`lineart`・`lineart_coarse`・`hed` と下描きは、thedeoxen の種類に合う制御 LoRA を使います。図は ai-toolkit 形式の参照画像として渡します。`strength` は LoRA の強さ（既定 1）です。`depth` に `backend: "lora"` を付けると、darask0 の代わりに thedeoxen の深度 LoRA を使います。LoRA の `start`・`end` は 0・1 だけを受けます。

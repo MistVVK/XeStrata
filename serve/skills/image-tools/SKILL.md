@@ -13,7 +13,9 @@ flowchart LR
 ```
 
 Each step's own tool: one part (edit_region), larger (upscale_image), more around it (extend_image), a cut-out
-(remove_background), faces or hands (fix_image), a picture's pose or layout for a new image (control). A tool given as
+(remove_background), faces or hands (fix_image), a picture's pose or layout for a new image (control). To keep a
+person while changing to another picture's pose, edit_image with that picture as `control.image`, not a reference.
+A tool given as
 one line answers its first call with its arguments.
 
 Prompts:
