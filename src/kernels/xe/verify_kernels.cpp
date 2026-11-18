@@ -438,7 +438,7 @@ sycl::event gdn_state_commit(sycl::queue& q, float* state0, const float* hbuf0, 
                 red[rg * GS_COLS + lc] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red[lc] + red[GS_COLS + lc] + red[2 * GS_COLS + lc] + red[3 * GS_COLS + lc];
-                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
             }
@@ -485,7 +485,7 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
                 red[rg * S + col] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red[col] + red[S + col] + red[2 * S + col] + red[3 * S + col];
-                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 float o = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) {
@@ -573,7 +573,7 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
                 red_kv[rg * S + col] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red_kv[col] + red_kv[S + col] + red_kv[2 * S + col] + red_kv[3 * S + col];
-                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 float o = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) {
