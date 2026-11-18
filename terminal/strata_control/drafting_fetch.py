@@ -41,11 +41,8 @@ def _mb(size: int) -> str:
     return f"{size / 1e6:.0f} MB"
 
 
-def offline_files_note(data_dir: str | Path | None, *, tuned: bool = False, variant: str | None = None, engine_reads_q4: bool | None = None) -> str:
-    """D1 (0.2.16 retest): what to put in place when the computer cannot download the drafter, by file name and size.  Without internet the drafter works from
-    ONE of two files copied into the model data folder's dflash2 folder (from another computer's Strata): the Q4_0 pack, or - for an engine that reads it
-    (CUDA, AMD, Metal) - the smaller prepared file.  A set with a tuned drafter has its own file (`tuned`, `variant`).  Plain words, no jargon."""
-    folder = (Path(data_dir) / drafting.FOLDER) if data_dir else Path(drafting.FOLDER)
+def offline_files_phrase(*, tuned: bool = False, variant: str | None = None, engine_reads_q4: bool | None = None) -> str:
+    """The file(s) that make the drafter work without internet, by name and size: "this file: NAME (340 MB)" or "one of these files: A (522 MB), or the smaller B (340 MB)"."""
     if tuned:
         pin = drafting.tuned_pack(variant)
         files = [(pin.name, pin.size)]
@@ -54,9 +51,17 @@ def offline_files_note(data_dir: str | Path | None, *, tuned: bool = False, vari
         if (drafting.engine_has_selector_q4() if engine_reads_q4 is None else engine_reads_q4):
             files.append((drafting.CONVERTED_NAME, drafting.CONVERTED_BYTES))
     if len(files) == 1:
-        what = f"this file: {files[0][0]} ({_mb(files[0][1])})"
-    else:
-        what = f"one of these files: {files[0][0]} ({_mb(files[0][1])}), or the smaller {files[1][0]} ({_mb(files[1][1])})"
+        return f"this file: {files[0][0]} ({_mb(files[0][1])})"
+    return f"one of these files: {files[0][0]} ({_mb(files[0][1])}), or the smaller {files[1][0]} ({_mb(files[1][1])})"
+
+
+def offline_files_note(data_dir: str | Path | None, *, tuned: bool = False, variant: str | None = None, engine_reads_q4: bool | None = None) -> str:
+    """D1 (0.2.16 retest): what to put in place when the computer cannot download the drafter, by file name and size.  Without internet the drafter works from
+    ONE of two files copied into the model data folder's dflash2 folder (from another computer's Strata): the Q4_0 pack, or - for an engine that reads it
+    (CUDA, AMD, Metal) - the smaller prepared file.  A set with a tuned drafter has its own file (`tuned`, `variant`).  Plain words, no jargon.
+    The Save screen and the launch line say the same (0217 item 9: Save said "both .pack files")."""
+    folder = (Path(data_dir) / drafting.FOLDER) if data_dir else Path(drafting.FOLDER)
+    what = offline_files_phrase(tuned=tuned, variant=variant, engine_reads_q4=engine_reads_q4)
     return f"To use it without internet, copy {what} into the folder {folder} (from a computer that has it) and start again."
 
 
@@ -250,6 +255,20 @@ def tuned_from_feed(*, feed: str | None = None, backend: str | None = None, size
                 return None
             return loaded.url(entry.url), entry.size, entry.sha256
     return None
+
+
+def tuned_offered(*, feed: str | None = None, backend: str | None = None, variant: str | None = None, components: str | Path | None = None) -> bool | None:
+    """Does the signed feed list the tuned drafter for this engine family (the same question ensure_tuned asks before it downloads)? True: it does, so the launch fetches that
+    small file. False: the feed answers but lists none (a test feed, an older release), so the launch fetches the standard drafter. None: not known (offline, the host is down, a feed
+    that does not verify): the launch says what happened itself. Reads the feed once; nothing is written. Used by the plan, so it lists the size the launch really downloads (0217 item 3)."""
+    from strata_control import signing
+    pin = drafting.tuned_pack(variant)
+    last, _state = _accepted_sequence(components)
+    try:
+        loaded = feedmod.fetch(_feed_source(feed), signing.load_trusted_keys(), timeout=FEED_TIMEOUT, channel="stable", last_sequence=last)
+    except Exception:                                     # noqa: BLE001 - not known is not "no": the plan keeps the tuned size until the feed answers
+        return None
+    return any(e.name == pin.name and (backend or drafting.TUNED_BACKEND) in e.backends and e.size == pin.size and e.sha256 == pin.sha256 for e in loaded.drafters)
 
 
 def _reachable(location: str) -> bool:

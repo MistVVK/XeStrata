@@ -58,6 +58,9 @@ class Ctx:
     probe_offline: bool = False              # S6: ask once, in the background, whether the download hosts answer (only the real launch screens turn this on)
     offline: bool | None = None              # None: not asked yet (or not asked at all)
     _probing: bool = False
+    tuned_offered: dict = field(default_factory=dict)     # (engine family, tuned file) -> True / False / None: whether the feed lists the small tuned drafter (check_tuned)
+    _tuned_asking: set = field(default_factory=set)
+    _tuned_wanted: tuple | None = None
 
     def check_offline(self, on_done=None) -> None:
         """S6: is this computer offline? One short HEAD request to each address Strata downloads from: the model files' (as the drafter fetch names
@@ -99,12 +102,62 @@ class Ctx:
             return cached[1]
         try:
             from strata_cli.launch.runner import Runner as PlanRunner
-            plan = PlanRunner(self.settings, catalog=self.catalog).download_plan()
+            planner = PlanRunner(self.settings, catalog=self.catalog, feed=self.feed)
+            planner.tuned_offered = self.tuned_offered          # what the feed said so far (check_tuned fills it in): the plan lists the size the launch really downloads
+            plan = planner.download_plan()
+            self._tuned_wanted = planner.tuned_wanted
         except Exception:                                    # noqa: BLE001 - a line of information, never a reason to stop the screens
             plan = None
         if key is not None:
             self._plan = (key, plan)
         return plan
+
+    def drafter_term(self) -> str:
+        """What the drafter this launch will use is called in a sentence: "the DFlash2 drafter", "the draft layer" (the MTP) or "" (Off). One term for one case (0217 items 9 and 10: Save and the
+        Folder step said "the draft layer" next to "the DFlash2 drafter"). Worked out once per set of choices."""
+        import dataclasses
+        import json
+        try:
+            key = json.dumps(dataclasses.asdict(self.settings), sort_keys=True, default=str)
+        except Exception:                                    # noqa: BLE001
+            key = None
+        cached = getattr(self, "_term", None)
+        if key is not None and cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            from strata_cli.launch.runner import Runner as PlanRunner
+            resolved = PlanRunner(self.settings, catalog=self.catalog).resolved_drafting(self.settings.family)
+        except Exception:                                    # noqa: BLE001 - not known: the layer, as before
+            resolved = "mtp"
+        word = {"dflash2": "the DFlash2 drafter", "mtp": "the draft layer"}.get(resolved, "")
+        if key is not None:
+            self._term = (key, word)
+        return word
+
+    def check_tuned(self, on_done=None) -> None:
+        """0217 item 3: when the plan lists the small tuned DFlash2 drafter, ask the signed feed once, in the background, whether it really lists that file for this engine family
+        (the launch fetches it only then, else the 1.2 GB standard drafter). The answer is kept; the plan is worked out again and on_done repaints. Never raises, never blocks a screen."""
+        key = getattr(self, "_tuned_wanted", None)
+        if not self.probe_offline or key is None or key in self.tuned_offered or key in self._tuned_asking:
+            return
+        self._tuned_asking.add(key)
+
+        def run() -> None:
+            try:
+                from strata_control import drafting_fetch
+                self.tuned_offered[key] = drafting_fetch.tuned_offered(feed=self.feed, backend=key[0], variant=key[1])
+            except Exception:                                # noqa: BLE001 - not known: the plan keeps the small file's size
+                self.tuned_offered[key] = None
+            finally:
+                self._tuned_asking.discard(key)
+            self._plan = None                                # worked out again with the answer
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:                            # noqa: BLE001
+                    pass
+        import threading
+        threading.Thread(target=run, daemon=True, name="feed-check").start()
 
     def refresh_disk(self) -> None:
         """Mark the Model list's disk verdicts again for the files in use: the model in the person's own folder needs no download (N1); every other
@@ -583,7 +636,7 @@ def _info_for(result: Result, s: S.LaunchSettings) -> dict:
         pass
     return {"url": result.urls[0] if result.urls else f"http://127.0.0.1:{s.port}", "urls": result.urls, "key": result.key,
             "model": cfg.get("model_name") or "strata", "context": s.context, "name": s.name, "profile": result.profile, "running": True,
-            "tunnel": result.tunnel}
+            "tunnel": result.tunnel, "last_run": getattr(result, "last_run", "")}
 
 
 def run_monitor(info: dict, *, keep_default: bool = True, color: str = "auto") -> int:

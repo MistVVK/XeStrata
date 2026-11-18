@@ -883,6 +883,7 @@ def run_launch(a: argparse.Namespace) -> int:
         move_data = _move_data_choice(a, s, catalog, machine)
         runner.s, runner.move_data = s, move_data
         if a.plan:
+            runner.look_up_feed = True                       # the plan asks the signed feed whether the small tuned drafter is listed (it lists the size the launch fetches)
             plan = runner.plan()
             plan["warnings"] = [n.line() for n in notes]
             if machine:
