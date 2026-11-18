@@ -9,8 +9,7 @@
 // `maddubs` and a `madd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
 // per block, times d_x * d_y * the format's constant - only the order of the float additions differs.
 //
-// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23, opt-in:
-// XESTRATA_IQ512_IQ4XS=1, its rows round differently from ggml-cpu's).  IQ1_M stays on ggml-cpu (no shipped
+// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23; XESTRATA_IQ512_IQ4XS=0 turns it off; its rows round differently from ggml-cpu's).  IQ1_M stays on ggml-cpu (no shipped
 // model has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"

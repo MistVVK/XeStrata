@@ -159,6 +159,13 @@ bool cpu_avx512vnni_ok() {
     return ok;
 }
 
+bool cpu_avx512_latent_ok() {
+    if (!cpu_avx2_ok() || !cpu_avx512vnni_ok()) return false;
+    unsigned r[4] = {0, 0, 0, 0};
+    cpuid_regs(7, 0, r);
+    return ((r[1] >> 30) & 1u) && ((r[1] >> 31) & 1u);  // AVX512BW, AVX512VL
+}
+
 bool cpu_avxvnniint8_ok() {
     static const bool ok = [] {
         if (const char* e = strata::env_get("NO_AVXVNNI"); e != nullptr && e[0] == '1') return false;

@@ -75,6 +75,8 @@ bool cpu_avxvnni_ok();
 /// OS saving the opmask and ZMM state (XCR0 bits 1, 2, 5, 6, 7).  Only what that kernel uses: cpu_avx512_ok's VBMI and BW
 /// would leave out the Cascade Lake servers, which have AVX-512 VNNI.  XESTRATA_FORCE_AVX2=1 answers no.
 bool cpu_avx512vnni_ok();
+/// AVX-512 VNNI with BW, VL, AVX2, FMA and F16C, for the latent U-row kernel.
+bool cpu_avx512_latent_ok();
 /// Whether this CPU (and its OS) runs AVX-VNNI-INT8 (vpdpbssd: s8 x s8; CPUID 7.1 EDX bit 4, Arrow Lake, Lunar Lake and
 /// later) beside AVX2.  XESTRATA_NO_AVXVNNI=1 answers no, as for AVX-VNNI.
 bool cpu_avxvnniint8_ok();

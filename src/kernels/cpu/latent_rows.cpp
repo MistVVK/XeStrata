@@ -213,7 +213,7 @@ void u_row_avx512vnni(const uint8_t* u, int H, int ELL, int fmt, const uint8_t* 
 void latent_u_row(const uint8_t* u_group, int H, int ELL, int fmt, const uint8_t* hq, float* out) {
 #if defined(__x86_64__) || defined(_M_X64)
     // the device's own reports, fastest first (never a maker's name); scalar is the reference fallback
-    if (cpu_avx512vnni_ok()) {
+    if (cpu_avx512_latent_ok()) {
         u_row_avx512vnni(u_group, H, ELL, fmt, hq, out);
         return;
     }

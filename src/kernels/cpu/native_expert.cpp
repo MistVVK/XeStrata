@@ -355,8 +355,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         tq_gu_rows(tq_isa(), f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
-    // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
-    // it, as before (its rows would round differently), unless XESTRATA_IQ512_IQ4XS=1 gives it the 512-bit rows.  Each
+    // IQ4_XS has both AVX-2 and AVX-512 kernels; XESTRATA_IQ512_IQ4XS=0 disables its 512-bit rows.  Each
     // kernel only for the formats it implements: falling through an empty switch would leave ff unwritten instead of
     // falling back to ggml-cpu.
     static const bool cpu512 = cpu_avx512_ok();

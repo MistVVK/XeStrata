@@ -55,7 +55,7 @@ WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq
                 "i8_gemm_vnni.cpp", "i8_gemm_avx512.cpp", "bf16_gemm_avx512.cpp", "vision_cpu_avx512.cpp",
                 "resize_rows_avx2.cpp",
                 # the latent MoE's CPU U rows (latent_rows.hpp): the VNNI / AVX-512 VNNI copies are target-attribute
-                # functions in the anonymous namespace, reached only through latent_u_row's cpu_avx512vnni_ok /
+                # functions in the anonymous namespace, reached only through latent_u_row's cpu_avx512_latent_ok /
                 # cpu_avxvnni_ok / cpu_avx2_ok; the file itself stays on the baseline so the dispatcher and the
                 # scalar form run on any x86-64
                 "latent_rows.cpp")
