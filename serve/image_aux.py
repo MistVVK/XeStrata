@@ -62,7 +62,9 @@ def aux_dir(cfg: dict) -> Path:
     if cfg.get("aux_dir"):
         return Path(cfg["aux_dir"])
     base = cfg.get("vae") or cfg.get("diffusion_model") or "."
-    return Path(base).resolve().parent.parent / _qimage().AUX_DIR
+    # not resolve(): a model file linked from another folder (mage-flow's VAE into comfy/vae) would move the weights
+    # with the model in use, away from setup's models/image-tools
+    return Path(os.path.abspath(base)).parent.parent / _qimage().AUX_DIR
 
 
 def info(name: str) -> dict:
