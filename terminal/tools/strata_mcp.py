@@ -463,6 +463,18 @@ def http_json(url: str, method="GET", body=None, api_key=None, timeout=3.0):
         return status, None
 
 
+def port_accepts(port: int, host="127.0.0.1", timeout=0.4) -> bool:
+    """True when something is listening on the port. A connect to a listening loopback port completes at once, whatever the program behind it
+    is doing; a port nobody listens on takes about two seconds on Windows to say no (the whole HTTP timeout), so the status check asks this
+    first and only then spends its longer timeouts (A9, 0.2.16 retest: 2.0 s of the app's first read was one closed port)."""
+    import socket
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
 def port_free(port: int, host="127.0.0.1") -> bool:
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1449,10 +1461,21 @@ class Strata:
                 return self.read_config(c)["api_key"]
         return None
 
+    def probe_many(self, ports: list[int], deep=True) -> list:
+        """probe() of each port, in the order given, all at once: every port nobody listens on costs its own wait, and a person with several
+        prepared models has several ports (A9)."""
+        if len(ports) < 2:
+            return [self.probe(p, deep) for p in ports]
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(8, len(ports))) as pool:
+            return list(pool.map(lambda p: self.probe(p, deep), ports))
+
     def probe(self, port: int, deep=True) -> dict | None:
         """What answers on 127.0.0.1:port: a Strata server's facts, {"other": True} for something else, None for
         nothing."""
         base = f"http://127.0.0.1:{port}"
+        if not port_accepts(port):
+            return None
         st, health = http_json(base + "/health", timeout=self.health_timeout)
         if st == 0:
             return None
@@ -2089,11 +2112,7 @@ class Tools:
     def strata_status(self, port=None, hardware=True) -> dict:
         s = self.s
         s.reap()
-        servers = []
-        for p in s.ports(port):
-            info = s.probe(p)
-            if info is not None:
-                servers.append(info)
+        servers = [info for info in s.probe_many(s.ports(port)) if info is not None]
         tracked = s.tracked_server()
         out = {}
         running = [x for x in servers if not x.get("other")]

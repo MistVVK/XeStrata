@@ -2424,6 +2424,9 @@ server.listen(PORT, HOST, () => {
   if (process.send) process.send({ type: 'strata-ready', port: PORT });
   // Engines a lost owner left behind (an earlier crash, an older version): ended after a PID + start time + command-line check.
   if (control && process.env.STRATA_PACKAGED === '1') control.cleanup().catch(() => {});
+  // A9: the first read of this PC (the graphics cards, the engine, the models: a few seconds) starts now, while the window is still opening,
+  // instead of when the first page asks. The first-run "Your model" step then often finds the list ready. It reads only; nothing is downloaded.
+  if (control && process.env.STRATA_PACKAGED === '1') Promise.resolve(native.refresh(false)).catch(() => { /* the page's own read tells the person */ });
 });
 
 let stopping=false;

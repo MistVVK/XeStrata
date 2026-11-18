@@ -22,6 +22,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { externalEnvironment } from './external-env.mjs';
 import { createAppUpdater } from './app-updater.mjs';
+import { APP_UPDATER_NOT_READY } from './update-messages.mjs';
 
 export const APP_UPDATE_UNAVAILABLE = 'app-update-unavailable';
 export const BROWSER_UPDATE_MESSAGE = "The Strata app itself can't be updated in browser mode. Start Strata from its icon, without --browser, to update it.";
@@ -75,7 +76,7 @@ export function createAppUi({ env = process.env, shutdown = () => {}, open = ope
   async function current() {
     if (bridge) return bridge;
     if (originalBridge) return originalBridge;
-    throw Object.assign(new Error(mode === 'browser' ? BROWSER_UPDATE_MESSAGE : 'The app updater is not ready yet. Try again in a moment.'), { code: APP_UPDATE_UNAVAILABLE });
+    throw Object.assign(new Error(mode === 'browser' ? BROWSER_UPDATE_MESSAGE : APP_UPDATER_NOT_READY), { code: APP_UPDATE_UNAVAILABLE });
   }
 
   return {

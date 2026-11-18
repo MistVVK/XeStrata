@@ -18,7 +18,7 @@ import { componentsDirectory, installerEnvironment, controlEnvironment, sourceSe
 import { createEngineStep } from './engine-step.mjs';
 import { dataFolderFromPick, isDriveRoot, makeFolder, rememberDataFolder, syncDataFolder, terminalSettingsFile } from './model-folder.mjs';
 import { createAutoTune, writeTuneConfig } from './native-autotune.mjs';
-import { plainError, PHASE_TEXT, UPDATE_WAITING_FOR_LOCK } from './update-messages.mjs';
+import { plainError, PHASE_TEXT, UPDATE_WAITING_FOR_LOCK, APP_UPDATER_NOT_READY, APP_CHECK_FAILED } from './update-messages.mjs';
 import { checkAndParseRunConfig, checkRunConfig, describeIssues } from './run-config-check.mjs';
 import { openTextFile } from './open-text-file.mjs';
 import { markEngine, engineRefusal } from './engine-version.mjs';
@@ -691,8 +691,24 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   if(appUpdater){
    job.summary='Looking for a new version of the app…';emit();
    let verdict;
-   try{verdict=await appUpdater.check();}catch(error){if(error?.code!=='app-update-unavailable')throw error;verdict={available:false};notes.push(appUpdater.unavailable||error.message);}
-   updateLog(`app check: ${verdict.available?`version ${verdict.version} is available`:'no newer app version'}`);
+   /* The app's own step (the shell's signed updater) comes AFTER Control's update, which already worked. Whatever happens in the app's check, Control's result stays what it was:
+      the job stays done and its summary does not follow a success with a failure sentence (W-F1, 0.2.16 retest: "Strata is updated... The app updater is not ready yet." read as a
+      failure after a success). "Not ready" (the window process has not handed over the shell's updater) and "did not work" (the feed could not be reached) go to the update log; the
+      Settings recheck that follows every finished update then says "couldn't check for a new version of the app itself", raw text behind Details. Only when Control changed
+      nothing is the app's side said in the summary, because then it is all the person asked for. Browser mode keeps its own plain sentence (it says what to do). */
+   const controlChanged=(done.results??[]).some(x=>x.status==='updated');
+   let checkProblem=null;
+   try{verdict=await appUpdater.check();}
+   catch(error){
+    if(job.abort.signal.aborted)throw error;
+    verdict={available:false};
+    const unavailable=error?.code==='app-update-unavailable';
+    checkProblem=unavailable?'the app updater is not available':'the check did not work';
+    updateLog(`app check: ${checkProblem} (${String(error?.message??error).slice(0,300)})`);
+    if(unavailable&&appUpdater.unavailable)notes.push(appUpdater.unavailable);
+    else if(!controlChanged){notes.length=0;notes.push(unavailable?APP_UPDATER_NOT_READY:APP_CHECK_FAILED);}
+   }
+   if(!checkProblem)updateLog(`app check: ${verdict.available?`version ${verdict.version} is available`:'no newer app version'}`);
    if(verdict.available){job.appUpdateFrom=thisAppVersion();job.appUpdateTo=verdict.version??null;emit();updateLog(`app update to ${verdict.version??'?'} starting; the installer will end this app`);await appUpdater.install({signal:job.abort.signal,onProgress:p=>{if(p.total){job.summary=`Downloading the app update: ${Math.round(100*p.downloaded/p.total)}%`;job.result={install:{step:job.summary,download:{file:'Strata app',percent:Math.round(100*p.downloaded/p.total)}}};emit();}}});notes.push('The app update is installed. Strata will restart.');}
   }
   return {summary:notes.filter(Boolean).join(' '),result:done};

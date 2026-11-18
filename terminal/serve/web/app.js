@@ -114,7 +114,7 @@ let health = {model: "strata", images: false, max_context: 0};
 // the texts that depend on what this server offers: the empty chat's line and the attach button's hint
 function renderEmptyChat() {
   $("attach-btn").title = health.images ? tr("composer.attachPictures", "Attach a text file or a picture (or drop it here)")
-                                        : tr("composer.attach", "Attach a text file (or drop it here)");
+                                        : tr("composer.attach", "Attach a text file (or drop it here). Pictures are not available with this model.");
   $("chat-empty-sub").textContent = tr("chat.emptyModel", "{model} runs on this PC. Nothing leaves it.", {model: health.model});
 }
 async function loadHealth() {
@@ -1588,7 +1588,7 @@ const thumbDeps = {makeImage: () => new Image(), makeCanvas: () => document.crea
 function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
-      if (!health.images) { toast("warn", tr("file.picturesOff", "Pictures are off"), tr("file.picturesOffText", "This model was set up for text only.")); continue; }
+      if (!health.images) { toast("warn", tr("file.picturesOff", "Pictures are off"), tr("file.picturesOffText", "This model can't read pictures. You can still attach text files.")); continue; }
       if (f.size > 20e6) { toast("warn", tr("file.pictureBig", "Picture too large"), tr("file.pictureBigText", "{name} is over 20 MB.", {name: f.name})); continue; }
       const r = new FileReader();
       r.onload = () => {
