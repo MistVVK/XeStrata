@@ -2148,7 +2148,7 @@ uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
     return bytes + bake + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) cols * 6;
 }
 
-bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n, const std::vector<float>& norms,
+bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t n, const std::vector<float>& norms,
                     float strength, std::vector<float>& coef, std::vector<float>& base, std::string& err) {
     if (e.kind != LoraKind::lora) {
         err = "a DoRA (dora_scale) on a ";
@@ -2161,15 +2161,14 @@ bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n
               "weight's decomposition where the scale is the output axis's)";
         return false;
     }
-    if (src_row < 0 || row0 < 0 || n < 0 || (int64_t) e.dora.size() < src_row + n ||
-        (int64_t) norms.size() < row0 + n) {
+    if (src_row < 0 || n < 0 || (int64_t) e.dora.size() < src_row + n || (int64_t) norms.size() < n) {
         err = "a DoRA (dora_scale) whose rows are not the weight's";
         return false;
     }
     coef.resize((size_t) n);
     base.resize((size_t) n);
     for (int64_t j = 0; j < n; ++j) {
-        const float c = e.dora[(size_t) (src_row + j)] / (norms[(size_t) (row0 + j)] + kLoraDoraEps);
+        const float c = e.dora[(size_t) (src_row + j)] / (norms[(size_t) j] + kLoraDoraEps);
         coef[(size_t) j] = c;
         base[(size_t) j] = 1.0f + strength * (c - 1.0f);
     }

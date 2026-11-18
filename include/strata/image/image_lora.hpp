@@ -401,12 +401,14 @@ const LoraEntry* lora_glora_for_weight(const LoraEntry& e, int64_t rows, int64_t
 /// the product's rows, added to the product's output.
 void lora_output_add(float* y, int64_t T, int64_t ldy, int64_t row0, const float* src, int64_t n, void* stream);
 
-/// One DoRA part's rows: `norms` (the weight's rows' norms, FP32) -> the delta's factor of each of the part's rows
-/// [src_row, src_row + n) of the entry at the weight's rows [row0, row0 + n), c = dora_scale / (norm + eps) in `coef`,
-/// and the base product's 1 + strength (c - 1) in `base`.  False with err for the DoRA the engine does not take: a
-/// scale over the columns (the other axis, whose norm is of the weight with the delta in it, and the columns are
-/// an input's), or a form whose rows a product's output does not have (a LoKr's are its Kronecker product's).
-bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n, const std::vector<float>& norms,
+/// One DoRA part's rows: `norms` (the part's n rows' composed norms ||W_r + (alpha/rank) (BA)_r||, FP32,
+/// dit_dora_norms) -> the delta's factor of each of the entry's rows [src_row, src_row + n),
+/// c = dora_scale / (norm + eps) in `coef`, and the base product's 1 + strength (c - 1) in `base` (PEFT's DoRA at
+/// strength 1: the base rows times c, the delta's times c and the file's alpha / rank; the strength blends the
+/// base's factor between 1 and c as it always has).  False with err for the DoRA the engine does not take: a scale
+/// over the columns (the other axis, whose norm is of the weight with the delta in it, and the columns are an
+/// input's), or a form whose rows a product's output does not have (a LoKr's are its Kronecker product's).
+bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t n, const std::vector<float>& norms,
                     float strength, std::vector<float>& coef, std::vector<float>& base, std::string& err);
 
 /// The bound part whose rows overlap [row0, row0 + n) of a weight's, where one of the two is a DoRA's, an OFT's, a

@@ -216,8 +216,8 @@ private:
     // low-rank form) reads the shared projection mlow_ instead
     void modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias);
     void build_lora_targets();
-    /// One of the file's tensors' row norms, FP32, cached (`name`: the file's own name).
-    bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
+    /// A DoRA's composed row norms of the slot's weight (dit_dora_norms over the file tensor's bf16 rows).
+    bool dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err);
     void ensure(int64_t hw, int n, int64_t max_text);
     void rope_tables(int64_t h, int64_t w);
     void drop_refs();
@@ -267,7 +267,6 @@ private:
     int64_t ref_rows_ = 0, refs_gen_ = 0;
     std::vector<std::pair<int64_t, int64_t>> ref_sizes_;
     float* xin_ = nullptr;    // the image rows' input [hw + ref_rows_][in_ch_]
-    std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
     // the products (W8A8's input, the deltas' buffers)
     DitProducts prod_{&gemm_, &allocs_, &s_, "image engine (Mage-Flow DiT)"};
     // the adapters bound (their table built at open, build_lora_targets)

@@ -558,7 +558,7 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 | --- | --- | --- |
 | LoRA, LoCon | `lora_A`/`lora_B` (down and up), and `.alpha` or the metadata's `lora_alpha` (its prefixed name too, `transformer.lora_alpha`) | strength × alpha / rank. A weight's `.alpha` tensor wins; the metadata reaches only the weights without one. Neither: 1 |
 | LoKr | `lokr_w1` and `lokr_w2` (whole, or each from two factors), and a linear weight's Tucker core `lokr_t2` | two products; the rank is w2's factors', else w1's |
-| DoRA | a plain LoRA and the weight's rows' magnitude: `dora_scale`, PEFT's `lora_magnitude_vector` or ai-toolkit's `.magnitude` (LyCORIS's `[rows][1]` shape too) | rows only: `c = the magnitude / (the weight's row norms + eps)`, which scales the base's rows and the delta's |
+| DoRA | a plain LoRA and the weight's rows' magnitude: `dora_scale`, PEFT's `lora_magnitude_vector` or ai-toolkit's `.magnitude` (LyCORIS's `[rows][1]` shape too) | rows only: `c = the magnitude / (||W + (alpha/rank) BA||'s rows + eps)` (PEFT's composed norm), which scales the base's rows and the delta's |
 | A whole difference | `.diff`, `.set_weight`, `.w_norm` | the difference is added; at a strength of 1 `set_weight` is that weight, and between, an interpolation |
 | LoHa | `hada_w1_a/b` and `hada_w2_a/b`, and a linear Tucker core | the element-wise product of two products; the rank is `hada_w1_b`'s rows |
 | A bias's delta | `.diff_b`, or `.b_norm` beside `.w_norm` | added to the weight's bias; alpha is not applied, only the request's strength |

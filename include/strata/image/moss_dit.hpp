@@ -232,11 +232,9 @@ private:
     /// The weights adapters may take, from the blocks, the text embedder and the weights outside them (open, and a
     /// later load_text).
     void build_lora_targets();
-    /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensors (the text embedder's
-    /// up_gate is ffn_up's rows and then ffn_gate's), cached a tensor (open drops the cache).
-    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
-    /// One of the file's tensors' row norms, FP32, cached (`name`: the file's own name).
-    bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
+    /// A DoRA's composed row norms of the slot's rows (dit_dora_norms over the file's tensors: the text embedder's
+    /// up_gate is ffn_up's rows and then ffn_gate's, the blocks' qkv one tensor or the three q, k and v).
+    bool dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err);
     // the shared product (DitProducts::run)
     DitOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                    const float* bias, bool same_input = false, bool defer = false) {
@@ -258,7 +256,6 @@ private:
     std::vector<void*> allocs_, text_allocs_;
     uint64_t weight_bytes_ = 0, text_bytes_ = 0;
     int64_t scratch_ = 0;
-    std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
     // the products (W8A8's input, the deltas' buffers)
     DitProducts prod_{&gemm_, &allocs_, &s_, "image engine (MOSS-Image DiT)"};
     // the adapters bound (their table built at open, build_lora_targets)

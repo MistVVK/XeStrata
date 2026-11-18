@@ -27,9 +27,11 @@
 // adapter's layer kept on the weight through the load); MOSS_STEP_BLOCK_MIB: the blocks' VRAM (the rest streamed).
 // MF_STEP_HW, MF_STEP_TEXT: the latent's rows a side (2) and the text's (4); MF_STEP_Q8=1: the blocks in 8 bits (else
 // FP16); MF_STEP_BLOCK_MIB: the blocks' VRAM (the rest streamed from RAM); MF_STEP_REFS: an edit's reference images
-// (one, at the latent size, its own rows after the target's).
+// (one, at the latent size, its own rows after the target's).  LORA_STEP_NOBAKE=1: every step keeps the plain LoRAs
+// beside the products instead of baking them in (a DoRA is never baked; the same path on both sides of a comparison).
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/dit_loras.hpp"
 #include "strata/image/image_lora.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/moss_dit.hpp"
@@ -460,7 +462,9 @@ void selftest_loha(void* s, int64_t T, int64_t K, int64_t R1, int64_t R2, int64_
 }
 
 // one DoRA entry: the base product's rows scaled by 1 + strength (c - 1), then the delta's rows by strength (file
-// scale) * c; c = dora_scale / (the weight's row norm + eps), the weight as the product takes it (FP16)
+// scale) * c; c = dora_scale / (||W + (alpha/rank) BA|| + eps), PEFT's composed row norm (the weight and the factors
+// as the product takes them, FP16).  The shared expansion (dit_dora_norms) is checked against PEFT's own form: the
+// composed weight made and its rows' norm taken directly.
 void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
     namespace si = strata::image;
     std::mt19937 rng((uint32_t) (T * 31 + K * 17 + R * 13 + N * 7 + 1));
@@ -484,21 +488,35 @@ void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
     si::lora_to_f16(a, e.a);
     si::lora_to_f16(b, e.b);
     const float strength = 0.7f, scale = strength * e.scale();
-    // the weight's rows' norms, from the FP16 values the product takes
+    // the composed norms ||W_r + (alpha/rank) (BA)_r||, from the FP16 values the product takes
     std::vector<uint16_t> w16((size_t) (N * K));
     si::lora_to_f16(w, w16);
-    std::vector<float> norms((size_t) N);
+    const auto read = [&w16, K](int64_t r0, int64_t n, float* out, std::string&) {
+        for (int64_t r = 0; r < n; ++r)
+            for (int64_t k = 0; k < K; ++k)
+                out[r * K + k] = strata::kernels::f32_from_f16(w16[(size_t) ((r0 + r) * K + k)]);
+        return true;
+    };
+    std::vector<float> norms;
+    std::string err;
+    if (!si::dit_dora_norms(e, 0, 0, N, K, read, norms, err)) throw std::runtime_error(err);
+    // PEFT's own form (tuners/lora/dora.py's get_weight_norm): the composed weight made, its rows' norm directly
+    const float fs = e.scale();
     for (int64_t r = 0; r < N; ++r) {
         double n2 = 0;
         for (int64_t k = 0; k < K; ++k) {
-            const double v = strata::kernels::f32_from_f16(w16[(size_t) (r * K + k)]);
+            double v = strata::kernels::f32_from_f16(w16[(size_t) (r * K + k)]);
+            for (int64_t j = 0; j < R; ++j)
+                v += (double) fs * strata::kernels::f32_from_f16(e.b[(size_t) (r * R + j)]) *
+                     strata::kernels::f32_from_f16(e.a[(size_t) (j * K + k)]);
             n2 += v * v;
         }
-        norms[(size_t) r] = (float) std::sqrt(n2);
+        const double want = std::sqrt(n2), got = norms[(size_t) r];
+        if (std::fabs(got - want) > 2e-5 * std::max(want, 1e-6))
+            throw std::runtime_error("the DoRA's composed norm is not PEFT's direct form's");
     }
     std::vector<float> coef, base;
-    std::string err;
-    if (!si::lora_dora_rows(e, 0, 0, N, norms, strength, coef, base, err)) throw std::runtime_error(err);
+    if (!si::lora_dora_rows(e, 0, N, norms, strength, coef, base, err)) throw std::runtime_error(err);
 
     si::LoraLayer layer;
     si::LoraPart part;
@@ -982,6 +1000,7 @@ int step(const std::string& dit_path, const std::string& out_path, const std::st
     si::QiDit dit;
     std::string err;
     if (!dit.open(dit_path, s, err)) throw std::runtime_error(err);
+    if (std::getenv("LORA_STEP_NOBAKE") != nullptr) dit.set_lora_bake(false);   // the adapters added to each product
     if (!lora_path.empty()) {
         std::vector<si::LoraUse> loras;
         loras.push_back({si::LoraFile::open(lora_path), scale, {}});
@@ -1110,6 +1129,7 @@ int moss_step(const std::string& dit_path, const std::string& out_path, const st
     std::string err;
     const bool q8 = std::getenv("MOSS_STEP_Q8") != nullptr;
     if (!dit.open(dit_path, s, err, false, q8)) throw std::runtime_error(err);
+    if (std::getenv("LORA_STEP_NOBAKE") != nullptr) dit.set_lora_bake(false);   // the adapters added to each product
     if (const char* mib = std::getenv("MOSS_STEP_BLOCK_MIB"); mib != nullptr && *mib != 0) {   // VRAM of the blocks
         dit.set_block_budget((uint64_t) std::strtoull(mib, nullptr, 10) << 20);
         std::printf("the blocks' VRAM %s MiB, %d of %d resident\n", mib, dit.resident_blocks(), dit.blocks());
@@ -1240,6 +1260,7 @@ int mf_step(const std::string& dit_path, const std::string& out_path, const std:
     std::string err;
     const bool q8 = std::getenv("MF_STEP_Q8") != nullptr;
     if (!dit.open(dit_path, s, err, false, q8)) throw std::runtime_error(err);
+    if (std::getenv("LORA_STEP_NOBAKE") != nullptr) dit.set_lora_bake(false);   // the adapters added to each product
     if (const char* mib = std::getenv("MF_STEP_BLOCK_MIB"); mib != nullptr && *mib != 0) {   // VRAM of the blocks
         dit.set_block_budget((uint64_t) std::strtoull(mib, nullptr, 10) << 20);
         std::printf("the blocks' VRAM %s MiB, %d of %d resident\n", mib, dit.resident_blocks(), (int) dit.blocks());

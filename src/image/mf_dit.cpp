@@ -85,10 +85,8 @@ MfDit::MfDit() {
     loras_.block_path = "transformer_blocks.";   // build_lora_targets' blocks (a request's block weights)
     DitLoraHooks& h = loras_.hooks;
     h.drop = [this] { drop_loras(); };
-    h.dora_norms = [this](const DitLoraSlot& slot, std::vector<float>& out, std::string& err) {
-        const std::vector<float>* norms = nullptr;
-        return tensor_norms(slot.name + ".weight", norms, err) &&
-               dit_slot_norms(slot, *norms, out, err, "image engine (Mage-Flow DiT)");
+    h.dora_norms = [this](const DitLoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err) {
+        return dora_norms(slot, e, out, err);
     };
     h.refuse = [](const DitLoraSlot& slot, const LoraEntry&, std::string& why) {
         if (slot.w->type != kTypeF32) return false;
@@ -120,7 +118,6 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
         s_ = stream;
         dry_ = dry;
         q8_ = q8;
-        norm_cache_.clear();
         // the int8 form: W8A8 (int8 activations a token, kTypeW8) where the GPU's library takes int8 products, else
         // Q8_0 (dequantized to FP16 for each product)
         w8_ = q8 && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
@@ -506,22 +503,20 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
     return loras_.set(loras, err, changed);
 }
 
-bool MfDit::tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err) {
-    auto it = norm_cache_.find(name);
-    if (it != norm_cache_.end()) {
-        out = &it->second;
-        return true;
-    }
+bool MfDit::dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err) {
     try {
+        const std::string name = slot.name + ".weight";
         const SafeTensor* t = st_->find(name);
         if (t == nullptr || t->shape.size() != 2)
             throw std::runtime_error("image engine (Mage-Flow DiT): no " + name);
         if (t->dtype != "BF16") throw std::runtime_error("image engine (Mage-Flow DiT): " + name + " is not bf16");
         const uint8_t* data = file_->data() + st_->data_base() + t->begin;
         const int64_t rows = (int64_t) t->shape[0], k = (int64_t) t->shape[1];
-        std::vector<float> norms = dit_bf16_row_norms(reinterpret_cast<const uint16_t*>(data), rows, k);
-        out = &norm_cache_.emplace(name, std::move(norms)).first->second;
-        return true;
+        if (slot.src_row + slot.row0 + slot.rows > rows)
+            throw std::runtime_error("image engine (Mage-Flow DiT): " + name + ": the file's rows are fewer than "
+                                     "the weight's");
+        return dit_dora_norms(e, slot.src_row, slot.src_row + slot.row0, slot.rows, k,
+                              dit_bf16_rows(reinterpret_cast<const uint16_t*>(data), k), out, err);
     } catch (const std::exception& ex) {
         err = std::string("image engine (Mage-Flow DiT): a DoRA's row norms: ") + ex.what();
         return false;

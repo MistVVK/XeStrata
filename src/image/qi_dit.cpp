@@ -84,8 +84,8 @@ QiDit::QiDit() {
     loras_.block_path = "transformer_blocks.";   // build_lora_targets' blocks (a request's block weights)
     DitLoraHooks& h = loras_.hooks;
     h.drop = [this] { drop_loras(); };
-    h.dora_norms = [this](const DitLoraSlot& slot, std::vector<float>& out, std::string& err) {
-        return dora_norms(slot, out, err);
+    h.dora_norms = [this](const DitLoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err) {
+        return dora_norms(slot, e, out, err);
     };
     h.refuse = [this](const DitLoraSlot& slot, const LoraEntry& e, std::string& why) {
         if (e.kind == LoraKind::bias || !e.bias.empty()) {
@@ -951,58 +951,41 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
     return ok;
 }
 
-bool QiDit::tensor_norms(const std::string& key, const std::vector<float>*& out, std::string& err) {
-    auto it = norm_cache_.find(key);
-    if (it != norm_cache_.end()) {
-        out = &it->second;
-        return true;
-    }
+bool QiDit::tensor_rows(const std::string& key, int64_t r0, int64_t n, float* out, std::string& err) {
     const TensorInfo* t = g_->gguf().find(key);
     if (t == nullptr || t->shape.size() != 2) {
         err = "image engine: the DiT has no " + key;
         return false;
     }
     const int64_t k = (int64_t) t->shape[0], rows = (int64_t) t->shape[1];
+    if (r0 < 0 || n < 0 || r0 + n > rows) {
+        err = "image engine: " + key + ": the file's rows are fewer than the weight's";
+        return false;
+    }
     const uint8_t* p = g_->data(*t);
-    std::vector<float> norms((size_t) rows);
     if (t->type == kTypeF32) {
-        const auto* f = reinterpret_cast<const float*>(p);
-        for (int64_t r = 0; r < rows; ++r) {
-            double s = 0;
-            for (int64_t c = 0; c < k; ++c) s += (double) f[r * k + c] * (double) f[r * k + c];
-            norms[(size_t) r] = (float) std::sqrt(s);
-        }
+        std::memcpy(out, p + (size_t) (r0 * k) * 4, (size_t) (n * k) * 4);
     } else if (t->type == kTypeF16 || t->type == kTypeBF16) {
         const auto* h = reinterpret_cast<const uint16_t*>(p);
-        for (int64_t r = 0; r < rows; ++r) {
-            double s = 0;
-            for (int64_t c = 0; c < k; ++c) {
-                const float v = t->type == kTypeF16 ? kernels::f32_from_f16(h[r * k + c])
-                                                   : kernels::f32_from_bf16(h[r * k + c]);
-                s += (double) v * (double) v;
-            }
-            norms[(size_t) r] = (float) std::sqrt(s);
-        }
+        for (int64_t r = 0; r < n; ++r)
+            for (int64_t c = 0; c < k; ++c)
+                out[r * k + c] = t->type == kTypeF16 ? kernels::f32_from_f16(h[(r0 + r) * k + c])
+                                                     : kernels::f32_from_bf16(h[(r0 + r) * k + c]);
     } else if (t->type == 8) {   // Q8_0: 34 bytes a 32 values, an FP16 scale and then the int8 ones
         const int64_t nb = k / 32;
-        for (int64_t r = 0; r < rows; ++r) {
-            const uint8_t* row = p + (size_t) (r * nb) * 34;
-            double s = 0;
+        for (int64_t r = 0; r < n; ++r) {
+            const uint8_t* row = p + (size_t) ((r0 + r) * nb) * 34;
             for (int64_t b = 0; b < nb; ++b) {
                 const uint8_t* q = row + b * 34;
                 const float d = kernels::f32_from_f16((uint16_t) ((uint16_t) q[0] | ((uint16_t) q[1] << 8)));
-                for (int j = 0; j < 32; ++j) {
-                    const double v = (double) d * (int8_t) q[2 + j];
-                    s += v * v;
-                }
+                for (int j = 0; j < 32; ++j) out[r * k + b * 32 + j] = d * (float) (int8_t) q[2 + j];
             }
-            norms[(size_t) r] = (float) std::sqrt(s);
         }
     } else if (kernels::dequant_bf16_supported((int) t->type) && gemm_.scratch() != nullptr &&
                gemm_.scratch_elems() >= 2 * k) {
         // the other block formats (Q6_K, Q4_K, the i-quants): the GPU's dequantization (the one the products use) to
         // FP32 in the products' scratch, a band of rows at a time (the scratch holds the largest weight in FP16, so
-        // half its rows in FP32), the rows' sums on the host
+        // half its rows in FP32), the rows copied out to the caller's
         const uint64_t bytes = tensor_payload_bytes(*t);
         uint8_t* blocks = nullptr;
         if (!gpu::alloc_device(&blocks, (size_t) bytes)) {
@@ -1011,18 +994,12 @@ bool QiDit::tensor_norms(const std::string& key, const std::vector<float>*& out,
         }
         const int64_t band = std::min<int64_t>(rows, gemm_.scratch_elems() / (2 * k));
         auto* f = reinterpret_cast<float*>(gemm_.scratch());
-        std::vector<float> h((size_t) (band * k));
         bool ok = gpu::copy_async(blocks, p, (size_t) bytes, s_);
-        for (int64_t r0 = 0; ok && r0 < rows; r0 += band) {
-            const int64_t nr = std::min(band, rows - r0);
-            kernels::dequant_f32((int) t->type, blocks, r0, nr, k, f, s_);
-            ok = gpu::copy_async(h.data(), f, (size_t) (nr * k) * 4, s_) && gpu::stream_sync(s_);
-            for (int64_t r = 0; ok && r < nr; ++r) {
-                double s = 0;
-                const float* row = h.data() + r * k;
-                for (int64_t c = 0; c < k; ++c) s += (double) row[c] * (double) row[c];
-                norms[(size_t) (r0 + r)] = (float) std::sqrt(s);
-            }
+        for (int64_t b0 = r0; ok && b0 < r0 + n; b0 += band) {
+            const int64_t nr = std::min(band, r0 + n - b0);
+            kernels::dequant_f32((int) t->type, blocks, b0, nr, k, f, s_);
+            ok = gpu::copy_async(out + (size_t) (b0 - r0) * k, f, (size_t) (nr * k) * 4, s_) &&
+                 gpu::stream_sync(s_);
         }
         gpu::stream_sync(s_);
         gpu::free(blocks);
@@ -1035,11 +1012,10 @@ bool QiDit::tensor_norms(const std::string& key, const std::vector<float>*& out,
               "file's F32, F16, BF16 and Q8_0 rows, and the GPU's dequantization does not take this format";
         return false;
     }
-    out = &norm_cache_.emplace(key, std::move(norms)).first->second;
     return true;
 }
 
-bool QiDit::dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err) {
+bool QiDit::dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err) {
     // the file's name of the weight: a fused weight takes diffusers' two names for its halves
     std::string name = slot.name;
     const auto ends = [&name](const char* suffix) {
@@ -1053,9 +1029,17 @@ bool QiDit::dora_norms(const LoraSlot& slot, std::vector<float>& out, std::strin
         name.resize(name.size() - 4);
         name += "gate_up";
     }
-    const std::vector<float>* norms = nullptr;
-    return tensor_norms("model.diffusion_model." + name + ".weight", norms, err) &&
-           dit_slot_norms(slot, *norms, out, err, "image engine");
+    const std::string key = "model.diffusion_model." + name + ".weight";
+    const TensorInfo* t = g_->gguf().find(key);
+    if (t == nullptr || t->shape.size() != 2) {
+        err = "image engine: the DiT has no " + key;
+        return false;
+    }
+    const int64_t k = (int64_t) t->shape[0];
+    const auto read = [this, &key](int64_t r0, int64_t n, float* o, std::string& e2) {
+        return tensor_rows(key, r0, n, o, e2);
+    };
+    return dit_dora_norms(e, slot.src_row, slot.src_row + slot.row0, slot.rows, k, read, out, err);
 }
 
 uint64_t QiDit::lora_bytes() const { return loras_.bytes(); }

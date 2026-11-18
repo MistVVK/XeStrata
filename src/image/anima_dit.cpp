@@ -197,10 +197,8 @@ AnimaDit::AnimaDit() {
     loras_.block_path = "blocks.";   // build_lora_targets' blocks (a request's block weights)
     DitLoraHooks& h = loras_.hooks;
     h.drop = [this] { drop_loras(); };
-    h.dora_norms = [this](const DitLoraSlot& slot, std::vector<float>& out, std::string& err) {
-        const std::vector<float>* norms = nullptr;
-        return tensor_norms(slot.name + ".weight", norms, err) &&
-               dit_slot_norms(slot, *norms, out, err, "image engine (Anima DiT)");
+    h.dora_norms = [this](const DitLoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err) {
+        return dora_norms(slot, e, out, err);
     };
     // a block's number in a key, in the DiT's own spelling or in sd-scripts' and the LyCORIS form's underscore one
     // (anima_block_of reads both and says where the number ends)
@@ -243,7 +241,6 @@ bool AnimaDit::open(const std::string& path, void* stream, std::string& err, boo
     try {
         s_ = stream;
         dry_ = dry;
-        norm_cache_.clear();
         file_ = std::make_unique<AnimaFile>(path);
         AnimaFile& f = *file_;
         // a file whose blocks are not bf16 has no bytes the GPU could rewrite in place: 8 bits
@@ -1061,21 +1058,19 @@ bool AnimaDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
     return ok;
 }
 
-bool AnimaDit::tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err) {
-    auto it = norm_cache_.find(name);
-    if (it != norm_cache_.end()) {
-        out = &it->second;
-        return true;
-    }
+bool AnimaDit::dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err) {
+    const std::string name = slot.name + ".weight";
     try {
         const SafeTensor& t = file_->get(name);
-        const int64_t rows = t.shape[0], k = t.shape[1];
+        const int64_t rows = (int64_t) t.shape[0], k = (int64_t) t.shape[1];
+        if (slot.src_row + slot.row0 + slot.rows > rows)
+            throw std::runtime_error(name + ": the file's rows are fewer than the weight's");
         std::vector<uint16_t> tmp;
         const uint16_t* h = file_->bf16(name, tmp);
-        std::vector<float> norms = dit_bf16_row_norms(h, rows, k);
+        const bool ok = dit_dora_norms(e, slot.src_row, slot.src_row + slot.row0, slot.rows, k,
+                                       dit_bf16_rows(h, k), out, err);
         file_->drop_cache(name);
-        out = &norm_cache_.emplace(name, std::move(norms)).first->second;
-        return true;
+        return ok;
     } catch (const std::exception& ex) {
         err = std::string("image engine (Anima DiT): a DoRA's row norms: ") + ex.what();
         return false;

@@ -39,8 +39,9 @@ struct DitLoraTarget {
 struct DitLoraHooks {
     /// The DiT's drop_loras: the set let go (DitLoras::drop) and the DiT's state made from it.
     std::function<void()> drop;
-    /// A DoRA's row norms: the slot's weight's, one a row of it (its `w->n` rows), from the file's tensors.
-    std::function<bool(const DitLoraSlot&, std::vector<float>&, std::string&)> dora_norms;
+    /// A DoRA's composed row norms (PEFT's ||W + (alpha/rank) BA||, dit_dora_norms): the slot's rows, one a row,
+    /// from the weight's tensors and the entry's factors.
+    std::function<bool(const DitLoraSlot&, const LoraEntry&, std::vector<float>&, std::string&)> dora_norms;
     /// An entry the DiT does not take on the slot: true, and why (null: none refused).
     std::function<bool(const DitLoraSlot&, const LoraEntry&, std::string&)> refuse;
     /// An entry's key as the DiT reads it, where it differs: true and the key (null: as written); `file` is called
@@ -108,10 +109,17 @@ private:
     uint64_t bake_bytes_ = 0;   // bake_tmp_'s and bake_at16_'s
 };
 
-/// A slot's row norms out of its weight's tensor's (`norms`: the tensor's rows, the slot's from src_row on).
-bool dit_slot_norms(const DitLoraSlot& slot, const std::vector<float>& norms, std::vector<float>& out,
-                    std::string& err, const char* what);
-/// The row norms of a bf16 tensor [rows][k], FP32 (summed in double).
-std::vector<float> dit_bf16_row_norms(const uint16_t* h, int64_t rows, int64_t k);
+/// A weight tensor's rows as FP32: read(r0, n, out, err) fills rows [r0, r0 + n) of it, k values a row.  The DiT's
+/// own storage behind it (a file's bf16 rows, a GGUF's quantized blocks dequantized as the products read them).
+using DitTensorRows = std::function<bool(int64_t, int64_t, float*, std::string&)>;
+/// A bf16 tensor's rows ([.][k] host bits) as a DitTensorRows.
+DitTensorRows dit_bf16_rows(const uint16_t* h, int64_t k);
+/// A DoRA's row norms as PEFT takes them: ||W_r + s (BA)_r|| with s = alpha / rank (the entry's own scale, not the
+/// request's strength), over the slot's `rows` rows - the weight tensor's rows [trow0, trow0 + rows) against the
+/// entry's rows [src_row, src_row + rows).  The composed weight is never made:
+///   ||W_r + s (BA)_r||^2 = |W_r|^2 + 2 s sum_j B_rj (W A^T)_rj + s^2 B_r (A A^T) B_r^T,
+/// W A^T and A A^T one pass each while the weight's rows are read (a LoRA's bind, not a generation step).
+bool dit_dora_norms(const LoraEntry& e, int64_t src_row, int64_t trow0, int64_t rows, int64_t k,
+                    const DitTensorRows& read, std::vector<float>& norms, std::string& err);
 
 }  // namespace strata::image

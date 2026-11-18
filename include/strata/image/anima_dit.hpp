@@ -178,7 +178,7 @@ private:
     const float* vec(const std::string& name, std::vector<void*>& owned, uint64_t& bytes);
     void load_text();
     void build_lora_targets();
-    bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
+    bool dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err);
     // the shared product (DitProducts::run); defer: a W8A8 product's int32 sums left for its reader to scale
     // (DitOut::at), no pass of its own (a 16-bit weight's sums are scaled here: Anima's readers take them as FP32)
     DitOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
@@ -214,7 +214,6 @@ private:
     int64_t scratch_ = 0;
     std::vector<int> block_map_;
     bool lora_remap_ = false;   // the file being bound names its blocks through block_map_
-    std::map<std::string, std::vector<float>> norm_cache_;
     // the products (W8A8's input, the deltas' buffers)
     DitProducts prod_{&gemm_, &allocs_, &s_, "image engine (Anima DiT)"};
     // the adapters bound (their table built at open, build_lora_targets)

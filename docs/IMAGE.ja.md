@@ -558,7 +558,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | --- | --- | --- |
 | LoRA・LoCon | `lora_A`/`lora_B`（下と上）と `.alpha` かメタデータの `lora_alpha`（`transformer.lora_alpha` のように模型の名前を冠った鍵も） | 強さ × alpha / rank。alpha は `.alpha` テンソルが勝ち、メタデータは `.alpha` の無い重みにだけ効く。どちらも無ければ 1 |
 | LoKr | `lokr_w1`・`lokr_w2`（丸ごと、または 2 つの因子）と、線形の重みの Tucker の核 `lokr_t2` | 2 段の積。rank は w2 の因子、無ければ w1 の因子 |
-| DoRA | 素の LoRA と、重みの行の大きさのベクトル（`dora_scale`、PEFT の `lora_magnitude_vector`、ai-toolkit の `.magnitude`。LyCORIS の `[行][1]` の形も） | 行方向だけ。`c = 大きさ / (重みの行のノルム + eps)` で、土台とデルタの行を掛ける |
+| DoRA | 素の LoRA と、重みの行の大きさのベクトル（`dora_scale`、PEFT の `lora_magnitude_vector`、ai-toolkit の `.magnitude`。LyCORIS の `[行][1]` の形も） | 行方向だけ。`c = 大きさ / (||W + (alpha/rank) BA|| の行 + eps)`（PEFT の合成ノルム）で、土台とデルタの行を掛ける |
 | 全体差分 | `.diff`・`.set_weight`・`.w_norm` | 差分を足す。`set_weight` は強さ 1 でその重みになり、その間は補間 |
 | LoHa | `hada_w1_a/b`・`hada_w2_a/b` と、線形の Tucker の核 | 2 組の積の要素ごとの積。rank は `hada_w1_b` の行 |
 | バイアスの差分 | `.diff_b`、または `.w_norm` の隣の `.b_norm` | 重みのバイアスに足す。alpha は掛からず、要求の強さだけ |

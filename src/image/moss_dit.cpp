@@ -184,8 +184,8 @@ MossDit::MossDit() {
     loras_.block_path = "layers.";   // build_lora_targets' blocks (a request's block weights)
     DitLoraHooks& h = loras_.hooks;
     h.drop = [this] { drop_loras(); };
-    h.dora_norms = [this](const DitLoraSlot& slot, std::vector<float>& out, std::string& err) {
-        return dora_norms(slot, out, err);
+    h.dora_norms = [this](const DitLoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err) {
+        return dora_norms(slot, e, out, err);
     };
     h.block_weights = [this](std::vector<DitW*>& ws) {
         for (Block& b : blocks_)
@@ -210,7 +210,6 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
         s_ = stream;
         dry_ = dry;
         q8_ = q8;
-        norm_cache_.clear();
         w8_ = q8 && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
         files_ = std::make_unique<MossFile>(path);
         const MossFile& f = *files_;
@@ -624,55 +623,61 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
     return loras_.set(loras, err, changed);
 }
 
-bool MossDit::tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err) {
-    auto it = norm_cache_.find(name);
-    if (it != norm_cache_.end()) {
-        out = &it->second;
-        return true;
-    }
+bool MossDit::dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err) {
     try {
-        const uint8_t* data = nullptr;
-        const SafeTensor& t = files_->bf16(name, &data);
-        const int64_t rows = (int64_t) t.shape[0], k = (int64_t) t.shape[1];
-        std::vector<float> norms = dit_bf16_row_norms(reinterpret_cast<const uint16_t*>(data), rows, k);
-        files_->drop_cache(name);   // read once, not kept in the page cache
-        out = &norm_cache_.emplace(name, std::move(norms)).first->second;
-        return true;
+        const std::string& name = slot.name;
+        const size_t dot = name.rfind('.');
+        const std::string prefix = dot == std::string::npos ? std::string() : name.substr(0, dot + 1);
+        const std::string last = dot == std::string::npos ? name : name.substr(dot + 1);
+        // the weight's tensors, its rows in order: one, or the parts a fused weight's rows route across (the text
+        // embedder's [up | gate] is two of the file, the blocks' qkv one or the three q, k and v)
+        std::vector<std::string> names;
+        if (last == "ffn_up_gate" || last == "ffn_up" || last == "ffn_gate") {
+            if (name.rfind("text_embedder.blocks.", 0) == 0)
+                names = {prefix + "ffn_up.weight", prefix + "ffn_gate.weight"};
+            else
+                names = {prefix + "ffn_up_gate.weight"};
+        } else if (last == "qkv" && name.rfind("text_embedder.blocks.", 0) != 0 &&
+                   files_->find(prefix + "proj.qkv.weight") == nullptr) {
+            names = {prefix + "proj.q.weight", prefix + "proj.k.weight", prefix + "proj.v.weight"};
+        } else {
+            names = {name + ".weight"};
+        }
+        std::vector<const uint16_t*> hp;
+        std::vector<int64_t> rows;
+        int64_t total = 0, k = 0;
+        for (const std::string& tn : names) {
+            const uint8_t* data = nullptr;
+            const SafeTensor& t = files_->bf16(tn, &data);
+            if (t.shape.size() != 2 || (k != 0 && (int64_t) t.shape[1] != k))
+                throw std::runtime_error(tn + " is not the weight's columns");
+            k = (int64_t) t.shape[1];
+            hp.push_back(reinterpret_cast<const uint16_t*>(data));
+            rows.push_back((int64_t) t.shape[0]);
+            total += (int64_t) t.shape[0];
+        }
+        const int64_t trow0 = slot.src_row + slot.row0;
+        if (trow0 + slot.rows > total)
+            throw std::runtime_error(slot.name + ": the file's rows are fewer than the weight's");
+        const auto read = [hp, rows, k](int64_t r0, int64_t n, float* o, std::string&) {
+            int64_t done = 0, base = 0;
+            for (size_t p = 0; p < hp.size(); ++p) {
+                const int64_t lo = std::max(r0, base), hi = std::min(r0 + n, base + rows[p]);
+                for (int64_t r = lo; r < hi; ++r)
+                    for (int64_t c = 0; c < k; ++c)
+                        o[(done + r - lo) * k + c] = kernels::f32_from_bf16(hp[p][(r - base) * k + c]);
+                done += hi - lo;
+                base += rows[p];
+            }
+            return true;
+        };
+        const bool ok = dit_dora_norms(e, slot.src_row, trow0, slot.rows, k, read, out, err);
+        for (const std::string& tn : names) files_->drop_cache(tn);   // read once, not kept in the page cache
+        return ok;
     } catch (const std::exception& ex) {
         err = std::string("image engine (MOSS-Image DiT): a DoRA's row norms: ") + ex.what();
         return false;
     }
-}
-
-bool MossDit::dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err) {
-    const std::string& name = slot.name;
-    const size_t dot = name.rfind('.');
-    const std::string prefix = dot == std::string::npos ? std::string() : name.substr(0, dot + 1);
-    const std::string last = dot == std::string::npos ? name : name.substr(dot + 1);
-    if (last == "ffn_up_gate" || last == "ffn_up" || last == "ffn_gate") {
-        // a fused [up | gate]: one tensor of the file, but the text embedder's, which is ffn_up's rows and ffn_gate's
-        const std::vector<float>* a = nullptr;
-        const std::vector<float>* b = nullptr;
-        if (name.rfind("text_embedder.blocks.", 0) == 0) {
-            if (!tensor_norms(prefix + "ffn_up.weight", a, err) || !tensor_norms(prefix + "ffn_gate.weight", b, err))
-                return false;
-            out.resize(a->size() + b->size());
-            std::copy(a->begin(), a->end(), out.begin());
-            std::copy(b->begin(), b->end(), out.begin() + (int64_t) a->size());
-        } else {
-            if (!tensor_norms(prefix + "ffn_up_gate.weight", a, err)) return false;
-            out.assign(a->begin(), a->end());
-        }
-        if ((int64_t) out.size() < slot.w->n) {
-            err = "image engine (MOSS-Image DiT): " + slot.name + ": the file's rows are fewer than the weight's";
-            return false;
-        }
-        out.resize((size_t) slot.w->n);
-        return true;
-    }
-    const std::vector<float>* norms = nullptr;
-    return tensor_norms(name + ".weight", norms, err) &&
-           dit_slot_norms(slot, *norms, out, err, "image engine (MOSS-Image DiT)");
 }
 
 uint64_t MossDit::lora_bytes() const { return loras_.bytes(); }

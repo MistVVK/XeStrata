@@ -6,9 +6,11 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/gpu_buf.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/f16_bits.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <thread>
 
 namespace strata::image {
 
@@ -165,10 +167,10 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
             for (size_t i = 0; i < slots.size(); ++i) {
                 const DitLoraSlot* slot = slots[i];
                 std::vector<float> norms;
-                if (dora && !hooks.dora_norms(*slot, norms, err)) return fail();
+                if (dora && !hooks.dora_norms(*slot, e, norms, err)) return fail();
                 if (dora) {
                     std::vector<float> c;
-                    if (!lora_dora_rows(e, slot->src_row, slot->row0, slot->rows, norms, us, c, bases[i], why)) {
+                    if (!lora_dora_rows(e, slot->src_row, slot->rows, norms, us, c, bases[i], why)) {
                         err.assign(at).append(": ").append(why);
                         return fail();
                     }
@@ -286,27 +288,85 @@ uint64_t DitLoras::bytes() const {
     return n + scratch_->glora_bytes() + bake_bytes_;
 }
 
-bool dit_slot_norms(const DitLoraSlot& slot, const std::vector<float>& norms, std::vector<float>& out,
-                    std::string& err, const char* what) {
-    if ((int64_t) norms.size() < slot.src_row + slot.w->n) {
-        err = std::string(what) + ": " + slot.name + ": the file's rows are fewer than the weight's";
-        return false;
-    }
-    out.assign(norms.begin() + slot.src_row, norms.begin() + slot.src_row + slot.w->n);
-    return true;
+DitTensorRows dit_bf16_rows(const uint16_t* h, int64_t k) {
+    return [h, k](int64_t r0, int64_t n, float* out, std::string&) {
+        for (int64_t r = 0; r < n; ++r)
+            for (int64_t c = 0; c < k; ++c) out[r * k + c] = kernels::f32_from_bf16(h[(r0 + r) * k + c]);
+        return true;
+    };
 }
 
-std::vector<float> dit_bf16_row_norms(const uint16_t* h, int64_t rows, int64_t k) {
-    std::vector<float> norms((size_t) rows);
-    for (int64_t r = 0; r < rows; ++r) {
-        double s = 0;
-        for (int64_t c = 0; c < k; ++c) {
-            const float v = kernels::f32_from_bf16(h[r * k + c]);
-            s += (double) v * (double) v;
-        }
-        norms[(size_t) r] = (float) std::sqrt(s);
+bool dit_dora_norms(const LoraEntry& e, int64_t src_row, int64_t trow0, int64_t rows, int64_t k,
+                    const DitTensorRows& read, std::vector<float>& norms, std::string& err) {
+    const int64_t rank = e.rank;
+    const float s = e.scale();
+    if (rank <= 0 || k <= 0 || rows <= 0 || (int64_t) e.a.size() < rank * k ||
+        (int64_t) e.b.size() < (src_row + rows) * rank) {
+        err = "a DoRA's factors are not the weight's shapes";
+        return false;
     }
-    return norms;
+    // the factors as FP32 once, and A A^T [rank][rank] (the delta's own gram, the s^2 term below reads)
+    std::vector<float> af((size_t) (rank * k));
+    for (size_t i = 0; i < af.size(); ++i) af[i] = kernels::f32_from_f16(e.a[i]);
+    std::vector<float> aat((size_t) (rank * rank));
+    for (int64_t j = 0; j < rank; ++j)
+        for (int64_t l = 0; l <= j; ++l) {
+            const float* aj = af.data() + j * k;
+            const float* al = af.data() + l * k;
+            float acc[4] = {0.f, 0.f, 0.f, 0.f};
+            int64_t c = 0;
+            for (; c + 4 <= k; c += 4)
+                for (int u = 0; u < 4; ++u) acc[u] += aj[c + u] * al[c + u];
+            float t = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+            for (; c < k; ++c) t += aj[c] * al[c];
+            aat[(size_t) (j * rank + l)] = aat[(size_t) (l * rank + j)] = t;
+        }
+    norms.assign((size_t) rows, 0.f);
+    const int nt = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    constexpr int64_t kBand = 128;   // the weight's rows read at a time (the reader's own bands may be smaller)
+    std::vector<float> w((size_t) (std::min(kBand, rows) * k));
+    for (int64_t b = 0; b < rows; b += kBand) {
+        const int64_t nb = std::min(kBand, rows - b);
+        if (!read(trow0 + b, nb, w.data(), err)) return false;
+        // one row: |W_r|^2 (double, as the base norms were), (W A^T)_rj (FP32, PEFT's own precision), then the
+        // composed square; a square gone negative by rounding is a zero row's
+        const auto work = [&](int64_t r0, int64_t r1) {
+            std::vector<float> wat((size_t) rank), bf((size_t) rank);
+            for (int64_t r = r0; r < r1; ++r) {
+                const float* wr = w.data() + (size_t) r * k;
+                double ss = 0;
+                for (int64_t c = 0; c < k; ++c) ss += (double) wr[c] * (double) wr[c];
+                for (int64_t j = 0; j < rank; ++j) {
+                    const float* aj = af.data() + j * k;
+                    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                    int64_t c = 0;
+                    for (; c + 4 <= k; c += 4)
+                        for (int u = 0; u < 4; ++u) acc[u] += wr[c + u] * aj[c + u];
+                    float t = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+                    for (; c < k; ++c) t += wr[c] * aj[c];
+                    wat[(size_t) j] = t;
+                }
+                for (int64_t j = 0; j < rank; ++j)
+                    bf[(size_t) j] = kernels::f32_from_f16(e.b[(size_t) ((src_row + b + r) * rank + j)]);
+                double cross = 0, quad = 0;
+                for (int64_t j = 0; j < rank; ++j) {
+                    cross += (double) bf[(size_t) j] * wat[(size_t) j];
+                    double t = 0;
+                    for (int64_t l = 0; l < rank; ++l) t += (double) aat[(size_t) (j * rank + l)] * bf[(size_t) l];
+                    quad += (double) bf[(size_t) j] * t;
+                }
+                const double n2 = ss + 2.0 * s * cross + (double) s * s * quad;
+                norms[(size_t) (b + r)] = (float) std::sqrt(n2 > 0 ? n2 : 0);
+            }
+        };
+        const int64_t per = (nb + nt - 1) / nt;
+        std::vector<std::thread> ts;
+        for (int t = 1; t < nt && t * per < nb; ++t)
+            ts.emplace_back(work, t * per, std::min(nb, (t + 1) * per));
+        work(0, std::min(nb, per));
+        for (std::thread& t : ts) t.join();
+    }
+    return true;
 }
 
 }  // namespace strata::image

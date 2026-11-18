@@ -211,12 +211,12 @@ private:
     LayerStream blocks_stream_;
     // the adapters: a weight and the rows of a file's entry it takes (dit_loras.hpp)
     using LoraSlot = DitLoraSlot;
-    /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensor (a fused weight's
-    /// gate_layer and proj are its gate_up's rows), cached a tensor (open drops the cache).
-    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
-    /// One of the file's tensors' row norms, FP32, cached (`key`: the GGUF's own name).
-    bool tensor_norms(const std::string& key, const std::vector<float>*& out, std::string& err);
-    std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
+    /// A DoRA's composed row norms of the slot's rows (dit_dora_norms over the GGUF tensor's rows; a fused weight's
+    /// gate_layer and proj are its gate_up's rows).
+    bool dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<float>& out, std::string& err);
+    /// A GGUF tensor's rows [r0, r0 + n) as FP32 (`key`: the GGUF's own name): the file's F32, F16, BF16 and Q8_0
+    /// read on the host, the other block formats through the GPU's dequantization (the products' own).
+    bool tensor_rows(const std::string& key, int64_t r0, int64_t n, float* out, std::string& err);
     std::vector<std::vector<float>> norms32_;   // an FP16 GGUF's q/k norms widened to FP32, streamed in their place
     bool prefix_cache_ = false;   // the blocks' pk and pv hold the context's prefix (set_context; set_loras drops it)
     // activations, grown on demand

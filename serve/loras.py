@@ -10,7 +10,7 @@ every dot as an underscore, by the model's own names - kohya_name, and the engin
 this model's when every weight it changes is one the DiT's products take (TARGETS: the names of qi_dit.cpp's,
 moss_dit.cpp's and mf_dit.cpp's build_lora_targets, written here a second time; the record's check sets them
 against the probe's `map` on the models, name for name), in a form the engine applies today: a plain LoRA, LoKr or
-LoHa (a DoRA: a plain LoRA with a magnitude over the weight's rows, the weight's rows' norms rescaled - `dora_scale`,
+LoHa (a DoRA: a plain LoRA with a magnitude over the weight's rows, PEFT's composed row norms rescaled - `dora_scale`,
 or the same vector as PEFT writes it (`lora_magnitude_vector`, its `.default` form too) or as ai-toolkit writes it
 (`.magnitude`), and LyCORIS's [rows][1] shape too), a whole weight's difference (diff, set_weight, w_norm), or an
 OFT's turn of the weight's rows (oft_blocks, a BOFT's four dimensions too; the file's alpha is the constraint on the
