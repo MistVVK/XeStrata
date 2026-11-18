@@ -34,7 +34,7 @@ using AotFn = bool (*)(void*, const uint16_t*, const uint16_t*, const uint16_t*,
                        int64_t, uint16_t*, bool, int64_t);   // strata_sdpa_aotriton's
 using AotTrainFn = bool (*)(void*, bool, const uint16_t*, const uint16_t*, const uint16_t*, const uint16_t*,
                             const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, uint16_t*, uint16_t*,
-                            uint16_t*, uint16_t*, float*);   // strata_sdpa_aotriton_train's
+                            uint16_t*, uint16_t*, float*);   // xestrata_sdpa_aotriton_train's
 AotTrainFn g_train = nullptr;
 
 // The aotriton module (src/kernels/xe/sdpa_aotriton_module.cpp), opened at an AMD GPU's first attention from the engine's
@@ -66,7 +66,7 @@ AotFn aotriton_module() {
             }
             fn = reinterpret_cast<AotFn>(reinterpret_cast<void*>(GetProcAddress(h, "strata_sdpa_aotriton")));
             g_train = reinterpret_cast<AotTrainFn>(
-                reinterpret_cast<void*>(GetProcAddress(h, "strata_sdpa_aotriton_train")));
+                reinterpret_cast<void*>(GetProcAddress(h, "xestrata_sdpa_aotriton_train")));
 #else
             void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
             if (h == nullptr) {
@@ -75,7 +75,7 @@ AotFn aotriton_module() {
                 continue;
             }
             fn = reinterpret_cast<AotFn>(dlsym(h, "strata_sdpa_aotriton"));
-            g_train = reinterpret_cast<AotTrainFn>(dlsym(h, "strata_sdpa_aotriton_train"));
+            g_train = reinterpret_cast<AotTrainFn>(dlsym(h, "xestrata_sdpa_aotriton_train"));
 #endif
             if (fn != nullptr) return;
             why = p.string() + ": no strata_sdpa_aotriton";
