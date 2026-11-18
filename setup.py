@@ -5766,12 +5766,19 @@ def import_anima(path: Path, models_dir: Path) -> str:
     if dest.name in reserved or "anima-" + path.stem in {v[0] for v in qi.IMAGE_MODELS.values()}:
         raise ValueError("the name is reserved for an Anima release")
     if dest.resolve() != path:
-        with path.open("rb") as src, dest.open("xb") as out:
-            try:
+        if dest.exists():
+            raise FileExistsError(f"{dest} is already there")
+        tmp = dest.with_name(dest.name + ".part")
+        try:
+            with path.open("rb") as src, tmp.open("xb") as out:
                 shutil.copyfileobj(src, out)
-            except BaseException:
-                dest.unlink()
-                raise
+            os.replace(tmp, dest)                # a half-copied file never appears under the final name
+        except BaseException:
+            try:                                 # after the with: Windows cannot unlink an open file
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
     name = qi.ANIMA_USER + path.stem
     if name not in qi.anima_user_dits(models_dir):
         raise ValueError("the name is reserved for an Anima release")
@@ -7825,8 +7832,10 @@ def server_on_port(port: int, api_key: str | None = None) -> tuple[str, list] | 
     key = (api_key or "").split(",")[0].strip()
     if key:
         req.add_header("Authorization", f"Bearer {key}")
+    # 127.0.0.1 is never behind a proxy: a proxy in http_proxy with no localhost in no_proxy would get the key
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with opener.open(req, timeout=5) as r:
             body = json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         e.close()
