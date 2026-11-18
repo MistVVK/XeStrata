@@ -48,6 +48,10 @@ namespace strata::image::sdpa {
 namespace {
 
 std::mutex g_mu;
+// the handle's stream set and the work put on it under this lock: the native commands of two queues run on the
+// runtime's host threads at once, and the handle is one a device - without it one command's execute could go on the
+// other's stream (the GPU work itself runs on, the workspaces apart below)
+std::mutex g_exec_mu;
 
 namespace fe = cudnn_frontend;
 
@@ -61,10 +65,26 @@ struct Cudnn {
     // a training step's: (rows, keys, heads, hd, backward) -> its graph
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool>, std::shared_ptr<fe::graph::Graph>> train;
     std::map<std::vector<int64_t>, std::shared_ptr<fe::graph::Graph>> convs;   // null: no plan for the shape
+};
+std::unordered_map<sycl::device, Cudnn> g_cudnn;
+
+// The workspace of a queue's cuDNN work: the queue's own belonging (Runtime::queue_item), freed when its stream is
+// destroyed.  One a device, two streams on the GPU ran their graphs on it at once, and a reallocation waited for the
+// calling queue alone while the other's work still read it; a queue's own, the wait covers every reader and the
+// streams never share it (a recorded graph's replay holds its queue's workspace, the epoch bump dropping the
+// recording when it is taken anew).
+struct CudnnWs {
+    explicit CudnnWs(sycl::queue& q) : q(q) {}
+    ~CudnnWs() {
+        if (ws != nullptr) {
+            sycl::free(ws, q);
+            core::graph_epoch_bump();   // a recorded step may hold the old one
+        }
+    }
+    sycl::queue q;
     void* ws = nullptr;
     int64_t ws_bytes = 0;
 };
-std::unordered_map<sycl::device, Cudnn> g_cudnn;
 
 constexpr int64_t kQ = 1, kK = 2, kV = 3, kO = 4;   // the tensors' ids in the variant pack
 constexpr int64_t kStats = 5, kDO = 6, kDQ = 7, kDK = 8, kDV = 9;   // a training step's
@@ -112,6 +132,7 @@ bool on_queue(sycl::queue& q, cudnnHandle_t handle, std::function<void()> run) {
     if (q.ext_oneapi_get_state() == sx::queue_state::recording && !capture().ok()) return false;
     q.submit([&](sycl::handler& h) {
         h.ext_codeplay_enqueue_native_command([handle, run](const sycl::interop_handle& ih) {
+            std::lock_guard<std::mutex> exec(g_exec_mu);
             const CUstream cs = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
             if (fe::detail::set_stream(handle, cs) != CUDNN_STATUS_SUCCESS) throw std::runtime_error("cudnnSetStream");
 #if CUDA_VERSION >= 12030
@@ -376,21 +397,22 @@ bool run_sdpa(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
             d.graph_lru.remove(key);
         }
         d.graph_lru.push_front(key);
+        CudnnWs& w = core::Runtime::of_queue(q).queue_item<CudnnWs>(q);
         int64_t ws = 0;
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
-        if (ws > d.ws_bytes) {
-            q.wait();
-            if (d.ws != nullptr) {
-                sycl::free(d.ws, q);
+        if (ws > w.ws_bytes) {
+            q.wait();   // this queue's work alone reads its workspace
+            if (w.ws != nullptr) {
+                sycl::free(w.ws, q);
                 core::graph_epoch_bump();   // a recorded step may hold the old one
             }
-            d.ws = sycl::malloc_device(ws, q);
-            d.ws_bytes = d.ws != nullptr ? ws : 0;
+            w.ws = sycl::malloc_device(ws, q);
+            w.ws_bytes = w.ws != nullptr ? ws : 0;
         }
         std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> pack = {
             {kQ, const_cast<uint16_t*>(q16)}, {kK, const_cast<uint16_t*>(k16)}, {kV, const_cast<uint16_t*>(v16)},
             {kO, out16}};
-        return on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = d.ws]() mutable {
+        return on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = w.ws]() mutable {
             if (!g->execute(handle, pack, ws).is_good()) throw std::runtime_error("cuDNN's SDPA failed");
         });
     } catch (const std::exception& e) {
@@ -420,16 +442,17 @@ bool cudnn_train(sycl::queue& q, bool bwd, const uint16_t* q16, const uint16_t* 
         const auto key = std::make_tuple(rows, keys, heads, hd, bwd);
         auto it = d.train.find(key);
         if (it == d.train.end()) it = d.train.emplace(key, train_graph(d.handle, rows, keys, heads, hd, bwd)).first;
+        CudnnWs& w = core::Runtime::of_queue(q).queue_item<CudnnWs>(q);
         int64_t ws = 0;
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
-        if (ws > d.ws_bytes) {
-            q.wait();
-            if (d.ws != nullptr) {
-                sycl::free(d.ws, q);
+        if (ws > w.ws_bytes) {
+            q.wait();   // this queue's work alone reads its workspace
+            if (w.ws != nullptr) {
+                sycl::free(w.ws, q);
                 core::graph_epoch_bump();
             }
-            d.ws = sycl::malloc_device(ws, q);
-            d.ws_bytes = d.ws != nullptr ? ws : 0;
+            w.ws = sycl::malloc_device(ws, q);
+            w.ws_bytes = w.ws != nullptr ? ws : 0;
         }
         std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> pack = {
             {kQ, const_cast<uint16_t*>(q16)}, {kK, const_cast<uint16_t*>(k16)}, {kV, const_cast<uint16_t*>(v16)},
@@ -443,7 +466,7 @@ bool cudnn_train(sycl::queue& q, bool bwd, const uint16_t* q16, const uint16_t* 
             pack.emplace(kDK, dk16);
             pack.emplace(kDV, dv16);
         }
-        return on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = d.ws]() mutable {
+        return on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = w.ws]() mutable {
             if (!g->execute(handle, pack, ws).is_good()) throw std::runtime_error("cuDNN's SDPA training failed");
         });
     } catch (const std::exception& e) {
@@ -484,22 +507,23 @@ bool run_conv(sycl::queue& q, const std::vector<int64_t>& key,
         auto it = d.convs.find(key);
         if (it == d.convs.end()) it = d.convs.emplace(key, make(d.handle)).first;
         if (!it->second) return false;
+        sdpa::CudnnWs& cw = core::Runtime::of_queue(q).queue_item<sdpa::CudnnWs>(q);
         int64_t ws = 0;
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
-        if (ws > d.ws_bytes) {
-            q.wait();
-            if (d.ws != nullptr) {
-                sycl::free(d.ws, q);
+        if (ws > cw.ws_bytes) {
+            q.wait();   // this queue's work alone reads its workspace
+            if (cw.ws != nullptr) {
+                sycl::free(cw.ws, q);
                 core::graph_epoch_bump();
             }
-            d.ws = sycl::malloc_device(ws, q);
-            d.ws_bytes = d.ws != nullptr ? ws : 0;
+            cw.ws = sycl::malloc_device(ws, q);
+            cw.ws_bytes = cw.ws != nullptr ? ws : 0;
         }
         std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> pack = {
             {sdpa::kX, const_cast<uint16_t*>(x)}, {sdpa::kW, const_cast<uint16_t*>(w)}, {sdpa::kY, y}};
         if (bias != nullptr) pack.emplace(sdpa::kB, const_cast<float*>(bias));
         if (add) pack.emplace(sdpa::kR, y);
-        return sdpa::on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = d.ws]() mutable {
+        return sdpa::on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = cw.ws]() mutable {
             if (!g->execute(handle, pack, ws).is_good()) throw std::runtime_error("cuDNN's convolution failed");
         });
     } catch (const std::exception& e) {   // this shape on the engine's own path from now on
