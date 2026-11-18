@@ -1673,6 +1673,12 @@ class SaveScreen(Base):
             out.append(f"{p['label'].removeprefix('the ')} {size}" if short else f"{p['label']}, {size}")
         return out or ["nothing: everything is on this computer"]
 
+    def compact_download(self) -> str:
+        """The Download row of the small-window summary: one line (cut at the end where the window is narrow, so it never wraps over the choices)."""
+        text = "Download " + ", ".join(self.download_lines(short=True))
+        room = max(20, self.width() - 6)
+        return text if len(text) <= room else text[:room - 1] + ("…" if self.g.unicode else ".")
+
     def refresh_body(self) -> None:
         """The summary, the name and the three choices. When the body is too short for all of it (a small window), the summary shrinks to a
         few short lines and the name field to one row, so the three choices stay on screen and Enter never acts on something you cannot see."""
@@ -1690,10 +1696,11 @@ class SaveScreen(Base):
             model = dict(lines)["Model"].replace("Qwen3.8-Flash-Next ", "")
             rows = [f"{model} \u00b7 {S.context_label(s.context)} \u00b7 memory {s.kv or 'int8'}",
                     f"Pictures {'on' if s.vision != 'off' else 'off'} \u00b7 Parallel {s.parallel or 'auto'} \u00b7 Tuning {s.tune}",
-                    f"Access {s.access}, port {s.port}" + (f" \u00b7 Storage {s.data_dir}" if s.data_dir else ""),
-                    "Download " + ", ".join(self.download_lines(short=True))]                  # T2: also in a small window
+                    self.compact_download(),                                                   # T2: also in a small window
+                    f"Access {s.access}, port {s.port}" + (" \u00b7 Storage " + middle_shorten(s.data_dir, max(20, self.width() - 36), "\u2026" if self.g.unicode else "...")
+                                                           if s.data_dir else "")]
             t.append("Save, then launch   name:\n" if tiny else "Save as preset, then launch   name:\n", style=f"bold {ACCENT}")
-            for ln in rows[:2 if tiny else 4]:
+            for ln in rows[:2 if tiny else 3 if body_h < 12 else 4]:
                 t.append("  " + ln + "\n")
             if warnings and not tiny:
                 t.append(f"  ! {warnings[0]}" + (f"  (+{len(warnings) - 1} more)" if len(warnings) > 1 else "") + "\n", style=WARN)
