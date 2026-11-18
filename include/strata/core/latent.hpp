@@ -34,6 +34,8 @@ int latent_dense_fmt_env(std::string& err);
 /// The pack's D/U file of the other format beside `path` (latent_dense_q4.bin / latent_dense_q8.bin, as Edge0 ships
 /// both), or empty when `path` is not one of those names or the file is not there.
 std::string latent_dense_sibling(const std::string& path, int fmt);
+/// The labels.bin beside the latent expert pack, using either path separator.
+std::string latent_labels_path(const std::string& path);
 
 /// The D/U dense file: layer l is D [G*ELL, H] then U [G*H, ELL], rows of Q8_0 (fmt 8, 34 B a 32-value block)
 /// or Q4_0 (fmt 4, 18 B).  The format is `fmt` when given, else XESTRATA_LATENT_DENSE_FMT's, else (auto) the one

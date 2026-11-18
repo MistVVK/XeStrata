@@ -1861,9 +1861,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 err = "prefill: the latent layout needs XESTRATA_LATENT_A=<experts.bin>";
                 return false;
             }
-            const std::string lp = apack;
-            const size_t slash = lp.find_last_of('/');
-            const std::string labels_path = slash == std::string::npos ? "labels.bin" : lp.substr(0, slash + 1) + "labels.bin";
+            const std::string labels_path = strata::core::latent_labels_path(apack);
             if (!strata::core::latent_labels_read(labels_path, g.n_layers, g.n_expert, m.lat_G_, m.lat_labels_, err))
                 return false;
             if (!strata::gpu::alloc_device((void**) &m.lat_labels_dev_, m.lat_labels_.size() * sizeof(int32_t)) ||

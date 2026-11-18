@@ -2056,9 +2056,7 @@ struct LatentTab {
             err = "the latent layout needs XESTRATA_LATENT_A=<experts.bin>";
             return false;
         }
-        const std::string lp = apack;
-        const size_t slash = lp.find_last_of('/');
-        const std::string labels_path = slash == std::string::npos ? "labels.bin" : lp.substr(0, slash + 1) + "labels.bin";
+        const std::string labels_path = strata::core::latent_labels_path(apack);
         if (!strata::core::latent_labels_read(labels_path, g.n_layers, g.n_expert, lat_G, labels, err)) {
             err = "latent dense: " + err;
             return false;

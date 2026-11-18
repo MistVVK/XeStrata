@@ -65,6 +65,11 @@ std::string latent_dense_sibling(const std::string& path, int fmt) {
     return std::ifstream(other, std::ios::binary).good() ? other : std::string();
 }
 
+std::string latent_labels_path(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "labels.bin";
+}
+
 bool LatentDense::open(const std::string& path, int64_t n_layers, int64_t n_groups, int64_t n_embd,
                        int64_t latent_dim, std::string& err, int fmt) {
     close();

@@ -161,9 +161,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
             err = "moe window: the latent layout needs XESTRATA_LATENT_A=<experts.bin>";
             return false;
         }
-        const std::string lp = std::string(apack);
-        const size_t slash = lp.find_last_of('/');
-        const std::string labels_path = slash == std::string::npos ? "labels.bin" : lp.substr(0, slash + 1) + "labels.bin";
+        const std::string labels_path = strata::core::latent_labels_path(apack);
         if (!latent_labels_read(labels_path, lay.n_layers, lay.n_expert, lat_G_, lat_labels_, err)) {
             err = "moe window latent: " + err;
             return false;
