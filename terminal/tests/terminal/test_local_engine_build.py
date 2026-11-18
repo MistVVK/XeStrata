@@ -127,6 +127,9 @@ class BuildRecord(unittest.TestCase):
         self.assertIsNone(local_engine.backend_of({"version": "0.1.60"}))
         self.assertEqual(local_engine.archs_of({"archs": [75, 86]}, "cuda"), ["sm_75", "sm_86"])
         self.assertEqual(local_engine.archs_of({"archs": ["gfx1100"]}, "hip"), ["gfx1100"])
+        # the Linux CUDA packages write one string (0.1.62 cuda12 / cuda13 BUILD.json)
+        self.assertEqual(local_engine.archs_of({"archs": "75;86;89;120"}, "cuda"), ["sm_75", "sm_86", "sm_89", "sm_120"])
+        self.assertEqual(local_engine.archs_of({"archs": "60;61;70;75;80;86;120;89"}, "cuda")[:3], ["sm_60", "sm_61", "sm_70"])
 
 
 if __name__ == "__main__":

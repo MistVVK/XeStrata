@@ -60,6 +60,44 @@ class UpdatePull(unittest.TestCase):
         call.assert_not_called()
         self.assertIn("git pull", out)
 
+    def test_u1_the_pull_is_one_summary_line_not_gits_change_list(self):
+        """U1: a release that moves folders made git print about 15,000 lines of renames."""
+        (self.origin / "src").mkdir()
+        for i in range(60):
+            (self.origin / "src" / f"f{i}.txt").write_text(f"file number {i}\n" * 20, encoding="utf-8")
+        git(self.origin, "add", "-A")
+        git(self.origin, "commit", "-q", "-m", "many files")
+        git(self.origin, "mv", "src", "lib")
+        git(self.origin, "commit", "-q", "-m", "renamed")
+        rc, call, out = self.update(self.clone, self.clone / "setup.py")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count("\n"), 2, out)                               # "Getting the newest ..." + one summary line
+        self.assertIn("Got the newest Strata (60 files changed).", out)
+        for noise in ("rename ", "create mode", "Fast-forward", "Updating ", "|"):
+            self.assertNotIn(noise, out)
+        self.assertTrue((self.clone / "lib" / "f59.txt").is_file())
+
+    def test_u1_up_to_date_says_so_in_one_line(self):
+        rc, call, out = self.update(self.clone, self.clone / "setup.py")
+        self.assertIn("Strata is up to date.", out)
+        self.assertNotIn("Already up to date", out)
+
+    def test_u1_a_failing_pull_still_shows_gits_own_words(self):
+        (self.clone / "setup.py").write_text("# my edit\n", encoding="utf-8")
+        (self.origin / "setup.py").write_text("# v2\n", encoding="utf-8")
+        git(self.origin, "commit", "-q", "-am", "v2")
+        rc, call, out = self.update(self.clone, self.clone / "setup.py")
+        self.assertEqual(rc, 1)
+        self.assertIn("setup.py", out)                                          # git names the file that stops the pull
+        self.assertIn("overwritten", out)
+        self.assertIn("git pull did not succeed (the reason is above)", out)
+
+    def test_u1_a_remote_that_cannot_be_reached_says_why(self):
+        git(self.clone, "remote", "set-url", "origin", str(self.tmp / "gone"))
+        rc, call, out = self.update(self.clone, self.clone / "setup.py")
+        self.assertEqual(rc, 1)
+        self.assertIn("fatal", out.lower())
+
     def test_a_clone_that_is_behind_is_pulled_and_the_update_runs_in_the_new_setup(self):
         (self.origin / "setup.py").write_text("# v2\n", encoding="utf-8")
         git(self.origin, "commit", "-q", "-am", "v2")

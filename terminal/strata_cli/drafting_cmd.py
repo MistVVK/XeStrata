@@ -208,12 +208,16 @@ def run(a) -> int:
                 print("Nothing to download.")
             return 0
         if out is None:                                    # (a set with a tuned drafter, and nothing answered: an explicit fetch says so)
-            raise drafting_fetch.OfflineError("There is no internet connection, so the DFlash2 drafter can't be downloaded now.")
+            offline = drafting_fetch.OfflineError("There is no internet connection, so the DFlash2 drafter can't be downloaded now.")
+            offline.files_note = drafting_fetch.offline_files_note(folder, tuned=drafting.tuned_applies(want["backend"], want["model_name"], want["archs"], **sig),
+                                                                  variant=drafting.tuned_variant(want["backend"], want["model_name"]))
+            raise offline
     except (drafting_fetch.DraftingError, acquisition.AcquisitionRefused) as exc:
+        note = getattr(exc, "files_note", "")                # D1: the exact file(s) to copy in by hand, when offline
         if machine:
-            print(json.dumps({"schema_version": 1, "ok": False, "error": {"code": "drafting_failed", "message": str(exc)}}, ensure_ascii=False))
+            print(json.dumps({"schema_version": 1, "ok": False, "error": {"code": "drafting_failed", "message": str(exc), **({"help": note} if note else {})}}, ensure_ascii=False))
         else:
-            print(f"\nstrata: {exc}", file=sys.stderr)
+            print(f"\nstrata: {exc}" + (f" {note}" if note else ""), file=sys.stderr)
         return 5
     if machine:
         print(json.dumps({"schema_version": 1, "ok": True, "event": "result", "pack": str(out)}, ensure_ascii=False))

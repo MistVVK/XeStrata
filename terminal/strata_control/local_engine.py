@@ -95,7 +95,9 @@ def backend_of(build: dict) -> str | None:
 
 def archs_of(build: dict, backend: str) -> list[str]:
     out = []
-    for item in build.get("archs") or []:
+    value = build.get("archs") or []
+    # The Linux CUDA packages write ONE string ("60;61;70"); a string used to be walked character by character.
+    for item in (re.split(r"[;,\s]+", value) if isinstance(value, str) else value):
         text = str(item).strip()
         if backend == "cuda" and text.isdigit():
             out.append(f"sm_{text}")

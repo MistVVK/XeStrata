@@ -287,7 +287,19 @@ class Engine(unittest.TestCase):
         eng, out, heads, got = self.run_get([setup.PREBUILT_URL])
         self.assertEqual(eng, self.root / "engine")
         self.assertEqual(got, [setup.PREBUILT_URL + setup.PREBUILT_ASSET])
-        self.assertIn("No ready-made engine for v0.1.31", out)
+        # F5: a 404 on this checkout's own release is the normal fallback, with no error text
+        self.assertNotIn("No ready-made engine", out)
+        self.assertNotIn("404", out)
+
+    def test_f5_another_reason_gets_one_plain_line(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            setup._next_release_note("engine", not_found("https://x/"))
+            setup._next_release_note("engine", urllib.error.URLError("no route to host"))
+        self.assertEqual(out.getvalue().count("\n"), 1)
+        self.assertIn("could not be reached", out.getvalue())
+        self.assertIn("trying the latest release", out.getvalue())
+        self.assertNotIn("HTTP Error", out.getvalue())
 
     def test_a_refused_archive_is_not_kept(self):
         """PR #324: a refused archive (too old, or no code for the GPU) kept its zip and .done mark, and every later
