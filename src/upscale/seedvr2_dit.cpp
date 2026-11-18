@@ -603,10 +603,10 @@ uint64_t Seedvr2Dit::activation_bytes(int64_t h, int64_t w, int64_t t) const {
         for (const Win& v : wins) r += image::qi_attn_rows(L_ + (v.t1 - v.t0) * (v.h1 - v.h0) * (v.w1 - v.w0));
         jr = std::max(jr, r);
     }
-    const uint64_t f32 = (uint64_t) (N * C_ * 2 + L_ * C_ * 2 + N * 3 * C_ + L_ * 3 * C_ + N * (v2_ ? 2 : 1) * F_ +
-                                     2 * N + (v2_ ? L_ * hd_ : 0));
+    const uint64_t f32 = (uint64_t) ((N + std::max(N, L_)) * C_ + L_ * C_ * 2 + N * 3 * C_ + L_ * 3 * C_ + std::max(N, L_) * (v2_ ? 2 : 1) * F_ +
+                                     2 * std::max(N, L_) + (v2_ ? L_ * hd_ : 0));
     const uint64_t f16 = (uint64_t) (N * kin_ + std::max(N, L_) * C_ + 3 * (N + L_) * C_ + 4 * jr * C_ + N * C_ +
-                                     N * F_);
+                                     std::max(N, L_) * F_);
     const uint64_t tables = (uint64_t) (N * hd_ * 2) * 4 + (uint64_t) (jr * 2) * 4;
     const uint64_t rows8 = w8_ ? (uint64_t) (std::max(N, L_) * std::max(C_, F_)) + (uint64_t) std::max(N, L_) * 8
                            : q8_ ? (uint64_t) (std::max(N, L_) * std::max(C_, F_)) * 2 : 0;
@@ -629,12 +629,12 @@ void Seedvr2Dit::ensure(int64_t t, int64_t h, int64_t w) {
     layout(1, t, h, w, act_);
     const int64_t jr = std::max(lay_[0].jrows, lay_[1].jrows);
     x_ = alloc<float>(act_, N * C_, "image engine (SeedVR2 DiT)");
-    y_ = alloc<float>(act_, N * C_, "image engine (SeedVR2 DiT)");
+    y_ = alloc<float>(act_, std::max(N, L_) * C_, "image engine (SeedVR2 DiT)");
     t_ = alloc<float>(act_, L_ * C_, "image engine (SeedVR2 DiT)");
     tsum_ = alloc<float>(act_, L_ * C_, "image engine (SeedVR2 DiT)");
     qkv_ = alloc<float>(act_, N * 3 * C_, "image engine (SeedVR2 DiT)");
     qkt_ = alloc<float>(act_, L_ * 3 * C_, "image engine (SeedVR2 DiT)");
-    hid_ = alloc<float>(act_, N * (v2_ ? 2 * F_ : F_), "image engine (SeedVR2 DiT)");
+    hid_ = alloc<float>(act_, std::max(N, L_) * (v2_ ? 2 * F_ : F_), "image engine (SeedVR2 DiT)");
     if (v2_) {   // the text's RoPE: row r on all three axes
         const int64_t half = hd_ / 2, nf = (int64_t) freqs_.size();
         std::vector<float> cs((size_t) (L_ * half), 1.f), sn((size_t) (L_ * half), 0.f);
@@ -662,7 +662,7 @@ void Seedvr2Dit::ensure(int64_t t, int64_t h, int64_t w) {
     jv_ = alloc<uint16_t>(act_, jr * C_, "image engine (SeedVR2 DiT)");
     jo_ = alloc<uint16_t>(act_, jr * C_, "image engine (SeedVR2 DiT)");
     o16_ = alloc<uint16_t>(act_, N * C_, "image engine (SeedVR2 DiT)");
-    g16_ = alloc<uint16_t>(act_, N * F_, "image engine (SeedVR2 DiT)");
+    g16_ = alloc<uint16_t>(act_, std::max(N, L_) * F_, "image engine (SeedVR2 DiT)");
     if (w8_) {
         xq8_ = alloc<int8_t>(act_, std::max(N, L_) * std::max(C_, F_), "image engine (SeedVR2 DiT)");
         xs_ = alloc<float>(act_, std::max(N, L_), "image engine (SeedVR2 DiT)");
