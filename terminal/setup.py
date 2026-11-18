@@ -7747,6 +7747,14 @@ def git_out(git: str, repo: Path, *args) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def detached_head(git: str, repo: Path) -> bool:
+    """A clone checked out on a tag or a commit (`git checkout v0.2.15`) has no branch: `git pull` can never bring anything there, and its
+    own error ("You are not currently on a branch") was followed by a message about changed files that had nothing to do with it.
+    `git symbolic-ref -q HEAD` exits 1 when HEAD is not a branch; any other failure (not a repository, git broken) is not claimed as this."""
+    r = subprocess.run([git, "-C", str(repo), "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return r.returncode == 1
+
+
 def pull_onto_new_history(git: str, repo: Path) -> int:
     """`git pull --ff-only` failed. A clone made before the history was rewritten on 2026-10-06 (#1276) has no commit in common with
     origin/main: it is moved to the new history when nothing tracked was changed, its old commits kept in a backup branch.  Any other
@@ -7804,6 +7812,11 @@ def update_pull(argv: list) -> int | None:
         say("  This folder is a git clone, but git is not installed: install it ("
             + ("winget install Git.Git" if WIN else "sudo apt install git") + ") or run")
         say(f'  "git pull" here yourself, then run {"START-HERE.bat --update" if WIN else "./setup.sh --update"} again.')
+        return 1
+    if detached_head(git, repo):
+        say()
+        say("  This folder is on a fixed release, not a branch: run  git checkout main  here, then the update again")
+        say(f"  ({'START-HERE.bat --update' if WIN else './setup.sh --update'}). Nothing was updated.")
         return 1
     before = git_out(git, repo, "rev-parse", "HEAD")
     say("  Getting the newest Strata (git pull) ...")
