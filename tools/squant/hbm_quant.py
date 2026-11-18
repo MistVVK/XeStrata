@@ -47,10 +47,10 @@ def apply_h64_sym(H: torch.Tensor) -> torch.Tensor:
     H64 = get_h64(H.device)
     K = H.shape[0]
     nb = K // 64
-    # H: [nb, 64, nb, 64] -> multiply on both 64-axes by H64 (symmetric orthogonal!)
+    # H: [nb, 64, nb, 64] -> multiply on both 64-axes (dim 1 and dim 3) by symmetric orthogonal H64!
     t = H.to(torch.float32).reshape(nb, 64, nb, 64)
-    t = torch.einsum("ai,ibjc->abjc", H64, t)
-    t = torch.einsum("abjc,cd->abjd", t, H64)
+    t = torch.einsum("ai,piqj->paqj", H64, t)
+    t = torch.einsum("paqj,jb->paqb", t, H64)
     return t.reshape(K, K)
 
 

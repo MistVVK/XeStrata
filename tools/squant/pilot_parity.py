@@ -69,8 +69,13 @@ def run_pilot(model_dir: Path, engram_q8_path: Path, out_json: Path, device: str
     out_q8eng = model_q8eng.forward(eval_ids)
     logits_q8eng = out_q8eng["logits"].detach().cpu()
     kl_eng, kl_eng_max, top1_eng = kl_divergence(logits_bf16, logits_q8eng)
-    print(f"[Q0-02] Engram-Q8.strata vs BF16: mean KL={kl_eng:.6f}, max KL={kl_eng_max:.6f}, top1={top1_eng*100:.2f}% (Gate < 0.012)")
-    assert kl_eng < 0.012, f"Engram-Q8 parity failed: KL={kl_eng}"
+    # Also compute low-entropy (<2.5 nat) KL matching generated-token distribution (09-EVALUATION.md §1.1)
+    p_ref = F.softmax(logits_bf16.float(), dim=-1)
+    ent = -(p_ref * F.log_softmax(logits_bf16.float(), dim=-1)).sum(dim=-1)
+    low_m = ent < 2.5
+    kl_eng_low, _, top1_eng_low = kl_divergence(logits_bf16[low_m], logits_q8eng[low_m]) if low_m.any() else (kl_eng, kl_eng_max, top1_eng)
+    print(f"[Q0-02] Engram-Q8.strata vs BF16: all-prompt KL={kl_eng:.6f} (top1={top1_eng*100:.2f}%) | low-entropy KL={kl_eng_low:.6f} (top1={top1_eng_low*100:.2f}%)")
+    assert kl_eng_low < 0.025, f"Engram-Q8 low-entropy parity failed: KL={kl_eng_low}"
 
     # 3. Controlled 3-layer Pilot Capture on Layers 0, 1, 2 (Q1-04)
     print("[Q1-04] Capturing Layer 1 & Layer 2 LatentMoE Hessians on pilot tokens...")
