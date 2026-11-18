@@ -152,6 +152,7 @@ double Trainer::update(const AdamW& o, float gscale) {
     parts.reserve(params_.size());
     for (const Param& p : params_) parts.emplace_back(p.g, p.n);
     const double norm = std::sqrt(sq_sum(parts, s)) * (double) gscale;
+    if (!std::isfinite(norm)) throw std::runtime_error("training: non-finite gradient norm");
     const float clip = (float) std::min(1.0, 1.0 / (norm + 1e-6));   // torch's clip_grad_norm_ at 1
     ++steps;
     for (const Param& p : params_) adamw(p.w, p.g, p.m, p.v, p.n, o, steps, gscale * clip, s);

@@ -192,6 +192,7 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
         for (float& v : eps) v = gauss(rng);
         const auto ts = std::chrono::steady_clock::now();
         const float loss = tr.step(smp, x0, eps, sigma, kMoss ? 1.f : train::flow_weight(idx), true);
+        if (!std::isfinite(loss)) throw std::runtime_error("training: non-finite loss");
         const double norm = tr.adamw(o);
         loss_avg = step == 1 ? loss : 0.98 * loss_avg + 0.02 * loss;
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
