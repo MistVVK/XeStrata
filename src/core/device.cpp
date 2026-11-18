@@ -1114,8 +1114,7 @@ void apply_uma_limit(uint64_t& free, uint64_t total) {
             os_total = kb << 10;
         else if (key == "MemAvailable:")
             avail = kb << 10;
-        else
-            meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     }
     if (avail == 0) return;   // no figure to cut to: the device's own stands
 #endif
