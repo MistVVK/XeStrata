@@ -159,6 +159,7 @@ from serve import loras as lora_api
 from serve import envvars
 from serve import vram_ledger
 from serve import idle_watch
+from serve.tool_parallel import LENT as LENT_LANE
 from serve.image_daemon import START_TIMEOUT_S
 from serve.model_terms import _qimage
 
@@ -1630,11 +1631,151 @@ def long_job_left(svc) -> int | None:
     return job_left(getattr(svc, "long_job", None))
 
 
-def refuse_during_long_job(svc) -> None:
-    """LongJobBusy while a long job holds the image engine (another image job would wait for all of it)."""
-    left = long_job_left(svc)
+def refuse_during_long_job(svc, gen=None) -> None:
+    """LongJobBusy while a long job holds the image engine (another image job would wait for all of it): the long job
+    of `gen`'s card (its ImageModels': the image GPU's, or the text model's lent to the images), else the server's."""
+    owner = getattr(gen, "owner", None)
+    left = job_left(owner.long_job) if isinstance(owner, ImageModels) else long_job_left(svc)
     if left is not None:
         raise LongJobBusy(f"a video job has the image engine for about {left} s more: ask again then", left)
+
+
+# A request's GPU for its image job (gpu, or extra_params' gpu; xestrata_images' gpu for the chat's tools): "auto" (the
+# image GPU; the text model's, lent to the images, while a video job holds the image GPU), "image", "text" (the text
+# model's, which makes room for the job as on a shared card while the chat waits), or a card by the Monitor's number
+# (gpu_roles' order) or its PCI address
+GPU_CHOICES = ("auto", "image", "text")
+PCI_ADDRESS = re.compile(r"(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
+
+
+def parse_gpu(v, where: str = "gpu") -> str | int:
+    """A request's GPU (above) -> "auto", "image", "text", a card's number or its PCI address (lower case); none or
+    blank: "auto".  ImageRequestError for anything else."""
+    if v is None or isinstance(v, str) and not v.strip():
+        return "auto"
+    if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in GPU_CHOICES or PCI_ADDRESS.fullmatch(s):
+            return s
+        if s.isdigit():
+            return int(s)
+    raise ImageRequestError(f"{where}: auto, image, text, a GPU's number or its PCI address, not {v!r}")
+
+
+def gpu_field(req: dict) -> str | int:
+    """The images API's GPU: the request's "gpu", else its extra_params' (a JSON object, or a form's text of one)."""
+    v = req.get("gpu")
+    if v is None or isinstance(v, str) and not v.strip():
+        extra = req.get("extra_params")
+        if isinstance(extra, str) and extra.strip():
+            try:
+                extra = json.loads(extra)
+            except ValueError:
+                extra = None   # upscale_fields says what is wrong with it
+        v = extra.get("gpu") if isinstance(extra, dict) else None
+    return parse_gpu(v)
+
+
+def can_lend(models) -> bool:
+    """Whether the text model's GPU may take the image jobs: the images have a card of their own and the text model one
+    its own (not its helper card), ImageModels.lend_cfgs."""
+    return isinstance(models, ImageModels) and models.separate and models.lend_cfgs is not None
+
+
+def card_name(svc, pci: str | None) -> str:
+    """A card's name as the Monitor shows it (the telemetry's, without its " at <address>"), else its address."""
+    tel = getattr(svc, "telemetry", None)
+    try:
+        cards = tel.snapshot()["now"].get("gpus") or [] if tel is not None else []
+    except (AttributeError, KeyError, TypeError):
+        cards = []
+    want = str(pci or "").lower()
+    for c in cards:
+        if want and str(c.get("pci") or "").lower() == want and c.get("name"):
+            return re.sub(r" at [0-9a-fA-F:.]+$", "", str(c["name"]))
+    return want or "the GPU"
+
+
+def image_cards(svc) -> list[dict]:
+    """The cards a request may choose for its image jobs (/health's image_gpus, the web page's choice): the image GPU
+    and the text model's (lent to the images), each with its id ("image", "text"), number (the Monitor's), address and
+    name; [] where the images have one card (a card of their own the text model cannot lend, or the text model's)."""
+    models = getattr(svc, "images", None)
+    if not isinstance(models, ImageModels) or not can_lend(models):
+        return []
+    roles = getattr(svc, "gpu_roles", None) or []
+    out = []
+    for cid, pci in (("image", models.gpu_pci), ("text", models.lend_pci)):
+        num = next((i for i, c in enumerate(roles) if pci and str(c.get("pci") or "").lower() == str(pci).lower()),
+                   None)
+        out.append({"id": cid, "index": num, "pci": pci, "name": card_name(svc, pci)})
+    return out
+
+
+def card_of(svc, gpu) -> str:
+    """parse_gpu's choice as "auto", "image" or "text": a card's number (the Monitor's, svc.gpu_roles) or address is the
+    image GPU's or the text model's lent to the images; ImageRequestError for a card that takes no image job here."""
+    if gpu in GPU_CHOICES:
+        return gpu
+    roles = getattr(svc, "gpu_roles", None) or []
+    if isinstance(gpu, int):
+        if gpu >= len(roles):
+            raise ImageRequestError(f"gpu: {gpu} is no GPU of this server's"
+                                    + (f" (0 to {len(roles) - 1})" if roles else ""))
+        card = roles[gpu]
+    else:
+        card = next((c for c in roles if str(c.get("pci") or "").lower() == gpu), {"pci": gpu, "roles": []})
+    pci = str(card.get("pci") or "").lower()
+    models = getattr(svc, "images", None)
+    if "image" in (card.get("roles") or ()):
+        return "image"
+    if isinstance(models, ImageModels) and can_lend(models) and pci and pci == str(models.lend_pci or "").lower():
+        return "text"
+    choices = ", ".join(f"{c['index']} ({c['id']})" for c in image_cards(svc) if c["index"] is not None)
+    where = f"; one of {choices}" if choices else "; the images have one GPU here"
+    raise ImageRequestError(f"gpu: {gpu!r} makes no images here{where}")
+
+
+def place(svc, gen: ImageGen, gpu) -> tuple[ImageGen, dict | None]:
+    """The image model `gen` on the GPU a request chose (parse_gpu's `gpu`) -> (its engine there, what the answer says
+    of the card when the job leaves the image GPU: {"card": "text", "name", "pci", and with "auto" "busy": "video" and
+    "busy_name", "left_s"}; None on the image GPU).  "text" where the images share the text model's card is that card;
+    where its GPU cannot be lent (its helper card) an ImageRequestError.  "auto" takes the text model's GPU while a
+    video job holds the image GPU (the user's decision, 2026-11-19: neither a refusal nor a wait for the video's end),
+    and the image GPU else - where none can be lent, the refusal it gives (LongJobBusy)."""
+    models = getattr(svc, "images", None)
+    if not isinstance(models, ImageModels) or getattr(gen, "owner", None) is not models:
+        return gen, None   # a model of the lent GPU's already, or a server without image models (tests)
+    card = card_of(svc, gpu)
+    lend = can_lend(models)
+    if card == "text":
+        if not models.separate:
+            return gen, None   # the images share the text model's card: the same
+        if not lend:
+            raise ImageRequestError("gpu: text: the image jobs run on the text model's helper GPU here; leave gpu out")
+        return models.lent().gens[gen.model], {"card": "text", "pci": models.lend_pci,
+                                               "name": card_name(svc, models.lend_pci)}
+    if card == "auto" and lend:
+        state = models.long_job
+        left = job_left(state)
+        if left is not None and state is not None and state.get("thread") != threading.get_ident():
+            return models.lent().gens[gen.model], {
+                "card": "text", "pci": models.lend_pci, "name": card_name(svc, models.lend_pci), "busy": "video",
+                "busy_name": card_name(svc, models.gpu_pci), "left_s": left}
+    return gen, None
+
+
+def place_words(moved: dict | None) -> str:
+    """What a tool's result says of place's card (the chat's model tells the user)."""
+    if not moved:
+        return ""
+    if moved.get("busy"):
+        return (f" A video job has {moved['busy_name']}, the image GPU, for about {moved['left_s']} s more, so this "
+                f"was made on {moved['name']}, the chat model's GPU, instead (the chat waited meanwhile): tell the "
+                "user so in a few words.")
+    return f" Made on {moved['name']}, the chat model's GPU, as asked (the chat waited meanwhile)."
 
 
 # The request's mark of the page that sent it (the web app's X-XeStrata-Job header, serve/server.py), kept with the
@@ -3959,8 +4100,12 @@ class ImageModels:
         # the text model's GPU lent to the images (use_text_gpu, tool_parallel): the same models with the text engine's
         # environment, made when first lent (server.py sets lend_cfgs on a card of their own)
         self.lend_cfgs: tuple | None = None
+        self.lend_pci: str | None = None   # that GPU's address (server.py, with lend_cfgs)
         self._lent: ImageModels | None = None
         self._lent_lock = threading.Lock()
+        # a long job's state while it holds this GPU's image engine (videos.upscale's; also svc.long_job, the chat's):
+        # another job asked of this GPU is refused (refuse_during_long_job), one of "auto" goes to the lent GPU (place)
+        self.long_job: dict | None = None
 
     def lending(self) -> bool:
         """Whether a job runs on the text model's GPU, lent to the images, now (the chat's requests wait meanwhile)."""
@@ -4417,7 +4562,7 @@ class ImageTools:
 
     def __init__(self, svc, images, messages: list, load, normalize, options: dict | None = None,
                  model: str | None = None, mask: bytes | None = None, user: dict | None = None,
-                 skills: str = "index", tools=None, text_gpu=None, all_tools=None):
+                 skills: str = "index", tools=None, text_gpu=None, all_tools=None, gpu=None):
         self.models = images if isinstance(images, ImageModels) else None
         gen = images.default if isinstance(images, ImageModels) else images
         if model is not None:   # the request's own image model (xestrata_images {"model": ...}): that one alone
@@ -4463,6 +4608,9 @@ class ImageTools:
         # ask: the chat's model asks for it by a call's use_text_gpu, on), the request's xestrata_images
         # use_text_gpu over it
         self.text_gpu = text_gpu_mode(gen.cfg.get("use_text_gpu"), text_gpu)
+        # the GPU of every image and video job of the request (xestrata_images' gpu, parse_gpu's; the web page's
+        # choice): "auto" as above, "image" never lent, "text" every job on the text model's GPU (place)
+        self.gpu = card_of(svc, parse_gpu(gpu, "xestrata_images.gpu"))
         # the tools beyond CORE_TOOLS declared once their skills are read (template_tools); all_tools: every one at
         # once (the image button's request, the Responses route's, xestrata_images' all_tools)
         self.all_tools = skills == "inline" or all_tools is True
@@ -4630,7 +4778,8 @@ class ImageTools:
                 t = self._with_lora(t, gens)
             params = dict(t["parameters"])   # the plan's step and group (combine-tools), every tool's
             params["properties"] = {**params["properties"], **PLAN_ARGS}
-            if self.text_gpu == "ask" and t["name"] not in ("upscale_video", "segment_video") and self._can_lend():
+            if self.text_gpu == "ask" and self.gpu == "auto" and t["name"] not in ("upscale_video", "segment_video") \
+                    and self._can_lend():
                 params["properties"]["use_text_gpu"] = {"type": "boolean"}
             t["parameters"] = params
             if len(self._gens()) > 1:   # the model's choice: each one's name and what it is good for
@@ -4907,9 +5056,12 @@ class ImageTools:
             return "now", "", False
         if name == "upscale_image" and args.get("method") == "lanczos" and not args.get("redraw"):
             return "now", "lanczos", False
+        # the request's "text": every GPU job on the text model's GPU, lent to the images, one after another
+        lane = LENT_LANE if self.gpu == "text" and can_lend(self.models or getattr(self.svc, "images", None)) \
+            else "images"
         if name in ("find_region", "remove_background"):
             gens = self._gens()
-            return "images", gens[0].model if gens else self.gen.model, False
+            return lane, gens[0].model if gens else self.gen.model, False
         if args.get("layout") not in (None, "", {}):
             gens = self._gens(name in EDIT_TOOLS)
             gens = [g for g in gens if _pipeline(g.family) == "latent_chat"] or gens
@@ -4919,11 +5071,10 @@ class ImageTools:
                 _, gen, _ = self._control_choice(name, args)
             except ImageRequestError:   # call reports the error; planning must not abort the conversation
                 gen = self.gen
-        return "images", gen.model, self.may_lend(args)
+        return lane, gen.model, lane == "images" and self.may_lend(args)
 
     def _can_lend(self) -> bool:
-        models = self.models or getattr(self.svc, "images", None)
-        return isinstance(models, ImageModels) and models.separate and models.lend_cfgs is not None
+        return can_lend(self.models or getattr(self.svc, "images", None))
 
     def may_lend(self, args: dict) -> bool:
         """Whether a call may run on the text model's GPU, lent to the images: the images have a card of their own
@@ -4931,7 +5082,7 @@ class ImageTools:
         use_text_gpu) is on, or ask with the call's use_text_gpu; and no other request's text is being written or waits
         (a lent GPU makes them wait)."""
         models = self.models or getattr(self.svc, "images", None)
-        if not isinstance(models, ImageModels) or not models.separate or models.lend_cfgs is None:
+        if not can_lend(models) or self.gpu == "image":
             return False
         mode = self.text_gpu
         if mode == "off" or mode == "ask" and args.get("use_text_gpu") is not True:
@@ -5099,7 +5250,8 @@ class ImageTools:
             model = f"seedvr2-{variant}" if method in ("seedvr2", "auto") and variant else method
             if model not in UPSCALE_MODELS and model not in UPSCALE_METHODS:
                 model = method
-            fields = {"model": model, **{k: args[k] for k in ("scale", "seed") if args.get(k) not in (None, "")}}
+            fields = {"model": model, **{k: args[k] for k in ("scale", "seed") if args.get(k) not in (None, "")},
+                      **({"gpu": self.gpu} if self.gpu != "auto" else {})}
             rec = videos.start_from_file(self.svc, videos.jobs_of(self.svc), f, fields, self.gen.cfg)
             src = rec["source"]
             text = (f"The upscale runs on the server as job {rec['id']}: {src['frames']} frames, "
@@ -5126,7 +5278,8 @@ class ImageTools:
             if isinstance(prompts, str):
                 prompts = [prompts]
             fields = {"prompts": json.dumps([str(p) for p in prompts]), "outputs": json.dumps(["overlay", "mask"]),
-                      "mask_video": "true" if args.get("masks") else "false"}
+                      "mask_video": "true" if args.get("masks") else "false",
+                      **({"gpu": self.gpu} if self.gpu != "auto" else {})}
             check_tool(self.gen.cfg, "segment_video")
             rec = videos.start_from_file(self.svc, videos.jobs_of(self.svc), f, fields, self.gen.cfg, "segment")
             src = rec["source"]
@@ -5144,7 +5297,7 @@ class ImageTools:
         return {"ok": ok, "text": text, "chars": len(text), "truncated": False,
                 "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "segment_video", "images": []}
 
-    def _aux_tool(self, name: str, args: dict, t0: float, cancel: threading.Event | None) -> dict:
+    def _aux_tool(self, name: str, args: dict, t0: float, cancel: threading.Event | None, lend: bool = False) -> dict:
         """find_region (the region marked on the image: image_regions.segment) and remove_background (BiRefNet's
         cut-out, image_regions.matte): an image shown to the user, nothing drawn by the image model."""
         from serve import image_regions
@@ -5157,6 +5310,7 @@ class ImageTools:
             gens = self._gens()
             gen = gens[0] if gens else self.gen
             check_tool(gen.cfg, name)
+            gen, moved = (self.svc.images.lent().gens[gen.model], None) if lend else place(self.svc, gen, self.gpu)
             picture = self.normalize(data)
             if name == "find_region":   # `prompt` read as the words too: the name a chat model reaches for first
                 region = str(args.get("region") or args.get("prompt") or "").strip()
@@ -5185,6 +5339,7 @@ class ImageTools:
                         f"{got['seconds']:.1f} s"
                         + (f"; {got['fallback']}" if got.get("fallback") else "")
                         + f") and the user sees it: {url}.")
+            text += place_words(moved)
             if name != "find_region":   # the marked picture shown to the user is not the source of the next tool
                 self.made.append(url.rsplit("/", 1)[1])
             urls = [url]
@@ -5236,7 +5391,7 @@ class ImageTools:
         if name == "train_lora":
             return self._train_lora_tool(args, t0)
         if name in ("find_region", "remove_background", "upscale_video", "segment_video"):
-            r = (self._aux_tool(name, args, t0, cancel) if name in ("find_region", "remove_background") else
+            r = (self._aux_tool(name, args, t0, cancel, lend) if name in ("find_region", "remove_background") else
                  self._video_tool(args, t0) if name == "upscale_video" else self._segment_video_tool(args, t0))
             if r["ok"]:
                 self.done_calls[key] = (r.get("images") or ["done"])[0]
@@ -5286,8 +5441,11 @@ class ImageTools:
                                  {k: args[k] for k in ("left", "top", "right", "bottom")
                                   if args.get(k) not in (None, "")})
             gens, gen, switched_from = self._control_choice(name, args)
+            moved = None
             if lend:   # the same model's engine on the text model's GPU (ImageModels.lent)
                 gen = self.svc.images.lent().gens[gen.model]
+            else:      # the request's GPU, or "auto"'s while a video job holds the image GPU
+                gen, moved = place(self.svc, gen, self.gpu)
             if merged:
                 req["n"] = merged
             if req.get("guidance") not in (None, "", []) and not guidance_methods(gen.cfg):
@@ -5388,6 +5546,7 @@ class ImageTools:
                 text += f" The original image was reduced to {job['extend_scale']:.1%} before extending it."
             if switched_from:
                 text += f" Changed image model from {switched_from} to {gen.model}: it takes this control."
+            text += place_words(moved)
             if found is not None:   # where edit_region drew, and its mask (another tool may take it)
                 mask_url = f"/v1/images/files/{gen.store(mask_to_bw(job['mask']), 'png')}"
                 text += (f" edit_region redrew {len(found['instances'])} {args['region']!r} region(s) that "
@@ -6027,7 +6186,7 @@ def _gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = No
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
     once no slot is generating), and the text engine made room for it per the policy.  Yields the policy used.  On a
     card of its own (ImageModels.separate), that card's turn alone (separate_turn)."""
-    refuse_during_long_job(svc)
+    refuse_during_long_job(svc, gen)
     owner = getattr(gen, "owner", None) or getattr(svc, "images", None)   # the lent text GPU's models: their own
     if isinstance(owner, ImageModels) and owner.separate:
         with separate_turn(svc, gen, job, cancel) as policy:

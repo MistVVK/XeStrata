@@ -276,8 +276,16 @@ def upscale_request(fields: dict, info: dict, cfg: dict, sync: bool) -> dict:
         job = img.ups_only_job({"prompt": "upscale", "seed": fields.get("seed")}, cfg, w, h, up)   # its seed too
     except img.ImageRequestError as e:   # the video entries' 400 (explain: invalid_video)
         raise VideoRequestError(str(e)) from None
-    job.update(video=True, chunk=chunk, overlap=overlap, codec=codec, source=info)
+    job.update(video=True, chunk=chunk, overlap=overlap, codec=codec, source=info, gpu=gpu_of(fields))
     return job
+
+
+def gpu_of(fields: dict) -> str | int:
+    """The form's GPU for the job (images.gpu_field: gpu, else extra_params' gpu), else a VideoRequestError."""
+    try:
+        return img.gpu_field(fields)
+    except img.ImageRequestError as e:
+        raise VideoRequestError(str(e)) from None
 
 
 def _json_field(fields: dict, name: str):
@@ -361,7 +369,8 @@ def segment_request(fields: dict, info: dict, sync: bool) -> dict:
                                 f"{info['frames']}); job true makes a job of it")
     return {"segment": {"words": words, "clicks": clicks, "mask_video": flag_field(fields, "mask_video"),
                         "outputs": list(dict.fromkeys(outputs))},
-            "width": info["width"], "height": info["height"], "n": 1, "steps": 1, "seed": 0, "source": info}
+            "width": info["width"], "height": info["height"], "n": 1, "steps": 1, "seed": 0, "source": info,
+            "gpu": gpu_of(fields)}
 
 
 def segment_answer(got: dict, job: dict, model: str, out: Path) -> dict:
@@ -418,12 +427,31 @@ def segment_answer(got: dict, job: dict, model: str, out: Path) -> dict:
     return {"path": out, "files": files, "objects": objects}
 
 
+def hold_long_job(svc, gen, state: dict, held: bool) -> None:
+    """A video job's state while it holds `gen`'s engine (`held` false: no more): the engine's (images.EngineLock), its
+    card's (images.ImageModels.long_job: refuse_during_long_job, place's "auto") and the server's (svc.long_job: the
+    chat's Service.load, the Monitor).  Two can run at once, one on each card (the text model's GPU lent to a video's
+    gpu "text"): the server's is the one that refuses the chat (the text engine made way for it, policy unload), else
+    the first."""
+    owner = getattr(gen, "owner", None)
+    with LONG_LOCK:
+        jobs = [s for s in getattr(svc, "long_jobs", None) or [] if s is not state] + ([state] if held else [])
+        svc.long_jobs = jobs
+        svc.long_job = next((s for s in jobs if s.get("policy") == "unload"), jobs[0] if jobs else None)
+        gen.long_job = state if held else None
+        if isinstance(owner, img.ImageModels):
+            owner.long_job = state if held else None
+
+
+LONG_LOCK = threading.Lock()
+
+
 def segment(svc, gen, job: dict, source: Path, stem: Path, model: str, progress: Callable[[int, int], None] | None,
             cancel: threading.Event | None) -> dict:
     """A segmentation's run: SAM 3.1's weights and its license (image_regions'), the words' CLIP tokens, then the
     engine's SEGV in the image jobs' GPU turn -> segment_answer's, with "figures"."""
     from serve import image_regions as regions
-    img.refuse_during_long_job(svc)
+    img.refuse_during_long_job(svc, gen)
     if image_aux.needs_consent("sam3", regions.root_of(gen)):
         raise img.ImageRequestError(regions.sam3_consent_words())
     weights, tok = regions.weights(gen, regions.seg_files(regions.SAM3))
@@ -447,11 +475,11 @@ def segment(svc, gen, job: dict, source: Path, stem: Path, model: str, progress:
             state.update(done=done, total=total)
             if progress is not None:
                 progress(done, total)
-        svc.long_job = gen.long_job = state
+        hold_long_job(svc, gen, state, True)
         try:
             got = gen.segment_video(weights, source, prompts, stem, seg, cancel, told)
         finally:
-            svc.long_job = gen.long_job = None
+            hold_long_job(svc, gen, state, False)
     answer = segment_answer(got, job, model, stem.parent / "segmentation.json")
     figures = {"seconds": round(time.monotonic() - t0, 2), "engine": "xestrata-image", "model": regions.SAM3,
                "frames": int(got.get("frames", 0)), "fps": float(got.get("fps", 0)),
@@ -633,7 +661,7 @@ def jobs_of(svc) -> VideoJobs:
     with svc.status_lock:
         if svc.video_jobs is None:
             def run(job, progress, cancel, source, stem, model):
-                gen = svc.images.pick_edit(None, True)
+                gen, _ = img.place(svc, svc.images.pick_edit(None, True), job.get("gpu", "auto"))
                 if job.get("segment"):
                     return segment(svc, gen, job, source, stem, model, progress, cancel)
                 return upscale(svc, gen, job, source, stem, progress, cancel)
@@ -697,6 +725,7 @@ def start_from_file(svc, jobs: VideoJobs, f: Path, fields: dict, cfg: dict, kind
     folder, the request's `fields` as the form's -> the job's record."""
     info = probe(f)
     job = segment_request(fields, info, False) if kind == "segment" else upscale_request(fields, info, cfg, False)
+    img.card_of(svc, job["gpu"])   # a card that takes no image job: refused before the job
     vid, folder = jobs.new_dir()
     dest = folder / ("input" + f.suffix)
     try:
@@ -724,7 +753,7 @@ def upscale(svc, gen, job: dict, source: Path, stem: Path, progress: Callable[[i
             cancel: threading.Event | None) -> dict:
     """An upscale job's run: its upscaler's weights (images.upscaler_weights: AuxPending while they download), SeedVR2
     where it fits (auto), then the engine's UPSV in the image jobs' GPU turn -> {"path", "mime", "figures"}."""
-    img.refuse_during_long_job(svc)
+    img.refuse_during_long_job(svc, gen)
     img.upscaler_weights(gen, job)
     img.seedvr2_or_realesrgan(gen, job)
     t0 = time.monotonic()
@@ -738,11 +767,11 @@ def upscale(svc, gen, job: dict, source: Path, stem: Path, progress: Callable[[i
             state.update(done=done, total=total)
             if progress is not None:
                 progress(done, total)
-        svc.long_job = gen.long_job = state
+        hold_long_job(svc, gen, state, True)
         try:
             got = gen.upscale_video(job, source, stem, cancel, told)
         finally:
-            svc.long_job = gen.long_job = None
+            hold_long_job(svc, gen, state, False)
     u = job["upscaler"]
     figures = {"seconds": round(time.monotonic() - t0, 2), "engine": "xestrata-image",
                "size": f"{job['width']}x{job['height']}", "seed": job["seed"],

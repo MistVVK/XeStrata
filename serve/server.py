@@ -4282,6 +4282,14 @@ def card_env(cfg: dict, env: dict, pci: str, what: str, who: str) -> tuple[dict,
     return out, True, f"{what}: {want} (separate from the text model's)"
 
 
+def with_gpu(body: dict, moved: dict | None) -> dict:
+    """An image tool's answer with images_api.place's word of the card in its "xestrata" figures, when the job left the
+    image GPU."""
+    if moved and isinstance(body, dict):
+        body["xestrata"] = {**(body.get("xestrata") or {}), "gpu": moved}
+    return body
+
+
 def gpu_roles(cfg: dict, gpu_pci: str | None, groups: list | None = None, split_serve: dict | None = None,
               image_pci: str | None = None, helper_card: str = "") -> list[dict]:
     """The cards the server's engines run on and what each does, the Monitor's tabs (serve/telemetry.py's `gpus`):
@@ -4650,6 +4658,7 @@ class Service:
         self.translation: Any = None                      # Translation when the config has "translate"
         self.video_jobs: Any = None                       # serve/videos.py's VideoJobs, made at the first video request
         self.long_job: Any = None                         # a video job's state while it holds the image engine
+        self.long_jobs: list = []                         # every video job's, one a card (videos.hold_long_job)
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = stop_token_ids(tokenizer)
         if hasattr(engine, "eos_ids"):
@@ -8595,6 +8604,9 @@ def make_handler(svc: Service):
                                  "image_text_gpu": {"mode": images_api.text_gpu_mode(
                                      svc.images.default.cfg.get("use_text_gpu")), "lent": svc.images.lending()}
                                  if svc.images is not None and svc.images.lend_cfgs is not None else None,
+                                 # the cards a request may choose for its image and video jobs (gpu): the image GPU
+                                 # and the text model's; none where the images have one
+                                 "image_gpus": images_api.image_cards(svc) if svc.images is not None else [],
                                  "video": videos_api.status(svc.images.default.cfg,
                                                             Path(svc.images.default.dir) / "video-jobs")
                                  if svc.images is not None else None,
@@ -9281,14 +9293,15 @@ def make_handler(svc: Service):
                 return
             gen = svc.images.pick(req.get("model"))             # the image model it names, else the default
             images_api.check_tool(gen.cfg, "generate_image")    # the config's image_tools, at every entry
+            gen, moved = images_api.place(svc, gen, images_api.gpu_field(req))   # the GPU it chose (gpu)
             req = controls_api.gather(req)
             if req.get("control") is not None:                  # the composition from a picture (image_controls)
                 images_api.check_tool(gen.cfg, "control")
                 job = controls_api.parse_job(req, gen.cfg, picture=self._control_picture(req))
-                self._image_job(gen, job, req.get("stream") is True, edit=job.get("refs") is not None)
+                self._image_job(gen, job, req.get("stream") is True, edit=job.get("refs") is not None, moved=moved)
                 return
             job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
-            self._image_job(gen, job, req.get("stream") is True)
+            self._image_job(gen, job, req.get("stream") is True, moved=moved)
 
         def _control_picture(self, req: dict) -> bytes | None:
             """The control's picture: the multipart control_image, else control.image given as an http(s) URL or a
@@ -9357,6 +9370,7 @@ def make_handler(svc: Service):
             gen = svc.images.pick_edit(req.get("model"), req.get("strength") is not None or mask is not None
                                        or region not in (None, ""))
             images_api.check_tool(gen.cfg, "edit_image")
+            gen, moved = images_api.place(svc, gen, images_api.gpu_field(req))   # the GPU it chose (gpu)
             if region not in (None, ""):   # the words' mask (image_regions: SAM 3 or Florence-2) in the GPU's turn
                 images_api.check_tool(gen.cfg, "edit_region")
                 if mask is not None:
@@ -9384,7 +9398,7 @@ def make_handler(svc: Service):
             else:
                 job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files],
                                                     gen.cfg, mask)
-            self._image_job(gen, job, req.get("stream") is True, edit=True)
+            self._image_job(gen, job, req.get("stream") is True, edit=True, moved=moved)
 
         def _images_upscale(self):
             """POST /v1/images/upscale (LocalAI's upscale; images_api.upscale_request): one image in a multipart form
@@ -9397,8 +9411,9 @@ def make_handler(svc: Service):
             req, model = images_api.upscale_request(fields)
             gen = svc.images.pick_edit(model, True)
             images_api.check_tool(gen.cfg, "upscale_image")
+            gen, moved = images_api.place(svc, gen, images_api.gpu_field(fields))   # the GPU it chose (gpu)
             job = images_api.parse_edit_request(req, [Vision.normalize(picture, keep_alpha=True)], gen.cfg)
-            self._image_job(gen, job, edit=True)
+            self._image_job(gen, job, edit=True, moved=moved)
 
         def _lora_jobs(self) -> lora_train_api.TrainJobs:
             return lora_train_api.jobs_of(svc)
@@ -9558,6 +9573,7 @@ def make_handler(svc: Service):
                 if seg:
                     images_api.check_tool(gen.cfg, "segment_video")
                     job = videos_api.segment_request(fields, info, sync)
+                    images_api.card_of(svc, job["gpu"])   # a card that takes no image job: 400 before the job
                     model = str(fields.get("model") or "sam3.1")
                     if model not in ("auto", *regions_api.SEG_ALIASES) or \
                             regions_api.SEG_ALIASES.get(model, regions_api.SAM3) != regions_api.SAM3:
@@ -9572,6 +9588,7 @@ def make_handler(svc: Service):
                         return
                     cancel = threading.Event()
                     self._watch_client(cancel)
+                    gen, _ = images_api.place(svc, gen, job["gpu"])
                     out = videos_api.segment(svc, gen, job, src["path"], folder / "out", model, None, cancel)
                     f = Path(out["path"])
                     self.send_response(200)
@@ -9586,6 +9603,7 @@ def make_handler(svc: Service):
                     return
                 images_api.check_tool(gen.cfg, "upscale_image")
                 job = videos_api.upscale_request(fields, info, gen.cfg, sync)
+                images_api.card_of(svc, job["gpu"])   # a card that takes no image job: 400 before the job
                 model = str(fields.get("model") or "auto")
                 svc.last_request_at = time.time()
                 if not sync:
@@ -9596,6 +9614,7 @@ def make_handler(svc: Service):
                 cancel = threading.Event()
                 self._watch_client(cancel)
                 t0 = time.monotonic()
+                gen, _ = images_api.place(svc, gen, job["gpu"])
                 out = videos_api.upscale(svc, gen, job, src["path"], folder / "out", None, cancel)
                 f = Path(out["path"])
                 self.send_response(200)
@@ -9787,21 +9806,24 @@ def make_handler(svc: Service):
             picture = Vision.normalize(picture)
             gen = next((g for g in svc.images.gens.values() if g.engine.alive()), svc.images.default)
             images_api.check_tool(gen.cfg, "find_region" if path.endswith("segmentations") else "remove_background")
+            gen, moved = images_api.place(svc, gen, images_api.gpu_field(fields))   # the GPU it chose (gpu)
             svc.last_request_at = time.time()
             cancel = threading.Event()
             self._watch_client(cancel)
             try:
                 if path == "/v1/images/segmentations":
                     print(f"[xestrata] segmentation: {str(fields.get('prompt') or '')[:60]!r}", flush=True)
-                    self._json(200, regions_api.segmentation_response(svc, gen, fields, picture, cancel))
+                    self._json(200, with_gpu(regions_api.segmentation_response(svc, gen, fields, picture, cancel),
+                                             moved))
                 elif path == "/v1/images/remove-background":
                     req = regions_api.remove_background_request(fields)
                     print(f"[xestrata] remove background: BiRefNet {req['version']}", flush=True)
                     addr = cast(Any, self.server.server_address)
                     host = self.headers.get("Host") or f"{addr[0]}:{addr[1]}"
                     scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
-                    self._json(200, regions_api.remove_background_response(svc, gen, req, picture,
-                                                                           f"{scheme}://{host}", cancel))
+                    self._json(200, with_gpu(regions_api.remove_background_response(svc, gen, req, picture,
+                                                                                    f"{scheme}://{host}", cancel),
+                                             moved))
                 else:   # Stability's: the image's bytes, or with Accept application/json {"image": base64}
                     data, fmt = regions_api.stability_remove_background(svc, gen, fields, picture, cancel)
                     if "application/json" in (self.headers.get("Accept") or ""):
@@ -9827,6 +9849,7 @@ def make_handler(svc: Service):
             fields, picture = self._one_image()
             gen = next((g for g in svc.images.gens.values() if g.engine.alive()), svc.images.default)
             images_api.check_tool(gen.cfg, "control")
+            gen, _ = images_api.place(svc, gen, images_api.gpu_field(fields))   # the GPU it chose (gpu)
             req = controls_api.preview_request(fields, Vision.normalize(picture))
             svc.last_request_at = time.time()
             cancel = threading.Event()
@@ -9876,9 +9899,10 @@ def make_handler(svc: Service):
             self._json(200, {**{k: v for k, v in got.items() if k != "path"},
                              "accepted": not image_aux.needs_consent(name, root)})
 
-        def _image_job(self, gen, job, stream=False, edit=False):
+        def _image_job(self, gen, job, stream=False, edit=False, moved=None):
             """One image job (a generation or an edit) in the GPU's turn, answered as OpenAI's images API does: one
-            JSON body, or with `stream` its events (_image_stream)."""
+            JSON body, or with `stream` its events (_image_stream).  `moved`: images_api.place's word of the card,
+            the figures' "gpu"."""
             svc.last_request_at = time.time()
             cancel = threading.Event()
             self._watch_client(cancel)
@@ -9889,13 +9913,18 @@ def make_handler(svc: Service):
             if job.get("lora_unknown"):
                 print(f"[xestrata] image: no such LoRA {', '.join(job['lora_unknown'])} in this model's folder: "
                       "left out of the prompt", flush=True)
+            if moved:
+                print(f"[xestrata] image: on {moved['name']}, the text model's GPU"
+                      + (f" ({moved['busy_name']} has a video job)" if moved.get("busy") else ""), flush=True)
             if stream:
-                return self._image_stream(gen, job, cancel, edit)
+                return self._image_stream(gen, job, cancel, edit, moved)
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
             try:
                 images, figures, policy = images_api.make_images(svc, gen, job, cancel)
                 figures["gpu_policy"] = policy
+                if moved:
+                    figures["gpu"] = moved
                 print(f"[xestrata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
                 body = gen.response(images, job, figures, f"{scheme}://{host}")   # cjxl may fail (jxl)
             except images_api.LoraRejected as e:   # an adapter the request names, which the engine does not take
@@ -9919,7 +9948,7 @@ def make_handler(svc: Service):
                 return
             self._json(200, body)
 
-        def _image_stream(self, gen, job, cancel, edit):
+        def _image_stream(self, gen, job, cancel, edit, moved=None):
             """OpenAI's streamed images: image_generation.partial_image events (image_edit.* for an edit) as the
             engine makes the job's partial_images, then one .completed event an image (b64_json, with the usage on
             each; and as the JSON body has, its seed and the "xestrata" figures), as SSE.  A failure after the stream
@@ -9942,6 +9971,8 @@ def make_handler(svc: Service):
                     images, figures, policy = images_api.make_images(svc, gen, job, cancel,
                                                                      preview if job.get("partial_images") else None)
                     figures["gpu_policy"] = policy
+                    if moved:
+                        figures["gpu"] = moved
                     print(f"[xestrata] image done in {figures['seconds']:.1f} s ({policy}, stream)", flush=True)
                     result["images"], result["figures"] = images, figures
                 except Exception as e:  # noqa: BLE001 - said in the stream: its status is sent already
@@ -10458,7 +10489,8 @@ def make_handler(svc: Service):
                                                     text_gpu=want.get("use_text_gpu") if isinstance(want, dict)
                                                     else None,
                                                     all_tools=want.get("all_tools") if isinstance(want, dict)
-                                                    else None)
+                                                    else None,
+                                                    gpu=want.get("gpu") if isinstance(want, dict) else None)
                 if user:
                     images_api.note_marks(messages, user)
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
@@ -12328,6 +12360,7 @@ def _main() -> int:
             if separate and not svc.images.helper_card:   # the text model's GPU may be lent to them (use_text_gpu)
                 text_pci = envvars.get("GPU_PCI", env=text_env) or gpu_select.selected_pci(icfgs[0]["exe"], text_env)
                 svc.images.lend_cfgs = (icfgs, ilog, gpu_select.scope(icfgs[0]["exe"], text_env, text_pci))
+                svc.images.lend_pci = str(text_pci or "").lower() or None
             svc.images.gpu_pci = envvars.get("GPU_PCI", env=ienv) if separate else None   # the Monitor's image card
         except ValueError as e:
             raise SystemExit(f"[xestrata] config: {e}")
