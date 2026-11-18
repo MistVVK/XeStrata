@@ -65,17 +65,53 @@ main() {
     Darwin-x86_64) die "this Mac has an Intel processor. Strata for Mac needs Apple silicon (M1 or newer), so it could not run a model here." ;;
     *) die "this computer ($os $arch) has no Strata Terminal. Supported: Linux x86_64 with an NVIDIA or AMD card, Linux ARM64 on an NVIDIA DGX Spark, macOS on Apple silicon (Windows: use install.ps1)." ;;
   esac
+  # The cards, for the person to read (nothing here decides which engine is used). Every card is named, with its count when several are the
+  # same ("2 x NVIDIA RTX A4000"); a name carries its maker once ("NVIDIA RTX A4000", not "NVIDIA NVIDIA RTX A4000").
+  # <cards>
+  with_maker() {     # $1 maker, $2 name: the name with the maker in front unless it already starts with it
+    case "$2" in "$1"*) printf '%s\n' "$2" ;; *) printf '%s %s\n' "$1" "$2" ;; esac
+  }
+  pci_card() {       # $1 an lspci line after the class (maker, chip, [product], (rev xx)): a plain name; nothing for a maker that is not ours
+    s=$(printf '%s' "$1" | sed -e 's/ *(rev [0-9A-Fa-f]*)//' -e 's/^ *//' -e 's/ *$//')
+    case "$s" in
+      "Advanced Micro Devices, Inc. [AMD/ATI]"*) maker=AMD; rest=${s#"Advanced Micro Devices, Inc. [AMD/ATI]"} ;;
+      "NVIDIA Corporation"*) maker=NVIDIA; rest=${s#"NVIDIA Corporation"} ;;
+      "Intel Corporation"*) maker=Intel; rest=${s#"Intel Corporation"} ;;
+      *) return 0 ;;
+    esac
+    rest=$(printf '%s' "$rest" | sed 's/^ *//')
+    case "$rest" in
+      "Device "*)    # a pciutils that does not know the id yet (a new card): the ids Strata's engines cover are named here
+        id=$(printf '%s' "${rest#Device }" | tr 'A-F' 'a-f' | cut -c1-4)
+        case "$maker:$id" in
+          AMD:7550) printf '%s\n' "AMD Radeon RX 9070 series" ;;
+          AMD:7551) printf '%s\n' "AMD Radeon AI PRO R9700" ;;
+          AMD:7590) printf '%s\n' "AMD Radeon RX 9060 XT" ;;
+          *) printf '%s\n' "$maker graphics card (PCI device $id)" ;;
+        esac ;;
+      *"["*"]"*)     # the product name in brackets ("Navi 48 [Radeon RX 9070/9070 XT]", "DG2 [Arc A750]") is the name a person knows
+        with_maker "$maker" "$(printf '%s' "$rest" | sed 's/^[^[]*\[\(.*\)\]$/\1/')" ;;
+      *) with_maker "$maker" "$rest" ;;
+    esac
+  }
+  list_cards() {     # stdin: one card name per line; stdout: "A, 2 x B"
+    awk 'NF { c[$0]++; if (!($0 in o)) { o[$0] = ++n; k[n] = $0 } } END { for (i = 1; i <= n; i++) printf "%s%s%s", (i > 1 ? ", " : ""), (c[k[i]] > 1 ? c[k[i]] " x " : ""), k[i]; printf "\n" }'
+  }
+  # </cards>
   gpu=""
   if command -v nvidia-smi >/dev/null 2>&1; then
     # only a clean answer is a card name: a driver that is not loaded prints an error sentence (on stdout, exit status 9)
-    gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null) || gpu=""
-    gpu=$(printf '%s' "$gpu" | head -1)
-    case "$gpu" in *[Ff]ailed*|*NVIDIA-SMI*|*"couldn't communicate"*|*"No devices"*) gpu="" ;; esac
-    [ -n "$gpu" ] && gpu="NVIDIA $gpu"
+    names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null) || names=""
+    case "$names" in *[Ff]ailed*|*NVIDIA-SMI*|*"couldn't communicate"*|*"No devices"*) names="" ;; esac
+    if [ -n "$names" ]; then
+      gpu=$(printf '%s\n' "$names" | sed 's/^ *//; s/ *$//' | while IFS= read -r n; do if [ -n "$n" ]; then with_maker NVIDIA "$n"; fi; done | list_cards)
+    fi
   fi
   if [ -z "$gpu" ] && [ "$os" = Linux ] && command -v lspci >/dev/null 2>&1; then
-    # the PCI class decides, not a word anywhere in the line (an SSD sold as "3D NAND" is not a graphics card)
-    gpu=$(lspci 2>/dev/null | grep -iE '^[^ ]+ (vga compatible controller|3d controller|display controller)[^:]*:' | head -1 | sed 's/^[^ ]* [^:]*: *//' || true)
+    # the PCI class decides, not a word anywhere in the line (an SSD sold as "3D NAND" is not a graphics card); only NVIDIA, AMD and Intel
+    # cards are named (a server board's ASPEED management chip is not a card to run a model on)
+    gpu=$(lspci 2>/dev/null | grep -iE '^[^ ]+ (vga compatible controller|3d controller|display controller)[^:]*:' | sed 's/^[^ ]* [^:]*: *//' \
+          | while IFS= read -r line; do pci_card "$line"; done | list_cards || true)
   fi
   if [ -z "$gpu" ] && [ "$os" = Darwin ]; then
     gpu=$(system_profiler SPDisplaysDataType 2>/dev/null | sed -n 's/^ *Chipset Model: //p' | head -1 || true)
