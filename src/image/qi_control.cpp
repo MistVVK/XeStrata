@@ -102,14 +102,21 @@ bool QiControl::open(const std::string& path, QiDit& dit, std::string& err, bool
             if (t == nullptr) throw std::runtime_error(path + ": no " + name + " (not the Fun ControlNet Union)");
             if (t->dtype != "BF16" || t->shape != std::vector<int64_t>(shape))
                 throw std::runtime_error(path + ": " + name + " is not the BF16 shape the DiT takes");
+            auto invalid = [&](const char* why) {
+                std::string msg = path;
+                msg += ": ";
+                msg += name;
+                msg += why;
+                return std::runtime_error(msg);
+            };
             uint64_t bytes = 2;
             for (int64_t d : t->shape) {
                 if (d <= 0 || (uint64_t) d > std::numeric_limits<uint64_t>::max() / bytes)
-                    throw std::runtime_error(path + ": " + name + ": invalid shape");
+                    throw invalid(": invalid shape");
                 bytes *= (uint64_t) d;
             }
             if (t->end < t->begin || t->end > file_->size() - st.data_base() || t->end - t->begin != bytes)
-                throw std::runtime_error(path + ": " + name + ": invalid data_offsets");
+                throw invalid(": invalid data_offsets");
             return *t;
         };
         const SafeTensor* inw = st.find("control_img_in.weight");
