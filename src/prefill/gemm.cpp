@@ -10,6 +10,7 @@
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/rows_i8.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/gpu.hpp"
@@ -1054,12 +1055,18 @@ template<class F> void Gemm::with_f16(int ggml_type, const void* W_blocks, int64
         if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = std::min(rows, N - r0);
-            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+            if (ggml_type == 0)
+                strata::kernels::f32_to_f16_bulk(static_cast<const float*>(W_blocks) + r0 * K, scratch_, n * K, stream_);
+            else
+                strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
             prod(scratch_, r0, n);
         }
         return;
     }
-    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    if (ggml_type == 0)
+        strata::kernels::f32_to_f16_bulk(static_cast<const float*>(W_blocks), scratch_, N * K, stream_);
+    else
+        strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
     prod(scratch_, 0, N);
 }
 

@@ -106,6 +106,12 @@ constexpr int kBF16 = 30;   // a BF16 file's projections: bf16_gemv_fp32_mmvf_mu
 constexpr int kF32 = 0;
 constexpr int kF16 = 1;
 
+// Matrices loaded by upload keep F16's exact values in F32; routed experts keep their file layout.
+uint64_t uploaded_bytes(const TensorInfo& t) {
+    const uint64_t bytes = tensor_payload_bytes(t);
+    return t.type == kF16 && t.shape.size() >= 2 && t.name.find("_exps.") == std::string::npos ? 2 * bytes : bytes;
+}
+
 bool mapped(size_t bytes, void** h, void** d) {
     if (!strata::gpu::alloc_host(h, bytes)) return false;
     std::memset(*h, 0, bytes);
@@ -188,7 +194,7 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
     const void* src = m.shard(at).tensor_data(*t);
     uint64_t bytes = tensor_payload_bytes(*t);
     std::vector<float> wide;
-    if ((f32 && w.type == kF16) || (widen && w.type != kBF16 && w.type != kF32)) {
+    if (w.type == kF16 || (widen && w.type != kBF16 && w.type != kF32)) {
         f32 = true;
         wide.resize((size_t) w.n_in * rows);
         if (!k::cpu::native_row_to_float(w.type, src, wide.data(), (int64_t) wide.size())) {
@@ -662,7 +668,7 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
     uint64_t head = 0;
     for (size_t i = 0; i < model_->size(); ++i)
         for (const TensorInfo& ti : model_->shard(i).tensors()) {
-            const uint64_t b = tensor_payload_bytes(ti);
+            const uint64_t b = uploaded_bytes(ti);
             if (ti.name.rfind("blk.", 0) == 0) {
                 const int64_t l = std::strtoll(ti.name.c_str() + 4, nullptr, 10);
                 if (l >= 0 && l < nl) block[(size_t) l] += b;
@@ -749,7 +755,7 @@ bool PlainModel::split_auto_points(std::string& err) {
     const int64_t M = s.n_moe_layers();
     if (M < n) return true;
     uint64_t head = 0;
-    if (size_t at = 0; const TensorInfo* t = model_->find(head_name(), &at)) head = tensor_payload_bytes(*t);
+    if (size_t at = 0; const TensorInfo* t = model_->find(head_name(), &at)) head = uploaded_bytes(*t);
     // a MoE layer's experts (the largest layer's three tensors: a file's layers can differ in type), and whether the
     // last GPU runs the MTP layer as well
     uint64_t layer_b = 0;
@@ -835,12 +841,12 @@ bool PlainModel::split_auto_role(std::string& err) {
             if (ti.name.rfind("blk.", 0) != 0) continue;
             const int64_t l = std::strtoll(ti.name.c_str() + 4, nullptr, 10);
             if (l < 0 || l >= L) continue;
-            const uint64_t b = tensor_payload_bytes(ti);
+            const uint64_t b = uploaded_bytes(ti);
             blk_b[(size_t) l] += b;
             if (ti.name.find("_exps.weight") != std::string::npos) exp_b[(size_t) l] += b;
         }
     uint64_t head = 0;
-    if (size_t at = 0; const TensorInfo* t = model_->find(head_name(), &at)) head = tensor_payload_bytes(*t);
+    if (size_t at = 0; const TensorInfo* t = model_->find(head_name(), &at)) head = uploaded_bytes(*t);
     std::vector<double> blob((size_t) L, 0.0);
     std::vector<int64_t> dense_l((size_t) L, 0), kv_l((size_t) L, 0);
     uint64_t dense_all = 0;
@@ -2711,9 +2717,9 @@ bool PlainModel::kv_resident_fits_vram() const {
             if (ti.name.rfind("blk.", 0) == 0) {
                 if (ti.name.find("_exps.") != std::string::npos) continue;   // the expert tier: elastic
                 const int64_t l = std::strtoll(ti.name.c_str() + 4, nullptr, 10);
-                if ((l >= lb_ && l < le_) || (has_mtp_ && l == s.n_layer)) weights += tensor_payload_bytes(ti);
+                if ((l >= lb_ && l < le_) || (has_mtp_ && l == s.n_layer)) weights += uploaded_bytes(ti);
             } else if (last && (ti.name == head_name() || ti.name == "output_norm.weight")) {
-                weights += tensor_payload_bytes(ti);
+                weights += uploaded_bytes(ti);
             }
         }
     for (int64_t l = lb_; l < le_; ++l)
@@ -3988,14 +3994,14 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     }
 
     // the MoE: route, publish, the shared expert while the host serves, then the experts and the combine
-    const bool sh_q8 = has_shared_ && b.sh_gate.type != kBF16 && b.sh_down.type != kBF16;
+    const bool sh_q8 = has_shared_ && q8_in(b.sh_gate) && q8_in(b.sh_up) && q8_in(b.sh_down);
     if (sh_q8) k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
     else k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
     k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
     moe_ring(ml, T, ring, rlog_, cs);
     if (has_shared_ && !sh_q8) {   // in FP32 between the products
         proj(b.sh_gate, hn_, sh_gate_, T, true);
-        proj(b.sh_up, hn_, sh_up_, T, false);
+        proj(b.sh_up, hn_, sh_up_, T, true);
         k::native_swiglu_f32(sh_gate_, sh_up_, sh_gate_, (int) FS, T, cs);
         proj(b.sh_down, sh_gate_, shared_, T, true);
         k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
@@ -4313,6 +4319,11 @@ void PlainModel::head_logits(const float* x, int T, strata::gpu::Stream cs) {
                                      head_.n_in, head_.n_out, T, cs);
         return;
     }
+    if (head_.type == kF32) {
+        k::f32_gemv_fp32_mmvf_multi(x, head_.n_in, static_cast<const float*>(head_.data), logits_, head_.n_out,
+                                    head_.n_in, head_.n_out, T, cs);
+        return;
+    }
     k::native_quantize_q8_1(x, xq_, head_.n_in, T, cs);
     k::native_mmvq(head_.type, head_.data, xq_, logits_, head_.n_in, head_.n_out, T, cs);
 }
@@ -4331,6 +4342,8 @@ bool PlainModel::record_mtp(int T, strata::gpu::Stream cs, std::string& err) {
     k::concat_rows(qfull_, hn_, mix_, N, T, cs);
     if (mtp_eh_.type == kBF16) {
         k::bf16_gemv_fp32_mmvf_multi(qfull_, 2 * N, static_cast<const uint16_t*>(mtp_eh_.data), x_, N, 2 * N, N, T, cs);
+    } else if (mtp_eh_.type == kF32) {
+        k::f32_gemv_fp32_mmvf_multi(qfull_, 2 * N, static_cast<const float*>(mtp_eh_.data), x_, N, 2 * N, N, T, cs);
     } else {
         k::native_quantize_q8_1(qfull_, xq_, (int) (2 * N), T, cs);
         k::native_mmvq(mtp_eh_.type, mtp_eh_.data, xq_, x_, (int) (2 * N), (int) N, T, cs);
@@ -4359,6 +4372,8 @@ bool PlainModel::record_mtp_slots(int T, strata::gpu::Stream cs, std::string& er
     k::concat_rows(qfull_, hn_, mix_, N, T, cs);
     if (mtp_eh_.type == kBF16) {
         k::bf16_gemv_fp32_mmvf_multi(qfull_, 2 * N, static_cast<const uint16_t*>(mtp_eh_.data), x_, N, 2 * N, N, T, cs);
+    } else if (mtp_eh_.type == kF32) {
+        k::f32_gemv_fp32_mmvf_multi(qfull_, 2 * N, static_cast<const float*>(mtp_eh_.data), x_, N, 2 * N, N, T, cs);
     } else {
         k::native_quantize_q8_1(qfull_, xq_, (int) (2 * N), T, cs);
         k::native_mmvq(mtp_eh_.type, mtp_eh_.data, xq_, x_, (int) (2 * N), (int) N, T, cs);
@@ -4381,13 +4396,15 @@ void PlainModel::draft_logits(const int32_t* pos, strata::gpu::Stream cs) {
     auto exact = [this, n_in](const void* rows, int n, float* y, void* s) {
         if (head_.type == kBF16) {
             k::bf16_gemv_fp32_mmvf_multi(hn_, n_in, static_cast<const uint16_t*>(rows), y, n, n_in, n, 1, s);
+        } else if (head_.type == kF32) {
+            k::f32_gemv_fp32_mmvf_multi(hn_, n_in, static_cast<const float*>(rows), y, n, n_in, n, 1, s);
         } else {
             k::native_mmvq(head_.type, rows, xq_, y, n_in, n, 1, s);
         }
     };
     const void* rows = dhead_ != nullptr ? dhead_ : head_.data;   // the subset's rows: logits_[i] is token dvocab_[i]'s
     const int n = (int) (dhead_ != nullptr ? n_dvocab_ : head_.n_out);
-    if (head_.type != kBF16) k::native_quantize_q8_1(hn_, xq_, n_in, 1, cs);
+    if (q8_in(head_)) k::native_quantize_q8_1(hn_, xq_, n_in, 1, cs);
     if (int2_ != nullptr)
         int2_->logits(hn_, static_cast<const uint8_t*>(rows),
                       [&](const uint8_t* r, int m, float* y, void* s) { exact(r, m, y, s); }, logits_, cs, pos);
@@ -4407,7 +4424,8 @@ void PlainModel::setup_int2() {
     const int type = (int) t->type;
     const size_t file_row = type == kBF16 ? (size_t) head_.n_in * 2 : k::cpu::native_row_bytes(type, head_.n_in);
     // the head's rows on the GPU keep their GGUF size in the engine's layouts (upload)
-    const size_t row = head_.type == kBF16 ? (size_t) head_.n_in * 2 : file_row;
+    const size_t row = head_.type == kBF16 ? (size_t) head_.n_in * 2
+                       : head_.type == kF32 ? (size_t) head_.n_in * 4 : file_row;
     const int64_t n = dhead_ != nullptr ? n_dvocab_ : head_.n_out;
     auto h = std::make_unique<DraftHeadInt2>();
     std::string e;
@@ -4421,6 +4439,7 @@ void PlainModel::setup_int2() {
     const int n_in = head_.n_in;
     auto exact = [this, n_in](const uint8_t* r, int m, float* y, void* s) {
         if (head_.type == kBF16) k::bf16_gemv_fp32_mmvf_multi(hn_, n_in, reinterpret_cast<const uint16_t*>(r), y, m, n_in, m, 1, s);
+        else if (head_.type == kF32) k::f32_gemv_fp32_mmvf_multi(hn_, n_in, reinterpret_cast<const float*>(r), y, m, n_in, m, 1, s);
         else k::native_mmvq(head_.type, r, xq_, y, n_in, m, 1, s);
     };
     // the timing reads hn_ before any window has written it: cleared, so the coarse logits are numbers (left as they

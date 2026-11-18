@@ -1247,6 +1247,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 if (head_.type == 30) {   // a BF16 head, as the decode reads it
                     k::bf16_gemv_fp32_mmvf_multi(P.hn, head_.n_in, static_cast<const uint16_t*>(head_.data), logits_,
                                                  head_.n_out, head_.n_in, head_.n_out, 1, cs);
+                } else if (head_.type == 0) {
+                    k::f32_gemv_fp32_mmvf_multi(P.hn, head_.n_in, static_cast<const float*>(head_.data), logits_,
+                                                head_.n_out, head_.n_in, head_.n_out, 1, cs);
                 } else {
                     k::native_quantize_q8_1(P.hn, xq_, head_.n_in, 1, cs);
                     k::native_mmvq(head_.type, head_.data, xq_, logits_, head_.n_in, head_.n_out, 1, cs);
