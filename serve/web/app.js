@@ -4338,7 +4338,7 @@ $("img-form").onsubmit = async (ev) => {
   if (partial) Object.assign(body, {stream: true, partial_images: 2});
   imageBusy = true;
   imgAbort = new AbortController();
-  const t0 = performance.now();
+  let t0 = performance.now();
   imgGoBusy(t0);
   paintLive();
   $("img-hint").textContent = tr("img.generatingHint", "Generating… (a minute or more on a small GPU)");
@@ -4359,8 +4359,16 @@ $("img-form").onsubmit = async (ev) => {
     }
     const url = refs.length ? "v1/images/edits" : "v1/images/generations";
     // Interrupt aborts the request; the server cancels a job whose client left, after the step it is on
-    const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body), signal: imgAbort.signal});
-    const j = partial && r.ok ? await imgStream(r) : await r.json();
+    let r, j;
+    for (;;) {
+      r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body), signal: imgAbort.signal});
+      j = partial && r.ok ? await imgStream(r) : await r.json();
+      if (r.ok || !j.error || j.error.code !== "weights_downloading") break;
+      await auxWait(j.error, imgAbort.signal, (p, words) => { $("img-hint").textContent = words; });
+      $("img-hint").textContent = tr("img.generatingHint", "Generating… (a minute or more on a small GPU)");
+      t0 = performance.now();
+      imgGoBusy(t0);
+    }
     if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
     const seconds = Math.round((performance.now() - t0) / 1000);
     for (const d of [...j.data].reverse()) {
@@ -4408,6 +4416,28 @@ $("img-go").onclick = (ev) => {
   ev.preventDefault();
   if (ev.detail > 0 || document.activeElement === $("img-go")) imgAbort.abort();
 };
+
+// A tool's weights downloading on the server (503 weights_downloading: serve/image_aux.py): wait for them through the
+// metrics' image_aux (polled every second), show(share, words) the progress, and return once they are done for the
+// caller to ask again; a download that fails, or one the server does not run (a license to agree to), throws.
+async function auxWait(err, signal, show) {
+  const downloads = err.downloads || [], names = new Set(downloads.map(d => d.name)), before = lastMetrics;
+  if (!downloads.length || downloads.some(d => d.status !== "downloading")) throw new Error(err.message || "weights_downloading");
+  for (;;) {
+    const m = lastMetrics, rows = m && m !== before ? (m.image_aux || []).filter(d => names.has(d.name)) : null;
+    const bad = rows && rows.find(d => d.status === "failed");
+    if (bad) throw new Error(tr("tool.downloadFailed", "Downloading {name} failed: {why}", {name: bad.name, why: bad.error || ""}));
+    if (rows && !rows.length) return;
+    const now = rows || downloads, got = now.reduce((a, d) => a + (d.bytes || 0), 0), all = now.reduce((a, d) => a + (d.total || 0), 0);
+    show(all ? got / all : 0, tr("tool.fetching", "Downloading the tool's weights ({name}): {got} of {total} MiB. It runs once they are here.",
+                                 {name: now.map(d => d.name).join(", "), got: Math.round(got / 1048576), total: Math.round(all / 1048576)}));
+    await new Promise((ok, no) => {
+      const stop = () => { clearTimeout(t); no(new DOMException("aborted", "AbortError")); };
+      const t = setTimeout(() => { signal.removeEventListener("abort", stop); ok(); }, 1000);
+      signal.addEventListener("abort", stop, {once: true});
+    });
+  }
+}
 
 // ------------------------------------------------------------------ the Tools tab: the image tools on their own
 // Each tool is its API's request: the upscale /v1/images/upscale (model, scale, extra_params: color_correction_method,
@@ -4677,17 +4707,25 @@ $("tool-form").onsubmit = async (ev) => {
   toolAbort = new AbortController();
   imageBusy = true;
   paintLive();
-  const t0 = performance.now();
+  let t0 = performance.now();
   toolBusy(t0);
   $("tool-hint").textContent = "";
   try {
-    const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body), signal: toolAbort.signal});
-    const j = await r.json();
-    if (!r.ok) {
-      const e = j.error || {};
-      if (e.code === "weights_downloading") throw new Error(tr("tool.downloading", "The tool's weights are downloading: run it again in a minute. ({msg})", {msg: e.message || ""}));
-      throw new Error(e.message || r.statusText);
+    let r, j;
+    for (;;) {
+      r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body), signal: toolAbort.signal});
+      j = await r.json();
+      if (r.ok || !j.error || j.error.code !== "weights_downloading") break;
+      await auxWait(j.error, toolAbort.signal, (p, words) => {
+        $("tool-progress").hidden = false;
+        $("tool-bar").style.width = `${Math.round(100 * p)}%`;
+        $("tool-cap").hidden = false;
+        $("tool-cap").textContent = words;
+      });
+      t0 = performance.now();
+      toolBusy(t0);
     }
+    if (!r.ok) throw new Error((j.error || {}).message || r.statusText);
     const seconds = Math.round((performance.now() - t0) / 1000);
     if (url.endsWith("segmentations")) {
       const items = j.data.map(d => ({score: d.score, box: d.box, mask: d.mask, label: d.label}));
@@ -4866,11 +4904,12 @@ function vidPost(url, fd, signal, uploaded) {
     x.send(fd);
   });
 }
-async function vidError(r) {
-  let e = {};
-  try { e = JSON.parse(await r.body.text()).error || {}; } catch { /* not JSON */ }
+async function vidErrorBody(r) {
+  try { return JSON.parse(await r.body.text()).error || {}; } catch { return {}; /* not JSON */ }
+}
+async function vidError(r, e) {
+  e = e || await vidErrorBody(r);
   const ra = r.header("Retry-After");
-  if (e.code === "weights_downloading") return tr("tool.downloading", "The tool's weights are downloading: run it again in a minute. ({msg})", {msg: e.message || ""});
   return (e.message || `HTTP ${r.status}`) + (r.status === 503 && ra ? " " + tr("vid.retry", "(try again in about {n} s)", {n: ra}) : "");
 }
 // running: the button is Interrupt with the seconds so far; the upload's share, then the frames done
@@ -4885,7 +4924,9 @@ function vidBusy(t0) {
     const s = (performance.now() - t0) / 1000, run = vidAbort;
     $("vid-go-time").textContent = tr("img.elapsed", "{n} s", {n: Math.round(s)});
     let p = null, cap = "";
-    if (run && run.upload < 1) {
+    if (run && run.aux) {
+      [p, cap] = run.aux;
+    } else if (run && run.upload < 1) {
       p = run.upload;
       cap = tr("vid.uploading", "Sending the video · {pct}%", {pct: Math.round(100 * p)});
     } else {
@@ -4926,14 +4967,23 @@ $("vid-form").onsubmit = async (ev) => {
   vidAbort = {ctl: new AbortController(), upload: 0};
   imageBusy = true;
   paintLive();
-  const t0 = performance.now();
+  let t0 = performance.now();
   vidBusy(t0);
   $("vid-hint").textContent = "";
   vidResult(null);
   try {
-    const r = await vidPost(path, vidForm(req, seg ? "video" : "input_references"), vidAbort.ctl.signal, (p) => { vidAbort.upload = p; });
-    vidAbort.upload = 1;
-    if (r.status !== 200) throw new Error(await vidError(r));
+    let r;
+    for (;;) {
+      r = await vidPost(path, vidForm(req, seg ? "video" : "input_references"), vidAbort.ctl.signal, (p) => { vidAbort.upload = p; });
+      vidAbort.upload = 1;
+      if (r.status === 200) break;
+      const e = await vidErrorBody(r);
+      if (e.code !== "weights_downloading") throw new Error(await vidError(r, e));
+      await auxWait(e, vidAbort.ctl.signal, (p, words) => { vidAbort.aux = [p, words]; });
+      Object.assign(vidAbort, {aux: null, upload: 0});
+      t0 = performance.now();
+      vidBusy(t0);
+    }
     if (seg && sync) {
       const seconds = Math.round((performance.now() - t0) / 1000);
       vidSegAnswer(JSON.parse(await r.body.text()), req, path, seconds);

@@ -5426,6 +5426,8 @@ class Service:
                 "requests_kept": len(rows), "totals": totals, "hardware": tel["now"],
                 "loop_guard": dict(self.loop_guard_counts, on=bool(self.loop_guard)),
                 "script_guard": dict(self.script_guard_counts, default=script_guard_name(self.script_guard)),
+                # the image tools' weights downloading (or failed): the page waits on them and asks again once done
+                "image_aux": image_aux.every(),
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now,
                 "engine_failure": self.engine_failure, "xe_kernel": self.xe_kernel}
