@@ -35,12 +35,13 @@ function snapshot(s) {
 }
 
 /** One model reply: the stream frames, then the committed message. */
-async function reply(s, text) {
+async function reply(s, text, pauseMs = 0) {
   const attemptId = `att-${randomUUID()}`;
   stream(s, { type: 'start', attemptId, turn: s.turn, step: 1 });
   const words = text.split(/(?<= )/);
   for (const [i, w] of words.entries()) {
     stream(s, { type: 'chunk', attemptId, index: i, chunk: { type: 'text-delta', index: 0, text: w } });
+    if (pauseMs) await sleep(pauseMs);   // `SCRIPT:slow`: a reply that takes a while, so a second page can take the turn over while it runs
   }
   stream(s, { type: 'end', attemptId });
   append(s, 'assistant/message', { turn: s.turn, step: 1, message: { role: 'assistant', content: [{ type: 'text', text }] } });
@@ -58,7 +59,8 @@ async function turn(s, message, body) {
 
 async function play(s, requestId, text) {
   const bg = /^SCRIPT:bg2?\b/.test(text), jobs = /^SCRIPT:bg2\b/.test(text) ? 2 : 1;   // `SCRIPT:bg2`: two background jobs, each finishing with its own turn
-  await turn(s, { source: { kind: 'user', rpcId: requestId }, content: [{ type: 'text', text }] }, () => reply(s, bg ? 'Started the job in the background. ' : `Echo: ${text}`));
+  const slow = /^SCRIPT:slow\b/.test(text);   // `SCRIPT:slow`: eight words, one every FAKE_HARNESS_SLOW_MS (default 200)
+  await turn(s, { source: { kind: 'user', rpcId: requestId }, content: [{ type: 'text', text }] }, () => slow ? reply(s, 'alpha bravo charlie delta echo foxtrot golf hotel ', Number(process.env.FAKE_HARNESS_SLOW_MS ?? 200)) : reply(s, bg ? 'Started the job in the background. ' : `Echo: ${text}`));
   if (!bg) return;
   for (let job = 1; job <= jobs; job++) {
     await sleep(wakeMs);

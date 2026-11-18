@@ -136,6 +136,8 @@
 .onboard-tune-stage:has(.onboard-tuning-status)>.onboard-art{grid-column:1;height:180px;margin:0;border-radius:20px 20px 0 0;border-bottom:0}
 .onboard-tuning-status{grid-column:1;padding:20px;border:1px solid var(--st-line);border-top:0;border-radius:0 0 20px 20px;background:var(--st-surface)}
 .onboard-tuning-status>strong{font-size:12px;line-height:1.6;display:block;margin:8px 0;overflow-wrap:anywhere}.onboard-tuning-status>small{font-size:10px;color:var(--st-ink-muted)}.onboard-tuning-status>.onboard-pulse-dot{display:none}
+.onboard-tuning-status>small.onboard-tuning-details{display:block;margin:0 0 6px}
+.onboard-version-size[data-here]{font-size:14px;white-space:normal;line-height:1.3}
 .onboard-tune-stage:has(.onboard-tuning-status)>.onboard-tour{grid-column:2;grid-row:1/3}
 .onboard-continue-anyway{display:block;text-align:center;margin:0 auto 20px;font-size:12px}
 .onboard-pulse-dot,.onboard-local-badge>span{width:6px;height:6px;background:var(--st-accent);border-radius:50%;display:inline-block;box-shadow:0 0 0 4px #10b98118;animation:onboard-glow 2.5s ease-in-out infinite}
@@ -203,6 +205,7 @@
 
 .onboard-load-vision{margin:12px 0;padding:14px;border:1px solid var(--st-line);border-radius:12px;background:var(--st-surface-2)}
 .onboard-engine-connect{display:grid;justify-items:start;gap:14px}
+.onboard-engine-connect[data-loading] .onboard-progress{width:min(360px,100%);margin:2px 0}
 @media(max-width:700px){.onboard-load-vision>span>small{line-height:1.5}}
 
 @media(max-width:700px){.onboard-model-top{grid-template-columns:minmax(0,1fr) 145px;gap:12px}.onboard-control-label{font-size:11px}.onboard-model-picker .select{font-size:13px}.onboard-hardware{gap:15px;padding:15px}.onboard-memory-equation{gap:10px;grid-template-columns:minmax(0,1fr) 14px minmax(0,1fr) 14px minmax(0,1fr)}.onboard-memory-value{gap:6px}.onboard-memory-value>strong{font-size:18px}.onboard-memory-value>.st-icon{width:18px!important;height:18px!important}.onboard-versions>button{padding:16px;min-height:112px;gap:15px}.onboard-version-copy strong{font-size:14px}.onboard-version-bottom{align-items:flex-start;flex-direction:column;gap:8px}.onboard-version-size{font-size:19px}.onboard-version-heading>span{font-size:10px}.onboard-download-identity{gap:7px}.onboard-download-identity>strong{font-size:12px}.onboard-download .onboard-art{height:248px}.onboard-tour-preview{min-height:225px}.onboard-tour-content>p{font-size:12px}.onboard-footer>.st-btn--primary{max-width:100%}.onboard-folder small{white-space:normal;line-height:1.5}.onboard-folder .st-btn{margin-left:32px}.onboard-tour-top>div{justify-content:space-between}}

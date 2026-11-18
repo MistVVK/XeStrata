@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { GatewayClient } from './gateway-client.mjs';
 import { HarnessProcess, resolveHarness, redact, stopStaleAgent } from './harness-runtime.mjs';
 import { StatusReporter } from './status.mjs';
@@ -143,7 +143,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
  * @param {string} [options.nodePath]                   the Node runtime that runs the Harness
  * @param {(line:string)=>void} [options.log]
  */
-export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, helperLimitMs = () => 0, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, liveMs = 90_000, startRuntimeImpl = null, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
+export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, helperLimitMs = () => 0, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, liveMs = 90_000, startRuntimeImpl = null, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500, restartWaitMs = 120_000 }) {
   const root = join(dataDir, 'agent');
   const home = join(root, 'home');
   const sessionsFile = join(root, 'sessions.json');
@@ -195,9 +195,14 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   // (c.holding: from the moment ensureRuntime handed it over until the chat's turn exists) but is not a turn yet, which a restart would close under it.
   const busyChats = () => [...chats.values()].filter(c => c.turn || c.holding).length;
   const notifyIdle = () => { if (busyChats() === 0) { for (const w of idleWaiters) w(); idleWaiters.clear(); } };
-  const waitIdle = (signal, ms) => new Promise((resolve, reject) => {
+  /** FIX-APP A5: what the person is told when the restart of the Harness cannot start because another chat is working. A change in Settings -> Tools is not "the list of models". */
+  const BUSY_WORDS = {
+    tools: 'Another chat is still working, so your new Tools settings are not in use yet. Send your message again when that chat has finished.',
+    models: 'Another chat is still working and the list of models changed. Try again when it finishes.',
+  };
+  const waitIdle = (signal, ms, why = 'models') => new Promise((resolve, reject) => {
     if (busyChats() === 0) return resolve();
-    const timer = setTimeout(() => { idleWaiters.delete(done); reject(new AgentUnavailable('Another chat is still working and the list of models changed. Try again when it finishes.', 'agent-busy')); }, ms);
+    const timer = setTimeout(() => { idleWaiters.delete(done); reject(new AgentUnavailable(BUSY_WORDS[why] ?? BUSY_WORDS.models, 'agent-busy')); }, ms);
     const done = () => { clearTimeout(timer); resolve(); };
     idleWaiters.add(done);
     signal?.addEventListener('abort', () => { clearTimeout(timer); idleWaiters.delete(done); reject(signal.reason ?? new Error('aborted')); }, { once: true });
@@ -206,8 +211,12 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   /** The agent's profile now, plus where its shaped routes really lead (read by the forwarding endpoint). */
   let shapeTargets = {};
   function buildProfileNow() {
-    const profile = buildProfile({ local: localInstances(), connections: connections(), gate, tools: tools(), skillsDir: skillsDir(), proxyBase, searchMock, defaultLocalId: defaultLocalId() });
+    const toolSettings = tools();
+    const profile = buildProfile({ local: localInstances(), connections: connections(), gate, tools: toolSettings, skillsDir: skillsDir(), proxyBase, searchMock, defaultLocalId: defaultLocalId() });
     shapeTargets = profile.shapeTargets ?? {};
+    // FIX-APP A5: which Settings -> Tools values this profile was made from (compared, never shown or logged), so a restart that waits for other chats can say whether the Tools
+    // settings or the model list is why (the tools signature moves with a model change too).
+    profile.toolsKey = createHash('sha256').update(JSON.stringify(toolSettings ?? null, (key, value) => value instanceof Set ? [...value].sort() : value)).digest('hex').slice(0, 16);
     return profile;
   }
   const llmTarget = key => shapeTargets[key] ?? null;
@@ -292,7 +301,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       if (known) return { rt, route };
       starting = (async () => {
         if (rt?.hp.running) {
-          await waitIdle(signal, 120_000);
+          await waitIdle(signal, restartWaitMs, rt.profile.toolsKey !== profile.toolsKey ? 'tools' : 'models');
           const old = rt; rt = null;
           old.events?.close(); old.gw.close(); await old.hp.stop();
         }
@@ -425,10 +434,15 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   }
 
   async function runTurnInner(c, { chatId, message, workspacePath, choice = null, mode = null, history = [], onFrame, requestId = `req-${randomUUID()}`, signal, goal = null, thinking = null, thinkingBudget = 0, images = [], planTask = null, planRun = null, researchTopic = null, adopt = null }) {
-    let send = onFrame; let attached = !adopt;
+    // FIX-APP A6: every page that follows this turn is a subscriber: the one that started it and each one that takes it over (a second window on the same chat, a page that reloaded).
+    // They all get every frame from the moment they joined; a page that leaves (its connection closed) drops out alone. Before, a page that took the turn over replaced the one
+    // that had it, so the other window got nothing but the heartbeat until the turn ended (soak 11-18: the "stuck chats" whose frames had gone to the driver's page check).
+    // A turn the agent started by itself (adopt) has nobody to begin with.
+    const subscribers = new Set(); if (!adopt) subscribers.add(onFrame);
+    const isAttached = () => subscribers.size > 0;
     // A research run gathers first; what the assistant writes while gathering is notes, not the answer, so it is not shown.
     let hideDeltas = !!researchTopic;
-    signal?.addEventListener('abort', () => { send = () => {}; attached = false; }, { once: true });
+    signal?.addEventListener('abort', () => { subscribers.delete(onFrame); }, { once: true });
     // What the assistant itself wrote in this run (not our own step lines): a plan turn reads its plan from it, a step reads its summary.
     const written = { all: '', step: '', reasoning: '' };
     // TOOLCALL-B: the texts this turn sent the assistant (a marker whose request carries one is this turn's), the time of its newest own event
@@ -438,7 +452,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     let terminal = null;
     // The turn guard (turn-guard.mjs): counts failing searches, searches, plan rewrites and a nearly full context. Set up once the route is known.
     let guard = null;
-    const raw = frame => { if (frame.type === 'done' || frame.type === 'error') terminal = frame; try { send(frame); } catch { send = () => {}; attached = false; } };
+    const toPage = (page, frame) => { try { page(frame); } catch { subscribers.delete(page); } };
+    const raw = frame => { if (frame.type === 'done' || frame.type === 'error') terminal = frame; for (const page of [...subscribers]) toPage(page, frame); };
     // What the turn made (files) and compact activity lines (notes-split-agent8.md): derived from the cards the turn already sends.
     const tracker = new DeliverableTracker(workspacePath, { ...trackerFolders(), claims: folderClaims, owner: chatId });
     let toolsRan = false;   // a turn that ran no tool wrote nothing, so there is nothing to look for at its end
@@ -545,12 +560,16 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
      * included) and the questions waiting for an answer. After that the turn's frames flow to the new page as they did to the old one.
      */
     turn.reattach = ({ onFrame, signal: again }) => {
-      send = onFrame; attached = true;
-      again?.addEventListener('abort', () => { send = () => {}; attached = false; }, { once: true });
-      raw({ type: 'start', model: route.name, contextMax: route.contextWindow, demo: false, remoteModel: route.kind === 'api', agent: true, mode: appliedMode, sessionId, requestId, skills: [], resumed: true, ...(planTask ? { planning: true } : {}) });
-      raw({ type: 'resync', content: hideDeltas ? '' : written.all, reasoning: written.reasoning });
-      for (const t of projector.tools.values()) if (t.card) raw({ type: 'agent-tool', tool: t.card });
-      for (const q of questions.values()) if (q.sessionId === sessionId) raw({ type: 'agent-question', callId: q.callId, questions: q.items });
+      // FIX-APP A6: the newcomer is one more subscriber (the page that has the turn keeps it); the catch-up goes to the newcomer only, then it gets the live frames with the others.
+      let alive = true;   // a page whose connection fails during the catch-up never joins
+      const newcomer = frame => { if (!alive) return; try { onFrame(frame); } catch { alive = false; } };
+      newcomer({ type: 'start', model: route.name, contextMax: route.contextWindow, demo: false, remoteModel: route.kind === 'api', agent: true, mode: appliedMode, sessionId, requestId, skills: [], resumed: true, ...(planTask ? { planning: true } : {}) });
+      newcomer({ type: 'resync', content: hideDeltas ? '' : written.all, reasoning: written.reasoning });
+      for (const t of projector.tools.values()) if (t.card) newcomer({ type: 'agent-tool', tool: t.card });
+      for (const q of questions.values()) if (q.sessionId === sessionId) newcomer({ type: 'agent-question', callId: q.callId, questions: q.items });
+      if (!alive) return;
+      subscribers.add(onFrame);
+      again?.addEventListener('abort', () => { subscribers.delete(onFrame); }, { once: true });
     };
     /**
      * A turn must always end. If the Harness sends nothing at all for a while (a tool that never returns, a model server that went
@@ -634,14 +653,14 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
       const frames = failure ? [{ type: 'error', message: plainAgentFailure(failure), details: failure, code: 'AGENT_STOPPED' }] : projector.finish({ model: route.name, contextMax: route.contextWindow, engine });
       for (const f of frames.slice(0, -1)) emit(f);
       // Messages typed while the goal ran and not delivered between steps go back to the page now, to be sent as ordinary messages.
-      if (turn.goalRun && attached) {
+      if (turn.goalRun && isAttached()) {
         const left = queueView(chatId);
         if (left.length) { queues.delete(chatId); onQueue(chatId, []); emit({ type: 'queued-release', messages: left.map(({ id, text }) => ({ id, text })) }); }
       }
       for (const f of frames.slice(-1)) emit(f);
       c.turn = null;
       // What a page that was away needs to show the end of this turn (attach, below).
-      c.last = { wake: !!adopt, taken: attached, requestId, sessionId, mode: appliedMode, model: route.name, contextMax: route.contextWindow, remoteModel: route.kind === 'api', content: hideDeltas ? '' : written.all.slice(0, 4_000_000), reasoning: written.reasoning, cards: [...projector.tools.values()].filter(t => t.card).map(t => t.card), terminal };
+      c.last = { wake: !!adopt, taken: isAttached(), requestId, sessionId, mode: appliedMode, model: route.name, contextMax: route.contextWindow, remoteModel: route.kind === 'api', content: hideDeltas ? '' : written.all.slice(0, 4_000_000), reasoning: written.reasoning, cards: [...projector.tools.values()].filter(t => t.card).map(t => t.card), terminal };
       // every reply the agent started by itself that no page took is kept, not only the last one: two background commands that finish while the app is closed both reach the chat
       if (c.last.wake && !c.last.taken) c.woken = [...(c.woken ?? []).filter(w => !w.taken), c.last].slice(-WOKEN_KEPT);
       turn.ended.resolve({ reason: projector.ended, failure: failure ?? null });

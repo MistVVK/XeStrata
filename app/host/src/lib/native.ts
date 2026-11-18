@@ -69,6 +69,10 @@ export function useNative(){
 export const nativeState=()=>state;
 /** QAGUI 0213: the engine answered but Control's list of installed models has not arrived yet (the first seconds after a start): a downloaded model must not be offered as a download. */
 export const installedListPending=(value:Pick<NativeState,'available'|'installed'|'error'|'checking'>|null|undefined):boolean=>!!value&&(value.checking===true||value.available===true&&!value.installed&&!value.error);
+/** FIX-APP A2: the first-run "Your model" step has no version list yet because the host is still reading the PC (nothing read yet, Control still starting, or the engine
+ *  answered and its catalog has not come): the page says it is checking, not "Connect engine" with a disabled Continue. A real "no installation" answer (`available` false
+ *  after the reads, or an error) is not loading. */
+export const catalogLoading=(value:Pick<NativeState,'available'|'catalog'|'error'|'checking'>|null|undefined):boolean=>!value||value.checking===true||(value.available===true&&!value.catalog&&!value.error);
 /** Connection-list projection only; memory reservations are not inferred. */
 export function nativeRouting(native:NativeState|null,hardware:Hardware|null):RuntimeModels|null{
  if(!native?.instances.length)return null;

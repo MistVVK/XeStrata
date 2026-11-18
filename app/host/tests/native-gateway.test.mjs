@@ -63,7 +63,7 @@ test('an Anthropic stream: the prompt count (message_start) and the output count
  }finally{await close(gateway);await close(engine);}
 });
 
-test('an Anthropic client that sends a model name of its own gets the one loaded model (#5312); OpenAI and Responses stay exact',{timeout:10000},async()=>{
+test('an Anthropic client that sends a model name of its own gets the one loaded model (#5312); with two loaded it stays a 400. OpenAI chat and Responses now do the same with one model (FIX-APP A4, as strata serve)',{timeout:10000},async()=>{
  const received=[];const engine=http.createServer(async(req,res)=>{let text='';for await(const chunk of req)text+=chunk;received.push(JSON.parse(text));res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({type:'message',content:[{type:'text',text:'Hi'}],usage:{input_tokens:1,output_tokens:1}}));});
  const port=await listen(engine);const records=[];
  const serving={open:value=>{const r={...value,id:String(records.length)};records.push(r);return r;},mark:(id,value)=>Object.assign(records[Number(id)],value),finish:(id,value)=>Object.assign(records[Number(id)],value)};
@@ -75,7 +75,9 @@ test('an Anthropic client that sends a model name of its own gets the one loaded
  try{
   let r=await call(p1,'/v1/messages',{model:'claude-5-5-sonnet',messages:[{role:'user',content:'Hi'}],max_tokens:5});assert.equal(r.status,200);await r.text();assert.equal(received.at(-1).model,'iq3_s');
   r=await call(p2,'/v1/messages',{model:'claude-5-5-sonnet',messages:[],max_tokens:5});assert.equal(r.status,400);assert.equal((await r.json()).error.param,'model');
-  r=await call(p1,'/v1/chat/completions',{model:'claude-5-5-sonnet',messages:[]});assert.equal(r.status,400);
-  r=await call(p1,'/v1/responses',{model:'claude-5-5-sonnet',input:'Hi'});assert.equal(r.status,400);
+  r=await call(p1,'/v1/chat/completions',{model:'claude-5-5-sonnet',messages:[]});assert.equal(r.status,200);await r.text();assert.equal(received.at(-1).model,'iq3_s');
+  r=await call(p1,'/v1/responses',{model:'claude-5-5-sonnet',input:'Hi'});assert.equal(r.status,200);await r.text();assert.equal(received.at(-1).model,'iq3_s');
+  r=await call(p2,'/v1/chat/completions',{model:'claude-5-5-sonnet',messages:[]});assert.equal(r.status,400);assert.equal((await r.json()).error.param,'model');
+  r=await call(p2,'/v1/responses',{model:'claude-5-5-sonnet',input:'Hi'});assert.equal(r.status,400);
  }finally{await close(single);await close(pair);await close(engine);}
 });

@@ -6,6 +6,14 @@ export function filesHere(plan:{files_complete?:unknown;partly_downloaded?:unkno
  const left=typeof plan?.download_left_gb==='number'&&Number.isFinite(plan.download_left_gb)&&plan.download_left_gb>=0?plan.download_left_gb:null;
  return {complete:plan?.files_complete===true,partly:plan?.partly_downloaded===true,left};
 }
+/** FIX-APP A1: what a version card on the "Your model" step shows in its size slot. `here` is the plan's answer for that version (read on this step, one step earlier than
+ *  the Prepare page): the files all on this computer say so instead of a download size; part of them here shows what is left. No answer (yet): the download size, as before. */
+export interface CardSize{kind:'download'|'here'|'left';/** the number in the slot (GB); none when the files are all here */value?:number;/** the words in the slot when there is no number */text?:string;/** the small words beside it; none = the page's own caption */caption?:string}
+export function versionCardSize(version:{download_gb:number},here?:FilesHere|null):CardSize{
+ if(here?.complete)return {kind:'here',text:'Already on this computer'};
+ if(here?.partly&&typeof here.left==='number'&&here.left>0&&here.left<version.download_gb)return {kind:'left',value:here.left,caption:'Left to download'};
+ return {kind:'download',value:version.download_gb};
+}
 /** The Prepare page's title: the check of the files is not a download, and files that are all here are only prepared. */
 export function prepareTitle(running:boolean,progress:DownloadProgress|undefined,here:FilesHere|undefined){
  if(running&&progress?.file==='checking files')return 'Checking the model files...';

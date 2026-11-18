@@ -15,6 +15,7 @@ import pic from '../locales/pic-zh.json';
 import gui from '../locales/gui-zh.json';
 import sav from '../locales/sav-zh.json';
 import net from '../locales/net-zh.json';
-export default {...base,...tune,...tools,...fix,...gh,...ui,...engine,...pick,...df2,...upd,...r3,...pic,...gui,...sav,...net,...dmg,...guic} as Record<string,string>;
+export default {...base,...tune,...tools,...fix,...gh,...ui,...engine,...pick,...df2,...upd,...r3,...pic,...gui,...sav,...net,...dmg,...guic,...fixa} as Record<string,string>;
 import dmg from '../locales/dmg-zh.json';
 import guic from '../locales/guic-zh.json';
+import fixa from '../locales/fixa-zh.json';

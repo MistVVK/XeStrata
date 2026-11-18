@@ -28,6 +28,18 @@ import { parseSaved as parseRoles, mirror as mirrorRoles } from './gpu-roles.mjs
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 /** The owner-approved words (11-15) when the draft layer cannot be downloaded offline and no other drafter runs: the Terminal's strata_control/drafting.py MTP_OFFLINE_NOTE. */
 export const MTP_OFFLINE_NOTE="There is no internet connection, so the draft layer can't be downloaded now. The model starts without a drafter.";
+/** FIX-APP A3: while the drafter (DFlash2, about 1.2 GB) is fetched during the first "Tune & start chatting" (or any load that fetches it), the step says so in plain words, with the size
+ *  in `details` as soon as Control's plan names it and the running figures after that. Control's own words for the other steps (checking, packing) stay. */
+export const DRAFTER_DOWNLOAD_SUMMARY='Downloading a small helper that makes answers faster. This happens once.';
+export function drafterDownloadStart(job,drafts){
+ job.summary=DRAFTER_DOWNLOAD_SUMMARY;
+ const gb=Number(drafts?.gb);job.details=Number.isFinite(gb)&&gb>0?`${gb.toFixed(1)} GB`:undefined;
+}
+export function drafterProgress(job,emit){
+ return event=>{if(event.event==='progress'&&job.state==='running'){
+  job.summary=/^downloading/i.test(String(event.step??''))?DRAFTER_DOWNLOAD_SUMMARY:event.step;
+  job.details=event.total>1&&event.done<event.total?`${(event.done/1e9).toFixed(2)} of ${(event.total/1e9).toFixed(2)} GB`:undefined;emit();}};
+}
 /** `args` without `--vision` and the picture word that follows it (the Qwen engine's --vision stands alone; an older config may carry a value). */
 const PICTURE_WORDS = new Set(['on', 'off', 'yes', 'no', 'gpu', 'cpu', 'none']);
 function withoutVisionFlag(args) {
@@ -381,7 +393,8 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   if(!packaged||typeof control.draftingFetch!=='function'||drafts?.needed!==true||!autoChoice(readJson(configFile).drafting))return false;
   job.engineAbort??=new AbortController();
   try{
-   const got=await withPlanFile(args,configFile,planFile=>control.draftingFetch({configPath:planFile,mode:'auto',throttle:true,...(noSplit?{noSplit:true}:{}),...(unloadsRunning(args)?{unloading:true}:{}),signal:job.engineAbort.signal,onEvent:event=>{if(event.event==='progress'&&job.state==='running'){job.summary=event.step;job.details=event.total>1&&event.done<event.total?`${(event.done/1e9).toFixed(2)} of ${(event.total/1e9).toFixed(2)} GB`:undefined;emit();}}}));
+   if(job.state==='running'){drafterDownloadStart(job,drafts);emit();}
+   const got=await withPlanFile(args,configFile,planFile=>control.draftingFetch({configPath:planFile,mode:'auto',throttle:true,...(noSplit?{noSplit:true}:{}),...(unloadsRunning(args)?{unloading:true}:{}),signal:job.engineAbort.signal,onEvent:drafterProgress(job,emit)}));
    if(job.state==='running'&&after){job.summary=after;job.details=undefined;emit();}
    return got?.pack!=null&&got?.skipped!==true;
   }catch(error){if(job.state==='running'){job.drafterNote=error.message;if(after){job.summary=after;job.details=undefined;}emit();}return false;}
@@ -412,7 +425,8 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   try{
    writeFileSync(probe,JSON.stringify(cfg),{mode:0o600});
    job.engineAbort??=new AbortController();
-   await control.draftingFetch({configPath:probe,mode:cfg.drafting??'auto',...(noSplit?{noSplit:true}:{}),...(unloadsRunning(args)?{unloading:true}:{}),signal:job.engineAbort.signal,onEvent:event=>{if(event.event==='progress'&&job.state==='running'){job.summary=event.step;job.details=event.total>1&&event.done<event.total?`${(event.done/1e9).toFixed(2)} of ${(event.total/1e9).toFixed(2)} GB`:undefined;emit();}}});
+   if(job.state==='running'){drafterDownloadStart(job,drafts);emit();}
+   await control.draftingFetch({configPath:probe,mode:cfg.drafting??'auto',...(noSplit?{noSplit:true}:{}),...(unloadsRunning(args)?{unloading:true}:{}),signal:job.engineAbort.signal,onEvent:drafterProgress(job,emit)});
    if(job.state==='running'){job.summary='Loading the model…';job.details=undefined;emit();}
   }catch(error){if(job.state==='running'){job.drafterNote=error.message;job.summary=drafts.mtp_here===false?'The DFlash2 drafter could not be downloaded, so the model starts without a drafter. Loading the model…':'The DFlash2 drafter could not be downloaded, so the model starts with the MTP. Loading the model…';emit();}}
   finally{try{rmSync(probe,{force:true});}catch{/* best effort */}}
@@ -598,7 +612,10 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
  function ensurePoll(){if(!timer){timer=setInterval(()=>void poll(),2000);timer.unref?.();}void poll();}
  async function benchmark(job,args){const instance=resolveInstance(args.instanceId);job.instanceId=instance.id;if(busy(requests().filter(r=>r.instanceId===instance.id)))throw new Error('Wait for this model to finish before benchmarking.');const started=Date.now();job.abort=new AbortController();const response=await fetcher(`http://127.0.0.1:${instance.port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${instance.key}`},signal:AbortSignal.any([job.abort.signal,AbortSignal.timeout(180000)]),body:JSON.stringify({model:instance.apiModelId,messages:[{role:'user',content:'Explain how a rainbow forms in clear, simple language.'}],temperature:0,reasoning_effort:'none',max_tokens:200,stream:false})});const body=await response.json();if(!response.ok)throw new Error(body.error?.message??'Benchmark failed.');if(job.state!=='running')return;const result={summary:'Measured benchmark complete.',at:new Date().toISOString(),model:instance.apiModelId,durationMs:Date.now()-started,tokensIn:body.usage?.prompt_tokens??null,tokensOut:body.usage?.completion_tokens??null,outputTps:body.timings?.predicted_per_second??null,promptTps:body.timings?.prompt_per_second??null,source:'engine',settings:'Greedy · thinking off · up to 200 output tokens'};writeFileSync(join(directory,'native-benchmark.json'),JSON.stringify(result,null,2),{mode:0o600});return result;}
  function resolveInstance(id){const aliases=[...instances.values()].filter(i=>i.aliases?.includes(id));if(aliases.length>1&&!instances.has(id)&&![...instances.values()].some(i=>i.apiModelId===id))throw new Error('This alias matches more than one instance. Choose its exact model ID.');const i=instances.get(id)??[...instances.values()].find(i=>i.apiModelId===id)??aliases[0]??(!id&&instances.size===1?[...instances.values()][0]:undefined);if(!i)throw new Error('Choose a loaded model ID.');if(i.status!=='ready')throw new Error('This model is not ready.');return i;}
- async function program(job,args){if(packaged)return componentProgram(job,args);if(externalRunning().length)throw new Error('Stop the native server running outside this UI before changing engine files.');if(instances.size)throw new Error('Unload native models before changing engine files.');const folder=repo();let {command,args:prefix}=python(),argv;
+ /* FIX-APP A7: a model whose load FAILED stays listed in state error (its engine process is gone or was stopped), and it made both Settings -> Updates jobs refuse with "Unload native models before changing engine files."
+    for the person who went there to fix the failure. An instance in error holds no engine file open: it is unloaded here, so the update goes on. A model that is loading, ready or unloading still refuses. */
+ async function dropFailedInstances(){for(const [id,instance] of [...instances]){if(instance.status!=='error')continue;try{await unload(id,true);}catch{instances.delete(id);processes.delete(id);}}}
+ async function program(job,args){if(packaged)return componentProgram(job,args);if(externalRunning().length)throw new Error('Stop the native server running outside this UI before changing engine files.');await dropFailedInstances();if(instances.size)throw new Error('Unload native models before changing engine files.');const folder=repo();let {command,args:prefix}=python(),argv;
   if(job.kind==='calibrate'||job.kind==='tune'){if(!state().capabilities.calibration)throw new Error('This installation calibrates NVIDIA GPUs only. Use the short benchmark on other devices.');const model=args.model??snapshot.installed?.models?.[0]?.model;const chosen=record(model);if(!chosen.entry.ready)throw new Error('Prepare this model before calibrating.');command=venvPython(folder);prefix=[];if(!existsSync(command))throw new Error('Prepare the Python environment first.');argv=['-c','import sys; from pathlib import Path; import setup; sys.exit(0 if setup.calibrate_config(Path(sys.argv[1])) else 1)',chosen.path];}
   else if(job.kind==='rollback'){if(!previousEngine())throw new Error('No saved previous engine is available.');argv=[join(folder,'setup.py'),'--rollback-engine'];}
   else if(job.kind==='update-engine'){if(!snapshot.installed?.models?.length)throw new Error('Prepare a model first. Its installer downloads the matching engine.');argv=[join(folder,'setup.py'),'--update'];}
@@ -612,6 +629,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
  async function componentProgram(job,args={}){
   if(!COMPONENT_KINDS.includes(job.kind)||typeof control.update!=='function')throw new Error(NO_INSTALL);
   repairAllControlPaths();
+  await dropFailedInstances();
   if(instances.size&&!(job.kind==='update-engine'&&args.stopModel===true))throw new Error('Unload native models before changing engine files.');
   job.abort=new AbortController();
   const subject=job.kind==='update-strata'?'Strata':'engine';
