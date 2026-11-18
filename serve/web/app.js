@@ -2331,8 +2331,11 @@ async function generateReply(opts = {}) {
   if (health.image_generation && opts.image)                // the image button: by the model chosen, else the words'
     body.xestrata_images = {...(ci && ci !== "auto" && ci !== "off" ? {model: ci} : {}), force: true};
   // what the user marked on a picture in its preview (previewAttachment): this message's image tools take it, even with
-  // images off
-  if (health.image_generation && imageMarks && !opts.resume) body.xestrata_images = marksBody(body.xestrata_images);
+  // images off. marksBody spends the marks; a hand-off retry builds a fresh body after the failed message was dropped,
+  // so carry their value over instead of asking the marks again (they are already gone).
+  let markedImages = opts.markedImages || null;
+  if (health.image_generation && imageMarks && !opts.resume && !markedImages) markedImages = marksBody(body.xestrata_images);
+  if (markedImages) body.xestrata_images = markedImages;
   // the chat model's GPU lent to the image calls (the drawer's choice over the server's use_text_gpu)
   if (body.xestrata_images && health.image_text_gpu && settings.textGpu)
     body.xestrata_images = {...(body.xestrata_images === true ? {} : body.xestrata_images), use_text_gpu: settings.textGpu};
@@ -2482,7 +2485,9 @@ async function generateReply(opts = {}) {
     saveChatOf(home);
     replyRead(me.rid);
     if (shown()) renderChat();
-    return generateReply({...opts, home, resume: null});
+    const next = {...opts, home, resume: null};
+    if (markedImages) next.markedImages = markedImages;
+    return generateReply(next);
   }
   paintLive();
   if (frame) cancelAnimationFrame(frame);
