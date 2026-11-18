@@ -141,12 +141,12 @@ class _Splitter(HTMLParser):
             self.pieces.append(self.run)
             self.run = None
 
-    def handle_starttag(self, tag, attrs):
+    def _start(self, tag, attrs, empty: bool):
         raw = self.get_starttag_text() or ""
         a = dict(attrs)
         no = a.get("translate") == "no" or "notranslate" in (a.get("class") or "").split()
         if self.skip:
-            if tag not in _VOID:
+            if not empty and tag not in _VOID:
                 self.skip_tags.append(tag)
                 self.skip += 1
             self.pieces.append(raw)
@@ -154,7 +154,7 @@ class _Splitter(HTMLParser):
         if tag in _SKIP or no:
             self._close()
             self.pieces.append(raw)
-            if tag not in _VOID:
+            if not empty and tag not in _VOID:
                 self.skip_tags.append(tag)
                 self.skip = 1
             return
@@ -166,16 +166,22 @@ class _Splitter(HTMLParser):
             self.run = _Run()
         self.run.parts.append(("tag", raw))
 
+    def handle_starttag(self, tag, attrs):
+        self._start(tag, attrs, False)
+
     def handle_startendtag(self, tag, attrs):
-        self.handle_starttag(tag, attrs)
+        # <path/> inside <svg> needs no closing tag: counting it as one leaves skip on for the rest of the document
+        self._start(tag, attrs, True)
 
     def handle_endtag(self, tag):
         raw = "</%s>" % tag
         if self.skip:
             self.pieces.append(raw)
-            if self.skip_tags and self.skip_tags[-1] == tag:
-                self.skip_tags.pop()
-                self.skip -= 1
+            if tag in self.skip_tags:
+                # HTMLParser does not infer an end tag for <pre><p>a</pre>: close the skipped inner tags too
+                at = len(self.skip_tags) - 1 - self.skip_tags[::-1].index(tag)
+                self.skip -= len(self.skip_tags) - at
+                del self.skip_tags[at:]
             return
         if tag in _BLOCK:
             self._close()
@@ -198,10 +204,18 @@ class _Splitter(HTMLParser):
         self.run.parts.append(("text", data))
 
     def handle_entityref(self, name):
-        self.handle_data(html.unescape("&%s;" % name))
+        raw = "&%s;" % name
+        if self.skip:                                   # kept markup stays escaped, or &lt;script&gt; becomes a tag
+            self.pieces.append(raw)
+        else:
+            self.handle_data(html.unescape(raw))
 
     def handle_charref(self, name):
-        self.handle_data(html.unescape("&#%s;" % name))
+        raw = "&#%s;" % name
+        if self.skip:
+            self.pieces.append(raw)
+        else:
+            self.handle_data(html.unescape(raw))
 
     def handle_comment(self, data):
         self._raw("<!--%s-->" % data)
