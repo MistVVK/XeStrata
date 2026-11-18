@@ -54,6 +54,9 @@ class Heal(unittest.TestCase):
         self.assertEqual((self.dir / "strata-direct.ps1").read_text(encoding="utf-8"), OLD_PS1)
         self.assertEqual(len(self.said), 1)
         self.assertIn("strata-direct.ps1", self.said[0])
+        log = (self.dir / launcher_heal.LOG_NAME).read_text(encoding="utf-8")      # a line for support, also when nobody saw the one above
+        self.assertEqual(len(log.splitlines()), 1)
+        self.assertIn("strata.ps1 was renamed to strata-direct.ps1", log)
         self.assertEqual(self.run_heal(), [])                      # once: nothing left to do, nothing said again
         self.assertEqual(len(self.said), 1)
 

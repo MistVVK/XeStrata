@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 HEADER = "# Strata Terminal launcher for PowerShell"
 RENAMED_TO = "strata-direct.ps1"
+LOG_NAME = "launcher-heal.log"                   # beside the renamed file: one line per rename
 
 
 def installed_bin():
@@ -64,6 +66,12 @@ def heal(path_value: str | None = None, extra: list | None = None, say=None, win
             except OSError:
                 continue
             renamed.append(ps1)
+            try:                                         # for support: when a update's own test start ran this, nobody saw the line below
+                with open(os.path.join(os.path.dirname(ps1), LOG_NAME), "a", encoding="utf-8") as log:
+                    log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} strata.ps1 was renamed to {RENAMED_TO} (a typed `strata` in PowerShell "
+                              "runs a .ps1 before a .cmd, and the default execution policy refuses it)\n")
+            except OSError:
+                pass
             say(f"strata: {ps1} was renamed to {RENAMED_TO}. PowerShell runs a .ps1 file before a .cmd file and refuses it with its "
                 "default settings; now typing  strata  works there.")
     except Exception:                                    # noqa: BLE001 - never a reason for a launcher to fail
