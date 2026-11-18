@@ -356,7 +356,7 @@ public:
     size_t slots() const { return slots_; }
 
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
-    // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
+    // the same conversation a turn back, whose deepest turn-boundary checkpoint the outgoing chain still holds, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
     // checkpoints older than that one.  A subagent's successive turns parked one such copy each, and make_room's
     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
@@ -369,7 +369,7 @@ public:
             const auto& e = entries_[i];
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+                if (!c.reply && (!deepest || c.ids.size() > deepest->ids.size())) deepest = &c;
             if (e.cvec == cvec && deepest && !deepest->ids.empty() &&
                 conversation_chain_holds(*deepest, ids, images, checkpoints) &&
                 !(guarded_ != 0 && serials_[i] == guarded_)) {
@@ -394,7 +394,7 @@ public:
             const auto& e = entries_[i];
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+                if (!c.reply && (!deepest || c.ids.size() > deepest->ids.size())) deepest = &c;
             if (e.cvec != cvec || !deepest || deepest->ids.empty() ||
                 !conversation_chain_holds(*deepest, ids, images, checkpoints) || (guarded_ != 0 && serials_[i] == guarded_))
                 continue;
@@ -416,7 +416,7 @@ public:
             if (e.cvec != cvec) continue;
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+                if (!c.reply && (!deepest || c.ids.size() > deepest->ids.size())) deepest = &c;
             if (!deepest || deepest->ids.empty()) continue;
             bool holds = deepest->ids == ids && deepest->imgs == images;
             for (const auto& k : checkpoints)

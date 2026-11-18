@@ -264,7 +264,7 @@ bool decode(const std::vector<uint8_t>& raw, Header& h) {
     return r.get(h.payload) && r.get(h.body_hash) && r.left() == 0 && !h.ids.empty();
 }
 
-// The checkpoints a file keeps: the deepest (where the next turn of this chat resumes; the next request does not
+// The checkpoints a file keeps: the deepest turn boundary (where the next turn of this chat resumes; it does not
 // always render this reply's header or thinking the same), the chain's root (the system prompt's end, where a new
 // chat of the same client starts), then the most recently used.  In their chain order.
 std::vector<size_t> kept_checkpoints(const std::vector<ConversationCheckpoint>& all, size_t limit) {
@@ -272,7 +272,8 @@ std::vector<size_t> kept_checkpoints(const std::vector<ConversationCheckpoint>& 
     if (all.empty() || limit == 0) return order;
     size_t deepest = 0, root = 0;
     for (size_t i = 1; i < all.size(); ++i) {
-        if (all[i].ids.size() >= all[deepest].ids.size()) deepest = i;
+        if ((!all[i].reply && all[deepest].reply) ||
+            (all[i].reply == all[deepest].reply && all[i].ids.size() >= all[deepest].ids.size())) deepest = i;
         if (all[i].ids.size() < all[root].ids.size()) root = i;
     }
     order.push_back(deepest);

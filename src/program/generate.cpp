@@ -11617,7 +11617,7 @@ int main(int argc, char** argv) {
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks) {
-                    newest_ckpt = std::max(newest_ckpt, (int64_t) c.ids.size());
+                    if (!c.reply) newest_ckpt = std::max(newest_ckpt, (int64_t) c.ids.size());
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
