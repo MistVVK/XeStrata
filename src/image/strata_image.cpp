@@ -102,6 +102,7 @@
 //                            MDEPTH:<path> the depth map (near white), MCTLENDS:<color end>,<depth end> (1, 1: the
 //                            shares of the steps each is on for)
 //   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>] [LORA:<strength>:<path>]...
+//                            MCTL:<path> and MCOLOR:1 / MDEPTH:1 count MOSS-Image control maps and their encoder
 //                            the VRAM an image of n prompt ids needs (from the files); MASK: or INIT:, a base image
 //                            (with a strength below 1 and references, MASK:<their first>); NEG: guidance's negative
 //                            prompt of n ids; LORA: the request's adapters (their A and B are fixed); CROP: as IMG's
@@ -502,10 +503,13 @@ bool read_word(const std::string& w, WordRead& t) {
         return true;
     }
     if (size) {
+        // A control map is encoded at the drawing's size; NEED needs its presence, not its pixels.
+        if (w.rfind("MCTL:", 0) == 0) { r.mctl = decoded_path(w.substr(5)); return true; }
+        if (w.rfind("MCOLOR:", 0) == 0) { r.mctl_color.width = 1; return true; }
+        if (w.rfind("MDEPTH:", 0) == 0) { r.mctl_depth.width = 1; return true; }
         // present is all a NEED line reads of these: the IMG line reads their values (and checks them)
         if (w.rfind("COLOR:", 0) == 0 || w == "UPSCALE" || w.rfind("TILES:", 0) == 0 || w.rfind("CTRL:", 0) == 0 ||
-            w.rfind("CTRLS:", 0) == 0 || w == "CTRLNOINPAINT" || w.rfind("MCTL:", 0) == 0 ||
-            w.rfind("MCOLOR:", 0) == 0 || w.rfind("MDEPTH:", 0) == 0 || w.rfind("MCTLENDS:", 0) == 0)
+            w.rfind("CTRLS:", 0) == 0 || w == "CTRLNOINPAINT" || w.rfind("MCTLENDS:", 0) == 0)
             return true;
         if (w.rfind("UPSIN:", 0) == 0) {
             const std::vector<int32_t> v = parse_ids(w.substr(6));
@@ -1877,8 +1881,19 @@ int serve(si::ImagePipeline& p) {
                 // the cut: the first reference (the base image without an init image) is drawn from at the
                 // line's size, and the steps' buffers come before the drawing and after it, beside what is held
                 if (crop && !init && !sizes.empty()) sizes[0] = {w, h};
+                const int maps = (lr.mctl_color.width > 0 ? 1 : 0) + (lr.mctl_depth.width > 0 ? 1 : 0);
+                if ((maps > 0) != !lr.mctl.empty() || (maps > 0 && !p.takes_moss_options()))
+                    throw std::invalid_argument("NEED: MCTL and at least one MCOLOR or MDEPTH are MOSS-Image's");
                 p.set_need_context(states, pictures, lr.refs_layout);
-                si::QiNeed nd = p.need(n, w, h, sizes, mask, n_neg, lr.loras);
+                p.set_need_control(maps);
+                si::QiNeed nd;
+                try { nd = p.need(n, w, h, sizes, mask, n_neg, lr.loras); }
+                catch (...) {
+                    p.set_need_control(0);
+                    p.set_need_context(false, {}, si::QiRefLayout::MossEdit);
+                    throw;
+                }
+                p.set_need_control(0);
                 p.set_need_context(false, {}, si::QiRefLayout::MossEdit);
                 if (!lr.upscaler.empty()) {   // the upscaler runs before the drawing, the image model's cache given back
                     su::UpscaleModel& m = ups.get(lr.upscaler);

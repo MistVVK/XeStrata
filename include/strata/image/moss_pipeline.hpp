@@ -80,6 +80,7 @@ public:
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
                 int64_t n_neg = 0, const std::vector<LoraUse>& loras = {}) override;
+    void set_need_control(int maps) override { need_control_maps_ = maps; }
     /// need() for a request whose states the chat's engine makes (the server's TE:): no text encoder counted
     void set_states_given(bool given) { states_given_ = given; }
     /// need() for a request with the text encoder's pictures of these sizes (the server's PIC:): the vision encoder
@@ -116,6 +117,8 @@ private:
     W8Choice w8_;   // --dit-q8 auto with both forms in the budget: the faster here (MossDit::time_forms)
     bool base_encoder_ = false, states_given_ = false;
     int64_t ref_rows_ = 0;   // the request's references' latent rows (plan counts their kept keys and values)
+    int need_control_maps_ = 0;   // NEED: the number of control maps (0, 1 or 2)
+    uint64_t control_work_ = 0;   // the current request's encoded maps and input projection rows
     QiRefLayout ref_layout_ = QiRefLayout::MossEdit;   // and their layout (in the stream: as text rows)
     std::string vision_path_;
     std::unique_ptr<core::Vision> vision_size_;

@@ -284,9 +284,13 @@ QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
     const uint64_t lora = lora_gpu_bytes(loras, n * (hw + max_text));
     uint64_t base = ref_enc,
              fixed = vae.weight_bytes() + dit.text_bytes() + lora + (stream ? dit.stream_bytes(R) : dit.ref_bytes(R));
-    if (R > 0 && base_encoder_) fixed += vae.encoder_bytes();
+    if ((R > 0 || mask || need_control_maps_ > 0) && base_encoder_) fixed += vae.encoder_bytes();
     if (mask && base_encoder_) {   // a base image: its encode, and its latent (and a mask's) kept
-        fixed += (R > 0 ? 0 : vae.encoder_bytes()) + LatentStart::bytes(dit.latent_channels() * h * w, h * w, true);
+        fixed += LatentStart::bytes(dit.latent_channels() * h * w, h * w, true);
+        base = std::max(base, vae.encode_scratch_bytes(h, w) + (uint64_t) (3 * height * width) * 4);
+    }
+    if (need_control_maps_ > 0) {
+        fixed += dit.control_weight_bytes() + dit.control_work_bytes(h * w, need_control_maps_);
         base = std::max(base, vae.encode_scratch_bytes(h, w) + (uint64_t) (3 * height * width) * 4);
     }
     // an ai-toolkit edit's pictures: the vision encoder, open beside the text encoder while they are read
@@ -347,9 +351,10 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
     QiPlan p;
     p.budget = budget();
     MossDit& d = *dit_;
-    p.fixed = d.weight_bytes() + d.lora_bytes() + d.scratch_bytes() +
+    p.fixed = d.weight_bytes() + d.lora_bytes() + d.scratch_bytes() + control_work_ +
               (text || d.text_loaded() ? d.text_bytes() : 0) + vae_->weight_bytes() +
-              (vae_->has_encoder() ? vae_->encoder_bytes() : 0) +
+              (vae_->has_encoder() ? vae_->encoder_bytes() : control_work_ ? vae_size_->encoder_bytes() : 0) +
+              (control_work_ && d.control_path().empty() ? d.control_weight_bytes() : 0) +
               (in_stream(ref_layout_) ? d.stream_bytes(ref_rows_) : d.ref_bytes(ref_rows_));
     p.lora = d.lora_bytes();
     p.lora_n = d.lora_count();
@@ -605,6 +610,9 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     if (r.te_rows == 0 && r.ids.empty()) throw std::invalid_argument("image engine: no prompt");
     const bool guided = r.cfg != 1.0f && (r.neg_te_rows > 0 || !r.neg_ids.empty());
     const int64_t h = r.height / 16, w = r.width / 16, HW = r.width * r.height;
+    const int control_maps = r.mctl.empty() ? 0 : (int) !r.mctl_color.rgba.empty() + (int) !r.mctl_depth.rgba.empty();
+    control_work_ = control_maps > 0 ? dit_size_->control_work_bytes(h * w, control_maps) : 0;
+    struct ControlWorkReset { uint64_t& bytes; ~ControlWorkReset() { bytes = 0; } } reset_control_work{control_work_};
     const bool mask = !r.mask.rgba.empty();
     const QiRef* base = base_image(r);
     if ((mask || r.strength < 1.0) && base == nullptr)
@@ -762,6 +770,25 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             gpu::free(depth);
         }
     } maps{d};
+    if (!r.mctl.empty()) {
+        if (control_maps == 0)
+            throw std::invalid_argument("image engine: MCTL: needs a color map (MCOLOR:) or a depth map (MDEPTH:)");
+        // The encoder and control projection open after planning.  The previous request's VAE scratch, activations,
+        // blocks and text layers give way before these allocations, including the maps kept for sampling.
+        const uint64_t enc = vae_->encode_scratch_bytes(h, w) + (uint64_t) (3 * HW) * 4 + control_work_ +
+                             (vae_->has_encoder() ? 0 : vae_size_->encoder_bytes()) +
+                             (d.control_path() == r.mctl ? 0 : d.control_weight_bytes()) + stage_slack();
+        const auto room = [&] {
+            const uint64_t b = budget(), used = held();
+            return std::min(free_vram(), b > used ? b - used : 0);
+        };
+        if (room() < enc) vae_->drop_scratch();
+        if (room() < enc) d.drop_activations();
+        if (room() < enc) { d.drop_blocks(); dit_set_ = 0; mlp_set_ = -1; }
+        if (room() < enc && te_) { te_.reset(); te_set_ = 0; }
+        if (room() < enc)
+            throw std::runtime_error("image engine: not enough GPU memory to encode the MOSS-Image control maps");
+    }
     d.set_control(r.mctl);
     if (!r.mctl.empty()) {
         const auto encode_map = [&](const QiRef& m) -> float* {
@@ -772,13 +799,12 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             f.rgba = control_resize(m, r.width, r.height);
             return encode_ref(f);
         };
-        if (r.mctl_color.rgba.empty() && r.mctl_depth.rgba.empty())
-            throw std::invalid_argument("image engine: MCTL: needs a color map (MCOLOR:) or a depth map (MDEPTH:)");
-        if (free_vram() < vae_->encode_scratch_bytes(h, w) + (uint64_t) (3 * HW) * 4) d.drop_activations();
         maps.color = encode_map(r.mctl_color);
         maps.depth = encode_map(r.mctl_depth);
-        if (d.resident_blocks() < d.blocks()) vae_->drop_scratch();
+        if (d.resident_blocks() < d.blocks() || vae_->scratch_held() > p.vae - p.activations) vae_->drop_scratch();
         d.set_control_input(maps.color, maps.depth, r.mctl_color_end, r.mctl_depth_end);
+        p = plan(h * w, n, std::max(rows0, rows1));
+        p.text_cached = cached;
     }
     const auto t1 = clock::now();
     // the seed's noise as the reference's ([channels][h][w], PyTorch's CPU randn), as the latent's tokens [h w][channels]

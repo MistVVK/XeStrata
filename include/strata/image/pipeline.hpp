@@ -214,6 +214,8 @@ public:
     virtual const char* no_loras_message() const { return "image engine: this image model's DiT takes no adapters"; }
     /// Extra inputs used when estimating a request, reset by the caller after need().
     virtual void set_need_context(bool, const std::vector<std::pair<int64_t, int64_t>>&, QiRefLayout) {}
+    /// Number of MOSS-Image color/depth maps in the request (reset after need).
+    virtual void set_need_control(int) {}
     virtual std::pair<uint64_t, uint64_t> control_need(const std::string&, int64_t, int64_t) {
         throw std::invalid_argument("image engine: ControlNet is Qwen-Image-2.1's only");
     }

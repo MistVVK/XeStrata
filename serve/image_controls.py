@@ -634,8 +634,12 @@ def img_words(job: dict, cfg: dict, width: int, height: int) -> str:
 
 
 def need_words(job: dict) -> str:
-    """NEED's ControlNet word: the branch's file (its blocks counted)."""
+    """NEED's ControlNet branch or MOSS-Image's control adapter and map count."""
     c = job.get("control") or {}
+    m = job.get("mctl") or {}
+    if m:
+        return (f" MCTL:{lora_api.encode_path(m['path'])}" + (" MCOLOR:1" if m.get("color") else "")
+                + (" MDEPTH:1" if m.get("depth") else ""))
     return f" CNET:{lora_api.encode_path(c['net'])}" if c.get("net") else ""
 
 

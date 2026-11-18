@@ -134,6 +134,11 @@ public:
     /// The images' rows take its first `in` columns (the adapter trained them with the rest).
     void set_control(const std::string& path);
     const std::string& control_path() const { return ctl_path_; }
+    /// The widened and image-only FP16 projections and bias, and a request's maps and FP16 input rows.
+    uint64_t control_weight_bytes() const { return (uint64_t) C_ * ((uint64_t) in_ch_ * 8 + 4); }
+    uint64_t control_work_bytes(int64_t rows, int maps) const {
+        return (uint64_t) rows * (uint64_t) in_ch_ * (uint64_t) (maps * 4 + 6);
+    }
     /// The request's control tokens [h w][in] (device FP32, the caller's, alive through sample(); null: that map off)
     /// and the share of the steps each is on for (a map past its end: zero tokens, as the adapter was trained).
     void set_control_input(const float* color, const float* depth, float color_end, float depth_end);
