@@ -1114,7 +1114,13 @@ def add(folders: list[Folder], tmp: Path, name: str) -> dict:
             if i + 1 < len(dirs):
                 shutil.copyfile(tmp, d / final)
             else:
-                os.replace(tmp, d / final)
+                # The source can be on a different filesystem (including another model's LoRA folder).
+                local = d / f".adding-{secrets.token_hex(8)}.part"
+                try:
+                    shutil.copyfile(tmp, local)
+                    os.replace(local, d / final)
+                finally:
+                    local.unlink(missing_ok=True)
     finally:
         if tmp.exists():
             tmp.unlink()

@@ -46,6 +46,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -279,7 +280,7 @@ def check_name(name: str) -> str:
 
 def check_trigger(trigger: str) -> str:
     t = str(trigger or "").strip()
-    if not t or len(t) > 120 or "\n" in t or "," in t:
+    if not t or len(t) > 120 or any(ord(c) < 32 or ord(c) == 127 for c in t) or "," in t:
         raise TrainError("trigger: one word or phrase, up to 120 characters, no comma or line break")
     return t
 
@@ -483,10 +484,13 @@ class TrainJobs:
 
     def _write(self, rec: dict) -> None:
         d = self.dir_of(rec["id"])
-        tmp = d / "record.json.tmp"
+        tmp = d / f"record.{uuid.uuid4().hex}.tmp"
         with self.record_lock:
-            tmp.write_text(json.dumps(rec), encoding="utf-8")
-            os.replace(tmp, d / "record.json")
+            try:
+                tmp.write_text(json.dumps(rec), encoding="utf-8")
+                os.replace(tmp, d / "record.json")
+            finally:
+                tmp.unlink(missing_ok=True)
 
     def get(self, jid: str) -> dict | None:
         try:
@@ -694,17 +698,21 @@ class TrainJobs:
         model_skill = "anima" if rec["family"] == "anima" else ("magetrail" if style == "booru" else "")
         if model_skill:
             cmd += ["--model-skill", model_skill]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        self._proc = proc
-        try:
-            while proc.poll() is None:
-                if cancel.is_set():
-                    self._terminate(proc, 10.0)  # captioner, not a GPU training process
-                    raise _Cancelled()
-                time.sleep(0.25)
-            out, _ = proc.communicate()
-        finally:
-            self._proc = None
+        with tempfile.TemporaryFile(mode="w+b") as output:
+            proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT, text=True)
+            self._proc = proc
+            try:
+                while proc.poll() is None:
+                    if cancel.is_set():
+                        self._terminate(proc, 10.0)  # captioner, not a GPU training process
+                        raise _Cancelled()
+                    cancel.wait(0.25)
+                output.seek(0, os.SEEK_END)
+                end = output.tell()
+                output.seek(max(0, end - 3200))
+                out = output.read().decode("utf-8", errors="replace")
+            finally:
+                self._proc = None
         if proc.returncode != 0:
             raise TrainError(f"the captions failed: {(out or '').strip()[-800:]}", 500)
         for item in rec["images"]:
@@ -724,8 +732,8 @@ class TrainJobs:
                 self.worker.start()
 
     def start(self, jid: str, fields: dict) -> dict:
-        rec = self._need(jid, ("draft", "cancelled", "interrupted", "awaiting_choice"))
-        if rec["status"] in ("cancelled", "interrupted", "awaiting_choice"):
+        rec = self._need(jid, ("draft", "cancelled", "interrupted", "awaiting_choice", "failed"))
+        if rec["status"] in ("cancelled", "interrupted", "awaiting_choice", "failed"):
             return self.resume(jid)
         if rec["model"] in DISTILLED:
             raise TrainError("this older draft uses a distilled model: create a new job with the base model")
@@ -778,7 +786,7 @@ class TrainJobs:
             return self._resume(jid, steps)
 
     def _resume(self, jid: str, steps: int | None = None) -> dict:
-        rec = self._need(jid, ("interrupted", "cancelled", "awaiting_choice", "completed"))
+        rec = self._need(jid, ("interrupted", "cancelled", "awaiting_choice", "completed", "failed"))
         if rec["model"] in DISTILLED:
             raise TrainError("this older job uses a distilled model: create a new job with the base model")
         if not rec.get("settings"):
@@ -852,7 +860,7 @@ class TrainJobs:
             return self._delete_version(jid, step)
 
     def _delete_version(self, jid: str, step: int) -> dict:
-        rec = self._need(jid, ("awaiting_choice", "cancelled", "interrupted", "completed"))
+        rec = self._need(jid, ("awaiting_choice", "cancelled", "interrupted", "completed", "failed"))
         v = next((v for v in rec["versions"] if v["step"] == step), None)
         if v is None:
             raise TrainError(f"versions: step {step} is not one of this job's", 404)
@@ -873,7 +881,7 @@ class TrainJobs:
             return self._register(jid, step, name)
 
     def _register(self, jid: str, step: int | None, name: str | None) -> dict:
-        rec = self._need(jid, ("awaiting_choice", "cancelled", "interrupted", "completed"))
+        rec = self._need(jid, ("awaiting_choice", "cancelled", "interrupted", "completed", "failed"))
         if not rec["versions"]:
             raise TrainError("versions: none saved yet")
         v = next((v for v in rec["versions"] if v["step"] == step), None) if step is not None \
@@ -887,11 +895,14 @@ class TrainJobs:
             raise TrainError("the version's file is gone", 404)
         stem = check_name(name or rec["name"])
         folders = [g.loras for g in self.svc.images.gens.values()]
-        tmp = self.dir_of(jid) / "register.part"
-        shutil.copyfile(src, tmp)
         try:
-            added = lora_api.add(folders, tmp, stem + ".safetensors")
-        except lora_api.LoraError as e:
+            tmp = lora_api.staging(folders, src.stat().st_size)
+            try:
+                shutil.copyfile(src, tmp)
+                added = lora_api.add(folders, tmp, stem + ".safetensors")
+            finally:
+                tmp.unlink(missing_ok=True)
+        except (lora_api.LoraError, OSError) as e:
             raise TrainError(str(e)) from None
         v["registered"] = added["name"]
         rec["registered"] = {"step": v["step"], "name": added["name"], "path": added["path"]}
