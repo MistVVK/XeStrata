@@ -5495,7 +5495,10 @@ def build_engine(llama, comp: dict, data: Path) -> Path:
     check_build_tools(comp)
     bdir = ROOT / "build-xe"
     cache = bdir / "CMakeCache.txt"
-    if cache.exists() and (f"CMAKE_CXX_COMPILER:FILEPATH={comp['cxx']}" not in cache.read_text(errors="replace")
+    cache_text = cache.read_text(errors="replace") if cache.exists() else ""
+    cached_cxx = next((line.split("=", 1)[1].strip() for line in cache_text.splitlines()
+                       if line.startswith("CMAKE_CXX_COMPILER:")), None)
+    if cache.exists() and (cached_cxx != comp["cxx"]
                            or (meta.get("compiler") or {}).get("cmake_args") != used.get("cmake_args")):
         shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
     say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
