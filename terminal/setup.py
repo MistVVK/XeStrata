@@ -938,13 +938,14 @@ def flush_typed_ahead() -> None:
         pass
 
 
-def ask(question, choices, default, yes):
+def ask(question, choices, default, yes, shown=None):
+    """`shown`: what the prompt prints inside the brackets instead of the default's own value (F3: "Enter = no")."""
     if yes:
         return default
     flush_typed_ahead()
     while True:
         try:
-            a = input(f"{question} [{default}]: ").strip()
+            a = input(f"{question} [{shown or default}]: ").strip()
         except EOFError:
             fail("input ended before a setup answer was received",
                  "run setup in a terminal, or pass --yes to accept the recommended answers")
@@ -5068,10 +5069,12 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
             break
         except OSError as e:
             if i + 1 < len(bases):
-                say(f"  No ready-made AMD engine for v{source_version()} ({e}): the latest release instead")
+                _next_release_note("AMD engine", e)
                 continue
-            warn(f"no ready-made AMD engine at {base} ({e})")
-            return engine_from_feed(eng, updating)
+            got = engine_from_feed(eng, updating)      # the 0.2 releases carry no flat zip: the signed feed has it (no error text for that)
+            if got is None:
+                warn(f"no ready-made AMD engine at {base} ({e})")
+            return got
     say("  Downloading the ready-made Strata engine for AMD GPUs (with the ROCm libraries it uses) ...")
     download(base + WIN_HIP_ASSET, z, "Strata AMD engine")
     try:
@@ -5763,6 +5766,15 @@ def engine_refused(asset: str, e: Exception, updating: bool) -> None:
     say("       Nothing was replaced. The bad download was deleted; run setup again to fetch it afresh.")
 
 
+def _next_release_note(what: str, err: Exception) -> None:
+    """F5 (0.2.16 retest): this checkout's own release has no flat engine zip (a clone of main ahead of its release, or every 0.2
+    release: the signed feed carries the engines).  "HTTP Error 404" there is the normal case, not an error: say nothing.  Any other
+    reason (no internet, a blocked address) gets one plain line."""
+    if isinstance(err, urllib.error.HTTPError) and err.code == 404:
+        return
+    say(f"  The ready-made {what} for v{source_version()} could not be reached ({err}): trying the latest release")
+
+
 def prebuilt_bases(url_base) -> list[str]:
     """Where to look for the ready-made engine, in order (each ending in a slash).  The default: the release of this
     checkout's version first, then the latest (#214); an explicit --prebuilt / STRATA_PREBUILT_URL: only that."""
@@ -5911,7 +5923,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             break
         except OSError as e:
             if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
-                say(f"  No ready-made engine for v{source_version()} ({e}): the latest release instead")
+                _next_release_note("engine", e)
                 continue
             got = engine_from_feed(eng, updating)      # 0.2 releases: the signed feed has it (#3469), the CUDA 12 package too (since 0.2.13)
             if got is not None and int(toolkit) == 12 and not feed_engine_covers(got, gpu):
@@ -7676,8 +7688,12 @@ def hardware_key(cfg: dict) -> str:
 
 
 #: The tuning question at the end of a setup (P12). Its default is "n", like the Terminal's Tuning step on a first launch (FIX-TUI T5).
+#: F3 (0.2.16 retest): the old one ended "... with: START-HERE.bat --calibrate [n]: ", so the default marker read like part of the command.
+#: The command now stands alone on its line and the prompt names the default in words.
 TUNE_QUESTION = ("Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow card; the PC is busy "
-                 "meanwhile). No lets you start sooner; you can tune any time later with: {again} --calibrate")
+                 "meanwhile).\nIf you say no, you can start sooner and tune at any time later by running:  {again} --calibrate\n"
+                 "Tune now? (y = yes, n = no)")
+TUNE_DEFAULT_SHOWN = "Enter = no"
 
 
 def setup_command() -> str:
@@ -7833,6 +7849,24 @@ def pull_onto_new_history(git: str, repo: Path) -> int:
     return 1
 
 
+def quiet_pull(git: str, repo: Path) -> int:
+    """U1 (0.2.16 retest): `git pull` printed git's whole change list, about 15,000 lines when a release moved the folders.  `-q` keeps
+    git quiet and its words are caught, not dropped: when the pull fails they are printed in full (they say why), so an error is never
+    hidden.  Returns git's exit code."""
+    r = subprocess.run([git, "-C", str(repo), "pull", "-q", "--ff-only"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        for line in ((r.stdout or "") + (r.stderr or "")).splitlines():
+            if line.strip():
+                say("  " + line.rstrip())
+    return r.returncode
+
+
+def pull_summary(git: str, repo: Path, before: str) -> str:
+    """" (7734 files changed)" for the line after a pull; "" when git cannot say."""
+    m = re.search(r"(\d+) files? changed", git_out(git, repo, "diff", "--shortstat", before, "HEAD"))
+    return f" ({m.group(1)} file{'' if m.group(1) == '1' else 's'} changed)" if m else ""
+
+
 def update_pull(argv: list) -> int | None:
     """`setup.py --update` (START-HERE.bat --update, ./setup.sh --update) first gets the newest code, as UPDATE.bat / update.sh did
     before 0.2.16 (MAP-0215 Q6: those two files go with the 0.2.16 layout).  None: go on with this run (nothing new, not a clone, or
@@ -7862,10 +7896,12 @@ def update_pull(argv: list) -> int | None:
         return 1
     before = git_out(git, repo, "rev-parse", "HEAD")
     say("  Getting the newest Strata (git pull) ...")
-    if subprocess.run([git, "-C", str(repo), "pull", "--ff-only"]).returncode != 0 and pull_onto_new_history(git, repo):
+    if quiet_pull(git, repo) != 0 and pull_onto_new_history(git, repo):
         return 1
     if git_out(git, repo, "rev-parse", "HEAD") == before:
+        say("  Strata is up to date.")
         return None
+    say("  Got the newest Strata" + pull_summary(git, repo, before) + ".")
     here = Path(__file__).resolve()
     new = here if here.is_file() else repo / "terminal" / "setup.py"
     return subprocess.call([sys.executable, str(new), *argv], cwd=str(new.parent), env={**os.environ, PULLED_ENV: "1"})
@@ -10834,7 +10870,7 @@ def main() -> int:
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
     # P12: Skip is the default, as in the Terminal's first launch (T5): a person who presses Enter all the way does not wait 15-30 minutes
-    if cal is None and not hip and not a.no_start and not a.yes and ask(TUNE_QUESTION.format(again=setup_command()), ["y", "n"], "n", a.yes) == "y":
+    if cal is None and not hip and not a.no_start and not a.yes and ask(TUNE_QUESTION.format(again=setup_command()), ["y", "n"], "n", a.yes, shown=TUNE_DEFAULT_SHOWN) == "y":
         tuned = calibrate_config(cfg_path)
     else:
         tuned = None                                   # not asked for: nothing to repeat below

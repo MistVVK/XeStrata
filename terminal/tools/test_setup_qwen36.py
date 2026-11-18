@@ -255,7 +255,7 @@ class InstallOwnPath(unittest.TestCase):
 
     def test_a_12gb_card_gets_the_size_that_fits_and_a_bigger_choice_is_kept_with_the_warning(self):
         # #5715: RTX 5070 12 GB; the menu marks 32K, --yes takes it
-        with mock.patch.object(setup, "ask", lambda question, choices, default, yes: default):     # Enter at every question
+        with mock.patch.object(setup, "ask", lambda question, choices, default, yes, shown=None: default):     # Enter at every question
             rc, out = self.install(model="UD-Q4_K_XL", vram=11.94, vision="no", yes=False)
         self.assertEqual(rc, 0, out)
         self.assertIn("2) 32K tokens   (recommended for your GPU)", out)
@@ -391,7 +391,7 @@ class InstallOwnPath(unittest.TestCase):
     def test_parallel_is_asked_when_attended_and_enter_keeps_one_at_a_time(self):
         asked = []
 
-        def ask(question, choices, default, yes):
+        def ask(question, choices, default, yes, shown=None):
             if "requests at once" not in question:
                 return default                                   # size, context, images: the recommended answers
             asked.append((question, default))
