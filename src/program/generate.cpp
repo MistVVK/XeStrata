@@ -9706,16 +9706,16 @@ int main(int argc, char** argv) {
                     keep = use_mtp ? strata::spec::Drafter::Mtp : strata::spec::Drafter::None;
                 }
                 if (df2_loaded && keep != strata::spec::Drafter::Df2) df2_drop(nullptr);   // one drafter is kept
-                // the MTP released where nothing else needs it: a parked or saved conversation carries its K/V
-                const bool conv_needs_mtp = (o.prompt_cache > 0 && o.conversation_cache_mib > 0) ||
-                                            !o.conversation_save.empty();
+                // SAVE is available whenever prompt caching is on, even without a parked-conversation cache or
+                // automatic saves.  Keep the draft K/V for its file layout; the unloaded layer never reads it.
+                const bool conv_needs_mtp = o.prompt_cache > 0;
                 if (use_mtp && keep != strata::spec::Drafter::Mtp) {
                     if (conv_needs_mtp) {
                         // a parked or saved conversation carries the draft layer's K/V: that part stays, the rest goes
                         const long long f0 = free_mib();
                         mtp.release_weights(df2_loaded && df2.head_shared());
                         std::fprintf(stderr, "xestrata serve: the MTP layer's weights, head and buffers released (%lld "
-                                             "MiB of VRAM back); its K/V stays (the conversation cache carries it)\n",
+                                             "MiB of VRAM back); its K/V stays (saved sessions carry it)\n",
                                      free_mib() - f0);
                         if (keep == strata::spec::Drafter::Df2) o.draft_rule = "df2";   // every request: DFlash2
                     } else {
