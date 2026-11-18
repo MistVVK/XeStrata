@@ -70,11 +70,12 @@ private:
     void encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls);
     // the sampling: n contexts, er_sde or Euler over sigmas from x (tokens), the mask's blend after each step
     void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, int n, float cfg, bool er_sde,
-                uint64_t seed, const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
+                float shift, uint64_t seed, const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
                 const std::function<void(int, const std::function<void(float*)>&)>& peek, const GuidanceSpec& guide);
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_;
     int q8_ = -1;
+    bool dit_requested_q8_ = false;
     W8Choice w8_;   // --dit-q8 auto with both forms in the budget: the faster here (AnimaDit::time_forms)
     std::unique_ptr<TextEncoder> te_, te_size_;
     std::unique_ptr<AnimaDit> dit_, dit_size_, dit16_size_;

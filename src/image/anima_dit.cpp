@@ -459,7 +459,7 @@ std::pair<double, double> AnimaDit::time_forms(int64_t rows) const {
 }
 
 uint64_t AnimaDit::activation_bytes(int64_t hw, int n, int64_t mlp_rows) const {
-    const int64_t R = n * hw, L = qi_attn_rows(kCtxRows), TP = qi_attn_rows(hw), Rk = std::max(R, L);
+    const int64_t R = n * hw, L = qi_attn_rows(std::max(kCtxRows, cap_L_)), TP = qi_attn_rows(hw), Rk = std::max(R, L);
     const int64_t band = mlp_rows > 0 ? std::min(R, mlp_rows) : R;
     return (uint64_t) R * C_ * 4 * 3 +                          // x, q, the products form's FP32 output
            (uint64_t) Rk * C_ * 4 * 3 +                         // k, v, a

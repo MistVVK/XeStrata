@@ -119,8 +119,17 @@ void AnimaPipeline::use_loras(const QiRequest& r) {
     std::vector<LoraUse> dit;
     lora_split(r.loras, dit, te_loras_);
     dit_->set_lora_bake(lora_bake_);
-    if (!dit_->set_loras(dit, err)) throw LoraRejected(err);
-    if (te_ && !te_->set_loras(te_loras_, err)) throw LoraRejected(err);
+    if (!dit_->set_loras(dit, err)) {
+        ctx_key_[0] = {};
+        ctx_key_[1] = {};
+        throw LoraRejected(err);
+    }
+    if (te_ && !te_->set_loras(te_loras_, err)) {
+        ctx_key_[0] = {};
+        ctx_key_[1] = {};
+        te_loras_now(te_->lora_key());
+        throw LoraRejected(err);
+    }
     if (dit_->lora_key() != before) {   // the contexts were the adapter's with the other adapters' weights
         ctx_key_[0] = {};
         ctx_key_[1] = {};
@@ -129,7 +138,7 @@ void AnimaPipeline::use_loras(const QiRequest& r) {
 }
 
 void AnimaPipeline::ensure_open(bool q8) {
-    if (dit_ && dit_->q8() != q8) {
+    if (dit_ && dit_requested_q8_ != q8) {
         gpu::stream_sync(s_);
         dit_.reset();
     }
@@ -148,6 +157,7 @@ void AnimaPipeline::ensure_open(bool q8) {
         d->set_block_budget(d->block_min());
         d->set_lora_block_map(block_map_);
         dit_ = std::move(d);
+        dit_requested_q8_ = q8;
         dit_set_ = dit_->block_min();
         mlp_set_ = -1;
         ctx_key_[0] = {};
@@ -293,9 +303,10 @@ void AnimaPipeline::encode(const std::vector<int32_t>& ids, std::vector<float>& 
     open_text();
     gpu::stream_sync(s_);
     std::string err;
-    out = te_->encode(ids, err);
+    auto states = te_->encode(ids, err);
     te_->drop_activations();
-    if (out.empty()) throw std::runtime_error("image engine: Anima's text encoder: " + err);
+    if (states.empty()) throw std::runtime_error("image engine: Anima's text encoder: " + err);
+    out = std::move(states);
 }
 
 void AnimaPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls) {
@@ -330,7 +341,7 @@ void AnimaPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentSta
 }
 
 void AnimaPipeline::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, int n, float cfg,
-                           bool er, uint64_t seed, const std::function<bool(int, int)>& step,
+                           bool er, float shift, uint64_t seed, const std::function<bool(int, int)>& step,
                            const std::function<void(float*, float)>& after,
                            const std::function<void(int, const std::function<void(float*)>&)>& peek,
                            const GuidanceSpec& spec) {
@@ -341,7 +352,7 @@ void AnimaPipeline::sample(float* x, int64_t h, int64_t w, const std::vector<flo
                                         " is not one of the model's " + std::to_string(d.blocks()));
     Guidance g(spec, s_, h * w * d.token_values(), d.token_values(), true, cfg, sigmas);
     flow_sample(s_, [&](const float* xx, float sigma, int nn, float* out) { d.forward(xx, sigma, h, w, nn, out); }, x,
-                h * w * d.token_values(), n, sigmas, cfg, er, kShift, seed, step, after, peek, &g,
+                h * w * d.token_values(), n, sigmas, cfg, er, shift, seed, step, after, peek, &g,
                 [&](const float* xx, float sigma, float* out) {
                     d.forward(xx, sigma, h, w, 1, out, &g.skip_layers());
                 });
@@ -471,7 +482,7 @@ std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times,
                 return img;
             });
         auto peek = [&](int done, const std::function<void(float*)>& make) { preview(done, make); };
-        sample(x, h, w, sigmas, n, guided ? r.cfg : 1.0f, er, r.seed, step, ls.after(s_), peek, r.guide);
+        sample(x, h, w, sigmas, n, guided ? r.cfg : 1.0f, er, r.shift > 0 ? r.shift : kShift, r.seed, step, ls.after(s_), peek, r.guide);
         preview.release();
         const auto t2 = clock::now();
         if (stage) stage("decode");
