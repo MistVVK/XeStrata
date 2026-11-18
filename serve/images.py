@@ -4987,11 +4987,27 @@ class ImageTools:
             return data
         m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))", which or "")
         data = self._file(m.group(1)) if m else None
+        if data is None and (near := self._near_link(which)) is not None:
+            data = self._file(near)
         if data is None:
             n = len(self.attached())
             raise ImageRequestError(f"{arg}: {which!r} is not an image here: give a link a result gave"
                                     + (f", or the user's pictures attached:1 to attached:{n}" if n else ""))
         return data
+
+    def _near_link(self, which: str) -> str | None:
+        """A link the chat's model copied with a slip (a small model drops or swaps a few of its 32 hex digits): the
+        one file this conversation's results named that is that close to it, else None."""
+        import difflib
+        m = re.search(r"([0-9a-f]{24,40})\.(png|jpeg|webp|jxl)", which or "")
+        if not m:
+            return None
+        named = set(self.made)
+        for msg in self.messages:
+            named.update(FILE_REF.findall(json.dumps(msg.get("content"), ensure_ascii=False, default=str)))
+        close = [n for n in named if n.endswith("." + m.group(2))
+                 and difflib.SequenceMatcher(None, m.group(1), n.split(".")[0]).ratio() >= 0.9]
+        return close[0] if len(close) == 1 else None
 
     def _video(self, which: str):
         """The video upscale_video takes: a /v1/videos/files/ link, else the conversation's last (the chat's page
