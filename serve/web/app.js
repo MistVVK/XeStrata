@@ -5568,6 +5568,11 @@ function ltwPanel(el) {
       st.job = await ltwFetch(`${base()}/captions`, {method: "PUT", headers: headers(true), body: JSON.stringify(caps)});
     });
     await edits;
+    el.querySelectorAll("[data-ltw-cap], [data-ltw-note]").forEach((t) => {
+      const file = t.dataset.ltwCap || t.dataset.ltwNote;
+      const saved = caps[file] && caps[file][t.dataset.ltwCap ? "caption" : "note"];
+      if (t.value === saved) t.defaultValue = saved;
+    });
   }
   function settings() {
     const g = (k) => { const i = el.querySelector(`[data-ltw-set="${k}"]`); return i ? i.value : ""; };
@@ -5714,7 +5719,7 @@ function ltwPanel(el) {
       <div class="ltw-row">
         <input class="st-input" data-ltw-regname placeholder="${esc(j.name)}" aria-label="${esc(tr("ltw.name", "Name"))}">
         <button type="button" class="st-btn" data-ltw-register${j.registered || !j.versions.length ? " disabled" : ""}>${esc(tr("ltw.register", "Register the picked version"))}</button>
-        ${j.status === "interrupted" ? `<button type="button" class="st-btn st-btn--secondary" data-ltw-resume>${esc(tr("ltw.resume", "Resume"))}</button>` : ""}
+        ${["interrupted", "cancelled", "failed"].includes(j.status) && j.settings ? `<button type="button" class="st-btn st-btn--secondary" data-ltw-resume>${esc(tr("ltw.resume", "Resume"))}</button>` : ""}
         <button type="button" class="st-btn st-btn--secondary" data-ltw-delunsel${j.registered ? " disabled" : ""}>${esc(tr("ltw.deleteUnselected", "Delete the unselected versions"))}</button>
         <button type="button" class="st-btn st-btn--secondary" data-ltw-deljob>${esc(tr("ltw.deleteJob", "Delete this job"))}</button>
       </div>`;
@@ -5723,8 +5728,28 @@ function ltwPanel(el) {
     const j = st.job;
     const view = !j || j.status === "draft" || j.status === "captioning" ? "setup"
       : LTW_ACTIVE.includes(j.status) ? "run" : "versions";
+    const keep = [];
+    if (view === "setup" && st.view === "setup" && st.renderedJob === (j && j.id)) {
+      el.querySelectorAll("[data-ltw-set], [data-ltw-cap], [data-ltw-note]").forEach((input) => {
+        const key = input.dataset.ltwSet != null ? "ltwSet" : input.dataset.ltwCap != null ? "ltwCap" : "ltwNote";
+        if (key !== "ltwSet" && input.value === input.defaultValue) return;
+        keep.push({key, name: input.dataset[key], value: input.value, focus: input === document.activeElement,
+                   start: input.selectionStart, end: input.selectionEnd});
+      });
+    }
     st.view = view;
+    st.renderedJob = j && j.id;
     el.innerHTML = view === "setup" ? setupHtml() : view === "run" ? runHtml() : versionsHtml();
+    for (const saved of keep) {
+      const input = [...el.querySelectorAll("[data-ltw-set], [data-ltw-cap], [data-ltw-note]")]
+        .find((n) => n.dataset[saved.key] === saved.name);
+      if (!input) continue;
+      input.value = saved.value;
+      if (saved.focus) {
+        input.focus();
+        if (saved.start != null) input.setSelectionRange(saved.start, saved.end);
+      }
+    }
     const q = (s) => el.querySelector(s);
     const on = (s, ev, fn) => { const n = q(s); if (n) n[ev] = fn; };
     if (view === "setup") {
