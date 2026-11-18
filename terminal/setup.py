@@ -3482,6 +3482,19 @@ def gguf_choice(name: str) -> tuple | None:
     return None
 
 
+def gguf_dir_choices(folder: Path, family: str | None = None, model: str | None = None) -> list:
+    """P13: the (--family, --model) choices the model files in a --gguf-dir folder stand for: every first shard (or single file) whose name is a
+    published one (gguf_choice), narrowed by a family or model the person already gave. One entry: the folder names the model. None: nothing
+    recognisable. Several: the folder holds more than one model, and the person is asked. Never raises."""
+    try:
+        names = sorted(p.name for p in Path(folder).glob("*.gguf")
+                       if not p.name.lower().startswith("mmproj") and (not SHARD_NAME.search(p.name) or SHARD_NAME.search(p.name).group(1) == "00001"))
+    except OSError:
+        return []
+    found = list(dict.fromkeys(c for c in map(gguf_choice, names) if c))
+    return [c for c in found if (not family or c[0] == family) and (not model or c[1] == model)]
+
+
 def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple | None:
     """#444: (message, hint) when --gguf-dir has no file setup can use for this choice: the chosen shard is a GGUF
     Strata cannot run (Unsloth's UD-IQ3_XXS taken for IQ3_XXS by its name), or it is missing and the folder holds
@@ -10281,6 +10294,11 @@ def main() -> int:
 
     # ---- 2. the questions
     step(2, "your choices")
+    if a.gguf_dir and not (a.family and a.model):     # P13: the files in --gguf-dir name the model: nothing to ask when they name exactly one
+        named = gguf_dir_choices(Path(a.gguf_dir), a.family, a.model)
+        if len(named) == 1:
+            a.family, a.model = named[0]
+            say(f"  The files in {a.gguf_dir} are {FAMILIES[a.family]['title']} {a.model}: using them (no question to answer).")
     if not a.family and not a.yes and FEED_MODELS is None:
         feed_models_setup(getattr(a, "feed", None))    # the signed feed's models, listed after the built-in ones (nothing happens when it has none)
     fams = menu_families(hip)
