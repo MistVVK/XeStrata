@@ -11,7 +11,7 @@ import { navigate } from '../lib/router';
 import { catalogLoading, nativeAction, useNative, type NativeJob } from '../lib/native';
 import { completeSetup, completeSetupStep, go, newSession, openSetup, selectRemoteModel, setSettingsSection, useStore } from '../lib/store';
 import type { LocalModelFolder, SetupState } from '../lib/types';
-import { downloadCounter, engineNotReadyAfterInstall, filesHere, modelFolderLabel, onboardingError, prepareTitle } from '../lib/onboarding-download';
+import { downloadCounter, engineNotReadyAfterInstall, filesHere, modelFolderLabel, onboardingError, prepareTitle, versionCardSize, type FilesHere } from '../lib/onboarding-download';
 import { guidedStatusText, installProgress, useDownloadEta } from '../lib/download-eta';
 import { VersionPicker } from './VersionPicker';
 import { contextIsTight, defaultContext } from '../lib/default-context';
@@ -44,6 +44,7 @@ export function GuidedSetup() {
     const [vision, setVision] = useState(saved?.vision ?? true), [directory, setDirectory] = useState(saved?.directory ?? '');
     const [profile, setProfile] = useState<'work' | 'performance'>(saved?.profile ?? 'work');
     const [installJobId, setInstallJobId] = useState(saved?.installJobId ?? ''), [tuneJobId, setTuneJobId] = useState(saved?.tuneJobId ?? '');
+    const [hereByVersion, setHereByVersion] = useState<Record<string, FilesHere>>({});
     const [plan, setPlan] = useState<Record<string, any> | null>(null), [tour, setTour] = useState(0), [folderOpen, setFolderOpen] = useState(false);
     const [pending, setPending] = useState(false), [checkingPlan, setCheckingPlan] = useState(false), [error, setError] = useState(''), [calibrate, setCalibrate] = useState(saved?.calibrate ?? true);
     const writes = useRef(Promise.resolve()), leaving = useRef(false), saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null), titleRef = useRef<HTMLHeadingElement>(null);
@@ -196,8 +197,33 @@ export function GuidedSetup() {
     // The recommended four first, then a list with every other version (the Models page's version list); a family without a recommended set shows them all.
     const cards = recommendedCards.length ? recommendedCards : selectedFamily?.sizes ?? [];
     const others = recommendedCards.length ? (selectedFamily?.sizes ?? []).filter(v => !recommendedCards.includes(v)) : [];
+    /* A1: what is already on this computer, asked on the "Your model" step with the same plan the Prepare step reads (a look at the files' sizes, nothing is hashed or fetched), for the
+       selected version and for each card, one after the other, so a version whose files are here says so on its card instead of showing a download size. Never blocks Continue;
+       an error leaves that card as it was. */
+    const hereKey = (id: string) => `${id}|${directory}`;
+    const hereAsk = [version, ...cards].filter((v, i, all): v is NonNullable<typeof version> => !!v && !v.needsNewerEngine && all.findIndex(x => x?.id === v.id) === i);
+    const hereAskIds = hereAsk.map(v => v.id).join(',');
+    useEffect(() => {
+        if (step !== 2 || !native?.available || folderOpen || !hereAsk.length)
+            return;
+        let cancelled = false;
+        const timer = setTimeout(async () => {
+            for (const v of hereAsk) {
+                if (cancelled)
+                    return;
+                try {
+                    const value = await api.post<Record<string, any>>('/api/native/plan', { ...values, family: v.sourceFamily, model: v.model, vision: v.images ? 'yes' : 'no' });
+                    if (!cancelled)
+                        setHereByVersion(old => ({ ...old, [hereKey(v.id)]: filesHere(value?.plan) }));
+                }
+                catch { /* the card keeps the download size */ }
+            }
+        }, 300);
+        return () => { cancelled = true; clearTimeout(timer); };
+    }, [step, native?.available, hereAskIds, directory, folderOpen]);
+    const cardSize = (v: { id: string; download_gb: number }) => versionCardSize(v, hereByVersion[hereKey(v.id)]);
     const readyIds = new Set((native?.installed?.models ?? []).filter(m => m.ready).map(m => m.model));
-    const versionCard = (v: NonNullable<typeof version>) => <button key={v.id} type="button" role="radio" tabIndex={version?.id === v.id ? 0 : -1} aria-checked={version?.id === v.id} data-selected={version?.id === v.id} onClick={() => { setSize(v.id); setPlan(null); }}><span className="onboard-version-top"><span className="onboard-version-copy"><strong>{tr(catalogVersionLabel(v))}</strong><small>{tr(v.model)}{tr(pickNote(v) ? <> · {tr(pickNote(v))}</> : null)}</small></span><span className="onboard-version-radio">{tr(version?.id === v.id ? <Icon name="check" size={12}/> : null)}</span></span><span className="onboard-version-bottom"><span className="onboard-version-size"><Icon name="download" size={15}/>{tr(v.download_gb.toFixed(1))} <small>{tr("GB")}</small></span><span className="onboard-version-fit">{tr(v.on_this_pc === 'does not fit' || v.on_this_pc === 'tight' || v.on_this_pc?.includes('slower') || v.on_this_pc?.startsWith('experimental:') ? <><Icon name="clock" size={13}/>{tr("May run slower")}</> : v.installed ? <><Icon name="check" size={13}/>{tr("On this computer")}</> : <>{tr("Download size")}</>)}</span></span></button>;
+    const versionCard = (v: NonNullable<typeof version>) => <button key={v.id} type="button" role="radio" tabIndex={version?.id === v.id ? 0 : -1} aria-checked={version?.id === v.id} data-selected={version?.id === v.id} onClick={() => { setSize(v.id); setPlan(null); }}><span className="onboard-version-top"><span className="onboard-version-copy"><strong>{tr(catalogVersionLabel(v))}</strong><small>{tr(v.model)}{tr(pickNote(v) ? <> · {tr(pickNote(v))}</> : null)}</small></span><span className="onboard-version-radio">{tr(version?.id === v.id ? <Icon name="check" size={12}/> : null)}</span></span><span className="onboard-version-bottom"><span className="onboard-version-size" data-here={cardSize(v).kind === 'here' ? 'true' : undefined}>{tr(cardSize(v).kind === 'here' ? <><Icon name="check" size={15}/>{tr(cardSize(v).text)}</> : <><Icon name="download" size={15}/>{tr((cardSize(v).value ?? v.download_gb).toFixed(1))} <small>{tr("GB")}</small></>)}</span><span className="onboard-version-fit">{tr(v.on_this_pc === 'does not fit' || v.on_this_pc === 'tight' || v.on_this_pc?.includes('slower') || v.on_this_pc?.startsWith('experimental:') ? <><Icon name="clock" size={13}/>{tr("May run slower")}</> : cardSize(v).kind === 'here' ? null : cardSize(v).kind === 'left' ? <>{tr("Left to download")}</> : v.installed ? <><Icon name="check" size={13}/>{tr("On this computer")}</> : <>{tr("Download size")}</>)}</span></span></button>;
     const here = filesHere(plan?.plan), counter = downloadCounter(plan?.plan?.download_gb ?? version?.download_gb, progress, preparing, here);
     const eta = useDownloadEta(preparing ? progress : undefined, installJob?.id);
     const title = step === 1 ? 'State of the art. At home.' : step === 2 ? 'Select the model you want to run.' : step === 3 ? prepareTitle(preparing, progress, here) : tuneJob?.state === 'running' ? 'A little tuning. A better fit.' : 'How you would like to work with Strata?';

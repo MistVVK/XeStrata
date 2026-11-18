@@ -136,6 +136,7 @@
 .onboard-tune-stage:has(.onboard-tuning-status)>.onboard-art{grid-column:1;height:180px;margin:0;border-radius:20px 20px 0 0;border-bottom:0}
 .onboard-tuning-status{grid-column:1;padding:20px;border:1px solid var(--st-line);border-top:0;border-radius:0 0 20px 20px;background:var(--st-surface)}
 .onboard-tuning-status>strong{font-size:12px;line-height:1.6;display:block;margin:8px 0;overflow-wrap:anywhere}.onboard-tuning-status>small{font-size:10px;color:var(--st-ink-muted)}.onboard-tuning-status>.onboard-pulse-dot{display:none}
+.onboard-version-size[data-here]{font-size:14px;white-space:normal;line-height:1.3}
 .onboard-tune-stage:has(.onboard-tuning-status)>.onboard-tour{grid-column:2;grid-row:1/3}
 .onboard-continue-anyway{display:block;text-align:center;margin:0 auto 20px;font-size:12px}
 .onboard-pulse-dot,.onboard-local-badge>span{width:6px;height:6px;background:var(--st-accent);border-radius:50%;display:inline-block;box-shadow:0 0 0 4px #10b98118;animation:onboard-glow 2.5s ease-in-out infinite}
