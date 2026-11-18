@@ -568,6 +568,8 @@
   "img.madeCrop": "(dibujada a {size} alrededor de la parte pintada)",
   "img.model": "Modelo",
   "img.nOf": "imagen {i} de {n}",
+  "img.partOf": "parte {i} de {n}",
+  "img.tileOf": "mosaico {i} de {n}",
   "img.negNeeded": "Este modelo de imagen solo guía con un prompt negativo.",
   "img.negUnused": "El prompt negativo solo se usa con una guía mayor que 1.",
   "img.negative": "Prompt negativo (opcional)",

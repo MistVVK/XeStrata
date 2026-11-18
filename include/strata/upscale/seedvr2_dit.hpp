@@ -42,6 +42,7 @@
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -61,8 +62,10 @@ public:
 
     /// The velocity [t h w][64] (device FP32, the tokens' order) of the noise and the condition latent ([t h w][64]
     /// each, device FP32): t latent frames (a video's; 1 an image's) of h x w tokens, the windows and the RoPE over
-    /// all three axes.
-    void forward(const float* noise, const float* cond, int64_t h, int64_t w, float* out, int64_t t = 1);
+    /// all three axes.  `block`, where given, is told each block done (its index from 1, the blocks' count) once the
+    /// GPU has run it.
+    void forward(const float* noise, const float* cond, int64_t h, int64_t w, float* out, int64_t t = 1,
+                 const std::function<void(int, int)>& block = nullptr);
 
     uint64_t weight_bytes() const { return weight_bytes_; }   // the parts outside the blocks
     uint64_t block_bytes() const { return blocks_.total(); }

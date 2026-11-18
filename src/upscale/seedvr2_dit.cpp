@@ -781,7 +781,8 @@ void Seedvr2Dit::stream_mlp(const Stream& st, const uint8_t* base, float* x, int
     rows::gate_add(x, y, mod + 5 * C_, T, C_, s_);
 }
 
-void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64_t w, float* out, int64_t t) {
+void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64_t w, float* out, int64_t t,
+                         const std::function<void(int, int)>& block) {
     ensure(t, h, w);
     const int64_t N = t * h * w, C = C_, L = L_;
     patch_in16(noise, cond, N, lat_, kin_, in16_, s_);
@@ -831,6 +832,10 @@ void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64
             stream_mlp(b.t, base, t_, L);
         }
         blocks_.end(i);
+        if (block) {   // told once the GPU has run it, not when it is queued
+            gpu::stream_sync(s_);
+            block(i + 1, nb);
+        }
         if (const char* dump = strata::env_get("SEEDVR2_DUMP")) {   // a check: the video stream after each block
             gpu::stream_sync(s_);
             std::vector<float> hx((size_t) (N * C));

@@ -75,7 +75,9 @@
 //                            first (an upscale's second pass; its time in crop_s); UPS:<name>[:<path>] with it: that
 //                            upscaler's (UPS's) first, then the drawing (its time in ups_s), UPSCOLOR:<m> its color
 //                            correction (UPS's COLOR:); UPS: with CROP: the box enlarged to the drawing's size by that
-//                            upscaler instead of Lanczos (crop_upscale; its time in ups_s);
+//                            upscaler instead of Lanczos (crop_upscale; its time in ups_s); the upscaler's run says
+//                            STAGE upscale, then PART <share done, 0..1> as it goes; TILES:'s drawing says TILE <i>
+//                            <n> before each tile's STEP lines;
 //                            LORA:<strength>[@<w0>,<w1>,...]:<path> an adapter (repeated, in the order given; the
 //                            strength first, so that a path's own colons, as Windows' have, stand; the path's spaces
 //                            and other separators %XX'd, the word's whitespace being the line's); @ the strength's
@@ -119,7 +121,8 @@
 //                            the picture <in> upscaled to width x height by the upscaler <name> (strata/upscale/
 //                            upscale.hpp: lanczos, or realesrgan with its weights' <path>, %XX'd as LORA:'s), no image
 //                            model run, its RGBA8 rows to <out>; COLOR: the color correction (the upscaler's own
-//                            when none is named); TILE: the tiles' largest core      -> STAGE upscale, then UPSCALED
+//                            when none is named); TILE: the tiles' largest core      -> STAGE upscale, PART <share
+//                            done, 0..1> as it goes, then UPSCALED
 //                            width=... height=... upscale_s=... model_s=... resize_s=... color_s=... color=...
 //                            tile=... tiles=...
 //   UPSNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:<m>]
@@ -766,7 +769,8 @@ uint64_t ups_room(si::ImagePipeline& p, su::UpscaleModel& m) {
 }
 
 // `src` upscaled by `m` as `rq` asks, in the room the image model leaves: its cache given back first where that is
-// too little for the upscaler's smallest tiles, then its parts
+// too little for the upscaler's smallest tiles, then its parts.  The share done goes to the server as PART lines
+// (serve/images.py: the Monitor's progress)
 si::QiRef run_upscale(si::ImagePipeline& p, su::UpscaleModel& m, const si::QiRef& src, const su::Request& rq,
                       su::Report& rep) {
     const su::ColorFix color = rq.color_set ? rq.color : m.info().color;
@@ -780,7 +784,10 @@ si::QiRef run_upscale(si::ImagePipeline& p, su::UpscaleModel& m, const si::QiRef
         p.release(true);
         avail = ups_room(p, m);
     }
-    return su::UpscaleRunner::run(m, src, rq, avail, &rep);
+    return su::UpscaleRunner::run(m, src, rq, avail, &rep, [](double f) {
+        std::printf("PART %.3f\n", f);
+        std::fflush(stdout);
+    });
 }
 
 constexpr uint64_t kUpsReserve = 512ull << 20;   // upscale_base's
@@ -795,6 +802,8 @@ constexpr uint64_t kUpsReserve = 512ull << 20;   // upscale_base's
 si::QiRef upscale_base(si::ImagePipeline& p, Upscalers& ups, const si::QiRequest& r, const si::QiRef& base, int64_t w,
                        int64_t h, double& ups_s) {
     if (r.upscaler.empty()) return si::lanczos_resize(base, w, h);
+    std::printf("STAGE upscale\n");   // the server's progress (serve/images.py), PART lines after it
+    std::fflush(stdout);
     const auto t0 = std::chrono::steady_clock::now();
     su::Request rq;
     rq.width = w;
@@ -1341,6 +1350,8 @@ std::vector<uint8_t> upscale_tiles(si::ImagePipeline& p, const si::QiRequest& r0
             r.init = cs.crop();
             r.mask = cs.regen();
             r.mask_share = cs.share();
+            std::printf("TILE %d %lld\n", index + 1, (long long) nx * (long long) ny);   // the server's progress: tile i of n
+            std::fflush(stdout);
             si::QiTimes tt;
             const auto img = p.generate(r, &tt, &pl, [&in](int done, int steps) {
                 std::printf("STEP %d %d\n", done, steps);

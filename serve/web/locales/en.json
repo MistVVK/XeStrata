@@ -528,6 +528,8 @@
   "img.model": "Model",
   "img.more": "More settings",
   "img.nOf": "image {i} of {n}",
+  "img.partOf": "part {i} of {n}",
+  "img.tileOf": "tile {i} of {n}",
   "img.negNeeded": "This image model guides only with a negative prompt.",
   "img.negUnused": "The negative prompt is used only with guidance above 1.",
   "img.negative": "Negative prompt (optional)",

@@ -2599,6 +2599,7 @@ class ImageEngine:
         self.ended = threading.Event()              # the daemon closed this connection
         self.pid: int | None = None                 # the engine's process (the daemon's READY), what holds its VRAM
         self.found = False                          # the last start found the daemon running (another server's)
+        self.on_progress: Callable[[str], None] | None = None   # the PART and TILE lines (ImageGen._engine_progress)
 
     def command(self) -> list[str]:
         cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"])]
@@ -2755,8 +2756,9 @@ class ImageEngine:
             stage=None, preview=None, pause=None) -> dict:
         """Send a request line and wait for its answer (the line starting with `want`) -> its fields; STEP lines go to
         `step`, STAGE lines (refs, text, sampling, decode) to `stage`, PREVIEW lines (a partial image: its index, the
-        step, the file of its RGBA8 rows) to `preview`; at a YIELD (UPSV's YIELD:1) `pause` runs, then RESUME goes
-        back.  ImageJobFailed on ERROR."""
+        step, the file of its RGBA8 rows) to `preview`, PART and TILE lines (an upscaler's share done, a tiled
+        drawing's tile) to on_progress, whatever the request; at a YIELD (UPSV's YIELD:1) `pause` runs, then RESUME
+        goes back.  ImageJobFailed on ERROR."""
         self.send(line)
         t0 = time.monotonic()
         while True:
@@ -2768,6 +2770,9 @@ class ImageEngine:
             elif got.startswith("STAGE "):
                 if stage is not None:
                     stage(got[6:].strip())
+            elif got.startswith(("PART ", "TILE ")):
+                if self.on_progress is not None:
+                    self.on_progress(got)
             elif got.startswith("PREVIEW "):
                 if preview is not None:
                     index, done, path = got.split(maxsplit=3)[1:4]
@@ -2857,6 +2862,7 @@ class ImageGen:
         self.loras = lora_api.folder(self.cfg)    # the adapters its DiT takes (serve/loras.py)
         self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "xestrata-image.log",
                                   self._say)
+        self.engine.on_progress = self._engine_progress
         self.tok = None
         self.t5: Any = None   # Anima's T5 tokenizer (tools/strata_unigram.py), read with the first prompt
         self._system: str | None = None          # HunyuanImage 3.0's system prompt, read once
@@ -3412,7 +3418,7 @@ class ImageGen:
             try:
                 pic, out = work / "picture", work / "out.rgba"
                 pic.write_bytes(job["init"])
-                self._live(stage="upscale", sampling_at=None)
+                self._live(stage="upscale", sampling_at=None, part=0.0)
                 try:
                     got = self.engine.ask(f"UPS {job['width']} {job['height']} {pic} {out} {self._ups_spec(job)}"
                                           + (f" COLOR:{u['color']}" if u.get("color") else "")
@@ -3641,7 +3647,8 @@ class ImageGen:
                         self._live(step=done, steps=steps)
 
                     def stage(name):
-                        self._live(stage=name, **({"sampling_at": time.monotonic()} if name == "sampling" else {}))
+                        self._live(stage=name, **({"sampling_at": time.monotonic()} if name == "sampling" else
+                                                  {"part": 0.0} if name == "upscale" else {}))
                     try:
                         r = self.engine.ask(f"IMG {lw} {lh} {job['seed'] + i} {self.drop_of(job)} {out} {ids}{sigmas}"
                                             f"{guide}{self._refs_words(job)}{self._cfg_words(job)}{shown}"
@@ -3780,7 +3787,8 @@ class ImageGen:
                     "text": "Reading the prompt", "sampling": "Sampling", "decode": "Decoding the image (VAE)",
                     "upscale": "Upscaling", "upscale-video": "Upscaling a video",
                     "segment-video": "Finding objects in a video", "segment": "Finding the region",
-                    "matte": "Removing the background"}
+                    "matte": "Removing the background", "control": "Making the control image",
+                    "detect": "Finding the parts"}
 
     def begin(self, job: dict) -> None:
         """The job has the GPU's turn (gpu_turn): from here it is the running job (again, after make_images gave the
@@ -3790,11 +3798,23 @@ class ImageGen:
             return
         self.job = {"started": time.time(), "t0": time.monotonic(), "stage": "waiting", "image": 1, "images": job["n"],
                     "step": 0, "steps": job.get("steps_run", job["steps"]), "size": f"{job['width']}x{job['height']}",
-                    "refs": len(job.get("refs") or ()), "edit": bool(job.get("refs")), "sampling_at": None}
+                    "refs": len(job.get("refs") or ()), "edit": bool(job.get("refs")), "sampling_at": None,
+                    "part": 0.0, "piece": 0, "pieces": 0, "piece_kind": None}
 
     def _live(self, **kw) -> None:
         if self.job is not None:
             self.job.update(kw)
+
+    def _engine_progress(self, line: str) -> None:
+        """The engine's PART <share> (an upscaler's run) and TILE <i> <n> (a tiled drawing's tile) into the live job."""
+        words = line.split()
+        try:
+            if words[0] == "PART":
+                self._live(part=float(words[1]))
+            else:
+                self._live(piece=int(words[1]), pieces=int(words[2]), piece_kind="tile")
+        except (IndexError, ValueError):
+            pass
 
     def live(self) -> dict | None:
         """The running job's stage, step n of the steps, the seconds so far and a step, its size and image i of n, and
@@ -3806,11 +3826,17 @@ class ImageGen:
         now = time.monotonic()
         stage, done, steps = j["stage"], j["step"], max(1, j["steps"])
         step_s = round((now - j["sampling_at"]) / done, 2) if j["sampling_at"] is not None and done > 0 else None
+        # the upscaler's own share (PART) while it runs: an upscale alone is all of it, a drawing's first pass then
+        # starts its bar again
         within = {"waiting": 0.0, "size": 0.01, "refs": 0.02, "text": 0.05, "sampling": 0.1 + 0.8 * done / steps,
-                  "decode": 0.9}.get(stage, 0.0)
+                  "decode": 0.9, "upscale": j.get("part", 0.0)}.get(stage, 0.0)
+        pieces = j.get("pieces") or 0   # a tiled drawing's tiles, the parts' fix's parts: each a share of the image
+        if pieces > 0:
+            within = (max(0, j.get("piece", 1) - 1) + within) / pieces
         frac = (j["image"] - 1 + within) / max(1, j["images"])
         return {"stage": stage, "label": self.STAGE_LABELS.get(stage, stage), "step": done, "steps": j["steps"],
                 "image": j["image"], "images": j["images"], "size": j["size"], "refs": j["refs"], "edit": j["edit"],
+                "piece": j.get("piece", 0), "pieces": pieces, "piece_kind": j.get("piece_kind"),
                 "elapsed_s": round(now - j["t0"], 1), "step_s": step_s, "progress": round(min(1.0, frac), 3)}
 
     def end(self, error: str | None, cancelled: bool = False) -> None:
@@ -5822,6 +5848,7 @@ def fix_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = N
     with gpu_turn(svc, gen, probe, cancel) as policy:
         used = policy
         found = []
+        gen._live(stage="detect")
         for part in job["fix"]["parts"]:
             dets, secs = gen.detect(Path(downloads[job["fix"]["parts"].index(part)]["path"]), picture, FIX_THRESHOLD,
                                     masks=part == "person")
@@ -5844,6 +5871,7 @@ def fix_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = N
                     done.append({**entry, "skipped": f"budget_s {budget:g} s"})
                     continue
                 one = fix_job(gen, job, current, region, seed)
+                gen._live(piece=k + 1, pieces=len(regions), piece_kind="part")
                 made, fig = gen.run(one, cancel)
                 current = made[0]
                 last = fig

@@ -568,6 +568,8 @@
   "img.madeCrop": "(칠한 부분 주변을 {size}로 그림)",
   "img.model": "모델",
   "img.nOf": "{n}장 중 {i}번째",
+  "img.partOf": "부분 {n}개 중 {i}번째",
+  "img.tileOf": "타일 {n}개 중 {i}번째",
   "img.negNeeded": "이 이미지 모델은 네거티브 프롬프트가 있을 때만 가이던스를 씁니다.",
   "img.negUnused": "네거티브 프롬프트는 가이던스가 1보다 클 때만 씁니다.",
   "img.negative": "네거티브 프롬프트 (선택)",

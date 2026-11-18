@@ -277,7 +277,8 @@ function spark(id, values, max, gaps = false) {
 }
 // an image job's step for the header and the state card: "step 3/8", or its stage before and after the sampling
 function imageStep(img) {
-  return img.stage === "sampling" ? tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps}) : img.label;
+  return img.stage === "sampling" ? tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps})
+    : img.stage === "upscale" ? `${img.label} ${Math.round(100 * (img.progress || 0))}%` : img.label;
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
@@ -730,8 +731,14 @@ function renderGpuTabs(cards) {
 
 // an image job's line on the state card: [label, detail, progress %]
 function imageState(img) {
-  const label = img.label + (img.images > 1 ? ` · ${tr("img.nOf", "image {i} of {n}", {i: img.image, n: img.images})}` : "");
-  const detail = [tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps}), img.step_s != null ? `${fmt(img.step_s, 2)} s/step` : null,
+  // a tiled drawing's tile, the parts' fix's part; the steps only while they are what moves the bar
+  const piece = img.pieces > 1 ? (img.piece_kind === "part" ? tr("img.partOf", "part {i} of {n}", {i: img.piece, n: img.pieces})
+                                                            : tr("img.tileOf", "tile {i} of {n}", {i: img.piece, n: img.pieces})) : null;
+  const label = img.label + (img.images > 1 ? ` · ${tr("img.nOf", "image {i} of {n}", {i: img.image, n: img.images})}` : "") +
+    (piece ? ` · ${piece}` : "");
+  const stepped = img.stage === "sampling" || img.stage === "decode";
+  const detail = [stepped ? tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps}) : null,
+                  stepped && img.step_s != null ? `${fmt(img.step_s, 2)} s/step` : null,
                   `${fmt(img.elapsed_s, 0)} s`, img.size,
                   img.refs ? tr("img.refs", {one: "{n} reference", other: "{n} references"}, {n: img.refs}) : null]
     .filter(Boolean).join(" · ");

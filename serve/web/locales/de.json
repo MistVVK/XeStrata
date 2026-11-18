@@ -568,6 +568,8 @@
   "img.madeCrop": "(gezeichnet mit {size} um den übermalten Teil)",
   "img.model": "Modell",
   "img.nOf": "Bild {i} von {n}",
+  "img.partOf": "Teil {i} von {n}",
+  "img.tileOf": "Kachel {i} von {n}",
   "img.negNeeded": "Dieses Bildmodell steuert nur mit einem negativen Prompt.",
   "img.negUnused": "Der negative Prompt wird nur bei einer Guidance über 1 verwendet.",
   "img.negative": "Negativer Prompt (optional)",

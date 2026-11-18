@@ -580,6 +580,8 @@
   "img.madeCrop": "(dessinée en {size} autour de la partie peinte)",
   "img.model": "Modèle",
   "img.nOf": "image {i} sur {n}",
+  "img.partOf": "partie {i} sur {n}",
+  "img.tileOf": "tuile {i} sur {n}",
   "img.negNeeded": "Ce modèle d’image ne guide qu’avec un prompt négatif.",
   "img.negUnused": "Le prompt négatif n’est utilisé qu’avec un guidage supérieur à 1.",
   "img.negative": "Prompt négatif (facultatif)",

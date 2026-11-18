@@ -588,6 +588,13 @@ void Seedvr2::run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, 
     float* noise = m.get<float>(n);
     float* vel = m.get<float>(n);
     float* planes = m.get<float>(4 * HW);
+    // the share done (progress): each frame's encoder, DiT blocks and decoder weighed by the last run's seconds of
+    // each, a fifth, three fifths and a fifth before there is one
+    const double last = m.enc_s + m.dit_s + m.dec_s;
+    const double we = last > 0 ? m.enc_s / last : 0.2, wd = last > 0 ? m.dit_s / last : 0.6;
+    const auto tell = [&](int64_t f, double within) {
+        if (progress) progress(((double) f + within) / (double) frames);
+    };
     m.enc_s = m.dit_s = m.dec_s = 0.0;
     auto t0 = std::chrono::steady_clock::now();
     const auto lap = [&](double& acc) {   // the stream's work so far into acc
@@ -607,13 +614,16 @@ void Seedvr2::run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, 
         }
         kernels::scale_inplace(cond, n, kScaling, m.s);
         lap(m.enc_s);
+        tell(f, we);
         m.vae->drop_scratch();   // the three parts take the room in turn: each one's buffers go before the next's
         // the noise in the latent's [16][h][w] order (torch.randn's), to the tokens' (value 4 c + 2 dy + dx)
         const std::vector<float> r = image::torch_cpu_randn(seed + (uint64_t) f, (uint64_t) n);
         std::vector<float> tok((size_t) n);
         image::noise_to_tokens(r.data(), lat, lh, lw, 2, tok.data());
         gpu::copy(noise, tok.data(), tok.size() * 4);
-        m.dit->forward(noise, cond, th, tw, vel);
+        m.dit->forward(noise, cond, th, tw, vel, 1, progress ? std::function<void(int, int)>([&](int i, int nb) {
+            tell(f, we + wd * i / nb);
+        }) : nullptr);
         lap(m.dit_s);
         m.dit->drop_activations();
         restore(noise, vel, n, 1.f / kScaling, cond, m.s);
@@ -625,6 +635,7 @@ void Seedvr2::run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, 
         }
         rgba8_of(planes, fin, HW, out + f * HW * 4, m.s);
         lap(m.dec_s);
+        tell(f, 1.0);
     }
     core::Runtime::get().stream(m.s).wait_and_throw();
 }

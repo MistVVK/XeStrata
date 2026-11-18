@@ -568,6 +568,8 @@
   "img.madeCrop": "（在涂抹部分周围以 {size} 绘制）",
   "img.model": "模型",
   "img.nOf": "第 {i} 张，共 {n} 张",
+  "img.partOf": "第 {i}/{n} 个部位",
+  "img.tileOf": "第 {i}/{n} 块",
   "img.negNeeded": "该图片模型只有在有负面提示词时才使用引导。",
   "img.negUnused": "只有引导大于 1 时才会使用负面提示词。",
   "img.negative": "负面提示词（可选）",

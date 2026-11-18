@@ -568,6 +568,8 @@
   "img.madeCrop": "(desenhada em {size} em volta da parte pintada)",
   "img.model": "Modelo",
   "img.nOf": "imagem {i} de {n}",
+  "img.partOf": "parte {i} de {n}",
+  "img.tileOf": "bloco {i} de {n}",
   "img.negNeeded": "Este modelo de imagem só orienta com um prompt negativo.",
   "img.negUnused": "O prompt negativo só é usado com orientação acima de 1.",
   "img.negative": "Prompt negativo (opcional)",

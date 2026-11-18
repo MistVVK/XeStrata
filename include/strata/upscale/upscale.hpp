@@ -63,6 +63,9 @@ struct ModelInfo {
 class UpscaleModel {
 public:
     virtual ~UpscaleModel() = default;
+    /// Told a run_clip's share done so far (0..1) as it goes, by a model whose run has parts worth telling (SeedVR2:
+    /// its encoder, each DiT block, its decoder); none: nothing told.  UpscaleRunner::run sets it for its run.
+    std::function<void(double)> progress;
     virtual const ModelInfo& info() const = 0;
     /// The weights' bytes on the GPU (held between runs until release(true)).
     virtual uint64_t weight_bytes() const = 0;
@@ -159,7 +162,9 @@ public:
     /// `src` (RGBA8) at r.width x r.height through `m`, in `avail` bytes of VRAM (the model's weights included): the
     /// tiles from it (halved while an allocation fails, down to the model's min_tile, then std::runtime_error).  The
     /// model's scratch is let go at the end; its weights stay.
-    static QiRef run(UpscaleModel& m, const QiRef& src, const Request& r, uint64_t avail, Report* rep = nullptr);
+    /// `step` is told the share done (0..1): the tiles done, and within a tile what the model tells (progress).
+    static QiRef run(UpscaleModel& m, const QiRef& src, const Request& r, uint64_t avail, Report* rep = nullptr,
+                     const std::function<void(double)>& step = nullptr);
     /// The VRAM a run of an sw x sh image to w x h takes: `least` with the smallest tiles, `full` the frame whole.
     static uint64_t least_bytes(const UpscaleModel& m, int64_t sw, int64_t sh, int64_t w, int64_t h,
                                 ColorFix color);

@@ -162,7 +162,8 @@ uint64_t UpscaleRunner::full_bytes(const UpscaleModel& m, int64_t sw, int64_t sh
     return frame_bytes(in, sw, sh, w, h, color) + work;
 }
 
-QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, uint64_t avail, Report* rep) {
+QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, uint64_t avail, Report* rep,
+                         const std::function<void(double)>& step) {
     const ModelInfo& in = m.info();
     const int64_t sw = src.width, sh = src.height, w = r.width, h = r.height;
     if (sw <= 0 || sh <= 0 || src.rgba.size() != (size_t) (sw * sh * 4))
@@ -209,6 +210,13 @@ QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, ui
     // window, so there is no shared band to ramp, no weights to add up and no divide to end.  Its side too comes from
     // halving until the run fits, not from weighing the tiles' positions against each other
     t0 = std::chrono::steady_clock::now();
+    // the share done (step): the tiles done, and the model's own share of the tile it is on
+    int64_t ntiles = 1, tdone = 0;
+    struct Unset {
+        UpscaleModel& m;
+        ~Unset() { m.progress = nullptr; }
+    } unset{m};
+    if (step) m.progress = [&](double f) { step(((double) tdone + std::clamp(f, 0.0, 1.0)) / (double) ntiles); };
     if (in.identity) {
         m.run_clip(fin, fw, fh, nfr, made.p, r.seed);
     } else {
@@ -229,6 +237,8 @@ QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, ui
         for (;;) {
             try {
                 const int64_t nx = in.context > 0 ? (fw + T - 1) / T : 1, ny = in.context > 0 ? (fh + T - 1) / T : 1;
+                ntiles = nx * ny;
+                tdone = 0;
                 if (nx * ny == 1) {
                     m.run_clip(fin, fw, fh, nfr, made.p, r.seed);
                     rp.tile = 0;
@@ -270,6 +280,8 @@ QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, ui
                                 for (int c = 0; c < 4; ++c) b[c] = a[c];
                             }), "upscale: tile out");
                             ++count;
+                            tdone = count;
+                            if (step) step((double) tdone / (double) ntiles);
                         }
                     rp.tile = T;
                     rp.tiles = count;
@@ -286,6 +298,7 @@ QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, ui
         }
         m.release(false);
     }
+    if (step) step(1.0);
     rp.model_s += since(t0);
     // the first frame at the size asked for
     t0 = std::chrono::steady_clock::now();
