@@ -37,6 +37,7 @@ inline std::vector<float> mage_sigmas(int n, float shift = 6.0f) {
 /// the exponential time shift by mu, a line in the image's tokens from base_shift 0.5 at 256 to max_shift 0.9 at
 /// 8192, then stretched to end at shift_terminal 0.02).  An image token is a 16 x 16 pixel square.
 inline std::vector<float> qi_base_sigmas(int steps, int64_t width, int64_t height) {
+    if (steps == 1) return {1.0f, 0.0f};
     const int64_t seq = (width / 16) * (height / 16);
     const double mu = 0.5 + (0.9 - 0.5) / (8192 - 256) * (double) (seq - 256);
     const double e = std::exp(mu);

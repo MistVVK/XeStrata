@@ -391,7 +391,7 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
 }
 
 void QiDit::mlp(const W& wgu, const W& wdown, float* x, const float* gate, int64_t n_text, int64_t mr) {
-    if (wgu.w8 && wdown.w8 && wgu.lora == nullptr && wdown.lora == nullptr) {
+    if (wgu.w8 && wdown.w8 && (wgu.lora == nullptr || wgu.baked) && (wdown.lora == nullptr || wdown.baked)) {
         // SwiGLU straight from the gate_up product's sums into the down product's int8 input, and the down product's
         // sums gated into x as they are
         product(h16_, wgu, gu_, mr, 0, 0, -1, false, true);
@@ -410,13 +410,7 @@ void QiDit::mlp(const W& wgu, const W& wdown, float* x, const float* gate, int64
 
 void QiDit::ensure(int64_t T, int64_t HW) {
     if (T > cap_T_) {
-        for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) h_, (void*) gu_, (void*) h16_,
-                        (void*) q16_, (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_,
-                        (void*) kmean_.buf})
-            if (p != nullptr) {
-                allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
-                gpu::free(p);
-            }
+        drop_activations();
         const int64_t TP = qi_attn_rows(T);
         x_ = alloc<float>(allocs_, T * C_, "image engine");
         q_ = alloc<float>(allocs_, T * C_, "image engine");
@@ -704,7 +698,7 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
         // W8A8: the sums scaled as qi_qk_norm_rope16 reads them (an adapter's delta is FP32: those products are not
         // deferred, and the sums are scaled here)
         DitOut qkv[3];
-        const bool i8 = wq.w8 && wk.w8 && wv.w8 && wq.lora == nullptr && wk.lora == nullptr && wv.lora == nullptr;
+        const bool i8 = wq.w8 && wk.w8 && wv.w8 && (wq.lora == nullptr || wq.baked) && (wk.lora == nullptr || wk.baked) && (wv.lora == nullptr || wv.baked);
         product(h16_, wq, q_ + r0 * C, Tr, 0, 0, -1, false, i8);
         qkv[0] = i8_;
         product(h16_, wk, k_ + r0 * C, Tr, 0, 0, -1, wq.w8, i8);
@@ -728,7 +722,7 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
         qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_ + r0 * C, s_, key_lim_, r0, true,
                      key_lim_ != nullptr ? &ref_spans_ : nullptr, &st);
         kmean_.mark((int64_t) bi * 2 + ctx_i_);
-        const bool od = product(o16_ + r0 * C, wo, h_, Tr, 0, 0, -1, false, wo.lora == nullptr);
+        const bool od = product(o16_ + r0 * C, wo, h_, Tr, 0, 0, -1, false, (wo.lora == nullptr || wo.baked));
         qi_gate_add(xr, h_, mod(1), ntr, Tr, C, s_, od ? &i8_ : nullptr);
         for (int64_t m0 = 0; m0 < Tr; m0 += mlp_rows_) {   // the MLP a band of rows at a time (its 2 x inter wide product)
             const int64_t mr = std::min(mlp_rows_, Tr - m0), mt = std::max<int64_t>(0, std::min(ntr - m0, mr));
@@ -809,7 +803,7 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
         qi_ln_mod16(x_, mod(0), 0, R, C, h16_, s_);
         // W8A8: the sums scaled as qi_qk_norm_rope16 reads them (the second context's rows from HW on)
         DitOut qkv[3], qkv2[3];
-        const bool i8 = wq.w8 && wk.w8 && wv.w8 && wq.lora == nullptr && wk.lora == nullptr && wv.lora == nullptr;
+        const bool i8 = wq.w8 && wk.w8 && wv.w8 && (wq.lora == nullptr || wq.baked) && (wk.lora == nullptr || wk.baked) && (wv.lora == nullptr || wv.baked);
         product(h16_, wq, q_, R, 0, 0, -1, false, i8);
         qkv[0] = i8_;
         product(h16_, wk, k_, R, 0, 0, -1, wq.w8, i8);
@@ -843,7 +837,7 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
         const auto stb = kmean_.stats((int64_t) bi * 2 + 1);
         qi_attention(q16b, k16b, v16b, Tb, heads_, kHead, nb, o16_ + HW * C, s_, o.key_lim, nb, true, nullptr, &stb);
         kmean_.mark((int64_t) bi * 2 + 1);
-        const bool od = product(o16_, wo, h_, R, 0, 0, -1, false, wo.lora == nullptr);
+        const bool od = product(o16_, wo, h_, R, 0, 0, -1, false, (wo.lora == nullptr || wo.baked));
         qi_gate_add(x_, h_, mod(1), 0, R, C, s_, od ? &i8_ : nullptr);
         for (int64_t m0 = 0; m0 < R; m0 += mlp_rows_) {   // the MLP a band of rows at a time
             const int64_t mr = std::min(mlp_rows_, R - m0);
