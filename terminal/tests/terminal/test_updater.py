@@ -245,6 +245,38 @@ class EngineUpdate(UpdaterCase):
         self.assertEqual(fixed["results"][0]["status"], "updated", fixed)
         self.assertEqual(self.resolved(), "0.1.47")
 
+    def test_a_test_start_failed_by_a_dead_host_of_an_older_control_is_tried_again_without_force(self):
+        """DIAG-WINHOST-0216: Controls up to 0.2.15 install the engine BEFORE the Control, so their own host (dead on a PC where WMI refuses the account)
+        fails the new engine's test start in the very run that installs the fixed Control. The next plain `strata update` must try the engine again."""
+        dead = "ProfileError: runtime control is unavailable; inspect the private host log"
+        self.install_current()
+        self.publish(("0.1.47", fx.BAD_ENGINE))
+        first = updater.run_update(self.ctx(), control=False)
+        self.assertEqual(first["results"][0]["status"], "failed", first)
+
+        def mark(**changes):
+            state = updater.State(self.components)
+            bad = state.section("engine")["failed"]["0.1.47"]
+            bad.update(changes)
+            for key in [k for k, v in changes.items() if v is None]:
+                bad.pop(key)
+            state.save()
+
+        with mock.patch.object(ec, "runtime_version", return_value="0.1.62"):
+            # a record of this very Control stays held back (the engine really fails to start)
+            mark(reason=dead, control="0.1.62")
+            self.assertEqual(updater.run_update(self.ctx(), control=False)["results"][0]["status"], "failed-before")
+            # a record of 0.2.15's Control (no "control" field) with the dead host's words: tried again, no --force
+            mark(reason=dead, control=None)
+            retried = updater.run_update(self.ctx(), control=False)
+            self.assertEqual(retried["results"][0]["status"], "failed", "the engine was tried again (and, this one being bad, failed again)")
+            self.assertEqual(updater.State(self.components).section("engine")["failed"]["0.1.47"].get("control"), "0.1.62")
+            # another Control's record with ANY OTHER reason is still held back
+            mark(reason="the engine said no", control=None)
+            self.assertEqual(updater.run_update(self.ctx(), control=False)["results"][0]["status"], "failed-before")
+            mark(reason=dead, control="0.1.61")
+            self.assertEqual(updater.run_update(self.ctx(), control=False)["results"][0]["status"], "failed", "a record of an older Control version")
+
     def test_an_interrupted_download_resumes(self):
         self.install_current()
         self.publish(("0.1.46", fx.GOOD_ENGINE, {"padding": 3_000_000}))
