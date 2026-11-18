@@ -5250,7 +5250,7 @@ class Service:
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
 
     def _image_running(self) -> bool:
-        return self.images is not None and self.images.job is not None
+        return self.images is not None and self.images.live() is not None
 
     def image_gpu_mode(self) -> str:
         """Where the image jobs run beside the chat: "separate" (a card of their own: they run at the same time),
@@ -5263,7 +5263,10 @@ class Service:
         return "separate" if getattr(self.images, "separate", False) else "shared"
 
     def _image_shares_text(self) -> bool:
-        return self._image_running() and self.image_gpu_mode() == "shared"
+        """An image job on the text model's card: the shared card's, or one on the text model's GPU lent to the images
+        (images_api.place, use_text_gpu)."""
+        live = self.images.live() if self.images is not None else None
+        return live is not None and (self.image_gpu_mode() == "shared" or bool(live.get("on_text")))
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -5461,9 +5464,21 @@ class Service:
                else {"now": {}, "history": {}, "static": {}})
         engine["image_gpu"] = self.image_gpu_mode()
         if tel["now"].get("gpus"):                      # what each card does right now (the Monitor's tabs light it)
-            doing = {"text": live["state"] in ("reading", "generating"), "image": image is not None}
-            tel["now"] = dict(tel["now"], gpus=[dict(g, active=[r for r in g.get("roles") or () if doing.get(r)])
-                                                for g in tel["now"]["gpus"]])
+            # a job on the text model's GPU, lent to the images (images_api.place): that card draws it, an image card
+            # of its own only its own job
+            lent = bool(image and image.get("on_text"))
+            own = self.images is not None and (self.images.current.live() is not None if lent else image is not None)
+            doing = {"text": live["state"] in ("reading", "generating"), "image": own}
+            lend_pci = str(getattr(self.images, "lend_pci", None) or "").lower() if lent else ""
+
+            def card(g: dict) -> dict:
+                roles = list(g.get("roles") or ())
+                active = [r for r in roles if doing.get(r)]
+                if lend_pci and str(g.get("pci") or "").lower() == lend_pci:
+                    roles += [] if "image" in roles else ["image"]
+                    active += [] if "image" in active else ["image"]
+                return dict(g, roles=roles, active=active)
+            tel["now"] = dict(tel["now"], gpus=[card(g) for g in tel["now"]["gpus"]])
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": rows[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),

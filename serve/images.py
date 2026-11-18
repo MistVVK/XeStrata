@@ -4111,6 +4111,16 @@ class ImageModels:
         """Whether a job runs on the text model's GPU, lent to the images, now (the chat's requests wait meanwhile)."""
         return self._lent is not None and any(g.job is not None for g in self._lent.gens.values())
 
+    def live(self) -> dict | None:
+        """The running job's progress (ImageGen.live; the Monitor's live.image): one on the text model's GPU, lent to
+        the images, first (the chat waits for it), marked "on_text"; else this GPU's model's."""
+        if self._lent is not None:
+            for g in self._lent.gens.values():
+                got = g.live()
+                if got is not None:
+                    return {**got, "on_text": True}
+        return self.current.live()
+
     def lent(self) -> "ImageModels":
         """The models' engines on the text model's GPU (made once): their jobs take the GPU's turn there as on a
         shared card, the text model making room for them (gpu_turn)."""

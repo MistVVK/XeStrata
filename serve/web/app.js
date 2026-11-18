@@ -759,7 +759,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   // model state. An image job on a card of its own (or the helper card) runs beside the chat: the row under it says
   // its state, and the state above stays the chat's. On the text model's card the job takes the state in its turn.
   // A local turn keeps metrics on "unloaded" for the whole engine start.
-  const beside = imageBeside();
+  // a job on the chat model's GPU, lent to the images (its live.image on_text), takes the state as on a shared card
+  const beside = imageBeside() && !(live.image && live.image.on_text);
   const image = beside ? null : live.image;
   const imageNow = !beside && imageLive(live);
   const starting = modelOp === "load" || (replies.size > 0 && live.state === "unloaded");
@@ -844,16 +845,21 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   // chat's decode on another card; All and the text model's cards keep the chat's speed
   const imageCard = Boolean(one) && (one.roles || []).includes("image") && !(one.roles || []).includes("text");
   for (const el of document.querySelectorAll(".speed-values .speed-prefill")) el.hidden = imageCard;
-  if (imageCard) {
-    const job = (requests || []).find((r) => r.kind === "image" && r.finish === "stop" && r.sampling_s > 0 && r.steps > 0);
-    const now = live.image && live.image.stage === "sampling" ? live.image.step_s : null;
-    const stepS = now != null ? now : job ? job.sampling_s / (job.steps * (job.n || 1)) : null;
+  // the seconds a step of `job` (its live.image) while it samples, else the last job's (the steps' seconds grow by the
+  // clock during the decode)
+  const stepOf = (job) => {
+    const last = (requests || []).find((r) => r.kind === "image" && r.finish === "stop" && r.sampling_s > 0 && r.steps > 0);
+    const now = job && job.stage === "sampling" ? job.step_s : null;
+    return now != null ? now : last ? last.sampling_s / (last.steps * (last.n || 1)) : null;
+  };
+  if (imageCard) {   // a job on the text model's card (on_text) is not this card's
+    const job = live.image && !live.image.on_text ? live.image : null, stepS = stepOf(job);
     setMetric("speed", stepS == null ? null : fmt(stepS, 2), "s/step",
-              live.image ? tr("img.pill", "Image · {step}", {step: imageStep(live.image)})
-              : job ? tr("mon.imageStepLast", "Image · last job") : tr("img.job", "Image job"));
+              job ? tr("img.pill", "Image · {step}", {step: imageStep(job)})
+              : stepS != null ? tr("mon.imageStepLast", "Image · last job") : tr("img.job", "Image job"));
   } else if (image) {   // an image job in the text model's turn: its seconds a step, not a decode rate
-    setMetric("speed", live.image.step_s == null ? null : fmt(live.image.step_s, 2), "s/step",
-              tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
+    const stepS = stepOf(image);
+    setMetric("speed", stepS == null ? null : fmt(stepS, 2), "s/step", tr("img.pill", "Image · {step}", {step: imageStep(image)}));
   } else {
     const speed = live.state === "generating" ? live.tok_s : avgDecode != null ? avgDecode : last ? last.decode_tok_s : null;
     setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
