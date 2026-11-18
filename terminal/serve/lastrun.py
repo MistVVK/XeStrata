@@ -21,7 +21,7 @@ MARKER_PREFIX = "last-run-"
 JOURNAL_WAIT_S = 5
 
 OOMD_WORDS = ("[strata] Last time, this computer's memory guard (systemd-oomd) ended Strata: it stops a program when memory has "
-              "been under strain for 20 seconds, and loading a large model can do that. Strata now frees memory before the load and pauses it for a few seconds when memory gets tight, "
+              "been under strain for 20 seconds, and loading a large model can do that. Strata now frees memory before the load and pauses it for a few seconds when memory gets tight. "
               "If it happens again: close other programs (a web browser uses a lot of memory) and start again, "
               "or start Strata from a text console or over ssh, which the memory guard does not watch.")
 UNCLEAN_WORDS = ("[strata] Last time, Strata did not end normally (the window was closed hard, the power went off, or the computer ran out of memory). "
