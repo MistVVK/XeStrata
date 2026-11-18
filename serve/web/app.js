@@ -3336,6 +3336,93 @@ function imgSliders() {
   }
   for (const r of imgRanges) r.style.setProperty("--fill", `${r.max > r.min ? (r.value - r.min) / (r.max - r.min) * 100 : 0}%`);
 }
+// The fields' explanations: an ⓘ button beside each label marked data-info="<key>" opens its text (info.<key>) under
+// the field, by a tap, a click or the keyboard, and the same button, Escape or a click elsewhere closes it - a title
+// shows only under a mouse, not on a phone.  The words follow the server's (serve/images.py, image_regions.py) and
+// docs/IMAGE.md.
+const INFO = {   // "\n" between lines, "- " before a list's items
+  upModel: "How the picture is made larger:\n- Auto: SeedVR2 when it is only made larger, RealESRGAN when it is drawn again (and where SeedVR2 does not fit the GPU)\n- Lanczos: a plain resize\n- RealESRGAN: a super-resolution model, sharp and quick\n- SeedVR2 7B: a diffusion model that restores detail in one step (photos, video frames)\n- SeedVR2 7B sharp: for anime and blurred pictures, crisper detail\nThe weights are downloaded the first time.",
+  upScale: "How many times larger each side gets (above 1, at most 4). The result is at most 4096 pixels a side, its sides multiples of 16.",
+  upColor: "The colors after the upscale, moved toward the original's:\n- Wavelet: the upscale's fine detail over the original's coarse colors\n- LAB: Wavelet's, then each Lab channel matched to the original's\n- AdaIN: each RGB channel's mean and spread matched\n- None: as the upscaler made them\n- The upscaler's own: none for RealESRGAN, LAB for SeedVR2",
+  upRedraw: "After the upscale the image model draws the larger picture again, adding detail. It needs a prompt that describes the picture. Past the model's size it is drawn in tiles.",
+  redrawStrength: "How much of the upscaled picture the image model changes (0.35 by default): lower keeps it, higher draws more of it anew.",
+  fixParts: "Faces, hands or people are found (YOLOv8 detectors, a score of 0.5 or more), each cut out with room around it, drawn again larger and put back, one at a time, the largest first. Parts already large (1024 pixels or more on the short side) or tiny ones are left as they are.",
+  fixStrength: "How much of each part is drawn again (0.5 by default): lower keeps the part as it was, higher draws it more anew.",
+  drawModel: "The image model that draws again (the upscale's redraw, the parts' fix), where several are installed.",
+  seed: "The same seed with the same settings gives the same picture. Empty: a new random one each time.",
+  segTask: "- Masks: the outline of each thing the words name\n- Boxes: only the boxes around them\n- Every thing with its name: Florence-2 finds each phrase of a caption, with a box and its name",
+  segModel: "- SAM 3.1: every instance of a concept of a few words (\"hair\", \"red car\"), the highest score first; it needs Meta's SAM License agreed to\n- Florence-2: reads a phrase such as \"the girl on the left\" and answers with outlines, without a score\n- Auto: SAM 3.1 for a concept of up to four words where its license is agreed to, else Florence-2 (large, base where large does not fit the GPU)",
+  segScore: "The least score a thing SAM 3.1 finds must have to be kept (0 to 1): lower finds more, with more mistakes. Florence-2 gives no score.",
+  segMaskT: "Where a mask's edge falls: the probability a pixel must pass to be inside (0 to 1). Lower makes the masks larger.",
+  bgModel: "BiRefNet's versions:\n- general (the default): reads at 1024x1024\n- lite: smaller and quicker, 1024x1024\n- lite-2k: 2560x1440, for large pictures\n- portrait: people\n- matting: hair, fur, glass, smoke and other soft edges\n- hr: 2048x2048, fine detail in large pictures\n- dynamic: reads at the picture's own size (256 to 2304)\nA version that does not fit the GPU gives way to lite (lite-2k for the large ones).",
+  bgRes: "The size BiRefNet reads the picture at (multiples of 32, 256 to 2304). Empty: the version's own.",
+  bgRefine: "Estimates the subject's own colors at its edge, so that the old background's color does not stay on the edge on another background (on by default).",
+  bgGrow: "Moves the cut's edge out by this many pixels; below 0, in.",
+  bgBlur: "Softens the cut's edge: the blur's radius in pixels.",
+  steps: "The sampler's steps: more is slower and often finer, up to a point. Empty: the model's own (Turbo models take few).",
+  cfg: "How strongly the picture follows the prompt over the negative prompt (classifier-free guidance). Higher follows the words more; too high oversaturates. 1 turns it off and is faster.",
+  strength: "How much of the first image is changed (above 0, at most 1): the lower, the more of it is kept, and the fewer steps run. By default 1 for an edit, 0.87 for drawing from an image (img2img).",
+  extend: "Draws past the image's edges to the shape chosen. The new area starts as copies of the edges and is drawn with a band of the image; the rest of the image is kept.",
+  cropEdit: "Cuts the painted part out with room around it, draws it at about 1024x1024 and puts it back, so that a small part gets the model's full detail. Off: the whole image is drawn again at its own size.",
+  colorMatch: "The drawn part's colors matched to the image's before it goes back:\n- Auto: by the part kept just outside the paint (only the model's drift is undone; a color change asked for stays)\n- Whole part: the whole cut's colors moved to the image's (a color change asked for fades too)\n- Off: as drawn",
+  refine: "MOSS-Image with two reference images or more: after the edit, the painted part is cut out and drawn again larger and finer, with the references (about 1.6 times the time).",
+  ctrlType: "What is taken from the picture for the new image: a person's pose, the depth (the composition), outlines, line art, straight lines and so on. \"Preview the map\" shows what is taken. A model without ControlNet takes the map as one more reference image.",
+  ctrlStrength: "How strongly the map steers the drawing: Qwen-Image-2.1's ControlNet 0 to 2 (1 by default); MOSS-Image its adapter's or LoRA's strength (1 by default).",
+  ctrlSpan: "The share of the steps the map is used for (0 to 1). An end of 0.6 to 0.8 keeps the composition and leaves the details free.",
+  lora: "Adapters that add a style or a character to the image model. Each has a strength (-2 to 2); a prompt can name one by its tag too.",
+  guide: "Optional ways to sample (nothing is applied unless chosen):\n- Detail Daemon: the model is given a slightly smaller noise level, for more detail\n- Skip Layer Guidance: the prompt read again with some blocks skipped, and the drawing steered away from that, for firmer structure\n- APG: the guidance's size held back (less oversaturation)",
+};
+let infoOpen = null;   // [the button, its text] while one is open
+function infoClose() {
+  if (!infoOpen) return;
+  infoOpen[0].setAttribute("aria-expanded", "false");
+  infoOpen[1].remove();
+  infoOpen = null;
+}
+function infoToggle(btn, key) {
+  const was = infoOpen && infoOpen[0] === btn;
+  infoClose();
+  if (was) return;
+  const pop = document.createElement("div");
+  pop.className = "info-pop";
+  pop.setAttribute("role", "note");
+  pop.id = `info-${key}`;
+  // its lines: those that start with "- " a list, the others paragraphs
+  let list = null;
+  for (const line of tr(`info.${key}`, INFO[key]).split("\n")) {
+    if (line.startsWith("- ")) {
+      if (!list) list = pop.appendChild(document.createElement("ul"));
+      list.appendChild(document.createElement("li")).textContent = line.slice(2);
+    } else {
+      list = null;
+      pop.appendChild(document.createElement("p")).textContent = line;
+    }
+  }
+  // under the field: after its label (a click in the text then does not reach the field), a details' summary after
+  // the section (shown while it is closed too), a legend after itself
+  const label = btn.closest("label"), summary = btn.closest("summary");
+  const after = summary ? summary.parentElement : label || btn.parentElement;
+  if (btn.closest("legend")) btn.closest("legend").after(pop); else after.after(pop);
+  btn.setAttribute("aria-expanded", "true");
+  btn.setAttribute("aria-controls", pop.id);
+  infoOpen = [btn, pop];
+}
+for (const el of document.querySelectorAll("[data-info]")) {
+  const key = el.dataset.info, b = document.createElement("button");
+  b.type = "button";
+  b.className = "st-btn st-btn--icon info-btn";
+  b.title = tr("ui.about", "What this is");
+  b.setAttribute("aria-label", b.title);
+  b.setAttribute("aria-expanded", "false");
+  b.innerHTML = icon("info");
+  b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); infoToggle(b, key); };
+  el.after(b);
+}
+document.addEventListener("click", (e) => {
+  if (infoOpen && !infoOpen[1].contains(e.target) && !e.target.closest(".info-btn")) infoClose();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") infoClose(); });
+
 // a slider's default: what its field holds when nothing is chosen - empty where the field's placeholder shows the
 // model's default (a request leaves it out), else the field's own first value (the page's), a select's first choice
 function sliderDefault(f) {
@@ -4616,7 +4703,6 @@ function toolShow() {
     : tr("tool.promptRedraw", "What the picture shows (the redraw's prompt)");
   $("tool-model-f").hidden = $("tool-model").options.length < 2 || (k === "upscale" && !redraw);
   $("tool-seed-f").hidden = k === "upscale" && !redraw;
-  $("tool-up-about").textContent = tr("img.upMethodTitle", "How the image is made larger: Auto (RealESRGAN when it is drawn again, SeedVR2 when not), Lanczos (a plain resize), RealESRGAN (sharper) or SeedVR2 (restores detail in one step; sharp: for anime and blurred pictures). The weights are downloaded the first time");
   toolUpSize();
 }
 for (const b of $("tool-kind").children)

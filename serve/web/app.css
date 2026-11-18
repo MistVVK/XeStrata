@@ -473,6 +473,15 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .st-btn.sl-reset .st-icon{width:14px;height:14px}
 .sl-reset:disabled{visibility:hidden}
 .st-label .sl-reset{width:22px;height:22px;margin-left:4px;vertical-align:middle}
+.info-btn{width:22px;height:22px;flex:none;margin-left:4px;vertical-align:middle;color:var(--st-ink-muted)}
+.st-btn.info-btn .st-icon{width:14px;height:14px}
+.info-btn[aria-expanded="true"]{color:var(--st-accent)}
+.info-pop{margin:var(--st-s-1) 0 var(--st-s-2);padding:var(--st-s-2) var(--st-s-3);border:1px solid var(--st-line);
+  border-radius:var(--st-r-md);background:var(--st-surface-2);color:var(--st-ink-soft);font-size:var(--st-fs-sm);
+  line-height:1.5;white-space:normal}
+.info-pop > *{margin:0}
+.info-pop > * + *{margin-top:var(--st-s-1)}
+.info-pop > ul{padding-left:1.2em}
 .img-sl__range,.tool-split{width:100%;height:24px;margin:0;background:transparent;cursor:pointer;-webkit-appearance:none;appearance:none}
 .img-sl__range:disabled{opacity:.45;cursor:default}
 .img-sl__range::-webkit-slider-runnable-track,.tool-split::-webkit-slider-runnable-track{height:6px;border-radius:3px;

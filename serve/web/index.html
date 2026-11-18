@@ -159,7 +159,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <div class="st-card img-settings">
         <label class="st-field" id="img-sampler-f" hidden><span data-i18n="img.sampler">Sampler</span>
           <select class="st-input" id="img-sampler"></select></label>
-        <label class="st-field img-sl" id="img-steps-f"><span class="img-sl__head"><span data-i18n="img.steps">Steps</span>
+        <label class="st-field img-sl" id="img-steps-f"><span class="img-sl__head"><span data-info="steps" data-i18n="img.steps">Steps</span>
           <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></span>
           <input class="img-sl__range" type="range" data-for="img-steps" tabindex="-1" aria-hidden="true"></label>
         <div class="img-size">
@@ -182,13 +182,13 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024"></span>
             <input class="img-sl__range" type="range" data-step="16" data-for="img-h" tabindex="-1" aria-hidden="true"></label>
         </div>
-        <label class="st-field img-sl" id="img-cfg-f"><span class="img-sl__head"><span id="img-cfg-l">Guidance (CFG)</span>
+        <label class="st-field img-sl" id="img-cfg-f"><span class="img-sl__head"><span data-info="cfg" id="img-cfg-l">Guidance (CFG)</span>
           <input class="st-input" id="img-cfg" type="number" min="0" max="30" step="0.5"></span>
           <input class="img-sl__range" type="range" data-for="img-cfg" tabindex="-1" aria-hidden="true"></label>
         <label class="st-field img-sl" id="img-n-f"><span class="img-sl__head"><span data-i18n="img.count">Images</span>
           <span class="img-n"><span class="img-n-est" id="img-n-est"></span><select class="st-input" id="img-n"><option>1</option></select></span></span>
           <input class="img-sl__range" type="range" data-for="img-n" tabindex="-1" aria-hidden="true"></label>
-        <div class="st-field"><label for="img-seed" data-i18n="img.seed">Seed</label>
+        <div class="st-field"><label for="img-seed" data-i18n="img.seed" data-info="seed">Seed</label>
           <span class="img-seed"><input class="st-input" id="img-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom">
             <button type="button" class="st-btn st-btn--icon" id="img-seed-random" title="A random seed" aria-label="A random seed" data-i18n-title="img.seedDice" data-i18n-label="img.seedDice">
               <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3.5" stroke="currentColor" stroke-width="1.5"/><circle cx="8.75" cy="8.75" r="1.25" fill="currentColor"/><circle cx="12" cy="12" r="1.25" fill="currentColor"/><circle cx="15.25" cy="15.25" r="1.25" fill="currentColor"/></svg></button>
@@ -199,10 +199,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <div class="st-collapse__body img-sec__body">
             <label class="st-field" id="img-ref-f"><input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp,image/jxl,.jxl" multiple
                    aria-labelledby="img-ref-l"></label>
-            <label class="st-field img-sl" id="img-strength-f" hidden title="How much of the image may change: lower keeps more of it" data-i18n-title="img.strengthTitle"><span class="img-sl__head"><span data-i18n="img.strength">Strength</span>
+            <label class="st-field img-sl" id="img-strength-f" hidden title="How much of the image may change: lower keeps more of it" data-i18n-title="img.strengthTitle"><span class="img-sl__head"><span data-info="strength" data-i18n="img.strength">Strength</span>
               <input class="st-input" id="img-strength" type="number" min="0.01" max="1" step="0.01"></span>
               <input class="img-sl__range" type="range" data-for="img-strength" tabindex="-1" aria-hidden="true"></label>
-            <label class="st-field" id="img-ext-f" hidden title="Draw past the image's edges to this shape (outpaint)" data-i18n-title="img.extendTitle"><span data-i18n="img.extend">Extend to</span>
+            <label class="st-field" id="img-ext-f" hidden title="Draw past the image's edges to this shape (outpaint)" data-i18n-title="img.extendTitle"><span data-info="extend" data-i18n="img.extend">Extend to</span>
               <select class="st-input" id="img-ext"><option value="" data-i18n="img.upNone">None</option><option value="1:1">1:1</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label>
             <div class="img-mask" id="img-mask" hidden>
               <span class="img-mask-title" data-i18n="img.mask">Mask (optional): paint the part of the first image to draw again; the rest stays as it is</span>
@@ -212,9 +212,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
                 <button type="button" class="st-btn" id="img-mask-clear" data-i18n="img.clear">Clear</button>
                 <span class="img-check img-region" title="Find the part the words name in the first image (SAM 3, or Florence-2) and paint it into the mask; the brush changes it after" data-i18n-title="img.regionTitle"><input class="st-input" id="img-region" type="text" placeholder="Words: hair, sky" aria-label="Words of the part" data-i18n-placeholder="img.region" data-i18n-label="img.regionLabel"> <button type="button" class="st-btn" id="img-region-go" data-i18n="img.regionGo">Make mask</button></span>
                 <a href="#" id="img-sam-license" hidden data-i18n="img.samLicense">SAM 3's license&hellip;</a>
-                <label class="img-check" title="The part around the paint is drawn at about 1024 x 1024 and put back; off draws again at the output's size" data-i18n-title="img.cropEditTitle"><input type="checkbox" id="img-crop" checked> <span data-i18n="img.cropEdit">Cut out the painted part and draw it larger</span></label>
-                <label class="img-check" title="Match the drawn part's colors to the image's: auto by the part kept around the paint, full by the whole cut" data-i18n-title="img.colorTitle"><span data-i18n="img.color">Color match</span> <select class="st-input" id="img-color"><option value="off" data-i18n="img.colorOff">Off</option><option value="auto" data-i18n="img.colorAuto">Auto</option><option value="full" data-i18n="img.colorWhole">Whole part</option></select></label>
-                <label class="img-check" id="img-refine-f" hidden title="MOSS-Image with two images or more: the whole picture first, then the painted part cut out of it and drawn again" data-i18n-title="img.refineTitle"><input type="checkbox" id="img-refine"> <span data-i18n="img.refine">Draw the painted part again, finer (about 1.6 times the time)</span></label>
+                <label class="img-check" title="The part around the paint is drawn at about 1024 x 1024 and put back; off draws again at the output's size" data-i18n-title="img.cropEditTitle"><input type="checkbox" id="img-crop" checked> <span data-info="cropEdit" data-i18n="img.cropEdit">Cut out the painted part and draw it larger</span></label>
+                <label class="img-check" title="Match the drawn part's colors to the image's: auto by the part kept around the paint, full by the whole cut" data-i18n-title="img.colorTitle"><span data-info="colorMatch" data-i18n="img.color">Color match</span> <select class="st-input" id="img-color"><option value="off" data-i18n="img.colorOff">Off</option><option value="auto" data-i18n="img.colorAuto">Auto</option><option value="full" data-i18n="img.colorWhole">Whole part</option></select></label>
+                <label class="img-check" id="img-refine-f" hidden title="MOSS-Image with two images or more: the whole picture first, then the painted part cut out of it and drawn again" data-i18n-title="img.refineTitle"><input type="checkbox" id="img-refine"> <span data-info="refine" data-i18n="img.refine">Draw the painted part again, finer (about 1.6 times the time)</span></label>
               </div>
               <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask" data-i18n-label="img.paint"></canvas></div>
             </div>
@@ -222,7 +222,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         </details>
         <details class="st-collapse img-sec" id="img-ctrl" hidden><summary><span id="img-ctrl-l" data-i18n="img.ctrl">Composition from a picture (ControlNet)</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
           <div class="st-collapse__body img-sec__body">
-            <label class="st-field"><span data-i18n="img.ctrlType">Take from the picture</span>
+            <label class="st-field"><span data-info="ctrlType" data-i18n="img.ctrlType">Take from the picture</span>
               <select class="st-input" id="img-ctrl-type">
                 <option value="" data-i18n="img.ctrlOff">Off</option>
                 <option value="pose" data-i18n="img.ctrlPose">Pose (people)</option>
@@ -244,10 +244,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <div id="img-ctrl-body" hidden>
               <label class="st-field"><input class="st-input" id="img-ctrl-file" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" aria-label="The picture" data-i18n-label="img.ctrlPicture"></label>
               <span class="composer-hint" id="img-ctrl-hint" hidden></span>
-              <label class="st-field img-sl" id="img-ctrl-strength-f" title="How strongly the image follows the map (ControlNet's strength)" data-i18n-title="img.ctrlStrengthTitle"><span class="img-sl__head"><span data-i18n="img.strength">Strength</span>
+              <label class="st-field img-sl" id="img-ctrl-strength-f" title="How strongly the image follows the map (ControlNet's strength)" data-i18n-title="img.ctrlStrengthTitle"><span class="img-sl__head"><span data-info="ctrlStrength" data-i18n="img.strength">Strength</span>
                 <input class="st-input" id="img-ctrl-strength" type="number" min="0" max="2" step="0.05" placeholder="1"></span>
                 <input class="img-sl__range" type="range" data-for="img-ctrl-strength" tabindex="-1" aria-hidden="true"></label>
-              <label class="st-field" id="img-ctrl-span-f" title="The share of the steps the map is followed from and to: an end below 1 keeps the composition and frees the details" data-i18n-title="img.ctrlSpanTitle"><span data-i18n="img.ctrlSpan">From and to (share of the steps)</span>
+              <label class="st-field" id="img-ctrl-span-f" title="The share of the steps the map is followed from and to: an end below 1 keeps the composition and frees the details" data-i18n-title="img.ctrlSpanTitle"><span data-info="ctrlSpan" data-i18n="img.ctrlSpan">From and to (share of the steps)</span>
                 <span class="img-pair"><input class="st-input" id="img-ctrl-start" type="number" min="0" max="1" step="0.05" placeholder="0" aria-label="Start" data-i18n-label="img.ctrlStart">
                 <input class="st-input" id="img-ctrl-end" type="number" min="0" max="1" step="0.05" placeholder="1" aria-label="End" data-i18n-label="img.ctrlEnd"></span></label>
               <label class="st-field" id="img-ctrl-canny-f" hidden><span data-i18n="img.ctrlThresholds">Low and high thresholds</span>
@@ -271,7 +271,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             </div>
           </div>
         </details>
-        <details class="st-collapse img-sec img-lora" id="img-lora" hidden><summary><span data-i18n="img.lora">LoRA</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+        <details class="st-collapse img-sec img-lora" id="img-lora" hidden><summary><span data-info="lora" data-i18n="img.lora">LoRA</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
           <div class="st-collapse__body img-sec__body">
             <label class="st-field" id="img-lora-add-f"><select class="st-input" id="img-lora-add" aria-label="LoRA" data-i18n-label="img.lora"></select></label>
             <span class="composer-hint" id="img-lora-hint" hidden></span>
@@ -290,7 +290,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
               <div class="img-lora-file-list" id="img-lora-file-list"></div></details>
           </div>
         </details>
-        <details class="st-collapse img-sec" id="img-guide" hidden><summary><span data-i18n="img.guide">Sampling guidance</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+        <details class="st-collapse img-sec" id="img-guide" hidden><summary><span data-info="guide" data-i18n="img.guide">Sampling guidance</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
           <div class="st-collapse__body img-sec__body">
             <label class="img-check" id="img-g-detail_daemon-f" title="Detail Daemon: the model asked at a slightly lower noise level, for finer detail" data-i18n-title="img.gDetailTitle"><input type="checkbox" id="img-g-detail_daemon"> <span data-i18n="img.gDetail">Detail Daemon</span>
               <input class="st-input" id="img-g-detail_daemon-v" type="number" min="-5" max="5" step="0.05" placeholder="0.1" aria-label="Detail amount" data-i18n-label="img.gDetailAmount"></label>
@@ -432,62 +432,61 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <div class="st-card img-settings">
         <!-- the upscale: /v1/images/upscale's model, scale and extra_params -->
         <div class="tool-fields" data-tool="upscale">
-          <label class="st-field"><span data-i18n="tool.upModel">Upscaler (model)</span>
+          <label class="st-field"><span data-info="upModel" data-i18n="tool.upModel">Upscaler (model)</span>
             <select class="st-input" id="tool-up-model">
               <option value="auto" data-i18n="tool.upAuto">Auto</option>
               <option value="lanczos">Lanczos</option>
               <option value="realesrgan-x4plus">RealESRGAN x4plus</option>
               <option value="seedvr2-7b">SeedVR2 7B</option>
               <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option></select></label>
-          <span class="composer-hint" id="tool-up-about"></span>
-          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.upScale">Scale</span>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="upScale" data-i18n="tool.upScale">Scale</span>
             <input class="st-input" id="tool-up-scale" type="number" min="1.1" max="4" step="0.1" placeholder="2"></span>
             <input class="img-sl__range" type="range" data-for="tool-up-scale" tabindex="-1" aria-hidden="true"></label>
           <span class="composer-hint" id="tool-up-size"></span>
-          <label class="st-field"><span data-i18n="tool.upColor">Color correction</span>
+          <label class="st-field"><span data-info="upColor" data-i18n="tool.upColor">Color correction</span>
             <select class="st-input" id="tool-up-color">
               <option value="" data-i18n="tool.upColorOwn">The upscaler's own</option>
               <option value="none" data-i18n="tool.upColorNone">None</option>
               <option value="lab">LAB</option><option value="adain">AdaIN</option><option value="wavelet" data-i18n="tool.upColorWavelet">Wavelet</option></select></label>
-          <label class="st-field img-check"><input type="checkbox" id="tool-up-redraw"> <span data-i18n="tool.upRedraw">Draw it again with the image model, adding detail</span></label>
-          <label class="st-field img-sl" id="tool-up-strength-f" hidden><span class="img-sl__head"><span data-i18n="tool.upStrength">How much is drawn again</span>
+          <label class="st-field img-check"><input type="checkbox" id="tool-up-redraw"> <span data-info="upRedraw" data-i18n="tool.upRedraw">Draw it again with the image model, adding detail</span></label>
+          <label class="st-field img-sl" id="tool-up-strength-f" hidden><span class="img-sl__head"><span data-info="redrawStrength" data-i18n="tool.upStrength">How much is drawn again</span>
             <input class="st-input" id="tool-up-strength" type="number" min="0.01" max="1" step="0.01" placeholder="0.35"></span>
             <input class="img-sl__range" type="range" data-for="tool-up-strength" tabindex="-1" aria-hidden="true"></label>
         </div>
         <!-- the parts' fix: the edits' fix {parts, strength} -->
         <div class="tool-fields" data-tool="fix" hidden>
-          <fieldset class="tool-parts"><legend data-i18n="tool.fixParts">The parts to find and draw again</legend>
+          <fieldset class="tool-parts"><legend data-info="fixParts" data-i18n="tool.fixParts">The parts to find and draw again</legend>
             <label class="img-check"><input type="checkbox" name="tool-part" value="face" checked> <span data-i18n="img.fixFace">Faces</span></label>
             <label class="img-check"><input type="checkbox" name="tool-part" value="hands"> <span data-i18n="tool.fixHands">Hands</span></label>
             <label class="img-check"><input type="checkbox" name="tool-part" value="person"> <span data-i18n="img.fixPerson">People</span></label></fieldset>
-          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.upStrength">How much is drawn again</span>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="fixStrength" data-i18n="tool.upStrength">How much is drawn again</span>
             <input class="st-input" id="tool-fix-strength" type="number" min="0.01" max="1" step="0.01" placeholder="0.5"></span>
             <input class="img-sl__range" type="range" data-for="tool-fix-strength" tabindex="-1" aria-hidden="true"></label>
         </div>
         <!-- the model that draws (the upscale's redraw_model, the parts' fix's model) and its seed -->
         <div class="tool-fields" data-tool="upscale fix">
-          <label class="st-field" id="tool-model-f" hidden><span data-i18n="tool.drawModel">Image model that draws</span>
+          <label class="st-field" id="tool-model-f" hidden><span data-info="drawModel" data-i18n="tool.drawModel">Image model that draws</span>
             <select class="st-input" id="tool-model"></select></label>
-          <label class="st-field" id="tool-seed-f"><span data-i18n="img.seed">Seed</span>
+          <label class="st-field" id="tool-seed-f"><span data-info="seed" data-i18n="img.seed">Seed</span>
             <input class="st-input" id="tool-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom"></label>
         </div>
         <!-- /v1/images/segmentations: task, model, score_threshold, mask_threshold -->
         <div class="tool-fields" data-tool="segment" hidden>
-          <label class="st-field"><span data-i18n="tool.segTask">What to find</span>
+          <label class="st-field"><span data-info="segTask" data-i18n="tool.segTask">What to find</span>
             <select class="st-input" id="tool-seg-task">
               <option value="mask" data-i18n="tool.segMask">Masks of the parts the words name</option>
               <option value="box" data-i18n="tool.segBox">Boxes around them</option>
               <option value="grounding" data-i18n="tool.segGrounding">Every thing the words name, with its name (Florence-2)</option></select></label>
-          <label class="st-field"><span data-i18n="tool.segModel">Model</span>
+          <label class="st-field"><span data-info="segModel" data-i18n="tool.segModel">Model</span>
             <select class="st-input" id="tool-seg-model">
               <option value="" data-i18n="tool.segAuto">Auto (SAM 3 where its license is agreed to, else Florence-2)</option>
               <option value="sam3.1">SAM 3.1</option>
               <option value="florence-2-large">Florence-2 large</option>
               <option value="florence-2-base">Florence-2 base</option></select></label>
-          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.segScore">Least score kept</span>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="segScore" data-i18n="tool.segScore">Least score kept</span>
             <input class="st-input" id="tool-seg-score" type="number" min="0" max="1" step="0.05" placeholder="0.5"></span>
             <input class="img-sl__range" type="range" data-for="tool-seg-score" tabindex="-1" aria-hidden="true"></label>
-          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.segMaskT">Mask threshold</span>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="segMaskT" data-i18n="tool.segMaskT">Mask threshold</span>
             <input class="st-input" id="tool-seg-mask" type="number" min="0" max="1" step="0.05" placeholder="0.5"></span>
             <input class="img-sl__range" type="range" data-for="tool-seg-mask" tabindex="-1" aria-hidden="true"></label>
           <a href="#" id="tool-sam-license" data-i18n="img.samLicense">SAM 3's license&hellip;</a>
@@ -495,21 +494,21 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <!-- /v1/images/remove-background: model (BiRefNet's version), operating_resolution, refine_foreground,
              mask_only, background_color, mask_grow, mask_blur, output_format -->
         <div class="tool-fields" data-tool="rembg" hidden>
-          <label class="st-field"><span data-i18n="tool.bgModel">BiRefNet version</span>
+          <label class="st-field"><span data-info="bgModel" data-i18n="tool.bgModel">BiRefNet version</span>
             <select class="st-input" id="tool-bg-model">
               <option value="general" data-i18n="tool.bgGeneral">general (the default)</option>
               <option value="lite">lite</option><option value="lite-2k">lite-2k</option><option value="portrait">portrait</option>
               <option value="matting">matting</option><option value="hr">hr</option><option value="dynamic">dynamic</option></select></label>
-          <label class="st-field"><span data-i18n="tool.bgRes">Resolution it reads at (width x height, multiples of 32)</span>
+          <label class="st-field"><span data-info="bgRes" data-i18n="tool.bgRes">Resolution it reads at (width x height, multiples of 32)</span>
             <input class="st-input" id="tool-bg-res" type="text" placeholder="the version's own" data-i18n-placeholder="tool.bgResOwn"></label>
-          <label class="st-field img-check"><input type="checkbox" id="tool-bg-refine" checked> <span data-i18n="tool.bgRefine">Clean the edge's colors (refine_foreground)</span></label>
+          <label class="st-field img-check"><input type="checkbox" id="tool-bg-refine" checked> <span data-info="bgRefine" data-i18n="tool.bgRefine">Clean the edge's colors (refine_foreground)</span></label>
           <label class="st-field img-check"><input type="checkbox" id="tool-bg-mask"> <span data-i18n="tool.bgMaskOnly">The mask only (white where the subject is)</span></label>
           <label class="st-field img-check"><input type="checkbox" id="tool-bg-color-on"> <span data-i18n="tool.bgColorOn">Fill the background with a color</span>
             <input type="color" id="tool-bg-color" value="#ffffff" aria-label="Background color" data-i18n-label="tool.bgColor"></label>
-          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.bgGrow">Grow the edge (pixels; below 0 shrinks)</span>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="bgGrow" data-i18n="tool.bgGrow">Grow the edge (pixels; below 0 shrinks)</span>
             <input class="st-input" id="tool-bg-grow" type="number" min="-64" max="64" step="1" placeholder="0"></span>
             <input class="img-sl__range" type="range" data-for="tool-bg-grow" tabindex="-1" aria-hidden="true"></label>
-          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.bgBlur">Soften the edge (pixels)</span>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="bgBlur" data-i18n="tool.bgBlur">Soften the edge (pixels)</span>
             <input class="st-input" id="tool-bg-blur" type="number" min="0" max="32" step="0.5" placeholder="0"></span>
             <input class="img-sl__range" type="range" data-for="tool-bg-blur" tabindex="-1" aria-hidden="true"></label>
           <label class="st-field"><span data-i18n="img.format">Format</span>
@@ -576,23 +575,23 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <div class="st-card img-settings">
         <!-- the upscale: /v1/videos' model, scale, seed and extra_params -->
         <div class="tool-fields" data-vid="upscale">
-          <label class="st-field"><span data-i18n="tool.upModel">Upscaler (model)</span>
+          <label class="st-field"><span data-info="upModel" data-i18n="tool.upModel">Upscaler (model)</span>
             <select class="st-input" id="vid-up-model">
               <option value="auto" data-i18n="tool.upAuto">Auto</option>
               <option value="lanczos">Lanczos</option>
               <option value="realesrgan-x4plus">RealESRGAN x4plus</option>
               <option value="seedvr2-7b">SeedVR2 7B</option>
               <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option></select></label>
-          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.upScale">Scale</span>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="upScale" data-i18n="tool.upScale">Scale</span>
             <input class="st-input" id="vid-up-scale" type="number" min="1.1" max="4" step="0.1" placeholder="2"></span>
             <input class="img-sl__range" type="range" data-for="vid-up-scale" tabindex="-1" aria-hidden="true"></label>
           <span class="composer-hint" id="vid-up-size"></span>
-          <label class="st-field"><span data-i18n="tool.upColor">Color correction</span>
+          <label class="st-field"><span data-info="upColor" data-i18n="tool.upColor">Color correction</span>
             <select class="st-input" id="vid-up-color">
               <option value="" data-i18n="tool.upColorOwn">The upscaler's own</option>
               <option value="none" data-i18n="tool.upColorNone">None</option>
               <option value="lab">LAB</option><option value="adain">AdaIN</option><option value="wavelet" data-i18n="tool.upColorWavelet">Wavelet</option></select></label>
-          <label class="st-field"><span data-i18n="img.seed">Seed</span>
+          <label class="st-field"><span data-info="seed" data-i18n="img.seed">Seed</span>
             <input class="st-input" id="vid-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom"></label>
           <details class="img-neg"><summary data-i18n="vid.more">SeedVR2's chunks</summary>
             <label class="st-field"><span data-i18n="vid.chunk">Frames a chunk (1, 5, 9 &hellip; 4 n + 1; empty: as many as the GPU holds)</span>

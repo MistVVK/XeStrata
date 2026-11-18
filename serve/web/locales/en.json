@@ -487,7 +487,6 @@
   "img.madeNearestText": "This image model makes a fixed set of sizes: {size} is the one whose shape is nearest the {asked} asked for.",
   "img.mask": "Mask (optional): paint the part of the first image to draw again; the rest stays as it is",
   "img.upNone": "None",
-  "img.upMethodTitle": "How the image is made larger: Auto (RealESRGAN when it is drawn again, SeedVR2 when not), Lanczos (a plain resize), RealESRGAN (sharper) or SeedVR2 (restores detail in one step; sharp: for anime and blurred pictures). The weights are downloaded the first time",
   "img.fixFace": "Faces",
   "img.fixPerson": "People",
   "img.region": "Words: hair, sky",
