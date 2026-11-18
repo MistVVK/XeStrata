@@ -158,9 +158,10 @@ struct Adapter {
 
 /// A DoRA's composed row norms into ad->norms [N], PEFT's ||W_r + scale (BA)_r|| with the factors as the products
 /// read them (FP16) and the norm detached: |W_r|^2 from ad->norms0 (once at open), W A^T and A A^T two products of
-/// ad->a with ad->w and itself.  `wat` holds rank * N and `aat` rank * rank FP32 (the block's adapter scratch).
-void dora_composed_norms(const Adapter* ad, int64_t N, int64_t K, float* wat, float* aat, prefill::Gemm& gemm,
-                         void* stream);
+/// ad->a with ad->w and itself, the FP16 factors widened and summed in FP32 (a library's half GEMM sums in FP16,
+/// whose range and rounding pull the norm at large rows).  `wat` holds rank * N and `aat` rank * rank FP32 (the
+/// block's adapter scratch).
+void dora_composed_norms(const Adapter* ad, int64_t N, int64_t K, float* wat, float* aat, void* stream);
 
 /// out[i] = a[i] * col[i % C] (col null: 1), n elements: a gate's or a norm's per-column factor on rows.
 void mul_cols(const float* a, const float* col, int64_t n, int64_t C, float* out, void* stream);

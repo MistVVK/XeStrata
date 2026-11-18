@@ -392,7 +392,7 @@ int main(int argc, char** argv) {
             strata::prefill::Gemm gemm;
             std::string err;
             if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
-            train::dora_composed_norms(&ad, N, K, scratch.f(), scratch.f() + N * rk, gemm, s);
+            train::dora_composed_norms(&ad, N, K, scratch.f(), scratch.f() + N * rk, s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) N);
             norms.read(ho.data(), N * 4);

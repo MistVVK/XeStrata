@@ -201,13 +201,43 @@ void ad_factors(const float* m, const float* norms, int64_t N, float scale, floa
 
 }  // namespace
 
-void dora_composed_norms(const Adapter* ad, int64_t N, int64_t K, float* wat, float* aat, prefill::Gemm& gemm,
-                         void* stream) {
+void dora_composed_norms(const Adapter* ad, int64_t N, int64_t K, float* wat, float* aat, void* stream) {
     const int64_t rk = ad->rank;
     const float sc = ad->scale;
-    // W A^T read as A W^T [rank][N] (the gemm takes W's rows as they are), A A^T [rank][rank]
-    gemm.f16(ad->a, ad->w, wat, rk, N, K);
-    gemm.f16(ad->a, ad->a, aat, rk, rk, K);
+    // W A^T read as A W^T [rank][N] and A A^T [rank][rank], the FP16 factors widened and summed in FP32 here (not
+    // gemm.f16: a library's half GEMM sums in FP16, whose range and rounding pull the composed norm at large rows —
+    // the block parity's --big-norm2 1e5 took 14 values over tolerance on the RTX 4070, cuBLAS's FP16 sums; the norm
+    // is one small product a forward, so FP32 accumulation costs little).  Four partial sums keep the reduction
+    // ordered as the reference's FP32 matmul class.
+    const uint16_t* a = ad->a;
+    const uint16_t* w = ad->w;
+    sycl::queue& q = dit_rows::q_of(stream);
+    q.parallel_for(sycl::range<2>((size_t) rk, (size_t) N), [=](sycl::id<2> id) {
+        const int64_t j = (int64_t) id[0], r = (int64_t) id[1];
+        const uint16_t* aj = a + j * K;
+        const uint16_t* wr = w + r * K;
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        int64_t c = 0;
+        for (; c + 4 <= K; c += 4)
+            for (int u = 0; u < 4; ++u)
+                acc[u] += kernels::f32_from_f16(aj[c + u]) * kernels::f32_from_f16(wr[c + u]);
+        float t = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+        for (; c < K; ++c) t += kernels::f32_from_f16(aj[c]) * kernels::f32_from_f16(wr[c]);
+        wat[j * N + r] = t;
+    });
+    q.parallel_for(sycl::range<2>((size_t) rk, (size_t) rk), [=](sycl::id<2> id) {
+        const int64_t j = (int64_t) id[0], l = (int64_t) id[1];
+        const uint16_t* aj = a + j * K;
+        const uint16_t* al = a + l * K;
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        int64_t c = 0;
+        for (; c + 4 <= K; c += 4)
+            for (int u = 0; u < 4; ++u)
+                acc[u] += kernels::f32_from_f16(aj[c + u]) * kernels::f32_from_f16(al[c + u]);
+        float t = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+        for (; c < K; ++c) t += kernels::f32_from_f16(aj[c]) * kernels::f32_from_f16(al[c]);
+        aat[j * rk + l] = t;
+    });
     const uint16_t* b = ad->b;          // the device's own pointers: the kernel must not read the host's struct
     const float* norms0 = ad->norms0;
     float* norms = ad->norms;
@@ -261,7 +291,7 @@ void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, fl
         // PEFT recomputes ||W + s BA|| every forward (the factors detached): A and B moved since the last step.
         // wat and aat live in the block's lora_bwd scratch, free in the forward (N rank + rank rank of its
         // T rank + N rank + rank K)
-        dora_composed_norms(ad, N, K, sc.scratch, sc.scratch + (size_t) N * ad->rank, gemm, stream);
+        dora_composed_norms(ad, N, K, sc.scratch, sc.scratch + (size_t) N * ad->rank, stream);
         ad_factors(ad->m, ad->norms, N, ad->scale, fa, fb, stream);
         fa_use = fa;
         fb_use = fb;
