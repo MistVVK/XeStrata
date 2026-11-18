@@ -4622,6 +4622,7 @@ class Service:
         # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.undeclared_tool_calls = "text"
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
+        self.lora_jobs: Any = None                        # training jobs, recovered before serving requests
         self.translation: Any = None                      # Translation when the config has "translate"
         self.video_jobs: Any = None                       # serve/videos.py's VideoJobs, made at the first video request
         self.long_job: Any = None                         # a video job's state while it holds the image engine
@@ -12259,6 +12260,9 @@ def _main() -> int:
             print(f"[xestrata] image generation: {svc.images.note()}", flush=True)
         import atexit
         atexit.register(svc.images.close)               # the image engine ends with the server
+        # Recover orphans before serving requests, outside status_lock, and stop our own trainer first on exit.
+        svc.lora_jobs = lora_train_api.TrainJobs(lora_train_api.data_root() / "lora-jobs", svc)
+        atexit.register(svc.lora_jobs.close)
     if isinstance(cfg.get("translate"), dict) and cfg["translate"].get("model"):   # the translation model, first used
         tcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "path") and isinstance(v, str) and not os.path.isabs(v) else v)

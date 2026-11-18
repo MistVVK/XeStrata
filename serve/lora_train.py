@@ -473,6 +473,20 @@ class TrainJobs:
                     rec.update(status="draft", error=None)
                 self._write(rec)
 
+    def close(self) -> None:
+        """Stop this server's queued and active work before its image engines close."""
+        with self.lock:
+            ids = list(self.cancels)
+            worker = self.worker
+        for jid in ids:
+            self.cancel(jid)
+        if worker is not None and worker is not threading.current_thread():
+            rec = self.get(self.current) if self.current else None
+            worker.join(self._stop_wait(rec or {}) * 2 + 10)
+            if worker.is_alive() and rec is not None:
+                self._stop_orphan(rec)
+                worker.join(self._stop_wait(rec) + 5)
+
     @staticmethod
     def _owner_alive(rec: dict) -> bool:
         from serve.vram_ledger import process_start
