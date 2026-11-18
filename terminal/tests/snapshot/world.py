@@ -12,7 +12,6 @@ import json
 import os
 import sys
 import tempfile
-import types
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +20,16 @@ from .matrix import MACHINES, Machine, ModelSet
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+class _SysAs:
+    """The `sys` module with one answer changed: `platform`. A module under test that asks `sys.platform` gets the simulated machine's system; every other name is the real sys."""
+
+    def __init__(self, platform: str) -> None:
+        self.platform = platform
+
+    def __getattr__(self, name: str):
+        return getattr(sys, name)
+
 
 #: The engine stub: the strings drafting.engine_form / engine_reads_selector_q4 look for in the program file (a current engine carries them).
 ENGINE_STUB = (b"STRATA ENGINE STUB (config snapshot)\n--mtp-draft-vocab FILE (or --mtp DIR\n--draft-fallback\n"
@@ -228,9 +237,13 @@ class World:
                 pass
             if m.os == "macos":
                 st.enter_context(mock.patch.object(sys, "platform", "darwin"))
-            # childenv's glibc arena cap (P11) is a Linux-only rule: answer for the simulated machine's system, not the host the test runs on
+            # Two rules read the system they run on and are the simulated machine's, not the test host's: childenv's glibc arena cap (P11, Linux only) and the launch
+            # catalog's "no pictures on an Intel Arc on Linux" (T14). Their `sys` answers the machine's platform; everything else is the real sys.
             from strata_control import childenv
-            st.enter_context(mock.patch.object(childenv, "sys", types.SimpleNamespace(platform={"windows": "win32", "linux": "linux", "macos": "darwin"}[m.os])))
+            from strata_cli.launch import catalog as launch_catalog
+            as_machine = _SysAs({"windows": "win32", "linux": "linux", "macos": "darwin"}[m.os])
+            st.enter_context(mock.patch.object(childenv, "sys", as_machine))
+            st.enter_context(mock.patch.object(launch_catalog, "sys", as_machine))
             yield self
         os.environ.clear()
         os.environ.update(saved_env)
