@@ -2595,7 +2595,8 @@ def print_packages(spec: str, mode: str) -> int:
     if spec:
         distro, _, makers_s = spec.partition("/")
         makers = {m.strip() for m in makers_s.split(",") if m.strip()}
-        ver = re.search(r"\d+", distro).group(0) if re.search(r"\d+", distro) else None
+        m = re.search(r"\d+", distro)
+        ver = m.group(0) if m else None
         distro = next((f for f in PACKAGES if distro.startswith(f)), distro)
     else:
         distro, makers = distro_family(), {g["vendor"] for g in gpus()}
