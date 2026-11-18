@@ -2447,6 +2447,16 @@ def distro_id() -> str:
     return m.group(1) if m else ""
 
 
+def distro_version() -> str | None:
+    """The distribution's version in /etc/os-release ("45", "26.04"), None when it cannot be read: NVIDIA's CUDA
+    toolkit on Fedora is chosen by it."""
+    try:
+        m = re.search(r"^VERSION_ID=\"?([^\"\n]*)", Path("/etc/os-release").read_text(), re.M)
+    except OSError:
+        return None
+    return m.group(1) or None if m else None
+
+
 def distro_family() -> str:
     """Which list of PACKAGES this PC's packages come from ("ubuntu", "fedora", "arch"): the ID in /etc/os-release, or
     ID_LIKE for a distribution whose own ID names nothing there (CachyOS: ID=cachyos, ID_LIKE=arch).  A distribution
@@ -2463,10 +2473,10 @@ def distro_family() -> str:
 
 
 def amd_elsewhere() -> str:
-    """Where an AMD GPU that this distribution's rocBLAS lacks runs: Fedora 44's rocBLAS has code for more of them
-    (README.md, "AMD GPUs")."""
+    """Where an AMD GPU that this distribution's rocBLAS lacks runs: Fedora's rocBLAS (44's as 45's) has code for
+    more of them (README.md, "AMD GPUs")."""
     return ("see README.md (AMD GPUs)" if distro_id() == "fedora" else
-            "Fedora 44's has code for more AMD GPUs (README.md, AMD GPUs)")
+            "Fedora 44's or 45's has code for more AMD GPUs (README.md, AMD GPUs)")
 
 
 # The distribution packages that building and running XeStrata from the source needs (docs/BUILD.md, "Packages"), by
@@ -2475,7 +2485,7 @@ def amd_elsewhere() -> str:
 # the contrib mode only).  opencl-headers: intel/llvm's
 # SYCL tools (sycl-ls, part of what its build installs) include CL/cl.h, and they get no include for the OpenCL headers
 # the configuration fetches (those are the runtime's own objects'); no distribution's compiler brings the header in (a
-# fresh Fedora 44 lacks it as Arch does).
+# fresh Fedora lacks it as Arch does).
 # oneMKL's series the contrib mode takes, and only it (Intel's repositories carry several side by side): one whose SYCL
 # library runs on the SYCL runtime XeStrata builds with, which tools/intel_llvm_build.py's TAG fixes (2026.2's needs
 # functions intel/llvm v7.1.1's libsycl.so.9 lacked, sycl::detail::defaultAsyncHandler among them: v7.2.0).  Raised
@@ -2499,7 +2509,8 @@ PACKAGES = {
         "intel-contrib": f"intel-oneapi-mkl-sycl-devel-{ONEMKL_SERIES}",
         "amd": "rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel "
                "hipblas-common-devel",
-        "nvidia": "cuda-toolkit-13-4",
+        # NVIDIA's CUDA toolkit, by the Fedora version (FEDORA_CUDA below): the newest known, a version not listed
+        "nvidia": "cuda-toolkit-13-5",
     },
     "arch": {
         # Arch and its derivatives (ID_LIKE=arch).  Intel's oneAPI repository has no Arch packages: there is no oneMKL
@@ -2524,6 +2535,12 @@ TOOL_PACKAGES = {
     "arch": {"g++": "base-devel", "pdf": "poppler", "jsonschema": "python-jsonschema", "ffmpeg": "ffmpeg"},
 }
 
+# NVIDIA's CUDA toolkit on Fedora, by the Fedora version (its repository, setup's NVIDIA_REPO and
+# tools/package/container.sh): Fedora 44 has 13.4 and 45 has 13.5, as the release's packages do
+# (tools/package/build.sh).  NVIDIA's repository is fedora44's so far, which Fedora 45 uses as well; its name says the
+# CUDA version, and a Fedora version not listed takes the newest known
+FEDORA_CUDA = {"44": "cuda-toolkit-13-4", "45": "cuda-toolkit-13-5"}
+
 # The command that installs distribution packages on this PC, by distro_family()
 INSTALLERS = {"ubuntu": "sudo apt install ", "fedora": "sudo dnf install ", "arch": "sudo pacman -S --needed "}
 
@@ -2538,9 +2555,10 @@ def tool_pkg(kind: str) -> str:
     return TOOL_PACKAGES[distro_family()][kind]
 
 
-def packages_for(distro: str, makers: set, mode: str) -> tuple:
+def packages_for(distro: str, makers: set, mode: str, ver: str | None = None) -> tuple:
     """The packages (PACKAGES) for a distribution ("ubuntu", "fedora", "arch"), the GPU makers ("intel", "amd",
-    "nvidia") and the build mode, and the notes that go with them (the repositories, what a mode cannot build)."""
+    "nvidia") and the build mode (`ver`: its version, NVIDIA's CUDA toolkit on Fedora by it), and the notes that go
+    with them (the repositories, what a mode cannot build)."""
     p = PACKAGES[distro]
     names = p["base"].split()
     notes = []
@@ -2553,9 +2571,9 @@ def packages_for(distro: str, makers: set, mode: str) -> tuple:
         names += p["amd"].split()
     if "nvidia" in makers:
         if mode == "contrib":
-            names += p["nvidia"].split()
+            names += [FEDORA_CUDA[ver]] if distro == "fedora" and ver in FEDORA_CUDA else p["nvidia"].split()
             notes.append("NVIDIA GPUs: NVIDIA's driver as well" +
-                         (" (cuda-toolkit-13-4 is in NVIDIA's CUDA repository)" if distro == "fedora" else ""))
+                         (f" ({names[-1]} is in NVIDIA's CUDA repository)" if distro == "fedora" else ""))
         else:
             notes.append("NVIDIA GPUs: the contrib mode only (--license contrib)")
     if any(n.startswith("intel-oneapi-") for n in names):
@@ -2573,20 +2591,23 @@ def print_packages(spec: str, mode: str) -> int:
         for line in lines:
             say(line)
         return 0
+    ver = None
     if spec:
         distro, _, makers_s = spec.partition("/")
         makers = {m.strip() for m in makers_s.split(",") if m.strip()}
+        ver = re.search(r"\d+", distro).group(0) if re.search(r"\d+", distro) else None
         distro = next((f for f in PACKAGES if distro.startswith(f)), distro)
     else:
         distro, makers = distro_family(), {g["vendor"] for g in gpus()}
+        ver = distro_version()
     if distro not in PACKAGES:
         fail(f"--packages: no list for {distro or 'this distribution'}",
-             "the lists are for Ubuntu 26.04, Fedora 44 and Arch: e.g. --packages ubuntu26.04/intel,amd")
+             "the lists are for Ubuntu 26.04, Fedora 44 or 45 and Arch: e.g. --packages ubuntu26.04/intel,amd")
     if not makers or not makers <= {"intel", "amd", "nvidia"}:
         fail("--packages: the GPU makers are intel, amd and nvidia" + ("" if spec else " (no GPU of theirs found)"),
-             "e.g. --packages fedora44/intel,amd")
-    names, notes = packages_for(distro, makers, mode)
-    say(f"Packages for {distro}, {', '.join(sorted(makers))} GPUs, the {mode} build:")
+             "e.g. --packages fedora45/intel,amd")
+    names, notes = packages_for(distro, makers, mode, ver)
+    say(f"Packages for {distro}{f' {ver}' if ver else ''}, {', '.join(sorted(makers))} GPUs, the {mode} build:")
     say("  " + INSTALLERS[distro] + " ".join(names))
     for n in notes:
         say(f"  - {n}")
@@ -2620,7 +2641,9 @@ INTEL_REPO = {
                "    'gpgkey=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB' \\\n"
                "    | sudo tee /etc/yum.repos.d/oneAPI.repo > /dev/null"),
 }
-# (Ubuntu's and Arch's own repositories carry the CUDA toolkit: multiverse, extra)
+# (Ubuntu's and Arch's own repositories carry the CUDA toolkit: multiverse, extra.  NVIDIA's repository is
+# fedora44's, which Fedora 45 uses as well - it has none of its own yet, 2026-11-18: change the URL when NVIDIA
+# publishes one, developer.download.nvidia.com/compute/cuda/repos/)
 NVIDIA_REPO = {
     "fedora": "sudo dnf config-manager addrepo \\\n"
               "    --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/"
@@ -2821,10 +2844,10 @@ def say_driver_update(lts: str) -> None:
 def check_igc(makers: set) -> None:
     """Says, without stopping, when an Intel GPU of Xe2 or later (the xe driver's graphics IP 20 or later, as the
     engine asks it: xe_gpu_from_xe2 in src/core/device.cpp) runs with a compiler the engine works around
-    (igc_affected), and sends the user to Fedora 44, whose IGC is a fixed one, or to the Podman container (Fedora
-    44 inside).  Ubuntu 24.04/26.04 is sent to the graphics PPA too - with the HWE kernel straight to it, from the
-    GA kernel to the HWE kernel first (the PPA installs the driver with the IGC, and that driver is the one for the
-    HWE kernel)."""
+    (igc_affected), and sends the user to Fedora 44 or later, whose IGC is a fixed one (45's is 2.41), or to the
+    Podman container (Fedora 45 inside).  Ubuntu 24.04/26.04 is sent to the graphics PPA too - with the HWE kernel
+    straight to it, from the GA kernel to the HWE kernel first (the PPA installs the driver with the IGC, and that
+    driver is the one for the HWE kernel)."""
     if WIN or "intel" not in makers:
         return
     v = igc_version()
@@ -2833,8 +2856,8 @@ def check_igc(makers: set) -> None:
     if not any(g["vendor"] == "intel" and (g.get("ip") or 0) >= 20 for g in gpus()):
         return
     warn(f"Intel's compiler (IGC {v}) has a bug XeStrata works around at the engine's start: the decode of short "
-         "prompts is up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install "
-         "with Podman (Fedora 44 inside: README, Install)")
+         "prompts is up to 10% slower. For full speed, use Fedora 44 or later (their IGC is 2.32 or later), or "
+         "install with Podman (Fedora 45 inside: README, Install)")
     lts = ubuntu_lts()
     if lts:
         if hwe_kernel(lts):
@@ -2925,7 +2948,7 @@ def check_level_zero(makers: set, yes: bool = False, explicit: bool = False) -> 
     GPU fault, and only a host reboot clears it).  On Ubuntu 24.04/26.04 with the HWE kernel the graphics PPA
     brings the fixed driver, and the start is stopped until it is updated or the user asks to go on (confirm_risk,
     --old-driver as the explicit consent); on the GA kernel, where the PPA's driver does not belong, the user is
-    sent to the HWE kernel and the PPA, or to Fedora 44, and the start goes on.  Elsewhere nothing is said: no
+    sent to the HWE kernel and the PPA, or to Fedora 44 or later, and the start goes on.  Elsewhere nothing is said: no
     repository to point at."""
     if WIN or "intel" not in makers:
         return
@@ -2948,14 +2971,14 @@ def check_level_zero(makers: set, yes: bool = False, explicit: bool = False) -> 
         again = " - the commands above" if _g_driver_update_said else ""
         warn(f"the Level Zero driver (build {build}) predates the fix for refusing device memory while the VRAM is "
              "free (the engine can fail to start; only a host reboot clears the card), and the GA kernel's xe "
-             "driver is the older one: move to the HWE kernel and the graphics PPA, or use Fedora 44 / Podman "
+             "driver is the older one: move to the HWE kernel and the graphics PPA, or use Fedora 44 or later / Podman "
              f"(README, Install){again}")
         say_driver_update(lts)
     else:
         warn(f"the Level Zero driver (build {build}) predates the fix for refusing device memory while the VRAM is "
              "free: the engine can fail to start, and only a host reboot clears the card (XeStrata #34, "
-             "intel/compute-runtime #916). Update the driver (compute-runtime 26.22 or later), or use Fedora 44 / "
-             "Podman (their drivers are newer)")
+             "intel/compute-runtime #916). Update the driver (compute-runtime 26.22 or later), or use Fedora 44 or "
+             "later / Podman (their drivers are newer)")
 
 
 def windows_nvidia_libs() -> list:
@@ -3179,11 +3202,11 @@ def check_build_packages(makers: set, mode: str) -> None:
     # oneMKL for any Intel GPU (intel_gpu_present), not only the cards this run chose
     makers = set(makers) | ({"nvidia"} if mode == "contrib" and cuda_archs() else set()) | \
         ({"amd"} if amd_archs() else set()) | ({"intel"} if intel_gpu_present() else set())
-    names, _ = packages_for(d, makers, mode)
+    names, _ = packages_for(d, makers, mode, distro_version())
     p = PACKAGES[d]
     skip = set()
     if cuda_toolkits():
-        skip |= set(p["nvidia"].split())
+        skip |= set(p["nvidia"].split()) | (set(FEDORA_CUDA.values()) if d == "fedora" else set())
     if mkl_root() is not None:
         skip |= set(p["intel-contrib"].split())
     if "amd" in makers:
@@ -10052,7 +10075,7 @@ def main() -> int:
     ap.add_argument("--packages", nargs="?", const="", metavar="DISTRO/MAKERS",
                     help="print the command that installs the distribution packages building from the source needs, "
                          "for the build mode (--license) and DISTRO/MAKERS, e.g. ubuntu26.04/intel,amd or "
-                         "fedora44/nvidia (default: this PC's distribution and GPUs), and exit; with XeStrata's deb or "
+                         "fedora45/nvidia (default: this PC's distribution and GPUs), and exit; with XeStrata's deb or "
                          "rpm, the GPU makers' packages this PC's GPUs lack")
     ap.add_argument("--remove-data", action="store_true",
                     help="delete the model files, settings and logs XeStrata keeps for you (asks first; removing the "

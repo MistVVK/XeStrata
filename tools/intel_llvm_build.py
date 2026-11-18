@@ -152,8 +152,11 @@ PREREQUISITES = {
                "how": "sudo apt install "},
     "fedora": {"git": "git", "cmake": "cmake", "ninja": "ninja-build", "g++": "gcc-c++", "ld.lld": "lld",
                "hwloc": "hwloc-devel",
-               "zstd": "libzstd-devel", "opencl": "opencl-headers", "cuda": "cuda-toolkit-13-4",
-               # (NVIDIA's CUDA repository, which Fedora's own do not carry the toolkit of: setup.py's NVIDIA_REPO)
+               "zstd": "libzstd-devel", "opencl": "opencl-headers", "cuda": "cuda-toolkit-13-5",
+               # (NVIDIA's CUDA repository, which Fedora's own do not carry the toolkit of: setup.py's NVIDIA_REPO.
+               # It is fedora44's, which Fedora 45 uses as well - NVIDIA has no repository of its own yet; change the
+               # URL when it publishes one, developer.download.nvidia.com/compute/cuda/repos/.  The toolkit's name
+               # says the CUDA version: 13.4 on Fedora 44 as the packages build with, 13.5 on 45)
                "cuda_repo": "sudo dnf config-manager addrepo \\\n"
                             "    --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/"
                             "x86_64/cuda-fedora44.repo",
@@ -183,7 +186,7 @@ def missing_prerequisites() -> list:
         need.append(p["hwloc"])
     # intel/llvm's SYCL tools (sycl-ls, which the build installs) include CL/cl.h through sycl/detail/cl.h, and their
     # target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own
-    # objects), and no distribution's compiler brings the header in (a fresh Fedora 44 lacks it as Arch does)
+    # objects), and no distribution's compiler brings the header in (a fresh Fedora lacks it as Arch does)
     if not Path("/usr/include/CL/cl.h").exists():
         need.append(p["opencl"])
     # the SYCL runtime reads zstd-compressed device images (oneMKL's, which oneMath calls in the contrib modes); without

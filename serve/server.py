@@ -872,8 +872,8 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     v = line.split("; IGC ", 1)[1].split(")", 1)[0] if "; IGC " in line else "?"
                     say("igc", f"[xestrata] Intel's compiler IGC {v} has a bug XeStrata works around: the decode of "
                         "short prompts is up to 10% slower.\n"
-                        "         For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman "
-                        "(Fedora 44 inside).")
+                        "         For full speed, use Fedora 44 or later (their IGC is 2.32 or later), or install "
+                        "with Podman (Fedora 45 inside).")
                 elif "session is up" in line:
                     say("up", "[xestrata] almost ready ...")
         if time.time() - last > heartbeat:
