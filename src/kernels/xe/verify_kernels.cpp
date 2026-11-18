@@ -428,8 +428,10 @@ sycl::event gdn_state_commit(sycl::queue& q, float* state0, const float* hbuf0, 
             for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
             for (int t = 0; t < n; ++t) {
                 const float* ht = hbuf + (size_t) t * C;
+                const float* hk = ht + qk;   // k and v stepped from the row, not ht[qk + ...] beside ht[2 * qk + ...]
+                const float* hv = hk + qk;   // (IGC's GEP simplification, as gdn_step_split)
                 sycl::group_barrier(it.get_group());
-                if (tid < S) sk[tid] = ht[qk + qh * S + tid];
+                if (tid < S) sk[tid] = hk[qh * S + tid];
                 sycl::group_barrier(it.get_group());
                 const float g = sycl::exp(gate[(size_t) t * h_v + head]);
                 float kv = 0.0f;
@@ -438,7 +440,7 @@ sycl::event gdn_state_commit(sycl::queue& q, float* state0, const float* hbuf0, 
                 red[rg * GS_COLS + lc] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red[lc] + red[GS_COLS + lc] + red[2 * GS_COLS + lc] + red[3 * GS_COLS + lc];
-                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
             }
@@ -475,8 +477,10 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
             for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
             for (int t = 0; t < n; ++t) {
                 const float* ht = hbuf + (size_t) t * C;
+                const float* hk = ht + qk;   // k and v stepped from the row, not ht[qk + ...] beside ht[2 * qk + ...]
+                const float* hv = hk + qk;   // (IGC's GEP simplification, as gdn_step_split)
                 sycl::group_barrier(it.get_group());   // the previous token is done with sk/sq/red/wsum
-                if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
+                if (tid < S) { sk[tid] = hk[qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
                 sycl::group_barrier(it.get_group());
                 const float g = sycl::exp(gate[(size_t) t * h_v + head]);
                 float kv = 0.0f;
@@ -485,7 +489,7 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
                 red[rg * S + col] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red[col] + red[S + col] + red[2 * S + col] + red[3 * S + col];
-                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 float o = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) {
@@ -548,7 +552,8 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
             const int value_dim = S * h_v;
             const int n = n_keep ? *n_keep : T;
             if (n > 0) {
-                if (rg == 0) sk[col] = hbuf[qk + qh * S + col];
+                const float* hk = hbuf + qk;   // k stepped from the row, not hbuf[qk + ...] beside hbuf[2 * qk + ...]
+                if (rg == 0) sk[col] = hk[qh * S + col];   // (IGC's GEP simplification, as gdn_step_split)
                 else if (rg == 1) sq[col] = hbuf[qh * S + col];
             }
             float s[RPG];
@@ -559,11 +564,14 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
             for (int t = 0; t < n; ++t) {
                 const int cur = (t & 1) * S, nxt = ((t + 1) & 1) * S;
                 const float* ht = hbuf + (size_t) t * C;
+                const float* hk = ht + qk;   // k and v stepped from the row (IGC's GEP simplification)
+                const float* hv = hk + qk;
                 // every work-item is done with the previous token (and its buffer, now nxt); the current one is staged
                 sycl::group_barrier(it.get_group());
                 if (t + 1 < n) {
                     const float* hn = ht + C;
-                    if (rg == 0) sk[nxt + col] = hn[qk + qh * S + col];
+                    const float* hnk = hn + qk;
+                    if (rg == 0) sk[nxt + col] = hnk[qh * S + col];
                     else if (rg == 1) sq[nxt + col] = hn[qh * S + col];
                 }
                 const float g = sycl::exp(gate[(size_t) t * h_v + head]);
@@ -573,7 +581,7 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
                 red_kv[rg * S + col] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red_kv[col] + red_kv[S + col] + red_kv[2 * S + col] + red_kv[3 * S + col];
-                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 float o = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) {
