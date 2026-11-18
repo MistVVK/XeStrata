@@ -27,9 +27,13 @@
     return first.split("\n")[0].trim().slice(0, TITLE_MAX) || untitled;
   }
 
-  // localStorage (the list off) holds about 5 MB for the whole page: pictures and files are kept as their names only
+  // localStorage (the list off) holds about 5 MB for the whole page: pictures and files are kept as their names only.
+  // A tool image's copy is a data URL as big as the picture: drop it too, or a few image tools fill the store and
+  // every later save fails silently (store.set returns false).
   const cleanMessages = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                                    files: (m.files || []).map((f) => ({name: f.name}))}));
+                                                    files: (m.files || []).map((f) => ({name: f.name})),
+                                                    ...(m.tools && m.tools.some((t) => t.copies)
+                                                      ? {tools: m.tools.map((t) => { const c = {...t}; delete c.copies; return c; })} : {})}));
   // IndexedDB (the saved-chats list) keeps a chat whole: the pictures and files sent and the copies of the images the
   // tools made (keepToolCopies), so a chat read again shows them and sends them to the model as before
   const cleanChat = (c) => ({...c, messages: c.messages.slice()});
