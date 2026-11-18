@@ -256,6 +256,8 @@ int main(int argc, char** argv) {
             const int64_t rows = qv.dim(0), dims = qv.dim(1);
             const int64_t head_dim = static_cast<int64_t>(*hdv.hf());
             const int64_t heads = dims / head_dim;
+            // the causal text rows' count where the case has them (a block's text stream beside its image rows)
+            const int64_t nt = std::ifstream(dir + "/n_causal.json") ? (int64_t) load(dir, "n_causal").hf()[0] : 0;
             Dev Q(qv), K(kv), V(vv), O32(rows * dims * 4);
             strata::prefill::Gemm gemm;
             std::string gerr;
@@ -269,7 +271,7 @@ int main(int argc, char** argv) {
                 for (auto [to, from] : {std::pair{&QP, &qv}, {&KP, &kv}, {&VP, &vv}})
                     if (!strata::gpu::copy(to->p(), from->raw.data(), from->raw.size()))
                         throw std::runtime_error("mf_train_probe: copy");
-                qi_attention_train(QP.ch(), KP.ch(), VP.ch(), rows, heads, head_dim, O32.f(), LSE.f(), s);
+                qi_attention_train(QP.ch(), KP.ch(), VP.ch(), rows, heads, head_dim, O32.f(), LSE.f(), s, nt);
                 std::vector<float> hl((size_t) rows * heads), ho32((size_t) rows * dims);
                 std::vector<uint16_t> ho16((size_t) rows * dims);
                 strata::gpu::stream_sync(s);
@@ -287,7 +289,7 @@ int main(int argc, char** argv) {
                 Var ov = load(dir, "o32"), dov = load(dir, "dO"), lv = load(dir, "lse");
                 Dev OO(ov), DO(dov), LS(lv), dQ(rows * dims * 4), dK(rows * dims * 4), dV(rows * dims * 4);
                 qi_attention_bwd(Q.ch(), K.ch(), V.ch(), OO.cf(), LS.cf(), DO.cf(), rows, heads, head_dim, dQ.f(),
-                                 dK.f(), dV.f(), false, gemm, s);
+                                 dK.f(), dV.f(), false, gemm, s, nt);
                 std::vector<float> ho((size_t) 3 * rows * dims);
                 strata::gpu::stream_sync(s);
                 dQ.read(ho.data(), rows * dims * 4);

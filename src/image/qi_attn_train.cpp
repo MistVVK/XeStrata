@@ -294,6 +294,30 @@ void scaled_do(const float* dO, const float* O, int64_t rows, int64_t heads, int
         });
 }
 
+// the training attention's workspaces, kept between the calls: (stream, slot) -> its buffer and size
+std::mutex g_ws_mu;
+std::map<std::pair<void*, int>, std::pair<uint8_t*, size_t>> g_ws_kept;
+
+// a stream's workspace of at least `bytes`, kept between the calls (`slot` one of a few, each its own): the fused
+// form's (0), the library forward's (1) and backward's (2), the products' two forms' (3, 4)
+uint8_t* workspace(void* stream, int slot, size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_ws_mu);
+    auto& [p, cap] = g_ws_kept[{stream, slot}];
+    if (cap < bytes) {
+        if (p != nullptr) {
+            gpu::stream_sync(stream);
+            gpu::free(p);
+            p = nullptr;
+            cap = 0;
+        }
+        if (!gpu::alloc_device(reinterpret_cast<void**>(&p), bytes))
+            throw std::runtime_error("image engine: the attention's workspace (" + std::to_string(bytes >> 20) +
+                                     " MiB)");
+        cap = bytes;
+    }
+    return p;
+}
+
 // the fused backward (kernels::flash_attn_bwd) where the GPU takes it: false, nothing done, where it does not
 bool fused_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32, const float* lse,
                const float* dO, int64_t T, int64_t H, int64_t hd, float* dQ, float* dK, float* dV, bool accumulate,
@@ -304,26 +328,7 @@ bool fused_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, co
     const int64_t Tp = qi_attn_rows(T);   // the chunks' rows, read whole: dO's past T zero, as q, k and v's are
     const size_t n16 = (size_t) (Tp * H * hd), n32 = (size_t) (H * T + H);
     const size_t bytes = 256 + n32 * 4 + n16 * 2;
-    static std::mutex mu;
-    static std::map<void*, std::pair<uint8_t*, size_t>> kept;
-    uint8_t* ws = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        auto& [p, cap] = kept[stream];
-        if (cap < bytes) {
-            if (p != nullptr) {
-                gpu::stream_sync(stream);
-                gpu::free(p);
-                p = nullptr;
-                cap = 0;
-            }
-            if (!gpu::alloc_device(reinterpret_cast<void**>(&p), bytes))
-                throw std::runtime_error("image engine: the attention's backward workspace (" +
-                                         std::to_string(bytes >> 20) + " MiB)");
-            cap = bytes;
-        }
-        ws = p;
-    }
+    uint8_t* ws = workspace(stream, 0, bytes);
     auto* bits = reinterpret_cast<uint32_t*>(ws);   // nd [H], nv [H] (H up to 32)
     if (2 * H * 4 > 256) return false;
     auto* D = reinterpret_cast<float*>(ws + 256);
@@ -355,27 +360,6 @@ bool fused_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, co
     a.accumulate = accumulate;
     a.q_rows = q_rows;
     return kernels::flash_attn_bwd(a, stream);
-}
-
-// a stream's workspace of at least `bytes`, kept between the calls (`slot` one of a few, each its own)
-uint8_t* workspace(void* stream, int slot, size_t bytes) {
-    static std::mutex mu;
-    static std::map<std::pair<void*, int>, std::pair<uint8_t*, size_t>> kept;
-    std::lock_guard<std::mutex> lock(mu);
-    auto& [p, cap] = kept[{stream, slot}];
-    if (cap < bytes) {
-        if (p != nullptr) {
-            gpu::stream_sync(stream);
-            gpu::free(p);
-            p = nullptr;
-            cap = 0;
-        }
-        if (!gpu::alloc_device(reinterpret_cast<void**>(&p), bytes))
-            throw std::runtime_error("image engine: the attention's workspace (" + std::to_string(bytes >> 20) +
-                                     " MiB)");
-        cap = bytes;
-    }
-    return p;
 }
 
 // The GPU maker's library's attention for training (oneDNN's SDPA on Intel GPUs, cuDNN's on NVIDIA ones in the
@@ -466,6 +450,15 @@ bool library_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
     const int64_t C = H * hd, ri = T - nt;
     constexpr size_t kHead = 512;   // nd [H], nv [H] and the flag
     if (ri <= 0 || (size_t) (2 * H * 4 + 4) > kHead) return false;
+    if (nt > 0) {
+        // the text rows' backward is the fused kernel's: where it cannot run (a GPU without FP16 matrix engines, a
+        // head width other than 128), refuse before anything is written, so the caller's products take the whole
+        // step - a return false after the library's rows would leave half-written gradients for the next form
+        const auto dev = core::Runtime::get().stream(stream).get_device();
+        if (hd != 128 || dQ == nullptr || dK == nullptr || dV == nullptr || 2 * H * 4 > 256 ||
+            kernels::flash_attn_path(&dev) < 0)
+            return false;
+    }
     if (keys <= 0) keys = T;
     const size_t n = (size_t) (T * C), nk = (size_t) (keys * C), nc = std::max(n, nk);
     uint8_t* ws = workspace(stream, 2, kHead + (size_t) (T * H + H) * 4 + (3 * n + 2 * nk) * 2 +
@@ -578,26 +571,7 @@ bool products_v2(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
     const size_t maps = (size_t) (H * tile * keys);
     const size_t bytes = 256 + ((size_t) (H * T + H) + 2 * (size_t) (keys * C) + 2 * maps + (size_t) (tile * C)) * 4 +
                          (size_t) (T * C) * 2 + 2 * maps * 2;
-    static std::mutex mu;
-    static std::map<void*, std::pair<uint8_t*, size_t>> kept;
-    uint8_t* ws = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        auto& [p, cap] = kept[stream];
-        if (cap < bytes) {
-            if (p != nullptr) {
-                gpu::stream_sync(stream);
-                gpu::free(p);
-                p = nullptr;
-                cap = 0;
-            }
-            if (!gpu::alloc_device(reinterpret_cast<void**>(&p), bytes))
-                throw std::runtime_error("image engine: the attention's backward workspace (" +
-                                         std::to_string(bytes >> 20) + " MiB)");
-            cap = bytes;
-        }
-        ws = p;
-    }
+    uint8_t* ws = workspace(stream, 3, bytes);
     auto* bits = reinterpret_cast<uint32_t*>(ws);
     auto* D = reinterpret_cast<float*>(ws + 256);
     float* g = D + H * T;
@@ -639,6 +613,19 @@ bool products_v2(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
 }
 
 }  // namespace
+
+void qi_attention_train_release(void* stream) {
+    std::lock_guard<std::mutex> lock(g_ws_mu);
+    gpu::stream_sync(stream);
+    for (auto it = g_ws_kept.begin(); it != g_ws_kept.end();) {
+        if (it->first.first != stream) {
+            ++it;
+            continue;
+        }
+        if (it->second.first != nullptr) gpu::free(it->second.first);
+        it = g_ws_kept.erase(it);
+    }
+}
 
 void qi_attention_train(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                         int64_t head_dim, float* out32, float* lse, void* stream, int64_t n_causal, int64_t keys) {
@@ -825,26 +812,7 @@ void products_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     const size_t bytes = (bits_bytes + 255) / 256 * 256 + (size_t) n32 * 4 + (size_t) n16 * 2;
     // the workspace, kept for the stream's next call (every block of a step takes the same shape): the stream runs in
     // order, so the last call's kernels are done with it when this one's run
-    static std::mutex mu;
-    static std::map<void*, std::pair<uint8_t*, size_t>> kept;
-    uint8_t* ws = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        auto& [p, cap] = kept[stream];
-        if (cap < bytes) {
-            if (p != nullptr) {
-                gpu::stream_sync(stream);
-                gpu::free(p);
-                p = nullptr;
-                cap = 0;
-            }
-            if (!gpu::alloc_device(reinterpret_cast<void**>(&p), bytes))
-                throw std::runtime_error("image engine: the attention's backward workspace (" +
-                                         std::to_string(bytes >> 20) + " MiB)");
-            cap = bytes;
-        }
-        ws = p;
-    }
+    uint8_t* ws = workspace(stream, 4, bytes);
     auto* bits = reinterpret_cast<uint32_t*>(ws);   // [H] dO's largest, then [ntiles][H] each tile's dS's largest
     auto* f = reinterpret_cast<float*>(ws + (bits_bytes + 255) / 256 * 256);
     float* D = f;

@@ -4,6 +4,7 @@
 #include "strata/image/train_trainer.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/image/qi_kernels.hpp"
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
@@ -396,6 +397,7 @@ void Trainer::pause() {
     ws.drop();          // the regions go; the pinned homes stay (the resume copies from them)
     drop_tapes();
     arena.release(s);
+    qi_attention_train_release(s);   // the attention's kept workspaces too (the stream is synced above)
     paused_ = true;
     replan_ = true;
 }

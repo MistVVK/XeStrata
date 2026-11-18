@@ -172,8 +172,16 @@ def case_attnreal(d: Path, r: np.random.Generator):
     return attn_rows(d, r, 1024, 24, 128)
 
 
-def attn_rows(d: Path, r: np.random.Generator, rows: int, heads: int, hd: int):
-    """Each head's rows are FP16 with the head's power of two already folded out, and one row sees every key."""
+def case_attncausal(d: Path, r: np.random.Generator):
+    """The first 48 rows causal (a block's text rows beside its image rows): the library backward's text rows go
+    through the fused kernel, and where it cannot run (XESTRATA_NO_XMX=1) the whole step must fall to the products
+    without a throw and with the same gradients."""
+    return attn_rows(d, r, 192, 4, 128, nt=48)
+
+
+def attn_rows(d: Path, r: np.random.Generator, rows: int, heads: int, hd: int, nt: int = 0):
+    """Each head's rows are FP16 with the head's power of two already folded out, and one row sees every key;
+    the rows below nt (causal) see the keys up to themselves."""
     q = (r.standard_normal((rows, heads * hd)) * 0.6).astype(np.float16)
     k = (r.standard_normal((rows, heads * hd)) * 0.6).astype(np.float16)
     v = (r.standard_normal((rows, heads * hd)) * 0.8).astype(np.float16)
@@ -181,6 +189,8 @@ def attn_rows(d: Path, r: np.random.Generator, rows: int, heads: int, hd: int):
     save(d, "k16", k)
     save(d, "v16", v)
     save(d, "head_dim", np.array([hd], dtype=np.float32))
+    if nt:
+        save(d, "n_causal", np.array([nt], dtype=np.float32))
     dO = r.standard_normal((rows, heads * hd)).astype(np.float32)
     save(d, "dO", dO)
     Q = q.astype(np.float64).reshape(rows, heads, hd).transpose(1, 0, 2)
@@ -188,6 +198,8 @@ def attn_rows(d: Path, r: np.random.Generator, rows: int, heads: int, hd: int):
     V = v.astype(np.float64).reshape(rows, heads, hd).transpose(1, 0, 2)
     DO = dO.reshape(rows, heads, hd).transpose(1, 0, 2)
     S = Q @ K.transpose(0, 2, 1) / np.sqrt(hd)
+    if nt:
+        S[:, :nt, :][:, np.arange(nt)[:, None] < np.arange(rows)[None, :]] = -np.inf
     P = np.exp(S - S.max(-1, keepdims=True))
     P /= P.sum(-1, keepdims=True)
     oo = P @ V
@@ -373,7 +385,7 @@ def case_dora(d: Path, r: np.random.Generator):
 
 CASES = {"lnmod": case_lnmod, "gelu": case_gelu, "silu": case_silu, "gate": case_gate, "patch": case_patch,
          "flow": case_flow, "products": case_products, "productsreal": case_productsreal,
-         "attn": case_attn, "attnreal": case_attnreal,
+         "attn": case_attn, "attnreal": case_attnreal, "attncausal": case_attncausal,
          "rows16": case_rows16,
          "qkrope": case_qkrope, "lora": case_lora, "lora_zero_rows": case_lora_zero_rows,
          "lora_zero": case_lora_zero, "lokr": case_lokr, "dora": case_dora}
@@ -395,14 +407,14 @@ RUNS = {"lnmod": [("lnmod", ["dx", "dshift", "dscale"])], "gelu": [("gelu", ["d"
 # products: P and dS are rounded to FP16 once each, so its gradients and its FP32 output carry FP16's own error
 # (dQ, dK, dV 2.7-3.4e-4 and o32 2.4e-4 measured on the B70, 2026-11-09)
 TOL = {"lora": 5e-4, "lora_zero_rows": 5e-4, "lora_zero": 0.0, "lokr": 1e-5, "dora": 1e-6, "qkrope": 2e-4,
-       "attn": 5e-4, "attnreal": 5e-4,
+       "attn": 5e-4, "attnreal": 5e-4, "attncausal": 5e-4,
        "rows16": 1e-3, "lnmod": 2e-5, "gelu": 5e-5, "silu": 5e-5, "gate": 2e-5, "patch": 1e-6, "flow": 1e-5,
        "products": 3e-3, "productsreal": 3e-3}
 
 
 # an FP16 tensor can only carry FP16's own error: an output written as FP16 is judged at two of its units
 TOL_OUT = {("attn", "o16"): 2e-3, ("attn", "o32"): 5e-4, ("attnreal", "o16"): 2e-3, ("attnreal", "o32"): 5e-4,
-           ("products", "db"): 1e-3}
+           ("attncausal", "o16"): 2e-3, ("attncausal", "o32"): 5e-4, ("products", "db"): 1e-3}
 # the attention through the GPU maker's library (--attn library: oneDNN's, cuDNN's or aotriton's SDPA for training),
 # whose output and gradients come out in FP16: their rounding alone is 2-3e-4 (oneDNN on the B70: dQ 6.3e-4, dK 5.1e-4,
 # dV 5.6e-4 and o32 4.3e-4 at the real shapes, 2026-11-09), so they are judged at 1e-3

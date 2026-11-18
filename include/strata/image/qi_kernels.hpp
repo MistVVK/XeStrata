@@ -66,6 +66,10 @@ void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* 
                       const float* lse, const float* dO, int64_t T, int64_t heads, int64_t head_dim, float* dQ,
                       float* dK, float* dV, bool accumulate, prefill::Gemm& gemm, void* stream,
                       int64_t n_causal = 0, int64_t keys = 0);
+/// The workspaces the training attention's forms keep for `stream` (the fused one's, the products' two, the
+/// library's forward and backward): given back after the stream is synced, so a trainer's pause returns their VRAM
+/// too.  The next call allocates its own again.
+void qi_attention_train_release(void* stream);
 
 /// The group a W8A8 product's operands are rotated in (kernels::rows_i8): K must be a multiple of it.
 constexpr int64_t kQiRotate = kernels::kI8Rotate;
