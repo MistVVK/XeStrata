@@ -47,6 +47,7 @@ import contextlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -159,7 +160,14 @@ def _user() -> str:
 class Ledger:
     def __init__(self, key: str, margin_mib: int | None = None, settle_s: float = SETTLE_S,
                  folder: str | None = None, total_mib: int = 0, engine_total: bool = False):
-        base = Path(folder or tempfile.gettempdir()) / f"xestrata-vram-{_user()}-{re.sub(r'[^A-Za-z0-9_.-]', '_', key)}"
+        # The system's temp folder is writable by everyone.  Work in a directory only this user can enter: another
+        # user cannot plant its .lock, its .json or a link at its .tmp, and lstat below refuses a planted directory.
+        root = Path(folder or tempfile.gettempdir()) / f"xestrata-vram-{_user()}"
+        root.mkdir(mode=0o700, exist_ok=True)
+        own = root.lstat()                          # not is_dir(): a link to someone else's folder is not ours
+        if not stat.S_ISDIR(own.st_mode) or (hasattr(os, "getuid") and own.st_uid != os.getuid()):
+            raise PermissionError(f"{root} is not this user's directory")
+        base = root / re.sub(r'[^A-Za-z0-9_.-]', '_', key)
         self.path, self.lock_path = Path(str(base) + ".json"), Path(str(base) + ".lock")
         self.margin_mib = margin_mib
         self.total_mib = int(total_mib)
@@ -167,9 +175,21 @@ class Ledger:
         self.settle_s = float(settle_s)
 
     # ---------------------------------------------------------------- the file, under the short lock
+    @staticmethod
+    def _owned(fd: int) -> bool:
+        st = os.fstat(fd)
+        return stat.S_ISREG(st.st_mode) and (not hasattr(os, "getuid") or st.st_uid == os.getuid())
+
     @contextlib.contextmanager
     def _locked(self):
-        f = open(self.lock_path, "a+b")
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            if not self._owned(fd):
+                raise PermissionError(f"{self.lock_path} is not this user's file")
+            f = os.fdopen(fd, "a+b")            # fdopen owns fd from here; no double close on the error paths above
+        except BaseException:
+            os.close(fd)
+            raise
         try:
             if os.name == "nt":
                 while True:
@@ -193,18 +213,31 @@ class Ledger:
             f.close()
 
     def _read(self) -> dict:
+        empty: dict = {"entries": [], "base_mib": None, "last_removed": 0.0}
         try:
+            st = self.path.lstat()
+            if not stat.S_ISREG(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+                return empty
             got = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(got, dict) and isinstance(got.get("entries"), list):
                 return got
         except (OSError, ValueError):
             pass
-        return {"entries": [], "base_mib": None, "last_removed": 0.0}
+        return empty
 
     def _write(self, state: dict) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state), encoding="utf-8")
-        os.replace(tmp, self.path)
+        # A unique name with O_EXCL: one server cannot overwrite another's half-written temporary file, and a link
+        # planted at a fixed name is never followed.  The parent is only writable by this user.
+        tmp = self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(state))
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
 
     @staticmethod
     def _alive(e: dict) -> bool:
