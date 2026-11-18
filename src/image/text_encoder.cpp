@@ -377,7 +377,7 @@ std::vector<float> TextEncoder::encode(const std::vector<int32_t>& ids, std::str
             for (; c < cells; ++c, ++p) put(c, p, p, p);
         }
         if (!model_->set_positions(pos3.data(), cells, err)) return {};
-        pos_set_ = grids ? n : 0;
+        pos_set_ = grids ? cells : 0;
     }
     std::vector<float> out(ids.size() * (size_t) N);
     auto done = [&] {
