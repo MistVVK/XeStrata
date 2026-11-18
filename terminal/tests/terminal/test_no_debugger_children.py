@@ -160,10 +160,11 @@ STRATA_PROGRAMS = {
     "strata_cli/launch/runner.py": 2,     # setup.py and the other children (_env)
     "strata_cli/launch/params.py": 2,     # engine --help (inherits)
     "strata_cli/cli.py": 2,               # setup.py, the revise command
-    "setup.py": 19,                       # builds, engine probes, the helpers it runs (main sets it); the update's git calls and the
+    "setup.py": 20,                       # builds, engine probes, the helpers it runs (main sets it); the update's git calls (P6: symbolic-ref) and the
                                           # re-run of the pulled setup.py (it inherits main's environment, Q6)
 }
 OTHER_PROGRAMS = {
+    "serve/oomd_pacer.py": 1,            # systemctl (read-only: is systemd-oomd active, its limit)
     "serve/mcp.py": 2,                 # the person's MCP servers and taskkill
     "serve/telemetry.py": 3,           # sysctl, a Metal tool, PowerShell's Get-PnpDevice (the Windows AMD PCIe link, #4884)
     "strata_control/doctor.py": 1,
