@@ -1324,6 +1324,8 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
     tiled = max(w, h) > side
     job = parse_request({**req, "size": f"{min(w, side)}x{min(h, side)}"}, cfg)
     job["width"], job["height"] = w, h
+    if _pipeline(cfg.get("family")) == "guided_token":
+        job["bucket"] = hunyuanimage3_size_bucket(cfg, w, h)
     job["init"] = image
     job["upscale"] = True
     job["upscaler"] = upscaler
@@ -2184,6 +2186,15 @@ def hunyuanimage3_bucket(cfg: dict, width: int, height: int) -> dict:
     """HunyuanImage 3.0's resolution bucket nearest the shape asked for (|ratio - height / width|, the earlier of two
     equally near)."""
     return min(hunyuanimage3_buckets(cfg), key=lambda b: abs(b["ratio"] - height / width))
+
+
+def hunyuanimage3_size_bucket(cfg: dict, width: int, height: int) -> dict:
+    """The bucket row for the exact size the engine draws, for a redraw or a fix whose size was decided after
+    parse_request chose a bucket: the nearest row's ratio with the image block's grid set to W/16 x H/16, so the
+    ids' VAE tokens answer to the IMG line's width and height."""
+    b = dict(hunyuanimage3_bucket(cfg, width, height))
+    b.update(width=width, height=height, tokens_w=width // 16, tokens_h=height // 16)
+    return b
 
 
 def _hunyuanimage3_marker(tok, name: str) -> int:
@@ -5763,6 +5774,9 @@ def fix_job(gen: ImageGen, job: dict, picture: bytes, region: dict, seed: int) -
     one = parse_edit_request(req, [picture], {**gen.cfg, "edit_lora": None, "vision": None},
                              region["mask"])
     one.update(crop=region["crop"], width=job["width"], height=job["height"], n=1, seed=seed)
+    if _pipeline(gen.family) == "guided_token":
+        gw, gh = region["crop"]["gen"]
+        one["bucket"] = hunyuanimage3_size_bucket(gen.cfg, gw, gh)
     one.pop("refine", None)
     one.pop("crop_ups", None)
     crop_upscaler(one, req)   # the region's own cut and enlargement
