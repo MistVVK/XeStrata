@@ -4517,6 +4517,7 @@ function toolsSetup() {
   for (const b of $("tool-kind").children) b.hidden = !has(b.dataset.tool);
   for (const b of document.querySelectorAll("[data-send-tool]")) b.hidden = !has(b.dataset.sendTool);
   if (any.length && !any.includes(toolKind)) toolKind = any[0];
+  toolSave();   // the fields' values the tool shown so far was given, before its model's choices go
   // the image model that draws (an upscale's redraw, the parts' fix): one that offers the tool, a choice of several
   const sel = $("tool-model"), was = sel.value;
   const draw = ms.filter(m => ((m.defaults || {}).tools || []).includes(TOOL_NAMES[toolKind === "fix" ? "fix" : "upscale"]));
@@ -4531,9 +4532,36 @@ const toolAboutText = (k) => k === "fix" ? tr("tool.aboutFix", "Finds faces, han
   : k === "segment" ? tr("tool.aboutSegment", "Finds the parts the words name. A mask found here can be the mask of an edit in the Images tab.")
   : k === "rembg" ? tr("tool.aboutRembg", "Cuts the subject out (BiRefNet): a PNG with a transparent background, or its mask.")
   : tr("tool.aboutUpscale", "Makes the image larger on the GPU; with the redraw, the image model draws the larger picture again for detail.");
+// The fields several tools show (the prompt, the image model, the seed) hold the chosen tool's values; the others'
+// are kept aside and come back with their tool, so that nothing one tool was given goes with another's request
+const TOOL_SHARED = ["tool-prompt", "tool-model", "tool-seed"];
+const toolValues = {};
+let toolValuesKind = toolKind, toolValuesSaved = false;
+// the tool the fields held: its values kept, before the image model's choices are made again for the next one
+function toolSave() {
+  if (toolValuesKind === toolKind || toolValuesSaved) return;
+  toolValues[toolValuesKind] = Object.fromEntries(TOOL_SHARED.map(id => [id, $(id).value]));
+  toolValuesSaved = true;
+}
+function toolSwap(k) {
+  if (toolValuesKind === k) return;
+  toolSave();
+  const mine = toolValues[k] || {};
+  for (const id of TOOL_SHARED) {
+    const el = $(id);
+    if (el.tagName === "SELECT") {   // its own choice where it is still offered, else the first
+      el.value = [...el.options].some(o => o.value === mine[id]) ? mine[id] : el.options.length ? el.options[0].value : "";
+    } else {
+      el.value = mine[id] ?? "";
+    }
+  }
+  toolValuesKind = k;
+  toolValuesSaved = false;
+}
 // the fields of the tool chosen, the prompt's label (or none), and the button's words
 function toolShow() {
   const k = toolKind;
+  toolSwap(k);
   for (const b of $("tool-kind").children) b.setAttribute("aria-checked", String(b.dataset.tool === k));
   for (const f of document.querySelectorAll("#tool-form .tool-fields")) f.hidden = !f.dataset.tool.split(" ").includes(k);
   $("tool-go-l").textContent = toolRunText(k);
@@ -4589,9 +4617,9 @@ async function toolOpen(kind, url, name, prompt) {
   toolKind = kind;
   store.set("tool_kind", kind);
   $("tool-file").value = "";
-  if (prompt && kind !== "segment") $("tool-prompt").value = prompt;
   showTab("tools");
   toolsSetup();
+  if (prompt && kind !== "segment") $("tool-prompt").value = prompt;   // the tool's own field, now it is shown
   await toolSetSource(url, name);
 }
 // the request of the tool chosen, on the image: [the endpoint, the body]
