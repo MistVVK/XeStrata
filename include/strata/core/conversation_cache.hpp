@@ -280,7 +280,7 @@ public:
         size_t deepest = 0;
         for (const auto& c : entries_[m.index].checkpoints) {
             if (c.pinned && (int64_t) c.ids.size() <= m.tokens) return false;
-            deepest = std::max(deepest, c.ids.size());
+            if (!c.reply) deepest = std::max(deepest, c.ids.size());
         }
         return (size_t) m.tokens < deepest;
     }
