@@ -33,14 +33,14 @@ class TheChoiceStaysWithItsFamily(unittest.TestCase):
         rows = [SimpleNamespace(family=f, model="m", verdict="fits", title=f) for f in ("qwen", "coder", "gyro")]
         for target, choice, want in (("coder", "off", None), ("gyro", "dflash2", "dflash2"), ("qwen", "mtp", "mtp")):
             s = S.LaunchSettings(family="qwen", model="m", drafting=choice)
-            fake = SimpleNamespace(ctx=SimpleNamespace(settings=s, notes=[]), rows=rows, input_open=lambda: False,
+            fake = SimpleNamespace(ctx=SimpleNamespace(settings=s, notes=[], refresh_disk=lambda: None), rows=rows, input_open=lambda: False,
                                    menu=lambda target=target: SimpleNamespace(current=SimpleNamespace(key=(target, "m"))))
             ModelScreen.commit(fake)
             self.assertEqual((s.family, s.drafting), (target, want), (target, choice))
         # and back to Qwen after the Coder: Auto (the choice that was made for the other model is gone), which the person can change again
         s = S.LaunchSettings(family="qwen", model="m", drafting="mtp")
         for target in ("coder", "qwen"):
-            fake = SimpleNamespace(ctx=SimpleNamespace(settings=s, notes=[]), rows=rows, input_open=lambda: False,
+            fake = SimpleNamespace(ctx=SimpleNamespace(settings=s, notes=[], refresh_disk=lambda: None), rows=rows, input_open=lambda: False,
                                    menu=lambda target=target: SimpleNamespace(current=SimpleNamespace(key=(target, "m"))))
             ModelScreen.commit(fake)
         self.assertIsNone(s.drafting)

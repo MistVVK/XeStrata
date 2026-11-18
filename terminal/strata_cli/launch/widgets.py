@@ -114,9 +114,10 @@ class Menu(Static):
     DEFAULT_CSS = "Menu { height: auto; text-wrap: nowrap; text-overflow: clip; }"
 
     def __init__(self, columns: list[tuple[str, int]] | None = None, *, glyphs: Glyphs | None = None, id: str | None = None,
-                 window: int = 0, palette: Palette | None = None) -> None:
+                 window: int = 0, palette: Palette | None = None, wrap_last: bool = True) -> None:
         super().__init__("", id=id, markup=False)
         self.palette = palette or DARK
+        self.wrap_last = wrap_last        # S2: the last cell goes on the next lines when it does not fit; False: it ends with an ellipsis instead (long tables)
         self.columns = columns or []
         self.items: list[Item] = []
         self.index = 0
@@ -188,14 +189,33 @@ class Menu(Static):
             out.append("\n")
         win = self.window or len(self.items)
         rows = self.items[self.top:self.top + win]
+        avail = self.size.width or 0
         for n, it in enumerate(rows):
             selected = (self.top + n) == self.index
             line = Text(no_wrap=True, overflow="crop")
             line.append((self.g.cursor + " ") if selected else pad, style=f"bold {self.palette.accent}" if selected else "")
+            more_lines: list[str] = []                       # S2: the end of a last cell that does not fit, on the lines below it
+            hang = 0
+            row_style = ""
             for k, c in enumerate(it.cells):
                 c = cell(c)
                 w = widths[k] if k < len(widths) else 0
-                txt = self.fit(c.text, w, any(cell(x).text for x in it.cells[k + 1:]))
+                text = c.text
+                if avail and text and not any(cell(x).text for x in it.cells[k + 1:]):
+                    used = len(pad) + sum(widths[:k])        # the cells before this one: its own room is what is left of the line
+                    room = avail - used
+                    if room >= 12 and len(text) > room and (not w or len(text) > w):
+                        if self.wrap_last:
+                            import textwrap
+                            parts = textwrap.wrap(text, room, break_long_words=True) or [text[:room]]
+                            if room < 28 and len(parts) > 1:         # a narrow last column: what fits stays, the rest runs under the row's own text at full width
+                                rest = text[len(parts[0]):].lstrip()
+                                text, more_lines, hang = parts[0], textwrap.wrap(rest, max(12, avail - len(pad) - 4)), len(pad) + 2
+                            else:
+                                text, more_lines, hang = parts[0], parts[1:], used
+                        else:
+                            text = text[:room - 1] + ("…" if self.g.unicode else ".")
+                txt = self.fit(text, w, any(cell(x).text for x in it.cells[k + 1:]))
                 style = c.style if not selected else (c.style if c.style and not selected else "")
                 if selected:
                     style = f"bold {self.palette.accent}" if c.style in ("", None) else c.style
@@ -204,11 +224,21 @@ class Menu(Static):
                 if not it.enabled and not selected:
                     style = self.palette.mute
                 line.append(txt, style=style)
-            if selected:
-                line.stylize(f"on {self.palette.sel}")
-                line.pad_right(max(0, (self.size.width or 100) - len(line.plain)))
-                line.stylize(f"on {self.palette.sel}")
-            out.append_text(line)
+                row_style = style
+            lines = [line]
+            for extra in more_lines:
+                cont = Text(no_wrap=True, overflow="crop")
+                cont.append(" " * hang + extra, style=row_style)
+                lines.append(cont)
+            for ln in lines:
+                if selected:
+                    ln.stylize(f"on {self.palette.sel}")
+                    ln.pad_right(max(0, (self.size.width or 100) - len(ln.plain)))
+                    ln.stylize(f"on {self.palette.sel}")
+            for j, ln in enumerate(lines):
+                out.append_text(ln)
+                if j < len(lines) - 1:
+                    out.append("\n")
             if n < len(rows) - 1:
                 out.append("\n")
         if self.window and len(self.items) > win:

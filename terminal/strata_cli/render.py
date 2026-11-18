@@ -237,15 +237,23 @@ def short_gpu(name: str | None) -> str:
     return name
 
 
+def shares_memory(name: object) -> bool:
+    """A graphics chip with no memory of its own: Apple silicon, the NVIDIA GB10 of a DGX Spark, a Ryzen AI Max (Strix Halo). Its memory is the
+    computer's, so a graphics-memory figure has nothing to show and the PCIe link line means nothing (T19; S8: the Hardware tab too)."""
+    low = str(name or "").lower()
+    return any(k in low for k in ("apple", "gb10", "strix halo", "8060s", "8050s", "8040s", "gfx1151"))
+
+
 def _device(row: dict, width: int) -> str:
     idx = row.get("index")
     label = f"GPU {idx if idx is not None else '?'}"
     used, total = row.get("mem_used"), row.get("mem_total")
-    mem = f"{number(used / 2**30 if isinstance(used, (int, float)) else None, '', 1)}/{number(total / 2**30 if isinstance(total, (int, float)) else None, ' GiB', 1)}"
+    unified = shares_memory(row.get("name")) and used is None and total is None      # S8: no "--/--" for a chip that has no memory of its own
+    mem = "shared memory" if unified else f"{number(used / 2**30 if isinstance(used, (int, float)) else None, '', 1)}/{number(total / 2**30 if isinstance(total, (int, float)) else None, ' GiB', 1)}"
     if width < 80:
         return _line(f"{label:<7} {mem:<17} util {number(row.get('util'), '%')}", width)
     name = short_gpu(row.get("name")) if row.get("name") else None
-    link = card_link(row)      # each card trains its own PCIe link: show that card's, not one card's for the run
+    link = "" if shares_memory(row.get("name")) else card_link(row)      # each card trains its own PCIe link: show that card's, not one card's for the run (a shared-memory chip has none: "Gen1 x1 of x16" was its idle internal link)
     base = (f"{label:<7} {field(name, 20)} {mem:<17} {number(row.get('util'), '%'):>5}  {number(row.get('temp'), ' C'):>6}"
             f"  {number(row.get('power'), ' W'):>7}")
     # an 80-column terminal has no room for a capped card's second number: the width the card runs at is the one that
@@ -334,14 +342,16 @@ def _device_detail(row: dict, topology: dict, width: int) -> list[str]:
     used, total = row.get("mem_used"), row.get("mem_total")
     used_gib = used / 2**30 if isinstance(used, (int, float)) else None
     total_gib = total / 2**30 if isinstance(total, (int, float)) else None
+    unified = shares_memory(row.get("name"))
     return ["DEVICE DETAIL  (read only)",
             _line(f"GPU {number(row.get('index'))}   {safe(row.get('name'), 30)}", width),
-            _line(f"VRAM {number(used_gib, ' GiB', 1)} / {number(total_gib, ' GiB', 1)}   Util {number(row.get('util'), '%')}", width),
+            _line((f"Memory shared with the computer   Util {number(row.get('util'), '%')}" if unified and used_gib is None and total_gib is None else
+                   f"VRAM {number(used_gib, ' GiB', 1)} / {number(total_gib, ' GiB', 1)}   Util {number(row.get('util'), '%')}"), width),
             _line(f"Temperature {number(row.get('temp'), ' C')}   Power {number(row.get('power'), ' W')}" +
                   # this card's own ceiling (NVML's enforced limit, sysfs power1_cap): the tile above shows the two
                   # cards' limits added together, so the card you picked needs its own
                   (f" of {number(row.get('power_limit'), ' W')}" if row.get("power_limit") is not None else "") +
-                  (f"   Link {card_link(row)}" if card_link(row) else ""), width),
+                  ("   PCIe not used (memory is shared)" if unified else f"   Link {card_link(row)}" if card_link(row) else ""), width),
             _line(f"Placement {safe(topology.get('mode'), 24)}; split {safe(topology.get('configured_split'), 24)}", width),
             _device_stage(topology, row.get("index"), width)]
 
@@ -402,7 +412,8 @@ def _wide_serving(lines: list[str], snapshot: dict, width: int, height: int,
         for i in range(start, end):
             row = devices[i]
             used, total = row.get("mem_used"), row.get("mem_total")
-            memory = f"{number(used / 2**30 if isinstance(used, (int, float)) else None, '', 1)}/{number(total / 2**30 if isinstance(total, (int, float)) else None, '', 1)}G"
+            memory = ("shared" if shares_memory(row.get("name")) and used is None and total is None else           # S8
+                      f"{number(used / 2**30 if isinstance(used, (int, float)) else None, '', 1)}/{number(total / 2**30 if isinstance(total, (int, float)) else None, '', 1)}G")
             right.append(_line(f"{'>' if i == selected else ' '} GPU {number(row.get('index')):<2} {field(row.get('name'), 8)} {memory:<11} {number(row.get('util'), '%'):>4} {number(row.get('temp'), 'C'):>4} {number(row.get('power'), 'W'):>5}", width-left_width-2))
     else:
         right.append("Per-device sensors unavailable")

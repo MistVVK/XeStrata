@@ -278,9 +278,10 @@ class ReusedDataLine(unittest.TestCase):
                              model_path=str(self.base / "docs"), data_dir=str(self.base / "c08-data"))
         r.say_reused_data(cfg)
         self.assertEqual(len(r.said), 1)
-        self.assertIn("the prepared pack and the draft layer are read from", r.said[0].lower())
+        self.assertIn("the model's prepared data and the draft layer are already stored in", r.said[0].lower())      # (S9: plain words)
         self.assertIn("dl-data", r.said[0])
-        self.assertIn("nothing was copied", r.said[0])
+        self.assertIn("the folder you named", r.said[0])
+        self.assertIn("nothing was copied", r.said[0].lower())
 
     def test_no_line_when_they_are_in_the_given_folder_or_nothing_was_given(self):
         new = self.base / "c08-data"

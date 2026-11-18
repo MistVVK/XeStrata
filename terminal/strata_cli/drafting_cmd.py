@@ -196,7 +196,8 @@ def run(a) -> int:
         if a.output == "jsonl":
             print(json.dumps({"event": "progress", "step": step, "done": done, "total": total}, ensure_ascii=False), flush=True)
         elif not machine and total:
-            print(f"\r{step} {done / 1e9:.2f} of {total / 1e9:.2f} GB", end="", flush=True)
+            # S4: the ready line of a drafter that was already here is reported as 1 of 1 byte: no figures, not "0.00 of 0.00 GB"
+            print(f"\r{step} {done / 1e9:.2f} of {total / 1e9:.2f} GB" if total > 1 else f"\r{step}", end="", flush=True)
 
     try:
         out = drafting_fetch.ensure_for(folder, model_name=want["model_name"], backend=want["backend"], progress=show, archs=want["archs"],

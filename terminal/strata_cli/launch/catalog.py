@@ -106,17 +106,30 @@ class ModelRow:
     fit_gb: float = 0.0           # the files without the lookup table: the "Needs" column and the fit label
     disk_need_gb: float = 0.0     # verdict "disk": the disk the download and its working room need ...
     disk_free_gb: float | None = None   # ... and what is free in the data folder's drive
+    mem_verdict: str = ""         # verdict "disk": the memory verdict it replaced (fits / tight / slower), "" when the disk mark is not set
+    mem_words: str = ""
 
     @property
     def title(self) -> str:
         return f"{self.family_title} {self.model}"
 
+    def without_disk(self) -> "ModelRow":
+        """This row as it is when the download does fit after all (another drive, or the person's own files): the memory verdict alone."""
+        if not self.mem_verdict:
+            return self
+        import dataclasses
+        return dataclasses.replace(self, verdict=self.mem_verdict, words=self.mem_words, mem_verdict="", mem_words="", disk_need_gb=0.0, disk_free_gb=None)
+
     @property
     def sentence(self) -> str:
-        """The verdict in words for a line under the list or a warning (the disk verdict says the two figures and the way out)."""
+        """The verdict in words for a line under the list or a warning (the disk verdict says the two figures and the way out; a model that is
+        also more than the memory holds says that too, T10b)."""
         if self.verdict == DISK and self.disk_free_gb is not None:
-            return (f"Not enough disk space: about {self.disk_need_gb:.0f} GB needed, {self.disk_free_gb:.0f} GB free. "
+            text = (f"Not enough disk space: about {self.disk_need_gb:.0f} GB needed, {self.disk_free_gb:.0f} GB free. "
                     "Pick a bigger drive on the Folder step, or a smaller model")
+            if self.mem_verdict == SLOWER:
+                text += ". It may also run slower on this computer, because it is more than the memory holds"
+            return text
         return self.words
 
 
@@ -415,7 +428,8 @@ class Catalog:
     def recommendation(self, hw: dict | None = None) -> dict:
         return self.strata.recommend(hw or self.hardware())
 
-    def rows(self, hw: dict | None = None) -> list[ModelRow]:
+    def rows(self, hw: dict | None = None, own: tuple[str, str] | None = None) -> list[ModelRow]:
+        """The model list for this computer. `own`: (family, model) of the files in the person's own folder (apply_disk: no download for it)."""
         hw = hw or self.hardware()
         comp = Computer(ram_gb=hw.get("ram_gb"), gpus=list(hw.get("gpus") or []), engine_vendor=self.engine_vendor(hw))
         vram = comp.main_vram_gb
@@ -435,13 +449,22 @@ class Catalog:
                     installed=bool(size.get("installed")) or self.installed_config(str(size["id"])) is not None, mem_total=bool(size.get("mem_total")),
                     memory_gb=float(size.get("memory_gb") or 0), fit_gb=float(size.get("fit_gb") or size.get("memory_gb") or 0),
                     recommended=(rec.get("family") == fam["family"] and rec.get("model") == size["model"])))
-        self.apply_disk(out, hw)
+        self.apply_disk(out, hw, own)
         return out
 
-    def apply_disk(self, rows: list[ModelRow], hw: dict) -> None:
+    def apply_disk(self, rows: list[ModelRow], hw: dict, own: tuple[str, str] | None = None) -> None:
         """T10: "fits" said nothing about the disk. A model that is not on this computer yet and whose download (what is still missing, plus room
-        to work) is more than the free space of the data folder's drive gets the verdict `disk`. Only a verdict that was "fits" or "tight" changes:
-        a model that is too big for the memory keeps its own words. Never a block: the person can still try, as with every verdict."""
+        to work) is more than the free space of the data folder's drive gets the verdict `disk`, whatever its memory verdict (T10b: "may run slower"
+        and "tight" keep their words in `mem_verdict`, the sentence says both); only a model that is too big for the computer keeps just that.
+        Never a block: the person can still try, as with every verdict.
+
+        `own` = (family, model) of the files in the person's own folder (N1: "Use model files I already have", --model-path): that model needs no
+        download, so it is never marked. The other rows count only what they would really download. Run again with another `own`, it first takes
+        the earlier marks off, so the Model list can be refreshed when the person points at their own files."""
+        for r in rows:
+            if r.mem_verdict:                              # an earlier call's mark: back to the memory verdict, then decide again
+                r.verdict, r.words, r.mem_verdict, r.mem_words = r.mem_verdict, r.mem_words, "", ""
+                r.disk_need_gb, r.disk_free_gb = 0.0, None
         free = hw.get("disk_free_gb")
         if free is None:
             return
@@ -450,7 +473,7 @@ class Catalog:
         except Exception:                                  # noqa: BLE001
             base = None
         for r in rows:
-            if r.installed or r.verdict not in (FITS, TIGHT):
+            if r.installed or r.verdict in (NO, DISK) or (own is not None and (r.family, r.model) == tuple(own)):
                 continue
             got = 0.0
             if base is not None:
@@ -461,8 +484,9 @@ class Catalog:
                     got = 0.0
             need = max(r.download_gb - got, 0.0) + DISK_ROOM_GB
             if need > float(free):
+                r.mem_verdict, r.mem_words = r.verdict, r.words
                 r.verdict = DISK
-                r.words = "not enough disk space"
+                r.words = "not enough disk space"                  # (a model that is also slow says so in the sentence under the list)
                 r.disk_need_gb, r.disk_free_gb = need, float(free)
 
     def unavailable(self, hw: dict | None = None) -> list[tuple[str, str]]:

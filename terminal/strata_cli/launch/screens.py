@@ -52,35 +52,26 @@ def middle_shorten(text: str, width: int, dots: str = "…") -> str:
     return head + dots + tail
 
 
-def drafting_choice_available(ctx) -> bool:
+def drafting_choice_available(ctx, family: str | None = None) -> bool:
     """The Drafting step exists only where there is something to choose: Qwen3.8-Flash-Next (qwen, gyro) on a computer whose engine can run DFlash2
-    (CUDA or HIP, strata_control/drafting.py). Every other model has no step: the rest have only the MTP."""
+    (CUDA or HIP, strata_control/drafting.py). Every other model has no step: the rest have only the MTP. `family`: the model family to ask for
+    (the Model step asks for the one under the cursor); default the chosen one."""
     from strata_control import drafting
-    if getattr(getattr(ctx, "settings", None), "family", None) not in drafting.SUPPORTED_FAMILIES or not drafting.ENGINE_SERVES_DFLASH2:
+    family = family if family is not None else getattr(getattr(ctx, "settings", None), "family", None)
+    if family not in drafting.SUPPORTED_FAMILIES or not drafting.ENGINE_SERVES_DFLASH2:
         return False
     catalog = getattr(ctx, "catalog", None)
     backend, archs = drafting.hardware_for(catalog.installed_backend() if catalog is not None else None)   # #5109: the installed engine's family
     return drafting.hardware_support(backend, archs).can_run
 
 
-def total_depends_on_model(ctx) -> bool:
-    """Whether the number of steps changes with the model picked on the first step: only the Drafting step comes and goes with the model, and it can
-    exist only on a computer whose engine runs DFlash2. There "Step 1 of 11" turned into "Step 2 of 10" after a model was chosen (T7)."""
-    from strata_control import drafting
-    if not drafting.ENGINE_SERVES_DFLASH2:
-        return False
-    catalog = getattr(ctx, "catalog", None)
-    backend, archs = drafting.hardware_for(catalog.installed_backend() if catalog is not None else None)
-    return drafting.hardware_support(backend, archs).can_run
-
-
-def flow_for(ctx) -> list[str]:
+def flow_for(ctx, family: str | None = None) -> list[str]:
     """The steps of this computer: the Cards step exists only when two or more graphics cards can be used; the Drafting step only for
-    Qwen3.8-Flash-Next on a computer that can run DFlash2."""
+    Qwen3.8-Flash-Next on a computer that can run DFlash2. `family`: see drafting_choice_available."""
     ids = [sid for sid, _ in STEPS]
     if len(ctx.computer.usable_gpus) < 2:
         ids.remove("cards")
-    if drafting_choice_available(ctx):
+    if drafting_choice_available(ctx, family):
         ids.insert(ids.index("pictures") + 1, "drafting")
     return ids
 
@@ -152,17 +143,19 @@ class Base(Screen):
     def rule(self) -> str:
         return self.g.rule * self.width()
 
+    def flow(self) -> list[str]:
+        """The steps this screen counts with (the Model step counts for the model under the cursor: S1)."""
+        return flow_for(self.ctx)
+
     def head_text(self) -> Text:
-        flow = flow_for(self.ctx)
+        flow = self.flow()
         out = Text(no_wrap=True, overflow="crop")
         out.append("STRATA  ", style=f"bold {ACCENT}")
         out.append(f"{self.title_line}", style=f"bold {ACCENT}")
         if self.step_id in flow:
             labels = STEP_LABELS
             n = flow.index(self.step_id)
-            if self.step_id == "model" and total_depends_on_model(self.ctx):      # T7: the model decides whether a Drafting step exists, so no total yet
-                out.append(f"   Step 1: {labels[self.step_id]}", style="")
-            elif self.width() >= 118:
+            if self.width() >= 118:
                 out.append("   ")
                 for i, sid in enumerate(flow):
                     mark = f"[{i + 1} {labels[sid]}]" if i == n else f"{i + 1} {labels[sid]}"
@@ -429,7 +422,7 @@ class ModelScreen(Base):
 
     def body(self) -> ComposeResult:
         yield Static("", id="question", markup=False)
-        yield Menu(id="menu")
+        yield Menu(id="menu", wrap_last=False)               # S2: a verdict that does not fit ends with an ellipsis (the full sentence is under the list)
         yield Input(placeholder="Folder with the model files, or one .gguf file", id="own", classes="field", disabled=True)
 
     def on_mount(self) -> None:
@@ -456,21 +449,23 @@ class ModelScreen(Base):
                 s.family, s.model = rec.family, rec.model
         items: list[Item] = []
         sel = 0
+        m = self.query_one(Menu)
+        cols = self.widths()
+        room = (m.size.width or self.width()) - 2 - sum(w for _t, w in cols[:-1])     # what is left of the line for the verdict (a scrollbar takes two cells: S2)
         for i, r in enumerate(self.rows):
             col = {"fits": "", "slower": WARN, "tight": WARN, "no": BAD, "disk": WARN}[r.verdict]
             tag = (" (recommended)" if r.recommended else "") + (" (installed)" if r.installed else "") + (" [experimental]" if r.experimental else "")
             need = f"{r.fit_gb:.0f} GB" if r.fit_gb else "-"
             verdict = r.words + tag
             if self.width() < 100:                           # a short verdict that fits the column; the full sentence is shown under the list
-                extra = " (recommended)" if r.recommended else " (installed)" if r.installed else " [experimental]" if r.experimental else ""
-                if r.verdict == "disk":                      # 18 cells: "no disk (rec.)" keeps the recommendation visible
-                    extra = " (rec.)" if r.recommended else extra
-                verdict = {"fits": "fits", "slower": "may run slower", "tight": "tight", "no": "too big", "disk": "no disk"}[r.verdict] + extra
+                base = {"fits": "fits", "slower": "may run slower", "tight": "tight", "no": "too big", "disk": "no disk"}[r.verdict]
+                full, short = ((" (recommended)", " (rec.)") if r.recommended else (" (installed)", " (inst.)") if r.installed else
+                               (" [experimental]", " [exp.]") if r.experimental else ("", ""))
+                verdict = base + (full if len(base + full) <= room else short)      # "no disk (rec.)": the mark stays visible when the long one does not fit
             items.append(Item([r.title, f"{r.download_gb:.0f} GB", need, Cell(verdict, col)], key=(r.family, r.model)))
             if (s.family, s.model) == (r.family, r.model):
                 sel = i
-        m = self.query_one(Menu)
-        m.columns = self.widths()
+        m.columns = cols
         m.show_header = True
         m.window = max(4, (self.size.height or 30) - 12)
         m.set_items(items, sel if (initial or not m.items) else None)
@@ -519,6 +514,13 @@ class ModelScreen(Base):
     def on_cursor(self) -> None:
         pass
 
+    def flow(self) -> list[str]:
+        """S1: "Step 1 of 10" counts the steps of the model under the cursor, so the number is the one every later step shows (the Drafting step
+        exists only for some families); it changes while the cursor moves, never after the model is chosen."""
+        m = self.menu()
+        cur = m.current if m is not None else None
+        return flow_for(self.ctx, cur.key[0] if cur is not None and isinstance(cur.key, tuple) else None)
+
     def commit(self) -> None:
         if self.input_open():
             return
@@ -529,6 +531,7 @@ class ModelScreen(Base):
             if (s.family, s.model) != (fam, model) or s.model_path:
                 s.model_path = None
             s.family, s.model = fam, model
+            self.ctx.refresh_disk()
             from strata_cli.launch import modelstate
             s.drafting = modelstate.drafting_for_family(s.drafting, fam)         # the other families have no Drafting choice: back to Auto
             r = next(x for x in self.rows if (x.family, x.model) == (fam, model))
@@ -585,6 +588,8 @@ class ModelScreen(Base):
             from strata_cli.launch import modelstate
             s.drafting = modelstate.drafting_for_family(s.drafting, s.family)
             self.ctx.picked_in_list = False
+            self.ctx.refresh_disk()                          # N1: these files need no download, so the list stops marking the row (and the Save screen its "!" line)
+            self.build_menu()
             self.close_field("own")
             gb = plan.get("total_bytes", 0) / 1e9
             self.say(f"These files are {sel['family']} {sel['model']} ({plan['file_count']} file(s), {gb:.0f} GB). Press Enter to use them.")
@@ -1143,15 +1148,48 @@ class ParallelScreen(Base):
         yield Static(Text("How many requests at the same time?", style=f"bold {ACCENT}"), markup=False)
         yield Menu(id="menu")
 
+    def shared_room(self) -> dict | None:
+        """S3: on a chip whose memory is the computer's own (a Mac, Strix Halo) there is no card size to count, so the figure is the shared memory the model
+        and one request leave free, and what each further request takes (its conversation memory at the chosen context: the Context step's own figure).
+        {"total", "model", "left", "each", "more"} in GB (more = further requests that fit, 0 or more), None when the memory or the model is unknown."""
+        c, s = self.ctx.computer, self.ctx.settings
+        if not c.ram_gb:
+            return None
+        row = next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
+        need = float(row.fit_gb or row.memory_gb or 0) if row is not None else 0.0
+        if not need:
+            return None
+        try:
+            cat = self.ctx.catalog
+            if any(g.get("unified_gb") for g in c.usable_gpus):          # a Mac: Metal keeps this share of the memory for one program (strata_control/mac_fit.py)
+                from strata_control import mac_fit
+                budget = mac_fit.gpu_budget_gb(float(c.ram_gb))
+            else:
+                from strata_cli.launch.catalog import SYSTEM_ROOM_GB
+                budget = float(c.ram_gb) - SYSTEM_ROOM_GB
+            tokens = s.context or cat.max_context(s.family, s.model, c.raw) or 32768
+            each = cat.kv_gb(int(tokens), s.kv or "int8")
+        except Exception:                                    # noqa: BLE001 - without the figure the screen says what it always said
+            return None
+        left = budget - need - each
+        if each <= 0:
+            return None
+        return {"total": float(c.ram_gb), "model": need, "left": max(left, 0.0), "each": each, "more": max(0, int(left // each)) if left > 0 else 0}
+
     def on_mount(self) -> None:
         vram = self.ctx.computer.main_vram_gb
         self.fit = S.fit_parallel(vram) if vram else 1
         s = self.ctx.settings
         shared = not vram and bool(self.ctx.computer.usable_gpus)
+        room = self.shared_room() if shared else None
         items = [Item([f"Fit to this computer ({self.fit})" if shared else f"Fit to my graphics card ({self.fit})", Cell("recommended", "")], key=None)]
         for n in (1, 2, 3, 4):
             note, style = "", ""
-            if n > self.fit:
+            if room is not None and n > 1:
+                note = f"+{(n - 1) * room['each']:.1f} GB more"
+                if n - 1 > room["more"]:
+                    note, style = f"may not fit: slower answers ({note})", WARN
+            elif n > self.fit and room is None:
                 note, style = "may not fit: slower answers", WARN
             items.append(Item([f"{n} request" + ("s" if n != 1 else ""), Cell(note, style)], key=n))
         sel = 0 if s.parallel is None else min(4, max(1, s.parallel))
@@ -1162,6 +1200,13 @@ class ParallelScreen(Base):
     def explain(self) -> Text:
         vram = self.ctx.computer.main_vram_gb
         if not vram and self.ctx.computer.usable_gpus:      # T3: a Mac or a Strix Halo PC has a chip whose memory is the computer's own, not a card with a size
+            room = self.shared_room()
+            if room is not None:                            # S3: a figure from the shared memory
+                fits = "so every choice fits" if room["more"] >= 3 else f"so {room['more']} more fit" if room["more"] > 1 else "so one more fits"
+                tail = (f"About {room['left']:.0f} GB is left, and each further request takes about {room['each']:.1f} GB, {fits}" if room["more"] else
+                        f"Not much is left, and each further request takes about {room['each']:.1f} GB")
+                return Text(f"This computer's graphics use the same memory as everything else ({room['total']:.0f} GB in all; the model takes about "
+                            f"{room['model']:.0f} GB). {tail}. 1 is the safe default; a team or several coding agents: more.", style=MUTE)
             return Text("This computer's graphics use the same memory as everything else, so Strata cannot count graphics memory to say how many "
                         "requests fit. 1 is the safe choice; more at once need more of that memory. One person: pick 1. A team or several coding "
                         "agents: more.", style=MUTE)
@@ -1201,8 +1246,10 @@ class TuningScreen(Base):
 
     def refresh_body(self) -> None:
         on = self.ctx.settings.tune_allow_small
+        # (S2: at 80 columns the "press a to change" half wrapped in the middle of its words; the key hint line under the screen says the same)
+        tail = "   press a to change" if self.width() >= 90 else ""
         self.query_one("#allowline", Static).update(Text(
-            f"\n  [{'x' if on else ' '}] Allow settings that change answers very slightly (same quality)   press a to change", style=MUTE))
+            f"\n  [{'x' if on else ' '}] Allow settings that change answers very slightly (same quality){tail}", style=MUTE))
 
     def explain(self) -> Text:
         later = ""
@@ -1236,7 +1283,7 @@ class AdvancedScreen(Base):
 
     def body(self) -> ComposeResult:
         yield Static("", id="advhead", markup=False)
-        yield Menu([("Setting", 26), ("Default", 11), ("Tuned", 13), ("Yours", 10), ("What it does", 0)], id="menu", window=8)
+        yield Menu([("Setting", 26), ("Default", 11), ("Tuned", 13), ("Yours", 10), ("What it does", 0)], id="menu", window=8, wrap_last=False)   # S2: one line per setting; the selected one's full text is under the table
         with VerticalScroll(id="cmdbox"):                    # the long command has its own scroll area (Tab, then the arrows) instead of running off the screen
             yield Static("", id="cmdline", markup=False)
         yield Input(id="edit", classes="field", disabled=True)
@@ -1446,7 +1493,9 @@ class AccessScreen(Base):
                  "To see the key later: strata launch --show-key. To use a key of your own: strata launch --api-key YOUR-KEY (or --api-key-env NAME).")
 
     BINDINGS = Base.BINDINGS + [Binding("p", "port", show=False), Binding("k", "newkey", show=False), Binding("t", "keytoggle", show=False),
-                                Binding("n", "go_next", show=False)]
+                                Binding("n", "go_next", show=False), Binding("u", "use_free_port", show=False)]
+
+    free_port: int | None = None             # S12: the next free port, while the one in the settings is held by another program
 
     def body(self) -> ComposeResult:
         yield Static(Text("Who can use it?", style=f"bold {ACCENT}"), markup=False)
@@ -1458,7 +1507,48 @@ class AccessScreen(Base):
         # #5812: the key this launch had when the step opened, and the one moving the highlight made (None: none made)
         self._entry_key, self._cursor_key = self.ctx.settings.api_key, None
         self.build()
+        self.check_port_busy()
         self.paint()
+
+    def on_resize(self, _e) -> None:
+        try:
+            self.build()                                     # the columns follow the window's width
+        except Exception:                                    # noqa: BLE001 - a screen that is closing
+            return
+        self.paint()
+
+    def check_port_busy(self, announce: bool = True) -> None:
+        """S12: the port in the settings (8080 unless the person or a preset chose another) is held by another program: say so here and offer the next free
+        one (u), as the failure screen does, instead of letting the start fail at the end. A server of this very launch is not "another program" (the
+        start asks what to do with that one itself)."""
+        s = self.ctx.settings
+        self.free_port = None
+        host = "127.0.0.1"                                   # (a "one address only" launch is checked by the start itself: a screen never connects to a network address)
+        try:
+            port = int(s.port)
+            if not S.port_in_use(port, host):
+                return
+            from strata_cli.launch.runner import Runner
+            if any(int(r.get("port", -1)) == port for r in Runner(s, catalog=self.ctx.catalog).serving_launches()):
+                return
+            self.free_port = S.next_free_port(port, host)
+        except Exception:                                    # noqa: BLE001 - a hint, never a reason to stop the screen
+            return
+        if announce and self.free_port:
+            self.say(f"Port {s.port} is already in use by another program. Press u to use port {self.free_port} (the next free one), or p to choose another.", True)
+
+    def action_use_free_port(self) -> None:
+        if self.input_open() or not self.free_port:
+            return
+        self.ctx.settings.port = self.free_port
+        self.free_port = None
+        self.build()
+        self.say(f"Port {self.ctx.settings.port}.")
+        self.paint()
+
+    def hints_text(self) -> str:
+        text = super().hints_text()
+        return text.replace("p port", f"p port   u use port {self.free_port}") if self.free_port else text
 
     def drop_cursor_key(self) -> bool:
         """Back on 'This computer only': a key that only moving the highlight made goes again, so a local launch keeps none (#5812).
@@ -1482,7 +1572,9 @@ class AccessScreen(Base):
             if o.kind == s.access:
                 sel = i
         self.opts = {o.kind: o for o in opts}
-        self.query_one(Menu).set_items(items, sel)
+        m = self.query_one(Menu)
+        m.columns = [("", 20), ("", 36), ("", 0)] if self.width() < 100 else [("", 22), ("", 46), ("", 0)]      # S2: at 80 columns the address column gives room to the note
+        m.set_items(items, sel)
 
     def refresh_body(self) -> None:
         s = self.ctx.settings
@@ -1549,6 +1641,7 @@ class AccessScreen(Base):
         self.close_field("portfield")
         self.build()
         self.say(n.line() if n else f"Port {self.ctx.settings.port}.", bool(n))
+        self.check_port_busy(announce=not n)               # (a port that is taken is said, with the next free one, in place of "Port N.")
         self.paint()
 
     def action_newkey(self) -> None:
@@ -1624,6 +1717,9 @@ class SaveScreen(Base):
         items = [Item(["Save as a preset and launch"], key="save_launch"), Item(["Launch without saving"], key="launch"),
                  Item(["Save the preset and stop here"], key="save")]
         self.query_one(Menu).set_items(items, 0)
+        plan = self.ctx.download_plan()
+        if plan is not None and (plan.get("parts") or not plan.get("engine_usable", True)):     # S6: something would be downloaded: is there a way to?
+            self.ctx.check_offline(lambda: self.app.call_from_thread(self.paint))
         self.paint()
 
     def hints_text(self) -> str:
@@ -1650,7 +1746,10 @@ class SaveScreen(Base):
                  ("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({fit_parallel_for(self.ctx.catalog, s, self.ctx.computer.main_vram_gb)})"),
                  ("Tuning", {"quick": "quick (about 20 min)", "thorough": "thorough (up to 2 h)", "skip": "skipped"}[s.tune]),
                  ("Access", f"{S.ACCESS_WORDS[s.access]}, port {s.port}" + (", API key on" if s.api_key else ", no API key")),
-                 ("Storage", s.data_dir or str(self.ctx.default_folder()))]
+                 # S9: with the person's own files, "Storage" was the folder ABOVE their model files and read like where the model is kept
+                 *([("Your files", f"{s.model_path} (used where they are)")] if s.model_path else []),
+                 ("Storage" if not s.model_path else "Strata data", (s.data_dir or str(self.ctx.default_folder())) +
+                  (" (packs and the draft layer go here)" if s.model_path else ""))]
         if s.extra:
             lines.append(("Advanced", ", ".join(f"{k}={v}" for k, v in s.extra.items())))
         for n, text in enumerate(self.download_lines()):                       # T2: everything that will be downloaded, with its size
@@ -1664,14 +1763,39 @@ class SaveScreen(Base):
         plan = self.ctx.download_plan()
         if plan is None:
             return []
+        if self.ctx.offline and (plan.get("parts") or not plan.get("engine_usable", True)):
+            return self.offline_lines(plan, short)
         out = []
         if not plan.get("engine_usable", True):
             out.append("engine" if short else "the engine for your graphics card (its size is shown when it starts)")
         for p in plan.get("parts") or []:
             gb = float(p["gb"])
             size = f"{gb:.2f} GB" if gb < 1 else f"{gb:.0f} GB" if gb >= 10 else f"{gb:.1f} GB"
+            if p.get("kind") == "dflash2" and gb >= 1 and not short:     # S5: the standard drafter is a 1.2 GB download that is packed down to the two files (0.52 + 0.34 GB) the engine reads
+                from strata_control import drafting
+                size += f" (packed to {(drafting.PACK_BYTES + drafting.CONVERTED_BYTES) / 1e9:.1f} GB on disk)"
             out.append(f"{p['label'].removeprefix('the ')} {size}" if short else f"{p['label']}, {size}")
         return out or ["nothing: everything is on this computer"]
+
+    #: S6: what to do for each thing that cannot be downloaded while the computer is offline (plain words, one short line each)
+    OFFLINE_WAYS = {"engine": "install it from a file: strata components install-file",
+                    "weights": "put its files in a folder, then choose Use model files I already have",
+                    "mtp": "copy its mtp folder from another Strata data folder into yours",
+                    "mmproj": "put its mmproj file beside your model files, or choose No pictures",
+                    "dflash2": "copy both of its .pack files into the dflash2 folder of your data folder"}
+
+    def offline_lines(self, plan: dict, short: bool = False) -> list[str]:
+        """The Download rows of a computer that cannot reach the download hosts: what is missing and how to put it in place, not "will download"."""
+        parts = list(plan.get("parts") or [])
+        missing = ([("engine", "the engine for your graphics card", None)] if not plan.get("engine_usable", True) else []) + \
+                  [(p["kind"], p["label"], float(p["gb"])) for p in parts]
+        if short:
+            return ["offline, missing: " + ", ".join(label.removeprefix("the ") for _k, label, _g in missing)]
+        out = ["offline: nothing can be downloaded now. Missing:"]
+        for kind, label, gb in missing:
+            size = "" if gb is None else f", {gb:.2f} GB" if gb < 1 else f", {gb:.0f} GB" if gb >= 10 else f", {gb:.1f} GB"
+            out.append(f"{label}{size}: {self.OFFLINE_WAYS.get(kind, 'copy it in from another computer')}")
+        return out
 
     def compact_download(self) -> str:
         """The Download row of the small-window summary: one line (cut at the end where the window is narrow, so it never wraps over the choices)."""
@@ -1711,8 +1835,9 @@ class SaveScreen(Base):
             t.append("  Name   ")
             t.append("(type below)\n", style=MUTE)
             for k, v in lines:
-                if k == "Storage":   # one row: a long folder wrapped and pushed the last choice off an 80x24 screen
-                    v = middle_shorten(v, self.width() - 14, "…" if self.g.unicode else "...")
+                if k in ("Storage", "Your files", "Strata data"):   # one row: a long folder wrapped and pushed the last choice off an 80x24 screen
+                    path, sep, note = v.partition(" (")
+                    v = middle_shorten(path, max(16, self.width() - 14 - (len(note) + 2 if sep else 0)), "…" if self.g.unicode else "...") + (sep + note if sep else "")
                 t.append(f"  {k:<10}{v}\n")
             for n in warnings:
                 t.append(f"  ! {n}\n", style=WARN)
@@ -1729,6 +1854,8 @@ class SaveScreen(Base):
         if plan is not None:                                 # T2: the same list as under Download above
             if plan.get("engine_usable", True) and float(plan.get("gb") or 0) < 0.05:
                 fetch = "Nothing needs to be downloaded."
+            elif self.ctx.offline:                           # S6
+                fetch = "This computer is offline, so what is listed under Download cannot be fetched now. Put it in place first, as it says."
             else:
                 fetch = "Strata downloads what is listed under Download first."
         else:

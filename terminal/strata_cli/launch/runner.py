@@ -803,6 +803,29 @@ class DownloadPace:
         return f" Finishing the last pieces ({size} left{pace})."
 
 
+class SteadyBar:
+    """S13: one bar for the whole model download that never moves back. Setup checks each finished file (a progress line of its own, 0 to 100 % of THAT file)
+    between the downloads, and the bar followed it: 61 % (52 GB), 32 %, 96 %, then 69 % when the next file began (VAST V2, a real Hugging Face download). While
+    files are checked after a download the bar stays where the download had got to, and the line says what is being checked; the percentage only goes up."""
+
+    def __init__(self) -> None:
+        self.high = 0.0
+        self.last: dict | None = None             # the last download figure: what the check line talks about
+
+    def apply(self, phase: str | None, dl: dict, already: bool, text: str) -> tuple[str, float]:
+        pct = float(dl["percent"])
+        if phase == "download" and not already:
+            self.last = dl
+            self.high = max(self.high, pct)
+            return text, self.high
+        if phase == "verify" and not already and self.last is not None and self.high > 0:
+            done, total = float(self.last.get("done_gb") or 0), float(self.last.get("total_gb") or 0)
+            return f"Checking the files downloaded so far ({done:.1f} of {total:.1f} GB); the download goes on after it", self.high
+        if phase not in ("download", "verify"):
+            self.high, self.last = 0.0, None      # another kind of file (the picture reader ...): its own bar
+        return text, pct
+
+
 _END = object()
 
 
@@ -1517,6 +1540,7 @@ class Runner:
         already: bool | None = None                          # all the model's files were on disk before this run wrote anything
         job = self.progress_job()
         pace, last_dl = DownloadPace(), None                 # T12: the last pieces of a big download crawl; say so
+        steady = SteadyBar()
         step_seen, step_since, quiet_since, said = None, time.monotonic(), time.monotonic(), None
         for line in self._read_lines(p):
             if self.cancel.is_set():
@@ -1551,7 +1575,8 @@ class Runner:
                     pace.add(float(dl.get("done_gb") or 0))
                     last_dl = dl
                     text += pace.finishing(dl)
-                self.emit("model", text, float(dl["percent"]), step=prog.get("step"))
+                text, pct = steady.apply(phase, dl, bool(already), text)         # S13: never back
+                self.emit("model", text, pct, step=prog.get("step"))
             elif label:
                 self.emit("model", label, None, step=prog.get("step"))
             elif prog.get("step"):
@@ -1592,7 +1617,7 @@ class Runner:
             args = [str(a) for a in read_config(path).get("args") or []]
             want = Path(s.data_dir).expanduser().resolve()
             elsewhere = []
-            for flag, label in (("--pack", "the prepared pack"), ("--mtp", "the draft layer")):
+            for flag, label in (("--pack", "the model's prepared data"), ("--mtp", "the draft layer")):
                 if flag in args and args.index(flag) + 1 < len(args):
                     value = args[args.index(flag) + 1]
                     if value.isdigit():
@@ -1602,8 +1627,9 @@ class Runner:
                         elsewhere.append((label, place))
             if elsewhere:
                 folders = sorted({str(pl.parent.parent if pl.parent.name in ("packs", "mtp") else pl.parent) for _l, pl in elsewhere})
-                text = (f"{' and '.join(l for l, _p in elsewhere).capitalize()} {'is' if len(elsewhere) == 1 else 'are'} read from "
-                        f"{', '.join(folders)}, not from {want}; nothing was copied.")
+                # S9: plain words: what is stored where, and that the folder the person named is not the one in use for it
+                text = (f"{' and '.join(l for l, _p in elsewhere).capitalize()} {'is' if len(elsewhere) == 1 else 'are'} already stored in "
+                        f"{', '.join(folders)}, so {'it is' if len(elsewhere) == 1 else 'they are'} used from there, not from {want} (the folder you named). Nothing was copied.")
                 self.notices.append(text)
                 self.emit("model", text, 100)
         except (OSError, ValueError):
@@ -1883,7 +1909,10 @@ class Runner:
             if want["data_dir"] is None or not (drafting.needs_pack(**want, **sig) or drafting.needs_tuned(**want, **sig)):
                 return
             tuned = drafting.tuned_applies(want["backend"], want["model_name"], want["archs"], **sig)
-            self.emit("model", f"Downloading the DFlash2 drafter ({drafting.tuned_pack(drafting.tuned_variant(want['backend'], want['model_name'])).gb if tuned else drafting.DOWNLOAD_GB:g} GB, once)…", 0)
+            if drafting.needs_pack(**want, **sig):
+                self.emit("model", f"Downloading the DFlash2 drafter ({drafting.tuned_pack(drafting.tuned_variant(want['backend'], want['model_name'])).gb if tuned else drafting.DOWNLOAD_GB:g} GB, once)…", 0)
+            else:                                            # S4: the drafter is on this computer (only the tuned file may still come, quietly): no size, no "downloading"
+                self.emit("model", "The DFlash2 drafter is ready.", 100)
 
             def show(step: str, done: int, total: int) -> None:
                 self.check_cancel()
@@ -1891,10 +1920,12 @@ class Runner:
                           100.0 * done / total if total > 0 else None)
             drafting_fetch.ensure_for(want["data_dir"], model_name=want["model_name"], backend=want["backend"], progress=show, cancel=self.cancel, throttle=True,
                                     archs=want["archs"], **sig)
+            if drafting.drafter_ready(want["data_dir"], want["model_name"], want["backend"]):
+                self.emit("model", "The DFlash2 drafter is ready.", 100)       # (what the person reads last: present, whatever the lines in between said)
         except Cancelled:
             raise
         except Exception as e:                               # noqa: BLE001 - the MTP still runs
-            then = "starts with the MTP instead" if want.get("mtp_here") is not False else "starts without a drafter"
+            then = "starts with the draft layer instead" if want.get("mtp_here") is not False else "starts without a drafter"       # S7: "the MTP" is a technical word
             text = f"{e} The model {then}." if isinstance(e, drafting_fetch.DraftingError) else \
                 f"The DFlash2 drafter could not be downloaded. The model {then}."
             self.notices.append(text)
@@ -2404,9 +2435,46 @@ class Runner:
 
     def mac_first_start(self) -> bool:
         """A Mac on the first start of a fresh engine (T22): the first answer builds the graphics code and takes about 10 seconds longer."""
-        if not (getattr(self, "engine_fresh", False) and sys.platform == "darwin"):
+        if sys.platform != "darwin":
             return False
-        return True
+        if getattr(self, "engine_fresh", False):
+            return True
+        return self.engine_first_start_here()
+
+    def engine_first_start_here(self) -> bool:
+        """S11: the engine was installed by something else (the one-line installer, the app) and this is the first time it starts on this Mac: its graphics
+        code is built on the first answer, whoever fetched it. Remembered per engine file (path, size, time) in the launch state folder, so the note is
+        said once per engine and never again; False when the engine cannot be found."""
+        try:
+            found = self.engine_exe_path()
+            if not found:
+                return False
+            exe = Path(found)
+            st = exe.stat()
+            key = f"{exe}|{st.st_size}|{st.st_mtime_ns}"
+            mark = launch_dir() / "mac-engines-started.json"
+            try:
+                seen = json.loads(mark.read_text(encoding="utf-8"))
+                seen = seen if isinstance(seen, list) else []
+            except (OSError, ValueError):
+                seen = []
+            if key in seen:
+                return False
+            write_private(mark, [*seen[-20:], key])
+            return True
+        except Exception:                                    # noqa: BLE001 - a note is never a reason to stop a launch
+            return False
+
+    def engine_exe_path(self) -> str:
+        """The installed engine's program (the one a start uses): the run config's, else the installed engine component's."""
+        try:
+            exe = read_config(self.config_path).get("engine") if self.config_path else None
+            if exe:
+                return str(exe)
+        except (OSError, ValueError, TypeError):
+            pass
+        from strata_control import engine_component as ec
+        return str((ec.status().get("engine") or {}).get("exe") or "")
 
     def server_log_path(self) -> Path | None:
         try:
@@ -2579,8 +2647,8 @@ class Runner:
             # said "nothing to download" and setup then asked for 129 GB): count what setup will fetch
             parts = [p for p in parts if p["kind"] != "weights"] + [{"kind": "weights", "label": "the ready-made pack", "gb": gap["gb"]}]
         intel = self.intel_chosen()
-        if intel:                                            # the Intel route builds the pack from the files and fetches no draft layer, picture reader or drafter
-            parts = [p for p in parts if p["kind"] not in ("mtp", "mmproj", "dflash2")]
+        if intel:                                            # the Intel route builds the pack from the files and fetches no draft layer or picture reader; its tuned drafter (0.52 GB) IS fetched (S5: p1006 did, the plan said nothing)
+            parts = [p for p in parts if p["kind"] not in ("mtp", "mmproj")]
         gb = round(sum(p["gb"] for p in parts), 1)
         engine, here = True, []
         try:

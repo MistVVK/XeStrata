@@ -28,6 +28,9 @@ class FakeAccess:
     def drop_cursor_key(self):
         return screens.AccessScreen.drop_cursor_key(self)
 
+    def check_port_busy(self, announce=True):         # (S12: the real screen looks at the port when it opens)
+        pass
+
     def build(self):
         pass
 
