@@ -67,7 +67,9 @@ class WholeSetup(unittest.TestCase):
             for n in names:
                 (Path(tmp) / n).write_bytes(b"")
             return install(ram, found, ["--gguf-dir", tmp, "--no-start"], answers=answers,
-                           extra=[mock.patch.object(setup, "whole_shard", lambda s: True)])
+                           extra=[mock.patch.object(setup, "whole_shard", lambda s: True),
+                                  mock.patch.object(setup, "feed_models_setup", lambda *a, **k: None)])      # no network: the signed feed lookup
+
 
     def test_one_model_in_the_folder_asks_neither_question(self):
         code, out, cfg, asked = self.run_setup([f"Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-{i:05d}-of-00002.gguf" for i in (1, 2)])
