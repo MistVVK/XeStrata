@@ -159,9 +159,13 @@ Built with sm_70 code only and run on an RTX 3070, CTest passed its 71 tests wit
 The parts and tests that need no model build without llama.cpp (`STRATA_NATIVE_EXPERTS=OFF`).
 The free mode (intel/llvm in `.tools/intel-llvm/install`):
 
+Every command configures with Ninja (`-G Ninja`; the generator setup, the packages and the Windows cross build use
+as well: with Make the SYCL device code's dependencies do not connect), so install Ninja first: `sudo dnf install
+ninja-build` on Fedora, `sudo apt install ninja-build` on Ubuntu, `sudo pacman -S --needed ninja` on Arch.
+
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/free \
+cmake -S . -B build/free -G Ninja \
   -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
@@ -190,7 +194,7 @@ setup.py fetches it.
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/free -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
+cmake -S . -B build/free -G Ninja -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/free --target strata -j6
 ```
@@ -199,7 +203,7 @@ For NVIDIA GPUs (contrib-llvm), with intel/llvm built by `tools/intel_llvm_build
 
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
-cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
+cmake -S . -B build/contrib-llvm -G Ninja -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
   -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/contrib-llvm --target strata -j6

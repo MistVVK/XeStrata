@@ -159,10 +159,11 @@ sm_70 だけのコードを作って RTX 3070 で動かすと、既定でも両�
 
 モデルを使わない部品とテストは、llama.cpp なしでビルドできます（`STRATA_NATIVE_EXPERTS=OFF`）。
 free の方式では次のとおりです（intel/llvm は `.tools/intel-llvm/install`）。
+生成器はどのコマンドでも Ninja です（`-G Ninja`。setup・パッケージ・Windows のクロスビルドと同じです。Make では SYCL の装置側のコードの依存がつながらないので、Ninja を先に入れます: Fedora は `sudo dnf install ninja-build`、Ubuntu は `sudo apt install ninja-build`、Arch は `sudo pacman -S --needed ninja`）。
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/free \
+cmake -S . -B build/free -G Ninja \
   -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
@@ -191,7 +192,7 @@ setup.py が取ってきます。
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/free -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
+cmake -S . -B build/free -G Ninja -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/free --target strata -j6
 ```
@@ -200,7 +201,7 @@ NVIDIA の GPU 向け（contrib-llvm）では、`tools/intel_llvm_build.py --con
 
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
-cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
+cmake -S . -B build/contrib-llvm -G Ninja -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
   -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/contrib-llvm --target strata -j6

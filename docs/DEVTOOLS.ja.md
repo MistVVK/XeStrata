@@ -33,7 +33,7 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 clang-tidy はビルドフォルダー（既定は `build/free`、`XESTRATA_LINT_BUILD` で変えられます）の `compile_commands.json` を読みます。
 
 ```sh
-cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake -S . -B build/free -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON   # 生成器は BUILD.ja.md と同じ Ninja（Make では SYCL の装置側のコードの依存がつながらない）
 ```
 
 ディストリビューションにないもの、またはあっても古すぎるものは `.lint/` に入れます。

@@ -33,7 +33,7 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `XESTRATA_LINT_BUILD` changes it):
 
 ```sh
-cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake -S . -B build/free -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON   # Ninja, as in BUILD.md (with Make the SYCL device code's dependencies do not connect)
 ```
 
 The ones the distribution does not package, or packages too old, go into `.lint/`:
