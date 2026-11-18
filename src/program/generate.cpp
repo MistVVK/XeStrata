@@ -3895,7 +3895,15 @@ int main(int argc, char** argv) {
         // two GPUs only, with the expert pool (the helper's rows are the pool's), without --pipeline-windows (a
         // split's own) and without --batch slots (their groups run one a GPU on a split; the helper was not tried
         // with them)
-        const bool helper_eligible = ns == 2 && !o.no_pool && o.pipeline_windows <= 0 && o.batch <= 0 && role != "split";
+        const auto& split_layout = strata::kernels::cpu::expert_layout();
+        const bool latent_layout = split_layout.native && !split_layout.fmt.empty() &&
+                                   split_layout.fmt[0].n_embd != (int64_t) g.n_embd;
+        if (latent_layout && (role == "helper" || o.split_roles_helper)) {
+            std::fprintf(stderr, "xestrata generate: the latent MoE cannot use a helper GPU; use a layer split instead\n");
+            return 1;
+        }
+        const bool helper_eligible = !latent_layout && ns == 2 && !o.no_pool && o.pipeline_windows <= 0 &&
+                                     o.batch <= 0 && role != "split";
         const int h = 1;   // the second GPU's index in the measurements above
         // the helper cache's window, predicted by the part the plain engine calls too (split_role.hpp)
         strata::core::HelperCachePrediction hc;
