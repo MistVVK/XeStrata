@@ -24,7 +24,7 @@ import zstandard as zstd
 from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from squant.codecs import ID_TO_NAME, QK_S, SUPERBLOCK_BYTES, decode_sk
+from squant.codecs import ID_TO_NAME, QK_S, SUPERBLOCK_BYTES, decode_sk, decode_sk_torch
 from squant.hy_v4_flash import ENGRAM_EPS, EngramTableReader, apply_interleaved_rope, rms_norm
 from squant.strata_format import (
     EXPERT_ENTRY_SIZE,
@@ -44,9 +44,8 @@ def decode_trunk_tensor(raw: bytes, fmt: str, shape: List[int], device: str) -> 
         scales = np.frombuffer(raw[: n_rows * 4], dtype=np.float32).reshape(n_rows, 1)
         qs = np.frombuffer(raw[n_rows * 4 :], dtype=np.int8).reshape(n_rows, cols)
         return torch.from_numpy((qs.astype(np.float32) * scales).reshape(shape)).to(device)
-    # S_K format
-    arr = decode_sk(raw, fmt).reshape(shape)
-    return torch.from_numpy(arr.copy()).to(device)
+    # S_K format -> GPU-accelerated bit-exact decode!
+    return decode_sk_torch(raw, fmt, device).view(shape)
 
 
 class StrataHy4Runner:
@@ -102,15 +101,22 @@ class StrataHy4Runner:
         self.routed_scale = float(self.tc["routed_scaling_factor"])
         self.top_k = int(self.tc["num_experts_per_tok"])
         self.layer_types = list(self.tc["layer_types"])
+        self._trunk_cache: Optional[Dict[Tuple[str, torch.dtype], torch.Tensor]] = None
 
     def get_trunk(self, name: str, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        key = (name, dtype)
+        if self._trunk_cache is not None and key in self._trunk_cache:
+            return self._trunk_cache[key]
         meta = self.trunk_map[name]
         self.fp.seek(self.sec1_off + meta["offset"])
         raw = self.fp.read(meta["bytes"])
-        return decode_trunk_tensor(raw, meta["format"], meta["shape"], self.device).to(dtype)
+        t = decode_trunk_tensor(raw, meta["format"], meta["shape"], self.device).to(dtype)
+        if self._trunk_cache is not None:
+            self._trunk_cache[key] = t
+        return t
 
     def load_expert_dequant(self, moe_layer: int, expert_id: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decode one expert from Section 4 -> (w_gu [3072, 1536] bf16, w_dn [1536, 1536] bf16, sq_xd_dn [1536] f32)."""
+        """Decode one expert from Section 4 on GPU -> (w_gu [3072, 1536] bf16, w_dn [1536, 1536] bf16, sq_xd_dn [1536] f32)."""
         ent = self.expert_dir[(moe_layer, expert_id)]
         self.fp.seek(self.sec4_off + ent.body_offset)
         body = self.fp.read(ent.body_bytes)
@@ -119,8 +125,8 @@ class StrataHy4Runner:
         dn_code = ID_TO_NAME[ent.dn_code_id]
         gu_len = 18432 * SUPERBLOCK_BYTES[gu_code]
         dn_len = 9216 * SUPERBLOCK_BYTES[dn_code]
-        w_gu = torch.from_numpy(decode_sk(body[3072 : 3072 + gu_len], gu_code).reshape(3072, 1536)).to(self.device, dtype=torch.bfloat16)
-        w_dn = torch.from_numpy(decode_sk(body[ent.dn_offset : ent.dn_offset + dn_len], dn_code).reshape(1536, 1536)).to(self.device, dtype=torch.bfloat16)
+        w_gu = decode_sk_torch(body[3072 : 3072 + gu_len], gu_code, self.device).view(3072, 1536).to(torch.bfloat16)
+        w_dn = decode_sk_torch(body[ent.dn_offset : ent.dn_offset + dn_len], dn_code, self.device).view(1536, 1536).to(torch.bfloat16)
         return w_gu, w_dn, sq_xd_dn
 
     def _hc_pre(self, x: torch.Tensor, prefix: str) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -271,6 +277,143 @@ class StrataHy4Runner:
         logits = F.linear(h_final.to(torch.float32), self.get_trunk("lm_head.weight", torch.float32))
         return logits
 
+    @torch.no_grad()
+    def forward_batch_prehead(self, seqs: List[np.ndarray]) -> List[torch.Tensor]:
+        """Layer-by-layer batched 42-layer forward returning pre-hc_head 4-stream states [T_i, 4, 3072] on CPU.
+        Loads every layer's trunk and active experts ONCE across all sequences -> ~20x faster for Scale-QAT & eval!
+        """
+        tok_nps = [np.asarray(s, dtype=np.int64) for s in seqs]
+        emb_w = self.get_trunk("model.embed_tokens.weight", torch.bfloat16)
+        X_list: List[torch.Tensor] = []
+        for tok_np in tok_nps:
+            tok_t = torch.from_numpy(tok_np).to(self.device, dtype=torch.long)
+            X_list.append(F.embedding(tok_t, emb_w).unsqueeze(1).expand(len(tok_np), self.hc_mult, self.hidden_size).contiguous().cpu())
+        del emb_w
+
+        for il in range(self.n_layers):
+            self._trunk_cache = {}
+            is_swa = self.layer_types[il] == "sliding_attention"
+            n_head = int(self.tc["swa_num_attention_heads"] if is_swa else self.tc["num_attention_heads"])
+            theta = float(self.tc["rope_parameters"]["sliding_attention" if is_swa else "deepseek_sparse_attention"]["rope_theta"])
+            pa = f"model.layers.{il}.self_attn"
+
+            # 1. Engram + Attention across all sequences (trunk weights cached for layer il)
+            for si, tok_np in enumerate(tok_nps):
+                T = len(tok_np)
+                pos = torch.arange(T, device=self.device, dtype=torch.int64)
+                x = X_list[si].to(self.device)
+                if il in self.engram_layers:
+                    x = self._apply_engram(x, il, tok_np)
+                res = x
+                cur, post_a = self._hc_pre(x, f"model.layers.{il}.hc_attn_layer")
+                cur = rms_norm(cur, self.get_trunk(f"model.layers.{il}.input_layernorm.weight", torch.bfloat16), self.rms_eps)
+                qr = rms_norm(F.linear(cur, self.get_trunk(f"{pa}.q_a_proj.weight")), self.get_trunk(f"{pa}.q_a_layernorm.weight"), self.rms_eps)
+                q = F.linear(qr, self.get_trunk(f"{pa}.q_b_proj.weight")).reshape(T, n_head, self.qk_head_dim)
+                q_nope, q_pe = q[..., : self.qk_nope_dim], apply_interleaved_rope(q[..., self.qk_nope_dim :], pos, theta)
+                kv_a = F.linear(cur, self.get_trunk(f"{pa}.kv_a_proj_with_mqa.weight"))
+                kv_cmpr = rms_norm(kv_a[:, : self.kv_lora_rank], self.get_trunk(f"{pa}.kv_a_layernorm.weight"), self.rms_eps)
+                k_pe = apply_interleaved_rope(kv_a[:, self.kv_lora_rank :].unsqueeze(1), pos, theta)
+                kv_exp = F.linear(kv_cmpr, self.get_trunk(f"{pa}.kv_b_proj.weight")).reshape(T, n_head, self.qk_nope_dim + self.v_head_dim)
+                k_nope, v = kv_exp[..., : self.qk_nope_dim], kv_exp[..., self.qk_nope_dim :]
+                q_full = torch.cat([q_nope, q_pe], dim=-1).transpose(0, 1)
+                k_full = torch.cat([k_nope, k_pe.expand(T, n_head, self.qk_rope_dim)], dim=-1).transpose(0, 1)
+                scores = torch.matmul(q_full.to(torch.float32), k_full.to(torch.float32).transpose(-2, -1)) / math.sqrt(self.qk_head_dim)
+                i_idx = torch.arange(T, device=self.device)[:, None]
+                j_idx = torch.arange(T, device=self.device)[None, :]
+                mask = torch.where((j_idx <= i_idx) & ((i_idx - j_idx) < self.swa_window), 0.0, float("-inf")) if is_swa else torch.where(j_idx <= i_idx, 0.0, float("-inf"))
+                scores = scores + mask.unsqueeze(0)
+                sinks = self.get_trunk(f"{pa}.learnable_sink_param", torch.float32).view(n_head, 1, 1).expand(n_head, T, 1)
+                probs = torch.softmax(torch.cat([scores, sinks], dim=-1), dim=-1)[..., :-1].to(torch.bfloat16)
+                attn = torch.matmul(probs, v.transpose(0, 1)).transpose(0, 1).reshape(T, n_head * self.v_head_dim)
+                attn = attn * torch.sigmoid(F.linear(cur, self.get_trunk(f"{pa}.linear_gate.weight")).to(torch.float32)).to(torch.bfloat16)
+                attn_out = rms_norm(F.linear(attn, self.get_trunk(f"{pa}.o_proj.weight")), self.get_trunk(f"{pa}.post_proj_norm.weight"), self.rms_eps)
+                X_list[si] = self._hc_post(attn_out, res, post_a).cpu()
+
+            self._trunk_cache.clear()
+            pm = f"model.layers.{il}.mlp"
+            if il == 0:
+                for si in range(len(tok_nps)):
+                    x = X_list[si].to(self.device)
+                    res = x
+                    cur, post_m = self._hc_pre(x, f"model.layers.{il}.hc_mlp_layer")
+                    cur = rms_norm(cur, self.get_trunk(f"model.layers.{il}.post_attention_layernorm.weight"), self.rms_eps)
+                    mlp_out = F.linear(F.silu(F.linear(cur, self.get_trunk(f"{pm}.gate_proj.weight"))) * F.linear(cur, self.get_trunk(f"{pm}.up_proj.weight")), self.get_trunk(f"{pm}.down_proj.weight"))
+                    mlp_out = rms_norm(mlp_out, self.get_trunk(f"{pm}.post_fc2_norm.weight"), self.rms_eps)
+                    X_list[si] = self._hc_post(mlp_out, res, post_m).cpu()
+            else:
+                # Route all sequences first, then execute each active expert ONCE across the combined batch!
+                cur_list, post_list, zf_list, idx_list, w_list = [], [], [], [], []
+                lens = []
+                for si in range(len(tok_nps)):
+                    x = X_list[si].to(self.device)
+                    cur, post_m = self._hc_pre(x, f"model.layers.{il}.hc_mlp_layer")
+                    cur = rms_norm(cur, self.get_trunk(f"model.layers.{il}.post_attention_layernorm.weight"), self.rms_eps)
+                    logits_r = F.linear(cur.to(torch.float32), self.get_trunk(f"{pm}.gate.weight", torch.float32))
+                    probs_e = torch.sigmoid(logits_r)
+                    b_corr = self.get_trunk(f"{pm}.gate.e_score_correction_bias", torch.float32)
+                    _, topk_idx = torch.topk(probs_e + b_corr.unsqueeze(0), k=self.top_k, dim=-1)
+                    topk_p = probs_e.gather(1, topk_idx)
+                    topk_w = (topk_p / (topk_p.sum(dim=-1, keepdim=True) + 1e-20)) * self.routed_scale
+                    z_folded = F.linear(cur, self.get_trunk(f"{pm}.routed_expert_down_proj.weight"))
+                    cur_list.append(cur)
+                    post_list.append(post_m)
+                    zf_list.append(z_folded)
+                    idx_list.append(topk_idx)
+                    w_list.append(topk_w)
+                    lens.append(cur.shape[0])
+
+                z_all = torch.cat(zf_list, dim=0)
+                idx_all = torch.cat(idx_list, dim=0)
+                w_all = torch.cat(w_list, dim=0)
+                z_out_all = torch.zeros((z_all.shape[0], 1536), device=self.device, dtype=torch.float32)
+
+                for e_id in torch.unique(idx_all).tolist():
+                    tm, sm = torch.where(idx_all == e_id)
+                    ze = z_all[tm]
+                    we = w_all[tm, sm].unsqueeze(-1)
+                    w_gu, w_dn, sq_xd_dn = self.load_expert_dequant(il - 1, e_id)
+                    gu = F.linear(ze, w_gu)
+                    g, u = gu[:, :1536].to(torch.float32), gu[:, 1536:].to(torch.float32)
+                    h = torch.clamp(F.silu(g), max=self.swiglu_limit) * torch.clamp(u, min=-self.swiglu_limit, max=self.swiglu_limit)
+                    ye = F.linear((h / sq_xd_dn.unsqueeze(0)).to(torch.bfloat16), w_dn).to(torch.float32)
+                    z_out_all.index_add_(0, tm, ye * we)
+
+                off = 0
+                for si, L in enumerate(lens):
+                    z_out = z_out_all[off : off + L]
+                    off += L
+                    cur = cur_list[si]
+                    moe_out = F.linear(z_out.to(torch.bfloat16), self.get_trunk(f"{pm}.routed_expert_up_proj.weight"))
+                    shexp = F.linear(
+                        F.silu(F.linear(cur, self.get_trunk(f"{pm}.shared_experts.gate_proj.weight")))
+                        * F.linear(cur, self.get_trunk(f"{pm}.shared_experts.up_proj.weight")),
+                        self.get_trunk(f"{pm}.shared_experts.down_proj.weight"),
+                    )
+                    mlp_out = rms_norm(moe_out + shexp, self.get_trunk(f"{pm}.combine_output_norm.weight"), self.rms_eps)
+                    X_list[si] = self._hc_post(mlp_out, X_list[si].to(self.device), post_list[si]).cpu()
+
+            self._trunk_cache = None
+        return X_list
+
+    @torch.no_grad()
+    def forward_batch_logits(self, seqs: List[np.ndarray]) -> List[torch.Tensor]:
+        """Layer-by-layer batched forward returning CPU float32 logits [T_i, V] for every sequence."""
+        X_list = self.forward_batch_prehead(seqs)
+        hc_fn = self.get_trunk("model.hc_head.hc_head_fn", torch.float32)
+        hc_scale = self.get_trunk("model.hc_head.hc_head_scale", torch.float32)
+        hc_base = self.get_trunk("model.hc_head.hc_head_base", torch.float32)
+        norm_w = self.get_trunk("model.norm.weight")
+        lm_head = self.get_trunk("lm_head.weight", torch.float32)
+        out_logits = []
+        for x_cpu in X_list:
+            x = x_cpu.to(self.device)
+            T = x.shape[0]
+            pre = torch.sigmoid(F.linear(rms_norm(x.reshape(T, self.hc_mult * self.hidden_size), None, self.rms_eps).to(torch.float32), hc_fn) * hc_scale + hc_base) + self.hc_eps
+            h_head = torch.einsum("thd,th->td", x.to(torch.float32), pre).to(torch.bfloat16)
+            h_final = rms_norm(h_head, norm_w, self.rms_eps)
+            out_logits.append(F.linear(h_final.to(torch.float32), lm_head).cpu())
+        return out_logits
+
 
 def evaluate_strata(
     strata_path: Path,
@@ -281,26 +424,35 @@ def evaluate_strata(
     n_seqs: int = 8,
     device: str = "cuda",
     out_json: Optional[Path] = None,
+    ref_cache: Optional[Path] = None,
 ) -> Dict:
     from squant.hy_v4_flash import Hy4FlashStreamedModel
     from squant.pilot_parity import kl_divergence
 
     t0 = time.time()
     data = json.loads((splits_dir / f"{split_name}.json").read_text(encoding="utf-8"))
-    seqs = data["seqs"][:n_seqs]
+    seqs = [np.array(s[:512], dtype=np.int64) for s in data["seqs"][:n_seqs]]
     segs = data["segments"][:n_seqs]
 
-    ref_model = Hy4FlashStreamedModel(model_dir, engram_q8_path=engram_q8_path, device=device)
+    if ref_cache is not None and ref_cache.is_file():
+        ref_logits_list = torch.load(ref_cache, map_location="cpu", weights_only=True)
+        ref_logits_list = [r.to(torch.float32) for r in ref_logits_list[: len(seqs)]]
+        print(f"  [{strata_path.name}] Loaded cached BF16 reference logits from {ref_cache.name}", flush=True)
+    else:
+        ref_model = Hy4FlashStreamedModel(model_dir, engram_q8_path=engram_q8_path, device=device)
+        ref_logits_list = [ref_model.forward(arr)["logits"].cpu() for arr in seqs]
+        del ref_model
+        torch.cuda.empty_cache()
+
     cand_model = StrataHy4Runner(strata_path, engram_q8_path, model_dir, device=device)
+    cand_logits_list = cand_model.forward_batch_logits(seqs)
 
     per_seq = []
     kls, top1s, ppl_refs, ppl_cands = [], [], [], []
-    for i, s in enumerate(seqs):
-        arr = np.array(s[:512], dtype=np.int64)
-        l_ref = ref_model.forward(arr)["logits"].cpu()
-        l_cand = cand_model.forward_logits(arr).cpu()
+    for i, arr in enumerate(seqs):
+        l_ref = ref_logits_list[i]
+        l_cand = cand_logits_list[i]
         kl_m, kl_x, t1 = kl_divergence(l_ref, l_cand)
-        # Next-token NLL / PPL
         tgt = torch.from_numpy(arr[1:])
         nll_r = float(F.cross_entropy(l_ref[:-1].float(), tgt).item())
         nll_c = float(F.cross_entropy(l_cand[:-1].float(), tgt).item())
@@ -362,6 +514,7 @@ if __name__ == "__main__":
     ap.add_argument("--n-seqs", type=int, default=6)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out-json", default=None)
+    ap.add_argument("--ref-cache", default=None)
     args = ap.parse_args()
     evaluate_strata(
         Path(args.strata),
@@ -372,4 +525,5 @@ if __name__ == "__main__":
         args.n_seqs,
         args.device,
         Path(args.out_json) if args.out_json else None,
+        Path(args.ref_cache) if args.ref_cache else None,
     )

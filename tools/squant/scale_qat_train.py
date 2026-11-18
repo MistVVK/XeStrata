@@ -73,6 +73,35 @@ def capture_teacher_targets(
     return out_path
 
 
+def capture_eval_ref(
+    model_dir: Path,
+    engram_q8_path: Path,
+    splits_dir: Path,
+    split_name: str,
+    out_path: Path,
+    n_seqs: int = 8,
+    seq_len: int = 512,
+    device: str = "cuda:0",
+) -> Path:
+    """Capture BF16 reference logits (FP16 on CPU) once for a held-out split so all 4 builds reuse them!"""
+    if out_path.is_file():
+        print(f"[EvalRef {split_name}] Reusing cached ref logits: {out_path}", flush=True)
+        return out_path
+    t0 = time.time()
+    data = json.loads((splits_dir / f"{split_name}.json").read_text(encoding="utf-8"))
+    seqs = [s[:seq_len] for s in data["seqs"][:n_seqs]]
+    model = Hy4FlashStreamedModel(model_dir, engram_q8_path=engram_q8_path, device=device)
+    ref_list = []
+    for i, s in enumerate(seqs):
+        l = model.forward(np.array(s, dtype=np.int64), return_dfly_kv=False)["logits"].to(torch.float16).cpu()
+        ref_list.append(l)
+        print(f"  [EvalRef {split_name}] Captured {i+1}/{len(seqs)} ({time.time()-t0:.1f}s)", flush=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(ref_list, out_path)
+    print(f"[EvalRef {split_name}] Saved {len(ref_list)} ref logits -> {out_path} in {time.time()-t0:.1f}s", flush=True)
+    return out_path
+
+
 def topk_tail_kl_loss(cand_logits: torch.Tensor, top_idx: torch.Tensor, top_logp: torch.Tensor, tail_p: torch.Tensor) -> torch.Tensor:
     """Exact top-256 + tail-bucket KL(p_teacher || q_cand) loss."""
     q_logp = F.log_softmax(cand_logits.to(torch.float32), dim=-1)
@@ -115,86 +144,24 @@ def run_scale_qat_for_build(
     #   2) 5-layer DFly2 mtp_fusion & confidence_head calibration
     #   3) Per-layer Sandwich post-norm diagonal calibration alpha_l (42 layers) via finite-difference/STE-free exact pass
     # First measure exact baseline KL on calibration sequences & collect h_head (4-stream pre-hc_head state)
-    h_x_list = []
+    # Using layer-by-layer batched GPU forward (loads every layer/expert ONCE across all sequences -> ~25s total!)
+    seqs_np = [rec["tokens"].numpy().astype(np.int64) for rec in teacher_recs]
+    h_x_list = runner.forward_batch_prehead(seqs_np)
+
     kl_before_list = []
     lm_head = runner.get_trunk("lm_head.weight", torch.float32)
+    hc_fn = runner.get_trunk("model.hc_head.hc_head_fn", torch.float32)
+    hc_sc = runner.get_trunk("model.hc_head.hc_head_scale", torch.float32)
+    hc_bs = runner.get_trunk("model.hc_head.hc_head_base", torch.float32)
+    norm_w = runner.get_trunk("model.norm.weight", torch.float32)
 
     with torch.no_grad():
         for i, rec in enumerate(teacher_recs):
-            tok_np = rec["tokens"].numpy().astype(np.int64)
-            # Run full 42-layer quantized forward up to x [T, 4, 3072] right before hc_head
-            tok_t = torch.from_numpy(tok_np).to(device, dtype=torch.long)
-            T = len(tok_np)
-            pos = torch.arange(T, device=device, dtype=torch.int64)
-            x = F.embedding(tok_t, runner.get_trunk("model.embed_tokens.weight")).unsqueeze(1).expand(T, 4, 3072).contiguous()
-            for il in range(runner.n_layers):
-                if il in runner.engram_layers:
-                    x = runner._apply_engram(x, il, tok_np)
-                res = x
-                cur, post_a = runner._hc_pre(x, f"model.layers.{il}.hc_attn_layer")
-                cur = rms_norm(cur, runner.get_trunk(f"model.layers.{il}.input_layernorm.weight"), runner.rms_eps)
-                is_swa = runner.layer_types[il] == "sliding_attention"
-                n_head = int(runner.tc["swa_num_attention_heads"] if is_swa else runner.tc["num_attention_heads"])
-                theta = float(runner.tc["rope_parameters"]["sliding_attention" if is_swa else "deepseek_sparse_attention"]["rope_theta"])
-                pa = f"model.layers.{il}.self_attn"
-                qr = rms_norm(F.linear(cur, runner.get_trunk(f"{pa}.q_a_proj.weight")), runner.get_trunk(f"{pa}.q_a_layernorm.weight"), runner.rms_eps)
-                q = F.linear(qr, runner.get_trunk(f"{pa}.q_b_proj.weight")).reshape(T, n_head, runner.qk_head_dim)
-                q_nope, q_pe = q[..., : runner.qk_nope_dim], apply_interleaved_rope(q[..., runner.qk_nope_dim :], pos, theta)
-                kv_a = F.linear(cur, runner.get_trunk(f"{pa}.kv_a_proj_with_mqa.weight"))
-                kv_cmpr = rms_norm(kv_a[:, : runner.kv_lora_rank], runner.get_trunk(f"{pa}.kv_a_layernorm.weight"), runner.rms_eps)
-                k_pe = apply_interleaved_rope(kv_a[:, runner.kv_lora_rank :].unsqueeze(1), pos, theta)
-                kv_exp = F.linear(kv_cmpr, runner.get_trunk(f"{pa}.kv_b_proj.weight")).reshape(T, n_head, runner.qk_nope_dim + runner.v_head_dim)
-                k_nope, v = kv_exp[..., : runner.qk_nope_dim], kv_exp[..., runner.qk_nope_dim :]
-                q_full = torch.cat([q_nope, q_pe], dim=-1).transpose(0, 1)
-                k_full = torch.cat([k_nope, k_pe.expand(T, n_head, runner.qk_rope_dim)], dim=-1).transpose(0, 1)
-                scores = torch.matmul(q_full.float(), k_full.float().transpose(-2, -1)) / math.sqrt(runner.qk_head_dim)
-                i_idx = torch.arange(T, device=device)[:, None]
-                j_idx = torch.arange(T, device=device)[None, :]
-                mask = torch.where((j_idx <= i_idx) & ((i_idx - j_idx) < runner.swa_window), 0.0, float("-inf")) if is_swa else torch.where(j_idx <= i_idx, 0.0, float("-inf"))
-                scores = scores + mask.unsqueeze(0)
-                sinks = runner.get_trunk(f"{pa}.learnable_sink_param", torch.float32).view(n_head, 1, 1).expand(n_head, T, 1)
-                probs = torch.softmax(torch.cat([scores, sinks], dim=-1), dim=-1)[..., :-1].to(torch.bfloat16)
-                attn = torch.matmul(probs, v.transpose(0, 1)).transpose(0, 1).reshape(T, n_head * runner.v_head_dim)
-                attn = attn * torch.sigmoid(F.linear(cur, runner.get_trunk(f"{pa}.linear_gate.weight")).float()).to(torch.bfloat16)
-                attn_out = rms_norm(F.linear(attn, runner.get_trunk(f"{pa}.o_proj.weight")), runner.get_trunk(f"{pa}.post_proj_norm.weight"), runner.rms_eps)
-                x = runner._hc_post(attn_out, res, post_a)
-
-                res = x
-                cur, post_m = runner._hc_pre(x, f"model.layers.{il}.hc_mlp_layer")
-                cur = rms_norm(cur, runner.get_trunk(f"model.layers.{il}.post_attention_layernorm.weight"), runner.rms_eps)
-                pm = f"model.layers.{il}.mlp"
-                if il == 0:
-                    mlp_out = F.linear(F.silu(F.linear(cur, runner.get_trunk(f"{pm}.gate_proj.weight"))) * F.linear(cur, runner.get_trunk(f"{pm}.up_proj.weight")), runner.get_trunk(f"{pm}.down_proj.weight"))
-                    mlp_out = rms_norm(mlp_out, runner.get_trunk(f"{pm}.post_fc2_norm.weight"), runner.rms_eps)
-                else:
-                    logits_r = F.linear(cur.float(), runner.get_trunk(f"{pm}.gate.weight", torch.float32))
-                    probs_e = torch.sigmoid(logits_r)
-                    b_corr = runner.get_trunk(f"{pm}.gate.e_score_correction_bias", torch.float32)
-                    _, topk_idx = torch.topk(probs_e + b_corr.unsqueeze(0), k=runner.top_k, dim=-1)
-                    topk_p = probs_e.gather(1, topk_idx)
-                    topk_w = (topk_p / (topk_p.sum(dim=-1, keepdim=True) + 1e-20)) * runner.routed_scale
-                    z_folded = F.linear(cur, runner.get_trunk(f"{pm}.routed_expert_down_proj.weight"))
-                    z_out = torch.zeros((T, 1536), device=device, dtype=torch.float32)
-                    for e_id in torch.unique(topk_idx).tolist():
-                        tm, sm = torch.where(topk_idx == e_id)
-                        ze, we = z_folded[tm], topk_w[tm, sm].unsqueeze(-1)
-                        w_gu, w_dn, sq_xd_dn = runner.load_expert_dequant(il - 1, e_id)
-                        gu = F.linear(ze, w_gu)
-                        h = torch.clamp(F.silu(gu[:, :1536].float()), max=runner.swiglu_limit) * torch.clamp(gu[:, 1536:].float(), min=-runner.swiglu_limit, max=runner.swiglu_limit)
-                        ye = F.linear((h / sq_xd_dn.unsqueeze(0)).to(torch.bfloat16), w_dn).float()
-                        z_out.index_add_(0, tm, ye * we)
-                    moe_out = F.linear(z_out.to(torch.bfloat16), runner.get_trunk(f"{pm}.routed_expert_up_proj.weight"))
-                    shexp = F.linear(F.silu(F.linear(cur, runner.get_trunk(f"{pm}.shared_experts.gate_proj.weight"))) * F.linear(cur, runner.get_trunk(f"{pm}.shared_experts.up_proj.weight")), runner.get_trunk(f"{pm}.shared_experts.down_proj.weight"))
-                    mlp_out = rms_norm(moe_out + shexp, runner.get_trunk(f"{pm}.combine_output_norm.weight"), runner.rms_eps)
-                x = runner._hc_post(mlp_out, res, post_m)
-
-            h_x_list.append(x.cpu())
-            hc_fn = runner.get_trunk("model.hc_head.hc_head_fn", torch.float32)
-            hc_sc = runner.get_trunk("model.hc_head.hc_head_scale", torch.float32)
-            hc_bs = runner.get_trunk("model.hc_head.hc_head_base", torch.float32)
+            x = h_x_list[i].to(device)
+            T = x.shape[0]
             pre = torch.sigmoid(F.linear(rms_norm(x.reshape(T, 4 * 3072), None, runner.rms_eps).float(), hc_fn) * hc_sc + hc_bs) + runner.hc_eps
             h_head = torch.einsum("thd,th->td", x.float(), pre)
-            h_fin = rms_norm(h_head, runner.get_trunk("model.norm.weight", torch.float32), runner.rms_eps)
+            h_fin = rms_norm(h_head, norm_w, runner.rms_eps)
             logits = F.linear(h_fin, lm_head)
             kl_b = float(topk_tail_kl_loss(logits, rec["top_idx"].to(device), rec["top_logp"].to(device), rec["tail_p"].to(device)).item())
             kl_before_list.append(kl_b)
@@ -259,6 +226,16 @@ if __name__ == "__main__":
     pt.add_argument("--splits-dir", required=True)
     pt.add_argument("--out", required=True)
     pt.add_argument("--n-seqs", type=int, default=24)
+    pt.add_argument("--device", default="cuda:0")
+
+    pe = sub.add_parser("eval-ref")
+    pe.add_argument("--model-dir", required=True)
+    pe.add_argument("--engram-q8", required=True)
+    pe.add_argument("--splits-dir", required=True)
+    pe.add_argument("--split", required=True)
+    pe.add_argument("--out", required=True)
+    pe.add_argument("--n-seqs", type=int, default=8)
+    pe.add_argument("--device", default="cuda:0")
 
     pq = sub.add_parser("qat")
     pq.add_argument("--build", required=True)
@@ -272,6 +249,8 @@ if __name__ == "__main__":
 
     args = ap.parse_args()
     if args.cmd == "teacher":
-        capture_teacher_targets(Path(args.model_dir), Path(args.engram_q8), Path(args.splits_dir), Path(args.out), n_seqs=args.n_seqs)
+        capture_teacher_targets(Path(args.model_dir), Path(args.engram_q8), Path(args.splits_dir), Path(args.out), n_seqs=args.n_seqs, device=args.device)
+    elif args.cmd == "eval-ref":
+        capture_eval_ref(Path(args.model_dir), Path(args.engram_q8), Path(args.splits_dir), args.split, Path(args.out), n_seqs=args.n_seqs, device=args.device)
     elif args.cmd == "qat":
         run_scale_qat_for_build(args.build, Path(args.strata), Path(args.engram_q8), Path(args.model_dir), Path(args.teacher), Path(args.out), device=args.device, epochs=args.epochs)

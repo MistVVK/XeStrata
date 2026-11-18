@@ -47,6 +47,7 @@ from squant.codecs import (
     QK_S,
     SUPERBLOCK_BYTES,
     decode_sk,
+    decode_sk_torch,
     encode_sk,
     expert_body_bytes,
     fwht64_np,
@@ -389,8 +390,8 @@ def _macaq_r_compensate_worker(
         sq_xd_dn = torch.from_numpy(np.frombuffer(body[:3072], dtype=np.float16).astype(np.float32).copy()).to(dev)
         gu_len = 18432 * SUPERBLOCK_BYTES[cg]
         dn_len = 9216 * SUPERBLOCK_BYTES[cd]
-        w_gu = torch.from_numpy(decode_sk(body[3072 : 3072 + gu_len], cg).reshape(3072, 1536)).to(dev, dtype=torch.bfloat16)
-        w_dn = torch.from_numpy(decode_sk(body[dn_off : dn_off + dn_len], cd).reshape(1536, 1536)).to(dev, dtype=torch.bfloat16)
+        w_gu = decode_sk_torch(body[3072 : 3072 + gu_len], cg, dev).view(3072, 1536).to(torch.bfloat16)
+        w_dn = decode_sk_torch(body[dn_off : dn_off + dn_len], cd, dev).view(1536, 1536).to(torch.bfloat16)
 
         tm, sm = torch.where(topk_idx == e)
         ze = z_f[tm]

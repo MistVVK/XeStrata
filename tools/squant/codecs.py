@@ -359,6 +359,89 @@ def decode_sk(raw: bytes | np.ndarray, code_name: str) -> np.ndarray:
     raise ValueError(f"Unknown code_name: {code_name}")
 
 
+_TORCH_TABLES: Dict[str, Tuple] = {}
+
+
+def decode_sk_torch(raw: bytes | np.ndarray, code_name: str, device: str | "torch.device") -> "torch.Tensor":
+    """GPU-accelerated bit-exact .strata v1.0 S_K decoder -> float32 tensor [n_sb * 256] on `device`.
+    ~100x faster than NumPy CPU decode_sk for MACaQ-R, Scale-QAT, and full 42-layer eval.
+    """
+    import torch
+
+    sb_b = SUPERBLOCK_BYTES[code_name]
+    buf_np = np.frombuffer(raw, dtype=np.uint8) if isinstance(raw, (bytes, bytearray, memoryview)) else raw
+    assert buf_np.size % sb_b == 0
+    n_sb = buf_np.size // sb_b
+    blocks = torch.from_numpy(np.array(buf_np, copy=True)).to(device=device, non_blocking=True).view(n_sb, sb_b)
+
+    # Header: bytes 0..1 = float16 D, bytes 2..5 = uint8 u[4]
+    D = blocks[:, :2].contiguous().view(torch.float16).view(n_sb).to(torch.float32)
+    u = blocks[:, 2:6].to(torch.float32)
+    eff = (D[:, None] * (u / 255.0))[:, :, None]  # [N, 4, 1]
+    pl = blocks[:, 6:]
+
+    if code_name == "S8_K":
+        q = pl.contiguous().view(torch.int8).to(torch.float32).view(n_sb, NUM_SUB, SUB_G)
+        return (q * eff).reshape(n_sb * QK_S)
+
+    if code_name in ("S2_K", "S3_K", "S4_K", "S5_K", "S6_K"):
+        bits = int(code_name[1])
+        half = ((1 << bits) - 1) / 2.0
+        if bits == 2:
+            q = torch.stack([(pl >> (2 * j)) & 0x03 for j in range(4)], dim=2).reshape(n_sb, QK_S)
+        elif bits == 3:
+            p_lo, p_hi = pl[:, :64], pl[:, 64:96]
+            lo = torch.stack([(p_lo >> (2 * j)) & 0x03 for j in range(4)], dim=2).reshape(n_sb, QK_S)
+            hi = torch.stack([(p_hi >> j) & 0x01 for j in range(8)], dim=2).reshape(n_sb, QK_S)
+            q = lo | (hi << 2)
+        elif bits == 4:
+            q = torch.stack([pl & 0x0F, (pl >> 4) & 0x0F], dim=2).reshape(n_sb, QK_S)
+        elif bits == 5:
+            p_lo, p_hi = pl[:, :128], pl[:, 128:160]
+            lo = torch.stack([p_lo & 0x0F, (p_lo >> 4) & 0x0F], dim=2).reshape(n_sb, QK_S)
+            hi = torch.stack([(p_hi >> j) & 0x01 for j in range(8)], dim=2).reshape(n_sb, QK_S)
+            q = lo | (hi << 4)
+        elif bits == 6:
+            p_lo, p_hi = pl[:, :128], pl[:, 128:192]
+            lo = torch.stack([p_lo & 0x0F, (p_lo >> 4) & 0x0F], dim=2).reshape(n_sb, QK_S)
+            hi = torch.stack([(p_hi >> (2 * j)) & 0x03 for j in range(4)], dim=2).reshape(n_sb, QK_S)
+            q = lo | (hi << 4)
+        qf = q.to(torch.float32).view(n_sb, NUM_SUB, SUB_G) - half
+        return (qf * eff).reshape(n_sb * QK_S)
+
+    dev_key = str(device)
+    if dev_key not in _TORCH_TABLES:
+        _TORCH_TABLES[dev_key] = (
+            torch.from_numpy(_T5_DECODE.astype(np.float32)).to(device),
+            torch.from_numpy(S125_CODEBOOK.astype(np.float32)).to(device),
+        )
+    t5_tab, s125_tab = _TORCH_TABLES[dev_key]
+
+    if code_name == "S1.5":
+        trits = t5_tab[pl.to(torch.long)].reshape(n_sb, 260)[:, :256].view(n_sb, NUM_SUB, SUB_G)
+        return (trits * eff).reshape(n_sb * QK_S)
+
+    if code_name == "S1.25":
+        pl40 = pl[:, :40].view(n_sb, 8, 5).to(torch.int64)
+        bits40 = (
+            pl40[:, :, 0]
+            | (pl40[:, :, 1] << 8)
+            | (pl40[:, :, 2] << 16)
+            | (pl40[:, :, 3] << 24)
+            | (pl40[:, :, 4] << 32)
+        )
+        idx = torch.stack([(bits40 >> (5 * j)) & 0x1F for j in range(8)], dim=2).reshape(n_sb, 64)
+        fb = pl[:, 40:42]
+        fine_q = torch.stack(
+            [fb[:, 0] & 0x0F, (fb[:, 0] >> 4) & 0x0F, fb[:, 1] & 0x0F, (fb[:, 1] >> 4) & 0x0F], dim=1
+        )
+        fine_f = (0.5 + fine_q.to(torch.float32) / 15.0)[:, :, None]
+        vals = s125_tab[idx].view(n_sb, NUM_SUB, SUB_G)
+        return (vals * eff * fine_f).reshape(n_sb * QK_S)
+
+    raise ValueError(f"Unknown code_name: {code_name}")
+
+
 def quantize_q8_1_g64(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Quantize activation vector [..., K] (K % 64 == 0) into 64-element Q8_1 blocks matching S_K sub-groups.
     Returns (qs int8 [..., K//64, 64], d float32 [..., K//64], s float32 [..., K//64] where s = d * sum(qs)).
