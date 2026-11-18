@@ -1161,7 +1161,13 @@ uint64_t unreported_vram_margin(const std::string& pci, uint64_t total) {
 }
 
 uint64_t max_alloc_bytes() {
-    static const uint64_t v = [] {
+    static std::mutex mu;
+    static std::map<int, uint64_t> limits;
+    std::lock_guard<std::mutex> lock(mu);
+    const int ordinal = Runtime::get().ordinal();
+    const auto found = limits.find(ordinal);
+    if (found != limits.end()) return found->second;
+    const uint64_t v = [] {
         const uint64_t dev = Runtime::get().device().get_info<sycl::info::device::max_mem_alloc_size>();
         const uint64_t lim = max_alloc_limit_bytes();
         const uint64_t claim = lim != 0 && lim < dev ? lim : dev;
@@ -1182,6 +1188,7 @@ uint64_t max_alloc_bytes() {
         }
         return good;
     }();
+    limits.emplace(ordinal, v);
     return v;
 }
 
