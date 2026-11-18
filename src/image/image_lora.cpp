@@ -1798,48 +1798,104 @@ void LoraLayer::bake(int type, void* w, int64_t n, int64_t k, prefill::Gemm& gem
                 w16[i] = strata::kernels::f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
             });
         } else if (type == -8) {
-            // a work-group a row: the delta's row turned in local memory (Sylvester's butterflies within each group of
-            // kQiRotate, times 1 / 16, as the weights were), added to the row's values, quantized again
+            // A work-group a row. Reserve one float a lane for the reduction's static local memory. The CUDA
+            // adapter opts in to larger allocations only above 48 KiB; avoid exactly that size on every device.
             auto* w8 = static_cast<int8_t*>(w);
             float* sw = reinterpret_cast<float*>(static_cast<uint8_t*>(w) + n * k);
             const int64_t row0 = p.row0;
             constexpr int64_t G = kQiRotate, L = 256;
-            q.submit([&](sycl::handler& h) {
-                sycl::local_accessor<float, 1> v(sycl::range<1>((size_t) k), h);
-                h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (rows * L)), sycl::range<1>((size_t) L)),
-                               [=](sycl::nd_item<1> it) {
-                    const auto rr = static_cast<int64_t>(it.get_group_linear_id());
-                    const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-                    const int64_t row = row0 + rr;
-                    for (int64_t c = lane; c < k; c += L) v[c] = s * tmp[rr * k + c];
-                    for (int64_t m = 1; m < G; m <<= 1) {
-                        sycl::group_barrier(it.get_group());
-                        for (int64_t i = lane; i < k / 2; i += L) {   // pair i: group g, its j in the half below m
-                            const int64_t g = i / (G / 2), o = i - g * (G / 2), lo = (o / m) * 2 * m + o % m;
-                            const int64_t j = g * G + lo;
-                            const float x = v[j], y = v[j + m];
-                            v[j] = x + y;
-                            v[j + m] = x - y;
+            const int64_t local_floats = (int64_t) (q.get_device().get_info<sycl::info::device::local_mem_size>() /
+                                                    sizeof(float));
+            constexpr int64_t optin_edge = 48LL * 1024 / (int64_t) sizeof(float);   // UR CUDA's dynamic shared-memory boundary
+            const int64_t fast_local = k + (k == optin_edge ? G : 0);
+            if (fast_local + L <= local_floats) {   // keep the row in local memory when it fits
+                q.submit([&](sycl::handler& h) {
+                    sycl::local_accessor<float, 1> v(sycl::range<1>((size_t) fast_local), h);
+                    h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (rows * L)), sycl::range<1>((size_t) L)),
+                                   [=](sycl::nd_item<1> it) {
+                        const auto rr = static_cast<int64_t>(it.get_group_linear_id());
+                        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+                        const int64_t row = row0 + rr;
+                        for (int64_t c = lane; c < k; c += L) v[c] = s * tmp[rr * k + c];
+                        for (int64_t m = 1; m < G; m <<= 1) {
+                            sycl::group_barrier(it.get_group());
+                            for (int64_t i = lane; i < k / 2; i += L) {   // pair i: group g, its j in the half below m
+                                const int64_t g = i / (G / 2), o = i - g * (G / 2), lo = (o / m) * 2 * m + o % m;
+                                const int64_t j = g * G + lo;
+                                const float x = v[j], y = v[j + m];
+                                v[j] = x + y;
+                                v[j + m] = x - y;
+                            }
                         }
-                    }
-                    sycl::group_barrier(it.get_group());
-                    const float d0 = sw[row];
-                    float amax = 0.f;
-                    for (int64_t c = lane; c < k; c += L) {
-                        const float u = (float) w8[row * k + c] * d0 + v[c] * (1.f / 16.f);
-                        v[c] = u;
-                        amax = sycl::fmax(amax, sycl::fabs(u));
-                    }
-                    amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
-                    const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
-                    // dithered: the weight's values sit on its grid, and a delta under half a step rounds back to
-                    // them (a LoRA lost); floor(x + u) keeps the delta on average over a product's sums
-                    for (int64_t c = lane; c < k; c += L)
-                        w8[row * k + c] = (int8_t) sycl::clamp(sycl::floor(v[c] * id + bake_dither(row, c)), -127.f,
-                                                               127.f);
-                    if (lane == 0) sw[row] = d;
+                        sycl::group_barrier(it.get_group());
+                        const float d0 = sw[row];
+                        float amax = 0.f;
+                        for (int64_t c = lane; c < k; c += L) {
+                            const float u = (float) w8[row * k + c] * d0 + v[c] * (1.f / 16.f);
+                            v[c] = u;
+                            amax = sycl::fmax(amax, sycl::fabs(u));
+                        }
+                        amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
+                        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+                        // dithered: the weight's values sit on its grid, and a delta under half a step rounds back to
+                        // them (a LoRA lost); floor(x + u) keeps the delta on average over a product's sums
+                        for (int64_t c = lane; c < k; c += L)
+                            w8[row * k + c] = (int8_t) sycl::clamp(sycl::floor(v[c] * id + bake_dither(row, c)), -127.f,
+                                                                   127.f);
+                        if (lane == 0) sw[row] = d;
+                    });
                 });
-            });
+            } else {   // a wide row: the partial sums live in tmp until the row's scale is known
+                int64_t width = (local_floats - 2 * L) / G * G;
+                if (width + L == optin_edge) width -= G;
+                if (width < G) throw std::runtime_error("image engine: insufficient local memory for LoRA baking");
+                q.submit([&](sycl::handler& h) {
+                    sycl::local_accessor<float, 1> v(sycl::range<1>((size_t) (width + L)), h);
+                    h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (rows * L)), sycl::range<1>((size_t) L)),
+                                   [=](sycl::nd_item<1> it) {
+                        const auto rr = static_cast<int64_t>(it.get_group_linear_id());
+                        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+                        const int64_t row = row0 + rr;
+                        const float d0 = sw[row];
+                        float amax = 0.f;
+                        for (int64_t base = 0; base < k; base += width) {
+                            const int64_t count = sycl::min(width, k - base);
+                            sycl::group_barrier(it.get_group());
+                            for (int64_t c = lane; c < count; c += L) v[c] = s * tmp[rr * k + base + c];
+                            for (int64_t m = 1; m < G; m <<= 1) {
+                                sycl::group_barrier(it.get_group());
+                                for (int64_t i = lane; i < count / 2; i += L) {
+                                    const int64_t g = i / (G / 2), o = i - g * (G / 2), lo = (o / m) * 2 * m + o % m;
+                                    const int64_t j = g * G + lo;
+                                    const float x = v[j], y = v[j + m];
+                                    v[j] = x + y;
+                                    v[j + m] = x - y;
+                                }
+                            }
+                            sycl::group_barrier(it.get_group());
+                            for (int64_t c = lane; c < count; c += L) {
+                                const int64_t col = base + c;
+                                const float u = (float) w8[row * k + col] * d0 + v[c] * (1.f / 16.f);
+                                tmp[rr * k + col] = u;
+                                amax = sycl::fmax(amax, sycl::fabs(u));
+                            }
+                        }
+                        v[width + lane] = amax;
+                        for (int64_t stride = L / 2; stride > 0; stride /= 2) {
+                            sycl::group_barrier(it.get_group());
+                            if (lane < stride) v[width + lane] = sycl::fmax(v[width + lane], v[width + lane + stride]);
+                        }
+                        sycl::group_barrier(it.get_group());
+                        amax = v[width];
+                        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+                        // Dithered: a delta below half a step must not always round back to the old weight.
+                        for (int64_t c = lane; c < k; c += L)
+                            w8[row * k + c] = (int8_t) sycl::clamp(
+                                sycl::floor(tmp[rr * k + c] * id + bake_dither(row, c)), -127.f, 127.f);
+                        if (lane == 0) sw[row] = d;
+                    });
+                });
+            }
         } else if (type == 8) {   // Q8_0: 32 values a block, its FP16 scale then the values
             auto* w8 = static_cast<uint8_t*>(w);
             const int64_t nb = k / 32, row0 = p.row0;
