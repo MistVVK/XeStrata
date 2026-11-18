@@ -1363,7 +1363,9 @@ function cfgInput(k, id, v, placeholder) {
   if (k.kind === "secret")
     return `<input class="st-input" id="${id}" type="password" value="" placeholder="${esc(k.set ? tr("about.cfgSecretSet", "set (type to replace)") : tr("about.cfgSecretUnset", "not set"))}" autocomplete="off">` +
       (k.set ? ` <button class="st-btn st-btn--secondary" type="button" data-cfg-clear="${esc(k.key)}">${esc(tr("about.cfgClear", "Clear"))}</button>` : "");
-  const text = v == null ? "" : v === "" ? tr("img.off", "off") : Array.isArray(v) ? v.join(", ") : String(v);
+  // the stored empty value has one spelling in every language: a translated word would come back as that word and
+  // be saved as a URL, a name or a number (the selects carry their own value, so their labels may be translated)
+  const text = v == null ? "" : v === "" ? "off" : Array.isArray(v) ? v.join(", ") : String(v);
   return `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
     `value="${esc(text)}" placeholder="${esc(placeholder)}" autocomplete="off">`;
 }
@@ -1403,10 +1405,11 @@ function renderConfig(keep) {
 function configValue(k, el) {
   const s = el.value.trim();
   if (s === "") return null;
-  if (k.kind === "url") return s.toLowerCase() === "off" ? "" : s;
   if (k.kind === "bool") return s === "true";
+  if (k.kind === "enum") return s;                  // script_guard's own value is "off"
+  if (s.toLowerCase() === "off") return "";        // the field's spelling of the stored empty value
   if (k.kind === "number") return Number(s);
-  return s;                                         // enum, secret, or names (the server splits them at commas)
+  return s;                                         // secret or names (the server splits them at commas)
 }
 async function saveConfig(globalSet, set) {
   if (!Object.keys(set).length && !Object.keys(globalSet).length) { $("cfg-msg").textContent = tr("about.cfgNothing", "Nothing changed."); return; }
