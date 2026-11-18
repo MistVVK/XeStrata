@@ -3377,6 +3377,7 @@ int main(int argc, char** argv) {
         if (!o.native_preset.empty()) {
             try {
                 strata::GgufFile model_gguf(o.native_preset);
+                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.embedding_length")) ga.n_embd = (int64_t) v->u;
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) ga.n_expert = (int64_t) v->u;
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) Ka = (int64_t) v->u;
             } catch (const std::exception& e) {
@@ -3897,7 +3898,7 @@ int main(int argc, char** argv) {
         // with them)
         const auto& split_layout = strata::kernels::cpu::expert_layout();
         const bool latent_layout = split_layout.native && !split_layout.fmt.empty() &&
-                                   split_layout.fmt[0].n_embd != (int64_t) g.n_embd;
+                                   split_layout.fmt[0].n_embd != (int64_t) ga.n_embd;
         if (latent_layout && (role == "helper" || o.split_roles_helper)) {
             std::fprintf(stderr, "xestrata generate: the latent MoE cannot use a helper GPU; use a layer split instead\n");
             return 1;
@@ -5523,8 +5524,16 @@ int main(int argc, char** argv) {
             // device 0's layers: the first stage's [0, split_at[0]) in a layer split, else every layer.  The later
             // stages' devices get their own layers where their caches are sized (the stages loop below).
             const int64_t le0 = multi_gpu ? split_at[0] : g.n_layers;
-            // a Q8_0 pair that does not fit at all takes the pack's Q4_0 one (the default only)
-            if (!lat_tab.upload(0, 0, le0, le) && !(lat_tab.q4_fallback && lat_tab.to_q4(0, 0, le0, le))) {
+            // Streaming must not first require the full pair to fit.  On an automatic single-card cache, retry a
+            // failed upload with all layers streamed; the later cache sizing accounts for the windows' rings.
+            const auto pick = strata::core::pick_from_env("LATENT_STREAM");
+            const bool can_stream = auto_cache && split_devs.empty() && pick != strata::core::Pick::Off;
+            bool ok = can_stream && pick == strata::core::Pick::On
+                ? lat_tab.stream(0, 0, le0, le0, le)
+                : lat_tab.upload(0, 0, le0, le) || (lat_tab.q4_fallback && lat_tab.to_q4(0, 0, le0, le));
+            if (!ok && can_stream && pick == strata::core::Pick::Auto)
+                ok = lat_tab.stream(0, 0, le0, le0, le);
+            if (!ok) {
                 std::fprintf(stderr, "xestrata generate: %s\n", le.c_str());
                 return 1;
             }
@@ -5617,7 +5626,7 @@ int main(int argc, char** argv) {
         // against 1291, a 1024-token chunk, prefill 642 -> 160 tok/s); the B70 (32 GB) at about 0.92-0.95 keeps
         // Q8_0, whose output Q4_0's departs from past the default line (KL 0.0070-0.0078 against 0.0058).  The four
         // fifths lies between the two cards' ratios; a 16 GB card's (the RX 9060 XT's) is not measured yet.
-        if (lat_tab.latent && lat_tab.q4_fallback) {
+        if (lat_tab.latent && lat_tab.q4_fallback && strata::core::latent_shared_on(0).host == nullptr) {
             const uint64_t du8 = strata::core::latent_device_bytes(0), du4 = du8 / 34 * 18;
             const int64_t slots_q4 = slots + (int64_t) ((du8 - du4) / (uint64_t) blob);
             auto chunk_at = [&](int64_t n) -> int64_t {   // the prompt chunk a cache of n slots would lend
@@ -5737,8 +5746,8 @@ int main(int argc, char** argv) {
                 }
             }
             const auto lat_pick = strata::core::pick_from_env("LATENT_STREAM");
-            if (lat_tab.latent && lat_pick != strata::core::Pick::Off &&
-                (lat_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
+            if (lat_tab.latent && strata::core::latent_shared_on(0).host == nullptr &&
+                lat_pick != strata::core::Pick::Off && (lat_pick == strata::core::Pick::On || (slots < min_slots && !reserve_adapted))) {
                 const auto& lsh = strata::core::latent_shared_on(0);
                 const int64_t L = (int64_t) (lsh.d_bytes + lsh.u_bytes), nl = g.n_layers;
                 // streaming k layers frees k of them, less the windows' rings of 2 and, lent from the cache, the
