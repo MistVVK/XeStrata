@@ -605,8 +605,11 @@ function renderConvCache(c) {
   const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
   $("cc-bars").hidden = !c.enabled;
   if (c.enabled) {
-    $("cc-slots-text").textContent = `${fmt(c.parked)} / ${fmt(c.slots)}`;
-    $("cc-slots-bar").style.width = pct(c.parked, c.slots);
+    // the engine's default slots (9999) leave the count to the memory: the number parked alone, no bar
+    const counted = c.slots && c.slots < 9999;
+    $("cc-slots-text").textContent = counted ? `${fmt(c.parked)} / ${fmt(c.slots)}` : fmt(c.parked);
+    $("cc-slots-bar").parentElement.hidden = !counted;
+    $("cc-slots-bar").style.width = counted ? pct(c.parked, c.slots) : "0%";
     const budget = c.budget_mib * 1048576;
     $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
     $("cc-mem-bar").style.width = pct(c.bytes, budget);

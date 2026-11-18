@@ -988,6 +988,9 @@ class ConvCacheLog:
         return dict(self.state)
 
 
+PROMPT_KEEP_MAX = 32   # the prompts the encoder keeps at most (#567): the conversations a client interleaves
+
+
 def conversation_slots(engine) -> int | None:
     """How many conversations the engine's cache holds: its --conversation-cache-slots argument, which is known
     before the engine has started (a lazy start has reported no INFO line yet), else the INFO line it reported."""
@@ -4657,11 +4660,12 @@ class Service:
         self.prompts = None
         if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
             from strata_tokenizer import PromptEncoder
-            # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
-            # encoder's own default without that setting
+            # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots), at most
+            # PROMPT_KEEP_MAX (the slots' default, 9999, leaves the count to the engine's RAM budget; a kept prompt
+            # is its token list, which grows with the conversation); the encoder's own default without the setting
             slots = conversation_slots(engine)
-            self.prompts = PromptEncoder(tokenizer, keep=slots) if slots is not None and slots > 0 \
-                else PromptEncoder(tokenizer)
+            self.prompts = PromptEncoder(tokenizer, keep=min(slots, PROMPT_KEEP_MAX)) \
+                if slots is not None and slots > 0 else PromptEncoder(tokenizer)
 
     # #28: the running server (main) sets it: a request's image URLs are fetched only from public addresses
     public_urls = False

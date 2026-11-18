@@ -248,7 +248,7 @@ struct Checkpoint {
 
 struct ConversationCache {
     int64_t budget = -1;          // bytes; 0: off, -1: not given (plain_main sizes it, core's auto_conversation_cache_mib)
-    int slots = 4;
+    int slots = 9999;             // --conversation-cache-slots; the default leaves it to the budget
     int64_t min_free = 2560ll << 20;
     int checkpoints = 6;          // --prompt-cache N: a conversation's checkpoints (0: none)
     int64_t every = 16384;        // --prompt-cache-every N fresh tokens (0: none)

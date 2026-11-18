@@ -491,11 +491,12 @@ struct Options {
     /// --serve: parked conversations (upstream ccc660b): a host-RAM budget for whole sessions put aside when another
     /// conversation takes the session, at most `slots` of them, and the RAM that must stay free when one is parked
     int64_t conversation_cache_mib = -1;   ///< -1: not given, --serve sizes it from the free RAM (#3493); 0: off
-    int conversation_cache_slots = 4;
+    /// --serve: the parked conversations at most; the default leaves it to the RAM budget (conversation_cache_mib)
+    int conversation_cache_slots = 9999;
     int64_t conversation_cache_min_free_mib = 2560;
-    /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
-    /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
-    /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
+    /// --serve: park only conversations of at least this many tokens.  Under a --conversation-cache-slots limit every
+    /// parked conversation costs one slot whatever its length, so a client that interleaves short side requests with
+    /// one long conversation evicts the long one (oldest first).  0 = park every conversation.
     int64_t conversation_cache_min_tokens = 0;
     /// --serve: write parked conversations to this folder (when the RAM cache pushes one out, and at QUIT) and
     /// read them back after a restart; empty = off.  Checkpoints per conversation (the deepest, the chain's root,
@@ -677,7 +678,7 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: from the free RAM,\n"
                  "                       up to 8192; 0 = off)\n"
-                 "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --conversation-cache-slots N  --serve: at most N parked conversations (default 9999: as many as the RAM budget holds)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
                  "  --ram-reserve-mib N  leave N MiB of RAM free for other programs (setup's --ram-reserve-gib): the\n"

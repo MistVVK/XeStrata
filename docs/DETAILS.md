@@ -1452,7 +1452,8 @@ Two options are off by default (both on one GPU).
 
 ### Several conversations
 
-Add `--conversation-cache-mib 8192 --conversation-cache-slots 4` to the engine arguments (the config's `args`) to park up to four conversations in at most 8 GiB of RAM.
+The engine parks as many conversations as `--conversation-cache-mib` of RAM holds (`--conversation-cache-mib 8192` in the config's `args`: 8 GiB in all).
+`--conversation-cache-slots N` limits their number; its default, 9999, leaves the number to the RAM budget.
 When a request continues another conversation than the one the engine holds, the engine first copies the held one aside
 (its K/V cache, running state and checkpoints) and puts back a parked one whose tokens start the request, instead of reading it again.
 A chat and an agent's subagent can then alternate without re-reading each other.
@@ -1469,7 +1470,7 @@ A chat and an agent's subagent can then alternate without re-reading each other.
   A match on a parked conversation's live state or its deepest checkpoint is that conversation going on and moves it into the session as before; so does a match that reaches a pinned shared prefix (`pin=N`).
   When the outgoing conversation fits only in the parked one's room, it keeps its place and the parked one is moved in whole, as before.
 - `--conversation-cache-min-tokens N` (default 0 = every one) parks only conversations of at least N tokens (upstream 624070c5).
-  A parked conversation takes one of the slots whatever its length, so a client that puts short side requests between the turns of a long conversation filled the slots with them and evicted the long one.
+  Under a `--conversation-cache-slots` limit a parked conversation counts as one whatever its length, so a client that puts short side requests between the turns of a long conversation fills the count with them and evicts the long one.
 - `--conversation-cache-park-gain N` (opt-in, default 0 = park every turn) parks a conversation again only after it advanced N tokens past the copy it would supersede (upstream d9cb22d2, #2265).
   A turn that grew by a few hundred tokens keeps the older copy instead of writing a whole snapshot that the next turn drops; a resume from the older copy then reads up to N tokens again.
 - A copy that fails to go back stops the engine instead of letting it answer from half a state.
