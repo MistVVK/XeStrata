@@ -372,9 +372,12 @@ int qi_prep(const std::string& vae_path, const std::string& te_path, const std::
     if (!list) throw std::runtime_error("cannot read " + list_path);
     std::vector<std::vector<std::string>> imgs, txts;
     for (std::string line; std::getline(list, line);) {
+        // tab-separated: a cache path can hold spaces (a Windows user's folder), never a tab.  The last field of a
+        // line written on Windows holds the CR of CRLF: whitespace splitting used to eat it, getline does not.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::istringstream ls(line);
         std::vector<std::string> w;
-        for (std::string t; ls >> t;) w.push_back(t);
+        for (std::string t; std::getline(ls, t, '\t');) w.push_back(t);
         if (w.empty()) continue;
         if (w[0] == "img" && w.size() == 5) imgs.push_back(w);
         else if (w[0] == "txt" && w.size() == 4) txts.push_back(w);

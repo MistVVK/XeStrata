@@ -69,7 +69,7 @@ def dataset_tokens(model: str, data: Path) -> int:
     text_rows = 0
     if model == "qwen-image-2.1":
         for line in data.read_text(encoding="utf-8").splitlines():
-            fields = line.split()
+            fields = line.split("\t")   # a cache path can hold spaces; the lists from mf_pre.py are tab-separated
             if len(fields) < 2:
                 continue
             with Path(fields[1]).open("rb") as f:

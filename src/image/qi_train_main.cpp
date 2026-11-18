@@ -11,8 +11,9 @@
 // The caches the trainer reads are ai-toolkit's, made before it trains by tools/image/mf_pre.py --cache qi (the list's
 // images through the VAE, its prompts through the text encoder; the reader is train_sample.hpp).
 //
-// train reads an items file, a line "<latent cache> <states cache>" each and a first line "empty <states cache>" (the
-// caption " " the dropout swaps in), and runs ai-toolkit's loop: each epoch the items in a new order, a caption
+// train reads a tab-separated items file, a line "<latent cache>\t<states cache>" each and a first line
+// "empty\t<states cache>" (the caption " " the dropout swaps in), and runs ai-toolkit's loop: each epoch the items in
+// a new order, a caption
 // dropped with its probability, a posterior draw of the latent and new noise, the schedule's index drawn, one step
 // and the clipped AdamW update; the LoRA saved every --save-every steps and at the end (<prefix>_<step>.safetensors).
 //
@@ -135,9 +136,11 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
         return text_of[path] = tr.add_text(st, n);
     };
     for (std::string line; std::getline(items, line);) {
+        // tab-separated: a cache path can hold spaces, never a tab.  A file written on Windows has CRLF lines.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::istringstream ls(line);
         std::string a, b;
-        if (!(ls >> a >> b)) continue;
+        if (!std::getline(ls, a, '\t') || !std::getline(ls, b, '\t')) continue;
         if (a == "empty") empty = text(b);
         else all.push_back({qi_train_latent(a), text(b)});
     }

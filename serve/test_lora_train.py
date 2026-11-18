@@ -433,7 +433,7 @@ class Training(unittest.TestCase):
     def test_real_cache_shapes_are_read_again(self):
         import struct
         from serve.train_budget import dataset_tokens
-        d = self.root / "cache-probe"
+        d = self.root / "cache probe"   # a data folder can hold spaces: the items file is tab-separated
         d.mkdir()
         lat = d / "latent"
         text = d / "text"
@@ -442,7 +442,7 @@ class Training(unittest.TestCase):
         text.write_bytes(struct.pack("<f", 29))
         empty.write_bytes(struct.pack("<f", 35))
         items = d / "items.txt"
-        items.write_text(f"empty {empty}\n{lat} {text}\n")
+        items.write_text(f"empty\t{empty}\n{lat}\t{text}\n")
         self.assertEqual(dataset_tokens("qwen-image-2.1", items), 48 * 48 + 35)
         lat.write_bytes(struct.pack("<ff", 64, 64))
         self.assertEqual(dataset_tokens("qwen-image-2.1", items), 64 * 64 + 35)

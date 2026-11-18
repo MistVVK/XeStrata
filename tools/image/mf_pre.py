@@ -172,7 +172,8 @@ def qi_prep(a) -> int:
     (the pixel sides of --budget), EXIF-turned, RGB, its caption read from the .txt beside it with the trigger word in
     it.  The cut images and the captions' ids go to xestrata-image-mf-pre qi-prep (the VAE's posterior mean and
     standard deviation, the text encoder's states before its final norm), and the caches it writes are the items
-    file's lines, as qi_trainer reads them (train_sample.hpp)."""
+    file's lines, as qi_trainer reads them (train_sample.hpp).  Both lists are tab-separated: a data folder's path
+    can hold spaces."""
     import strata_tokenizer   # tools/strata_tokenizer.py: Qwen3-VL's tokenizer from the GGUF
 
     out = Path(a.out)
@@ -186,6 +187,13 @@ def qi_prep(a) -> int:
         raise SystemExit(f"mf_pre: no images in {a.dir}")
     lines, items = [], []
 
+    def field(path: Path) -> str:
+        # the lists are tab-separated: a space in a data-folder path is fine, a tab or newline cannot be a field
+        s = str(path)
+        if any(c in s for c in "\t\r\n"):
+            raise SystemExit(f"mf_pre: a cache path cannot hold a tab or newline: {s!r}")
+        return s
+
     def text(name: str, caption: str) -> Path:
         # ai-toolkit's prompt encoder: an empty prompt reads as " ", the chat template parsed for special tokens
         # (a <|im_end|> written in a caption is that token, as its processor reads it)
@@ -193,7 +201,7 @@ def qi_prep(a) -> int:
                        np.int32)
         ids_path, states = out / "txt" / f"{name}.ids", out / "txt" / f"{name}.states"
         ids.tofile(ids_path)
-        lines.append(f"txt {ids_path} {GENERATION_DROP} {states}")
+        lines.append(f"txt\t{field(ids_path)}\t{GENERATION_DROP}\t{field(states)}")
         return states
 
     empty = text("_dropout", qi_caption("", a.trigger))   # get_dropout_caption: "WORD " with a trigger word
@@ -208,14 +216,14 @@ def qi_prep(a) -> int:
             rgb = out / "img" / f"{f.stem}-{res}.rgb"
             np.asarray(c, np.uint8).tofile(rgb)
             lat = out / "img" / f"{f.stem}-{res}.lat"
-            lines.append(f"img {rgb} {c.width} {c.height} {lat}")
-            items.append(f"{lat} {states}")
+            lines.append(f"img\t{field(rgb)}\t{c.width}\t{c.height}\t{field(lat)}")
+            items.append(f"{field(lat)}\t{field(states)}")
         print(f"ok   {f.name} {len(a.budgets)} resolution(s)")
-    (out / "list.txt").write_text("\n".join(lines) + "\n")
+    (out / "list.txt").write_text("\n".join(lines) + "\n", newline="\n")
     r = subprocess.run([a.pre, "qi-prep", a.vae, a.text, str(out / "list.txt")])
     if r.returncode != 0:
         raise SystemExit(r.returncode)
-    (out / "items.txt").write_text(f"empty {empty}\n" + "\n".join(items) + "\n")
+    (out / "items.txt").write_text(f"empty\t{field(empty)}\n" + "\n".join(items) + "\n", newline="\n")
     for p in (out / "img").glob("*.rgb"):
         p.unlink()
     print(f"mf_pre: {len(items)} items in {out / 'items.txt'}")
