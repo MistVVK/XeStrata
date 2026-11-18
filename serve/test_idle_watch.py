@@ -72,6 +72,25 @@ class IdleWatchTest(unittest.TestCase):
             self.assertIn("the daemon's log is closed", log.getvalue())
             self.assertIn("failing", log.getvalue())
 
+    def test_a_success_between_failures_resets_the_count(self):
+        # three failures with a good round between them are not three failures in a row
+        watch = Watch()
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) in (1, 3, 5, 6, 7):
+                raise OSError("busy")
+            return None
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            watch.add(0.01, flaky, repeat=True)
+            deadline = time.monotonic() + 3
+            while len(calls) < 7 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.1)
+        self.assertEqual(len(calls), 7)   # dropped at 5, 6, 7: the three in a row
+
     def test_a_lone_failure_keeps_the_repeat(self):
         # one round that raises is said and re-armed: an action that trips once still gets its next rounds
         watch = Watch()

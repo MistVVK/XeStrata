@@ -54,6 +54,8 @@ class Watch:
             print(f"[xestrata] WARNING: idle action {getattr(action, '__qualname__', None) or repr(action)} "
                   f"failed ({e!r})", flush=True)
             fails += 1
+        else:
+            fails = 0                 # FAIL_LIMIT is rounds in a row, not failures over the watch's whole life
         if interval and again is not False and fails < FAIL_LIMIT:
             self.add(interval, action, repeat=True, fails=fails)
 
