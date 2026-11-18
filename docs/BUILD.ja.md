@@ -332,7 +332,7 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 - Intel の GPU のドライバー（`libze-intel-gpu1` ほか）は、Ubuntu 24.04/26.04 では古いものが配布されます（26.04 は compute-runtime 26.05 と IGC 2.28）。
   compute-runtime 26.22 未満には、VRAM に空きがあっても確保を断る状態になる不具合があります（Intel の [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916)。xe カーネルのバグ（Linux 7.1 で修正）に 26.22 のドライバーが対応したもの。XeStrata では[#34](https://github.com/MistVVK/XeStrata/issues/34)）。
   Ubuntu 24.04/26.04 で HWE カーネルを使っているとき、setup は [Intel の graphics PPA](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics)（compute-runtime と IGC が新しい）への更新を勧めて、更新まで起動を止めます（`--old-driver` でそのまま起動もできます）。
-  GA カーネルでは、HWE カーネルにして PPA を入れるか、Fedora 44 以降 / Podman（IGC も 2.32 以降。[困ったとき](DETAILS.ja.md#困ったとき)）を勧めます。
+  GA カーネルでは、HWE カーネルにして PPA を入れるか、Fedora 44 か 45 / Podman（IGC も 2.32 以降。[困ったとき](DETAILS.ja.md#困ったとき)）を勧めます。
 - 共通の行の `libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話をディスクにも置く)）のためです。
 - AMD の行の `clang-21` と `libclang-rt-21-dev`（Fedora は `rocm-clang` と `rocm-clang-runtime-devel`、ROCm の clang とその実行時）は、コンパイルには使いません（コンパイルは intel/llvm がします）。
   oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
