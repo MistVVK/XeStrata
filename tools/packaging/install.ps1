@@ -70,6 +70,33 @@ function Fetch([string]$url, [string]$out) {
         }
     }
 }
+# <path-step>
+# Adds $dir to the user PATH and changes nothing else in it: the value is read as it is stored ("%USERPROFILE%\..." entries are not expanded,
+# a trailing ";" stays) and written back with the type it had (REG_EXPAND_SZ stays REG_EXPAND_SZ). [Environment]::GetEnvironmentVariable
+# expands the %VAR% entries and SetEnvironmentVariable stores the result as a plain string, which flattened them. $sub is only for tests.
+function Add-ToUserPath([string]$dir, [string]$sub = 'Environment') {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($sub, $true)
+    if (-not $key) { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($sub) }
+    try {
+        $raw = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $kind = if ($null -ne $raw) { $key.GetValueKind('Path') } else { [Microsoft.Win32.RegistryValueKind]::ExpandString }
+        if ($null -eq $raw) { $raw = '' }
+        $want = $dir.TrimEnd('\')
+        foreach ($entry in ($raw -split ';')) {
+            $e = $entry.Trim().Trim('"')
+            if ($e -and [Environment]::ExpandEnvironmentVariables($e).TrimEnd('\') -ieq $want) { return $false }
+        }
+        $new = if ($raw.Trim() -eq '') { $dir } elseif ($raw.EndsWith(';')) { $raw + $dir } else { $raw + ';' + $dir }
+        $key.SetValue('Path', $new, $kind)
+    }
+    finally { $key.Close() }
+    if ($sub -eq 'Environment') {
+        # tell running programs (Explorer, new terminals) that the environment changed, as SetEnvironmentVariable does
+        try { [Environment]::SetEnvironmentVariable('StrataInstallNotify', '1', 'User'); [Environment]::SetEnvironmentVariable('StrataInstallNotify', $null, 'User') } catch { }
+    }
+    return $true
+}
+# </path-step>
 if (-not $feed) {
     Die 'this installer does not know where the Strata release folder is. Set $env:STRATA_FEED to its address and run it again, for example: $env:STRATA_FEED=''https://example.org/strata'''
 }
@@ -188,11 +215,8 @@ try {
     }
     $bin = Join-Path $current 'bin'
     if ($env:STRATA_NO_PATH -ne '1') {
-        $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-        if (-not $user) { $user = '' }
-        if (($user -split ';') -notcontains $bin) {
-            [Environment]::SetEnvironmentVariable('Path', ($user.TrimEnd(';') + ';' + $bin).TrimStart(';'), 'User')
-        }
+        try { [void](Add-ToUserPath $bin) }
+        catch { Write-Host "  (your user PATH could not be changed: $($_.Exception.Message). Run $bin\strata.cmd, or add that folder to PATH yourself.)" }
         $env:Path = "$env:Path;$bin"
     }
     Write-Host 'Installed. Run: strata launch'
