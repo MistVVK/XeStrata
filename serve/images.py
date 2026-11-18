@@ -5054,7 +5054,8 @@ class ImageTools:
                         f"{got['seconds']:.1f} s"
                         + (f"; {got['fallback']}" if got.get("fallback") else "")
                         + f") and the user sees it: {url}.")
-            self.made.append(url.rsplit("/", 1)[1])
+            if name != "find_region":   # the marked picture shown to the user is not the source of the next tool
+                self.made.append(url.rsplit("/", 1)[1])
             urls = [url]
             seen = self._seen(gen, png)
             ok = True
