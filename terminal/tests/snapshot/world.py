@@ -207,7 +207,7 @@ class World:
             st.enter_context(mock.patch.object(drafting, "converted_ok", fake_converted_ok))
             st.enter_context(mock.patch.object(drafting, "_here", exists))
             st.enter_context(mock.patch.object(drafting, "engine_has_selector_q4", lambda: True))
-            st.enter_context(mock.patch.object(drafting, "installed_engine_exe", lambda: self.exe))
+            st.enter_context(mock.patch.object(drafting, "installed_engine_exe", lambda backend=None: self.exe))
             st.enter_context(mock.patch.object(drafting, "card_vram_mib", lambda cfg, backend, archs=None: None if m.unified else vram))
             st.enter_context(mock.patch.object(drafting_fetch, "ensure_tuned", fake_ensure_tuned))
             st.enter_context(mock.patch.object(drafting_fetch, "ensure", fake_ensure))
