@@ -60,6 +60,15 @@ constexpr int64_t kAdaW = 0, kAdaB = kAdaW + 3 * kX * kX, kLnW = kAdaB + 3 * kX,
                   kM1B = kM1W + kX * kX, kM2W = kM1B + kX, kM2B = kM2W + kX * kX, kResSize = kM2B + kX;
 constexpr int64_t kFnW = kRes0 + kResBlocks * kResSize, kFlW = kFnW + kX, kFlB = kFlW + 3 * kX, kPixW = kFlB + 3;
 
+struct TempBuffers : std::vector<void*> {
+    explicit TempBuffers(void* stream) : stream_(stream) {}
+    ~TempBuffers() {
+        gpu::stream_sync(stream_);
+        for (void* p : *this) gpu::free(p);
+    }
+    void* stream_;
+};
+
 template<class T> T* alloc_pinned(std::vector<void*>& owned, int64_t n) {
     void* p = gpu::alloc_host((size_t) std::max<int64_t>(n, 1) * sizeof(T));
     if (p == nullptr)
@@ -867,7 +876,7 @@ void MfVae::encode_moments(const float* rgb, int64_t h, int64_t w, float* moment
     if (f2_) throw std::runtime_error("image engine (Flux2 VAE): its encoder gives the latent only (encode)");
     if (!has_encoder()) throw std::runtime_error("image engine (Mage-VAE): the encoder is not loaded");
     const int64_t n = h * w, Ch = enc_head_[0].c1.out, Fh = enc_head_[0].c4.out;
-    std::vector<void*> tmp;
+    TempBuffers tmp(s_);
     float* hs = alloc<float>(tmp, n * Ch, "image engine (Mage-VAE)");
     float* ls = alloc<float>(tmp, n * C_, "image engine (Mage-VAE)");
     DiCoBufs b;
@@ -886,7 +895,6 @@ void MfVae::encode_moments(const float* rgb, int64_t h, int64_t w, float* moment
     ln_mod16(hs, e_norm_, e_norm_ + C_, n, C_, b.a16, s_);
     conv(e_out_, b.a16, h, w, moments);
     gpu::stream_sync(s_);
-    for (void* p : tmp) gpu::free(p);
 }
 
 void MfVae::encode(const float* rgb, int64_t h, int64_t w, const float* eps, float* z, uint64_t limit) {
@@ -1345,7 +1353,7 @@ void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, in
     const int64_t H = h * kPatch, W = w * kPatch;
     const F2Sizes f = f2_walk(h, w, 0, k, true, false), b = f2_walk(th, tw, k, n, false, true);
     f2_grow(f2_max(f, b));
-    std::vector<void*> tmp;
+    TempBuffers tmp(s_);
     float* acc = alloc<float>(tmp, 4 * H * W, "image engine (Mage-VAE)");
     float* trgb = alloc<float>(tmp, 3 * th * tw * kPix, "image engine (Mage-VAE)");
     gpu::memset_async(acc, 0, (size_t) (4 * H * W) * 4, s_);
@@ -1370,7 +1378,6 @@ void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, in
         }
     tile_finish(acc, 3, TilePlanes::Planes, H * W, acc + 3 * H * W, rgb, s_);
     gpu::stream_sync(s_);
-    for (void* p : tmp) gpu::free(p);
 }
 
 // ---- the Flux2 VAE's encoder
@@ -1382,7 +1389,7 @@ void MfVae::f2_encode_tiled(const float* rgb, int64_t h, int64_t w, float* z, in
     th = std::min(h, th);
     tw = std::min(w, tw);
     const int64_t H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
-    std::vector<void*> tmp;
+    TempBuffers tmp(s_);
     float* acc = alloc<float>(tmp, (V + 1) * h * w, "image engine (Mage-VAE)");
     float* trgb = alloc<float>(tmp, 3 * th * tw * kPix, "image engine (Mage-VAE)");
     float* tz = alloc<float>(tmp, th * tw * V, "image engine (Mage-VAE)");
@@ -1399,7 +1406,6 @@ void MfVae::f2_encode_tiled(const float* rgb, int64_t h, int64_t w, float* z, in
         }
     tile_finish(acc, V, TilePlanes::Interleaved, h * w, acc + V * h * w, z, s_);
     gpu::stream_sync(s_);
-    for (void* p : tmp) gpu::free(p);
 }
 
 void MfVae::open_flux2_encoder(SafeTensors& st) {
@@ -2050,7 +2056,7 @@ int64_t MfVae::v_encode_tiled(const float* rgb, int64_t T, int64_t h, int64_t w,
     }
     const int64_t th = video_side(h, tt), tw = video_side(w, tt), H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
     const int64_t k = first ? (T - 1) / 4 + 1 : T / 4, plane = th * tw * kPix;
-    std::vector<void*> tmp;
+    TempBuffers tmp(s_);
     float* acc = alloc<float>(tmp, k * (V + 1) * h * w, "image engine (Mage-VAE)");
     float* trgb = alloc<float>(tmp, T * 3 * plane, "image engine (Mage-VAE)");
     float* tz = alloc<float>(tmp, k * th * tw * V, "image engine (Mage-VAE)");
@@ -2077,7 +2083,6 @@ int64_t MfVae::v_encode_tiled(const float* rgb, int64_t T, int64_t h, int64_t w,
         tile_finish(aj, V, TilePlanes::Interleaved, h * w, aj + V * h * w, z + j * h * w * V, s_);
     }
     gpu::stream_sync(s_);
-    for (void* p : tmp) gpu::free(p);
     return k;
 }
 
@@ -2096,7 +2101,7 @@ int64_t MfVae::v_decode_tiled(const float* z, int64_t n, int64_t h, int64_t w, b
     }
     const int64_t th = video_side(h, tt), tw = video_side(w, tt), H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
     const int64_t frames = first ? 1 + 4 * (n - 1) : 4 * n, TH = th * kPatch, TW = tw * kPatch;
-    std::vector<void*> tmp;
+    TempBuffers tmp(s_);
     float* acc = alloc<float>(tmp, frames * 4 * H * W, "image engine (Mage-VAE)");
     float* tz = alloc<float>(tmp, n * th * tw * V, "image engine (Mage-VAE)");
     float* trgb = alloc<float>(tmp, frames * 3 * TH * TW, "image engine (Mage-VAE)");
@@ -2122,7 +2127,6 @@ int64_t MfVae::v_decode_tiled(const float* z, int64_t n, int64_t h, int64_t w, b
         tile_finish(acc + f * 4 * H * W, 3, TilePlanes::Planes, H * W, acc + f * 4 * H * W + 3 * H * W,
                     rgb + f * 3 * H * W, s_);
     gpu::stream_sync(s_);
-    for (void* p : tmp) gpu::free(p);
     return frames;
 }
 

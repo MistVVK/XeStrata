@@ -406,6 +406,7 @@ VideoReport UpscaleRunner::run_video(UpscaleModel& m, const std::string& in, con
             made((uint64_t) (fw * fh * 4)), out((uint64_t) (w * h * 4)), ref((uint64_t) (w * h * 4));
         const uint64_t frame = frame_bytes(mi, sw, sh, w, h, rep.color) + (uint64_t) (fw * fh * 4) * 2;
         m.set_room(avail > frame ? avail - frame : 0);
+        try {
         m.video_begin(fw, fh, info.frames, r.frame.seed, r.chunk, r.overlap);
         std::deque<std::vector<uint8_t>> waiting;   // the frames pushed whose output is not out yet (their colors')
         std::vector<uint8_t> host((size_t) (w * h * 4));
@@ -479,6 +480,10 @@ VideoReport UpscaleRunner::run_video(UpscaleModel& m, const std::string& in, con
         rep.model_s += since(t0);
         drain();
         m.release(false);
+        } catch (...) {
+            m.release(false);
+            throw;
+        }
     }
     const auto t0 = std::chrono::steady_clock::now();
     wr.finish();
