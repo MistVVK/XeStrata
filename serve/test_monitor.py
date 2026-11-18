@@ -192,6 +192,16 @@ class Monitor(unittest.TestCase):
             release.set()
             self.assertEqual(first.result()[0], 200)
             self.assertEqual(second.result()[0], 200)
+        # the server writes the final state in the handler's finally, which can run just after the HTTP answer:
+        # errors and disconnects get a state too, and a stream is only done when its last line was written.  A reader
+        # of the monitor therefore sees a brief lag; wait for it rather than asking the server to report "completed"
+        # before the request is actually over.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            records = list(self.svc.api_requests)
+            if len(records) == 2 and all(r["state"] == "completed" for r in records):
+                break
+            time.sleep(0.01)
         records = list(self.svc.api_requests)
         self.assertGreater(records[0]["load_s"], 0.02)
         self.assertGreater(records[1]["queue_s"], 0.02)
