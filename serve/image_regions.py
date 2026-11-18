@@ -222,7 +222,7 @@ def segment(svc, gen, picture: bytes, prompt: str, task: str = "mask", model: st
                   () if chosen == SAM3 else (FLORENCE_BEAMS, FLORENCE_MAX_NEW))
     result = None
     with img.gpu_turn(svc, gen, job, cancel):
-        gen._live(stage="segment")
+        gen._live(stage="segment", part=0.0)
         with _work(gen) as work:
             pic = work / "picture"
             pic.write_bytes(picture)

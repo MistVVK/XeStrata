@@ -46,6 +46,9 @@ public:
 
     /// The parity probes' view of the parts: a name and an FP32 host copy.
     std::function<void(const char*, const std::vector<float>&)> dump;
+    /// Told a run's share done so far (0..1) as it goes (the parts' ends, the decoder's steps), by a net that tells
+    /// one, and 0 once load() has read the weights; none: nothing told.
+    std::function<void(double)> progress;
 
     /// A linear layer: y [T][n] = x [T][k] . w^T + b.
     struct Lin {

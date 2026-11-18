@@ -278,7 +278,7 @@ function spark(id, values, max, gaps = false) {
 // an image job's step for the header and the state card: "step 3/8", or its stage before and after the sampling
 function imageStep(img) {
   return img.stage === "sampling" ? tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps})
-    : img.stage === "upscale" ? `${img.label} ${Math.round(100 * (img.progress || 0))}%` : img.label;
+    : img.stage === "upscale" || img.stage === "segment" ? `${img.label} ${Math.round(100 * (img.progress || 0))}%` : img.label;
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;

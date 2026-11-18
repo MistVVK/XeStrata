@@ -784,6 +784,10 @@ si::QiRef run_upscale(si::ImagePipeline& p, su::UpscaleModel& m, const si::QiRef
         p.release(true);
         avail = ups_room(p, m);
     }
+    if (m.held() == 0) {   // its weights read first (the first run, or after it let them go): the server says so
+        std::printf("STAGE load\n");
+        std::fflush(stdout);
+    }
     return su::UpscaleRunner::run(m, src, rq, avail, &rep, [](double f) {
         std::printf("PART %.3f\n", f);
         std::fflush(stdout);
@@ -856,6 +860,25 @@ struct AuxNets {
         }
         if (all) open.clear();
     }
+};
+
+// An auxiliary model's run told to the server (serve/images.py: the Monitor's progress): STAGE load where its weights
+// are read first, then PART <share done> as the model tells it; unset again at the end
+struct AuxTold {
+    si::AuxNet& m;
+    explicit AuxTold(si::AuxNet& n) : m(n) {
+        if (!m.loaded()) {
+            std::printf("STAGE load\n");
+            std::fflush(stdout);
+        }
+        m.progress = [](double f) {
+            std::printf("PART %.3f\n", f);
+            std::fflush(stdout);
+        };
+    }
+    ~AuxTold() { m.progress = nullptr; }
+    AuxTold(const AuxTold&) = delete;
+    AuxTold& operator=(const AuxTold&) = delete;
 };
 
 // Room for an auxiliary model's run that needs `need` bytes beyond what it holds: what the budget leaves beside the
@@ -1651,6 +1674,7 @@ int serve(si::ImagePipeline& p) {
                 si::Sam3& m = aux.get<si::Sam3>(weights);
                 const si::QiRef img = read_image(pic);
                 aux_room(p, m.need_bytes(img.width, img.height), "SAM 3", &aux, &m);
+                const AuxTold told(m);
                 si::Sam3::Times t;
                 std::vector<si::Segment> segs;
                 try {
@@ -1689,6 +1713,7 @@ int serve(si::ImagePipeline& p) {
                 si::Sam3& m = aux.get<si::Sam3>(decoded_path(weights));
                 const si::QiRef img = read_image(pic);
                 aux_room(p, m.need_bytes(img.width, img.height), "SAM 3", &aux, &m);
+                const AuxTold told(m);
                 std::vector<std::vector<si::Segment>> found;
                 try {
                     found = m.run_many(img, ids, score, mask);
@@ -1757,6 +1782,7 @@ int serve(si::ImagePipeline& p) {
                 si::Florence2& m = aux.get<si::Florence2>(weights);
                 const si::QiRef img = read_image(pic);
                 aux_room(p, m.need_bytes(beams, max_new), "Florence-2", &aux, &m);
+                const AuxTold told(m);
                 si::Florence2::Times t;
                 std::vector<int32_t> got;
                 try {
@@ -1798,6 +1824,7 @@ int serve(si::ImagePipeline& p) {
                 si::Birefnet& m = aux.get<si::Birefnet>(weights);
                 const si::QiRef img = read_image(pic);
                 aux_room(p, m.need_bytes(sw, sh, img.width, img.height, refine), "BiRefNet", &aux, &m);
+                const AuxTold told(m);
                 si::Birefnet::Times t;
                 double refine_s = 0.0;
                 try {

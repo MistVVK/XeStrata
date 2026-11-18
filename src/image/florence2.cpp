@@ -483,7 +483,7 @@ void Florence2::step(int64_t B, int64_t T, int64_t cap, uint16_t* cache, const u
     qi_bias_add(logits, logits_bias_, B, V, s_);
 }
 
-std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
+std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps, const std::function<void(int)>& each) {
     const int64_t B = beams, T = enc_T_, d = d_, L = (int64_t) dec_.size(), V = vocab_;
     const int64_t max_length = 1 + max_new, cap = max_length;
     if (max_length > max_pos_) throw std::invalid_argument("image engine (Florence-2): max_new past the positions");
@@ -568,6 +568,7 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
         if (steps < 4 && dump)
             dump(("logits" + std::to_string(steps)).c_str(), std::vector<float>(lg.begin(), lg.begin() + V));
         ++steps;
+        if (each) each(steps);
 
         // log-softmax, the processors (no repeated 3-gram, <s> first, </s> at the last place), the running scores
         // a beam's values: the log-softmax, the banned ones and all but the forced token -inf, plus its running score.
@@ -692,21 +693,33 @@ std::vector<int32_t> Florence2::run(const QiRef& image, const std::vector<int32_
         throw std::invalid_argument("image engine (Florence-2): no picture");
     if (beams < 1 || beams > 8 || max_new < 1) throw std::invalid_argument("image engine (Florence-2): beams 1 to 8");
     load();
+    // the share done (progress): the vision tower, the encoder and the decoder weighed by the last run's seconds of
+    // each (before there is one: 3, 1 and 6 tenths), the decoder's steps against the last run's (32 before one, its
+    // share held under its end until the answer ends: an answer's length is not known ahead)
+    const double last = last_.vision + last_.encoder + last_.decoder;
+    const double wv = last > 0 ? last_.vision / last : 0.3, we = last > 0 ? last_.encoder / last : 0.1;
+    const double expect = last_.steps > 0 ? last_.steps : 32;
+    if (progress) progress(0.0);
+    Times now;
     auto t0 = std::chrono::steady_clock::now();
     vision(image);
     gpu::stream_sync(s_);
-    if (t) t->vision = since(t0);
+    now.vision = since(t0);
+    if (progress) progress(wv);
     t0 = std::chrono::steady_clock::now();
     encoder(text_ids);
     gpu::stream_sync(s_);
-    if (t) t->encoder = since(t0);
+    now.encoder = since(t0);
+    if (progress) progress(wv + we);
     t0 = std::chrono::steady_clock::now();
     int steps = 0;
-    auto ids = decode(std::min<int>(max_new, (int) max_pos_ - 1), beams, steps);
-    if (t) {
-        t->decoder = since(t0);
-        t->steps = steps;
-    }
+    auto ids = decode(std::min<int>(max_new, (int) max_pos_ - 1), beams, steps, progress ? std::function<void(int)>(
+        [&](int done) { progress(wv + we + (1.0 - wv - we) * std::min(0.95, done / expect)); }) : nullptr);
+    now.decoder = since(t0);
+    now.steps = steps;
+    last_ = now;
+    if (t) *t = now;
+    if (progress) progress(1.0);
     return ids;
 }
 

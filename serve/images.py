@@ -2599,7 +2599,8 @@ class ImageEngine:
         self.ended = threading.Event()              # the daemon closed this connection
         self.pid: int | None = None                 # the engine's process (the daemon's READY), what holds its VRAM
         self.found = False                          # the last start found the daemon running (another server's)
-        self.on_progress: Callable[[str], None] | None = None   # the PART and TILE lines (ImageGen._engine_progress)
+        # the PART and TILE lines, and STAGE where a request takes no stage callback (ImageGen._engine_progress)
+        self.on_progress: Callable[[str], None] | None = None
 
     def command(self) -> list[str]:
         cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"])]
@@ -2756,9 +2757,9 @@ class ImageEngine:
             stage=None, preview=None, pause=None) -> dict:
         """Send a request line and wait for its answer (the line starting with `want`) -> its fields; STEP lines go to
         `step`, STAGE lines (refs, text, sampling, decode) to `stage`, PREVIEW lines (a partial image: its index, the
-        step, the file of its RGBA8 rows) to `preview`, PART and TILE lines (an upscaler's share done, a tiled
-        drawing's tile) to on_progress, whatever the request; at a YIELD (UPSV's YIELD:1) `pause` runs, then RESUME
-        goes back.  ImageJobFailed on ERROR."""
+        step, the file of its RGBA8 rows) to `preview`, PART and TILE lines (a run's share done, a tiled drawing's
+        tile) to on_progress whatever the request, and STAGE lines there too where `stage` is not given; at a YIELD
+        (UPSV's YIELD:1) `pause` runs, then RESUME goes back.  ImageJobFailed on ERROR."""
         self.send(line)
         t0 = time.monotonic()
         while True:
@@ -2770,6 +2771,8 @@ class ImageEngine:
             elif got.startswith("STAGE "):
                 if stage is not None:
                     stage(got[6:].strip())
+                elif self.on_progress is not None:
+                    self.on_progress(got)
             elif got.startswith(("PART ", "TILE ")):
                 if self.on_progress is not None:
                     self.on_progress(got)
@@ -3647,8 +3650,7 @@ class ImageGen:
                         self._live(step=done, steps=steps)
 
                     def stage(name):
-                        self._live(stage=name, **({"sampling_at": time.monotonic()} if name == "sampling" else
-                                                  {"part": 0.0} if name == "upscale" else {}))
+                        self._stage(name)
                     try:
                         r = self.engine.ask(f"IMG {lw} {lh} {job['seed'] + i} {self.drop_of(job)} {out} {ids}{sigmas}"
                                             f"{guide}{self._refs_words(job)}{self._cfg_words(job)}{shown}"
@@ -3788,7 +3790,7 @@ class ImageGen:
                     "upscale": "Upscaling", "upscale-video": "Upscaling a video",
                     "segment-video": "Finding objects in a video", "segment": "Finding the region",
                     "matte": "Removing the background", "control": "Making the control image",
-                    "detect": "Finding the parts"}
+                    "detect": "Finding the parts", "load": "Loading the weights"}
 
     def begin(self, job: dict) -> None:
         """The job has the GPU's turn (gpu_turn): from here it is the running job (again, after make_images gave the
@@ -3805,11 +3807,26 @@ class ImageGen:
         if self.job is not None:
             self.job.update(kw)
 
+    def _stage(self, name: str) -> None:
+        """The engine's STAGE <name> into the live job: load (a model's weights read first) keeps the stage it
+        interrupts, which the run's first PART brings back."""
+        if name == "load":
+            self._live(stage="load", resume=(self.job or {}).get("stage"))
+        else:
+            self._live(stage=name, resume=None, **({"sampling_at": time.monotonic()} if name == "sampling" else
+                                                   {"part": 0.0} if name == "upscale" else {}))
+
     def _engine_progress(self, line: str) -> None:
-        """The engine's PART <share> (an upscaler's run) and TILE <i> <n> (a tiled drawing's tile) into the live job."""
+        """The engine's PART <share> (a run's share done), TILE <i> <n> (a tiled drawing's tile) and a STAGE outside
+        a drawing's into the live job."""
         words = line.split()
         try:
-            if words[0] == "PART":
+            if words[0] == "STAGE":
+                self._stage(words[1])
+            elif words[0] == "PART":
+                j = self.job or {}
+                if j.get("stage") == "load" and j.get("resume"):
+                    self._live(stage=j["resume"], resume=None)
                 self._live(part=float(words[1]))
             else:
                 self._live(piece=int(words[1]), pieces=int(words[2]), piece_kind="tile")
@@ -3827,9 +3844,10 @@ class ImageGen:
         stage, done, steps = j["stage"], j["step"], max(1, j["steps"])
         step_s = round((now - j["sampling_at"]) / done, 2) if j["sampling_at"] is not None and done > 0 else None
         # the upscaler's own share (PART) while it runs: an upscale alone is all of it, a drawing's first pass then
-        # starts its bar again
+        # starts its bar again.  A model's weights read first (load) leave the bar where it is
+        part = j.get("part", 0.0)   # a run that tells its share: the upscalers, Florence-2, SAM 3
         within = {"waiting": 0.0, "size": 0.01, "refs": 0.02, "text": 0.05, "sampling": 0.1 + 0.8 * done / steps,
-                  "decode": 0.9, "upscale": j.get("part", 0.0)}.get(stage, 0.0)
+                  "decode": 0.9, "upscale": part, "segment": part}.get(stage, 0.0)
         pieces = j.get("pieces") or 0   # a tiled drawing's tiles, the parts' fix's parts: each a share of the image
         if pieces > 0:
             within = (max(0, j.get("piece", 1) - 1) + within) / pieces

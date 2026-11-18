@@ -843,20 +843,31 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
     Times local;
     Times& t = tm != nullptr ? *tm : local;
     load();
+    // the share done (progress) at each part's end, the parts weighed by the last run's seconds of each (before
+    // there is one: 6, 1, 2 and 1 tenths)
+    const double last = last_.vision + last_.text + last_.detect + last_.masks;
+    const double wv = last > 0 ? last_.vision / last : 0.6, wt = last > 0 ? last_.text / last : 0.1;
+    const double wd = last > 0 ? last_.detect / last : 0.2;
+    if (progress) progress(0.0);
     auto t0 = std::chrono::steady_clock::now();
     vision(image);
     gpu::stream_sync(s_);
     t.vision = since(t0);
+    if (progress) progress(wv);
     t0 = std::chrono::steady_clock::now();
     text(ids);
     gpu::stream_sync(s_);
     t.text = since(t0);
+    if (progress) progress(wv + wt);
     t0 = std::chrono::steady_clock::now();
     const Detection det = detect(score_threshold);
     t.detect = since(t0);
+    if (progress) progress(wv + wt + wd);
     t0 = std::chrono::steady_clock::now();
     std::vector<Segment> out = segments(det, image.width, image.height, mask_threshold);
     t.masks = since(t0);
+    last_ = t;
+    if (progress) progress(1.0);
     return out;
 }
 

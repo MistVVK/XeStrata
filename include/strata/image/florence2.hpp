@@ -17,6 +17,7 @@
 #include "strata/image/pipeline.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -81,7 +82,8 @@ private:
     void step(int64_t B, int64_t T, int64_t cap, uint16_t* cache, const uint16_t* ckv, const int32_t* dids, float* h,
               float* y, uint16_t* h16, uint16_t* g16, uint16_t* a16, uint16_t* q16, float* logits);
     void encoder(const std::vector<int32_t>& text_ids);
-    std::vector<int32_t> decode(int max_new, int beams, int& steps);
+    /// `each`, where given, is told the steps done after each.
+    std::vector<int32_t> decode(int max_new, int beams, int& steps, const std::function<void(int)>& each = nullptr);
 
     // the model's shape (config.json's, checked against the file)
     int64_t d_ = 768, heads_ = 12, ffn_ = 3072, vocab_ = 51289, max_pos_ = 1024, image_dim_ = 1024;
@@ -101,6 +103,7 @@ private:
     // the run's state
     float* feats_ = nullptr;   // [577][d]: the picture's tokens, then the encoder's states [T][d]
     int64_t img_tokens_ = 0, enc_T_ = 0;
+    Times last_;               // the last run's parts and steps: the shares progress weighs them by
 };
 
 }  // namespace strata::image

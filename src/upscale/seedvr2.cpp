@@ -596,6 +596,7 @@ void Seedvr2::run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, 
         if (progress) progress(((double) f + within) / (double) frames);
     };
     m.enc_s = m.dit_s = m.dec_s = 0.0;
+    tell(0, 0.0);   // the weights are loaded: the run starts (the server leaves its loading stage)
     auto t0 = std::chrono::steady_clock::now();
     const auto lap = [&](double& acc) {   // the stream's work so far into acc
         core::Runtime::get().stream(m.s).wait_and_throw();

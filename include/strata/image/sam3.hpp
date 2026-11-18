@@ -157,6 +157,7 @@ public:
                        float* token);
 
 private:
+    Times last_;   // the last run's parts: the shares progress weighs them by
     void load_weights() override;
     void vision(const QiRef& image);
     void trunk_from(const uint16_t* pix16);

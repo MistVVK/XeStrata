@@ -115,6 +115,7 @@ void AuxNet::load() {
         release();
         throw;
     }
+    if (progress) progress(0.0);   // read: the run starts (a caller showing the loading moves on)
 }
 
 float* AuxNet::scratch(int slot, size_t bytes) {
