@@ -10706,8 +10706,14 @@ def make_handler(svc: Service):
                         yield from asm.feed(x)
                     elif kind == "mcp":
                         x = cast(dict, x)
-                        if x.get("name") in search_names if x.get("event") == "call" else \
-                                asm.item is not None and asm.item["type"] == "web_search_call":
+                        held = asm.hosted.get(x.get("id")) if x.get("event") != "call" else None
+                        if held is not None:
+                            search = held["type"] == "web_search_call"
+                        elif x.get("event") == "call":
+                            search = x.get("name") in search_names
+                        else:
+                            search = asm.item is not None and asm.item["type"] == "web_search_call"
+                        if search:
                             yield from asm.search_call(x)
                         else:
                             yield from asm.image_call(x, image_b64)

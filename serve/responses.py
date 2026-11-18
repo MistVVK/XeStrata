@@ -737,6 +737,7 @@ class Assembler:
         self.prompt_tokens = prompt_tokens
         self.seq = 0
         self.item: Any = None                        # the open output item
+        self.hosted: dict[Any, dict] = {}             # hosted tool calls still open: call id -> output item
         self.json_text: list[str] = []               # structured output: the answer, held until it is checked
         self.called = False                          # a tool call was made: this turn is not the final answer
         r = req.get("reasoning")
@@ -802,6 +803,14 @@ class Assembler:
 
     def close(self, status=None) -> list[dict]:
         item, self.item = self.item, None
+        out = self._close_item(item, status)
+        for cid, held in list(self.hosted.items()):
+            if held is item:
+                del self.hosted[cid]
+        return out
+
+    def _close_item(self, item, status=None) -> list[dict]:
+        """Close one item, whether or not it is the last one opened: several hosted calls can run side by side."""
         if item is None:
             return []
         at, out = self.response["output"].index(item), []
@@ -946,37 +955,56 @@ class Assembler:
             item["namespace"] = namespace
         return item
 
+    def _hosted(self, x: dict, kind: str) -> dict | None:
+        item = self.hosted.get(x.get("id"))
+        return item if item is not None and item["type"] == kind else None
+
     def image_call(self, x: dict, image_b64) -> list[dict]:
         """An image tool's activity (run_with_mcp's "mcp" events: call, result) as an image_generation_call item, as
-        OpenAI's hosted image_generation tool shows one: its result the PNG in base64 (`image_b64(url)`)."""
+        OpenAI's hosted image_generation tool shows one: its result the PNG in base64 (`image_b64(url)`).  Calls can
+        run side by side, so the events of a result go to the item of its own call id (the last opened is not always
+        the one that ended)."""
         out: list[dict] = []
         if x.get("event") == "call":
-            out += self.close()
+            if self.item is not None and self.item["type"] not in ("image_generation_call", "web_search_call"):
+                out += self.close()
             raw = x.get("arguments")
             args: dict = raw if isinstance(raw, dict) else {}
             item = {"id": new_id("ig"), "type": "image_generation_call", "status": "in_progress", "result": None,
                     "revised_prompt": args.get("prompt")}
             out += self._open(item)
+            at = self.index
+            if x.get("id") is not None:
+                self.hosted[x["id"]] = item
             out.append(self.event("response.image_generation_call.in_progress", item_id=item["id"],
-                                  output_index=self.index))
+                                  output_index=at))
             out.append(self.event("response.image_generation_call.generating", item_id=item["id"],
-                                  output_index=self.index))
-        elif x.get("event") == "partial" and self.item is not None and self.item["type"] == "image_generation_call":
-            out.append(self.event("response.image_generation_call.partial_image", item_id=self.item["id"],
-                                  output_index=self.index, partial_image_index=x.get("index", 0),
-                                  partial_image_b64=x.get("b64")))
-        elif x.get("event") == "result" and self.item is not None and self.item["type"] == "image_generation_call":
+                                  output_index=at))
+        elif x.get("event") == "partial":
+            item = self._hosted(x, "image_generation_call")
+            if item is None:
+                return out
+            out.append(self.event("response.image_generation_call.partial_image", item_id=item["id"],
+                                  output_index=self.response["output"].index(item),
+                                  partial_image_index=x.get("index", 0), partial_image_b64=x.get("b64")))
+        elif x.get("event") == "result":
+            item = self._hosted(x, "image_generation_call")
+            if item is None:
+                return out
             urls = x.get("images") or []
-            self.item["result"] = image_b64(urls[0]) if urls else None
+            item["result"] = image_b64(urls[0]) if urls else None
             # what OpenAI's item says of the image: its size, quality, background, format and the prompt used
-            self.item.update(x.get("image") or {})
-            if x.get("ok") and self.item["result"]:
-                out.append(self.event("response.image_generation_call.completed", item_id=self.item["id"],
-                                      output_index=self.index))
-                out += self.close("completed")
+            item.update(x.get("image") or {})
+            at = self.response["output"].index(item)
+            if x.get("ok") and item["result"]:
+                out.append(self.event("response.image_generation_call.completed", item_id=item["id"],
+                                      output_index=at))
+                status = "completed"
             else:
-                self.item["error"] = x.get("text")
-                out += self.close("failed")
+                item["error"] = x.get("text")
+                status = "failed"
+            out += self.close(status) if self.item is item else self._close_item(item, status)
+            self.hosted.pop(x.get("id"), None)
         return out
 
     def search_call(self, x: dict) -> list[dict]:
@@ -985,21 +1013,30 @@ class Assembler:
         fetch_page, an open_page."""
         out: list[dict] = []
         if x.get("event") == "call":
-            out += self.close()
+            if self.item is not None and self.item["type"] not in ("image_generation_call", "web_search_call"):
+                out += self.close()
             raw = x.get("arguments")
             args: dict = raw if isinstance(raw, dict) else {}
             action = ({"type": "open_page", "url": args.get("url")} if x.get("name") == "fetch_page"
                       else {"type": "search", "query": args.get("query")})
             item = {"id": new_id("ws"), "type": "web_search_call", "status": "in_progress", "action": action}
             out += self._open(item)
-            out.append(self.event("response.web_search_call.in_progress", item_id=item["id"], output_index=self.index))
-            out.append(self.event("response.web_search_call.searching", item_id=item["id"], output_index=self.index))
-        elif x.get("event") == "result" and self.item is not None and self.item["type"] == "web_search_call":
-            if self.item["action"]["type"] == "search":
-                self.item["action"]["sources"] = [{"type": "url", "url": s["url"]} for s in x.get("sources") or []]
-            out.append(self.event("response.web_search_call.completed", item_id=self.item["id"],
-                                  output_index=self.index))
-            out += self.close("completed" if x.get("ok") else "failed")
+            at = self.index
+            if x.get("id") is not None:
+                self.hosted[x["id"]] = item
+            out.append(self.event("response.web_search_call.in_progress", item_id=item["id"], output_index=at))
+            out.append(self.event("response.web_search_call.searching", item_id=item["id"], output_index=at))
+        elif x.get("event") == "result":
+            item = self._hosted(x, "web_search_call")
+            if item is None:
+                return out
+            if item["action"]["type"] == "search":
+                item["action"]["sources"] = [{"type": "url", "url": s["url"]} for s in x.get("sources") or []]
+            out.append(self.event("response.web_search_call.completed", item_id=item["id"],
+                                  output_index=self.response["output"].index(item)))
+            status = "completed" if x.get("ok") else "failed"
+            out += self.close(status) if self.item is item else self._close_item(item, status)
+            self.hosted.pop(x.get("id"), None)
         return out
 
     def finish(self, done: dict, validate=None) -> list[dict]:
