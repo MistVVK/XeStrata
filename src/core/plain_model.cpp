@@ -3708,6 +3708,12 @@ bool PlainModel::restore_parts(const Snapshot& snap, bool recurrent_only, std::s
     for (PlainModel* st : chain())
         for (const StatePart& p : st->state_parts(snap.tokens, recurrent_only))
             if (p.bytes != snap.parts[i++].size()) { err = "plain model: a state of another shape"; return false; }
+    // the state's cells are mapped before they are written: a saved or parked conversation may be longer than this
+    // request's prompt (the grow before the request only saw the prompt), and --kv-grow's trim may have given the
+    // cells past it back to the tier.  A recurrent-only restore copies no attention cells (the rings are whole)
+    if (!recurrent_only)
+        for (PlainModel* st : chain())
+            if (!st->kv_grow_to(snap.tokens, err)) return false;
     i = 0;
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
