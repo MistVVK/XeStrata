@@ -428,7 +428,7 @@
   "tool.bgResOwn": "该版本的默认值",
   "ui.default": "恢复默认值",
   "ui.about": "这是什么",
-  "info.upModel": "放大图片的方式：\n- 自动：只放大时用 SeedVR2，重绘时用 RealESRGAN（SeedVR2 放不进 GPU 时也用 RealESRGAN）\n- Lanczos：普通缩放\n- RealESRGAN：超分辨率模型，清晰且快\n- SeedVR2 7B：一步恢复细节的扩散模型（照片、视频帧）\n- SeedVR2 7B sharp：适合动画和模糊图片，细节更锐利\n首次使用时下载权重。",
+  "info.upModel": "放大图片的方式：\n- 自动：只放大时用 SeedVR2，重绘时用 RealESRGAN（SeedVR2 放不进 GPU 时也用 RealESRGAN）\n- Lanczos：普通缩放\n- RealESRGAN：超分辨率模型，清晰且快\n- SeedVR2 7B：一步恢复细节的扩散模型（照片、视频帧）\n- SeedVR2 7B sharp：适合动画和模糊图片，细节更锐利\n- SeedVR2 3B：适合较小的 GPU，7B 放不下时使用\n首次使用时下载权重。",
   "info.upScale": "每条边放大几倍（大于 1，最多 4）。结果每边最多 4096 像素，边长为 16 的倍数。",
   "info.upColor": "放大后把颜色向原图靠拢的方式：\n- Wavelet：细节取放大结果，整体颜色取原图\n- LAB：先做 Wavelet，再让 Lab 各通道与原图一致\n- AdaIN：让 RGB 各通道的均值和分布一致\n- 无：保持放大后的颜色\n- 放大器默认：RealESRGAN 为无，SeedVR2 为 LAB",
   "info.upRedraw": "放大后由图像模型重绘大图并补充细节。需要描述画面的提示词。超过模型尺寸的部分分块绘制。",

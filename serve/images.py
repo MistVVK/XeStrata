@@ -1840,8 +1840,8 @@ def plan_crop(image: bytes, mask: bytes, cfg: dict, context: float = CROP_CONTEX
 
 
 def crop_upscaler(job: dict, req: dict) -> None:
-    """A request's crop_upscale ("auto", "lanczos", "realesrgan", "seedvr2", or {"method", "variant"}: SeedVR2's 7b or
-    7b-sharp), how the masked edit's cut is enlarged to the drawing's size -> job["crop_ups"] (an upscaler as
+    """A request's crop_upscale ("auto", "lanczos", "realesrgan", "seedvr2", or {"method", "variant"}: SeedVR2's 7b,
+    7b-sharp or 3b), how the masked edit's cut is enlarged to the drawing's size -> job["crop_ups"] (an upscaler as
     job["upscaler"] is, and the enlargement) where it is an upscaler; Lanczos is the engine's own resize.  auto: an
     upscaler from CROP_UPS_AUTO times on.  A cut that is not enlarged is resized as it is."""
     v = req.get("crop_upscale")
@@ -1861,8 +1861,8 @@ def crop_upscaler(job: dict, req: dict) -> None:
     if method not in CROP_UPSCALE:
         raise ImageRequestError(f"crop_upscale: one of {', '.join(CROP_UPSCALE)}, not {method!r}")
     variant = v.get("variant") or None
-    if variant is not None and variant not in SEEDVR2_VARIANTS[:2]:
-        raise ImageRequestError(f"crop_upscale's variant: SeedVR2's {' or '.join(SEEDVR2_VARIANTS[:2])}")
+    if variant is not None and variant not in SEEDVR2_VARIANTS:
+        raise ImageRequestError(f"crop_upscale's variant: SeedVR2's {', '.join(SEEDVR2_VARIANTS)}")
     if variant is not None and method not in ("seedvr2", "auto"):
         raise ImageRequestError("crop_upscale's variant: SeedVR2's alone")
     if variant is not None:
@@ -4052,7 +4052,7 @@ IMAGE_ARG = {"type": "string", "description": "attached:N (the user's Nth pictur
 # how the masked edit enlarges the part it cuts out before it is drawn (crop_upscale), and SeedVR2's version for it
 CROP_UPSCALE = ("auto", "lanczos", "realesrgan", "seedvr2")
 CROP_ARGS: dict[str, Any] = {"crop_upscale": {"type": "string", "enum": list(CROP_UPSCALE)},
-                             "variant": {"type": "string", "enum": ["7b", "7b-sharp"]}}
+                             "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS)}}
 # The enum is constrained as well as described: the chat sees each meaning beside its value.
 CONTROL_TYPES = {
     "canny": "edges", "depth": "depth and composition", "pose": "pose skeleton",
@@ -4118,7 +4118,7 @@ TOOLS: list[dict[str, Any]] = [
          "image": IMAGE_ARG,
          "scale": {"type": "number"},
          "method": {"type": "string", "enum": list(UPSCALE_METHODS)},
-         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2])},
+         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS)},
          "redraw": {"type": "boolean"},
          "strength": {"type": "number"},
          "seed": {"type": "integer"}}}},
@@ -4128,7 +4128,7 @@ TOOLS: list[dict[str, Any]] = [
          "video": {"type": "string", "description": "a /v1/videos/files/ link (default: the last video)"},
          "scale": {"type": "number"},
          "method": {"type": "string", "enum": list(UPSCALE_METHODS)},
-         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2])},
+         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS)},
          "seed": {"type": "integer"}}}},
     {"name": "segment_video",
      "description": "Find and follow things through the attached video (SAM 3.1): a job on the server; the answer says "

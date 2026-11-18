@@ -428,7 +428,7 @@
   "tool.bgResOwn": "版の既定",
   "ui.default": "既定値に戻す",
   "ui.about": "これは何か",
-  "info.upModel": "画像を大きくする手段:\n- 自動: 大きくするだけなら SeedVR2、描き直すときは RealESRGAN（SeedVR2 が GPU に入らないときも RealESRGAN）\n- Lanczos: 単純な拡大\n- RealESRGAN: 超解像のモデル。くっきりして速い\n- SeedVR2 7B: 1 ステップで細部を復元する拡散モデル（写真や動画のフレーム向け）\n- SeedVR2 7B sharp: アニメやぼやけた画像向け。細部がよりくっきりする\n重みは初めて使うときにダウンロードします。",
+  "info.upModel": "画像を大きくする手段:\n- 自動: 大きくするだけなら SeedVR2、描き直すときは RealESRGAN（SeedVR2 が GPU に入らないときも RealESRGAN）\n- Lanczos: 単純な拡大\n- RealESRGAN: 超解像のモデル。くっきりして速い\n- SeedVR2 7B: 1 ステップで細部を復元する拡散モデル（写真や動画のフレーム向け）\n- SeedVR2 7B sharp: アニメやぼやけた画像向け。細部がよりくっきりする\n- SeedVR2 3B: 小さい GPU 向け。7B が入らないとき\n重みは初めて使うときにダウンロードします。",
   "info.upScale": "各辺を何倍にするか（1 より大きく 4 まで）。仕上がりは 1 辺 4096 ピクセルまでで、辺は 16 の倍数になります。",
   "info.upColor": "拡大の後の色を元の画像に寄せる方法:\n- Wavelet: 細かい部分は拡大の結果、大まかな色は元の画像のもの\n- LAB: Wavelet の後、Lab の各チャンネルを元の画像に合わせる\n- AdaIN: RGB の各チャンネルの平均と広がりを合わせる\n- なし: 拡大したままの色\n- 拡大の道具の既定: RealESRGAN はなし、SeedVR2 は LAB",
   "info.upRedraw": "拡大の後、画像のモデルが大きな画像を描き直して細部を足します。画像の中身を説明するプロンプトが要ります。モデルの大きさを超える分はタイルに分けて描きます。",

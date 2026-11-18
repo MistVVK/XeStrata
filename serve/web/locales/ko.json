@@ -428,7 +428,7 @@
   "tool.bgResOwn": "버전의 기본값",
   "ui.default": "기본값으로",
   "ui.about": "이것은 무엇인가요",
-  "info.upModel": "그림을 크게 하는 방법:\n- 자동: 크게만 할 때는 SeedVR2, 다시 그릴 때는 RealESRGAN(SeedVR2가 GPU에 들어가지 않을 때도 RealESRGAN)\n- Lanczos: 단순한 크기 변경\n- RealESRGAN: 초해상도 모델로 선명하고 빠름\n- SeedVR2 7B: 한 단계로 디테일을 복원하는 확산 모델(사진, 동영상 프레임)\n- SeedVR2 7B sharp: 애니메이션과 흐린 그림용, 디테일이 더 선명함\n가중치는 처음 쓸 때 내려받습니다.",
+  "info.upModel": "그림을 크게 하는 방법:\n- 자동: 크게만 할 때는 SeedVR2, 다시 그릴 때는 RealESRGAN(SeedVR2가 GPU에 들어가지 않을 때도 RealESRGAN)\n- Lanczos: 단순한 크기 변경\n- RealESRGAN: 초해상도 모델로 선명하고 빠름\n- SeedVR2 7B: 한 단계로 디테일을 복원하는 확산 모델(사진, 동영상 프레임)\n- SeedVR2 7B sharp: 애니메이션과 흐린 그림용, 디테일이 더 선명함\n- SeedVR2 3B: 작은 GPU용. 7B가 들어가지 않을 때\n가중치는 처음 쓸 때 내려받습니다.",
   "info.upScale": "각 변을 몇 배로 할지(1보다 크고 4까지). 결과는 한 변 4096픽셀까지이며 변은 16의 배수입니다.",
   "info.upColor": "확대 후 색을 원본 쪽으로 맞추는 방법:\n- Wavelet: 세부는 확대 결과, 큰 색감은 원본\n- LAB: Wavelet 후 Lab 각 채널을 원본에 맞춤\n- AdaIN: RGB 각 채널의 평균과 분산을 맞춤\n- 없음: 확대한 그대로\n- 확대 도구 기본값: RealESRGAN은 없음, SeedVR2는 LAB",
   "info.upRedraw": "확대 후 이미지 모델이 큰 그림을 다시 그려 디테일을 더합니다. 그림을 설명하는 프롬프트가 필요합니다. 모델 크기를 넘는 부분은 타일로 나눠 그립니다.",
