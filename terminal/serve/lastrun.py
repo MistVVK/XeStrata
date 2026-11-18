@@ -68,7 +68,7 @@ def oomd_killed_since(epoch: float, run=subprocess.run) -> bool:
     """Whether the user journal (our own, no root needed) has a "systemd-oomd killed" line since `epoch`.  False when it cannot be read."""
     try:
         done = run(["journalctl", "--user", "--no-pager", "-q", "-o", "cat", "--since", f"@{int(epoch) - 5}"],
-                   capture_output=True, text=True, timeout=JOURNAL_WAIT_S, encoding="utf-8", errors="replace")
+                   capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=JOURNAL_WAIT_S, encoding="utf-8", errors="replace")
     except (OSError, subprocess.SubprocessError):
         return False
     return done.returncode == 0 and any("systemd-oomd killed" in line for line in (done.stdout or "").splitlines())

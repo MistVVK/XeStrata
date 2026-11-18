@@ -998,7 +998,7 @@ class _Metal:
         if _Metal._recent and now - _Metal._recent[0][0] < _Metal.FRESH_S:
             return _Metal._recent[0][1]
         try:
-            text = subprocess.run(list(_Metal.cmd), capture_output=True, text=True, timeout=10).stdout or ""
+            text = subprocess.run(list(_Metal.cmd), capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=10).stdout or ""
         except (OSError, subprocess.SubprocessError):
             text = ""
         _Metal._recent[:] = [(time.monotonic(), text)]
@@ -1496,7 +1496,7 @@ def _cpu_topology(root: str = "/sys/devices/system"):
             return (sockets or None), numa
         if sys.platform == "darwin":
             import subprocess
-            out = subprocess.run(["sysctl", "-n", "hw.packages"], capture_output=True, text=True, timeout=5).stdout.strip()
+            out = subprocess.run(["sysctl", "-n", "hw.packages"], capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=5).stdout.strip()
             return (int(out) if out.isdigit() else 1), None
         import glob
         packages = set()

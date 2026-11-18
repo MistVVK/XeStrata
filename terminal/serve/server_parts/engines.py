@@ -928,7 +928,7 @@ def gpu_speed_scores(indices: list[int]) -> dict[int, float] | None:
         env = dict(os.environ)
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env.pop("CUDA_VISIBLE_DEVICES", None)
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30, env=env)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=30, env=env)
         got = {}
         for line in r.stdout.splitlines():
             i, sm, khz = (int(x) for x in line.split())
@@ -1101,7 +1101,7 @@ def engine_arch_note(cfg: dict, cards: dict[int, int] | None = None, built: dict
         if not archs:
             return None
         if cards is None:
-            r = subprocess.run(["nvidia-smi", "--query-gpu=index,compute_cap", "--format=csv,noheader"], capture_output=True, text=True,
+            r = subprocess.run(["nvidia-smi", "--query-gpu=index,compute_cap", "--format=csv,noheader"], capture_output=True, stdin=subprocess.DEVNULL, text=True,
                                errors="replace", timeout=10)
             cards = {int(i): int(round(float(c) * 10)) for i, c in (ln.split(",") for ln in (r.stdout or "").strip().splitlines())}
         used = gpu_list(cfg) or sorted(cards)

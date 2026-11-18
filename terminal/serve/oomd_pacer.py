@@ -79,7 +79,7 @@ def kill_limit_percent(show_text: str) -> float | None:
 
 def _run(args: list[str]) -> str | None:
     try:
-        done = subprocess.run(args, capture_output=True, text=True, timeout=5, encoding="utf-8", errors="replace")
+        done = subprocess.run(args, capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=5, encoding="utf-8", errors="replace")
     except (OSError, subprocess.SubprocessError):
         return None
     return done.stdout if done.returncode == 0 else None

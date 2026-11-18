@@ -3654,7 +3654,7 @@ def hip_auto_devices(cfg: dict, env: dict) -> list[int] | None:
     if not probe.is_file():
         return None
     try:
-        done = subprocess.run([str(probe), "--list-devices"], capture_output=True, text=True, timeout=60, cwd=str(probe.parent), env=env,
+        done = subprocess.run([str(probe), "--list-devices"], capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=60, cwd=str(probe.parent), env=env,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         return None
