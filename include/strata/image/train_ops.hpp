@@ -262,7 +262,7 @@ struct AdScratch {
 /// takes (rows_of_product(i)), its width and input width, and the adapter's rank; `plain` while every one is a plain
 /// LoRA (its delta takes y1 alone: no y2).
 struct AdSizes {
-    int64_t rows = 0, n = 0, rank = 0, scratch = 0, tmp = 0;
+    int64_t rows = 0, n = 0, rank = 0, scratch = 0, tmp = 0, map = 0;
     bool plain = true;
 };
 
@@ -279,6 +279,14 @@ AdSizes ad_sizes(const Product* const* p, const Adapter* const* ad, int n, Rows 
         s.scratch = std::max(s.scratch, T * rk + N * rk + rk * K);
         // A plain LoRA reuses the dgrad's FP16 dY rows. DoRA needs a second set after its row scaling.
         s.tmp = std::max(s.tmp, (a->method == AdapterMethod::lora ? T * N : 2 * T * N) + T * rk);
+        s.map = std::max(s.map, T * N);
+        if (a->method == AdapterMethod::lokr) {
+            s.map = std::max({s.map, T * a->ol * rk, T * a->ol * a->inn, T * a->im * rk,
+                              T * a->im * a->ok, a->ok * a->inn,
+                              a->ol * a->im + a->ok * a->inn + a->ok * rk + rk * a->inn});
+            s.tmp = std::max(s.tmp, T * N + T * a->ol * rk + T * a->inn * a->ol +
+                                        a->ok * a->inn + a->ok * rk + rk * a->inn);
+        }
         s.plain = s.plain && a->method == AdapterMethod::lora;
     }
     return s;

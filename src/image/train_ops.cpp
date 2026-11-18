@@ -622,8 +622,8 @@ AdScratch take_ad_scratch(Pool& pool, const AdSizes& s) {
     AdScratch sc;
     if (s.n == 0) return sc;
     sc.hf = pool.rf(s.rows * s.rank);
-    sc.y1 = pool.rf(s.rows * s.n);
-    sc.y2 = !s.plain ? pool.rf(s.rows * s.n) : nullptr;
+    sc.y1 = pool.rf(s.map);
+    sc.y2 = !s.plain ? pool.rf(s.map) : nullptr;
     sc.fa = pool.rf(s.n);
     sc.fb = pool.rf(s.n);
     sc.scratch = pool.rf(s.scratch);
