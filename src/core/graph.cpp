@@ -168,12 +168,12 @@ bool StepForm::run(uint64_t key, void* stream, const std::function<void()>& body
         return true;
     }
     if (epoch_ != graph_epoch()) {
-        clear();
+        this->clear();
         epoch_ = graph_epoch();
     }
     auto it = graphs_.find(key);
     if (it == graphs_.end()) {   // a key's first step straight: what its libraries set up at a first call is done
-        if (graphs_.size() >= 16) clear();   // the keys of buffers since grown or shapes since gone
+        if (graphs_.size() >= 16) this->clear();   // the keys of buffers since grown or shapes since gone
         graphs_.emplace(key, nullptr);
         setup_ = true;
         body();
