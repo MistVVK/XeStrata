@@ -1484,6 +1484,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
                    fix_req={k: v for k, v in req.items() if k not in ("fix", "n", "size", "strength", "mask")})
         return job
     extend_scale = 1.0
+    extend_ref = None
     if req.get("extend") is not None:   # an outpaint: the canvas grown, its new area the mask
         if mask is not None:
             raise ImageRequestError("extend: not with a mask (extend the image, then edit the result with one)")
@@ -1496,6 +1497,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
                 buf = io.BytesIO()
                 im.resize(size, Image.Resampling.LANCZOS).save(buf, format="PNG")
                 images[0] = buf.getvalue()
+        extend_ref = images[0]   # keep the repeated-edge padding out of the reference
         images[0], mask = extend_canvas(images[0], pads)
         dims[0] = (size[0] + pads[0] + pads[2], size[1] + pads[1] + pads[3])
     if mask is not None:
@@ -1534,7 +1536,9 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     if extend_scale < 1:
         job["extend_scale"] = extend_scale
     if edits:
-        job["refs"] = list(images)
+        job["refs"] = ([extend_ref, *images[1:]] if extend_ref is not None else list(images))
+        if extend_ref is not None:
+            job["init"] = images[0]
         # the references at about 1 MP (the cut's first, the picture the engine cuts from, as it is: an
         # ai-toolkit edit's cut again at the references' size beside the drawing's base, _crop_ref)
         if moss:
@@ -3258,7 +3262,8 @@ class ImageGen:
                 job["pic_paths"] = []
                 for i, data in enumerate(job["refs"]):
                     p = work / f"pic_{i}"
-                    p.write_bytes(moss_picture(data, crop.get("box") if i == 0 and crop.get("box") else None))
+                    p.write_bytes(moss_picture(data, crop.get("box") if i == 0 and crop.get("box")
+                                               and not job.get("init") else None))
                     job["pic_paths"].append(str(p))
             for key in ("init", "mask"):
                 if job.get(key):

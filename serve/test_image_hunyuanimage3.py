@@ -182,6 +182,22 @@ class Extend(unittest.TestCase):
         self.assertLess(job["extend_scale"], 1)
         self.assertLessEqual(max(images.image_dims(job["init"])), 2048)
         self.assertEqual(images.image_dims(job["init"]), images.image_dims(job["mask"]))
+        job = images.parse_edit_request({"prompt": "a cube", "extend": {"aspect": "16:9"}},
+                                        [buf.getvalue()], cfg())
+        self.assertLess(job["extend_scale"], 1)
+        self.assertEqual(images.image_dims(job["init"]), images.image_dims(job["mask"]))
+        rw, rh = images.image_dims(job["refs"][0])
+        cw, ch = images.image_dims(job["init"])
+        self.assertLess(rw, cw)
+        self.assertEqual(rh, ch)
+        with Image.open(io.BytesIO(job["refs"][0])) as ref:
+            self.assertEqual(ref.getpixel((0, 0)), (255, 0, 0))
+        job = images.parse_edit_request({"prompt": "a cube", "extend": {"aspect": "4:5"}},
+                                        [buf.getvalue()], cfg())
+        self.assertNotIn("extend_scale", job)
+        self.assertEqual(job["refs"][0], buf.getvalue())
+        self.assertEqual(images.image_dims(job["init"]), images.image_dims(job["mask"]))
+        self.assertGreater(images.image_dims(job["init"])[0], 832)
 
 
 class AuxiliaryMemory(unittest.TestCase):
