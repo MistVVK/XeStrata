@@ -7892,7 +7892,7 @@ int main(int argc, char** argv) {
         // Verifier::pl_finish copies it across.
         float* pl_mtp_R = nullptr;
         if (pipe) {
-            const size_t hb = (size_t) strata::kernels::kVerifyNarrowT *
+            const size_t hb = (size_t) win_rows *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             auto hand_alloc = [&](int dev) -> float* {
                 const strata::core::OnDevice on(dev);
@@ -7912,11 +7912,13 @@ int main(int argc, char** argv) {
                 }
             }
             ver_b.set_stage(0, split_at[0], nullptr, hand_out_b[0]);
+            ver_b.set_handoff_rows(win_rows);
             for (int st = 1; st < n_stages; ++st) {
                 GpuStage& gs = *stages[(size_t) st - 1];
                 const bool last = st + 1 == n_stages;
                 gs.ver_b.set_stage(split_at[(size_t) st - 1], last ? -1 : split_at[(size_t) st],
                                    hand_in_b[(size_t) st - 1], last ? nullptr : hand_out_b[(size_t) st]);
+                gs.ver_b.set_handoff_rows(win_rows);
                 const strata::core::OnDevice on(gs.dev);
                 strata::core::VerifyHits vs;
                 vs.d_res = gs.d_res;
@@ -7931,7 +7933,7 @@ int main(int argc, char** argv) {
                                  gs.dev, st + 1, err.c_str());
                     return 1;
                 }
-                if (last && !strata::gpu::alloc_device(&pl_mtp_R, (size_t) strata::kernels::kVerifyNarrowT *
+                if (last && !strata::gpu::alloc_device(&pl_mtp_R, (size_t) win_rows *
                                                                       (size_t) (g.hc * g.n_embd) * sizeof(float))) {
                     std::fprintf(stderr, "xestrata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
                     return 1;
