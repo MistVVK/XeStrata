@@ -13,6 +13,12 @@ src/kernels/cuda/dflash2.cu), "bf16" (the selector's two codebooks: only gathere
 The matrices' quantization matches ggml's quantize_row_q8_0 (d = amax / 127, q = round(x / d), d stored as fp16); the research harness
 (tools/dflash2/q8test.py) measured no acceptance loss from it.
 """
+import sys
+if sys.platform == "win32":
+    # CPython 3.12's WMI helper (_wmi, behind platform.system() / uname()) takes an access violation in a worker thread when WMI refuses the
+    # account (0x80041003) and the caller has already gone (DIAG-WINHOST-0216). Without _wmi, platform uses the registry and the environment.
+    sys.modules["_wmi"] = None
+
 import json
 import struct
 import sys

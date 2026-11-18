@@ -705,12 +705,30 @@ def _choose_engine(feed: feedmod.Feed, ctx: Context, state: State) -> tuple[dict
     bad = (section.get("failed") or {}).get(offered.version)
     if bad and _failed_mark_is_old(bad, ctx):
         bad = None                                           # a failure is held against a version for a day, not for ever
+    if bad and _failed_by_an_older_control(bad):
+        bad = None                                           # the Control that tried it could not start any engine here (DIAG-WINHOST-0216): try again with this one
     if report["status"] == "available" and not ctx.force:
         if bad and bad.get("manifest_sha256") == offered.manifest_sha256:
             report["status"] = "failed-before"
             report["note"] = (f"{offered.version} failed its test start on {bad.get('at', 'an earlier try')} ({bad.get('reason')}); "
                               "run `strata update --force` to try it again")
     return report, offered
+
+
+#: The words of a test start that failed because the Control's own runtime host died, not because of the engine (Windows 0.2.15 and older on a PC where
+#: WMI refuses the account: an access violation in CPython's `_wmi`, DIAG-WINHOST-0216; the host's answer is "runtime control is unavailable").
+HOST_DEAD_WORDS = "runtime control is unavailable"
+
+
+def _failed_by_an_older_control(mark: dict) -> bool:
+    """A failure record made by a DIFFERENT Control (older: records of 0.2.15 and before carry no "control" field) whose reason is the dead host
+    says nothing about the engine, because that Control's host could not start ANY engine on this PC. The first `strata update` from such a
+    Control installs the new Control after it has already failed the engine's test start (its order is engine, then Control, and it cannot be
+    changed); the next plain `strata update` therefore tries the engine again instead of asking for `--force`."""
+    if HOST_DEAD_WORDS not in str(mark.get("reason", "")):
+        return False
+    mine = ec.runtime_version()
+    return mark.get("control") != mine if mine else mark.get("control") is None
 
 
 def installed_copy(root: Path, pkg: feedmod.EnginePackage) -> str | None:
@@ -1465,7 +1483,7 @@ def _finish_engine_install(ctx: Context, state: State, pkg: feedmod.EnginePackag
             at = (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat()
             if not exc.busy:                                 # a busy card says nothing about the engine: the next update tries again
                 section.setdefault("failed", {})[pkg.version] = {
-                    "manifest_sha256": pkg.manifest_sha256, "reason": exc.reason[:300], "at": at}
+                    "manifest_sha256": pkg.manifest_sha256, "reason": exc.reason[:300], "at": at, "control": ec.runtime_version()}
             state.history({"at": at, "action": "update-engine", "to": pkg.version,
                            "from": before_installed.version if before_installed else None, "ok": False,
                            "detail": f"test start failed: {exc.reason[:200]}"})

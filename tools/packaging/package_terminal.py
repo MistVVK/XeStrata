@@ -298,6 +298,34 @@ def drop_pip(root: Path, target: str) -> dict:
     return {"version": version, "paths": gone}
 
 
+#: The bundled interpreter's own start-up file (site-packages/sitecustomize.py, imported by `site` in every process of this python, also
+#: `python -c` and `-I`): no process of the bundle may reach CPython 3.12's `_wmi` (DIAG-WINHOST-0216). Every Strata entry point also does it
+#: itself (tests/terminal/test_wmi_guard.py); this covers a process nothing of ours starts first (a `python -c`, a tool run by path).
+SITECUSTOMIZE = '''"""Strata Terminal bundle: CPython 3.12's WMI helper must never run in a Strata process.
+
+On Windows `platform.system()` / `uname()` ask WMI through `_wmi.exec_query`. When WMI refuses the account (a standard user over an ssh logon,
+0x80041003) the query takes seconds, `exec_query` gives up after 100 ms and returns, and its worker thread later reads a struct on the caller's
+gone stack: an access violation that ends the whole process (0xC0000005). Without `_wmi`, `platform` answers from the registry, `ver` and the
+environment, as it did before Python 3.12. See strata_control/sysinfo.py.
+"""
+import sys
+if sys.platform == "win32":
+    sys.modules["_wmi"] = None
+'''
+
+
+def add_sitecustomize(root: Path, target: str) -> str:
+    """Write the bundle's sitecustomize.py (above) into its site-packages; returns its path relative to root. Never overwrites another one."""
+    windows = target.startswith("windows")
+    lib = root / "python" / ("Lib" if windows else f"lib/python{PYTHON_VERSION.rsplit('.', 1)[0]}")
+    path = lib / "site-packages" / "sitecustomize.py"
+    if path.exists() and path.read_text(encoding="utf-8") != SITECUSTOMIZE:
+        raise SystemExit(f"{path} already exists and is not Strata's: refusing to replace it")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(SITECUSTOMIZE, encoding="utf-8", newline="\n")
+    return path.relative_to(root).as_posix()
+
+
 def local_imports(folder: Path, entry: tuple[str, ...]) -> list[str]:
     """The tools/ modules `entry` imports, transitively (static: import and from-import statements)."""
     import ast
@@ -504,6 +532,7 @@ def main() -> int:
             removed = drop_build_path_launchers(root, staging, target)
             pip_removed = drop_pip(root, target)            # #5303: the build's tool, not the bundle's
             print(f"  removed pip {pip_removed['version']} and its spare wheel ({len(pip_removed['paths'])} paths)")
+            print(f"  wrote {add_sitecustomize(root, target)} (no _wmi in a Strata process)")
             # nothing the bundle writes while it is built may stay: compiled files are rebuilt on first use
             for cache_dir in list(root.rglob("__pycache__")):
                 shutil.rmtree(cache_dir, ignore_errors=True)
