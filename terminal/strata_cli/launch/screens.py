@@ -1523,7 +1523,7 @@ class AccessScreen(Base):
         start asks what to do with that one itself)."""
         s = self.ctx.settings
         self.free_port = None
-        host = s.listen if s.access == "address" and s.listen else "127.0.0.1"
+        host = "127.0.0.1"                                   # (a "one address only" launch is checked by the start itself: a screen never connects to a network address)
         try:
             port = int(s.port)
             if not S.port_in_use(port, host):

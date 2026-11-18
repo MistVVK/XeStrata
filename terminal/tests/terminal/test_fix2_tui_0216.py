@@ -413,12 +413,19 @@ class S6Offline(Base):
             ctx.check_offline()
         self.assertIsNone(ctx.offline)
 
-    def test_an_update_source_of_the_persons_own_is_not_judged_by_two_hosts(self):
+    def test_a_folder_of_the_persons_own_is_not_probed_as_a_web_address(self):
+        import time
+        asked = []
         ctx = make_ctx()
         ctx.probe_offline, ctx.feed = True, "/my/feed"
-        with mock.patch.object(drafting_fetch, "online", side_effect=AssertionError("not asked")):
+        with mock.patch.object(drafting_fetch, "online", side_effect=lambda url, timeout=0: asked.append(url) or True):
             ctx.check_offline()
-        self.assertIsNone(ctx.offline)
+            for _ in range(50):
+                if ctx.offline is not None:
+                    break
+                time.sleep(0.05)
+        self.assertFalse(ctx.offline)
+        self.assertEqual(asked, [drafting.base_url()])               # only the model files' address: the feed is a folder here
 
     def test_the_save_screen_says_what_is_missing_and_how_to_put_it_in_place(self):
         plan = {"gb": 85.2, "parts": self.PARTS, "engine_usable": False, "engine_missing": True, "own_files": False, "text": ""}
@@ -631,6 +638,23 @@ class S12PortAtTheAccessStep(Base):
             self.assertNotIn("already in use", flat(app))
             self.assertIsNone(app.screen.free_port)
         self.run_app(case)
+
+    def test_the_screen_only_ever_looks_at_this_computer(self):
+        seen = []
+
+        def look(port, host="127.0.0.1"):
+            seen.append(host)
+            return False
+
+        async def case(app, pilot, ctx):
+            await goto(pilot, app, "context")
+            ctx.settings.access, ctx.settings.listen = "address", "192.168.1.5"
+            await goto(pilot, app, "access")
+            await press(pilot, "p")
+        with mock.patch.object(S, "port_in_use", look):
+            self.run_app(case)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"127.0.0.1"})
 
     def test_a_server_of_this_launch_is_not_another_program(self):
         held = socket.socket()

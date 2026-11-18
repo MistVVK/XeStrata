@@ -60,20 +60,19 @@ class Ctx:
     _probing: bool = False
 
     def check_offline(self, on_done=None) -> None:
-        """S6: is this computer offline? One short HEAD request to each of the two hosts Strata downloads from (the download's own opener: same
-        certificates and proxy settings, strata_control/drafting_fetch.online), in a thread of its own; offline only when neither answers. The answer
-        is kept, so the Save screen says what is missing instead of "will download". Never raises, never blocks a screen."""
-        import os
+        """S6: is this computer offline? One short HEAD request to each address Strata downloads from: the model files' (as the drafter fetch names
+        it, which follows a mirror the person set) and the update feed's, when that is a web address and not a folder of the person's own (the download's
+        own opener: same certificates and proxy settings, strata_control/drafting_fetch.online), in a thread of its own; offline only when none answers.
+        The answer is kept, so the Save screen says what is missing instead of "will download". Never raises, never blocks a screen."""
         if not self.probe_offline or self.offline is not None or self._probing:
             return
-        if self.feed or os.environ.get("STRATA_UPDATE_FEED") or os.environ.get("HF_ENDPOINT"):
-            return                                           # an update source or mirror of the person's own: these two hosts say nothing about it
         self._probing = True
 
         def run() -> None:
             try:
-                from strata_control import drafting_fetch
-                self.offline = not any(drafting_fetch.online(url, timeout=4.0) for url in ("https://huggingface.co/", "https://github.com/"))
+                from strata_control import drafting, drafting_fetch
+                urls = [u for u in (drafting.base_url(), drafting_fetch._feed_source(self.feed)) if str(u).lower().startswith(("http://", "https://"))]
+                self.offline = bool(urls) and not any(drafting_fetch.online(url, timeout=4.0) for url in urls)
             except Exception:                                # noqa: BLE001 - not knowing counts as online: the download itself says what is wrong
                 self.offline = False
             finally:
