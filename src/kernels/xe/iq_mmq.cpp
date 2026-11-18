@@ -31,6 +31,7 @@
 #include "amd_wmma.hpp"
 #include "strata/core/graph.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/platform/env.hpp"
 #include "iq_bits.hpp"
 #include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_mmq
@@ -1787,7 +1788,7 @@ bool timed_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, in
 }
 bool intel_sub_group_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, int64_t K,
                            const std::function<sycl::event()>& sg, const std::function<sycl::event()>& wg) {
-    static const char* const env = std::getenv("XESTRATA_IQ_MMQ_SUB_GROUP");
+    static const char* const env = strata::env_get("IQ_MMQ_SUB_GROUP");
     if (env != nullptr && (env[0] == '0' || env[0] == '1')) return env[0] == '1';
     return timed_first(q, ty, mean_rows, n, N, K, 8, sg, wg);
 }
@@ -1804,7 +1805,7 @@ bool intel_sub_group_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int
 constexpr int kF16TopClass = 10, kF16FirstClass = 9;
 int f16_env() {
     static const int v = [] {
-        const char* e = std::getenv("XESTRATA_IQ_MMQ_F16");
+        const char* e = strata::env_get("IQ_MMQ_F16");
         return e == nullptr || e[0] == '\0' ? -1 : (int) std::strtol(e, nullptr, 10) != 0;
     }();
     return v;
@@ -1845,7 +1846,7 @@ bool takes_work_group(sycl::queue& q) {
 // its registers.  XESTRATA_IQ_MMQ_FX_SPLIT=0: the int8 products' shapes (an experiment, measured on the RX 8060S only)
 bool fx_split() {
     static const bool on = [] {
-        const char* v = std::getenv("XESTRATA_IQ_MMQ_FX_SPLIT");
+        const char* v = strata::env_get("IQ_MMQ_FX_SPLIT");
         return v == nullptr || v[0] != '0';
     }();
     return on;
@@ -2182,7 +2183,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
 void iq_mmq_choose_forms(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, int n) {
     if (!iq_mmq_type_ok(t)) return;
     if (intel_shape_of(q) != 0) {   // Intel's two forms (intel_sub_group_first)
-        if (const char* env = std::getenv("XESTRATA_IQ_MMQ_SUB_GROUP"); env != nullptr && (env[0] == '0' || env[0] == '1'))
+        if (const char* env = strata::env_get("IQ_MMQ_SUB_GROUP"); env != nullptr && (env[0] == '0' || env[0] == '1'))
             return;
     } else if (f16_env() >= 0 || std::max(n, 1) == 1 || !iq_mmq_f16_ok(q, t, w_rows, w_cols)) {   // f16_first
         return;   // one form only

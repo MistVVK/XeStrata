@@ -792,6 +792,22 @@
     "src/kernels/cpu/iq_avx512.cpp:238"
    ]
   },
+  "IQ_MMQ_F16": {
+   "reads": [
+    "src/kernels/xe/iq_mmq.cpp:1808"
+   ]
+  },
+  "IQ_MMQ_FX_SPLIT": {
+   "reads": [
+    "src/kernels/xe/iq_mmq.cpp:1849"
+   ]
+  },
+  "IQ_MMQ_SUB_GROUP": {
+   "reads": [
+    "src/kernels/xe/iq_mmq.cpp:1791",
+    "src/kernels/xe/iq_mmq.cpp:2186"
+   ]
+  },
   "IQ_MT_MIN": {
    "reads": [
     "src/kernels/cpu/native_expert.cpp:237"
