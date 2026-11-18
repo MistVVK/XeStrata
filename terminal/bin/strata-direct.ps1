@@ -1,10 +1,12 @@
-# Strata Terminal launcher for PowerShell. It finds a Python in a fixed order and hands over to strata.py.
-# It installs nothing and downloads nothing.
+# Strata Terminal launcher for PowerShell, for scripts. It finds a Python in a fixed order and hands over to strata.py.
+# It installs nothing and downloads nothing. It is NOT named strata.ps1 on purpose: this folder is on the user PATH, and PowerShell runs a
+# strata.ps1 before strata.cmd, which a default (Restricted) execution policy refuses. Typing  strata  is always strata.cmd.
+# What it adds over strata.cmd: the arguments reach Python exactly as given (cmd.exe re-reads & | < > ^ in an argument without a space).
 #   1. $env:STRATA_PYTHON                  an explicit override, always wins
 #   2. <root>\python\python.exe            the private runtime shipped in the terminal archive
 #   3. <root>\.venv\Scripts\python.exe     a source checkout set up by SETUP.bat
 #   4. py -3 / python on PATH, 3.10+       a developer convenience, never a requirement
-# If scripts are blocked on this PC, use bin\strata.cmd, or:  powershell -ExecutionPolicy Bypass -File bin\strata.ps1 ...
+# Run it with:  powershell -NoProfile -ExecutionPolicy Bypass -File bin\strata-direct.ps1 ...
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = if (Test-Path -LiteralPath (Join-Path $here 'strata.py')) { $here } else { Split-Path -Parent $here }

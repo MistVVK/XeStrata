@@ -109,12 +109,12 @@ class InstallShFailsVisibly(unittest.TestCase):
         lspci = ("echo '01:00.0 Non-Volatile memory controller: Sandisk Corp WD Black 3D NAND SN850X'; "
                  "echo '03:00.0 Display controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon AI PRO R9700]'")
         line = self.hardware_line(None, lspci)
-        self.assertIn("graphics: Advanced Micro Devices", line)
+        self.assertIn("graphics: AMD Radeon AI PRO R9700", line)        # P10: the product name, the maker once
         self.assertNotIn("Sandisk", line)
         broken = "echo \"NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.\"; exit 9"
         line = self.hardware_line(broken, "echo '00:02.0 VGA compatible controller: Intel Corporation DG2 [Arc A750]'")
         self.assertNotIn("failed", line)
-        self.assertIn("graphics: Intel Corporation", line)
+        self.assertIn("graphics: Intel Arc A750", line)
         line = self.hardware_line("echo 'NVIDIA RTX A6000'", None)
         self.assertIn("NVIDIA RTX A6000", line)
 

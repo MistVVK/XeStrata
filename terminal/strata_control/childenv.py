@@ -10,9 +10,40 @@ set here, and the environment is left as the developer made it).
 from __future__ import annotations
 
 import os
+import sys
 
 NO_BACKTRACE = "GGML_NO_BACKTRACE"
 DEVELOPER_SWITCH = "STRATA_BACKTRACE"
+
+#: glibc gives every thread that allocates its own memory arena, up to eight per core; a server that starts a thread per request keeps a
+#: little of each. Measured on the serve soak (l620, 120 min, same head, engine and schedule): server RSS 312 MiB and +4.5 %/h by default,
+#: 252 MiB and +0.69 %/h with MALLOC_ARENA_MAX=2. A person never sets environment variables, so Control sets it where it starts the server
+#: and the engine. An explicit value (the person's, a service file's) always wins. Linux only: no other C library reads it.
+ARENA_VAR = "MALLOC_ARENA_MAX"
+ARENA_VALUE = "2"
+M_ARENA_MAX = -8                                    # glibc's mallopt(3) parameter number
+
+
+def arena_env(env: dict | None = None) -> dict:
+    """`env` (this process's own environment when None) with MALLOC_ARENA_MAX=2 on Linux unless it is already there. Changes the dict it is
+    given and returns it, so it fits where a child's environment is built. It acts on the CHILDREN: a process reads the variable once, at start."""
+    target = os.environ if env is None else env
+    if sys.platform.startswith("linux") and ARENA_VAR not in target:
+        target[ARENA_VAR] = ARENA_VALUE
+    return target
+
+
+def limit_own_arenas() -> bool:
+    """The same limit for THIS process, for a server that was started by hand (nothing set the variable before it began): glibc's
+    mallopt(M_ARENA_MAX, 2) works while the process runs. False (and nothing done) when the variable was set at start, off Linux, or when the
+    C library has no such call (musl)."""
+    if not sys.platform.startswith("linux") or ARENA_VAR in os.environ:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.CDLL(None).mallopt(M_ARENA_MAX, int(ARENA_VALUE)))
+    except (OSError, AttributeError, ValueError):
+        return False
 
 
 def developer_wants_backtrace(env=None) -> bool:

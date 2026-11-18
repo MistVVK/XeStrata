@@ -71,8 +71,35 @@ class FeedEngine(unittest.TestCase):
             self.assertEqual(got, self.eng)
             feed.assert_called_once()
             feed.reset_mock()
-            setup.get_prebuilt(setup.PREBUILT_URL, gpu, "none", updating=True, toolkit=12)
-            feed.assert_not_called()                      # the experimental CUDA 12 engine has no feed package here
+            # P8 (0.2.16): the feed has had a CUDA 12 package since 0.2.13, so a Pascal / Volta card (toolkit 12) gets it as well, and
+            # setup.sh no longer compiles the engine where the signed package is there. The mocked package covers sm_89, not sm_60:
+            gpu12 = {"arch": 60, "archs": [60], "vram_gb": 16.0, "index": 0}
+            self.assertIsNone(setup.get_prebuilt(setup.PREBUILT_URL, gpu12, "none", updating=True, toolkit=12))
+            feed.assert_called_once()                     # asked, then refused: no code for sm_60 in it (compile instead)
+
+    def test_a_pascal_card_takes_the_cuda_12_package_from_the_feed(self):
+        """P8: setup.sh on a P100 compiled the engine in the clone although the feed's cuda12 package has sm_60 (USERTEST-LIN L2)."""
+        gpu = {"arch": 60, "archs": [60], "vram_gb": 16.0, "index": 0}
+        asked = []
+
+        def from_feed(eng, updating=False):               # what the real one does: the package's files, BUILD.json with its archs, become the engine
+            asked.append(eng)
+            (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.62", "source": "prebuilt", "archs": [60, 61, 70, 75, 80, 86, 89]}), encoding="utf-8")
+            return eng
+        (self.eng / "BUILD.json").unlink()                         # nothing installed yet: the first setup
+        with mock.patch.object(setup, "engine_dir", lambda toolkit=13: self.eng),                 mock.patch.object(setup, "_urlopen", side_effect=OSError("HTTP Error 404")),                 mock.patch.object(setup, "engine_from_feed", side_effect=from_feed):
+            got = setup.get_prebuilt(setup.PREBUILT_URL, gpu, "none", toolkit=12)
+        self.assertEqual(got, self.eng)
+        self.assertEqual(asked, [self.eng])
+
+    def test_a_feed_package_without_the_cards_code_is_not_used(self):
+        for archs, ptx, want, covered in (([60, 70, 89], False, [60], True), ([75, 86, 89], False, [60], False),
+                                          ([75, 86, 89], False, [60, 89], False), ([60, 70], True, [60, 89], True), ([], False, [60], True)):
+            (self.eng / "BUILD.json").write_text(json.dumps({"version": "0.1.62", "archs": archs, "ptx": ptx}), encoding="utf-8")
+            with self.subTest(archs=archs, ptx=ptx, want=want):
+                self.assertIs(setup.feed_engine_covers(self.eng, {"arch": want[0], "archs": want}), covered)
+        (self.eng / "BUILD.json").unlink()
+        self.assertFalse(setup.feed_engine_covers(self.eng, {"arch": 60, "archs": [60]}))
 
     def test_the_minimum_is_the_0_2_engine(self):
         self.assertLess((0, 1, 45), setup.MIN_ENGINE)

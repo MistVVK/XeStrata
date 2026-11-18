@@ -41,6 +41,11 @@ if __name__ == "__main__":
     handed = maybe_hand_over(sys.argv[1:])
     if handed is not None:
         raise SystemExit(handed)
+    try:                                               # an old install's strata.ps1 beside its strata.cmd (Windows; strata_cli/launcher_heal.py)
+        from strata_cli import launcher_heal
+        launcher_heal.heal(extra=[launcher_heal.installed_bin()])
+    except Exception:                                  # noqa: BLE001 - never a reason for the command to fail
+        pass
     code = _preflight(sys.argv[1:])
     if code:
         raise SystemExit(code)

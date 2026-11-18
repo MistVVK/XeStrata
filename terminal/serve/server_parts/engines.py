@@ -305,6 +305,12 @@ def start_exit_note(rc: int | None, exe=None) -> str:
     if not words:
         return ""
     note = f"\nthe engine process ended: {words}"
+    if sys.platform.startswith("linux"):
+        try:                                        # systemd-oomd ended it (serve/oomd_pacer.py): say so in plain words
+            from serve.oomd_pacer import killed_words
+            note += killed_words(rc)
+        except Exception:                           # noqa: BLE001 - a nicety
+            pass
     try:                                            # 0xC0000135: say which DLL (the loader prints nothing)
         from serve.loader_diag import missing_note
         note += missing_note(rc, exe)

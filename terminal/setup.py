@@ -3487,6 +3487,19 @@ def gguf_choice(name: str) -> tuple | None:
     return None
 
 
+def gguf_dir_choices(folder: Path, family: str | None = None, model: str | None = None) -> list:
+    """P13: the (--family, --model) choices the model files in a --gguf-dir folder stand for: every first shard (or single file) whose name is a
+    published one (gguf_choice), narrowed by a family or model the person already gave. One entry: the folder names the model. None: nothing
+    recognisable. Several: the folder holds more than one model, and the person is asked. Never raises."""
+    try:
+        names = sorted(p.name for p in Path(folder).glob("*.gguf")
+                       if not p.name.lower().startswith("mmproj") and (not SHARD_NAME.search(p.name) or SHARD_NAME.search(p.name).group(1) == "00001"))
+    except OSError:
+        return []
+    found = list(dict.fromkeys(c for c in map(gguf_choice, names) if c))
+    return [c for c in found if (not family or c[0] == family) and (not model or c[1] == model)]
+
+
 def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple | None:
     """#444: (message, hint) when --gguf-dir has no file setup can use for this choice: the chosen shard is a GGUF
     Strata cannot run (Unsloth's UD-IQ3_XXS taken for IQ3_XXS by its name), or it is missing and the folder holds
@@ -5839,6 +5852,19 @@ def rollback_engine(toolkit=13) -> int:
     return 0
 
 
+def feed_engine_covers(eng: Path, gpu) -> bool:
+    """Whether the engine installed in `eng` has code for every architecture of `gpu` (BUILD.json "archs", or PTX it can run on newer cards).
+    An engine whose BUILD.json names no architectures is taken as covering (the same rule get_prebuilt applies to an installed one)."""
+    try:
+        meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    have = arch_numbers(meta.get("archs"))
+    miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])
+            if have and int(x) not in have and not (meta.get("ptx") and int(x) > max(have))]
+    return not miss
+
+
 def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | None:
     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
     updating: called to replace an installed engine, which starts instead when this fails (no compile).
@@ -5887,10 +5913,12 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
                 say(f"  No ready-made engine for v{source_version()} ({e}): the latest release instead")
                 continue
-            if int(toolkit) != 12:                     # 0.2 releases: the signed feed has it (#3469)
-                got = engine_from_feed(eng, updating)
-                if got is not None:
-                    return got
+            got = engine_from_feed(eng, updating)      # 0.2 releases: the signed feed has it (#3469), the CUDA 12 package too (since 0.2.13)
+            if got is not None and int(toolkit) == 12 and not feed_engine_covers(got, gpu):
+                warn("the engine package from the update feed has no code for your graphics card" + ("" if updating else ": compiling instead"))
+                return None
+            if got is not None:
+                return got
             warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
             return None
     say("  Downloading the ready-made Strata engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
@@ -7647,6 +7675,15 @@ def hardware_key(cfg: dict) -> str:
                      cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"])
 
 
+#: The tuning question at the end of a setup (P12). Its default is "n", like the Terminal's Tuning step on a first launch (FIX-TUI T5).
+TUNE_QUESTION = ("Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow card; the PC is busy "
+                 "meanwhile). No lets you start sooner; you can tune any time later with: {again} --calibrate")
+
+
+def setup_command() -> str:
+    return "START-HERE.bat" if WIN else "./setup.sh"
+
+
 def calibrate_config(cfg_path: Path) -> bool:
     """Measure the engine's hardware-dependent settings on this PC (tools/calibrate.py), write them into the run
     config and remember them per PC and model in the settings file, so an update or a reinstall keeps them."""
@@ -7752,6 +7789,14 @@ def git_out(git: str, repo: Path, *args) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def detached_head(git: str, repo: Path) -> bool:
+    """A clone checked out on a tag or a commit (`git checkout v0.2.15`) has no branch: `git pull` can never bring anything there, and its
+    own error ("You are not currently on a branch") was followed by a message about changed files that had nothing to do with it.
+    `git symbolic-ref -q HEAD` exits 1 when HEAD is not a branch; any other failure (not a repository, git broken) is not claimed as this."""
+    r = subprocess.run([git, "-C", str(repo), "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return r.returncode == 1
+
+
 def pull_onto_new_history(git: str, repo: Path) -> int:
     """`git pull --ff-only` failed. A clone made before the history was rewritten on 2026-10-06 (#1276) has no commit in common with
     origin/main: it is moved to the new history when nothing tracked was changed, its old commits kept in a backup branch.  Any other
@@ -7809,6 +7854,11 @@ def update_pull(argv: list) -> int | None:
         say("  This folder is a git clone, but git is not installed: install it ("
             + ("winget install Git.Git" if WIN else "sudo apt install git") + ") or run")
         say(f'  "git pull" here yourself, then run {"START-HERE.bat --update" if WIN else "./setup.sh --update"} again.')
+        return 1
+    if detached_head(git, repo):
+        say()
+        say("  This folder is on a fixed release, not a branch: run  git checkout main  here, then the update again")
+        say(f"  ({'START-HERE.bat --update' if WIN else './setup.sh --update'}). Nothing was updated.")
         return 1
     before = git_out(git, repo, "rev-parse", "HEAD")
     say("  Getting the newest Strata (git pull) ...")
@@ -8432,6 +8482,47 @@ def mtp_corrupt(mtp: Path, env=None) -> bool:
     r = subprocess.run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "verify", "--out", str(mtp)], env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     return r.returncode == 3
+
+
+def auto_drafter(a, family: str, fam: dict, model: str, hip: bool, gpu: dict, mtp_here: bool) -> str | None:
+    """P14 (0.2.16): the drafter a fresh setup uses when the person named none (no --drafter, no --mtp): the Terminal's Auto rule
+    (strata_control/drafting.py choice_of, the one `strata launch` and the app use), not a copy of it. "dflash2" when Auto means DFlash2 on this
+    computer and the MTP layer is not on disk yet, so the ~5 GB MTP download is skipped and the 1.2 GB DFlash2 drafter is fetched instead (a P100 got the
+    5 GB layer from setup while the Terminal's Auto picks DFlash2 there). None in every other case: the MTP layer is already here (nothing to save), a
+    drafter was named, or Auto means the MTP; setup then goes on as before. Never raises."""
+    if getattr(a, "drafter", None) or a.mtp is not None or mtp_here:
+        return None
+    try:
+        from strata_control import drafting
+        backend, archs = drafting.hardware_for("hip" if hip else "cuda")
+        pick = drafting.choice_of("auto", model_name=f"{fam['name']}-{model.lower()}", family=family, backend=backend, archs=archs,
+                                  vram_mib=float(gpu.get("vram_gb") or 0) * 1024 or None)
+        return "dflash2" if pick == "dflash2" else None
+    except Exception:                                  # noqa: BLE001 - a rule that cannot be read leaves setup as it was
+        return None
+
+
+def fetch_dflash2_drafter(data: Path, fam: dict, model: str, hip: bool, gpu: dict) -> bool:
+    """Make the DFlash2 drafter (about 1.2 GB, resumable, checked) exist under `data`, as `strata drafting fetch` does (drafting_fetch.ensure_for).
+    True when it is there; False (with the reason said) when it could not be had: the caller then fetches the MTP layer as before."""
+    try:
+        from strata_control import drafting, drafting_fetch
+        backend, archs = drafting.hardware_for("hip" if hip else "cuda")
+
+        def show(step, done, total):
+            if total:
+                print(f"\r  {step} {done / 1e9:.2f} of {total / 1e9:.2f} GB", end="", flush=True)
+        out = drafting_fetch.ensure_for(data, model_name=f"{fam['name']}-{model.lower()}", backend=backend, archs=archs, progress=show,
+                                        vram_mib=float(gpu.get("vram_gb") or 0) * 1024 or None)
+        say()
+        if out is None:
+            warn("the DFlash2 drafter could not be fetched (no answer from the network): fetching the MTP draft layer instead")
+            return False
+        return True
+    except Exception as e:                             # noqa: BLE001 - offline, refused, a failed check: the MTP layer is the fallback, never a stop
+        say()
+        warn(f"the DFlash2 drafter could not be fetched ({e}): fetching the MTP draft layer instead")
+        return False
 
 
 def provide_dflash2_vocab(data: Path, choice: str = "cjk") -> None:
@@ -10208,6 +10299,11 @@ def main() -> int:
 
     # ---- 2. the questions
     step(2, "your choices")
+    if a.gguf_dir and not (a.family and a.model):     # P13: the files in --gguf-dir name the model: nothing to ask when they name exactly one
+        named = gguf_dir_choices(Path(a.gguf_dir), a.family, a.model)
+        if len(named) == 1:
+            a.family, a.model = named[0]
+            say(f"  The files in {a.gguf_dir} are {FAMILIES[a.family]['title']} {a.model}: using them (no question to answer).")
     if not a.family and not a.yes and FEED_MODELS is None:
         feed_models_setup(getattr(a, "feed", None))    # the signed feed's models, listed after the built-in ones (nothing happens when it has none)
     fams = menu_families(hip)
@@ -10541,6 +10637,8 @@ def main() -> int:
     pack_now = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
     pack_bin = ready or ((pack_now / "experts.bin").exists() and (pack_now / "index.txt").exists())   # ready: in the download
     mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
+    if not ready and (picked := auto_drafter(a, family, fam, model, hip, gpu, mtp_have)):      # P14: the Terminal's Auto rule, not always the 5 GB layer
+        a.drafter, a.drafter_auto = picked, True
     q2_avx = model == "Q2_0" and avx512 and family == "qwen"
     prep_gb = MODELS[model].get("prepare_gb", 0.0) if ready and MODELS[model].get("prepare") and \
         not prepared_done(model, models_dir) else 0.0
@@ -10687,6 +10785,8 @@ def main() -> int:
     if corrupt:
         warn("some MTP tensors are not the checkpoint's (a download mirror that ignored range requests, #327): "
              "fetching them again and rebuilding the draft layer")
+    if getattr(a, "drafter_auto", False) and not (rt / "experts.bin").exists() and not fetch_dflash2_drafter(data, fam, model, hip, gpu):
+        a.drafter = None                               # P14: the DFlash2 drafter could not be had: the MTP layer, as before (never no drafter)
     if a.mtp == "off" and not (rt / "experts.bin").exists():
         ok("the draft layer (MTP) is off: its ~5 GB are not downloaded (`--mtp on` fetches it later)")   # round 8, N3
     elif getattr(a, "drafter", None) == "dflash2" and not (rt / "experts.bin").exists():
@@ -10733,9 +10833,8 @@ def main() -> int:
                        after_carry=(lambda c: uma_cache_guard(c, model, gpu)) if gpu.get("uma") else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
-    if cal is None and not hip and not a.no_start and not a.yes and ask(
-            "Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow card; the PC is busy "
-            "meanwhile; later: START-HERE --calibrate)", ["y", "n"], "y", a.yes) == "y":
+    # P12: Skip is the default, as in the Terminal's first launch (T5): a person who presses Enter all the way does not wait 15-30 minutes
+    if cal is None and not hip and not a.no_start and not a.yes and ask(TUNE_QUESTION.format(again=setup_command()), ["y", "n"], "n", a.yes) == "y":
         tuned = calibrate_config(cfg_path)
     else:
         tuned = None                                   # not asked for: nothing to repeat below

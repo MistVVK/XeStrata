@@ -173,9 +173,9 @@ def main() -> int:
 
         if os.name == "nt":
             ps = Path(env["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-            r = run([str(ps), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(root / "bin" / "strata.ps1"),
+            r = run([str(ps), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(root / "bin" / "strata-direct.ps1"),
                      "--version"], env, root)
-            check("version (strata.ps1)", r["rc"] == 0 and inside_archive(root, r["stdout"]),
+            check("version (strata-direct.ps1)", r["rc"] == 0 and inside_archive(root, r["stdout"]),
                   rc=r["rc"], output=r["stdout"].strip(), stderr=r["stderr"].strip()[:200])
 
         r = run([*strata, "doctor"], env, root)

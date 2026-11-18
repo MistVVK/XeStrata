@@ -119,7 +119,7 @@ The Terminal bundles a private Python and its dependencies for `windows-x86_64`,
 - The interpreter is python-build-standalone CPython 3.12.15, digest-checked at build time.
 - Packages come from `packaging/locks/runtime-<target>-cp312.txt` and are installed with
   `pip install --require-hashes --no-deps --only-binary=:all:` at build time only. `lock_wheels.py` makes the lock; review its diff when a pin changes.
-- Wrappers: `bin/strata.cmd` and `bin/strata.ps1` on Windows, `bin/strata` on POSIX. `START-HERE.bat`, `SETUP.bat`, `UPDATE.bat`, `setup.sh`
+- Wrappers: `bin/strata.cmd` and `bin/strata-direct.ps1` on Windows (never a `strata.ps1`: PowerShell would run it before `strata.cmd`, and the default execution policy refuses it), `bin/strata` on POSIX. `START-HERE.bat`, `SETUP.bat`, `UPDATE.bat`, `setup.sh`
   and `update.sh` use a `python/` folder beside them when there is one.
 - `smoke_terminal.py <archive>` extracts an archive into a clean environment (a path with a space, a PATH with no Python) and runs
   `--version`, `doctor`, `profile list`, `install` and `serve --engine mock`.

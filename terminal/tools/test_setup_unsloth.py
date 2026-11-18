@@ -305,10 +305,10 @@ class Main(Base):
         for f in d.iterdir():                                                         # the first run "downloaded" them
             f.unlink()
         import shutil
-        shutil.rmtree(self.t / "data" / "mtp", ignore_errors=True)       # #897: a draft layer already there needs less room
+        shutil.rmtree(self.t / "data" / "mtp", ignore_errors=True)       # P14: --drafter mtp below keeps these cases about the 5 GB layer (Auto would pick DFlash2 here); #897: a draft layer already there needs less room
         (d / (list(setup.UNSLOTH_SHARDS)[0] + ".part")).write_bytes(b"x" * 1_500_000)
         with mock.patch.dict(setup.MODELS[M], {"download_gb": 0.003}):              # 1.5 MB still missing, but the 8 GB working room is only a guess (0.2.2): setup warns and goes on
-            code, out, cfg = self.main(["--context", "8192"], free=8.001)
+            code, out, cfg = self.main(["--context", "8192", "--drafter", "mtp"], free=8.001)
         self.assertEqual(code, 0, out)
         self.assertNotIn("not enough free disk space", out)
         self.assertIn("little free disk space", out)
@@ -317,7 +317,7 @@ class Main(Base):
         shutil.rmtree(self.t / "data" / "mtp", ignore_errors=True)
         (d / (list(setup.UNSLOTH_SHARDS)[0] + ".part")).write_bytes(b"x" * 1_500_000)
         with mock.patch.dict(setup.MODELS[M], {"download_gb": 3.0}):                # 1.5 GB of real files still to write, 1 GB free: refuse
-            code, out, cfg = self.main(["--context", "8192"], free=1.0)
+            code, out, cfg = self.main(["--context", "8192", "--drafter", "mtp"], free=1.0)
         self.assertEqual(code, 1)
         self.assertIn("not enough free disk space", out)
 

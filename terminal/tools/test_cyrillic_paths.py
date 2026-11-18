@@ -45,7 +45,7 @@ class CyrillicFolder(unittest.TestCase):
         self.assertEqual(out[1], "True")
 
     def test_windows_launchers_set_utf8_mode(self):
-        for name in ("../START-HERE.bat", "bin/strata.cmd", "bin/strata.ps1"):
+        for name in ("../START-HERE.bat", "bin/strata.cmd", "bin/strata-direct.ps1"):
             text = (ROOT / name).read_text(encoding="utf-8")
             self.assertIn("PYTHONUTF8", text, name)
 
