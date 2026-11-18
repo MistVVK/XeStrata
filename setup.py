@@ -1900,6 +1900,8 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
     gguf_py = (env or {}).get("XESTRATA_GGUF_PY")
     if gguf_py and not Path(gguf_py).is_dir() and Path(gguf_py).parent == ROOT / "third_party" / "main" / "llama.cpp":
         get_llama_cpp()                                # the preparation tools read GGUF files with it: fetched now
+    env = dict(os.environ if env is None else env)
+    envvars.put_default(env, "EXIT_WITH_PARENT", "1")   # mtp_fetch.py ends with setup (upstream #3257)
     say("  > " + " ".join(str(c) for c in cmd))
     if JSON_OUT and not quiet:                         # the program's lines as log objects, not loose on stdout
         with subprocess.Popen([str(c) for c in cmd], cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -1913,8 +1915,6 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
     r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
                        stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
                        text=True, errors="replace")
-    env = dict(os.environ if env is None else env)
-    envvars.put_default(env, "EXIT_WITH_PARENT", "1")   # mtp_fetch.py ends with setup (upstream #3257)
     if check and r.returncode != 0:
         if quiet and r.stdout:
             say(r.stdout[-4000:])
