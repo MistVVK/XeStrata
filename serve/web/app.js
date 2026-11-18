@@ -2995,6 +2995,7 @@ function openDrawer(open) {
   $("scrim").hidden = !open;
   if (open) { loadDrawer(); loadShared(); loadMcp(); loadSkills(); }
 }
+let memoryShown = "";   // the memory field's value when the drawer was filled, so a tool's write is not read as an edit
 const checked = (id) => $(id).getAttribute("aria-checked") === "true";
 const segValue = (id) => { const b = [...$(id).children].find((x) => x.getAttribute("aria-checked") === "true"); return b ? b.dataset.v : null; };
 function loadDrawer(s = settings) {
@@ -3019,7 +3020,8 @@ function loadDrawer(s = settings) {
   $("s-edit").setAttribute("aria-checked", String(!!s.chatEdit));
   $("s-seg").setAttribute("aria-checked", String(s.segments !== false));
   $("s-seglimit").value = s.segmentLimit || "";
-  $("s-memory").value = StrataSegments.memoryAt(messages);
+  memoryShown = StrataSegments.memoryAt(messages);
+  $("s-memory").value = memoryShown;
   for (const b of $("s-busy").children) b.setAttribute("aria-checked", String(b.dataset.v === (s.whileBusy === "interject" ? "interject" : "queue")));
   outputs();
 }
@@ -3137,7 +3139,8 @@ $("s-apply").onclick = async () => {
   store.set("sampling", settings);
   // the chat's memory, edited here: kept on the last message, so a rewind past it takes the edit back too (segments.js)
   const memory = $("s-memory").value;
-  if (!locked && messages.length && memory !== StrataSegments.memoryAt(messages)) {
+  // an answer that wrote memory while the drawer was open changed the chat, not the field: do not write the old field back
+  if (!locked && messages.length && memory !== memoryShown && memory !== StrataSegments.memoryAt(messages)) {
     messages[messages.length - 1].memoryEdit = memory;
     saveChat();
   }

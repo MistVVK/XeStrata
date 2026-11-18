@@ -412,6 +412,12 @@ function saveAnswerEdit(i, text) {
   if (typeof text !== "string" || !text.trim()) { toast("warn", tr("hist.empty", "The answer is empty"), tr("hist.emptyText", "Write something before saving.")); return false; }
   const plan = H.editAnswer(messages, i, text, tr("hist.edited", "Edited"));
   if (!plan) return false;
+  // the tool calls go away with the old text; keep the memory this answer wrote, or editing it reverts the memory
+  const old = messages[i];
+  if (((old.tools || []).some((t) => t.name === "memory_write" && t.state === "done")) || typeof old.memoryEdit === "string") {
+    const memory = StrataSegments.memoryAt(messages, i + 1);
+    if (memory) plan.keep[plan.keep.length - 1].memoryEdit = memory;
+  }
   closePanel();
   commit(plan.keep, plan.hidden ? tr("hist.editedHidden", {one: "Answer edited, {n} message hidden", other: "Answer edited, {n} messages hidden"}, {n: plan.hidden})
                                 : tr("hist.editedOnly", "Answer edited"));
