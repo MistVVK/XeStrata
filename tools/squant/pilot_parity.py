@@ -23,6 +23,7 @@ from squant.hbm_quant import (
     apply_h64_cols,
     apply_h64_sym,
     compute_macaq_smooth_scale,
+    damped_cholesky_inv,
     gptq_flip_quantize_sk_gpu,
 )
 from squant.hy_v4_flash import Hy4FlashStreamedModel
@@ -118,60 +119,68 @@ def run_pilot(model_dir: Path, engram_q8_path: Path, out_json: Path, device: str
         "pilot_3layer": {},
     }
 
-    # Pre-load Layer 1 & 2 weights once
+    # Pre-load Layer 1 & 2 weights and precompute Cholesky factors ONCE across all 4 recipes (~5x faster!)
     L_gu = {il: model_q8eng.loader.get(f"model.layers.{il}.mlp.experts.gate_up_proj", device, torch.float32) for il in (1, 2)}
     L_dn = {il: model_q8eng.loader.get(f"model.layers.{il}.mlp.experts.down_proj", device, torch.float32) for il in (1, 2)}
+    H_layer_h64_map = {}
+    H_layer_chol_map = {}
+    H_dn_mean_map = {}
+    rank_of_map = {}
+    for il in (1, 2):
+        ranks = np.argsort(-usage[il])
+        rank_of_map[il] = {int(e): r for r, e in enumerate(ranks)}
+        H_layer_h64_map[il] = apply_h64_sym(H_gu[il])
+        H_layer_chol_map[il] = damped_cholesky_inv(H_layer_h64_map[il], damp_frac=0.01)
+        active_dn = [H_dn_per_e[(il, e)] for e in range(512) if (il, e) in H_dn_per_e]
+        H_dn_mean_map[il] = sum(active_dn) / max(1, len(active_dn))
+
+    # Cache quantized experts by (il, e, code) so identical codes across recipes are never recomputed!
+    gu_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
+    dn_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
+
+    def get_quant_expert(il: int, e: int, cg: str, cd: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (il, e, cg) not in gu_cache:
+            W_gu_h = apply_h64_cols(L_gu[il][e])
+            Q_gu_h, _ = gptq_flip_quantize_sk_gpu(W_gu_h, H_layer_h64_map[il], cg, max_flips=32, precomputed_H=H_layer_chol_map[il])
+            gu_cache[(il, e, cg)] = apply_h64_cols(Q_gu_h).to(torch.bfloat16)
+        if (il, e, cd) not in dn_cache:
+            H_d = H_dn_per_e.get((il, e), H_dn_mean_map[il])
+            W_dn = L_dn[il][e]
+            s_dn = compute_macaq_smooth_scale(torch.diag(H_d), W_dn.abs().amax(dim=0))
+            W_dn_s = W_dn * s_dn.unsqueeze(0)
+            H_d_s = H_d / (s_dn.unsqueeze(1) * s_dn.unsqueeze(0))
+            Q_dn_s, _ = gptq_flip_quantize_sk_gpu(W_dn_s, H_d_s, cd, max_flips=32)
+            dn_cache[(il, e, cd)] = (Q_dn_s / s_dn.unsqueeze(0)).to(torch.bfloat16)
+        return gu_cache[(il, e, cg)], dn_cache[(il, e, cd)]
 
     for rname, (h_gu, h_dn, w_gu, w_dn, c_gu, c_dn, cut0, cut1) in recipes.items():
         t_r = time.time()
         overrides = {}
         for il in (1, 2):
-            # Rank experts by usage
-            ranks = np.argsort(-usage[il])
-            rank_of = {int(e): r for r, e in enumerate(ranks)}
-            H_layer_h64 = apply_h64_sym(H_gu[il])
-            # Quantize only active experts in eval_ids (exact 100% fidelity to full quantization on eval_ids!)
-            q_gu_dict = {}
-            q_dn_dict = {}
-            active_es = [e for e in range(512) if usage[il][e] > 0]
-            for e in active_es:
-                rk = rank_of[e]
-                if rk < cut0:
-                    cg, cd = h_gu, h_dn
-                elif rk < cut1:
-                    cg, cd = w_gu, w_dn
-                else:
-                    cg, cd = c_gu, c_dn
-                # Apply H64 transform to gate_up columns (zero-cost folded into routed_expert_down_proj!)
-                W_gu_h = apply_h64_cols(L_gu[il][e])
-                Q_gu_h, _ = gptq_flip_quantize_sk_gpu(W_gu_h, H_layer_h64, cg, max_flips=32)
-                # Inverse H64 back to original space for functional equivalence check
-                q_gu_dict[e] = apply_h64_cols(Q_gu_h).to(torch.bfloat16)
-
-                H_d = H_dn_per_e[(il, e)]
-                W_dn = L_dn[il][e]
-                s_dn = compute_macaq_smooth_scale(torch.diag(H_d), W_dn.abs().amax(dim=0))
-                W_dn_s = W_dn * s_dn.unsqueeze(0)
-                H_d_s = H_d / (s_dn.unsqueeze(1) * s_dn.unsqueeze(0))
-                Q_dn_s, _ = gptq_flip_quantize_sk_gpu(W_dn_s, H_d_s, cd, max_flips=32)
-                q_dn_dict[e] = (Q_dn_s / s_dn.unsqueeze(0)).to(torch.bfloat16)
-
-            def make_fn(qgu, qdn):
+            def make_fn(layer_i, r_hgu, r_hdn, r_wgu, r_wdn, r_cgu, r_cdn, r_cut0, r_cut1):
                 def fn(z, topk_idx, topk_w):
                     z_out = torch.zeros((z.shape[0], z.shape[1]), device=z.device, dtype=torch.float32)
                     for e_id in torch.unique(topk_idx).tolist():
+                        rk = rank_of_map[layer_i][e_id]
+                        if rk < r_cut0:
+                            cg, cd = r_hgu, r_hdn
+                        elif rk < r_cut1:
+                            cg, cd = r_wgu, r_wdn
+                        else:
+                            cg, cd = r_cgu, r_cdn
+                        w_gu_q, w_dn_q = get_quant_expert(layer_i, e_id, cg, cd)
                         tm, sm = torch.where(topk_idx == e_id)
                         ze = z[tm]
                         we = topk_w[tm, sm].unsqueeze(-1)
-                        gu = F.linear(ze, qgu[e_id])
+                        gu = F.linear(ze, w_gu_q)
                         g, u = gu[:, :1536].to(torch.float32), gu[:, 1536:].to(torch.float32)
                         h = torch.clamp(F.silu(g), max=10.0) * torch.clamp(u, min=-10.0, max=10.0)
-                        ye = F.linear(h.to(torch.bfloat16), qdn[e_id]).to(torch.float32)
+                        ye = F.linear(h.to(torch.bfloat16), w_dn_q).to(torch.float32)
                         z_out.index_add_(0, tm, ye * we)
                     return z_out
                 return fn
 
-            overrides[il] = {"experts_fn": make_fn(q_gu_dict, q_dn_dict)}
+            overrides[il] = {"experts_fn": make_fn(il, h_gu, h_dn, w_gu, w_dn, c_gu, c_dn, cut0, cut1)}
 
         out_r = model_q8eng.forward(eval_ids, layer_overrides=overrides)
         logits_r = out_r["logits"].detach().cpu()
