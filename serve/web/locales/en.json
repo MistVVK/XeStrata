@@ -648,6 +648,7 @@
   "mon.phaseThinking": "Thinking",
   "mon.phaseAnswering": "Answering",
   "mon.phaseToolDone": "Tool call complete",
+  "mon.auxDownloading": "Downloading the image tools' weights",
   "mon.waiting": "Waiting for a request",
   "mon.loading": "Loading",
   "mon.loadingDetail": "The model is loading.",

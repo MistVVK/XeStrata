@@ -709,6 +709,7 @@
   "mon.phaseThinking": "Réfléchit",
   "mon.phaseAnswering": "Répond",
   "mon.phaseToolDone": "Appel d'outil terminé",
+  "mon.auxDownloading": "Téléchargement des poids des outils d’image",
   "mon.waiting": "En attente d'une requête",
   "mon.loading": "Chargement",
   "mon.loadingDetail": "Le modèle se charge.",

@@ -697,6 +697,7 @@
   "mon.phaseThinking": "Denkt nach",
   "mon.phaseAnswering": "Antwortet",
   "mon.phaseToolDone": "Tool-Aufruf fertig",
+  "mon.auxDownloading": "Gewichte der Bildwerkzeuge werden heruntergeladen",
   "mon.waiting": "Wartet auf eine Anfrage",
   "mon.loading": "Lädt",
   "mon.loadingDetail": "Das Modell wird geladen.",

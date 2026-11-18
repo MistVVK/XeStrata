@@ -697,6 +697,7 @@
   "mon.phaseThinking": "Pensando",
   "mon.phaseAnswering": "Respondiendo",
   "mon.phaseToolDone": "Llamada a herramienta completa",
+  "mon.auxDownloading": "Descargando los pesos de las herramientas de imagen",
   "mon.waiting": "Esperando una solicitud",
   "mon.loading": "Cargando",
   "mon.loadingDetail": "El modelo se está cargando.",

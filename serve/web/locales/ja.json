@@ -697,6 +697,7 @@
   "mon.phaseThinking": "考えています",
   "mon.phaseAnswering": "答えています",
   "mon.phaseToolDone": "道具の呼び出しを書き終えました",
+  "mon.auxDownloading": "画像の道具の重みをダウンロード中",
   "mon.waiting": "要求を待っています",
   "mon.loading": "読み込み中",
   "mon.loadingDetail": "モデルを読み込んでいます。",

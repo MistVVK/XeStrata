@@ -697,6 +697,7 @@
   "mon.phaseThinking": "생각 중",
   "mon.phaseAnswering": "답하는 중",
   "mon.phaseToolDone": "도구 호출 완료",
+  "mon.auxDownloading": "이미지 도구의 가중치를 내려받는 중",
   "mon.waiting": "요청을 기다리는 중",
   "mon.loading": "불러오는 중",
   "mon.loadingDetail": "모델을 불러오고 있습니다.",

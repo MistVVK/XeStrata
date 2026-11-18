@@ -697,6 +697,7 @@
   "mon.phaseThinking": "Думает",
   "mon.phaseAnswering": "Отвечает",
   "mon.phaseToolDone": "Вызов инструмента готов",
+  "mon.auxDownloading": "Загрузка весов инструментов для изображений",
   "mon.waiting": "Ждёт запроса",
   "mon.loading": "Загрузка",
   "mon.loadingDetail": "Модель загружается.",

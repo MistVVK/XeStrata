@@ -697,6 +697,7 @@
   "mon.phaseThinking": "思考中",
   "mon.phaseAnswering": "回答中",
   "mon.phaseToolDone": "工具调用已写完",
+  "mon.auxDownloading": "正在下载图像工具的权重",
   "mon.waiting": "等待请求",
   "mon.loading": "加载中",
   "mon.loadingDetail": "模型正在加载。",

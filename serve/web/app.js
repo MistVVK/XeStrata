@@ -766,6 +766,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     b.classList.toggle("on", lit);
   }
   const prog = $("state-progress");
+  const auxNow = ((lastMetrics && lastMetrics.image_aux) || []).filter(d => d.status === "downloading");
   let label = tr("mon.waiting", "Waiting for a request"), detail = "", pct = 0;
   if (image) {
     [label, detail, pct] = imageState(image);
@@ -800,6 +801,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     label = tr("pill.unloaded", "Unloaded");
     delete prog.dataset.tone;
     detail = tr("mon.unloadedDetail", "Load brings it back. A message does too.");
+  } else if (auxNow.length) {   // the image tools' weights the server is downloading (image_aux)
+    const got = auxNow.reduce((a, d) => a + (d.bytes || 0), 0), all = auxNow.reduce((a, d) => a + (d.total || 0), 0);
+    label = tr("mon.auxDownloading", "Downloading the image tools' weights");
+    prog.dataset.tone = "info";
+    pct = all ? (100 * got) / all : 0;
+    detail = `${auxNow.map(d => d.name).join(", ")} · ${fmt(got / 1048576, 0)} / ${fmt(all / 1048576, 0)} MiB`;
   } else if (last) {
     delete prog.dataset.tone;
     detail = last.decode_tok_s ? tr("mon.lastAt", "last: {n} tokens at {rate} tok/s", {n: fmt(last.output_tokens), rate: fmt(last.decode_tok_s, 1)})
