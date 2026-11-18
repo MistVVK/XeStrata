@@ -15,7 +15,7 @@ services:
       dockerfile: Containerfile
       args:
         XESTRATA_VERSION: ${XESTRATA_VERSION:-latest}
-        XESTRATA_VARIANT: ${XESTRATA_VARIANT:-contrib-cuda13.4}
+        XESTRATA_VARIANT: ${XESTRATA_VARIANT:-contrib-cuda13.5}
         XESTRATA_NONFREE: ${XESTRATA_NONFREE:-1}
         XESTRATA_ROCM: ${XESTRATA_ROCM:-10.1}
     image: localhost/xestrata

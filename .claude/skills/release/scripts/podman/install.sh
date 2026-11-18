@@ -4,7 +4,8 @@
 # podman/install.sh - the inside of the bench image's Containerfile: the tools the bench scripts and upstream's setup
 # call, and for each GPU maker in MAKERS the toolchain upstream's engines are built with: Intel's oneAPI DPC++ (its
 # sycl/ port's docs/INTEL.md; ONEAPI), NVIDIA's CUDA toolkit from its Fedora 44 repository (CUDA, as
-# tools/package/container.sh adds it), and for AMD the development packages of the ROCm the image already runs (AMD's
+# tools/package/container.sh adds it - fedora44's, which the Fedora 45 image uses as well until NVIDIA publishes a
+# repository of its own), and for AMD the development packages of the ROCm the image already runs (AMD's
 # own when container/ put it in /opt/rocm/core-<version>, else Fedora's), so that upstream's engine runs on the same
 # GPU libraries as XeStrata's; for Intel also Vulkan's headers and shader compiler, for upstream's image generator.
 set -eu

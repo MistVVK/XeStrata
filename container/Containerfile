@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# XeStrata in a container: the Fedora 44 package from the GitHub Releases (or an rpm put in container/rpm/), with the
+# XeStrata in a container: the Fedora 45 package from the GitHub Releases (or an rpm put in container/rpm/), with the
 # GPU makers' libraries the package records.  Built on the user's PC (podman compose build), never distributed: the
 # contrib packages' cuBLAS and oneMKL are not free software.  docs/BUILD.md#podman
-# the image tools/package/build.sh builds the Fedora 44 packages in
-ARG FEDORA=docker.io/library/fedora@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+# the image tools/package/build.sh builds the Fedora 45 packages in
+ARG FEDORA=docker.io/library/fedora@sha256:53d138f25f6738257c78553d51369b662efc0e0eb1cd1556a2fe0ad5a115be88
 FROM ${FEDORA}
 ARG XESTRATA_VERSION=latest
-ARG XESTRATA_VARIANT=contrib-cuda13.4
+ARG XESTRATA_VARIANT=contrib-cuda13.5
 ARG XESTRATA_NONFREE=1
 # the version of AMD's ROCm for AMD GPUs (install.sh), or fedora: Fedora's own
 ARG XESTRATA_ROCM=10.1

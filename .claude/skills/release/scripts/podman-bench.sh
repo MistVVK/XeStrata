@@ -1,9 +1,9 @@
 #!/bin/bash
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# .claude/skills/release/scripts/podman-bench.sh - the disposable Fedora 44 container a release's speed tables are
+# .claude/skills/release/scripts/podman-bench.sh - the disposable Fedora 45 container a release's speed tables are
 # measured in on one machine (SKILL.md, step 9), with rootless Podman: XeStrata as a user installs it (the release's
-# Fedora 44 rpm through container/), upstream's engines built in the same image by its own setup's functions
+# Fedora 45 rpm through container/), upstream's engines built in the same image by its own setup's functions
 # (podman/up_build.py), and ComfyUI with a venv of the same packages as the one given; so the three run on one OS
 # with the same GPU drivers' user space (NVIDIA's driver libraries are the host's, through CDI, for all three alike).
 #

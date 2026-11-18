@@ -45,9 +45,10 @@ print("amd=" + shlex.quote(" ".join(r.get("amd") or [])))
 print("gfx=" + shlex.quote(" ".join(d.get("hip_archs") or [])))' /usr/lib64/xestrata/engine/BUILD.json \
   "$XESTRATA_NONFREE")"
 # AMD's GPUs: ROCm XESTRATA_ROCM from AMD's Radeon repository for RHEL 10 (MIT, its LLVM Apache-2.0), in place of
-# Fedora's.  Its hipBLASLt has code for gfx1102, gfx1103 and gfx1150 as well, which Fedora 44's 7.1 lacks, and from
-# 10.1 its HIP runtime gives the VRAM it unmaps back to other processes (7.1 keeps it until the whole reserved range
-# goes).  Its libraries keep the names the engine links (libamdhip64.so.7, librocblas.so.5, libhipblaslt.so.1).  One
+# Fedora's.  Its hipBLASLt has code for gfx1102, gfx1103 and gfx1150 as well, which Fedora's lacks (7.1 as 7.2), and
+# from 10.1 its HIP runtime gives the VRAM it unmaps back to other processes (Fedora's keeps it until the whole
+# reserved range goes).  Its libraries keep the names the engine links (libamdhip64.so.7, librocblas.so.5,
+# libhipblaslt.so.1).  One
 # package of their code per AMD GPU the engine has code for (BUILD.json's hip_archs), so that one image runs RDNA2 to
 # RDNA4; XESTRATA_ROCM=fedora, or an AMD GPU AMD's release has no package for, keeps Fedora's (the record's "amd")
 rocm=$XESTRATA_ROCM
