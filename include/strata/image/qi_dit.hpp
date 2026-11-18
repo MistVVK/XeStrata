@@ -107,6 +107,10 @@ public:
     int resident_blocks() const { return blocks_stream_.resident(); }
     /// What the blocks and the activations hold on the GPU now.
     uint64_t blocks_vram() const { return blocks_stream_.vram(); }
+    /// The remaining resident allocations, including their measured device overhead.
+    uint64_t blocks_pending_physical() const { return blocks_stream_.pending_physical(); }
+    /// Called once after the first block has queued and completed its work.
+    void set_first_block_hook(std::function<void()> hook) { first_block_hook_ = std::move(hook); }
     uint64_t activations_held() const { return cap_T_ > 0 ? activation_bytes(cap_T_, mlp_rows_) : 0; }
     /// Frees the blocks' VRAM (they come back from the file on use).
     void drop_blocks() { blocks_stream_.drop(); }
@@ -155,6 +159,7 @@ public:
     void set_control(QiControl* control) { control_ = control; }
 
 private:
+    std::function<void()> first_block_hook_;
     friend class QiControl;
     QiControl* control_ = nullptr;
     bool control_on(float t) const;   // the branch on for the step at time t (sigma x 1000)

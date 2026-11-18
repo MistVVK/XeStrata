@@ -149,6 +149,13 @@ uint64_t LayerStream::pending_vram() const {
     return n;
 }
 
+uint64_t LayerStream::pending_physical() const {
+    uint64_t n = 0;
+    for (int i = 0; i < resident_; ++i)
+        if (layers_[(size_t) i].d == nullptr) n += layers_[(size_t) i].bytes + allocation_extra_;
+    return n;
+}
+
 void LayerStream::drop() {
     {   // the worker's queue drained
         std::unique_lock<std::mutex> l(mu_);
@@ -371,7 +378,17 @@ uint8_t* LayerStream::take_home(uint64_t bytes) {
 
 void LayerStream::load_resident(int i) {
     Layer& l = layers_[(size_t) i];
-    if (l.d == nullptr) check(gpu::alloc_device(&l.d, l.bytes), "a layer");
+    if (l.d == nullptr) {
+        // Measure the device's allocation cost, not a maker-specific page size. Qwen-Image's blocks have the
+        // same shape; the free-memory difference includes the allocator's rounding.
+        size_t before = 0, after = 0, total = 0;
+        const bool measure = !allocation_measured_ && gpu::mem_info(&before, &total);
+        check(gpu::alloc_device(&l.d, l.bytes), "a layer");
+        if (measure && gpu::mem_info(&after, &total)) {
+            allocation_extra_ = before > after + l.bytes ? before - after - l.bytes : 0;
+            allocation_measured_ = true;
+        }
+    }
     uint8_t* home;
     bool prepped;
     {

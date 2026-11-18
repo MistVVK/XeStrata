@@ -76,6 +76,8 @@ public:
     uint64_t vram() const;   // what the layers take now
     /// The configured resident layers' device bytes not yet allocated by begin().
     uint64_t pending_vram() const;
+    /// Pending bytes plus the measured device allocation overhead for each remaining resident layer.
+    uint64_t pending_physical() const;
 
     /// The device region of layer i for work about to be queued on the compute stream (which is made to wait for its
     /// copy), and the next streamed layer's copy started.
@@ -130,10 +132,10 @@ private:
     void free_homes(int lo, int hi);        // the homes of layers lo .. hi - 1
 
     std::vector<Layer> layers_;
-    uint64_t budget_ = 0, max_bytes_ = 0;
+    uint64_t budget_ = 0, max_bytes_ = 0, allocation_extra_ = 0;
     int resident_ = 0;
     int min_slots_ = 2, slot_count_ = 0;
-    bool streaming_ = false;
+    bool streaming_ = false, allocation_measured_ = false;
     Source source_ = Source::relay;
     uint64_t home_headroom_ = 0;            // the RAM a home leaves beside it (take_home)
     bool homes_full_ = false;               // a home was refused: the rest of this streaming go through the relay
