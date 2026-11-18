@@ -1385,6 +1385,7 @@ int serve(si::ImagePipeline& p) {
         std::string op;
         ls >> op;
         try {
+            if (op == "IMG" || op == "UPSV" || op == "SEGV") in.stop() = false;
             if (op == "IMG" || op == "NEED" || op == "RATIO" || op == "UPS" || op == "UPSNEED" || op == "UPSV" ||
                 op == "UPSVNEED")
                 aux_yield(aux);
@@ -1472,7 +1473,6 @@ int serve(si::ImagePipeline& p) {
                     std::printf("PREVIEW %d %d %s\n", index, done, path.c_str());
                     std::fflush(stdout);
                 };
-                in.stop() = false;
                 si::QiTimes t;
                 si::QiPlan pl;
                 const auto img = p.generate(r, &t, &pl, [&in](int done, int steps) {
@@ -1560,7 +1560,6 @@ int serve(si::ImagePipeline& p) {
                 const uint64_t avail = ups_room(p, m);
                 std::printf("STAGE upscale-video\n");
                 std::fflush(stdout);
-                in.stop() = false;
                 const auto t0 = std::chrono::steady_clock::now();
                 const auto step = [&in](int64_t d, int64_t n) {
                     std::printf("STEP %lld %lld\n", (long long) d, (long long) n);
@@ -1713,7 +1712,6 @@ int serve(si::ImagePipeline& p) {
                          &m);
                 std::printf("STAGE segment-video\n");
                 std::fflush(stdout);
-                in.stop() = false;
                 o.step = [&in](int64_t d, int64_t n) {
                     std::printf("STEP %lld %lld\n", (long long) d, (long long) n);
                     std::fflush(stdout);
