@@ -4063,6 +4063,12 @@ TOOLS: list[dict[str, Any]] = [
          "start": {"type": "number"},
          "end": {"type": "number"},
          "backend": {"type": "string", "enum": ["moss", "lora"]},
+         "preprocess": {"type": "boolean", "description": "false when image is the color map already"},
+         "regions": {"type": "array", "description": "MOSS-Image color map: one description per exact map color",
+                     "items": {"type": "object", "properties": {
+                         "color": {"type": "string", "description": "the map color as #rrggbb"},
+                         "prompt": {"type": "string", "description": "what to draw there"}},
+                         "required": ["color", "prompt"]}},
          "lineart_input": {"type": "string", "enum": ["photo", "drawing"],
                            "description": "for ControlNet lineart: drawing for a hand-drawn sketch"},
          "seed": {"type": "integer"}},
@@ -4709,7 +4715,7 @@ class ImageTools:
             return "images", gens[0].model if gens else self.gen.model, False
         gens = self._gens(name in EDIT_TOOLS)
         if name == "control":
-            gens = [g for g in gens if _controls().capability(g.cfg)]
+            gens = [g for g in gens if _controls().mode_of(g.cfg, str(args.get("type") or "canny"))]
         if args.get("layout") not in (None, "", {}):
             gens = [g for g in gens if _pipeline(g.family) == "latent_chat"] or gens
         asked = args.get("model")
@@ -5029,7 +5035,7 @@ class ImageTools:
                                   if args.get(k) not in (None, "")})
             gens = self._gens(name in EDIT_TOOLS)
             if name == "control":
-                gens = [g for g in gens if _controls().capability(g.cfg)]
+                gens = [g for g in gens if _controls().mode_of(g.cfg, str(args.get("type") or "canny"))]
             asked = args.get("model")
             gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
             if asked not in (None, "") and gen.model != asked:
@@ -5103,8 +5109,8 @@ class ImageTools:
                 data = self._image(str(args.get("image") or ""))
                 if data is None:
                     raise ImageRequestError("there is no picture in the conversation to take the composition from")
-                req["control"] = {k: args[k] for k in ("type", "strength", "start", "end", "backend", "lineart_input")
-                                  if args.get(k) not in (None, "")}
+                req["control"] = {k: args[k] for k in ("type", "strength", "start", "end", "backend", "lineart_input",
+                                                       "preprocess", "regions") if args.get(k) not in (None, "")}
                 job = _controls().parse_job(req, gen.cfg, picture=self.normalize(data))
             else:
                 raise ImageRequestError(f"there is no tool named {name!r}")
@@ -5159,7 +5165,7 @@ class ImageTools:
                 made_map = job["control"].get("map_png")
                 if made_map is not None and job["control"]["type"] != "none":
                     map_url = f"/v1/images/files/{gen.store(made_map, 'png')}"
-                    text += f" The map: {map_url} (control type none takes it as it is)."
+                    text += f" The map: {map_url} (preprocess false sends it as it is)."
             seen = self._seen(gen, images[0])
             ok = True
         except AuxPending as e:   # the tool's weights are downloading: not an image, not an error to retry now

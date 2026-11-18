@@ -32,6 +32,7 @@ import base64
 import bisect
 import contextlib
 import io
+import re
 import struct
 import tempfile
 import time
@@ -171,6 +172,62 @@ def _params(v: dict, kind: str) -> dict:
     return p
 
 
+def _regions(value) -> list[dict]:
+    """The colors of a map and their descriptions; the colors name pixels, not words for the model."""
+    if not isinstance(value, list) or not 1 <= len(value) <= 8:
+        raise img.ImageRequestError("control.regions: a list of 1 to 8 {color, prompt} objects")
+    out: list[dict] = []
+    for r in value:
+        if not isinstance(r, dict) or set(r) != {"color", "prompt"}:
+            raise img.ImageRequestError("control.regions: each region needs color and prompt")
+        color, prompt = r["color"], r["prompt"]
+        if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            raise img.ImageRequestError("control.regions.color: the map's exact #rrggbb color")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000 or "\0" in prompt:
+            raise img.ImageRequestError("control.regions.prompt: a non-empty description of at most 2000 characters")
+        if any(x["color"] == color.lower() for x in out):
+            raise img.ImageRequestError("control.regions.color: each color only once")
+        out.append({"color": color.lower(), "prompt": prompt.strip()})
+    return out
+
+
+def region_prompt(png: bytes, regions: list[dict]) -> str:
+    """Locate each exact color by its centroid. Give the model positions, never the map's color names.
+
+    Use the axis with the greatest minimum separation, so vertically stacked regions use top-to-bottom even where
+    their horizontal coordinates coincide. Refuse coincident centroids rather than silently assign the wrong region.
+    """
+    import numpy as np
+    from PIL import Image
+    a = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"))
+    h, w = a.shape[:2]
+    points = []
+    for region in regions:
+        color = tuple(bytes.fromhex(region["color"][1:]))
+        y, x = np.nonzero(np.all(a == color, axis=2))
+        if not len(x):
+            raise img.ImageRequestError(f"control.regions: color {region['color']} is not in the color map")
+        points.append((float(x.mean()) / w, float(y.mean()) / h))
+    if len(points) == 1:
+        return f"The subject is {regions[0]['prompt']}."
+    gaps = []
+    for axis in (0, 1):
+        values = sorted(p[axis] for p in points)
+        gaps.append(min(b - a for a, b in zip(values, values[1:])))
+    axis = 0 if gaps[0] >= gaps[1] else 1
+    if gaps[axis] < 0.03:
+        raise img.ImageRequestError("control.regions: their centers are too close to assign distinct positions")
+    order = sorted(range(len(points)), key=lambda i: points[i][axis])
+    positions: tuple[str, ...] = (("left", "right") if axis == 0 else ("top", "bottom"))
+    if len(order) == 3:
+        positions = (("left", "center", "right") if axis == 0 else ("top", "middle", "bottom"))
+    elif len(order) > 3:
+        edge = "left" if axis == 0 else "top"
+        positions = tuple(f"position {i + 1} from the {edge}" for i in range(len(order)))
+    return " ".join(f"The subject at the {position} of the image: {regions[i]['prompt']}."
+                    for position, i in zip(positions, order))
+
+
 def _moss(items: list, cfg: dict, picture: bytes | None) -> dict:
     """MOSS-Image's color and depth: one control or a list of the two (each its own picture; the multipart
     control_image the first's), the adapter's strength (the first's, or the only one given) -> {"type": "color",
@@ -178,12 +235,17 @@ def _moss(items: list, cfg: dict, picture: bytes | None) -> dict:
     "strength"}."""
     maps: list[dict[str, Any]] = []
     strength: float | None = None
+    regions = None
     for i, v in enumerate(items):
         if not isinstance(v, dict):
             raise img.ImageRequestError("control: an object {type, image, strength, end, ...}, or a list of them")
         kind = _kind(v)
         if v.get("backend") not in (None, "moss"):
             raise img.ImageRequestError("control.backend: color and depth together need the moss backend")
+        if v.get("regions") is not None:
+            if kind != "color":
+                raise img.ImageRequestError("control.regions: give the regions on the color map")
+            regions = _regions(v["regions"])
         if kind not in MOSS_KINDS:
             raise img.ImageRequestError(f"control.type: MOSS-Image's control takes color and depth together (a list); "
                                         f"{kind!r} goes alone (a reference image)")
@@ -201,7 +263,7 @@ def _moss(items: list, cfg: dict, picture: bytes | None) -> dict:
                      "end": _num(v, "end", 0.0, 1.0, 1.0), "as_map": v.get("preprocess") is False,
                      "resolution": int(_num(v, "resolution", 64, MAX_RESOLUTION, RESOLUTION))})
     return {"type": "+".join(m["type"] for m in maps), "mode": "moss", "maps": maps,
-            "strength": 1.0 if strength is None else strength, "image": maps[0]["image"]}
+            "strength": 1.0 if strength is None else strength, "image": maps[0]["image"], "regions": regions}
 
 
 def parse_control(v: Any, cfg: dict, picture: bytes | None = None) -> dict:
@@ -242,6 +304,8 @@ def parse_control(v: Any, cfg: dict, picture: bytes | None = None) -> dict:
                                     f"{', '.join(kinds_for(cfg)) or 'none'})")
     if mode == "moss":
         return _moss([v], cfg, picture)
+    if v.get("regions") is not None:
+        raise img.ImageRequestError("control.regions: MOSS-Image's color map only")
     as_map = v.get("preprocess") is False
     if as_map and mode != "lora":
         kind = "none"
@@ -331,6 +395,8 @@ def parse_job(req: dict, cfg: dict, files: list[bytes] | None = None, mask: byte
         job = img.parse_edit_request(r, files, cfg, mask)
     else:
         job = img.parse_request(r, cfg)
+    if c.get("regions") and (job.get("layout") or job.get("enhance")):
+        raise img.ImageRequestError("control.regions: not with layout or prompt enhancement")
     job["control"] = c
     return job
 
@@ -568,6 +634,11 @@ def _prepare_moss(svc, gen, job: dict, cancel=None) -> None:
         made[m["type"]] = got["image"]
         figures.append({"type": m["type"], "size": f"{got['width']}x{got['height']}", "seconds": got["seconds"],
                         **({"objects": got["objects"]} if "objects" in got else {})})
+    if c.get("regions"):
+        addition = region_prompt(made["color"], c["regions"])
+        if len(job["prompt"]) + len(addition) + 1 > 16000:
+            raise img.ImageRequestError("control.regions: the combined prompt is longer than 16000 characters")
+        job["prompt"] = job["prompt"].rstrip() + " " + addition
     path = weights(gen, [MOSS_CONTROL])[0]
     ends = {m["type"]: m["end"] for m in c["maps"]}
     job["mctl"] = {"path": path, "color": made.get("color"), "depth": made.get("depth"),

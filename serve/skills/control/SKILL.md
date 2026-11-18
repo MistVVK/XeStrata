@@ -11,6 +11,8 @@ metadata:
   straight lines), `normal` (surface orientation), `segmentation` (regions of objects and background),
   `gray` (shading), `none` (the image is a map already, one control returned).
 - With `normal` or `segmentation`, describe the composition in the prompt: full body or close-up, and where people are.
+- Qwen-Image-2.1 has no normal or segmentation ControlNet: use depth for 3D shape or object placement. For
+  MOSS-Image's straight lines or shading, prefer canny or depth; its M-LSD and gray maps are reference images.
 - For Qwen-Image-2.1 lineart from a hand drawing, set `lineart_input: "drawing"`; for a photo leave it unset.
   Thin lines and hatching can otherwise be copied rather than followed. `none` passes a map without processing.
 - The prompt describes the whole new image, nothing about the control. A person who must stay (their face, their
@@ -19,4 +21,8 @@ metadata:
   follows) 1, 0.6 to 0.8 frees the details. For depth when the new subject differs from the map, use `strength` 0.6
   and `end` 1. `size` the picture's shape by default.
 - MOSS-Image: `color` and `depth` by its adapter (`end` the share of the steps: 0.5 from a 3D mannequin).
-  Its control LoRAs take pose, outlines, normals and segmentation. Other models take the map as a reference image.
+  For `color`, `regions` is `[{"color":"#rrggbb","prompt":"what to draw"}, ...]`; the color must exactly match the
+  map. With a ready map set `preprocess: false`. The server turns the colors into positions, not color words. It rejects
+  regions with centers too close to distinguish. For people, use a silhouette map (e.g. segmentation from a photo):
+  a mannequin's joints can be copied. Overlapping shapes can make extra heads. Its control LoRAs take pose, outlines,
+  normals and segmentation. Other models take the map as a reference image.

@@ -253,6 +253,11 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
               <label class="st-field" id="img-ctrl-canny-f" hidden><span data-i18n="img.ctrlThresholds">Low and high thresholds</span>
                 <span class="img-pair"><input class="st-input" id="img-ctrl-low" type="number" min="0" max="255" step="1" placeholder="100" aria-label="Low threshold" data-i18n-label="img.ctrlLow">
                 <input class="st-input" id="img-ctrl-high" type="number" min="0" max="255" step="1" placeholder="200" aria-label="High threshold" data-i18n-label="img.ctrlHigh"></span></label>
+              <div id="img-ctrl-regions-f" hidden>
+                <label class="img-check"><input type="checkbox" id="img-ctrl-color-map"> <span data-i18n="img.ctrlColorMap">The picture is already a color map</span></label>
+                <label class="st-field"><span data-i18n="img.ctrlRegions">Regions: one #rrggbb: description per line</span>
+                  <textarea class="st-input" id="img-ctrl-regions" rows="3" spellcheck="false"></textarea></label>
+              </div>
               <label class="img-check" id="img-ctrl-drawing-f" hidden><input type="checkbox" id="img-ctrl-drawing"> <span data-i18n="img.ctrlDrawing">The picture is a hand-drawn line drawing</span></label>
               <span class="img-check" id="img-ctrl-pose-f" hidden>
                 <label class="img-check"><input type="checkbox" id="img-ctrl-body-on" checked> <span data-i18n="img.ctrlBody">Body</span></label>

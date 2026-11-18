@@ -3849,7 +3849,7 @@ function imgCtrlMode() {
 }
 function imgCtrlKind() {
   const k = $("img-ctrl-type").value, mode = imgCtrlMode();
-  $("img-ctrl-strength-f").hidden = mode !== "controlnet" && mode !== "moss";
+  $("img-ctrl-strength-f").hidden = !["controlnet", "moss", "lora"].includes(mode);
   $("img-ctrl-span-f").hidden = mode !== "controlnet" && mode !== "moss";
   $("img-ctrl-start").hidden = mode === "moss";
   $("img-ctrl-hint").hidden = mode !== "reference";
@@ -3858,6 +3858,7 @@ function imgCtrlKind() {
   $("img-ctrl-canny-f").hidden = k !== "canny";
   $("img-ctrl-pose-f").hidden = k !== "pose";
   $("img-ctrl-drawing-f").hidden = mode !== "controlnet" || !["lineart", "lineart_coarse"].includes(k);
+  $("img-ctrl-regions-f").hidden = mode !== "moss" || k !== "color";
   $("img-ctrl-preview").hidden = k === "none";
   imgCtrlReset();
 }
@@ -3886,7 +3887,16 @@ async function imgCtrlBody(body) {
   // the map shown, as it is: MOSS-Image's color and depth keep their kind (preprocess false), the others are "none"
   if (imgCtrlMap && $("img-ctrl-use").checked) {
     delete c.lineart_input;
-    Object.assign(c, imgCtrlMode() === "moss" ? {preprocess: false, image: imgCtrlMap} : {type: "none", image: imgCtrlMap});
+    Object.assign(c, ["moss", "lora"].includes(imgCtrlMode()) ? {preprocess: false, image: imgCtrlMap} : {type: "none", image: imgCtrlMap});
+  }
+  if (!$("img-ctrl-regions-f").hidden) {
+    if ($("img-ctrl-color-map").checked) c.preprocess = false;
+    const lines = $("img-ctrl-regions").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+    if (lines.length) {
+      const regions = lines.map(x => x.match(/^(#[0-9a-fA-F]{6})\s*:\s*(\S.*)$/));
+      if (regions.some(x => !x)) return tr("img.ctrlRegionsInvalid", "Each region needs a #rrggbb color, a colon, and a description.");
+      c.regions = regions.map(x => ({color: x[1], prompt: x[2]}));
+    }
   }
   if (!$("img-ctrl-strength-f").hidden && $("img-ctrl-strength").value !== "") c.strength = Number($("img-ctrl-strength").value);
   if (!$("img-ctrl-span-f").hidden) {
