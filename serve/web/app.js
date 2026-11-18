@@ -151,20 +151,23 @@ function renderEmptyChat() {
     : tr("chat.emptyModel", "{model} runs on this PC. Nothing leaves it.", {model: health.model});
 }
 async function loadHealth() {
-  try {
-    health = await (await fetch("health")).json();
-    renderEmptyChat();
-    paintCtxRing();                      // the model's context is known now
-    $("tab-btn-images").hidden = !health.image_generation;
-    $("img-note").hidden = !health.image_note;
-    $("img-note").textContent = health.image_note || "";
-    imgModels();
-    thinkingButtons();
-    if (["#images", "#tools"].includes(location.hash) && health.image_generation) showTab(location.hash.slice(1));
-    $("tab-btn-translate").hidden = !health.translation;
-    if (location.hash === "#translate" && health.translation) showTab("translate");
-  } catch (e) {
-    setTimeout(loadHealth, 2000);
+  for (;;) {
+    try {
+      health = await (await fetch("health")).json();
+      renderEmptyChat();
+      paintCtxRing();                    // the model's context is known now
+      $("tab-btn-images").hidden = !health.image_generation;
+      $("img-note").hidden = !health.image_note;
+      $("img-note").textContent = health.image_note || "";
+      imgModels();
+      thinkingButtons();
+      if (["#images", "#tools"].includes(location.hash) && health.image_generation) showTab(location.hash.slice(1));
+      $("tab-btn-translate").hidden = !health.translation;
+      if (location.hash === "#translate" && health.translation) showTab("translate");
+      return;                            // the callers wait for the real health, e.g. to read kept replies
+    } catch (e) {
+      await new Promise((ok) => setTimeout(ok, 2000));
+    }
   }
 }
 
