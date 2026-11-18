@@ -9,7 +9,7 @@ from pathlib import Path
 def load(path: str | Path, *, strict: bool = True):
     path = Path(path)
     try:
-        text = path.read_text(encoding="utf-8-sig" if strict else "utf-8")
+        text = path.read_text(encoding="utf-8-sig")   # a BOM is valid JSON input for both readers (Windows Notepad)
     except FileNotFoundError:
         return {}
     data = json.loads(text)

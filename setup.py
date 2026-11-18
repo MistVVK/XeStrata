@@ -6660,10 +6660,17 @@ def load_settings() -> dict:
 
 
 def save_settings(s: dict) -> None:
+    path = settings_path()
+    if path.exists():
+        try:
+            settings.load(path)              # never replace settings we could not read with an empty default
+        except (OSError, ValueError) as e:
+            warn(f"could not read {path} ({e}); its settings are kept until the file is fixed")
+            return
     try:
-        settings.save(settings_path(), s)
+        settings.save(path, s)
     except OSError as e:
-        warn(f"could not save {settings_path()} ({e})")
+        warn(f"could not save {path} ({e})")
 
 
 def has_data(folder: Path) -> bool:
