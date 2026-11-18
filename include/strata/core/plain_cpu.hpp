@@ -50,6 +50,11 @@ public:
     bool run(const int32_t* tokens, int64_t n, int64_t pos, int rows, float* logits, std::string& err);
     /// A tail's blocks over n rows of n_embd floats `x` (in place), at positions pos .. pos + n - 1, in chunks.
     bool run_blocks(float* x, int64_t n, int64_t pos, std::string& err);
+    /// Row copies of the recurrent states for a window's drafts going back (n copies: the states after rows
+    /// 0 .. n-1, as the GPU window kernel's); 0 frees them.  run_blocks takes them while the rows fit one window.
+    void set_snap_rows(int n);
+    /// The recurrent states back to the state after row n (set_snap_rows' copy n); false without one.
+    bool rollback(int n, std::string& err);
     /// The state of the first `tokens` tokens as host parts (every recurrent layer's state and convolution history;
     /// with `kv`, every attention layer's K and V cells too), and back.
     void save(int64_t tokens, bool kv, std::vector<std::vector<uint8_t>>& parts) const;

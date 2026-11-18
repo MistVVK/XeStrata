@@ -1217,6 +1217,8 @@ bool PlainModel::load_qwen(std::string& err) {
                 conv_snap_[g].push_back(cv);
             }
     }
+    // the CPU tail's recurrent layers keep the same row copies in RAM (its blocks run row by row to take them)
+    if (cpu_tail_ != nullptr) cpu_tail_->set_snap_rows(n_snap_);
     // --pipeline-windows 2: on a stage before the last, the copies a guessed window may have to give back (pl_save)
     if (model_mtp_ && n_snap_ > 0 && opt_.pipeline_windows >= 2 && !last()) {
         pl_bak_state_.assign(gdn_state_.size(), {});
@@ -4192,6 +4194,7 @@ bool PlainModel::set_window_drafts(int drafts, std::string& err) {
             }
     }
     n_snap_ = drafts;
+    if (cpu_tail_ != nullptr) cpu_tail_->set_snap_rows(drafts);
     drop_window_graphs();   // a window's graph took the copies of its rows
     return true;
 }
@@ -5628,6 +5631,8 @@ bool PlainModel::rollback(int n, std::string& err) {
                 return false;
             }
     }
+    // the CPU tail's recurrent layers ran the window's rows too: their copies go back as the GPU stages' do
+    if (cpu_tail_ != nullptr && cpu_tail_->recurrent() && !cpu_tail_->rollback(n, err)) return false;
     return true;
 }
 
