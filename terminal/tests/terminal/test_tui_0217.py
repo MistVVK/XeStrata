@@ -13,6 +13,7 @@ from strata_cli.launch.runner import Runner
 from strata_control import drafting, drafting_fetch
 from tests.terminal.launch_support import HW_12, Home, catalog
 from tests.terminal.launch_support import text_of
+from strata_cli.launch import store
 from tests.terminal.test_fix2_tui_0216 import goto, small
 from tests.terminal.test_launch_tui import Base, make_ctx
 
@@ -344,6 +345,265 @@ class LastRunNote(Base):
         from strata_cli.launch.runner import Result
         res = Result("launch-x", ["http://127.0.0.1:8080"], "k", None, [], "/nope.json", last_run="Last time, x")
         self.assertEqual(launch_app._info_for(res, S.LaunchSettings(port=8080))["last_run"], "Last time, x")
+
+
+# ------------------------------------------------------------------------------------------------ items 12, 13, 15, 18 and the small ones
+
+class MacNote(unittest.TestCase):
+    def ready_line(self, result):
+        events = []
+        with Home(), mock.patch("strata_control.runtime.status", return_value={"state": "stopped"}), \
+                mock.patch("strata_control.runtime.start", return_value=result), \
+                mock.patch.object(Runner, "stop_others"), mock.patch.object(Runner, "check_port_free"), mock.patch.object(Runner, "log_marks", return_value={}), \
+                mock.patch.object(Runner, "start_wait", return_value=60), mock.patch.object(Runner, "report_drafting"), \
+                mock.patch.object(Runner, "mac_first_start", return_value=True):
+            r = Runner(S.LaunchSettings(name="x", family="qwen", model="Q2_0", context=32768), catalog=catalog(HW_12), emit=events.append)
+            r.start()
+        return [e.text for e in events if e.stage == "start"][-1]
+
+    def test_no_ten_seconds_note_when_the_starts_own_answer_already_ran(self):
+        self.assertEqual(self.ready_line({"ok": True, "state": "ready", "generation_ready": True}), "The model is loaded and answering.")
+
+    def test_the_note_stays_for_a_start_that_made_no_answer(self):
+        self.assertIn("10 seconds longer", self.ready_line({"ok": True, "state": "ready"}))
+
+
+class CardsSentence(unittest.TestCase):
+    def cards(self, names):
+        return [{"index": i, "name": n, "vendor": "nvidia", "vram_gb": 16.0, "usable": True, "memory_mib": 16376, "total_mib": 16376} for i, n in enumerate(names)]
+
+    def test_two_alike_cards_are_named_once(self):
+        from strata_control import gpu_roles
+        text = gpu_roles.sentence(self.cards(["NVIDIA RTX A4000", "NVIDIA RTX A4000"]), "nvidia")
+        self.assertEqual(text.count("RTX A4000"), 1, text)
+        self.assertIn("Both cards are RTX A4000, so they are alike: one is Main and the other helps.", text)
+        self.assertNotIn("is Main: the cards are alike", text)
+
+    def test_unlike_cards_keep_their_reason(self):
+        from strata_control import gpu_roles
+        text = gpu_roles.sentence(self.cards(["NVIDIA RTX A4000", "NVIDIA RTX 4090"]), "nvidia")
+        self.assertIn("is Main:", text)
+
+
+class OfflineDialog(Base):
+    def ask(self, offline):
+        asked = {}
+
+        async def case(app, pilot, ctx):
+            ctx.offline = offline
+            from tests.terminal.test_launch_tui import FakeRunner
+            FakeRunner.download = 76.0
+            app.run_launch()
+            await pilot.pause(0.3)
+            asked["text"] = flat_text(text_of(app))
+            await pilot.press("escape")
+        small(self, case, make_ctx())
+        return asked["text"]
+
+    def test_offline_the_dialog_says_so_and_the_first_choice_is_not_a_promise(self):
+        t = self.ask(True)
+        self.assertIn("This computer is offline", t)
+        self.assertIn("Try the download", t)
+        self.assertNotIn("Download and start", t)
+
+    def test_online_it_is_as_before(self):
+        t = self.ask(None)
+        self.assertIn("Download and start", t)
+        self.assertNotIn("offline", t)
+
+
+class OfflineProbe(unittest.TestCase):
+    def setUp(self):
+        self.home = Home().__enter__()
+        self.addCleanup(self.home.__exit__, None, None, None)
+
+    def test_a_feed_on_this_computer_does_not_make_an_offline_computer_look_online(self):
+        ctx = make_ctx()
+        ctx.feed = "http://127.0.0.1:19881/strata-feed.json"
+        seen = []
+        with mock.patch.object(drafting_fetch, "online", side_effect=lambda url, timeout=0: seen.append(url) or False):
+            self.assertTrue(ctx.probe_now())
+        self.assertEqual(seen, [drafting.base_url()])                 # only the model host was asked; the loopback feed was not
+
+    def test_a_feed_elsewhere_still_counts(self):
+        ctx = make_ctx()
+        ctx.feed = "https://mirror.example.org/strata-feed.json"
+        with mock.patch.object(drafting_fetch, "online", side_effect=lambda url, timeout=0: url.startswith("https://mirror")):
+            self.assertFalse(ctx.probe_now())
+
+    def test_is_offline_asks_for_a_start_that_skipped_the_save_screen_and_keeps_the_answer(self):
+        ctx = make_ctx()
+        ctx.probe_offline = True
+        with mock.patch.object(drafting_fetch, "online", return_value=False) as ask:
+            self.assertTrue(ctx.is_offline())
+            first = ask.call_count
+            self.assertTrue(ctx.is_offline())
+        self.assertEqual(ask.call_count, first)                        # asked once
+
+
+# ------------------------------------------------------------------------------------------------ items 11, 16, 18: the 80-column cuts
+
+class At80Columns(unittest.TestCase):
+    def draw(self, raw, width=78, height=22, **kw):
+        from strata_cli import overview
+        from tests.terminal.test_overview import draw
+        return draw(overview.build(raw), width=width, height=height, connect=True, **kw)
+
+    def test_the_request_table_has_whole_headers_and_cells(self):
+        from tests.terminal.test_overview import metrics
+        text = self.draw(metrics("generating"))
+        for head in ("TIME", "STATE", "TOK/S", "TOOK"):
+            self.assertIn(head, text)
+        self.assertNotIn("…", text.split("Recent requests")[1])                      # no cut cell, no cut header
+        self.assertIn("429.8 s", text)
+        self.assertIn("17,183", text)
+
+    def test_a_wide_window_keeps_the_full_headers(self):
+        from tests.terminal.test_overview import metrics
+        text = self.draw(metrics("generating"), width=110, height=30)
+        for head in ("STATUS", "PROMPT", "REUSED", "OUTPUT", "DURATION"):
+            self.assertIn(head, text)
+
+    def test_the_help_line_is_there_in_the_22_rows_the_window_gives(self):
+        from tests.terminal.test_overview import metrics
+        text = self.draw(metrics("generating"), width=78, height=22).rstrip("\n").split("\n")
+        self.assertLessEqual(len(text), 22)
+        self.assertIn("? help   q quit", text[-1])
+        self.assertIn("7 views", text[-1])
+
+    def test_nothing_in_the_state_line_is_cut(self):
+        from tests.terminal.test_overview import metrics
+        line = next(ln for ln in self.draw(metrics("generating")).split("\n") if ln.startswith("Model state"))
+        self.assertTrue(line.rstrip().endswith("3%"), line)
+
+    def test_the_tiles_of_a_mac_say_whole_words(self):
+        from tests.terminal.test_overview import metrics
+        m = metrics("generating")
+        m["hardware_static"] = {"gpu_name": "Apple M5 Max", "gpu_count": 1, "cores": 18, "threads": 18}
+        m["hardware"] = {**m["hardware"], "gpu_mem_used": None, "gpu_mem_total": None, "gpu_pcie_gen": None, "gpu_pcie_width": None, "ram_total": 128 * 2 ** 30}
+        text = self.draw(m)
+        for whole in ("shared memory", "memory shared", "18 cores"):
+            self.assertIn(whole, text)
+        for cut in ("shar ", "cac ", "18 cores · 18 "):
+            self.assertNotIn(cut, text)
+
+    def test_the_experts_tile_never_ends_in_half_a_word(self):
+        from tests.terminal.test_overview import metrics
+        text = self.draw(metrics("generating"))
+        self.assertIn("1,644 experts", text)
+        self.assertNotIn("experts cac", text)
+
+    def test_an_idle_card_says_its_link_is_resting(self):
+        from tests.terminal.test_overview import metrics
+        m = metrics("idle")
+        m["hardware"] = {**m["hardware"], "gpu_pcie_gen": 1, "gpu_pcie_gen_max": 4}
+        text = self.draw(m, width=110, height=30)
+        self.assertIn("Gen1 x16", text)
+        self.assertIn("idle, max Gen4", text)
+        busy = metrics("generating")
+        busy["hardware"] = {**busy["hardware"], "gpu_pcie_gen": 4, "gpu_pcie_gen_max": 4}
+        self.assertNotIn("idle, max", self.draw(busy, width=110, height=30))
+
+    def test_the_text_views_use_the_same_rule_as_the_other_screens(self):
+        from strata_cli.render import render_view
+        snap = {"source": "x", "sampled_at": __import__("time").time(), "model": {"id": "m", "loaded": True}, "work": {}, "rates": {}, "devices": [], "recent": [], "totals": {},
+                "topology": {}, "quality": {}, "instance": {}}
+        out = render_view(snap, "hardware", width=100, height=24, glyphs="unicode")
+        self.assertIn("─" * 40, out)
+        self.assertNotIn("-" * 20, out)
+        plain = render_view(snap, "hardware", width=100, height=24, glyphs="ascii")
+        self.assertIn("-" * 40, plain)
+
+    def test_the_header_keeps_free_and_shortens_the_cards_name(self):
+        hw = {**HW_12}
+        with Home():
+            comp = catalog(hw).computer()
+        line = comp.line(width=62)
+        self.assertTrue(line.endswith("free"), line)
+        self.assertLessEqual(len(line), 62)
+        comp.usable_gpus[0]["name"] = "AMD Radeon(TM) 8060S Graphics With A Very Long Name Indeed"
+        line = comp.line(width=62)
+        self.assertTrue(line.endswith("free"), line)
+        self.assertLessEqual(len(line), 62, line)
+        self.assertIn("…", line)
+        self.assertEqual(comp.line(), comp.line(width=300))                           # room enough: as before
+
+
+class StartRowAt80(Base):
+    def test_the_preset_row_is_whole_and_the_header_has_free(self):
+        store.save(S.LaunchSettings(name="IQ3_XXS 128K", family="qwen", model="IQ3_XXS", context=131072, parallel=1, tuned_preset="x", tuned_at="2026-10-16", last_used="2026-11-12 10:00"))
+        store.save(S.LaunchSettings(name="Coder 64K", family="coder", model="IQ1_M", context=65536, parallel=2))
+
+        async def case(app, pilot, ctx):
+            t = text_of(app)
+            self.assertIn("tuned 10-16", t)
+            self.assertIn("not tuned", t)
+            for ln in t.splitlines():
+                self.assertLessEqual(len(ln), 80, ln)
+                self.assertNotIn("not tu ", ln + " ")
+            self.assertIn("GB free", t.splitlines()[0])
+        small(self, case, make_ctx())
+
+    def test_last_used_is_shown_where_it_fits(self):
+        store.save(S.LaunchSettings(name="IQ3_XXS 128K", family="qwen", model="IQ3_XXS", context=131072, parallel=1, tuned_preset="x", tuned_at="2026-10-16", last_used="2026-11-12 10:00"))
+
+        async def case(app, pilot, ctx):
+            self.assertIn("last used 11-12", text_of(app))
+        small(self, case, make_ctx(), size=(120, 36))
+
+
+class AdvancedAt80(Base):
+    def test_same_as_is_whole_and_the_description_has_room(self):
+        async def case(app, pilot, ctx):
+            await goto(pilot, app, "advanced")
+            await pilot.pause(0.3)
+            t = flat_text(text_of(app))
+            self.assertIn("Same as: strata launch --model", t)
+            self.assertIn("--port 8080", t)                                           # the end of the line, not cut or scrolled out
+            self.assertNotIn("Tuned", t)                                              # the column is left out of a narrow window ...
+            self.assertIn("Qwen: 0.2.6 behaviour", t)                                  # ... and the description has its room
+            for ln in text_of(app).splitlines():
+                self.assertLessEqual(len(ln), 80, ln)
+        small(self, case, make_ctx())
+
+    def test_a_wide_window_keeps_the_tuned_column(self):
+        async def case(app, pilot, ctx):
+            await goto(pilot, app, "advanced")
+            await pilot.pause(0.3)
+            self.assertIn("Tuned", text_of(app))
+        small(self, case, make_ctx(), size=(120, 40))
+
+
+class PhaseNames(Base):
+    def test_a_finished_phase_stays_named_when_the_next_bar_starts_at_zero(self):
+        from strata_cli.launch.runner import Event
+
+        async def case(app, pilot, ctx):
+            await goto(pilot, app, "save")
+            app.run_launch()
+            await pilot.pause(0.3)
+            scr = app.run_screen
+            scr.handle_event(Event("model", "Preparing the model data for the engine (one time)", 99.0, "info", {}))
+            scr.handle_event(Event("model", "Downloading the DFlash2 drafter (1.2 GB, once)…", 0.0, "info", {}))
+            scr.handle_event(Event("model", "Downloading the DFlash2 drafter… 0.26 of 1.21 GB", 21.0, "info", {}))
+            await pilot.pause(0.3)
+            t = text_of(app)
+            self.assertIn("Preparing the model data for the engine", t)           # the finished phase, by name
+            self.assertIn("Downloading the DFlash2 drafter… 0.26 of 1.21 GB", t)    # the one that runs
+            self.assertEqual(t.count("Preparing the model data"), 1)
+            app.cancel.set()
+        from tests.terminal.test_launch_tui import FakeRunner
+        FakeRunner.behaviour = "wait"
+        small(self, case, make_ctx())
+
+
+class ReaderBar(unittest.TestCase):
+    def test_which_download_figures_belong_to_the_picture_reader(self):
+        from strata_cli.launch.runner import is_reader_file
+        self.assertTrue(is_reader_file("vision encoder"))
+        self.assertTrue(is_reader_file("mmproj-F16.gguf"))
+        self.assertFalse(is_reader_file("qwen3.8-flash-next-q2_0-00001-of-00002.gguf"))     # the model's own line: its 75.8 GB are not the reader's
+        self.assertFalse(is_reader_file(None))
 
 
 def flat_text(text: str) -> str:

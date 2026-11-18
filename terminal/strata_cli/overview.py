@@ -164,7 +164,7 @@ def build(metrics: dict | None) -> dict | None:
                 "vram_hist": _series(history, "gpu_mem_used", GIB), "temp": _num(hw.get("gpu_temp")), "temp_hist": _series(history, "gpu_temp"),
                 "power": _num(hw.get("gpu_power")), "power_limit": _num(hw.get("gpu_power_limit")), "power_hist": _series(history, "gpu_power"),
                 "pcie_rx": _num(hw.get("gpu_pcie_rx_mb")), "pcie_hist": _series(history, "gpu_pcie_rx_mb"),
-                "pcie_gen": gen if gen is not None else genmax, "pcie_width": width, "pcie_width_max": width_cap,
+                "pcie_gen": gen if gen is not None else genmax, "pcie_gen_max": genmax, "pcie_width": width, "pcie_width_max": width_cap,
                 "count": _num(static.get("gpu_count"))},
         "cpu": {"load": _num(hw.get("cpu_pct") if hw.get("cpu_pct") is not None else hw.get("cpu")), "hist": _series(history, "cpu"),
                 "cores": _num(static.get("cores")), "threads": _num(static.get("threads")), "sockets": _num(static.get("sockets")),
@@ -197,6 +197,7 @@ def build(metrics: dict | None) -> dict | None:
         slow = pcie_bottleneck([(c["index"], c) for c in cards])
         if slow is not None:
             g["pcie_gen"] = slow["gen"] if slow["gen"] is not None else slow["gen_max"]
+            g["pcie_gen_max"] = slow["gen_max"]
             g["pcie_width"], g["pcie_width_max"] = slow["width"], slow["width_max"]
     return model
 
@@ -285,7 +286,10 @@ def k(v: float | None) -> str:
     return f"{v / 1024:.0f}K" if v >= 1024 else f"{v:.0f}"
 
 
-def _tile(title: str, big: str, sub: str, series: str, width: int, *, accent: str, box_style, big_style: str = "bold") -> Panel:
+def _tile(title: str, big: str, sub, series: str, width: int, *, accent: str, box_style, big_style: str = "bold") -> Panel:
+    if isinstance(sub, (list, tuple)):          # 0217 item 11: the words that fit the tile (the longest first); a cut word ("64 experts cac", "memory is shar") is never shown
+        room = width - 4
+        sub = next((s for s in sub if len(s) <= room), str(sub[-1])[:room])
     body = Text(no_wrap=True, overflow="crop")
     body.append(big + "\n", style=big_style)
     body.append(sub + "\n", style="dim")
@@ -412,6 +416,10 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
         right_txt = f"{model['queued']} queued"
     else:
         right_txt = ""
+    if done is not None and total and len(st.plain) + 2 + len(right_txt) > min(width, 110):       # (0217 item 11: the end of the line was cropped at 80 columns) the longer words give way, the figures stay
+        right_txt = f"{tokens(done)} / {tokens(total)} {dot} {pct}%"
+        if len(st.plain) + 2 + len(right_txt) > min(width, 110):
+            right_txt = f"{pct}%"
     st.append(" " * max(2, min(width, 110) - len(st.plain) - len(right_txt)) + right_txt, style="dim")
     state_bar = bar((done / total) if done is not None and total else None, bar_w, glyphs, state_color if state != "Idle" else accent)
 
@@ -426,14 +434,14 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     util_scale = dict(lo=0, hi=100)
     tiles1 = [
         _tile("Speed", f"{fmt(spd, 1)} tok/s" if spd is not None else "-- tok/s", spd_note, spark(spd_hist, inner, glyphs), tile_w, accent=accent, box_style=box_style),
-        _tile("GPU load", f"{fmt(g['util'])} %", f"busiest of {ncards} cards" if ncards else
+        _tile("GPU load", f"{fmt(g['util'])} %", (f"busiest of {ncards} cards", "busiest card") if ncards else
               short_gpu(g["name"]) if g["count"] in (None, 1) else f"{short_gpu(g['name'])} +{int(g['count']) - 1}",
               spark(g["util_hist"], inner, glyphs, **util_scale), tile_w, accent=accent, box_style=box_style),
-        (_tile("Memory", f"{fmt(model['ram'][0], 1)} / {fmt(model['ram'][1], 0)} GB", "shared with graphics", spark([], inner, glyphs, lo=0),
+        (_tile("Memory", f"{fmt(model['ram'][0], 1)} / {fmt(model['ram'][1], 0)} GB", ("shared with graphics", "shared memory"), spark([], inner, glyphs, lo=0),
                tile_w, accent=accent, box_style=box_style) if unified and g["vram_total"] is None else
          _tile("VRAM", f"{fmt(g['vram_used'], 1)} / {fmt(g['vram_total'], 0)} GB",
                (f"all {ncards} cards" if ncards else
-                f"{int(model['experts']['slots']):,} experts cached" if model["experts"]["slots"] is not None else "graphics memory"),
+                (f"{int(model['experts']['slots']):,} experts cached", f"{int(model['experts']['slots']):,} experts") if model["experts"]["slots"] is not None else "graphics memory"),
                spark(g["vram_hist"], inner, glyphs, lo=0, hi=g["vram_total"]), tile_w, accent=accent, box_style=box_style)),
         _tile("GPU temp", f"{fmt(g['temp'])} °C" if not ascii_mode else f"{fmt(g['temp'])} C", "hottest card" if ncards else "",
               spark(g["temp_hist"], inner, glyphs, lo=20, hi=100), tile_w, accent=plain(AMBER) if color else "default", box_style=box_style),
@@ -446,8 +454,11 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     # with the slowest link (the Cards strip names each card's own)
     if g["pcie_width"] and g.get("pcie_width_max") and g["pcie_width_max"] > g["pcie_width"]:
         link += f" of x{int(g['pcie_width_max'])}"
-    cpu_sub = (f"{int(c['sockets'])} CPUs {dot} {int(c['cores'])} cores" if c.get("sockets") and c["sockets"] > 1 and c["cores"] else
-               f"{int(c['cores'])} cores {dot} {int(c['threads'])} threads" if c["cores"] and c["threads"] else
+    # 0217 item 16: a card at rest runs its link slower to save power (NVML: Gen1 on a Gen4 card); the tile says so instead of reading like a slot that is limited
+    gmax = g.get("pcie_gen_max")
+    link_note = f"idle, max Gen{int(gmax)}" if g["pcie_gen"] and gmax and g["pcie_gen"] < gmax else ""
+    cpu_sub = ((f"{int(c['sockets'])} CPUs {dot} {int(c['cores'])} cores", f"{int(c['sockets'])} CPUs") if c.get("sockets") and c["sockets"] > 1 and c["cores"] else
+               (f"{int(c['cores'])} cores {dot} {int(c['threads'])} threads", f"{int(c['cores'])} cores", f"{int(c['threads'])} threads") if c["cores"] and c["threads"] else
                f"{int(c['threads'])} threads" if c["threads"] else "")
     # the Power tile is a sum over the cards, and so is its ceiling, so with two or more cards the tile says whose
     # power it is, like every other tile says which card its number comes from: a bare "15 W" reads as one card's.
@@ -459,10 +470,10 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     tiles2 = [
         _tile("Power", f"{fmt(g['power'])} W", power_sub, spark(g["power_hist"], inner, glyphs, lo=0),
               tile_w, accent=accent, box_style=box_style),
-        (_tile("PCIe", "not used", "memory is shared", spark([], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style)
+        (_tile("PCIe", "not used", ("memory is shared", "memory shared"), spark([], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style)
          if unified else
-         _tile("PCIe", link, f"slowest of {ncards} cards" if ncards else
-               (f"to GPU {fmt(g['pcie_rx'])} MB/s" if g["pcie_rx"] is not None else "to GPU --"),
+         _tile("PCIe", link, link_note if link_note else (f"slowest of {ncards} cards", "slowest card") if ncards else
+               ((f"to GPU {fmt(g['pcie_rx'])} MB/s", f"{fmt(g['pcie_rx'])} MB/s") if g["pcie_rx"] is not None else "to GPU --"),
                spark(g["pcie_hist"], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style)),
         _tile("CPU", f"{fmt(c['load'])} %", cpu_sub, spark(c["hist"], inner, glyphs, lo=0, hi=100), tile_w, accent=accent, box_style=box_style),
         _tile("Disk read", f"{fmt(d['read'], 1)} MB/s", f"write {fmt(d['write'], 1)} MB/s" if d["write"] is not None else "write --",
@@ -477,7 +488,7 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
         return t
 
     # ---- bars and requests
-    left_w = max(24, min(width, 110) * 2 // 5)
+    left_w = max(32, min(width, 110) * 2 // 5)
     used_ctx = (ctx_used / ctx_max) if ctx_used is not None and ctx_max else None
     e = model["experts"]
     e_frac = (e["slots"] / e["total"]) if e["slots"] is not None and e["total"] else None
@@ -497,27 +508,40 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     t.append(f"{fmt(ram_used, 1)} / {fmt(ram_total, 0)} GB", style="dim")
     lines += [t, bar(ram_frac, left_w, glyphs, plain(RED) if ram_frac is not None and ram_frac > 0.9 else accent)]
 
-    req = Table(box=None, padding=(0, 1), show_header=True, header_style="dim", pad_edge=False)
-    for col, just in (("TIME", "left"), ("STATUS", "left"), ("PROMPT", "right"), ("REUSED", "right"), ("OUTPUT", "right"), ("TOK/S", "right"),
-                      ("DURATION", "right")):
+    # 0217 items 11 and 18: the table has the room that is left of the window beside the bars (44 cells at 80 columns); the full headers need 51, so a narrow window gets the
+    # short ones and no REUSED column (every cell whole, none ending in an ellipsis: "STA… PRO… REU…" before)
+    narrow = min(width, 110) - left_w - 3 < 52
+    req = Table(box=None, padding=(0, 1), show_header=True, header_style="dim", pad_edge=False, collapse_padding=narrow)
+    cols = ((("TIME", "left"), ("STATE", "left"), ("IN", "right"), ("OUT", "right"), ("TOK/S", "right"), ("TOOK", "right")) if narrow else
+            (("TIME", "left"), ("STATUS", "left"), ("PROMPT", "right"), ("REUSED", "right"), ("OUTPUT", "right"), ("TOK/S", "right"), ("DURATION", "right")))
+    for col, just in cols:
         req.add_column(col, justify=just, no_wrap=True)
     strip_rows = (1 + min(ncards, 4) + (1 if ncards > 4 else 0) + 1) if ncards else 0
     show = max(2, min(6, height - 20 - strip_rows))
     for r in model["recent"][:show]:
         stamp = time.strftime("%H:%M:%S", time.localtime(r["time"])) if r["time"] else "--"
-        req.add_row(stamp, Text(r["state"], style=plain(accent) if r["state"] == "Done" else plain(RED if r["state"] == "Error" else AMBER)),
-                    tokens(r["prompt"]), tokens(r["reused"]), tokens(r["output"]), fmt(r["tps"], 1), fmt(r["duration"], 1, " s"))
+        cells = [stamp, Text(r["state"], style=plain(accent) if r["state"] == "Done" else plain(RED if r["state"] == "Error" else AMBER)),
+                 tokens(r["prompt"]), tokens(r["reused"]), tokens(r["output"]), fmt(r["tps"], 1), fmt(r["duration"], 1, " s")]
+        if narrow:
+            del cells[3]                                     # REUSED
+        req.add_row(*cells)
     if not model["recent"]:
-        req.add_row("No requests yet", "", "", "", "", "", "")
+        req.add_row("No requests yet", *([""] * (len(cols) - 1)))
     bottom = Table.grid(padding=(0, 3))
     bottom.add_column(width=left_w)
     bottom.add_column()
     right = Group(Text("Recent requests", style=f"bold {accent}"), req)
     bottom.add_row(Group(*lines), right)
 
-    hint = Text(f"{nav.keys(connect)} views" + "   / filter   Space freeze   r refresh   t theme   b open in browser   ? help   q quit", style="dim")
-    parts: list[Any] = [head, tabs, rule, st, state_bar, Text(""), row(tiles1), row(tiles2)]
+    # 0217 item 18: at 80x24 the help line was the one that fell off the bottom (the window gives 22 rows: two blank spacer rows and a second line of keys were over). A window that is
+    # short or narrow gets the keys on one line and no spacer rows, so the line is there.
+    tight = height < 24
+    keys = (f"{nav.keys(connect)} views" + "   / filter   Space freeze   r refresh   t theme   ? help   q quit") if width < 100 else \
+        (f"{nav.keys(connect)} views" + "   / filter   Space freeze   r refresh   t theme   b open in browser   ? help   q quit")
+    hint = Text(keys, style="dim")
+    gap = [] if tight else [Text("")]
+    parts: list[Any] = [head, tabs, rule, st, state_bar, *gap, row(tiles1), row(tiles2)]
     if ncards:
         parts += [Text(""), _cards_strip(cards, glyphs, accent, ascii_mode, width)]
-    parts += [bottom, Text(""), hint]
+    parts += [bottom, *gap, hint]
     return Group(*parts)

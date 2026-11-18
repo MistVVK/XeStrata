@@ -62,6 +62,30 @@ class Ctx:
     _tuned_asking: set = field(default_factory=set)
     _tuned_wanted: tuple | None = None
 
+    def probe_now(self) -> bool:
+        """The probe itself: True when none of the download addresses answers. A feed on this computer itself (a loopback address: a test feed, a mirror running here) does not
+        count as an answer from the internet (0217 item 5: with one set, an offline computer looked online); a person's own mirror elsewhere does."""
+        from urllib.parse import urlparse
+        from strata_control import drafting, drafting_fetch
+        urls = []
+        for u in (drafting.base_url(), drafting_fetch._feed_source(self.feed)):
+            if not str(u).lower().startswith(("http://", "https://")):
+                continue
+            if (urlparse(str(u)).hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
+                continue
+            urls.append(u)
+        return bool(urls) and not any(drafting_fetch.online(url, timeout=4.0) for url in urls)
+
+    def is_offline(self) -> bool:
+        """The answer now: the one the Save screen's probe kept, else (a preset started with one key, which never visited Save) the probe, here and now; False when the screens do not
+        probe (the unit tests) or it cannot be told."""
+        if self.offline is None and self.probe_offline:
+            try:
+                self.offline = self.probe_now()
+            except Exception:                                # noqa: BLE001
+                self.offline = False
+        return bool(self.offline)
+
     def check_offline(self, on_done=None) -> None:
         """S6: is this computer offline? One short HEAD request to each address Strata downloads from: the model files' (as the drafter fetch names
         it, which follows a mirror the person set) and the update feed's, when that is a web address and not a folder of the person's own (the download's
@@ -73,9 +97,7 @@ class Ctx:
 
         def run() -> None:
             try:
-                from strata_control import drafting, drafting_fetch
-                urls = [u for u in (drafting.base_url(), drafting_fetch._feed_source(self.feed)) if str(u).lower().startswith(("http://", "https://"))]
-                self.offline = bool(urls) and not any(drafting_fetch.online(url, timeout=4.0) for url in urls)
+                self.offline = self.probe_now()
             except Exception:                                # noqa: BLE001 - not knowing counts as online: the download itself says what is wrong
                 self.offline = False
             finally:
@@ -168,7 +190,7 @@ class Ctx:
         except Exception:                                    # noqa: BLE001 - a mark in a list is never a reason to stop the screens
             pass
 
-    def computer_line(self) -> str:
+    def computer_line(self, width: int | None = None) -> str:
         """The computer's one line (the header of the start screen, the model list) with the free disk read again now: it was read once when the
         screens opened and stayed "88 GB free" after a download left 26 GB (T9). A statvfs call; nothing else is asked again."""
         try:
@@ -177,7 +199,7 @@ class Ctx:
                 self.computer.disk_free_gb = free
         except Exception:                                    # noqa: BLE001 - the old figure is better than none
             pass
-        return self.computer.line()
+        return self.computer.line(width=width)
 
     def card_roles(self) -> tuple[dict[int, str], list[dict]] | None:
         """The role of every card this launch will use (named here, else the installed model's own, else the recommendation) with the cards, or None
@@ -499,12 +521,16 @@ class LaunchApp(App):
             title, text = asker() if asker else (f"Download about {gb:.0f} GB?",
                                                  f"This model is not on this computer yet. Strata will download about {gb:.0f} GB now; "
                                                  "an interrupted download continues where it stopped.")
+            offline = self.ctx.is_offline()                  # 0217 item 13: the dialog said nothing about the computer being offline
+            go = "Try the download" if offline else "Download and start"
+            if offline:
+                text = "This computer is offline, so this download will probably not work now. " + text
             if kinds:
                 what = ("the draft layer" if kinds == {"mtp"} else "pictures" if kinds == {"mmproj"} else "them")
-                options = [("go", "Download and start"), ("skip", f"Start without {what}")]
+                options = [("go", go), ("skip", f"Start without {what}")]
                 text += " Or start now without it: answers are a little slower or text only, and you can add it later."
             else:
-                options = [("go", "Download and start"), ("no", "Not now")]
+                options = [("go", go), ("no", "Not now")]
             self.push_screen(ConfirmScreen(title, text + room + warn, options), done)
             return
         screen = RunScreen()

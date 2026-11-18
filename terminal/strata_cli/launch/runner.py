@@ -763,6 +763,11 @@ def saved_launch_word(name: str) -> str | None:
 # ----------------------------------------------------------------------------------------------- the runner
 
 
+def is_reader_file(name: object) -> bool:
+    """Is this download line's file the picture reader's (setup labels it "vision encoder", the file is an mmproj)? progress_words says "the picture reader" by the same words."""
+    return any(w in str(name or "").lower() for w in ("vision", "picture", "mmproj"))
+
+
 def download_text(dl: dict, already: bool, label: str | None = None) -> str:
     """The step line for a download or a check. `label` is what is being fetched, in words (strata_control/progress_words.py). A model whose
     files were all on disk before this run says so instead of "Downloading 58.5 of 58.5 GB"."""
@@ -1575,6 +1580,10 @@ class Runner:
             said = (label, phase) if label else None
             if phase == "waiting":                           # setup is waiting for a server to answer: say which one (netpolicy's line)
                 self.emit("model", label, None, step=prog.get("step"))
+            elif phase == "pictures" and dl and not is_reader_file(dl.get("file")):
+                # 0217 item 18: the figures are the MODEL's last download line ("75.8 of 75.8 GB", 99 %), not the picture reader's (0.9 GB): say what is fetched, with its own size
+                from strata_control.discovery import MMPROJ_GB
+                self.emit("model", f"{label} ({MMPROJ_GB:.1f} GB)", None, step=prog.get("step"))
             elif dl and dl.get("total_gb", 0) >= 0.05 and not (s.model_path and phase == "download"):
                 if phase == "download" and already is None:
                     already = float(dl["percent"]) >= 99.5
@@ -2436,7 +2445,10 @@ class Runner:
                                             shared_memory=self.shares_memory())
             self.end_failed_start()
             raise LaunchError(text, nxt, 6)
-        self.emit("start", "The model is loaded and answering." + (MAC_FIRST_ANSWER if self.mac_first_start() else ""), 100)
+        # 0217 item 15: the start's own one-token answer (strata_control/readiness.py generation_ready) already built the graphics code, so the first answer of a person is not slow
+        # (m1002: 0.9 s); the note is only for a start that did not make one
+        warmed = bool(r.get("generation_ready"))
+        self.emit("start", "The model is loaded and answering." + (MAC_FIRST_ANSWER if not warmed and self.mac_first_start() else ""), 100)
         self.report_drafting()
 
     _marks: dict | None = None

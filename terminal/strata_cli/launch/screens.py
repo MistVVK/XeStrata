@@ -280,22 +280,38 @@ class StartScreen(Base):
         self.reload()
         self.paint()
 
-    def reload(self) -> None:
+    def reload(self, keep: int | None = None) -> None:
         self.presets = store.list_presets()
+        columns, with_used = self.preset_columns()
         items: list[Item] = []
         for p in self.presets:
             sm = store.summary(p)
             req = (f"{p.parallel} request" + ("s" if p.parallel != 1 else "")) if p.parallel else "fit to card"
             tuned = f"tuned {p.tuned_at[5:]}" if p.is_tuned and p.tuned_at else "not tuned"
             used = f"last used {p.last_used[5:10]}" if p.last_used else "not used yet"
-            items.append(Item([p.name or "?", str(sm["model"]), S.context_label(p.context), req, Cell(tuned, MUTE if not p.is_tuned else ""),
-                               Cell(used, MUTE)], key=("preset", p.name)))
+            cells = [p.name or "?", str(sm["model"]), S.context_label(p.context), req, Cell(tuned, MUTE if not p.is_tuned else ""), Cell(used, MUTE)]
+            items.append(Item(cells if with_used else cells[:-1], key=("preset", p.name)))
         items.append(Item([Cell("Set up from the beginning", "")], key=("new", None)))
         items.append(Item([Cell("Use model files I already have", "")], key=("own", None)))
         m = self.query_one(Menu)
-        m.columns = [("", 34), ("", 14), ("", 8), ("", 14), ("", 14)]
+        m.columns = columns
         m.show_header = False
-        m.set_items(items, 0)
+        m.set_items(items, keep if keep is not None else 0)
+
+    def preset_columns(self) -> tuple[list[tuple[str, int]], bool]:
+        """The preset row's columns for this window (0217 item 11: at 80 columns "tuned 10-16" and "last used 11-12" ran past the edge and ended in "not tu"): the name takes
+        what is left, and "last used" is shown only where it fits whole."""
+        room = self.width() - 2                          # (the two cells of the cursor)
+        fixed = [14, 7, 13, 13]                          # model, context, requests, tuned
+        used = 17
+        if room - sum(fixed) - used >= 24:
+            return [("", min(34, room - sum(fixed) - used)), *[("", w) for w in fixed], ("", 0)], True
+        return [("", max(16, min(34, room - sum(fixed)))), *[("", w) for w in fixed]], False
+
+    def on_resize(self, _e) -> None:
+        if getattr(self, "presets", None) is not None and self.is_mounted:
+            self.reload(keep=self.query_one(Menu).index)
+        self.paint()
 
     def refresh_body(self) -> None:
         intro = Text()
@@ -321,7 +337,7 @@ class StartScreen(Base):
     def head_text(self) -> Text:
         out = Text(no_wrap=True, overflow="crop")
         out.append("STRATA  Launch", style=f"bold {ACCENT}")
-        info = self.ctx.computer_line()
+        info = self.ctx.computer_line(self.width() - len("STRATA  Launch") - 2)       # (0217 item 11: the card's name gives way, "free" stays)
         gap = max(2, self.width() - len("STRATA  Launch") - len(info))
         out.append(" " * gap + info, style=MUTE)
         return out
@@ -1311,15 +1327,34 @@ class AdvancedScreen(Base):
                 continue
             d, t, y = r.cells()[1:]
             desc = ("[experimental] " if r.experimental else "") + r.description
-            items.append(Item([r.name, d, t, Cell(y, ACCENT if y != "-" else ""), Cell(desc, WARN if r.experimental else (BAD if not r.known else ""))],
-                              key=r.name))
-        items.append(Item([Cell("+ Add a setting by name…", ""), "", "", "", Cell("for flags of newer engine versions", MUTE)], key="__add__"))
+            cells = [r.name, d, t, Cell(y, ACCENT if y != "-" else ""), Cell(desc, WARN if r.experimental else (BAD if not r.known else ""))]
+            if self.narrow():
+                del cells[2]                                 # the Tuned column: its value is in the line under the table
+            items.append(Item(cells, key=r.name))
+        add = [Cell("+ Add a setting by name…", ""), "", "", "", Cell("for flags of newer engine versions", MUTE)]
+        items.append(Item(add[:3] + add[4:] if self.narrow() else add, key="__add__"))
+        m = self.query_one(Menu)
+        # 0217 item 11: at 80 columns the description had 16 cells ("Qwen: 0.2.6 beh…"); without the Tuned column (said under the table instead) it has 29
+        m.columns = ([("Setting", 26), ("Default", 10), ("Yours", 9), ("What it does", 0)] if self.narrow() else
+                     [("Setting", 26), ("Default", 11), ("Tuned", 13), ("Yours", 10), ("What it does", 0)])
+        self.fit_box()
+        m.set_items(items, min(m.index, len(items) - 1))
+
+    def fit_box(self) -> None:
+        """The command box is as tall as its text (the title, the command, "Same as", a note) while the list keeps at least three rows; it was a third of the body, so "Same as"
+        lost its end at 80x24 (0217 item 11)."""
+        import textwrap
         m = self.query_one(Menu)
         body_h = self.query_one("#body").size.height or max(6, (self.size.height or 30) - 8)
-        box_h = max(3, min(8, body_h // 3))
+        wrap_w = max(20, self.width() - 4)
+        texts = ["  " + self.ctx.command_text(), "  Same as: " + self.ctx.flags_line(), *(["  " + self.ctx.engine_note] if self.ctx.engine_note else [])]
+        need = 1 + sum(len(textwrap.wrap(text, wrap_w)) or 1 for text in texts)
+        box_h = max(3, min(need, max(4, body_h - 7)))
         self.query_one("#cmdbox").styles.height = box_h
         m.window = max(3, body_h - box_h - 4)                # the heading, the column titles, the "n of m" line and the box's rule
-        m.set_items(items, min(m.index, len(items) - 1))
+
+    def narrow(self) -> bool:
+        return self.width() < 100
 
     def on_resize(self, _e) -> None:
         if hasattr(self, "rows"):
@@ -1330,9 +1365,12 @@ class AdvancedScreen(Base):
         eng = self.ctx.engine_note
         t = Text(no_wrap=True, overflow="ellipsis")
         t.append("All settings", style=f"bold {ACCENT}")
-        if self.width() >= 70:
+        if self.width() >= 90:
             t.append("   (optional · for tinkerers)", style=MUTE)
             extra = "   / filter" + (f": {self.filter}" if self.filter else "") + "   x show experimental only" + (" (on)" if self.only_experimental else "")
+        elif self.width() >= 70:                             # 80 columns: the line was one word too long and wrapped ("only" alone on a second row)
+            t.append("   (optional)", style=MUTE)
+            extra = "   / filter" + (f": {self.filter}" if self.filter else "") + "   x experimental only" + (" (on)" if self.only_experimental else "")
         else:
             extra = "  (optional)" + (f"  filter: {self.filter}" if self.filter else "") + ("  experimental only" if self.only_experimental else "")
         t.append(extra, style=MUTE)
@@ -1346,6 +1384,11 @@ class AdvancedScreen(Base):
         if eng:
             out.append("  " + eng, style=WARN)
         self.query_one("#cmdline", Static).update(out)
+        try:                                                 # the box follows its text (a flag typed just now makes the command longer)
+            self.fit_box()
+            self.query_one(Menu)._refresh()
+        except Exception:                                    # noqa: BLE001 - a screen that is closing
+            pass
 
     def hints_text(self) -> str:
         if (self.size.width or 80) < 60:
@@ -1360,7 +1403,8 @@ class AdvancedScreen(Base):
         if cur is not None and cur.key not in (None, "__add__"):
             r = next((x for x in self.rows if x.name == cur.key), None)
             if r:
-                return Text(f"{r.name}: {r.description}" + (" This one is experimental: it may change answers or not work on every card." if r.experimental else ""), style=MUTE)
+                tuned = f" The tuner chose {r.tuned}." if self.narrow() and r.tuned not in ("-", "", None) else ""     # (the Tuned column is left out of a narrow window)
+                return Text(f"{r.name}: {r.description}" + tuned + (" This one is experimental: it may change answers or not work on every card." if r.experimental else ""), style=MUTE)
         return Text("Press e on a row to set your own value; Del puts the tuned value back. You can go on without touching anything: Enter.", style=MUTE)
 
     # ---- editing
@@ -1998,6 +2042,8 @@ class RunScreen(Base):
                 break
             if self.state[k]["status"] in ("wait", "run"):
                 self.state[k]["status"] = "done" if self.state[k]["text"] else "skip"
+        if st["text"] and st["pct"] is not None and st["pct"] >= 95 and ev.pct is not None and ev.pct < 50 and ev.text != st["text"]:
+            st.setdefault("past", []).append(st["text"])       # 0217 item 14: a new phase starts its own bar at 0 %; the finished one stays on the screen by name
         st["text"] = ev.text
         st["pct"] = ev.pct
         st["level"] = ev.level
@@ -2041,9 +2087,14 @@ class RunScreen(Base):
             style = ACCENT if st["status"] in ("run", "done") else MUTE
             if st.get("level") == "warn" and st["status"] != "run":
                 style = WARN
+            for past in (st.get("past") or [])[-2:]:                       # the phases of this stage that are finished (item 14: the next one's bar starts at 0 % again)
+                t.append(f"  {g.tick} {label:<10}", style=f"bold {ACCENT}")
+                t.append(past + "\n", style=MUTE)
             t.append(f"  {mark}{label:<10}", style=f"bold {style}")
             if st["pct"] is not None and st["status"] == "run":
-                t.append(bar(st["pct"] / 100.0, width, g) + f" {st['pct']:.0f}%  ", style=ACCENT)
+                # the bar gives way so the words after it (the phase: "Downloading the DFlash2 drafter ...") are whole in a small window (item 14: at 80 columns they wrapped under it)
+                own = max(8, min(width, self.width() - 14 - 7 - len(st["text"] or "")))
+                t.append(bar(st["pct"] / 100.0, own, g) + f" {st['pct']:.0f}%  ", style=ACCENT)
             t.append((st["text"] or "") + "\n", style=FG if st["status"] == "run" else MUTE)
         for note in getattr(self, "notes", None) or []:       # 0217 item 7: stays under the rows for the whole launch
             t.append("\n")
