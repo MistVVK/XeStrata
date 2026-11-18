@@ -1526,7 +1526,6 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         job["mask"] = mask
     if crop is not None:   # the image at the first image's size, drawn at the plan's
         job["crop"] = crop
-        crop_upscaler(job, req)
         job["color_match"] = color_match_mode(req, cfg)
         job["width"], job["height"] = w0, h0
         if moss and edits and len(images) > 1 and not crop.get("empty") and not crop["whole"]:   # CROP_REFINE_STRENGTH
@@ -1534,6 +1533,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
             if parse_flag(req.get("refine"), "refine"):
                 job["refine"] = {"crop": crop, "strength": CROP_REFINE_STRENGTH,
                                  "steps_run": strength_run(job["steps"], CROP_REFINE_STRENGTH)}
+        crop_upscaler(job, req)   # the cut the first pass actually draws, after the whole picture replaces it
     if strength is not None and strength < 1:
         run = strength_run(job["steps"], strength)
         if run < 1:
