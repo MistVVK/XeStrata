@@ -13,7 +13,7 @@ XeStrata は、ふつうはサーバーで動かす 1,250 億パラメーター�
 **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** と、画像を作るモデルを、自分の PC で動かすためのソフトウェアです。
 GPU は Intel Arc、AMD Radeon（RDNA2 以降）、NVIDIA のどれか 1 枚を使い、OS は Linux か Windows です。
 `xestrata --setup` を 1 回実行すれば、文章のモデル、画像のモデル、ブラウザの画面と API がそろいます。
-Ubuntu 26.04 と Fedora 44 には deb と rpm のパッケージ、Windows には 7z があり、Podman のコンテナでも動きます。
+Ubuntu 26.04 と Fedora 44・45 には deb と rpm のパッケージ、Windows には 7z があり、Podman のコンテナでも動きます。
 自由ソフトウェアで、Intel と AMD の GPU なら自由ソフトウェアだけでもビルドして動かせます。
 
 > **目次:** [All in One](#all-in-one) · [XeStrata とは](#xestrata-とは) · [必要なもの](#必要なもの) · [モデルの選び方](#モデルの選び方) ·
@@ -56,7 +56,7 @@ GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコー�
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
 | RAM | ふつうは 32〜62 GB（[モデルの選び方](#モデルの選び方)）。いちばん小さな Gyro-Coder は 26 GB（VRAM が補えば RAM と VRAM の合計で 28 GB）、大きな版は 100 GB 以上です。 |
 | ディスク | モデルに 60〜110 GB ほど（大きな版は 190 GB まで）、ほかに MTP 層に約 5 GB。SSD（NVMe）を強く勧めます。 |
-| OS | Linux（パッケージは Ubuntu 26.04 と Fedora 44 向け。ほかのディストリビューションでは [Podman](#podman) か[ソースから](docs/BUILD.ja.md#ソースから入れる)）、Windows 10 と 11（x64、[Windows](#windows)）。WSL 2 は動くかもしれません（プルリクエスト歓迎）。 |
+| OS | Linux（パッケージは Ubuntu 26.04 と Fedora 44・45 向け。ほかのディストリビューションでは [Podman](#podman) か[ソースから](docs/BUILD.ja.md#ソースから入れる)）、Windows 10 と 11（x64、[Windows](#windows)）。WSL 2 は動くかもしれません（プルリクエスト歓迎）。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 
 - **行列エンジン**: Intel の XMX、AMD の WMMA（RDNA3 以降）、NVIDIA の Tensor Core を使い、ない GPU では DP4a などの整数の内積の命令で計算します。
@@ -73,7 +73,7 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 そのため、XeStrata が動くのは、ディストリビューションの rocBLAS がコードを持っている GPU だけです。
 AMD 自身の ROCm（amdrocm のパッケージ、`/opt/rocm/core-<版>`）が入っていて、エンジンのリンクする 3 つのライブラリと使う GPU のコードが揃っていれば、setup はディストリビューションの ROCm を求めずにそちらを使います（エンジンのライブラリの道をそちらに向けます）。
 
-| GPU | gfx | Ubuntu 26.04 | Fedora 44 と Windows |
+| GPU | gfx | Ubuntu 26.04 | Fedora 44・45 と Windows |
 | --- | --- | :-: | :-: |
 | RX 6800 / 6900 | gfx1030 | ○ | ○ |
 | RX 6700 | gfx1031 | × | ○ |
@@ -87,11 +87,11 @@ AMD 自身の ROCm（amdrocm のパッケージ、`/opt/rocm/core-<版>`）が�
 | RX 9060 | gfx1200 | ○ | ○ |
 | RX 9070 | gfx1201 | ○ | ○ |
 
-- **RX 6700 と RX 7600 では Fedora 44 を使ってください。** Ubuntu 26.04 の rocBLAS には、これらの GPU のコードがありません。
+- **RX 6700 と RX 7600 では Fedora 44 か 45 を使ってください。** Ubuntu 26.04 の rocBLAS には、これらの GPU のコードがありません。
 - RX 6600（gfx1032）と RX 6500 / 6400（gfx1034）は、どちらのディストリビューションの rocBLAS にもコードがないので動きません。
-- gfx1152 と gfx1153（Ryzen AI の一部の内蔵 GPU）は、Fedora 44 の rocBLAS にはコードがありますが、XeStrata が使う intel/llvm にそのターゲットがないので動きません。
+- gfx1152 と gfx1153（Ryzen AI の一部の内蔵 GPU）は、Fedora の rocBLAS（44・45）にはコードがありますが、XeStrata が使う intel/llvm にそのターゲットがないので動きません。
 - 自分の GPU の gfx は、`xestrata --check` が GPU の名前の後ろに出します。
-- 表は、どちらのディストリビューションも ROCm 7.1 の rocBLAS のものです。確かめたのは RX 9060 XT（gfx1200）だけです。
+- 表は、Ubuntu 26.04 の ROCm 7.1 と Fedora 44 の 7.1・45 の 7.2 の rocBLAS のものです。確かめたのは RX 9060 XT（gfx1200）だけです。
 
 ## モデルの選び方
 
@@ -169,7 +169,7 @@ RAM の少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の�
 
 ### Podman
 
-ホストに入れるのは Podman と podman-compose だけです。XeStrata は Fedora 44 のコンテナの中に、Releases の rpm から入ります（rootless）。
+ホストに入れるのは Podman と podman-compose だけです。XeStrata は Fedora 45 のコンテナの中に、Releases の rpm から入ります（rootless）。
 
 ```bash
 git clone https://github.com/MistVVK/XeStrata && cd XeStrata/container
@@ -201,9 +201,9 @@ podman compose up -d                         # http://127.0.0.1:8095（止める
 > [!NOTE]
 > NVIDIA の GPU を使わない場合は、どちらの CUDA のバージョンを使っても変わりありません。
 
-| GPU | Ubuntu 26.04 | Fedora 44 |
+| GPU | Ubuntu 26.04 | Fedora 44 / 45 |
 | --- | --- | --- |
-| **おすすめ**: Intel、AMD（RDNA2 以降）、NVIDIA（Turing 以降） | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| **おすすめ**: Intel、AMD（RDNA2 以降）、NVIDIA（Turing 以降） | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4`（44）/ `cuda13.5`（45） |
 | Intel、AMD（RDNA2 以降）、NVIDIA の Pascal と Volta（P100、P40、GTX 10 シリーズ、V100 など） | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
 
 - パッケージは一度に 1 つだけ入ります。CUDA 13 の版には Pascal と Volta のコードがなく、これらを扱う NVIDIA のドライバーも 580 の系列（CUDA 12.4 に対応）までです。
@@ -235,7 +235,7 @@ podman compose up -d                         # http://127.0.0.1:8095（止める
 （ブラウザは開きません）。先に `xestrata` で一度設定しておきます。
 そのモデルをもう一度起動すると（`xestrata`、窓の「Start」）、2 つ目のサーバーは立てずに、動いているものにつなぎます。
 
-**窓（任意）**: 導入・起動・設定を画面で行う窓は、別のパッケージ `xestrata-gui` です（Ubuntu 26.04 と Fedora 44。どの版のパッケージにも合います）。
+**窓（任意）**: 導入・起動・設定を画面で行う窓は、別のパッケージ `xestrata-gui` です（Ubuntu 26.04 と Fedora 44・45。どの版のパッケージにも合います）。
 `sudo apt install ./xestrata-gui_*.deb` か `sudo dnf install ./xestrata-gui-*.rpm` で入れると、ディストリビューションの .NET 10 のランタイムも一緒に入ります。
 `xestrata gui` かメニューの XeStrata で開きます。
 窓がなくても、端末の `xestrata` とブラウザで全部使えます。.NET を要るのは窓だけです。
@@ -273,7 +273,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 
 - **要るもの**: [.NET 10 のランタイム](https://dotnet.microsoft.com/download/dotnet/10.0)と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)、GPU のドライバー。
   Visual C++ の再頒布可能パッケージがなければ、`xestrata.exe` が知らせて止まります。
-- **GPU**: Intel、NVIDIA（Pascal 以降、cuda12.4 のパッケージと同じコード）、AMD（RDNA2 以降、[上の表](#amd-の-gpu)の Fedora 44 と Windows の列の gfx）です。AMD は Adrenalin 26.5.1 以降のドライバーが要ります（`amdhip64_7.dll`）。
+- **GPU**: Intel、NVIDIA（Pascal 以降、cuda12.4 のパッケージと同じコード）、AMD（RDNA2 以降、[上の表](#amd-の-gpu)の Fedora 44・45 と Windows の列の gfx）です。AMD は Adrenalin 26.5.1 以降のドライバーが要ります（`amdhip64_7.dll`）。
 - **計算ライブラリ**: Intel の oneMKL、NVIDIA の cuBLAS と cuDNN、AMD の rocBLAS と hipBLASLt は 7z に入っていません。
   入っていなければ、setup が入れるかを聞き、答えが y なら 7z の Python に `pip install` で入れます。`--check` のときと 7z のフォルダーに書き込めないときは、入れるコマンドを示すだけです。なくても XeStrata 自身のカーネルで動きます。
 - **置き場所**: 7z のフォルダーに書き込むのは、上の計算ライブラリ（7z の `python\`）だけです。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。ウィンドウが思わぬエラーで止まったときは、理由を `%LOCALAPPDATA%\xestrata\state\launcher.log` に残します。そこに何も残らずにウィンドウが落ちるときは、コマンドプロンプトから `xestrata.exe --software-render` で起動すると、GPU を使わずに描きます。
@@ -318,7 +318,7 @@ SearXNG 互換の検索サーバーを設定すると、API と Web のページ
 
 **setup がドライバーや IGC が古いと言う**
 Intel の GPU のドライバー（Level Zero）や、その中のコンパイラ（IGC）の版によっては、VRAM の確保が断られたり、遅くなったりします。
-setup が示す方法（Intel の graphics PPA、Fedora 44、Podman）で新しいものにしてください。
+setup が示す方法（Intel の graphics PPA、Fedora 44 以降、Podman）で新しいものにしてください。
 
 **起動時に VRAM の確保が拒否された（`alloc_device: ... refused`）**
 VRAM に空きがあっても確保を断る、Intel の GPU のドライバーの状態です。エンジンは確保を小分けにしてやり直し、確保できる分だけで起動します。

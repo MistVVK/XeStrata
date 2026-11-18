@@ -315,21 +315,21 @@ When some are missing, setup stops at its first step with one command that insta
 
 From the table, take the common row of the mode you build and the rows of the GPU makers the PC has (any number of them), and put them after `sudo apt install` (`sudo dnf install` on Fedora, `sudo pacman -S` on Arch).
 `./setup.sh --packages` prints that line for this PC's distribution and GPUs and the mode of `--license` (contrib-llvm unless given).
-It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --license free`.
+It prints other choices too, as in `./setup.sh --packages fedora45/intel,amd --license free`.
 
-| Choice | Ubuntu 26.04 | Fedora 44 | Arch |
+| Choice | Ubuntu 26.04 | Fedora 44 / 45 | Arch |
 | --- | --- | --- | --- |
 | common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev opencl-headers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static opencl-headers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd opencl-headers blosc2` |
 | Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime` |
 | Intel GPUs (contrib-llvm) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | none (oneMKL is not in Arch's repositories) |
 | AMD GPUs (free, contrib-llvm) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common` |
-| NVIDIA GPUs (contrib-llvm) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (NVIDIA's CUDA repository) and NVIDIA's driver | `cuda` and NVIDIA's driver |
+| NVIDIA GPUs (contrib-llvm) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (44) / `cuda-toolkit-13-5` (45) (NVIDIA's CUDA repository) and NVIDIA's driver | `cuda` and NVIDIA's driver |
 
 - The packages starting with `intel-oneapi-` are in Intel's oneAPI repository (Intel's guides show how to add it: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
 - Intel GPU drivers (`libze-intel-gpu1` and the rest) ship old on Ubuntu 24.04/26.04 (26.04 has compute-runtime 26.05 and IGC 2.28).
   Below compute-runtime 26.22 a driver state can refuse device allocations while the VRAM is free (Intel's [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916); the driver works around an xe kernel bug fixed in Linux 7.1 — on XeStrata's side, [#34](https://github.com/MistVVK/XeStrata/issues/34)).
   On Ubuntu 24.04/26.04 with the HWE kernel, setup points to [Intel's graphics PPA](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics) (a newer compute-runtime and IGC) and stops the start until it is updated (`--old-driver` starts anyway).
-  On the GA kernel it recommends moving to the HWE kernel with the PPA, or Fedora 44 / Podman (whose IGC is 2.32 or later; [Troubleshooting](DETAILS.md#troubleshooting)).
+  On the GA kernel it recommends moving to the HWE kernel with the PPA, or Fedora 44 or later / Podman (whose IGC is 2.32 or later; [Troubleshooting](DETAILS.md#troubleshooting)).
 - The common row's `libblosc2-dev` (`blosc2-devel`) is for compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-on-the-disk)).
 - The AMD row's `clang-21` and `libclang-rt-21-dev` (on Fedora `rocm-clang` and `rocm-clang-runtime-devel`: ROCm's clang and its runtime) compile nothing (intel/llvm does the compiling).
   HIP's CMake package, which oneMath's rocBLAS backend reads, asks the compiler for clang's runtime builtins (`libclang_rt.builtins`) to add them to the link.
@@ -341,7 +341,7 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
 - Arch's ROCm lies under AMD's own tree, `/opt/rocm` (its CMake packages in `/opt/rocm/lib/cmake`, its libraries in `/opt/rocm/lib`).
   Neither CMake's default search nor ld.so's looks there, so `cmake/StrataHip.cmake` puts `/opt/rocm` on `CMAKE_PREFIX_PATH`, and setup records `/opt/rocm/lib` among the engine's library folders.
 - `opencl-headers` is installed on every distribution: intel/llvm's build installs the SYCL tools too, and `sycl-ls` includes `CL/cl.h` through `sycl/detail/cl.h` while its target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own objects).
-  No compiler brings that header in (a fresh Fedora 44 lacks it, as Arch does).
+  No compiler brings that header in (a fresh Fedora (44 and 45) lacks it, as Arch does).
 - oneMKL is not in Arch's repositories: install Intel's offline installer for it if it is wanted.
   The contrib-llvm mode hands an Intel GPU's dense products to oneMKL, so it needs oneMKL for an Intel GPU.
   Without it, use the free mode: it builds intel/llvm from the source, and an Intel GPU's dense products are XeStrata's own kernels' work.
@@ -371,6 +371,8 @@ tools/package/build.sh ubuntu26.04 cuda13.1   # xestrata-contrib-cuda13.1
 tools/package/build.sh ubuntu26.04 cuda12.4   # xestrata-contrib-cuda12.4
 tools/package/build.sh fedora44 free
 tools/package/build.sh fedora44 cuda13.4
+tools/package/build.sh fedora45 free
+tools/package/build.sh fedora45 cuda13.5
 ```
 
 - **The input is a commit**: `git archive` passes the commit's files, nothing else, to the container.
@@ -399,20 +401,23 @@ tools/package/build.sh fedora44 cuda13.4
 
 | Variant | Distribution | CUDA toolkit | NVIDIA code |
 | --- | --- | --- | --- |
-| free | Ubuntu 26.04, Fedora 44 | — | — |
+| free | Ubuntu 26.04, Fedora 44 and 45 | — | — |
 | cuda13.1 | Ubuntu 26.04 | `cuda-toolkit-13-1` from multiverse | sm_75, sm_80, sm_86, sm_89, sm_90 |
 | cuda13.4 | Fedora 44 | `cuda-toolkit-13-4` from NVIDIA's repository | sm_75, sm_80, sm_86, sm_89, sm_90 |
+| cuda13.5 | Fedora 45 | `cuda-toolkit-13-5` from NVIDIA's repository | sm_75, sm_80, sm_86, sm_89, sm_90 |
 | cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_60, sm_61, sm_70, sm_75, sm_80, sm_86, sm_89, sm_90 |
 
-Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1) has code for (but gfx1152 and gfx1153, which intel/llvm 7.2.0 has no target for).
+Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1; Fedora 45's is 7.2) has code for (but gfx1152 and gfx1153, which intel/llvm 7.2.0 has no target for).
 
 | Distribution | AMD code |
 | --- | --- |
 | Ubuntu 26.04 | gfx1030, gfx1100, gfx1101, gfx1151, gfx1200, gfx1201 |
 | Fedora 44 | gfx1030, gfx1031, gfx1035, gfx1036, gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1200, gfx1201 |
+| Fedora 45 | gfx1030, gfx1031, gfx1035, gfx1036, gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1200, gfx1201 |
 
-- A cuda variant is named after the CUDA version it is built with.
-  NVIDIA's repository for Fedora 44 has CUDA 13.3 and 13.4 only, so Fedora's is 13.4; it has no CUDA 12 either, so cuda12.4 is Ubuntu's only.
+- A cuda variant is named after the CUDA version it is built with. Fedora 44's rpm is 13.4 and Fedora 45's is 13.5.
+  NVIDIA has no repository of Fedora 45's own, so Fedora 45 uses fedora44's (switch when NVIDIA publishes one; on 2026-11-18 its fedora45
+  repository holds DCGM only). Fedora has no CUDA 12 either, so cuda12.4 is Ubuntu's only.
 - CUDA 13 builds no Pascal (sm_60, sm_61) or Volta (sm_70) code: a P100, P40 or V100 takes cuda12.4.
 - intel/llvm 7.2.0's SYCL has no name above sm_90: newer GPUs (an RTX 50) run sm_90's PTX, which their driver compiles.
 - The PTX is the toolkit's version, so the driver must support that CUDA version.
@@ -439,7 +444,8 @@ distribution (`tools/package/gui.sh`).
 
 ```bash
 tools/package/build.sh ubuntu26.04 gui   # xestrata-gui_<version>_amd64.deb
-tools/package/build.sh fedora44 gui      # xestrata-gui-<version>.x86_64.rpm
+tools/package/build.sh fedora44 gui      # xestrata-gui-<version>-<release>.fc44.x86_64.rpm
+tools/package/build.sh fedora45 gui      # xestrata-gui-<version>-<release>.fc45.x86_64.rpm
 ```
 
 - The distribution's `dotnet-sdk-10.0` (Ubuntu's archive, Fedora's updates) publishes the window for linux-x64,
@@ -474,7 +480,7 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
 - The packages provide `xestrata-engine` at their version and conflict with it: one is installed at a time, and
   installing another replaces it.
   They only suggest the window's package `xestrata-gui` ([the window's package](#the-windows-package-xestrata-gui)).
-- Neither Ubuntu 26.04 (`dpclang` up to 6) nor Fedora 44 has libsycl 9, so the packages carry it.
+- Neither Ubuntu 26.04 (`dpclang` up to 6) nor Fedora (44 and 45) has libsycl 9, so the packages carry it.
   intel/llvm's `libsycl-jit` (157 MB) is opened only to compile kernels from source, which the engine does not: it is left out.
 - The dependencies are the distribution's.
   The Python packages are the distribution's versions, not pip's pinned ones (`requirements.txt`).
@@ -509,25 +515,25 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
 The Containerfile and the compose files in `container/` run XeStrata in a rootless Podman container (how to use it: [README](../README.md#podman)).
 The image is built on the user's PC and not distributed: the contrib packages' image holds cuBLAS and oneMKL, which are not free software.
 
-- **What it holds**: the Fedora 44 image `tools/package/build.sh` uses (pinned by digest), with the release's rpm, checked against `SHA256SUMS`.
+- **What it holds**: the Fedora 45 image `tools/package/build.sh` uses (pinned by digest), with the release's rpm, checked against `SHA256SUMS`.
   Then every maker's package its `BUILD.json` records in `runtime` (Level Zero, cuBLAS, oneMKL)
   NVIDIA's driver libraries and `nvidia-smi` are not in it: CDI brings the host's.
-- **AMD's ROCm**: not Fedora's (7.1) but the ROCm of AMD's Radeon repository (its RHEL 10 one; 10.1 by default): its HIP runtime, rocBLAS and hipBLASLt.
+- **AMD's ROCm**: not Fedora's (7.2) but the ROCm of AMD's Radeon repository (its RHEL 10 one; 10.1 by default): its HIP runtime, rocBLAS and hipBLASLt.
   rocBLAS's and hipBLASLt's packages go in for every AMD GPU the engine has code for (`BUILD.json`'s `hip_archs`: RDNA2 to RDNA4), so that one image runs on each generation.
-  Its hipBLASLt has code for gfx1102, 1103 and 1150 as well, which Fedora's lacks, and from 10.1 the HIP runtime gives the VRAM of memory it unmaps back to other processes.
-  The libraries keep 7.1's names (`libamdhip64.so.7`, `librocblas.so.5`, `libhipblaslt.so.1`), so the Fedora 44 package's engine runs on them as it is.
+  Its hipBLASLt has code for gfx1102, 1103 and 1150 as well, which Fedora's (7.1 as 7.2) lacks, and from 10.1 the HIP runtime gives the VRAM of memory it unmaps back to other processes.
+  The libraries keep 7.1's and 7.2's names (`libamdhip64.so.7`, `librocblas.so.5`, `libhipblaslt.so.1`), so the Fedora 44 and 45 packages' engine runs on them as it is.
   Where AMD's release has no package for one of `hip_archs`, Fedora's goes in instead.
 - **Build arguments**: environment variables for `podman compose build`.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `XESTRATA_VERSION` | `latest` | the release's tag (`xe0.1.43.1`, for example) |
-| `XESTRATA_VARIANT` | `contrib-cuda13.4` | the rpm's variant |
+| `XESTRATA_VARIANT` | `contrib-cuda13.5` | the rpm's variant |
 | `XESTRATA_NONFREE` | `1` | `0` leaves out oneMKL and NVIDIA's cuBLAS and cuDNN (Intel's and NVIDIA's dense products and NVIDIA's image attention then run on XeStrata's own kernels) |
-| `XESTRATA_ROCM` | `10.1` | the ROCm version for AMD GPUs (AMD's repository's; `10.1` for now); `fedora` installs Fedora's (7.1). Both are free software, installed with `XESTRATA_NONFREE=0` as well |
+| `XESTRATA_ROCM` | `10.1` | the ROCm version for AMD GPUs (AMD's repository's; `10.1` for now); `fedora` installs Fedora's (7.2). Both are free software, installed with `XESTRATA_NONFREE=0` as well |
 
 - **A local rpm**: one rpm in `container/rpm/` is installed instead of the release's.
-  `xestrata-free`, which the Releases do not have, is made with `tools/package/build.sh fedora44 free` and put there.
+  `xestrata-free`, which the Releases do not have, is made with `tools/package/build.sh fedora45 free` and put there.
 - **GPU**: `/dev/dri` is passed, and `userns_mode: keep-id` with `group_add: keep-groups` opens it as the host's user, with its uid and render group
   (`keep-groups` needs the crun runtime). For AMD, `compose.amd.yaml` adds `/dev/kfd`.
   For NVIDIA, `compose.nvidia.yaml` passes CDI's `nvidia.com/gpu=all`: install the NVIDIA Container Toolkit (`nvidia-container-toolkit`, in NVIDIA's repository) on the host and make its CDI specification once.

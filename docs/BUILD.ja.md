@@ -317,21 +317,21 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 
 次の表から、使うモードの共通の行と、PC にある GPU のメーカーの行（いくつでも）を選び、`sudo apt install`（Fedora は `sudo dnf install`、Arch は `sudo pacman -S`）の後ろに並べます。
 `./setup.sh --packages` は、この PC のディストリビューションと GPU、`--license` のモード（既定は contrib-llvm）に合わせて、その 1 行を出します。
-`./setup.sh --packages fedora44/intel,amd --license free` のように、ほかの組み合わせも出せます。
+`./setup.sh --packages fedora45/intel,amd --license free` のように、ほかの組み合わせも出せます。
 
-| 選択 | Ubuntu 26.04 | Fedora 44 | Arch |
+| 選択 | Ubuntu 26.04 | Fedora 44 / 45 | Arch |
 | --- | --- | --- | --- |
 | 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev opencl-headers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static opencl-headers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd opencl-headers blosc2` |
 | Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime` |
 | Intel の GPU（contrib-llvm） | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | なし（oneMKL は Arch のリポジトリにありません） |
 | AMD の GPU（free、contrib-llvm） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common` |
-| NVIDIA の GPU（contrib-llvm） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー | `cuda` と NVIDIA のドライバー |
+| NVIDIA の GPU（contrib-llvm） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（44）/ `cuda-toolkit-13-5`（45）（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー | `cuda` と NVIDIA のドライバー |
 
 - `intel-oneapi-` で始まるものは、Intel の oneAPI のリポジトリにあります（追加のしかたは Intel の手順: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）。
 - Intel の GPU のドライバー（`libze-intel-gpu1` ほか）は、Ubuntu 24.04/26.04 では古いものが配布されます（26.04 は compute-runtime 26.05 と IGC 2.28）。
   compute-runtime 26.22 未満には、VRAM に空きがあっても確保を断る状態になる不具合があります（Intel の [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916)。xe カーネルのバグ（Linux 7.1 で修正）に 26.22 のドライバーが対応したもの。XeStrata では[#34](https://github.com/MistVVK/XeStrata/issues/34)）。
   Ubuntu 24.04/26.04 で HWE カーネルを使っているとき、setup は [Intel の graphics PPA](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics)（compute-runtime と IGC が新しい）への更新を勧めて、更新まで起動を止めます（`--old-driver` でそのまま起動もできます）。
-  GA カーネルでは、HWE カーネルにして PPA を入れるか、Fedora 44 / Podman（IGC も 2.32 以降。[困ったとき](DETAILS.ja.md#困ったとき)）を勧めます。
+  GA カーネルでは、HWE カーネルにして PPA を入れるか、Fedora 44 以降 / Podman（IGC も 2.32 以降。[困ったとき](DETAILS.ja.md#困ったとき)）を勧めます。
 - 共通の行の `libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話をディスクにも置く)）のためです。
 - AMD の行の `clang-21` と `libclang-rt-21-dev`（Fedora は `rocm-clang` と `rocm-clang-runtime-devel`、ROCm の clang とその実行時）は、コンパイルには使いません（コンパイルは intel/llvm がします）。
   oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
@@ -343,7 +343,7 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 - Arch の ROCm は AMD 自身の入れ方と同じ `/opt/rocm` にあります（CMake のパッケージは `/opt/rocm/lib/cmake`、ライブラリは `/opt/rocm/lib`）。
   CMake の既定の探索にも ld.so の既定にも入らないので、`cmake/StrataHip.cmake` が `/opt/rocm` を `CMAKE_PREFIX_PATH` に足し、setup は `/opt/rocm/lib` をエンジンのライブラリのフォルダーに記録します。
 - どのディストリビューションでも `opencl-headers` を入れます。intel/llvm のビルドは SYCL の道具（`sycl-ls`）もインストールし、それは `sycl/detail/cl.h` から `CL/cl.h` を読みますが、そのターゲットには構成が取ってくる OpenCL のヘッダーの include が付きません（あれはランタイム自身のオブジェクトのものです）。
-  コンパイラーはこのヘッダーを連れてきません（入れたばかりの Fedora 44 にも、Arch にもありません）。
+  コンパイラーはこのヘッダーを連れてきません（入れたばかりの Fedora（44・45）にも、Arch にもありません）。
 - oneMKL は Arch のリポジトリにないので、要るなら Intel のオフラインインストーラーで入れます。
   contrib-llvm のモードは Intel の GPU の密な積を oneMKL に任せるので、Intel の GPU では oneMKL が要ります。
   入れない場合は free のモードを使います。intel/llvm をソースからビルドし、Intel の GPU の密な積は XeStrata 自身のカーネルが行います。
@@ -373,6 +373,8 @@ tools/package/build.sh ubuntu26.04 cuda13.1   # xestrata-contrib-cuda13.1
 tools/package/build.sh ubuntu26.04 cuda12.4   # xestrata-contrib-cuda12.4
 tools/package/build.sh fedora44 free
 tools/package/build.sh fedora44 cuda13.4
+tools/package/build.sh fedora45 free
+tools/package/build.sh fedora45 cuda13.5
 ```
 
 - **入力はコミットだけ**: `git archive` で、コミットの中身だけをコンテナに渡します。
@@ -400,20 +402,23 @@ tools/package/build.sh fedora44 cuda13.4
 
 | 版 | ディストリビューション | CUDA ツールキット | NVIDIA のコード |
 | --- | --- | --- | --- |
-| free | Ubuntu 26.04、Fedora 44 | — | — |
+| free | Ubuntu 26.04、Fedora 44・45 | — | — |
 | cuda13.1 | Ubuntu 26.04 | multiverse の `cuda-toolkit-13-1` | sm_75、sm_80、sm_86、sm_89、sm_90 |
 | cuda13.4 | Fedora 44 | NVIDIA のリポジトリの `cuda-toolkit-13-4` | sm_75、sm_80、sm_86、sm_89、sm_90 |
+| cuda13.5 | Fedora 45 | NVIDIA のリポジトリの `cuda-toolkit-13-5` | sm_75、sm_80、sm_86、sm_89、sm_90 |
 | cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_60、sm_61、sm_70、sm_75、sm_80、sm_86、sm_89、sm_90 |
 
-AMD のコードは、どの版にも、そのディストリビューションの rocBLAS（ROCm 7.1）がコードを持つ GPU の分を入れます（intel/llvm 7.2.0 にターゲットのない gfx1152 と gfx1153 を除きます）。
+AMD のコードは、どの版にも、そのディストリビューションの rocBLAS（Ubuntu は 7.1、Fedora 44 は 7.1、45 は 7.2）がコードを持つ GPU の分を入れます（intel/llvm 7.2.0 にターゲットのない gfx1152 と gfx1153 を除きます）。
 
 | ディストリビューション | AMD のコード |
 | --- | --- |
 | Ubuntu 26.04 | gfx1030、gfx1100、gfx1101、gfx1151、gfx1200、gfx1201 |
 | Fedora 44 | gfx1030、gfx1031、gfx1035、gfx1036、gfx1100、gfx1101、gfx1102、gfx1103、gfx1150、gfx1151、gfx1200、gfx1201 |
+| Fedora 45 | gfx1030、gfx1031、gfx1035、gfx1036、gfx1100、gfx1101、gfx1102、gfx1103、gfx1150、gfx1151、gfx1200、gfx1201 |
 
-- cuda の版の名前は、ビルドに使った CUDA の版です。
-  Fedora 44 向けの NVIDIA のリポジトリには CUDA 13.3 と 13.4 しかないので、Fedora では 13.4 を使います。CUDA 12 もないので、cuda12.4 は Ubuntu だけです。
+- cuda の版の名前は、ビルドに使った CUDA の版です。Fedora 44 の rpm は 13.4、45 の rpm は 13.5 です。
+  NVIDIA のリポジトリは fedora44 用しかないので、Fedora 45 でもそれを使います（NVIDIA が fedora45 用の置き場を出したら切り替えます。2026-11-18 時点で fedora45 用には DCGM しかありません）。
+  Fedora に CUDA 12 は無いので、cuda12.4 は Ubuntu だけです。
 - CUDA 13 は Pascal（sm_60・sm_61）と Volta（sm_70）のコードを作らないので、P100、P40、V100 などは cuda12.4 を使います。
 - intel/llvm 7.2.0 の SYCL には sm_90 より上の名前がないので、RTX 50 などの新しい GPU は sm_90 の PTX をドライバーがコンパイルして動かします。
 - PTX はツールキットの版なので、ドライバーはその CUDA の版に対応している必要があります。
@@ -439,7 +444,8 @@ Linux の窓（`launcher/`）も、同じ `tools/package/build.sh` で、その�
 
 ```bash
 tools/package/build.sh ubuntu26.04 gui   # xestrata-gui_<版>_amd64.deb
-tools/package/build.sh fedora44 gui      # xestrata-gui-<版>.x86_64.rpm
+tools/package/build.sh fedora44 gui      # xestrata-gui-<版>-<Release>.fc44.x86_64.rpm
+tools/package/build.sh fedora45 gui      # xestrata-gui-<版>-<Release>.fc45.x86_64.rpm
 ```
 
 - ディストリビューションの `dotnet-sdk-10.0`（Ubuntu はアーカイブ、Fedora は updates）で、窓を linux-x64 のフレームワーク依存で publish します。
@@ -456,7 +462,8 @@ tools/package/build.sh fedora44 gui      # xestrata-gui-<版>.x86_64.rpm
 
 どの版（`xestrata-free`、`xestrata-contrib-cuda<版>`）も、1 つのパッケージに次のものを入れます。
 パッケージの版は Debian の付け方にならい、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）です。
-xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）です。
+xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1 に Fedora のタグを付けた `1.fc44`・`1.fc45`）です。
+  タグは、Fedora 44 と 45 の同じ版の名前（gui と free）が、リリースの集め先で重ならないようにするためです。
 
 | 中身 | 置き場所 |
 | --- | --- |
@@ -465,7 +472,7 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 
 - パッケージは `xestrata-engine` を版つきで提供し、互いに衝突します。一度に 1 つだけ入り、別のものを入れると入れ替わります。
   窓のパッケージ `xestrata-gui` は提案（Suggests）だけです（[窓のパッケージ](#窓のパッケージxestrata-gui)）。
-- libsycl 9 は Ubuntu 26.04（`dpclang` 6 まで）にも Fedora 44 にもないので、パッケージに同梱します。
+- libsycl 9 は Ubuntu 26.04（`dpclang` 6 まで）にも Fedora（44・45）にもないので、パッケージに同梱します。
   intel/llvm の `libsycl-jit`（157 MB）は、ソースからカーネルをコンパイルするときだけ開かれ、エンジンはそれをしないので入れません。
 - 依存は、ディストリビューションにあるものを使います。
   Python のパッケージは pip の固定版（`requirements.txt`）ではなく、ディストリビューションの版です。
@@ -498,25 +505,25 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 `container/` の Containerfile と compose のファイルで、XeStrata を rootless の Podman のコンテナで動かします（使い方は [README](../README.ja.md#podman)）。
 イメージは使う人の PC で作り、配布しません。contrib の版のイメージには、自由ソフトウェアでない cuBLAS と oneMKL が入るためです。
 
-- **中身**: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、Releases の rpm を `SHA256SUMS` で確かめて入れます。
+- **中身**: `tools/package/build.sh` と同じ Fedora 45 のイメージ（ダイジェストで固定）に、Releases の rpm を `SHA256SUMS` で確かめて入れます。
   続けて、その `BUILD.json` の `runtime` にあるメーカーのもの（Level Zero、cuBLAS、oneMKL）と
   NVIDIA のドライバーのライブラリと `nvidia-smi` は入れず、CDI でホストのものを使います。
-- **AMD の ROCm**: Fedora のもの（7.1）でなく、AMD の Radeon 向けのリポジトリ（RHEL 10 版）の ROCm（既定は 10.1）の HIP の実行時と rocBLAS と hipBLASLt を入れます。
+- **AMD の ROCm**: Fedora のもの（7.2）でなく、AMD の Radeon 向けのリポジトリ（RHEL 10 版）の ROCm（既定は 10.1）の HIP の実行時と rocBLAS と hipBLASLt を入れます。
   rocBLAS と hipBLASLt は、エンジンがコードを持つ AMD の GPU（`BUILD.json` の `hip_archs`: RDNA2 から RDNA4 まで）ごとのパッケージを全部入れるので、1 つのイメージがどの世代でも動きます。
-  hipBLASLt は Fedora のものにない gfx1102・1103・1150 のコードも持ち、HIP の実行時は 10.1 から、外したメモリの VRAM をほかのプロセスに戻します。
-  ライブラリの名前（`libamdhip64.so.7`・`librocblas.so.5`・`libhipblaslt.so.1`）は 7.1 と同じなので、Fedora 44 のパッケージのエンジンがそのまま動きます。
+  hipBLASLt は Fedora のもの（7.1・7.2）にない gfx1102・1103・1150 のコードも持ち、HIP の実行時は 10.1 から、外したメモリの VRAM をほかのプロセスに戻します。
+  ライブラリの名前（`libamdhip64.so.7`・`librocblas.so.5`・`libhipblaslt.so.1`）は 7.1・7.2 と同じなので、Fedora 44・45 のパッケージのエンジンがそのまま動きます。
   AMD の版に `hip_archs` のどれかのパッケージがないときは、Fedora のものを入れます。
 - **ビルドの引数**: 環境変数で `podman compose build` に渡します。
 
 | 変数 | 既定 | 意味 |
 | --- | --- | --- |
 | `XESTRATA_VERSION` | `latest` | リリースのタグ（`xe0.1.43.1` など） |
-| `XESTRATA_VARIANT` | `contrib-cuda13.4` | 入れる rpm の版 |
+| `XESTRATA_VARIANT` | `contrib-cuda13.5` | 入れる rpm の版 |
 | `XESTRATA_NONFREE` | `1` | `0` で oneMKL と、NVIDIA の cuBLAS・cuDNN を入れません（Intel と NVIDIA の密な積と NVIDIA の画像の注意は XeStrata の自前のカーネルになります） |
-| `XESTRATA_ROCM` | `10.1` | AMD の GPU の ROCm の版（AMD のリポジトリのもの、いまは `10.1` だけ）。`fedora` で Fedora のもの（7.1）を入れます。ROCm はどちらも自由ソフトウェアで、`XESTRATA_NONFREE=0` でも入れます |
+| `XESTRATA_ROCM` | `10.1` | AMD の GPU の ROCm の版（AMD のリポジトリのもの、いまは `10.1` だけ）。`fedora` で Fedora のもの（7.2）を入れます。ROCm はどちらも自由ソフトウェアで、`XESTRATA_NONFREE=0` でも入れます |
 
 - **手元の rpm**: `container/rpm/` に rpm を 1 つ置くと、Releases から取らずにそれを入れます。
-  Releases にない `xestrata-free` は、`tools/package/build.sh fedora44 free` で作ってここに置きます。
+  Releases にない `xestrata-free` は、`tools/package/build.sh fedora45 free` で作ってここに置きます。
 - **GPU**: `/dev/dri` を渡し、`userns_mode: keep-id` と `group_add: keep-groups` で、ホストのユーザーの uid と render グループの権限のまま開きます
   （`keep-groups` には crun のランタイムが要ります）。AMD は `compose.amd.yaml` が `/dev/kfd` を足します。
   NVIDIA は `compose.nvidia.yaml` が CDI の `nvidia.com/gpu=all` を渡すので、ホストに NVIDIA Container Toolkit（`nvidia-container-toolkit`、NVIDIA のリポジトリにあります）を入れて、一度 CDI の設定を作ります。

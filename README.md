@@ -13,7 +13,7 @@ XeStrata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-N
 that normally runs on a server, and models that make images, on your own PC.
 It uses one Intel Arc, AMD Radeon (RDNA2 or later) or NVIDIA GPU, on Linux or Windows.
 One run of `xestrata --setup` gives you the text model, the image models, the browser app and the API.
-Ubuntu 26.04 and Fedora 44 have deb and rpm packages, Windows a 7z, and it runs in a Podman container as well.
+Ubuntu 26.04 and Fedora 44 and 45 have deb and rpm packages, Windows a 7z, and it runs in a Podman container as well.
 It is free software, and on an Intel or AMD GPU it also builds and runs with free software only.
 
 > **Contents:** [All in One](#all-in-one) · [About XeStrata](#about-xestrata) · [What you need](#what-you-need) ·
@@ -56,7 +56,7 @@ The models, the install, the app and the API are much the same as Strata's.
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
 | RAM | Usually 32-62 GB ([Choosing a model](#choosing-a-model)). The smallest, Gyro-Coder, needs 26 GB (28 GB of RAM and VRAM together, where the VRAM makes up for the RAM); the largest sizes 100 GB or more. |
 | Disk | About 60-110 GB for the model (up to 190 GB for the largest sizes), and about 5 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
-| OS | Linux (the packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [Podman](#podman) or [from the source](docs/BUILD.md#installing-from-the-source)), Windows 10 and 11 (x64, [Windows](#windows)). WSL 2 may work (pull requests welcome). |
+| OS | Linux (the packages are for Ubuntu 26.04 and Fedora 44 and 45; on other distributions, [Podman](#podman) or [from the source](docs/BUILD.md#installing-from-the-source)), Windows 10 and 11 (x64, [Windows](#windows)). WSL 2 may work (pull requests welcome). |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
 
 - **Matrix engines:** Intel's XMX, AMD's WMMA (RDNA3 or later) and NVIDIA's tensor cores are used; a GPU without
@@ -77,7 +77,7 @@ When AMD's own ROCm is installed (the amdrocm packages, `/opt/rocm/core-<version
 engine links and the code of the GPUs in use, setup uses that one instead and does not ask for the distribution's (the
 engine's library path is pointed at it).
 
-| GPU | gfx | Ubuntu 26.04 | Fedora 44 and Windows |
+| GPU | gfx | Ubuntu 26.04 | Fedora 44 / 45 and Windows |
 | --- | --- | :-: | :-: |
 | RX 6800 / 6900 | gfx1030 | yes | yes |
 | RX 6700 | gfx1031 | no | yes |
@@ -91,12 +91,12 @@ engine's library path is pointed at it).
 | RX 9060 | gfx1200 | yes | yes |
 | RX 9070 | gfx1201 | yes | yes |
 
-- **On an RX 6700 or an RX 7600, use Fedora 44.** Ubuntu 26.04's rocBLAS has no code for these GPUs.
+- **On an RX 6700 or an RX 7600, use Fedora 44 or 45.** Ubuntu 26.04's rocBLAS has no code for these GPUs.
 - The RX 6600 (gfx1032) and the RX 6500 / 6400 (gfx1034) do not run: neither distribution's rocBLAS has code for them.
-- gfx1152 and gfx1153 (some Ryzen AI integrated graphics) do not run: Fedora 44's rocBLAS has code for them, but the
+- gfx1152 and gfx1153 (some Ryzen AI integrated graphics) do not run: Fedora's rocBLAS (44 and 45) has code for them, but the
   intel/llvm XeStrata builds with has no target for them.
 - `xestrata --check` shows your GPU's gfx after its name.
-- The table is that of ROCm 7.1's rocBLAS on both distributions. Only the RX 9060 XT (gfx1200) has been checked.
+- The table is that of Ubuntu 26.04's ROCm 7.1 and Fedora 44's 7.1 / 45's 7.2 rocBLAS. Only the RX 9060 XT (gfx1200) has been checked.
 
 ## Choosing a model
 
@@ -176,7 +176,7 @@ Choosing one, using it and the API: [docs/TRANSLATE.md](docs/TRANSLATE.md).
 
 ### Podman
 
-Only Podman and podman-compose go on the host. XeStrata goes into a Fedora 44 container, from the release's rpm (rootless).
+Only Podman and podman-compose go on the host. XeStrata goes into a Fedora 45 container, from the release's rpm (rootless).
 
 ```bash
 git clone https://github.com/MistVVK/XeStrata && cd XeStrata/container
@@ -202,15 +202,15 @@ podman compose up -d                         # http://127.0.0.1:8095 (podman com
 
 1. Pick the package for your GPU from the table below and download it from [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases) (with `SHA256SUMS`).
 1. Check it: `sha256sum -c SHA256SUMS --ignore-missing`.
-1. Install it: `sudo apt install ./xestrata-contrib-cuda13.1_*.deb` (Ubuntu) or `sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm` (Fedora).
+1. Install it: `sudo apt install ./xestrata-contrib-cuda13.1_*.deb` (Ubuntu) or `sudo dnf install ./xestrata-contrib-cuda13.*-*.rpm` (Fedora).
 1. Run `xestrata --setup` in a terminal. If a GPU library or the render group is missing, it prints the command that installs it and stops; run that command, then `xestrata --setup` again.
 
 > [!NOTE]
 > Without an NVIDIA GPU, either CUDA version works the same.
 
-| GPU | Ubuntu 26.04 | Fedora 44 |
+| GPU | Ubuntu 26.04 | Fedora 44 / 45 |
 | --- | --- | --- |
-| **Recommended**: Intel, AMD (RDNA2 or later), NVIDIA (Turing or later) | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| **Recommended**: Intel, AMD (RDNA2 or later), NVIDIA (Turing or later) | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` (44) / `cuda13.5` (45) |
 | Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta (P100, P40, GTX 10 series, V100 and others) | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
 - One package is installed at a time. The CUDA 13 packages have no code for Pascal and Volta, and NVIDIA's drivers for them end with the 580 series (CUDA 12.4 works with it).
@@ -244,7 +244,7 @@ Then it downloads the model and starts it, and your browser opens `http://127.0.
 Starting that model again (`xestrata`, the window's Start) starts no second server: it connects to the one running.
 
 **The window (optional):** the window that installs, starts and sets up the models is a package of its own,
-`xestrata-gui` (Ubuntu 26.04 and Fedora 44; it goes with every variant).
+`xestrata-gui` (Ubuntu 26.04 and Fedora 44 and 45; it goes with every variant).
 `sudo apt install ./xestrata-gui_*.deb` or `sudo dnf install ./xestrata-gui-*.rpm` installs it, with the distribution's
 .NET 10 runtime.
 `xestrata gui` or XeStrata in the menu opens it.
@@ -287,7 +287,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
 
 - **What it needs:** the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0), the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) and the GPU's driver.
   Without the Visual C++ Redistributable, `xestrata.exe` says so and stops.
-- **GPUs:** Intel, NVIDIA (from Pascal on, the code of the cuda12.4 package) and AMD (RDNA2 and later, the gfx of the "Fedora 44 and Windows" column [above](#amd-gpus)). AMD needs Adrenalin 26.5.1 or a later driver (`amdhip64_7.dll`).
+- **GPUs:** Intel, NVIDIA (from Pascal on, the code of the cuda12.4 package) and AMD (RDNA2 and later, the gfx of the "Fedora 44 / 45 and Windows" column [above](#amd-gpus)). AMD needs Adrenalin 26.5.1 or a later driver (`amdhip64_7.dll`).
 - **Math libraries:** Intel's oneMKL, NVIDIA's cuBLAS and cuDNN, and AMD's rocBLAS and hipBLASLt are not in the 7z.
   Where they are missing, setup asks whether to install them and, on a y, installs them into the 7z's Python with `pip install`. With `--check`, and where the 7z's folder cannot be written, it only shows the command. Without them XeStrata's own kernels do the work.
 - **Where things go:** the only things written into the 7z's folder are the math libraries above (in the 7z's `python\`). The settings go to `%APPDATA%\xestrata`, the logs and the rest to `%LOCALAPPDATA%\xestrata`, the models to the data folder (by default `%LOCALAPPDATA%\xestrata\data`). When the window stops on an unexpected error, it leaves why in `%LOCALAPPDATA%\xestrata\state\launcher.log`. When the window closes and leaves nothing there, start it from a Command Prompt with `xestrata.exe --software-render`: it is then drawn without the GPU.
@@ -334,7 +334,7 @@ Run `xestrata --setup`: it says what is missing and the command that installs it
 
 **Setup says the driver or IGC is old.**
 Some versions of Intel's GPU driver (Level Zero), or of the compiler in it (IGC), refuse VRAM allocations or run slower.
-Update them the way setup shows (Intel's graphics PPA, Fedora 44, or Podman).
+Update them the way setup shows (Intel's graphics PPA, Fedora 44 or later, or Podman).
 
 **A VRAM allocation was refused at start (`alloc_device: ... refused`).**
 Intel's GPU driver can refuse allocations while the VRAM is free. The engine allocates again in smaller pieces and starts with what it gets.
