@@ -1655,9 +1655,11 @@ bool MfVae::finite(const float* x, int64_t n) {
     int* bad = vbad_;
     gpu::memset_async(bad, 0, sizeof(int), s_);
     q_of(s_).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        if (!sycl::isfinite(x[id[0]])) *bad = 1;
+        if (!sycl::isfinite(x[id[0]]))
+            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device>(*bad).store(1);
     });
     int h = 0;
+    gpu::stream_sync(s_);
     gpu::copy(&h, bad, sizeof(int));
     return h == 0;
 }
