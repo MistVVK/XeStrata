@@ -609,6 +609,10 @@ def main() -> int:
     a = ap.parse_args()
     if a.compat_bf16 and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
+    # setup.py runs this with STRATA_EXIT_WITH_PARENT=1: when setup is cancelled or killed (the app quit during "Prepare and load") the packer ends
+    # with it instead of writing on for minutes. What it had written is the resumable part (experts.bin.tmp + its sidecar, dense.bin.tmp).
+    from exit_with_parent import exit_with_parent
+    exit_with_parent()
     # HF snapshot files are symlinks to hash-named blobs. Keep the shard filename for discovery: .absolute(), not
     # .resolve(), which would follow the link to the blob and lose the -0000N-of-0000M name.
     src = pathlib.Path(a.gguf).absolute()

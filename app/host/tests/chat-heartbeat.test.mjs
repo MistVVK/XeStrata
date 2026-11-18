@@ -155,18 +155,18 @@ async function setup(t, beatMs) {
   };
   return { worker, chat, alive: () => child.exitCode === null, log: () => log };
 }
-const until = async (fn, ms = 8000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await sleep(25); } return false; };
+// A wait for an event, not a deadline: on a loaded Windows PC the host, the scripted model and the test share the CPU with whatever else runs, and a window of 1.5 s or 8 s
+// failed now and then (0.2.16 INT runs). The limit only ends a test that would otherwise hang; the test's own timeout is longer.
+const until = async (fn, ms = 30_000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await sleep(25); } return false; };
 
-test('route: a silent API model gets beats; a client that leaves cancels the model request before the next beat', { timeout: 40_000 }, async t => {
+test('route: a silent API model gets beats; a client that leaves cancels the model request', { timeout: 90_000 }, async t => {
   const s = await setup(t, 300);
-  let first = null;
-  const quiet = s.chat('chat-beat-a', 'SCRIPT:hang', f => { if (f.type === 'beat' && first === null) first = Date.now(); });
+  const quiet = s.chat('chat-beat-a', 'SCRIPT:hang');
   assert.ok(await until(() => quiet.frames.filter(f => f.type === 'beat').length >= 2), 'two beats while the model says nothing');
   const framesBefore = quiet.frames.length;
   quiet.abort();
   await assert.rejects(quiet.done, { name: 'AbortError' });
-  // the next beat is 300 ms away: the model request must already be cancelled well before it
-  assert.ok(await until(() => s.worker.aborted >= 1, 1500), 'disconnect cancelled the direct model request');
+  assert.ok(await until(() => s.worker.aborted >= 1), 'disconnect cancelled the direct model request');
   assert.ok(framesBefore >= 2);
   const next = s.chat('chat-beat-a', 'SCRIPT:echo still works');
   const frames = await next.done;
@@ -175,7 +175,19 @@ test('route: a silent API model gets beats; a client that leaves cancels the mod
   assert.ok(s.alive(), 'the host is alive');
 });
 
-test('route: two chats at once are independent; leaving one does not touch the other', { timeout: 40_000 }, async t => {
+test('route: a client that leaves cancels the model request at once, not when the next beat finds the connection closed', { timeout: 90_000 }, async t => {
+  // The beat is 20 s here and the wait below is shorter than that: no beat can reach the closed connection while the test waits, so a cancel can only come from the
+  // connection's own close. (The version of this check that raced a 300 ms beat against a 1.5 s window failed on a loaded PC; this one has no clock in it.)
+  const s = await setup(t, 20_000);
+  const quiet = s.chat('chat-beat-close', 'SCRIPT:hang');
+  assert.ok(await until(() => s.worker.requests.length >= 1), 'the model request is under way');
+  quiet.abort();
+  await assert.rejects(quiet.done, { name: 'AbortError' });
+  assert.ok(await until(() => s.worker.aborted >= 1, 15_000), 'the disconnect cancelled the model request, with no beat involved');
+  assert.equal(quiet.frames.filter(f => f.type === 'beat').length, 0, 'no beat had been sent: the cancel did not wait for one');
+});
+
+test('route: two chats at once are independent; leaving one does not touch the other', { timeout: 90_000 }, async t => {
   const s = await setup(t, 250);
   const a = s.chat('chat-beat-1', 'SCRIPT:hang');
   const b = s.chat('chat-beat-2', 'SCRIPT:hang');
@@ -183,7 +195,7 @@ test('route: two chats at once are independent; leaving one does not touch the o
   assert.ok(await until(() => count(a) >= 2 && count(b) >= 2), 'both beat');
   a.abort();
   await assert.rejects(a.done, { name: 'AbortError' });
-  assert.ok(await until(() => s.worker.aborted === 1, 1500), 'exactly the one request was cancelled');
+  assert.ok(await until(() => s.worker.aborted === 1), 'exactly the one request was cancelled');
   const frozen = count(a);
   const bBefore = count(b);
   assert.ok(await until(() => count(b) >= bBefore + 2), 'the other chat keeps getting beats');
@@ -191,7 +203,7 @@ test('route: two chats at once are independent; leaving one does not touch the o
   assert.equal(s.worker.aborted, 1, 'the other model request was not cancelled');
   b.abort();
   await assert.rejects(b.done, { name: 'AbortError' });
-  assert.ok(await until(() => s.worker.aborted === 2, 1500));
+  assert.ok(await until(() => s.worker.aborted === 2));
   assert.ok(s.alive());
 });
 

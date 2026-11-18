@@ -90,7 +90,7 @@ test('runCli passes the arguments untouched (no shell) and reads JSON', async ()
 
 // ---------------------------------------------------------------------------------- native-control in packaged mode
 
-function packagedFixture({ engineUsable = true, updater = null, repair = false, ids = ['iq2_xs', 'iq3_s'], controlVersion = '0.1.45', extraSizes = [], cliStartWait = 'old', installPoll = null } = {}) {
+function packagedFixture({ engineUsable = true, updater = null, repair = false, ids = ['iq2_xs', 'iq3_s'], controlVersion = '0.1.45', extraSizes = [], cliStartWait = 'old', installPoll = null, rpcHook = null } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'strata-packaged-test-'));
   const install = join(root, 'install'), data = join(root, 'data');
   mkdirSync(install, { recursive: true });
@@ -172,7 +172,10 @@ function packagedFixture({ engineUsable = true, updater = null, repair = false, 
       else if (message.params.arguments?.confirm) { installJob = { running: false, exit_code: 0 }; result = { structuredContent: { summary: 'Install started', plan: { download_gb: 66.4 }, install: { running: true, step: 'downloading' } } }; }
       else if (message.params.arguments?.cancel === undefined && message.params.arguments?.confirm === undefined) result = { structuredContent: installPoll ?? { summary: 'Install finished', install: { running: false, exit_code: 0 } } };
       else result = { structuredContent: { summary: 'Plan', plan: { title: 'Qwen3.8-Flash-Next Q2_0', download_gb: 66.4, disk_short: null } } };
-      queueMicrotask(() => child.stdout.emit('data', Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + String.fromCharCode(10))));
+      const deliver = answer => queueMicrotask(() => child.stdout.emit('data', Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: answer }) + String.fromCharCode(10))));
+      /* a test can take over the answer to a tool call (to answer later, or differently): rpcHook(params, usualAnswer, deliver) returns true when it will deliver */
+      if (rpcHook && message.method === 'tools/call' && rpcHook(message.params, result, deliver)) return;
+      deliver(result);
     } };
     return child;
   };
@@ -772,4 +775,61 @@ test('packaged: a run config that names a longer engine wait is honoured, and ne
     assert.equal(f.calls.find(c => c[0] === 'start')[2], 1800, 'the wait of the newest Control, which is what the ceiling allows');
     assert.equal(f.saved[0].engine_ready_s, 3600, 'setup’s own longer wait stays as it is');
   } finally { await f.native.close(); f.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------------- 0.2.17: quit while "Prepare and load" runs (the model packer kept writing to the disk)
+
+/** An installer whose job the tests can watch: `state.running` is whether setup and the packer run. `cancelIgnored` cancels leave it running (a stop that did not take). */
+function watchedInstaller({ startMs = 250, cancelIgnored = 0 } = {}) {
+  const state = { running: false, cancels: [], ignored: cancelIgnored };
+  const rpcHook = (params, _usual, deliver) => {
+    const a = params.arguments ?? {};
+    if (params.name !== 'strata_install') return false;
+    if (a.confirm) {                                   // the installer is busy planning, then launches the job and answers
+      setTimeout(() => { state.running = true; deliver({ structuredContent: { summary: 'Install started', plan: { download_gb: 75.8 }, install: { running: true, step: 'packing' } } }); }, startMs);
+      return true;
+    }
+    if (a.cancel) {
+      state.cancels.push(state.running);
+      const was = state.running;
+      if (was && state.ignored > 0) state.ignored--; else state.running = false;
+      deliver({ structuredContent: { summary: was ? 'the install was stopped' : 'no install is running' } });
+      return true;
+    }
+    deliver({ structuredContent: { summary: 'x', install: { running: state.running, step: 'packing' } } });
+    return true;
+  };
+  return { state, rpcHook };
+}
+const startSeen = async f => { for (let i = 0; i < 300; i++) { if (f.rpc.some(c => c.name === 'strata_install' && c.arguments.confirm)) return; await new Promise(r => setTimeout(r, 10)); } throw new Error('the install start was not sent'); };
+
+test('quit while the install is still starting: the cancel waits for the start, then stops the job it launched (it ran on after the app had gone)', async () => {
+  const w = watchedInstaller();
+  const f = packagedFixture({ rpcHook: w.rpcHook });
+  try {
+    await f.native.refresh(true);
+    const id = f.native.operation('install', { family: 'qwen', model: 'Q2_0' }).id;
+    await startSeen(f);
+    assert.equal(w.state.running, false, 'the installer has not launched the job yet');
+    await f.native.close();
+    await new Promise(r => setTimeout(r, 400));          // longer than the installer needs to launch: nothing may be left running
+    assert.equal(w.state.running, false, 'the model preparation still runs after the app was closed');
+    assert.ok(w.state.cancels.at(-1) === true || w.state.cancels.includes(true), 'a cancel reached the job after it was launched');
+    assert.notEqual(f.native.state().jobs.find(j => j.id === id)?.state, 'running');
+  } finally { f.cleanup(); }
+});
+
+test('quit: a cancel that did not take is repeated until the installer says no install runs', async () => {
+  const w = watchedInstaller({ startMs: 20, cancelIgnored: 1 });
+  const f = packagedFixture({ rpcHook: w.rpcHook });
+  try {
+    await f.native.refresh(true);
+    f.native.operation('install', { family: 'qwen', model: 'Q2_0' });
+    await startSeen(f);
+    await new Promise(r => setTimeout(r, 100));          // the job runs
+    assert.equal(w.state.running, true);
+    await f.native.close();
+    assert.equal(w.state.running, false, 'the second cancel stopped it');
+    assert.equal(w.state.cancels.length, 2, 'one cancel that did not take, one that did');
+  } finally { f.cleanup(); }
 });

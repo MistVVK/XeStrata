@@ -191,8 +191,10 @@ export function controlCallName(args) {
 }
 
 /** Operations the app uses. `run` is injectable so the host's tests need no Python; `log` (a line writer) makes every call write its start, its end and how long it took. */
-export function createControl({ control = findControl(), env = process.env, run = null, log = null, now = () => Date.now() } = {}) {
+export function createControl({ control = findControl(), env = process.env, run = null, log = null, now = () => Date.now(), sleep = ms => new Promise(r => setTimeout(r, ms)), lockWaitMs = 30_000, lockPollMs = 1_000 } = {}) {
   if (!control) return null;
+  const checksInFlight = new Map();
+  let lastCheck = Promise.resolve();
   const base = run ?? ((args, options) => runCli(control, args, { env, ...options }));
   // A call to Control that never returns (a stuck stop, a start that waits) used to leave nothing in the host log to say which call it was or for how long.
   let numbered = 0;
@@ -230,9 +232,32 @@ export function createControl({ control = findControl(), env = process.env, run 
      * STRATA_NO_ACQUIRE for that one process. Starting, serving, listing and rolling back never do.
      */
     async updateCheck({ feed = env.STRATA_UPDATE_FEED ?? null, appVersion = env.STRATA_APP_VERSION ?? null } = {}) {
-      const result = await call(['update', '--check', '--output', 'json', ...feedArgs(feed), ...(appVersion ? ['--app-version', appVersion] : [])], { timeoutMs: 90_000, acquire: true });
-      if (result.json?.ok) return result.json;
-      throw failure(result, 'The update check failed.');
+      /* One check at a time per question: Control's update lock lets one `update --check` in and refuses the rest ("another update is already running"). Two pages
+         (the app window and a browser tab), the first-run card and Settings > About, or a press at the same moment as the first read each started their own
+         check, and the one that lost the lock showed "couldn't read its download list" for good (0.2.16 N-A1, about 1 start in 8) or "another update is already
+         running" (N-A3). A call that meets a check in flight takes its answer. */
+      const key = JSON.stringify([feed, appVersion]);
+      const running = checksInFlight.get(key);
+      if (running) return running;
+      const args = ['update', '--check', '--output', 'json', ...feedArgs(feed), ...(appVersion ? ['--app-version', appVersion] : [])];
+      const before = lastCheck;      // a check about another question (the app's version differs) follows the one in flight, so the two never meet at the lock
+      const attempt = (async () => {
+        await before.catch(() => {});
+        /* A check is short, so a lock held by someone else (a Terminal's `strata update`, the end of another check) is waited for, up to lockWaitMs, before it is an answer. */
+        for (let tries = 0; ; tries++) {
+          try {
+            const result = await call(args, { timeoutMs: 90_000, acquire: true });
+            if (result.json?.ok) return result.json;
+            throw failure(result, 'The update check failed.');
+          } catch (error) {
+            if (error?.code !== 'update_busy' || tries >= Math.ceil(lockWaitMs / lockPollMs)) throw error;
+            await sleep(lockPollMs);
+          }
+        }
+      })().finally(() => checksInFlight.delete(key));
+      checksInFlight.set(key, attempt);
+      lastCheck = attempt;
+      return attempt;
     },
     async update({ feed = env.STRATA_UPDATE_FEED ?? null, engine = true, control: withControl = true, appVersion = env.STRATA_APP_VERSION ?? null, force = false, stopModel = false, onEvent = null, signal = null } = {}) {
       const args = ['update', '--output', 'jsonl', ...feedArgs(feed), ...(engine ? [] : ['--no-engine']), ...(withControl ? [] : ['--no-control']),

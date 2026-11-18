@@ -72,7 +72,7 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
  mkdirSync(directory,{recursive:true});
  const settingsPath=join(directory,'native-host.json');
  let preferences=readJson(settingsPath,{repo:defaultRepo});
- let child=null,seq=0,buffer='',pending=new Map(),definitions=[],refreshing=null,lastRead=0,connecting=null;
+ let child=null,seq=0,buffer='',pending=new Map(),definitions=[],refreshing=null,lastRead=0,connecting=null,installStart=null;
  /* QAGUI 0213: until Control has answered once, the state says it is still being asked (`checking`), not that nothing is installed. A failed read during Control's start is read again after a few seconds instead of standing for 45 s; after READ_TRIES failures the answer is final and the error shows. */
  let everRead=false,failedReads=0;const READ_TRIES=4,RETRY_MS=3000;
  let snapshot={available:false,repo:preferences.repo,summary:'Connect a local Strata installation.',catalog:null,installed:null,hardware:null,error:null};
@@ -249,7 +249,8 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
    await engineTask;
    if(job.state!=='running')return;
   }
-  let result=await tool('strata_install',installArgs(args,true));
+  /* the start call is remembered while it is on its way: a quit meets it (stopInstallForQuit) */
+  let result;installStart=tool('strata_install',installArgs(args,true));try{result=await installStart;}finally{installStart=null;}
   publish(result);
   if(engineStep&&!engineTask)engineTask=engineStep.run();
   try{
@@ -898,7 +899,22 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   return {done:true,folder:st.from,partial:st.to,removed:result.removed??0,restored:result.restored??0};
  }
  async function cancel(id){const job=jobs.get(id);if(!job||job.state!=='running')throw new Error('This operation is no longer running.');if(job.kind==='install'){job.engineAbort?.abort();await tool('strata_install',{cancel:true});}else if(job.kind==='models-move'){/* a safe stop: the copy in flight is dropped, files already moved stay */try{writeFileSync(job.cancelFile,'stop');}catch{/* the run ends anyway */}job.summary='Stopping…';emit();return state();}else if(job.abort)job.abort.abort();else if(job.process){if(!['tune','calibrate','autotune','recheck'].includes(job.kind))throw new Error('File updates cannot be cancelled safely while files are being replaced.');job.state='cancelled';await stopProcess(job.process);}job.state='cancelled';job.summary=job.kind==='install'?'Stopped. Completed downloads are kept.':'Stopped.';emit();return state();}
- async function close(){closing=true;clearInterval(timer);const installing=packaged&&child&&[...jobs.values()].some(j=>j.kind==='install'&&j.state==='running');if(installing)await send('tools/call',{name:'strata_install',arguments:{cancel:true}},15000).catch(()=>{});const operations=[];for(const job of jobs.values()){job.abort?.abort();if(job.process)operations.push(stopProcess(job.process));if(job.state==='running'&&!(job.kind==='update-strata'&&typeof job.appUpdateFrom==='string'))job.state='cancelled';}/* (an app update ends the app on purpose: its job stays running, so the next start can say it finished) */await Promise.all(operations);await Promise.all([...instances.keys()].map(id=>unload(id,true).catch(()=>{})));jobStore.close();disconnect();}
+ /* A call to the installer made while the connection is being closed: it may start the installer again (connect() refuses once closing is set). */
+ async function quitCall(name,args,timeout){if(!child||!definitions.length){if(connecting)await connecting;else await startClient();}const result=await send('tools/call',{name,arguments:args},timeout);let value=result.structuredContent;if(!value){const text=result.content?.find(c=>c.type==='text')?.text;try{value=JSON.parse(text);}catch{value={summary:text};}}return value??{};}
+ /* Quitting while "Prepare and load" runs: the installer's job (setup and the model packer under it) is stopped, and the stop is checked. Three things made it miss before: a start
+    still on its way (the installer launches the job when it gets its lock, after a cancel that found nothing to stop), no connection to the installer at that moment (the cancel was
+    skipped), and a cancel whose answer was never looked at. The packer's half-written files stay on disk and the next preparation resumes them (tools/iq_pack.py). */
+ async function stopInstallForQuit(){
+  const starting=installStart;
+  if(starting)await Promise.race([starting.catch(()=>{}),new Promise(resolve=>{const t=setTimeout(resolve,20000);t.unref?.();})]);
+  for(let attempt=1;attempt<=3;attempt++){
+   try{await quitCall('strata_install',{cancel:true},15000);}catch(error){updateLog(`quit: stopping the model preparation did not answer (${String(error?.message??error).slice(0,200)})`);}
+   try{const answer=await quitCall('strata_install',{},10000);if(!answer.install?.running){if(attempt>1)updateLog('quit: the model preparation is stopped');return true;}}catch{/* not confirmed: ask again */}
+  }
+  updateLog('quit: the model preparation could not be confirmed stopped; it continues in the background and can be stopped from Settings');
+  return false;
+ }
+ async function close(){closing=true;clearInterval(timer);const installing=packaged&&(installStart||[...jobs.values()].some(j=>j.kind==='install'&&j.state==='running'));if(installing)await stopInstallForQuit();const operations=[];for(const job of jobs.values()){job.abort?.abort();if(job.process)operations.push(stopProcess(job.process));if(job.state==='running'&&!(job.kind==='update-strata'&&typeof job.appUpdateFrom==='string'))job.state='cancelled';}/* (an app update ends the app on purpose: its job stays running, so the next start can say it finished) */await Promise.all(operations);await Promise.all([...instances.keys()].map(id=>unload(id,true).catch(()=>{})));jobStore.close();disconnect();}
  // Remove nonserializable process references from public jobs.
  const publicState=()=>{const value=state();value.jobs=value.jobs.map(({process,engineAbort,rawResult,...job})=>job);return value;};
  async function localPreview(path){if(!packaged)throw new Error('Checking local model files is part of the Strata app.');if(typeof path!=='string'||!path.trim()||[...path].some(c=>c.charCodeAt(0)<32))throw new Error('Choose a folder.');return control.importPlan(path.trim());}
