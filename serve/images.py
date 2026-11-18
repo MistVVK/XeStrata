@@ -1483,13 +1483,21 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         job.update(fix=fix, picture=images[0], width=w0, height=h0,
                    fix_req={k: v for k, v in req.items() if k not in ("fix", "n", "size", "strength", "mask")})
         return job
+    extend_scale = 1.0
     if req.get("extend") is not None:   # an outpaint: the canvas grown, its new area the mask
         if mask is not None:
             raise ImageRequestError("extend: not with a mask (extend the image, then edit the result with one)")
-        pads = parse_extend(req["extend"], *dims[0], int(cfg.get("max_side") or 2048))
+        size, pads, extend_scale = parse_extend(req["extend"], *dims[0], int(cfg.get("max_side") or 2048))
         images = list(images)
+        if size != dims[0]:
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(images[0])) as im:
+                buf = io.BytesIO()
+                im.resize(size, Image.Resampling.LANCZOS).save(buf, format="PNG")
+                images[0] = buf.getvalue()
         images[0], mask = extend_canvas(images[0], pads)
-        dims[0] = (dims[0][0] + pads[0] + pads[2], dims[0][1] + pads[1] + pads[3])
+        dims[0] = (size[0] + pads[0] + pads[2], size[1] + pads[1] + pads[3])
     if mask is not None:
         mask = check_mask(mask, dims[0])
     crop = None
@@ -1523,6 +1531,8 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
             raise ImageRequestError("edit_adapter: MOSS-Image's edits' alone"
                                     + ("" if moss else f" ({cfg.get('model_name') or 'this model'} is not MOSS-Image)"))
         job = parse_request(req, cfg)
+    if extend_scale < 1:
+        job["extend_scale"] = extend_scale
     if edits:
         job["refs"] = list(images)
         # the references at about 1 MP (the cut's first, the picture the engine cuts from, as it is: an
@@ -1908,10 +1918,10 @@ def crop_word(crop: dict, ref: tuple[int, int] | None = None) -> str:
     return word + (f",{ref[0]},{ref[1]}" if ref else "")
 
 
-def parse_extend(v, w: int, h: int, side: int) -> tuple[int, int, int, int]:
+def parse_extend(v, w: int, h: int, side: int) -> tuple[tuple[int, int], tuple[int, int, int, int], float]:
     """An edit's `extend`, the canvas grown past the first image (w x h): {"left", "top", "right", "bottom"} in pixels,
     or {"aspect": "W:H"} (the canvas grown on the two sides the shape asks for, evenly) -> (left, top, right, bottom);
-    ImageRequestError when it is not one of those, grows nothing, or passes `side` pixels a side."""
+    The picture and pads shrink together to fit `side` where needed; returns (picture size, pads, scale)."""
     if isinstance(v, str):   # a form's field: its JSON
         try:
             v = json.loads(v)
@@ -1932,8 +1942,8 @@ def parse_extend(v, w: int, h: int, side: int) -> tuple[int, int, int, int]:
         if wide <= 0 or high <= 0:
             raise ImageRequestError('extend.aspect: "W:H", e.g. "16:9"')
         a = wide / high
-        if not math.isfinite(a) or h * a > side or w / a > side:
-            raise ImageRequestError(f"extend: the canvas would pass {side} pixels a side (max_side)")
+        if not math.isfinite(a) or a == 0 or not math.isfinite(h * a) or not math.isfinite(w / a):
+            raise ImageRequestError("extend.aspect: ratio is too extreme")
         nw, nh = max(w, round(h * a)), max(h, round(w / a))
         pads = ((nw - w) // 2, (nh - h) // 2, nw - w - (nw - w) // 2, nh - h - (nh - h) // 2)
     else:
@@ -1949,9 +1959,14 @@ def parse_extend(v, w: int, h: int, side: int) -> tuple[int, int, int, int]:
     if not any(pads):
         raise ImageRequestError("extend: the canvas grows on no side: give aspect (e.g. 16:9 wide, 9:16 tall) or the "
                                 "pixels of a side (left, top, right, bottom)")
-    if w + pads[0] + pads[2] > side or h + pads[1] + pads[3] > side:
-        raise ImageRequestError(f"extend: the canvas would pass {side} pixels a side (max_side)")
-    return pads
+    scale = min(1.0, side / max(w + pads[0] + pads[2], h + pads[1] + pads[3]))
+    size = (int(w * scale), int(h * scale))
+    if min(size) < 16:
+        raise ImageRequestError("extend: the picture would be smaller than 16 pixels; use a less extreme extension")
+    pads = (int(pads[0] * scale), int(pads[1] * scale), int(pads[2] * scale), int(pads[3] * scale))
+    if not any(pads):
+        raise ImageRequestError("extend: the extension would be smaller than one pixel")
+    return size, pads, scale
 
 
 def extend_canvas(data: bytes, pads: tuple[int, int, int, int], feather: int = EXTEND_FEATHER) -> tuple[bytes, bytes]:
@@ -3724,6 +3739,8 @@ class ImageGen:
             two = job["refine"]["crop"]
             figures["refine"] = {"box": list(two["box"]), "made_size": "{}x{}".format(*two["gen"]),
                                  "strength": job["refine"]["strength"]}
+        if job.get("extend_scale") is not None:
+            figures["extend_scale"] = job["extend_scale"]
         if job.get("requested_size"):                      # made at the model's bucket instead: the web page says so
             figures["requested_size"] = job["requested_size"]
         if job.get("loras"):                               # the IMAGE line's count and VRAM, and a tag's names left out
@@ -5362,6 +5379,8 @@ class ImageTools:
             by = f" with {gen.model}" if len(self._gens()) > 1 else ""
             text = (f"The image is made{by} ({job['width']}x{job['height']}, seed {job['seed']}, "
                     f"{figures['seconds']:.0f} s) and the user sees it: {urls[0]}. This step is done.")
+            if job.get("extend_scale") is not None:
+                text += f" The original image was reduced to {job['extend_scale']:.1%} before extending it."
             if switched_from:
                 text += f" Changed image model from {switched_from} to {gen.model}: it takes this control."
             if found is not None:   # where edit_region drew, and its mask (another tool may take it)

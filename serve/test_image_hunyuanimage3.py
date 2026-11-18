@@ -155,6 +155,48 @@ class Requests(unittest.TestCase):
         self.assertNotIn("guidance", job)
 
 
+class Extend(unittest.TestCase):
+    def test_fit_canvas_and_scale_picture_and_sides(self):
+        for size, spec, ratio in (((832, 1216), {"aspect": "16:9"}, 16 / 9),
+                                  ((1216, 832), {"aspect": "9:16"}, 9 / 16),
+                                  ((1024, 1024), {"aspect": "21:9"}, 21 / 9)):
+            with self.subTest(size=size, spec=spec):
+                shrunk, pads, scale = images.parse_extend(spec, *size, 2048)
+                canvas = (shrunk[0] + pads[0] + pads[2], shrunk[1] + pads[1] + pads[3])
+                self.assertLess(scale, 1)
+                self.assertLessEqual(max(canvas), 2048)
+                self.assertAlmostEqual(canvas[0] / canvas[1], ratio, delta=0.005)
+        size, pads, scale = images.parse_extend({"left": 1000, "bottom": 900}, 1600, 1200, 2048)
+        self.assertLess(scale, 1)
+        self.assertEqual(pads[0], int(1000 * scale))
+        self.assertEqual(pads[3], int(900 * scale))
+        self.assertLessEqual(max(size[0] + pads[0], size[1] + pads[3]), 2048)
+
+    def test_edit_uses_shrunk_picture_and_reports_scale(self):
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (832, 1216), "red").save(buf, format="PNG")
+        job = images.parse_edit_request({"prompt": "a cube", "extend": {"aspect": "16:9"}},
+                                        [buf.getvalue()], cfg(vision=None))
+        self.assertLess(job["extend_scale"], 1)
+        self.assertLessEqual(max(images.image_dims(job["init"])), 2048)
+        self.assertEqual(images.image_dims(job["init"]), images.image_dims(job["mask"]))
+
+
+class AuxiliaryMemory(unittest.TestCase):
+    def test_allocation_refusal_is_a_memory_shortage(self):
+        from serve import image_regions
+
+        class Gen:
+            def aux_ask(self, line, want):
+                raise images.ImageJobFailed("image engine (BiRefNet): GPU memory: alloc_device: 123 bytes refused; "
+                                            "device free 54 MiB")
+        with self.assertRaises(image_regions.MemoryShort) as caught:
+            image_regions._ask(Gen(), "MATTE", "MATTE")
+        self.assertNotIn("alloc_device", str(caught.exception))
+
+
 class Sequence(unittest.TestCase):
     """The sequence the DiT reads, over a tokenizer that only answers what the builder asks."""
 
