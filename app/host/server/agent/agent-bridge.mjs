@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { GatewayClient } from './gateway-client.mjs';
 import { HarnessProcess, resolveHarness, redact, stopStaleAgent } from './harness-runtime.mjs';
 import { StatusReporter } from './status.mjs';
@@ -143,7 +143,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
  * @param {string} [options.nodePath]                   the Node runtime that runs the Harness
  * @param {(line:string)=>void} [options.log]
  */
-export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, helperLimitMs = () => 0, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, liveMs = 90_000, startRuntimeImpl = null, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
+export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, helperLimitMs = () => 0, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, liveMs = 90_000, startRuntimeImpl = null, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500, restartWaitMs = 120_000 }) {
   const root = join(dataDir, 'agent');
   const home = join(root, 'home');
   const sessionsFile = join(root, 'sessions.json');
@@ -195,9 +195,14 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   // (c.holding: from the moment ensureRuntime handed it over until the chat's turn exists) but is not a turn yet, which a restart would close under it.
   const busyChats = () => [...chats.values()].filter(c => c.turn || c.holding).length;
   const notifyIdle = () => { if (busyChats() === 0) { for (const w of idleWaiters) w(); idleWaiters.clear(); } };
-  const waitIdle = (signal, ms) => new Promise((resolve, reject) => {
+  /** FIX-APP A5: what the person is told when the restart of the Harness cannot start because another chat is working. A change in Settings -> Tools is not "the list of models". */
+  const BUSY_WORDS = {
+    tools: 'Another chat is still working, so your new Tools settings are not in use yet. Send your message again when that chat has finished.',
+    models: 'Another chat is still working and the list of models changed. Try again when it finishes.',
+  };
+  const waitIdle = (signal, ms, why = 'models') => new Promise((resolve, reject) => {
     if (busyChats() === 0) return resolve();
-    const timer = setTimeout(() => { idleWaiters.delete(done); reject(new AgentUnavailable('Another chat is still working and the list of models changed. Try again when it finishes.', 'agent-busy')); }, ms);
+    const timer = setTimeout(() => { idleWaiters.delete(done); reject(new AgentUnavailable(BUSY_WORDS[why] ?? BUSY_WORDS.models, 'agent-busy')); }, ms);
     const done = () => { clearTimeout(timer); resolve(); };
     idleWaiters.add(done);
     signal?.addEventListener('abort', () => { clearTimeout(timer); idleWaiters.delete(done); reject(signal.reason ?? new Error('aborted')); }, { once: true });
@@ -206,8 +211,12 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   /** The agent's profile now, plus where its shaped routes really lead (read by the forwarding endpoint). */
   let shapeTargets = {};
   function buildProfileNow() {
-    const profile = buildProfile({ local: localInstances(), connections: connections(), gate, tools: tools(), skillsDir: skillsDir(), proxyBase, searchMock, defaultLocalId: defaultLocalId() });
+    const toolSettings = tools();
+    const profile = buildProfile({ local: localInstances(), connections: connections(), gate, tools: toolSettings, skillsDir: skillsDir(), proxyBase, searchMock, defaultLocalId: defaultLocalId() });
     shapeTargets = profile.shapeTargets ?? {};
+    // FIX-APP A5: which Settings -> Tools values this profile was made from (compared, never shown or logged), so a restart that waits for other chats can say whether the Tools
+    // settings or the model list is why (the tools signature moves with a model change too).
+    profile.toolsKey = createHash('sha256').update(JSON.stringify(toolSettings ?? null, (key, value) => value instanceof Set ? [...value].sort() : value)).digest('hex').slice(0, 16);
     return profile;
   }
   const llmTarget = key => shapeTargets[key] ?? null;
@@ -292,7 +301,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       if (known) return { rt, route };
       starting = (async () => {
         if (rt?.hp.running) {
-          await waitIdle(signal, 120_000);
+          await waitIdle(signal, restartWaitMs, rt.profile.toolsKey !== profile.toolsKey ? 'tools' : 'models');
           const old = rt; rt = null;
           old.events?.close(); old.gw.close(); await old.hp.stop();
         }
