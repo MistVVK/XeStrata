@@ -58,6 +58,7 @@
 #include "strata/platform/downgrade.hpp"
 #include "strata/platform/env.hpp"
 #include "strata/platform/process.hpp"
+#include "strata/platform/replace.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -346,7 +347,7 @@ bool session_write(const std::string& path, const std::string& model_id, const s
     for (const Checkpoint& c : checks) ok = ok && put_parts(*c.snap);
     ok = std::fflush(f) == 0 && ok;
     ok = std::fclose(f) == 0 && ok;
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (!ok || !strata::platform::replace_file(tmp, path)) {
         std::remove(tmp.c_str());
         err = "writing " + path + " failed";
         return false;
