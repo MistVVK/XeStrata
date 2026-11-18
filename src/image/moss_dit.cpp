@@ -638,8 +638,8 @@ bool MossDit::dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<f
             else
                 names = {prefix + "ffn_up_gate.weight"};
         } else if (last == "qkv" && name.rfind("text_embedder.blocks.", 0) != 0 &&
-                   files_->find(prefix + "proj.qkv.weight") == nullptr) {
-            names = {prefix + "proj.q.weight", prefix + "proj.k.weight", prefix + "proj.v.weight"};
+                   files_->find(name + ".weight") == nullptr) {
+            names = {prefix + "q.weight", prefix + "k.weight", prefix + "v.weight"};
         } else {
             names = {name + ".weight"};
         }
@@ -666,7 +666,7 @@ bool MossDit::dora_norms(const LoraSlot& slot, const LoraEntry& e, std::vector<f
                 for (int64_t r = lo; r < hi; ++r)
                     for (int64_t c = 0; c < k; ++c)
                         o[(done + r - lo) * k + c] = kernels::f32_from_bf16(hp[p][(r - base) * k + c]);
-                done += hi - lo;
+                done += std::max<int64_t>(0, hi - lo);   // a part left of the window contributes nothing
                 base += rows[p];
             }
             return true;
