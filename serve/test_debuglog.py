@@ -89,8 +89,10 @@ class DebugLogPacking(unittest.TestCase):
         self.log.day = "1999-12-31"
         self.log.request({"n": "first of the new day"})
         packed = self.packed(path)
+        # the files swap inside the packing, the flag clears when the whole round is over (the trim follows the
+        # swap): wait for the flag too, not for the files alone
         deadline = time.monotonic() + 5
-        while (path.exists() or not packed.exists()) and time.monotonic() < deadline:
+        while (path.exists() or not packed.exists() or self.log.packing) and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertFalse(path.exists())
         self.assertEqual(lzma.open(packed, "rb").read(), body)

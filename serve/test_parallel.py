@@ -546,6 +546,14 @@ class ParallelService(unittest.TestCase):
         a.join(30)
         return res
 
+    def wait_slots_free(self):
+        """The HTTP reply can finish while a background BDONE drain still owns a slot (the handler's
+        _release_slot_when_done frees it at the engine's BDONE, on a thread of its own): wait for its notification,
+        but still fail if a slot never comes free - the leak or deadlock such a wait must not hide."""
+        with self.engine.slot_cv:
+            self.assertTrue(self.engine.slot_cv.wait_for(lambda: not any(self.engine.slot_busy), timeout=10),
+                            f"slots did not clear: {self.engine.slot_busy}")
+
     def test_a_long_prompt_gives_way_to_a_short_one(self):
         """#656: a long solo prompt read gives way at a chunk boundary; the short request is answered first, then the
         long one goes on (in the slot its part waited in) and is answered too."""
@@ -560,7 +568,7 @@ class ParallelService(unittest.TestCase):
         self.assertTrue(any(x.startswith("YIELD ") for x in log), log)
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 2)
-        self.assertFalse(any(self.engine.slot_busy))
+        self.wait_slots_free()
 
     def test_three_requests_long_long_short_do_not_deadlock(self):
         """ENGINE_REVIEW finding 1 (0.1.41 check): two long prompts fill both slots, a short one arrives a moment later
@@ -610,7 +618,7 @@ class ParallelService(unittest.TestCase):
         self.assertLess(res[short_q][1], res[long_q][1] - 0.5, res)
         log = self.log.read_text().splitlines()
         self.assertTrue(any(x.startswith("YIELD ") for x in log), log)
-        self.assertFalse(any(self.engine.slot_busy))
+        self.wait_slots_free()
 
     def test_no_way_given_to_a_long_one(self):
         """Two prompts of about the same length: no BYIELD (it only goes to a much shorter one)."""
