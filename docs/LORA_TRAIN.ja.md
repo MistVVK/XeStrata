@@ -395,7 +395,7 @@ Qwen-Image-2.1 のキャラ学習の既定は 8〜15 層・1500 更新です。�
 
 学習の土台は setup の `--images qwen-image-turbo --image-lora-training` のように用意します。画像モデルを複数選ぶと、それぞれの土台を取得します。対話とランチャーでも同じ選択ができます。指定しなければ学習用の追加ダウンロードはありません。
 
-蒸留モデルは学習の一覧に出ません。Qwen-Image-2.1 Turbo は Qwen-Image-2.1 の F16、Mage-Flow Turbo は `mage-flow`（RL）、MOSS-Image 4-step は `moss-image`（SFT）、Anima Turbo は `anima-base` を使います。Anima Base は作者の学習向けの選択であり、Turbo の教師と断定するものではありません。MageTrail は独立して学習し、Mage-Flow の LoRA との互換性は未検証です。蒸留モデルを API やチャットで指定すると土台に切り替え、その事実を返します。できた LoRA は対応する蒸留モデルにも使えます。
+蒸留モデルは学習の一覧に出ません。Qwen-Image-2.1 Turbo は Qwen-Image-2.1 の F16、Mage-Flow Turbo は `mage-flow`（RL）、MOSS-Image 4-step は `moss-image-sft`（SFT）、Anima Turbo は `anima-base` を使います。Anima Base は作者の学習向けの選択であり、Turbo の教師と断定するものではありません。MageTrail は独立して学習し、Mage-Flow の LoRA との互換性は未検証です。蒸留モデルを API やチャットで指定すると土台に切り替え、その事実を返します。できた LoRA は対応する蒸留モデルにも使えます。
 
 - チャットで「この子の LoRA を作りたい」と言うと、モデルがスキル `lora-train` を読み、道具 `train_lora` を呼びます。チャットの中に作成画面が出ます（Images タブの LoRA の節の「LoRA を学習…」からも開けます）。
 - 画面の流れ: 画像を入れる（ドラッグ＆ドロップ・複数・このチャットの画像も選べる）→ 種類（character・style・other）・名前・呼び出し語・模型を選ぶ → キャプションを自動で付けて（`tools/image/lora_caption.py`。チャットの画像を読める模型が書く。[キャプションの方針](#キャプションの方針)どおり）画面で直す → 設定（既定はプリセット。最大 step 数 n・何 step ごとに版を保存するか k・rank・lr・seed・層の絞り・見本の prompt。詳しい設定は畳む）→ 開始。

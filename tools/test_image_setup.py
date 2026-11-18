@@ -187,7 +187,7 @@ class Config(unittest.TestCase):
 
     def test_the_models_that_take_adapters_name_their_folder(self):
         """serve/loras.py reads a model's LoRA files from "lora_dir": one folder for every model that applies them."""
-        for model in ("qwen-image-turbo", "mage-flow-turbo", "moss-image"):
+        for model in ("qwen-image-turbo", "mage-flow-turbo", "moss-image-sft"):
             cfg = QI.image_config("Q8_0", "/engine/xestrata-image", "/models", model=model)
             self.assertEqual(cfg["lora_dir"], "/models/loras", model)
 
@@ -200,7 +200,7 @@ class TrainingBases(unittest.TestCase):
             eng = root / "engine"
             eng.mkdir()
             (eng / setup.IMAGE_EXE).touch()
-            a = argparse.Namespace(images="qwen-image-turbo,mage-flow-turbo,moss-image-4-step,anima-turbo",
+            a = argparse.Namespace(images="qwen-image-turbo,mage-flow-turbo,moss-image-sft-4-step,anima-turbo",
                                    image_lora_training=False, yes=True, image_quant=None, image_gpu_policy="auto")
 
             def fetch(url, path, what):
@@ -223,13 +223,13 @@ class TrainingBases(unittest.TestCase):
                 self.assertNotIn("training_base_only", cfgs["qwen-image-2.1-turbo"])
                 self.assertIn("qwen-image-2.1", cfgs)
                 self.assertIn("mage-flow", cfgs)
-                self.assertIn("moss-image", cfgs)
+                self.assertIn("moss-image-sft", cfgs)
                 self.assertIn("anima-base", cfgs)
                 for key in ("base-F16", "mf-rl-bf16", "anima-base-bf16"):
                     self.assertTrue(QI.local_path(root / "training", key).is_file(), key)
                 self.assertFalse(QI.local_path(root / "training", "mf-edit-rl-bf16").exists())
                 self.assertNotIn("edit_model", cfgs["mage-flow"])
-                self.assertNotIn("few_step", cfgs["moss-image"])
+                self.assertNotIn("few_step", cfgs["moss-image-sft"])
                 self.assertEqual(cfgs["qwen-image-2.1"]["diffusion_model"],
                                  str(QI.local_path(root / "training", "base-F16")))
 

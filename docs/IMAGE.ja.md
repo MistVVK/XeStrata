@@ -27,10 +27,10 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
 | `mage-flow-base` | [Mage-Flow-Base](https://huggingface.co/Comfy-Org/Mage-Flow) | 30（CFG） | 調整の前の元のモデル |
 | `magetrail` | [MageTrail](https://huggingface.co/RicemanT/MageTrail) | 30（CFG） | Mage-Flow を Danbooru と e621 の画像で微調整した版。booru のタグで描くイラスト向け。編集はできない（img2img とマスクは使える） |
 | `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent の大きな MoE のモデル（80B）。いちばん細かく描け、いちばん遅い。プロンプトを自分で読むので文の読み手が要らず、ディスクと RAM をいちばん多く使う（約 52 GB）。編集は参照画像 3 枚まで（透明な背景はない） |
-| `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50（CFG） | OpenMOSS の 5B のモデル。画像の中の文字と、枠で決めた配置（`layout`）に向く。プロンプトの書き広げ（`enhance`）も使える。編集は chinoll の編集の LoRA（Moss-Image-Edit）で、参照画像 4 枚まで（img2img とマスクも使える） |
+| `moss-image-sft` | [MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50（CFG） | OpenMOSS の 5B のモデル。画像の中の文字と、枠で決めた配置（`layout`）に向く。プロンプトの書き広げ（`enhance`）も使える。編集は chinoll の編集の LoRA（Moss-Image-Edit）で、参照画像 4 枚まで（img2img とマスクも使える） |
 | `moss-image-base` | [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | 50（CFG） | 調整の前の元のモデル |
-| `moss-image-4-step` | SFT と akhaliq の [4 ステップ LoRA](https://huggingface.co/akhaliq/MOSS-Image-SFT-4-steps) | 4〜8 | 通常の Euler で描く。1024² 以下は 4、より大きい画像は 6 または 8 ステップ。CFG と negative prompt は使わない。部分の編集にも使えるが、画風の変更は通常版を使う |
-| `moss-image-uncensored`、`moss-image-base-uncensored`、`moss-image-4-step-uncensored` | 上の 3 つ | 上と同じ | 文の読み手を HauhauCS の拒否を外した Qwen3.5-9B にした組み合わせ |
+| `moss-image-sft-4-step` | SFT と akhaliq の [4 ステップ LoRA](https://huggingface.co/akhaliq/MOSS-Image-SFT-4-steps) | 4〜8 | 通常の Euler で描く。1024² 以下は 4、より大きい画像は 6 または 8 ステップ。CFG と negative prompt は使わない。部分の編集にも使えるが、画風の変更は通常版を使う |
+| `moss-image-sft-uncensored`、`moss-image-base-uncensored`、`moss-image-sft-4-step-uncensored` | 上の 3 つ | 上と同じ | 文の読み手を HauhauCS の拒否を外した Qwen3.5-9B にした組み合わせ |
 | `anima-base` | [Anima](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | CircleStone Labs の 2B のモデル。Danbooru のタグと文で描くアニメ調のイラスト向け。編集はできない（img2img とマスクは使える） |
 | `anima-aesthetic` | [Anima-Aesthetic](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | 決まった整った画風に調整した版 |
 | `anima-turbo` | [Anima-Turbo](https://huggingface.co/circlestone-labs/Anima) | 10 | 速さのために蒸留した版（CFG なし） |
@@ -678,7 +678,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
   量子化したファイルは PedroMarinhoDev が単一ファイルとして公開しているものです。
 - MOSS-Image（SFT と Base）の重みは Apache 2.0 で、OpenMOSS（MOSI. AI）が公開しています。VAE は MOSS-Image のリポジトリにあるものです。
   4 ステップの LoRA は akhaliq の [MOSS-Image-SFT-4-steps](https://huggingface.co/akhaliq/MOSS-Image-SFT-4-steps) で、Apache 2.0 です。強さ 1 で焼き込まずに当てます。ステップ数の指定は 4〜8 です。
-  以前の 4 ステップ設定も、新しい LoRA があれば自動で読み替えます。新しいファイルがなければ setup で `moss-image-4-step` を選び直してください。古い 3 ファイルは自動では消しません。
+  以前の 4 ステップ設定も、新しい LoRA があれば自動で読み替えます。新しいファイルがなければ setup で `moss-image-sft-4-step` を選び直してください。古い 3 ファイルは自動では消しません。
   編集の LoRA は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit) です。setup は PedroMarinhoDev が単一ファイルに直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)（GPL-3.0 表記）を取ります。
 - Anima（Base、Aesthetic、Turbo）の重みは CircleStone Labs の非商用のライセンスと、土台の Cosmos-Predict2 の NVIDIA Open Model License です。モデルを商用に使うことはできません（作った画像は使えます）。使う前に [Anima のページ](https://huggingface.co/circlestone-labs/Anima) を読んでください。
   Anima-2.9B（Gazingstars123）と派生モデルには、それぞれの公開元のライセンスが適用されます。

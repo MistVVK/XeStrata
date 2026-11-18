@@ -15,7 +15,7 @@ setup.py --images does inside the normal setup (setup.py's setup_images).
 the config's text model leaves, unless --ssd-offload on; Mage-Flow's comes in one size (bf16); HunyuanImage 3.0's as
 w4a8 (its default) or int8, which the RAM lowers to w4a8 (it has no text encoder, so only its own size is lowered).
 --model qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|mage-flow-base|magetrail[-uncensored]|
-hunyuan-image-3-distil|moss-image|moss-image-base[-uncensored]: the image model (setup.py --images), or several,
+hunyuan-image-3-distil|moss-image-sft|moss-image-base[-uncensored]: the image model (setup.py --images), or several,
 comma-separated (the first the default, the others named by a request's "model"), or no (image generation taken out of
 --config); -uncensored: its text encoder with the refusal direction removed (HunyuanImage 3.0 has none: it reads its own
 prompt).  The text encoder is Q8_0, or lowered first; MOSS-Image's Qwen3.5-9B is the chat model's own file when the
@@ -61,8 +61,8 @@ def main(argv=None) -> int:
                          "(Qwen-Image-2.1, 40 steps), mage-flow-turbo (Mage-Flow-Turbo, 4 steps), mage-flow (its RL "
                          "model, 20 steps), mage-flow-base (its base model, 30 steps), magetrail (30 steps) or "
                          "hunyuan-image-3-distil (HunyuanImage 3.0 Instruct-Distil, 8 steps, guidance 2.5, its own "
-                         "tokenizer and system prompt: no text encoder), moss-image (MOSS-Image, 50 steps, guidance "
-                         "3) or moss-image-base (its base model), or several, comma-separated (the first the "
+                         "tokenizer and system prompt: no text encoder), moss-image-sft (MOSS-Image-SFT, 50 steps, "
+                         "guidance 3) or moss-image-base (its base model), or several, comma-separated (the first the "
                          "default); -uncensored: the text encoder (Qwen3-VL-8B, Mage-Flow's 4B, MOSS-Image's "
                          "Qwen3.5-9B) with the refusal direction removed")
     ap.add_argument("--lora-training", action="store_true", default=None,

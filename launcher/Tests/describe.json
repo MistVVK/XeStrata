@@ -2261,7 +2261,7 @@
    "own": false
   },
   {
-   "id": "moss-image",
+   "id": "moss-image-sft",
    "title": "MOSS-Image",
    "about": "OpenMOSS's 5B model: text in images and a layout of boxes in the prompt, 50 steps with guidance; edits with up to four reference images (its edit adapter, fetched with it)",
    "download_gb": 22.1,
@@ -2373,7 +2373,7 @@
    "own": false
   },
   {
-   "id": "moss-image-4-step",
+   "id": "moss-image-sft-4-step",
    "title": "MOSS-Image 4-step",
    "about": "MOSS-Image SFT with akhaliq's 4-step LoRA, without guidance; no edits",
    "download_gb": 21.1,
@@ -2656,7 +2656,7 @@
  "image_default": [
   "mage-flow-turbo-uncensored",
   "qwen-image-turbo-uncensored",
-  "moss-image-uncensored"
+  "moss-image-sft-uncensored"
  ],
  "web_search": null,
  "custom": null,

@@ -2989,7 +2989,7 @@ class ImageGen:
         """The 4-step LoRA is installed by setup, not by a generation request."""
         path = self.cfg.get("turbo_lora")
         if path and not Path(path).is_file():
-            return "the 4-step LoRA is missing; run setup --images moss-image-4-step again"
+            return "the 4-step LoRA is missing; run setup --images moss-image-sft-4-step again"
         return None
 
     def require_available(self) -> None:

@@ -109,7 +109,7 @@ class FakeGen:
 class FakeSvc:
     def __init__(self, tmp: Path, gen: FakeGen):
         gens = {gen.model: gen}
-        for fam, model in (("qwen-image", "qwen-image-2.1"), ("moss-image", "moss-image"), ("anima", "anima")):
+        for fam, model in (("qwen-image", "qwen-image-2.1"), ("moss-image", "moss-image-sft"), ("anima", "anima")):
             g = FakeGen(tmp, model=model, family=fam)
             gens[model] = g
         self.images = type("M", (), {"gens": gens, "default": gen,
@@ -480,7 +480,7 @@ class Training(unittest.TestCase):
         self.assertIn("--vram-control", argv)
         self.assertIn("--state", argv)
         self.assertNotIn("--resume", argv)
-        for fam, exe, model in (("qwen-image", "qi", "qwen-image-2.1"), ("moss-image", "moss", "moss-image"),
+        for fam, exe, model in (("qwen-image", "qi", "qwen-image-2.1"), ("moss-image", "moss", "moss-image-sft"),
                                 ("anima", "anima", "anima")):
             r = {**rec, "family": fam, "model": model}
             r["settings"] = lt.check_settings({"steps": 100, "save_every": 25}, fam, "character")
@@ -633,11 +633,11 @@ class Training(unittest.TestCase):
         from serve import images as img
         self.assertNotIn("moss-image-base-4-step", lt.DISTILLED)
         self.assertNotIn("moss-image-base-4-step-uncensored", lt.DISTILLED)
-        self.assertEqual(lt.training_model("moss-image-4-step-uncensored")[0], "moss-image-uncensored")
-        cases = [("mage-flow-turbo", "mage-flow"), ("moss-image-4-step", "moss-image"),
+        self.assertEqual(lt.training_model("moss-image-sft-4-step-uncensored")[0], "moss-image-sft-uncensored")
+        cases = [("mage-flow-turbo", "mage-flow"), ("moss-image-sft-4-step", "moss-image-sft"),
                  ("anima-turbo", "anima-base"),
                  ("qwen-image-2.1-turbo", "qwen-image-2.1")]
-        families = {"mage-flow": "mage-flow", "moss-image": "moss-image", "anima-base": "anima",
+        families = {"mage-flow": "mage-flow", "moss-image-sft": "moss-image", "anima-base": "anima",
                     "qwen-image-2.1": "qwen-image"}
         for requested, base in cases:
             with self.subTest(model=requested):

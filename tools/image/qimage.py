@@ -43,7 +43,7 @@ to, are computed from the model's base size and the four sizes its image process
 Tencent publishes the model in bf16 only; the two quantized files and the VAE are pinned where they are published as
 single-file checkpoints (the SHA-256 of the copies this engine was measured on, 2026-10-25).
 
-MOSS-Image (OpenMOSS, Apache 2.0; moss-image, the SFT model, and moss-image-base): its DiT as diffusers has it (the
+MOSS-Image (OpenMOSS, Apache 2.0; moss-image-sft, the SFT model, and moss-image-base): its DiT as diffusers has it (the
 transformer folder's three bf16 shards, which the engine keeps 16-bit or quantizes to 8 bits as it reads them, as
 Mage-Flow's: "dit_q8"), its Flux2 VAE with a narrower decoder (fixed, bf16), and Qwen3.5-9B as its text encoder: the
 chat model's own GGUFs, Unsloth's or, with -uncensored, HauhauCS's (MOSS_TEXT_QUANTS, Q8_0 lowered for the RAM like
@@ -892,12 +892,13 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
                 "hunyuan-image-3-distil": ("hunyuan-image-3-distil", "hunyuanimage3", ""),
                 # MOSS-Image: its SFT model (the recommended one) and its base model, with Qwen3.5-9B (Qwen's, or
                 # HauhauCS's with its refusals removed) as the text encoder
-                "moss-image": ("moss-image", "moss-sft", "moss-stock"),
-                "moss-image-uncensored": ("moss-image-uncensored", "moss-sft", "moss-uncensored"),
+                "moss-image-sft": ("moss-image-sft", "moss-sft", "moss-stock"),
+                "moss-image-sft-uncensored": ("moss-image-sft-uncensored", "moss-sft", "moss-uncensored"),
                 "moss-image-base": ("moss-image-base", "moss-base", "moss-stock"),
                 "moss-image-base-uncensored": ("moss-image-base-uncensored", "moss-base", "moss-uncensored"),
-                "moss-image-4-step": ("moss-image-4-step", "moss-sft-4-step", "moss-stock"),
-                "moss-image-4-step-uncensored": ("moss-image-4-step-uncensored", "moss-sft-4-step", "moss-uncensored"),
+                "moss-image-sft-4-step": ("moss-image-sft-4-step", "moss-sft-4-step", "moss-stock"),
+                "moss-image-sft-4-step-uncensored": ("moss-image-sft-4-step-uncensored", "moss-sft-4-step",
+                                                     "moss-uncensored"),
                 # Anima: the release's three and the 2.9B expansion, Qwen3-0.6B-Base as the text encoder
                 "anima-base": ("anima-base", "anima-base", "anima-stock"),
                 "anima-aesthetic": ("anima-aesthetic", "anima-aesthetic", "anima-stock"),
@@ -906,13 +907,14 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
 # Training uses the full-step model, not its distilled derivative.  The text encoder's variant is kept.
 TRAINING_BASE = {"qwen-image-turbo": "qwen-image-base", "qwen-image-turbo-uncensored": "qwen-image-base-uncensored",
                  "mage-flow-turbo": "mage-flow", "mage-flow-turbo-uncensored": "mage-flow-uncensored",
-                 "moss-image-4-step": "moss-image", "moss-image-4-step-uncensored": "moss-image-uncensored",
+                 "moss-image-sft-4-step": "moss-image-sft",
+                 "moss-image-sft-4-step-uncensored": "moss-image-sft-uncensored",
                  "anima-turbo": "anima-base"}
 
 DEFAULT_MODEL = "qwen-image-turbo"
 # the image models setup's question and the Windows launcher's checkboxes offer a text model set up for the first
 # time (the first the default model); one set up again offers what it has
-SETUP_DEFAULT = ("mage-flow-turbo-uncensored", "qwen-image-turbo-uncensored", "moss-image-uncensored")
+SETUP_DEFAULT = ("mage-flow-turbo-uncensored", "qwen-image-turbo-uncensored", "moss-image-sft-uncensored")
 # The picker levels, in display order: family title, file origin and its versions (choice, version title).
 # Parameter counts are the DiT's; the Anima 2.9B preview is named at its version level.
 IMAGE_FAMILIES = (
@@ -921,7 +923,7 @@ IMAGE_FAMILIES = (
      (("mage-flow-turbo", "Turbo"), ("mage-flow", "Instruct"), ("mage-flow-base", "Base"))),
     ("MageTrail (2.9B)", "Original files, quantized by XeStrata when read", (("magetrail", "MageTrail"),)),
     ("MOSS-Image (5B)", "Original files, quantized by XeStrata when read",
-     (("moss-image", "SFT"), ("moss-image-base", "Base"), ("moss-image-4-step", "SFT 4-step"))),
+     (("moss-image-sft", "SFT"), ("moss-image-base", "Base"), ("moss-image-sft-4-step", "SFT 4-step"))),
     ("Anima (2B)", "Original files, quantized by XeStrata when read",
      (("anima-base", "Anima"), ("anima-aesthetic", "Aesthetic"), ("anima-turbo", "Turbo"),
       ("anima-2.9b", "2.9B (preview)"))),
@@ -939,11 +941,11 @@ ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
          "magetrail": "Mage-Flow tuned on Danbooru and e621 images, for illustrations from booru tags; no edits",
          "hunyuan-image-3-distil": "Tencent's large MoE model (80B), the most detailed and the slowest; reads its own "
                                    "prompt, needs about 50 GB of RAM; edits with up to 3 reference images",
-         "moss-image": "OpenMOSS's 5B model: text in images and a layout of boxes in the prompt, 50 steps with "
-                       "guidance; edits with up to four reference images (its edit adapter, fetched with it)",
+         "moss-image-sft": "OpenMOSS's 5B model: text in images and a layout of boxes in the prompt, 50 steps with "
+                           "guidance; edits with up to four reference images (its edit adapter, fetched with it)",
          "moss-image-base": "MOSS-Image's base model, before its fine-tuning, 50 steps with guidance",
-         "moss-image-4-step": "MOSS-Image SFT with akhaliq's 4-step LoRA, without guidance; "
-                              "edits with chinoll's adapter",
+         "moss-image-sft-4-step": "MOSS-Image SFT with akhaliq's 4-step LoRA, without guidance; "
+                                  "edits with chinoll's adapter",
          "anima-base": "Anima (2B), anime illustrations from Danbooru tags and sentences, 30 steps with guidance; the "
                        "model to train LoRAs on",
          "anima-aesthetic": "Anima tuned to a consistent, polished default style, 30 steps with guidance",
