@@ -1069,6 +1069,21 @@ def card_note(cfg: dict, env: dict) -> str | None:
             f"{', '.join(names)} - the first runs the first layers and the picture reader, the last runs the head and the draft layer")
 
 
+def build_arch_numbers(value) -> list[int]:
+    """The CUDA architectures of a BUILD.json `archs` value as sorted numbers.  The Linux packages write ONE string ("60;61;70;75;80;86;120;89");
+    other builds write a list ([75, 86], ["sm_75", "compute_89"]); "60,61 70" is read too.  A string used to be walked character by
+    character, which said "built for sm_0, sm_1, sm_2 ..." on every Pascal card (0.2.16 retest, p1004)."""
+    if value is None or value == "":
+        return []
+    parts = list(value) if isinstance(value, (list, tuple, set)) else re.split(r"[;,\s]+", str(value))
+    found = set()
+    for part in parts:
+        m = re.search(r"\d+", str(part))
+        if m:
+            found.add(int(m.group()))
+    return sorted(found)
+
+
 def engine_arch_note(cfg: dict, cards: dict[int, int] | None = None, built: dict | None = None) -> str | None:
     """#4662: a compiled engine holds code for the architectures it was built for (BUILD.json "archs"); on a card of another one a long prompt
     ends in "unspecified launch failure" (the kernels it needs are a trap there).  One plain line when a card this run uses is not covered
@@ -1082,7 +1097,7 @@ def engine_arch_note(cfg: dict, cards: dict[int, int] | None = None, built: dict
             if not isinstance(exe, str) or engine_component.is_reference(exe):
                 return None
             built = json.loads((Path(exe).parent / "BUILD.json").read_text(encoding="utf-8-sig"))
-        archs = sorted({int(re.sub(r"\D", "", str(a))) for a in built.get("archs") or [] if re.sub(r"\D", "", str(a))})
+        archs = build_arch_numbers(built.get("archs"))
         if not archs:
             return None
         if cards is None:
