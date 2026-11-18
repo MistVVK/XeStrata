@@ -124,6 +124,11 @@ ROOM_MIN_CACHE = 1 << 30            # the manager's file cache is at least 1 GiB
 ROOM_FREE_FRACTION = 0.8            # ... and free memory is below 0.8 x the size of the model's files (else there is room without it)
 ROOM_MIN_FREED = 256 << 20          # say it only when at least this much was given back
 ROOM_MAX_FILES = 200000
+
+
+def size_words(nbytes: int) -> str:
+    """An amount of memory for the person: whole GB from 1 GB up, whole MB below (0.25 to 0.99 GB was shown as "0 GB" or "1 GB")."""
+    return f"{nbytes / 1e9:.0f} GB" if nbytes >= 1e9 else f"{nbytes / 1e6:.0f} MB"
 _DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", None)
 
 
@@ -233,7 +238,7 @@ def make_room(args, say=None, environ=None, *, found=None, drop=_drop_cache, cac
             print(f"[strata] memory guard (debug): make_room: cache {before} -> {after}, {len(files)} files, free {free}", flush=True)
         if freed >= ROOM_MIN_FREED:
             (say or (lambda text: print(text, flush=True)))(
-                f"[strata] memory guard: freed {freed / 1e9:.0f} GB of memory that still held copies of this model's files from an earlier start, "
+                f"[strata] memory guard: freed {size_words(freed)} of memory that still held copies of this model's files from an earlier start, "
                 "so that loading does not run short of memory and this desktop (systemd-oomd) does not end it")
         return freed
     except Exception as exc:                             # noqa: BLE001 - a nicety, never a reason for a start to fail

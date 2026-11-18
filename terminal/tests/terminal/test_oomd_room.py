@@ -54,6 +54,17 @@ class MakeRoom(unittest.TestCase):
         self.assertIn("freed 15 GB of memory that still held copies of this model's files", self.said[0])
         self.assertIn("systemd-oomd", self.said[0])
 
+    def test_an_amount_below_1_GB_is_said_in_MB_not_as_0_GB(self):      # 0.2.17 item 18: 256 MiB to 0.5 GB was "freed 0 GB"
+        for freed, words in ((256 << 20, "268 MB"), (400 * (1 << 20), "419 MB"), (500_000_000, "500 MB"), (999_000_000, "999 MB"),
+                             (1_000_000_000, "1 GB"), (1_400_000_000, "1 GB"), (14 * GIB, "15 GB")):
+            self.assertEqual(op.size_words(freed), words)
+        self.said.clear()
+        self.cache[0] = 3 * GIB
+        self.assertEqual(self.room(cache=3 * GIB - (400 << 20)), 400 << 20)
+        self.assertEqual(len(self.said), 1)
+        self.assertIn("freed 419 MB of memory that still held copies", self.said[0])
+        self.assertNotIn("0 GB", self.said[0])
+
     def test_nothing_is_done_when_there_is_room_without_it(self):
         self.assertEqual(self.room(free=200 * GIB), 0)                                         # a big PC: free memory covers the model
         self.assertEqual(self.dropped, [])
