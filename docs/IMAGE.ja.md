@@ -617,6 +617,17 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - 画像のエンジンはサーバーとは別のプロセスで、文章のモデルを替えても残ります。どのサーバーもつながらなくなって 30 分たつと終わります（`daemon_idle_s`）。
 - Qwen-Image-2.1 の編集の参照画像のトークンの K と V のキャッシュ（1024x1024 の 1 枚で約 2 GB）は、VRAM に入らない分をピン留めした RAM に置いて毎ステップ運びます。
 
+### 画像を作る GPU を選ぶ
+
+画像に専用の GPU があり、文章のモデルがほかの GPU を使うとき（2 枚の GPU で文章と画像を分けているとき）は、画像・道具・動画を作る GPU を要求ごとに選べます。
+
+- 画像の API（`/v1/images/generations`、`/v1/images/edits`、`/v1/images/upscale`、`/v1/images/segmentations`、`/v1/images/remove-background`、`/v1/images/controls`）は `gpu`（または `extra_params` の `gpu`）、動画の API（`/v1/videos`、`/v1/videos/sync`、`/v1/videos/segmentations`）はフォームの `gpu`、チャットの道具は `xestrata_images` の `gpu` で受けます。
+- 値は `auto`（既定）、`image`（画像の GPU）、`text`（文章のモデルの GPU）、または Monitor の GPU の番号か PCI の住所です。選べる GPU は `/health` の `image_gpus` に出ます。
+- `text` では、1 枚の GPU を分け合うときと同じく、文章のモデルが場所を空け（`--image-gpu-policy`）、終わると元に戻します。その間、チャットの要求は待ちます。
+- `auto` は画像の GPU で作ります。動画のジョブが画像の GPU を使っている間は、画像（生成、編集、拡大、道具）を文章のモデルの GPU で作り、結果にそう書きます（API の応答の `xestrata.gpu`）。文章のモデルの GPU を使えないときと `image` を選んだときは、503 で断り、残りのおよその秒数を返します。
+- Web のページでは、Images・Tools・Video のタブの「作る GPU」と、チャットの設定の「チャットの画像と動画を作る GPU」で選べます。選んだものはブラウザーだけが覚え、サーバーの設定は変わりません。
+- Monitor では、文章のモデルの GPU で画像を作っている間、その GPU のタブに Image の印が付き、速さの欄は 1 ステップの秒数になります。
+
 **画像の注意**: Intel の GPU では oneDNN、AMD の GPU では AOTriton（どちらもパッケージと 7z に入っています）、NVIDIA の GPU では cuDNN が入っていれば cuDNN（contrib-llvm。`xestrata --setup` が入れ方を示します）で計算し、ほかは XeStrata のカーネルで計算します。
 
 ## 速さ

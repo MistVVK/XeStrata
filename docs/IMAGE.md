@@ -617,6 +617,17 @@ On the text model's GPU, before a job the engine says the VRAM the image needs (
 - The image engine is a process apart from the server, and stays when the text model is changed. It ends 30 minutes after the last server leaves (`daemon_idle_s`).
 - The K and V cache of the reference images' tokens in a Qwen-Image-2.1 edit (about 2 GB for one 1024x1024 image) keeps what the VRAM cannot hold in pinned RAM and brings it over at each step.
 
+### Choosing the GPU that makes it
+
+Where the images have a GPU of their own and the text model takes another (two GPUs, the text on one, the images on the other), each request can choose the GPU that makes its images, tools' results and videos.
+
+- The images API (`/v1/images/generations`, `/v1/images/edits`, `/v1/images/upscale`, `/v1/images/segmentations`, `/v1/images/remove-background`, `/v1/images/controls`) takes `gpu` (or `extra_params`' `gpu`), the videos API (`/v1/videos`, `/v1/videos/sync`, `/v1/videos/segmentations`) the form's `gpu`, the chat's tools `xestrata_images`' `gpu`.
+- Its values: `auto` (the default), `image` (the image GPU), `text` (the text model's GPU), or a GPU's number in the Monitor or its PCI address. `/health`'s `image_gpus` lists the GPUs to choose from.
+- With `text` the text model makes room for the job as on one shared GPU (`--image-gpu-policy`) and gets it back after; the chat's requests wait meanwhile.
+- `auto` makes it on the image GPU. While a video job has the image GPU, the images (generations, edits, upscales, the tools) are made on the text model's GPU instead, and the result says so (the answer's `xestrata.gpu` in the API). Where the text model's GPU cannot be used, and with `image`, the request is refused with a 503 and about the seconds left.
+- On the web page: "GPU that makes it" in the Images, Tools and Video tabs, and "GPU that makes the chat's images and videos" in the Chat settings. The choice stays in the browser alone; the server's settings stay as they are.
+- In the Monitor, while an image is made on the text model's GPU, that GPU's tab carries the Image mark and the speed is the seconds a step.
+
 **The image attention** runs on oneDNN on Intel GPUs and on AOTriton on AMD GPUs (both are in the packages and the 7z), on cuDNN on NVIDIA GPUs where it is installed (contrib-llvm; `xestrata --setup` says how), and on XeStrata's own kernel otherwise.
 
 ## Speed
