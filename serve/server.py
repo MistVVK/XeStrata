@@ -872,8 +872,14 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     v = line.split("; IGC ", 1)[1].split(")", 1)[0] if "; IGC " in line else "?"
                     say("igc", f"[xestrata] Intel's compiler IGC {v} has a bug XeStrata works around: the decode of "
                         "short prompts is up to 10% slower.\n"
-                        "         For full speed, use Fedora 44 or later (their IGC is 2.32 or later), or install "
+                        "         For full speed, use Fedora 44 or 45 (their IGC is 2.32 or later), or install "
                         "with Podman (Fedora 45 inside).")
+                elif "the xe driver's SVM is broken on Linux" in line:   # Ubuntu's 7.0.0 kernel (AGENTS.md)
+                    v = line.split("on Linux ", 1)[1].split(" (Ubuntu", 1)[0] if "on Linux " in line else "?"
+                    say("svm", f"[xestrata] Linux {v} has the xe driver's bug: a page its SVM moves can oops the "
+                        "kernel or leak memory silently. XeStrata works around nothing; use Fedora 44 or 45, or a "
+                        "kernel without the error (Ubuntu's 7.0.0-38 or earlier, or the build with the fix). "
+                        "A container runs on the host's kernel, so change the host's.")
                 elif "session is up" in line:
                     say("up", "[xestrata] almost ready ...")
         if time.time() - last > heartbeat:

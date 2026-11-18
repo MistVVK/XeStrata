@@ -88,21 +88,25 @@ In short, for when it is not there:
 - No preamble, recap or closing, no tangents; facts only, no plans or alternatives (the stage line excepted).
 
 Each section starts with the warnings below (the user's decision, 2026-10-21; AGENTS.md, "Intel Graphics Compiler"), then a line of the stage: 先行報: upstream との速さの比較は後で足す / Preliminary: the speed comparison with upstream follows.
-The first paragraph is the IGC bug, the second the Level Zero driver's: they stay while Ubuntu 26.04 or Debian 13 ships an IGC from 2.27 to 2.30, and while Ubuntu 26.04 ships a compute-runtime older than 26.22; the user decides when they go.
-They name Podman, Fedora 44 or later and - on Ubuntu 24.04/26.04 with the HWE kernel - Intel's graphics PPA (xestrata --setup prints its commands) as the way out.
+The first paragraph is the IGC bug, the second the Level Zero driver's, the third Ubuntu's 7.0.0 kernel from ABI 40 on: they stay while Ubuntu 26.04 or Debian 13 ships an IGC from 2.27 to 2.30, while Ubuntu 26.04 ships a compute-runtime older than 26.22, and while Ubuntu 26.04's resolute kernel carries the one-sided drm/pagemap backport; the user decides when they go.
+They name Podman, Fedora 44 or 45 and - on Ubuntu 24.04/26.04 with the HWE kernel - Intel's graphics PPA (xestrata --setup prints its commands) as the way out; the third paragraph's way out is Fedora 44 or 45 or an older kernel instead, since a container runs on the host's kernel and is no escape there.
 
 ```markdown
 > [!WARNING]
-> **Intel Arc B-series, Lunar Lake and Panther Lake on Linux:** the Intel graphics compiler (IGC) 2.27 to 2.30, which Ubuntu 26.04 and Debian 13 ship, miscompiles some GPU code. XeStrata turns the affected optimization off by itself, at a cost of up to 10% in the decode of short prompts. For full speed, install with **Podman** (below; its image brings a fixed IGC), use **Fedora 44 or later** (Fedora 45's IGC is 2.41), or - on Ubuntu 24.04/26.04 with the HWE kernel - update the driver from Intel's graphics PPA: `xestrata --setup` prints the commands.
+> **Intel Arc B-series, Lunar Lake and Panther Lake on Linux:** the Intel graphics compiler (IGC) 2.27 to 2.30, which Ubuntu 26.04 and Debian 13 ship, miscompiles some GPU code. XeStrata turns the affected optimization off by itself, at a cost of up to 10% in the decode of short prompts. For full speed, install with **Podman** (below; its image brings a fixed IGC), use **Fedora 44 or 45** (Fedora 45's IGC is 2.41), or - on Ubuntu 24.04/26.04 with the HWE kernel - update the driver from Intel's graphics PPA: `xestrata --setup` prints the commands.
 >
-> **Every Intel GPU, a separate bug:** a compute-runtime older than 26.22 (Ubuntu 26.04 ships 26.05) can refuse device memory while the card's VRAM is free: the engine then fails to start, and only a reboot brings the card back. This release makes the engine retry the cache in pieces when the driver refuses the one big allocation, and start with what the card gives. The way out is the same: update the driver (26.22 or later), or use Fedora 44 or later / Podman. On Ubuntu 24.04/26.04 with the HWE kernel, `xestrata --setup` stops before starting and prints the PPA commands; `--old-driver` starts anyway.
+> **Every Intel GPU, a separate bug:** a compute-runtime older than 26.22 (Ubuntu 26.04 ships 26.05) can refuse device memory while the card's VRAM is free: the engine then fails to start, and only a reboot brings the card back. This release makes the engine retry the cache in pieces when the driver refuses the one big allocation, and start with what the card gives. The way out is the same: update the driver (26.22 or later), or use Fedora 44 or 45 / Podman. On Ubuntu 24.04/26.04 with the HWE kernel, `xestrata --setup` stops before starting and prints the PPA commands; `--old-driver` starts anyway.
+>
+> **Ubuntu 26.04's kernel 7.0.0 from ABI 40 on, on Intel Arc GPUs:** the kernel's drm/pagemap bug can crash the kernel (Oops) or leak memory silently when the xe driver's SVM moves a page. XeStrata works around nothing; use **Fedora 44 or 45**, or a kernel without the error (Ubuntu's 7.0.0-38 or earlier, or the build with the fix). A container (Podman, incus) runs on the host's kernel, so it is no escape.
 ```
 
 ```markdown
 > [!WARNING]
-> **Linux の Intel Arc B シリーズ・Lunar Lake・Panther Lake:** Ubuntu 26.04 と Debian 13 が入れる Intel のグラフィックスのコンパイラー（IGC）2.27〜2.30 は、GPU のコードの一部を誤ってコンパイルします。XeStrata は該当する最適化を自動で切るので動きますが、短い prompt の decode が最大 10% 遅くなります。本来の速さで使うには、**Podman** で入れる（下の手順。中の IGC は直った版です）、**Fedora 44 以降**（45 は 2.41 です）を使う、または Ubuntu 24.04/26.04 で HWE カーネルなら Intel の graphics PPA でドライバーを更新してください（`xestrata --setup` がコマンドを出します）。
+> **Linux の Intel Arc B シリーズ・Lunar Lake・Panther Lake:** Ubuntu 26.04 と Debian 13 が入れる Intel のグラフィックスのコンパイラー（IGC）2.27〜2.30 は、GPU のコードの一部を誤ってコンパイルします。XeStrata は該当する最適化を自動で切るので動きますが、短い prompt の decode が最大 10% 遅くなります。本来の速さで使うには、**Podman** で入れる（下の手順。中の IGC は直った版です）、**Fedora 44 か 45**（45 は 2.41 です）を使う、または Ubuntu 24.04/26.04 で HWE カーネルなら Intel の graphics PPA でドライバーを更新してください（`xestrata --setup` がコマンドを出します）。
 >
-> **すべての Intel GPU に、別の不具合:** 26.22 より古い compute-runtime（Ubuntu 26.04 は 26.05 を入れます）は、カードの VRAM に空きがあっても GPU メモリの確保を断ることがあります。エンジンは起動に失敗し、カードは再起動しないと戻りません。この版から、エンジンは一括の確保を断られたときに expert cache を小分けで取り直し、確保できた分だけで起動します。抜け道は同じで、ドライバーを 26.22 以降に更新するか、Fedora 44 以降 / Podman を使ってください。Ubuntu 24.04/26.04 で HWE カーネルなら、`xestrata --setup` は起動の前に止まって PPA のコマンドを出します（`--old-driver` でそのまま起動できます）。
+> **すべての Intel GPU に、別の不具合:** 26.22 より古い compute-runtime（Ubuntu 26.04 は 26.05 を入れます）は、カードの VRAM に空きがあっても GPU メモリの確保を断ることがあります。エンジンは起動に失敗し、カードは再起動しないと戻りません。この版から、エンジンは一括の確保を断られたときに expert cache を小分けで取り直し、確保できた分だけで起動します。抜け道は同じで、ドライバーを 26.22 以降に更新するか、Fedora 44 か 45 / Podman を使ってください。Ubuntu 24.04/26.04 で HWE カーネルなら、`xestrata --setup` は起動の前に止まって PPA のコマンドを出します（`--old-driver` でそのまま起動できます）。
+>
+> **Ubuntu 26.04 のカーネル 7.0.0 の ABI 40 以降、Intel Arc GPU で:** カーネルの drm/pagemap の誤りにより、xe ドライバーの SVM がページを移すとカーネルが落ちたり（Oops）、メモリーが黙って漏れたりします。XeStrata は何も回避しません。**Fedora 44 か 45** を使うか、誤りのないカーネル（Ubuntu の 7.0.0-38 以前、または修正入りの版）にしてください。コンテナ（Podman、incus）はホストのカーネルで動くので抜け道になりません。
 ```
 
 Show the notes to the user.

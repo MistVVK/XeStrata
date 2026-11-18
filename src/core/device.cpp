@@ -25,6 +25,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 #if defined(__has_include)
 #if __has_include(<drm/xe_drm.h>)
@@ -330,6 +331,35 @@ CompilerWorkaround intel_compiler_workaround() {
     return done;
 }
 
+// Ubuntu 26.04's kernel update ("resolute", 7.0.0 ABI 40 and later; -40 through -44 at 2026-11-19, and the first
+// build with the fix will end the range) took upstream's "drm/pagemap: Prevent double migration of device pages"
+// (c4126f1db36e, Ubuntu's cherry-pick 180caa211989) without the upstream series that reads the flag it writes
+// (2e03c0c5c59a and its fellows, 2026-03-12): the flag lands in the low bits of a page's zone_device_data, and
+// drm_pagemap_folio_free, which Ubuntu's 7.0.0 still reads without the mask, frees the zdd through a pointer that
+// carries it - a refcount warning, a kernel oops at 256 to 511 references (a shifted pointer into complete_all; the
+// SeedVR2 upscaler's streamed blocks hit it on the B70, 2026-11-18), silent corruption above.  Ubuntu's own
+// cherry-pick note concedes the readers ("missing some commits"); checked against the source of Ubuntu's 7.0.0-14
+// to -44 (the flag is absent through -38, so those are safe).  Upstream is whole: 7.2.y and 7.3.y carry the writer
+// and the masked readers (get_flags' DRM_PAGEMAP_ZDD_FLAG_MASK, the zone_device_data accessor's ~mask, folio_split;
+// SVMFIX/evidence/fedora-kernels), so Fedora 44 and 45 (7.2.15 and 7.3.3/7.3.4 at 2026-11-19) do not carry the error;
+// whether Fedora's own patches add anything is not checked (unverified: its kernels track upstream stable, and the
+// one-sided backport is Ubuntu's own).  The engine works around nothing: it tells the user to leave the kernel
+// (Fedora 44 or 45, or 7.0.0-38 or earlier, or the build with the fix).  The notice's conditions, in one place as
+// the IGC workaround's are: Linux, the kernel's release carries the error (svm_broken_kernel), and an xe GPU of
+// graphics IP 20 or later is present (the IGC workaround's xe2 query).
+std::string g_svm_workaround_release;   // set by engine_devices when the notice applies to a listed GPU
+
+std::string svm_notice_release() {
+#if defined(_WIN32)
+    return {};
+#else
+    utsname u;
+    if (uname(&u) != 0 || !svm_broken_kernel(u.release)) return {};
+    if (!xe_gpu_from_xe2()) return {};   // the GPUs the SVM runs on are the xe2 query's
+    return u.release;
+#endif
+}
+
 // The SYCL runtime's on-disk cache of the device code it builds (SYCL_CACHE_PERSISTENT), on unless the user set it:
 // without it every start builds each kernel module it uses from the SPIR-V again, linking the device libraries in, and
 // the GPU driver's own cache does not spare that.  GLM-5.3-Flash on the B70 (2026-10-19): a 1K-token prompt took 54.7 s
@@ -394,16 +424,26 @@ const std::vector<sycl::device>& engine_devices() {
         hip_hw_queues();
         g_start_counters = host_counters();
         const CompilerWorkaround w = intel_compiler_workaround();
+        const std::string svm = svm_notice_release();
         std::vector<sycl::device> found = find_devices();
-        if (w.set && std::any_of(found.begin(), found.end(), [](const sycl::device& d) {
-                return d.get_backend() == sycl::backend::ext_oneapi_level_zero;
-            })) {
+        const bool level_zero = std::any_of(found.begin(), found.end(), [](const sycl::device& d) {
+            return d.get_backend() == sycl::backend::ext_oneapi_level_zero;
+        });
+        if (w.set && level_zero) {
             g_workaround_version = w.version.empty() ? "unknown" : w.version;
             std::fprintf(stderr, "Xe runtime: IGC's GEP simplification is off (IGC_EnableGEPSimplification=0; IGC %s): "
                                  "2.27 to 2.30 miscompile some reads for Xe2 and later GPUs. The decode of short "
                                  "prompts is up to 10%% slower. For full speed, use Fedora 44 or 45 (their IGC is "
                                  "2.32 or later), or install with Podman (Fedora 45 inside)\n",
                          g_workaround_version.c_str());
+        }
+        if (!svm.empty() && level_zero) {
+            g_svm_workaround_release = svm;
+            std::fprintf(stderr, "Xe runtime: the xe driver's SVM is broken on Linux %s (Ubuntu's 7.0.0 from ABI 40 on): "
+                                 "a page the SVM moves can oops the kernel or leak memory silently on xe GPUs such as this one. "
+                                 "XeStrata works around nothing here; use Fedora 44 or 45, or a kernel without the error "
+                                 "(Ubuntu's 7.0.0-38 or earlier, or the build with the fix). A container (Podman, incus) runs on "
+                                 "the host's kernel, so it is no escape.\n", svm.c_str());
         }
         return found;
     }();
@@ -469,6 +509,18 @@ std::chrono::seconds hang_limit() {
 std::string compiler_workaround() {
     (void) engine_devices();
     return g_workaround_version;
+}
+
+bool svm_broken_kernel(const char* release) {
+    if (release == nullptr || std::strncmp(release, "7.0.0-", 6) != 0) return false;
+    char* end = nullptr;
+    const long abi = std::strtol(release + 6, &end, 10);
+    return end != release + 6 && abi >= 40;   // no ABI number: upstream's 7.0.0, or an -rc, or another build's suffix
+}
+
+std::string svm_workaround() {
+    (void) engine_devices();
+    return g_svm_workaround_release;
 }
 
 int current_device() { return t_current; }

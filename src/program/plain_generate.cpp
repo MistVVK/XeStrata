@@ -1040,10 +1040,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     // the INFO line, the watchdog and READY: at once, or after the start's measurement of the drafters (below)
     auto announce = [&]() {
         {   // Qwen3.8-Flash-Next's fields where these models have them (the server reads them: grammar, logit_bias,
-            // batch_slots, experts_ram and arena_mib, vram_free_mib, igc_workaround, engine)
+            // batch_slots, experts_ram and arena_mib, vram_free_mib, igc_workaround, svm_workaround, engine)
             size_t free_b = 0, total_b = 0;
             strata::gpu::mem_info(&free_b, &total_b);
             const std::string igc = strata::core::compiler_workaround();
+            // Ubuntu's 7.0.0 ABI 40 and later: the kernel whose xe-driver SVM the runtime turned off, "none" otherwise
+            const std::string svm = strata::core::svm_workaround();
             strata::program::InfoLine()
                 .add("logit_bias", 1)
                 .add("context", (long long) ctx)
@@ -1065,6 +1067,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 .add("slot_cache", bs.empty() ? 0 : 1)
                 .add("experts_ram", model.experts_ram())
                 .add("igc_workaround", igc.empty() ? "none" : igc.c_str())
+                .add("svm_workaround", svm.empty() ? "none" : svm)
                 .add("grammar", strata::core::grammar_built() ? 1 : 0)
                 .add("script_table", 1)
                 .add("cvec", cvecs.summary)

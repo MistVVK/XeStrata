@@ -9563,6 +9563,9 @@ int main(int argc, char** argv) {
                 // notice), "none" otherwise
                 const std::string igc = strata::core::compiler_workaround();
                 const std::string igc_workaround = igc.empty() ? "none" : igc;
+                // Ubuntu's 7.0.0 ABI 40 and later: the kernel whose xe-driver SVM the runtime turned off (the
+                // server's notice), "none" otherwise
+                const std::string svm = strata::core::svm_workaround();
                 strata::program::InfoLine()
                     .add("logit_bias", 1)
                     .add("context", (long long) o.max_context)
@@ -9592,6 +9595,7 @@ int main(int argc, char** argv) {
                     .add("slot_cache", o.batch > 0 && o.prompt_cache > 0 ? 1 : 0)
                     .add("experts_ram", experts_ram)
                     .add("igc_workaround", igc_workaround)
+                    .add("svm_workaround", svm.empty() ? "none" : svm)
                     .add("grammar", strata::core::grammar_built() && (o.batch == 0 || o.batch_groups <= 1) ? 1 : 0)
                     .add("script_table", o.batch == 0 ? 1 : 0)
                     .add("helper_pci", drive.d.remote_count > 0

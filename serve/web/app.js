@@ -578,6 +578,13 @@ function render(m) {
     toast("warn", tr("xekernel.toast", "Update the Linux kernel"), tr("xekernel.toastText", "Linux {version} lacks the fix of the xe driver's CVE-2026-68264: a GPU memory bind that is retried can crash the driver. Update the kernel. A container (Podman, incus) runs on the host's kernel, so update the host's.", {version: m.xe_kernel}), 15000,
           {label: tr("show", "Show"), run: () => showTab("about")});
   }
+  // Ubuntu's 7.0.0 kernel (ABI 40 and later): the engine tells the user to leave it (INFO svm_workaround);
+  // said once a release
+  if (eng.svm_workaround && eng.svm_workaround !== "none" && store.get("svm-told", "") !== eng.svm_workaround) {
+    store.set("svm-told", eng.svm_workaround);
+    toast("warn", tr("svm.toast", "The xe driver's SVM is broken on this Linux kernel"), tr("svm.toastText", "Linux {version} has the xe driver's drm/pagemap bug (Ubuntu's 7.0.0 from ABI 40 on): a page its SVM moves can oops the kernel or leak memory silently. XeStrata works around nothing; use Fedora 44 or 45, or a kernel without the error (Ubuntu's 7.0.0-38 or earlier, or the build with the fix).", {version: eng.svm_workaround}), 15000,
+          {label: tr("show", "Show"), run: () => showTab("about")});
+  }
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, fail);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "about") renderAbout(eng, hw, st, m.xe_kernel);
@@ -1037,6 +1044,7 @@ function renderAbout(eng, hw, st, xeKernel) {
     [tr("about.projection", "Experimental speed projection"), projectionText(eng.cvec)],
     [tr("igc.label", "Intel compiler"), eng.igc_workaround && eng.igc_workaround !== "none" ? tr("igc.about", "IGC {version} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 or 45 (their IGC is 2.32 or later), or install with Podman (Fedora 45 inside).", {version: eng.igc_workaround}) : null],
     [tr("xekernel.label", "Linux kernel"), xeKernel ? tr("xekernel.about", "Linux {version} lacks the fix of the xe driver's CVE-2026-68264 (a GPU memory bind that is retried can crash the driver). Update the kernel; a container (Podman, incus) runs on the host's kernel.", {version: xeKernel}) : null],
+    [tr("svm.label", "xe driver's SVM"), eng.svm_workaround && eng.svm_workaround !== "none" ? tr("svm.about", "Linux {version} has the xe driver's drm/pagemap bug (Ubuntu's 7.0.0 from ABI 40 on): a page its SVM moves can oops the kernel or leak memory silently. XeStrata works around nothing here; use Fedora 44 or 45, or a kernel without the error (Ubuntu's 7.0.0-38 or earlier, or the build with the fix).", {version: eng.svm_workaround}) : null],
   ]);
   facts($("facts-hw"), [
     ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : tr("about.gpuUnreadable", "not readable (xe driver)")],

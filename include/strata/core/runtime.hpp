@@ -28,6 +28,14 @@ bool device_free_memory(const sycl::device& d, uint64_t& free);
 /// The version of the Intel Graphics Compiler whose GEP simplification the runtime turned off for the engine's
 /// Level Zero GPU ("2.28.4"; "unknown" when the library carries none), empty when it did not (src/core/device.cpp).
 std::string compiler_workaround();
+/// Whether a Linux kernel's release (uname's) is one whose drm/pagemap frees a page the xe driver's SVM moved back
+/// to RAM with the moved flag still set (Ubuntu's 7.0.0 from ABI 40 on until the build with the fix; src/core/device.cpp).
+/// The engine works around nothing: it tells the user to leave the kernel (svm_workaround's notice).
+bool svm_broken_kernel(const char* release);
+/// The kernel's release the engine tells the user to leave ("7.0.0-43-generic"), empty when there is nothing to
+/// tell: Linux, svm_broken_kernel's release, and an xe GPU (src/core/device.cpp).  The start log, the web app's
+/// notice and About, and xestrata --setup say it.
+std::string svm_workaround();
 /// Ends the process on SIGTERM and SIGINT after the GPUs' queues are drained (at most 5 s), on a thread of its own; called
 /// first in main, before any thread exists (src/core/device.cpp).
 void route_stop_signals();

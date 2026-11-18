@@ -2795,6 +2795,16 @@ def igc_affected(version: str | None) -> bool:
     return major == 2 and 25 <= minor < 32
 
 
+def svm_broken_kernel(release: str | None) -> bool:
+    """Whether a Linux kernel's release (uname's) frees, on a page the xe driver's SVM moved back to RAM, the zdd
+    through a pointer that still carries the moved flag: Ubuntu's 7.0.0 from ABI 40 on, until the build with the fix
+    (checked against the source of Ubuntu's 7.0.0-14 to -44, 2026-11-18; -38 and earlier have no flag at all).  The
+    engine's svm_broken_kernel in src/core/device.cpp is this rule (AGENTS.md, "Ubuntu's 7.0.0 kernel and the xe
+    driver's SVM")."""
+    m = re.match(r"7\.0\.0-(\d+)", release or "")
+    return m is not None and int(m.group(1)) >= 40
+
+
 def ubuntu_lts() -> str | None:
     """Ubuntu 24.04 or 26.04 ("26.04"), the two LTS releases the graphics PPA serves; None elsewhere."""
     if distro_id() != "ubuntu":
@@ -2876,6 +2886,21 @@ def check_xe_kernel(makers: set) -> None:
     rel = kernel_check.unfixed_release()
     if rel is not None:
         warn(kernel_check.text(rel))
+
+
+def check_svm_kernel(makers: set) -> None:
+    """Says, without stopping, when an Intel GPU runs on the xe driver of a kernel whose drm/pagemap frees a page
+    its SVM moved back to RAM with the moved flag still set (svm_broken_kernel: Ubuntu's 7.0.0 ABI 40 and later):
+    a moved page can oops the kernel or leak memory silently.  The engine works around nothing; it says so too (the
+    start log and INFO svm_workaround).  This is the same two conditions."""
+    if WIN or "intel" not in makers:
+        return
+    rel = platform.release()
+    if kernel_check.xe_gpu() and svm_broken_kernel(rel):
+        warn(f"Linux {rel} has the xe driver's drm/pagemap bug (Ubuntu's 7.0.0 from ABI 40 on): a page its SVM "
+             "moves can oops the kernel or leak memory silently on xe GPUs. XeStrata works around nothing here; "
+             "use Fedora 44 or 45, or a kernel without the error (Ubuntu's 7.0.0-38 or earlier, or the build with "
+             "the fix). A container (Podman, incus) runs on the host's kernel, so change the host's")
 
 
 IOMMU_PT = {   # the kernel option iommu=pt, set the way each distribution's boot loader takes it
@@ -3175,6 +3200,7 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
         return
     check_igc(makers)
     check_xe_kernel(makers)
+    check_svm_kernel(makers)
     check_level_zero(makers, yes, explicit)
     linux_nvidia_libs(makers, data, (packaged_engine().get("runtime") or {}).get("nvidia_pip") or [])
     check_pdf()
