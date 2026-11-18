@@ -4888,7 +4888,10 @@ int main(int argc, char** argv) {
         if (o.draft == "dflash2") o.draft = "mtp";
     }
     if (want_df2)
-        df2.set_capacity_rows(o.spec >= strata::kernels::kWindowMaxT &&
+        // the capacity holds the accepted rows a window passes as context (draft, context_async): a lookup window
+        // (--suffix-draft, --lookup-chain) may accept up to --spec rows, which the suffix rule raises by 2, so any
+        // spec past the narrow window needs the wide capacity, not only spec 16
+        df2.set_capacity_rows(o.spec > strata::kernels::kVerifyNarrowT &&
                               strata::core::window_rows_cap() >= strata::kernels::kWindowMaxT
                                   ? strata::kernels::kWindowMaxT : strata::kernels::kVerifyNarrowT);
     // auto without --serve: the MTP (the start's measurement runs in --serve, before its first request)
