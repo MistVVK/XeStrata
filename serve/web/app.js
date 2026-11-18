@@ -4734,6 +4734,21 @@ $("tool-to-mask").onclick = async () => {
 $("tool-to-ref").onclick = () => toolLast && imgUseAsRef(toolLast.url, toolLast.name);
 $("tool-copy").onclick = () => toolLast && copyText(JSON.stringify(toolLast.req, null, 2), $("tool-copy"));
 $("tool-sam-license").onclick = (ev) => $("img-sam-license").onclick(ev);
+// The seconds left from how fast the bar has moved lately (its last 20 s), not since the button was pressed: the time
+// before the job moves it (the upload, the queue, a weights' download, the model's start) and a bar that starts again
+// (a drawing after its upscale) would make the start's rate wrong.  null until it has moved for a few seconds.
+function leftEstimator() {
+  let pts = [];
+  return (p) => {
+    const t = performance.now() / 1000;
+    if (pts.length && p < pts[pts.length - 1][1]) pts = [];
+    pts.push([t, p]);
+    while (pts.length > 2 && t - pts[0][0] > 20) pts.shift();
+    const [ta, pa] = pts[0];
+    if (t - ta < 3 || p - pa < 0.005) return null;
+    return Math.round((1 - p) * (t - ta) / (p - pa));
+  };
+}
 // running: the button is Interrupt with the seconds so far; an image job's progress (the metrics' live.image) beside
 function toolBusy(t0) {
   clearInterval(toolTimer);
@@ -4742,6 +4757,7 @@ function toolBusy(t0) {
   $("tool-progress").hidden = true;
   $("tool-cap").hidden = true;
   if (t0 == null) return;
+  const left = leftEstimator();
   toolTimer = setInterval(() => {
     const s = (performance.now() - t0) / 1000, live = lastMetrics && lastMetrics.live && lastMetrics.live.image;
     $("tool-go-time").textContent = tr("img.elapsed", "{n} s", {n: Math.round(s)});
@@ -4750,7 +4766,8 @@ function toolBusy(t0) {
     $("tool-progress").hidden = false;
     $("tool-bar").style.width = `${Math.round(100 * p)}%`;
     $("tool-cap").hidden = false;
-    $("tool-cap").textContent = imageState(live)[0] + (p > 0.05 ? " · " + tr("tool.left", "about {n} s left", {n: Math.round(s * (1 - p) / p)}) : "");
+    const n = left(p);
+    $("tool-cap").textContent = imageState(live)[0] + (n != null ? " · " + tr("tool.left", "about {n} s left", {n}) : "");
   }, 500);
 }
 $("tool-go").onclick = (ev) => {
