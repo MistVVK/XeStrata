@@ -840,6 +840,8 @@ FILES = {
     "moss-control": (_MC, "loras/moss_image_color_depth_control.safetensors", 313_063_368,
                      "e5c0c3efd05e4269207a39de6005798f14c90c6687c89c54eaffe4b76c43a763"),
 }
+# MOSS-Image's bf16 DiT shards, the only files whose blocks the engine quantizes to Q8_0 in RAM
+MOSS_DIT_SHARDS = tuple(k for k in FILES if k.startswith(("moss-sft-", "moss-base-")) and k[-1].isdigit())
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 TEXT_QUANTS = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")      # the text encoder's, smallest first like QUANTS
 # MOSS-Image's text encoder, Qwen3.5-9B: the chat model's own sizes (setup's PLAIN_FAMILIES "qwen35"), so a chat model
@@ -1344,8 +1346,9 @@ def ram_need_gb(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant
             + HOST_GB
     if is_mage(dit) and not keep and dit in MF_EDIT:
         names = tuple(k for k in names if k != f"{MF_EDIT[dit][0]}-bf16")
-    if is_moss(dit):   # its shards: the blocks' weights, all but a few hundred MB of them
-        return sum(FILES[k][2] * (share if k[-1].isdigit() else 1) for k in names) / 1e9 + HOST_GB
+    if is_moss(dit):   # its shards: the blocks' weights, all but a few hundred MB of them.  The text encoder is a
+        # GGUF already: its bytes are what they are, not bf16 blocks to be quantized again
+        return sum(FILES[k][2] * (share if k in MOSS_DIT_SHARDS else 1) for k in names) / 1e9 + HOST_GB
     return sum(FILES[k][2] * (share if k.endswith("-bf16") and engine_quantized(dit) else 1) for k in names) / 1e9 \
         + HOST_GB
 
