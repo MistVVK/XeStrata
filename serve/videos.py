@@ -568,7 +568,10 @@ class VideoJobs:
                     (self.dir_of(vid) / rec["input"]).unlink()
                 with self.lock:
                     self.cancels.pop(vid, None)
-            self._write(rec)
+            # delete() may have removed this job's folder while it ran: a missing record must not end the worker
+            # before the rest of the queue starts.
+            with contextlib.suppress(OSError):
+                self._write(rec)
 
     def get(self, vid: str) -> dict | None:
         try:

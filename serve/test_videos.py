@@ -7,8 +7,11 @@
 from __future__ import annotations
 
 import io
+import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -38,6 +41,44 @@ class UploadName(unittest.TestCase):
             self.assertNotIn("\n", path.name)
             self.assertNotIn(" ", path.name)
             self.assertTrue(path.is_file())
+
+
+class DeletedJob(unittest.TestCase):
+    def test_a_deleted_job_does_not_stop_the_worker(self):
+        # delete() waits at most 60 s for a running job, then removes its folder; the worker must survive writing
+        # that job's final record and go on with the queue.
+        def job(n):
+            return {"width": 64, "height": 64, "n": n,
+                    "source": {"width": 64, "height": 64, "fps": 30.0, "vfr": False, "frames": 1,
+                               "duration": 0.03}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "jobs"
+            started, release = threading.Event(), threading.Event()
+
+            def run(job, progress, cancel, source, stem, model):
+                if job["n"] == 1:
+                    started.set()
+                    release.wait(3)
+                    shutil.rmtree(source.parent, ignore_errors=True)
+                return {"path": str(stem / "out.mp4"), "mime": "video/mp4"}
+
+            jobs = videos.VideoJobs(root, run)
+            ids = []
+            for n in (1, 2):
+                vid, folder = jobs.new_dir()
+                source = folder / "input.mp4"
+                source.write_bytes(b"video")
+                jobs.create(vid, "auto", job(n), source)
+                ids.append(vid)
+                if n == 1:
+                    self.assertTrue(started.wait(2))
+            release.set()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and (jobs.get(ids[1]) or {}).get("status") != "completed":
+                time.sleep(0.01)
+            self.assertEqual(jobs.get(ids[1])["status"], "completed")
+            self.assertIsNone(jobs.get(ids[0]))   # its folder went away with the delete
 
 
 if __name__ == "__main__":
