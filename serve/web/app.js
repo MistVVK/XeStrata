@@ -4866,7 +4866,7 @@ $("vid-src").addEventListener("pause", () => { if (vidBoth()) $("vid-out").pause
 $("vid-src").addEventListener("seeked", () => { if (vidBoth()) $("vid-out").currentTime = $("vid-src").currentTime; });
 // a frame back or on (the result's rate where there is one, else the source's as the server read it, else 30)
 function vidStep(n) {
-  const fps = (vidLast && vidLast.fps) || 30;
+  const fps = (vidLast && vidLast.fps) || (vidSeg && vidSeg.fps) || 30;
   for (const v of [$("vid-src"), $("vid-out")]) {
     if (v.hidden || !v.src) continue;
     v.pause();
@@ -5178,10 +5178,13 @@ function vidSegRequest() {
   const req = {model: "sam3.1"};
   if (words.length) req.prompt = words[0];
   if (words.length > 1) req.prompts = words.slice(1);
+  // the server reads int(time * fps + 1e-3): three decimals turn one frame in three of a 30 fps source into the frame
+  // before (k/fps = 0.0333... sent as 0.033). Six keep the frame the page shows, and group clicks on the same frame.
+  const clickTime = (t) => Number(t.toFixed(6));
   const groups = new Map();
   for (const c of vidClicks) {
-    const key = `${c.time.toFixed(3)}|${c.target}`;
-    if (!groups.has(key)) groups.set(key, {time: Number(c.time.toFixed(3)), object: c.target.startsWith("new") ? null : Number(c.target), points: []});
+    const key = `${clickTime(c.time)}|${c.target}`;
+    if (!groups.has(key)) groups.set(key, {time: clickTime(c.time), object: c.target.startsWith("new") ? null : Number(c.target), points: []});
     const g = groups.get(key);
     if (c.box) g.box = c.box.map(Math.round);
     else g.points.push([Math.round(c.x), Math.round(c.y), c.label]);
