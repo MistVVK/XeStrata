@@ -2393,6 +2393,9 @@ async function generateReply(opts = {}) {
   // the chat model's GPU lent to the image calls (the drawer's choice over the server's use_text_gpu)
   if (body.xestrata_images && health.image_text_gpu && settings.textGpu)
     body.xestrata_images = {...(body.xestrata_images === true ? {} : body.xestrata_images), use_text_gpu: settings.textGpu};
+  // and the GPU of its image and video jobs (the drawer's choice; none: automatic)
+  if (body.xestrata_images && gpuMany() && settings.imageGpu)
+    body.xestrata_images = {...(body.xestrata_images === true ? {} : body.xestrata_images), gpu: settings.imageGpu};
   if (health.web_search && $("chat-search").value !== "off") body.web_search_options = {};   // the server's search tools
 
   let firstAt = null, thinkStart = null, usage = null, tokens = 0, frame = 0, overflow = false, handoff = false;
@@ -3061,6 +3064,8 @@ function loadDrawer(s = settings) {
   $("s-skills").setAttribute("aria-checked", String(s.skills !== false));
   $("s-textgpu").value = s.textGpu || "";
   $("textgpu-row").hidden = !health.image_text_gpu;
+  gpuOptions($("s-imagegpu"), s.imageGpu || "");
+  $("imagegpu-row").hidden = !gpuMany();
   $("s-share").setAttribute("aria-checked", String(sharedOn));
   $("s-list").setAttribute("aria-checked", String(!!s.chatList));
   $("s-edit").setAttribute("aria-checked", String(!!s.chatEdit));
@@ -3188,7 +3193,7 @@ $("s-apply").onclick = async () => {
               top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
               seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
-              skills: checked("s-skills"), textGpu: $("s-textgpu").value,
+              skills: checked("s-skills"), textGpu: $("s-textgpu").value, imageGpu: $("s-imagegpu").value,
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
               whileBusy: segValue("s-busy") || "queue", segments: checked("s-seg"), segmentLimit: $("s-seglimit").value.trim(),
               // the language's own choice stays "": it follows a later change of the page's language
@@ -3525,9 +3530,42 @@ function chatSearch() {
   renderEmptyChat();
 }
 $("chat-search").onchange = () => { store.set("chat_search", $("chat-search").value); renderEmptyChat(); };
+// The GPU of the Images, Tools and Video tabs' jobs (their requests' gpu) and of the chat's (xestrata_images' gpu):
+// automatic, the image GPU or the chat model's (/health image_gpus, two cards or more), the browser's choice alone - the
+// server's settings stay as they are
+function gpuOptions(sel, keep) {
+  const cards = health.image_gpus || [];
+  const name = (c) => `${c.index != null ? `GPU ${c.index} · ` : ""}${c.name || c.pci || c.id}`;
+  sel.replaceChildren(new Option(tr("img.gpuAuto", "Automatic"), ""),
+    ...cards.map((c) => new Option(c.id === "text" ? tr("img.gpuText", "{name} (the chat model's: the chat waits)", {name: name(c)})
+                                                   : tr("img.gpuImage", "{name} (the image GPU)", {name: name(c)}), c.id)));
+  sel.value = cards.some((c) => c.id === keep) ? keep : "";
+}
+const gpuMany = () => (health.image_gpus || []).length > 1;
+function gpuPicks() {
+  for (const id of ["img-gpu", "tool-gpu", "vid-gpu"]) {
+    gpuOptions($(id), store.get("image-gpu", ""));
+    $(`${id}-f`).hidden = !gpuMany();
+  }
+}
+for (const id of ["img-gpu", "tool-gpu", "vid-gpu"]) $(id).onchange = () => { store.set("image-gpu", $(id).value); gpuPicks(); };
+// the tabs' requests' gpu: none for automatic
+function gpuBody() {
+  const v = gpuMany() ? store.get("image-gpu", "") : "";
+  return v ? {gpu: v} : {};
+}
+// a job the server moved to the chat model's GPU (its answer's xestrata.gpu): said once it is done
+function gpuMoved(fig) {
+  const g = fig && fig.gpu;
+  if (!g || !g.busy) return;
+  toast("info", tr("img.gpuMovedTitle", "Made on {name}", {name: g.name}),
+        tr("img.gpuMoved", "A video job had {busy} (about {left} s more), so this was made on {name}, the chat model's GPU; the chat waited meanwhile.",
+           {busy: g.busy_name, left: g.left_s, name: g.name}), 10000);
+}
 function imgModels() {
   chatImages();
   chatSearch();
+  gpuPicks();
   const ms = health.image_models || [], sel = $("img-model"), was = sel.value;
   sel.replaceChildren(...ms.map(m => new Option(m.id, m.id)));
   if (ms.some(m => m.id === was)) sel.value = was;
@@ -4559,7 +4597,7 @@ $("img-form").onsubmit = async (ev) => {
   const size = $("img-size").value === "custom" ? `${$("img-w").value}x${$("img-h").value}` : $("img-size").value;
   const refs = Array.from($("img-ref").files || []);
   // "auto" goes as it is: the server makes it 1024 x 1024, a reference's shape, or the model's own choice
-  const body = {prompt, size, response_format: "b64_json"};
+  const body = {prompt, size, response_format: "b64_json", ...gpuBody()};
   if (!$("img-model-f").hidden) body.model = $("img-model").value;
   const loras = imgLorasBody();
   if (loras.length) body.lora = loras;
@@ -4623,6 +4661,7 @@ $("img-form").onsubmit = async (ev) => {
     $("img-seed-reuse").disabled = false;
     imgShow(0);
     $("img-hint").textContent = tr("img.doneIn", "Done in {n} s.", {n: seconds});
+    gpuMoved(j.xestrata);
     if (imgPhone.matches) $("img-view").scrollIntoView({block: "start", behavior: "smooth"});
     if (j.xestrata && j.xestrata.made_size && !j.xestrata.crop)
       toast("info", tr("img.madeAt", "Made at {size}", {size: j.xestrata.made_size}), tr("img.madeCutText", "The image model needs sides that are multiples of 16: the middle {size} was cut out.", {size: j.size}), 8000);
@@ -4808,7 +4847,7 @@ async function toolOpen(kind, url, name, prompt) {
 function toolRequest() {
   const k = toolKind, num = (id) => $(id).value === "" ? undefined : Number($(id).value);
   const prompt = $("tool-prompt").value.trim(), seed = num("tool-seed"), model = $("tool-model-f").hidden ? undefined : $("tool-model").value;
-  const body = {image: toolSrc.url};
+  const body = {image: toolSrc.url, ...gpuBody()};
   if (k === "upscale") {
     Object.assign(body, {model: $("tool-up-model").value, scale: num("tool-up-scale") ?? 2});
     const extra = {};
@@ -4822,7 +4861,7 @@ function toolRequest() {
   }
   if (k === "fix") {
     const parts = [...document.querySelectorAll("[name=tool-part]:checked")].map(x => x.value);
-    const req = {images: [{image_url: toolSrc.url}], fix: {parts, ...(num("tool-fix-strength") != null && {strength: num("tool-fix-strength")})}};
+    const req = {images: [{image_url: toolSrc.url}], fix: {parts, ...(num("tool-fix-strength") != null && {strength: num("tool-fix-strength")})}, ...gpuBody()};
     return ["v1/images/edits", {...req, ...(prompt && {prompt}), ...(model && {model}), ...(seed != null && {seed}), ...toolFormatBody(),
             response_format: "b64_json"}];
   }
@@ -5039,6 +5078,7 @@ $("tool-form").onsubmit = async (ev) => {
       toolResult({url: `data:image/${fmt};base64,` + d.b64_json, name: `xestrata-${toolKind}.${fmt === "jpeg" ? "jpg" : fmt}`, req, info: imgInfoText(url, req, answer)});
     }
     $("tool-hint").textContent = tr("img.doneIn", "Done in {n} s.", {n: seconds});
+    gpuMoved(j.xestrata);
   } catch (e) {
     if (toolAbort.signal.aborted) $("tool-hint").textContent = tr("img.interrupted", "Interrupted.");
     else toast("error", toolRunText(toolKind), String(e.message || e), 10000);
@@ -5254,7 +5294,7 @@ $("vid-form").onsubmit = async (ev) => {
   ev.preventDefault();
   if (vidAbort) return;
   if (!vidSrc) { toast("warn", tr("tab.video", "Video"), tr("vid.noVideo", "Choose a video first."), 5000); return; }
-  const seg = vidKind === "segment", req = seg ? vidSegRequest() : vidRequest(), v = health.video || {};
+  const seg = vidKind === "segment", req = {...(seg ? vidSegRequest() : vidRequest()), ...gpuBody()}, v = health.video || {};
   if (seg && !req.prompt && !(req.clicks || []).length) {
     toast("warn", tr("vid.segment", "Find objects"), tr("vid.segNothing", "Give the words of what to find, or click on the video."), 6000);
     return;

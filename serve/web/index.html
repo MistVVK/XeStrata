@@ -144,6 +144,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <div class="st-card img-prompts">
         <label class="st-field img-model" id="img-model-f" hidden><span data-i18n="img.model">Model</span>
           <select class="st-input" id="img-model"></select></label>
+        <label class="st-field img-gpu" id="img-gpu-f" hidden><span data-i18n="img.gpu">GPU that makes it</span>
+          <select class="st-input" id="img-gpu"></select></label>
         <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"
                   data-i18n-placeholder="img.prompt" data-i18n-label="img.promptLabel"></textarea>
         <details class="img-neg" id="img-neg-f" open><summary data-i18n="img.negative">Negative prompt (optional)</summary>
@@ -421,6 +423,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <span class="composer-hint" id="tool-about"></span>
         <label class="st-field" id="tool-file-f"><span data-i18n="tool.image">Image (or drop one here)</span>
           <input class="st-input" id="tool-file" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp,image/jxl,.jxl"></label>
+        <label class="st-field img-gpu" id="tool-gpu-f" hidden><span data-i18n="img.gpu">GPU that makes it</span>
+          <select class="st-input" id="tool-gpu"></select></label>
         <label class="st-field" id="tool-prompt-f"><span id="tool-prompt-l">Prompt</span>
           <textarea class="st-input img-prompt" id="tool-prompt" rows="2"></textarea></label>
       </div>
@@ -571,6 +575,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <span class="composer-hint" data-vid="segment" data-i18n="vid.aboutSegment" hidden>Finds every instance of the words on every frame and follows it (SAM 3.1); points and boxes on any frame add an object or fix one.</span>
         <label class="st-field"><span data-i18n="vid.file">Video (or drop one here)</span>
           <input class="st-input" id="vid-file" type="file" accept="video/*,.mkv"></label>
+        <label class="st-field img-gpu" id="vid-gpu-f" hidden><span data-i18n="img.gpu">GPU that makes it</span>
+          <select class="st-input" id="vid-gpu"></select></label>
         <span class="composer-hint" id="vid-src-info"></span>
       </div>
       <div class="img-go-bar">
@@ -935,6 +941,11 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <option value="on" data-i18n="drawer.textGpuOn">Whenever it helps</option>
       </select>
       <span class="muted small" data-i18n="drawer.textGpuNote">The image calls of one answer then run on both GPUs at once; a chat waits while the chat model's GPU makes an image.</span>
+    </div>
+    <div class="st-field" id="imagegpu-row" hidden>
+      <label class="st-label" for="s-imagegpu"><span data-i18n="drawer.imageGpu">GPU that makes the chat's images and videos</span></label>
+      <select class="st-input" id="s-imagegpu"></select>
+      <span class="muted small" data-i18n="drawer.imageGpuNote">For this browser only; the server's settings stay as they are. On the chat model's GPU, a chat waits while it makes an image.</span>
     </div>
     <div class="drawer-group" role="group" aria-labelledby="g-skills">
       <h3 class="drawer-group__title" id="g-skills" data-i18n="skills.title">Skills</h3>
