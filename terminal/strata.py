@@ -35,6 +35,11 @@ def _preflight(argv):
 if __name__ == "__main__":
     # a newer Control installed by `strata update` takes over before anything heavy is imported (stdlib only)
     from strata_cli.handover import maybe_hand_over, refuse_old_updater
+    try:                                               # the app host started this for a long download or pack: it ends with the host (strata_control/parentwatch.py)
+        from strata_control.parentwatch import exit_with_parent
+        exit_with_parent()
+    except Exception:                                  # noqa: BLE001 - never a reason for the command to fail
+        pass
     refused = refuse_old_updater(sys.argv[1:])
     if refused is not None:
         raise SystemExit(refused)

@@ -136,6 +136,7 @@ function packagedFixture({ engineUsable = true, updater = null, repair = false, 
     async saveProfile(name, path) { calls.push(['saveProfile', name, basename(path)]); saved.push(JSON.parse(readFileSync(path, 'utf8'))); return {}; },
     async start(name, options) { calls.push(['start', name, options?.waitSeconds]); if (startFailure && startFailureLeft-- > 0) { const e = new Error(startFailure.message); e.output = startFailure.output; throw e; } return { ok: true, state: 'ready' }; },
     async stop(name) { calls.push(['stop', name]); return { ok: true, state: 'stopped' }; },
+    async killChildren() { calls.push(['killChildren']); return 0; },
     async status(name) { calls.push(['status', name]); return typeof statusAnswer === 'function' ? statusAnswer(name) : statusAnswer; },
     ...(repair ? { async repairAccess() { calls.push(['repairAccess']); return { ok: true }; } } : {}),
     ...(updater ? { async updateCheck() { calls.push(['updateCheck']); return updater.report; }, async update(options) { calls.push(['update', options.engine, options.control]); return updater.update(options); } } : {}),
@@ -816,6 +817,27 @@ test('quit while the install is still starting: the cancel waits for the start, 
     assert.equal(w.state.running, false, 'the model preparation still runs after the app was closed');
     assert.ok(w.state.cancels.at(-1) === true || w.state.cancels.includes(true), 'a cancel reached the job after it was launched');
     assert.notEqual(f.native.state().jobs.find(j => j.id === id)?.state, 'running');
+  } finally { f.cleanup(); }
+});
+
+test('quit while the engine or a drafter is being downloaded for the job: the download is told to stop (the job\'s engineAbort), and what Control still runs is ended', async () => {
+  let seenSignal = null;
+  const report = { engine: { status: 'install', offered: { version: '0.1.60' }, download_bytes: 7e8 } };
+  const w = watchedInstaller({ startMs: 5 });
+  const f = packagedFixture({ engineUsable: false, rpcHook: w.rpcHook, updater: { report, async update(options) {
+    seenSignal = options.signal;
+    await new Promise(resolve => options.signal.addEventListener('abort', resolve, { once: true }));
+    throw new Error('stopped');
+  } } });
+  try {
+    await f.native.refresh(true);
+    f.native.operation('install', { family: 'qwen', model: 'Q2_0' });
+    for (let i = 0; i < 300 && !seenSignal; i++) await new Promise(r => setTimeout(r, 10));
+    assert.ok(seenSignal, 'the engine download started');
+    assert.equal(seenSignal.aborted, false);
+    await f.native.close();
+    assert.equal(seenSignal.aborted, true, 'the quit stopped the download (before, only a Stop press did)');
+    assert.ok(f.calls.some(c => c[0] === 'killChildren'), 'Control programs that are still running are ended last');
   } finally { f.cleanup(); }
 });
 

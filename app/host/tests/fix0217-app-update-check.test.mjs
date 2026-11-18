@@ -6,7 +6,10 @@
 //  - N-A2: after a successful app update the old host's log said "update-strata failed: fetch failed" (the installer ends the shell, its address stops answering).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createControl } from '../server/control-runtime.mjs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { controlEnvironment, createControl } from '../server/control-runtime.mjs';
 import { engineFirstRun, checkComponentUpdates } from '../server/updates.mjs';
 import * as appUpdater from '../server/app-updater.mjs';
 
@@ -84,6 +87,35 @@ test('another failure (not the lock) is not retried', async () => {
   const ctl = createControl({ control, sleep: async () => { throw new Error('must not wait'); }, run: async () => { runs++; return { code: 5, json: null, text: '', stderr: 'could not read the feed' }; } });
   await assert.rejects(ctl.updateCheck(), /could not read the feed/);
   assert.equal(runs, 1);
+});
+
+// ---------------------------------------------------------------------------------- item 2: a quit ends the Control programs the host started
+
+test('killChildren ends a Control program that is still running (a download or a pack a closed app left writing) and waits for it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'strata-kill-children-'));
+  try {
+    const pidfile = join(dir, 'pid');
+    const script = join(dir, 'cli.mjs');
+    writeFileSync(script, "import { writeFileSync } from 'node:fs'; writeFileSync(process.env.TEST_PIDFILE, String(process.pid)); console.log('{\"event\":\"progress\",\"step\":\"x\",\"done\":1,\"total\":2}'); setInterval(() => {}, 1000);");
+    const ctl = createControl({ control: { dir, python: process.execPath, cli: script }, env: { ...process.env, TEST_PIDFILE: pidfile } });
+    const fetching = ctl.draftingFetch({ configPath: join(dir, 'cfg.json') }).then(() => null, error => error);
+    for (let i = 0; i < 300 && !existsSync(pidfile); i++) await new Promise(r => setTimeout(r, 20));
+    assert.ok(existsSync(pidfile), 'the program is running');
+    const pid = Number(readFileSync(pidfile, 'utf8'));
+    process.kill(pid, 0);                                    // alive
+    assert.equal(await ctl.killChildren({ waitMs: 15_000 }), 1);
+    assert.ok((await fetching) instanceof Error, 'the call that waited for it ends with an error, as for any program that stopped');
+    let alive = true;
+    for (let i = 0; i < 100 && alive; i++) { try { process.kill(pid, 0); await new Promise(r => setTimeout(r, 50)); } catch { alive = false; } }
+    assert.equal(alive, false, 'the program is gone');
+    assert.equal(await ctl.killChildren(), 0, 'nothing is left to end');
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+});
+
+test('the downloads that Control runs for the host end with the host: STRATA_EXIT_WITH_PARENT is set for the acquiring calls only', () => {
+  const c = { dir: '/c', python: 'p', cli: 'c' };
+  assert.equal(controlEnvironment(c, { env: {}, components: '/k', acquire: true }).STRATA_EXIT_WITH_PARENT, '1');
+  assert.equal(controlEnvironment(c, { env: {}, components: '/k' }).STRATA_EXIT_WITH_PARENT, undefined);
 });
 
 // ---------------------------------------------------------------------------------- N-A2

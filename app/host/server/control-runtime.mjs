@@ -11,7 +11,7 @@
  * timeout, no shell), and the four operations the app needs: which engine this PC would use, which models are
  * installed, start a saved profile, stop it.
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -99,7 +99,11 @@ export function controlEnvironment(control, { env = process.env, components = co
     ...(control?.dir ? { STRATA_CONTROL_DIR: control.dir } : {}),
   };
   // Only the explicit update step (`strata update`) may acquire; every other Control process keeps the switch on.
-  if (acquire) delete result.STRATA_NO_ACQUIRE;
+  if (acquire) {
+    delete result.STRATA_NO_ACQUIRE;
+    // What downloads and packs for a long time ends when the host that asked for it ends, even when the host is killed and cannot say so (strata.py watches its parent).
+    result.STRATA_EXIT_WITH_PARENT = '1';
+  }
   return result;
 }
 
@@ -130,12 +134,13 @@ const BOOT = {
 };
 
 /** Run one CLI command of Control (or, with `boot`, one of its modules). Resolves { code, json, text, stderr }; rejects only if it cannot start or times out. */
-export function runCli(control, args, { env = process.env, timeoutMs = 60_000, spawnProcess = spawn, components, acquire = false, onLine = null, signal = null, boot = null } = {}) {
+export function runCli(control, args, { env = process.env, timeoutMs = 60_000, spawnProcess = spawn, components, acquire = false, onLine = null, signal = null, boot = null, track = null } = {}) {
   return new Promise((resolveRun, reject) => {
     const child = spawnProcess(control.python, boot ? ['-c', BOOT[boot], ...args] : [control.cli, ...args], {
       cwd: control.dir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
       env: controlEnvironment(control, { env, acquire, ...(components ? { components } : {}) }),
     });
+    if (track) { try { track(child); } catch { /* a tracker must not break a call */ } }
     if (signal) {
       if (signal.aborted) { try { child.kill(); } catch { /* gone */ } }
       else signal.addEventListener('abort', () => { try { child.kill(); } catch { /* gone */ } }, { once: true });
@@ -190,12 +195,25 @@ export function controlCallName(args) {
   return profile ? `${words.join(' ')} (profile ${profile})` : words.join(' ');
 }
 
+/** End one Control program with what it started: Windows takes the tree (taskkill /T), elsewhere it is asked to stop (SIGTERM) and, if it is still there two seconds later, ended (SIGKILL). */
+export function endChild(child) {
+  try {
+    if (process.platform === 'win32' && child.pid) { spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 10_000 }); return; }
+    child.kill('SIGTERM');
+    const later = setTimeout(() => { try { if (child.exitCode == null && child.signalCode == null) child.kill('SIGKILL'); } catch { /* gone */ } }, 2000);
+    later.unref?.();
+  } catch { /* already gone */ }
+}
+
 /** Operations the app uses. `run` is injectable so the host's tests need no Python; `log` (a line writer) makes every call write its start, its end and how long it took. */
 export function createControl({ control = findControl(), env = process.env, run = null, log = null, now = () => Date.now(), sleep = ms => new Promise(r => setTimeout(r, ms)), lockWaitMs = 30_000, lockPollMs = 1_000 } = {}) {
   if (!control) return null;
   const checksInFlight = new Map();
   let lastCheck = Promise.resolve();
-  const base = run ?? ((args, options) => runCli(control, args, { env, ...options }));
+  /* The Control programs this host started and that still run: a quit ends them (killChildren). A download or a pack that a closed app leaves running keeps writing to the disk. */
+  const children = new Set();
+  const track = child => { children.add(child); child.once?.('close', () => children.delete(child)); child.once?.('error', () => children.delete(child)); };
+  const base = run ?? ((args, options) => runCli(control, args, { env, track, ...options }));
   // A call to Control that never returns (a stuck stop, a start that waits) used to leave nothing in the host log to say which call it was or for how long.
   let numbered = 0;
   const call = !log ? base : async (args, options) => {
@@ -219,6 +237,19 @@ export function createControl({ control = findControl(), env = process.env, run 
      * Use the newest whole Control there is now (findControl again), after an update installed one: true when it changed. Every later call runs the new one.
      * The caller makes sure nothing of the old one is running (native-control.mjs switchControl).
      */
+    /**
+     * The app is quitting: end every Control program this host started that still runs (a drafter or picture-reader download and its packing, an update, a folder move),
+     * and wait for them to be gone (at most waitMs). Resolves with how many there were. A call that was waiting for one of them rejects as it would for any ended program.
+     */
+    async killChildren({ waitMs = 5000, end = endChild } = {}) {
+      const running = [...children];
+      for (const child of running) end(child);
+      const gone = child => new Promise(resolve => { if (child.exitCode != null || child.signalCode != null) resolve(); else child.once('close', resolve); });
+      let timer;
+      await Promise.race([Promise.all(running.map(gone)), new Promise(resolve => { timer = setTimeout(resolve, waitMs); timer.unref?.(); })]);
+      clearTimeout(timer);
+      return running.length;
+    },
     reload({ find = findControl } = {}) {
       const next = find({ env });
       if (!next || resolve(next.dir) === resolve(control.dir)) return false;
