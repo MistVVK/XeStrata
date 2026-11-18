@@ -4374,15 +4374,17 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             : new PinnedArena(want + (uint64_t) blob, bounds, 0, shared_arena_file, pack_hash, cuts);
     } catch (const std::exception& e) {
         // a runtime without the registration (intel/llvm's CUDA adapter has no urUSMImportExp) takes host USM
-        if (!shared_arena_file.empty() || host_usm) {
+        if (!shared_arena_file.empty() || (host_usm && host_usm_want >= 0)) {
             err = std::string("ArenaExpertSource: ") + e.what();
             return false;
         }
-        std::fprintf(stderr, "xestrata: %s; the expert arena takes host USM instead\n", e.what());
+        const bool alternate_usm = !host_usm;
+        std::fprintf(stderr, "xestrata: %s; the expert arena tries %s instead\n", e.what(),
+                     alternate_usm ? "host USM" : "registered mapping");
         try {
-            a = new PinnedArena(want + (uint64_t) blob, bounds, (uint64_t) blob, /*host_usm=*/true);
+            a = new PinnedArena(want + (uint64_t) blob, bounds, (uint64_t) blob, alternate_usm, cuts);
         } catch (const std::exception& e2) {
-            err = std::string("ArenaExpertSource: ") + e.what() + "; host USM: " + e2.what();
+            err = std::string("ArenaExpertSource: ") + e.what() + "; alternate arena: " + e2.what();
             return false;
         }
     }
