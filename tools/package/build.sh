@@ -5,8 +5,9 @@
 #
 #   tools/package/build.sh ubuntu26.04 free|cuda13.1|cuda12.4 [COMMIT]
 #   tools/package/build.sh fedora44    free|cuda13.4          [COMMIT]
+#   tools/package/build.sh fedora45    free|cuda13.5          [COMMIT]
 #   tools/package/build.sh windows     cuda12.4               [COMMIT]
-#   tools/package/build.sh ubuntu26.04|fedora44 gui          [COMMIT]
+#   tools/package/build.sh ubuntu26.04|fedora44|fedora45 gui [COMMIT]
 #
 # XESTRATA_JOBS=N compiles N files at once in every build in the container (default: as many as the threads;
 # intel/llvm's links as many as the free RAM allows).
@@ -37,8 +38,9 @@ set -eu
 usage() {
   echo "usage: $0 ubuntu26.04 free|cuda13.1|cuda12.4 [COMMIT]" >&2
   echo "       $0 fedora44 free|cuda13.4 [COMMIT]" >&2
+  echo "       $0 fedora45 free|cuda13.5 [COMMIT]" >&2
   echo "       $0 windows cuda12.4 [COMMIT]" >&2
-  echo "       $0 ubuntu26.04|fedora44 gui [COMMIT]" >&2
+  echo "       $0 ubuntu26.04|fedora44|fedora45 gui [COMMIT]" >&2
   exit 2
 }
 
@@ -49,14 +51,16 @@ commit=${3:-HEAD}
 case "$distro/$variant" in
   ubuntu26.04/free | ubuntu26.04/cuda13.1 | ubuntu26.04/cuda12.4) ;;
   fedora44/free | fedora44/cuda13.4) ;;
-  ubuntu26.04/gui | fedora44/gui) ;;
+  fedora45/free | fedora45/cuda13.5) ;;
+  ubuntu26.04/gui | fedora44/gui | fedora45/gui) ;;
   windows/cuda12.4) ;;
   *) usage ;;
 esac
-# the images as pulled on 2026-10-06: a newer one is taken by changing these lines
+# the images as pulled on 2026-10-06 (Fedora 45 on 2026-11-18): a newer one is taken by changing these lines
 case "$distro" in
   ubuntu26.04 | windows) image=docker.io/library/ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 ;;
   fedora44) image=docker.io/library/fedora@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 ;;
+  fedora45) image=docker.io/library/fedora@sha256:53d138f25f6738257c78553d51369b662efc0e0eb1cd1556a2fe0ad5a115be88 ;;
 esac
 
 cd "$(git rev-parse --show-toplevel)"

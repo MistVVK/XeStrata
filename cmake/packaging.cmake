@@ -23,6 +23,8 @@ set(STRATA_PACKAGE_RECOMMENDS "" CACHE STRING "the package's weak dependencies, 
 set(STRATA_PACKAGE_SUGGESTS "" CACHE STRING "the package's suggestions, not installed by default")
 set(STRATA_PACKAGE_RUNTIME "{}" CACHE STRING
     "the GPU makers' packages by maker, as a JSON object, for setup to tell what a PC lacks (BUILD.json's runtime)")
+set(STRATA_PACKAGE_RELEASE_SUFFIX "" CACHE STRING
+    "the rpm Release's dist tag (fc44, fc45), which tells the two Fedoras' gui and free packages apart in a release's folder")
 if(NOT STRATA_PACKAGE_NAME)
   message(FATAL_ERROR "STRATA_PACKAGE needs STRATA_PACKAGE_NAME (tools/package/build.sh sets it)")
 endif()
@@ -252,7 +254,7 @@ set(CPACK_DEBIAN_PACKAGE_REPLACES xestrata-engine)
 
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 set(CPACK_RPM_PACKAGE_NAME ${STRATA_PACKAGE_NAME})
-set(CPACK_RPM_PACKAGE_RELEASE ${XESTRATA_REVISION})
+set(CPACK_RPM_PACKAGE_RELEASE ${XESTRATA_REVISION}${STRATA_PACKAGE_RELEASE_SUFFIX})
 set(CPACK_RPM_PACKAGE_LICENSE "LGPL-3.0-or-later AND MIT AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND OFL-1.1")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Engineering")
 set(CPACK_RPM_PACKAGE_REQUIRES "${STRATA_PACKAGE_DEPENDS}")

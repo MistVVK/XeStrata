@@ -23,6 +23,13 @@ case "$cuda_ver" in
   13.*) archs="sm_75;sm_80;sm_86;sm_89;sm_90" ;;
 esac
 
+# the rpm's Release carries its Fedora's dist tag (fc44, fc45): nothing else tells a fedora44 rpm from a fedora45 one
+# of the same variant, and a release's folder gathers both (the gui and free packages of the two Fedoras)
+rel_suffix=
+case "$distro" in
+  fedora*) rel_suffix=".fc$(sed -n 's/^VERSION_ID=//p' /etc/os-release)" ;;
+esac
+
 # cuDNN's headers, for the image engine's attention: from NVIDIA's redistributable archive for the CUDA version's major
 # (neither Ubuntu nor NVIDIA's Fedora repository has them), its SHA-256 checked, kept in the downloads' cache, into
 # /opt/cudnn.  At run time the engine opens cuDNN and the CUDA runtime cudnn-frontend opens where setup tells the user
@@ -46,6 +53,10 @@ cudnn_headers() {
 }
 
 intel_key=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+# NVIDIA's CUDA repository: fedora44's, which Fedora 45's builds use as well (NVIDIA has no repository of Fedora 45's
+# own yet - only its DCGM packages are there, 2026-11-18): change these lines when NVIDIA publishes one
+# (developer.download.nvidia.com/compute/cuda/repos/)
+nvidia_cuda_repo=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/cuda-fedora44.repo
 # oneMKL's series (setup.py's ONEMKL_SERIES: the newest whose SYCL library runs on intel/llvm 7.1.1's runtime); the
 # packages suggest the package of the library the engine links, so this series
 mkl_series=$(sed -n 's/^ONEMKL_SERIES = "\(.*\)"$/\1/p' "$src/setup.py")
@@ -101,8 +112,7 @@ python3-requests, python3-pillow, python3-psutil, python3-jsonschema"
     ffmpeg="ffmpeg-free"    # Fedora's own ffmpeg (H.264 through openh264, else VP9: video_io.cpp takes what it has)
     if [ "$license" = contrib ]; then
       dnf install -y -q dnf5-plugins   # config-manager
-      dnf config-manager addrepo \
-        --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/cuda-fedora44.repo
+      dnf config-manager addrepo --from-repofile="$nvidia_cuda_repo"
       v=$(echo "$cuda_ver" | tr . -)
       dnf install -y -q "cuda-toolkit-$v" xz
       cuda_path=/usr/local/cuda-$cuda_ver
@@ -256,7 +266,8 @@ case "$distro" in
   fedora*) generator=RPM ;;
 esac
 cmake -DSTRATA_PACKAGE_DEPENDS="$depends" -DSTRATA_PACKAGE_RECOMMENDS="$recommends" \
-  -DSTRATA_PACKAGE_SUGGESTS="$suggests" -DSTRATA_PACKAGE_RUNTIME="$runtime" /build/engine
+  -DSTRATA_PACKAGE_SUGGESTS="$suggests" -DSTRATA_PACKAGE_RUNTIME="$runtime" \
+  -DSTRATA_PACKAGE_RELEASE_SUFFIX="$rel_suffix" /build/engine
 cd /build/engine
 cpack -G "$generator"
 find . -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} /out/ \;

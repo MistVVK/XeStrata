@@ -30,6 +30,13 @@ lap tools
 upstream=$(sed -n 's/^set(STRATA_UPSTREAM_VERSION "\(.*\)")$/\1/p' "$src/CMakeLists.txt" | tr - '~')
 revision=$(sed -n 's/^set(XESTRATA_REVISION \([0-9]*\))$/\1/p' "$src/CMakeLists.txt")
 version="$upstream-$revision"
+# the rpm's Release carries its Fedora's dist tag (fc44, fc45), so the two Fedoras' gui packages differ in a release's
+# folder (as the main packages': tools/package/container.sh).  The Requires below keeps the plain revision: it names
+# what the main package provides, which carries no tag
+rel_suffix=
+case "$distro" in
+  fedora*) rel_suffix=".fc$(sed -n 's/^VERSION_ID=//p' /etc/os-release)" ;;
+esac
 
 # the window, its NuGet packages exactly as the lock files name them (launcher/Directory.Build.props)
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 AVALONIA_TELEMETRY_OPTOUT=1 NUGET_PACKAGES=/cache/nuget
@@ -77,7 +84,7 @@ CONTROL
     cat > /build/rpm/xestrata-gui.spec <<SPEC
 Name: xestrata-gui
 Version: $upstream
-Release: $revision
+Release: $revision$rel_suffix
 Summary: $summary
 License: LGPL-3.0-or-later AND MIT AND BSD-3-Clause AND FTL AND Libpng AND Zlib AND IJG AND Apache-2.0 AND LicenseRef-Adobe-DNG-SDK
 URL: https://github.com/MistVVK/XeStrata
